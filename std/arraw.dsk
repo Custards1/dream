@@ -1,3 +1,0 @@
-let do! it = it |> string.upper() |> std.console.print! ()
-
-let main! = "hello world" |> do!;
