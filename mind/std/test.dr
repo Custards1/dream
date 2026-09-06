@@ -1,0 +1,146 @@
+// A test framework.
+//
+// Each case runs in its own process. That is not ceremony: a case that raises,
+// or that loops, is isolated from the rest of the suite, and the failure
+// arrives at the runner as an ordinary value through `join!` rather than as
+// something that has already unwound the runner's own stack.
+//
+//     import std.test;
+//
+//     let main! = test.suite! "list" [
+//         test.case "sum"     $( test.eq! 6 (list.sum [1, 2, 3]) ),
+//         test.case "reverse" $( test.eq! [3, 2, 1] (list.reverse [1, 2, 3]) ),
+//     ]
+
+// Only `std.core` is imported, never `std.list`. A module's own tests import
+// this framework, so anything it depends on could not have tests of its own --
+// the import would be a cycle. Walking lists with the primitives directly is a
+// small price for letting every module test itself.
+import std.console;
+import std.core;
+
+// --- cases ------------------------------------------------------------------
+
+/// A case is a name and a suspended computation, as made by `$( .. )`.
+let case name body = [name, body];
+
+let case_name c = core.head c;
+let case_body c = core.head (core.tail c);
+
+// --- assertions -------------------------------------------------------------
+//
+// Each raises a message describing the difference. Raising is what ends a case
+// at its first failure, and what the runner catches.
+
+let eq! expected actual = {
+    if expected == actual { :ok }
+    else {
+        raise! ("expected " + to_string expected + ", got " + to_string actual)
+    }
+};
+
+let ne! unexpected actual = {
+    if unexpected != actual { :ok }
+    else { raise! ("expected anything but " + to_string unexpected) }
+};
+
+let true! actual = {
+    if actual == true { :ok }
+    else { raise! ("expected true, got " + to_string actual) }
+};
+
+let false! actual = {
+    if actual == false { :ok }
+    else { raise! ("expected false, got " + to_string actual) }
+};
+
+/// Floats rarely compare exactly, so compare within a tolerance.
+let near! tolerance expected actual = {
+    let d = expected - actual;
+    let magnitude = if d < 0 { 0 - d } else { d };
+    if magnitude <= tolerance { :ok }
+    else {
+        raise! ("expected " + to_string expected + " within " + to_string tolerance
+                + ", got " + to_string actual)
+    }
+};
+
+let rec has_element x xs =
+    if core.is_empty xs { false }
+    else if core.head xs == x { true }
+    else { has_element x (core.tail xs) };
+
+let contains! x xs = {
+    if has_element x xs { :ok }
+    else { raise! (to_string xs + " does not contain " + to_string x) }
+};
+
+let empty! xs = {
+    if core.is_empty xs { :ok }
+    else { raise! ("expected an empty list, got " + to_string xs) }
+};
+
+/// The computation must raise. Used to check that errors are reported.
+let raises! body = {
+    let outcome = try! { join! (spawn! body); :did_not_raise } catch e { :raised };
+    if outcome == :raised { :ok } else { raise! "expected this to raise, but it returned" }
+};
+
+/// Fail unconditionally, for a branch that should be unreachable.
+let fail! message = raise! message;
+
+// --- running ----------------------------------------------------------------
+
+let rec run_cases! passed failed cases = {
+    if core.is_empty cases { [passed, failed] }
+    else {
+        let c = core.head cases;
+        let name = case_name c;
+        // Running the case in its own process means a failure -- including one
+        // the case did not intend -- comes back as a value instead of taking
+        // the runner with it.
+        let outcome = try! { join! (spawn! (case_body c)); :pass } catch e { e };
+        if outcome == :pass {
+            console.write! ("  ok    " + name + "\n")
+            run_cases! (passed + 1) failed (core.tail cases)
+        } else {
+            console.write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n")
+            run_cases! passed (failed + 1) (core.tail cases)
+        }
+    }
+};
+
+/// Run a suite. Returns the number of failures, so a caller can sum several
+/// suites and exit accordingly.
+let suite! name cases = {
+    console.write! ("\n" + name + "\n")
+    let counts = run_cases! 0 0 cases;
+    let passed = core.head counts;
+    let failed = core.head (core.tail counts);
+    console.write! ("  " + to_string passed + " passed"
+                    + (if failed > 0 { ", " + to_string failed + " FAILED" } else { "" })
+                    + "\n")
+    failed
+};
+
+/// Run several suites and report the total. Each entry is `[name, cases]`.
+let rec run_suites! failed suites = {
+    if core.is_empty suites { failed }
+    else {
+        let s = core.head suites;
+        let f = suite! (core.head s) (core.head (core.tail s));
+        run_suites! (failed + f) (core.tail suites)
+    }
+};
+
+/// The usual entry point: run everything and print a summary.
+let main_of! suites = {
+    let failed = run_suites! 0 suites;
+    if failed > 0 {
+        console.write! ("\n" + to_string failed + " test(s) failed\n")
+        raise! :tests_failed
+    } else {
+        console.write! "\nall tests passed\n"
+        :ok
+    }
+};

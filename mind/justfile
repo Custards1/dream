@@ -1,0 +1,10 @@
+src := "mind.dr"
+output := "mind.dream"
+
+clean:
+   rm -f $(output) 
+build:
+    dawnc $(src)
+run:
+    mindv2 $(output)    
+rebuild: build run
