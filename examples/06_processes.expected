@@ -1,0 +1,10 @@
+self:        :process
+joined:      144
+echoed:      :hello
+parallel:    [1, 4, 9, 16, 25]
+factorials:  [120, 720, 5040]
+failure:     [:caught, <error :divide_by_zero division by zero>]
+unaffected:  42
+child's:     [1, 2, 3, 4]
+ours:        [1, 2, 3]
+long loop:   :liftoff

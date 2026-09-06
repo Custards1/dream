@@ -8,6 +8,8 @@ cargo build
 ./target/debug/dreamc examples/sample.dr --dump
 ```
 
+The full language reference is [docs/language-spec.md](../docs/language-spec.md).
+
 ## The language
 
 Values are integers, floats, chars, bools, unit, and objects. The canonical

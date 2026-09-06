@@ -42,8 +42,19 @@ struct NativeResult {
 /// the host attached. Builtins are immediates and pass themselves.
 using NativeFn = NativeResult (*)(Process& p, Value callee, Value* args, uint32_t argc);
 
+/// An `arity` of this means "however many arguments the call site passed".
+///
+/// A curried language cannot decide on its own when a variadic call is
+/// saturated -- `f a b` and `f a b c` differ only in how many arguments the
+/// application node carries -- so a variadic native consumes exactly the
+/// arguments of the application that reached it, and is never partially
+/// applied. Every argument is forced, since `strict_mask` has no bit to spare
+/// for an unbounded list.
+constexpr uint32_t NATIVE_VARIADIC = 0xFFFFFFFFu;
+
 struct NativeDef {
     const char* name;
+    /// Number of arguments, or `NATIVE_VARIADIC`.
     uint32_t arity;
     uint32_t strict_mask;  // bit i: force argument i before calling
     NativeFn fn;
@@ -87,6 +98,9 @@ public:
     std::shared_ptr<Process> find_process(uint64_t id) const;
     void retire_process(uint64_t id);
     size_t live_process_count() const;
+    /// Every process the runtime still knows about, newest last. Used by
+    /// `std.vm` to report what the system is doing.
+    std::vector<std::shared_ptr<Process>> all_processes() const;
 
     Scheduler* scheduler() { return scheduler_; }
     void set_scheduler(Scheduler* s) { scheduler_ = s; }

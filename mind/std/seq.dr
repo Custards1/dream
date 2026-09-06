@@ -1,0 +1,100 @@
+// Sequences: everything a container gets for free once it can fold.
+//
+// This module is generic. It declares one hole -- `fold` -- and writes every
+// other operation in terms of it, so a container becomes a full sequence by
+// deriving this module and answering that one question:
+//
+//     derive std.seq;
+//     let fold f init xs = ..;
+//
+// `std.array` and `std.str` are the two that do. Because Dream compiles whole
+// programs, `derive` specializes this module's syntax tree against the deriving
+// module's `fold`, so `array.sum` is ordinary code with the array fold inlined
+// into it -- there is no dispatch at run time and nothing to pay for the
+// generality.
+//
+// What deliberately is *not* here: anything lazy. `fold` walks the whole
+// container, so every operation below is strict and terminates only on a finite
+// one. `std.list` keeps its own implementations for that reason -- `take 5
+// (from 1)` has to work on an infinite list, and it cannot if it goes through a
+// fold.
+
+import std.core;
+
+// --- the hole ---------------------------------------------------------------
+
+/// Combine every element into an accumulator, left to right:
+/// `fold f init [a, b]` is `f (f init a) b`.
+virtual let fold f init xs;
+
+/// What this kind of sequence is called, for error messages and `describe`.
+/// A deriving module may leave this alone.
+virtual let name xs = "sequence";
+
+// --- size -------------------------------------------------------------------
+
+/// Counts by folding, so it costs a walk even where the container knows its
+/// own size. `std.array` overrides it with the constant-time answer.
+let length xs = fold (fn n _ -> n + 1) 0 xs;
+
+let is_empty xs = length xs == 0;
+
+// --- arithmetic -------------------------------------------------------------
+
+let sum xs = fold (fn acc x -> acc + x) 0 xs;
+
+let product xs = fold (fn acc x -> acc * x) 1 xs;
+
+// --- searching --------------------------------------------------------------
+
+/// How many elements satisfy `keep`.
+let count keep xs = fold (fn n x -> if keep x { n + 1 } else { n }) 0 xs;
+
+/// Does any element satisfy `keep`? Folds the whole sequence either way, so it
+/// does not short-circuit; that is the price of having only `fold`.
+let any keep xs = fold (fn seen x -> seen || keep x) false xs;
+
+let all keep xs = fold (fn ok x -> ok && keep x) true xs;
+
+let contains wanted xs = any (fn x -> x == wanted) xs;
+
+// --- extremes ---------------------------------------------------------------
+//
+// `()` on an empty sequence, matching how `std.list` answers `nth` and `last`
+// out of range: a total function that says "nothing" rather than one that
+// raises.
+
+let extreme_by better xs =
+    fold (fn best x -> if best == () { x } else if better x best { x } else { best }) () xs;
+
+let minimum xs = extreme_by (fn a b -> a < b) xs;
+
+let maximum xs = extreme_by (fn a b -> a > b) xs;
+
+/// The element for which `rank` is smallest.
+let minimum_by rank xs =
+    fold (fn best x -> if best == () { x } else if rank x < rank best { x } else { best }) () xs;
+
+let maximum_by rank xs =
+    fold (fn best x -> if best == () { x } else if rank x > rank best { x } else { best }) () xs;
+
+// --- converting -------------------------------------------------------------
+
+/// The elements as a list, in order. `fold` builds it reversed -- consing is
+/// what makes each step constant time -- so this reverses once at the end
+/// rather than appending at every step.
+let to_list xs = {
+    let rec rev acc ys =
+        if core.is_empty ys { acc } else { rev (core.cons (core.head ys) acc) (core.tail ys) };
+    rev [] (fold (fn acc x -> core.cons x acc) [] xs)
+};
+
+/// Every element rendered and joined with `sep` between them.
+let join sep xs = {
+    let step acc x =
+        if acc == () { to_string x } else { acc + sep + to_string x };
+    let joined = fold step () xs;
+    if joined == () { "" } else { joined }
+};
+
+let describe xs = name xs + " of " + to_string (length xs)

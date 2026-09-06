@@ -1,0 +1,42 @@
+// The tool itself: text in, a report out.
+//
+// Every other module in this package is a file of its own, and this one wires
+// them together. Nothing here reaches into how any of them works.
+import std.console;
+import std.list;
+import std.str;
+
+import textstats.tokenize;
+import textstats.counter;
+import textstats.stats;
+
+// Two reporters over the same generic base, chosen by name at the call site.
+import textstats.report_plain as plain;
+import textstats.report_bars as bars;
+
+let sample = "the quick brown fox jumps over the lazy dog.
+The DOG barks, and the fox runs! The fox is quick; the dog is lazy.";
+
+let main! = {
+    let words = tokenize.words sample;
+    let counts = counter.tally words;
+
+    console.print! "words:      " (list.length words)
+    console.print! "distinct:   " (counter.distinct counts)
+    console.print! "total:      " (counter.total counts)
+    console.print! "count 'the':" (counter.count_of counts "the")
+    console.print! "count 'fox':" (counter.count_of counts "fox")
+    console.print! "first five: " (list.take 5 words)
+    console.print! ""
+
+    let top5 = counter.top 5 counts;
+    console.print! (plain.render top5 (counter.total counts))
+    console.print! ""
+    console.print! (bars.render top5 (counter.total counts))
+    console.print! ""
+
+    let lengths = list.map (fn w -> str.length w) words;
+    console.print! "lengths:    " (stats.describe_lengths lengths)
+    console.print! "longest:    " (stats.longest words)
+    console.print! "significant:" (list.take 4 (tokenize.significant 4 sample))
+};

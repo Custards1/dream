@@ -1,0 +1,35 @@
+// A plain `word  count` report.
+//
+// It derives `textstats.report`, so `render`, `body`, `width` and `pad` all
+// come from there. Only what makes this report *plain* is written here.
+//
+// Note what is absent: no `import std.str`. A deriving module inherits the
+// base's imports, so re-importing one would be a duplicate.
+derive textstats.report;
+
+let row label count = "  " + pad 12 label + to_string count;
+
+let heading n = "word counts (" + to_string n + ")";
+
+let footer total = "  -- " + to_string total + " words in all";
+
+when test {
+    import std.test;
+
+    // The generic half comes from `textstats.report`; these check that it is
+    // specialized against *this* module's holes.
+    let tests = [
+        test.case "row uses this module's format"
+            $( test.eq! "  hi          3" (row "hi" 3) ),
+        test.case "heading is overridden"
+            $( test.eq! "word counts (2)" (heading 2) ),
+        test.case "footer is overridden"
+            $( test.eq! "  -- 9 words in all" (footer 9) ),
+        test.case "pad comes from the base"  $( test.eq! "ab  " (pad 4 "ab") ),
+        test.case "width comes from the base"
+            $( test.eq! 3 (width [["ab", 1], ["abc", 2]]) ),
+        test.case "render puts it together"
+            $( test.eq! "word counts (1)\n  a           2\n  -- 2 words in all"
+                        (render [["a", 2]] 2) ),
+    ];
+}

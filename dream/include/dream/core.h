@@ -24,6 +24,16 @@ typedef double   dream_float;
  * Values are only meaningful relative to the process that owns them. */
 typedef uint64_t dream_value;
 
+/* An arity meaning "however many arguments the call site passed".
+ *
+ * Dream functions are curried, so a variadic function cannot be recognised by
+ * saturation -- `f a b` and `f a b c` differ only in the application node. A
+ * variadic host function therefore receives exactly the arguments of the
+ * application that reached it, and is never partially applied. Every argument
+ * is forced, whatever the registered strict mask says, because a 32-bit mask
+ * cannot describe an unbounded argument list. `std.console.print!` is one. */
+#define DREAM_VARIADIC 0xFFFFFFFFu
+
 /* The language's surface types, as reported by `type_of`.
  * The canonical list lives in dawnc/src/types.rs; these must stay in step. */
 typedef enum dream_type {

@@ -7,6 +7,8 @@ compile_commands.json
 *.vscode
 build/
 build-mindv2/
+build-nojit/
+build-tsan/
 CMakeFiles/
 out/
 target/

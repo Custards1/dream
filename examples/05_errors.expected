@@ -1,0 +1,16 @@
+divide:    <error :divide_by_zero division by zero>
+type:      <error :type_error cannot apply `add` to integer 1 and a string>
+not a fn:  <error :not_a_function integer 1 is not a function>
+no member: <error :no_such_member module `std.console` has no member `nope!`>
+bounds:    <error :out_of_bounds index 9 is outside an array of 1>
+custom:    <error :error :my_problem>
+with text: <error :error went wrong>
+fallback:  0
+nested:    :inner
+type_of:   :error
+no raise:  42
+parse ok:  34
+parse bad: <error :error not a number: abc>
+parse neg: <error :error :negative_age>
+in process:[:error, <error :divide_by_zero division by zero>]
+survived:  [20, :skipped, 50]

@@ -1,0 +1,8 @@
+one
+two:   42
+many:  1 2 3 [4, 5]
+forced: 120 2 :atom c
+split: abc
+piped: 720
+line:  true
+indirect: 7

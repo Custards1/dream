@@ -13,6 +13,7 @@ struct Options {
     package_roots: Vec<PathBuf>,
     config: dreamc::config::Config,
     test_mode: bool,
+    host_modules: Vec<String>,
     print_cfg: bool,
     dump: bool,
     show_ast: bool,
@@ -32,6 +33,8 @@ options:
   -I, --include <dir>   also search this directory for module files
   -L, --package-path <dir>  a package, or a directory holding packages
       --packages        list the packages that were found
+      --host-module <path>  a module the host registers at run time, so that
+                        importing it compiles (repeatable)
       --test            compile a test runner from each module's `tests`
   -D, --define <name[=value]>  define a flag or setting for `when`
       --release         define `release`
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Options, String> {
         package_roots: Vec::new(),
         config: dreamc::config::Config::new(),
         test_mode: false,
+        host_modules: Vec::new(),
         print_cfg: false,
         dump: false,
         show_ast: false,
@@ -89,6 +93,10 @@ fn parse_args() -> Result<Options, String> {
                     .push(PathBuf::from(args.next().ok_or("`-L` needs a directory")?));
             }
             "--packages" => opts.show_packages = true,
+            "--host-module" => {
+                opts.host_modules
+                    .push(args.next().ok_or("`--host-module` needs a module path")?);
+            }
             "--test" => {
                 // Test builds turn on the `test` flag and swap the entry point
                 // for one that runs what the modules export.
@@ -172,6 +180,7 @@ fn run(opts: &Options) -> Result<(), String> {
         debug_info: opts.debug_info,
         config: opts.config.clone(),
         test_mode: opts.test_mode,
+        host_modules: opts.host_modules.clone(),
     };
 
     if opts.show_packages {

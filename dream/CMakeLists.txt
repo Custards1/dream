@@ -146,6 +146,7 @@ set(DREAM_SOURCES
   src/interp.cpp
   src/builtins.cpp
   src/ffi.cpp
+  src/io.cpp
   src/scheduler.cpp
   src/runtime.cpp
   src/capi.cpp
@@ -241,7 +242,13 @@ add_executable(mindv2_embed_example examples/embed.c)
 target_link_libraries(mindv2_embed_example PRIVATE mindv2)
 set_target_properties(mindv2_embed_example PROPERTIES OUTPUT_NAME embed C_STANDARD 11)
 
+
+include(GNUInstallDirs)
+
+
+
 install(TARGETS mindv2 mindv2_cli
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib)
-install(DIRECTORY include/ DESTINATION include)
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  

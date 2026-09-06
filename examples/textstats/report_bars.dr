@@ -1,0 +1,20 @@
+// The same report as a bar chart. Same base module, different holes filled.
+derive textstats.report;
+
+let row label count = "  " + pad 12 label + str.repeat count "#";
+
+let heading n = "frequency (" + to_string n + ")";
+
+when test {
+    import std.test;
+
+    // Same base module, different holes: the shared code must produce a
+    // different report here than it does in `report_plain`.
+    let tests = [
+        test.case "row is a bar"        $( test.eq! "  hi          ###" (row "hi" 3) ),
+        test.case "heading is overridden" $( test.eq! "frequency (2)" (heading 2) ),
+        test.case "footer keeps the default" $( test.eq! "" (footer 9) ),
+        test.case "render omits an empty footer"
+            $( test.eq! "frequency (1)\n  a           ##" (render [["a", 2]] 2) ),
+    ];
+}

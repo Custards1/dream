@@ -1,0 +1,11 @@
+fib table:  [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
+answer:     42
+fib 20:     6765
+mixed:      30
+digits:     ['1', '2', '3', '4', '5']
+squares:    [1, 4, 9, 16]
+build kind: normal
+platform:   linux
+trace:      [n] 42
+same:       true
+same:       true

@@ -42,6 +42,13 @@ public:
     std::shared_ptr<Process> create_process();
     void enqueue(const std::shared_ptr<Process>& p);
 
+    /// Write a snapshot of every process and open handle to stderr.
+    ///
+    /// The same report `vm.dump!` produces, reachable from C++ so that a
+    /// program which has stopped making progress can still be asked what it is
+    /// doing -- at that point no Dream code can run to ask on its own.
+    void dump(const char* why) const;
+
     /// Block until every process has finished, or until deadlock is detected.
     /// Returns false when nothing could run but processes were still alive.
     bool wait_for_all();
@@ -51,6 +58,30 @@ public:
     bool send(Process& sender, uint64_t target, Value message);
     bool receive(Process& p, Value* out);
     JoinState join(Process& p, uint64_t target, Value* out);
+
+    /// Make a parked process runnable again. Public because the IO poller
+    /// calls it from its own thread when a descriptor becomes ready, which is
+    /// the same handshake a message arriving uses.
+    void wake(uint64_t pid);
+
+    /// A process is waiting on something outside the scheduler -- a descriptor
+    /// the poller is watching. Such a process is not deadlocked even though
+    /// nothing in the system can run: the kernel still owes it an answer.
+    void note_io_wait(bool waiting) {
+        if (waiting) {
+            io_waiters_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            io_waiters_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    size_t io_waiters() const { return io_waiters_.load(std::memory_order_relaxed); }
+
+    // --- introspection, for `std.vm` ---
+    size_t live() const { return live_.load(std::memory_order_relaxed); }
+    size_t runnable() const { return runnable_.load(std::memory_order_relaxed); }
+    unsigned idle_workers() const { return idle_workers_.load(std::memory_order_relaxed); }
+    /// How many processes are sitting on run queues right now.
+    size_t queued() const;
 
     unsigned worker_count() const { return unsigned(workers_.size()); }
     /// Errors raised by processes that nobody was waiting on. A failure that
@@ -72,7 +103,6 @@ private:
     std::shared_ptr<Process> steal(unsigned thief);
     void run_slice(const std::shared_ptr<Process>& p);
     void finish(const std::shared_ptr<Process>& p);
-    void wake(uint64_t pid);
     void note_idle(bool idle);
 
     Runtime& rt_;
@@ -85,6 +115,8 @@ private:
     /// Processes sitting on a run queue or currently executing.
     std::atomic<size_t> runnable_{0};
     std::atomic<unsigned> idle_workers_{0};
+    /// Processes parked on a descriptor rather than on another process.
+    std::atomic<size_t> io_waiters_{0};
     std::atomic<uint64_t> total_reductions_{0};
     std::atomic<bool> deadlocked_{false};
 

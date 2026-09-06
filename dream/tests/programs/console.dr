@@ -1,0 +1,32 @@
+// Every `std.console` member is variadic: it prints each argument in turn,
+// with no separator. A fixed arity here was always arbitrary -- `print!` took
+// exactly a label and a value only so the pipe would read correctly -- and
+// counting arguments is not something a caller should have to do.
+import std.console;
+
+let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
+
+let main! = {
+    console.print! "one"
+    console.print! "two:   " 42
+    console.print! "many:  " 1 " " 2 " " 3 " " [4, 5]
+
+    // Arguments are forced, whatever their shape, and in order.
+    console.print! "forced: " (fac 5) " " (1 + 1) " " (:atom) " " ('c')
+
+    // `write!` adds no newline, so several calls compose into one line.
+    console.write! "split" ": "
+    console.write! "a" "b" "c"
+    console.write! "\n"
+
+    // The pipe still lowers to a single application, which is what lets a
+    // variadic member keep the `value |> print! "label "` idiom working.
+    fac 6 |> console.print! "piped: "
+
+    console.line! "line:  " true
+
+    // A member used as a value is still a value; nothing is printed until it
+    // is applied.
+    let p = console.print!;
+    p "indirect: " 7
+};

@@ -94,9 +94,23 @@ pub struct LetDecl {
     pub name_span: Span,
 }
 
+/// `import std.list;`, `import std.list as l;`, `import std.list.{map, filter};`
+/// or `import std;` naming a package rather than a module.
 #[derive(Debug, Clone)]
 pub struct Import {
     pub path: Vec<String>,
+    pub alias: String,
+    /// The members named in `.{ .. }`, bound unqualified in the importing
+    /// module. Empty for a plain import, which binds the module itself.
+    pub only: Vec<ImportName>,
+    pub span: Span,
+}
+
+/// One name inside `import path.{ .. }`, with the span to point at if it turns
+/// out the module does not export it.
+#[derive(Debug, Clone)]
+pub struct ImportName {
+    pub name: String,
     pub alias: String,
     pub span: Span,
 }
@@ -141,9 +155,22 @@ pub enum CfgExpr {
     Literal(bool),
 }
 
+/// `mod util { .. }` -- a module written inside another one.
+///
+/// It is exactly a module: the loader registers it as `parent.util` and leaves
+/// the parent importing it, so a submodule and a file behave the same way.
+#[derive(Debug, Clone)]
+pub struct ModDecl {
+    pub name: String,
+    pub items: Vec<Item>,
+    pub span: Span,
+    pub name_span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     Import(Import),
+    Mod(ModDecl),
     Derive(Derive),
     Virtual(VirtualDecl),
     Let(LetDecl),

@@ -1,0 +1,200 @@
+// Strings: UTF-8 text.
+//
+// A string is a sequence of characters, so this module derives `std.seq` and
+// gets `count`, `any`, `all`, `contains`, `minimum`, `join` and the rest for
+// free over its characters. Only what is genuinely about text is written here.
+//
+// **Characters and bytes are not the same thing here.** The runtime stores a
+// string as UTF-8 bytes, and its primitives are byte-indexed because that is
+// what makes them constant time. This module keeps the two apart by name:
+// `length` and everything inherited from `std.seq` count *characters*, while
+// `byte_length`, `slice` and `find` work in *bytes*. Mixing them silently is
+// the one thing a text library must not do, so nothing here does it implicitly.
+
+derive std.seq;
+import std.list;
+
+// --- the hole std.seq declares ----------------------------------------------
+
+/// Left to right over the characters, not the bytes.
+let fold f init s = list.fold f init (core.str_chars s);
+
+let name s = "string";
+
+// --- size -------------------------------------------------------------------
+
+/// The number of characters. Decodes the whole string, because UTF-8 does not
+/// know its own character count without looking.
+let length s = list.length (core.str_chars s);
+
+/// The number of bytes, which the runtime knows without decoding anything.
+/// For text that is all ASCII the two agree; for anything else they do not.
+let byte_length s = core.str_len s;
+
+let is_empty s = core.str_len s == 0;
+
+// --- characters -------------------------------------------------------------
+
+let chars s = core.str_chars s;
+
+let of_chars cs = core.str_of_chars cs;
+
+let first_or default s = list.first_or default (core.str_chars s);
+
+// --- bytes ------------------------------------------------------------------
+
+/// `count` bytes from byte offset `from`. Clamped rather than raising: running
+/// off the end is how a loop over a string finishes, and an error there would
+/// be noise. Slicing through the middle of a multi-byte character will split
+/// it, which is why the offsets to pass are the ones `find` returns.
+let slice from count s = core.str_slice s from count;
+
+/// The byte offset of `needle` at or after byte offset `from`, or `-1`.
+let find_from from needle s = core.str_find s needle from;
+
+let find needle s = core.str_find s needle 0;
+
+let contains_str needle s = core.str_find s needle 0 >= 0;
+
+let starts_with prefix s = core.str_slice s 0 (core.str_len prefix) == prefix;
+
+let ends_with suffix s =
+    core.str_slice s (core.str_len s - core.str_len suffix) (core.str_len suffix) == suffix;
+
+// --- building ---------------------------------------------------------------
+
+let concat a b = a + b;
+
+/// The strings in `parts` with `sep` between them. `std.seq` supplies `join`,
+/// which renders each element with `to_string`; this one is for strings that
+/// are already strings and should not gain quotes.
+let join_str sep parts = {
+    let step acc s = if acc == () { s } else { acc + sep + s };
+    let joined = list.fold step () parts;
+    if joined == () { "" } else { joined }
+};
+
+/// `s` repeated `n` times.
+let rec repeat n s = if n <= 0 { "" } else { s + repeat (n - 1) s };
+
+/// The parts of `s` between each occurrence of `sep`, as a list of strings.
+/// An empty separator would not make progress, so it yields the whole string.
+let split sep s = {
+    let seplen = core.str_len sep;
+    let rec go from =
+        if from > core.str_len s { [] }
+        else {
+            let at = core.str_find s sep from;
+            if at < 0 { [core.str_slice s from (core.str_len s - from)] }
+            else { core.cons (core.str_slice s from (at - from)) (go (at + seplen)) }
+        };
+    if seplen == 0 { [s] } else { go 0 }
+};
+
+// --- transforming -----------------------------------------------------------
+
+let map f s = core.str_of_chars (list.map f (core.str_chars s));
+
+let filter keep s = core.str_of_chars (list.filter keep (core.str_chars s));
+
+let reverse s = core.str_of_chars (list.reverse (core.str_chars s));
+
+// --- case, for ASCII --------------------------------------------------------
+//
+// Only the ASCII range. Real Unicode case folding is a table this library does
+// not carry, and pretending otherwise would be worse than saying so.
+
+let upper_char c =
+    if c >= 'a' && c <= 'z' { core.char_of_code (core.char_code c - 32) } else { c };
+
+let lower_char c =
+    if c >= 'A' && c <= 'Z' { core.char_of_code (core.char_code c + 32) } else { c };
+
+let upper s = map upper_char s;
+
+let lower s = map lower_char s;
+
+// --- trimming ---------------------------------------------------------------
+
+let is_space c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+
+let trim_start s = core.str_of_chars (list.drop_while is_space (core.str_chars s));
+
+let trim_end s =
+    core.str_of_chars (list.reverse (list.drop_while is_space (list.reverse (core.str_chars s))));
+
+let trim s = trim_end (trim_start s);
+
+// --- tests ------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        // --- from std.seq, over characters ---
+        test.case "seq count"        $( test.eq! 3 (count (fn c -> c == 'l') "Hello, World") ),
+        test.case "seq any"          $( test.true! (any (fn c -> c == 'W') "Hello, World") ),
+        test.case "seq all"          $( test.true! (all (fn c -> c != 'z') "abc") ),
+        test.case "seq contains"     $( test.true! (contains 'e' "hello") ),
+        test.case "seq minimum"      $( test.eq! 'a' (minimum "cab") ),
+        test.case "seq maximum"      $( test.eq! 'c' (maximum "cab") ),
+        test.case "seq describe"     $( test.eq! "string of 3" (describe "abc") ),
+
+        // --- size, and the character/byte distinction ---
+        test.case "length"           $( test.eq! 5 (length "hello") ),
+        test.case "length of empty"  $( test.eq! 0 (length "") ),
+        test.case "byte_length"      $( test.eq! 5 (byte_length "hello") ),
+        test.case "length counts characters" $( test.eq! 5 (length "h\u{e9}llo") ),
+        test.case "byte_length counts bytes" $( test.eq! 6 (byte_length "h\u{e9}llo") ),
+        test.case "is_empty"         $( test.true! (is_empty "") ),
+
+        // --- characters ---
+        test.case "chars"            $( test.eq! ['a', 'b'] (chars "ab") ),
+        test.case "of_chars"         $( test.eq! "ab" (of_chars ['a', 'b']) ),
+        test.case "of_chars round trip" $( test.eq! "h\u{e9}llo" (of_chars (chars "h\u{e9}llo")) ),
+        test.case "first_or"         $( test.eq! 'a' (first_or 'z' "abc") ),
+        test.case "first_or of empty" $( test.eq! 'z' (first_or 'z' "") ),
+
+        // --- searching, in bytes ---
+        test.case "find"             $( test.eq! 7 (find "World" "Hello, World") ),
+        test.case "find missing"     $( test.eq! (0 - 1) (find "zzz" "Hello") ),
+        test.case "find_from"        $( test.eq! 1 (find_from 1 "a" "aabaa") ),
+        test.case "find_from skips a match" $( test.eq! 3 (find_from 2 "a" "aabaa") ),
+        test.case "contains_str"     $( test.true! (contains_str "lo, " "Hello, World") ),
+        test.case "starts_with"      $( test.true! (starts_with "Hell" "Hello") ),
+        test.case "starts_with fails" $( test.false! (starts_with "ello" "Hello") ),
+        test.case "ends_with"        $( test.true! (ends_with "llo" "Hello") ),
+        test.case "ends_with fails"  $( test.false! (ends_with "Hell" "Hello") ),
+
+        // --- slicing ---
+        test.case "slice"            $( test.eq! "ell" (slice 1 3 "Hello") ),
+        test.case "slice clamps"     $( test.eq! "lo" (slice 3 99 "Hello") ),
+
+        // --- building ---
+        test.case "concat"           $( test.eq! "ab" (concat "a" "b") ),
+        test.case "repeat"           $( test.eq! "ababab" (repeat 3 "ab") ),
+        test.case "repeat none"      $( test.eq! "" (repeat 0 "ab") ),
+        test.case "join_str"         $( test.eq! "a-b-c" (join_str "-" ["a", "b", "c"]) ),
+        test.case "join_str of empty" $( test.eq! "" (join_str "-" []) ),
+        test.case "split"            $( test.eq! ["a", "b", "c"] (split "," "a,b,c") ),
+        test.case "split without separator" $( test.eq! ["abc"] (split "," "abc") ),
+        test.case "split on empty separator" $( test.eq! ["abc"] (split "" "abc") ),
+        test.case "split round trip" $( test.eq! "a,b,c" (join_str "," (split "," "a,b,c")) ),
+
+        // --- transforming ---
+        test.case "map"              $( test.eq! "AB" (map upper_char "ab") ),
+        test.case "filter"           $( test.eq! "ac" (filter (fn c -> c != 'b') "abc") ),
+        test.case "reverse"          $( test.eq! "cba" (reverse "abc") ),
+
+        // --- case, ASCII only ---
+        test.case "upper"            $( test.eq! "ABC" (upper "abc") ),
+        test.case "lower"            $( test.eq! "abc" (lower "ABC") ),
+        test.case "case leaves non-ASCII alone" $( test.eq! "H\u{e9}LLO" (upper "h\u{e9}llo") ),
+
+        // --- trimming ---
+        test.case "trim"             $( test.eq! "a b" (trim "  a b \n") ),
+        test.case "trim_start"       $( test.eq! "a  " (trim_start "  a  ") ),
+        test.case "trim_end"         $( test.eq! "  a" (trim_end "  a  ") ),
+        test.case "trim of blank"    $( test.eq! "" (trim "   ") ),
+    ];
+}

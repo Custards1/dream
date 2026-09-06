@@ -1,5 +1,7 @@
 #include "builtins.hpp"
 
+#include "io.hpp"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -646,6 +648,179 @@ NativeResult vm_has_ffi(Process&, Value, Value*, uint32_t) {
     return NativeResult::ok(make_bool(ffi_available()));
 }
 
+// --- introspection ----------------------------------------------------------
+//
+// What the VM is doing, as ordinary Dream values. This exists because the
+// alternative is a debugger and a print statement: when a program stops making
+// progress, the question is always "which processes are stuck, and on what",
+// and nothing in the language could answer it before.
+
+/// Build a map from key/value pairs, in one place so every report below has
+/// the same shape.
+Value info_map(Process& p, std::initializer_list<std::pair<const char*, Value>> pairs) {
+    // A map's capacity must be a power of two: lookup masks with `cap - 1`,
+    // and anything else turns probing into a loop that never terminates.
+    // Twice the entry count keeps the table from filling up.
+    uint32_t cap = 8;
+    while (cap < pairs.size() * 2) cap *= 2;
+    Value m = p.heap().make_map(cap);
+    for (auto& [key, value] : pairs) {
+        map_insert(p, resolve(m), make_atom(p.runtime().intern_atom(key)), value);
+        m = resolve(m);
+    }
+    return m;
+}
+
+Value atom_of(Process& p, const char* name) {
+    return make_atom(p.runtime().intern_atom(name));
+}
+
+Value text_of(Process& p, const std::string& s) {
+    return p.heap().make_string(s.data(), uint32_t(s.size()));
+}
+
+const char* status_name(ProcStatus s) {
+    switch (s) {
+        case ProcStatus::Runnable: return "runnable";
+        case ProcStatus::Running: return "running";
+        case ProcStatus::Waiting: return "waiting";
+        case ProcStatus::Finished: return "finished";
+        case ProcStatus::Failed: return "failed";
+    }
+    return "unknown";
+}
+
+/// One process, as a map. `waiting_on` is the part worth having: a process
+/// parked on a message and one parked on a socket look identical without it.
+Value process_info(Process& p, Process& about) {
+    ProcStatus st = about.status.load(std::memory_order_relaxed);
+    WaitReason reason = about.wait_reason.load(std::memory_order_relaxed);
+    int fd = about.wait_fd.load(std::memory_order_relaxed);
+    return info_map(
+        p, {
+               {"id", make_integer(p, int64_t(about.id()))},
+               {"status", atom_of(p, status_name(st))},
+               {"waiting_on", st == ProcStatus::Waiting ? atom_of(p, wait_reason_name(reason))
+                                                        : atom_of(p, "none")},
+               {"fd", make_integer(p, int64_t(fd))},
+               {"reductions", make_integer(p, int64_t(about.total_reductions))},
+               {"heap_bytes", make_integer(p, int64_t(about.heap().bytes_allocated()))},
+               {"collections", make_integer(p, int64_t(about.heap().collections()))},
+               {"mailbox", make_integer(p, int64_t(about.mailbox.size()))},
+               {"failed", make_bool(about.failed)},
+           });
+}
+
+NativeResult vm_process_list(Process& p, Value, Value*, uint32_t) {
+    auto all = p.runtime().all_processes();
+    Value list = NIL;
+    for (size_t i = all.size(); i-- > 0;) {
+        list = p.heap().make_cons(process_info(p, *all[i]), list);
+    }
+    return NativeResult::ok(list);
+}
+
+NativeResult vm_process_info(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    uint64_t id = 0;
+    if (is_obj(v, ObjType::Pid)) {
+        id = static_cast<PidObj*>(as_obj(v))->id;
+    } else if (is_fixnum(v)) {
+        id = uint64_t(fixnum_value(v));
+    } else {
+        return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error,
+                                               "process_info! needs a process or an id"));
+    }
+    auto proc = p.runtime().find_process(id);
+    if (!proc) return NativeResult::ok(UNIT);
+    return NativeResult::ok(process_info(p, *proc));
+}
+
+NativeResult vm_scheduler(Process& p, Value, Value*, uint32_t) {
+    Scheduler* s = p.runtime().scheduler();
+    if (!s) return NativeResult::ok(UNIT);
+    return NativeResult::ok(info_map(
+        p, {
+               {"workers", make_integer(p, int64_t(s->worker_count()))},
+               {"idle", make_integer(p, int64_t(s->idle_workers()))},
+               {"live", make_integer(p, int64_t(s->live()))},
+               {"runnable", make_integer(p, int64_t(s->runnable()))},
+               {"queued", make_integer(p, int64_t(s->queued()))},
+               // Processes waiting on a descriptor. While this is above zero
+               // the system is not deadlocked however idle it looks: the
+               // kernel still owes somebody an answer.
+               {"io_waiters", make_integer(p, int64_t(s->io_waiters()))},
+               {"reductions", make_integer(p, int64_t(s->total_reductions()))},
+               {"deadlocked", make_bool(s->deadlocked())},
+           }));
+}
+
+NativeResult vm_io(Process& p, Value, Value*, uint32_t) {
+    auto handles = io_snapshot();
+    Value list = NIL;
+    for (size_t i = handles.size(); i-- > 0;) {
+        const IoHandleInfo& h = handles[i];
+        const char* kind = h.kind == HandleKind::File     ? "file"
+                         : h.kind == HandleKind::Listener ? "listener"
+                                                          : "stream";
+        list = p.heap().make_cons(
+            info_map(p, {
+                            {"handle", make_integer(p, h.handle)},
+                            {"fd", make_integer(p, int64_t(h.fd))},
+                            {"kind", atom_of(p, kind)},
+                            {"busy", make_integer(p, int64_t(h.busy))},
+                            {"waiting", h.waiting_pid == 0
+                                            ? UNIT
+                                            : make_integer(p, int64_t(h.waiting_pid))},
+                        }),
+            list);
+    }
+    return NativeResult::ok(list);
+}
+
+NativeResult vm_async_io(Process&, Value, Value*, uint32_t) {
+    return NativeResult::ok(make_bool(io_async_available()));
+}
+
+/// A readable snapshot on stderr, for when a program has stopped making
+/// progress and the question is why.
+NativeResult vm_dump(Process& p, Value, Value*, uint32_t) {
+    std::string out = "--- vm ---\n";
+    if (Scheduler* s = p.runtime().scheduler()) {
+        out += "scheduler: workers=" + std::to_string(s->worker_count())
+             + " idle=" + std::to_string(s->idle_workers())
+             + " live=" + std::to_string(s->live())
+             + " runnable=" + std::to_string(s->runnable())
+             + " queued=" + std::to_string(s->queued())
+             + " io_waiters=" + std::to_string(s->io_waiters())
+             + (s->deadlocked() ? " DEADLOCKED" : "") + "\n";
+    }
+    for (auto& proc : p.runtime().all_processes()) {
+        ProcStatus st = proc->status.load(std::memory_order_relaxed);
+        out += "  process " + std::to_string(proc->id()) + ": " + status_name(st);
+        if (st == ProcStatus::Waiting) {
+            WaitReason r = proc->wait_reason.load(std::memory_order_relaxed);
+            out += " on " + std::string(wait_reason_name(r));
+            int fd = proc->wait_fd.load(std::memory_order_relaxed);
+            if (r == WaitReason::Io && fd >= 0) out += " fd=" + std::to_string(fd);
+        }
+        out += " reductions=" + std::to_string(proc->total_reductions)
+             + " mailbox=" + std::to_string(proc->mailbox.size()) + "\n";
+    }
+    for (const IoHandleInfo& h : io_snapshot()) {
+        const char* kind = h.kind == HandleKind::File     ? "file"
+                         : h.kind == HandleKind::Listener ? "listener"
+                                                          : "stream";
+        out += "  handle " + std::to_string(h.handle) + ": fd=" + std::to_string(h.fd) + " "
+             + kind + " busy=" + std::to_string(h.busy);
+        if (h.waiting_pid) out += " waiting=" + std::to_string(h.waiting_pid);
+        out += "\n";
+    }
+    std::fwrite(out.data(), 1, out.size(), stderr);
+    std::fflush(stderr);
+    return NativeResult::ok(UNIT);
+}
+
 }  // namespace
 
 ModuleDef make_vm_module() {
@@ -657,19 +832,32 @@ ModuleDef make_vm_module() {
                          {"heap_bytes!", 1, 0b1, vm_heap_bytes},
                          {"modules!", 1, 0b1, vm_modules},
                          {"has_ffi", 1, 0b1, vm_has_ffi},
+                         {"async_io", 1, 0b1, vm_async_io},
+                         {"processes_info!", 1, 0b1, vm_process_list},
+                         {"process_info!", 1, 0b1, vm_process_info},
+                         {"scheduler!", 1, 0b1, vm_scheduler},
+                         {"io!", 1, 0b1, vm_io},
+                         {"dump!", 1, 0b1, vm_dump},
                      }};
 }
 
 ModuleDef make_console_module() {
-    // `print!` takes two arguments because that is how the language's pipe
-    // reads: `value |> console.print! "label "` becomes `print! "label " value`.
-    // `write!` and `line!` are the one-argument forms.
+    // Every member is variadic: it prints each argument in turn, with no
+    // separator, and `print!`/`line!`/`error!` add a newline at the end.
+    //
+    // Variadic rather than fixed-arity because a fixed arity here was always
+    // arbitrary. `print!` used to take exactly two arguments -- a label and a
+    // value -- purely so that the pipe would read correctly, since
+    // `value |> console.print! "label "` lowers to `print! "label " value`.
+    // That still works, because the pipe folds into a single application; but
+    // `print! v` and `print! "x = " x " y = " y` now work too, and nothing has
+    // to count arguments to say what it means.
     return ModuleDef{"std.console",
                      {
-                         {"print!", 2, 0b11, con_print},
-                         {"write!", 1, 0b1, con_write},
-                         {"line!", 1, 0b1, con_line},
-                         {"error!", 2, 0b11, con_error},
+                         {"print!", NATIVE_VARIADIC, 0, con_print},
+                         {"write!", NATIVE_VARIADIC, 0, con_write},
+                         {"line!", NATIVE_VARIADIC, 0, con_line},
+                         {"error!", NATIVE_VARIADIC, 0, con_error},
                      }};
 }
 
@@ -929,7 +1117,13 @@ NativeResult core_array_get(Process& p, Value, Value* args, uint32_t) {
             p, p.runtime().intern_atom("out_of_bounds"),
             "index " + std::to_string(k) + " is outside an array of " + std::to_string(a->len)));
     }
-    return NativeResult::ok(a->items()[k]);
+    // Forced, like `head` and `tail`: an array's elements are stored as thunks,
+    // and a native's return value goes straight into `p.result`, which the
+    // machine takes to be in weak head normal form. Handing back the raw slot
+    // would leak a thunk into an operator's operand.
+    Value out;
+    if (!force_whnf(p, a->items()[k], &out)) return NativeResult::raise(p.result);
+    return NativeResult::ok(out);
 }
 
 NativeResult core_array_set(Process& p, Value, Value* args, uint32_t) {
@@ -1004,8 +1198,13 @@ NativeResult core_map_get(Process& p, Value, Value* args, uint32_t) {
     Value m = resolve(args[0]);
     if (!is_obj(m, ObjType::Map)) return type_fail(p, "map_get needs a map");
     Value found;
-    if (!map_lookup(p, m, args[1], &found)) return NativeResult::ok(args[2]);
-    return NativeResult::ok(found);
+    // A map's values stay lazy, and so does the default -- an unused default
+    // should cost nothing -- so whichever one is returned is forced here rather
+    // than handed back as a thunk. See the note in `core_array_get`.
+    Value out;
+    if (!map_lookup(p, m, args[1], &found)) found = args[2];
+    if (!force_whnf(p, found, &out)) return NativeResult::raise(p.result);
+    return NativeResult::ok(out);
 }
 
 NativeResult core_map_has(Process& p, Value, Value* args, uint32_t) {

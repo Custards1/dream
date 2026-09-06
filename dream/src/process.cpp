@@ -5,6 +5,46 @@
 
 namespace dream {
 
+const char* mode_name(Mode m) {
+    switch (m) {
+        case Mode::Eval: return "eval";
+        case Mode::Return: return "return";
+        case Mode::Raise: return "raise";
+        case Mode::Halted: return "halted";
+    }
+    return "?";
+}
+
+const char* cont_kind_name(ContKind k) {
+    switch (k) {
+        case ContKind::Halt: return "halt";
+        case ContKind::UpdateThunk: return "update_thunk";
+        case ContKind::ApplyTo: return "apply_to";
+        case ContKind::IfBranch: return "if_branch";
+        case ContKind::BinRight: return "bin_right";
+        case ContKind::BinFinish: return "bin_finish";
+        case ContKind::LogicRight: return "logic_right";
+        case ContKind::UnaryFinish: return "unary_finish";
+        case ContKind::BlockNext: return "block_next";
+        case ContKind::Catch: return "catch";
+        case ContKind::FieldOf: return "field_of";
+        case ContKind::NativeArg: return "native_arg";
+        case ContKind::NativeRetry: return "native_retry";
+        case ContKind::MapEntry: return "map_entry";
+    }
+    return "?";
+}
+
+const char* wait_reason_name(WaitReason r) {
+    switch (r) {
+        case WaitReason::Message: return "message";
+        case WaitReason::Join: return "join";
+        case WaitReason::Io: return "io";
+        case WaitReason::None: break;
+    }
+    return "none";
+}
+
 // ---------------------------------------------------------------------------
 // Mailbox
 // ---------------------------------------------------------------------------

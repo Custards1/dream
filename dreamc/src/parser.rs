@@ -15,12 +15,12 @@ use crate::lexer::{Span, Tok, Token};
 
 const KEYWORDS: &[&str] = &[
     "let", "rec", "if", "else", "import", "as", "catch", "true", "false", "not", "try!", "fn",
-    "virtual", "derive", "comp", "comp!", "when",
+    "virtual", "derive", "comp", "comp!", "when", "mod",
 ];
 
 /// Keywords that can never begin an expression, so they end an application.
 const NON_STARTERS: &[&str] =
-    &["let", "rec", "else", "import", "as", "catch", "virtual", "derive", "when"];
+    &["let", "rec", "else", "import", "as", "catch", "virtual", "derive", "when", "mod"];
 
 pub struct Parser<'a> {
     toks: &'a [Token],
@@ -154,13 +154,16 @@ impl<'a> Parser<'a> {
                 self.parse_virtual().map(Item::Virtual)
             } else if self.is_kw("when") {
                 self.parse_when()
+            } else if self.is_kw("mod") {
+                self.parse_mod().map(Item::Mod)
             } else if self.is_kw("let") {
                 self.parse_let_decl().map(Item::Let)
             } else {
                 Err(Diag::error(
                     self.span(),
                     format!(
-                        "expected `import`, `derive`, `virtual` or `let` at top level, found {}",
+                        "expected `import`, `derive`, `virtual`, `mod` or `let` at top level, \
+                         found {}",
                         self.describe()
                     ),
                 ))
@@ -188,7 +191,8 @@ impl<'a> Parser<'a> {
                 Some(t) => {
                     let at_item = t.starts_line
                         && matches!(&t.tok, Tok::Ident(s) if s == "let" || s == "import"
-                                    || s == "derive" || s == "virtual" || s == "when");
+                                    || s == "derive" || s == "virtual" || s == "when"
+                                    || s == "mod");
                     if at_item {
                         return;
                     }
@@ -202,15 +206,54 @@ impl<'a> Parser<'a> {
         let start = self.span();
         self.pos += 1; // `import`
         let mut path = vec![self.expect_ident("a module name")?.0];
+        let mut only = Vec::new();
         while self.eat(&Tok::Dot) {
+            // `.{` ends the path and starts a list of members to bring in
+            // unqualified: `import std.list.{map, filter as keep};`
+            if self.at(&Tok::LBrace) {
+                only = self.parse_import_names()?;
+                break;
+            }
             path.push(self.expect_ident("a module path segment")?.0);
         }
         let alias = if self.eat_kw("as") {
+            if !only.is_empty() {
+                return Err(Diag::error(
+                    self.span(),
+                    "`as` cannot follow a `.{ .. }` list",
+                )
+                .with_note("rename an individual member instead: `.{ name as other }`"));
+            }
             self.expect_ident("an alias name")?.0
         } else {
             path.last().cloned().unwrap_or_default()
         };
-        Ok(Import { path, alias, span: start.to(self.prev_span()) })
+        Ok(Import { path, alias, only, span: start.to(self.prev_span()) })
+    }
+
+    /// The `{ a, b as c }` of a selective import. Newlines inside are not
+    /// statement ends, so a long list can be spread over several lines.
+    fn parse_import_names(&mut self) -> PResult<Vec<ImportName>> {
+        self.expect(&Tok::LBrace, "`{` after `.` in an import")?;
+        let names = self.grouped(|p| {
+            let mut names = Vec::new();
+            while !p.at(&Tok::RBrace) && p.peek().is_some() {
+                let (name, span) = p.expect_ident("a member name")?;
+                let alias =
+                    if p.eat_kw("as") { p.expect_ident("an alias name")?.0 } else { name.clone() };
+                names.push(ImportName { name, alias, span });
+                if !p.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            Ok(names)
+        })?;
+        self.expect(&Tok::RBrace, "`}` closing the import list")?;
+        if names.is_empty() {
+            return Err(Diag::error(self.prev_span(), "an import list needs at least one name")
+                .with_note("to bring in the whole module, drop the `.{ }`"));
+        }
+        Ok(names)
     }
 
     /// `when <cond> { items }`, or `when <cond> <item>` for a single one.
@@ -259,6 +302,8 @@ impl<'a> Parser<'a> {
             self.parse_virtual().map(Item::Virtual)
         } else if self.is_kw("when") {
             self.parse_when()
+        } else if self.is_kw("mod") {
+            self.parse_mod().map(Item::Mod)
         } else if self.is_kw("let") {
             self.parse_let_decl().map(Item::Let)
         } else {
@@ -267,6 +312,39 @@ impl<'a> Parser<'a> {
                 format!("expected a declaration inside `when`, found {}", self.describe()),
             ))
         }
+    }
+
+    /// `mod name { items }`. The body holds the same items a file may, so a
+    /// submodule can import, derive, declare virtuals and nest further.
+    fn parse_mod(&mut self) -> PResult<ModDecl> {
+        let start = self.span();
+        self.pos += 1; // `mod`
+        let (name, name_span) = self.expect_ident("a module name")?;
+        self.expect(&Tok::LBrace, "`{` opening the module body")?;
+        let (nl, nb) = (self.nl_sensitive, self.no_brace);
+        self.nl_sensitive = true;
+        self.no_brace = false;
+        let mut items = Vec::new();
+        let result = loop {
+            while self.eat(&Tok::Semi) {}
+            if self.at(&Tok::RBrace) || self.peek().is_none() {
+                break Ok(());
+            }
+            match self.parse_conditional_item() {
+                Ok(item) => items.push(item),
+                Err(e) => break Err(e),
+            }
+            self.eat(&Tok::Semi);
+        };
+        self.nl_sensitive = nl;
+        self.no_brace = nb;
+        result?;
+        if !self.at(&Tok::RBrace) {
+            return Err(Diag::error(start, "this module is never closed")
+                .with_note("expected a matching `}`"));
+        }
+        self.pos += 1;
+        Ok(ModDecl { name, items, span: start.to(self.prev_span()), name_span })
     }
 
     fn parse_cfg_or(&mut self) -> PResult<CfgExpr> {

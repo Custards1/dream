@@ -1,0 +1,1178 @@
+# The Dream Language
+
+A reference for the Dream language as it is actually implemented, plus one
+clearly-marked section for a design that is not implemented yet.
+
+Dream is **dynamically typed**, **lazily evaluated**, and **functional**, with
+green processes for concurrency and a purity rule enforced by the spelling of a
+name. Two programs implement it:
+
+| | |
+|-|-|
+| [`dreamc/`](../dreamc) | the compiler, in Rust — `.dr` source to a `.dream` image |
+| [`dream/`](../dream) | the VM, `mindv2`, in C++ — interpreter, processes, LLVM JIT |
+| [`mind/`](../mind) | the standard library and build system, written in Dream |
+
+> **Status legend.** Everything in this document is implemented and covered by
+> tests unless it carries a **PROPOSED** marker. Only [§12 Pattern
+> matching](#12-pattern-matching-proposed) is so marked.
+
+---
+
+## Contents
+
+1. [Dream in sixty seconds](#1-dream-in-sixty-seconds)
+2. [Lexical structure](#2-lexical-structure)
+3. [Values and types](#3-values-and-types)
+4. [Expressions](#4-expressions)
+5. [Laziness and strictness](#5-laziness-and-strictness)
+6. [Purity](#6-purity)
+7. [Declarations](#7-declarations)
+8. [Modules and packages](#8-modules-and-packages)
+9. [Processes](#9-processes)
+10. [Errors](#10-errors)
+11. [Compile-time evaluation](#11-compile-time-evaluation)
+12. [Pattern matching (PROPOSED)](#12-pattern-matching-proposed)
+13. [The standard library](#13-the-standard-library)
+14. [The toolchain](#14-the-toolchain)
+15. [Embedding](#15-embedding)
+
+---
+
+## 1. Dream in sixty seconds
+
+```dream
+import std.console;
+
+let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
+
+let greet! who result = {
+    who    |> console.print! "Hi, "
+    result |> console.print! "The result is "
+};
+
+let main! = {
+    let number = fac 5;
+    spawn! $( greet! "process 2" number )
+    let safe = try! { 12 / 0 } catch e { 0 };
+    greet! "process 1" safe
+};
+```
+
+Six rules carry most of the language:
+
+1. **Application is juxtaposition and binds tighter than every operator.**
+   `fac n - 1` is `(fac n) - 1`. The recursive call needs `fac (n - 1)`.
+2. **Functions are curried.** `f a b` is `(f a) b`.
+3. **`x |> f a` feeds `x` in as the _last_ argument**, giving `f a x`.
+4. **A trailing `!` on a name means impure.** A pure function may not reach an
+   impure one; the compiler rejects it.
+5. **Everything is lazy** unless the compiler marked it strict — the statements
+   of an impure block, an `if` condition, a `try!` body.
+6. **`$( e )` suspends `e`** as a thunk, which is what `spawn!` runs.
+
+---
+
+## 2. Lexical structure
+
+### Comments
+
+```dream
+// to end of line
+/* block, which does not nest */
+```
+
+### Identifiers and the `!` suffix
+
+```
+ident  ::=  [A-Za-z_] [A-Za-z0-9_]* '!'?
+```
+
+The `!` is **part of the name**, not an operator: `print!` and `print` are
+different identifiers, and the `!` is what marks the binding impure ([§6](#6-purity)).
+
+Keywords, which may not be used as ordinary names:
+
+```
+let  rec  if  else  import  as  catch  true  false
+not  try!  fn  virtual  derive  comp  comp!  when  mod
+```
+
+Of these, `let  rec  else  import  as  catch  virtual  derive  when  mod` can
+never begin an expression, so encountering one ends an application's argument
+list.
+
+### Literals
+
+| Form | Example |
+|------|---------|
+| integer | `42`, `1_000_000`, `0xFF`, `0b1010`, `0o755` |
+| float | `1.5`, `1_0.25`, `2.5e-3`, `1e9` |
+| string | `"hello\n"`, `"\u{1F600}"` |
+| char | `'c'`, `'\n'`, `'\u{41}'` |
+| atom | `:ok`, `:not_found` |
+| bool | `true`, `false` |
+| unit | `()` |
+| list | `[1, 2, 3]` |
+| array | `#[1, 2, 3]` |
+| map | `%{ :k => 1, :j => 2 }` |
+| thunk | `$( expr )` |
+
+Escapes inside strings and chars: `\n \t \r \0 \\ \' \"` and `\u{HEX}`.
+Underscores are permitted as digit separators in every numeric base.
+
+### Newlines are significant
+
+Inside a block and at top level, **a line break ends a statement**. Two rules
+relax that:
+
+- A line that *begins* with an infix operator, `.`, `else`, or `catch`
+  continues the previous line, since none of those can start a statement.
+- Newlines never end a statement inside `(`, `[`, `$(`, `#[`, or `%{`. Braces
+  `{ }` are *not* in that list — a block is newline-sensitive.
+
+```dream
+let total = a
+    + b            // continues: the line starts with an operator
+    + c;
+
+let names! = vm
+    .modules! ();  // continues: the line starts with `.`
+```
+
+`;` ends a statement explicitly and is always allowed.
+
+---
+
+## 3. Values and types
+
+`type_of v` returns the type's name as an atom. The canonical list lives in
+[`dreamc/src/types.rs`](../dreamc/src/types.rs); the compiler, the VM's
+`type_of`, and this table are checked against it by tests rather than kept in
+step by hand.
+
+### Scalars
+
+| Type | |
+|------|-|
+| `integer` | a signed integer |
+| `float` | double precision |
+| `char` | one Unicode scalar value |
+| `bool` | `true` or `false` |
+| `unit` | `()`, the value of an expression with nothing to say |
+
+### Object kinds
+
+`object` is the umbrella type; these are its kinds.
+
+| Kind | |
+|------|-|
+| `pure_fn` | a function with no effects |
+| `impure_fn` | a function whose name ends in `!` |
+| `module` | what `import` binds, and what `mod` declares |
+| `list` | `[a, b, c]` — a cons chain, lazy in head *and* tail |
+| `array` | `#[a, b, c]` — flat, constant-time indexing |
+| `map` | `%{ k => v }` — keys forced, values lazy |
+| `error` | a raised kind and payload, caught by `try!` |
+| `process` | a green process (`thread` is an accepted alias) |
+| `atom` | an interned name, `:like_this`; compares by identity |
+| `string` | UTF-8 text |
+
+### Representation
+
+A value is one 64-bit word, tagged in the low bits:
+
+| Pattern | Meaning |
+|---------|---------|
+| `....1` | fixnum — a 63-bit signed integer, `(int64)v >> 1` |
+| `...000` | pointer to a heap object (8-byte aligned); `0` means "no value" |
+| `...010` | immediate — unit, bool, char, atom, nil, builtin |
+
+Integers get the one-bit tag because arithmetic is the hot path, and the
+tagging preserves order so the JIT can compare two tagged fixnums directly.
+
+---
+
+## 4. Expressions
+
+### Precedence, loosest to tightest
+
+| Level | Operators | Associativity |
+|-------|-----------|---------------|
+| lowest | `\|>` | left |
+| 0 | `\|\|` | left |
+| 1 | `&&` | left |
+| 2 | `==` `!=` `<` `<=` `>` `>=` | left |
+| 3 | `+` `-` | left |
+| 4 | `*` `/` `%` | left |
+| 5 | unary `-`, `not` | prefix |
+| 6 | `comp`, `comp!` | prefix |
+| tightest | **application** `f a b`, then postfix `.field` | left |
+
+Every infix operator is left-associative. The single most important
+consequence: **application binds tighter than everything**, so
+
+```dream
+fac n - 1      //  (fac n) - 1
+fac (n - 1)    //  what a recursive call usually wants
+f a b + g c    //  (f a b) + (g c)
+```
+
+`comp` sits between the operators and application, so `comp f x` folds the whole
+call.
+
+### Application and currying
+
+```dream
+let add a b = a + b;
+let inc = add 1;        // partial application
+inc 41                  // 42
+```
+
+`()` in a parameter list is a unit parameter that occupies a slot but binds no
+name — `let now! () = ...` is called as `now! ()`.
+
+### Pipe
+
+`|>` feeds the left side in as the **last** argument of the right side:
+
+```dream
+x |> f a           // f a x
+[1,2,3] |> list.map inc |> list.sum
+```
+
+The pipe is folded during lowering, not desugared into a nested call: `x |> f a`
+becomes a **single** application of `f` to `[a, x]`. That is what lets
+`v |> console.print! "got: "` land as one variadic call `print! "got: " v`, and
+it is why `console.print!` puts its label first.
+
+### Operators on non-numbers
+
+`+` is overloaded by the runtime:
+
+- two numbers — arithmetic
+- two strings — concatenation
+- two lists — concatenation, **without forcing the elements**
+
+Integer arithmetic that overflows a fixnum falls through to `float` rather than
+wrapping silently. `/` and `%` by an integer zero raise `:divide_by_zero`.
+
+### `if`
+
+```dream
+if cond { then_expr } else { else_expr }
+if a { .. } else if b { .. } else { .. }
+```
+
+The branches are blocks, so the braces are required. The condition is forced;
+the taken branch is not, unless the surrounding context forces it. `else` is
+optional, and a missing one yields `()`.
+
+While parsing an `if` condition, `{` starts the branch body rather than a block
+being passed as an argument.
+
+### Blocks
+
+```dream
+{ stmt; stmt; last_expr }
+```
+
+A block's value is its last statement, or `()` when empty. Statements are
+separated by newlines or `;`. A block may contain `let` declarations, which
+scope to the rest of the block.
+
+### Lambdas
+
+```dream
+fn x -> x + 1
+fn a b -> a * b
+```
+
+`fn` needs at least one parameter. The body extends as far as the expression
+grammar allows, so parenthesize when passing a lambda as a non-final argument.
+
+### Thunks
+
+`$( e )` suspends `e` as a first-class thunk object. It is what `spawn!` turns
+into a process, and what `std.test` uses to hold a test case for later.
+
+### Collections
+
+```dream
+[1, 2, 3]                     // list  — lazy head and tail
+#[1, 2, 3]                    // array — constant-time indexing
+%{ :a => 1, "b" => 2 }        // map   — keys forced, values lazy
+```
+
+**`obj.field` is module-member access and nothing else.** The field name may
+carry a trailing `!` (`console.print!`). It is not map or record indexing —
+applying it to anything but a module raises `:no_such_member`. Maps are read
+with `core.map_get`, arrays with `core.array_get`:
+
+```dream
+core.map_get point :r ()        // the value at `:r`, or the default `()`
+core.array_get arr 0
+```
+
+---
+
+## 5. Laziness and strictness
+
+Every argument, list element, map value and `let` binding starts as a **thunk**:
+a node index plus the frame to evaluate it in. Forcing a thunk overwrites it in
+place with an indirection to its result, so every holder sees the computed value
+and the work happens once.
+
+**The compiler decides where evaluation order is observable and says so in the
+bytecode.** The VM forces a node only when it is marked `STRICT`:
+
+- the statements of an **impure block**,
+- an **`if` condition**,
+- a **`try!` body**.
+
+Everything else stays suspended. A discarded *pure* statement is not evaluated
+at all, so it cannot raise an error the program never asked for.
+
+```dream
+let ones = list.repeat 1;      // an infinite list
+list.take 5 ones               // fine: only five cells are ever built
+```
+
+Sharing is preserved by returning the *binding's* thunk rather than a fresh
+wrapper, and the allocation is skipped entirely when a node is already a value
+(constants, variable references, closures).
+
+### What this means for the JIT
+
+The JIT compiles only the strict numeric spine — arithmetic, comparisons,
+branches, self tail recursion. That limit is a soundness requirement: compiled
+code evaluates a self tail call's arguments eagerly, and doing that to an
+argument the callee would never have forced turns a terminating program into one
+that raises. A **strictness analysis** runs first, and a function is compiled
+only if every parameter is provably forced on every path:
+
+```
+strict(Local i)      = {i}
+strict(If c, t, e)   = strict(c) ∪ (strict(t) ∩ strict(e))
+strict(a `binop` b)  = strict(a) ∪ strict(b)
+strict(a && b)       = strict(a)          -- b is conditional
+```
+
+Functions that do not qualify stay interpreted, where laziness is explicit and
+free.
+
+---
+
+## 6. Purity
+
+**A name ending in `!` denotes an impure value, and a pure function may not
+reach one.**
+
+```
+error: cannot use the impure member `print!` inside the pure function `greet`
+ --> greet.dr:2:5
+  |
+2 |     console.print! name
+  |     ^^^^^^^^^^^^^^
+  = note: mark the function impure by ending its name with `!`, e.g. `let f! x = ..`
+```
+
+This is checked during lowering, and it is what makes `pure_fn` and `impure_fn`
+genuinely distinct object types rather than a naming convention. It is also what
+lets the compiler decide where evaluation order matters: statements in an impure
+block are sequenced, everything else stays lazy.
+
+Because every process operation ends in `!` (`spawn!`, `join!`, `send!`,
+`recv!`, `self!`), **starting or addressing a process is an effect** and the
+purity rule already keeps concurrency out of pure functions. The same holds for
+`raise!` and for `try!`.
+
+---
+
+## 7. Declarations
+
+### `let`
+
+```dream
+let name = expr;                    // a value
+let f a b = expr;                   // a function, curried
+let rec loop n = ...;               // may refer to itself
+let impure! x = ...;                // impure, by the trailing `!`
+```
+
+`let` appears both at top level (as an item) and inside a block (as a
+statement), and the two differ in one way:
+
+- **Top-level `let`s are mutually visible.** Every one is a global, so they can
+  refer to each other and to themselves in any order, and `rec` is optional.
+- **A block-local `let` is in scope only for the statements after it.** A local
+  that refers to itself needs `rec`, or the name is not yet bound:
+
+  ```
+  error: cannot find `go` in this scope
+   --> f.dr:3:39
+    |
+  3 |     let go n = if n <= 0 { 0 } else { go (n - 1) };
+    |                                       ^^
+  ```
+
+Writing `rec` at top level is still worth doing where it documents intent; the
+standard library does.
+
+### `import`
+
+```dream
+import std.console;                 // binds `console`
+import std.list as l;               // binds `l`
+import std.list.{map, filter};      // binds the members, unqualified
+import std;                         // the whole package, as `std.list.map`
+```
+
+The alias defaults to the last path segment. All four forms, and what a package
+namespace can and cannot be used for, are in
+[§8](#8-modules-and-packages).
+
+### `mod`
+
+```dream
+mod util {
+    let helper x = x + 1;
+}
+```
+
+A module written inside another, reached as `util.helper`. It holds the same
+items a file does and nests freely; see [§8](#8-modules-and-packages).
+
+### `virtual` and `derive`
+
+A **virtual** declares a hole in a module; a module that `derive`s it fills the
+hole. A default body makes filling it optional.
+
+```dream
+// shape.dr  -- in the package `shapes`
+virtual let area s;                       // must be filled
+virtual let name s = "shape";             // may be overridden
+let describe s = name s + " of area " + to_string (area s);
+
+// circle.dr
+derive shapes.shape;
+let area r = 3.14159 * r * r;
+let name r = "circle";
+```
+
+`shapes.circle.describe 2.0` is then `"circle of area 12.56636"`.
+
+A virtual needs at least one parameter — a parameterless virtual would be a
+constant, not a hole. Because Dream compiles whole programs, `derive`
+specializes the base module's *syntax tree* against the deriving module's
+implementations, so there is no run-time dispatch.
+
+### `when` — conditional compilation
+
+```dream
+when test {
+    import std.vm;
+    let verbose = true;
+}
+
+when os == "linux" && not release {
+    let trace! msg = console.error! "[trace] " msg;
+}
+
+when release  let verbose = false;        // single item, no braces
+```
+
+The condition vocabulary is deliberately the language's own — `&&`, `||`, `not`,
+parentheses, `true`, `false`, a bare flag, or `setting == "value"`. A `when` is
+resolved **before anything is loaded**, so an import inside a false branch is
+never even followed, and a module that only test builds need is never read.
+`when` may contain any item, including another `when`.
+
+A **flag** is either defined or not; a **setting** has a value. A setting that
+has a value also counts as defined, so `when os { .. }` is true and
+`when nonsense { .. }` is false.
+
+| Setting | Known without being told |
+|---------|--------------------------|
+| `os` | `"linux"`, `"macos"`, … |
+| `arch` | `"x86_64"`, `"aarch64"`, … |
+| `family` | `"unix"`, `"windows"` |
+| `dream_version` | the compiler's version |
+
+Everything else comes from `-D name`, `-D name=value`, `--test` (defines
+`test`), `--release` (defines `release`), and `--debug-cfg` (defines `debug`).
+`dreamc --print-cfg` prints the lot.
+
+---
+
+## 8. Modules and packages
+
+**A module is one file** — or a `mod` block inside one. `import a.b.c` resolves
+to `a/b/c.dr`, or to `a/b/c/mod.dr` if the module has grown into a directory —
+importers do not change when it does. The only module extension is `.dr`.
+
+### `mod` — a module written inside another
+
+```dream
+mod math {
+    let square x = x * x;
+    let cube x = x * square x;
+
+    mod deep {
+        let answer = 42;
+    }
+}
+
+let main! = { math.square 5 };        // 25
+                                      // math.deep.answer is 42
+```
+
+A `mod` body holds exactly what a file holds: `let`, `import`, `derive`,
+`virtual`, `when`, and further `mod`s. That is not a coincidence — the loader
+registers `mod util { .. }` inside module `m` as the module **`m.util`** and
+leaves `m` importing it, so from that point on a submodule and a file are the
+same thing to every later pass. Purity, `derive` and member lookup need no
+special case.
+
+Two consequences worth knowing:
+
+- **A submodule does not re-export what it imports.** `mod text { import
+  std.list; .. }` gives you `text`'s own members, not `text.list`. A module's
+  aliases hold its imports as well as its declarations, so only a module
+  actually named `text.<name>` counts as a submodule. (A *host* module is the
+  exception, because it is a value as well as a namespace.)
+- **An import resolves relative to the current module first,** so
+  `import util.{ helper };` inside a module declaring `mod util { .. }` means
+  that submodule rather than some file called `util.dr`.
+
+**A package is a named group of modules,** marked by a `mind.toml` at its root
+(`dusk.toml` is also accepted). A package declares its own name, so `import
+std.list` means "the module `list` in the package called `std`", wherever that
+package happens to sit on disk.
+
+```toml
+[package]
+name = "std"
+version = "0.1.0"
+src = "."
+
+[dependencies]
+other = { path = "../other" }
+```
+
+`name` is required; `version` defaults to `0.0.0` and `src` to the manifest's
+own directory. Only path dependencies are supported so far.
+
+A project is itself a package, so its own modules are reachable both as
+`mypkg.util` and, from inside, as plain `util`. Dropping a manifest into a
+directory is the whole ceremony.
+
+Dream **compiles whole programs**: every reachable module is parsed and lowered
+into a single image, which is what makes a cross-module call resolve to a global
+index at compile time rather than a name lookup at run time. A module path with
+no file behind it is assumed to be host-provided; those are listed explicitly
+(see [§13](#13-the-standard-library)) so a typo in an import is an error rather
+than a mystery at run time.
+
+### The three forms of `import`
+
+```dream
+import std.list;                      // binds `list`
+import std.list as l;                 // binds `l`
+import std.list.{map, filter};        // binds `map` and `filter`, unqualified
+import std.list.{sum as total};       // ..renaming as it goes
+import std;                           // the whole package: `std.list.map`
+```
+
+**`import path.{ a, b }`** binds members rather than the module. Each name
+resolves exactly as `path.a` would, so the two spellings can never disagree —
+including about purity, which is why `import std.console.{print!};` still keeps
+`print!` out of a pure function. A name that the module does not export is an
+error naming what it does export, and a name that collides with a `let` in the
+importing module is an error too rather than the `let` quietly winning.
+
+**`import <package>;`** names a package rather than a module and brings in
+every module the package provides, reached through it:
+
+```dream
+import std;
+
+let main! = { std.list.map (fn x -> x * 2) [1, 2, 3] };
+```
+
+The package name is a **namespace, not a value**: `std` and `std.list` are
+compile-time names, and only `std.list.map` is something you can pass around.
+Mentioning either on its own is an error that says so.
+
+`-L DIR` adds a package search root; `dreamc FILE --packages` and
+`dreamc FILE --modules` report what a program pulls in.
+
+An **embedder's own host module** is declared with `--host-module PATH`, which
+is what lets `import host;` compile against a module registered through
+`dream_vm_register_module` ([§15](#15-embedding)). It is deliberately not a
+wildcard — naming the module is what keeps a typo in an import a compile error
+rather than a mystery at run time.
+
+---
+
+## 9. Processes
+
+A **process** is the unit of concurrency, of failure, and of garbage collection.
+Processes share no memory: `send!` deep-copies the message, so nothing one
+process does to a value can be seen by another.
+
+| Operation | Meaning |
+|-----------|---------|
+| `spawn! $( .. )` | run a suspended computation in a new process; returns it |
+| `send! p v` | copy `v` into `p`'s mailbox |
+| `recv! ()` | take the next message, parking until one arrives |
+| `self! ()` | the current process |
+| `join! p` | wait for `p` and take its result; a failure arrives as an error |
+
+```dream
+let worker! () = {
+    let msg = recv! ();
+    msg |> console.print! "got: "
+};
+
+let main! = {
+    let w = spawn! $( worker! () );
+    send! w :hello
+    join! w
+};
+```
+
+**Isolation buys three things:** collection never stops the world and never takes
+a lock; thunk update needs no atomics, because only one process can force a
+thunk; and one process failing cannot corrupt another. The cost is that a thunk
+shared between two processes is evaluated twice — for a language with both
+concurrency and laziness, isolation is the better trade.
+
+**Scheduling** is per-worker run queues with work stealing. A process runs for a
+fixed number of reductions and then goes back on a queue, whatever it is in the
+middle of — including inside a JIT-compiled loop, which writes its loop-carried
+values back to the frame and exits to the interpreter. When every worker is idle
+and processes remain, they are all parked on messages that cannot arrive, and
+the runtime says so rather than hanging.
+
+A process that fails and that nobody joins is reported at shutdown. One that a
+joiner is waiting for is that joiner's business, and is not reported twice.
+
+---
+
+## 10. Errors
+
+An `error` is a value: a **kind** (an atom) and a **payload**.
+
+```dream
+raise! "something went wrong"           // raise any value
+try! { 12 / 0 } catch e { 0 }           // catch it and supply a fallback
+```
+
+`try!` requires a `catch` with a binder — `try! { .. } catch e { .. }` — and the
+body is strict, so the error surfaces where the `try!` is rather than wherever
+the value later happens to be forced.
+
+Well-known kinds the runtime raises:
+
+| Kind | Raised by |
+|------|-----------|
+| `:divide_by_zero` | `/` or `%` with an integer zero on the right |
+| `:type_error` | an operation applied to a type it does not accept |
+| `:not_a_function` | applying arguments to something that is not callable |
+| `:no_such_member` | `mod.name` where the module has no such member |
+| `:out_of_bounds` | an array index outside the array |
+| `:loop` | a value that depends on itself |
+| `:killed`, `:timeout` | process failure |
+
+`:normal` and `:ok` are used as success markers. An error renders as
+`<error :kind message>`.
+
+Both `raise!` and `try!` are impure, so error handling is an effect and stays
+out of pure functions.
+
+---
+
+## 11. Compile-time evaluation
+
+```dream
+let squares = comp build 5;                    // evaluated by the compiler
+let digits  = comp! core.str_chars "12345";    // evaluated by running it on the VM
+```
+
+`comp e` evaluates `e` at compile time and bakes the result into the image.
+`comp! e` is the same but may perform effects, so it is evaluated by running it
+on a real VM rather than by the compiler's own evaluator — the compiler embeds
+the VM through the C API described in [§15](#15-embedding) and reads the value
+back.
+
+`comp` binds tighter than any operator but looser than application, so
+`comp f x` folds the whole call and `comp (1 + 2) * 10` is `30`.
+
+**`comp` cannot reach a host module.** `std.console`, `std.core` and the rest
+are C++ in the VM, and the compiler's own evaluator has no VM to run them on:
+
+```
+error: `core` is not a Dream module, so `core.cons` is not available at compile time
+  = note: host modules perform effects; `comp` cannot run them
+```
+
+That is what `comp!` is for — it hands the expression to a real VM. So the rule
+is: `comp` for arithmetic and pure Dream code, `comp!` for anything that needs
+the runtime.
+
+---
+
+## 12. Pattern matching (PROPOSED)
+
+> **Not implemented.** There is no `match` token in the lexer, no `Pattern` node
+> in the AST, and no matching opcode in the IR. This section records the design
+> so it can be reviewed before it is built; everything else in this document
+> describes code that exists.
+
+### Syntax
+
+```dream
+match expr {
+    pattern => expr,
+    pattern if guard => expr,
+    _ => expr,
+}
+```
+
+`=>` is already the map separator, and `{ }` already delimits every other
+control form, so `match` introduces no new punctuation. Arms are separated by
+commas; a trailing comma is allowed. Arms are tried **in source order** and the
+first that matches wins.
+
+### Patterns
+
+| Pattern | Matches |
+|---------|---------|
+| `_` | anything, binding nothing |
+| `x` | anything, binding it to `x` |
+| `1`, `1.5`, `'c'`, `true`, `"s"`, `:atom`, `()` | that literal, by the same equality `==` uses |
+| `[]` | the empty list |
+| `[a, b, c]` | a list of exactly three elements |
+| `[x, ..rest]` | a non-empty list; `rest` is the tail |
+| `#[a, b]` | an array of exactly two elements |
+| `#[a, ..rest]` | an array of at least one element |
+| `%{ :k => v }` | a map containing key `:k`; other keys ignored |
+| `p as name` | `p`, also binding the whole value to `name` |
+
+Patterns nest. A name may be bound at most once per arm.
+
+```dream
+let rec sum xs = match xs {
+    []          => 0,
+    [x, ..rest] => x + sum rest,
+};
+
+let classify v = match v {
+    0                => :zero,
+    n if n < 0       => :negative,
+    n                => :positive,
+};
+
+let route msg = match msg {
+    %{ :kind => :get, :path => p }  => handle_get p,
+    %{ :kind => :post } as m        => handle_post m,
+    other                           => reject other,
+};
+```
+
+### Forcing — the part that matters in a lazy language
+
+**A pattern forces exactly as much of the scrutinee as it needs to decide.**
+
+- `_` and a bare binder force nothing.
+- Every other pattern forces the scrutinee to weak head normal form.
+- A nested pattern forces its sub-position to WHNF, recursively, and only along
+  the path it is inspecting: `[x, ..rest]` forces the first cell but neither
+  `x` nor `rest`.
+- A guard is evaluated strictly, but only after its arm's pattern has matched.
+
+Arms are tried in order, so an earlier arm's forcing is observable by a later
+one. This is the same bargain `if` already makes with its condition.
+
+### Interaction with the rest of the language
+
+- **Purity.** `match` is pure. The scrutinee, guards and arm bodies follow the
+  ordinary rule: impure only inside an impure context.
+- **Strictness analysis.** `strict(Match s, arms) = strict(s) ∪ ⋂ strict(armᵢ)` —
+  the same shape as `If`, which is what lets a `match`-written loop stay
+  JIT-eligible.
+- **Exhaustiveness.** Dream is dynamically typed, so exhaustiveness cannot be
+  checked in general. A `match` with no arm that matches raises `:match_error`
+  carrying the unmatched value. A `_` arm is therefore the way to be total.
+
+### Destructuring `let` and parameters
+
+The same pattern grammar, restricted to **irrefutable** patterns (`_`, binders,
+`as`, and fixed-length `[..]` / `#[..]` / `%{..}` forms), extends `let` and
+parameter lists:
+
+```dream
+let [a, b] = pair;
+let f %{ :x => x, :y => y } = x + y;
+```
+
+A refutable pattern in either position is a compile error, naming the pattern
+that could fail.
+
+### Implementation sketch
+
+The work lands in five places, in this order:
+
+1. `lexer.rs` — one new token, `..` for the rest pattern. `match` itself needs
+   no token: keywords are ordinary `Ident`s that the parser recognises.
+2. `parser.rs` — add `"match"` to `KEYWORDS` and to `NON_STARTERS` (it cannot
+   begin an argument), then `parse_match` and `parse_pattern`. The scrutinee
+   needs the same `no_brace` treatment `if` already gets, so that the `{`
+   opening the arms is not read as an argument. `parse_pattern` can reuse the
+   existing `[`, `#[`, `%{` group handling verbatim.
+3. `ast.rs` — a `Pattern` enum, `ExprKind::Match { scrutinee, arms }`, and a
+   `pattern` field on `Param` and `LetDecl`.
+4. `lower.rs` — compile each arm to a decision chain of test-and-bind nodes.
+   Bindings become frame slots exactly as parameters do, so scope resolution
+   already handles them and the purity check needs no change.
+5. `interp.cpp` — the test opcodes, and `match_error` added to
+   `WellKnownAtoms`.
+
+No image-format change is required: the arms lower to existing node kinds plus
+a small number of new opcodes **appended** to the table in `ir.rs` — appended
+because the opcode's position is its identity, so inserting one would
+invalidate every image already built.
+
+The e2e suite is the acceptance test: a `match`-based `sum` and a
+`match`-written tail-recursive loop must print the same thing under both tiers,
+and the lazy program must show that `[x, ..rest]` forces the cell without
+forcing `x`.
+
+---
+
+## 13. The standard library
+
+Two layers. **Native modules** are C++ in the VM and are listed explicitly in
+both halves — [`dreamc/src/modules.rs`](../dreamc/src/modules.rs) and the VM's
+registry — with a test proving the two agree. **Dream modules** live in
+[`mind/std/`](../mind/std) and are compiled like any other package.
+
+### Builtins
+
+Resolved directly, without an import, unless shadowed by a binding:
+
+| | |
+|-|-|
+| `spawn!` | thunk → process |
+| `join!` | process → value |
+| `send!` | process → value → unit |
+| `recv!` | unit → value |
+| `self!` | unit → process |
+| `raise!` | value → never |
+| `type_of` | value → atom |
+| `to_string` | value → string |
+| `len` | list \| array \| map \| string → integer |
+
+### `std.core` — what the language cannot express in itself
+
+Everything here is either a primitive the representation hides (a string's
+bytes, a map's buckets) or something that must be a single machine step for the
+rest of the library to be worth writing.
+
+| Area | Members |
+|------|---------|
+| lists | `head` `tail` `cons` `is_empty` |
+| strings | `str_len` `str_chars` `str_of_chars` `str_slice` `str_find` `str_byte` |
+| chars | `char_code` `char_of_code` |
+| numbers | `to_float` `to_int` `parse_int` `parse_float` |
+| arrays | `array_new` `array_get` `array_set` `array_of_list` `array_to_list` |
+| maps | `map_new` `map_get` `map_has` `map_put` `map_remove` `map_pairs` |
+| ordering | `compare` |
+
+### `std.console`
+
+| | |
+|-|-|
+| `print! ..` | writes every argument, then a newline, to stdout |
+| `write! ..` | the same without the trailing newline |
+| `line! ..` | as `print!` |
+| `error! ..` | as `print!`, to stderr |
+
+**Every member is variadic**: it takes however many arguments the call site
+passed, writes each in turn with no separator between them, and forces every
+one.
+
+```dream
+console.print! "done"
+console.print! "x = " x ", y = " y
+x |> console.print! "x = "            // one application, so this still works
+```
+
+Variadic is possible here only because Dream lowers `a |> f b` to a *single*
+application node, so a variadic native can take "everything at this call site"
+as its meaning. The flip side is that **a variadic function is never partially
+applied** — currying cannot tell `f a b` from a half-finished `f a b c` — so
+`console.print! "label"` prints immediately rather than returning a function
+waiting for a value.
+
+### `std.math`
+
+`sqrt` · `abs` · `floor`
+
+### `std.vm` — the runtime describing itself
+
+`processes! ()` · `reductions! ()` · `collections! ()` · `heap_bytes! ()` ·
+`modules! ()` · `has_ffi ()`
+
+### `std.ffi`
+
+`open!` · `close!` · `bind!` · `load!` · `sizeof` · `alloc!` · `free!` ·
+`read_cstr!` · `read_u8!` · `write_u8!`
+
+Built only when libffi is found. Without it every member except `sizeof` raises,
+and `vm.has_ffi ()` reports `false`, so a program can degrade rather than fail
+to load.
+
+### `mind/std` — the Dream-level library
+
+Anything that can be written in Dream is written in Dream.
+
+- **`std.list`** — the list library. Most of it works on lists that are never
+  fully built; functions that must see the whole list to answer (`length`,
+  `reverse`, `sort`) say so in their doc comment.
+- **`std.seq`** — the generic sequence layer, described below.
+- **`std.array`** — arrays. `derive`s `std.seq`, and adds `get`, `set`, `build`,
+  `slice`, `map`, `sort` and the rest of what is specific to a flat, finite,
+  constant-time-indexed sequence.
+- **`std.str`** — text. Also `derive`s `std.seq`, over **characters**, and adds
+  `split`, `trim`, `upper`, `find` and friends.
+- **`std.test`** — the test framework. Each case runs in **its own process**, so
+  a case that raises or loops is isolated, and the failure reaches the runner as
+  an ordinary value through `join!` rather than having already unwound the
+  runner's stack.
+- **`std.all`** — imports every module, so that adding a module there is all it
+  takes for its tests to run, and a module that no longer compiles fails the
+  build rather than being quietly skipped.
+
+### `std.seq` — what `virtual` and `derive` are for
+
+`std.seq` is the standard library's own use of the feature in
+[§7](#virtual-and-derive). It declares **one hole**:
+
+```dream
+virtual let fold f init xs;
+virtual let name xs = "sequence";     // optional, has a default
+```
+
+and writes `length`, `is_empty`, `sum`, `product`, `count`, `any`, `all`,
+`contains`, `minimum`, `maximum`, `minimum_by`, `maximum_by`, `to_list`, `join`
+and `describe` in terms of it. A container becomes a full sequence by answering
+that one question:
+
+```dream
+// std/array.dr
+derive std.seq;
+let fold f init xs = { .. };          // a counted loop
+let name xs = "array";
+let length xs = len xs;               // override: an array knows its own size
+```
+
+```dream
+array.sum #[1, 2, 3]                  // 6      -- from std.seq
+str.count (fn c -> c == 'l') "hello"  // 2      -- from std.seq, over characters
+array.describe #[1, 2, 3]             // "array of 3"
+```
+
+Because Dream compiles whole programs, `derive` specializes `std.seq`'s syntax
+tree against each module's `fold`, so `array.sum` is ordinary code with the
+array loop inlined into it. **The generality costs nothing at run time** — there
+is no dispatch and no wrapper.
+
+Two things follow from having only `fold`, and the module says both out loud
+rather than leaving them to be discovered:
+
+- **Nothing in `std.seq` is lazy.** `fold` walks the whole container, so every
+  operation is strict and terminates only on a finite one. This is exactly why
+  `std.list` keeps its own implementations instead of deriving: `take 5 (from 1)`
+  has to work on an infinite list, and it cannot through a fold.
+- **`any` and `all` do not short-circuit.** A fold has no way to stop early, so
+  they fold the whole sequence either way.
+
+`std.str` also keeps **characters and bytes apart by name**: `length` and
+everything inherited from `std.seq` count characters, while `byte_length`,
+`slice` and `find` work in bytes, because the runtime's string primitives are
+byte-indexed. `length "héllo"` is `5` and `byte_length "héllo"` is `6`.
+
+### Writing tests
+
+A module opts into the test runner by defining a **parameterless `tests`
+binding**, conventionally inside a `when test { .. }` so it costs nothing in a
+normal build:
+
+```dream
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "sum"     $( test.eq! 6 (list.sum [1, 2, 3]) ),
+        test.case "reverse" $( test.eq! [3, 2, 1] (list.reverse [1, 2, 3]) ),
+    ];
+}
+```
+
+`dreamc FILE --test` then scans **the modules it actually loaded** for that
+binding and generates an entry point that runs each suite it found. There is no
+registry to keep in step, and no test that is silently never run; a program with
+no `tests` anywhere still compiles, and reports that there was nothing to run.
+
+Assertions — `test.eq!`, `test.ne!`, `test.true!`, `test.false!`, `test.near!` —
+raise on failure, which is what ends a case at its first failure and what the
+runner catches.
+
+```
+just test-std                       # the standard library's own suite
+dreamc mind/std/all.dr --test -L mind -o t.dream && mindv2 t.dream
+```
+
+---
+
+## 14. The toolchain
+
+### `dreamc` — the compiler
+
+```
+dreamc FILE [-o OUT.dream] [options]
+```
+
+| Flag | |
+|------|-|
+| `-o`, `--output PATH` | where to write the image |
+| `-I`, `--include DIR` | add a module search directory |
+| `-L`, `--package-path DIR` | add a package search root |
+| `--host-module PATH` | a module the host registers at run time (repeatable) |
+| `-D`, `--define NAME[=VALUE]` | define a `when` flag |
+| `--test` | define `test` and generate a runner (see below) |
+| `--release` / `--debug-cfg` | define `release` / `debug` |
+| `--print-cfg` | print the flags that are defined |
+| `--modules` / `--packages` | report what the program pulls in |
+| `--dump` | disassemble the image by reading it back |
+| `--ast` | print the syntax tree |
+| `--no-emit` | check only: scope, purity, verification |
+| `--no-debug` | omit debug info |
+
+### `mindv2` — the VM
+
+```
+mindv2 PROGRAM.dream [options]
+```
+
+| Flag | |
+|------|-|
+| `-e`, `--entry NAME` | entry point (default `main!`) |
+| `-j`, `--workers N` | scheduler threads; `0` means one per hardware thread |
+| `--no-jit` | interpreter only |
+| `--jit-threshold N` | calls before a function is compiled (default 32) |
+| `--dump-jit FN` | print the LLVM IR generated for one function |
+| `--dump` | disassemble the loaded image |
+| `--stats` | reductions and collections |
+
+### `just`
+
+```
+just                 # build both halves
+just run FILE        # compile and run
+just check FILE      # scope, purity and verification, no image
+just test            # compiler, VM, end-to-end, and standard-library tests
+just test-all        # the above plus fuzzing, heap verification, no-JIT build
+```
+
+`DREAM_VERIFY_HEAP=1` verifies the heap after every collection.
+
+### The pipeline
+
+```
+.dr source
+   │  lexer.rs      logos tokens, newline tracking
+   │  parser.rs     recursive descent, precedence climbing
+   │  modules.rs    whole-program module and package resolution
+   │  lower.rs      scope resolution, closure conversion, purity checking
+   │  consteval.rs  comp / comp!
+   │  ir.rs         node arena, opcodes, constant pool
+   │  verify.rs     structural validation
+   │  emit.rs       container writer
+   ▼
+.dream image        a flat arena of 16-byte nodes linked by index
+   │                (format: dreamc/docs/bytecode-format.md)
+   ▼
+mindv2              image.cpp loads and revalidates; interp.cpp reduces;
+                    jit.cpp compiles the strict numeric spine
+```
+
+An image is a flat arena of 16-byte execution-tree nodes linked by index, so the
+VM can map the file and start forcing nodes without rebuilding a tree. The VM
+**revalidates every image it loads** — a malformed one is rejected, never
+crashed on.
+
+---
+
+## 15. Embedding
+
+[`dream/include/dream/dream.h`](../dream/include/dream/dream.h) is a C API:
+create a VM, load an image, register host modules, run an entry point.
+
+```c
+dream_vm* vm = dream_vm_new();
+
+const char* names[]           = {"shout!", "total!"};
+const uint32_t arities[]      = {1, DREAM_VARIADIC};
+const uint32_t strict[]       = {1, 0};
+const dream_native_fn fns[]   = {host_shout, host_total};
+dream_vm_register_module(vm, "host", names, arities, strict, fns, 2);
+
+dream_vm_load_file(vm, "program.dream", err, sizeof err);
+dream_vm_run(vm, NULL);           /* runs main! */
+puts(dream_vm_result_text(vm));
+dream_vm_free(vm);
+```
+
+The Dream side is compiled with the module named, so that the import resolves:
+
+```
+dreamc program.dr --host-module host -o program.dream
+```
+
+[`dream/examples/embed.c`](../dream/examples/embed.c) is this example in full,
+and it is built as part of the VM.
+
+The surface falls into six groups:
+
+| Group | |
+|-------|-|
+| lifecycle | `dream_vm_new` `dream_vm_free` `dream_vm_load_file` `dream_vm_load_bytes` |
+| configuration | `dream_vm_set_workers` `dream_vm_set_jit` `dream_vm_register_module` |
+| running | `dream_vm_run` `dream_vm_run_value` `dream_vm_result_text` `dream_vm_failed` |
+| reading values | `dream_value_type` and the `dream_value_*` accessors; `dream_force` `dream_vm_force_deep` |
+| building values | `dream_make_*`, `dream_array_set`, `dream_map_insert`, `dream_map_get` |
+| introspection | `dream_vm_reductions` `dream_vm_collections` `dream_vm_process_count` `dream_vm_module_count` `dream_vm_native_module_count` |
+
+Four things are worth knowing:
+
+- **Host functions receive forced arguments** unless the registration cleared
+  their bit in `strict_mask`. One trampoline serves every registered function —
+  the C function pointer travels on the function value itself — so the number of
+  host functions is unlimited rather than capped by a table of generated thunks.
+- **An arity of `DREAM_VARIADIC`** makes a member take however many arguments
+  its call site passed, with every one forced — `strict_mask` is a 32-bit map of
+  argument positions, and an unbounded list has no fixed positions to map. Such
+  a member is never partially applied, for the reason given under
+  [`std.console`](#stdconsole). This is how `console.print!` is registered.
+- **`dream_vm_run_value` is for tools that want the answer rather than a
+  transcript.** The result is forced all the way down before it is handed over,
+  so every nested value is safe to inspect. This is how the compiler's `comp!`
+  works.
+- **Values are only meaningful relative to the process that owns them,** and a
+  borrowed string pointer is valid only until the next allocation.
+
+`dream_vm_native_module_count` / `_name` exist so a test can prove the
+compiler's list of native modules and the runtime's registry still agree.

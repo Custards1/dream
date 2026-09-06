@@ -5,11 +5,14 @@
 // Importing them is also a check in itself: a module that no longer compiles
 // fails the build rather than being quietly skipped.
 
+import std.array;
 import std.list;
+import std.seq;
+import std.str;
 import std.test;
 
 /// The library's own version, so a program can report what it was built with.
 let version = "0.1.0";
 
 /// The modules this build provides.
-let modules = ["std.core", "std.list", "std.test"];
+let modules = ["std.array", "std.core", "std.list", "std.seq", "std.str", "std.test"];

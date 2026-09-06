@@ -25,6 +25,9 @@ fn sp(s: Span) -> (u32, u32) {
 fn item_span(item: &Item) -> Span {
     match item {
         Item::Import(i) => i.span,
+        // The loader turns every `mod` into a module plus an import, so one
+        // never reaches lowering.
+        Item::Mod(m) => m.span,
         Item::Derive(d) => d.span,
         Item::Virtual(v) => v.span,
         Item::Let(l) => l.span,
@@ -63,6 +66,10 @@ enum ModuleRef {
     Dream(usize),
     /// The global index holding the module value.
     Native(u32),
+    /// A namespace rather than a module: an index into `Lowerer::groups`,
+    /// which holds the dotted prefix. `import std;` binds one, so that
+    /// `std.list` names the module and `std.list.map` its member.
+    Group(u32),
 }
 
 /// Per-module name resolution state.
@@ -70,6 +77,11 @@ enum ModuleRef {
 struct ModuleCtx<'a> {
     globals: HashMap<String, u32>,
     aliases: HashMap<String, ModuleRef>,
+    /// Members brought in unqualified by `import path.{ a, b as c }`, keyed by
+    /// the name they are bound under. Resolved when the name is used rather
+    /// than when the import is declared, because the module it comes from may
+    /// not have declared its own globals yet.
+    only: HashMap<String, (ModuleRef, String, String)>,
     /// The module's top-level functions, so `comp` can call them.
     funcs: HashMap<String, &'a LetDecl>,
     source: usize,
@@ -108,6 +120,8 @@ pub struct Lowerer<'a> {
     current_source: usize,
     frames: Vec<Frame>,
     set: Option<&'a ModuleSet>,
+    /// Dotted prefixes behind `ModuleRef::Group`.
+    groups: Vec<String>,
     pub pending_comp: Vec<PendingComp>,
 }
 
@@ -124,6 +138,7 @@ impl<'a> Lowerer<'a> {
             current_source: 0,
             frames: Vec::new(),
             set: None,
+            groups: Vec::new(),
             pending_comp: Vec::new(),
         }
     }
@@ -288,7 +303,10 @@ impl<'a> Lowerer<'a> {
         seen.push(mi);
         for item in &set.modules[mi].ast.items {
             if let Item::Derive(d) = item {
-                if let Some(base) = set.find(&d.path.join(".")) {
+                // Resolved the same way `declare_module` resolves it, or a
+                // submodule deriving a sibling would collect no base items.
+                let path = Self::relative_path(set, mi, &d.path.join("."));
+                if let Some(base) = set.find(&path) {
                     self.effective_items(set, base, out, seen);
                 }
             }
@@ -313,7 +331,7 @@ impl<'a> Lowerer<'a> {
             match item {
                 Item::Import(imp) => self.declare_import(set, mi, imp),
                 Item::Derive(d) => {
-                    let path = d.path.join(".");
+                    let path = Self::relative_path(set, mi, &d.path.join("."));
                     match set.find(&path) {
                         Some(base) => {
                             if derives.is_some() {
@@ -441,6 +459,36 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // A `let` and an `import path.{ .. }` of the same name would both bind
+        // it, and the `let` would quietly win. Say so instead: which one the
+        // author meant is not something to guess at.
+        let clashes: Vec<String> = self.modules[mi]
+            .only
+            .keys()
+            .filter(|k| self.modules[mi].globals.contains_key(*k))
+            .cloned()
+            .collect();
+        for name in clashes {
+            let (_, member, from) = self.modules[mi].only.remove(&name).expect("just listed");
+            let span = set.modules[mi]
+                .ast
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Import(i) => i.only.iter().find(|s| s.alias == name).map(|s| s.span),
+                    _ => None,
+                })
+                .unwrap_or_else(|| set.modules[mi].ast.items.first().map(item_span).unwrap_or_default());
+            self.diags.push(
+                Diag::error(span, format!("`{name}` is already bound in this module"))
+                    .with_note(format!(
+                        "it is imported from `{from}` and also defined here; \
+                         rename one, or use `{from}.{member}` where the import is meant"
+                    ))
+                    .in_source(set.modules[mi].source),
+            );
+        }
+
         let globals_count = self.prog.globals.len() as u32 - globals_start;
         self.prog.modules.push(ModuleRec {
             name: name_k,
@@ -494,14 +542,55 @@ impl<'a> Lowerer<'a> {
         Box::leak(Box::new(decl))
     }
 
+    /// A module path as seen from inside module `mi`.
+    ///
+    /// Enclosing scopes are tried from the inside out before the path is taken
+    /// as absolute, so a submodule can name its own children and its siblings
+    /// the way any nested scope does.
+    fn relative_path(set: &ModuleSet, mi: usize, path: &str) -> String {
+        let mut scope = set.modules[mi].name.as_str();
+        loop {
+            let candidate = format!("{scope}.{path}");
+            if set.find(&candidate).is_some() {
+                return candidate;
+            }
+            match scope.rfind('.') {
+                Some(cut) => scope = &scope[..cut],
+                None => return path.to_string(),
+            }
+        }
+    }
+
     fn declare_import(&mut self, set: &ModuleSet, mi: usize, imp: &Import) {
-        let path = imp.path.join(".");
-        if self.modules[mi].aliases.contains_key(&imp.alias) {
+        // An import is resolved against the enclosing modules first, so that
+        // `import io.{ quiet }` inside a module declaring `mod io { .. }` means
+        // that submodule rather than a file called `io` somewhere.
+        let path = Self::relative_path(set, mi, &imp.path.join("."));
+        // `import path.{ a, b as c }` binds members, not the module, so the
+        // module's own name is never taken and cannot collide.
+        if imp.only.is_empty() && self.modules[mi].aliases.contains_key(&imp.alias) {
             self.err(imp.span, format!("`{}` is already imported here", imp.alias));
             return;
         }
         if let Some(target) = set.find(&path) {
+            if !imp.only.is_empty() {
+                self.declare_import_names(mi, ModuleRef::Dream(target), &path, imp);
+                return;
+            }
             self.modules[mi].aliases.insert(imp.alias.clone(), ModuleRef::Dream(target));
+            return;
+        }
+        // A whole package: `import std;` binds a namespace, not a module.
+        if set.namespaces.contains(&path) {
+            if !imp.only.is_empty() {
+                self.err(
+                    imp.span,
+                    format!("`{path}` is a package, so `.{{ .. }}` has no members to take"),
+                );
+                return;
+            }
+            let g = self.group(&path);
+            self.modules[mi].aliases.insert(imp.alias.clone(), g);
             return;
         }
 
@@ -518,10 +607,31 @@ impl<'a> Lowerer<'a> {
             target: import_idx,
             flags: 0,
         });
+        if !imp.only.is_empty() {
+            self.declare_import_names(mi, ModuleRef::Native(g), &path, imp);
+            return;
+        }
         self.modules[mi].aliases.insert(imp.alias.clone(), ModuleRef::Native(g));
         // A host module is a value as well as a namespace, so a bare mention of
         // the alias yields the module itself.
         self.modules[mi].globals.insert(imp.alias.clone(), g);
+    }
+
+    /// Record the members of `import path.{ a, b as c }`. Nothing is resolved
+    /// here: the module they come from may not have declared its globals yet,
+    /// so the lookup happens when the name is used.
+    fn declare_import_names(&mut self, mi: usize, m: ModuleRef, path: &str, imp: &Import) {
+        for sel in &imp.only {
+            if self.modules[mi].globals.contains_key(&sel.alias)
+                || self.modules[mi].only.contains_key(&sel.alias)
+            {
+                self.err(sel.span, format!("`{}` is already bound in this module", sel.alias));
+                continue;
+            }
+            self.modules[mi]
+                .only
+                .insert(sel.alias.clone(), (m, sel.name.clone(), path.to_string()));
+        }
     }
 
     /// Reserve the function and global records; returns the function index.
@@ -643,12 +753,46 @@ impl<'a> Lowerer<'a> {
             ExprKind::Field(obj, field) => {
                 // `list.map` where `list` names a Dream module is a global, not
                 // a lookup: the whole program is compiled together, so the
-                // member's index is known now.
-                if let ExprKind::Name(alias) = &obj.kind {
-                    if self.resolve_local_or_capture(alias).is_none() {
-                        if let Some(m) = self.modules[self.current].aliases.get(alias).copied() {
-                            return self.lower_module_member(m, alias, field, e.span);
+                // member's index is known now. The same walk handles a package
+                // namespace, where `std.list` is itself only a step on the way
+                // to `std.list.map`.
+                if let Some((m, shown)) = self.as_namespace(obj) {
+                    // `math.deep` where `deep` is a submodule: keep walking, so
+                    // `math.deep.answer` finds the member.
+                    if let ModuleRef::Dream(target) = m {
+                        if let Some(inner) = self.submodule(target, field) {
+                            return self.namespace_is_not_a_value(
+                                inner,
+                                &format!("{shown}.{field}"),
+                                e.span,
+                            );
                         }
+                    }
+                    match m {
+                        ModuleRef::Group(_) => match self.group_member(m, field) {
+                            Some(inner) => {
+                                // `std.list` on its own is a namespace, not a
+                                // value; only `std.list.map` is.
+                                return self.namespace_is_not_a_value(
+                                    inner,
+                                    &format!("{shown}.{field}"),
+                                    e.span,
+                                );
+                            }
+                            None => {
+                                let source = self.current_source;
+                                self.diags.push(
+                                    Diag::error(
+                                        e.span,
+                                        format!("`{shown}` has no module `{field}`"),
+                                    )
+                                    .with_note(self.group_contents(m))
+                                    .in_source(source),
+                                );
+                                return self.node(Node::new(Op::Unit), e.span);
+                            }
+                        },
+                        _ => return self.lower_module_member(m, &shown, field, e.span),
                     }
                 }
                 let o = self.lower_expr(obj);
@@ -822,6 +966,121 @@ impl<'a> Lowerer<'a> {
         self.capture(top, name)
     }
 
+    /// Intern a namespace prefix, reusing the entry if it is already there.
+    fn group(&mut self, prefix: &str) -> ModuleRef {
+        match self.groups.iter().position(|g| g == prefix) {
+            Some(i) => ModuleRef::Group(i as u32),
+            None => {
+                self.groups.push(prefix.to_string());
+                ModuleRef::Group(self.groups.len() as u32 - 1)
+            }
+        }
+    }
+
+    /// The dotted prefix behind a `Group`.
+    fn group_prefix(&self, m: ModuleRef) -> &str {
+        match m {
+            ModuleRef::Group(i) => &self.groups[i as usize],
+            _ => "",
+        }
+    }
+
+    /// `field` inside a namespace: the module `prefix.field` if there is one,
+    /// otherwise a deeper namespace if any module lives under it.
+    fn group_member(&mut self, m: ModuleRef, field: &str) -> Option<ModuleRef> {
+        let candidate = format!("{}.{}", self.group_prefix(m), field);
+        let set = self.set?;
+        if let Some(target) = set.find(&candidate) {
+            return Some(ModuleRef::Dream(target));
+        }
+        let deeper = format!("{candidate}.");
+        if set.by_name.keys().any(|n| n.starts_with(&deeper)) || set.namespaces.contains(&candidate)
+        {
+            return Some(self.group(&candidate));
+        }
+        None
+    }
+
+    /// What a namespace holds, for the note on a failed lookup.
+    fn group_contents(&self, m: ModuleRef) -> String {
+        let prefix = format!("{}.", self.group_prefix(m));
+        let Some(set) = self.set else { return "it holds nothing".to_string() };
+        let mut names: Vec<&str> = set
+            .by_name
+            .keys()
+            .filter_map(|n| n.strip_prefix(&prefix))
+            .filter(|rest| !rest.contains('.'))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.is_empty() {
+            "it holds nothing".to_string()
+        } else {
+            format!("it holds: {}", names.join(", "))
+        }
+    }
+
+    /// A module or namespace mentioned where a value belongs.
+    fn namespace_is_not_a_value(&mut self, m: ModuleRef, shown: &str, span: Span) -> u32 {
+        let note = match m {
+            ModuleRef::Group(_) => {
+                format!("use a module inside it, as in `{shown}.something.member`")
+            }
+            _ => format!("use one of its members, as in `{shown}.something`"),
+        };
+        let source = self.current_source;
+        self.diags.push(
+            Diag::error(span, format!("`{shown}` is a module, not a value"))
+                .with_note(note)
+                .in_source(source),
+        );
+        self.node(Node::new(Op::Unit), span)
+    }
+
+    /// `field` as a *submodule* of the module at `target`.
+    ///
+    /// A module's aliases hold everything it imported as well as what it
+    /// declared, so the name alone is not enough: `text.str` must not reach
+    /// `std.str` just because `text` imports it. Only a module actually named
+    /// `parent.field` counts, which is exactly what `mod field { .. }` creates.
+    fn submodule(&mut self, target: usize, field: &str) -> Option<ModuleRef> {
+        let m = self.modules[target].aliases.get(field).copied()?;
+        let ModuleRef::Dream(inner) = m else { return None };
+        let set = self.set?;
+        let expected = format!("{}.{}", set.modules[target].name, field);
+        (set.modules[inner].name == expected).then_some(m)
+    }
+
+    /// If `e` names a module or namespace rather than a value, which one --
+    /// and the spelling to show in a diagnostic.
+    fn as_namespace(&mut self, e: &Expr) -> Option<(ModuleRef, String)> {
+        match &e.kind {
+            ExprKind::Name(name) => {
+                if self.resolve_local_or_capture(name).is_some() {
+                    return None;
+                }
+                let m = self.modules[self.current].aliases.get(name).copied()?;
+                Some((m, name.clone()))
+            }
+            ExprKind::Field(obj, field) => {
+                let (base, shown) = self.as_namespace(obj)?;
+                match base {
+                    ModuleRef::Group(_) => {
+                        let inner = self.group_member(base, field)?;
+                        Some((inner, format!("{shown}.{field}")))
+                    }
+                    ModuleRef::Dream(target) => {
+                        let inner = self.submodule(target, field)?;
+                        Some((inner, format!("{shown}.{field}")))
+                    }
+                    // `console.print.x` -- a host module's members are values.
+                    ModuleRef::Native(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn lower_module_member(
         &mut self,
         m: ModuleRef,
@@ -864,6 +1123,20 @@ impl<'a> Lowerer<'a> {
                     self.prog.set_flag(n, F_IMPURE);
                 }
                 n
+            }
+            // A namespace holds modules, not members. Callers resolve it with
+            // `group_member` first; reaching here means the name was used one
+            // level too shallow, as in `std.map` for `std.list.map`.
+            ModuleRef::Group(_) => {
+                let prefix = self.group_prefix(m).to_string();
+                let note = self.group_contents(m);
+                let source = self.current_source;
+                self.diags.push(
+                    Diag::error(span, format!("`{prefix}` is a package, not a module"))
+                        .with_note(format!("{note}; `{field}` would have to be inside one"))
+                        .in_source(source),
+                );
+                self.node(Node::new(Op::Unit), span)
             }
         }
     }
@@ -915,7 +1188,9 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .filter_map(|(k, v)| match v {
                     ModuleRef::Dream(i) => Some((k.clone(), *i)),
-                    ModuleRef::Native(_) => None,
+                    // A host module cannot run at compile time, and a package
+                    // namespace is not a module at all.
+                    ModuleRef::Native(_) | ModuleRef::Group(_) => None,
                 })
                 .collect(),
             current: self.current,
@@ -1023,6 +1298,13 @@ impl<'a> Lowerer<'a> {
                 self.node(Node::with(Op::Builtin, b, NO_NODE, NO_NODE), span)
             }
             None => {
+                // A member brought in by `import path.{ .. }` resolves exactly
+                // as `path.member` would, so the two spellings cannot disagree.
+                if let Some((m, member, from)) =
+                    self.modules[self.current].only.get(name).cloned()
+                {
+                    return self.lower_module_member(m, &from, &member, span);
+                }
                 // A Dream module is a compile-time namespace, not a value, so
                 // say that rather than claiming the name does not exist.
                 if let Some(ModuleRef::Dream(_)) = self.modules[self.current].aliases.get(name) {

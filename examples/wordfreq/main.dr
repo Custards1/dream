@@ -1,0 +1,39 @@
+// Using another package.
+//
+// `textstats` is a path dependency declared in `mind.toml`. Its modules are
+// reached by package name; this package's own `report` is reached unqualified,
+// which is what keeps two modules of the same name apart.
+import std.console;
+import std.list;
+
+import textstats.tokenize;
+import textstats.counter;
+import textstats.stats;
+import textstats.report_plain as plain;
+
+// This package's own module, same name as one in the dependency.
+import report;
+
+// ..and a selective import from the dependency, to check that works across a
+// package boundary too.
+import textstats.counter.{top, distinct};
+
+let corpus = "red green blue red blue red. GREEN green, blue red!";
+
+let main! = {
+    console.print! (report.banner "wordfreq")
+
+    let words = tokenize.words corpus;
+    let counts = counter.tally words;
+
+    console.print! (report.bullet "words" (list.length words))
+    console.print! (report.bullet "distinct" (distinct counts))
+    console.print! (report.bullet "commonest" (list.head (list.head (top 1 counts))))
+    console.print! ""
+
+    console.print! (plain.render (top 4 counts) (counter.total counts))
+    console.print! ""
+
+    let lengths = list.map (fn w -> len w) words;
+    console.print! (report.bullet "lengths" (stats.describe_lengths lengths))
+};

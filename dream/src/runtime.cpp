@@ -1,5 +1,8 @@
 #include "runtime.hpp"
 
+#include "io.hpp"
+
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -29,9 +32,18 @@ Runtime::Runtime() : wk_(std::make_unique<WellKnownAtoms>()) {
     register_module(make_core_module());
     register_module(make_vm_module());
     register_module(make_ffi_module());
+    register_module(make_io_module());
+    register_module(make_net_module());
+    // The poller thread has to exist before any process can wait on a
+    // descriptor, and it costs nothing when nothing does IO.
+    io_init();
 }
 
-Runtime::~Runtime() = default;
+Runtime::~Runtime() {
+    // Stop the poller before the scheduler it wakes into can go away, and
+    // close whatever descriptors the program left open.
+    io_shutdown();
+}
 
 bool Runtime::load_image_file(const std::string& path, std::string& error) {
     auto img = std::make_unique<Image>();
@@ -120,6 +132,18 @@ size_t Runtime::live_process_count() const {
         if (!p->is_done()) ++n;
     }
     return n;
+}
+
+std::vector<std::shared_ptr<Process>> Runtime::all_processes() const {
+    std::shared_lock<std::shared_mutex> g(processes_mutex_);
+    std::vector<std::shared_ptr<Process>> out;
+    out.reserve(processes_.size());
+    for (auto& [id, p] : processes_) out.push_back(p);
+    std::sort(out.begin(), out.end(),
+              [](const std::shared_ptr<Process>& a, const std::shared_ptr<Process>& b) {
+                  return a->id() < b->id();
+              });
+    return out;
 }
 
 const WellKnownAtoms& well_known(Runtime& rt) { return rt.well_known_atoms(); }

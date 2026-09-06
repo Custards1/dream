@@ -1,0 +1,10 @@
+[package]
+name = "wordfreq"
+version = "0.1.0"
+src = "."
+
+# A path dependency. The path is relative to this manifest, and the package it
+# points at declares its own name -- so what `import textstats.tokenize` means
+# does not depend on where either package sits on disk.
+[dependencies]
+textstats = { path = "../textstats" }

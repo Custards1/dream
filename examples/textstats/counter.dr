@@ -1,0 +1,59 @@
+// Counting occurrences, over a map.
+//
+// A map's keys are forced so they can be hashed; its values stay lazy. Counts
+// are forced the moment they are compared, so nothing accumulates here.
+import std.core;
+import std.list;
+
+/// An empty tally.
+let empty = %{};
+
+/// `counts` with one more occurrence of `key`.
+let bump counts key = core.map_put counts key (core.map_get counts key 0 + 1);
+
+/// How many times `key` was seen.
+let count_of counts key = core.map_get counts key 0;
+
+/// Tally every element of `xs`.
+let tally xs = list.fold bump empty xs;
+
+/// The tally as `[key, count]` pairs, commonest first. Ties are broken by key
+/// so the order is total -- otherwise the same input could report differently
+/// from one run to the next.
+let ranked counts = {
+    let pairs = core.map_pairs counts;
+    let before a b = {
+        let ca = list.nth 1 a;
+        let cb = list.nth 1 b;
+        if ca != cb { ca > cb } else { list.head a < list.head b }
+    };
+    list.sort_by before pairs
+};
+
+/// The `n` commonest, as `[key, count]` pairs.
+let top n counts = list.take n (ranked counts);
+
+/// How many distinct keys were seen.
+let distinct counts = len counts;
+
+/// How many occurrences in total.
+let total counts = list.sum (list.map (fn p -> list.nth 1 p) (core.map_pairs counts));
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "empty tally"      $( test.eq! 0 (distinct (tally [])) ),
+        test.case "counts one"       $( test.eq! 1 (count_of (tally ["a"]) "a") ),
+        test.case "counts repeats"   $( test.eq! 3 (count_of (tally ["a", "b", "a", "a"]) "a") ),
+        test.case "missing is zero"  $( test.eq! 0 (count_of (tally ["a"]) "zz") ),
+        test.case "distinct"         $( test.eq! 2 (distinct (tally ["a", "b", "a"])) ),
+        test.case "total"            $( test.eq! 3 (total (tally ["a", "b", "a"])) ),
+        test.case "ranked by count"  $( test.eq! ["a", 2] (list.head (ranked (tally ["b", "a", "a"]))) ),
+        test.case "ties break by key"
+            $( test.eq! [["a", 1], ["b", 1]] (ranked (tally ["b", "a"])) ),
+        test.case "top n"            $( test.eq! 2 (list.length (top 2 (tally ["a", "b", "c"]))) ),
+        test.case "top more than there is"
+            $( test.eq! 1 (list.length (top 9 (tally ["a"]))) ),
+    ];
+}

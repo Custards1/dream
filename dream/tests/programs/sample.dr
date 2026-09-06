@@ -1,0 +1,25 @@
+import std.console;
+
+
+let hello_world! x result = {
+    x |> console.print! "Hi, "
+    result |> console.print! "The result is " 
+}
+
+let rec fac(n) = if n <= 1 { 1 } else { fac n-1 };
+
+let div_by_zero () = 12 / 0; 
+
+let main! = {
+    let number = fac 2;
+
+    spawn! $(hello_world! "im thread 2" number )
+    let zero = try! {
+        div_by_zero
+    } catch e {
+        0
+    };
+    zero
+    hello_world! "im thread 1" zero
+
+}

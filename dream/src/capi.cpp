@@ -17,6 +17,11 @@
 
 using namespace dream;
 
+// The C header cannot include the C++ one, so the sentinel is spelled twice.
+// This is what keeps the two spellings the same value.
+static_assert(DREAM_VARIADIC == NATIVE_VARIADIC,
+              "DREAM_VARIADIC and NATIVE_VARIADIC must agree");
+
 namespace {
 
 /// One registered host function, kept alive for the lifetime of the VM so the

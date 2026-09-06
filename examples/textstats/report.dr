@@ -1,0 +1,43 @@
+// A report, generically.
+//
+// This module declares the holes and writes everything that does not depend on
+// how a row actually looks. A concrete reporter fills the holes by deriving it
+// -- see `report_plain.dr` and `report_bars.dr`, which share every line below.
+//
+// Because Dream compiles whole programs, `derive` specializes this module's
+// syntax tree against each deriving module's implementations, so a call to
+// `plain.render` is ordinary code with `plain`'s `row` inlined. The generality
+// costs nothing at run time.
+import std.str;
+import std.list;
+
+// --- the holes --------------------------------------------------------------
+
+/// One line of the body, given the key and its count.
+virtual let row label count;
+
+/// The heading. A deriving module may leave this alone.
+virtual let heading n = "top " + to_string n;
+
+/// Rendered after the body. Defaults to nothing.
+virtual let footer total = "";
+
+// --- what every reporter shares ---------------------------------------------
+
+/// The widest key in `pairs`, so columns can line up.
+let width pairs =
+    list.fold (fn w p -> { let n = str.length (list.head p); if n > w { n } else { w } }) 0 pairs;
+
+/// `label` padded out to `n` characters.
+let pad n label = label + str.repeat (n - str.length label) " ";
+
+/// The body: one `row` per pair, in the order given.
+let body pairs = list.map (fn p -> row (list.head p) (list.nth 1 p)) pairs;
+
+/// The whole report, as a single string.
+let render pairs total = {
+    let lines = list.append [heading (list.length pairs)] (body pairs);
+    let all = if str.is_empty (footer total) { lines }
+              else { list.append lines [footer total] };
+    str.join_str "\n" all
+};

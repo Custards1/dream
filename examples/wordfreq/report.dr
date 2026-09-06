@@ -1,0 +1,13 @@
+// A module in *this* package called `report`, while the dependency also has a
+// `textstats.report`. The two never collide: an import names the package it
+// comes from, so a package's own modules are reachable unqualified while
+// another's need the package name.
+import std.str;
+import std.list;
+
+let banner title = {
+    let bar = str.repeat (str.length title) "=";
+    str.join_str "\n" [title, bar]
+};
+
+let bullet label value = "  * " + label + ": " + to_string value;

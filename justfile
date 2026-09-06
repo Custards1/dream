@@ -81,7 +81,7 @@ install: release
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std
+test: test-compiler test-vm test-e2e test-std test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -92,6 +92,20 @@ test-vm: vm
 # Real programs, run under both the interpreter and the JIT, which must agree.
 test-e2e: build
     dream/tests/e2e.sh
+
+# Every example program, compiled and run, output checked against what is
+# recorded beside it. `just examples-bless` re-records after a deliberate change.
+test-examples: build
+    examples/run.sh
+
+examples-bless: build
+    examples/run.sh --bless
+
+# The example package's own tests, which also exercise `virtual`/`derive`
+# across files and a path dependency between two packages.
+test-examples-std: build
+    ./{{dreamc}} examples/textstats/main.dr --test -L mind -L examples -o /tmp/dream-ex-tests.dream
+    ./{{mindv2}} /tmp/dream-ex-tests.dream
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build

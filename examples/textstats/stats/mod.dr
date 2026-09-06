@@ -1,0 +1,53 @@
+// Summary statistics.
+//
+// This module lives at `stats/mod.dr` rather than `stats.dr`, which is how a
+// module grows into a directory without any importer changing: `import
+// textstats.stats` finds either spelling.
+import std.core;
+import std.list;
+import std.str;
+
+/// The mean of a list of numbers, or `()` for an empty one.
+let mean xs = if list.is_empty xs { () } else { core.to_float (list.sum xs) / core.to_float (list.length xs) };
+
+/// The middle value once sorted. For an even count, the lower of the two --
+/// which keeps the result the same type as the input.
+let median xs = {
+    let sorted = list.sort xs;
+    let n = list.length sorted;
+    if n == 0 { () } else { list.nth ((n - 1) / 2) sorted }
+};
+
+/// The longest word. `()` for an empty list, as `median` and `mean` answer.
+///
+/// The whole application is one expression, so it is written on one line or
+/// inside brackets: at top level a newline ends a statement, and a line that
+/// starts with `(` does not continue the previous one.
+let longest words = {
+    let better best w = if best == () || str.length w > str.length best { w } else { best };
+    list.fold better () words
+};
+
+/// A one-line summary of a list of word lengths.
+let describe_lengths lengths = {
+    let m = mean lengths;
+    "n=" + to_string (list.length lengths)
+        + " min=" + to_string (list.minimum lengths)
+        + " max=" + to_string (list.maximum lengths)
+        + " median=" + to_string (median lengths)
+        + " mean=" + to_string m
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "mean"            $( test.eq! 2.0 (mean [1, 2, 3]) ),
+        test.case "mean of empty"   $( test.eq! () (mean []) ),
+        test.case "median odd"      $( test.eq! 2 (median [3, 1, 2]) ),
+        test.case "median even"     $( test.eq! 2 (median [1, 2, 3, 4]) ),
+        test.case "median of empty" $( test.eq! () (median []) ),
+        test.case "longest"         $( test.eq! "three" (longest ["a", "three", "of"]) ),
+        test.case "longest of empty" $( test.eq! () (longest []) ),
+    ];
+}

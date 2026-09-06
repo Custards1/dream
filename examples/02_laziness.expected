@@ -1,0 +1,14 @@
+unused binding: :never_forced
+if branch:      :taken
+short circuit:  false true
+lazy list:      3
+lazy array:     2
+lazy map:       1
+naturals:       [1, 2, 3, 4, 5]
+fibs:           [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+mapped:         [1, 4, 9, 16]
+filtered:       [3, 6, 9, 12]
+take_while:     [1, 2, 3, 4, 5]
+zip stops:      [[1, 10], [2, 11], [3, 12]]
+thunk type:     :pure_fn
+thunk joined:   42

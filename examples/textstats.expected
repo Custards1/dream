@@ -1,0 +1,25 @@
+words:      24
+distinct:   12
+total:      24
+count 'the':6
+count 'fox':3
+first five: ["the", "quick", "brown", "fox", "jumps"]
+
+word counts (5)
+  the         6
+  dog         3
+  fox         3
+  is          2
+  lazy        2
+  -- 24 words in all
+
+frequency (5)
+  the         ######
+  dog         ###
+  fox         ###
+  is          ##
+  lazy        ##
+
+lengths:    n=24 min=2 max=5 median=3 mean=3.5
+longest:    quick
+significant:["quick", "brown", "jumps", "over"]

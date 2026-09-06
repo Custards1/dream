@@ -1,0 +1,16 @@
+list.head:     1
+text.upper:    ALIASED
+map:           [2, 4, 6]
+filter:        [2, 3]
+renamed total: 6
+std.seq.join:  1, 2, 3
+std.str.trim:  x
+std.list.sum:  6
+geometry:      12.56636
+  square:      16
+  describe:    RADIUS = 2
+  nested:      27
+  nested:      4.188786666666666
+validate:      true true
+from submod:   3.14159
+from submod:   COUNT = 3

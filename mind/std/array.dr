@@ -1,0 +1,139 @@
+// Arrays: a flat sequence with constant-time indexing, written `#[a, b, c]`.
+//
+// Everything an array shares with any other sequence -- `sum`, `any`, `count`,
+// `minimum`, `join` -- comes from `std.seq`, which is derived below. Only what
+// is genuinely about arrays is written here.
+//
+// Unlike a list, an array is strict and finite: `core.array_new` fills every
+// slot, and indexing does not walk anything.
+
+derive std.seq;
+import std.list;
+
+// --- the hole std.seq declares ----------------------------------------------
+
+/// Left to right over the elements. Indexing is constant time, so this is a
+/// counted loop rather than a walk.
+let fold f init xs = {
+    let n = len xs;
+    let rec go i acc = if i >= n { acc } else { go (i + 1) (f acc (core.array_get xs i)) };
+    go 0 init
+};
+
+let name xs = "array";
+
+// --- size -------------------------------------------------------------------
+
+/// Overrides `std.seq`'s folding version: an array knows its own length.
+let length xs = len xs;
+
+let is_empty xs = len xs == 0;
+
+// --- elements ---------------------------------------------------------------
+
+/// The element at `i`. Raises `:out_of_bounds` outside the array; `get_or` is
+/// the total form.
+let get xs i = core.array_get xs i;
+
+let get_or default xs i = if i < 0 || i >= len xs { default } else { core.array_get xs i };
+
+let first_or default xs = get_or default xs 0;
+
+let last_or default xs = get_or default xs (len xs - 1);
+
+// --- building ---------------------------------------------------------------
+
+/// `n` slots, every one holding `fill`.
+let new n fill = core.array_new n fill;
+
+let of_list xs = core.array_of_list xs;
+
+/// Overrides `std.seq`'s fold-and-reverse with the primitive.
+let to_list xs = core.array_to_list xs;
+
+/// `#[f 0, f 1, .., f (n - 1)]`.
+let build n f = {
+    let rec fill a i = if i >= n { a } else { fill (core.array_set a i (f i)) (i + 1) };
+    if n <= 0 { core.array_of_list [] } else { fill (core.array_new n (f 0)) 0 }
+};
+
+/// A copy with index `i` replaced. The original is untouched.
+let set xs i v = core.array_set xs i v;
+
+// --- transforming -----------------------------------------------------------
+//
+// These go through lists because that is where `std.list` already has them,
+// and an array is finite so the round trip terminates.
+
+let map f xs = core.array_of_list (list.map f (core.array_to_list xs));
+
+let filter keep xs = core.array_of_list (list.filter keep (core.array_to_list xs));
+
+let reverse xs = core.array_of_list (list.reverse (core.array_to_list xs));
+
+let sort xs = core.array_of_list (list.sort (core.array_to_list xs));
+
+let sort_by before xs = core.array_of_list (list.sort_by before (core.array_to_list xs));
+
+let append xs ys =
+    core.array_of_list (list.append (core.array_to_list xs) (core.array_to_list ys));
+
+/// The elements from `from` up to but not including `until`.
+let slice from until xs =
+    core.array_of_list (list.take (until - from) (list.drop from (core.array_to_list xs)));
+
+// --- tests ------------------------------------------------------------------
+//
+// These cover the array-specific code *and* what `std.seq` contributes, since
+// a derived operation is only correct once it has a real `fold` under it.
+// `std.seq` has no tests of its own for that reason: it has no `fold` until a
+// module supplies one.
+
+when test {
+    import std.test;
+
+    let tests = [
+        // --- from std.seq, over the derived fold ---
+        test.case "seq sum"          $( test.eq! 6 (sum #[1, 2, 3]) ),
+        test.case "seq sum of empty" $( test.eq! 0 (sum #[]) ),
+        test.case "seq product"      $( test.eq! 24 (product #[1, 2, 3, 4]) ),
+        test.case "seq count"        $( test.eq! 2 (count (fn x -> x > 1) #[1, 2, 3]) ),
+        test.case "seq any"          $( test.true! (any (fn x -> x == 2) #[1, 2, 3]) ),
+        test.case "seq any misses"   $( test.false! (any (fn x -> x == 9) #[1, 2, 3]) ),
+        test.case "seq all"          $( test.true! (all (fn x -> x > 0) #[1, 2, 3]) ),
+        test.case "seq all fails"    $( test.false! (all (fn x -> x > 1) #[1, 2, 3]) ),
+        test.case "seq contains"     $( test.true! (contains 2 #[1, 2, 3]) ),
+        test.case "seq minimum"      $( test.eq! 1 (minimum #[3, 1, 2]) ),
+        test.case "seq maximum"      $( test.eq! 3 (maximum #[3, 1, 2]) ),
+        test.case "seq extremes of empty" $( test.eq! () (minimum #[]) ),
+        test.case "seq minimum_by"   $( test.eq! "a" (minimum_by (fn s -> len s) #["bbb", "a"]) ),
+        test.case "seq join"         $( test.eq! "1, 2, 3" (join ", " #[1, 2, 3]) ),
+        test.case "seq join of empty" $( test.eq! "" (join ", " #[]) ),
+        test.case "seq describe"     $( test.eq! "array of 3" (describe #[1, 2, 3]) ),
+
+        // --- array's own ---
+        test.case "length"           $( test.eq! 3 (length #[1, 2, 3]) ),
+        test.case "length of empty"  $( test.eq! 0 (length #[]) ),
+        test.case "is_empty"         $( test.true! (is_empty #[]) ),
+        test.case "get"              $( test.eq! 2 (get #[1, 2, 3] 1) ),
+        test.case "get_or in range"  $( test.eq! 1 (get_or 0 #[1, 2, 3] 0) ),
+        test.case "get_or past end"  $( test.eq! 0 (get_or 0 #[1, 2, 3] 9) ),
+        test.case "get_or negative"  $( test.eq! 0 (get_or 0 #[1, 2, 3] (0 - 1)) ),
+        test.case "first_or"         $( test.eq! 1 (first_or 0 #[1, 2, 3]) ),
+        test.case "last_or"          $( test.eq! 3 (last_or 0 #[1, 2, 3]) ),
+        test.case "last_or of empty" $( test.eq! 0 (last_or 0 #[]) ),
+        test.case "new"              $( test.eq! #[7, 7] (new 2 7) ),
+        test.case "of_list"          $( test.eq! #[1, 2] (of_list [1, 2]) ),
+        test.case "to_list"          $( test.eq! [1, 2] (to_list #[1, 2]) ),
+        test.case "build"            $( test.eq! #[0, 1, 4] (build 3 (fn i -> i * i)) ),
+        test.case "build of zero"    $( test.eq! #[] (build 0 (fn i -> i)) ),
+        test.case "set copies"       $( test.eq! #[1, 9, 3] (set #[1, 2, 3] 1 9) ),
+        test.case "map"              $( test.eq! #[2, 4] (map (fn x -> x * 2) #[1, 2]) ),
+        test.case "filter"           $( test.eq! #[2] (filter (fn x -> x > 1) #[1, 2]) ),
+        test.case "reverse"          $( test.eq! #[3, 2, 1] (reverse #[1, 2, 3]) ),
+        test.case "sort"             $( test.eq! #[1, 2, 3] (sort #[3, 1, 2]) ),
+        test.case "sort_by"          $( test.eq! #[3, 2, 1] (sort_by (fn a b -> a > b) #[1, 3, 2]) ),
+        test.case "append"           $( test.eq! #[1, 2, 3] (append #[1] #[2, 3]) ),
+        test.case "slice"            $( test.eq! #[2, 3] (slice 1 3 #[1, 2, 3, 4]) ),
+    ];
+}

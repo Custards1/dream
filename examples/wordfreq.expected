@@ -1,0 +1,13 @@
+wordfreq
+========
+  * words: 10
+  * distinct: 3
+  * commonest: red
+
+word counts (3)
+  red         4
+  blue        3
+  green       3
+  -- 10 words in all
+
+  * lengths: n=10 min=3 max=5 median=4 mean=3.9

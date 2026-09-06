@@ -1,0 +1,65 @@
+// Green processes: the unit of concurrency, of failure, and of collection.
+//
+// Processes share no memory. `send!` copies the message, so nothing one
+// process does to a value can be seen by another. Every process operation ends
+// in `!`, so starting one is an effect and the purity rule already keeps
+// concurrency out of pure functions.
+//
+// Output here is deterministic because every result is collected with `join!`
+// in a fixed order, never printed from inside a worker racing its neighbours.
+import std.console;
+import std.list;
+
+let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
+
+// Take one message and answer the sender.
+let echo! () = {
+    let msg = recv! ();
+    msg
+};
+
+// A worker that computes and returns; the parent picks the value up.
+let square_worker! n = n * n;
+
+// Spawn one process per element and join them in order.
+let parallel_map! f xs =
+    list.map (fn p -> join! p) (list.map (fn x -> spawn! $( f x )) xs);
+
+let rec countdown n = if n <= 0 { :liftoff } else { countdown (n - 1) };
+
+let main! = {
+    // A process is a value with its own identity.
+    console.print! "self:        " (type_of (self! ()))
+
+    // spawn / join: the child's result comes back to the parent.
+    let w = spawn! $( square_worker! 12 );
+    console.print! "joined:      " (join! w)
+
+    // send / recv: a mailbox handshake.
+    let e = spawn! $( echo! () );
+    send! e :hello
+    console.print! "echoed:      " (join! e)
+
+    // Many at once, joined in order, so the output cannot race.
+    console.print! "parallel:    " (parallel_map! (fn x -> x * x) [1, 2, 3, 4, 5])
+    console.print! "factorials:  " (parallel_map! fac [5, 6, 7])
+
+    // A process that fails hands the error to whoever joins it, rather than
+    // taking the whole program down.
+    let bad = spawn! $( 1 / 0 );
+    console.print! "failure:     " (try! { join! bad } catch err { [:caught, err] })
+
+    // ..and its neighbours are unaffected.
+    let good = spawn! $( 6 * 7 );
+    console.print! "unaffected:  " (join! good)
+
+    // Isolation: the child gets a *copy*, so it cannot alter what we hold.
+    let shared = [1, 2, 3];
+    let mutator = spawn! $( list.append shared [4] );
+    console.print! "child's:     " (join! mutator)
+    console.print! "ours:        " shared
+
+    // Tail recursion runs in constant space, so a long loop in a process is
+    // fine and stays preemptible.
+    console.print! "long loop:   " (join! (spawn! $( countdown 500000 )))
+};

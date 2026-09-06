@@ -252,6 +252,12 @@ void do_apply(Process& p, Value callee, uint32_t argc) {
             mask = nat->strict_mask;
         }
         (void)mask;
+        if (arity == NATIVE_VARIADIC) {
+            // Takes the whole application. There is nothing to under- or
+            // over-apply: `print! a b c` hands the native all three.
+            resume_native(p, callee, uint32_t(base), argc, 0);
+            return;
+        }
         if (argc < arity) {
             Value pap = p.heap().make_pap(callee, argc);
             auto* po = static_cast<PapObj*>(as_obj(pap));
@@ -283,22 +289,30 @@ void do_apply(Process& p, Value callee, uint32_t argc) {
 
 /// Force the strict arguments of a native one at a time, then call it.
 void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint32_t from) {
-    uint32_t mask;
+    uint32_t mask, arity;
     NativeFn fn;
     if (is_builtin(callee)) {
         const BuiltinDef& bd = builtin_def(uint32_t(imm_payload(callee)));
         mask = bd.strict_mask;
+        arity = bd.arity;
         fn = bd.fn;
     } else {
         auto* nat = static_cast<NativeObj*>(as_obj(callee));
         mask = nat->strict_mask;
+        arity = nat->arity;
         fn = reinterpret_cast<NativeFn>(nat->fn);
     }
+    // A variadic native forces every argument: `strict_mask` is a 32-bit map of
+    // argument positions, and an unbounded call has no fixed positions to map.
+    // The `i < 32` guard is the same point from the other side -- it keeps a
+    // 33rd argument to a fixed-arity native from shifting out of range.
+    const bool all_strict = arity == NATIVE_VARIADIC;
 
     for (uint32_t i = from; i < argc; ++i) {
         Value v = resolve(p.stack[base + i]);
         p.stack[base + i] = v;
-        if ((mask & (1u << i)) && !is_whnf(v)) {
+        const bool strict = all_strict || (i < 32 && (mask & (1u << i)));
+        if (strict && !is_whnf(v)) {
             push_cont(p, ContKind::NativeArg, base, argc, i, callee);
             // `enter` sets up the machine to force it; the NativeArg
             // continuation writes the result back into the argument slot.

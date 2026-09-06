@@ -30,8 +30,10 @@ dream_result dream_vm_load_file(dream_vm* vm, const char* path, char* err, size_
 dream_result dream_vm_load_bytes(dream_vm* vm, const uint8_t* data, size_t size,
                                char* err, size_t err_size);
 
-/* Register a module before running. `member_names` and `member_fns` are
- * parallel arrays of `count` entries. */
+/* Register a module before running. `member_names`, `member_arities`,
+ * `member_strict_masks` and `member_fns` are parallel arrays of `count`
+ * entries. An arity of DREAM_VARIADIC makes a member take however many
+ * arguments its call site passed, with every one forced. */
 dream_result dream_vm_register_module(dream_vm* vm, const char* module_name,
                                     const char* const* member_names,
                                     const uint32_t* member_arities,

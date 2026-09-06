@@ -845,3 +845,296 @@ fn a_project_without_a_manifest_still_compiles() {
         .file("main.dr", "import util;\nlet main! = { util.v }");
     assert!(p.compile("main.dr").is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Host modules
+//
+// `dream_vm_register_module` lets an embedder add a module at run time, but the
+// compiler still has to be told the import resolves to something. These check
+// that `--host-module` is that channel, and that it stays a named list rather
+// than a wildcard -- a typo in an import must remain a compile error.
+// ---------------------------------------------------------------------------
+
+/// A directory no other test in this binary will pick. Tests run in parallel
+/// and share a process id, so that alone is not unique enough -- two tests
+/// using the same name would delete each other's files mid-run.
+fn scratch_dir(what: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("dreamc-{what}-{}-{n}", std::process::id()))
+}
+
+fn compile_file(src: &str, host_modules: &[&str]) -> Result<(), Vec<String>> {
+    let dir = scratch_dir("host");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("prog.dr");
+    std::fs::write(&file, src).expect("write the test program");
+
+    let opts = dreamc::Options {
+        host_modules: host_modules.iter().map(|s| s.to_string()).collect(),
+        ..dreamc::Options::default()
+    };
+    let result = dreamc::compile_program(&file, &opts);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    result.map(|_| ()).map_err(|e| e.diags.into_iter().map(|d| d.message).collect())
+}
+
+#[test]
+fn a_declared_host_module_can_be_imported() {
+    compile_file("import host;\nlet main! = { host.shout! \"hi\" }", &["host"])
+        .expect("a declared host module should resolve");
+}
+
+#[test]
+fn an_undeclared_host_module_is_still_an_error() {
+    let errs = compile_file("import host;\nlet main! = { 1 }", &[])
+        .expect_err("an unknown module must not resolve silently");
+    assert!(
+        errs.iter().any(|e| e.contains("host")),
+        "the error should name the module, got: {errs:?}"
+    );
+}
+
+#[test]
+fn declaring_one_host_module_does_not_admit_another() {
+    let errs = compile_file("import other;\nlet main! = { 1 }", &["host"])
+        .expect_err("`--host-module host` must not make `other` resolve too");
+    assert!(
+        errs.iter().any(|e| e.contains("other")),
+        "the error should name the module, got: {errs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Modules: submodules, selective imports, package imports
+// ---------------------------------------------------------------------------
+
+/// Write a package of `(module name, source)` files and compile `root` from it.
+fn compile_pkg(pkg: &str, files: &[(&str, &str)], root: &str) -> Result<(), Vec<String>> {
+    let dir = scratch_dir("mod");
+    std::fs::create_dir_all(&dir).expect("create the package directory");
+    std::fs::write(
+        dir.join("mind.toml"),
+        format!("[package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\nsrc = \".\"\n"),
+    )
+    .expect("write the manifest");
+    for (name, src) in files {
+        std::fs::write(dir.join(format!("{name}.dr")), src).expect("write a module");
+    }
+
+    let opts = dreamc::Options {
+        package_roots: vec![dir.clone()],
+        ..dreamc::Options::default()
+    };
+    let result = dreamc::compile_program(&dir.join(format!("{root}.dr")), &opts);
+    let _ = std::fs::remove_dir_all(&dir);
+    result.map(|_| ()).map_err(|e| e.diags.into_iter().map(|d| d.message).collect())
+}
+
+#[test]
+fn a_submodule_is_reached_through_its_name() {
+    ok("mod m { let x = 1; }\nlet main! = { m.x }");
+}
+
+#[test]
+fn submodules_nest() {
+    ok("mod a { mod b { let x = 1; } }\nlet main! = { a.b.x }");
+}
+
+#[test]
+fn a_submodule_does_not_re_export_a_dream_module_it_imports() {
+    // `inner.lib` must not reach `p.lib` just because `inner` imports it: a
+    // module's aliases hold its imports as well as its own declarations, so
+    // walking them blindly would re-export every dependency.
+    //
+    // A *host* module is a different case and is deliberately not covered here:
+    // it is a value as well as a namespace, so a module that imports one does
+    // export it as an ordinary member.
+    let errs = compile_pkg(
+        "p",
+        &[
+            ("lib", "let a = 1;"),
+            ("main", "mod inner { import p.lib; let b = lib.a; }\nlet main! = { inner.lib.a }"),
+        ],
+        "main",
+    )
+    .expect_err("an imported Dream module must not be re-exported");
+    assert!(
+        errs.iter().any(|e| e.contains("has no member `lib`")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn two_submodules_cannot_share_a_name() {
+    let errs = errors("mod a { let x = 1; }\nmod a { let y = 2; }\nlet main! = { a.x }");
+    assert!(
+        errs.iter().any(|e| e.contains("already a module")),
+        "expected a duplicate-module error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn a_submodule_used_as_a_value_says_so() {
+    let errs = errors("mod m { let x = 1; }\nlet main! = { m }");
+    assert!(
+        errs.iter().any(|e| e.contains("is a module, not a value")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn a_selective_import_binds_the_member_unqualified() {
+    compile_pkg(
+        "p",
+        &[("lib", "let double x = x * 2;"), ("main", "import p.lib.{double};\nlet main! = { double 2 }")],
+        "main",
+    )
+    .expect("a selected member should be bound unqualified");
+}
+
+#[test]
+fn a_selective_import_can_rename() {
+    compile_pkg(
+        "p",
+        &[("lib", "let double x = x * 2;"), ("main", "import p.lib.{double as twice};\nlet main! = { twice 2 }")],
+        "main",
+    )
+    .expect("`as` inside the list should rename the binding");
+}
+
+#[test]
+fn a_selective_import_of_a_missing_member_is_caught() {
+    let errs = compile_pkg(
+        "p",
+        &[("lib", "let double x = x * 2;"), ("main", "import p.lib.{nope};\nlet main! = { nope 1 }")],
+        "main",
+    )
+    .expect_err("a member the module does not export must not resolve");
+    assert!(errs.iter().any(|e| e.contains("no member `nope`")), "got: {errs:?}");
+}
+
+#[test]
+fn a_selective_import_that_clashes_with_a_let_is_caught() {
+    // Without this the `let` silently wins, which is the worst of the options.
+    let errs = compile_pkg(
+        "p",
+        &[
+            ("lib", "let double x = x * 2;"),
+            ("main", "import p.lib.{double};\nlet double = 1;\nlet main! = { double }"),
+        ],
+        "main",
+    )
+    .expect_err("a name bound twice must be reported");
+    assert!(errs.iter().any(|e| e.contains("already bound")), "got: {errs:?}");
+}
+
+#[test]
+fn importing_a_package_brings_in_its_modules() {
+    compile_pkg(
+        "p",
+        &[
+            ("one", "let a = 1;"),
+            ("two", "let b = 2;"),
+            ("main", "import p;\nlet main! = { p.one.a + p.two.b }"),
+        ],
+        "main",
+    )
+    .expect("`import p` should make every module in `p` reachable");
+}
+
+#[test]
+fn a_package_namespace_is_not_a_value() {
+    let errs = compile_pkg(
+        "p",
+        &[("one", "let a = 1;"), ("main", "import p;\nlet main! = { p.one }")],
+        "main",
+    )
+    .expect_err("a module is a namespace, not a value");
+    assert!(errs.iter().any(|e| e.contains("is a module, not a value")), "got: {errs:?}");
+}
+
+#[test]
+fn a_missing_module_in_a_package_names_what_is_there() {
+    let errs = compile_pkg(
+        "p",
+        &[("one", "let a = 1;"), ("main", "import p;\nlet main! = { p.nope.a }")],
+        "main",
+    )
+    .expect_err("a module the package does not have must not resolve");
+    assert!(errs.iter().any(|e| e.contains("has no module `nope`")), "got: {errs:?}");
+}
+
+#[test]
+fn the_same_package_reached_two_ways_is_not_a_name_clash() {
+    // A package is routinely found twice: once as a path dependency spelled
+    // `../lib`, and once under a `-L` root that covers the same tree. Those are
+    // the same directory, and reporting them as two packages sharing a name
+    // would be a false alarm on a perfectly ordinary layout.
+    let dir = scratch_dir("dup");
+    let lib = dir.join("lib");
+    let app = dir.join("app");
+    std::fs::create_dir_all(&lib).expect("create lib");
+    std::fs::create_dir_all(&app).expect("create app");
+    std::fs::write(lib.join("mind.toml"), "[package]\nname = \"lib\"\nsrc = \".\"\n").unwrap();
+    std::fs::write(lib.join("thing.dr"), "let value = 1;\n").unwrap();
+    std::fs::write(
+        app.join("mind.toml"),
+        "[package]\nname = \"app\"\nsrc = \".\"\n\n[dependencies]\nlib = { path = \"../lib\" }\n",
+    )
+    .unwrap();
+    std::fs::write(app.join("main.dr"), "import lib.thing;\nlet main! = { thing.value }\n").unwrap();
+
+    // `-L dir` finds `lib` directly; the manifest finds it as `app/../lib`.
+    let opts = dreamc::Options { package_roots: vec![dir.clone()], ..dreamc::Options::default() };
+    let result = dreamc::compile_program(&app.join("main.dr"), &opts);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let compiled = result.unwrap_or_else(|e| {
+        panic!("expected success, got: {:?}", e.diags.iter().map(|d| &d.message).collect::<Vec<_>>())
+    });
+    let warnings: Vec<&str> =
+        compiled.warnings.iter().map(|d| d.message.as_str()).filter(|m| m.contains("two packages")).collect();
+    assert!(warnings.is_empty(), "spurious duplicate-package warning: {warnings:?}");
+}
+
+#[test]
+fn two_different_packages_sharing_a_name_still_warn() {
+    let dir = scratch_dir("dup2");
+    for which in ["a", "b"] {
+        let p = dir.join(which);
+        std::fs::create_dir_all(&p).expect("create");
+        std::fs::write(p.join("mind.toml"), "[package]\nname = \"same\"\nsrc = \".\"\n").unwrap();
+        std::fs::write(p.join("thing.dr"), "let value = 1;\n").unwrap();
+    }
+    std::fs::write(dir.join("main.dr"), "import same.thing;\nlet main! = { thing.value }\n").unwrap();
+
+    let opts = dreamc::Options { package_roots: vec![dir.clone()], ..dreamc::Options::default() };
+    let result = dreamc::compile_program(&dir.join("main.dr"), &opts);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let compiled = result.expect("it still compiles, using the first");
+    assert!(
+        compiled.warnings.iter().any(|d| d.message.contains("two packages are named")),
+        "a real clash between different directories must still be reported"
+    );
+}
+
+#[test]
+fn a_submodule_can_derive_a_sibling() {
+    // `derive shape` inside `mod circle` means the sibling `mod shape`, found by
+    // walking outwards through the enclosing modules the way any nested scope
+    // is searched.
+    ok("mod shape { virtual let area s; let describe s = to_string (area s); }\n\
+        mod circle { derive shape; let area r = r * r; }\n\
+        let main! = { circle.describe 3 }");
+}
+
+#[test]
+fn a_submodule_can_import_a_sibling() {
+    ok("mod helpers { let twice x = x * 2; }\n\
+        mod user { import helpers; let go x = helpers.twice x; }\n\
+        let main! = { user.go 4 }");
+}

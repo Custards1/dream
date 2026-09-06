@@ -1,0 +1,55 @@
+// Errors are values: a kind (an atom) and a payload. `try!` catches them.
+//
+// Both `raise!` and `try!` are impure, so error handling is an effect and the
+// purity rule keeps it out of pure functions.
+import std.console;
+import std.core;
+import std.list;
+
+let div a b = a / b;
+
+let parse_age! s = {
+    let n = core.parse_int s;
+    if n == () { raise! ("not a number: " + s) }
+    else if n < 0 { raise! :negative_age }
+    else { n }
+};
+
+// A total wrapper: turn a raised error into an ordinary value.
+let attempt! thunk = try! { join! (spawn! thunk) } catch e { [:error, e] };
+
+let main! = {
+    // The kinds the runtime raises.
+    console.print! "divide:    " (try! { div 1 0 } catch e { e })
+    console.print! "type:      " (try! { 1 + "x" } catch e { e })
+    console.print! "not a fn:  " (try! { (1) 2 } catch e { e })
+    console.print! "no member: " (try! { console.nope! 1 } catch e { e })
+    console.print! "bounds:    " (try! { core.array_get #[1] 9 } catch e { e })
+
+    // Raising a value of your own.
+    console.print! "custom:    " (try! { raise! :my_problem } catch e { e })
+    console.print! "with text: " (try! { raise! "went wrong" } catch e { e })
+
+    // The handler supplies a fallback, so the program keeps going.
+    console.print! "fallback:  " (try! { div 12 0 } catch e { 0 })
+
+    // Nested: the inner handler catches, the outer never sees it.
+    console.print! "nested:    " (try! { try! { div 1 0 } catch e { :inner } } catch e { :outer })
+
+    // Reading the parts of an error.
+    let err = try! { div 1 0 } catch e { e };
+    console.print! "type_of:   " (type_of err)
+
+    // A `try!` whose body does not raise just yields the body.
+    console.print! "no raise:  " (try! { 6 * 7 } catch e { :unused })
+
+    // Validation that reports the first bad input.
+    console.print! "parse ok:  " (try! { parse_age! "34" } catch e { e })
+    console.print! "parse bad: " (try! { parse_age! "abc" } catch e { e })
+    console.print! "parse neg: " (try! { parse_age! "-1" } catch e { e })
+
+    // A failure inside a process arrives at `join!` as a value, so one bad
+    // computation cannot take the rest down with it.
+    console.print! "in process:" (attempt! $( div 1 0 ))
+    console.print! "survived:  " (list.map (fn n -> try! { 100 / n } catch e { :skipped }) [5, 0, 2])
+};

@@ -96,10 +96,27 @@ enum class Mode : uint8_t {
 enum class ProcStatus : uint8_t {
     Runnable,
     Running,
-    Waiting,   // blocked in `recv!` or `join!`
+    Waiting,   // blocked in `recv!`, `join!`, or on a descriptor
     Finished,
     Failed,
 };
+
+/// What a parked process is parked on.
+///
+/// The status alone says a process is stuck but not why, and "waiting for a
+/// message that will never come" and "waiting for a socket the kernel has not
+/// answered" look identical from outside. `std.vm` reports this so the
+/// difference is visible without a debugger.
+enum class WaitReason : uint8_t {
+    None,
+    Message,   // `recv!`
+    Join,      // `join!`
+    Io,        // a descriptor the poller is watching
+};
+
+const char* wait_reason_name(WaitReason r);
+const char* mode_name(Mode m);
+const char* cont_kind_name(ContKind k);
 
 class Process final : public RootSource {
 public:
@@ -107,6 +124,12 @@ public:
     ~Process() override;
 
     uint64_t id() const { return id_; }
+
+    /// The handle of a `net.connect!` that has been issued but not yet
+    /// finished, or -1. A blocking native is re-entered from the top when its
+    /// process is woken, and `connect` is the one operation where the second
+    /// call must ask how the first went rather than start again.
+    int64_t io_pending = -1;
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }
 
@@ -152,6 +175,11 @@ public:
     bool park_requested = false;
     /// Set by a waker that found the process still running.
     bool wake_pending = false;
+    /// Why this process asked to be parked. Written by the blocking native
+    /// alongside `park_requested`, and read by `std.vm` from another thread.
+    std::atomic<WaitReason> wait_reason{WaitReason::None};
+    /// The descriptor being waited on, when `wait_reason` is `Io`.
+    std::atomic<int> wait_fd{-1};
 
     bool is_done() const {
         ProcStatus s = status.load(std::memory_order_relaxed);

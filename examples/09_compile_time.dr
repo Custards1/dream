@@ -1,0 +1,84 @@
+// Work done before the program runs: `comp`, `comp!`, and `when`.
+import std.console;
+import std.core;
+import std.list;
+
+// --- comp: evaluated by the compiler, baked into the image ------------------
+
+let rec fib n = if n < 2 { n } else { fib (n - 1) + fib (n - 2) };
+
+/// The first `n` Fibonacci numbers, built with list literals and `+`.
+///
+/// It avoids `std.list` deliberately: `comp` runs on the compiler's own
+/// evaluator, which has no VM and so cannot reach a host module -- and every
+/// `std.list` function goes through `std.core`, which is C++ in the VM. See
+/// `digits` below for the other half of the story.
+let rec fib_upto n = if n <= 0 { [] } else { fib_upto (n - 1) + [fib n] };
+
+/// Computed once, at compile time. The image holds the list, not the loop.
+let fib_table = comp fib_upto 14;
+
+let answer = comp 6 * 7;
+
+let big_power = comp fib 20;
+
+/// `comp` binds tighter than any operator but looser than application, so
+/// `comp f x` folds the whole call and this is `(comp (1 + 2)) * 10`.
+let mixed = comp (1 + 2) * 10;
+
+// --- comp!: evaluated by running it on a real VM ----------------------------
+//
+// `comp` uses the compiler's own evaluator, which has no VM and so cannot
+// reach a host module. `comp!` hands the expression to a real VM instead, so
+// anything in `std.core` and friends is available.
+
+let digits = comp! core.str_chars "12345";
+let squares = comp! list.map (fn x -> x * x) [1, 2, 3, 4];
+
+// --- when: items that exist only under a condition --------------------------
+//
+// Resolved before anything is loaded, so an import inside a false branch is
+// never even followed and a module only test builds need is never read.
+
+when test {
+    let build_kind = "test";
+}
+when not test {
+    let build_kind = "normal";
+}
+
+when os == "linux" {
+    let platform = "linux";
+}
+when not (os == "linux") {
+    let platform = "other";
+}
+
+// A `when` may hold any item, including a `mod`. Both branches bind `traced`,
+// so the program compiles either way -- which is the point: a `when` that only
+// one configuration can build is a `when` that only one configuration tests.
+when not release {
+    mod debug {
+        let trace label value = "[" + label + "] " + to_string value;
+    }
+    let traced = debug.trace "n" 42;
+}
+when release {
+    let traced = "(tracing is compiled out of a release build)";
+}
+
+let main! = {
+    console.print! "fib table:  " fib_table
+    console.print! "answer:     " answer
+    console.print! "fib 20:     " big_power
+    console.print! "mixed:      " mixed
+    console.print! "digits:     " digits
+    console.print! "squares:    " squares
+    console.print! "build kind: " build_kind
+    console.print! "platform:   " platform
+    console.print! "trace:      " traced
+
+    // The compile-time and run-time answers agree; only the timing differs.
+    console.print! "same:       " (fib_table == fib_upto 14)
+    console.print! "same:       " (digits == core.str_chars "12345")
+};

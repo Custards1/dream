@@ -1,0 +1,38 @@
+list:       [5, 3, 8, 1, 9, 2]
+length:     6
+head/tail:  5 [3, 8, 1, 9, 2]
+map:        [10, 6, 16, 2, 18, 4]
+filter:     [5, 8, 9]
+fold:       28
+sum/product:28 24
+sort:       [1, 2, 3, 5, 8, 9]
+sort_by:    [9, 8, 5, 3, 2, 1]
+reverse:    [2, 9, 1, 8, 3, 5]
+append:     [1, 2, 3, 4]
+range:      [0, 1, 2, 3, 4]
+take/drop:  [5, 3] [9, 2]
+unique:     [1, 2, 3]
+partition:  [[8, 2], [5, 3, 1, 9]]
+min/max:    1 9
+any/all:    true true
+enumerate:  [[0, :a], [1, :b]]
+flat_map:   [1, 1, 2, 2]
+array:      #[5, 3, 8]
+get:        3
+get_or:     0
+set copies: #[100, 3, 8] original #[5, 3, 8]
+build:      #[0, 1, 4, 9, 16]
+of_list:    #[1, 2, 3]
+to_list:    [5, 3, 8]
+sum/sort:   16 #[3, 5, 8]
+slice:      #[2, 3]
+join:       5 - 3 - 8
+map:        3
+get:        34
+missing:    :none
+has:        true
+put:        4
+remove:     2
+pairs:      3
+types:      :list :array :map
+to_array:   #[1, 2, 3]

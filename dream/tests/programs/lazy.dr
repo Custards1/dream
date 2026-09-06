@@ -1,6 +1,7 @@
 // Laziness is observable: each of these would raise if the VM evaluated more
 // than it had to.
 import std.console;
+import std.core;
 let boom n = 1 / 0;
 
 let main! = {
@@ -21,4 +22,16 @@ let main! = {
 
     // A map's values are lazy too, though its keys are forced to be hashed.
     console.print! "lazy map:      " (len %{ :a => boom 8, :b => boom 9 })
+
+    // Array elements are lazy too.
+    console.print! "lazy array:    " (len #[boom 10, boom 11])
+
+    // ...but an accessor must hand back a *forced* element. A native's return
+    // value goes straight into the machine's result, which is taken to be in
+    // weak head normal form, so returning the raw slot would leak a thunk into
+    // whatever used it -- and the leak only shows up on an operator that
+    // inspects its operand's type, like ordering two strings.
+    console.print! "array_get:     " (core.array_get #["bbb", "a"] 0 < "zzz")
+    console.print! "map_get:       " (core.map_get %{ :k => "bbb" } :k "zzz" < "zzz")
+    console.print! "map_get miss:  " (core.map_get %{ :k => "bbb" } :absent "aaa" < "zzz")
 }

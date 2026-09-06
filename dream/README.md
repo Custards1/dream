@@ -1,7 +1,8 @@
 # mindv2, the Dream VM
 
 A virtual machine for [Dream](../dreamc), a dynamically typed, lazily evaluated
-functional language. It has three parts worth knowing about:
+functional language -- see [docs/language-spec.md](../docs/language-spec.md) for
+the language itself. The VM has three parts worth knowing about:
 
 - a **lazy graph-reduction interpreter** written as an explicit state machine,
 - **green processes** with isolated heaps and copied messages, in the style of
@@ -171,6 +172,13 @@ dream_vm_run(vm, NULL);           /* runs main! */
 puts(dream_vm_result_text(vm));
 dream_vm_free(vm);
 ```
+
+A member registered with an arity of `DREAM_VARIADIC` takes however many
+arguments its call site passed, with every one forced. Because functions are
+curried, such a member can never be partially applied -- `f a b` and a
+half-finished `f a b c` are the same thing until the application node says
+otherwise -- so it is the right shape for something like `console.print!` and
+the wrong one for anything a caller might want to pre-fill.
 
 ## Layout
 

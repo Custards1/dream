@@ -25,12 +25,18 @@ use crate::lexer::{self, Span};
 use crate::package::PackageSet;
 use crate::parser;
 
-/// Modules the VM provides natively. A `import` of one of these resolves to a
-/// runtime lookup rather than to Dream source.
-/// Modules the VM provides natively. This must match the runtime's registry
-/// exactly; a test proves it does rather than trusting that it still is.
+/// Modules the VM provides natively. An `import` of one of these resolves to a
+/// runtime lookup rather than to Dream source. This must match the runtime's
+/// registry exactly; a test proves it does rather than trusting that it still
+/// is.
+///
+/// An embedder can add to this list for one compilation with `--host-module`,
+/// which is what makes a program that imports a host module registered through
+/// `dream_vm_register_module` compilable. It is deliberately not a wildcard:
+/// naming the module is what keeps a typo in an import an error rather than a
+/// mystery at run time.
 pub const NATIVE_MODULES: &[&str] =
-    &["std.console", "std.core", "std.ffi", "std.math", "std.vm"];
+    &["std.console", "std.core", "std.ffi", "std.io", "std.math", "std.net", "std.vm"];
 
 pub fn is_native(path: &str) -> bool {
     NATIVE_MODULES.contains(&path)
@@ -59,6 +65,10 @@ pub struct ModuleSet {
     pub files: Vec<SourceFile>,
     /// Native module paths actually imported, in first-seen order.
     pub natives: Vec<String>,
+    /// Dotted paths that name a *namespace* rather than a module -- a package
+    /// brought in whole by `import std;`. Its modules are reached through it,
+    /// as `std.list`.
+    pub namespaces: HashSet<String>,
 }
 
 impl ModuleSet {
@@ -84,6 +94,9 @@ pub struct Loader {
     /// provided rather than reported. Used for compiling a single source
     /// string, where there is no file system to search.
     assume_native: bool,
+    /// Host modules this embedder registers at run time, named with
+    /// `--host-module`. Treated exactly as `NATIVE_MODULES` are.
+    host_modules: Vec<String>,
     set: ModuleSet,
     diags: Vec<Diag>,
     /// Modules currently being loaded, to spot an import cycle.
@@ -99,6 +112,7 @@ impl Loader {
             config: Config::new(),
             test_mode: false,
             assume_native: false,
+            host_modules: Vec::new(),
             set: ModuleSet::default(),
             diags: Vec::new(),
             in_progress: Vec::new(),
@@ -187,7 +201,7 @@ impl Loader {
             // Still a valid program: it reports that there was nothing to run,
             // which is more useful than an image with no entry point.
             src = String::from(
-                "import std.console;\n                 let main! = { console.print! \"no tests found\" \
+                "import std.console;\n                 let main! = { console.print! \"no tests found \" \
                  \"(a module exports tests by defining `tests`)\" };\n",
             );
         }
@@ -208,6 +222,17 @@ impl Loader {
     pub fn with_config(mut self, config: Config) -> Loader {
         self.config = config;
         self
+    }
+
+    /// Extra module paths the host provides, beyond `NATIVE_MODULES`.
+    pub fn with_host_modules(mut self, modules: Vec<String>) -> Loader {
+        self.host_modules = modules;
+        self
+    }
+
+    /// Is this path provided by the runtime rather than by Dream source?
+    fn is_host_module(&self, path: &str) -> bool {
+        is_native(path) || self.host_modules.iter().any(|m| m == path)
     }
 
     pub fn with_test_runner(mut self, yes: bool) -> Loader {
@@ -281,10 +306,60 @@ impl Loader {
         None
     }
 
+    /// Is `dep` a module already loaded under one of `current`'s enclosing
+    /// scopes? `derive shape` inside `a.circle` means `a.shape`, the sibling,
+    /// so the search walks outwards: `a.circle.shape`, then `a.shape`, then
+    /// nothing. Returns the qualified name it found.
+    fn local_module(&self, current: &str, dep: &str) -> Option<String> {
+        let mut scope = current;
+        loop {
+            let candidate = format!("{scope}.{dep}");
+            if self.set.by_name.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            match scope.rfind('.') {
+                Some(cut) => scope = &scope[..cut],
+                None => return None,
+            }
+        }
+    }
+
+    /// `import std;` where `std` is a package rather than a module: load every
+    /// module the package provides, and record the name as a namespace so that
+    /// `std.list` resolves through it.
+    ///
+    /// Returns false when nothing by that name is a package, so the caller can
+    /// report the import as unresolved.
+    fn load_package(&mut self, dotted: &str, at: Span, from_source: usize) -> bool {
+        let Some(pkg) = self.packages.find(dotted) else { return false };
+        let members = pkg.modules();
+        if members.is_empty() {
+            self.diags.push(
+                Diag::error(at, format!("package `{dotted}` provides no modules"))
+                    .with_note("a package's modules are the `.dr` files under its `src`")
+                    .in_source(from_source),
+            );
+            return true;
+        }
+        self.set.namespaces.insert(dotted.to_string());
+        self.visited.insert(dotted.to_string());
+        for m in members {
+            let path = format!("{dotted}.{m}");
+            // A module of the package that is already being loaded is the one
+            // doing the importing: `mind/std/all.dr` says `import std;`. Taking
+            // it as a cycle would be wrong -- it is asking for its siblings.
+            if self.in_progress.iter().any(|p| *p == path) {
+                continue;
+            }
+            self.load_named(&path, at, from_source);
+        }
+        true
+    }
+
     /// Load a module by dotted name, if it is not already loaded.
     fn load_named(&mut self, dotted: &str, at: Span, from_source: usize) {
-        if self.visited.contains(dotted) || is_native(dotted) {
-            if is_native(dotted) && !self.set.natives.iter().any(|n| n == dotted) {
+        if self.visited.contains(dotted) || self.is_host_module(dotted) {
+            if self.is_host_module(dotted) && !self.set.natives.iter().any(|n| n == dotted) {
                 self.set.natives.push(dotted.to_string());
             }
             return;
@@ -305,6 +380,11 @@ impl Loader {
             return;
         }
         let Some(path) = self.resolve_path(dotted) else {
+            // No module by that name -- but a *package* by that name is
+            // `import std;`, which brings in everything the package provides.
+            if self.load_package(dotted, at, from_source) {
+                return;
+            }
             self.diags.push(self.unresolved(dotted, at, from_source));
             return;
         };
@@ -379,11 +459,19 @@ impl Loader {
             }
         } else {
             let names = self.packages.names();
+            let mut hosts: Vec<&str> = NATIVE_MODULES.to_vec();
+            hosts.extend(self.host_modules.iter().map(String::as_str));
             note.push_str(&format!(
                 "no package is named `{first}`, and no file matched.\n         \
                  Host-provided modules: {}.",
-                NATIVE_MODULES.join(", ")
+                hosts.join(", ")
             ));
+            if self.host_modules.is_empty() {
+                note.push_str(
+                    "\n         An embedder's own host module must be named with \
+                     `--host-module <path>` so that importing it compiles.",
+                );
+            }
             if names.is_empty() {
                 note.push_str(
                     "\n         No packages were found. A package is any directory with a \
@@ -407,6 +495,71 @@ impl Loader {
         Diag::error(at, format!("cannot find module `{dotted}`"))
             .with_note(note)
             .in_source(from_source)
+    }
+
+    /// Register `mod child { .. }` as the module `parent.child`, and return the
+    /// import that replaces it in the parent.
+    ///
+    /// The submodule shares the parent's source file, so its diagnostics point
+    /// at the right lines. It is deliberately *not* recorded in `by_path`:
+    /// identity there is the file, and the file already belongs to the parent.
+    fn hoist_mod(&mut self, parent: &str, source: usize, m: ast::ModDecl) -> ast::Item {
+        let full = format!("{parent}.{}", m.name);
+        let import = ast::Item::Import(ast::Import {
+            path: full.split('.').map(str::to_string).collect(),
+            alias: m.name.clone(),
+            only: Vec::new(),
+            span: m.span,
+        });
+        if self.set.by_name.contains_key(&full) {
+            self.diags.push(
+                Diag::error(m.name_span, format!("`{}` is already a module here", m.name))
+                    .in_source(source),
+            );
+            return import;
+        }
+
+        // Its own `when`s and nested `mod`s, resolved the way a file's are.
+        let mut kept = Vec::with_capacity(m.items.len());
+        self.expand_items(m.items, &mut kept);
+        let mut items = Vec::with_capacity(kept.len());
+        for item in kept {
+            match item {
+                ast::Item::Mod(inner) => items.push(self.hoist_mod(&full, source, inner)),
+                other => items.push(other),
+            }
+        }
+
+        // A submodule may import, so follow those before it is recorded.
+        self.in_progress.push(full.clone());
+        let deps: Vec<(String, Span)> = items
+            .iter()
+            .filter_map(|item| match item {
+                ast::Item::Import(i) => Some((i.path.join("."), i.span)),
+                ast::Item::Derive(d) => Some((d.path.join("."), d.span)),
+                _ => None,
+            })
+            .collect();
+        for (dep, span) in deps {
+            // Its own submodule, put there by the hoist above, or a sibling
+            // reached by walking outwards: either way already registered.
+            if self.set.by_name.contains_key(&dep) || self.local_module(&full, &dep).is_some() {
+                continue;
+            }
+            self.load_named(&dep, span, source);
+        }
+        self.in_progress.pop();
+
+        let index = self.set.modules.len();
+        self.set.modules.push(LoadedModule {
+            name: full.clone(),
+            path: PathBuf::from(&full),
+            source,
+            ast: ast::Module { items },
+        });
+        self.set.by_name.insert(full.clone(), index);
+        self.visited.insert(full);
+        import
     }
 
     fn load_file(&mut self, path: &Path, name: &str, imported_at: Option<(Span, usize)>) {
@@ -458,9 +611,24 @@ impl Loader {
         self.expand_items(module_ast.items, &mut kept);
         module_ast.items = kept;
 
+        self.in_progress.push(name.to_string());
+
+        // A `mod name { .. }` is a module written inside another. Register it
+        // as `parent.name` and leave the parent importing it, so from here on
+        // a submodule and a file are the same thing to every later pass.
+        // Submodules go into the list first, which keeps the "dependencies
+        // first" order the lowerer relies on.
+        let mut hoisted = Vec::with_capacity(module_ast.items.len());
+        for item in std::mem::take(&mut module_ast.items) {
+            match item {
+                ast::Item::Mod(m) => hoisted.push(self.hoist_mod(name, source, m)),
+                other => hoisted.push(other),
+            }
+        }
+        module_ast.items = hoisted;
+
         // Follow this module's own imports before recording it, so the module
         // list comes out with dependencies first.
-        self.in_progress.push(name.to_string());
         let mut deps: Vec<(String, Span)> = Vec::new();
         for item in &module_ast.items {
             match item {
@@ -470,6 +638,12 @@ impl Loader {
             }
         }
         for (dep, span) in deps {
+            // `import io.{ .. }` inside a module that declares `mod io { .. }`
+            // means *that* submodule, which is registered as `parent.io`. It is
+            // already loaded, so there is nothing to search the file system for.
+            if self.local_module(name, &dep).is_some() {
+                continue;
+            }
             self.load_named(&dep, span, source);
         }
         self.in_progress.pop();

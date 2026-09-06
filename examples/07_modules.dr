@@ -1,0 +1,70 @@
+// The module system, in one file.
+//
+// A module is one file -- or a `mod` block inside one. The loader registers
+// `mod util { .. }` inside module `m` as the module `m.util` and leaves `m`
+// importing it, so a submodule and a file behave identically from there on.
+import std.console;
+
+// --- the four forms of import ----------------------------------------------
+
+import std.list;                       // binds `list`
+import std.str as text;                // binds `text`
+import std.list.{map, filter};         // binds the members, unqualified
+import std.array.{sum as total};       // ..renaming as it goes
+import std;                            // the whole package: `std.seq.join`
+
+// --- submodules -------------------------------------------------------------
+
+mod geometry {
+    let pi = 3.14159;
+    let circle_area r = pi * r * r;
+    let square_area s = s * s;
+
+    // A submodule may import, and what it imports is *not* re-exported:
+    // `geometry.str` is not a thing.
+    import std.str;
+    let describe name value = str.upper name + " = " + to_string value;
+
+    // ..and it may nest.
+    mod solid {
+        let cube_volume s = s * s * s;
+        let sphere_volume r = 4.0 / 3.0 * 3.14159 * r * r * r;
+    }
+}
+
+// A submodule can be imported from selectively, resolved relative to this
+// module, so `geometry` here means the one declared above.
+import geometry.{circle_area, describe};
+
+mod validate {
+    let positive n = n > 0;
+    let in_range lo hi n = n >= lo && n <= hi;
+}
+
+let main! = {
+    // plain and aliased imports
+    console.print! "list.head:     " (list.head [1, 2, 3])
+    console.print! "text.upper:    " (text.upper "aliased")
+
+    // selective imports, used unqualified
+    console.print! "map:           " (map (fn x -> x * 2) [1, 2, 3])
+    console.print! "filter:        " (filter (fn x -> x > 1) [1, 2, 3])
+    console.print! "renamed total: " (total #[1, 2, 3])
+
+    // the whole package, reached through its namespace
+    console.print! "std.seq.join:  " (std.array.join ", " #[1, 2, 3])
+    console.print! "std.str.trim:  " (std.str.trim "  x  ")
+    console.print! "std.list.sum:  " (std.list.sum [1, 2, 3])
+
+    // submodules
+    console.print! "geometry:      " (geometry.circle_area 2.0)
+    console.print! "  square:      " (geometry.square_area 4)
+    console.print! "  describe:    " (geometry.describe "radius" 2.0)
+    console.print! "  nested:      " (geometry.solid.cube_volume 3)
+    console.print! "  nested:      " (geometry.solid.sphere_volume 1.0)
+    console.print! "validate:      " (validate.positive 5) " " (validate.in_range 1 10 7)
+
+    // selectively imported from the submodule above
+    console.print! "from submod:   " (circle_area 1.0)
+    console.print! "from submod:   " (describe "count" 3)
+};

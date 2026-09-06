@@ -1,5 +1,7 @@
 #include "scheduler.hpp"
 
+#include "io.hpp"
+
 #include <chrono>
 
 #include "builtins.hpp"
@@ -106,7 +108,10 @@ void Scheduler::worker_loop(unsigned index) {
                     std::lock_guard<std::mutex> g(w->mutex);
                     if (!w->queue.empty()) { any_queued = true; break; }
                 }
-                if (!any_queued && runnable_.load() == 0) {
+                // A process waiting on a descriptor is not deadlocked: the
+                // poller thread still owes it a wake-up, and nothing inside
+                // the scheduler can produce that.
+                if (!any_queued && runnable_.load() == 0 && io_waiters_.load() == 0) {
                     deadlocked_.store(true);
                     done_cv_.notify_all();
                 }
@@ -122,6 +127,8 @@ void Scheduler::worker_loop(unsigned index) {
 
 void Scheduler::run_slice(const std::shared_ptr<Process>& p) {
     p->status.store(ProcStatus::Running, std::memory_order_relaxed);
+    p->wait_reason.store(WaitReason::None, std::memory_order_relaxed);
+    p->wait_fd.store(-1, std::memory_order_relaxed);
     uint64_t before = p->total_reductions;
 
     run_process(*p, REDUCTIONS_PER_SLICE);
@@ -155,6 +162,15 @@ void Scheduler::run_slice(const std::shared_ptr<Process>& p) {
     // let something else run; the whole state is in the Process, so there is
     // nothing to save.
     enqueue(p);
+}
+
+size_t Scheduler::queued() const {
+    size_t n = 0;
+    for (auto& w : workers_) {
+        std::lock_guard<std::mutex> g(w->mutex);
+        n += w->queue.size();
+    }
+    return n;
 }
 
 std::vector<std::string> Scheduler::take_failures() {
@@ -210,11 +226,84 @@ void Scheduler::wake(uint64_t pid) {
     proc->wake_pending = true;
 }
 
+void Scheduler::dump(const char* why) const {
+    std::string out = std::string("--- vm: ") + why + " ---\n";
+    out += "scheduler: workers=" + std::to_string(workers_.size())
+         + " idle=" + std::to_string(idle_workers_.load())
+         + " live=" + std::to_string(live_.load())
+         + " runnable=" + std::to_string(runnable_.load())
+         + " io_waiters=" + std::to_string(io_waiters_.load())
+         + " reductions=" + std::to_string(total_reductions_.load())
+         + (deadlocked_.load() ? " DEADLOCKED" : "") + "\n";
+    for (auto& proc : rt_.all_processes()) {
+        ProcStatus st = proc->status.load(std::memory_order_relaxed);
+        const char* name = st == ProcStatus::Runnable   ? "runnable"
+                         : st == ProcStatus::Running    ? "running"
+                         : st == ProcStatus::Waiting    ? "waiting"
+                         : st == ProcStatus::Finished   ? "finished"
+                                                        : "failed";
+        out += "  process " + std::to_string(proc->id()) + ": " + name;
+        if (st == ProcStatus::Waiting) {
+            WaitReason r = proc->wait_reason.load(std::memory_order_relaxed);
+            out += " on " + std::string(wait_reason_name(r));
+            int fd = proc->wait_fd.load(std::memory_order_relaxed);
+            if (r == WaitReason::Io && fd >= 0) out += " fd=" + std::to_string(fd);
+        }
+        // Mode and the top continuation say *where* in the machine a process
+        // is, which is the difference between "looping in my program" and
+        // "looping in the runtime".
+        out += " mode=" + std::string(mode_name(proc->mode))
+             + " conts=" + std::to_string(proc->conts.size())
+             + (proc->conts.empty() ? std::string()
+                                    : " top=" + std::string(cont_kind_name(proc->conts.back().kind)))
+             + " reductions=" + std::to_string(proc->total_reductions)
+             + " mailbox=" + std::to_string(proc->mailbox.size()) + "\n";
+    }
+    for (const IoHandleInfo& h : io_snapshot()) {
+        const char* kind = h.kind == HandleKind::File     ? "file"
+                         : h.kind == HandleKind::Listener ? "listener"
+                                                          : "stream";
+        out += "  handle " + std::to_string(h.handle) + ": fd=" + std::to_string(h.fd) + " "
+             + kind + " busy=" + std::to_string(h.busy);
+        if (h.waiting_pid) out += " waiting=" + std::to_string(h.waiting_pid);
+        out += "\n";
+    }
+    std::fwrite(out.data(), 1, out.size(), stderr);
+    std::fflush(stderr);
+}
+
 bool Scheduler::wait_for_all() {
+    // `DREAM_STUCK_SECONDS=n` reports what every process is doing if the whole
+    // system goes that long without spending a single reduction. A program
+    // parked on IO is not deadlocked -- the kernel may yet answer -- so the
+    // runtime cannot simply declare it stuck; but a program that has stopped
+    // for good is exactly the case where nothing is left that could ask.
+    const char* env = std::getenv("DREAM_STUCK_SECONDS");
+    double stuck_after = env ? std::atof(env) : 0.0;
+
     std::unique_lock<std::mutex> lk(idle_mutex_);
-    done_cv_.wait(lk, [this] {
-        return live_.load() == 0 || deadlocked_.load() || !running_.load();
-    });
+    if (stuck_after <= 0.0) {
+        done_cv_.wait(lk, [this] {
+            return live_.load() == 0 || deadlocked_.load() || !running_.load();
+        });
+        return live_.load() == 0;
+    }
+
+    uint64_t last = total_reductions_.load();
+    bool reported = false;
+    for (;;) {
+        auto period = std::chrono::duration<double>(stuck_after);
+        bool done = done_cv_.wait_for(lk, std::chrono::duration_cast<std::chrono::milliseconds>(period), [this] {
+            return live_.load() == 0 || deadlocked_.load() || !running_.load();
+        });
+        if (done) break;
+        uint64_t now = total_reductions_.load();
+        if (now == last) {
+            dump("no progress");
+        }
+        (void)reported;
+        last = now;
+    }
     return live_.load() == 0;
 }
 
@@ -256,6 +345,7 @@ bool Scheduler::receive(Process& p, Value* out) {
     auto msg = p.mailbox.pop();
     if (!msg) {
         p.park_requested = true;
+        p.wait_reason.store(WaitReason::Message, std::memory_order_relaxed);
         return false;
     }
     *out = Heap::copy_between(p.heap(), msg->value);
@@ -292,6 +382,7 @@ Scheduler::JoinState Scheduler::join(Process& p, uint64_t target, Value* out) {
     {
         std::lock_guard<std::mutex> g2(p.sched_mutex);
         p.park_requested = true;
+        p.wait_reason.store(WaitReason::Join, std::memory_order_relaxed);
     }
     return JoinState::Blocked;
 }

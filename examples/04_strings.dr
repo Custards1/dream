@@ -1,0 +1,68 @@
+// Text, with `std.str`.
+//
+// The one thing to keep straight: `length` and everything std.str inherits
+// from `std.seq` count CHARACTERS, while `byte_length`, `slice` and `find`
+// work in BYTES. For ASCII the two agree; for anything else they do not, and
+// the library keeps them apart by name rather than hoping you notice.
+import std.console;
+import std.str;
+import std.list;
+
+let greeting = "Hello, World";
+let accented = "h\u{e9}llo";
+
+let main! = {
+    console.print! "string:      " greeting
+    console.print! "length:      " (str.length greeting)
+    console.print! "byte_length: " (str.byte_length greeting)
+    console.print! "is_empty:    " (str.is_empty "") " " (str.is_empty "x")
+
+    // characters vs bytes
+    console.print! "accented:    " accented
+    console.print! "  chars:     " (str.length accented)
+    console.print! "  bytes:     " (str.byte_length accented)
+    console.print! "  as chars:  " (str.chars accented)
+    console.print! "  roundtrip: " (str.of_chars (str.chars accented))
+
+    // searching, in byte offsets
+    console.print! "find:        " (str.find "World" greeting)
+    console.print! "find missing:" (str.find "zzz" greeting)
+    console.print! "contains:    " (str.contains_str "lo, " greeting)
+    console.print! "starts/ends: " (str.starts_with "Hello" greeting) " " (str.ends_with "World" greeting)
+    console.print! "slice:       " (str.slice 7 5 greeting)
+    console.print! "slice clamps:" (str.slice 7 999 greeting)
+
+    // building
+    console.print! "concat:      " (str.concat "a" "b")
+    console.print! "repeat:      " (str.repeat 3 "ab")
+    console.print! "split:       " (str.split ", " greeting)
+    console.print! "split words: " (str.split " " "the quick brown fox")
+    console.print! "join_str:    " (str.join_str "-" ["a", "b", "c"])
+    console.print! "round trip:  " (str.join_str ", " (str.split ", " greeting))
+
+    // transforming
+    console.print! "upper/lower: " (str.upper greeting) " / " (str.lower greeting)
+    console.print! "reverse:     " (str.reverse greeting)
+    console.print! "filter:      " (str.filter (fn c -> c != 'l') greeting)
+    console.print! "map:         " (str.map str.upper_char "shout")
+    console.print! "ASCII only:  " (str.upper accented)
+
+    // trimming
+    console.print! "trim:        " ("[" + str.trim "  padded  \n" + "]")
+    console.print! "trim_start:  " ("[" + str.trim_start "  padded  " + "]")
+    console.print! "trim_end:    " ("[" + str.trim_end "  padded  " + "]")
+
+    // inherited from std.seq, over characters
+    console.print! "count 'l':   " (str.count (fn c -> c == 'l') greeting)
+    console.print! "any/all:     " (str.any (fn c -> c == 'W') greeting) " " (str.all (fn c -> c != 'z') greeting)
+    console.print! "min/max:     " (str.minimum "cab") " " (str.maximum "cab")
+    console.print! "describe:    " (str.describe greeting)
+
+    // a small pipeline: title-case each word
+    let title s = {
+        let cap w = if str.is_empty w { w }
+                    else { str.upper (str.slice 0 1 w) + str.slice 1 (str.byte_length w) w };
+        str.join_str " " (list.map cap (str.split " " s))
+    };
+    console.print! "title case:  " (title "the quick brown fox")
+};

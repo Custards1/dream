@@ -66,6 +66,10 @@ pub struct Options {
     pub config: config::Config,
     /// Build a test runner instead of using the program's own `main!`.
     pub test_mode: bool,
+    /// Module paths the host registers at run time, beyond the built-in
+    /// `std.*` ones. An embedder names its own module here so that a program
+    /// importing it compiles.
+    pub host_modules: Vec<String>,
 }
 
 impl Default for Options {
@@ -76,6 +80,7 @@ impl Default for Options {
             debug_info: true,
             config: config::Config::new(),
             test_mode: false,
+            host_modules: Vec::new(),
         }
     }
 }
@@ -99,6 +104,7 @@ pub fn compile_program(root: &Path, opts: &Options) -> Result<Compiled, CompileE
     let (set, mut diags) = modules::Loader::new(search)
         .with_packages(packages)
         .with_config(opts.config.clone())
+        .with_host_modules(opts.host_modules.clone())
         .with_test_runner(opts.test_mode)
         .load_root(root);
     for note in package_notes {

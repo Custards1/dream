@@ -110,6 +110,16 @@ pub struct PackageSet {
     pub notes: Vec<String>,
 }
 
+/// Whether two paths name the same directory. Falls back to comparing the
+/// paths as written when either cannot be canonicalized, which is what happens
+/// for a directory that does not exist.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 impl PackageSet {
     pub fn find(&self, name: &str) -> Option<&Package> {
         self.by_name.get(name).map(|i| &self.packages[*i])
@@ -127,7 +137,12 @@ impl PackageSet {
 
     fn add(&mut self, pkg: Package) -> Option<usize> {
         if let Some(&existing) = self.by_name.get(&pkg.name) {
-            if self.packages[existing].root != pkg.root {
+            // Compare where the directories actually are, not how they were
+            // spelled. The same package is routinely reached two ways -- once
+            // as a path dependency (`../textstats`) and once under a `-L` root
+            // -- and reporting that as a name clash would be a false alarm.
+            let same = same_directory(&self.packages[existing].root, &pkg.root);
+            if !same {
                 self.notes.push(format!(
                     "two packages are named `{}`: {} and {}; using the first",
                     pkg.name,

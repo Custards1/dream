@@ -1,0 +1,38 @@
+// Turning raw text into words.
+//
+// A module is one file, and this is the whole of it. Nothing here knows how
+// the words will be counted or reported -- that is the point of splitting it.
+import std.str;
+import std.list;
+
+/// Characters that separate words. Anything that is not one is part of a word.
+let is_separator c =
+    c == ' ' || c == '\n' || c == '\t' || c == '\r'
+    || c == '.' || c == ',' || c == ';' || c == ':'
+    || c == '!' || c == '?' || c == '"' || c == '(' || c == ')';
+
+/// The words of `text`, lowercased, with punctuation dropped and empty pieces
+/// removed. Splitting on characters rather than on a separator string is what
+/// lets several separators in a row collapse.
+let words text = {
+    let cleaned = str.map (fn c -> if is_separator c { ' ' } else { c }) (str.lower text);
+    list.filter (fn w -> not (str.is_empty w)) (str.split " " cleaned)
+};
+
+/// Words of at least `n` characters -- a crude way to skip "the", "a", "of".
+let significant n text = list.filter (fn w -> str.length w >= n) (words text);
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "splits on spaces"    $( test.eq! ["a", "b"] (words "a b") ),
+        test.case "lowercases"          $( test.eq! ["abc"] (words "ABC") ),
+        test.case "drops punctuation"   $( test.eq! ["hi", "there"] (words "Hi, there!") ),
+        test.case "collapses runs"      $( test.eq! ["a", "b"] (words "a   b") ),
+        test.case "empty text"          $( test.eq! [] (words "") ),
+        test.case "only separators"     $( test.eq! [] (words " .,! ") ),
+        test.case "newlines separate"   $( test.eq! ["a", "b"] (words "a\nb") ),
+        test.case "significant filters" $( test.eq! ["quick"] (significant 4 "a is quick") ),
+    ];
+}

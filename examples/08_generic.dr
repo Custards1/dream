@@ -1,0 +1,72 @@
+// Generic code, with `virtual` and `derive`.
+//
+// A `virtual` declares a hole in a module; a module that derives it fills the
+// hole. Because Dream compiles whole programs, `derive` specializes the base
+// module's *syntax tree* against the deriving module's implementations -- so
+// the generality is resolved at compile time and costs nothing at run time.
+// There is no dispatch, no vtable, and no wrapper object.
+import std.console;
+import std.list;
+
+// --- a shape, generically ---------------------------------------------------
+
+mod shape {
+    /// Must be filled: a shape without an area is not a shape.
+    virtual let area s;
+    /// May be left alone: the default is used when a deriving module is quiet.
+    virtual let name s = "shape";
+
+    // Everything below is written once and shared by every shape.
+    let describe s = name s + " of area " + to_string (area s);
+    let bigger_than s limit = area s > limit;
+}
+
+mod circle {
+    derive shape;
+    let area r = 3.14159 * r * r;
+    let name r = "circle";
+}
+
+mod square {
+    derive shape;
+    let area side = side * side;
+    let name side = "square";
+}
+
+// A deriving module that does *not* override `name`, so the default stands.
+mod blob {
+    derive shape;
+    let area x = x;
+}
+
+// --- a sequence, generically ------------------------------------------------
+//
+// The standard library's own use of the feature: `std.seq` declares `fold` and
+// writes fifteen operations in terms of it. `std.array` and `std.str` derive
+// it, so both get all fifteen from one implementation each.
+import std.array;
+import std.str;
+
+let main! = {
+    console.print! "circle:      " (circle.describe 2.0)
+    console.print! "square:      " (square.describe 4)
+    console.print! "default name:" (blob.describe 7)
+    console.print! "shared code: " (circle.bigger_than 2.0 10.0) " " (square.bigger_than 1 10)
+
+    // The same generic `describe` produced all three lines above, specialized
+    // three ways.
+    console.print! "all:         " (list.map (fn f -> f 2) [square.area, blob.area])
+
+    // std.seq, through its two instances in the standard library.
+    console.print! "array.sum:   " (array.sum #[1, 2, 3, 4])
+    console.print! "array.any:   " (array.any (fn x -> x > 3) #[1, 2, 3, 4])
+    console.print! "array.join:  " (array.join " | " #[1, 2, 3])
+    console.print! "array.descr: " (array.describe #[1, 2, 3])
+    console.print! "str.count:   " (str.count (fn c -> c == 'o') "foo boo")
+    console.print! "str.minimum: " (str.minimum "dream")
+    console.print! "str.descr:   " (str.describe "dream")
+
+    // `describe` is one function in `std.seq`, reading `name` from whichever
+    // module it was specialized into.
+    console.print! "same code:   " (array.describe #[1]) " vs " (str.describe "a")
+};
