@@ -474,6 +474,15 @@ pub const BUILTINS: &[&str] = &[
     "type_of",  // 6: value -> atom
     "to_string",// 7: value -> string
     "len",      // 8: list|array|map|string -> integer
+    "strict!",  // 9: value -> the same value, evaluated all the way down
+    // 10-14: what `match` compiles to. Named so they cannot be reached by
+    // accident -- a builtin wins over an imported name, so a plain `head` here
+    // would quietly shadow `import std.list.{head}`.
+    "match_is_cons",  // 10: value -> bool, true for a non-empty list
+    "match_head",     // 11: list -> its head, unforced
+    "match_tail",     // 12: list -> its tail, unforced
+    "match_at",       // 13: array -> index -> element, unforced
+    "match_key",      // 14: map -> key -> [value] if present, [] if not
 ];
 
 pub fn builtin_id(name: &str) -> Option<u32> {

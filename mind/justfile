@@ -1,10 +1,11 @@
-src := "mind.dr"
+std:="./std"
+src := "tool/main.dr"
 output := "mind.dream"
 
 clean:
    rm -f $(output) 
 build:
-    dawnc $(src)
+    dreamc -L {{std}} -o mind {{src}}
 run:
     dream $(output)    
 rebuild: build run

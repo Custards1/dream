@@ -1138,3 +1138,77 @@ fn a_submodule_can_import_a_sibling() {
         mod user { import helpers; let go x = helpers.twice x; }\n\
         let main! = { user.go 4 }");
 }
+
+// ---------------------------------------------------------------------------
+// Statement continuation
+//
+// A newline ends a statement, but a line indented past the statement it
+// follows continues it. Before that rule a call spread over several lines
+// silently became several statements and the block took the value of the last,
+// with no error anywhere -- which is the worst way for a language to be wrong.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_indented_line_continues_the_call_above_it() {
+    // Three arguments, so if the continuation lines were read as separate
+    // statements the block would yield the last of them instead of the sum.
+    let c = ok("let add3 a b c = a + b + c;\n\
+                let main! = {\n\
+                \x20   add3 (1 + 1)\n\
+                \x20        (2 + 2)\n\
+                \x20        (3 + 3)\n\
+                }");
+    // One statement, not three: the two continuation lines belong to the call.
+    let body = node(&c.program, func(&c.program, "main!").body);
+    assert_eq!(body.opcode(), Some(Op::Block));
+    assert_eq!(body.b, 1, "the split call should be one statement, got {}", body.b);
+
+    // ..and that statement applies `add3` to three arguments.
+    let stmt = node(&c.program, kids(&c.program, body.a, body.b)[0]);
+    assert_eq!(stmt.opcode(), Some(Op::Apply), "got {:?}", stmt.opcode());
+    assert_eq!(stmt.c, 3, "expected three arguments, got {}", stmt.c);
+}
+
+#[test]
+fn a_line_at_the_same_indentation_starts_a_new_statement() {
+    // The two calls must stay separate: this is the common case, and reading
+    // them as one application would break every program ever written.
+    let c = ok("let f x = x;\n\
+                let main! = {\n\
+                \x20   f 1\n\
+                \x20   f 2\n\
+                }");
+    let fn_main = func(&c.program, "main!");
+    let body = node(&c.program, fn_main.body);
+    assert_eq!(
+        body.opcode(),
+        Some(Op::Block),
+        "two statements at one indentation should stay a block of two"
+    );
+    assert_eq!(body.b, 2, "expected two statements, got {}", body.b);
+}
+
+#[test]
+fn a_less_indented_line_ends_the_statement() {
+    let c = ok("let f x = x;\n\
+                let main! = {\n\
+                \x20     f 1\n\
+                \x20   f 2\n\
+                }");
+    let body = node(&c.program, func(&c.program, "main!").body);
+    assert_eq!(body.opcode(), Some(Op::Block));
+    assert_eq!(body.b, 2, "a dedent must end the statement above it");
+}
+
+#[test]
+fn an_operator_continues_whatever_its_indentation() {
+    // `+` cannot start a statement, so it continues regardless -- including
+    // when it is indented *less* than the line above.
+    let c = ok("let main! = {\n\
+                \x20   let n = 1\n\
+                \x20 + 2;\n\
+                \x20   n\n\
+                }");
+    let body = node(&c.program, func(&c.program, "main!").body);
+    assert_eq!(body.b, 2, "the operator line should not have become a statement");
+}

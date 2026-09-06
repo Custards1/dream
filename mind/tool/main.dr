@@ -1,0 +1,187 @@
+// mind -- the build tool for Dream.
+//
+//   mind new <name>     start a project
+//   mind build          compile it
+//   mind run [args]     compile and run it
+//   mind test           compile with `--test` and run the result
+//   mind check          compile without writing an image
+//   mind fetch          get dependencies, without building
+//   mind deps           show what the project resolves to
+//   mind clean          remove `target/`
+//
+// `mind` is written in Dream and compiled by `dreamc`, the same as any other
+// program here. It has no compiler of its own: Dream compiles whole programs,
+// so a build is "find the packages, hand them to `dreamc`, run it".
+import std.console;
+import std.core;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+import build;
+import fetch;
+import manifest;
+import util;
+
+let usage = "mind -- the build tool for Dream
+
+usage: mind <command> [arguments]
+
+  new <name>     create a project in ./<name>
+  build          compile the project to target/<name>.dream
+  run [args]     compile, then run it with the arguments given
+  test           compile with --test and run the result
+  check          compile without writing an image
+  fetch          download dependencies without building
+  deps           list the packages this project resolves to
+  clean          remove target/
+  help           this message
+
+A project is a directory with a `mind.toml`. Commands other than `new` look
+for one here or above, so they work from anywhere inside a project.
+
+Dependencies are local directories or things to fetch, and there is no index:
+
+  [dependencies]
+  util = { path = \"../util\" }
+  json = { git = \"https://github.com/u/dream-json\", tag = \"v1.0\" }
+  pkg  = { url = \"https://example.com/pkg.tar.gz\" }
+
+A git dependency must be pinned with `tag`, `rev` or `branch`.
+";
+
+let fail! message = {
+    console.error! "mind: " message
+    os.exit! 1
+};
+
+/// Load the project, or stop with the reason.
+let project! () =
+    match manifest.find! (os.cwd! ()) {
+        [:ok, m] => m,
+        [:error, why] => fail! why,
+    };
+
+// --- commands ---------------------------------------------------------------
+
+let cmd_new! name = {
+    if str.is_empty name { fail! "new needs a project name" }
+    if io.exists! name { fail! (name + " already exists") }
+    util.mkdir_p! name
+    util.write_file! (util.join name "mind.toml")
+        ("[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\nsrc = \".\"\n\n[dependencies]\n")
+    util.write_file! (util.join name "main.dr")
+        ("import std.console;\n\nlet main! = {\n    console.print! \"Hello from " + name + "\"\n};\n")
+    util.write_file! (util.join name ".gitignore") "target/\n*.dream\n"
+    console.print! "created " name
+    console.print! "  cd " name " && mind run"
+};
+
+let report_build! m extra label = {
+    match build.compile! m extra {
+        [:error, why] => {
+            console.error! why
+            os.exit! 1
+        },
+        [:ok, _] => {
+            console.print! label " " (manifest.name m) " v" (manifest.version m)
+            :ok
+        },
+    }
+};
+
+let cmd_build! () = {
+    let m = project! ();
+    report_build! m [] "compiled"
+    console.print! "  " (build.image m)
+};
+
+let cmd_check! () = {
+    let m = project! ();
+    report_build! m ["--no-emit"] "checked"
+};
+
+let cmd_run! args = {
+    let m = project! ();
+    report_build! m [] "running"
+    let r = build.run_image! m args;
+    match r {
+        [code, out, err] => {
+            if not (str.is_empty out) { console.write! out }
+            if not (str.is_empty err) { console.error! err }
+            if code != 0 { os.exit! code }
+            :ok
+        },
+    }
+};
+
+let cmd_test! () = {
+    let m = project! ();
+    report_build! m ["--test"] "testing"
+    let r = build.run_image! m [];
+    match r {
+        [code, out, err] => {
+            if not (str.is_empty out) { console.write! out }
+            if not (str.is_empty err) { console.error! err }
+            if code != 0 { os.exit! code }
+            :ok
+        },
+    }
+};
+
+let cmd_deps! () = {
+    let m = project! ();
+    console.print! (manifest.name m) " v" (manifest.version m)
+    let ds = manifest.dependencies m;
+    if list.is_empty ds { console.print! "  (no dependencies)" }
+    let show! d = {
+        match fetch.resolve! (manifest.root m) d {
+            [:ok, dir] => console.print! "  " (manifest.dep_name d) " -> " dir,
+            [:error, why] => console.print! "  " (manifest.dep_name d) " -> unresolved: " why,
+        }
+    };
+    strict! (list.map show! ds)
+    :ok
+};
+
+let cmd_fetch! () = {
+    let m = project! ();
+    match build.search_paths! m {
+        [:error, why] => fail! why,
+        [:ok, paths] => {
+            let dirs = list.filter (fn p -> p != "-L") paths;
+            console.print! "fetched " (list.length dirs - 1) " dependencies"
+        },
+    }
+};
+
+let cmd_clean! () = {
+    let m = project! ();
+    let dir = build.target_dir m;
+    if io.exists! dir {
+        os.exec! "rm" ["-rf", dir]
+        console.print! "removed " dir
+    } else {
+        console.print! "nothing to clean"
+    }
+};
+
+let main! = {
+    match os.args! () {
+        [] => console.write! usage,
+        ["help", ..rest] => console.write! usage,
+        ["--help", ..rest] => console.write! usage,
+        ["-h", ..rest] => console.write! usage,
+        ["new", name, ..rest] => cmd_new! name,
+        ["new"] => fail! "new needs a project name",
+        ["build", ..rest] => cmd_build! (),
+        ["check", ..rest] => cmd_check! (),
+        ["run", ..rest] => cmd_run! rest,
+        ["test", ..rest] => cmd_test! (),
+        ["deps", ..rest] => cmd_deps! (),
+        ["fetch", ..rest] => cmd_fetch! (),
+        ["clean", ..rest] => cmd_clean! (),
+        [other, ..rest] => fail! ("unknown command `" + to_string other + "`; try `mind help`"),
+    }
+};

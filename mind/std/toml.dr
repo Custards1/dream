@@ -1,0 +1,371 @@
+// TOML, enough of it to describe a package.
+//
+// This is deliberately a subset, and the subset is the one `mind.toml` uses:
+// comments, `[section]` and `[dotted.section]` headers, `key = value`, and
+// values that are strings, integers, floats, booleans, arrays or inline
+// tables. What is missing is everything a manifest has no use for -- array-of-
+// table headers `[[x]]`, multi-line strings, dates, and dotted keys inside a
+// section. A manifest that uses one gets an error naming the line rather than
+// a quietly wrong parse.
+//
+// The result is a map of section name to a map of its keys, with keys written
+// before any header collected under `""`:
+//
+//     [package]              %{ "package" => %{ "name" => "demo" },
+//     name = "demo"             "dependencies" => %{
+//                                  "json" => %{ "git" => "https://..." } } }
+//     [dependencies]
+//     json = { git = "https://..." }
+//
+// Like `std.json`, nothing here raises: `parse` answers `[:ok, table]` or
+// `[:error, message]`, because reading a file is not an effect.
+
+import std.core;
+import std.list;
+import std.str;
+
+// --- characters -------------------------------------------------------------
+
+let is_ws c = c == ' ' || c == '\t';
+let is_digit c = c >= '0' && c <= '9';
+
+let is_bare c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit c || c == '_' || c == '-';
+
+let rec skip_ws cs =
+    if list.is_empty cs { cs }
+    else if is_ws (list.head cs) { skip_ws (list.tail cs) }
+    else { cs };
+
+/// Whitespace, comments and line breaks: everything between one item and the
+/// next. A `#` runs to the end of its line.
+let rec skip_blank cs = {
+    let s = skip_ws cs;
+    if list.is_empty s { s }
+    else {
+        let c = list.head s;
+        if c == '\n' || c == '\r' { skip_blank (list.tail s) }
+        else if c == '#' { skip_blank (drop_line s) }
+        else { s }
+    }
+};
+
+let rec drop_line cs =
+    if list.is_empty cs { cs }
+    else if list.head cs == '\n' { list.tail cs }
+    else { drop_line (list.tail cs) };
+
+/// Whitespace and a comment, but not the line break: what may follow a value.
+let rec end_of_line cs = {
+    let s = skip_ws cs;
+    if list.is_empty s { s }
+    else if list.head s == '#' { drop_line s }
+    else if list.head s == '\n' { list.tail s }
+    else if list.head s == '\r' { end_of_line (list.tail s) }
+    else { () }          // something else on the line: not valid
+};
+
+let step value rest = [value, rest];
+let step_value s = list.head s;
+let step_rest s = list.head (list.tail s);
+
+// --- scalars ----------------------------------------------------------------
+
+let rec quoted_body cs acc =
+    if list.is_empty cs { () }
+    else {
+        let c = list.head cs;
+        let rest = list.tail cs;
+        if c == '"' { step (str.of_chars (list.reverse acc)) rest }
+        else if c == '\n' { () }                       // a basic string is one line
+        else if c != '\\' { quoted_body rest (list.cons c acc) }
+        else if list.is_empty rest { () }
+        else {
+            let e = list.head rest;
+            let after = list.tail rest;
+            if e == 'n' { quoted_body after (list.cons '\n' acc) }
+            else if e == 't' { quoted_body after (list.cons '\t' acc) }
+            else if e == 'r' { quoted_body after (list.cons '\r' acc) }
+            else if e == '"' { quoted_body after (list.cons '"' acc) }
+            else if e == '\\' { quoted_body after (list.cons '\\' acc) }
+            else { () }
+        }
+    };
+
+/// A literal string: single quotes, no escapes at all, which is what makes it
+/// the right thing for a Windows path or a regular expression.
+let rec literal_body cs acc =
+    if list.is_empty cs { () }
+    else if list.head cs == '\'' { step (str.of_chars (list.reverse acc)) (list.tail cs) }
+    else if list.head cs == '\n' { () }
+    else { literal_body (list.tail cs) (list.cons (list.head cs) acc) };
+
+let rec number_chars cs acc floaty =
+    if list.is_empty cs { [list.reverse acc, floaty, cs] }
+    else {
+        let c = list.head cs;
+        if is_digit c || c == '-' || c == '+' { number_chars (list.tail cs) (list.cons c acc) floaty }
+        else if c == '.' || c == 'e' || c == 'E' { number_chars (list.tail cs) (list.cons c acc) true }
+        else if c == '_' { number_chars (list.tail cs) acc floaty }   // 1_000 is 1000
+        else { [list.reverse acc, floaty, cs] }
+    };
+
+let parse_number cs = {
+    let taken = number_chars cs [] false;
+    let text = str.of_chars (list.head taken);
+    let floaty = list.nth 1 taken;
+    let rest = list.nth 2 taken;
+    if str.is_empty text { () }
+    else {
+        let n = if floaty { core.parse_float text } else { core.parse_int text };
+        if n == () { () } else { step n rest }
+    }
+};
+
+let rec starts cs word =
+    if list.is_empty word { true }
+    else if list.is_empty cs { false }
+    else if list.head cs == list.head word { starts (list.tail cs) (list.tail word) }
+    else { false };
+
+let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
+
+// --- values -----------------------------------------------------------------
+
+let rec parse_value cs = {
+    let s = skip_ws cs;
+    if list.is_empty s { () }
+    else {
+        let c = list.head s;
+        if c == '"' { quoted_body (list.tail s) [] }
+        else if c == '\'' { literal_body (list.tail s) [] }
+        else if c == '[' { parse_array (list.tail s) [] }
+        else if c == '{' { parse_inline (list.tail s) (core.map_new ()) true }
+        else if starts s (str.chars "true") { step true (drop_n 4 s) }
+        else if starts s (str.chars "false") { step false (drop_n 5 s) }
+        else if is_digit c || c == '-' || c == '+' { parse_number s }
+        else { () }
+    }
+};
+
+/// An array. TOML allows a trailing comma and line breaks inside, so this
+/// skips blanks between elements rather than only spaces.
+let rec parse_array cs acc = {
+    let s = skip_blank cs;
+    if list.is_empty s { () }
+    else if list.head s == ']' { step (list.reverse acc) (list.tail s) }
+    else {
+        let v = parse_value s;
+        if v == () { () }
+        else {
+            let after = skip_blank (step_rest v);
+            let grown = list.cons (step_value v) acc;
+            if list.is_empty after { () }
+            else if list.head after == ',' { parse_array (list.tail after) grown }
+            else if list.head after == ']' { step (list.reverse grown) (list.tail after) }
+            else { () }
+        }
+    }
+};
+
+let rec parse_inline cs acc first = {
+    let s = skip_blank cs;
+    if list.is_empty s { () }
+    else if list.head s == '}' { step acc (list.tail s) }
+    else {
+        let after_comma =
+            if first { s }
+            else if list.head s == ',' { skip_blank (list.tail s) }
+            else { () };
+        if after_comma == () { () }
+        else if list.is_empty after_comma { () }
+        else if list.head after_comma == '}' { step acc (list.tail after_comma) }
+        else {
+            let k = parse_key after_comma;
+            if k == () { () }
+            else {
+                let eq = skip_ws (step_rest k);
+                if list.is_empty eq { () }
+                else if list.head eq != '=' { () }
+                else {
+                    let v = parse_value (list.tail eq);
+                    if v == () { () }
+                    else {
+                        let grown = core.map_put acc (step_value k) (step_value v);
+                        parse_inline (step_rest v) grown false
+                    }
+                }
+            }
+        }
+    }
+};
+
+/// A key: bare, or quoted when it has characters a bare key may not.
+let parse_key cs = {
+    let s = skip_ws cs;
+    if list.is_empty s { () }
+    else if list.head s == '"' { quoted_body (list.tail s) [] }
+    else if list.head s == '\'' { literal_body (list.tail s) [] }
+    else {
+        let rec bare cs acc =
+            if list.is_empty cs || not (is_bare (list.head cs)) {
+                if list.is_empty acc { () } else { step (str.of_chars (list.reverse acc)) cs }
+            } else { bare (list.tail cs) (list.cons (list.head cs) acc) };
+        bare s []
+    }
+};
+
+/// A `[section]` or `[a.b]` header, as the name between the brackets.
+let parse_header cs = {
+    let rec take cs acc =
+        if list.is_empty cs { () }
+        else if list.head cs == ']' { step (str.of_chars (list.reverse acc)) (list.tail cs) }
+        else if list.head cs == '\n' { () }
+        else { take (list.tail cs) (list.cons (list.head cs) acc) };
+    take cs []
+};
+
+// --- the document ------------------------------------------------------------
+
+/// `[table, section_name, section_map, rest]` threaded through the loop below.
+/// A section is collected into its own map and folded into the document when
+/// the next header arrives, so a key can never land in the wrong section.
+let rec parse_items cs table section current = {
+    let s = skip_blank cs;
+    if list.is_empty s {
+        [:ok, core.map_put table section current]
+    }
+    else if list.head s == '[' {
+        let h = parse_header (list.tail s);
+        if h == () { [:error, "a section header is not closed"] }
+        else {
+            let done = core.map_put table section current;
+            let name = str.trim (step_value h);
+            // A header seen twice keeps what the first one collected, so
+            // `[a]` .. `[b]` .. `[a]` adds to `a` rather than emptying it.
+            let existing = core.map_get done name (core.map_new ());
+            parse_items (step_rest h) done name existing
+        }
+    }
+    else {
+        let k = parse_key s;
+        if k == () { [:error, "expected a key"] }
+        else {
+            let eq = skip_ws (step_rest k);
+            if list.is_empty eq { [:error, "expected `=` after " + step_value k] }
+            else if list.head eq != '=' { [:error, "expected `=` after " + step_value k] }
+            else {
+                let v = parse_value (list.tail eq);
+                if v == () { [:error, "the value of " + step_value k + " is not valid TOML"] }
+                else {
+                    let after = end_of_line (step_rest v);
+                    if after == () { [:error, "unexpected text after the value of " + step_value k] }
+                    else {
+                        let grown = core.map_put current (step_value k) (step_value v);
+                        parse_items after table section grown
+                    }
+                }
+            }
+        }
+    }
+};
+
+/// `[:ok, table]`, or `[:error, message]`.
+let parse text = parse_items (str.chars text) (core.map_new ()) "" (core.map_new ());
+
+let ok r = list.head r == :ok;
+let value r = list.nth 1 r;
+
+let parse_or default text = {
+    let r = parse text;
+    if ok r { value r } else { default }
+};
+
+// --- reading what was parsed -------------------------------------------------
+
+/// The map for `[name]`, or an empty one. A missing section reads like an
+/// empty section, so a manifest with no `[dependencies]` needs no special case.
+let section table name = core.map_get table name (core.map_new ());
+
+/// `table[section][key]`, or `default`.
+let get default table sec key = core.map_get (section table sec) key default;
+
+/// The names of every section, in the order the map holds them.
+let sections table = list.map (fn p -> list.head p) (core.map_pairs table);
+
+/// The `key = value` pairs of one section, as `[key, value]` lists.
+let entries table name = core.map_pairs (section table name);
+
+// --- tests ------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let parsed text = value (parse text);
+    let at text sec key = get () (parsed text) sec key;
+
+    let tests = [
+        // scalars
+        test.case "string"        $( test.eq! "x" (at "a = \"x\"" "" "a") ),
+        test.case "literal string" $( test.eq! "a\\b" (at "a = 'a\\b'" "" "a") ),
+        test.case "escape"        $( test.eq! "a\nb" (at "a = \"a\\nb\"" "" "a") ),
+        test.case "integer"       $( test.eq! 42 (at "a = 42" "" "a") ),
+        test.case "negative"      $( test.eq! (0 - 5) (at "a = -5" "" "a") ),
+        test.case "underscores"   $( test.eq! 1000 (at "a = 1_000" "" "a") ),
+        test.case "float"         $( test.eq! 1.5 (at "a = 1.5" "" "a") ),
+        test.case "true"          $( test.true! (at "a = true" "" "a") ),
+        test.case "false"         $( test.false! (at "a = false" "" "a") ),
+
+        // structure
+        test.case "array"         $( test.eq! ["a", "b"] (at "a = [\"a\", \"b\"]" "" "a") ),
+        test.case "empty array"   $( test.eq! [] (at "a = []" "" "a") ),
+        test.case "trailing comma" $( test.eq! [1] (at "a = [1,]" "" "a") ),
+        test.case "array over lines" $( test.eq! [1, 2] (at "a = [\n1,\n2\n]" "" "a") ),
+        test.case "nested array"  $( test.eq! [[1]] (at "a = [[1]]" "" "a") ),
+        test.case "inline table"
+            $( test.eq! "v" (core.map_get (at "a = { k = \"v\" }" "" "a") "k" ()) ),
+        test.case "empty inline table"
+            $( test.eq! 0 (len (at "a = {}" "" "a")) ),
+        test.case "inline table, two keys"
+            $( test.eq! 2 (len (at "a = { x = 1, y = 2 }" "" "a")) ),
+
+        // sections
+        test.case "section"       $( test.eq! "d" (at "[p]\nn = \"d\"" "p" "n") ),
+        test.case "dotted section" $( test.eq! 1 (at "[a.b]\nk = 1" "a.b" "k") ),
+        test.case "two sections"
+            $( test.eq! 2 (at "[a]\nk = 1\n[b]\nk = 2" "b" "k") ),
+        test.case "keys before any header" $( test.eq! 1 (at "k = 1\n[a]\nj = 2" "" "k") ),
+        test.case "a repeated header keeps what it had"
+            $( test.eq! 1 (at "[a]\nk = 1\n[b]\nj = 0\n[a]\nm = 2" "a" "k") ),
+        test.case "missing section is empty" $( test.eq! 0 (len (section (parsed "") "nope")) ),
+        test.case "missing key"   $( test.eq! :none (get :none (parsed "[a]\nk = 1") "a" "j") ),
+
+        // comments and blank lines
+        test.case "comment line"  $( test.eq! 1 (at "# hi\na = 1" "" "a") ),
+        test.case "trailing comment" $( test.eq! 1 (at "a = 1 # hi" "" "a") ),
+        test.case "blank lines"   $( test.eq! 1 (at "\n\n a = 1 \n\n" "" "a") ),
+        test.case "comment only"  $( test.true! (ok (parse "# nothing here")) ),
+        test.case "empty document" $( test.true! (ok (parse "")) ),
+
+        // failures are values
+        test.case "unclosed header" $( test.false! (ok (parse "[a")) ),
+        test.case "key with no value" $( test.false! (ok (parse "a =")) ),
+        test.case "key with no equals" $( test.false! (ok (parse "a")) ),
+        test.case "junk after value" $( test.false! (ok (parse "a = 1 2")) ),
+        test.case "unclosed array" $( test.false! (ok (parse "a = [1")) ),
+        test.case "unclosed string" $( test.false! (ok (parse "a = \"x")) ),
+        test.case "parse_or"      $( test.eq! :fallback (parse_or :fallback "[") ),
+
+        // a real manifest
+        test.case "a package manifest"
+            $( test.eq! "std"
+                        (at "[package]\nname = \"std\"\nversion = \"0.1.0\"\nsrc = \".\"\n"
+                            "package" "name") ),
+        test.case "a dependency table"
+            $( test.eq! "../util"
+                        (core.map_get
+                           (at "[dependencies]\nutil = { path = \"../util\" }\n"
+                               "dependencies" "util")
+                           "path" ()) ),
+    ];
+}

@@ -1,0 +1,90 @@
+// Reading `mind.toml`.
+//
+// A manifest describes one package: what it is called, where its modules live,
+// and what it depends on. A dependency is either somewhere on this machine
+// (`path`) or somewhere to fetch (`git`, `url`) -- there is no index and no
+// registry, so a dependency says where it is rather than naming a version the
+// world is expected to agree on.
+import std.core;
+import std.list;
+import std.str;
+import std.toml;
+
+import util;
+
+/// Where a package's manifest lives, and what it says.
+let make root doc = %{ :root => root, :doc => doc };
+
+let root m = core.map_get m :root ".";
+let doc m = core.map_get m :doc (core.map_new ());
+
+let name m = toml.get "" (doc m) "package" "name";
+let version m = toml.get "0.0.0" (doc m) "package" "version";
+
+/// Where this package's modules are, relative to the manifest. Defaults to the
+/// manifest's own directory, which is what a single-file project wants.
+let src m = util.join (root m) (toml.get "." (doc m) "package" "src");
+
+/// The file a build starts from. `main.dr` beside the sources unless the
+/// manifest says otherwise.
+let entry m = util.join (src m) (toml.get "main.dr" (doc m) "package" "entry");
+
+/// `[[name, spec], ..]`, the spec being the inline table as written.
+let dependencies m = toml.entries (doc m) "dependencies";
+
+let dep_name d = list.head d;
+let dep_spec d = list.nth 1 d;
+
+let spec_get d key = core.map_get (dep_spec d) key ();
+
+/// How a dependency is obtained: `:path`, `:git`, `:url`, or `:unknown`.
+let dep_kind d =
+    match [spec_get d "path", spec_get d "git", spec_get d "url"] {
+        [(), (), ()] => :unknown,
+        [(), (), _] => :url,
+        [(), _, _] => :git,
+        _ => :path,
+    };
+
+/// The revision a git dependency is pinned to, as `[kind, value]`.
+///
+/// An unpinned dependency is the one thing this refuses: "whatever is on the
+/// default branch today" is not a dependency, it is a moving target, and the
+/// build that breaks tomorrow will not say why.
+let dep_rev d =
+    match [spec_get d "tag", spec_get d "rev", spec_get d "branch"] {
+        [(), (), ()] => [:none, ()],
+        [(), (), b] => [:branch, b],
+        [(), r, _] => [:rev, r],
+        [t, _, _] => [:tag, t],
+    };
+
+/// Read the manifest in `dir`, or `[:error, message]`.
+let load! dir = {
+    let path = util.join dir "mind.toml";
+    match util.read_file! path {
+        () => [:error, "no manifest at " + path],
+        text => match toml.parse text {
+            [:ok, d] => {
+                let m = make dir d;
+                if str.is_empty (name m) {
+                    [:error, path + ": [package] has no `name`"]
+                } else { [:ok, m] }
+            },
+            [:error, why] => [:error, path + ": " + why],
+            _ => [:error, path + ": could not be read"],
+        },
+    }
+};
+
+/// Walk up from `dir` looking for a manifest, so `mind build` works from
+/// anywhere inside a project -- the same way `git` finds its root.
+let rec find! dir =
+    match util.read_file! (util.join dir "mind.toml") {
+        () => {
+            let parent = util.dirname dir;
+            if parent == dir || dir == "." || dir == "/" { [:error, "no mind.toml here or above"] }
+            else { find! parent }
+        },
+        _ => load! dir,
+    };

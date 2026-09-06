@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #include "interp.hpp"
 
 #include <cinttypes>
@@ -335,6 +337,19 @@ void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint3
     }
 
     NativeResult r = fn(p, callee, p.stack.data() + base, argc);
+
+    // A nested force inside the native hit a blocking operation and gave up
+    // (see `force_whnf`). Whatever the native decided to return is built on a
+    // value it never actually got, so the answer is not "this failed" -- it is
+    // "not yet". Park and call it again, rather than trusting the result.
+    //
+    // Catching it here rather than in each native means a native cannot forget
+    // to: the ones that force a value deeply are exactly the ones that would
+    // not think to check.
+    if (p.park_requested && r.outcome != NativeOutcome::Block) {
+        r = NativeResult::block();
+    }
+
     switch (r.outcome) {
         case NativeOutcome::Value:
             p.stack.resize(base);
@@ -1086,12 +1101,85 @@ void prime_force(Process& p, Value v) {
     enter(p, v);
 }
 
+/// The limits that keep one runaway process from taking the runtime with it.
+///
+/// A process is the unit of failure here, so exhausting memory has to kill the
+/// process that did it and nothing else. Without these, `std::bad_alloc`
+/// escapes the allocator and calls `terminate`, which loses every other
+/// process, the scheduler, and any work already done.
+///
+/// Each is generous enough that ordinary programs never approach it -- a tail
+/// call pops its continuation, so a loop runs in constant space, and
+/// `sum_to 100000` needs 100k frames against a limit of four million -- and
+/// each can be moved for a program that genuinely needs more.
+struct Limits {
+    size_t conts;
+    size_t stack;
+    size_t heap_bytes;
+
+    static const Limits& get() {
+        static Limits l = [] {
+            auto from_env = [](const char* name, size_t fallback) {
+                if (const char* env = std::getenv(name)) {
+                    long long n = std::atoll(env);
+                    if (n > 0) return size_t(n);
+                }
+                return fallback;
+            };
+            return Limits{
+                from_env("DREAM_MAX_DEPTH", size_t(4u) << 20),      // ~96 MB of continuations
+                from_env("DREAM_MAX_STACK", size_t(4u) << 20),      // ~32 MB of values
+                from_env("DREAM_MAX_HEAP", size_t(1u) << 30),       // 1 GB per process
+            };
+        }();
+        return l;
+    }
+};
+
+/// Raise in `p` if it has outgrown what one process may use. Returns true when
+/// it did, so the caller can stop what it was doing.
+///
+/// Called at safepoints rather than from `push_cont` or `alloc`: here the
+/// process is already in a consistent state, and safepoints are one reduction
+/// apart, so a limit can only be overshot by a bounded amount. Making the
+/// allocator itself fail would mean every caller of `alloc` -- most of which
+/// hold raw object pointers -- had to cope with a null.
+bool check_limits(Process& p) {
+    if (p.mode == Mode::Raise) return false;  // already unwinding; let it finish
+    const Limits& l = Limits::get();
+    const WellKnownAtoms& wk = well_known(p.runtime());
+
+    if (p.conts.size() > l.conts) {
+        do_raise(p, raise_error(p, wk.stack_overflow,
+                                "recursion too deep: " + std::to_string(p.conts.size()) +
+                                    " pending frames"));
+        return true;
+    }
+    if (p.stack.size() > l.stack) {
+        do_raise(p, raise_error(p, wk.stack_overflow,
+                                "value stack too deep: " + std::to_string(p.stack.size()) +
+                                    " entries"));
+        return true;
+    }
+    // Checked after a collection has had its chance, so this fires only for a
+    // process whose *live* data is too big, not one that merely allocates fast.
+    if (p.heap().bytes_allocated() > l.heap_bytes && p.heap().bytes_live() > l.heap_bytes / 2) {
+        do_raise(p, raise_error(p, wk.out_of_memory,
+                                "process heap grew past " + std::to_string(l.heap_bytes) +
+                                    " bytes"));
+        return true;
+    }
+    return false;
+}
+
 void run_process(Process& p, int64_t budget) {
     p.reductions = budget;
     while (p.reductions > 0) {
         // Safepoint. Every live value is reachable from the process's stacks,
         // its frame and its result -- nothing is stranded in a C++ local.
         if (p.heap().should_collect()) p.maybe_collect();
+
+        check_limits(p);
 
         switch (p.mode) {
             case Mode::Eval:
@@ -1131,6 +1219,7 @@ bool force_whnf(Process& p, Value v, Value* out) {
     // process's own stacks still hold every root, so a collection during this
     // is as safe as one at the outer level.
     const size_t floor = p.conts.size();
+    const size_t stack_floor = p.stack.size();
     const Mode saved_mode = p.mode;
     const uint32_t saved_node = p.node;
     const Value saved_frame = p.frame;
@@ -1138,6 +1227,7 @@ bool force_whnf(Process& p, Value v, Value* out) {
 
     enter(p, v);
     bool ok = true;
+    bool blocked = false;
     for (;;) {
         if (p.mode == Mode::Return && p.conts.size() <= floor) break;
         if (p.mode == Mode::Halted) break;
@@ -1152,6 +1242,53 @@ bool force_whnf(Process& p, Value v, Value* out) {
         } else {
             step_return(p);
         }
+
+        // The limit check the outer loop has, but *not* its collection.
+        // Without this a runaway recursion reached through a native --
+        // `console.print!` forcing a value that recurses for ever -- grows
+        // until the allocator throws, because this loop is where that forcing
+        // happens.
+        //
+        // Collecting here would be a bug: `force_whnf` is called from natives
+        // that hold raw object pointers across the call, and moving their
+        // objects out from under them is exactly what the "allocation never
+        // collects" rule exists to prevent. The outer loop still collects.
+        check_limits(p);
+
+        // A blocking native inside the value being forced -- `join!`, `recv!`,
+        // a read on a socket -- asked to be parked. This loop cannot park: it
+        // is running underneath a native, whose C++ frame has to return before
+        // the scheduler can touch the process. Carrying on would re-enter that
+        // native for ever, which is a livelock, not a hang: the loop spins
+        // without spending a reduction, so it never even yields its slice.
+        //
+        // So abandon the force and let the *outer* machine park instead. The
+        // native above us returns Block, and is called again once the thing it
+        // was waiting for has arrived.
+        if (p.park_requested) {
+            blocked = true;
+            ok = false;
+            break;
+        }
+    }
+
+    if (blocked) {
+        // Everything this force pushed has to come back off, and the thunks it
+        // blackholed have to be un-blackholed. Blackholing only rewrites the
+        // object's type tag -- the node and frame are untouched -- so putting
+        // the tag back leaves a thunk that can be forced again from scratch.
+        //
+        // Without this the retry walks straight into its own blackhole and
+        // reports `:loop value depends on itself`, which is the same bug
+        // wearing a different hat.
+        for (size_t i = p.conts.size(); i-- > floor;) {
+            const Cont& c = p.conts[i];
+            if (c.kind != ContKind::UpdateThunk) continue;
+            Obj* o = as_obj(c.v1);
+            if (o->type == ObjType::Blackhole) o->type = ObjType::Thunk;
+        }
+        p.conts.resize(floor);
+        p.stack.resize(stack_floor);
     }
 
     *out = p.result;

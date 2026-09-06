@@ -68,6 +68,54 @@ pub enum ExprKind {
     List(Vec<Expr>),
     Array(Vec<Expr>),
     Map(Vec<(Expr, Expr)>),
+
+    /// `match e { p => b, .. }`
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+}
+
+/// A pattern, as written in a `match` arm.
+///
+/// Patterns are matched in source order and force only as much of the value as
+/// deciding takes -- `[x, ..rest]` forces the first cell and neither `x` nor
+/// `rest`. That is what keeps `match` usable on a lazy or infinite structure.
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// `_` -- matches anything, binds nothing, forces nothing.
+    Wildcard,
+    /// A name -- matches anything and binds it. Forces nothing.
+    Bind(String),
+    /// A literal, compared with the same equality `==` uses.
+    Int(i64),
+    Float(f64),
+    Char(char),
+    Bool(bool),
+    Str(String),
+    Atom(String),
+    Unit,
+    /// `[a, b]`, or `[a, ..rest]` where the tail is bound (or `..` alone,
+    /// which matches the rest without naming it).
+    List(Vec<Pattern>, Option<Option<String>>),
+    /// `#[a, b]` and `#[a, ..rest]`.
+    Array(Vec<Pattern>, Option<Option<String>>),
+    /// `%{ k => p }` -- the keys are expressions, matched against what the map
+    /// holds. Keys the pattern does not mention are ignored.
+    Map(Vec<(Expr, Pattern)>),
+    /// `p as name` -- matches `p` and also binds the whole value.
+    As(Box<Pattern>, String),
+}
+
+/// One `pattern => body` of a `match`, with an optional guard.
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    /// `pattern if cond => ..` -- checked after the pattern matched, so the
+    /// guard can use what the pattern bound.
+    pub guard: Option<Expr>,
+    pub body: Expr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

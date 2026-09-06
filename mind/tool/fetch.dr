@@ -1,0 +1,136 @@
+// Getting dependencies.
+//
+// There is no index and no registry. A dependency says where it is -- a
+// directory on this machine, a git repository, or a tarball -- and `mind`
+// puts a copy where the compiler can find it. That is the whole model, and it
+// is Go's rather than Cargo's: no central name to squat, nothing to publish
+// to, and a URL that means the same thing to everyone who reads it.
+//
+// Fetching shells out to `git`, `curl` and `tar` rather than speaking those
+// protocols. They are already installed, already know about proxies and
+// credentials and certificate stores, and none of that is a build tool's
+// business.
+import std.core;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+import manifest;
+import util;
+
+/// Where fetched packages are kept. Shared between projects, because a
+/// repository at a given revision is the same bytes whoever asked for it.
+let cache_root! () =
+    match os.env! "MIND_HOME" {
+        () => match os.env! "HOME" {
+            () => ".mind",
+            home => util.join home ".mind",
+        },
+        home => home,
+    };
+
+/// A URL turned into one path segment. Not a hash: a directory you can read is
+/// worth more than one you cannot when a fetch goes wrong and you want to look.
+let slug url = {
+    let keep c =
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+    str.map (fn c -> if keep c { c } else { '_' }) url
+};
+
+let dep_dir! d = {
+    let rev = manifest.dep_rev d;
+    let at = match rev { [:none, _] => "", [_, v] => "@" + to_string v };
+    let source = match manifest.dep_kind d {
+        :git => manifest.spec_get d "git",
+        :url => manifest.spec_get d "url",
+        _ => manifest.dep_name d,
+    };
+    util.join (util.join (cache_root! ()) "cache") (slug (to_string source) + at)
+};
+
+/// Run a command, and answer `[:ok, out]` or `[:error, message]`.
+let run! what program args = {
+    let r = os.exec_for! program args 600000;
+    let code = core.map_get r :code (0 - 1);
+    let timed = core.map_get r :timed_out false;
+    if timed { [:error, what + ": timed out after 10 minutes"] }
+    else if code != 0 {
+        let err = str.trim (core.map_get r :err "");
+        [:error, what + " failed (" + to_string code + ")"
+            + (if str.is_empty err { "" } else { ": " + err })]
+    }
+    else { [:ok, core.map_get r :out ""] }
+};
+
+let git_fetch! d dir = {
+    let url = to_string (manifest.spec_get d "git");
+    let rev = manifest.dep_rev d;
+    // `--depth 1` against a tag or branch; a bare revision needs history to
+    // find it, so that case clones fully and then checks out.
+    let cloned = match rev {
+        [:tag, t] => run! "git clone" "git" ["clone", "--quiet", "--depth", "1", "--branch", to_string t, url, dir],
+        [:branch, b] => run! "git clone" "git" ["clone", "--quiet", "--depth", "1", "--branch", to_string b, url, dir],
+        _ => run! "git clone" "git" ["clone", "--quiet", url, dir],
+    };
+    match cloned {
+        [:error, why] => [:error, why],
+        _ => match rev {
+            [:rev, r] => run! "git checkout" "git" ["-C", dir, "checkout", "--quiet", to_string r],
+            _ => [:ok, ""],
+        },
+    }
+};
+
+let url_fetch! d dir = {
+    let url = to_string (manifest.spec_get d "url");
+    let archive = dir + ".tar.gz";
+    match run! "curl" "curl" ["--fail", "--silent", "--show-error", "--location", "--output", archive, url] {
+        [:error, why] => [:error, why],
+        _ => {
+            util.mkdir_p! dir
+            // `--strip-components 1`, because a release tarball is
+            // conventionally one directory holding the project.
+            match run! "tar" "tar" ["-xzf", archive, "-C", dir, "--strip-components", "1"] {
+                [:error, why] => [:error, why],
+                _ => {
+                    io.remove! archive
+                    [:ok, ""]
+                },
+            }
+        },
+    }
+};
+
+/// Where `d` is on disk, fetching it first if it is not there yet.
+///
+/// A fetched dependency is never re-fetched: it is pinned to a revision, so
+/// the copy in the cache is by definition the right one. `mind clean --deps`
+/// is how to change your mind.
+let resolve! from_root d = {
+    match manifest.dep_kind d {
+        :path => {
+            // Relative to the manifest that named it, so moving a project
+            // does not change what its dependencies mean.
+            let p = util.join from_root (to_string (manifest.spec_get d "path"));
+            if io.exists! p { [:ok, p] }
+            else { [:error, manifest.dep_name d + ": no directory at " + p] }
+        },
+        :unknown => [:error, manifest.dep_name d + ": needs one of `path`, `git` or `url`"],
+        kind => {
+            let dir = dep_dir! d;
+            if io.exists! (util.join dir "mind.toml") { [:ok, dir] }
+            else {
+                util.mkdir_p! (util.dirname dir)
+                let got = match kind { :git => git_fetch! d dir, _ => url_fetch! d dir };
+                match got {
+                    [:error, why] => [:error, manifest.dep_name d + ": " + why],
+                    _ =>
+                        if io.exists! (util.join dir "mind.toml") { [:ok, dir] }
+                        else { [:error, manifest.dep_name d + ": fetched, but it has no mind.toml"] },
+                }
+            }
+        },
+    }
+};

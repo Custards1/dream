@@ -1,0 +1,90 @@
+// Building: working out the package graph, then calling the compiler.
+//
+// `mind` does not compile anything itself. Dream compiles whole programs, so
+// the compiler wants every package at once rather than a series of object
+// files -- which means a build is: find the packages, hand `dreamc` their
+// directories, run it. There is nothing to cache and no link step.
+import std.core;
+import std.list;
+import std.os;
+import std.str;
+
+import fetch;
+import manifest;
+import util;
+
+/// Every package the root needs, transitively, as directories to search.
+///
+/// Depth-first with a seen-set: a diamond is normal (two dependencies sharing
+/// a third) and must be visited once, and a cycle must not spin.
+let rec collect! m seen acc = {
+    let deps = manifest.dependencies m;
+    let rec each! ds seen acc =
+        match ds {
+            [] => [:ok, seen, acc],
+            [d, ..rest] => match fetch.resolve! (manifest.root m) d {
+                [:error, why] => [:error, why, acc],
+                [:ok, dir] =>
+                    if list.contains dir seen { each! rest seen acc }
+                    else {
+                        match manifest.load! dir {
+                            [:error, why] => [:error, why, acc],
+                            [:ok, dep_m] => {
+                                let deeper = collect! dep_m (list.cons dir seen) (list.cons dir acc);
+                                match deeper {
+                                    [:error, why, partial] => [:error, why, partial],
+                                    [:ok, seen2, acc2] => each! rest seen2 acc2,
+                                }
+                            },
+                        }
+                    },
+            },
+        };
+    each! deps seen acc
+};
+
+/// `[:ok, [-L, dir, -L, dir, ..]]` -- the search paths for one build.
+let search_paths! m = {
+    match collect! m [manifest.root m] [] {
+        [:error, why, _] => [:error, why],
+        [:ok, _, dirs] => {
+            // The standard library, then every dependency. `MIND_STDLIB` is how
+            // an installed `mind` finds the library that shipped with it.
+            let std_root = match os.env! "MIND_STDLIB" { () => "mind", p => p };
+            let all = list.cons std_root (list.reverse dirs);
+            [:ok, list.flat_map (fn d -> ["-L", d]) all]
+        },
+    }
+};
+
+let target_dir m = util.join (manifest.root m) "target";
+let image m = util.join (target_dir m) (manifest.name m + ".dream");
+
+/// Compile the package. `extra` carries flags like `--test`.
+let compile! m extra = {
+    match search_paths! m {
+        [:error, why] => [:error, why],
+        [:ok, paths] => {
+            util.mkdir_p! (target_dir m)
+            let args = list.append [manifest.entry m]
+                                   (list.append paths
+                                                (list.append ["-o", image m] extra));
+            let compiler = match os.env! "DREAMC" { () => "dreamc", c => c };
+            let r = os.exec! compiler args;
+            let code = core.map_get r :code (0 - 1);
+            if code == 0 { [:ok, core.map_get r :out ""] }
+            else {
+                let err = core.map_get r :err "";
+                let out = core.map_get r :out "";
+                [:error, str.trim (err + out)]
+            }
+        },
+    }
+};
+
+/// Run a built image, passing `args` to the program.
+let run_image! m args = {
+    let vm = match os.env! "DREAM" { () => "dream", v => v };
+    let r = os.exec! vm (list.cons (image m) args);
+    [core.map_get r :code (0 - 1), core.map_get r :out "", core.map_get r :err ""]
+};

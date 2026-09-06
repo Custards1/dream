@@ -107,6 +107,8 @@ pub enum Tok {
     #[token("*")] Star,
     #[token("/")] Slash,
     #[token("%")] Percent,
+    // Longer first: `..` is the rest of a list pattern, `.` is a member.
+    #[token("..")] DotDot,
     #[token(".")] Dot,
     #[token(",")] Comma,
     #[token(";")] Semi,
@@ -167,6 +169,9 @@ pub struct Token {
     pub span: Span,
     /// True when a line break separates this token from the previous one.
     pub starts_line: bool,
+    /// 1-based column. Only meaningful for a token that starts a line, where
+    /// it decides whether the line continues the statement above it.
+    pub col: u32,
 }
 
 #[derive(Debug)]
@@ -182,7 +187,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
     for (res, range) in Tok::lexer(src).spanned() {
         let tok = res.map_err(|_| LexError { span: Span::new(range.start, range.end) })?;
         let starts_line = src[prev_end..range.start].contains('\n');
-        out.push(Token { tok, span: Span::new(range.start, range.end), starts_line });
+        let line_start = src[..range.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        // Counted in characters rather than bytes, so a line indented with
+        // anything non-ASCII still lines up with its neighbours.
+        let col = src[line_start..range.start].chars().count() as u32 + 1;
+        out.push(Token { tok, span: Span::new(range.start, range.end), starts_line, col });
         prev_end = range.end;
     }
     Ok(out)

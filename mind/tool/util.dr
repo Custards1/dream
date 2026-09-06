@@ -1,0 +1,81 @@
+// Paths, files, and the small things every other module here needs.
+import std.core;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+// --- paths ------------------------------------------------------------------
+//
+// Textual, not resolved against the file system: `mind` passes paths to
+// `dreamc` and to `git`, both of which do their own resolving, so normalising
+// here would only lose information -- a relative dependency path is meaningful
+// relative to the manifest that named it.
+
+let join a b =
+    if str.is_empty a { b }
+    else if str.is_empty b { a }
+    else if str.ends_with "/" a { a + b }
+    else { a + "/" + b };
+
+/// Everything before the last `/`, or "." when there is none.
+let dirname path = {
+    let rec last_slash i best =
+        if i >= str.byte_length path { best }
+        else if str.slice i 1 path == "/" { last_slash (i + 1) i }
+        else { last_slash (i + 1) best };
+    let at = last_slash 0 (0 - 1);
+    if at < 0 { "." } else if at == 0 { "/" } else { str.slice 0 at path }
+};
+
+let basename path = {
+    let parts = str.split "/" path;
+    if list.is_empty parts { path } else { list.last parts }
+};
+
+// --- files ------------------------------------------------------------------
+
+let rec read_chunks! h acc = {
+    let chunk = io.read! h 65536;
+    if len chunk == 0 { acc } else { read_chunks! h (acc + chunk) }
+};
+
+/// The whole file, or `()` when it cannot be opened.
+let read_file! path = {
+    let opened = try! { io.open! path :read } catch e { () };
+    match opened {
+        () => (),
+        h => {
+            let text = read_chunks! h "";
+            io.close! h
+            text
+        }
+    }
+};
+
+let write_file! path text = {
+    let h = io.open! path :write;
+    let rec put! offset = {
+        let left = str.byte_length text - offset;
+        if left <= 0 { :done }
+        else {
+            let wrote = io.write! h (str.slice offset left text);
+            put! (offset + wrote)
+        }
+    };
+    put! 0
+    io.close! h
+};
+
+/// Make `path` and every directory above it.
+let rec mkdir_p! path =
+    match path {
+        "" => :done,
+        "." => :done,
+        "/" => :done,
+        p => {
+            let parent = dirname p;
+            if parent != p { mkdir_p! parent } else { :done }
+            io.mkdir! p
+        }
+    };

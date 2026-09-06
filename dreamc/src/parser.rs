@@ -15,7 +15,7 @@ use crate::lexer::{Span, Tok, Token};
 
 const KEYWORDS: &[&str] = &[
     "let", "rec", "if", "else", "import", "as", "catch", "true", "false", "not", "try!", "fn",
-    "virtual", "derive", "comp", "comp!", "when", "mod",
+    "virtual", "derive", "comp", "comp!", "when", "mod", "match",
 ];
 
 /// Keywords that can never begin an expression, so they end an application.
@@ -28,6 +28,10 @@ pub struct Parser<'a> {
     end: Span,
     nl_sensitive: bool,
     no_brace: bool,
+    /// The column the statement being parsed began at. A line indented past it
+    /// continues that statement rather than starting a new one -- see
+    /// `continues`.
+    stmt_indent: u32,
     pub diags: Vec<Diag>,
 }
 
@@ -41,6 +45,7 @@ impl<'a> Parser<'a> {
             end: Span::new(src_len, src_len),
             nl_sensitive: true,
             no_brace: false,
+            stmt_indent: 0,
             diags: Vec::new(),
         }
     }
@@ -130,11 +135,40 @@ impl<'a> Parser<'a> {
     }
 
     /// May the current token continue the expression under construction?
+    ///
+    /// A newline ends a statement, but a line *indented past the statement it
+    /// follows* continues it. Without that rule a call spread over several
+    /// lines silently became several statements, and a block quietly took the
+    /// value of the last of them -- a call written as
+    ///
+    /// ```text
+    ///     f (g x)
+    ///       (h y)
+    /// ```
+    ///
+    /// parsed as `f (g x)` and then `(h y)`, with no error anywhere. Since the
+    /// indentation is what a reader already goes by, the parser now goes by it
+    /// too.
+    ///
+    /// Lines beginning with an infix operator, `.`, `else` or `catch` continue
+    /// regardless; none of those can start a statement, so they are
+    /// unambiguous whatever their indentation, and they are handled at their
+    /// own call sites rather than here.
     fn continues(&self) -> bool {
         match self.peek() {
             None => false,
-            Some(t) => !(self.nl_sensitive && t.starts_line),
+            Some(t) => !(self.nl_sensitive && t.starts_line) || t.col > self.stmt_indent,
         }
+    }
+
+    /// Run `f` with the statement indentation set from the current token, and
+    /// restore it afterwards so a nested block does not disturb its parent.
+    fn statement<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.stmt_indent;
+        self.stmt_indent = self.peek().map(|t| t.col).unwrap_or(0);
+        let r = f(self);
+        self.stmt_indent = saved;
+        r
     }
 
     // ---- items ------------------------------------------------------------
@@ -146,28 +180,28 @@ impl<'a> Parser<'a> {
             if self.peek().is_none() {
                 break;
             }
-            let result = if self.is_kw("import") {
-                self.parse_import().map(Item::Import)
-            } else if self.is_kw("derive") {
-                self.parse_derive().map(Item::Derive)
-            } else if self.is_kw("virtual") {
-                self.parse_virtual().map(Item::Virtual)
-            } else if self.is_kw("when") {
-                self.parse_when()
-            } else if self.is_kw("mod") {
-                self.parse_mod().map(Item::Mod)
-            } else if self.is_kw("let") {
-                self.parse_let_decl().map(Item::Let)
+            let result = self.statement(|p| if p.is_kw("import") {
+                p.parse_import().map(Item::Import)
+            } else if p.is_kw("derive") {
+                p.parse_derive().map(Item::Derive)
+            } else if p.is_kw("virtual") {
+                p.parse_virtual().map(Item::Virtual)
+            } else if p.is_kw("when") {
+                p.parse_when()
+            } else if p.is_kw("mod") {
+                p.parse_mod().map(Item::Mod)
+            } else if p.is_kw("let") {
+                p.parse_let_decl().map(Item::Let)
             } else {
                 Err(Diag::error(
-                    self.span(),
+                    p.span(),
                     format!(
                         "expected `import`, `derive`, `virtual`, `mod` or `let` at top level, \
                          found {}",
-                        self.describe()
+                        p.describe()
                     ),
                 ))
-            };
+            });
             match result {
                 Ok(item) => {
                     items.push(item);
@@ -650,6 +684,7 @@ impl<'a> Parser<'a> {
                     ExprKind::Bool(false)
                 }
                 "if" => return self.parse_if(),
+                "match" => return self.parse_match(),
                 "try!" => return self.parse_try(),
                 "fn" => return self.parse_lambda(),
                 "comp" | "comp!" => {
@@ -772,6 +807,176 @@ impl<'a> Parser<'a> {
         Ok(Expr { kind: ExprKind::If(Box::new(cond), Box::new(then), els), span })
     }
 
+    /// `match e { p => b, p if g => b, _ => b }`
+    fn parse_match(&mut self) -> PResult<Expr> {
+        let start = self.span();
+        self.pos += 1; // `match`
+
+        // The scrutinee stops at `{`, exactly as an `if` condition does --
+        // otherwise the brace opening the arms would be read as a block being
+        // passed to it.
+        let saved = self.no_brace;
+        self.no_brace = true;
+        let scrutinee = self.parse_expr();
+        self.no_brace = saved;
+        let scrutinee = scrutinee?;
+
+        self.expect(&Tok::LBrace, "`{` opening the match arms")?;
+        let arms = self.grouped(|p| {
+            let mut arms = Vec::new();
+            while !p.at(&Tok::RBrace) && p.peek().is_some() {
+                let arm_start = p.span();
+                let pattern = p.parse_pattern()?;
+                let guard = if p.is_kw("if") {
+                    p.pos += 1;
+                    Some(p.parse_expr()?)
+                } else {
+                    None
+                };
+                p.expect(&Tok::FatArrow, "`=>` after a match pattern")?;
+                let body = p.parse_expr()?;
+                arms.push(MatchArm { pattern, guard, body, span: arm_start.to(p.prev_span()) });
+                if !p.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            Ok(arms)
+        })?;
+        self.expect(&Tok::RBrace, "`}` closing the match arms")?;
+        if arms.is_empty() {
+            return Err(Diag::error(start, "a match needs at least one arm")
+                .with_note("an arm is `pattern => expression`"));
+        }
+        let span = start.to(self.prev_span());
+        Ok(Expr { kind: ExprKind::Match { scrutinee: Box::new(scrutinee), arms }, span })
+    }
+
+    /// A pattern, including a trailing `as name`.
+    fn parse_pattern(&mut self) -> PResult<Pattern> {
+        let inner = self.parse_pattern_primary()?;
+        if self.is_kw("as") {
+            self.pos += 1;
+            let (name, _) = self.expect_ident("a name to bind the whole value to")?;
+            return Ok(Pattern::As(Box::new(inner), name));
+        }
+        Ok(inner)
+    }
+
+    /// The elements of a `[..]` or `#[..]` pattern, and the `..rest` if there
+    /// is one. `Some(None)` is a bare `..`: match the rest without naming it.
+    fn parse_pattern_elements(
+        &mut self,
+        close: &Tok,
+        what: &str,
+    ) -> PResult<(Vec<Pattern>, Option<Option<String>>)> {
+        let result = self.grouped(|p| {
+            let mut items = Vec::new();
+            let mut rest = None;
+            while !p.at(close) && p.peek().is_some() {
+                if p.eat(&Tok::DotDot) {
+                    // `..` and `..name` both take everything left, so nothing
+                    // may follow them.
+                    let name = match p.peek() {
+                        Some(Token { tok: Tok::Ident(n), .. })
+                            if !KEYWORDS.contains(&n.as_str()) =>
+                        {
+                            let n = n.clone();
+                            p.pos += 1;
+                            Some(n)
+                        }
+                        _ => None,
+                    };
+                    rest = Some(name);
+                    break;
+                }
+                items.push(p.parse_pattern()?);
+                if !p.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            Ok((items, rest))
+        })?;
+        self.expect(close, what)?;
+        Ok(result)
+    }
+
+    fn parse_pattern_primary(&mut self) -> PResult<Pattern> {
+        let start = self.span();
+        let Some(t) = self.peek() else {
+            return Err(Diag::error(self.end, "unexpected end of file in a pattern"));
+        };
+        Ok(match &t.tok {
+            Tok::Int(v) => { let v = *v; self.pos += 1; Pattern::Int(v) }
+            Tok::Float(v) => { let v = *v; self.pos += 1; Pattern::Float(v) }
+            Tok::Char(c) => { let c = *c; self.pos += 1; Pattern::Char(c) }
+            Tok::Str(s) => { let s = s.clone(); self.pos += 1; Pattern::Str(s) }
+            Tok::Atom(s) => { let s = s.clone(); self.pos += 1; Pattern::Atom(s) }
+            // A negative literal: `-1` is one pattern, not an operator applied
+            // to one, because there is nothing in a pattern to apply it to.
+            Tok::Minus => {
+                self.pos += 1;
+                match self.peek().map(|t| &t.tok) {
+                    Some(Tok::Int(v)) => { let v = -*v; self.pos += 1; Pattern::Int(v) }
+                    Some(Tok::Float(v)) => { let v = -*v; self.pos += 1; Pattern::Float(v) }
+                    _ => return Err(Diag::error(start, "expected a number after `-` in a pattern")),
+                }
+            }
+            Tok::LParen => {
+                self.pos += 1;
+                if self.eat(&Tok::RParen) {
+                    Pattern::Unit
+                } else {
+                    let inner = self.grouped(|p| p.parse_pattern())?;
+                    self.expect(&Tok::RParen, "`)`")?;
+                    inner
+                }
+            }
+            Tok::LBracket => {
+                self.pos += 1;
+                let (items, rest) = self.parse_pattern_elements(&Tok::RBracket, "`]`")?;
+                Pattern::List(items, rest)
+            }
+            Tok::HashBracket => {
+                self.pos += 1;
+                let (items, rest) = self.parse_pattern_elements(&Tok::RBracket, "`]`")?;
+                Pattern::Array(items, rest)
+            }
+            Tok::PercentBrace => {
+                self.pos += 1;
+                let pairs = self.grouped(|p| {
+                    let mut pairs = Vec::new();
+                    while !p.at(&Tok::RBrace) && p.peek().is_some() {
+                        let key = p.parse_expr()?;
+                        p.expect(&Tok::FatArrow, "`=>` between a map key and its pattern")?;
+                        let value = p.parse_pattern()?;
+                        pairs.push((key, value));
+                        if !p.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    Ok(pairs)
+                })?;
+                self.expect(&Tok::RBrace, "`}` closing the map pattern")?;
+                Pattern::Map(pairs)
+            }
+            Tok::Ident(name) => match name.as_str() {
+                "true" => { self.pos += 1; Pattern::Bool(true) }
+                "false" => { self.pos += 1; Pattern::Bool(false) }
+                "_" => { self.pos += 1; Pattern::Wildcard }
+                other if KEYWORDS.contains(&other) => {
+                    return Err(Diag::error(start, format!("`{other}` cannot be a pattern")));
+                }
+                _ => { let n = name.clone(); self.pos += 1; Pattern::Bind(n) }
+            },
+            other => {
+                return Err(Diag::error(
+                    start,
+                    format!("expected a pattern, found `{}`", tok_text(other)),
+                ));
+            }
+        })
+    }
+
     fn parse_try(&mut self) -> PResult<Expr> {
         let start = self.span();
         self.pos += 1; // `try!`
@@ -829,11 +1034,13 @@ impl<'a> Parser<'a> {
             if self.at(&Tok::RBrace) || self.peek().is_none() {
                 break Ok(());
             }
-            let stmt = if self.is_kw("let") {
-                self.parse_let_decl().map(Stmt::Let)
-            } else {
-                self.parse_expr().map(Stmt::Expr)
-            };
+            let stmt = self.statement(|p| {
+                if p.is_kw("let") {
+                    p.parse_let_decl().map(Stmt::Let)
+                } else {
+                    p.parse_expr().map(Stmt::Expr)
+                }
+            });
             match stmt {
                 Ok(s) => stmts.push(s),
                 Err(e) => break Err(e),
@@ -915,6 +1122,7 @@ fn tok_text(t: &Tok) -> &'static str {
         Tok::Star => "*",
         Tok::Slash => "/",
         Tok::Percent => "%",
+        Tok::DotDot => "..",
         Tok::Dot => ".",
         Tok::Comma => ",",
         Tok::Semi => ";",

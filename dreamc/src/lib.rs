@@ -70,6 +70,8 @@ pub struct Options {
     /// `std.*` ones. An embedder names its own module here so that a program
     /// importing it compiles.
     pub host_modules: Vec<String>,
+    /// Packages in scope without an import. `mind` passes `std`.
+    pub preludes: Vec<String>,
 }
 
 impl Default for Options {
@@ -81,6 +83,7 @@ impl Default for Options {
             config: config::Config::new(),
             test_mode: false,
             host_modules: Vec::new(),
+            preludes: Vec::new(),
         }
     }
 }
@@ -138,6 +141,15 @@ fn lower_set(
     debug_info: bool,
     carried: Vec<Diag>,
 ) -> Result<Compiled, CompileError> {
+    lower_set_with(set, debug_info, carried, Vec::new())
+}
+
+fn lower_set_with(
+    set: modules::ModuleSet,
+    debug_info: bool,
+    carried: Vec<Diag>,
+    preludes: Vec<String>,
+) -> Result<Compiled, CompileError> {
     let files = set.files.clone();
     let root = set.modules.len().saturating_sub(1);
     let (name, source_path) = match set.modules.get(root) {
@@ -146,6 +158,7 @@ fn lower_set(
     };
 
     let mut lo = lower::Lowerer::new(&name, &source_path);
+    lo.with_preludes(preludes);
     lo.diags = carried;
     lo.lower_program(&set);
     if lo.diags.iter().any(|d| d.level == Level::Error) {

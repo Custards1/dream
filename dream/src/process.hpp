@@ -130,6 +130,11 @@ public:
     /// process is woken, and `connect` is the one operation where the second
     /// call must ask how the first went rather than start again.
     int64_t io_pending = -1;
+
+    /// The `std.os.exec!` whose child is still running, or -1. Same reason as
+    /// `io_pending`: a blocking native is re-entered from the top, and this is
+    /// how the second entry knows which child it was waiting for.
+    int64_t os_pending = -1;
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }
 

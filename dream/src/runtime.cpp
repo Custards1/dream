@@ -1,6 +1,7 @@
 #include "runtime.hpp"
 
 #include "io.hpp"
+#include "os.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -22,6 +23,8 @@ Runtime::Runtime() : wk_(std::make_unique<WellKnownAtoms>()) {
     wk_->not_a_function = intern_atom("not_a_function");
     wk_->no_such_member = intern_atom("no_such_member");
     wk_->loop = intern_atom("loop");
+    wk_->stack_overflow = intern_atom("stack_overflow");
+    wk_->out_of_memory = intern_atom("out_of_memory");
     wk_->killed = intern_atom("killed");
     wk_->normal = intern_atom("normal");
     wk_->timeout = intern_atom("timeout");
@@ -34,6 +37,7 @@ Runtime::Runtime() : wk_(std::make_unique<WellKnownAtoms>()) {
     register_module(make_ffi_module());
     register_module(make_io_module());
     register_module(make_net_module());
+    register_module(make_os_module());
     // The poller thread has to exist before any process can wait on a
     // descriptor, and it costs nothing when nothing does IO.
     io_init();
@@ -43,6 +47,7 @@ Runtime::~Runtime() {
     // Stop the poller before the scheduler it wakes into can go away, and
     // close whatever descriptors the program left open.
     io_shutdown();
+    os_shutdown();
 }
 
 bool Runtime::load_image_file(const std::string& path, std::string& error) {

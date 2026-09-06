@@ -1,0 +1,372 @@
+// JSON, parsed and rendered.
+//
+// The parser is recursive descent over a list of characters. Every parsing
+// function has the same shape -- it takes the characters still to read and
+// returns `[value, rest]`, or `()` if it did not match -- which is what lets
+// them compose without any parser state to thread through.
+//
+// Nothing here raises. A parser that raised could not be used from a pure
+// function, and reading a configuration file is not an effect. `parse` answers
+// `[:ok, value]` or `[:error, message]` instead, and `parse_or` is the form for
+// when a default is more useful than a diagnosis.
+//
+// | JSON      | Dream                                    |
+// |-----------|------------------------------------------|
+// | object    | map, with string keys                    |
+// | array     | list                                      |
+// | string    | string                                    |
+// | number    | integer when it has no `.`/`e`, else float |
+// | true/false| bool                                      |
+// | null      | `()`                                      |
+//
+// `null` and "absent" are therefore the same value, which matches how the rest
+// of the library answers a missing thing.
+
+import std.core;
+import std.list;
+import std.str;
+
+// --- reading ----------------------------------------------------------------
+
+let is_ws c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+
+let rec skip_ws cs = if list.is_empty cs { cs }
+                     else if is_ws (list.head cs) { skip_ws (list.tail cs) }
+                     else { cs };
+
+let is_digit c = c >= '0' && c <= '9';
+
+/// `[value, rest]`, the shape every parser below returns.
+let step value rest = [value, rest];
+let step_value s = list.head s;
+let step_rest s = list.head (list.tail s);
+
+/// Does `cs` begin with the characters of `word`?
+let rec starts cs word =
+    if list.is_empty word { true }
+    else if list.is_empty cs { false }
+    else if list.head cs == list.head word { starts (list.tail cs) (list.tail word) }
+    else { false };
+
+let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
+
+// --- strings ----------------------------------------------------------------
+
+/// The four hex digits of a `\uXXXX` escape, as a number.
+let hex_value c =
+    if c >= '0' && c <= '9' { core.char_code c - 48 }
+    else if c >= 'a' && c <= 'f' { core.char_code c - 87 }
+    else if c >= 'A' && c <= 'F' { core.char_code c - 55 }
+    else { 0 - 1 };
+
+let rec hex4 cs n acc =
+    if n <= 0 { [acc, cs] }
+    else if list.is_empty cs { () }
+    else {
+        let d = hex_value (list.head cs);
+        if d < 0 { () } else { hex4 (list.tail cs) (n - 1) (acc * 16 + d) }
+    };
+
+/// The body of a string, after the opening quote. `acc` collects characters in
+/// reverse, because consing is constant time and reversing once at the end is
+/// cheaper than appending at every step.
+let rec string_body cs acc =
+    if list.is_empty cs { () }
+    else {
+        let c = list.head cs;
+        let rest = list.tail cs;
+        if c == '"' { step (str.of_chars (list.reverse acc)) rest }
+        else if c != '\\' { string_body rest (list.cons c acc) }
+        else if list.is_empty rest { () }
+        else {
+            let e = list.head rest;
+            let after = list.tail rest;
+            if e == 'n' { string_body after (list.cons '\n' acc) }
+            else if e == 't' { string_body after (list.cons '\t' acc) }
+            else if e == 'r' { string_body after (list.cons '\r' acc) }
+            else if e == 'b' { string_body after (list.cons (core.char_of_code 8) acc) }
+            else if e == 'f' { string_body after (list.cons (core.char_of_code 12) acc) }
+            else if e == '"' { string_body after (list.cons '"' acc) }
+            else if e == '\\' { string_body after (list.cons '\\' acc) }
+            else if e == '/' { string_body after (list.cons '/' acc) }
+            else if e == 'u' {
+                let h = hex4 after 4 0;
+                if h == () { () }
+                else {
+                    let code = list.head h;
+                    let tail_after = list.head (list.tail h);
+                    string_body tail_after (list.cons (core.char_of_code code) acc)
+                }
+            }
+            else { () }
+        }
+    };
+
+// --- numbers ----------------------------------------------------------------
+
+/// Take the characters that can belong to a JSON number, and note whether any
+/// of them made it a float. JSON has no hex or leading `+`, so this is exactly
+/// the set `parse_int`/`parse_float` will accept.
+let rec number_chars cs acc floaty =
+    if list.is_empty cs { [list.reverse acc, floaty, cs] }
+    else {
+        let c = list.head cs;
+        if is_digit c || c == '-' || c == '+' {
+            number_chars (list.tail cs) (list.cons c acc) floaty
+        } else if c == '.' || c == 'e' || c == 'E' {
+            number_chars (list.tail cs) (list.cons c acc) true
+        } else { [list.reverse acc, floaty, cs] }
+    };
+
+let parse_number cs = {
+    let taken = number_chars cs [] false;
+    let text = str.of_chars (list.head taken);
+    let floaty = list.nth 1 taken;
+    let rest = list.nth 2 taken;
+    if str.is_empty text { () }
+    else {
+        let n = if floaty { core.parse_float text } else { core.parse_int text };
+        if n == () { () } else { step n rest }
+    }
+};
+
+// --- values -----------------------------------------------------------------
+
+let rec parse_value cs = {
+    let s = skip_ws cs;
+    if list.is_empty s { () }
+    else {
+        let c = list.head s;
+        if c == '"' { string_body (list.tail s) [] }
+        else if c == '{' { parse_object (list.tail s) (core.map_new ()) true }
+        else if c == '[' { parse_array (list.tail s) [] true }
+        else if starts s (str.chars "true") { step true (drop_n 4 s) }
+        else if starts s (str.chars "false") { step false (drop_n 5 s) }
+        else if starts s (str.chars "null") { step () (drop_n 4 s) }
+        else if is_digit c || c == '-' { parse_number s }
+        else { () }
+    }
+};
+
+let rec parse_object cs acc first = {
+    let s = skip_ws cs;
+    if list.is_empty s { () }
+    else if list.head s == '}' { step acc (list.tail s) }
+    else {
+        // A comma is required between members and forbidden before the first.
+        let after_comma =
+            if first { s }
+            else if list.head s == ',' { skip_ws (list.tail s) }
+            else { () };
+        if after_comma == () { () }
+        else if list.is_empty after_comma { () }
+        else if list.head after_comma != '"' { () }
+        else {
+            let k = string_body (list.tail after_comma) [];
+            if k == () { () }
+            else {
+                let colon = skip_ws (step_rest k);
+                if list.is_empty colon { () }
+                else if list.head colon != ':' { () }
+                else {
+                    let v = parse_value (list.tail colon);
+                    if v == () { () }
+                    else {
+                        let grown = core.map_put acc (step_value k) (step_value v);
+                        parse_object (step_rest v) grown false
+                    }
+                }
+            }
+        }
+    }
+};
+
+let rec parse_array cs acc first = {
+    let s = skip_ws cs;
+    if list.is_empty s { () }
+    else if list.head s == ']' { step (list.reverse acc) (list.tail s) }
+    else {
+        let after_comma =
+            if first { s }
+            else if list.head s == ',' { list.tail s }
+            else { () };
+        if after_comma == () { () }
+        else {
+            let v = parse_value after_comma;
+            if v == () { () }
+            else { parse_array (step_rest v) (list.cons (step_value v) acc) false }
+        }
+    }
+};
+
+/// `[:ok, value]`, or `[:error, message]`.
+let parse text = {
+    let r = parse_value (str.chars text);
+    if r == () { [:error, "not valid JSON"] }
+    else {
+        let rest = skip_ws (step_rest r);
+        if list.is_empty rest { [:ok, step_value r] }
+        else { [:error, "trailing characters after the JSON value"] }
+    }
+};
+
+let ok r = list.head r == :ok;
+let value r = list.nth 1 r;
+
+/// The parsed value, or `default` if the text is not valid JSON.
+let parse_or default text = {
+    let r = parse text;
+    if ok r { value r } else { default }
+};
+
+// --- writing ----------------------------------------------------------------
+//
+// The inverse of the table at the top of this file, with one asymmetry worth
+// knowing: `()` renders as `null`, so a round trip through JSON cannot tell a
+// missing member from one that was explicitly null. JSON cannot either.
+
+let escape_char c =
+    if c == '"' { "\\\"" }
+    else if c == '\\' { "\\\\" }
+    else if c == '\n' { "\\n" }
+    else if c == '\t' { "\\t" }
+    else if c == '\r' { "\\r" }
+    else if core.char_code c == 8 { "\\b" }
+    else if core.char_code c == 12 { "\\f" }
+    else if core.char_code c < 32 {
+        // The only characters JSON insists on escaping, and the only ones that
+        // need the `\u` form: everything else is legal as itself, including
+        // any non-ASCII, which stays as UTF-8 rather than becoming escapes.
+        let code = core.char_code c;
+        let digits = "0123456789abcdef";
+        let hi = str.slice ((code / 16) % 16) 1 digits;
+        let lo = str.slice (code % 16) 1 digits;
+        "\\u00" + hi + lo
+    }
+    else { str.of_chars [c] };
+
+let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
+
+/// A number as JSON. Dream renders a whole float as `2` where JSON readers
+/// generally expect `2.0` back, but both parse to the same value, and forcing
+/// a `.0` on would misrepresent an integer.
+let rec write v = {
+    let t = type_of v;
+    if t == :unit { "null" }
+    else if t == :bool { if v { "true" } else { "false" } }
+    else if t == :integer { to_string v }
+    else if t == :float { to_string v }
+    else if t == :string { quote v }
+    else if t == :atom { quote (str.slice 1 (str.byte_length (to_string v)) (to_string v)) }
+    else if t == :list { "[" + str.join_str "," (list.map write v) + "]" }
+    else if t == :array { "[" + str.join_str "," (list.map write (core.array_to_list v)) + "]" }
+    else if t == :map {
+        let pair p = quote (to_string (list.head p)) + ":" + write (list.nth 1 p);
+        "{" + str.join_str "," (list.map pair (core.map_pairs v)) + "}"
+    }
+    else { quote (to_string v) }
+};
+
+/// The same, spread over lines with two-space indentation.
+let rec write_indented depth v = {
+    let pad n = str.repeat n "  ";
+    let t = type_of v;
+    let inner = depth + 1;
+    if t == :list || t == :array {
+        let items = if t == :array { core.array_to_list v } else { v };
+        if list.is_empty items { "[]" }
+        else {
+            let one x = pad inner + write_indented inner x;
+            "[\n" + str.join_str ",\n" (list.map one items) + "\n" + pad depth + "]"
+        }
+    }
+    else if t == :map {
+        let pairs = core.map_pairs v;
+        if list.is_empty pairs { "{}" }
+        else {
+            let one p = {
+                let key = quote (to_string (list.head p));
+                pad inner + key + ": " + write_indented inner (list.nth 1 p)
+            };
+            "{\n" + str.join_str ",\n" (list.map one pairs) + "\n" + pad depth + "}"
+        }
+    }
+    else { write v }
+};
+
+let pretty v = write_indented 0 v;
+
+// --- tests ------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let parsed text = value (parse text);
+
+    let tests = [
+        // scalars
+        test.case "integer"        $( test.eq! 42 (parsed "42") ),
+        test.case "negative"       $( test.eq! (0 - 7) (parsed "-7") ),
+        test.case "float"          $( test.eq! 3.5 (parsed "3.5") ),
+        test.case "exponent"       $( test.eq! 1500.0 (parsed "1.5e3") ),
+        test.case "true"           $( test.true! (parsed "true") ),
+        test.case "false"          $( test.false! (parsed "false") ),
+        test.case "null is unit"   $( test.eq! () (parsed "null") ),
+        test.case "string"         $( test.eq! "hi" (parsed "\"hi\"") ),
+
+        // escapes
+        test.case "escaped newline" $( test.eq! "a\nb" (parsed "\"a\\nb\"") ),
+        test.case "escaped quote"   $( test.eq! "a\"b" (parsed "\"a\\\"b\"") ),
+        test.case "escaped solidus" $( test.eq! "a/b" (parsed "\"a\\/b\"") ),
+        test.case "unicode escape"  $( test.eq! "A" (parsed "\"\\u0041\"") ),
+        test.case "non-ascii escape" $( test.eq! "\u{e9}" (parsed "\"\\u00e9\"") ),
+
+        // structures
+        test.case "empty array"    $( test.eq! [] (parsed "[]") ),
+        test.case "array"          $( test.eq! [1, 2, 3] (parsed "[1,2,3]") ),
+        test.case "nested array"   $( test.eq! [[1], [2]] (parsed "[[1],[2]]") ),
+        test.case "mixed array"    $( test.eq! [1, "a", true, ()] (parsed "[1,\"a\",true,null]") ),
+        test.case "empty object"   $( test.eq! 0 (len (parsed "{}")) ),
+        test.case "object member"  $( test.eq! 1 (core.map_get (parsed "{\"a\":1}") "a" 0) ),
+        test.case "two members"    $( test.eq! 2 (len (parsed "{\"a\":1,\"b\":2}")) ),
+        test.case "nested object"
+            $( test.eq! 2 (core.map_get (core.map_get (parsed "{\"x\":{\"y\":2}}") "x" ()) "y" 0) ),
+
+        // whitespace is not significant
+        test.case "leading space"  $( test.eq! 1 (parsed "   1") ),
+        test.case "spaces everywhere"
+            $( test.eq! 1 (core.map_get (parsed " { \"a\" : 1 } ") "a" 0) ),
+        test.case "newlines"       $( test.eq! [1, 2] (parsed "[\n1,\n2\n]") ),
+
+        // failures are values, not raises
+        test.case "unquoted key"   $( test.false! (ok (parse "{a:1}")) ),
+        test.case "trailing comma" $( test.false! (ok (parse "[1,]")) ),
+        test.case "unclosed"       $( test.false! (ok (parse "[1")) ),
+        test.case "trailing text"  $( test.false! (ok (parse "1 2")) ),
+        test.case "empty input"    $( test.false! (ok (parse "")) ),
+        test.case "bare word"      $( test.false! (ok (parse "nope")) ),
+        test.case "parse_or"       $( test.eq! :fallback (parse_or :fallback "{") ),
+
+        // writing
+        test.case "write integer"  $( test.eq! "1" (write 1) ),
+        test.case "write null"     $( test.eq! "null" (write ()) ),
+        test.case "write bool"     $( test.eq! "true" (write true) ),
+        test.case "write string"   $( test.eq! "\"a\"" (write "a") ),
+        test.case "write escapes"  $( test.eq! "\"a\\nb\"" (write "a\nb") ),
+        test.case "write control"  $( test.eq! "\"\\u0001\"" (write (core.char_of_code 1 |> fn c -> str.of_chars [c])) ),
+        test.case "write array"    $( test.eq! "[1,2]" (write [1, 2]) ),
+        test.case "write empty"    $( test.eq! "[]" (write []) ),
+        test.case "write atom drops the colon" $( test.eq! "\"ok\"" (write :ok) ),
+        test.case "write object"   $( test.eq! "{\"a\":1}" (write %{ "a" => 1 }) ),
+
+        // and back again
+        test.case "round trip array"
+            $( test.eq! [1, "a", true] (parsed (write [1, "a", true])) ),
+        test.case "round trip quotes"
+            $( test.eq! "q\"uote" (parsed (write "q\"uote")) ),
+        test.case "round trip object"
+            $( test.eq! 1 (core.map_get (parsed (write %{ "a" => 1 })) "a" 0) ),
+        test.case "pretty round trips"
+            $( test.eq! [1, 2] (parsed (pretty [1, 2])) ),
+    ];
+}

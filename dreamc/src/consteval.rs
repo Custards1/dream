@@ -177,6 +177,15 @@ impl<'a> ConstEvaluator<'a> {
 
     fn eval_inner(&mut self, e: &Expr, env: &Env, module: usize) -> Result<CValue, Diag> {
         match &e.kind {
+            // `match` is not evaluated at compile time yet. Saying so beats
+            // the alternatives: silently treating it as unevaluatable would
+            // make `comp` quietly skip work it was asked to do.
+            ExprKind::Match { .. } => Err(Diag::error(
+                e.span,
+                "`match` cannot be evaluated at compile time yet",
+            )
+            .with_note("move the `match` out of the `comp`, or use `comp!`")),
+
             ExprKind::Int(v) => Ok(CValue::Int(*v)),
             ExprKind::Float(v) => Ok(CValue::Float(*v)),
             ExprKind::Bool(v) => Ok(CValue::Bool(*v)),

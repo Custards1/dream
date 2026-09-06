@@ -175,6 +175,7 @@ fn run(opts: &Options) -> Result<(), String> {
     }
 
     let options = dreamc::Options {
+        preludes: vec![],
         include: opts.include.clone(),
         package_roots: opts.package_roots.clone(),
         debug_info: opts.debug_info,

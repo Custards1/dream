@@ -190,8 +190,15 @@ int main(int argc, char** argv) {
     bool dump = false, stats = false, use_jit = true;
     uint32_t jit_threshold = 0;
 
+    std::vector<std::string> program_args;
+    bool past_image = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
+        // Once the image is named, stop interpreting anything as a VM option.
+        if (past_image) {
+            program_args.push_back(a);
+            continue;
+        }
         auto next = [&](const char* what) -> std::string {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "dream: %s needs a value\n", what);
@@ -221,9 +228,13 @@ int main(int argc, char** argv) {
             return 2;
         } else if (path.empty()) {
             path = a;
+            past_image = true;
         } else {
-            std::fprintf(stderr, "dream: only one image can be run at a time\n");
-            return 2;
+            // Everything after the image belongs to the program, not to the
+            // VM -- including anything that looks like an option, which is why
+            // this branch is reached before the `-` check can complain about
+            // it. `std.os.args!` is where it arrives.
+            program_args.push_back(a);
         }
     }
 
@@ -233,6 +244,7 @@ int main(int argc, char** argv) {
     }
 
     Runtime rt;
+    rt.set_program_args(std::move(program_args));
     std::string error;
     if (!rt.load_image_file(path, error)) {
         std::fprintf(stderr, "dream: %s\n", error.c_str());

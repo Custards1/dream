@@ -123,11 +123,23 @@ Underscores are permitted as digit separators in every numeric base.
 
 ### Newlines are significant
 
-Inside a block and at top level, **a line break ends a statement**. Two rules
+Inside a block and at top level, **a line break ends a statement**. Three rules
 relax that:
 
+- **A line indented past the statement it follows continues it.** This is what
+  lets a call be spread over several lines, and it is the same cue a reader
+  already goes by:
+
+  ```dream
+  let total = add3 (1 + 1)
+                   (2 + 2)
+                   (3 + 3);
+  ```
+
+  A line at the same indentation, or less, starts a new statement.
 - A line that *begins* with an infix operator, `.`, `else`, or `catch`
-  continues the previous line, since none of those can start a statement.
+  continues the previous line whatever its indentation, since none of those can
+  start a statement.
 - Newlines never end a statement inside `(`, `[`, `$(`, `#[`, or `%{`. Braces
   `{ }` are *not* in that list — a block is newline-sensitive.
 
@@ -138,6 +150,11 @@ let total = a
 
 let names! = vm
     .modules! ();  // continues: the line starts with `.`
+
+let main! = {
+    print! "a"     // two statements: same indentation
+    print! "b"
+};
 ```
 
 `;` ends a statement explicitly and is always allowed.
@@ -291,10 +308,35 @@ fn a b -> a * b
 `fn` needs at least one parameter. The body extends as far as the expression
 grammar allows, so parenthesize when passing a lambda as a non-final argument.
 
-### Thunks
+### Thunks, and forcing them
 
 `$( e )` suspends `e` as a first-class thunk object. It is what `spawn!` turns
 into a process, and what `std.test` uses to hold a test case for later.
+
+`strict! e` is the other direction: it evaluates `e` **all the way down** and
+hands it back. Laziness is the default and usually right, but it has one sharp
+edge — an effect in a lazy position does not happen until something forces it,
+and "something" may be much later, or never:
+
+```dream
+// Every `spawn!` here is a thunk. They run one at a time, as each `join!`
+// forces its element -- which is the opposite of what the code looks like.
+let ps = list.map (fn n -> spawn! $( work n )) jobs;
+
+// Now they have all started before the first `join!`.
+let ps = strict! (list.map (fn n -> spawn! $( work n )) jobs);
+```
+
+It forces *deeply* rather than to weak head normal form, because forcing the
+list without forcing its elements would leave the effects exactly where they
+were. It is impure by name, which is right: forcing is when effects happen.
+Forcing a value that is already forced costs nothing.
+
+The block form reads well when several things have to happen first:
+
+```dream
+strict! { let a = expensive (); [a, a * 2] }
+```
 
 ### Collections
 
@@ -683,6 +725,8 @@ Well-known kinds the runtime raises:
 | `:no_such_member` | `mod.name` where the module has no such member |
 | `:out_of_bounds` | an array index outside the array |
 | `:loop` | a value that depends on itself |
+| `:stack_overflow` | recursion too deep — see **Runaway processes** below |
+| `:out_of_memory` | a process's heap grew past its limit |
 | `:killed`, `:timeout` | process failure |
 
 `:normal` and `:ok` are used as success markers. An error renders as
@@ -690,6 +734,34 @@ Well-known kinds the runtime raises:
 
 Both `raise!` and `try!` are impure, so error handling is an effect and stays
 out of pure functions.
+
+### Runaway processes
+
+A process is the unit of failure, and that has to hold even when the failure is
+running out of memory. So the runtime bounds what one process may use, and
+**raises in the process that exceeded the bound** rather than letting the
+allocator throw and lose the whole system:
+
+| Limit | Default | Raises | Set with |
+|-------|---------|--------|----------|
+| pending continuations | 4,194,304 | `:stack_overflow` | `DREAM_MAX_DEPTH` |
+| value stack entries | 4,194,304 | `:stack_overflow` | `DREAM_MAX_STACK` |
+| heap bytes per process | 1 GiB | `:out_of_memory` | `DREAM_MAX_HEAP` |
+
+These are ordinary errors: `try!` catches them, `join!` delivers them, and every
+other process carries on.
+
+A tail call pops its continuation, so a loop runs in constant space and never
+approaches the first limit. What does is runaway **non-tail** recursion — and
+the usual cause is the precedence rule in [§4](#4-expressions):
+
+```dream
+let rec f n = f n - 1;      // `(f n) - 1` -- the subtraction is always pending
+let rec f n = f (n - 1);    // what was meant
+```
+
+The first leaves a continuation on every call and never returns. It now fails
+with `:stack_overflow` naming the depth, instead of exhausting memory.
 
 ---
 
@@ -873,6 +945,7 @@ Resolved directly, without an import, unless shadowed by a binding:
 | `type_of` | value → atom |
 | `to_string` | value → string |
 | `len` | list \| array \| map \| string → integer |
+| `strict!` | value → the same value, evaluated all the way down |
 
 ### `std.core` — what the language cannot express in itself
 
@@ -920,10 +993,49 @@ waiting for a value.
 
 `sqrt` · `abs` · `floor`
 
+### `std.os`
+
+| | |
+|-|-|
+| `args! ()` | the arguments after the image on the command line |
+| `env! name` / `set_env! name value` | environment variables; `()` when unset |
+| `cwd! ()` / `chdir! path` | the working directory |
+| `list_dir! path` | the names in a directory, sorted, without `.` and `..` |
+| `exec! program args` | run a child to completion → `%{ :code, :out, :err, :timed_out }` |
+| `exec_for! program args ms` | the same, killing the child after `ms` |
+| `pid! ()` · `platform ()` · `exit! code` | |
+
+**`exec!` parks the process, not the worker.** Waiting for a child on a worker
+thread would block every process queued behind it, so the whole job — spawn,
+read both pipes, reap — goes to a helper thread, and the calling process parks
+through the same handshake `recv!` uses. Five children each sleeping a second
+finish in one second on a single worker.
+
+`exec_for!` matters for anything that runs other people's programs: a `git
+clone` against an unreachable host would otherwise wait for ever. A child that
+outlives the deadline is killed, and `timed_out` distinguishes that from an
+ordinary non-zero exit.
+
 ### `std.vm` — the runtime describing itself
 
 `processes! ()` · `reductions! ()` · `collections! ()` · `heap_bytes! ()` ·
-`modules! ()` · `has_ffi ()`
+`modules! ()` · `has_ffi ()` · `async_io ()`
+
+And, for when a program has stopped doing what it looked like it would:
+
+| | |
+|-|-|
+| `processes_info! ()` | every process: status, what it is waiting on, reductions, heap |
+| `process_info! p` | one of them |
+| `scheduler! ()` | workers, idle, runnable, queued, `io_waiters`, deadlocked |
+| `io! ()` | every open handle, and which process is parked on it |
+| `dump! ()` | all of the above, to stderr |
+
+`waiting_on` is the part worth having. A process parked on a message and one
+parked on a socket look identical from outside, and the difference is usually
+the whole answer. `DREAM_STUCK_SECONDS=n` prints the same report from the
+runtime when nothing has spent a reduction for that long — at which point no
+Dream code can run to ask on its own.
 
 ### `std.ffi`
 
@@ -947,6 +1059,12 @@ Anything that can be written in Dream is written in Dream.
   constant-time-indexed sequence.
 - **`std.str`** — text. Also `derive`s `std.seq`, over **characters**, and adds
   `split`, `trim`, `upper`, `find` and friends.
+- **`std.json`** — JSON, parsed and written. `parse` answers `[:ok, value]` or
+  `[:error, message]` rather than raising, so it stays usable from pure code.
+- **`std.toml`** — the subset of TOML a manifest uses: comments, `[section]` and
+  `[a.b]` headers, strings, numbers, booleans, arrays and inline tables. What is
+  missing — `[[array-of-tables]]`, multi-line strings, dates — is an error
+  naming the problem rather than a quietly wrong parse.
 - **`std.test`** — the test framework. Each case runs in **its own process**, so
   a case that raises or loops is isolated, and the failure reaches the runner as
   an ordinary value through `join!` rather than having already unwound the

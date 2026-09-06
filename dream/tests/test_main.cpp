@@ -362,10 +362,15 @@ static void test_atom_interning() {
 static void test_builtin_table_matches_compiler() {
     std::printf("builtin table\n");
     // The ids are baked into every image, so this order is a wire format.
-    const char* expected[] = {"spawn!", "join!", "send!",     "recv!", "self!",
-                              "raise!", "type_of", "to_string", "len"};
-    CHECK_EQ(builtin_count(), uint32_t(sizeof(expected) / sizeof(expected[0])));
-    for (uint32_t i = 0; i < builtin_count(); ++i) {
+    const char* expected[] = {"spawn!",  "join!",   "send!",     "recv!", "self!",
+                              "raise!",  "type_of", "to_string", "len",   "strict!",
+                              "match_is_cons", "match_head", "match_tail",
+                              "match_at", "match_key"};
+    const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
+    CHECK_EQ(builtin_count(), n);
+    // Bounded by both, so a table that has grown past this list reports the
+    // mismatch above rather than reading off the end of it.
+    for (uint32_t i = 0; i < builtin_count() && i < n; ++i) {
         CHECK_EQ(std::string(builtin_def(i).name), std::string(expected[i]));
     }
     // `spawn!` must not force its argument, or spawning would run the work here.

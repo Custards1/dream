@@ -1,0 +1,4 @@
+direct:    <error :stack_overflow recursion too deep: 50001 pending frames>
+joined:    <error :stack_overflow recursion too deep: 50001 pending frames>
+survivors: 42
+deep ok:   200010000

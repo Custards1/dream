@@ -1,0 +1,31 @@
+// A process that runs away must die on its own, not take the runtime with it.
+//
+// `blow n - 1` is `(blow n) - 1`: the subtraction is still pending when the
+// recursive call is made, so it is not a tail call and every level leaves a
+// continuation behind. Unbounded, that grows until the allocator throws and
+// `terminate` loses every other process along with it.
+//
+// A process is the unit of failure here, so instead the runtime raises in the
+// process that did it. `try!` catches it, `join!` receives it, and everything
+// else carries on. `runaway.env` sets a small limit so this is quick; the real
+// one is four million frames.
+import std.console;
+
+let rec blow n = blow n - 1;
+
+let rec sum_to n = if n <= 0 { 0 } else { n + sum_to (n - 1) };
+
+let main! = {
+    // Caught in the process that ran away.
+    console.print! "direct:    " (try! { blow 1 } catch e { e })
+
+    // ..and delivered to a joiner when it happens in another process.
+    let bad = spawn! $( blow 1 );
+    console.print! "joined:    " (try! { join! bad } catch e { e })
+
+    // The runtime is unharmed: other processes still run.
+    console.print! "survivors: " (join! (spawn! $( 6 * 7 )))
+
+    // Recursion that is merely deep, rather than unbounded, is untouched.
+    console.print! "deep ok:   " (sum_to 20000)
+};

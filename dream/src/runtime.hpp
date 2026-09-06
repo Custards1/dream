@@ -102,6 +102,11 @@ public:
     /// `std.vm` to report what the system is doing.
     std::vector<std::shared_ptr<Process>> all_processes() const;
 
+    /// The arguments the program was run with, not counting the VM's own
+    /// options or the image path. `std.os.args!` hands these to Dream.
+    const std::vector<std::string>& program_args() const { return program_args_; }
+    void set_program_args(std::vector<std::string> args) { program_args_ = std::move(args); }
+
     Scheduler* scheduler() { return scheduler_; }
     void set_scheduler(Scheduler* s) { scheduler_ = s; }
 
@@ -131,6 +136,7 @@ private:
     std::unordered_map<uint64_t, std::shared_ptr<Process>> processes_;
     uint64_t next_pid_ = 1;
 
+    std::vector<std::string> program_args_;
     Scheduler* scheduler_ = nullptr;
     class Jit* jit_ = nullptr;
     std::unique_ptr<struct WellKnownAtoms> wk_;
@@ -144,6 +150,8 @@ struct WellKnownAtoms {
     uint32_t not_a_function;
     uint32_t no_such_member;
     uint32_t loop;
+    uint32_t stack_overflow;
+    uint32_t out_of_memory;
     uint32_t killed;
     uint32_t normal;
     uint32_t timeout;

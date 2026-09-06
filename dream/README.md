@@ -13,7 +13,39 @@ the language itself. The VM has three parts worth knowing about:
 ```
 cmake -S . -B build && cmake --build build -j
 ./build-dream/bin/dream program.dream
-```
+```cd /home/blake/project/dream
+sed -i 's|#include <atomic>|#include <algorithm>\n#include <atomic>|' dream/src/os.cpp
+just build 2>&1 | grep -E "error:" -A 5 | head -20; echo "=== BUILT ==="
+S=/tmp/nix-shell-140670-2475414227/claude-1000/-home-blake-project-dream/916c0e2f-75ef-4c7b-8714-dbe1054b4db5/scratchpad
+cat > $S/os1.dr <<'EOF'
+import std.console;
+import std.core;
+import std.os;
+import std.list;
+let main! = {
+    console.print! "platform: " (os.platform ())
+    console.print! "args:     " (os.args! ())
+    console.print! "HOME set: " (os.env! "HOME" != ())
+    console.print! "missing:  " (os.env! "DEFINITELY_NOT_SET_XYZ")
+    console.print! "cwd ends: " (os.cwd! () != "")
+    console.print! "pid > 0:  " (os.pid! () > 0)
+
+    let r = os.exec! "echo" ["hello", "from", "exec"];
+    console.print! "exec out: " (core.map_get r :out "")
+    console.print! "exec code:" (core.map_get r :code (0 - 1))
+
+    let f = os.exec! "false" [];
+    console.print! "fail code:" (core.map_get f :code (0 - 1))
+
+    let e = os.exec! "sh" ["-c", "echo oops >&2; exit 3"];
+    console.print! "stderr:   " (core.map_get e :err "")
+    console.print! "code:     " (core.map_get e :code (0 - 1))
+
+    console.print! "missing:  " (try! { os.exec! "no_such_program_xyz" [] } catch err { err })
+    console.print! "dir has:  " (list.contains "mind" (os.list_dir! "."))
+};
+EOF
+./target/debug/dreamc $S/os1.dr -L mind -o $S/os1.dream >/dev/null 2>&1 && build-dream/bin/dream $S/os1.dream one twov
 
 ## Why the interpreter is a state machine
 
@@ -90,6 +122,18 @@ language with concurrency and laziness, isolation is the better trade.
 
 A process that fails and that nobody joins is reported at shutdown. One that a
 joiner is waiting for is that joiner's business, and is not reported twice.
+
+**Running out of memory is a process's failure, not the runtime's.** A process
+that recurses without bound, or allocates without bound, would otherwise grow
+until `alloc` throws and `terminate` takes every other process with it. So the
+runtime bounds pending continuations (`DREAM_MAX_DEPTH`), value-stack depth
+(`DREAM_MAX_STACK`) and heap bytes (`DREAM_MAX_HEAP`) per process, and raises
+`:stack_overflow` or `:out_of_memory` in the offender. The checks sit at
+interpreter safepoints rather than in `push_cont` or `alloc`: there the process
+is already consistent, and safepoints are one reduction apart, so a limit can
+only be overshot by a bounded amount. Making the allocator itself fail would
+mean every caller of `alloc` -- most of which hold raw object pointers -- had to
+cope with a null.
 
 **Scheduling** is per-worker run queues with work stealing. A process runs for
 `REDUCTIONS_PER_SLICE` reductions and then goes back on a queue, whatever it is

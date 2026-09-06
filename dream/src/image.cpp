@@ -1,5 +1,7 @@
 #include "image.hpp"
 
+#include "builtins.hpp"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -16,7 +18,10 @@ constexpr uint8_t MAGIC[8] = {'D', 'A', 'G', 'N', 'C', 'A', 'A', 'F'};
 constexpr uint16_t SUPPORTED_MAJOR = 0;
 constexpr size_t HEADER_SIZE = 32;
 constexpr size_t SECTION_ENTRY_SIZE = 16;
-constexpr uint32_t BUILTIN_COUNT = 9;
+// Deliberately not a constant here: the builtin table lives in builtins.cpp,
+// and a second copy of its size is a copy that drifts. It did -- a builtin was
+// appended and every image using it was rejected as malformed.
+inline uint32_t builtin_limit() { return builtin_count(); }
 
 constexpr uint32_t tag(const char s[5]) {
     return uint32_t(uint8_t(s[0])) | (uint32_t(uint8_t(s[1])) << 8) |
@@ -364,7 +369,7 @@ bool Image::validate(std::string& error) {
             case Op::ConstChar: if (n.a > 0x10FFFF) return fail("char constant is not a Unicode scalar value"); break;
             case Op::ConstBool: if (n.a > 1) return fail("bool constant is neither 0 nor 1"); break;
             case Op::Global: if (n.a >= n_globals_) return fail("bad global index"); break;
-            case Op::Builtin: if (n.a >= BUILTIN_COUNT) return fail("unknown builtin id"); break;
+            case Op::Builtin: if (n.a >= builtin_limit()) return fail("unknown builtin id"); break;
             case Op::MakeClosure:
             case Op::MakeThunk: if (n.a >= n_funcs_) return fail("bad function index"); break;
             case Op::Field:

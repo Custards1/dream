@@ -122,6 +122,8 @@ pub struct Lowerer<'a> {
     set: Option<&'a ModuleSet>,
     /// Dotted prefixes behind `ModuleRef::Group`.
     groups: Vec<String>,
+    /// Packages every module can name without importing them.
+    preludes: Vec<String>,
     pub pending_comp: Vec<PendingComp>,
 }
 
@@ -139,8 +141,15 @@ impl<'a> Lowerer<'a> {
             frames: Vec::new(),
             set: None,
             groups: Vec::new(),
+            preludes: Vec::new(),
             pending_comp: Vec::new(),
         }
+    }
+
+    /// Packages every module may name without importing them. `mind` passes
+    /// `std`, so a project it builds can say `std.list.map` straight away.
+    pub fn with_preludes(&mut self, preludes: Vec<String>) {
+        self.preludes = preludes;
     }
 
     fn err(&mut self, span: Span, msg: impl Into<String>) {
@@ -364,6 +373,36 @@ impl<'a> Lowerer<'a> {
                 }
                 _ => {}
             }
+        }
+
+        // `std.core` is available everywhere without an import. It is the one
+        // module every program reaches for -- `head`, `tail`, the map and
+        // array primitives -- and writing the same import at the top of every
+        // file is ceremony, not information.
+        //
+        // Only when the module has not bound `core` itself, so an explicit
+        // `import std.core as core;` and a `let core = ..` both still win.
+        let binds_core = self.modules[mi].aliases.contains_key("core")
+            || set.modules[mi].ast.items.iter().any(|it| match it {
+                Item::Let(d) => d.name == "core",
+                Item::Import(i) => i.alias == "core",
+                _ => false,
+            });
+        if !binds_core {
+            let g = self.declare_native(mi, "std.core", "core");
+            self.modules[mi].aliases.insert("core".to_string(), ModuleRef::Native(g));
+            self.modules[mi].globals.insert("core".to_string(), g);
+        }
+
+        // Packages named as preludes are in scope as namespaces, so a build
+        // driven by `mind` can say `std.list.map` without importing anything.
+        let preludes = self.preludes.clone();
+        for pkg in preludes {
+            if self.modules[mi].aliases.contains_key(&pkg) || !set.namespaces.contains(&pkg) {
+                continue;
+            }
+            let g = self.group(&pkg);
+            self.modules[mi].aliases.insert(pkg, g);
         }
 
         // Collect the items this module contributes, base first.
@@ -595,18 +634,7 @@ impl<'a> Lowerer<'a> {
         }
 
         // Host-provided: keep a module value and resolve members at run time.
-        let path_k = self.prog.k.string(&path);
-        let alias_k = self.prog.k.string(&imp.alias);
-        let import_idx = self.prog.imports.len() as u32;
-        self.prog.imports.push(ImportEntry { path: path_k, alias: alias_k });
-
-        let g = self.prog.globals.len() as u32;
-        self.prog.globals.push(Global {
-            name: alias_k,
-            kind: GlobalKind::Module,
-            target: import_idx,
-            flags: 0,
-        });
+        let g = self.declare_native(mi, &path, &imp.alias);
         if !imp.only.is_empty() {
             self.declare_import_names(mi, ModuleRef::Native(g), &path, imp);
             return;
@@ -615,6 +643,23 @@ impl<'a> Lowerer<'a> {
         // A host module is a value as well as a namespace, so a bare mention of
         // the alias yields the module itself.
         self.modules[mi].globals.insert(imp.alias.clone(), g);
+    }
+
+    /// Reserve the import record and global for a host module, and return the
+    /// global. Shared by `import std.console;` and by the automatic ones.
+    fn declare_native(&mut self, _mi: usize, path: &str, alias: &str) -> u32 {
+        let path_k = self.prog.k.string(path);
+        let alias_k = self.prog.k.string(alias);
+        let import_idx = self.prog.imports.len() as u32;
+        self.prog.imports.push(ImportEntry { path: path_k, alias: alias_k });
+        let g = self.prog.globals.len() as u32;
+        self.prog.globals.push(Global {
+            name: alias_k,
+            kind: GlobalKind::Module,
+            target: import_idx,
+            flags: 0,
+        });
+        g
     }
 
     /// Record the members of `import path.{ a, b as c }`. Nothing is resolved
@@ -872,6 +917,8 @@ impl<'a> Lowerer<'a> {
                 self.inherit(n, &[a, b]);
                 n
             }
+
+            ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, e.span),
 
             ExprKind::If(c, t, f) => {
                 let cn = self.lower_expr(c);
@@ -1269,6 +1316,331 @@ impl<'a> Lowerer<'a> {
         let off = self.prog.push_kids(&kids);
         let n = self.node(Node::with(op, off, kids.len() as u32, NO_NODE), span);
         self.inherit(n, &kids);
+        n
+    }
+
+    // --- pattern matching ---------------------------------------------------
+    //
+    // A `match` becomes a chain of `if`s over the value, bound once to a slot
+    // so the arms do not re-evaluate it. There are no matching opcodes: every
+    // test is an ordinary comparison or a call to one of the `match_*`
+    // builtins, which is what lets `match` work in a module that imports
+    // nothing.
+    //
+    // Two properties are worth stating because the shape of the code follows
+    // from them. First, a pattern forces only as much as deciding takes --
+    // `[x, ..rest]` asks whether the value is a cell and looks no further, so
+    // matching on an infinite list terminates. Second, the arms after this one
+    // are bound to a *lazy* local rather than duplicated into both branches of
+    // a guard, so a guarded arm costs one binding rather than a second copy of
+    // everything below it.
+
+    fn builtin_ref(&mut self, name: &str, span: Span) -> u32 {
+        let id = builtin_id(name).expect("match lowering names a builtin that exists");
+        self.node(Node::with(Op::Builtin, id, NO_NODE, NO_NODE), span)
+    }
+
+    fn call_builtin(&mut self, name: &str, args: &[u32], span: Span) -> u32 {
+        let callee = self.builtin_ref(name, span);
+        self.emit_apply(callee, args, span)
+    }
+
+    fn local_ref(&mut self, slot: u32, span: Span) -> u32 {
+        self.node(Node::with(Op::Local, slot, NO_NODE, NO_NODE), span)
+    }
+
+    fn bool_and(&mut self, a: u32, b: u32, span: Span) -> u32 {
+        // `&&` short-circuits, which is what keeps a later test from running
+        // against a value the earlier one already rejected.
+        let n = self.node(Node::with(Op::And, a, b, NO_NODE), span);
+        self.inherit(n, &[a, b]);
+        self.prog.set_flag(a, F_STRICT);
+        n
+    }
+
+    fn eq_const(&mut self, value: u32, konst: u32, span: Span) -> u32 {
+        let n = self.node(Node::with(Op::Eq, value, konst, NO_NODE), span);
+        self.inherit(n, &[value, konst]);
+        n
+    }
+
+    /// Does `subject` match `pattern`? Emits the test, and records every
+    /// binding the pattern makes as `(name, expression that extracts it)`.
+    fn pattern_test(
+        &mut self,
+        pattern: &Pattern,
+        subject: u32,
+        binds: &mut Vec<(String, u32)>,
+        span: Span,
+    ) -> u32 {
+        let always = |me: &mut Self| me.node(Node::with(Op::ConstBool, 1, NO_NODE, NO_NODE), span);
+        match pattern {
+            Pattern::Wildcard => always(self),
+            Pattern::Bind(name) => {
+                binds.push((name.clone(), subject));
+                always(self)
+            }
+            Pattern::As(inner, name) => {
+                binds.push((name.clone(), subject));
+                self.pattern_test(inner, subject, binds, span)
+            }
+            Pattern::Unit => {
+                let k = self.node(Node::new(Op::Unit), span);
+                self.eq_const(subject, k, span)
+            }
+            Pattern::Int(v) => {
+                let idx = self.prog.k.int(*v);
+                let k = self.node(Node::with(Op::ConstInt, idx, NO_NODE, NO_NODE), span);
+                self.eq_const(subject, k, span)
+            }
+            Pattern::Float(v) => {
+                let idx = self.prog.k.float(*v);
+                let k = self.node(Node::with(Op::ConstFloat, idx, NO_NODE, NO_NODE), span);
+                self.eq_const(subject, k, span)
+            }
+            Pattern::Char(c) => {
+                let k = self.node(Node::with(Op::ConstChar, *c as u32, NO_NODE, NO_NODE), span);
+                self.eq_const(subject, k, span)
+            }
+            Pattern::Bool(b) => {
+                let k =
+                    self.node(Node::with(Op::ConstBool, u32::from(*b), NO_NODE, NO_NODE), span);
+                self.eq_const(subject, k, span)
+            }
+            Pattern::Str(text) => {
+                let idx = self.prog.k.string(text);
+                let k = self.node(Node::with(Op::ConstStr, idx, NO_NODE, NO_NODE), span);
+                self.eq_const(subject, k, span)
+            }
+            Pattern::Atom(name) => {
+                let idx = self.prog.k.atom(name);
+                let k = self.node(Node::with(Op::ConstAtom, idx, NO_NODE, NO_NODE), span);
+                self.eq_const(subject, k, span)
+            }
+            Pattern::List(items, rest) => self.list_test(items, rest, subject, binds, span),
+            Pattern::Array(items, rest) => self.array_test(items, rest, subject, binds, span),
+            Pattern::Map(pairs) => self.map_test(pairs, subject, binds, span),
+        }
+    }
+
+    /// `[a, b]` and `[a, ..rest]`, walked one cell at a time so nothing beyond
+    /// what the pattern names is ever forced.
+    fn list_test(
+        &mut self,
+        items: &[Pattern],
+        rest: &Option<Option<String>>,
+        subject: u32,
+        binds: &mut Vec<(String, u32)>,
+        span: Span,
+    ) -> u32 {
+        // The value must be a list at all. Without this `[]` would match
+        // anything that is not a cons cell -- an array, a map, a number --
+        // because "not a cell" and "the end of a list" look the same from
+        // `match_is_cons` alone. `type_of` answers `:list` for both the empty
+        // list and a cell, so one test covers every list pattern.
+        let type_of = self.builtin_ref("type_of", span);
+        let ty = self.emit_apply(type_of, &[subject], span);
+        let atom = self.prog.k.atom("list");
+        let want = self.node(Node::with(Op::ConstAtom, atom, NO_NODE, NO_NODE), span);
+        let is_list = self.eq_const(ty, want, span);
+
+        let mut cursor = subject;
+        let mut test: Option<u32> = Some(is_list);
+        for item in items {
+            let is_cons = self.call_builtin("match_is_cons", &[cursor], span);
+            test = Some(match test {
+                None => is_cons,
+                Some(t) => self.bool_and(t, is_cons, span),
+            });
+            let head = self.call_builtin("match_head", &[cursor], span);
+            let inner = self.pattern_test(item, head, binds, span);
+            test = Some(self.bool_and(test.expect("just set"), inner, span));
+            cursor = self.call_builtin("match_tail", &[cursor], span);
+        }
+        match rest {
+            // `..` takes whatever is left, including nothing, so there is no
+            // further test -- only a binding, when it was named.
+            Some(name) => {
+                if let Some(name) = name {
+                    binds.push((name.clone(), cursor));
+                }
+                test.expect("the type test is always present")
+            }
+            // A fixed-length list: what is left must be the end.
+            None => {
+                let is_cons = self.call_builtin("match_is_cons", &[cursor], span);
+                let ends = self.node(Node::with(Op::Not, is_cons, NO_NODE, NO_NODE), span);
+                self.inherit(ends, &[is_cons]);
+                let t = test.expect("the type test is always present");
+                self.bool_and(t, ends, span)
+            }
+        }
+    }
+
+    fn array_test(
+        &mut self,
+        items: &[Pattern],
+        rest: &Option<Option<String>>,
+        subject: u32,
+        binds: &mut Vec<(String, u32)>,
+        span: Span,
+    ) -> u32 {
+        // An array knows its own length, so the shape is one comparison rather
+        // than a walk.
+        let type_of = self.builtin_ref("type_of", span);
+        let ty = self.emit_apply(type_of, &[subject], span);
+        let atom = self.prog.k.atom("array");
+        let want = self.node(Node::with(Op::ConstAtom, atom, NO_NODE, NO_NODE), span);
+        let is_array = self.eq_const(ty, want, span);
+
+        let len_fn = self.builtin_ref("len", span);
+        let length = self.emit_apply(len_fn, &[subject], span);
+        let idx = self.prog.k.int(items.len() as i64);
+        let n = self.node(Node::with(Op::ConstInt, idx, NO_NODE, NO_NODE), span);
+        let long_enough = if rest.is_some() {
+            let cmp = self.node(Node::with(Op::Ge, length, n, NO_NODE), span);
+            self.inherit(cmp, &[length, n]);
+            cmp
+        } else {
+            self.eq_const(length, n, span)
+        };
+        let mut test = self.bool_and(is_array, long_enough, span);
+
+        for (i, item) in items.iter().enumerate() {
+            let idx = self.prog.k.int(i as i64);
+            let at = self.node(Node::with(Op::ConstInt, idx, NO_NODE, NO_NODE), span);
+            let element = self.call_builtin("match_at", &[subject, at], span);
+            let inner = self.pattern_test(item, element, binds, span);
+            test = self.bool_and(test, inner, span);
+        }
+        // `#[a, ..rest]` names the remainder, which an array cannot hand back
+        // without copying, so it is reported rather than silently allocating.
+        if let Some(Some(name)) = rest {
+            self.err(
+                span,
+                format!("`..{name}` cannot name the rest of an array"),
+            );
+        }
+        test
+    }
+
+    fn map_test(
+        &mut self,
+        pairs: &[(Expr, Pattern)],
+        subject: u32,
+        binds: &mut Vec<(String, u32)>,
+        span: Span,
+    ) -> u32 {
+        let type_of = self.builtin_ref("type_of", span);
+        let ty = self.emit_apply(type_of, &[subject], span);
+        let atom = self.prog.k.atom("map");
+        let want = self.node(Node::with(Op::ConstAtom, atom, NO_NODE, NO_NODE), span);
+        let mut test = self.eq_const(ty, want, span);
+
+        for (key, value) in pairs {
+            let k = self.lower_expr(key);
+            // `[v]` when the key is there, `[]` when it is not -- so presence
+            // and the value come from one lookup.
+            let found = self.call_builtin("match_key", &[subject, k], span);
+            let present = self.call_builtin("match_is_cons", &[found], span);
+            test = self.bool_and(test, present, span);
+            let held = self.call_builtin("match_head", &[found], span);
+            let inner = self.pattern_test(value, held, binds, span);
+            test = self.bool_and(test, inner, span);
+        }
+        test
+    }
+
+    fn lower_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> u32 {
+        let value = self.lower_expr(scrutinee);
+        let slot = self.alloc_slot();
+        let bind = self.node(Node::with(Op::Bind, slot, value, NO_NODE), span);
+        self.inherit(bind, &[value]);
+        // Every pattern but `_` and a bare name looks at the value, and the
+        // arms are tried in order, so evaluating it once up front is both
+        // cheaper and the only way the order is observable at all.
+        self.prog.set_flag(bind, F_STRICT);
+
+        let chain = self.lower_arms(arms, slot, span);
+        let kids = vec![bind, chain];
+        let off = self.prog.push_kids(&kids);
+        let n = self.node(Node::with(Op::Block, off, kids.len() as u32, NO_NODE), span);
+        self.inherit(n, &kids);
+        n
+    }
+
+    fn lower_arms(&mut self, arms: &[MatchArm], slot: u32, span: Span) -> u32 {
+        let Some((arm, rest_arms)) = arms.split_first() else {
+            // Nothing matched. Dream is dynamically typed, so exhaustiveness
+            // cannot be checked; saying so at run time is the honest answer,
+            // and a `_` arm is how a program declares itself total.
+            let raise = self.builtin_ref("raise!", span);
+            let atom = self.prog.k.atom("match_error");
+            let kind = self.node(Node::with(Op::ConstAtom, atom, NO_NODE, NO_NODE), span);
+            let n = self.emit_apply(raise, &[kind], span);
+            self.prog.set_flag(n, F_STRICT);
+            return n;
+        };
+
+        self.frame().scopes.push(HashMap::new());
+        let subject = self.local_ref(slot, arm.span);
+        let mut binds = Vec::new();
+        let test = self.pattern_test(&arm.pattern, subject, &mut binds, arm.span);
+
+        // The bindings go into slots before the guard or body can name them.
+        let mut stmts = Vec::new();
+        for (name, expr) in &binds {
+            let s = self.alloc_slot();
+            self.define(name, s);
+            let b = self.node(Node::with(Op::Bind, s, *expr, NO_NODE), arm.span);
+            self.inherit(b, &[*expr]);
+            stmts.push(b);
+        }
+
+        let taken = match &arm.guard {
+            None => {
+                let body = self.lower_expr(&arm.body);
+                stmts.push(body);
+                body
+            }
+            Some(guard) => {
+                let g = self.lower_expr(guard);
+                self.prog.set_flag(g, F_STRICT);
+                let body = self.lower_expr(&arm.body);
+                // The guard failing falls through to the arms below, which are
+                // bound lazily by the caller so this costs a reference rather
+                // than a second copy of them.
+                let fallback = self.lower_arms(rest_arms, slot, span);
+                let n = self.node(Node::with(Op::If, g, body, fallback), arm.span);
+                self.inherit(n, &[g, body, fallback]);
+                stmts.push(n);
+                n
+            }
+        };
+        let _ = taken;
+
+        let off = self.prog.push_kids(&stmts);
+        let block = self.node(Node::with(Op::Block, off, stmts.len() as u32, NO_NODE), arm.span);
+        self.inherit(block, &stmts);
+        self.frame().scopes.pop();
+
+        // A guarded arm has already folded the rest into itself.
+        let otherwise = if arm.guard.is_some() {
+            self.node(Node::new(Op::Unit), span)
+        } else {
+            self.lower_arms(rest_arms, slot, span)
+        };
+        if arm.guard.is_some() {
+            // The test alone decides; the guard was handled inside.
+            let unreachable = otherwise;
+            let n = self.node(Node::with(Op::If, test, block, unreachable), arm.span);
+            self.inherit(n, &[test, block, unreachable]);
+            self.prog.set_flag(test, F_STRICT);
+            return n;
+        }
+        let n = self.node(Node::with(Op::If, test, block, otherwise), arm.span);
+        self.inherit(n, &[test, block, otherwise]);
+        self.prog.set_flag(test, F_STRICT);
         n
     }
 

@@ -36,7 +36,7 @@ use crate::parser;
 /// naming the module is what keeps a typo in an import an error rather than a
 /// mystery at run time.
 pub const NATIVE_MODULES: &[&str] =
-    &["std.console", "std.core", "std.ffi", "std.io", "std.math", "std.net", "std.vm"];
+    &["std.console", "std.core", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.vm"];
 
 pub fn is_native(path: &str) -> bool {
     NATIVE_MODULES.contains(&path)
@@ -421,8 +421,22 @@ impl Loader {
     /// The name a module is known by, regardless of how it was imported: the
     /// package it belongs to plus its path inside that package.
     fn canonical_name(&self, path: &Path, fallback: &str) -> String {
+        // Compare where the file actually is, not how it was spelled. A
+        // dependency reached as `../greet` produces a path that literally
+        // begins with the *depending* package's directory, so a textual
+        // `strip_prefix` claims the wrong owner and names the module
+        // `app....greet.hello`.
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut best: Option<(usize, String)> = None;
+
         for pkg in &self.packages.packages {
-            let Ok(rel) = path.strip_prefix(&pkg.src) else { continue };
+            let src = std::fs::canonicalize(&pkg.src).unwrap_or_else(|_| pkg.src.clone());
+            let Ok(rel) = real.strip_prefix(&src) else { continue };
+            // A path that has to climb out of a directory does not belong to
+            // the package rooted there, whatever the prefix says.
+            if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                continue;
+            }
             let mut segs: Vec<String> = rel
                 .with_extension("")
                 .components()
@@ -436,9 +450,14 @@ impl Loader {
                 name.push('.');
                 name.push_str(&segs.join("."));
             }
-            return name;
+            // Nested packages are legal, so prefer the innermost one: the
+            // longest `src` that still contains the file is its real owner.
+            let depth = src.components().count();
+            if best.as_ref().is_none_or(|(d, _)| depth > *d) {
+                best = Some((depth, name));
+            }
         }
-        fallback.to_string()
+        best.map(|(_, name)| name).unwrap_or_else(|| fallback.to_string())
     }
 
     /// Explain a failed import in terms of what was actually searched.

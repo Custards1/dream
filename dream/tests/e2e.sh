@@ -9,7 +9,11 @@
 set -uo pipefail
 
 DREAMC="${DREAMC:-}"
-dream="${dream:-}"
+# `DREAM` is the conventional spelling; the lowercase `dream` is accepted too
+# because it is what this script used first, and a lowercase environment
+# variable is easy to set by accident from a shell where `dream` is also a
+# path or an alias.
+dream="${DREAM:-${dream:-}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -z "$DREAMC" ]]; then
@@ -58,9 +62,21 @@ for src in "$HERE"/programs/*.dr; do
     continue
   fi
 
-  jit_out="$("$dream" "$image" 2>&1)"
+  # A program may set VM environment variables in `<name>.env`, one
+  # `NAME=value` per line. It is how a test that has to trip a runtime limit
+  # asks for a small one, rather than spending the seconds it would take to
+  # reach the real one.
+  env_args=()
+  if [[ -f "$HERE/programs/$name.env" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      env_args+=("$line")
+    done < "$HERE/programs/$name.env"
+  fi
+
+  jit_out="$(env "${env_args[@]}" "$dream" "$image" 2>&1)"
   jit_rc=$?
-  int_out="$("$dream" --no-jit "$image" 2>&1)"
+  int_out="$(env "${env_args[@]}" "$dream" --no-jit "$image" 2>&1)"
   int_rc=$?
 
   if [[ "$jit_out" != "$int_out" || "$jit_rc" != "$int_rc" ]]; then

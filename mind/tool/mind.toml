@@ -1,4 +1,4 @@
 [package]
-name = "std"
+name = "mind"
 version = "0.1.0"
 src = "."
