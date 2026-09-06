@@ -1,0 +1,11 @@
+// Tail recursion must run in constant space, and non-tail recursion must be
+// able to go deep without a native stack to overflow.
+import std.console;
+let rec count_down n = if n <= 0 { 0 } else { count_down (n - 1) };
+let rec sum_to n = if n <= 0 { 0 } else { n + sum_to (n - 1) };
+let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
+let main! = {
+    count_down 2000000 |> console.print! "tail:     "
+    sum_to 100000     |> console.print! "non-tail: "
+    fac 20            |> console.print! "fac 20:   "
+}

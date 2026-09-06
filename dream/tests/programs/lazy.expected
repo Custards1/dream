@@ -1,0 +1,6 @@
+unused binding: :never_forced
+if branch:     :taken
+short circuit: false
+short circuit: true
+lazy elements: 3
+lazy map:      2

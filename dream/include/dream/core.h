@@ -1,0 +1,57 @@
+/* Dream VM — core C ABI types.
+ *
+ * This header is C-compatible so the VM can be embedded from C and C++.
+ */
+#ifndef DREAM_CORE_H
+#define DREAM_CORE_H 1
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define DREAM_BAD 0
+#define DREAM_OK  1
+#define DREAM_IS_OK(x) ((x) != DREAM_BAD)
+
+typedef int      dream_result;
+typedef int64_t  dream_integer;
+typedef double   dream_float;
+
+/* A Dream value: an immediate, or a tagged pointer into a process heap.
+ * Values are only meaningful relative to the process that owns them. */
+typedef uint64_t dream_value;
+
+/* The language's surface types, as reported by `type_of`.
+ * The canonical list lives in dawnc/src/types.rs; these must stay in step. */
+typedef enum dream_type {
+    DREAM_TYPE_INTEGER = 0,
+    DREAM_TYPE_FLOAT,
+    DREAM_TYPE_CHAR,
+    DREAM_TYPE_BOOL,
+    DREAM_TYPE_UNIT,
+    DREAM_TYPE_STRING,
+    DREAM_TYPE_ATOM,
+    DREAM_TYPE_LIST,
+    DREAM_TYPE_ARRAY,
+    DREAM_TYPE_MAP,
+    DREAM_TYPE_PURE_FN,
+    DREAM_TYPE_IMPURE_FN,
+    DREAM_TYPE_MODULE,
+    DREAM_TYPE_ERROR,
+    /* A green process: isolated heap, mailbox, scheduler slot. */
+    DREAM_TYPE_PROCESS,
+    DREAM_TYPE_UNKNOWN
+} dream_type;
+
+/* `thread` was the original spelling in the language spec and is kept as an
+ * alias so existing embedders keep compiling. */
+#define DREAM_TYPE_THREAD DREAM_TYPE_PROCESS
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* DREAM_CORE_H */
