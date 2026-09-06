@@ -32,9 +32,20 @@ Value thunk_for(Process& p, uint32_t node, Value frame);
 Value global_value(Process& p, uint32_t index);
 
 /// Force to weak head normal form from inside a native, by running a nested
-/// machine loop. Returns false if the evaluation raised; the error is left in
-/// `p.result`.
+/// machine loop. Returns false either when the evaluation raised (error in
+/// `p.result`) or when a blocking native inside the forced value set
+/// `p.park_requested`. Callers that return NativeResult should use
+/// `force_failed(p)` rather than `NativeResult::raise(p.result)` so that a
+/// park is correctly propagated as a Block, not a spurious error.
 bool force_whnf(Process& p, Value v, Value* out);
+
+/// Return the right NativeResult after force_whnf (or force_deep / stringify)
+/// returned false: Block if a blocking native set park_requested, Raise
+/// otherwise.
+inline NativeResult force_failed(Process& p) {
+    if (p.park_requested) return NativeResult::block();
+    return NativeResult::raise(p.result);
+}
 
 /// Force a value and everything reachable through it. Used by printing.
 bool force_deep(Process& p, Value v, Value* out);

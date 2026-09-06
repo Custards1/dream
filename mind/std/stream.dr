@@ -1,0 +1,338 @@
+// std.stream — ergonomic IO built on std.io, for any handle.
+//
+// `std.io` is the native layer: handles, raw read/write, and path operations.
+// A handle is anything the VM can read or write — a regular file, a socket,
+// a pipe, or a terminal. This module adds the ergonomic layer that works
+// uniformly over all of them:
+//
+//   - `read_all!`   — drain a handle into a string
+//   - `write_all!`  — write every byte, retrying on short writes
+//   - `slurp!`      — open a path, read all, close
+//   - `spit!`       — open a path for writing, write all, close
+//   - `read_line!`  — read one newline-terminated line
+//   - `lines!`      — read all lines from a handle as a list
+//   - `read_lines!` — open a path, read all lines, close
+//   - `with_file!`  — open, run a block, close even on error
+//   - `copy!`       — stream one handle into another
+//
+// All `std.io` members are re-exported so callers only need one import.
+// As richer stream abstractions are added (buffering, framing, codecs)
+// they will live here alongside these primitives.
+
+import std.core;
+import std.io;
+import std.str;
+
+// ---------------------------------------------------------------------------
+// Re-exports from the native layer
+// ---------------------------------------------------------------------------
+
+/// Open a file. `mode` is one of `:read` `:write` `:append` `:update`.
+/// Returns an opaque handle integer.
+let open! path mode = io.open! path mode;
+
+/// Close a handle. Safe to call while another process is reading the same
+/// handle -- the underlying descriptor is closed only after every in-flight
+/// operation finishes.
+let close! h = io.close! h;
+
+/// Read at most `n` bytes from `h`. Returns `""` at end of file.
+let read! h n = io.read! h n;
+
+/// Write as many bytes of `s` as the descriptor will accept in one call.
+/// Returns the number of bytes written, which may be less than `len s`.
+let write! h s = io.write! h s;
+
+/// `fsync` a regular file. No-op for sockets and streams.
+let flush! h = io.flush! h;
+
+/// Seek to absolute byte offset. Returns the new position.
+let seek! h offset = io.seek! h offset;
+
+/// Size of a regular file in bytes.
+let size! h = io.size! h;
+
+/// `:file`, `:listener`, or `:stream`.
+let kind! h = io.kind! h;
+
+/// `false` after `close!` or for an integer that was never a handle.
+let is_open! h = io.is_open! h;
+
+/// The handle for the process's standard input. Not owned: closing it is safe
+/// but does nothing to the underlying file descriptor.
+let stdin! () = io.stdin! ();
+
+/// Standard output.
+let stdout! () = io.stdout! ();
+
+/// Standard error.
+let stderr! () = io.stderr! ();
+
+/// `true` if the path names anything.
+let exists! path = io.exists! path;
+
+/// `true` if the path is a directory.
+let is_dir! path = io.is_dir! path;
+
+/// Delete a file or empty directory.
+let remove! path = io.remove! path;
+
+/// Rename or move.
+let rename! from to = io.rename! from to;
+
+/// Create a directory. Succeeds silently when it already exists.
+let mkdir! path = io.mkdir! path;
+
+/// `true` when IO parks the calling process rather than a worker thread.
+/// Always `true` on Linux (epoll). On other platforms IO is still correct
+/// but blocks a worker during the syscall.
+let async () = io.async ();
+
+// ---------------------------------------------------------------------------
+// Higher-level helpers
+// ---------------------------------------------------------------------------
+
+/// Read the entire contents of `h` into a string.
+///
+/// Loops until `read!` returns `""` (end of file). Each chunk is appended, so
+/// the total allocation is proportional to file size. For large files prefer
+/// streaming with `read!` directly.
+let rec read_all_into! h acc = {
+    let chunk = io.read! h 65536;
+    if len chunk == 0 {
+        acc
+    } else {
+        read_all_into! h (acc + chunk)
+    }
+};
+
+let read_all! h = read_all_into! h "";
+
+/// Open `path`, read its entire contents, and close it.
+let slurp! path = {
+    let h = io.open! path :read;
+    let contents = try! { read_all! h } catch e { io.close! h; raise! e };
+    io.close! h;
+    contents
+};
+
+/// Write every byte of `s` to `h`, retrying on short writes.
+///
+/// `io.write!` may write fewer bytes than asked when the descriptor is full.
+/// This loops until everything is written or an error is raised.
+let rec write_all! h s = {
+    if len s == 0 { () } else {
+        let written = io.write! h s;
+        if written < len s {
+            write_all! h (core.str_slice s written (len s - written))
+        } else {
+            ()
+        }
+    }
+};
+
+/// Open `path` for writing, write `contents`, and close it.
+let spit! path contents = {
+    let h = io.open! path :write;
+    let result = try! { write_all! h contents } catch e { io.close! h; raise! e };
+    io.close! h;
+    result
+};
+
+/// Open `path`, call `f h`, close the handle even if `f` raises, then return
+/// `f`'s result. The Dream equivalent of `with open(...) as f:`.
+let with_file! path mode f = {
+    let h = io.open! path mode;
+    let result = try! { f h } catch e { io.close! h; raise! e };
+    io.close! h;
+    result
+};
+
+/// Read one line from `h`, including the trailing `\n`.
+/// Returns `""` when the handle is at end of file.
+/// For interactive or network streams this reads one byte at a time to avoid
+/// consuming bytes that belong to the next line.
+let rec read_line_loop! h acc = {
+    let byte = io.read! h 1;
+    if len byte == 0 {
+        // EOF: return whatever we accumulated, or "" if nothing.
+        acc
+    } else {
+        let so_far = acc + byte;
+        if byte == "\n" {
+            so_far
+        } else {
+            read_line_loop! h so_far
+        }
+    }
+};
+
+let read_line! h = read_line_loop! h "";
+
+/// Read all remaining lines from `h` as a list of strings, each including its
+/// trailing `\n` (except possibly the last line if the file does not end with
+/// one).
+let rec read_lines_acc! h acc = {
+    let line = read_line! h;
+    if len line == 0 {
+        // Reverse so lines come out in file order.
+        let rec rev a xs =
+            if core.is_empty xs { a }
+            else { rev (core.cons (core.head xs) a) (core.tail xs) };
+        rev [] acc
+    } else {
+        read_lines_acc! h (core.cons line acc)
+    }
+};
+
+let lines! h = read_lines_acc! h [];
+
+/// Read all lines from `path` as a list.
+let read_lines! path = with_file! path :read lines!;
+
+/// Copy all bytes from `src` to `dst` in 64 KiB chunks.
+/// Returns the total number of bytes copied.
+let rec copy_loop! src dst total = {
+    let chunk = read! src 65536;
+    if len chunk == 0 {
+        total
+    } else {
+        write_all! dst chunk;
+        copy_loop! src dst (total + len chunk)
+    }
+};
+
+let copy! src dst = copy_loop! src dst 0;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    // Write a temp file, read it back, and check round-trip correctness.
+    // Each test runs in its own process (that is what `test.case` and
+    // `$(..)` give us) so temp-file names do not collide.
+
+    let tmp_path suffix = "/tmp/dream-io-test-" + suffix;
+
+    let tests = [
+        test.case "write_all and read_all round-trip" $({
+            let path = tmp_path "rw";
+            let h = open! path :write;
+            write_all! h "hello, world";
+            close! h;
+            let got = slurp! path;
+            remove! path;
+            test.eq! "hello, world" got
+        }),
+
+        test.case "slurp and spit" $({
+            let path = tmp_path "slurp";
+            spit! path "dream\n";
+            let got = slurp! path;
+            remove! path;
+            test.eq! "dream\n" got
+        }),
+
+        test.case "read_line reads one line" $({
+            let path = tmp_path "lines";
+            spit! path "first\nsecond\nthird";
+            let h = open! path :read;
+            let l1 = read_line! h;
+            let l2 = read_line! h;
+            close! h;
+            remove! path;
+            test.eq! "first\n" l1;
+            test.eq! "second\n" l2
+        }),
+
+        test.case "lines reads all lines" $({
+            let path = tmp_path "alllines";
+            spit! path "a\nb\nc\n";
+            let ls = read_lines! path;
+            remove! path;
+            test.eq! ["a\n", "b\n", "c\n"] ls
+        }),
+
+        test.case "read_all on empty file" $({
+            let path = tmp_path "empty";
+            spit! path "";
+            let got = slurp! path;
+            remove! path;
+            test.eq! "" got
+        }),
+
+        test.case "with_file reads content" $({
+            let path = tmp_path "with";
+            spit! path "hello";
+            let got = with_file! path :read read_all!;
+            remove! path;
+            test.eq! "hello" got
+        }),
+
+        test.case "with_file handle is open inside" $({
+            let path = tmp_path "withopen";
+            spit! path "x";
+            let open_inside = with_file! path :read is_open!;
+            remove! path;
+            test.true! open_inside
+        }),
+
+        test.case "exists and is_dir" $({
+            let path = tmp_path "exist";
+            spit! path "y";
+            let found = exists! path;
+            let is_d = is_dir! path;
+            remove! path;
+            test.true! found;
+            test.false! is_d
+        }),
+
+        test.case "mkdir and remove" $({
+            let path = tmp_path "dir";
+            mkdir! path;
+            let d = is_dir! path;
+            remove! path;
+            test.true! d
+        }),
+
+        test.case "size" $({
+            let path = tmp_path "size";
+            spit! path "12345";
+            let h = open! path :read;
+            let s = size! h;
+            close! h;
+            remove! path;
+            test.eq! 5 s
+        }),
+
+        test.case "seek" $({
+            let path = tmp_path "seek";
+            spit! path "abcdef";
+            let h = open! path :read;
+            seek! h 3;
+            let got = read_all! h;
+            close! h;
+            remove! path;
+            test.eq! "def" got
+        }),
+
+        test.case "copy" $({
+            let src = tmp_path "copy-src";
+            let dst = tmp_path "copy-dst";
+            spit! src "copydata";
+            let hs = open! src :read;
+            let hd = open! dst :write;
+            let n = copy! hs hd;
+            close! hs;
+            close! hd;
+            let got = slurp! dst;
+            remove! src;
+            remove! dst;
+            test.eq! 8 n;
+            test.eq! "copydata" got
+        }),
+    ];
+}

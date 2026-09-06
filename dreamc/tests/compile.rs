@@ -446,7 +446,7 @@ fn diagnostics_render_with_a_caret_under_the_span() {
 // Modules, virtuals and compile-time evaluation
 // ---------------------------------------------------------------------------
 
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 
 /// Write a small multi-file project into a scratch directory and compile it.
 struct Project {

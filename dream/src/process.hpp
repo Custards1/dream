@@ -181,6 +181,11 @@ public:
     /// The descriptor being waited on, when `wait_reason` is `Io`.
     std::atomic<int> wait_fd{-1};
 
+    /// When this process is blocked in `join!`, holds a strong reference to
+    /// the target so we can read its exit value even after it has been retired
+    /// from the process table.
+    std::shared_ptr<Process> join_target;
+
     bool is_done() const {
         ProcStatus s = status.load(std::memory_order_relaxed);
         return s == ProcStatus::Finished || s == ProcStatus::Failed;

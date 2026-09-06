@@ -1152,6 +1152,19 @@ bool force_whnf(Process& p, Value v, Value* out) {
         } else {
             step_return(p);
         }
+        // A blocking native inside the forced value set park_requested. We
+        // cannot complete the force right now, so restore the outer machine
+        // state and bail out. The NativeRetry continuation that resume_native
+        // already pushed for the *inner* blocking call is still on the cont
+        // stack above `floor`; unwinding back to `floor` discards it so the
+        // outer scheduler park-and-retry cycle operates on the correct frame.
+        // The caller (a native) must check park_requested and return Block.
+        if (p.park_requested) {
+            // Discard any continuations the inner force pushed above floor.
+            p.conts.resize(floor);
+            ok = false;
+            break;
+        }
     }
 
     *out = p.result;

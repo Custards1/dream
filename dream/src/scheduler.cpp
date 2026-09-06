@@ -207,6 +207,13 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
     live_.fetch_sub(1, std::memory_order_acq_rel);
     for (uint64_t id : waiters) wake(id);
     done_cv_.notify_all();
+    // Drop the process from the table now that its exit value has been
+    // published and every joiner has been woken. Keeping it indefinitely
+    // leaks the entire heap of every finished process.  Joiners that were
+    // woken above still hold their own shared_ptr (via find_process) for as
+    // long as they need the exit value; removing from the map just releases
+    // the table's reference.
+    rt_.retire_process(p->id());
 }
 
 void Scheduler::wake(uint64_t pid) {
@@ -353,7 +360,9 @@ bool Scheduler::receive(Process& p, Value* out) {
 }
 
 Scheduler::JoinState Scheduler::join(Process& p, uint64_t target, Value* out) {
-    auto proc = rt_.find_process(target);
+    // On retry after a park, we may have saved the target's shared_ptr to
+    // survive its retirement from the process table. Use it if available.
+    auto proc = p.join_target ? p.join_target : rt_.find_process(target);
     if (!proc) {
         // Unknown pid: either it never existed or it has been reaped.
         *out = UNIT;
@@ -367,6 +376,7 @@ Scheduler::JoinState Scheduler::join(Process& p, uint64_t target, Value* out) {
     std::lock_guard<std::mutex> g(proc->waiters_mutex);
     if (proc->is_done()) {
         *out = Heap::copy_between(p.heap(), proc->exit_value);
+        p.join_target.reset();  // release our hold now that we have the value
         if (proc->failed) {
             // Delivered to a joiner, so it is handled; drop it from the list
             // the runtime reports at shutdown.
@@ -377,8 +387,10 @@ Scheduler::JoinState Scheduler::join(Process& p, uint64_t target, Value* out) {
         return JoinState::Ready;
     }
     // Register before parking, under the same lock the exiting process takes,
-    // so an exit that happens right now cannot slip past us.
+    // so an exit that happens right now cannot slip past us. Save the
+    // shared_ptr so we can find the process even after it has been retired.
     proc->waiters.push_back(p.id());
+    p.join_target = proc;
     {
         std::lock_guard<std::mutex> g2(p.sched_mutex);
         p.park_requested = true;

@@ -393,7 +393,7 @@ NativeResult bi_send(Process& p, Value, Value* args, uint32_t) {
     // The message must be fully evaluated before it leaves: a thunk carries a
     // frame that points into this process's heap, which the receiver cannot see.
     Value forced;
-    if (!force_deep(p, args[1], &forced)) return NativeResult::raise(p.result);
+    if (!force_deep(p, args[1], &forced)) return force_failed(p);
     if (!p.runtime().scheduler()->send(p, target, forced)) {
         return NativeResult::raise(raise_error(p, well_known(p.runtime()).error,
                                                "no such thread"));
@@ -454,7 +454,7 @@ NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
 
 NativeResult bi_to_string(Process& p, Value, Value* args, uint32_t) {
     std::string s;
-    if (!stringify(p, args[0], &s)) return NativeResult::raise(p.result);
+    if (!stringify(p, args[0], &s)) return force_failed(p);
     return NativeResult::ok(p.heap().make_string(s.data(), uint32_t(s.size())));
 }
 
@@ -473,7 +473,7 @@ NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
         Value cur = v;
         for (;;) {
             Value w;
-            if (!force_whnf(p, cur, &w)) return NativeResult::raise(p.result);
+            if (!force_whnf(p, cur, &w)) return force_failed(p);
             if (!is_obj(w, ObjType::Cons)) break;
             ++n;
             cur = static_cast<ConsObj*>(as_obj(w))->tail;
@@ -512,7 +512,7 @@ namespace {
 NativeResult write_values(Process& p, Value* args, uint32_t argc, bool newline, std::FILE* out) {
     std::string text;
     for (uint32_t i = 0; i < argc; ++i) {
-        if (!stringify(p, args[i], &text)) return NativeResult::raise(p.result);
+        if (!stringify(p, args[i], &text)) return force_failed(p);
     }
     if (newline) text.push_back('\n');
     // One write, so interleaved output from concurrent processes stays legible.
@@ -580,7 +580,7 @@ NativeResult list_head(Process& p, Value, Value* args, uint32_t) {
     }
     Value out;
     if (!force_whnf(p, static_cast<ConsObj*>(as_obj(v))->head, &out)) {
-        return NativeResult::raise(p.result);
+        return force_failed(p);
     }
     return NativeResult::ok(out);
 }
@@ -593,7 +593,7 @@ NativeResult list_tail(Process& p, Value, Value* args, uint32_t) {
     }
     Value out;
     if (!force_whnf(p, static_cast<ConsObj*>(as_obj(v))->tail, &out)) {
-        return NativeResult::raise(p.result);
+        return force_failed(p);
     }
     return NativeResult::ok(out);
 }
@@ -962,12 +962,12 @@ NativeResult core_str_of_chars(Process& p, Value, Value* args, uint32_t) {
     Value cur = args[0];
     for (;;) {
         Value w;
-        if (!force_whnf(p, cur, &w)) return NativeResult::raise(p.result);
+        if (!force_whnf(p, cur, &w)) return force_failed(p);
         if (is_nil(w)) break;
         if (!is_obj(w, ObjType::Cons)) return type_fail(p, "str_of_chars needs a list of chars");
         auto* c = static_cast<ConsObj*>(as_obj(w));
         Value head;
-        if (!force_whnf(p, c->head, &head)) return NativeResult::raise(p.result);
+        if (!force_whnf(p, c->head, &head)) return force_failed(p);
         if (!is_char(head)) return type_fail(p, "str_of_chars needs a list of chars");
         utf8_encode(uint32_t(imm_payload(head)), &out);
         cur = c->tail;
@@ -1122,7 +1122,7 @@ NativeResult core_array_get(Process& p, Value, Value* args, uint32_t) {
     // machine takes to be in weak head normal form. Handing back the raw slot
     // would leak a thunk into an operator's operand.
     Value out;
-    if (!force_whnf(p, a->items()[k], &out)) return NativeResult::raise(p.result);
+    if (!force_whnf(p, a->items()[k], &out)) return force_failed(p);
     return NativeResult::ok(out);
 }
 
@@ -1157,7 +1157,7 @@ NativeResult core_array_of_list(Process& p, Value, Value* args, uint32_t) {
         Value w;
         if (!force_whnf(p, cur, &w)) {
             p.stack.resize(base);
-            return NativeResult::raise(p.result);
+            return force_failed(p);
         }
         if (is_nil(w)) break;
         if (!is_obj(w, ObjType::Cons)) {
@@ -1203,7 +1203,7 @@ NativeResult core_map_get(Process& p, Value, Value* args, uint32_t) {
     // than handed back as a thunk. See the note in `core_array_get`.
     Value out;
     if (!map_lookup(p, m, args[1], &found)) found = args[2];
-    if (!force_whnf(p, found, &out)) return NativeResult::raise(p.result);
+    if (!force_whnf(p, found, &out)) return force_failed(p);
     return NativeResult::ok(out);
 }
 

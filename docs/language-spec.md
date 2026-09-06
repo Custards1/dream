@@ -880,59 +880,232 @@ Everything here is either a primitive the representation hides (a string's
 bytes, a map's buckets) or something that must be a single machine step for the
 rest of the library to be worth writing.
 
-| Area | Members |
-|------|---------|
-| lists | `head` `tail` `cons` `is_empty` |
-| strings | `str_len` `str_chars` `str_of_chars` `str_slice` `str_find` `str_byte` |
-| chars | `char_code` `char_of_code` |
-| numbers | `to_float` `to_int` `parse_int` `parse_float` |
-| arrays | `array_new` `array_get` `array_set` `array_of_list` `array_to_list` |
-| maps | `map_new` `map_get` `map_has` `map_put` `map_remove` `map_pairs` |
-| ordering | `compare` |
+**Lists**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `head xs` | list → value | the first element; raises `:type_error` on an empty list |
+| `tail xs` | list → list | everything after the first element |
+| `cons x xs` | value × list → list | prepend `x`; lazy in both arguments |
+| `is_empty xs` | list → bool | `true` for `[]` |
+
+**Strings** (byte-indexed unless noted)
+
+| Member | Signature | |
+|--------|-----------|--|
+| `str_len s` | string → integer | byte length |
+| `str_chars s` | string → list | decode UTF-8 into a list of chars |
+| `str_of_chars cs` | list → string | encode a list of chars as UTF-8 |
+| `str_slice s from count` | string × integer × integer → string | `count` bytes from byte offset `from`; clamped, never raises |
+| `str_find s needle from` | string × string × integer → integer | byte offset of `needle` at or after `from`, or `-1` |
+| `str_byte s i` | string × integer → integer | the raw byte at byte index `i` |
+
+**Characters**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `char_code c` | char → integer | Unicode code point |
+| `char_of_code n` | integer → char | code point to char |
+
+**Numbers**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `to_float n` | integer → float | widen to double |
+| `to_int f` | float → integer | truncate toward zero |
+| `parse_int s` | string → integer or `:parse_error` | decimal string to integer |
+| `parse_float s` | string → float or `:parse_error` | decimal string to float |
+
+**Arrays**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `array_new n fill` | integer × value → array | `n`-element array; every slot holds `fill` |
+| `array_get xs i` | array × integer → value | element at index `i`; raises `:out_of_bounds` |
+| `array_set xs i v` | array × integer × value → array | copy with slot `i` replaced; original unchanged |
+| `array_of_list xs` | list → array | collect a list into an array |
+| `array_to_list xs` | array → list | elements as a lazy list |
+
+**Maps** (keys compared by value for flat types, by identity otherwise)
+
+| Member | Signature | |
+|--------|-----------|--|
+| `map_new n` | integer → map | empty map with initial capacity `n` (rounded to power of two) |
+| `map_get m key default` | map × value × value → value | value at `key`, or `default`; value is forced before returning |
+| `map_has m key` | map × value → bool | `true` when `key` is present |
+| `map_put m key value` | map × value × value → map | copy with `key` set to `value` |
+| `map_remove m key` | map × value → map | copy with `key` removed; no-op when absent |
+| `map_pairs m` | map → list | list of `[key, value]` pairs in unspecified order |
+
+**Ordering**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `compare a b` | value × value → integer | negative / zero / positive for less / equal / greater; total over the flat types |
 
 ### `std.console`
 
-| | |
-|-|-|
-| `print! ..` | writes every argument, then a newline, to stdout |
-| `write! ..` | the same without the trailing newline |
-| `line! ..` | as `print!` |
-| `error! ..` | as `print!`, to stderr |
+| Member | | |
+|--------|-|-|
+| `print! ..` | variadic | write every argument rendered, then a newline, to stdout |
+| `write! ..` | variadic | as `print!` without the trailing newline |
+| `line! ..` | variadic | alias for `print!` |
+| `error! ..` | variadic | as `print!`, to stderr |
 
-**Every member is variadic**: it takes however many arguments the call site
-passed, writes each in turn with no separator between them, and forces every
-one.
+All four are variadic: they take however many arguments the call site passed,
+render each with the same rules as `to_string`, and force every one.
+Because Dream lowers `x |> f a` to a single application, `x |> console.print!
+"label"` still works and produces one write.
 
-```dream
-console.print! "done"
-console.print! "x = " x ", y = " y
-x |> console.print! "x = "            // one application, so this still works
-```
-
-Variadic is possible here only because Dream lowers `a |> f b` to a *single*
-application node, so a variadic native can take "everything at this call site"
-as its meaning. The flip side is that **a variadic function is never partially
-applied** — currying cannot tell `f a b` from a half-finished `f a b c` — so
-`console.print! "label"` prints immediately rather than returning a function
-waiting for a value.
+A variadic member is never partially applied — `console.print! "label"` prints
+immediately, it does not return a function waiting for a value.
 
 ### `std.math`
 
-`sqrt` · `abs` · `floor`
+| Member | Signature | |
+|--------|-----------|--|
+| `sqrt n` | number → float | square root |
+| `abs n` | number → number | absolute value; returns integer for integer input, float for float |
+| `floor n` | number → integer | floor toward negative infinity; no-op on integers |
 
 ### `std.vm` — the runtime describing itself
 
-`processes! ()` · `reductions! ()` · `collections! ()` · `heap_bytes! ()` ·
-`modules! ()` · `has_ffi ()`
+All members take a unit argument `()`.
 
-### `std.ffi`
+| Member | Returns | |
+|--------|---------|--|
+| `processes! ()` | integer | number of live processes right now |
+| `reductions! ()` | integer | reductions spent by this process so far |
+| `collections! ()` | integer | GC collections in this process's heap |
+| `heap_bytes! ()` | integer | bytes currently allocated in this process's heap |
+| `modules! ()` | list of string | module names loaded in this image, in image order |
+| `has_ffi ()` | bool | `true` when libffi is compiled in |
+| `async_io ()` | bool | `true` when the poller is available (epoll on Linux) |
+| `processes_info! ()` | list of map | one map per live process — see below |
+| `process_info! p` | map or `()` | info map for process `p` (pid or integer id), or `()` if it no longer exists |
+| `scheduler! ()` | map | scheduler-level counters — see below |
+| `io! ()` | list of map | one map per open IO handle — see below |
+| `dump! ()` | unit | prints a human-readable snapshot of every process to stderr |
 
-`open!` · `close!` · `bind!` · `load!` · `sizeof` · `alloc!` · `free!` ·
-`read_cstr!` · `read_u8!` · `write_u8!`
+**Process info map keys:** `id` · `status` (`:runnable` `:running` `:waiting` `:finished` `:failed`) · `waiting_on` (`:none` `:message` `:join` `:io`) · `fd` · `reductions` · `heap_bytes` · `collections` · `mailbox` · `failed`
 
-Built only when libffi is found. Without it every member except `sizeof` raises,
-and `vm.has_ffi ()` reports `false`, so a program can degrade rather than fail
-to load.
+**Scheduler map keys:** `workers` · `idle` · `live` · `runnable` · `queued` · `io_waiters` · `reductions` · `deadlocked`
+
+**IO handle map keys:** `handle` · `fd` · `kind` (`:file` `:listener` `:stream`) · `busy` · `waiting` (pid integer or `()`)
+
+### `std.io` — files, streams, and paths
+
+Handles are integers issued by `open!` or the standard-stream accessors. A
+generation is embedded in each integer so a stale handle from a closed file is
+rejected rather than silently reused.
+
+**Opening and closing**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `open! path mode` | string × atom → handle | open a file; mode is `:read` `:write` `:append` `:update` |
+| `close! h` | handle → unit | close the handle; safe to call while another process is reading |
+| `stdin! ()` | unit → handle | the process's standard input (not owned — closing it is a no-op) |
+| `stdout! ()` | unit → handle | standard output |
+| `stderr! ()` | unit → handle | standard error |
+
+**Reading and writing**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `read! h n` | handle × integer → string | read at most `n` bytes; returns `""` at end of file |
+| `write! h s` | handle × string → integer | write as many bytes of `s` as the descriptor will take; returns the count |
+| `flush! h` | handle → unit | `fsync` a regular file; no-op on sockets and streams |
+
+**Positioning (regular files)**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `seek! h offset` | handle × integer → integer | seek to absolute byte offset; returns the new position |
+| `size! h` | handle → integer | file size in bytes |
+
+**Inspection**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `kind! h` | handle → atom | `:file` `:listener` or `:stream` |
+| `is_open! h` | handle → bool | `false` after `close!` or if the handle was never valid |
+| `async ()` | unit → bool | `true` when IO parks the process rather than a worker thread |
+
+**Paths**
+
+| Member | Signature | |
+|--------|-----------|--|
+| `exists! path` | string → bool | `true` if the path names anything at all |
+| `is_dir! path` | string → bool | `true` if the path is a directory |
+| `remove! path` | string → unit | delete a file or empty directory |
+| `rename! from to` | string × string → unit | rename or move |
+| `mkdir! path` | string → unit | create a directory; succeeds silently if it already exists |
+
+**Blocking behaviour.** `read!` and `write!` park the calling process (not the
+worker thread) when the descriptor would block, provided `io.async ()` is
+`true`. On Linux this is backed by epoll; on other platforms it falls back to
+blocking the worker. The park-and-retry cycle is invisible to Dream code —
+`read!` simply returns when data arrives.
+
+**Error kinds** raised by this module:
+
+| Kind | Condition |
+|------|-----------|
+| `:io_closed` | operating on a handle that has been closed |
+| `:not_found` | path does not exist (`ENOENT`) |
+| `:permission_denied` | `EACCES` or `EPERM` |
+| `:already_exists` | `EEXIST` |
+| `:wrong_kind` | e.g. `open!` on a directory (`EISDIR` / `ENOTDIR`) |
+| `:io_error` | any other OS error; payload includes `strerror` text |
+
+### `std.net` — TCP sockets
+
+Sockets are handles like any other. `io.read!` and `io.write!` work on them
+unchanged. This module adds only what files do not have: listening, accepting,
+and connecting.
+
+| Member | Signature | |
+|--------|-----------|--|
+| `listen! port` | integer → handle | bind and listen on `port` on all interfaces; port 0 lets the kernel pick |
+| `accept! listener` | handle → handle | park until a connection arrives; returns a stream handle |
+| `connect! host port` | string × integer → handle | resolve `host`, open a TCP connection to `port`; parks during the attempt |
+| `peer! h` | handle → string | `"host:port"` of the other end of a connection |
+| `port! h` | handle → integer | local port; use after `listen! 0` to find the assigned port |
+| `shutdown! h` | handle → unit | send TCP FIN; the other end sees EOF while this end can still read |
+
+`connect!` calls `getaddrinfo` synchronously (no portable async resolver), which stalls one worker briefly. The socket connection itself is non-blocking and parks the process, not the worker.
+
+**Error kinds** (in addition to those from `std.io`):
+
+| Kind | Condition |
+|------|-----------|
+| `:connection_refused` | `ECONNREFUSED` |
+| `:connection_lost` | `ECONNRESET` or `EPIPE` |
+| `:address_in_use` | `EADDRINUSE` |
+| `:timed_out` | `ETIMEDOUT` |
+
+### `std.ffi` — C foreign function interface
+
+Built only when libffi is found at compile time. Without it every member except
+`sizeof` raises `:ffi_unavailable`, and `vm.has_ffi ()` reports `false`, so a
+program can degrade gracefully.
+
+| Member | Signature | |
+|--------|-----------|--|
+| `open! path` | string → handle | `dlopen` a shared library; returns an opaque handle |
+| `close! h` | handle → unit | `dlclose` |
+| `bind! h symbol arg_types ret_type` | handle × string × list × atom → fn | look up `symbol` and return a callable Dream function |
+| `load! h symbol arg_types ret_type` | handle × string × list × atom → value | call `symbol` once and return its result immediately |
+| `sizeof type` | atom → integer | size in bytes of a C type atom (works without libffi) |
+| `alloc! n` | integer → pointer | allocate `n` bytes of C memory; returns an opaque pointer integer |
+| `free! ptr` | pointer → unit | free memory from `alloc!` |
+| `read_cstr! ptr` | pointer → string | read a null-terminated C string |
+| `read_u8! ptr offset` | pointer × integer → integer | read one byte |
+| `write_u8! ptr offset byte` | pointer × integer × integer → unit | write one byte |
+
+**Type atoms** accepted by `sizeof`, `bind!`, and `load!`:
+`:void` · `:bool` · `:i8` `:i16` `:i32` `:i64` · `:u8` `:u16` `:u32` `:u64` · `:f32` `:f64` · `:ptr` · `:cstr`
 
 ### `mind/std` — the Dream-level library
 

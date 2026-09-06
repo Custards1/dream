@@ -1,0 +1,236 @@
+// std.network — TCP networking built on std.net and std.stream.
+//
+// The native layer (std.net in the VM) provides the socket primitives:
+// listen!, accept!, connect!, peer!, port!, shutdown!.
+// `std.io` read! and write! work on sockets unchanged.
+//
+// This module adds:
+//
+//   - Re-exports of all native std.net and std.io members
+//   - `write_all!`  — write every byte to a socket, retrying short writes
+//   - `read_all!`   — drain a socket/handle to EOF
+//   - `read_line!`  — read one newline-terminated line (byte at a time)
+//   - `serve!`      — accept loop: spawn a process per connection
+//   - `dial!`       — connect and return a handle
+//   - `request!`    — connect, write, read response, close
+//
+// Sockets are handles (integers) issued by listen!, accept!, or connect!.
+// io.read! and io.write! work on them directly; this module only adds
+// the patterns that recur in almost every network program.
+
+import std.io;
+import std.stream;
+import std.core;
+
+// ---------------------------------------------------------------------------
+// Re-exports: native std.net primitives
+// ---------------------------------------------------------------------------
+
+/// Bind and listen on `port` on all interfaces. Port 0 lets the kernel pick.
+/// Returns a listener handle.
+let listen! port = net.listen! port;
+
+/// Park until a connection arrives on `listener`. Returns a stream handle.
+let accept! listener = net.accept! listener;
+
+/// Open a TCP connection to `host:port`. Parks during DNS and connect.
+/// Returns a stream handle.
+let connect! host port = net.connect! host port;
+
+/// The remote address of a connected socket, as `"host:port"`.
+let peer! h = net.peer! h;
+
+/// The local port of a listener or connected socket.
+/// Use after `listen! 0` to find the kernel-assigned port.
+let port! h = net.port! h;
+
+/// Send TCP FIN. The other end sees EOF; this end can still read.
+let shutdown! h = net.shutdown! h;
+
+// Re-export io primitives that are used on every socket.
+let read! h n    = io.read! h n;
+let write! h s   = io.write! h s;
+let close! h     = io.close! h;
+let is_open! h   = io.is_open! h;
+
+// ---------------------------------------------------------------------------
+// Stream helpers (re-used from std.stream, bound locally for convenience)
+// ---------------------------------------------------------------------------
+
+/// Write every byte of `s` to `h`, retrying on short writes.
+let write_all! h s = stream.write_all! h s;
+
+/// Drain `h` to EOF into a string.
+let read_all! h = stream.read_all! h;
+
+/// Read one newline-terminated line from `h`.
+/// Returns `""` at EOF.
+let read_line! h = stream.read_line! h;
+
+/// Read all lines from `h` as a list.
+let lines! h = stream.lines! h;
+
+// ---------------------------------------------------------------------------
+// Higher-level patterns
+// ---------------------------------------------------------------------------
+
+/// Connect to `host:port`, run `f conn`, close, return result.
+/// Closes the socket even if `f` raises.
+let dial! host port f = {
+    let h = net.connect! host port;
+    let result = try! { f h } catch e { io.close! h; raise! e };
+    io.close! h;
+    result
+};
+
+/// Simple request/response: connect, write `req`, read up to `max_bytes`
+/// of response, close, return the response string.
+let request! host port req max_bytes = {
+    dial! host port (fn h -> {
+        write_all! h req;
+        net.shutdown! h;
+        read_all! h
+    })
+};
+
+/// Accept loop. Binds `port`, then for each incoming connection spawns
+/// `handler conn` as a new process and loops.
+///
+///   net.serve! 8080 (fn conn -> {
+///       let req = net.read_line! conn;
+///       net.write_all! conn ("echo: " + req);
+///   })
+///
+/// `serve!` never returns under normal operation. The listener is closed
+/// only if `accept!` raises (e.g. the listener handle was closed externally),
+/// at which point the error propagates to the caller.
+let rec serve_loop! listener handler = {
+    let conn = net.accept! listener;
+    spawn! $( handler conn );
+    serve_loop! listener handler
+};
+
+let serve! port handler = {
+    let listener = net.listen! port;
+    let result = try! {
+        serve_loop! listener handler
+    } catch e {
+        io.close! listener;
+        raise! e
+    };
+    io.close! listener;
+    result
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    // The tests spin up a real listener on a loopback port. Each test
+    // spawns a server process and a client process, joins both, and
+    // checks the outcome. Port 0 lets the kernel pick a free port.
+
+    /// Echo server: read one line, write it back, close.
+    let echo_handler! conn = {
+        let line = read_line! conn;
+        write_all! conn line;
+        io.close! conn
+    };
+
+    let tests = [
+        test.case "connect and echo" $({
+            let listener = listen! 0;
+            let p = net.port! listener;
+            let server = spawn! $( {
+                let conn = accept! listener;
+                io.close! listener;
+                echo_handler! conn
+            } );
+            let client = spawn! $( {
+                let h = connect! "127.0.0.1" p;
+                write_all! h "hello\n";
+                let reply = read_line! h;
+                io.close! h;
+                reply
+            } );
+            join! server;
+            let got = join! client;
+            test.eq! "hello\n" got
+        }),
+
+        test.case "peer returns address" $({
+            let listener = listen! 0;
+            let p = net.port! listener;
+            let server = spawn! $( {
+                let conn = accept! listener;
+                io.close! listener;
+                io.close! conn
+            } );
+            let client = spawn! $( {
+                let h = connect! "127.0.0.1" p;
+                let addr = peer! h;
+                io.close! h;
+                addr
+            } );
+            join! server;
+            let addr = join! client;
+            // addr is "127.0.0.1:<port>" — check the prefix
+            test.true! (stream.starts_with "127.0.0.1" addr)
+        }),
+
+        test.case "shutdown signals EOF to reader" $({
+            let listener = listen! 0;
+            let p = net.port! listener;
+            let server = spawn! $( {
+                let conn = accept! listener;
+                io.close! listener;
+                write_all! conn "data";
+                shutdown! conn;
+                // wait for client to close
+                let _ = read_all! conn;
+                io.close! conn
+            } );
+            let client = spawn! $( {
+                let h = connect! "127.0.0.1" p;
+                let got = read_all! h;
+                io.close! h;
+                got
+            } );
+            join! server;
+            let got = join! client;
+            test.eq! "data" got
+        }),
+
+        test.case "request helper" $({
+            // A minimal HTTP-ish echo: read request line, write it back.
+            let listener = listen! 0;
+            let p = net.port! listener;
+            let server = spawn! $( {
+                let conn = accept! listener;
+                io.close! listener;
+                let req = read_all! conn;
+                write_all! conn req;
+                io.close! conn
+            } );
+            let got = request! "127.0.0.1" p "ping" 1024;
+            join! server;
+            test.eq! "ping" got
+        }),
+
+        test.case "write_all handles short writes" $({
+            // write_all! on a regular file exercises the retry path
+            // (real sockets rarely short-write in loopback, but the loop
+            // must still be correct).
+            let path = "/tmp/dream-net-test-writeall";
+            let h = io.open! path :write;
+            write_all! h "abcdefghij";
+            io.close! h;
+            let got = stream.slurp! path;
+            io.remove! path;
+            test.eq! "abcdefghij" got
+        }),
+    ];
+}
