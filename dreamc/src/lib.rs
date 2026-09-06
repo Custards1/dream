@@ -195,7 +195,7 @@ fn resolve_impure_comp(lo: &mut lower::Lowerer<'_>) {
                 lo.diags.push(
                     Diag::error(pc.span, "`comp!` needs the Dream VM, which could not be loaded")
                         .with_note(format!(
-                            "set DREAM_VM_LIB to libmindv2.so, or build the VM. Last attempt: {e}"
+                            "set DREAM_VM_LIB to libdream.so, or build the VM. Last attempt: {e}"
                         ))
                         .in_source(pc.source),
                 );

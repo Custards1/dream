@@ -1,17 +1,17 @@
 # Dream: a lazily evaluated functional language.
 #
 #   dreamc/  the compiler (dreamc), in Rust   -- source to `.dream` bytecode
-#   dream/  the VM (mindv2), in C++          -- interpreter, green processes, LLVM JIT
+#   dream/  the VM (dream), in C++          -- interpreter, green processes, LLVM JIT
 #   mind/   the build system and standard library, in Dream
 #
 # `just` with no target builds both halves.
 
 set positional-arguments
-install_dir :="~/.mindv2/bin"
-build_dir := "build-mindv2"
+install_dir :="~/.dream/bin"
+build_dir := "build-dream"
 dreamc := "target/debug/dreamc"
 dreamc_release := "target/release/dreamc"
-mindv2 := build_dir / "bin/mindv2"
+dream := build_dir / "bin/dream"
 
 default: build
 
@@ -48,7 +48,7 @@ clean:
 # Compile and run a program: `just run examples/hello.dr`
 run FILE *ARGS: build
     ./{{dreamc}} {{FILE}} -o /tmp/dream-run.dream
-    ./{{mindv2}} /tmp/dream-run.dream {{ARGS}}
+    ./{{dream}} /tmp/dream-run.dream {{ARGS}}
 
 # Compile only.
 compile FILE *ARGS: compiler
@@ -72,11 +72,11 @@ packages FILE: compiler
 # The LLVM IR generated for one function.
 jit-ir FILE FN: build
     ./{{dreamc}} {{FILE}} -o /tmp/dream-jit.dream
-    ./{{mindv2}} /tmp/dream-jit.dream --dump-jit {{FN}}
+    ./{{dream}} /tmp/dream-jit.dream --dump-jit {{FN}}
 
 install: release
     mv {{dreamc_release}} {{install_dir}}
-    mv {{mindv2}} {{install_dir}}
+    mv {{dream}} {{install_dir}}
 
 # --- testing ----------------------------------------------------------------
 
@@ -87,7 +87,7 @@ test-compiler:
     cargo test --offline -p dreamc
 
 test-vm: vm
-    ./{{build_dir}}/bin/mindv2_tests
+    ./{{build_dir}}/bin/dream_tests
 
 # Real programs, run under both the interpreter and the JIT, which must agree.
 test-e2e: build
@@ -105,12 +105,12 @@ examples-bless: build
 # across files and a path dependency between two packages.
 test-examples-std: build
     ./{{dreamc}} examples/textstats/main.dr --test -L mind -L examples -o /tmp/dream-ex-tests.dream
-    ./{{mindv2}} /tmp/dream-ex-tests.dream
+    ./{{dream}} /tmp/dream-ex-tests.dream
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
     ./{{dreamc}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
-    ./{{mindv2}} /tmp/dream-std-tests.dream
+    ./{{dream}} /tmp/dream-std-tests.dream
 
 # Malformed images must be rejected, never crashed on.
 fuzz ITERATIONS="400": build
@@ -127,7 +127,7 @@ test-races:
       -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
       -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
     cmake --build build-tsan -j
-    MINDV2=build-tsan/bin/mindv2 dream/tests/e2e.sh
+    dream=build-tsan/bin/dream dream/tests/e2e.sh
 
 # The slow, thorough set. What to run before believing a change is safe.
 test-all: test fuzz test-heap vm-no-jit

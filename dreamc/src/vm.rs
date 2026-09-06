@@ -60,7 +60,7 @@ macro_rules! sym {
         unsafe {
             *$lib
                 .get::<$ty>(concat!($name, "\0").as_bytes())
-                .map_err(|e| format!("libmindv2 is missing `{}`: {e}", $name))?
+                .map_err(|e| format!("libdream is missing `{}`: {e}", $name))?
         }
     };
 }
@@ -99,12 +99,12 @@ impl Vm {
             out.push(PathBuf::from(p));
         }
         let relative = [
-            "build-mindv2/lib/libmindv2.so",
-            "build/lib/libmindv2.so",
-            "dawn/build/lib/libmindv2.so",
-            "../build-mindv2/lib/libmindv2.so",
-            "../dawn/build/lib/libmindv2.so",
-            "../../build-mindv2/lib/libmindv2.so",
+            "build-dream/lib/libdream.so",
+            "build/lib/libdream.so",
+            "dawn/build/lib/libdream.so",
+            "../build-dream/lib/libdream.so",
+            "../dawn/build/lib/libdream.so",
+            "../../build-dream/lib/libdream.so",
         ];
         if let Some(dir) = exe_dir {
             // target/debug/dreamc -> walk up to the project root.
@@ -117,7 +117,7 @@ impl Vm {
         for r in relative {
             out.push(PathBuf::from(r));
         }
-        out.push(PathBuf::from("libmindv2.so"));
+        out.push(PathBuf::from("libdream.so"));
         out
     }
 

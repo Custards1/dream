@@ -6,7 +6,7 @@ compile_commands.json
 *.cache
 *.vscode
 build/
-build-mindv2/
+build-dream/
 CMakeFiles/
 out/
 target/

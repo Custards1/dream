@@ -10,7 +10,7 @@ name. Two programs implement it:
 | | |
 |-|-|
 | [`dreamc/`](../dreamc) | the compiler, in Rust — `.dr` source to a `.dream` image |
-| [`dream/`](../dream) | the VM, `mindv2`, in C++ — interpreter, processes, LLVM JIT |
+| [`dream/`](../dream) | the VM, `dream`, in C++ — interpreter, processes, LLVM JIT |
 | [`mind/`](../mind) | the standard library and build system, written in Dream |
 
 > **Status legend.** Everything in this document is implemented and covered by
@@ -1032,7 +1032,7 @@ runner catches.
 
 ```
 just test-std                       # the standard library's own suite
-dreamc mind/std/all.dr --test -L mind -o t.dream && mindv2 t.dream
+dreamc mind/std/all.dr --test -L mind -o t.dream && dream t.dream
 ```
 
 ---
@@ -1061,10 +1061,10 @@ dreamc FILE [-o OUT.dream] [options]
 | `--no-emit` | check only: scope, purity, verification |
 | `--no-debug` | omit debug info |
 
-### `mindv2` — the VM
+### `dream` — the VM
 
 ```
-mindv2 PROGRAM.dream [options]
+dream PROGRAM.dream [options]
 ```
 
 | Flag | |
@@ -1105,7 +1105,7 @@ just test-all        # the above plus fuzzing, heap verification, no-JIT build
 .dream image        a flat arena of 16-byte nodes linked by index
    │                (format: dreamc/docs/bytecode-format.md)
    ▼
-mindv2              image.cpp loads and revalidates; interp.cpp reduces;
+dream              image.cpp loads and revalidates; interp.cpp reduces;
                     jit.cpp compiles the strict numeric spine
 ```
 

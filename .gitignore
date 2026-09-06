@@ -6,9 +6,12 @@ compile_commands.json
 *.cache
 *.vscode
 build/
-build-mindv2/
+build-dream/
 build-nojit/
 build-tsan/
 CMakeFiles/
 out/
 target/
+result/
+lib/
+bin/

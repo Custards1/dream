@@ -20,7 +20,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 BUILD_TYPE=RelWithDebInfo
-BUILD_DIR=build-mindv2
+BUILD_DIR=build-dream
 RUN_TESTS=1
 DO_CLEAN=0
 PREFIX=""
@@ -133,7 +133,7 @@ ok "$DREAMC"
 
 # --- VM ---------------------------------------------------------------------
 
-step "Building the VM (libmindv2, mindv2)"
+step "Building the VM (libdream, dream)"
 cmake -S . -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
       -DDREAM_ENABLE_JIT="$ENABLE_JIT" \
@@ -142,10 +142,10 @@ cmake -S . -B "$BUILD_DIR" \
 cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | \
   grep -E 'error|warning:' | sed 's/^/    /' || true
 
-MINDV2="$BUILD_DIR/bin/mindv2"
-[[ -x "$MINDV2" ]] || die "cmake finished but $MINDV2 is missing"
-ok "$MINDV2"
-ok "$BUILD_DIR/lib/libmindv2.so"
+dream="$BUILD_DIR/bin/dream"
+[[ -x "$dream" ]] || die "cmake finished but $dream is missing"
+ok "$dream"
+ok "$BUILD_DIR/lib/libdream.so"
 
 # --- smoke test -------------------------------------------------------------
 
@@ -158,7 +158,7 @@ let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
 let main! = { fac 10 |> console.print! "fac 10 = " }
 DREAM
 "$DREAMC" "$TMP/hello.dr" -o "$TMP/hello.dream" >/dev/null 2>&1 || die "the compiler could not compile a trivial program"
-result="$("$MINDV2" "$TMP/hello.dream" 2>&1)" || die "the VM could not run a trivial program: $result"
+result="$("$dream" "$TMP/hello.dream" 2>&1)" || die "the VM could not run a trivial program: $result"
 [[ "$result" == "fac 10 = 3628800" ]] || die "unexpected result: $result"
 ok "compiled and ran a program end to end"
 
@@ -167,8 +167,8 @@ ok "compiled and ran a program end to end"
 if [[ $RUN_TESTS -eq 1 ]]; then
   step "Running tests"
   cargo test --offline -p dreamc ${CARGO_PROFILE} 2>&1 | grep -E '^test result' | sed 's/^/    compiler: /'
-  "$BUILD_DIR/bin/mindv2_tests" 2>&1 | tail -1 | sed 's/^/    vm: /'
-  DREAMC="$DREAMC" MINDV2="$MINDV2" dream/tests/e2e.sh 2>&1 | tail -1 | sed 's/^/    programs: /'
+  "$BUILD_DIR/bin/dream_tests" 2>&1 | tail -1 | sed 's/^/    vm: /'
+  DREAMC="$DREAMC" dream="$dream" dream/tests/e2e.sh 2>&1 | tail -1 | sed 's/^/    programs: /'
 fi
 
 # --- install ----------------------------------------------------------------
@@ -176,7 +176,7 @@ fi
 if [[ -n "$PREFIX" ]]; then
   step "Installing into $PREFIX"
   cmake --install "$BUILD_DIR" --prefix "$PREFIX" >/dev/null
-  install -Dm755 "$DREAMC" "$PREFIX/bin/mindv2c"
+  install -Dm755 "$DREAMC" "$PREFIX/bin/dreamc"
   if [[ -d mind/std ]]; then
     mkdir -p "$PREFIX/share/dream"
     cp -r mind "$PREFIX/share/dream/"
@@ -190,9 +190,9 @@ fi
 echo
 printf '%sDream is built.%s\n' "$BOLD" "$RESET"
 printf '  compiler  %s\n' "$DREAMC"
-printf '  vm        %s\n' "$MINDV2"
-printf '  library   %s\n' "$BUILD_DIR/lib/libmindv2.so"
+printf '  vm        %s\n' "$dream"
+printf '  library   %s\n' "$BUILD_DIR/lib/libdream.so"
 echo
 printf '  %s./%s program.dr -o program.dream && ./%s program.dream%s\n' \
-       "$DIM" "$DREAMC" "$MINDV2" "$RESET"
+       "$DIM" "$DREAMC" "$dream" "$RESET"
 printf '  %sjust --list  for the other tasks%s\n' "$DIM" "$RESET"

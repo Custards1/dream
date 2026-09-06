@@ -1,7 +1,7 @@
 # Dream: a lazily evaluated functional language.
 #
 #   dreamc/  the compiler (dreamc), in Rust -- source to `.dream` images
-#   dream/  the VM (mindv2), in C++      -- interpreter, green processes, LLVM JIT
+#   dream/  the VM (dream), in C++      -- interpreter, green processes, LLVM JIT
 #
 # The compiler is built by Cargo. This drives it as a custom target so that
 # `cmake --build .` produces both halves, and so the VM's end-to-end tests have
@@ -25,8 +25,8 @@ if(DREAM_BUILD_COMPILER)
       COMMENT "Building the dreamc compiler"
       USES_TERMINAL)
     # The VM's e2e tests shell out to the compiler, so make the ordering explicit.
-    if(TARGET mindv2_cli)
-      add_dependencies(mindv2_cli dreamc)
+    if(TARGET dream_cli)
+      add_dependencies(dream_cli dreamc)
     endif()
   else()
     message(WARNING "Dream: cargo not found; the compiler will not be built. "

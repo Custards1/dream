@@ -1,5 +1,5 @@
 [workspace]
-# Only the compiler is a Cargo project. The VM (mindv2) is C++ and is built by
+# Only the compiler is a Cargo project. The VM (dream) is C++ and is built by
 # CMake; see build.sh. The `dream` directory holds the VM, and its leftover
 # Cargo manifest is not part of this workspace.
 members = ["dreamc"]

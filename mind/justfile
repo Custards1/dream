@@ -6,5 +6,5 @@ clean:
 build:
     dawnc $(src)
 run:
-    mindv2 $(output)    
+    dream $(output)    
 rebuild: build run

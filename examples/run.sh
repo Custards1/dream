@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
 DREAMC="${DREAMC:-}"
-MINDV2="${MINDV2:-}"
+dream="${dream:-}"
 # Take the most recently built compiler, not the release one: preferring
 # release would silently check the examples against a stale binary, which is
 # exactly the sort of bug these examples exist to catch.
@@ -28,17 +28,17 @@ if [[ -z "$DREAMC" ]]; then
   done
   DREAMC="$newest"
 fi
-if [[ -z "$MINDV2" ]]; then
-  for c in "$ROOT/build-mindv2/bin/mindv2" "$ROOT/build/bin/mindv2"; do
-    [[ -x "$c" ]] && MINDV2="$c" && break
+if [[ -z "$dream" ]]; then
+  for c in "$ROOT/build-dream/bin/dream" "$ROOT/build/bin/dream"; do
+    [[ -x "$c" ]] && dream="$c" && break
   done
 fi
 if [[ ! -x "${DREAMC:-}" ]]; then
   echo "examples: cannot find dreamc; run \`just build\` or set DREAMC" >&2
   exit 1
 fi
-if [[ ! -x "${MINDV2:-}" ]]; then
-  echo "examples: cannot find mindv2; run \`just build\` or set MINDV2" >&2
+if [[ ! -x "${dream:-}" ]]; then
+  echo "examples: cannot find dream; run \`just build\` or set dream" >&2
   exit 1
 fi
 
@@ -79,7 +79,7 @@ check() {
     return
   fi
 
-  if ! "$MINDV2" "$image" >"$WORK/$name.out" 2>&1; then
+  if ! "$dream" "$image" >"$WORK/$name.out" 2>&1; then
     echo "FAIL $name (run)"
     sed 's/^/    /' "$WORK/$name.out"
     fail=$((fail + 1))
