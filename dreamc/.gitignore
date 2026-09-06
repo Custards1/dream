@@ -10,3 +10,4 @@ build-mindv2/
 CMakeFiles/
 out/
 target/
+bin/
