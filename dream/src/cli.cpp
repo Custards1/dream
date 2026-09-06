@@ -1,4 +1,4 @@
-// The `mindv2` command: load a bytecode image and run it.
+// The `dream` command: load a bytecode image and run it.
 
 #include <cinttypes>
 #include <cstdio>
@@ -20,9 +20,9 @@ using namespace dream;
 namespace {
 
 const char* USAGE =
-    "mindv2 -- the Dream virtual machine\n"
+    "dream -- the Dream virtual machine\n"
     "\n"
-    "usage: mindv2 <image.dream> [options]\n"
+    "usage: dream <image.dream> [options]\n"
     "\n"
     "options:\n"
     "  -e, --entry <name>   run this global instead of `main!`\n"
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
             if (i + 1 >= argc) {
-                std::fprintf(stderr, "mindv2: %s needs a value\n", what);
+                std::fprintf(stderr, "dream: %s needs a value\n", what);
                 std::exit(2);
             }
             return argv[++i];
@@ -217,12 +217,12 @@ int main(int argc, char** argv) {
         } else if (a == "--dump-jit") {
             dump_jit_fn = next("--dump-jit");
         } else if (!a.empty() && a[0] == '-') {
-            std::fprintf(stderr, "mindv2: unknown option `%s`\n", a.c_str());
+            std::fprintf(stderr, "dream: unknown option `%s`\n", a.c_str());
             return 2;
         } else if (path.empty()) {
             path = a;
         } else {
-            std::fprintf(stderr, "mindv2: only one image can be run at a time\n");
+            std::fprintf(stderr, "dream: only one image can be run at a time\n");
             return 2;
         }
     }
@@ -235,7 +235,7 @@ int main(int argc, char** argv) {
     Runtime rt;
     std::string error;
     if (!rt.load_image_file(path, error)) {
-        std::fprintf(stderr, "mindv2: %s\n", error.c_str());
+        std::fprintf(stderr, "dream: %s\n", error.c_str());
         return 1;
     }
 
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
 
     if (!dump_jit_fn.empty()) {
         if (!Jit::available()) {
-            std::fprintf(stderr, "mindv2: this build has no JIT\n");
+            std::fprintf(stderr, "dream: this build has no JIT\n");
             return 1;
         }
         if (!jit_owner) jit_owner = std::make_unique<Jit>(rt);
@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
                 return 0;
             }
         }
-        std::fprintf(stderr, "mindv2: no function named `%s`\n", dump_jit_fn.c_str());
+        std::fprintf(stderr, "dream: no function named `%s`\n", dump_jit_fn.c_str());
         return 1;
     }
 
@@ -270,12 +270,12 @@ int main(int argc, char** argv) {
     if (!entry.empty()) {
         int g = rt.image().find_global(entry.c_str());
         if (g < 0) {
-            std::fprintf(stderr, "mindv2: no global named `%s`\n", entry.c_str());
+            std::fprintf(stderr, "dream: no global named `%s`\n", entry.c_str());
             return 1;
         }
         const GlobalRec& gr = rt.image().global(uint32_t(g));
         if (gr.kind != GLOBAL_FUNCTION) {
-            std::fprintf(stderr, "mindv2: `%s` is not a function\n", entry.c_str());
+            std::fprintf(stderr, "dream: `%s` is not a function\n", entry.c_str());
             return 1;
         }
         func = gr.target;
@@ -283,7 +283,7 @@ int main(int argc, char** argv) {
         func = rt.image().entry();
         if (func == NO_NODE) {
             std::fprintf(stderr,
-                         "mindv2: this image has no `main!`; pass --entry to name one\n");
+                         "dream: this image has no `main!`; pass --entry to name one\n");
             return 1;
         }
     }
@@ -306,19 +306,19 @@ int main(int argc, char** argv) {
     int status = 0;
     if (!clean) {
         std::fprintf(stderr,
-                     "mindv2: deadlock -- every process is waiting for a message that "
+                     "dream: deadlock -- every process is waiting for a message that "
                      "cannot arrive\n");
         status = 1;
     } else if (root->failed) {
         std::string text;
         stringify(*root, root->exit_value, &text);
-        std::fprintf(stderr, "mindv2: uncaught error: %s\n", text.c_str());
+        std::fprintf(stderr, "dream: uncaught error: %s\n", text.c_str());
         status = 1;
     }
 
     for (const std::string& f : sched.take_failures()) {
         if (f.rfind("process " + std::to_string(root->id()) + ":", 0) == 0) continue;
-        std::fprintf(stderr, "mindv2: uncaught error in %s\n", f.c_str());
+        std::fprintf(stderr, "dream: uncaught error in %s\n", f.c_str());
         status = 1;
     }
 

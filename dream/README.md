@@ -1,4 +1,4 @@
-# mindv2, the Dream VM
+# dream, the Dream VM
 
 A virtual machine for [Dream](../dreamc), a dynamically typed, lazily evaluated
 functional language -- see [docs/language-spec.md](../docs/language-spec.md) for
@@ -12,7 +12,7 @@ the language itself. The VM has three parts worth knowing about:
 
 ```
 cmake -S . -B build && cmake --build build -j
-./build-mindv2/bin/mindv2 program.dream
+./build-dream/bin/dream program.dream
 ```
 
 ## Why the interpreter is a state machine

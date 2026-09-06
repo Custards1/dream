@@ -106,7 +106,7 @@ Value Process::make_error_value(const char* kind, const char* message) {
 }
 
 void Process::unreachable(const char* what) {
-    std::fprintf(stderr, "mindv2: internal error: %s\n", what);
+    std::fprintf(stderr, "dream: internal error: %s\n", what);
     std::abort();
 }
 

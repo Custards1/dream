@@ -1,8 +1,8 @@
-# mindv2, the Dream VM: a lazy graph-reduction interpreter with BEAM-style green
+# dream, the Dream VM: a lazy graph-reduction interpreter with BEAM-style green
 # processes, and an optional LLVM JIT tier.
 
 cmake_minimum_required(VERSION 3.20)
-project(mindv2 CXX C)
+project(dream CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -158,34 +158,34 @@ else()
   list(APPEND DREAM_SOURCES src/jit_stub.cpp src/jit_rt.cpp)
 endif()
 
-add_library(mindv2 SHARED ${DREAM_SOURCES})
-set_target_properties(mindv2 PROPERTIES
-  OUTPUT_NAME mindv2
+add_library(dream SHARED ${DREAM_SOURCES})
+set_target_properties(dream PROPERTIES
+  OUTPUT_NAME dream
   VERSION 0.1
   SOVERSION 0)
 
-target_include_directories(mindv2
+target_include_directories(dream
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 find_package(Threads REQUIRED)
-target_link_libraries(mindv2 PUBLIC Threads::Threads)
-target_link_libraries(mindv2 PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(dream PUBLIC Threads::Threads)
+target_link_libraries(dream PRIVATE ${CMAKE_DL_LIBS})
 
 if(DREAM_HAVE_FFI)
-  target_compile_definitions(mindv2 PRIVATE DREAM_HAVE_FFI=1)
-  target_include_directories(mindv2 SYSTEM PRIVATE ${DREAM_FFI_INCLUDE})
-  target_link_libraries(mindv2 PRIVATE ${DREAM_FFI_LIB})
+  target_compile_definitions(dream PRIVATE DREAM_HAVE_FFI=1)
+  target_include_directories(dream SYSTEM PRIVATE ${DREAM_FFI_INCLUDE})
+  target_link_libraries(dream PRIVATE ${DREAM_FFI_LIB})
 endif()
 
-target_compile_options(mindv2 PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_options(dream PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 if(DREAM_HAVE_LLVM)
-  target_compile_definitions(mindv2 PRIVATE DREAM_HAVE_LLVM=1
+  target_compile_definitions(dream PRIVATE DREAM_HAVE_LLVM=1
                              __STDC_CONSTANT_MACROS __STDC_FORMAT_MACROS __STDC_LIMIT_MACROS)
-  target_include_directories(mindv2 SYSTEM PRIVATE ${DREAM_LLVM_INCLUDEDIR})
-  target_link_directories(mindv2 PRIVATE ${DREAM_LLVM_LIBDIR})
-  target_link_libraries(mindv2 PRIVATE ${DREAM_LLVM_LIBS} ${DREAM_LLVM_SYSLIBS})
+  target_include_directories(dream SYSTEM PRIVATE ${DREAM_LLVM_INCLUDEDIR})
+  target_link_directories(dream PRIVATE ${DREAM_LLVM_LIBDIR})
+  target_link_libraries(dream PRIVATE ${DREAM_LLVM_LIBS} ${DREAM_LLVM_SYSLIBS})
   # LLVM is normally built without RTTI; matching it avoids undefined vtable
   # references when we inherit from or dynamic_cast its types.
   if(NOT DREAM_LLVM_RTTI STREQUAL "YES")
@@ -194,29 +194,29 @@ if(DREAM_HAVE_LLVM)
 endif()
 
 # ---------------------------------------------------------------------------
-# The `mindv2` executable
+# The `dream` executable
 # ---------------------------------------------------------------------------
-add_executable(mindv2_cli src/cli.cpp)
-set_target_properties(mindv2_cli PROPERTIES OUTPUT_NAME mindv2)
-target_link_libraries(mindv2_cli PRIVATE mindv2)
-target_include_directories(mindv2_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(dream_cli src/cli.cpp)
+set_target_properties(dream_cli PROPERTIES OUTPUT_NAME dream)
+target_link_libraries(dream_cli PRIVATE dream)
+target_include_directories(dream_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 if(DREAM_BUILD_TESTS)
   enable_testing()
-  add_executable(mindv2_tests tests/test_main.cpp)
-  target_link_libraries(mindv2_tests PRIVATE mindv2)
-  target_include_directories(mindv2_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  add_test(NAME mindv2_tests COMMAND mindv2_tests)
+  add_executable(dream_tests tests/test_main.cpp)
+  target_link_libraries(dream_tests PRIVATE dream)
+  target_include_directories(dream_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME dream_tests COMMAND dream_tests)
 
   # End-to-end tests need the compiler, so they are skipped when it is absent
   # rather than failing a VM-only build.
   add_test(NAME dream_e2e
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e.sh)
   set_tests_properties(dream_e2e PROPERTIES
-    ENVIRONMENT "MINDV2=$<TARGET_FILE:mindv2_cli>"
+    ENVIRONMENT "dream=$<TARGET_FILE:dream_cli>"
     SKIP_RETURN_CODE 1)
 
   # A malformed image must be rejected, never crashed on. Kept short here; run
@@ -224,7 +224,7 @@ if(DREAM_BUILD_TESTS)
   add_test(NAME dream_fuzz_image
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_image.sh)
   set_tests_properties(dream_fuzz_image PROPERTIES
-    ENVIRONMENT "MINDV2=$<TARGET_FILE:mindv2_cli>;ITERATIONS=120"
+    ENVIRONMENT "dream=$<TARGET_FILE:dream_cli>;ITERATIONS=120"
     SKIP_RETURN_CODE 1
     TIMEOUT 600)
 
@@ -232,23 +232,22 @@ if(DREAM_BUILD_TESTS)
   add_test(NAME dream_e2e_verified_heap
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e.sh)
   set_tests_properties(dream_e2e_verified_heap PROPERTIES
-    ENVIRONMENT "MINDV2=$<TARGET_FILE:mindv2_cli>;DREAM_VERIFY_HEAP=1"
+    ENVIRONMENT "dream=$<TARGET_FILE:dream_cli>;DREAM_VERIFY_HEAP=1"
     SKIP_RETURN_CODE 1)
 endif()
 
 # A worked example of embedding the VM from C. Building it keeps the public
 # header honest: it must compile as C, not just as C++.
-add_executable(mindv2_embed_example examples/embed.c)
-target_link_libraries(mindv2_embed_example PRIVATE mindv2)
-set_target_properties(mindv2_embed_example PROPERTIES OUTPUT_NAME embed C_STANDARD 11)
+add_executable(dream_embed_example examples/embed.c)
+target_link_libraries(dream_embed_example PRIVATE dream)
+set_target_properties(dream_embed_example PROPERTIES OUTPUT_NAME embed C_STANDARD 11)
 
 
 include(GNUInstallDirs)
 
 
 
-install(TARGETS mindv2 mindv2_cli
+install(TARGETS dream dream_cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-  

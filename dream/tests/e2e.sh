@@ -9,7 +9,7 @@
 set -uo pipefail
 
 DREAMC="${DREAMC:-}"
-MINDV2="${MINDV2:-}"
+dream="${dream:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -z "$DREAMC" ]]; then
@@ -24,10 +24,10 @@ if [[ -z "$DREAMC" ]]; then
   done
   DREAMC="$newest"
 fi
-if [[ -z "$MINDV2" ]]; then
-    for c in "$HERE/../../build-mindv2/bin/mindv2" "$HERE/../build-mindv2/bin/mindv2" \
-           "$HERE/../build/bin/mindv2"; do
-    [[ -x "$c" ]] && MINDV2="$c" && break
+if [[ -z "$dream" ]]; then
+    for c in "$HERE/../../build-dream/bin/dream" "$HERE/../build-dream/bin/dream" \
+           "$HERE/../build/bin/dream"; do
+    [[ -x "$c" ]] && dream="$c" && break
   done
 fi
 
@@ -35,8 +35,8 @@ if [[ ! -x "${DREAMC:-}" ]]; then
   echo "e2e: cannot find dawnc; build it or set DREAMC" >&2
   exit 1
 fi
-if [[ ! -x "${MINDV2:-}" ]]; then
-  echo "e2e: cannot find the mindv2 VM; build it or set MINDV2" >&2
+if [[ ! -x "${dream:-}" ]]; then
+  echo "e2e: cannot find the dream VM; build it or set dream" >&2
   exit 1
 fi
 
@@ -58,9 +58,9 @@ for src in "$HERE"/programs/*.dr; do
     continue
   fi
 
-  jit_out="$("$MINDV2" "$image" 2>&1)"
+  jit_out="$("$dream" "$image" 2>&1)"
   jit_rc=$?
-  int_out="$("$MINDV2" --no-jit "$image" 2>&1)"
+  int_out="$("$dream" --no-jit "$image" 2>&1)"
   int_rc=$?
 
   if [[ "$jit_out" != "$int_out" || "$jit_rc" != "$int_rc" ]]; then

@@ -311,7 +311,7 @@ void Heap::collect(RootSource& roots) {
     if (verify_after_gc()) {
         std::string problem = verify(roots);
         if (!problem.empty()) {
-            std::fprintf(stderr, "mindv2: heap corrupted after collection %llu: %s\n",
+            std::fprintf(stderr, "dream: heap corrupted after collection %llu: %s\n",
                          static_cast<unsigned long long>(collections_), problem.c_str());
             std::abort();
         }

@@ -20,7 +20,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DREAMC="${DREAMC:-}"
-MINDV2="${MINDV2:-}"
+dream="${dream:-}"
 ITERATIONS="${ITERATIONS:-400}"
 
 if [[ -z "$DREAMC" ]]; then
@@ -31,14 +31,14 @@ if [[ -z "$DREAMC" ]]; then
   done
   DREAMC="$newest"
 fi
-if [[ -z "$MINDV2" ]]; then
-  for c in "$HERE/../../build-mindv2/bin/mindv2" "$HERE/../build-mindv2/bin/mindv2" \
-           "$HERE/../build/bin/mindv2"; do
-    [[ -x "$c" ]] && MINDV2="$c" && break
+if [[ -z "$dream" ]]; then
+  for c in "$HERE/../../build-dream/bin/dream" "$HERE/../build-dream/bin/dream" \
+           "$HERE/../build/bin/dream"; do
+    [[ -x "$c" ]] && dream="$c" && break
   done
 fi
-if [[ ! -x "${DREAMC:-}" || ! -x "${MINDV2:-}" ]]; then
-  echo "fuzz: need both dreamc and mindv2; build them or set DREAMC/MINDV2" >&2
+if [[ ! -x "${DREAMC:-}" || ! -x "${dream:-}" ]]; then
+  echo "fuzz: need both dreamc and dream; build them or set DREAMC/dream" >&2
   exit 1
 fi
 
@@ -74,7 +74,7 @@ loops=0
 # `--dump` nothing is evaluated, so failing to finish is a bug.
 run_and_check() {
   local file="$1" label="$2" flags="${3:-}"
-  timeout 10 "$MINDV2" $flags "$file" >/dev/null 2>&1
+  timeout 10 "$dream" $flags "$file" >/dev/null 2>&1
   local rc=$?
   checked=$((checked + 1))
   if [[ $rc -ge 128 ]]; then
