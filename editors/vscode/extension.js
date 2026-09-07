@@ -22,14 +22,18 @@ let client;
 function findServer(config, folders) {
   const configured = config.get('server.path');
   if (configured) return configured;
+const candidates = [];
+  if (process.env.MINDV2_PATH) candidates.push(path.join(process.env.MINDV2_PATH, 'lucid.dream'));
+if (process.env.MINDV2_PATH) candidates.push(path.join(process.env.MINDV2_PATH, 'lucid'));
 
-  const candidates = [];
+  if (process.env.LUCID_IMAGE) candidates.push(process.env.LUCID_IMAGE);
+  
   for (const folder of folders || []) {
     const root = folder.uri.fsPath;
     candidates.push(path.join(root, 'build', 'lucid.dream'));
     candidates.push(path.join(root, 'build-dream', 'bin', 'lucid.dream'));
   }
-  if (process.env.LUCID_IMAGE) candidates.push(process.env.LUCID_IMAGE);
+  
 
   return candidates.find((c) => fs.existsSync(c));
 }

@@ -190,47 +190,70 @@ bool is_directory(const std::string& path) {
     return std::filesystem::is_directory(path, ec);
 }
 
-std::string skip_file(std::string& path, const std::string& MINDV2_PATH,bool*file_ok) {
+/// Resolve the image to run.
+///
+/// A path is a path: if it names a directory or has a separator in it, it is
+/// taken literally and a miss is an error. A bare name is a program, and
+/// programs are installed in `$MINDV2_PATH` -- so `dream lucid` finds
+/// `lucid.dream` there, the way a shell finds a binary on PATH.
+std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* file_ok) {
     *file_ok = true;
-    if(!std::filesystem::exists(path) || is_directory(path)) {
-        *file_ok = false;
-        //if the path is just a name, not a path with directories, lets check the dream path for it
-        if(path.find('/') == std::string::npos && path.find('\\') == std::string::npos ) {
-            if(!MINDV2_PATH.empty()) {
-                std::string full_path = std::string(MINDV2_PATH) + "/" + path;
+    if (std::filesystem::exists(path) && !is_directory(path)) return path;
 
-                if(std::filesystem::exists(full_path)) {
-                    *file_ok = true;
-                   return full_path;
-                }
+    const bool is_bare_name =
+        path.find('/') == std::string::npos && path.find('\\') == std::string::npos;
+    if (!is_bare_name) {
+        std::fprintf(stderr, "dream: no such file `%s`\n", path.c_str());
+        *file_ok = false;
+        return "";
+    }
+
+    if (!MINDV2_PATH.empty()) {
+        // As written, then with the extension the installer gives it. Both,
+        // because `dream lucid` and `dream lucid.dream` should mean the same
+        // program.
+        const std::string candidates[] = {
+            MINDV2_PATH + "/" + path,
+            MINDV2_PATH + "/" + path + ".dream",
+        };
+        for (const std::string& candidate : candidates) {
+            if (std::filesystem::exists(candidate) && !is_directory(candidate)) {
+                *file_ok = true;
+                return candidate;
             }
-        } else {
-            std::fprintf(stderr, "dream: no such file `%s`\n", path.c_str());
-            *file_ok= false;
-            return "";
         }
     }
-    return path;
+
+    std::fprintf(stderr, "dream: no such file `%s`\n", path.c_str());
+    *file_ok = false;
+    return "";
 }
 
+/// Where installed images live: `$MINDV2_PATH`, or `~/.mindv2` when that
+/// directory exists.
+///
+/// Returned by value throughout. The obvious way to write this -- keep a
+/// `const char*` and point it at a local string's `c_str()` -- leaves the
+/// pointer dangling the moment that string goes out of scope, which it does
+/// before the return. It survived only because a short string lives in the
+/// object itself and the stack slot happened to still hold the bytes.
 std::string get_mindv2_path() {
-    const char* MINDV2_PATH = std::getenv("MINDV2_PATH");
-    if(!MINDV2_PATH) {
-        #if defined(__linux__) || defined(__APPLE__)
-        std::string home = std::getenv("HOME");
-        std::string default_path = home + "/.mindv2";
-        if(std::filesystem::exists(default_path)) {
-            MINDV2_PATH = default_path.c_str();
-        }
-        #elif defined(_WIN32)
-        const char* userprofile = std::getenv("USERPROFILE");
-        std::string default_path = std::string(userprofile) + "\\.mindv2";
-        if(std::filesystem::exists(default_path)) {
-            MINDV2_PATH = default_path.c_str();
-        }
-        #endif
+    if (const char* from_env = std::getenv("MINDV2_PATH")) {
+        return std::string(from_env);
     }
-    return MINDV2_PATH ? std::string(MINDV2_PATH) : "";
+    #if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+    const char* sep = "\\";
+    #else
+    const char* home = std::getenv("HOME");
+    const char* sep = "/";
+    #endif
+    // `getenv` answers null for a variable that is not set, and constructing a
+    // `std::string` from null is undefined rather than empty.
+    if (!home) return "";
+    std::string candidate = std::string(home) + sep + ".mindv2";
+    if (std::filesystem::exists(candidate)) return candidate;
+    return "";
 }
 
 int main(int argc, char** argv) {
