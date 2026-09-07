@@ -19,15 +19,27 @@ runtime, and — in progress — its self-hosted compiler.
 
 `dreams` is replacing `dreamc`. The plan, in order:
 
-1. `dreams` reaches parity with `dreamc` — every stage agrees on the whole corpus.
-2. An old `dreams` build bootstraps the new one, and `dreamc` drops out.
+1. ~~`dreams` reaches parity with `dreamc`~~ — every stage agrees on the corpus.
+2. ~~An old `dreams` build bootstraps the new one~~ — **done**: `dreams` compiles
+   itself to a fixpoint. `dreamc` is no longer needed to build the compiler.
 3. `mind` moves into `dreams`: `dreams` grows a CLI in `mind`'s shape (project
-   commands, not just file-at-a-time flags) and takes over its role.
+   commands, not just file-at-a-time flags) and takes over its role. **Next.**
 
-`dreams` is complete through the front end and lowering, and its image writer
-works: `dreams/tests/compile.sh` compiles nine examples with `dreams` and runs
-them. What is not done is `comp` (compile-time evaluation), which needs a VM to
-evaluate on.
+`dreams` builds from `dreams/bootstrap/dreams.dream`, an image of itself that is
+checked in. The seed needs the VM and nothing else, so building the compiler no
+longer involves Rust:
+
+```
+just bootstrap         # build dreams from the seed, into build/dreams.dream
+just bootstrap-check   # the seed still reproduces itself from this source
+```
+
+The guarantee is byte equality: compiling this source with the seed produces an
+identical image, and so does the stage after that. When you change the compiler,
+run `just bootstrap` and keep `build/dreams.dream` as the new seed.
+
+What is still missing is `comp` (compile-time evaluation), which needs a VM to
+evaluate on — `dreamc` remains the reference the corpus tests compare against.
 
 `mind` finds its compiler through the `DREAMC` environment variable
 ([mind/tool/build.dr:114](mind/tool/build.dr#L114)), defaulting to `dreamc` on
@@ -73,6 +85,7 @@ are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
 | `test-dreams-scope` | `dreams`'s resolution and purity agree, verdict by verdict |
 | `test-dreams-lower` | Everything `dreamc` accepts also lowers |
 | `test-dreams-compile` | Programs `dreams` compiled, run, output compared |
+| `test-bootstrap` | The seed still reproduces itself byte for byte |
 
 The four `dreams/tests/*.sh` scripts default to `target/debug/dreamc` and
 `build-dream/bin/dream`, so they run directly with no environment set. Override
