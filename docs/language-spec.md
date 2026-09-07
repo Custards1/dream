@@ -1074,6 +1074,12 @@ Anything that can be written in Dream is written in Dream.
   `[a.b]` headers, strings, numbers, booleans, arrays and inline tables. What is
   missing — `[[array-of-tables]]`, multi-line strings, dates — is an error
   naming the problem rather than a quietly wrong parse.
+- **`std.cli`** — command lines. An option is described once — a spelling, a
+  short form, whether it takes a value, and a line of help — and both the parser
+  and the usage message read that one description, so an option cannot be
+  parsed without being documented or documented without being parsed. Handles
+  `--name value`, `--name=value`, `-o value`, `-ovalue`, repeated options that
+  collect in order, and `--` to end the options.
 - **`std.test`** — the test framework. Each case runs in **its own process**, so
   a case that raises or loops is isolated, and the failure reaches the runner as
   an ordinary value through `join!` rather than having already unwound the
