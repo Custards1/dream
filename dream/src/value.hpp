@@ -95,7 +95,8 @@ enum class ObjType : uint8_t {
     Str,
     Cons,      // lazy list cell
     Array,
-    Map,
+    Map,       // a branch of the hash trie; every map value is one of these
+    MapLeaf,   // one entry of a map, or a chain of them sharing a hash
     Closure,
     Thunk,     // an unevaluated (node, frame) pair
     Blackhole, // a thunk currently being forced
@@ -149,13 +150,70 @@ struct ArrayObj : Obj {
     Value* items() { return reinterpret_cast<Value*>(this + 1); }
 };
 
-/// Open-addressed map. Keys are forced (we have to hash them); values stay
-/// lazy. `cap` is always a power of two.
+/// A persistent map: a hash array mapped trie. Keys are forced (we have to hash
+/// them); values stay lazy.
+///
+/// This was an open-addressed table, which is the right shape for a language
+/// that mutates and the wrong one for a language that does not. Every `map_put`
+/// had to copy the whole table to leave the original standing, so building a
+/// map an entry at a time -- the only way to build one here -- cost O(n^2) time
+/// and allocated O(n^2) bytes. A program accumulating ten thousand entries did
+/// fifty million copies to do it.
+///
+/// A trie shares structure instead. Putting rebuilds only the path from the
+/// root to the leaf that changed, about log32(n) nodes, and every other node is
+/// shared with the map it came from. Both maps stay valid, which is what a
+/// persistent value has to promise, and neither pays for the other.
+///
+/// A branch holds up to 32 children chosen by five bits of the key's hash.
+/// `bitmap` says which of the 32 are present and the children are packed
+/// against each other, so a sparse node costs only what it actually holds.
+/// The root of a map is always a branch, so that every map value has the same
+/// type however few entries it has.
 struct MapObj : Obj {
+    /// Entries in this whole subtree. The root's is the map's size, which is
+    /// what makes `len` on a map constant time.
     uint32_t count;
-    uint32_t cap;
-    Value* entries() { return reinterpret_cast<Value*>(this + 1); }  // k,v,k,v...
+    uint32_t bitmap;
+    Value* slots() { return reinterpret_cast<Value*>(this + 1); }
 };
+
+/// One entry, or a chain of them when two keys hash to the same 64 bits.
+///
+/// Keys with different hashes always separate somewhere in the trie, so a chain
+/// is only ever a real collision rather than a probe sequence -- which is why
+/// there is no load factor here and nothing to rehash.
+struct MapLeafObj : Obj {
+    uint64_t hash;
+    Value key;
+    Value value;
+    Value next;  // NIL, or another leaf with the same hash
+};
+
+/// Five bits of hash per level: 32 children, and a 64-bit hash runs out after
+/// thirteen of them, by which point any two distinct hashes have separated.
+constexpr uint32_t MAP_BITS = 5;
+constexpr uint32_t MAP_WIDTH = 1u << MAP_BITS;
+constexpr uint32_t MAP_MASK = MAP_WIDTH - 1;
+
+inline uint32_t map_bit_count(uint32_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return uint32_t(__builtin_popcount(x));
+#else
+    uint32_t n = 0;
+    while (x) { x &= x - 1; ++n; }
+    return n;
+#endif
+}
+
+/// Which child a hash selects at this depth, and where that child sits in the
+/// packed array.
+inline uint32_t map_index(uint64_t hash, uint32_t shift) {
+    return uint32_t(hash >> shift) & MAP_MASK;
+}
+inline uint32_t map_slot_of(uint32_t bitmap, uint32_t bit) {
+    return map_bit_count(bitmap & (bit - 1));
+}
 
 struct ClosureObj : Obj {
     uint32_t func;

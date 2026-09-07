@@ -208,6 +208,15 @@ A value is one 64-bit word, tagged in the low bits:
 Integers get the one-bit tag because arithmetic is the hot path, and the
 tagging preserves order so the JIT can compare two tagged fixnums directly.
 
+Lists are cons cells and arrays are flat, both as you would expect. **Maps are a
+hash array mapped trie** — a tree branching 32 ways on five bits of the key's
+hash per level. That shape is chosen for the same reason the rest of the runtime
+is: a value here is never updated, only succeeded. A flat table would have to be
+copied on every `map_put` to leave the original standing, which makes building a
+map an entry at a time quadratic; a trie shares everything the change does not
+touch, so the update is `log32(n)` new nodes and the map it came from is
+untouched and still cheap to use.
+
 ---
 
 ## 4. Expressions

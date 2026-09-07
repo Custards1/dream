@@ -91,7 +91,36 @@ let op_name op = match find_op op 0 ops { () => "?", o => list.nth 2 o };
 /// The opcode a number stands for, for reading an image back.
 let op_of_code n = match find_op n 1 ops { () => (), o => list.nth 0 o };
 
-// --- flags ---------------------------------------------------------------------
+// --- function flags -------------------------------------------------------------
+
+let fn_impure = 1;
+let fn_rec = 2;
+/// A parameterless binding: a zero-arity function.
+let fn_thunk = 4;
+/// ..and a pure one is a value the VM forces once and remembers, where an
+/// impure one is an action that has to run again on every call.
+let fn_global_value = 8;
+
+// --- global flags ---------------------------------------------------------------
+
+let g_exported = 1;
+let g_impure = 2;
+
+/// What a global points at.
+let global_function = 0;
+let global_module = 1;
+
+/// A module with a hole in it: it declares a virtual nobody filled.
+let m_abstract = 2;
+
+/// How a capture says where the enclosing frame keeps the value. The high bit
+/// means "in that frame's captures" rather than "in one of its slots".
+let cap_from_capture = 2147483648;
+
+let encode_capture from_capture index =
+    if from_capture { cap_from_capture + index } else { index };
+
+// --- node flags ------------------------------------------------------------------
 
 /// Must be forced where it appears; its effects are ordered.
 let f_strict = 1;
@@ -170,7 +199,9 @@ let program = %{
     :kids => core.map_new (), :kid_count => 0,
     :funcs => [], :globals => [], :modules => [], :imports => [],
     :ints => pool_new, :floats => pool_new, :strs => pool_new, :atoms => pool_new,
-    :entry => no_node,
+    // The function `main!` compiles to, and the names an image reports itself
+    // by. All three are filled in when the program is linked.
+    :entry => no_node, :module_name => 0, :source_name => 0,
 };
 
 let nodes p      = core.map_get p :nodes (core.map_new ());
@@ -182,6 +213,8 @@ let globals p    = core.map_get p :globals [];
 let prog_modules p = core.map_get p :modules [];
 let imports p    = core.map_get p :imports [];
 let entry p      = core.map_get p :entry no_node;
+let module_name p = core.map_get p :module_name 0;
+let source_name p = core.map_get p :source_name 0;
 
 let ints p   = core.map_get p :ints pool_new;
 let floats p = core.map_get p :floats pool_new;
@@ -226,7 +259,15 @@ let push_kids xs p = {
 let intern_int v p   = { let got = intern v (ints p);   [core.map_put p :ints (list.head got), list.nth 1 got] };
 let intern_float v p = { let got = intern v (floats p); [core.map_put p :floats (list.head got), list.nth 1 got] };
 let intern_str v p   = { let got = intern v (strs p);   [core.map_put p :strs (list.head got), list.nth 1 got] };
-let intern_atom v p  = { let got = intern v (atoms p);  [core.map_put p :atoms (list.head got), list.nth 1 got] };
+
+/// An atom is stored as the string-table index of its name, because the runtime
+/// interns atoms by name when it loads an image. Interning the name first is
+/// what makes that index exist.
+let intern_atom v p = {
+    let named = intern_str v p;
+    let got = intern (list.nth 1 named) (atoms (list.head named));
+    [core.map_put (list.head named) :atoms (list.head got), list.nth 1 got]
+};
 
 /// Set a flag on a node already in the arena. Nodes are appended and never
 /// moved, so an index stays valid, and a flag discovered late -- that a call is
@@ -240,6 +281,13 @@ let set_node_flag i f p = {
 
 let node_flags_at i p = node_flags (node_at i p);
 
+/// Replace a node already in the arena.
+///
+/// Only compile-time evaluation needs this: the expression is lowered into a
+/// placeholder, and what it came to is only known once the program has been
+/// built and run. Everything else emits a node once and leaves it alone.
+let set_node i n p = settle (core.map_put p :nodes (core.map_put (nodes p) i n));
+
 // --- what the arena becomes -------------------------------------------------------
 
 /// Put every pool the right way round. Everything downstream -- the dump, and
@@ -251,7 +299,7 @@ let finish p = %{
     :modules => prog_modules p, :imports => imports p,
     :ints => pool_list (ints p), :floats => pool_list (floats p),
     :strs => pool_list (strs p), :atoms => pool_list (atoms p),
-    :entry => entry p,
+    :entry => entry p, :module_name => module_name p, :source_name => source_name p,
 };
 
 // --- reading it back --------------------------------------------------------------
@@ -280,7 +328,12 @@ let show_node img i n = {
             :const_int   => const_at :ints (node_a n),
             :const_float => const_at :floats (node_a n),
             :const_str   => quoted (const_at :strs (node_a n)),
-            :const_atom  => ":" + const_at :atoms (node_a n),
+            :const_atom  => {
+                let ats = core.map_get img :atoms [];
+                let at = node_a n;
+                if at >= list.length ats { ":?" }
+                else { ":" + const_at :strs (list.nth at ats) }
+            },
             :const_char  => "'" + str.of_chars [core.char_of_code (node_a n)] + "'",
             :const_bool  => if node_a n == 1 { "true" } else { "false" },
             :unit        => "",
@@ -382,6 +435,16 @@ when test {
                         { let a = intern_str "x" program;
                           let b = intern_str "y" (list.head a);
                           core.map_get (finish (list.head b)) :strs [] } ),
+        test.case "an atom is stored as the index of its name"
+            $( test.eq! [["ok"], [0]]
+                        { let got = intern_atom "ok" program;
+                          let p = list.head got;
+                          [core.map_get (finish p) :strs [], core.map_get (finish p) :atoms []] } ),
+        test.case "the same atom interns once"
+            $( test.eq! [0, 0]
+                        { let a = intern_atom "ok" program;
+                          let b = intern_atom "ok" (list.head a);
+                          [list.nth 1 a, list.nth 1 b] } ),
         test.case "the pools are separate"
             $( test.eq! [0, 0]
                         { let a = intern_int 1 program;

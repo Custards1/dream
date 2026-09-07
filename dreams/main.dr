@@ -15,6 +15,7 @@
 
 import std.console;
 import std.core;
+import std.io;
 import std.list;
 import std.os;
 import std.str;
@@ -23,6 +24,7 @@ import std.vm;
 import dreams.ast;
 import dreams.config;
 import dreams.diag;
+import dreams.emit;
 import dreams.ir;
 import dreams.lexer;
 import dreams.lower;
@@ -157,6 +159,49 @@ let show_ir! l = {
     }
 };
 
+/// Compile the program and write the image.
+///
+/// This is the point of the whole front end: what comes out is a file the VM
+/// can map and run. Nothing is written when anything went wrong, so a failed
+/// build leaves the last good image where it was rather than a half-written one.
+let build! l out = {
+    let r = scope.resolve! l;
+    let low = lower.link! l r;
+    let ds = list.append (modules.diags l) (lower.all_diags r low);
+    if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
+    else {
+        let img = lower.image low;
+        let bytes = emit.to_binary img;
+        let h = try! { io.open! out :write } catch e { () };
+        match h {
+            () => {
+                console.error! ("dreams: cannot write " + out)
+                1
+            },
+            handle => {
+                write_all! handle bytes
+                io.close! handle
+                console.error! ("compiled -> " + out + " (" + to_string (str.byte_length bytes)
+                                + " bytes, " + to_string (list.length (modules.modules l))
+                                + " modules, " + to_string (list.length (core.map_get img :nodes []))
+                                + " nodes, " + to_string (list.length (core.map_get img :funcs []))
+                                + " functions)")
+                print_diags! (modules.files l) ds
+            },
+        }
+    }
+};
+
+/// A short write is not an error, so writing means looping until it is all out.
+let rec write_all! handle text = {
+    let n = str.byte_length text;
+    if n == 0 { :done }
+    else {
+        let wrote = io.write! handle text;
+        if wrote >= n { :done } else { write_all! handle (str.slice wrote (n - wrote) text) }
+    }
+};
+
 /// What the program contains, counted. Useful on its own, and the quickest way
 /// to see that a change to the front end did not quietly change its output.
 let show_stats! l = {
@@ -229,6 +274,15 @@ let name_start src offset = {
     back offset
 };
 
+/// The identifier that begins at this offset, or `""`.
+let name_at src at = {
+    let rec forward i =
+        if i >= str.byte_length src { i }
+        else if is_name_byte (core.str_byte src i) { forward (i + 1) }
+        else { i };
+    str.slice at (forward at - at) src
+};
+
 /// Say what is at a position, and where it came from. The primitive an editor
 /// needs for go-to-definition and for hover.
 let show_at! l file line col = {
@@ -243,15 +297,42 @@ let show_at! l file line col = {
             let source = modules.module_source m;
             let src = diag.source_text (list.nth source (modules.files l));
             let at = name_start src (diag.offset_of src line col);
-            match scope.at r source at {
-                () => {
-                    console.print! "nothing resolved here"
-                    1
-                },
+            let pos = diag.line_col src at;
+            let here = to_string (list.head pos) + ":" + to_string (list.nth 1 pos) + "  ";
+            // Three tables, because a cursor can be on three different things:
+            // a name being used, a name being bound, or a name being declared.
+            // An editor asks the same question at all three.
+            match scope.at r mi source at {
+                () =>
+                    match scope.binding r mi source (ast.span_of at at) {
+                        () =>
+                            // A declaration records one span, covering the
+                            // whole of it rather than just its name, so a
+                            // definition is recognised by the name sitting
+                            // under the cursor being the one declared there.
+                            match list.filter (fn d ->
+                                      list.nth 2 d == name_at src at
+                                      && at >= ast.span_start (list.nth 3 d)
+                                      && at <= ast.span_end (list.nth 3 d))
+                                  (scope.module_defs r mi) {
+                                [] => {
+                                    console.print! "nothing resolved here"
+                                    1
+                                },
+                                hits => {
+                                    console.print! (here + "the definition of `"
+                                                    + list.nth 2 (list.head hits) + "`")
+                                    0
+                                },
+                            },
+                        b => {
+                            console.print! (here + "binds `" + list.nth 0 b + "`, slot "
+                                            + to_string (list.nth 1 b))
+                            0
+                        },
+                    },
                 found => {
-                    let pos = diag.line_col src at;
-                    console.print! (to_string (list.head pos) + ":" + to_string (list.nth 1 pos)
-                                    + "  " + describe_resolution l r found)
+                    console.print! (here + describe_resolution l r found)
                     0
                 },
             }
@@ -283,7 +364,7 @@ let describe_resolution l r found =
 
 let defaults = %{ :command => :check, :file => (), :roots => [], :includes => [],
                   :defines => [], :hosts => [], :test => false, :quiet => false,
-                  :position => (), :error => () };
+                  :position => (), :output => (), :error => () };
 
 let opt o k = core.map_get o k ();
 let with_opt k v o = core.map_put o k v;
@@ -314,6 +395,11 @@ let rec parse_args args o =
         ["--ast", ..rest]       => parse_args rest (with_opt :command :ast o),
         ["--parse", ..rest]     => parse_args rest (with_opt :command :parse o),
         ["--check", ..rest]     => parse_args rest (with_opt :command :check o),
+        ["-o"] => with_opt :error "-o needs a path" o,
+        ["-o", out, ..rest]     => parse_args rest (with_opt :output out
+                                                     (with_opt :command :build o)),
+        ["--output", out, ..rest] => parse_args rest (with_opt :output out
+                                                       (with_opt :command :build o)),
         ["--modules", ..rest]   => parse_args rest (with_opt :command :modules o),
         ["--packages", ..rest]  => parse_args rest (with_opt :command :packages o),
         ["--ir", ..rest]        => parse_args rest (with_opt :command :ir o),
@@ -362,6 +448,7 @@ let usage! () = {
         "usage: dreams [options] FILE",
         "",
         "what to do (one of; the default is --check):",
+        "  -o, --output PATH  compile the program and write the image there",
         "  --check        resolve every name and check purity, across the whole program",
         "  --parse        parse this file alone, following no imports",
         "  --tokens       print the tokens",
@@ -420,6 +507,7 @@ let run_command! o file =
         :ast       => with_source! file (fn src -> ast! file src),
         :parse     => with_source! file (fn src -> parse_only! file src),
         :check     => check_program! (load! o file),
+        :build     => build! (load! o file) (opt o :output),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),

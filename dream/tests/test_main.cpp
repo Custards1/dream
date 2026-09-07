@@ -286,11 +286,27 @@ static void test_heap_verifier_follows_every_object_kind() {
         CHECK(!h.verify(roots).empty());
     }
     {
+        // A branch whose child is not a pointer to anything.
         VectorRoots roots;
-        Value m = h.make_map(8);
+        Value m = h.make_map_branch(1);
+        auto* branch = static_cast<MapObj*>(as_obj(m));
+        branch->bitmap = 1;
+        branch->count = 1;
+        branch->slots()[0] = 0x2000;
         roots.values = {m};
-        static_cast<MapObj*>(as_obj(m))->entries()[0] = 0x2000;
-        static_cast<MapObj*>(as_obj(m))->entries()[1] = UNIT;
+        CHECK(!h.verify(roots).empty());
+    }
+    {
+        // And a leaf with a bad key, which is where a map's own values live.
+        VectorRoots roots;
+        Value leaf = h.make_map_leaf(1, UNIT, UNIT, NIL_SLOT);
+        Value m = h.make_map_branch(1);
+        auto* branch = static_cast<MapObj*>(as_obj(m));
+        branch->bitmap = 1;
+        branch->count = 1;
+        branch->slots()[0] = leaf;
+        static_cast<MapLeafObj*>(as_obj(leaf))->key = 0x2000;
+        roots.values = {m};
         CHECK(!h.verify(roots).empty());
     }
     {
@@ -383,13 +399,13 @@ static void test_maps() {
     auto proc = rt.spawn_process();
     Process& p = *proc;
 
-    // Insert without re-resolving between calls: growth must leave the caller's
-    // handle usable, or every loop that fills a map corrupts memory.
-    Value m = p.heap().make_map(8);
+    // A put answers a new map and leaves the one it was given alone. The
+    // caller keeps what comes back -- that is the whole contract, and the
+    // reason a map can be shared without being copied.
+    Value m = p.heap().make_map(0);
     for (int i = 0; i < 200; ++i) {
-        map_insert(p, m, make_fixnum(i), make_fixnum(i * 2));
+        m = map_insert(p, m, make_fixnum(i), make_fixnum(i * 2));
     }
-    m = resolve(m);
     CHECK_EQ(static_cast<MapObj*>(as_obj(m))->count, 200u);
     for (int i = 0; i < 200; ++i) {
         Value out;
@@ -399,12 +415,48 @@ static void test_maps() {
     Value missing;
     CHECK(!map_lookup(p, m, make_fixnum(9999), &missing));
 
+    // The map put into is untouched: the older version still answers as it did,
+    // and does not see the newer one's entry.
+    Value grown = map_insert(p, m, make_fixnum(1000), make_fixnum(7));
+    CHECK_EQ(static_cast<MapObj*>(as_obj(m))->count, 200u);
+    CHECK_EQ(static_cast<MapObj*>(as_obj(grown))->count, 201u);
+    Value peek;
+    CHECK(!map_lookup(p, m, make_fixnum(1000), &peek));
+    CHECK(map_lookup(p, grown, make_fixnum(1000), &peek));
+
+    // Replacing a key changes the value without changing the size.
+    Value replaced = map_insert(p, m, make_fixnum(5), make_fixnum(99));
+    CHECK_EQ(static_cast<MapObj*>(as_obj(replaced))->count, 200u);
+    CHECK(map_lookup(p, replaced, make_fixnum(5), &peek));
+    CHECK_EQ(fixnum_value(peek), int64_t(99));
+    CHECK(map_lookup(p, m, make_fixnum(5), &peek));
+    CHECK_EQ(fixnum_value(peek), int64_t(10));
+
+    // Removing likewise leaves the original standing.
+    Value without = map_erase(p, m, make_fixnum(5));
+    CHECK_EQ(static_cast<MapObj*>(as_obj(without))->count, 199u);
+    CHECK(!map_lookup(p, without, make_fixnum(5), &peek));
+    CHECK(map_lookup(p, m, make_fixnum(5), &peek));
+    // Removing something that was never there changes nothing.
+    Value same = map_erase(p, m, make_fixnum(9999));
+    CHECK_EQ(static_cast<MapObj*>(as_obj(same))->count, 200u);
+
+    // Emptying a map leaves a map, not nothing.
+    Value one = map_insert(p, p.heap().make_map(0), make_fixnum(1), UNIT);
+    Value none = map_erase(p, one, make_fixnum(1));
+    CHECK(is_obj(none, ObjType::Map));
+    CHECK_EQ(static_cast<MapObj*>(as_obj(none))->count, 0u);
+
+    // Every entry comes back exactly once, however the trie is shaped.
+    std::vector<std::pair<Value, Value>> entries;
+    map_collect(m, entries);
+    CHECK_EQ(entries.size(), size_t(200));
+
     // String keys compare by contents, not identity.
-    Value m2 = p.heap().make_map(8);
-    map_insert(p, m2, p.heap().make_string("key", 3), make_fixnum(1));
-    m2 = resolve(m2);
+    Value m2 = map_insert(p, p.heap().make_map(0), p.heap().make_string("key", 3),
+                          make_fixnum(1));
     Value found;
-    CHECK(map_lookup(p, resolve(m2), p.heap().make_string("key", 3), &found));
+    CHECK(map_lookup(p, m2, p.heap().make_string("key", 3), &found));
     CHECK_EQ(fixnum_value(found), int64_t(1));
 }
 

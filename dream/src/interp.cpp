@@ -158,12 +158,16 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
             auto* x = static_cast<MapObj*>(oa);
             auto* y = static_cast<MapObj*>(ob);
             if (x->count != y->count) return false;
-            for (uint32_t i = 0; i < x->cap; ++i) {
-                Value k = x->entries()[i * 2];
-                if (k == NIL_SLOT) continue;
+            // Two maps holding the same entries may have different shapes only
+            // if their hashes differ, which they cannot -- but comparing by
+            // lookup rather than by shape is what makes that not something to
+            // rely on.
+            std::vector<std::pair<Value, Value>> entries;
+            map_collect(fa, entries);
+            for (auto& [k, v] : entries) {
                 Value found;
                 if (!map_lookup(p, fb, k, &found)) return false;
-                if (!values_equal(p, x->entries()[i * 2 + 1], found, raised, depth + 1)) return false;
+                if (!values_equal(p, v, found, raised, depth + 1)) return false;
                 if (*raised) return false;
             }
             return true;
@@ -873,9 +877,7 @@ void step_eval(Process& p) {
             return;
         }
         case Op::MakeMap: {
-            uint32_t cap = 8;
-            while (cap < n.b * 2) cap *= 2;
-            p.stack.push_back(p.heap().make_map(cap));
+            p.stack.push_back(p.heap().make_map(0));
             advance_map(p, n.a, n.b, 0, frame);
             return;
         }
@@ -1041,8 +1043,7 @@ void step_return(Process& p) {
         case ContKind::MapEntry: {
             Value key = p.result;
             Value valth = thunk_for(p, img_of(p).kid(c.a + c.c * 2 + 1), c.v1);
-            p.stack.back() = resolve(p.stack.back());
-            map_insert(p, p.stack.back(), key, valth);
+            p.stack.back() = map_insert(p, resolve(p.stack.back()), key, valth);
             advance_map(p, c.a, c.b, c.c + 1, c.v1);
             return;
         }
@@ -1402,14 +1403,22 @@ bool force_deep(Process& p, Value v, Value* out) {
         }
         case ObjType::Map: {
             p.stack.push_back(head);
-            uint32_t cap = static_cast<MapObj*>(as_obj(head))->cap;
-            for (uint32_t i = 0; i < cap; ++i) {
-                if (static_cast<MapObj*>(as_obj(p.stack.back()))->entries()[i * 2] == NIL_SLOT) continue;
-                Value item = static_cast<MapObj*>(as_obj(p.stack.back()))->entries()[i * 2 + 1];
+            // The leaves are collected once and then forced in place. A leaf
+            // may be shared with another version of the map, which is fine:
+            // forcing a thunk yields the same value to everyone holding it.
+            std::vector<std::pair<Value, Value>> entries;
+            map_collect(p.stack.back(), entries);
+            for (auto& [k, v] : entries) {
+                (void)k;
                 Value tmp;
-                if (!force_deep(p, item, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
-                static_cast<MapObj*>(as_obj(p.stack.back()))->entries()[i * 2 + 1] = tmp;
+                if (!force_deep(p, v, &tmp)) {
+                    if (!p.force_blocked) p.stack.pop_back();
+                    *out = p.result;
+                    return false;
+                }
             }
+            // Re-collect, because forcing may have allocated and the leaves
+            // hold the forced values already through their own indirections.
             *out = p.stack.back();
             p.stack.pop_back();
             return true;

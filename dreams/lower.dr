@@ -24,8 +24,10 @@ import std.str;
 import dreams.ast;
 import dreams.builtins;
 import dreams.diag;
+import dreams.emit;
 import dreams.ir;
 import dreams.modules;
+import std.vm;
 import dreams.scope;
 
 // --- the lowering state -----------------------------------------------------
@@ -34,25 +36,42 @@ import dreams.scope;
 // came from, so a diagnostic raised this late still points at a line.
 
 let lowering r p source =
-    %{ :r => r, :prog => p, :source => source, :diags => [],
+    %{ :r => r, :prog => p, :source => source, :ctx => 0, :diags => [],
        // Which node is each function's body. Filled in as the functions are
        // met, because a lambda's body is lowered where it is written -- into
        // the same arena as everything else -- and only the entry point differs.
-       :func_bodies => core.map_new () };
+       :func_bodies => core.map_new (),
+       // Compile-time expressions waiting to be evaluated: `[node, function]`.
+       // The node is a placeholder that whatever the function comes to will
+       // overwrite, once the program has been built and can be run.
+       :pending_comp => [] };
 
 let res l    = core.map_get l :r ();
 let prog l   = core.map_get l :prog ir.program;
 let source l = core.map_get l :source 0;
+/// The module whose names this body was resolved against. Not always the module
+/// it was written in: a body inherited through `derive` is lowered once per
+/// deriving module, and resolves differently each time.
+let ctx l = core.map_get l :ctx 0;
 let l_diags l = core.map_get l :diags [];
 
 let set_prog p l = core.map_put l :prog p;
 let set_source i l = core.map_put l :source i;
+let set_ctx i l = core.map_put l :ctx i;
 
 let func_bodies l = core.map_get l :func_bodies (core.map_new ());
 let set_func_body fi n l = core.map_put l :func_bodies (core.map_put (func_bodies l) fi n);
 
+let pending_comp l = core.map_get l :pending_comp [];
+let add_comp node fi l = core.map_put l :pending_comp (list.append (pending_comp l) [[node, fi]]);
+
 let complain span message l =
     core.map_put l :diags (list.append (l_diags l) [diag.in_source (source l) (diag.error span message)]);
+
+let warn span message note l =
+    core.map_put l :diags
+        (list.append (l_diags l)
+                     [diag.in_source (source l) (diag.with_note note (diag.warning span message))]);
 
 /// Emit a node: `[lowering, index]`.
 let emit n l = { let got = ir.push_node n (prog l); [set_prog (list.head got) l, list.nth 1 got] };
@@ -71,11 +90,11 @@ let inherit i children l =
     else { l };
 
 /// What `scope` recorded for the name at this span.
-let lookup span l = scope.resolution (res l) (source l) span;
+let lookup span l = scope.resolution (res l) (ctx l) (source l) span;
 
 /// The slot a binder at this span was given.
 let slot_at span l =
-    match scope.binding (res l) (source l) span { () => (), b => list.nth 1 b };
+    match scope.binding (res l) (ctx l) (source l) span { () => (), b => list.nth 1 b };
 
 // --- constants ----------------------------------------------------------------
 
@@ -269,11 +288,22 @@ let rec lower_expr e l =
 
         [:match, scrutinee, arms, span] => lower_match scrutinee arms span l,
 
-        // `comp` and `comp!` are evaluated at compile time, which needs a VM to
-        // run them on. Until that exists they lower to unit rather than to
-        // something that looks like it worked.
-        [:comp, _, _, span] =>
-            emit_leaf :unit (complain span "`comp` is not lowered yet" l),
+        // `comp` and `comp!` are evaluated before the program runs, which means
+        // running them -- so the expression is lowered into a function of its
+        // own and a placeholder is left where its value will go. What it comes
+        // to is not known until the whole program has been built, because the
+        // expression may call any of it.
+        [:comp, _, body, span] =>
+            match lookup span l {
+                [:comp, fi, _] => {
+                    let inner = lower_expr body l;
+                    let done = set_func_body fi (list.nth 1 inner)
+                                             (mark_tail (list.nth 1 inner) (list.head inner));
+                    let made = emit_leaf :unit done;
+                    [add_comp (list.nth 1 made) fi (list.head made), list.nth 1 made]
+                },
+                _ => emit_leaf :unit l,
+            },
 
         _ => emit_leaf :unit l,
     };
@@ -284,9 +314,16 @@ let rec lower_function span op body l =
     match lookup span l {
         [_, fi] => {
             let inner = lower_expr body l;
-            emit (ir.node op fi ir.no_node ir.no_node)
-                 (set_func_body fi (list.nth 1 inner)
-                                (mark_tail (list.nth 1 inner) (list.head inner)))
+            let done = set_func_body fi (list.nth 1 inner)
+                                     (mark_tail (list.nth 1 inner) (list.head inner));
+            let made = emit (ir.node op fi ir.no_node ir.no_node) done;
+            // Suspending an effect is not performing one, so a thunk is a pure
+            // value -- unless what it suspends is effectful, in which case
+            // whoever forces it is performing that effect and needs to know.
+            if is_impure_node (list.nth 1 inner) done {
+                [set_flag (list.nth 1 made) ir.f_impure (list.head made), list.nth 1 made]
+            }
+            else { made }
         },
         _ => emit_leaf :unit l,
     };
@@ -354,10 +391,37 @@ let rec lower_block stmts span l = {
                 [list.head got, list.append (list.nth 1 acc) [list.nth 1 got]]
             },
         }) [l, []] stmts;
-    let placed = kids (list.nth 1 done) (list.head done);
-    let made = emit (ir.node :block (list.nth 1 placed) (list.length (list.nth 1 done)) ir.no_node)
+    // A non-final statement contributes nothing but its effects. Inside an
+    // impure function force it, so those effects happen in the order they were
+    // written rather than whenever something happens to want the value. Inside
+    // a pure one there are no effects to have, so it is dead code -- and
+    // forcing it would only risk raising an error the program never asked for.
+    let impure_here = match lookup span (list.head done) { [:block, yes] => yes, _ => false };
+    let stmt_nodes = list.nth 1 done;
+    let sequenced =
+        if list.length stmt_nodes <= 1 { list.head done }
+        else {
+            list.fold (fn acc pair -> {
+                let k = list.nth 0 pair;
+                let st = list.nth 1 pair;
+                // A bind stays lazy: the ones whose value is effectful were
+                // already forced where they were bound.
+                if ir.node_op (ir.node_at k (prog acc)) == :bind { acc }
+                else if impure_here { set_flag k ir.f_strict acc }
+                else if is_impure_node k acc { acc }
+                else {
+                    warn (ast.span st)
+                         "this statement's value is discarded, and a pure expression has no other effect"
+                         "only the final expression of a block is used" acc
+                }
+            }) (list.head done)
+              (list.zip (list.take (list.length stmt_nodes - 1) stmt_nodes)
+                        (list.take (list.length stmts - 1) stmts))
+        };
+    let placed = kids stmt_nodes sequenced;
+    let made = emit (ir.node :block (list.nth 1 placed) (list.length stmt_nodes) ir.no_node)
                     (list.head placed);
-    [inherit (list.nth 1 made) (list.nth 1 done) (list.head made), list.nth 1 made]
+    [inherit (list.nth 1 made) stmt_nodes (list.head made), list.nth 1 made]
 };
 
 // --- patterns ---------------------------------------------------------------------
@@ -610,29 +674,229 @@ let rec mark_tail i l =
 /// whatever uses them. Nothing here depends on that -- a global is an index by
 /// now, and an index does not care when it was filled in -- but keeping it means
 /// a dump reads in the order the program was written.
+/// Intern a string and answer `[lowering, index]`.
+let strk text l = { let got = ir.intern_str text (prog l); [set_prog (list.head got) l, list.nth 1 got] };
+
+/// Push one function's captures into the shared pool and answer where they
+/// went. Captures live in the same pool as call arguments and block statements
+/// because they are the same thing to a loader: a contiguous run of indices
+/// addressed by an offset and a count.
+let place_captures caps l = {
+    let encoded = list.map (fn c ->
+        match c {
+            [:local, slot] => ir.encode_capture false slot,
+            [:capture, idx] => ir.encode_capture true idx,
+            _ => 0,
+        }) caps;
+    kids encoded l
+};
+
+/// The function records, as an image stores them. The two halves of a function
+/// meet here: `scope` knows its name, arity, frame size and captures, and
+/// lowering knows which node its body turned out to be.
+let link_funcs r bodies l =
+    list.fold (fn acc pair -> {
+        let f = list.nth 0 pair;
+        let fi = list.nth 1 pair;
+        let l0 = list.head acc;
+        let named = strk (scope.func_name f) l0;
+        let placed = place_captures (scope.func_captures f) (list.head named);
+        let flags = (if scope.func_impure f { ir.fn_impure } else { 0 })
+                  + (if core.map_get f :rec false { ir.fn_rec } else { 0 })
+                  + (if core.map_get f :thunk false { ir.fn_thunk } else { 0 })
+                  // A parameterless pure binding is a value the VM forces once
+                  // and remembers; an impure one has to run again every time.
+                  + (if core.map_get f :thunk false && not (scope.func_impure f) {
+                         ir.fn_global_value
+                     } else { 0 });
+        [list.head placed,
+         list.append (list.nth 1 acc)
+             [%{ :name => list.nth 1 named, :body => core.map_get bodies fi ir.no_node,
+                 :arity => scope.func_arity f, :flags => flags,
+                 :slots => scope.func_slots f,
+                 :n_captures => list.length (scope.func_captures f),
+                 :captures_off => list.nth 1 placed,
+                 :span_start => ast.span_start (core.map_get f :span ast.no_span),
+                 :span_end => ast.span_end (core.map_get f :span ast.no_span) }]]
+    }) [l, []] (list.zip (scope.funcs r) (list.range 0 (list.length (scope.funcs r))));
+
+let link_globals r l =
+    list.fold (fn acc g -> {
+        let named = strk (list.nth 1 g) (list.head acc);
+        let is_module = list.nth 2 g == :module;
+        [list.head named,
+         list.append (list.nth 1 acc)
+             [%{ :name => list.nth 1 named,
+                 :kind => if is_module { ir.global_module } else { ir.global_function },
+                 :target => match list.nth 3 g { () => ir.no_node, t => t },
+                 :flags => ir.g_exported
+                           + (if builtins.is_impure_name (list.nth 1 g) { ir.g_impure }
+                              else { 0 }) }]]
+    }) [l, []] (scope.r_global_recs r);
+
+let link_imports r l =
+    list.fold (fn acc i -> {
+        let path = strk (list.nth 0 i) (list.head acc);
+        let alias = strk (list.nth 1 i) (list.head path);
+        [list.head alias,
+         list.append (list.nth 1 acc)
+             [%{ :path => list.nth 1 path, :alias => list.nth 1 alias }]]
+    }) [l, []] (scope.r_imports r);
+
+let link_modules ld r l =
+    list.fold (fn acc m -> {
+        let mi = list.nth 0 m;
+        let mod_at = modules.module_at ld mi;
+        let named = strk (modules.module_name mod_at) (list.head acc);
+        let src = strk (modules.module_path mod_at) (list.head named);
+        [list.head src,
+         list.append (list.nth 1 acc)
+             [%{ :name => list.nth 1 named, :source => list.nth 1 src,
+                 :globals_start => list.nth 1 m, :globals_count => list.nth 2 m,
+                 :flags => if list.nth 3 m { ir.m_abstract } else { 0 },
+                 :derives => match list.nth 4 m { () => ir.no_node, d => d } }]]
+    }) [l, []] (scope.r_module_recs r);
+
+/// The function `main!` compiles to, or nothing. The entry point is a global of
+/// the root module, which is the last one loaded -- everything else was loaded
+/// because it reached it.
+let find_entry ld r = {
+    let last = list.length (modules.modules ld) - 1;
+    let hits = list.filter (fn b -> list.nth 0 b == last
+                                    && scope.decl_name (list.nth 2 b) == "main!")
+                           (scope.bodies r);
+    if list.is_empty hits { ir.no_node } else { list.nth 3 (list.head hits) }
+};
+
+/// Lower every body the resolver queued, then link what comes out.
+///
+/// The order is the resolver's, which is the loader's: dependencies before
+/// whatever uses them. Nothing here depends on that -- a global is an index by
+/// now, and an index does not care when it was filled in -- but keeping it means
+/// a dump reads in the order the program was written.
 let lower_program r = {
     let start = lowering r ir.program 0;
-    let done = list.fold (fn acc b -> {
+    let walked = list.fold (fn acc b -> {
         let src = list.nth 1 b;
         let d = list.nth 2 b;
         let fi = list.nth 3 b;
-        let got = lower_expr (scope.decl_body d) (set_source src acc);
+        let got = lower_expr (scope.decl_body d) (set_ctx (list.nth 0 b) (set_source src acc));
         set_func_body fi (list.nth 1 got) (mark_tail (list.nth 1 got) (list.head got))
     }) start (scope.bodies r);
 
-    // Give every function its body and the frame size the resolver worked out.
-    // The two halves of a function meet here: `scope` knows how many slots it
-    // needs and what it captures, and lowering knows what it does.
-    let described = list.map (fn pair -> {
-        let f = list.nth 0 pair;
-        %{ :name => scope.func_name f, :arity => scope.func_arity f,
-           :slots => scope.func_slots f, :captures => scope.func_captures f,
-           :impure => scope.func_impure f,
-           :body => core.map_get (func_bodies done) (list.nth 1 pair) ir.no_node }
-    }) (list.zip (scope.funcs r) (list.range 0 (list.length (scope.funcs r))));
+    let fs = link_funcs r (func_bodies walked) walked;
+    let gs = link_globals r (list.head fs);
+    let is = link_imports r (list.head gs);
+    let linked = list.head is;
 
-    core.map_put (set_prog (core.map_put (prog done) :funcs described) done)
-                 :image (ir.finish (core.map_put (prog done) :funcs described))
+    let p = core.map_put (core.map_put (core.map_put (prog linked) :funcs (list.nth 1 fs))
+                                       :globals (list.nth 1 gs))
+                         :imports (list.nth 1 is);
+    core.map_put (set_prog p linked) :image (ir.finish p)
+};
+
+/// Evaluate every compile-time expression the program contains, and put the
+/// values where the placeholders were.
+///
+/// Done after linking, because an expression may call anything in the program
+/// and so needs the whole of it to be runnable first. Each one is run against
+/// an image of the program with that expression as the entry point -- the
+/// program is built once and only the entry differs.
+let settle_comps! l = {
+    let pend = pending_comp l;
+    if list.is_empty pend { l }
+    else {
+        let built = ir.finish (prog l);
+        list.fold (fn acc one ->
+            settle_comp! (fn fi img -> core.map_put img :entry fi) (fn _ -> built) one acc)
+            l pend
+    }
+};
+
+/// The whole thing, with the module table an image also needs. The loader is
+/// wanted here and nowhere else, which is why it is a separate way in rather
+/// than an argument threaded through every step.
+let link! ld r = {
+    let low = settle_comps! (lower_program r);
+    let ms = link_modules ld r low;
+    let named = strk (modules.module_name (modules.module_at ld
+                          (list.length (modules.modules ld) - 1)))
+                     (list.head ms);
+    let sourced = strk (modules.module_path (modules.module_at ld
+                            (list.length (modules.modules ld) - 1)))
+                       (list.head named);
+    let p = core.map_put
+                (core.map_put
+                    (core.map_put (core.map_put (prog (list.head sourced))
+                                                :modules (list.nth 1 ms))
+                                  :entry (find_entry ld r))
+                    :module_name (list.nth 1 named))
+                :source_name (list.nth 1 sourced);
+    core.map_put (set_prog p (list.head sourced)) :image (ir.finish p)
+};
+
+// --- compile-time values ------------------------------------------------------
+//
+// What an expression came to, turned back into nodes. A compile-time value is
+// data -- that is what makes it something an image can hold -- so this is a
+// walk over the shapes data comes in, and nothing else needs to be handled: the
+// evaluator refuses to hand back a closure or a process in the first place.
+
+let rec emit_const v l =
+    match type_of v {
+        :integer => const_int v l,
+        :float   => const_float v l,
+        :string  => const_str v l,
+        :char    => const_char v l,
+        :bool    => const_bool v l,
+        :unit    => emit_leaf :unit l,
+        // `to_string` of an atom keeps the leading colon, which is not part of
+        // the name the image stores.
+        :atom    => const_atom (str.slice 1 (str.byte_length (to_string v) - 1) (to_string v)) l,
+        :list    => const_seq :make_list (list.map (fn x -> x) v) l,
+        :array   => const_seq :make_array (core.array_to_list v) l,
+        :map     => const_seq :make_map
+                        (list.concat (list.map (fn kv -> [list.nth 0 kv, list.nth 1 kv])
+                                               (core.map_pairs v))) l,
+        _ => emit_leaf :unit l,
+    };
+
+let rec const_seq op items l = {
+    let done = list.fold (fn acc x -> {
+        let got = emit_const x (list.head acc);
+        [list.head got, list.append (list.nth 1 acc) [list.nth 1 got]]
+    }) [l, []] items;
+    let placed = kids (list.nth 1 done) (list.head done);
+    let n = if op == :make_map { list.length items / 2 } else { list.length items };
+    emit (ir.node op (list.nth 1 placed) n ir.no_node) (list.head placed)
+};
+
+/// Evaluate one compile-time expression and put what it came to where the
+/// placeholder was.
+///
+/// The expression is run by building an image whose entry point is its own
+/// function and handing that to a VM. That is the whole trick, and it is only
+/// available to a compiler that is itself running on one: the value a `comp`
+/// produces is produced by exactly the machinery that would have produced it at
+/// run time, so the two cannot disagree.
+let settle_comp! entry_of img_of one l = {
+    let node = list.nth 0 one;
+    let fi = list.nth 1 one;
+    let value = try! { vm.eval_image! (emit.to_binary (entry_of fi (img_of l))) }
+                catch e { [:comp_error, e] };
+    match value {
+        [:comp_error, why] =>
+            complain (ast.no_span)
+                     ("a compile-time expression could not be evaluated: " + to_string why) l,
+        v => {
+            let built = emit_const v l;
+            // The placeholder keeps its index -- everything already points at
+            // it -- and becomes the node the value is.
+            set_prog (ir.set_node node (ir.node_at (list.nth 1 built) (prog (list.head built)))
+                                  (prog (list.head built)))
+                     (list.head built)
+        },
+    }
 };
 
 let image l = core.map_get l :image (ir.finish ir.program);
@@ -651,193 +915,21 @@ let all_diags r l = list.append (scope.r_diags r) (l_diags l);
 let dump l = {
     let img = image l;
     let fs = core.map_get img :funcs [];
+    let strs = core.map_get img :strs [];
+    let name_of i = if i < list.length strs { list.nth i strs } else { "?" };
     str.join_str "\n"
         (list.append
             (list.map (fn i -> {
                 let f = list.nth i fs;
-                "fn" + to_string i + " " + core.map_get f :name "?"
+                "fn" + to_string i + " " + name_of (core.map_get f :name 0)
                 + "/" + to_string (core.map_get f :arity 0)
-                + (if core.map_get f :impure false { "!" } else { "" })
                 + "  slots=" + to_string (core.map_get f :slots 0)
-                + (match core.map_get f :captures [] {
-                       [] => "",
-                       cs => "  captures=" + to_string cs,
+                + (match core.map_get f :n_captures 0 {
+                       0 => "",
+                       n => "  captures=" + to_string n
+                             + "@" + to_string (core.map_get f :captures_off 0),
                    })
                 + "  body=" + to_string (core.map_get f :body ir.no_node)
              }) (list.range 0 (list.length fs)))
             [ir.dump img])
 };
-
-// --- tests -------------------------------------------------------------------
-
-when test {
-    import std.test;
-    import dreams.config;
-    import dreams.package;
-
-    /// A program from source text: loaded, resolved, lowered. Native imports
-    /// still resolve, so effects and host calls can be exercised without a file
-    /// system.
-    let low! src = {
-        let l = modules.load_text! (modules.loader package.empty config.empty [] [])
-                                   src "<t>" "t" "<t>";
-        lower_program (scope.resolve! l)
-    };
-
-    let img! src = image (low! src);
-    let all_nodes! src = core.map_get (img! src) :nodes [];
-
-    /// The opcodes, in the order they were emitted.
-    let ops! src = list.map (fn n -> ir.op_name (ir.node_op n)) (all_nodes! src);
-
-    let node! src i = list.nth i (all_nodes! src);
-    let fn! src i = list.nth i (core.map_get (img! src) :funcs []);
-    let flags! src i = ir.node_flags (node! src i);
-
-    let tests = [
-        // --- leaves ---
-        test.case "a literal becomes a constant node"
-            $( test.eq! ["int"] (ops! "let a = 1;") ),
-        test.case "each kind of literal has its own node"
-            $( test.eq! ["int", "float", "str", "bool", "atom", "unit", "list"]
-                        (ops! "let a = [1, 1.5, \"s\", true, :k, ()];") ),
-        test.case "a constant written twice is interned once"
-            $( test.eq! ["x"] (core.map_get (img! "let a = [\"x\", \"x\"];") :strs []) ),
-
-        // --- names ---
-        test.case "a parameter becomes a slot reference"
-            $( test.eq! ["local"] (ops! "let f x = x;") ),
-        test.case "a global becomes an index, not a name"
-            $( test.eq! [:global, 0] { let n = node! "let a = 1;\nlet f = a;" 1;
-                                       [ir.node_op n, ir.node_a n] } ),
-        test.case "a builtin becomes its runtime id"
-            $( test.eq! [:builtin, 8] { let n = node! "let f xs = len xs;" 0;
-                                        [ir.node_op n, ir.node_a n] } ),
-        test.case "a captured name becomes a capture reference"
-            $( test.eq! ["capture", "closure"] (ops! "let f x = fn y -> x;") ),
-
-        // --- operators ---
-        test.case "a binary operator is one node over its two sides"
-            $( test.eq! ["local", "int", "add"] (ops! "let f x = x + 1;") ),
-        test.case "unary minus is negation, not subtraction"
-            $( test.eq! ["local", "neg"] (ops! "let f x = -x;") ),
-        test.case "`not` is its own node"
-            $( test.eq! ["local", "not"] (ops! "let f x = not x;") ),
-
-        // --- calls ---
-        test.case "a call is one node with all of its arguments"
-            $( test.eq! [:apply, 2]
-                        { let n = node! "let f g = g 1 2;" 3; [ir.node_op n, ir.node_c n] } ),
-        test.case "a pipe folds into the call rather than nesting one"
-            $( test.eq! [:apply, 2]
-                        { let n = node! "let f g x = x |> g 1;" 3; [ir.node_op n, ir.node_c n] } ),
-        test.case "a pipe into a bare name is a call of one argument"
-            $( test.eq! [:apply, 1]
-                        { let n = node! "let f g x = x |> g;" 2; [ir.node_op n, ir.node_c n] } ),
-
-        // --- control ---
-        // A branch is written `{ .. }`, so it lowers as a block -- the braces
-        // are a block expression, not part of the `if`.
-        test.case "an if keeps all three of its parts"
-            $( test.eq! ["bool", "int", "block", "int", "block", "if"]
-                        (ops! "let f = if true { 1 } else { 2 };") ),
-        test.case "a missing else is a unit branch"
-            $( test.eq! ["bool", "int", "block", "unit", "if"] (ops! "let f = if true { 1 };") ),
-        test.case "the condition of an if is forced where it is written"
-            $( test.true! (ir.has_flag (flags! "let f = if true { 1 } else { 2 };" 0)
-                                       ir.f_strict) ),
-        test.case "a block's lets become binds"
-            $( test.eq! ["int", "bind", "local", "block"] (ops! "let f = { let a = 1; a };") ),
-
-        // --- functions ---
-        test.case "a lambda becomes a closure over a function of its own"
-            $( test.eq! [2, "<lambda>"]
-                        { let i = img! "let f = fn x -> x;";
-                          [list.length (core.map_get i :funcs []),
-                           core.map_get (list.nth 1 (core.map_get i :funcs [])) :name "?"] } ),
-        test.case "a function records the slots and captures it needs"
-            $( test.eq! [1, [[:local, 0]]]
-                        { let f = fn! "let f x = fn y -> x;" 1;
-                          [core.map_get f :slots 0, core.map_get f :captures []] } ),
-        test.case "a thunk is a function, made rather than called"
-            $( test.eq! "thunk" (list.last (ops! "let f = $( 1 );")) ),
-        test.case "every function points at the node its body is"
-            $( test.true! (list.all (fn f -> ir.is_node (core.map_get f :body ir.no_node))
-                                    (core.map_get (img! "let f x = fn y -> x;") :funcs [])) ),
-
-        // --- effects ---
-        test.case "an impure name marks its node"
-            $( test.true! (list.any (fn n -> ir.node_op n == :global
-                                             && ir.has_flag (ir.node_flags n) ir.f_impure)
-                                    (all_nodes! "let go! = 1;\nlet f! = go!;")) ),
-        test.case "a pure name does not"
-            $( test.false! (list.any (fn n -> ir.node_op n == :global
-                                              && ir.has_flag (ir.node_flags n) ir.f_impure)
-                                     (all_nodes! "let go = 1;\nlet f = go;")) ),
-        test.case "calling an impure value is itself an effect"
-            $( test.true! { let src = "import std.console;\nlet f! x = console.print! x;";
-                            ir.has_flag (flags! src 3) ir.f_impure } ),
-        test.case "an effect bound in a block is sequenced where it is written"
-            $( test.true! { let src = "import std.console;\nlet f! = { let a = console.print! 1; a };";
-                            let ns = all_nodes! src;
-                            list.any (fn n -> ir.node_op n == :bind
-                                              && ir.has_flag (ir.node_flags n) ir.f_strict) ns } ),
-
-        // --- tail calls ---
-        test.case "a call a function ends with is a tail call"
-            $( test.true! { let src = "let rec go n = if n == 0 { 0 } else { go (n - 1) };";
-                            let ns = all_nodes! src;
-                            list.any (fn n -> ir.node_op n == :apply
-                                              && ir.has_flag (ir.node_flags n) ir.f_tail) ns } ),
-        test.case "a call in the middle of a function is not"
-            $( test.false! { let src = "let f g = { let a = g 1; a };";
-                             let ns = all_nodes! src;
-                             list.any (fn n -> ir.node_op n == :apply
-                                               && ir.has_flag (ir.node_flags n) ir.f_tail) ns } ),
-
-        // --- host modules ---
-        test.case "a host module's member is a field of the module value"
-            $( test.eq! ["global", "field", "str", "apply"]
-                        (ops! "import std.console;\nlet main! = console.print! \"hi\";") ),
-
-        // --- match ---
-        test.case "a match holds its subject once, strictly"
-            $( test.true! (ir.has_flag (flags! "let f v = match v { _ => 0, };" 1) ir.f_strict) ),
-        test.case "a wildcard arm tests nothing"
-            $( test.true! (list.contains "bool" (ops! "let f v = match v { _ => 0, };")) ),
-        test.case "an unmatched value raises rather than falling through"
-            $( test.true! (list.contains "match_error"
-                                         (core.map_get (img! "let f v = match v { _ => 0, };")
-                                                       :atoms [])) ),
-        test.case "a list pattern checks the type before walking the cells"
-            $( test.true! (list.contains "list"
-                                         (core.map_get (img! "let f v = match v { [a] => a, };")
-                                                       :atoms [])) ),
-        test.case "a fixed-length list pattern checks that it ends"
-            $( test.true! (list.contains "not" (ops! "let f v = match v { [a] => a, };")) ),
-        test.case "a `..rest` pattern does not check for the end"
-            $( test.false! (list.contains "not" (ops! "let f v = match v { [a, ..r] => r, };")) ),
-        // `len` is a builtin, so what shows in the arena is a `builtin` node
-        // holding its id -- not an opcode of its own.
-        test.case "an array pattern compares the length rather than walking it"
-            $( test.true! (list.any (fn n -> ir.node_op n == :builtin
-                                             && ir.node_a n == builtins.id "len")
-                                    (all_nodes! "let f v = match v { #[a] => a, };")) ),
-        test.case "an array pattern indexes rather than walking cells"
-            $( test.false! (list.contains "match_tail"
-                   (list.map (fn n -> ir.op_name (ir.node_op n))
-                             (all_nodes! "let f v = match v { #[a] => a, };"))) ),
-        // Three, and each is a different question: did the guard hold, did
-        // this arm's pattern match, and did the arm below it.
-        test.case "a guard falls through to the arms below it"
-            $( test.eq! 3 (list.count (fn o -> o == "if")
-                   (ops! "let f v = match v { a if a > 1 => a, _ => 0, };")) ),
-        test.case "an unguarded arm needs no test of its own beyond the pattern"
-            $( test.eq! 2 (list.count (fn o -> o == "if")
-                   (ops! "let f v = match v { a => a, _ => 0, };")) ),
-
-        // --- what is not lowered yet ---
-        test.case "comp is reported rather than silently producing nothing"
-            $( test.eq! 1 (list.length (diags (low! "let f = comp 1;"))) ),
-    ];
-}

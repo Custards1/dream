@@ -103,7 +103,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -138,11 +138,15 @@ test-dreams: build
 # Every Dream file in the repository must parse. The corpus is the real test of
 # a parser: the standard library, the build tool, the examples, and `dreams`
 # itself, which is the one that has to keep working for this to go anywhere.
+#
+# `--parse` rather than the default, because the question here is whether each
+# file is well formed on its own -- a module in the middle of a package is not a
+# program, and following its imports would be asking something else.
 test-dreams-corpus: build
     {{dreamc}} dreams/main.dr -L mind -L . -o /tmp/dreams.dream
     @for f in mind/std/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
               dream/tests/programs/*.dr dreams/*.dr; do \
-        ./{{dream}} /tmp/dreams.dream "$f" || exit 1; \
+        ./{{dream}} /tmp/dreams.dream --parse "$f" || exit 1; \
     done
     @echo "every file in the corpus parses"
     {{dreamc}} dreams/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
@@ -160,6 +164,13 @@ test-dreams-modules: build
 # from both compilers, and the broken ones must be rejected for the same reason.
 test-dreams-scope: build
     dreamc={{dreamc}} dream={{dream}} dreams/tests/scope.sh
+
+# `dreams`'s lowering. Every program the reference compiler accepts must lower
+# to an execution tree, the compiler itself included -- which is the only
+# program here big enough to notice a quadratic mistake before it becomes an
+# out-of-memory.
+test-dreams-lower: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/lower.sh
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
