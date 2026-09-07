@@ -9,8 +9,8 @@
 # program, and this is the only place they are checked.
 set -u
 
-dreamc=${dreamc:-target/debug/dreamc}
 dream=${dream:-build-dream/bin/dream}
+dreams=${dreams:-build/dreams.dream}
 image=${image:-/tmp/lucid-session.dream}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -18,7 +18,7 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 say_fail() { echo "FAIL: $*"; fail=1; }
 
-"$dreamc" lucid/main.dr -L mind -L . -o "$image" >/dev/null || exit 1
+"$dream" "$dreams" lucid/main.dr -L mind -L . -o "$image" >/dev/null 2>&1 || exit 1
 
 # --- a workspace, and a buffer that disagrees with it -----------------------
 

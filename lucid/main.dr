@@ -203,6 +203,11 @@ let rec serve! inh out s =
 
 let opts = [
     cli.list_of "L" "package-path" "DIR" "a package, or a directory holding packages",
+    // An LSP client names the transport it started us on. `vscode-languageclient`
+    // appends `--stdio` to the command line by itself, and a server that rejects
+    // it dies before it has read a byte. Stdio is the only transport here, so the
+    // flag is accepted and means nothing.
+    cli.flag "" "stdio" "speak LSP on stdin and stdout (the default, and the only one)",
     cli.flag "h" "help" "this message",
     cli.flag "" "version" "print the version",
 ];

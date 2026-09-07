@@ -131,16 +131,22 @@ let vm_command! () = match os.env! "DREAM" { () => "dream", v => v };
 
 /// Which compiler to run, in the order a person would expect to be obeyed:
 /// what this build asked for, then what the package asks for, then the
-/// environment, then whatever is called `dreamc` on the path.
+/// environment, then the installed one.
 ///
-/// `DREAMS` comes before `DREAMC` because it names the compiler that is
-/// replacing the other; a machine with both set is mid-migration and means the
-/// newer one.
+/// `DREAMS` comes before `DREAMC` because it names the compiler that replaced
+/// the other; a machine with both set is mid-migration and means the newer one.
+///
+/// The default is `dreams.dream` rather than a program on the path, because the
+/// compiler is an image now: the VM resolves a bare name against `$MINDV2_PATH`,
+/// so this finds whatever the installation put there. A native compiler is
+/// still perfectly usable -- name it, and it is executed directly.
+let default_compiler = "dreams.dream";
+
 let choose_compiler! m explicit =
     match explicit {
         () => match manifest.compiler m {
             () => match os.env! "DREAMS" {
-                () => match os.env! "DREAMC" { () => "dreamc", c => c },
+                () => match os.env! "DREAMC" { () => default_compiler, c => c },
                 d  => d,
             },
             c => c,
@@ -220,6 +226,75 @@ let compile! m o = {
         },
     }
 };
+
+// --- the interactive session ---------------------------------------------------
+//
+// `mind repl` is the compiler's own REPL, started with what this project sees:
+// the standard library, every dependency, and the `when` flags the manifest
+// sets. That is the whole reason for it being a `mind` command -- the flags a
+// session wants are the flags a build wants, and working them out by hand for a
+// project with dependencies is a chore nobody should have to repeat.
+//
+// It hands the terminal over with `os.replace!` rather than running a child:
+// `exec!` gives the child pipes and reads them to the end, which is fine for a
+// compiler and useless for something that prompts.
+
+/// The directory that holds the project's package -- its manifest's own
+/// directory, which is what `-L` wants: a package, or a directory of them.
+let root_of m = manifest.root m;
+
+/// The arguments a session is started with, without the compiler's own name.
+let repl_args m o =
+    list.concat [
+        ["--repl"],
+        repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
+        repeated "-I" (list.append (manifest.includes m) (option o :includes [])),
+        repeated "--host-module"
+                 (list.append (manifest.host_modules m) (option o :hosts [])),
+        repeated "-D" (list.append (manifest.defines m) (option o :defines [])),
+        manifest.compiler_flags m,
+        option o :flags [],
+    ];
+
+/// Become the compiler, in interactive mode. Answers only `[:error, why]`, and
+/// only when it could not: on success there is nothing left of `mind` to return
+/// to.
+let become_repl! m o args = {
+    if option o :verbose false {
+        console.error! (str.join_str " " (list.cons (choose_compiler! m (option o :compiler ()))
+                                                    args))
+    }
+    match compiler_command! (choose_compiler! m (option o :compiler ())) {
+        [program, lead] => {
+            match try! { os.replace! program (list.append lead args) }
+                  catch e { [:error, "cannot start " + to_string program + ": " + to_string e] } {
+                [:error, why] => [:error, why],
+                _ => [:error, "the session did not start"],
+            }
+        },
+    }
+};
+
+/// A session inside a project: every package it can see is on the search path,
+/// the project's own included.
+///
+/// The project has to be named explicitly. A build finds it by walking up from
+/// the entry file, and a session has no entry file to walk up from -- what it
+/// compiles is a scratch file somewhere else entirely -- so a `-L` on the root
+/// is what makes `import <this project>` work from the prompt.
+let repl! m o =
+    match search_paths! m {
+        [:error, why] => [:error, why],
+        [:ok, paths] =>
+            become_repl! m o (list.concat [repl_args m o, paths, ["-L", root_of m]]),
+    };
+
+/// A session outside one. The standard library is enough to explore the
+/// language with, and demanding a `mind.toml` before answering would make the
+/// quickest thing here the most ceremonious.
+let bare_repl! o =
+    become_repl! manifest.empty o
+                 (list.append (repl_args manifest.empty o) ["-L", stdlib_root! ()]);
 
 /// Run a built image, passing `args` to the program.
 let run_image! m o args = {

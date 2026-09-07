@@ -274,6 +274,7 @@ import std.os;
 |------|-----------|-------------|
 | `exec!` | `program:string → args:list of string → map` | Runs `program` to completion and returns a map `%{ :code, :out, :err, :timed_out }`. `program` is resolved via `PATH`. Parks the calling process — not the worker thread — while the child runs. |
 | `exec_for!` | `program:string → args:list of string → timeout_ms:integer → map` | Same as `exec!` but kills the child after `timeout_ms` milliseconds. Sets `:timed_out true` in the result map when the deadline is hit, so the caller can distinguish that from an ordinary non-zero exit code. |
+| `replace!` | `program:string → args:list of string → never` | **Becomes** `program`: `execvp`, so this VM — image, heap and every thread — is gone and the named program takes over the process, inheriting the terminal and every open descriptor. Stdio is flushed first. It returns only by failing, raising `:not_found` when the program cannot be run. Use it to hand over to something interactive; `exec!` gives its child pipes, which is right for a compiler and useless for anything that prompts. |
 
 The result map fields:
 

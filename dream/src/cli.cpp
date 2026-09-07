@@ -23,9 +23,13 @@ namespace {
 const char* USAGE =
     "dream -- the Dream virtual machine\n"
     "\n"
-    "usage: dream <image.dream> [options]\n"
+    "usage: dream <image> [options]\n"
+    "\n"
+    "<image> is a file, that file with `.dream` added, or either of those in\n"
+    "$MINDV2_PATH -- so `dream mind` runs ./mind.dream, or the installed one.\n"
     "\n"
     "options:\n"
+    "  -x, --exec <name>    run <name>.dream from $MINDV2_PATH, not from here\n"
     "  -e, --entry <name>   run this global instead of `main!`\n"
     "  -j, --workers <n>    scheduler threads (default: one per core)\n"
     "      --dump           disassemble the image and exit\n"
@@ -192,39 +196,65 @@ bool is_directory(const std::string& path) {
 
 /// Resolve the image to run.
 ///
-/// A path is a path: if it names a directory or has a separator in it, it is
-/// taken literally and a miss is an error. A bare name is a program, and
-/// programs are installed in `$MINDV2_PATH` -- so `dream lucid` finds
-/// `lucid.dream` there, the way a shell finds a binary on PATH.
+/// `dream mind` should mean what `mind` means when it is typed on its own, so a
+/// name is tried four ways, nearest first:
+///
+///   1. as written, which is what a path is;
+///   2. with `.dream` added, so `dream mind` runs `./mind.dream` -- an image is
+///      a program, and naming its extension every time is noise;
+///   3. and 4., both of those under `$MINDV2_PATH`, where an installation keeps
+///      what it ships, the way a shell finds a binary on PATH.
+///
+/// The working directory comes before the installation, because a project's own
+/// build is what someone standing in it means. The installed lookup is for a
+/// bare name only: a path with a separator in it is a place, and answering it
+/// with a file from somewhere else would be a surprise. `dream -x NAME` is the
+/// other half of this -- the installation and nothing else.
 std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* file_ok) {
     *file_ok = true;
-    if (std::filesystem::exists(path) && !is_directory(path)) return path;
 
     const bool is_bare_name =
         path.find('/') == std::string::npos && path.find('\\') == std::string::npos;
-    if (!is_bare_name) {
-        std::fprintf(stderr, "dream: no such file `%s`\n", path.c_str());
+
+    std::vector<std::string> candidates{path, path + ".dream"};
+    if (is_bare_name && !MINDV2_PATH.empty()) {
+        candidates.push_back(MINDV2_PATH + "/" + path);
+        candidates.push_back(MINDV2_PATH + "/" + path + ".dream");
+    }
+    for (const std::string& candidate : candidates) {
+        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
+    }
+
+    *file_ok = false;
+    return "";
+}
+
+/// `-x name`: the installed image called `name`, and nothing else.
+///
+/// This is the same lookup `skip_file` falls back to, without the fallback. A
+/// bare `dream lucid` prefers a file called `lucid` in the working directory,
+/// which is what a path should mean; `-x lucid` says the installation is the
+/// only place to look, so a stray file next to the caller cannot shadow an
+/// installed program.
+std::string installed_image(const std::string& name, const std::string& MINDV2_PATH,
+                            bool* file_ok) {
+    *file_ok = true;
+    if (MINDV2_PATH.empty()) {
+        std::fprintf(stderr,
+                     "dream: -x needs $MINDV2_PATH (or ~/.mindv2) to look in, to find `%s`\n",
+                     name.c_str());
         *file_ok = false;
         return "";
     }
-
-    if (!MINDV2_PATH.empty()) {
-        // As written, then with the extension the installer gives it. Both,
-        // because `dream lucid` and `dream lucid.dream` should mean the same
-        // program.
-        const std::string candidates[] = {
-            MINDV2_PATH + "/" + path,
-            MINDV2_PATH + "/" + path + ".dream",
-        };
-        for (const std::string& candidate : candidates) {
-            if (std::filesystem::exists(candidate) && !is_directory(candidate)) {
-                *file_ok = true;
-                return candidate;
-            }
-        }
+    const std::string candidates[] = {
+        MINDV2_PATH + "/" + name,
+        MINDV2_PATH + "/" + name + ".dream",
+    };
+    for (const std::string& candidate : candidates) {
+        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
     }
-
-    std::fprintf(stderr, "dream: no such file `%s`\n", path.c_str());
+    std::fprintf(stderr, "dream: no installed image `%s` in %s\n", name.c_str(),
+                 MINDV2_PATH.c_str());
     *file_ok = false;
     return "";
 }
@@ -265,6 +295,9 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> program_args;
     bool past_image = false;
+    // `-x` has already resolved the image, so the working directory must not be
+    // consulted for it again.
+    bool installed = false;
     std::string MINDV2_PATH = get_mindv2_path(); 
     
     for (int i = 1; i < argc; ++i) {
@@ -284,6 +317,12 @@ int main(int argc, char** argv) {
         if (a == "-h" || a == "--help") {
             std::fputs(USAGE, stdout);
             return 0;
+        } else if (a == "-x" || a == "--exec") {
+            bool ok = true;
+            path = installed_image(next("--exec"), MINDV2_PATH, &ok);
+            if (!ok) return 1;
+            installed = true;
+            past_image = true;
         } else if (a == "-e" || a == "--entry") {
             entry = next("--entry");
         } else if (a == "-j" || a == "--workers") {
@@ -319,10 +358,13 @@ int main(int argc, char** argv) {
         std::fputs(USAGE, stderr);
         return 2;
     }
-    bool file_ok=true;
-    path = skip_file(path, MINDV2_PATH,&file_ok);
-    if(!file_ok) {
-        std::fprintf(stderr, "dream: file not found: `%s`\n", path.c_str());
+    bool file_ok = true;
+    // The name as it was typed, because that is the one worth reporting: what
+    // the lookup answers on a miss is nothing at all.
+    const std::string asked = path;
+    if (!installed) path = skip_file(path, MINDV2_PATH, &file_ok);
+    if (!file_ok) {
+        std::fprintf(stderr, "dream: no such image `%s`\n", asked.c_str());
         return 1;
     }
 

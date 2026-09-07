@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests: compile each program with dawnc, run it under the VM, and
+# End-to-end tests: compile each program with `dreams`, run it under the VM, and
 # compare against the recorded output.
 #
 # Every program runs twice, once with the JIT and once without. Both tiers must
@@ -8,41 +8,41 @@
 
 set -uo pipefail
 
-DREAMC="${DREAMC:-}"
 # `DREAM` is the conventional spelling; the lowercase `dream` is accepted too
 # because it is what this script used first, and a lowercase environment
 # variable is easy to set by accident from a shell where `dream` is also a
 # path or an alias.
 dream="${DREAM:-${dream:-}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 
-if [[ -z "$DREAMC" ]]; then
-  # Cargo puts workspace artifacts in the workspace root's target directory,
-  # not in the crate's own. Take the most recently built one: preferring
-  # release would silently test a stale binary.
-  newest=""
-  for c in "$HERE/../../target/release/dreamc" "$HERE/../../target/debug/dreamc" \
-           "$HERE/../../dreamc/target/release/dreamc" "$HERE/../../dreamc/target/debug/dreamc"; do
-    [[ -x "$c" ]] || continue
-    if [[ -z "$newest" || "$c" -nt "$newest" ]]; then newest="$c"; fi
-  done
-  DREAMC="$newest"
-fi
 if [[ -z "$dream" ]]; then
-    for c in "$HERE/../../build-dream/bin/dream" "$HERE/../build-dream/bin/dream" \
-           "$HERE/../build/bin/dream"; do
+    for c in "$ROOT/build-dream/bin/dream" "$HERE/../build-dream/bin/dream" \
+           "$ROOT/build/bin/dream"; do
     [[ -x "$c" ]] && dream="$c" && break
   done
 fi
 
-if [[ ! -x "${DREAMC:-}" ]]; then
-  echo "e2e: cannot find dawnc; build it or set DREAMC" >&2
-  exit 1
-fi
 if [[ ! -x "${dream:-}" ]]; then
   echo "e2e: cannot find the dream VM; build it or set dream" >&2
   exit 1
 fi
+
+# The compiler is `dreams`, an image rather than a native program: a freshly
+# built one when there is one, and otherwise the checked-in seed, which needs
+# nothing but the VM this script is testing. `$DREAMC` still overrides, and a
+# name that does not end in `.dream` is executed directly.
+DREAMC="${DREAMC:-}"
+if [[ -z "$DREAMC" ]]; then
+  for c in "$ROOT/build/dreams.dream" "$ROOT/dreams/bootstrap/dreams.dream"; do
+    [[ -f "$c" ]] && DREAMC="$c" && break
+  done
+fi
+if [[ -z "$DREAMC" ]]; then
+  echo "e2e: cannot find a compiler; run \`just dreams\` or set DREAMC" >&2
+  exit 1
+fi
+if [[ "$DREAMC" == *.dream ]]; then compile=("$dream" "$DREAMC"); else compile=("$DREAMC"); fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -55,7 +55,7 @@ for src in "$HERE"/programs/*.dr; do
   expected="$HERE/programs/$name.expected"
   image="$WORK/$name.dream"
 
-  if ! "$DREAMC" "$src" -o "$image" >"$WORK/$name.compile" 2>&1; then
+  if ! "${compile[@]}" "$src" -o "$image" >"$WORK/$name.compile" 2>&1; then
     echo "FAIL $name (compile)"
     sed 's/^/    /' "$WORK/$name.compile"
     fail=$((fail + 1))
@@ -99,7 +99,7 @@ done
 
 # --- shebang images ---------------------------------------------------------
 #
-# `dreamc --shebang` writes an interpreter line before the image and sets the
+# `--shebang` writes an interpreter line before the image and sets the
 # execute bit. The VM skips such a line, so the file has to work both ways: run
 # as a command, and loaded as an ordinary image. Testing only the first would
 # miss an image the VM can no longer read.
@@ -111,7 +111,7 @@ import std.console;
 let main! = console.print! "shebang";
 EOF
 
-if "$DREAMC" "$shebang_src/hello.dr" --shebang "$(cd "$(dirname "$dream")" && pwd)/$(basename "$dream")" \
+if "${compile[@]}" "$shebang_src/hello.dr" --shebang "$(cd "$(dirname "$dream")" && pwd)/$(basename "$dream")" \
      -o "$shebang_src/hello" >/dev/null 2>&1; then
   direct_out="$("$shebang_src/hello" 2>&1)"
   loaded_out="$("$dream" "$shebang_src/hello" 2>&1)"

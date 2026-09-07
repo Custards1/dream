@@ -8,7 +8,7 @@ import std.str;
 // --- paths ------------------------------------------------------------------
 //
 // Textual, not resolved against the file system: `mind` passes paths to
-// `dreamc` and to `git`, both of which do their own resolving, so normalising
+// the compiler and to `git`, both of which do their own resolving, so normalising
 // here would only lose information -- a relative dependency path is meaningful
 // relative to the manifest that named it.
 
@@ -90,7 +90,7 @@ when test {
     import std.test;
 
     let tests = [
-        // paths are textual: `mind` hands them to `dreamc` and to `git`, which
+        // paths are textual: `mind` hands them to the compiler and to `git`, which
         // do their own resolving, so normalising here would lose meaning.
         test.case "join"              $( test.eq! "a/b" (join "a" "b") ),
         test.case "join keeps one slash" $( test.eq! "a/b" (join "a/" "b") ),

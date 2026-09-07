@@ -15,32 +15,33 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-DREAMC="${DREAMC:-}"
 dream="${dream:-}"
-# Take the most recently built compiler, not the release one: preferring
-# release would silently check the examples against a stale binary, which is
-# exactly the sort of bug these examples exist to catch.
-if [[ -z "$DREAMC" ]]; then
-  newest=""
-  for c in "$ROOT/target/release/dreamc" "$ROOT/target/debug/dreamc"; do
-    [[ -x "$c" ]] || continue
-    if [[ -z "$newest" || "$c" -nt "$newest" ]]; then newest="$c"; fi
-  done
-  DREAMC="$newest"
-fi
 if [[ -z "$dream" ]]; then
   for c in "$ROOT/build-dream/bin/dream" "$ROOT/build/bin/dream"; do
     [[ -x "$c" ]] && dream="$c" && break
   done
 fi
-if [[ ! -x "${DREAMC:-}" ]]; then
-  echo "examples: cannot find dreamc; run \`just build\` or set DREAMC" >&2
-  exit 1
-fi
 if [[ ! -x "${dream:-}" ]]; then
-  echo "examples: cannot find dream; run \`just build\` or set dream" >&2
+  echo "examples: cannot find dream; run \`just vm\` or set dream" >&2
   exit 1
 fi
+
+# The compiler is `dreams`, which is an image rather than a native program: a
+# freshly built one if there is one, and otherwise the checked-in seed, which
+# needs nothing but the VM. `$DREAMC` still overrides, and a name that does not
+# end in `.dream` is run directly -- that is how a native compiler is still
+# usable here without this script knowing anything about which one it is.
+DREAMC="${DREAMC:-}"
+if [[ -z "$DREAMC" ]]; then
+  for c in "$ROOT/build/dreams.dream" "$ROOT/dreams/bootstrap/dreams.dream"; do
+    [[ -f "$c" ]] && DREAMC="$c" && break
+  done
+fi
+if [[ -z "$DREAMC" ]]; then
+  echo "examples: cannot find a compiler; run \`just dreams\` or set DREAMC" >&2
+  exit 1
+fi
+if [[ "$DREAMC" == *.dream ]]; then compile=("$dream" "$DREAMC"); else compile=("$DREAMC"); fi
 
 bless=0
 filter=""
@@ -65,7 +66,7 @@ check() {
   local name="$1" src="$2" expected="$3"
   local image="$WORK/$name.dream"
 
-  if ! "$DREAMC" "$src" "${LIBS[@]}" -o "$image" >"$WORK/$name.compile" 2>&1; then
+  if ! "${compile[@]}" "$src" "${LIBS[@]}" -o "$image" >"$WORK/$name.compile" 2>&1; then
     echo "FAIL $name (compile)"
     sed 's/^/    /' "$WORK/$name.compile"
     fail=$((fail + 1))

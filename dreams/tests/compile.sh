@@ -9,8 +9,12 @@
 # against another implementation of it.
 set -u
 
-dreamc=${dreamc:-target/debug/dreamc}
+# `dreams` builds itself: the checked-in seed compiles this source, and the
+# image that comes out is the one under test. There is no reference compiler in
+# this script any more, and there does not need to be -- what it compares
+# against is the recorded output of each example, not another implementation.
 dream=${dream:-build-dream/bin/dream}
+seed=${seed:-dreams/bootstrap/dreams.dream}
 image=${image:-/tmp/dreams-compile.dream}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -18,7 +22,7 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 pass=0
 
-"$dreamc" dreams/main.dr -L mind -L . -o "$image" >/dev/null || exit 1
+"$dream" "$seed" dreams/main.dr -L mind -L . -o "$image" >/dev/null 2>&1 || exit 1
 
 for src in examples/*.dr; do
     [ -f "$src" ] || continue

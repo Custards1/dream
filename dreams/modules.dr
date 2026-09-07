@@ -23,7 +23,9 @@
 // module is registered.
 
 import std.core;
+import std.io;
 import std.list;
+import std.os;
 import std.str;
 
 import dreams.ast;
@@ -560,16 +562,49 @@ let load_root! l file test_mode = {
     if test_mode { add_test_runner! loaded_all } else { loaded_all }
 };
 
+/// Where a module is looked for when nothing said where to look.
+///
+/// A compiler that can only find the standard library when it is told to is a
+/// compiler every script has to be told about, so a root file gets three search
+/// paths for free:
+///
+///   - its own directory, so a program's siblings are modules of it;
+///   - every entry of `$MINDV2_PATH`, which is where an installation keeps what
+///     it ships;
+///   - the nearest enclosing `mind` directory that holds a `std`, so a checkout
+///     is its own installation and `dream/tests/programs/match.dr` can import
+///     `std.list` with no `-L` at all.
+///
+/// What the command line asked for comes first, because a search path given by
+/// hand is a decision and these are a convenience.
+let rec enclosing_minds! dir acc = {
+    let candidate = path.join dir "mind";
+    let grown = if io.is_dir! (path.join candidate "std") { list.append acc [candidate] }
+                else { acc };
+    let up = path.dirname dir;
+    if up == dir { grown } else { enclosing_minds! up grown }
+};
+
+let default_search_paths! file extra =
+    list.concat [
+        extra,
+        [path.dirname file],
+        match os.env! "MINDV2_PATH" { () => [], v => package.split_roots v },
+        enclosing_minds! (path.dirname (path.absolute! file)) [],
+    ];
+
 /// The usual way in: discover packages around `file`, then load it.
 let load! file roots cfg test_mode =
-    load_root! (loader (package.discover! file roots) cfg roots []) file test_mode;
+    load_root! (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])
+               file test_mode;
 
 /// The same, reading `ov` -- a map of path to text -- instead of the disk for
 /// the files it names. This is what a language server loads through: the
 /// program it must answer questions about is the one in the editor's buffers,
 /// which may differ from the one on disk in every file at once.
 let load_overlaid! file roots cfg test_mode ov =
-    load_root! (with_overlay ov (loader (package.discover! file roots) cfg roots []))
+    load_root! (with_overlay ov (loader (package.discover! file roots) cfg
+                                        (default_search_paths! file roots) []))
                file test_mode;
 
 let failed l = diag.error_count (diags l) > 0;

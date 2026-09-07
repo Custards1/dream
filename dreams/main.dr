@@ -32,9 +32,14 @@ import dreams.modules;
 import dreams.package;
 import dreams.parser;
 import dreams.path;
+import dreams.repl;
 import dreams.scope;
 
 let version = "0.1.0";
+
+/// What `--shebang` writes when it is not given a line. `env` so that it finds
+/// whichever `dream` is on the PATH rather than one fixed place.
+let default_shebang = "#!/usr/bin/env dream";
 
 // --- reporting --------------------------------------------------------------
 
@@ -164,14 +169,20 @@ let show_ir! l = {
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out = {
+let build! l out shebang = {
     let r = scope.resolve! l;
     let low = lower.link! l r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
     else {
         let img = lower.image low;
-        let bytes = emit.to_binary img;
+        // The shebang goes in front of the image rather than into it: the VM
+        // skips a leading `#!` line when it loads a file, which is what makes
+        // one file both an image and a program.
+        let bytes = match shebang {
+                        () => emit.to_binary img,
+                        line => line + "\n" + emit.to_binary img,
+                    };
         let h = try! { io.open! out :write } catch e { () };
         match h {
             () => {
@@ -181,6 +192,10 @@ let build! l out = {
             handle => {
                 write_all! handle bytes
                 io.close! handle
+                // There is no `chmod` builtin, and the execute bit is the whole
+                // point of the `#!` line, so this is one place where shelling
+                // out is the implementation rather than a shortcut.
+                match shebang { () => (), _ => os.exec! "chmod" ["+x", out] }
                 console.error! ("compiled -> " + out + " (" + to_string (str.byte_length bytes)
                                 + " bytes, " + to_string (list.length (modules.modules l))
                                 + " modules, " + to_string (list.length (core.map_get img :nodes []))
@@ -364,7 +379,7 @@ let describe_resolution l r found =
 
 let defaults = %{ :command => :check, :file => (), :roots => [], :includes => [],
                   :defines => [], :hosts => [], :test => false, :quiet => false,
-                  :position => (), :output => (), :error => () };
+                  :position => (), :output => (), :shebang => (), :error => () };
 
 let opt o k = core.map_get o k ();
 let with_opt k v o = core.map_put o k v;
@@ -409,6 +424,18 @@ let rec parse_args args o =
         ["--symbols", ..rest]   => parse_args rest (with_opt :command :symbols o),
         ["--stats", ..rest]     => parse_args rest (with_opt :command :stats o),
         ["--print-cfg", ..rest] => parse_args rest (with_opt :command :print_cfg o),
+        ["--repl", ..rest]      => parse_args rest (with_opt :command :repl o),
+        // The VM skips a leading `#!` line, so an image carrying one is both a
+        // valid image and a file that runs when it is executed. The line is
+        // optional: `--shebang` on its own writes the usual one, and anything
+        // that is not another option replaces it.
+        ["--shebang"] => with_opt :shebang default_shebang o,
+        ["--shebang", nxt, ..rest] =>
+            if str.starts_with "-" nxt { parse_args (list.cons nxt rest)
+                                                    (with_opt :shebang default_shebang o) }
+            else if str.starts_with "#!" nxt { parse_args rest (with_opt :shebang nxt o) }
+            else { parse_args rest (with_opt :shebang ("#!" + nxt) o) },
+        ["-i", ..rest]          => parse_args rest (with_opt :command :repl o),
         ["--version", ..rest]   => parse_args rest (with_opt :command :version o),
         ["-h", ..rest]          => parse_args rest (with_opt :command :help o),
         ["--help", ..rest]      => parse_args rest (with_opt :command :help o),
@@ -463,6 +490,8 @@ let usage! () = {
         "  --at LINE:COL  say what is at a position, and where it came from",
         "  --stats        count what the program contains",
         "  --print-cfg    print the `when` flags that are defined",
+        "  --shebang [LINE]  prefix the image with a `#!` line and make it executable",
+        "  -i, --repl     an interactive session: read, compile, run, repeat",
         "  --version      print the version",
         "",
         "where to look:",
@@ -510,7 +539,7 @@ let run_command! o file =
         :ast       => with_source! file (fn src -> ast! file src),
         :parse     => with_source! file (fn src -> parse_only! file src),
         :check     => check_program! (load! o file),
-        :build     => build! (load! o file) (opt o :output),
+        :build     => build! (load! o file) (opt o :output) (opt o :shebang),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),
@@ -531,6 +560,8 @@ let run! args = {
                     console.print! ("dreams " + version)
                     0
                 },
+                :repl => repl.start! (list.append (opt o :roots) (opt o :includes))
+                                     (configured! o) version,
                 :print_cfg => {
                     list.map (fn line -> console.print! line) (config.describe (configured! o))
                         |> strict!

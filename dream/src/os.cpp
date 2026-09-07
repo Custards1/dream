@@ -453,6 +453,39 @@ NativeResult os_exit(Process& p, Value, Value* args, uint32_t) {
     std::_Exit(int(fixnum_value(v)));
 }
 
+/// `replace! program args` -- become another program.
+///
+/// This is `execvp`: the image, the heap and every thread of this VM are gone,
+/// and the program named here takes over the process. Nothing comes back, so
+/// there is no result type and no `!`-suffixed thing to do with one -- the only
+/// way this returns is by failing.
+///
+/// `exec!` is the wrong tool for handing over to something *interactive*: it
+/// gives the child pipes and reads them to the end, so a program that prompts
+/// has nobody typing at it. A tool that runs an editor, a shell or a REPL wants
+/// this instead -- the child inherits the terminal, because it inherits
+/// everything.
+NativeResult os_replace(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "replace! needs a program name");
+    std::vector<std::string> argv{string_arg(args[0])};
+    if (!read_string_list(p, args[1], &argv)) {
+        if (p.park_requested) return NativeResult::block();
+        return fail(p, "type_error", "replace! needs a list of string arguments");
+    }
+
+    std::vector<char*> raw;
+    raw.reserve(argv.size() + 1);
+    for (std::string& a : argv) raw.push_back(a.data());
+    raw.push_back(nullptr);
+
+    // Anything still sitting in a stdio buffer would be lost with the address
+    // space, so it goes out first.
+    std::fflush(nullptr);
+    ::execvp(raw[0], raw.data());
+    return fail(p, "not_found",
+                std::string("cannot run `") + argv[0] + "`: " + std::strerror(errno));
+}
+
 }  // namespace
 
 void os_shutdown() { Jobs::get().drain(); }
@@ -468,6 +501,7 @@ ModuleDef make_os_module() {
                          {"list_dir!", 1, 0b1, os_list_dir},
                          {"exec!", 2, 0b01, os_exec},
                          {"exec_for!", 3, 0b101, os_exec_for},
+                         {"replace!", 2, 0b01, os_replace},
                          {"pid!", 1, 0b1, os_pid},
                          {"platform", 1, 0b1, os_platform},
                          {"exit!", 1, 0b1, os_exit},

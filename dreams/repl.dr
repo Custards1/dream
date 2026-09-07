@@ -1,0 +1,430 @@
+// The interactive interpreter.
+//
+// A REPL for a whole-program language is not the usual loop. There is no
+// environment to extend one binding at a time: a Dream program is compiled all
+// at once, from a root file, and the meaning of a name depends on every other
+// name in the program. So this keeps the only thing that can be kept -- the
+// *text* of what has been defined -- and compiles the whole of it again on
+// every entry. The session is a source file being written a line at a time, and
+// each entry is a full build of it.
+//
+// That sounds expensive and is not: the compiler is the one running the loop,
+// so a rebuild is a few thousand nodes through passes that already exist, with
+// no process to start and no file to find. What it buys is that the REPL cannot
+// disagree with the compiler about anything, because it *is* the compiler --
+// a name means here exactly what it would mean in a file.
+//
+// Running the result is the one thing that must leave: an image needs a VM, and
+// this is a Dream program rather than the VM itself. So an entry that produces
+// a value is run as a child VM (`$DREAM`, or `dream` on the path) and its
+// output relayed. The consequence is worth stating plainly, because it is
+// visible from the prompt: nothing *runtime* survives between entries. A
+// definition persists because its text does; a value does not, and neither does
+// a file left open or a process left running.
+import std.console;
+import std.core;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+import dreams.ast;
+import dreams.diag;
+import dreams.emit;
+import dreams.lower;
+import dreams.modules;
+import dreams.parser;
+import dreams.scope;
+
+let prompt = "dream> ";
+let continued = "  ...> ";
+
+// --- the session --------------------------------------------------------------
+//
+// Two lists of source lines, kept apart because imports must come first in a
+// module. `std.console` is always there: the loop prints the value of every
+// entry, so it is part of the program whether or not anyone asked for it.
+
+let base_imports = ["import std.console;"];
+
+let session imports defs = %{ :imports => imports, :defs => defs };
+let imports s = core.map_get s :imports base_imports;
+let defs s    = core.map_get s :defs [];
+
+let empty_session = session base_imports [];
+
+/// An import already in the session is not added twice -- a module imported
+/// twice is an error, and typing the same line again is not a mistake worth
+/// ending the session over.
+let with_import i s =
+    if list.contains i (imports s) { s }
+    else { core.map_put s :imports (list.append (imports s) [i]) };
+
+let with_def d s = core.map_put s :defs (list.append (defs s) [d]);
+
+/// The program the session currently is, with `body` as its entry point.
+let program s body =
+    str.join_str "\n" (list.concat [imports s, defs s, [body]]) + "\n";
+
+/// What an entry that is an expression compiles to. The value is bound and then
+/// matched rather than printed directly, so that `()` -- what an entry made
+/// only of effects answers -- prints nothing. A REPL that echoes `()` after
+/// every `console.print!` is reporting on itself rather than on the program.
+let echo expr =
+    "let main! = {\n    let it = (" + expr + ");\n"
+    + "    match it {\n        () => (),\n        v => console.print! (to_string v),\n    }\n};";
+
+/// What an entry that is a definition compiles to. There is nothing to run --
+/// the point is whether it compiles at all -- but a program needs an entry
+/// point to be a program.
+let quiet_main = "let main! = ();";
+
+// --- reading an entry -----------------------------------------------------------
+
+/// One line from a handle, or `()` at end of input.
+///
+/// A byte at a time, because a terminal hands over a line at a time and there
+/// is nothing to gain by buffering; and reading past the newline would take
+/// input that belongs to the next entry.
+let rec read_line! h acc =
+    match io.read! h 1 {
+        "" => if str.is_empty acc { () } else { acc },
+        "\n" => acc,
+        c => read_line! h (acc + c),
+    };
+
+/// Whether the parser's complaint is "there is more of this to come".
+///
+/// This is the whole of the continuation rule, and it is the parser's opinion
+/// rather than a second one: a bracket counter here would be a small parser
+/// that disagrees with the real one about strings and comments. Running out of
+/// input is the only error that more input can fix.
+let unfinished message =
+    str.find "end of file" message >= 0
+    || str.find "unterminated" message >= 0;
+
+/// The first word, which is what decides whether an entry is read as a
+/// declaration or as an expression.
+let first_word text =
+    match str.split " " (str.trim text) {
+        [] => "",
+        [w, .._] => w,
+    };
+
+let declarative text =
+    list.contains (first_word text)
+                  ["let", "import", "mod", "when", "virtual", "derive", "//", "///"];
+
+/// Parse an entry the way it will be compiled: `[:ok]`, or `[:error, message]`.
+let parsed text =
+    if declarative text {
+        match parser.parse_module text {
+            [:ok, _] => [:ok],
+            [:error, m, _] => [:error, m],
+        }
+    } else {
+        match parser.parse_expression text {
+            [:ok, _] => [:ok],
+            [:error, m, _] => [:error, m],
+        }
+    };
+
+let complete text =
+    match parsed text {
+        [:ok] => true,
+        [:error, m] => not (unfinished m),
+    };
+
+/// Read until the entry is something the parser can finish reading. An empty
+/// line ends a continuation whatever the parser thinks, because otherwise a
+/// missing brace is a prompt with no way out.
+let rec read_entry! h acc =
+    match read_line! h "" {
+        () => if str.is_empty (str.trim acc) { () } else { acc },
+        line => {
+            let text = if str.is_empty acc { line } else { acc + "\n" + line };
+            if str.is_empty (str.trim line) && not (str.is_empty acc) { text }
+            else if str.is_empty (str.trim text) { text }
+            else if complete text { text }
+            else {
+                console.write! continued
+                read_entry! h text
+            }
+        },
+    };
+
+// --- compiling and running ------------------------------------------------------
+
+/// A short write is not an error, so writing means looping until it is all out.
+let rec write_all! handle text = {
+    let n = str.byte_length text;
+    if n == 0 { :done }
+    else {
+        let wrote = io.write! handle text;
+        if wrote >= n { :done } else { write_all! handle (str.slice wrote (n - wrote) text) }
+    }
+};
+
+/// `true` if the file was written. The REPL's scratch files live wherever the
+/// system puts temporary files, and a session that cannot write one has nowhere
+/// to compile to, which is worth saying rather than crashing on.
+let write_file! path text =
+    match try! { io.open! path :write } catch e { () } {
+        () => false,
+        h => {
+            write_all! h text
+            io.close! h
+            true
+        },
+    };
+
+/// The scratch file's name is an implementation detail, and a diagnostic that
+/// names it is telling the reader about the REPL rather than about their
+/// program. The line and column are worth keeping -- they point into the
+/// session as `:list` prints it -- so only the path is replaced.
+let as_session path text = str.join_str "session" (str.split path text);
+
+/// Compile the session, with `body` as its entry point.
+/// `[:ok, image]`, or `[:error, rendered diagnostics]`.
+let compile! s body roots cfg source image = {
+    if write_file! source (program s body) { () }
+    else { console.error! ("dreams: cannot write " + source) }
+    let l = modules.load! source roots cfg false;
+    let r = scope.resolve! l;
+    let low = lower.link! l r;
+    let ds = list.append (modules.diags l) (lower.all_diags r low);
+    if diag.error_count ds > 0 {
+        [:error, as_session source (diag.render_all (modules.files l) ds)]
+    }
+    else if write_file! image (emit.to_binary (lower.image low)) { [:ok, image] }
+    else { [:error, "dreams: cannot write " + image] }
+};
+
+/// The VM to run an image with. The same variable `mind` reads, because a
+/// session started from a build should reach the same VM the build did.
+let vm! () = match os.env! "DREAM" { () => "dream", v => v };
+
+/// Run the image and relay what it said. Its stderr is our stderr and its
+/// stdout is our stdout -- the program's output is the answer, and a REPL that
+/// reformats it is showing something the same program in a file would not.
+let run! image = {
+    match try! { os.exec! (vm! ()) [image] } catch e { [:failed, e] } {
+        [:failed, e] => console.error! ("dreams: cannot run " + vm! () + ": " + to_string e),
+        r => {
+            let out = core.map_get r :out "";
+            let err = core.map_get r :err "";
+            if str.is_empty out { () } else { console.write! out }
+            if str.is_empty err { () } else { console.write! err }
+        },
+    }
+};
+
+// --- the commands ---------------------------------------------------------------
+
+let help = "
+  :help          this message
+  :list          the session so far, as the program it is
+  :load PATH     read a file and enter each of its declarations
+  :reset         forget every definition
+  :quit          leave (so does end of input)
+
+Anything else is Dream. A `let`, `import` or `mod` is remembered; anything
+else is evaluated and its value printed. An entry the parser cannot finish
+reading is continued on the next line, and a blank line abandons it.
+
+An error says `session:LINE:COL`, counting through the program `:list` prints:
+the session is compiled whole, so that is where the compiler was reading.
+";
+
+let show_session! s = {
+    list.map (fn line -> console.print! line) (imports s) |> strict!
+    list.map (fn line -> console.print! line) (defs s) |> strict!
+    if list.is_empty (defs s) { console.print! "// (nothing defined yet)" } else { () }
+};
+
+let is_command text = str.starts_with ":" (str.trim text);
+
+/// `:load` enters a file's declarations as though they had been typed. It reads
+/// the text rather than importing the file, because a REPL wants what is *in*
+/// the file at the top level, and an import would only bring the module in
+/// under a name.
+let command_argument text = str.trim (str.slice (str.find " " text) 
+                                                (str.byte_length text - str.find " " text)
+                                                text);
+
+// --- the loop ---------------------------------------------------------------------
+
+/// Where this session's scratch files go. One pair per process, so two sessions
+/// on one machine do not compile over each other.
+let scratch! name =
+    (match os.env! "TMPDIR" { () => "/tmp", d => d })
+    + "/dream-repl-" + to_string (os.pid! ()) + name;
+
+/// Enter one declaration: keep it only if the session still compiles with it.
+///
+/// The check is a whole build rather than a parse, because a definition that
+/// parses and does not resolve would otherwise sit in the session breaking
+/// every entry after it, and the line that broke things would be long gone.
+let define! s text roots cfg source image = {
+    let grown = if declarative text && first_word text == "import" { with_import (str.trim text) s }
+                else { with_def text s };
+    match compile! grown quiet_main roots cfg source image {
+        [:error, why] => {
+            console.error! why
+            s
+        },
+        [:ok, _] => grown,
+    }
+};
+
+/// Evaluate one expression: compile the session with it as the entry point and
+/// run what comes out.
+let evaluate! s text roots cfg source image =
+    match compile! s (echo text) roots cfg source image {
+        [:error, why] => console.error! why,
+        [:ok, img] => run! img,
+    };
+
+let rec load_lines! s lines roots cfg source image =
+    match lines {
+        [] => s,
+        [line, ..rest] =>
+            if str.is_empty (str.trim line) { load_lines! s rest roots cfg source image }
+            else { load_lines! (define! s line roots cfg source image) rest roots cfg source image },
+    };
+
+/// A file's declarations, entered as though typed. Items are separated by blank
+/// lines rather than parsed apart: a file written for this is a file of
+/// definitions, and anything more elaborate belongs in a module and an import.
+let load_file! s path roots cfg source image =
+    match try! { io.open! path :read } catch e { () } {
+        () => {
+            console.error! ("dreams: cannot read " + path)
+            s
+        },
+        h => {
+            let rec slurp! acc =
+                match io.read! h 65536 {
+                    "" => acc,
+                    chunk => slurp! (acc + chunk),
+                };
+            let text = slurp! "";
+            io.close! h
+            load_lines! s (str.split "\n\n" text) roots cfg source image
+        },
+    };
+
+/// One entry. Answers `[:go, session]` or `[:done]`.
+let step! s text roots cfg source image =
+    if is_command text {
+        let word = first_word text;
+        if word == ":quit" || word == ":exit" || word == ":q" { [:done] }
+        else if word == ":help" || word == ":?" {
+            console.print! help
+            [:go, s]
+        }
+        else if word == ":list" {
+            show_session! s
+            [:go, s]
+        }
+        else if word == ":reset" {
+            console.print! "session reset"
+            [:go, empty_session]
+        }
+        else if word == ":load" {
+            [:go, load_file! s (command_argument text) roots cfg source image]
+        }
+        else {
+            console.error! ("dreams: no such command " + word + " (try :help)")
+            [:go, s]
+        }
+    }
+    else if declarative text { [:go, define! s text roots cfg source image] }
+    else {
+        evaluate! s text roots cfg source image
+        [:go, s]
+    };
+
+let rec loop! h s roots cfg source image = {
+    console.write! prompt
+    match read_entry! h "" {
+        () => {
+            // End of input. The newline is ours: the terminal's cursor is
+            // sitting after a prompt that will never be answered.
+            console.print! ""
+            0
+        },
+        text =>
+            if str.is_empty (str.trim text) { loop! h s roots cfg source image }
+            else {
+                match step! s (str.trim text) roots cfg source image {
+                    [:done] => 0,
+                    [:go, s2] => loop! h s2 roots cfg source image,
+                }
+            },
+    }
+};
+
+let banner version =
+    "dreams " + version + " -- the Dream compiler, interactively.\n"
+    + "Definitions are remembered, values are printed, `:help` explains the rest.";
+
+/// Start a session. `roots` and `cfg` are the ones the command line asked for,
+/// so a REPL started with `-L` can import what a build with the same `-L`
+/// could.
+let start! roots cfg version = {
+    console.print! (banner version)
+    loop! (io.stdin! ()) empty_session roots cfg (scratch! ".dr") (scratch! ".dream")
+};
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    /// The parser's verdict on an entry, as the loop reads it: whether it is
+    /// finished, and whether it is a declaration or something to evaluate.
+    let reading text = [complete text, declarative text];
+
+    let tests = [
+        // --- what an entry is ---
+        test.case "an expression is complete and is not a declaration"
+            $( test.eq! [true, false] (reading "1 + 2") ),
+        test.case "a `let` is a declaration"
+            $( test.eq! [true, true] (reading "let x = 1;") ),
+        test.case "an import is a declaration"
+            $( test.eq! [true, true] (reading "import std.list;") ),
+        test.case "a call is an expression, `!` and all"
+            $( test.eq! [true, false] (reading "console.print! \"hi\"") ),
+
+        // --- when to keep reading ---
+        //
+        // An unclosed brace is more of the same entry; a wrong one is a
+        // mistake, and prompting for more of it would never end.
+        test.case "an unclosed block is not finished"
+            $( test.eq! false (complete "let f x = {") ),
+        test.case "an unclosed string is not finished"
+            $( test.eq! false (complete "\"abc") ),
+        test.case "a syntax error is finished, and reported"
+            $( test.eq! true (complete "let g = ;") ),
+
+        // --- the program a session is ---
+        test.case "a fresh session is its imports and its entry point"
+            $( test.eq! "import std.console;\nlet main! = ();\n"
+                        (program empty_session quiet_main) ),
+        test.case "a definition is remembered in order"
+            $( test.eq! ["let a = 1;", "let b = 2;"]
+                        (defs (with_def "let b = 2;" (with_def "let a = 1;" empty_session))) ),
+        test.case "the same import twice is imported once"
+            $( test.eq! ["import std.console;", "import std.list;"]
+                        (imports (with_import "import std.list;"
+                                      (with_import "import std.list;" empty_session))) ),
+
+        // The scratch file is this REPL's business, not the reader's: what a
+        // diagnostic must keep is where in the session the compiler was.
+        test.case "a diagnostic names the session rather than the scratch file"
+            $( test.eq! "session:3:15: error: nope"
+                        (as_session "/tmp/dream-repl-7.dr"
+                                    "/tmp/dream-repl-7.dr:3:15: error: nope") ),
+    ];
+}

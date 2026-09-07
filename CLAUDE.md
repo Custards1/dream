@@ -7,11 +7,11 @@ runtime, and — in progress — its self-hosted compiler.
 
 | Directory | What it is | Written in |
 |---|---|---|
-| `dreamc/` | The reference compiler. `.dr` source to `.dream` bytecode. | Rust |
+| `dreamc/` | The old compiler, kept as a second opinion. | Rust |
 | `dream/` | The VM: interpreter, green processes, LLVM JIT. | C++ |
 | `mind/tool/` | `mind`, the build tool. Finds packages, shells out to a compiler. | Dream |
 | `mind/std/` | The standard library. | Dream |
-| `dreams/` | The self-hosted compiler. **The active work.** | Dream |
+| `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
@@ -19,52 +19,63 @@ runtime, and — in progress — its self-hosted compiler.
 
 ## Where this is going
 
-`dreams` is replacing `dreamc`. The plan, in order:
+`dreams` has replaced `dreamc`. The plan, in order:
 
 1. ~~`dreams` reaches parity with `dreamc`~~ — every stage agrees on the corpus.
 2. ~~An old `dreams` build bootstraps the new one~~ — **done**: `dreams` compiles
-   itself to a fixpoint. `dreamc` is no longer needed to build the compiler.
-3. `mind` moves into `dreams`: `dreams` grows a CLI in `mind`'s shape (project
+   itself to a fixpoint.
+3. ~~`dreams` is the compiler~~ — **done**: nothing in a normal build or in
+   `just test` runs `dreamc`. `mind`, `lucid`, the examples, the end-to-end
+   programs and `dreams` itself are all compiled by `dreams`.
+4. `mind` moves into `dreams`: `dreams` grows a CLI in `mind`'s shape (project
    commands, not just file-at-a-time flags) and takes over its role. **Next.**
 
+`dreamc` is still in the tree for one reason: `just test-reference` asks both
+compilers the same questions — which modules a program resolves to, what its
+scope and purity verdicts are, whether it lowers — and compares the answers.
+That is a second opinion, not a dependency. When it stops earning its keep,
+`dreamc/` and the Rust workspace go.
+
 `dreams` builds from `dreams/bootstrap/dreams.dream`, an image of itself that is
-checked in. The seed needs the VM and nothing else, so building the compiler no
-longer involves Rust:
+checked in. The seed needs the VM and nothing else, so building the compiler
+does not involve Rust:
 
 ```
-just bootstrap         # build dreams from the seed, into build/dreams.dream
+just dreams            # build/dreams.dream, the compiler every other recipe runs
+just bootstrap         # the same build, said as what it is
 just bootstrap-check   # the seed still reproduces itself from this source
 ```
 
 The guarantee is byte equality: compiling this source with the seed produces an
 identical image, and so does the stage after that. When you change the compiler,
-run `just bootstrap` and keep `build/dreams.dream` as the new seed.
+run `just bootstrap` and copy `build/dreams.dream` over the seed.
 
-What is still missing is `comp` (compile-time evaluation), which needs a VM to
-evaluate on — `dreamc` remains the reference the corpus tests compare against.
-
-`mind` finds its compiler through the `DREAMC` environment variable
-([mind/tool/build.dr:114](mind/tool/build.dr#L114)), defaulting to `dreamc` on
-the path. That indirection is the seam the migration goes through — point it at
-a `dreams` image and `mind` builds with the self-hosted compiler.
+`mind` finds its compiler through `--compiler`, then `[build] compiler`, then
+`$DREAMS`, then `$DREAMC`, then `dreams.dream` from the installation
+([mind/tool/build.dr:143](mind/tool/build.dr#L143)). A name ending in `.dream`
+is an image and is run by the VM; anything else is executed directly, which is
+how a native compiler still works there.
 
 ## Building
 
 ```
-just              # both halves: cargo build -p dreamc, then cmake the VM
-just compiler     # dreamc only
+just              # the VM, then the compiler built from the seed
 just vm           # the VM only
+just dreams       # build/dreams.dream, the compiler
 just mind         # build/mind, the build tool
+just lucid        # build/lucid.dream, the language server
+just compiler     # dreamc, the reference compiler -- only `test-reference` wants it
 ```
 
 The binaries that matter:
 
-- `target/debug/dreamc` — the reference compiler
 - `build-dream/bin/dream` — the VM
+- `build/dreams.dream` — the compiler, an image the VM runs
 
 `build/` is a leftover CMake tree and is not the VM build directory —
-`build-dream/` is. The only thing `build/` is used for now is `build/mind`,
-which `just mind` writes. Do not reach for a `dream` binary under `build/`.
+`build-dream/` is. What `build/` holds now is what the Dream-side recipes write
+into it: `dreams.dream`, `mind`, `lucid.dream`. Do not reach for a `dream`
+binary under `build/`.
 
 `./build.sh` builds from a clean checkout and reports what optional dependencies
 are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
@@ -75,7 +86,6 @@ are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
 
 | Recipe | Question |
 |---|---|
-| `test-compiler` | `cargo test -p dreamc` |
 | `test-vm` | The VM's own C++ checks (heap, images, atoms) |
 | `test-e2e` | Real programs under both interpreter and JIT, which must agree |
 | `test-examples` | Every example, output compared against what is recorded beside it |
@@ -83,17 +93,21 @@ are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
 | `test-mind` | `mind`'s path handling, manifests, dependency specs |
 | `test-dreams` | Every `when test` block `dreams/main.dr` reaches |
 | `test-dreams-corpus` | Every `.dr` file in the repository parses |
-| `test-dreams-modules` | `dreams`'s module loader resolves as `dreamc` does |
-| `test-dreams-scope` | `dreams`'s resolution and purity agree, verdict by verdict |
-| `test-dreams-lower` | Everything `dreamc` accepts also lowers |
 | `test-dreams-compile` | Programs `dreams` compiled, run, output compared |
 | `test-bootstrap` | The seed still reproduces itself byte for byte |
 | `test-lucid` | The language server's units: positions, framing, URIs |
 | `test-lucid-session` | One whole LSP conversation, against a running server |
 
-The four `dreams/tests/*.sh` scripts default to `target/debug/dreamc` and
-`build-dream/bin/dream`, so they run directly with no environment set. Override
-with `dreamc=... dream=... dreams/tests/scope.sh`.
+`just test-reference` is the group that still needs `dreamc`, and it is not part
+of `just test`: `test-compiler` (`cargo test -p dreamc`), `test-dreams-modules`
+(both loaders resolve the same modules in the same order), `test-dreams-scope`
+(both reach the same verdict, and reject for the same reason) and
+`test-dreams-lower` (everything `dreamc` accepts also lowers).
+
+The four `dreams/tests/*.sh` scripts run directly with no environment set.
+`compile.sh` needs only the VM and the seed; the other three are the differential
+ones and default to `target/debug/dreamc`. Override with
+`dreamc=... dream=... dreams/tests/scope.sh`.
 
 `just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
 is **not** in `just test`, because it needs `npm install` in `editors/vscode`
@@ -104,11 +118,33 @@ first and the rest of the suite needs nothing from outside the repository.
 ## Running things
 
 ```
+just repl              # an interactive session
 just run FILE [args]   # compile and run
 just check FILE        # scope- and purity-check, no image
 just dump FILE         # the execution trees it compiles to
 just modules FILE      # what it pulls in
 ```
+
+`dreams --repl` is the interactive interpreter, and it is not the usual loop.
+There is no environment to extend one binding at a time — a Dream program is
+compiled whole — so the session is the *text* of what has been defined, and
+every entry recompiles all of it. A definition survives because its text does;
+a runtime value does not, because the result is run as a child VM (`$DREAM`).
+[dreams/repl.dr](dreams/repl.dr) says the rest.
+
+`mind repl` is the same session with a project's packages already on the search
+path — the flags a session wants are the flags a build wants. It hands the
+terminal over with `os.replace!` (`execvp`) rather than running a child, because
+`exec!` gives its child pipes and a prompt needs a terminal. Outside a project
+it still starts, with just the standard library.
+
+The VM resolves an image four ways, nearest first: the name as written, that
+name with `.dream` added, and both of those under `$MINDV2_PATH`. So `dream
+mind` runs `./mind.dream` if there is one and the installed `mind.dream`
+otherwise, and an arbitrary path still means that path. `dream -x NAME` is the
+other half — the installation and nothing else, so a file in the working
+directory cannot shadow an installed program. `just install` is what puts
+`dreams.dream` and `lucid.dream` there.
 
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
@@ -123,6 +159,11 @@ an ordinary import.
 ```
 just lucid          # build/lucid.dream, which the VS Code extension looks for
 ```
+
+The extension starts it over stdio, and `vscode-languageclient` appends
+`--stdio` to the command line by itself. `lucid` accepts that flag and ignores
+it; a server that rejects an unknown option dies before it has read a byte, and
+the editor reports only that the connection is erroring.
 
 It analyses the editor's **buffer**, not the file on disk. That is what
 `modules.load_overlaid!` is for: a map of path to text the loader reads instead

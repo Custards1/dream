@@ -9,9 +9,9 @@
 //   mind deps           show what the project resolves to
 //   mind clean          remove `target/`
 //
-// `mind` is written in Dream and compiled by `dreamc`, the same as any other
+// `mind` is written in Dream and compiled by `dreams`, the same as any other
 // program here. It has no compiler of its own: Dream compiles whole programs,
-// so a build is "find the packages, hand them to `dreamc`, run it".
+// so a build is "find the packages, hand them to the compiler, run it".
 import std.cli;
 import std.console;
 import std.core;
@@ -58,6 +58,7 @@ commands:
   run [args]     compile, then run it with the arguments given
   test           compile with --test and run the result
   check          compile without writing an image
+  repl           an interactive session, with this project's packages
   fetch          download dependencies without building
   deps           list the packages this project resolves to
   info           show what this build would run, without running it
@@ -91,9 +92,14 @@ every one of these has a command-line spelling that wins over it:
   flags        = [\"-q\"]           # passed to the compiler as written
 
 The compiler is chosen in this order: --compiler, then [build] compiler, then
-$DREAMS, then $DREAMC, then `dreamc` on the path.
+$DREAMS, then $DREAMC, then `dreams.dream` from the installation. A name ending
+in `.dream` is an image and is run by the VM; anything else is executed.
 
 `mind run -- ARGS` passes ARGS to the program rather than to mind.
+
+`mind repl` starts the compiler's interactive session with this project's
+packages on the search path. It works outside a project too, with just the
+standard library.
 "
 
 let usage = "mind -- the build tool for Dream
@@ -181,6 +187,20 @@ let cmd_test! m o args = {
     report_build! m (build.with_option :extra ["--test"] o) "testing"
     relay! (build.run_image! m o args)
 };
+
+/// An interactive session. It replaces `mind` with the compiler rather than
+/// running it as a child, so the terminal is the session's -- which is why
+/// nothing here relays anything, and why the only thing to report is failing
+/// to start.
+///
+/// Outside a project it still starts: the standard library is enough to explore
+/// the language with, and asking for a `mind.toml` first would make the
+/// quickest thing here the most ceremonious.
+let cmd_repl! here o =
+    match manifest.find! (getdir! here) {
+        [:ok, m] => match build.repl! m o { [:error, why] => fail! why },
+        [:error, _] => match build.bare_repl! o { [:error, why] => fail! why },
+    };
 
 /// What this build would do, without doing it. The compiler is chosen from
 /// four places, so "which one is it going to run" is a real question, and the
@@ -325,6 +345,7 @@ let run_command! c theirs = {
                 "fetch" => cmd_fetch! (project_in! here),
                 "clean" => cmd_clean! (project_in! here),
                 "info"  => cmd_info! (project_in! here) o,
+                "repl"  => cmd_repl! here o,
                 other   => fail! ("unknown command `" + to_string other + "`; try `mind help`"),
             },
     }
