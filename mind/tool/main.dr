@@ -56,12 +56,22 @@ let fail! message = {
     os.exit! 1
 };
 
+let getdir! ma = {
+    match ma {
+        ()=>os.cwd!(),
+        _=> ma
+    }
+
+}
 /// Load the project, or stop with the reason.
-let project! () =
-    match manifest.find! (os.cwd! ()) {
+let project_in! in =
+    match manifest.find! (getdir! in) {
         [:ok, m] => m,
         [:error, why] => fail! why,
     };
+
+/// Load the project, or stop with the reason.
+let project! () = project_in! ()
 
 // --- commands ---------------------------------------------------------------
 
@@ -91,19 +101,16 @@ let report_build! m extra label = {
     }
 };
 
-let cmd_build! () = {
-    let m = project! ();
+let cmd_build! m = {
     report_build! m [] "compiled"
     console.print! ("  " + to_string (build.image m))
 };
 
-let cmd_check! () = {
-    let m = project! ();
+let cmd_check! m = {
     report_build! m ["--no-emit"] "checked"
 };
 
-let cmd_run! args = {
-    let m = project! ();
+let cmd_run! m args = {
     report_build! m [] "running"
     let r = build.run_image! m args;
     match r {
@@ -116,8 +123,7 @@ let cmd_run! args = {
     }
 };
 
-let cmd_test! () = {
-    let m = project! ();
+let cmd_test! m = {
     report_build! m ["--test"] "testing"
     let r = build.run_image! m [];
     match r {
@@ -130,8 +136,7 @@ let cmd_test! () = {
     }
 };
 
-let cmd_deps! () = {
-    let m = project! ();
+let cmd_deps! m = {
     console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
     let ds = manifest.dependencies m;
     if list.is_empty ds { console.print! "  (no dependencies)" }
@@ -145,8 +150,7 @@ let cmd_deps! () = {
     :ok
 };
 
-let cmd_fetch! () = {
-    let m = project! ();
+let cmd_fetch! m = {
     match build.search_paths! m {
         [:error, why] => fail! why,
         [:ok, paths] => {
@@ -156,8 +160,7 @@ let cmd_fetch! () = {
     }
 };
 
-let cmd_clean! () = {
-    let m = project! ();
+let cmd_clean! m = {
     let dir = build.target_dir m;
     if io.exists! dir {
         os.exec! "rm" ["-rf", dir]
@@ -203,7 +206,8 @@ let patch! filein fileout = filepatch! filein fileout "#!/bin/env dream\n"
 
 let cmd_patch! filein fileout = patch! filein $( if (fileout) {fileout} else {"./a.out"})
 
-let main! = {
+let rec main_runner! project = {
+    let proj = project_in! project;
     match os.args! () {
         [] => console.write! usage,
         ["help", ..rest] => console.write! usage,
@@ -211,14 +215,16 @@ let main! = {
         ["-h", ..rest] => console.write! usage,
         ["new", name, ..rest] => cmd_new! name,
         ["new"] => fail! "new needs a project name",
-        ["build", ..rest] => cmd_build! (),
-        ["patch", infile, outfile] => cmd_build! (),
-        ["check", ..rest] => cmd_check! (),
-        ["run", ..rest] => cmd_run! rest,
-        ["test", ..rest] => cmd_test! (),
-        ["deps", ..rest] => cmd_deps! (),
-        ["fetch", ..rest] => cmd_fetch! (),
-        ["clean", ..rest] => cmd_clean! (),
+        ["build", ..rest] => cmd_build! proj,
+        ["-d",outfile,..rest] =>main_runner! outfile,
+        ["project",outfile,..rest] =>main_runner! outfile,
+        ["check", ..rest] => cmd_check! proj,
+        ["run", ..rest] => cmd_run! proj rest,
+        ["test", ..rest] => cmd_test! proj,
+        ["deps", ..rest] => cmd_deps! proj,
+        ["fetch", ..rest] => cmd_fetch! proj,
+        ["clean", ..rest] => cmd_clean! proj,
         [other, ..rest] => fail! ("unknown command `" + to_string other + "`; try `mind help`"),
     }
 };
+let main! = main_runner! ()
