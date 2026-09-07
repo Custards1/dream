@@ -138,6 +138,9 @@ let derive_d path span             = [:derive, path, span];
 let virtual_d name params body span = [:virtual, name, params, body, span];
 let when_d cond items span         = [:when, cond, items, span];
 
+/// The root returned by the parser for one source file.
+let module items = [:module, items];
+
 // --- patterns ---------------------------------------------------------------
 //
 // A pattern forces exactly as much of the value as deciding takes, which is
@@ -160,3 +163,178 @@ let arm pattern guard body span = [pattern, guard, body, span];
 let arm_pattern a = list.nth 0 a;
 let arm_guard a   = list.nth 1 a;
 let arm_body a    = list.nth 2 a;
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a span keeps its byte endpoints"
+            $( test.eq! [2, 7] (span_of 2 7) ),
+        test.case "span_to covers its two inputs"
+            $( test.eq! [2, 13] (span_to [2, 7] [8, 13]) ),
+        test.case "every expression keeps its kind and span"
+            $( test.eq! [:int, [4, 6]]
+                        [kind (int_e 42 [4, 6]), span (int_e 42 [4, 6])] ),
+        test.case "an application holds all of its arguments"
+            $( test.eq! [:apply, [:name, "f", [0, 1]],
+                         [[:int, 1, [2, 3]], [:int, 2, [4, 5]]], [0, 5]]
+                        (apply_e (name_e "f" [0, 1])
+                                 [int_e 1 [2, 3], int_e 2 [4, 5]] [0, 5]) ),
+        test.case "a pipe remains distinct until lowering"
+            $( test.eq! [:pipe, [:name, "x", [0, 1]], [:name, "f", [5, 6]], [0, 6]]
+                        (pipe_e (name_e "x" [0, 1]) (name_e "f" [5, 6]) [0, 6]) ),
+        test.case "token kinds map to binary operators"
+            $( test.eq! [:add, :eq, ()]
+                        [infix_of :plus, infix_of :eq_eq, infix_of :ident] ),
+        test.case "binary precedence follows the parser ladder"
+            $( test.eq! [0, 1, 2, 3, 4, -1]
+                        [precedence :or, precedence :and, precedence :eq,
+                         precedence :add, precedence :mul, precedence :unknown] ),
+        test.case "a declaration records recursion and parameters"
+            $( test.eq! [:let, "go", [["n", [4, 5]]], [:name, "n", [8, 9]], true, [0, 9]]
+                        (let_d "go" [param "n" [4, 5]] (name_e "n" [8, 9]) true [0, 9]) ),
+        test.case "a literal pattern keeps the expression it will compare"
+            $( test.eq! [:literal, [:atom, "ok", [0, 3]], [0, 3]]
+                        (literal_p (atom_e "ok" [0, 3]) [0, 3]) ),
+        test.case "pattern arms expose their pieces"
+            $( test.eq! [[:bind, "x", [0, 1]], (), [:name, "x", [5, 6]]]
+                        [arm_pattern (arm (bind_p "x" [0, 1]) () (name_e "x" [5, 6]) [0, 6]),
+                         arm_guard (arm (bind_p "x" [0, 1]) () (name_e "x" [5, 6]) [0, 6]),
+                         arm_body (arm (bind_p "x" [0, 1]) () (name_e "x" [5, 6]) [0, 6])] ),
+    ];
+}
+
+// --- rendering --------------------------------------------------------------
+//
+// A node as text, without spans. This is what `--ast` prints, and what the
+// parser's own tests compare against -- a tree written out in one line is far
+// easier to read in a failure than a nest of lists with byte offsets in it.
+
+import std.str;
+
+/// A string as it would be written in source. `to_string` is the identity on
+/// a plain string, which in a dump loses the very thing that tells a string
+/// from a name -- `(str hi)` and `(name hi)` should not look alike.
+let quote_str s =
+    "\"" + str.join_str "" (list.map (fn ch ->
+        if ch == '"' { "\\\"" }
+        else if ch == '\\' { "\\\\" }
+        else if ch == '\n' { "\\n" }
+        else if ch == '\t' { "\\t" }
+        else { str.of_chars [ch] }) (str.chars s)) + "\"";
+
+/// An atom's name, without the leading `:`. Operators are atoms, and a tree
+/// reads better with `(binary add ..)` than `(binary :add ..)`.
+let atom_name a = { let s = to_string a; str.slice 1 (str.byte_length s - 1) s };
+
+let rec show e =
+    match e {
+        [:int, v, _]        => "(int " + to_string v + ")",
+        [:float, v, _]      => "(float " + to_string v + ")",
+        [:char, ch, _]      => "(char '" + str.of_chars [ch] + "')",
+        [:bool, b, _]       => "(bool " + to_string b + ")",
+        [:str, s, _]        => "(str " + quote_str s + ")",
+        [:atom, n, _]       => "(atom " + n + ")",
+        [:unit, _]          => "(unit)",
+        [:name, n, _]       => "(name " + n + ")",
+        [:field, o, n, _]   => "(field " + show o + " " + n + ")",
+        [:apply, f, args, _] => "(apply " + show f + " " + show_all args + ")",
+        [:pipe, l, r, _]    => "(pipe " + show l + " " + show r + ")",
+        [:unary, op, x, _]  => "(unary " + atom_name op + " " + show x + ")",
+        [:binary, op, l, r, _] => "(binary " + atom_name op + " " + show l + " " + show r + ")",
+        [:if, cond, t, el, _] =>
+            "(if " + show cond + " " + show t + (if el == () { "" } else { " " + show el }) + ")",
+        [:block, stmts, _]  => "(block" + (if list.is_empty stmts { "" } else { " " + show_all stmts }) + ")",
+        [:thunk, x, _]      => "(thunk " + show x + ")",
+        [:try, b, binder, h, _] => "(try " + show b + " " + binder + " " + show h + ")",
+        [:lambda, ps, b, _] => "(fn " + show_params ps + " " + show b + ")",
+        [:comp, impure, x, _] => "(" + (if impure { "comp!" } else { "comp" }) + " " + show x + ")",
+        [:list, xs, _]      => "(list " + show_all xs + ")",
+        [:array, xs, _]     => "(array " + show_all xs + ")",
+        [:map, pairs, _]    => "(map " + show_pairs pairs + ")",
+        [:match, s, arms, _] => "(match " + show s + " " + show_arms arms + ")",
+        [:let, n, ps, b, is_rec, _] =>
+            "(let " + (if is_rec { "rec " } else { "" }) + n
+            + (if list.is_empty ps { "" } else { " " + show_params ps }) + " " + show b + ")",
+        [:import, segments, alias, names, _] =>
+            "(import " + str.join_str "." segments
+            + (match names { () => "", ns => ".{" + show_import_names ns + "}" })
+            + (match alias { () => "", a => " as " + a })
+            + ")",
+        [:derive, segments, _]  => "(derive " + str.join_str "." segments + ")",
+        [:mod, n, items, _]     => "(mod " + n + " " + show_all items + ")",
+        [:virtual, n, ps, body, _] =>
+            "(virtual " + n + (if list.is_empty ps { "" } else { " " + show_params ps })
+            + (match body { () => "", b => " " + show b }) + ")",
+        [:when, cond, items, _] => "(when " + show_cfg cond + " " + show_all items + ")",
+        other => "(?" + to_string (core.head other) + ")",
+    }
+;
+
+let show_all xs = str.join_str " " (list.map (fn x -> show x) xs)
+;
+
+let show_params ps =
+    str.join_str " " (list.map (fn p -> match param_name p { () => "()", n => n }) ps)
+;
+
+let show_pairs pairs =
+    str.join_str " " (list.map (fn kv -> "[" + show (list.nth 0 kv) + " " + show (list.nth 1 kv) + "]") pairs)
+;
+
+let show_arms arms = str.join_str " " (list.map (fn a -> show_arm a) arms)
+;
+
+let show_arm a =
+    "[" + show_pattern (arm_pattern a)
+        + (match arm_guard a { () => "", g => " if " + show g })
+        + " " + show (arm_body a) + "]"
+;
+
+let rec show_pattern p =
+    match p {
+        [:wildcard, _]      => "_",
+        [:bind, n, _]       => n,
+        [:literal, e, _]    => show e,
+        [:list_p, items, rest, _]  => "[" + show_items items rest + "]",
+        [:array_p, items, rest, _] => "#[" + show_items items rest + "]",
+        [:map_p, pairs, _]  =>
+            "%{" + str.join_str " " (list.map (fn kv -> show (list.nth 0 kv) + " => "
+                                                        + show_pattern (list.nth 1 kv)) pairs) + "}",
+        [:as_p, inner, n, _] => "(" + show_pattern inner + " as " + n + ")",
+        other => "?" + to_string (core.head other),
+    }
+;
+
+let show_items items rest = {
+    let shown = str.join_str " " (list.map (fn i -> show_pattern i) items);
+    let tail = match rest {
+        ()     => "",
+        [()]   => "..",
+        [n]    => ".." + n,
+        _      => "",
+    };
+    if tail == "" { shown }
+    else if str.is_empty shown { tail }
+    else { shown + " " + tail }
+};
+
+/// `{ map, filter, sum as total }` -- the members an import binds directly.
+let show_import_names ns =
+    str.join_str " " (list.map (fn n ->
+        match list.nth 1 n { () => list.nth 0 n, a => list.nth 0 n + " as " + a }) ns);
+
+/// A `when` condition. The vocabulary is the language's own, so it renders
+/// the same way the rest of the tree does.
+let rec show_cfg c =
+    match c {
+        [:const, b]        => "(const " + to_string b + ")",
+        [:flag, n]         => "(flag " + n + ")",
+        [:equals, n, v]    => "(equals " + n + " " + quote_str v + ")",
+        [:not, e]          => "(not " + show_cfg e + ")",
+        [:and, l, r]       => "(and " + show_cfg l + " " + show_cfg r + ")",
+        [:or, l, r]        => "(or " + show_cfg l + " " + show_cfg r + ")",
+        other              => "(?cfg)",
+    };

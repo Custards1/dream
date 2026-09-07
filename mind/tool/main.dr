@@ -167,6 +167,42 @@ let cmd_clean! () = {
     }
 };
 
+let filepatch! filein outfile using  = {
+    let rec update_writer! out cont = {
+         if cont && out{
+            let data = recv!();
+            if data {
+                strict! {
+                    data |> io.write! out
+                }
+                update_writer! out data 
+            }
+            
+         } else {
+            false
+         }
+
+    }
+    let writer = spawn! $(update_writer! (io.open! outfile :write) true )
+  
+    let reader = io.open! filein :read
+    let rec read_and_update! r w remaining = {
+        match remaining {
+            [] =>  () |> send! w,
+            _=> {
+                strict!{ send! w remaining }
+                read_and_update! r w (io.read! r 4000)
+            }
+        }
+    }
+    strict! {read_and_update! reader writer using }
+    send! writer ()
+    join! writer
+}
+let patch! filein fileout = filepatch! filein fileout "#!/bin/env dream\n"
+
+let cmd_patch! filein fileout = patch! filein $( if (fileout) {fileout} else {"./a.out"})
+
 let main! = {
     match os.args! () {
         [] => console.write! usage,
@@ -176,6 +212,7 @@ let main! = {
         ["new", name, ..rest] => cmd_new! name,
         ["new"] => fail! "new needs a project name",
         ["build", ..rest] => cmd_build! (),
+        ["patch", infile, outfile] => cmd_build! (),
         ["check", ..rest] => cmd_check! (),
         ["run", ..rest] => cmd_run! rest,
         ["test", ..rest] => cmd_test! (),

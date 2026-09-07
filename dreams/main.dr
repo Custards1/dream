@@ -15,7 +15,9 @@ import std.list;
 import std.os;
 import std.str;
 
+import dreams.ast;
 import dreams.lexer;
+import dreams.parser;
 
 // --- reading ----------------------------------------------------------------
 
@@ -96,7 +98,7 @@ let tokenize! path src = {
 };
 
 /// Lex without printing: the exit code is the whole answer.
-let check path src =
+let check! path src =
     match lexer.lex src {
         [:ok, _] => 0,
         [:error, message, offset] => {
@@ -106,20 +108,46 @@ let check path src =
         _ => 1,
     };
 
+/// Parse, and print the syntax tree one item per line.
+let ast! path src =
+    match parser.parse_module src {
+        [:ok, items] => {
+            list.map (fn i -> console.print! (ast.show i)) items |> strict!
+            0
+        },
+        [:error, message, span] => {
+            report! path src message (ast.span_start span)
+            1
+        },
+    };
+
+/// Parse without printing: the exit code is the whole answer.
+let check_parse! path src =
+    match parser.parse_module src {
+        [:ok, _] => 0,
+        [:error, message, span] => {
+            report! path src message (ast.span_start span)
+            1
+        },
+    };
+
 let usage! () = {
     console.error! "dreams -- the Dream compiler, in Dream"
     console.error! ""
-    console.error! "usage: dreams [--tokens] FILE"
+    console.error! "usage: dreams [--tokens | --ast] FILE"
     console.error! ""
     console.error! "  --tokens   print the tokens instead of only checking them"
+    console.error! "  --ast      print the syntax tree"
     2
 };
+
 
 let run! args =
     match args {
         [] => usage! (),
         ["--tokens", path] => with_source! path (fn src -> tokenize! path src),
-        [path] => with_source! path (fn src -> check path src),
+        ["--ast", path] => with_source! path (fn src -> ast! path src),
+        [path] => with_source! path (fn src -> check_parse! path src),
         _ => usage! (),
     };
 

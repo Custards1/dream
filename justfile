@@ -97,7 +97,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -124,9 +124,25 @@ test-examples-std: build
     ./{{dream}} /tmp/dream-ex-tests.dream
 
 # `dreams`, the self-hosted compiler: the parts of it that exist so far.
+# Built from `main.dr` so that every module it reaches has its tests collected.
 test-dreams: build
-    {{dreamc}} dreams/lexer.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
+    {{dreamc}} dreams/main.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
     ./{{dream}} /tmp/dream-dreams-tests.dream
+
+# Every Dream file in the repository must parse. The corpus is the real test of
+# a parser: the standard library, the build tool, the examples, and `dreams`
+# itself, which is the one that has to keep working for this to go anywhere.
+test-dreams-corpus: build
+    {{dreamc}} dreams/main.dr -L mind -L . -o /tmp/dreams.dream
+    @for f in mind/std/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
+              dream/tests/programs/*.dr dreams/*.dr; do \
+        ./{{dream}} /tmp/dreams.dream "$f" || exit 1; \
+    done
+    @echo "every file in the corpus parses"
+    {{dreamc}} dreams/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
+    ./{{dream}} /tmp/dream-ast-tests.dream
+    {{dreamc}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
+    ./{{dream}} /tmp/dream-parser-tests.dream
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
