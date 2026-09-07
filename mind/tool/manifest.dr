@@ -88,3 +88,44 @@ let rec find! dir =
         },
         _ => load! dir,
     };
+
+when test {
+    import std.test;
+
+    let of text = make "." (toml.value (toml.parse text));
+    let dep_of text = list.head (dependencies (of text));
+
+    let tests = [
+        test.case "name"     $( test.eq! "demo" (name (of "[package]\nname = \"demo\"")) ),
+        test.case "version defaults"
+            $( test.eq! "0.0.0" (version (of "[package]\nname = \"d\"")) ),
+        test.case "version"  $( test.eq! "1.2" (version (of "[package]\nname=\"d\"\nversion=\"1.2\"")) ),
+        test.case "src defaults to the manifest's directory"
+            $( test.eq! "." (src (of "[package]\nname = \"d\"")) ),
+        test.case "entry defaults to main.dr"
+            $( test.eq! "main.dr" (entry (of "[package]\nname = \"d\"")) ),
+        test.case "entry can be set"
+            $( test.eq! "cli.dr" (entry (of "[package]\nname=\"d\"\nentry=\"cli.dr\"")) ),
+
+        test.case "a path dependency"
+            $( test.eq! :path (dep_kind (dep_of "[dependencies]\na = { path = \"../a\" }")) ),
+        test.case "a git dependency"
+            $( test.eq! :git (dep_kind (dep_of "[dependencies]\na = { git = \"u\" }")) ),
+        test.case "a url dependency"
+            $( test.eq! :url (dep_kind (dep_of "[dependencies]\na = { url = \"u\" }")) ),
+        test.case "a dependency with no source"
+            $( test.eq! :unknown (dep_kind (dep_of "[dependencies]\na = { x = 1 }")) ),
+
+        test.case "pinned by tag"
+            $( test.eq! [:tag, "v1"] (dep_rev (dep_of "[dependencies]\na={git=\"u\",tag=\"v1\"}")) ),
+        test.case "pinned by rev"
+            $( test.eq! [:rev, "abc"] (dep_rev (dep_of "[dependencies]\na={git=\"u\",rev=\"abc\"}")) ),
+        test.case "pinned by branch"
+            $( test.eq! [:branch, "m"] (dep_rev (dep_of "[dependencies]\na={git=\"u\",branch=\"m\"}")) ),
+        test.case "unpinned"
+            $( test.eq! [:none, ()] (dep_rev (dep_of "[dependencies]\na={git=\"u\"}")) ),
+        test.case "a tag wins over a branch"
+            $( test.eq! [:tag, "v1"]
+                        (dep_rev (dep_of "[dependencies]\na={git=\"u\",tag=\"v1\",branch=\"m\"}")) ),
+    ];
+}

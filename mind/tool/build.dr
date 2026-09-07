@@ -5,6 +5,7 @@
 // files -- which means a build is: find the packages, hand `dreamc` their
 // directories, run it. There is nothing to cache and no link step.
 import std.core;
+import std.io;
 import std.list;
 import std.os;
 import std.str;
@@ -43,15 +44,56 @@ let rec collect! m seen acc = {
     each! deps seen acc
 };
 
+/// Where the standard library is.
+///
+/// Every program gets `std` without asking for it, so finding it is `mind`'s
+/// job and not the user's. The candidates, in order:
+///
+///   1. `MIND_STDLIB`, for an installed `mind` to point at what shipped with
+///      it, and for anyone who wants a different library entirely.
+///   2. `$MIND_HOME/std` (default `~/.mind/std`), where an install puts it.
+///   3. a `mind` directory at or above the working directory -- which is what
+///      makes the library's own repository work with no configuration at all.
+///
+/// The last is a search rather than a fixed path because a build may be run
+/// from anywhere inside a project, exactly as `git` may be.
+let stdlib_root! () = {
+    let named = os.env! "MIND_STDLIB";
+    if named != () { named }
+    else {
+        let home = match os.env! "MIND_HOME" { () => util.join (home_dir! ()) ".mind", h => h };
+        let installed = util.join home "std";
+        if io.is_dir! installed { home }
+        else {
+            match find_upwards! (os.cwd! ()) "mind" {
+                () => "mind",
+                found => found,
+            }
+        }
+    }
+};
+
+let home_dir! () = match os.env! "HOME" { () => ".", h => h };
+
+/// The nearest `name` directory at or above `from`, or `()`. Holds a library
+/// whose `std` is a package, so it is the *parent* that becomes a `-L` root.
+let rec find_upwards! from name = {
+    let candidate = util.join from name;
+    if io.is_dir! (util.join candidate "std") { candidate }
+    else {
+        let up = util.dirname from;
+        if up == from || up == "." { () } else { find_upwards! up name }
+    }
+};
+
+/// `[:ok, [-L, dir, -L, dir, ..]]` -- the search paths for one build.
 /// `[:ok, [-L, dir, -L, dir, ..]]` -- the search paths for one build.
 let search_paths! m = {
     match collect! m [manifest.root m] [] {
         [:error, why, _] => [:error, why],
         [:ok, _, dirs] => {
-            // The standard library, then every dependency. `MIND_STDLIB` is how
-            // an installed `mind` finds the library that shipped with it.
-            let std_root = match os.env! "MIND_STDLIB" { () => "mind", p => p };
-            let all = list.cons std_root (list.reverse dirs);
+            // The standard library, then every dependency.
+            let all = list.cons (stdlib_root! ()) (list.reverse dirs);
             [:ok, list.flat_map (fn d -> ["-L", d]) all]
         },
     }

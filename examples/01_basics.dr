@@ -26,28 +26,28 @@ let classify n =
     else { :positive };
 
 let main! = {
-    console.print! "pi        = " pi
-    console.print! "flag      = " flag
-    console.print! "letter    = " letter
-    console.print! "name      = " name
-    console.print! "tag       = " tag
-    console.print! "unit      = " nothing
-    console.print! "bases     = " hexed " " binary " " octal " " big " " sci
+    console.print! ("pi        = " + to_string pi)
+    console.print! ("flag      = " + to_string flag)
+    console.print! ("letter    = " + to_string letter)
+    console.print! ("name      = " + to_string name)
+    console.print! ("tag       = " + to_string tag)
+    console.print! ("unit      = " + to_string nothing)
+    console.print! ("bases     = " + to_string hexed + " " + to_string binary + " " + to_string octal + " " + to_string big + " " + to_string sci)
 
     // Application binds tightest: `fac n - 1` would be `(fac n) - 1`.
-    console.print! "fac 5     = " (fac 5)
-    console.print! "inc 41    = " (inc 41)
-    console.print! "classify  = " (classify (0 - 5)) " " (classify 0) " " (classify 7)
+    console.print! ("fac 5     = " + to_string (fac 5))
+    console.print! ("inc 41    = " + to_string (inc 41))
+    console.print! ("classify  = " + to_string (classify (0 - 5)) + " " + to_string (classify 0) + " " + to_string (classify 7))
 
     // Precedence ladder: || < && < comparison < + - < * / %
-    console.print! "1 + 2 * 3 = " (1 + 2 * 3)
-    console.print! "(1+2) * 3 = " ((1 + 2) * 3)
-    console.print! "chained   = " (1 < 2 && 3 >= 3 || false)
-    console.print! "modulo    = " (17 % 5) " " (17 / 5) " " (17.0 / 5.0)
+    console.print! ("1 + 2 * 3 = " + to_string (1 + 2 * 3))
+    console.print! ("(1+2) * 3 = " + to_string ((1 + 2) * 3))
+    console.print! ("chained   = " + to_string (1 < 2 && 3 >= 3 || false))
+    console.print! ("modulo    = " + to_string (17 % 5) + " " + to_string (17 / 5) + " " + to_string (17.0 / 5.0))
 
     // `+` is overloaded: numbers, strings, and lists.
-    console.print! "concat    = " ("dr" + "eam") " " ([1, 2] + [3])
+    console.print! ("concat    = " + to_string ("dr" + "eam") + " " + to_string ([1, 2] + [3]))
 
     // The pipe reads left to right.
-    5 |> console.print! "piped     = "
+    console.print! ("piped     = " + to_string (5))
 };

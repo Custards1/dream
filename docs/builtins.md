@@ -65,6 +65,7 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 | `str_len` | `string → integer` | The byte length of the string. |
 | `str_chars` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). |
 | `str_of_chars` | `list of char → string` | Encodes a list of characters into a UTF-8 string. |
+| `str_of_bytes` | `list of integer → string` | Builds a string from raw byte values, each `0`–`255`. The inverse of `str_byte`, and the way to produce **binary** output: `str_of_chars` UTF-8-encodes its input, so byte `0x80` would become two bytes. Raises `:type_error` for a non-integer or a value outside `0`–`255`. A `0` byte is an ordinary byte and does not end the string. |
 | `str_slice` | `string → start:integer → len:integer → string` | Returns `len` bytes starting at byte offset `start`. Clamped silently — running past the end is how string-walking loops finish. |
 | `str_find` | `haystack:string → needle:string → from:integer → integer` | Returns the byte offset of the first occurrence of `needle` at or after `from`, or `-1` if not found. |
 | `str_byte` | `string → index:integer → integer` | The raw byte value (0–255) at byte `index`, or `-1` if out of range. |
@@ -441,6 +442,20 @@ A lazy singly-linked list. Most operations work on infinite lists. Functions tha
 | `of_array a` | Converts an array to a list. |
 | `force xs` | Forces every element. Useful before `send!`. |
 
+**Accumulator-passing forms.** Several functions above are thin wrappers over a
+recursive worker that carries its accumulator as the first argument. The worker
+is reachable too, and is the form to use when you already have a partial result
+to continue from.
+
+| Name | Description |
+|------|-------------|
+| `length_from acc xs` | `acc` plus the length of `xs`. `length` is `length_from 0`. |
+| `reverse_from acc xs` | `xs` reversed, with `acc` left on the end: `reverse_from [9] [1,2,3]` is `[3, 2, 1, 9]`. This is `reverse` and `append` in one pass. |
+| `index_of_from i x xs` | Index of the first `x`, counting as if `xs` started at index `i`; `-1` if absent. `i` is an offset added to the answer, **not** a position to start searching from. |
+| `min_by_from best less xs` | The smallest of `best` and the elements of `xs`, by the comparator `less a b → bool`. Returns `best` unchanged on an empty list, which is how `minimum`/`maximum` get a seed without a special case for one-element lists. |
+| `unique_from seen xs` | The elements of `xs` not already in the list `seen`, with duplicates removed. Elements in `seen` are dropped from the output. |
+| `merge_by before xs ys` | Merges two lists that are **already sorted** by `before`, preserving order. The merge step of `sort_by`; on unsorted input it interleaves rather than sorts. |
+
 ---
 
 ### `std.str`
@@ -479,6 +494,15 @@ UTF-8 text. Derives `std.seq`, so it also exposes `sum`, `any`, `all`, `contains
 | `trim s` | Removes leading and trailing whitespace (space, tab, newline, carriage return). |
 | `trim_start s` | Removes leading whitespace. |
 | `trim_end s` | Removes trailing whitespace. |
+
+**Character-level helpers.** These take and return a `char`, not a string, and
+are what `upper`, `lower` and the `trim` family are written in terms of.
+
+| Name | Description |
+|------|-------------|
+| `is_space c` | `true` for space, tab, newline or carriage return. |
+| `upper_char c` | ASCII uppercase of one character. Anything outside `a`–`z` is returned unchanged. |
+| `lower_char c` | ASCII lowercase of one character. Anything outside `A`–`Z` is returned unchanged. |
 
 ---
 
@@ -537,9 +561,315 @@ Generic sequence interface. Not imported directly — a module derives it and pr
 | `maximum xs` | Largest element, or `unit` if empty. |
 | `minimum_by rank xs` | Element for which `rank` is smallest. |
 | `maximum_by rank xs` | Element for which `rank` is largest. |
+| `extreme_by better xs` | The element that `better a b → bool` prefers over every other, or `unit` if empty. `minimum` is `extreme_by (fn a b -> a < b)` and `maximum` is `extreme_by (fn a b -> a > b)`. |
 | `to_list xs` | Convert to a list by folding. |
 | `join sep xs` | Render each element with `to_string` and join with `sep`. |
 | `describe xs` | `"<name> of <length>"`, e.g. `"array of 3"`. |
+
+---
+
+### `std.json`
+
+```dream
+import std.json;
+```
+
+JSON, parsed and rendered. **Nothing here raises.** A parser that raised could
+not be called from a pure function, and reading a configuration file is not an
+effect — so `parse` answers with a value describing the outcome instead.
+
+| JSON | Dream |
+|------|-------|
+| object | `map`, with string keys |
+| array | `list` |
+| string | `string` |
+| number | `integer` when it has no `.`, `e` or `E`; otherwise `float` |
+| `true` / `false` | `bool` |
+| `null` | `()` |
+
+`null` and "absent" are therefore the same value, which is how the rest of the
+library already answers a missing thing — and it means a round trip cannot tell
+a member that was absent from one that was explicitly `null`. Neither can JSON.
+
+#### Reading
+
+| Name | Description |
+|------|-------------|
+| `parse text` | `[:ok, value]`, or `[:error, message]`. Trailing characters after the value are an error. |
+| `ok result` | `true` if a `parse` result succeeded. |
+| `value result` | The value out of a `parse` result. Meaningless unless `ok` is `true`. |
+| `parse_or default text` | The parsed value, or `default` if `text` is not valid JSON. The form to use when a fallback is more useful than a diagnosis. |
+
+```dream
+let r = json.parse "{\"a\": 1, \"b\": [true, null, 2.5]}";
+json.ok r                       // true
+json.value r                    // %{"a" => 1, "b" => [true, (), 2.5]}
+
+json.parse "{oops}"             // [:error, "not valid JSON"]
+json.parse_or %{} "not json"    // %{}
+```
+
+#### Writing
+
+| Name | Description |
+|------|-------------|
+| `write v` | `v` as compact JSON on one line, with no spaces. |
+| `write_indented depth v` | `v` as JSON indented two spaces per level, starting at `depth`. |
+| `pretty v` | `write_indented 0 v` — the usual entry point for readable output. |
+| `quote s` | One string as a quoted, escaped JSON string, including the surrounding `"`. |
+| `escape_char c` | One character as its JSON representation. Escapes `"`, `\`, and the characters with their own shorthand (`\n`, `\t`, `\r`, `\b`, `\f`); anything else below `0x20` becomes `\u00XX`. **Non-ASCII is left as itself**, so output stays UTF-8 rather than becoming escapes. Used by `quote`. |
+
+```dream
+json.write %{ "a" => 1, "b" => [1, true, ()] }   // {"a":1,"b":[1,true,null]}
+json.pretty %{ "a" => [1, 2] }                   // multi-line, two-space indent
+json.quote "he said \"hi\""                      // 16 characters, including the outer quotes
+```
+
+> **Map order is not insertion order.** A map is a hash table, so `write` emits
+> members in whatever order the map holds them, and that order is not the one
+> they were written in. JSON objects are unordered, so this is valid output —
+> but it does mean two maps that compare equal can render as different text,
+> and that output is not stable enough to compare byte-for-byte in a test. Sort
+> `core.map_pairs` yourself if you need a canonical rendering.
+
+#### Parser internals
+
+The parser is recursive descent over a list of characters. Every step takes the
+characters still to read and returns `[value, rest]` — or `()` when it does not
+match — which is what lets the steps compose with no parser state threaded
+through. These are not part of the interface, but they are reachable, and they
+are the shape to copy when writing a parser of your own.
+
+| Name | Description |
+|------|-------------|
+| `step value rest` | Builds the `[value, rest]` pair every step returns. |
+| `step_value s` / `step_rest s` | The two halves back out of one. |
+| `is_ws c` / `skip_ws cs` | Whitespace, and dropping a run of it. |
+| `is_digit c` | `'0'`–`'9'`. |
+| `starts cs word` | Does the character list `cs` begin with the characters of `word`? |
+| `drop_n n cs` | Drops `n` characters. |
+| `hex_value c` / `hex4 cs n acc` | One hex digit as a number (`-1` if it is not one), and the four digits of a `\uXXXX` escape accumulated into `acc` over `n` digits. |
+| `string_body cs acc` | A string's characters up to the closing quote, handling escapes. |
+| `number_chars cs acc floaty` | The characters of a number, and whether it had a `.` or an exponent. |
+| `parse_number cs` · `parse_value cs` | The steps for a number and for any value. |
+| `parse_object cs acc first` · `parse_array cs acc first` | The steps for `{…}` and `[…]`, accumulating into `acc`; `first` tracks whether a separating comma is required yet. |
+
+---
+
+### `std.toml`
+
+```dream
+import std.toml;
+```
+
+TOML — **deliberately a subset**, and the subset is the one a `mind.toml`
+manifest uses: comments, `[section]` and `[dotted.section]` headers,
+`key = value`, and values that are strings, integers, floats, booleans, arrays
+or inline tables.
+
+What is missing is what a manifest has no use for: array-of-table headers
+`[[x]]`, multi-line strings, dates, and dotted keys inside a section. Using one
+is an **error rather than a quietly wrong parse** — though the message says
+only where the parse gave up, not which unsupported construct caused it:
+`[[x]]` reports `"expected a key"`. Like `std.json`, nothing here raises.
+
+The result is a map of section name to a map of that section's keys. Keys
+written before any header are collected under the empty string `""`:
+
+```toml
+name = "top"           %{ ""             => %{ "name" => "top" },
+[package]                 "package"      => %{ "name" => "demo", "ver" => 2 },
+name = "demo"             "dependencies" => %{ "a" => %{ "path" => "../a" } } }
+ver = 2
+[dependencies]
+a = { path = "../a" }
+```
+
+An inline table becomes a nested map, so `a = { path = "../a" }` reads back as a
+map — which is what lets a dependency carry `path`, `git`, `tag` and the rest.
+
+#### Reading
+
+| Name | Description |
+|------|-------------|
+| `parse text` | `[:ok, table]`, or `[:error, message]`. |
+| `ok result` / `value result` | As `std.json` — did it parse, and the table out of it. |
+| `parse_or default text` | The parsed table, or `default`. |
+
+#### Reading what was parsed
+
+| Name | Description |
+|------|-------------|
+| `section table name` | The map for `[name]`, or an **empty map** if there is no such section. A missing section reads exactly like an empty one, so a manifest with no `[dependencies]` needs no special case. |
+| `get default table sec key` | `table[sec][key]`, or `default` if either the section or the key is absent. |
+| `sections table` | The name of every section. Includes `""` when the file had keys before its first header. |
+| `entries table name` | One section's `key = value` pairs as `[key, value]` lists — `core.map_pairs` of that section. |
+
+```dream
+let t = toml.value (toml.parse text);
+toml.get "0.0.0" t "package" "version"
+toml.sections t                        // ["", "package", "dependencies"]
+toml.entries t "package"               // [["name", "demo"], ["ver", 2]]
+```
+
+> **Order is the map's, not the file's.** `sections` and `entries` return
+> whatever order the underlying map holds, which is not the order the file
+> wrote them in. Read a manifest by name; do not depend on the sequence.
+
+#### Parser internals
+
+The same `[value, rest]` shape as `std.json`, over a list of characters.
+
+| Name | Description |
+|------|-------------|
+| `is_ws c` · `is_digit c` · `is_bare c` | Character classes; a bare key is `[A-Za-z0-9_-]`. |
+| `skip_ws cs` | Spaces and tabs — **not** newlines, which are significant here. |
+| `skip_blank cs` | Whitespace, comments and line breaks: everything between one item and the next. |
+| `drop_line cs` / `end_of_line cs` | Discarding a comment, and checking nothing but a comment follows a value. |
+| `step` · `step_value` · `step_rest` · `starts` · `drop_n` | As in `std.json`. |
+| `quoted_body cs acc` / `literal_body cs acc` | The body of a `"…"` and of a `'…'` string. |
+| `number_chars` / `parse_number` | Numbers, with `_` accepted as a digit separator (`1_000` is `1000`). |
+| `parse_key cs` | A key: bare, or quoted when it holds characters a bare key may not. |
+| `parse_header cs` | A `[section]` or `[a.b]` header, as the name between the brackets. |
+| `parse_value cs` · `parse_array cs acc` · `parse_inline cs acc first` | A value, an `[…]` array, and a `{…}` inline table. |
+| `parse_items cs table section current` | The top-level loop: `table` is the sections finished so far, `section` the name of the one being read, and `current` its keys. |
+
+---
+
+### `std.test`
+
+```dream
+import std.test;
+```
+
+The test framework. **Each case runs in its own process.** That is not
+ceremony: a case that raises, or that loops forever, is isolated from the rest
+of the suite, and its failure arrives at the runner as an ordinary value
+through `join!` rather than as something that has already unwound the runner's
+own stack.
+
+`std.test` imports only `std.console` and `std.core` — never `std.list`.
+A module's own tests import this framework, so anything the framework depended
+on could not have tests of its own; the import would be a cycle. Walking lists
+with the primitives directly is the price of letting every module test itself.
+
+#### Cases
+
+A case is a name and a **suspended** computation. The `$( .. )` is required —
+without it the body would run where it is written, not where the runner puts it.
+
+| Name | Description |
+|------|-------------|
+| `case name body` | A case: `[name, body]`, where `body` is a thunk. |
+| `case_name c` / `case_body c` | The two halves back out. |
+
+#### Assertions
+
+Each raises a message describing the difference. Raising is what ends a case at
+its first failure, and what the runner catches.
+
+| Name | Description |
+|------|-------------|
+| `eq! expected actual` | Equal by `==`. The most-used one. |
+| `ne! unexpected actual` | Not equal. |
+| `true! actual` / `false! actual` | Exactly `true` / exactly `false` — not merely truthy. |
+| `near! tolerance expected actual` | Within `tolerance`, for floats that will not compare exactly. |
+| `contains! x xs` | The list `xs` has an element equal to `x`. |
+| `empty! xs` | The list is `[]`. |
+| `raises! body` | The **thunk** `body` must raise. `test.raises! $( 1 / 0 )` — the `$( )` is what defers it, and the body runs in its own process, so an error that would kill the case cannot. |
+| `fail! message` | Fail unconditionally, for a branch that should be unreachable. |
+| `has_element x xs` | The predicate behind `contains!`. Returns a `bool` rather than raising, so it is usable in a condition. |
+
+Note the argument order: **expected first, actual second**, so
+`test.eq! 6 (list.sum [1, 2, 3])` reads as the claim being made.
+
+#### Running
+
+| Name | Description |
+|------|-------------|
+| `run_cases! passed failed cases` | Runs each case, printing a line per result. Returns `[passed, failed]`. |
+| `suite! name cases` | Prints a heading, runs the cases, prints the tally. Returns the **number of failures**, so several suites can be summed. |
+| `run_suites! failed suites` | Runs `[name, cases]` entries, returning the total failures, seeded with `failed`. |
+| `main_of! suites` | The usual entry point: run everything, print a summary, and `raise! :tests_failed` if anything failed — which is what makes the process exit non-zero. |
+
+```dream
+let main! = test.main_of! [
+    ["arith", [
+        test.case "adds"    $( test.eq! 4 (2 + 2) ),
+        test.case "divides" $( test.raises! $( 1 / 0 ) ),
+    ]],
+];
+```
+
+```
+arith
+  ok    adds
+  ok    divides
+  2 passed
+
+all tests passed
+```
+
+A failing case prints the error beside its name and the run ends non-zero:
+
+```
+  FAIL  a failure on purpose
+          <error :error expected 1, got 2>
+  7 passed, 2 FAILED
+```
+
+#### The generated runner
+
+Writing `main!` by hand as above is the explicit form. The usual way is to let
+the compiler build it: a module opts in by defining a **parameterless `tests`
+binding**, conventionally inside a `when test { .. }` so it costs nothing in an
+ordinary build.
+
+```dream
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "sum" $( test.eq! 6 (list.sum [1, 2, 3]) ),
+    ];
+}
+```
+
+`dreamc FILE --test` then scans **the modules it actually loaded** for that
+binding and generates an entry point that runs every suite it found. There is
+no registry to keep in step and no test that is silently never run; a program
+with no `tests` anywhere still compiles, and reports that there was nothing to
+run.
+
+---
+
+### `std.all`
+
+```dream
+import std.all;
+```
+
+Every module in the standard library, imported in one place. Two things use it.
+
+`dreamc mind/std/all.dr --test` builds a runner from the `tests` each of those
+modules exports, so **adding a module here is all it takes for its tests to
+run**. Importing them is also a check in itself: a module that no longer
+compiles fails the build rather than being quietly skipped.
+
+| Name | Description |
+|------|-------------|
+| `version` | The library's own version as a string, so a program can report what it was built against. Currently `"0.1.0"`. |
+| `modules` | The module names this build provides, as a list of strings. |
+
+```dream
+all.version     // "0.1.0"
+all.modules     // ["std.array", "std.core", "std.json", "std.list",
+                //  "std.seq", "std.str", "std.test", "std.toml"]
+```
+
+`modules` is a hand-maintained list, so it names what the library intends to
+ship rather than what happens to be on disk — a module that exists but is not
+listed here is not part of the library's interface.
 
 ---
 

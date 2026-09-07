@@ -72,7 +72,13 @@ let git_fetch! d dir = {
     let cloned = match rev {
         [:tag, t] => run! "git clone" "git" ["clone", "--quiet", "--depth", "1", "--branch", to_string t, url, dir],
         [:branch, b] => run! "git clone" "git" ["clone", "--quiet", "--depth", "1", "--branch", to_string b, url, dir],
-        _ => run! "git clone" "git" ["clone", "--quiet", url, dir],
+        // A bare revision needs history to find, so this one clones fully and
+        // checks out below.
+        [:rev, _] => run! "git clone" "git" ["clone", "--quiet", url, dir],
+        // Refusing an unpinned dependency is the point. "Whatever is on the
+        // default branch today" is not a dependency, it is a moving target,
+        // and the build that breaks next week will not say why.
+        _ => [:error, "needs `tag`, `rev` or `branch` -- an unpinned git dependency is not reproducible"],
     };
     match cloned {
         [:error, why] => [:error, why],
@@ -134,3 +140,18 @@ let resolve! from_root d = {
         },
     }
 };
+
+when test {
+    import std.test;
+
+    let tests = [
+        // A readable directory beats an unreadable hash: when a fetch goes
+        // wrong the first thing anyone does is go and look at it.
+        test.case "slug keeps what is safe"
+            $( test.eq! "github.com_u_repo" (slug "github.com/u/repo") ),
+        test.case "slug replaces punctuation"
+            $( test.eq! "https___x.y_z" (slug "https://x.y/z") ),
+        test.case "slug keeps dots and dashes"
+            $( test.eq! "a-b.c" (slug "a-b.c") ),
+    ];
+}

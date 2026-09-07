@@ -120,7 +120,7 @@ impl Loader {
         }
     }
 
-    /// Search paths for a root file: its own directory, anything in `DREAM_PATH`,
+    /// Search paths for a root file: its own directory, anything in `MINDV2_PATH`,
     /// and the nearest enclosing `mind` directory, so a project's `dusk/std`
     /// is found without configuration.
     pub fn default_search_paths(root: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
@@ -128,7 +128,7 @@ impl Loader {
         if let Some(dir) = root.parent() {
             paths.push(dir.to_path_buf());
         }
-        if let Ok(env) = std::env::var("DREAM_PATH") {
+        if let Ok(env) = std::env::var("MINDV2_PATH") {
             for part in env.split(':').filter(|p| !p.is_empty()) {
                 paths.push(PathBuf::from(part));
             }

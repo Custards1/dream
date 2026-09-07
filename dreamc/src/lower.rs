@@ -22,6 +22,75 @@ fn sp(s: Span) -> (u32, u32) {
     (s.start, s.end)
 }
 
+/// Does this item mention `core` anywhere?
+///
+/// Deciding whether to bring `std.core` in automatically has to be answered
+/// before any body is lowered, because a module's globals must be contiguous:
+/// discovering the need halfway through and appending one then would put it
+/// outside the range the image records for this module.
+fn item_names_core(item: &Item) -> bool {
+    match item {
+        Item::Let(d) => expr_names_core(&d.body),
+        Item::Virtual(v) => v.default.as_ref().is_some_and(expr_names_core),
+        Item::When { items, .. } => items.iter().any(item_names_core),
+        // A `mod` is hoisted into a module of its own before this runs, and
+        // decides for itself.
+        Item::Mod(_) | Item::Import(_) | Item::Derive(_) => false,
+    }
+}
+
+fn expr_names_core(e: &Expr) -> bool {
+    let any = |es: &[Expr]| es.iter().any(expr_names_core);
+    match &e.kind {
+        ExprKind::Name(n) => n == "core",
+        ExprKind::Field(obj, _) => expr_names_core(obj),
+        ExprKind::Apply(f, args) => expr_names_core(f) || any(args),
+        ExprKind::Pipe(a, b) => expr_names_core(a) || expr_names_core(b),
+        ExprKind::Unary(_, a) => expr_names_core(a),
+        ExprKind::Binary(_, a, b) => expr_names_core(a) || expr_names_core(b),
+        ExprKind::If(c, t, f) => {
+            expr_names_core(c)
+                || expr_names_core(t)
+                || f.as_ref().is_some_and(|f| expr_names_core(f))
+        }
+        ExprKind::Block(stmts) => stmts.iter().any(|s| match s {
+            Stmt::Let(d) => expr_names_core(&d.body),
+            Stmt::Expr(e) => expr_names_core(e),
+        }),
+        ExprKind::Thunk(a) => expr_names_core(a),
+        ExprKind::Try { body, handler, .. } => expr_names_core(body) || expr_names_core(handler),
+        ExprKind::Lambda { body, .. } => expr_names_core(body),
+        ExprKind::Comp { expr, .. } => expr_names_core(expr),
+        ExprKind::List(items) | ExprKind::Array(items) => any(items),
+        ExprKind::Map(pairs) => pairs.iter().any(|(k, v)| expr_names_core(k) || expr_names_core(v)),
+        ExprKind::Match { scrutinee, arms } => {
+            expr_names_core(scrutinee)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().is_some_and(expr_names_core)
+                        || expr_names_core(&a.body)
+                        || pattern_names_core(&a.pattern)
+                })
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
+        | ExprKind::Atom(_)
+        | ExprKind::Unit => false,
+    }
+}
+
+/// A map pattern's keys are expressions, so they can name `core` too.
+fn pattern_names_core(p: &Pattern) -> bool {
+    match p {
+        Pattern::Map(pairs) => pairs.iter().any(|(k, v)| expr_names_core(k) || pattern_names_core(v)),
+        Pattern::List(items, _) | Pattern::Array(items, _) => items.iter().any(pattern_names_core),
+        Pattern::As(inner, _) => pattern_names_core(inner),
+        _ => false,
+    }
+}
+
 fn item_span(item: &Item) -> Span {
     match item {
         Item::Import(i) => i.span,
@@ -122,8 +191,6 @@ pub struct Lowerer<'a> {
     set: Option<&'a ModuleSet>,
     /// Dotted prefixes behind `ModuleRef::Group`.
     groups: Vec<String>,
-    /// Packages every module can name without importing them.
-    preludes: Vec<String>,
     pub pending_comp: Vec<PendingComp>,
 }
 
@@ -141,15 +208,8 @@ impl<'a> Lowerer<'a> {
             frames: Vec::new(),
             set: None,
             groups: Vec::new(),
-            preludes: Vec::new(),
             pending_comp: Vec::new(),
         }
-    }
-
-    /// Packages every module may name without importing them. `mind` passes
-    /// `std`, so a project it builds can say `std.list.map` straight away.
-    pub fn with_preludes(&mut self, preludes: Vec<String>) {
-        self.preludes = preludes;
     }
 
     fn err(&mut self, span: Span, msg: impl Into<String>) {
@@ -375,40 +435,34 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // `std.core` is available everywhere without an import. It is the one
-        // module every program reaches for -- `head`, `tail`, the map and
-        // array primitives -- and writing the same import at the top of every
-        // file is ceremony, not information.
-        //
-        // Only when the module has not bound `core` itself, so an explicit
-        // `import std.core as core;` and a `let core = ..` both still win.
-        let binds_core = self.modules[mi].aliases.contains_key("core")
-            || set.modules[mi].ast.items.iter().any(|it| match it {
-                Item::Let(d) => d.name == "core",
-                Item::Import(i) => i.alias == "core",
-                _ => false,
-            });
-        if !binds_core {
-            let g = self.declare_native(mi, "std.core", "core");
-            self.modules[mi].aliases.insert("core".to_string(), ModuleRef::Native(g));
-            self.modules[mi].globals.insert("core".to_string(), g);
-        }
-
-        // Packages named as preludes are in scope as namespaces, so a build
-        // driven by `mind` can say `std.list.map` without importing anything.
-        let preludes = self.preludes.clone();
-        for pkg in preludes {
-            if self.modules[mi].aliases.contains_key(&pkg) || !set.namespaces.contains(&pkg) {
-                continue;
-            }
-            let g = self.group(&pkg);
-            self.modules[mi].aliases.insert(pkg, g);
-        }
-
         // Collect the items this module contributes, base first.
         let mut items: Vec<(usize, &'a Item)> = Vec::new();
         let mut seen = Vec::new();
         self.effective_items(set, mi, &mut items, &mut seen);
+
+        // `std.core` is available without an import -- it is the one module
+        // every program reaches for, and writing the same line at the top of
+        // every file is ceremony rather than information.
+        //
+        // Only when the module actually names `core`, so a module that never
+        // touches it carries no extra import record or global; and only when
+        // it has not bound `core` itself, so an explicit `import std.core as
+        // core;` and a `let core = ..` both still win.
+        //
+        // Decided here rather than alongside the explicit imports because
+        // `items` includes what a derived module inherits, and inherited code
+        // needs the import as much as code written in place.
+        let binds_core = self.modules[mi].aliases.contains_key("core")
+            || items.iter().any(|(_, it)| match it {
+                Item::Let(d) => d.name == "core",
+                Item::Import(i) => i.alias == "core",
+                _ => false,
+            });
+        if !binds_core && items.iter().any(|(_, it)| item_names_core(it)) {
+            let g = self.declare_native(mi, "std.core", "core");
+            self.modules[mi].aliases.insert("core".to_string(), ModuleRef::Native(g));
+            self.modules[mi].globals.insert("core".to_string(), g);
+        }
 
         // A later `let` of the same name overrides an earlier one, which is how
         // a deriving module implements a virtual.

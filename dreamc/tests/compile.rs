@@ -1212,3 +1212,62 @@ fn an_operator_continues_whatever_its_indentation() {
     let body = node(&c.program, func(&c.program, "main!").body);
     assert_eq!(body.b, 2, "the operator line should not have become a statement");
 }
+
+// ---------------------------------------------------------------------------
+// `std.core` without an import
+//
+// It is the one module every program reaches for, so it is bound
+// automatically -- but only where it is used, and never over something the
+// module bound itself.
+// ---------------------------------------------------------------------------
+
+/// How many `std.core` import records the program carries.
+fn core_imports(c: &Compiled) -> usize {
+    c.program
+        .imports
+        .iter()
+        .filter(|i| c.program.k.strings[i.path as usize] == "std.core")
+        .count()
+}
+
+#[test]
+fn core_is_available_without_importing_it() {
+    let c = ok("let main! = { core.head [1] }");
+    assert_eq!(core_imports(&c), 1, "using `core` should bring `std.core` in");
+}
+
+#[test]
+fn core_is_not_imported_when_it_is_not_used() {
+    // A module that never names `core` should carry no extra import record and
+    // no extra global for it.
+    let c = ok("let main! = { 1 + 1 }");
+    assert_eq!(core_imports(&c), 0, "an unused module must not be imported");
+}
+
+#[test]
+fn an_explicit_core_import_is_not_duplicated() {
+    let c = ok("import std.core;\nlet main! = { core.head [1] }");
+    assert_eq!(core_imports(&c), 1, "the automatic one must not be added as well");
+}
+
+#[test]
+fn a_binding_named_core_wins_over_the_automatic_import() {
+    // `core` here is an integer, so `core.head` would be a type error at run
+    // time -- the point is that the name resolves to the binding, and no
+    // import is added behind it.
+    let c = ok("let core = 42;\nlet main! = { core }");
+    assert_eq!(core_imports(&c), 0, "a module's own `core` must not be shadowed");
+}
+
+#[test]
+fn core_is_found_through_a_nested_expression() {
+    // The scan has to walk into every expression form, not just the top level.
+    let c = ok("let main! = { let f = fn x -> [core.head x]; f [1] }");
+    assert_eq!(core_imports(&c), 1, "`core` inside a lambda inside a list still counts");
+}
+
+#[test]
+fn core_is_found_through_a_match_arm() {
+    let c = ok("let main! = { match [1] { [x] => core.head [x], _ => 0 } }");
+    assert_eq!(core_imports(&c), 1, "`core` in a match arm still counts");
+}

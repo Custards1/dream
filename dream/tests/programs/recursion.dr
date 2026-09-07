@@ -5,7 +5,7 @@ let rec count_down n = if n <= 0 { 0 } else { count_down (n - 1) };
 let rec sum_to n = if n <= 0 { 0 } else { n + sum_to (n - 1) };
 let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
 let main! = {
-    count_down 2000000 |> console.print! "tail:     "
-    sum_to 100000     |> console.print! "non-tail: "
-    fac 20            |> console.print! "fac 20:   "
+    console.print! ("tail:     " + to_string (count_down 2000000))
+    console.print! ("non-tail: " + to_string (sum_to 100000))
+    console.print! ("fac 20:   " + to_string (fac 20))
 }

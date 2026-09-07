@@ -12,9 +12,12 @@ import std.str;
 // here would only lose information -- a relative dependency path is meaningful
 // relative to the manifest that named it.
 
+/// `.` is dropped rather than kept, so a project at `.` gets `main.dr` and not
+/// `././main.dr` -- these paths end up in error messages and in the `-L` flags
+/// handed to the compiler, and both are read by people.
 let join a b =
-    if str.is_empty a { b }
-    else if str.is_empty b { a }
+    if str.is_empty a || a == "." { b }
+    else if str.is_empty b || b == "." { a }
     else if str.ends_with "/" a { a + b }
     else { a + "/" + b };
 
@@ -59,7 +62,7 @@ let write_file! path text = {
         let left = str.byte_length text - offset;
         if left <= 0 { :done }
         else {
-            let wrote = io.write! h (str.slice offset left text);
+            let wrote = io.write! (to_string h + to_string (str.slice offset left text));
             put! (offset + wrote)
         }
     };
@@ -79,3 +82,28 @@ let rec mkdir_p! path =
             io.mkdir! p
         }
     };
+
+when test {
+    import std.test;
+
+    let tests = [
+        // paths are textual: `mind` hands them to `dreamc` and to `git`, which
+        // do their own resolving, so normalising here would lose meaning.
+        test.case "join"              $( test.eq! "a/b" (join "a" "b") ),
+        test.case "join keeps one slash" $( test.eq! "a/b" (join "a/" "b") ),
+        test.case "join with empty left" $( test.eq! "b" (join "" "b") ),
+        test.case "join with empty right" $( test.eq! "a" (join "a" "") ),
+        test.case "join drops a dot on the left"  $( test.eq! "b" (join "." "b") ),
+        test.case "join drops a dot on the right" $( test.eq! "a" (join "a" ".") ),
+        test.case "join of two dots"              $( test.eq! "." (join "." ".") ),
+        test.case "join relative"     $( test.eq! "a/../b" (join "a" "../b") ),
+
+        test.case "dirname"           $( test.eq! "a/b" (dirname "a/b/c") ),
+        test.case "dirname of a bare name" $( test.eq! "." (dirname "c") ),
+        test.case "dirname at the root" $( test.eq! "/" (dirname "/c") ),
+        test.case "dirname nested"    $( test.eq! "/a" (dirname "/a/b") ),
+
+        test.case "basename"          $( test.eq! "c" (basename "a/b/c") ),
+        test.case "basename of a bare name" $( test.eq! "c" (basename "c") ),
+    ];
+}

@@ -1,0 +1,614 @@
+// The lexer, in Dream.
+//
+// Dream is newline-sensitive at statement level: inside a block a newline ends
+// a statement unless the parser is mid-expression or inside a bracket group.
+// Rather than emit newline tokens, every token records whether a line break
+// appeared in the gap before it, and what column it starts at. The parser
+// consults those where a continuation is optional -- application arguments and
+// infix operators.
+//
+// Two things about the language shape this file.
+//
+// **It is a stream, not a pass.** `tokens` hands back a lazy list: forcing a
+// cell scans exactly one token, and its tail is the rest of the file, still
+// suspended. Nothing accumulates and nothing is reversed. A parser that stops
+// at the first error on line 3 never looks at line 4, and tokens it has moved
+// past become garbage while the file is still being read. `lex` is the strict
+// wrapper for callers that want the whole file or a diagnosis, and it is
+// written in terms of the stream rather than the other way round.
+//
+// **Errors are tokens.** A lazy scan cannot return `[:error, ..]` up front
+// without forcing the whole file first, which would give up everything above.
+// So a failure is an `:error` token at the point it happened, and the stream
+// ends there. The parser sees it with a span, in order, like any other token.
+//
+// The scan walks **byte offsets**. A span is a byte range, which is what a
+// diagnostic needs to slice the source back out, and `core.str_byte` makes
+// indexing O(1). The one place characters matter is `col`, counted in
+// characters so a line indented with anything non-ASCII still lines up.
+//
+// Every function here but `lex_all!` is pure.
+
+import std.core;
+import std.list;
+import std.str;
+
+// --- tokens -----------------------------------------------------------------
+//
+// A token is `[kind, value, start, end, starts_line, col]`. `kind` is an atom
+// naming the form; `value` carries the payload for the kinds that have one and
+// is `()` for every piece of punctuation. On an `:error` token the payload is
+// the message.
+
+let make kind value start end starts_line col = [kind, value, start, end, starts_line, col];
+
+let kind t        = list.nth 0 t;
+let value t       = list.nth 1 t;
+let span_start t  = list.nth 2 t;
+let span_end t    = list.nth 3 t;
+let starts_line t = list.nth 4 t;
+let col t         = list.nth 5 t;
+
+let is_error t = kind t == :error;
+
+/// The source text a token was cut from.
+let text_of s t = str.slice (span_start t) (span_end t - span_start t) s;
+
+// --- byte classes -----------------------------------------------------------
+//
+// Bytes rather than chars: `str_byte` answers an integer, and every character
+// that matters to the grammar is ASCII. Past the end it answers `-1`, which
+// falls out of every range test below as "not that", so the end of the file
+// needs no special case in any of them.
+
+let tab     = 9;
+let newline = 10;
+let ff      = 12;
+let cr      = 13;
+let space   = 32;
+let eof     = 0 - 1;
+
+let is_digit b = b >= 48 && b <= 57;
+let is_lower b = b >= 97 && b <= 122;
+let is_upper b = b >= 65 && b <= 90;
+let is_alpha b = is_lower b || is_upper b || b == 95;
+let is_alnum b = is_alpha b || is_digit b;
+
+/// The value of one digit in `radix`, or `-1` if it is not one.
+let digit_value b radix = {
+    let v = if is_digit b { b - 48 }
+            else if is_lower b { b - 97 + 10 }
+            else if is_upper b { b - 65 + 10 }
+            else { 0 - 1 };
+    if v >= 0 && v < radix { v } else { 0 - 1 }
+};
+
+/// Does `s` carry the bytes of `word` at `i`?
+let rec starts_at s i word j =
+    if j >= str.byte_length word { true }
+    else if core.str_byte s (i + j) != core.str_byte word j { false }
+    else { starts_at s i word (j + 1) };
+
+/// How many bytes the character starting at `i` occupies.
+let char_bytes s i = {
+    let b = core.str_byte s i;
+    if b < 128 { 1 } else if b < 224 { 2 } else if b < 240 { 3 } else { 4 }
+};
+
+/// Characters, not bytes, between two offsets. A UTF-8 continuation byte is
+/// `10xxxxxx`: the middle of a character rather than one of its own.
+let rec char_len s i stop acc =
+    if i >= stop { acc }
+    else if core.str_byte s i >= 128 && core.str_byte s i < 192 { char_len s (i + 1) stop acc }
+    else { char_len s (i + 1) stop (acc + 1) };
+
+// --- trivia -----------------------------------------------------------------
+//
+// Whitespace and comments carry no token, but they do carry two things the
+// parser needs: whether a newline was crossed, and what column we are now at.
+// `skip_trivia` answers `[i, col, saw_newline]`, or `[:error, message, offset]`.
+
+/// A `//` comment runs to the end of the line. The newline is left for the
+/// caller, so that it still counts as a line break before the next token.
+let rec drop_line s i =
+    if core.str_byte s i == eof || core.str_byte s i == newline { i }
+    else { drop_line s (i + 1) };
+
+/// A `/* */` comment, which does not nest. An unterminated one is an error
+/// naming where it opened -- the alternative is to lex the `/` and the `*` as
+/// operators and report something baffling much further down the file.
+let rec drop_block s i col opened =
+    if core.str_byte s i == eof { [:error, "unterminated block comment", opened] }
+    else if core.str_byte s i == newline { drop_block s (i + 1) 1 opened }
+    else if core.str_byte s i == 42 && core.str_byte s (i + 1) == 47 { [i + 2, col + 2] }
+    else { drop_block s (i + 1) (col + 1) opened };
+
+let rec skip_trivia s i col nl = {
+    let b = core.str_byte s i;
+    if b == newline { skip_trivia s (i + 1) 1 true }
+    else if b == space || b == tab || b == cr || b == ff { skip_trivia s (i + 1) (col + 1) nl }
+    else if b == 47 && core.str_byte s (i + 1) == 47 {
+        let j = drop_line s (i + 2);
+        skip_trivia s j (col + char_len s i j 0) nl
+    }
+    else if b == 47 && core.str_byte s (i + 1) == 42 {
+        let r = drop_block s (i + 2) (col + 2) i;
+        if list.head r == :error { r }
+        else { skip_trivia s (list.nth 0 r) (list.nth 1 r) nl }
+    }
+    else { [i, col, nl] }
+};
+
+// --- escapes ----------------------------------------------------------------
+//
+// Shared by string and character literals. An unknown escape is the character
+// itself, so `\q` is `q` -- the same forgiving rule the Rust lexer follows.
+
+/// The `\u{HEX}` form. `[text, next]`, or `()` if it is malformed.
+///
+/// A scalar above `0x10FFFF` is not a character, and `char_of_code` would
+/// raise on it -- which a pure lexer may not do -- so the range is checked
+/// here and a bad one is reported like any other malformed escape.
+let rec hex_body s i acc seen =
+    if core.str_byte s i == 125 {
+        if seen == 0 || acc > 1114111 { () }
+        else { [str.of_chars [core.char_of_code acc], i + 1] }
+    }
+    else if digit_value (core.str_byte s i) 16 >= 0 {
+        hex_body s (i + 1) (acc * 16 + digit_value (core.str_byte s i) 16) (seen + 1)
+    }
+    else { () };
+
+/// What the escape after a backslash at `i` stands for: `[text, next]`, or
+/// `()` if the file ends mid-escape.
+let escape_at s i = {
+    let b = core.str_byte s i;
+    if b == 110 { ["\n", i + 1] }
+    else if b == 116 { ["\t", i + 1] }
+    else if b == 114 { ["\r", i + 1] }
+    else if b == 48 { [str.of_chars [core.char_of_code 0], i + 1] }
+    else if b == 92 { ["\\", i + 1] }
+    else if b == 39 { ["'", i + 1] }
+    else if b == 34 { ["\"", i + 1] }
+    // `\u` must be `\u{HEX}`. Rust's lexer quietly swallows a malformed one
+    // and emits nothing, which is an accident of how it is written rather than
+    // a rule worth keeping: it turns a typo into missing text.
+    else if b == 117 && core.str_byte s (i + 1) == 123 { hex_body s (i + 2) 0 0 }
+    else if b == 117 { () }
+    else if b == eof { () }
+    else { [str.slice i (char_bytes s i) s, i + char_bytes s i] }
+};
+
+// --- string and character literals ------------------------------------------
+
+/// A run of ordinary string bytes: everything up to a quote, a backslash, or
+/// the end of the file.
+let rec plain_run s i =
+    if core.str_byte s i == eof || core.str_byte s i == 34 || core.str_byte s i == 92 { i }
+    else { plain_run s (i + 1) };
+
+/// The body of a `"..."`. Pieces are accumulated and joined rather than built
+/// character by character, so a run of ordinary text costs one slice however
+/// long it is.
+let rec string_body s i pieces opened =
+    if core.str_byte s i == eof { [:error, "unterminated string", opened] }
+    else if core.str_byte s i == 34 { [:ok, str.join_str "" (list.reverse pieces), i + 1] }
+    else if core.str_byte s i == 92 {
+        let e = escape_at s (i + 1);
+        if e == () && core.str_byte s (i + 1) == 117 { [:error, "expected \\u{HEX}", i] }
+        else if e == () { [:error, "unterminated string", opened] }
+        else { string_body s (list.nth 1 e) (core.cons (list.head e) pieces) opened }
+    }
+    else {
+        let j = plain_run s i;
+        string_body s j (core.cons (str.slice i (j - i) s) pieces) opened
+    };
+
+/// A `'c'` literal: one character, or one escape, then a closing quote.
+let char_literal s i = {
+    let inner = if core.str_byte s (i + 1) == 92 { escape_at s (i + 2) }
+                else if core.str_byte s (i + 1) == eof { () }
+                else { [str.slice (i + 1) (char_bytes s (i + 1)) s,
+                        i + 1 + char_bytes s (i + 1)] };
+    if inner == () { [:error, "unterminated character literal", i] }
+    else {
+        let cs = str.chars (list.head inner);
+        let after = list.nth 1 inner;
+        if list.is_empty cs { [:error, "empty character literal", i] }
+        else if core.str_byte s after != 39 { [:error, "unterminated character literal", i] }
+        else { [:ok, list.head cs, after + 1] }
+    }
+};
+
+// --- numbers ----------------------------------------------------------------
+
+/// Digits of `radix`, with `_` as a separator. `[value, next, seen]`; `seen`
+/// counts the digits, so a bare `0x` can be told from `0x0`.
+let rec digits s i radix acc seen = {
+    let b = core.str_byte s i;
+    if b == 95 { digits s (i + 1) radix acc seen }
+    else if digit_value b radix >= 0 {
+        digits s (i + 1) radix (acc * radix + digit_value b radix) (seen + 1)
+    }
+    else { [acc, i, seen] }
+};
+
+/// Past the digits and separators of a decimal run.
+let rec float_run s i =
+    if is_digit (core.str_byte s i) || core.str_byte s i == 95 { float_run s (i + 1) }
+    else { i };
+
+/// The exponent of a float, if one starts here: `e` or `E`, an optional sign,
+/// then at least one digit. Answers the offset after it, or `i` if absent --
+/// so `1e` is the number `1` followed by the name `e`.
+let exponent s i = {
+    let b = core.str_byte s i;
+    if b != 101 && b != 69 { i }
+    else {
+        let j = if core.str_byte s (i + 1) == 43 || core.str_byte s (i + 1) == 45 { i + 2 }
+                else { i + 1 };
+        if is_digit (core.str_byte s j) { float_run s j } else { i }
+    }
+};
+
+let radix_literal s i radix = {
+    let d = digits s (i + 2) radix 0 0;
+    if list.nth 2 d == 0 { [:error, "a number with no digits", i] }
+    else { [:int, list.head d, list.nth 1 d] }
+};
+
+/// A number literal at `i`: `[kind, value, next]`.
+///
+/// A float needs a digit on both sides of its point, so `1..2` lexes as `1`,
+/// `..`, `2` rather than as a malformed float, and `x.field` is never a number.
+let number s i = {
+    let b1 = core.str_byte s (i + 1);
+    if core.str_byte s i == 48 && (b1 == 120 || b1 == 88) { radix_literal s i 16 }
+    else if core.str_byte s i == 48 && (b1 == 98 || b1 == 66) { radix_literal s i 2 }
+    else if core.str_byte s i == 48 && (b1 == 111 || b1 == 79) { radix_literal s i 8 }
+    else {
+        let after_int = float_run s i;
+        let dotted = core.str_byte s after_int == 46 && is_digit (core.str_byte s (after_int + 1));
+        let after_frac = if dotted { float_run s (after_int + 1) } else { after_int };
+        let after_exp = exponent s after_frac;
+        if dotted || after_exp != after_frac {
+            let raw = str.slice i (after_exp - i) s;
+            [:float, core.parse_float (str.filter (fn c -> c != '_') raw), after_exp]
+        }
+        else {
+            let d = digits s i 10 0 0;
+            [:int, list.head d, list.nth 1 d]
+        }
+    }
+};
+
+// --- identifiers ------------------------------------------------------------
+
+let rec ident_run s i = if is_alnum (core.str_byte s i) { ident_run s (i + 1) } else { i };
+
+/// An identifier, including a trailing `!` when there is one -- the `!` is part
+/// of the name and is what marks the binding impure. It is taken greedily, so
+/// `a!= b` is the name `a!` and then `=`, exactly as the Rust lexer reads it.
+let identifier s i = {
+    let j = ident_run s i;
+    if core.str_byte s j == 33 { j + 1 } else { j }
+};
+
+// --- operators --------------------------------------------------------------
+//
+// Longest first: `..` must be tried before `.`, and `$(` before a bare `$`,
+// which is not a token at all.
+
+let operators = [
+    ["$(", :dollar_paren], ["#[", :hash_bracket], ["%{", :percent_brace],
+    ["|>", :pipe_into], ["->", :arrow], ["=>", :fat_arrow],
+    ["==", :eq_eq], ["!=", :bang_eq], ["<=", :le], [">=", :ge],
+    ["&&", :and_and], ["||", :or_or], ["..", :dot_dot],
+    ["(", :lparen], [")", :rparen], ["[", :lbracket], ["]", :rbracket],
+    ["{", :lbrace], ["}", :rbrace],
+    ["<", :lt], [">", :gt], ["=", :eq],
+    ["+", :plus], ["-", :minus], ["*", :star], ["/", :slash], ["%", :percent],
+    [".", :dot], [",", :comma], [";", :semi], [":", :colon],
+];
+
+let rec match_operator s i ops =
+    if list.is_empty ops { () }
+    else if starts_at s i (list.head (list.head ops)) 0 { list.head ops }
+    else { match_operator s i (list.tail ops) };
+
+// --- one token --------------------------------------------------------------
+
+/// The token at `i`, which is known not to be trivia: `[kind, value, next]`,
+/// or `[:error, message, offset]`.
+let token_at s i = {
+    let b = core.str_byte s i;
+    if is_digit b { number s i }
+    else if is_alpha b {
+        let j = identifier s i;
+        [:ident, str.slice i (j - i) s, j]
+    }
+    else if b == 58 && is_alpha (core.str_byte s (i + 1)) {
+        let j = ident_run s (i + 1);
+        [:atom, str.slice (i + 1) (j - i - 1) s, j]
+    }
+    else if b == 34 {
+        let r = string_body s (i + 1) [] i;
+        if list.head r == :error { r } else { [:str, list.nth 1 r, list.nth 2 r] }
+    }
+    else if b == 39 {
+        let r = char_literal s i;
+        if list.head r == :error { r } else { [:char, list.nth 1 r, list.nth 2 r] }
+    }
+    else {
+        let op = match_operator s i operators;
+        if op == () { [:error, "unexpected character", i] }
+        else { [list.nth 1 op, (), i + str.byte_length (list.head op)] }
+    }
+};
+
+// --- the stream -------------------------------------------------------------
+//
+// The whole point of the file. `core.cons` is lazy in both head and tail, so
+// the recursive call below is a suspension rather than a call: forcing one
+// cell scans one token and leaves the rest of the file untouched.
+
+/// An `:error` token, which is always the last cell of a stream.
+let error_token message at nl col = [make :error message at at nl col];
+
+let rec stream s i col nl = {
+    let t = skip_trivia s i col nl;
+    if list.head t == :error { error_token (list.nth 1 t) (list.nth 2 t) nl col }
+    else {
+        let at = list.nth 0 t;
+        let c = list.nth 1 t;
+        let saw = list.nth 2 t;
+        if core.str_byte s at == eof { [] }
+        else {
+            let r = token_at s at;
+            if list.head r == :error { error_token (list.nth 1 r) (list.nth 2 r) saw c }
+            else {
+                let next = list.nth 2 r;
+                core.cons (make (list.head r) (list.nth 1 r) at next saw c)
+                          (stream s next (c + char_len s at next 0) false)
+            }
+        }
+    }
+};
+
+/// Every token in `s`, as a lazy list. This is the interface the parser wants.
+let tokens s = stream s 0 1 false;
+
+// --- the strict form --------------------------------------------------------
+
+let rec find_error ts =
+    if list.is_empty ts { () }
+    else if is_error (list.head ts) { list.head ts }
+    else { find_error (list.tail ts) };
+
+/// The whole file at once: `[:ok, tokens]`, or `[:error, message, offset]`.
+/// For a caller that wants a diagnosis rather than a stream to pull on.
+let lex s = {
+    let ts = tokens s;
+    let bad = find_error ts;
+    if bad == () { [:ok, ts] }
+    else { [:error, value bad, span_start bad] }
+};
+
+let ok r = list.head r == :ok;
+let result r = list.nth 1 r;
+let error_message r = list.nth 1 r;
+let error_offset r = list.nth 2 r;
+
+// --- many files -------------------------------------------------------------
+//
+// Laziness is the answer within one file. Processes are the answer across
+// several -- but only for the right shape of answer, and the difference is
+// large enough to be worth stating rather than discovering.
+//
+// A process is cheap to start and shares no memory, so `spawn!` per file is
+// the obvious move. What is not obvious is that **`join!` deep-copies the
+// result**. Lexing is allocation-heavy and its result is far bigger than its
+// input, so handing a whole token list back across a process boundary costs
+// more than the lexing saved. Measured over eight files of 1,200 lines each,
+// on eight workers:
+//
+//     sequential, whole token list        2.1s
+//     one process per file, list back     6.0s     2.8x slower
+//     one process per file, count back    1.5s     1.4x faster
+//
+// Same lexing in all three. The only thing that changed is what crossed the
+// boundary. So the rule is: **fan out when the answer is small relative to
+// the work**, and stay in-process when it is not.
+//
+// For a compiler that means the unit of parallelism is not the lexer. It is a
+// whole module -- lex, parse and lower in one process, returning something
+// compact -- or a check that only has to answer whether a file is well-formed.
+// `lex_errors!` below is the second of those, and is the only fan-out in this
+// file that pays. Pulling a token stream belongs in the process that will
+// parse it.
+//
+// Both forms are kept, and they return the same thing. `lex_errors` is pure
+// and sequential and works everywhere, including inside a pure function, where
+// nothing may spawn; `lex_errors!` is the opt-in for a caller that is impure
+// anyway and has enough files to be worth it. A module that can only be used
+// from an impure context is a module that cannot be reused.
+
+/// Whether a source lexes: `()` if it does, `[message, offset]` if it does not.
+let verdict s = {
+    let r = lex s;
+    if ok r { () } else { [error_message r, error_offset r] }
+};
+
+/// Check several sources, in order. Pure, sequential, and the one to reach for
+/// by default -- it works anywhere, including from inside a pure function,
+/// where nothing may spawn.
+let lex_errors sources = list.map (fn s -> verdict s) sources;
+
+/// The same answer, one process per source.
+///
+/// Identical results to `lex_errors`, so a caller can swap one for the other;
+/// this one is worth it only when there are several substantial files and the
+/// caller is impure anyway. Both `strict!`s are load-bearing:
+///
+/// - the first is what *starts* the processes. Without it every `spawn!` is
+///   itself a thunk, and they would run one at a time as each `join!` forced
+///   its element -- the exact opposite of what the code looks like.
+/// - the second is what makes this return *values*. `list.map (fn p -> join! p)`
+///   is a lazy list whose cells are still `join!`s, so without it the waiting
+///   happens wherever the caller eventually forces a cell, which may be much
+///   later and somewhere that has no idea it is waiting on a process. An
+///   impure function should hand back an answer, not an effect still waiting
+///   to happen.
+let lex_errors! sources = {
+    let running = strict! (list.map (fn s -> spawn! $( strict! (verdict s) )) sources);
+    strict! (list.map (fn p -> join! p) running)
+};
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    /// The kinds of every token, which is what most of these want to check.
+    let kinds src = list.map (fn t -> kind t) (lex_ok src);
+
+    /// The values of every token.
+    let values src = list.map (fn t -> value t) (lex_ok src);
+
+    /// Tokens of a source that must lex cleanly.
+    let lex_ok src = {
+        let r = lex src;
+        if ok r { result r } else { [] }
+    };
+
+    /// The message of a source that must not.
+    let lex_error src = {
+        let r = lex src;
+        if ok r { :lexed_when_it_should_not_have } else { error_message r }
+    };
+
+    let one src = list.head (lex_ok src);
+
+    let tests = [
+        // --- numbers ---
+        test.case "decimal"        $( test.eq! [42] (values "42") ),
+        test.case "separators"     $( test.eq! [1000] (values "1_000") ),
+        test.case "hex"            $( test.eq! [255] (values "0xFF") ),
+        test.case "binary"         $( test.eq! [10] (values "0b1010") ),
+        test.case "octal"          $( test.eq! [493] (values "0o755") ),
+        test.case "float"          $( test.eq! [1.5] (values "1.5") ),
+        test.case "float exponent" $( test.eq! [0.0025] (values "2.5e-3") ),
+        test.case "bare exponent"  $( test.eq! [:float] (kinds "1e9") ),
+        // A float needs a digit on both sides of its point, so these are three
+        // tokens and not a malformed number.
+        test.case "a range is not a float"
+            $( test.eq! [:int, :dot_dot, :int] (kinds "1..2") ),
+        // `1e` has no digits after the `e`, so the `e` is a name.
+        test.case "an exponent needs digits"
+            $( test.eq! [:int, :ident] (kinds "1e") ),
+        test.case "a radix needs digits"
+            $( test.eq! "a number with no digits" (lex_error "0x") ),
+
+        // --- names ---
+        test.case "identifier"     $( test.eq! ["abc"] (values "abc") ),
+        test.case "a trailing ! is part of the name"
+            $( test.eq! ["print!"] (values "print!") ),
+        // Greedy, exactly as the Rust lexer reads it.
+        test.case "a! = binds the bang to the name"
+            $( test.eq! [:ident, :eq, :ident] (kinds "a!= b") ),
+        test.case "a! = keeps the bang out of the operator"
+            $( test.eq! ["a!"] (list.take 1 (values "a!= b")) ),
+        test.case "atom"           $( test.eq! [:atom] (kinds ":ok") ),
+        test.case "atom value"     $( test.eq! ["ok"] (values ":ok") ),
+        // A `:` not followed by a name is the colon token.
+        test.case "a bare colon"   $( test.eq! [:colon] (kinds ": ") ),
+        test.case "member access"  $( test.eq! [:ident, :dot, :ident] (kinds "x.field") ),
+
+        // --- strings and chars ---
+        test.case "string"         $( test.eq! ["hi"] (values "\"hi\"") ),
+        test.case "escapes"        $( test.eq! ["a\nb\tc"] (values "\"a\\nb\\tc\"") ),
+        test.case "unicode escape" $( test.eq! ["A"] (values "\"\\u{41}\"") ),
+        test.case "an unknown escape is itself"
+            $( test.eq! ["q"] (values "\"\\q\"") ),
+        test.case "char"           $( test.eq! ['c'] (values "'c'") ),
+        test.case "escaped char"   $( test.eq! ['\n'] (values "'\\n'") ),
+        test.case "unterminated string"
+            $( test.eq! "unterminated string" (lex_error "\"oops") ),
+        test.case "a bad unicode escape is an error"
+            $( test.eq! "expected \\u{HEX}" (lex_error "\"\\u0041\"") ),
+        test.case "unterminated char"
+            $( test.eq! "unterminated character literal" (lex_error "'ab'") ),
+
+        // --- operators ---
+        test.case "two-character operators win"
+            $( test.eq! [:eq_eq] (kinds "==") ),
+        test.case "pipe"           $( test.eq! [:pipe_into] (kinds "|>") ),
+        test.case "thunk opener"   $( test.eq! [:dollar_paren] (kinds "$(") ),
+        test.case "a bare $ is not a token"
+            $( test.eq! "unexpected character" (lex_error "$ x") ),
+
+        // --- trivia ---
+        test.case "line comments vanish"
+            $( test.eq! [:ident, :ident] (kinds "a // gone\nb") ),
+        test.case "block comments vanish"
+            $( test.eq! [:ident, :ident] (kinds "a /* gone */ b") ),
+        test.case "an unterminated block comment is an error"
+            $( test.eq! "unterminated block comment" (lex_error "a /* forever") ),
+
+        // --- what the parser actually reads the tokens for ---
+        test.case "a newline before a token is recorded"
+            $( test.true! (starts_line (list.nth 1 (lex_ok "a\nb"))) ),
+        test.case "a space before a token is not"
+            $( test.false! (starts_line (list.nth 1 (lex_ok "a b"))) ),
+        test.case "columns are 1-based"
+            $( test.eq! 1 (col (one "abc")) ),
+        test.case "indentation is a column"
+            $( test.eq! 3 (col (list.nth 1 (lex_ok "a\n  b"))) ),
+        // The two disagree, and each is what its consumer needs. `é` is two
+        // bytes but one character, so the `abc` after it sits at a different
+        // byte offset than it would after an `a` -- and at the same column.
+        // A span slices the source; a column lines up with the line above.
+        test.case "columns count characters, not bytes"
+            $( test.eq! (col (list.nth 1 (lex_ok "\"a\" abc")))
+                        (col (list.nth 1 (lex_ok "\"é\" abc"))) ),
+        test.case "spans count bytes, not characters"
+            $( test.ne! (span_start (list.nth 1 (lex_ok "\"a\" abc")))
+                        (span_start (list.nth 1 (lex_ok "\"é\" abc"))) ),
+        test.case "a byte span is what slices the source"
+            $( test.eq! "abc" (text_of "\"é\" abc" (list.nth 1 (lex_ok "\"é\" abc"))) ),
+        test.case "a span slices its own text back out"
+            $( test.eq! "field" (text_of "x.field" (list.nth 2 (lex_ok "x.field"))) ),
+        test.case "non-ASCII survives a string"
+            $( test.eq! ["héllo"] (values "\"héllo\"") ),
+
+        // --- the stream ---
+        //
+        // The point of the whole file: tokens before an error are readable
+        // without the error being reached. A strict lexer cannot do this, and
+        // it is what lets a parser report the first real problem rather than
+        // the last lexical one.
+        test.case "tokens are available before a later error is reached"
+            $( test.eq! [:ident, :ident, :ident]
+                        (list.map (fn t -> kind t) (list.take 3 (tokens "a b c \"oops"))) ),
+        test.case "an error ends the stream as a token"
+            $( test.eq! :error (kind (list.nth 3 (tokens "a b c \"oops"))) ),
+        test.case "an empty file is an empty stream"
+            $( test.empty! (tokens "") ),
+        test.case "trivia alone is an empty stream"
+            $( test.empty! (tokens "  // nothing\n  ") ),
+
+        // --- across files ---
+        test.case "every source is checked, in order"
+            $( test.eq! [(), ["unterminated string", 2], ()]
+                        (lex_errors ["a b", "c \"oops", "d"]) ),
+        test.case "all clean is all unit"
+            $( test.eq! [(), ()] (lex_errors ["let x = 1", "let y = 2"]) ),
+        test.case "no sources, no verdicts"
+            $( test.empty! (lex_errors []) ),
+        // The sequential and parallel forms are interchangeable, which is the
+        // only reason it is safe to offer both.
+        test.case "the parallel form agrees with the sequential one"
+            $( test.eq! (lex_errors ["a b", "c \"oops", "d"])
+                        (lex_errors! ["a b", "c \"oops", "d"]) ),
+    ];
+}

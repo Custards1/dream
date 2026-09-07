@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <filesystem>
 
 #include "builtins.hpp"
 #include "image.hpp"
@@ -32,8 +33,8 @@ const char* USAGE =
     "      --no-jit         stay in the interpreter\n"
     "      --jit-threshold <n>  calls before a function is compiled\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function\n"
+    "      --mindv2         mindv2 path override\n"
     "  -h, --help           show this message\n";
-
 void dump_node(const Image& img, uint32_t idx, int depth, std::string& out);
 
 void indent(std::string& out, int depth) { out.append(size_t(depth) * 2, ' '); }
@@ -183,6 +184,55 @@ void dump_image(const Image& img) {
 
 }  // namespace
 
+
+bool is_directory(const std::string& path) {
+    std::error_code ec;
+    return std::filesystem::is_directory(path, ec);
+}
+
+std::string skip_file(std::string& path, const std::string& MINDV2_PATH,bool*file_ok) {
+    *file_ok = true;
+    if(!std::filesystem::exists(path) || is_directory(path)) {
+        *file_ok = false;
+        //if the path is just a name, not a path with directories, lets check the dream path for it
+        if(path.find('/') == std::string::npos && path.find('\\') == std::string::npos ) {
+            if(!MINDV2_PATH.empty()) {
+                std::string full_path = std::string(MINDV2_PATH) + "/" + path;
+
+                if(std::filesystem::exists(full_path)) {
+                    *file_ok = true;
+                   return full_path;
+                }
+            }
+        } else {
+            std::fprintf(stderr, "dream: no such file `%s`\n", path.c_str());
+            *file_ok= false;
+            return "";
+        }
+    }
+    return path;
+}
+
+std::string get_mindv2_path() {
+    const char* MINDV2_PATH = std::getenv("MINDV2_PATH");
+    if(!MINDV2_PATH) {
+        #if defined(__linux__) || defined(__APPLE__)
+        std::string home = std::getenv("HOME");
+        std::string default_path = home + "/.mindv2";
+        if(std::filesystem::exists(default_path)) {
+            MINDV2_PATH = default_path.c_str();
+        }
+        #elif defined(_WIN32)
+        const char* userprofile = std::getenv("USERPROFILE");
+        std::string default_path = std::string(userprofile) + "\\.mindv2";
+        if(std::filesystem::exists(default_path)) {
+            MINDV2_PATH = default_path.c_str();
+        }
+        #endif
+    }
+    return MINDV2_PATH ? std::string(MINDV2_PATH) : "";
+}
+
 int main(int argc, char** argv) {
     std::string path, entry;
     std::string dump_jit_fn;
@@ -192,6 +242,8 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> program_args;
     bool past_image = false;
+    std::string MINDV2_PATH = get_mindv2_path(); 
+    
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         // Once the image is named, stop interpreting anything as a VM option.
@@ -219,6 +271,8 @@ int main(int argc, char** argv) {
             stats = true;
         } else if (a == "--no-jit") {
             use_jit = false;
+        }else if (a == "-m" || a == "--mindv2") {
+            MINDV2_PATH = next("--mindv2");
         } else if (a == "--jit-threshold") {
             jit_threshold = uint32_t(std::stoul(next("--jit-threshold")));
         } else if (a == "--dump-jit") {
@@ -241,6 +295,12 @@ int main(int argc, char** argv) {
     if (path.empty()) {
         std::fputs(USAGE, stderr);
         return 2;
+    }
+    bool file_ok=true;
+    path = skip_file(path, MINDV2_PATH,&file_ok);
+    if(!file_ok) {
+        std::fprintf(stderr, "dream: file not found: `%s`\n", path.c_str());
+        return 1;
     }
 
     Runtime rt;

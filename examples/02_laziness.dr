@@ -13,29 +13,29 @@ let rec fibs_from a b = list.cons a (fibs_from b (a + b));
 let main! = {
     // A pure binding that nobody forces is never evaluated.
     let unused = boom 1;
-    console.print! "unused binding: " :never_forced
+    console.print! ("unused binding: " + to_string :never_forced)
 
     // `if` enters one branch only.
-    console.print! "if branch:      " (if true { :taken } else { boom 2 })
+    console.print! ("if branch:      " + to_string (if true { :taken } else { boom 2 }))
 
     // `&&` and `||` short-circuit.
-    console.print! "short circuit:  " (false && (boom 3) == 1) " " (true || (boom 4) == 1)
+    console.print! ("short circuit:  " + to_string (false && (boom 3) == 1) + " " + to_string (true || (boom 4) == 1))
 
     // Elements of a list, array or map stay suspended; `len` walks the spine.
-    console.print! "lazy list:      " (len [boom 5, boom 6, boom 7])
-    console.print! "lazy array:     " (len #[boom 8, boom 9])
-    console.print! "lazy map:       " (len %{ :a => boom 10 })
+    console.print! ("lazy list:      " + to_string (len [boom 5, boom 6, boom 7]))
+    console.print! ("lazy array:     " + to_string (len #[boom 8, boom 9]))
+    console.print! ("lazy map:       " + to_string (len %{ :a => boom 10 }))
 
     // Infinite lists, consumed finitely.
-    console.print! "naturals:       " (list.take 5 (naturals 1))
-    console.print! "fibs:           " (list.take 10 (fibs_from 0 1))
-    console.print! "mapped:         " (list.take 4 (list.map (fn x -> x * x) (naturals 1)))
-    console.print! "filtered:       " (list.take 4 (list.filter (fn x -> x % 3 == 0) (naturals 1)))
-    console.print! "take_while:     " (list.take_while (fn x -> x < 6) (naturals 1))
-    console.print! "zip stops:      " (list.zip [1, 2, 3] (naturals 10))
+    console.print! ("naturals:       " + to_string (list.take 5 (naturals 1)))
+    console.print! ("fibs:           " + to_string (list.take 10 (fibs_from 0 1)))
+    console.print! ("mapped:         " + to_string (list.take 4 (list.map (fn x -> x * x) (naturals 1))))
+    console.print! ("filtered:       " + to_string (list.take 4 (list.filter (fn x -> x % 3 == 0) (naturals 1))))
+    console.print! ("take_while:     " + to_string (list.take_while (fn x -> x < 6) (naturals 1)))
+    console.print! ("zip stops:      " + to_string (list.zip [1, 2, 3] (naturals 10)))
 
     // `$( .. )` suspends a computation as a first-class value.
     let suspended = $( 6 * 7 );
-    console.print! "thunk type:     " (type_of suspended)
-    console.print! "thunk joined:   " (join! (spawn! suspended))
+    console.print! ("thunk type:     " + to_string (type_of suspended))
+    console.print! ("thunk joined:   " + to_string (join! (spawn! suspended)))
 };

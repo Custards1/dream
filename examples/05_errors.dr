@@ -20,36 +20,36 @@ let attempt! thunk = try! { join! (spawn! thunk) } catch e { [:error, e] };
 
 let main! = {
     // The kinds the runtime raises.
-    console.print! "divide:    " (try! { div 1 0 } catch e { e })
-    console.print! "type:      " (try! { 1 + "x" } catch e { e })
-    console.print! "not a fn:  " (try! { (1) 2 } catch e { e })
-    console.print! "no member: " (try! { console.nope! 1 } catch e { e })
-    console.print! "bounds:    " (try! { core.array_get #[1] 9 } catch e { e })
+    console.print! ("divide:    " + to_string (try! { div 1 0 } catch e { e }))
+    console.print! ("type:      " + to_string (try! { 1 + "x" } catch e { e }))
+    console.print! ("not a fn:  " + to_string (try! { (1) 2 } catch e { e }))
+    console.print! ("no member: " + to_string (try! { console.nope! 1 } catch e { e }))
+    console.print! ("bounds:    " + to_string (try! { core.array_get #[1] 9 } catch e { e }))
 
     // Raising a value of your own.
-    console.print! "custom:    " (try! { raise! :my_problem } catch e { e })
-    console.print! "with text: " (try! { raise! "went wrong" } catch e { e })
+    console.print! ("custom:    " + to_string (try! { raise! :my_problem } catch e { e }))
+    console.print! ("with text: " + to_string (try! { raise! "went wrong" } catch e { e }))
 
     // The handler supplies a fallback, so the program keeps going.
-    console.print! "fallback:  " (try! { div 12 0 } catch e { 0 })
+    console.print! ("fallback:  " + to_string (try! { div 12 0 } catch e { 0 }))
 
     // Nested: the inner handler catches, the outer never sees it.
-    console.print! "nested:    " (try! { try! { div 1 0 } catch e { :inner } } catch e { :outer })
+    console.print! ("nested:    " + to_string (try! { try! { div 1 0 } catch e { :inner } } catch e { :outer }))
 
     // Reading the parts of an error.
     let err = try! { div 1 0 } catch e { e };
-    console.print! "type_of:   " (type_of err)
+    console.print! ("type_of:   " + to_string (type_of err))
 
     // A `try!` whose body does not raise just yields the body.
-    console.print! "no raise:  " (try! { 6 * 7 } catch e { :unused })
+    console.print! ("no raise:  " + to_string (try! { 6 * 7 } catch e { :unused }))
 
     // Validation that reports the first bad input.
-    console.print! "parse ok:  " (try! { parse_age! "34" } catch e { e })
-    console.print! "parse bad: " (try! { parse_age! "abc" } catch e { e })
-    console.print! "parse neg: " (try! { parse_age! "-1" } catch e { e })
+    console.print! ("parse ok:  " + to_string (try! { parse_age! "34" } catch e { e }))
+    console.print! ("parse bad: " + to_string (try! { parse_age! "abc" } catch e { e }))
+    console.print! ("parse neg: " + to_string (try! { parse_age! "-1" } catch e { e }))
 
     // A failure inside a process arrives at `join!` as a value, so one bad
     // computation cannot take the rest down with it.
-    console.print! "in process:" (attempt! $( div 1 0 ))
-    console.print! "survived:  " (list.map (fn n -> try! { 100 / n } catch e { :skipped }) [5, 0, 2])
+    console.print! ("in process:" + to_string (attempt! $( div 1 0 )))
+    console.print! ("survived:  " + to_string (list.map (fn n -> try! { 100 / n } catch e { :skipped }) [5, 0, 2]))
 };

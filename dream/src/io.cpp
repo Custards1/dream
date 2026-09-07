@@ -372,8 +372,10 @@ public:
         // under a reader would park that reader for ever. It wakes, retries,
         // and gets the "closed" error the retry produces.
         if (had && w.sched) {
-            w.sched->note_io_wait(false);
+            // Wake before releasing the IO-waiter count; see `run_child` in
+            // os.cpp for why the other order invents a deadlock.
             w.sched->wake(w.pid);
+            w.sched->note_io_wait(false);
         }
 #else
         (void)fd;
@@ -412,8 +414,9 @@ private:
                 }
                 if (w.sched) {
                     IOTRACE("ready fd=%d -> wake pid=%llu", fd, (unsigned long long)w.pid);
-                    w.sched->note_io_wait(false);
+                    // Wake first, then release the count; see `run_child`.
                     w.sched->wake(w.pid);
+                    w.sched->note_io_wait(false);
                 }
             }
         }

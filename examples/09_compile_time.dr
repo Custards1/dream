@@ -68,17 +68,17 @@ when release {
 }
 
 let main! = {
-    console.print! "fib table:  " fib_table
-    console.print! "answer:     " answer
-    console.print! "fib 20:     " big_power
-    console.print! "mixed:      " mixed
-    console.print! "digits:     " digits
-    console.print! "squares:    " squares
-    console.print! "build kind: " build_kind
-    console.print! "platform:   " platform
-    console.print! "trace:      " traced
+    console.print! ("fib table:  " + to_string fib_table)
+    console.print! ("answer:     " + to_string answer)
+    console.print! ("fib 20:     " + to_string big_power)
+    console.print! ("mixed:      " + to_string mixed)
+    console.print! ("digits:     " + to_string digits)
+    console.print! ("squares:    " + to_string squares)
+    console.print! ("build kind: " + to_string build_kind)
+    console.print! ("platform:   " + to_string platform)
+    console.print! ("trace:      " + to_string traced)
 
     // The compile-time and run-time answers agree; only the timing differs.
-    console.print! "same:       " (fib_table == fib_upto 14)
-    console.print! "same:       " (digits == core.str_chars "12345")
+    console.print! ("same:       " + to_string (fib_table == fib_upto 14))
+    console.print! ("same:       " + to_string (digits == core.str_chars "12345"))
 };

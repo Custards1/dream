@@ -29,37 +29,37 @@ let rec countdown n = if n <= 0 { :liftoff } else { countdown (n - 1) };
 
 let main! = {
     // A process is a value with its own identity.
-    console.print! "self:        " (type_of (self! ()))
+    console.print! ("self:        " + to_string (type_of (self! ())))
 
     // spawn / join: the child's result comes back to the parent.
     let w = spawn! $( square_worker! 12 );
-    console.print! "joined:      " (join! w)
+    console.print! ("joined:      " + to_string (join! w))
 
     // send / recv: a mailbox handshake.
     let e = spawn! $( echo! () );
     send! e :hello
-    console.print! "echoed:      " (join! e)
+    console.print! ("echoed:      " + to_string (join! e))
 
     // Many at once, joined in order, so the output cannot race.
-    console.print! "parallel:    " (parallel_map! (fn x -> x * x) [1, 2, 3, 4, 5])
-    console.print! "factorials:  " (parallel_map! fac [5, 6, 7])
+    console.print! ("parallel:    " + to_string (parallel_map! (fn x -> x * x) [1, 2, 3, 4, 5]))
+    console.print! ("factorials:  " + to_string (parallel_map! fac [5, 6, 7]))
 
     // A process that fails hands the error to whoever joins it, rather than
     // taking the whole program down.
     let bad = spawn! $( 1 / 0 );
-    console.print! "failure:     " (try! { join! bad } catch err { [:caught, err] })
+    console.print! ("failure:     " + to_string (try! { join! bad } catch err { [:caught, err] }))
 
     // ..and its neighbours are unaffected.
     let good = spawn! $( 6 * 7 );
-    console.print! "unaffected:  " (join! good)
+    console.print! ("unaffected:  " + to_string (join! good))
 
     // Isolation: the child gets a *copy*, so it cannot alter what we hold.
     let shared = [1, 2, 3];
     let mutator = spawn! $( list.append shared [4] );
-    console.print! "child's:     " (join! mutator)
-    console.print! "ours:        " shared
+    console.print! ("child's:     " + to_string (join! mutator))
+    console.print! ("ours:        " + to_string shared)
 
     // Tail recursion runs in constant space, so a long loop in a process is
     // fine and stays preemptible.
-    console.print! "long loop:   " (join! (spawn! $( countdown 500000 )))
+    console.print! ("long loop:   " + to_string (join! (spawn! $( countdown 500000 ))))
 };

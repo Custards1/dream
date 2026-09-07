@@ -43,28 +43,28 @@ mod validate {
 
 let main! = {
     // plain and aliased imports
-    console.print! "list.head:     " (list.head [1, 2, 3])
-    console.print! "text.upper:    " (text.upper "aliased")
+    console.print! ("list.head:     " + to_string (list.head [1, 2, 3]))
+    console.print! ("text.upper:    " + to_string (text.upper "aliased"))
 
     // selective imports, used unqualified
-    console.print! "map:           " (map (fn x -> x * 2) [1, 2, 3])
-    console.print! "filter:        " (filter (fn x -> x > 1) [1, 2, 3])
-    console.print! "renamed total: " (total #[1, 2, 3])
+    console.print! ("map:           " + to_string (map (fn x -> x * 2) [1, 2, 3]))
+    console.print! ("filter:        " + to_string (filter (fn x -> x > 1) [1, 2, 3]))
+    console.print! ("renamed total: " + to_string (total #[1, 2, 3]))
 
     // the whole package, reached through its namespace
-    console.print! "std.seq.join:  " (std.array.join ", " #[1, 2, 3])
-    console.print! "std.str.trim:  " (std.str.trim "  x  ")
-    console.print! "std.list.sum:  " (std.list.sum [1, 2, 3])
+    console.print! ("std.seq.join:  " + to_string (std.array.join ", " #[1, 2, 3]))
+    console.print! ("std.str.trim:  " + to_string (std.str.trim "  x  "))
+    console.print! ("std.list.sum:  " + to_string (std.list.sum [1, 2, 3]))
 
     // submodules
-    console.print! "geometry:      " (geometry.circle_area 2.0)
-    console.print! "  square:      " (geometry.square_area 4)
-    console.print! "  describe:    " (geometry.describe "radius" 2.0)
-    console.print! "  nested:      " (geometry.solid.cube_volume 3)
-    console.print! "  nested:      " (geometry.solid.sphere_volume 1.0)
-    console.print! "validate:      " (validate.positive 5) " " (validate.in_range 1 10 7)
+    console.print! ("geometry:      " + to_string (geometry.circle_area 2.0))
+    console.print! ("  square:      " + to_string (geometry.square_area 4))
+    console.print! ("  describe:    " + to_string (geometry.describe "radius" 2.0))
+    console.print! ("  nested:      " + to_string (geometry.solid.cube_volume 3))
+    console.print! ("  nested:      " + to_string (geometry.solid.sphere_volume 1.0))
+    console.print! ("validate:      " + to_string (validate.positive 5) + " " + to_string (validate.in_range 1 10 7))
 
     // selectively imported from the submodule above
-    console.print! "from submod:   " (circle_area 1.0)
-    console.print! "from submod:   " (describe "count" 3)
+    console.print! ("from submod:   " + to_string (circle_area 1.0))
+    console.print! ("from submod:   " + to_string (describe "count" 3))
 };

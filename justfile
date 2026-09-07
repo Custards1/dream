@@ -7,7 +7,7 @@
 # `just` with no target builds both halves.
 
 set positional-arguments
-install_dir :="~/.dream/bin"
+install_dir :="~/.mindv2"
 build_dir := "build-dream"
 dreamc := "target/debug/dreamc"
 dreamc_release := "target/release/dreamc"
@@ -28,20 +28,34 @@ release:
     cmake -S . -B {{build_dir}} -DCMAKE_BUILD_TYPE=Release
     cmake --build {{build_dir}} -j
 
+
 # The VM, with the JIT if LLVM can be found.
 vm:
     cmake -S . -B {{build_dir}} -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build {{build_dir}} -j
+
 
 # Interpreter only, to check the VM still builds without LLVM.
 vm-no-jit:
     cmake -S . -B build-nojit -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build build-nojit -j
 
+# The build tool, itself a Dream program compiled by dreamc.
+mind:
+    mkdir -p build
+    {{dreamc}} -L mind/std mind/tool/main.dr -o build/mind
+
+# `mind`'s own tests: path handling, manifest reading, dependency specs.
+test-mind: build
+    {{dreamc}} -L mind/std mind/tool/main.dr --test -o /tmp/dream-mind-tests.dream
+    ./{{dream}} /tmp/dream-mind-tests.dream
+
 clean:
     cargo clean
     rm -rf {{build_dir}} build-nojit build-tsan
+    rm build/mind
     find . -name '*.dream' -delete
+
 
 # --- running ----------------------------------------------------------------
 
@@ -74,14 +88,16 @@ jit-ir FILE FN: build
     ./{{dreamc}} {{FILE}} -o /tmp/dream-jit.dream
     ./{{dream}} /tmp/dream-jit.dream --dump-jit {{FN}}
 
-install: release
-    mv {{dreamc_release}} {{install_dir}}
-    mv {{dream}} {{install_dir}}
+install: release mind
+    mv {{dreamc_release}} {{install_dir}}/bin || true
+    mv {{dream}} {{install_dir}}/bin || true
+    mv build/mind {{install_dir}} || true
+
 
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -106,6 +122,11 @@ examples-bless: build
 test-examples-std: build
     ./{{dreamc}} examples/textstats/main.dr --test -L mind -L examples -o /tmp/dream-ex-tests.dream
     ./{{dream}} /tmp/dream-ex-tests.dream
+
+# `dreams`, the self-hosted compiler: the parts of it that exist so far.
+test-dreams: build
+    {{dreamc}} dreams/lexer.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
+    ./{{dream}} /tmp/dream-dreams-tests.dream
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build

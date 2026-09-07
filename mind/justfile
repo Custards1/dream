@@ -5,7 +5,9 @@ output := "mind.dream"
 clean:
    rm -f $(output) 
 build:
-    dreamc -L {{std}} -o mind {{src}}
+    dreamc -L {{std}} -o {{output}} {{src}}
+selfbuild:
+    dream mind.dream
 run:
     dream $(output)    
 rebuild: build run

@@ -1,5 +1,8 @@
 #include "scheduler.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "io.hpp"
 
 #include <chrono>
@@ -61,6 +64,12 @@ std::shared_ptr<Process> Scheduler::take_local(unsigned index) {
     if (w.queue.empty()) return nullptr;
     auto p = std::move(w.queue.front());
     w.queue.pop_front();
+    // Counted as runnable while still holding the queue lock. A live process
+    // must be findable at every instant -- in a queue, in `runnable_`, or
+    // parked -- and counting it after the pop instead would leave a moment
+    // when it is in none of those, which the deadlock check reads as "nothing
+    // left to run".
+    runnable_.fetch_add(1, std::memory_order_relaxed);
     return p;
 }
 
@@ -74,6 +83,7 @@ std::shared_ptr<Process> Scheduler::steal(unsigned thief) {
         if (w.queue.empty()) continue;
         auto p = std::move(w.queue.back());
         w.queue.pop_back();
+        runnable_.fetch_add(1, std::memory_order_relaxed);  // see `take_local`
         return p;
     }
     return nullptr;
@@ -119,7 +129,7 @@ void Scheduler::worker_loop(unsigned index) {
             continue;
         }
 
-        runnable_.fetch_add(1, std::memory_order_relaxed);
+        // Already counted by whichever of `take_local` or `steal` produced it.
         run_slice(p);
         runnable_.fetch_sub(1, std::memory_order_relaxed);
     }

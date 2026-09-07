@@ -19,14 +19,14 @@ let main! = {
     let e = spawn! $(echo! ());
     send! e :ping
     send! e me
-    console.print! "echoed:    " (recv! ())
+    console.print! ("echoed:    " + to_string (recv! ()))
 
     // A process's result is delivered to whoever joins it.
     let w = spawn! $( 6 * 7 );
-    console.print! "joined:    " (join! w)
+    console.print! ("joined:    " + to_string (join! w))
 
     // Failure in one process does not take down the one that joins it.
     let bad = spawn! $( 1 / 0 );
     let caught = try! { join! bad } catch err { :handled };
-    console.print! "join fail: " caught
+    console.print! ("join fail: " + to_string caught)
 }

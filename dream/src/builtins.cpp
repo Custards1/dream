@@ -958,22 +958,31 @@ ModuleDef make_vm_module() {
 }
 
 ModuleDef make_console_module() {
-    // Every member is variadic: it prints each argument in turn, with no
-    // separator, and `print!`/`line!`/`error!` add a newline at the end.
+    // One argument each. `print!`, `line!` and `error!` add a newline;
+    // `write!` does not.
     //
-    // Variadic rather than fixed-arity because a fixed arity here was always
-    // arbitrary. `print!` used to take exactly two arguments -- a label and a
-    // value -- purely so that the pipe would read correctly, since
-    // `value |> console.print! "label "` lowers to `print! "label " value`.
-    // That still works, because the pipe folds into a single application; but
-    // `print! v` and `print! "x = " x " y = " y` now work too, and nothing has
-    // to count arguments to say what it means.
+    // These used to be variadic, printing every argument in turn. It read
+    // well -- `print! "x = " x " y = " y` -- but a variadic function can never
+    // be passed too many arguments, so nothing was ever an error and a stray
+    // value on the end of a line was silently printed instead of being the
+    // thing the line evaluated to:
+    //
+    //     if n < 0 { 1 } else { console.print! total 0 }   // prints "...0"
+    //
+    // That block means to answer `0`. Variadic makes it print `0` and answer
+    // unit, and no arity check can ever catch it. With one argument the same
+    // line is `(print! total) 0`, which raises `:not_a_function` -- loudly,
+    // where the mistake is.
+    //
+    // Several values are joined by the caller, which is what `+` is for.
+    // `to_string` is the identity on a string, so it is always safe to reach
+    // for: `print! ("x = " + to_string x)`.
     return ModuleDef{"std.console",
                      {
-                         {"print!", NATIVE_VARIADIC, 0, con_print},
-                         {"write!", NATIVE_VARIADIC, 0, con_write},
-                         {"line!", NATIVE_VARIADIC, 0, con_line},
-                         {"error!", NATIVE_VARIADIC, 0, con_error},
+                         {"print!", 1, 0b1, con_print},
+                         {"write!", 1, 0b1, con_write},
+                         {"line!", 1, 0b1, con_line},
+                         {"error!", 1, 0b1, con_error},
                      }};
 }
 
@@ -1086,6 +1095,39 @@ NativeResult core_str_of_chars(Process& p, Value, Value* args, uint32_t) {
         if (!force_whnf(p, c->head, &head)) return NativeResult::raise(p.result);
         if (!is_char(head)) return type_fail(p, "str_of_chars needs a list of chars");
         utf8_encode(uint32_t(imm_payload(head)), &out);
+        cur = c->tail;
+    }
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+/// The inverse of `str_byte`: a list of byte values becomes a string holding
+/// exactly those bytes.
+///
+/// `str_of_chars` cannot do this. It takes Unicode scalars and UTF-8-encodes
+/// them, so byte 0x80 comes back out as the two bytes 0xC2 0x80 -- which is
+/// right for text and wrong for everything else. A string is a length and a
+/// byte buffer, `io.write!` puts those bytes out untouched, and `str_byte`
+/// reads them back, so this is the one piece missing before a Dream program
+/// can produce binary output rather than only consume it.
+NativeResult core_str_of_bytes(Process& p, Value, Value* args, uint32_t) {
+    std::string out;
+    Value cur = args[0];
+    for (;;) {
+        Value w;
+        if (!force_whnf(p, cur, &w)) return NativeResult::raise(p.result);
+        if (is_nil(w)) break;
+        if (!is_obj(w, ObjType::Cons)) return type_fail(p, "str_of_bytes needs a list of integers");
+        auto* c = static_cast<ConsObj*>(as_obj(w));
+        Value head;
+        if (!force_whnf(p, c->head, &head)) return NativeResult::raise(p.result);
+        if (!is_fixnum(head)) return type_fail(p, "str_of_bytes needs a list of integers");
+        int64_t b = fixnum_value(head);
+        if (b < 0 || b > 255) {
+            return NativeResult::raise(raise_error(
+                p, well_known(p.runtime()).type_error,
+                "str_of_bytes needs bytes in 0..255, got " + std::to_string(b)));
+        }
+        out.push_back(char(uint8_t(b)));
         cur = c->tail;
     }
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
@@ -1450,6 +1492,7 @@ ModuleDef make_core_module() {
             {"str_len", 1, 0b1, core_str_len},
             {"str_chars", 1, 0b1, core_str_chars},
             {"str_of_chars", 1, 0b1, core_str_of_chars},
+            {"str_of_bytes", 1, 0b1, core_str_of_bytes},
             {"str_slice", 3, 0b111, core_str_slice},
             {"str_find", 3, 0b111, core_str_find},
             {"str_byte", 2, 0b11, core_str_byte},

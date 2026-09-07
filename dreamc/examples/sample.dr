@@ -2,8 +2,8 @@ import std.console;
 
 
 let hello_world! x result = {
-    x |> console.print! "Hi, "
-    result |> console.print! "The result is " 
+    console.print! ("Hi, " + to_string (x))
+    console.print! ("The result is " + to_string (result))
 }
 
 let rec fac(n) = if n <= 1 { 1 } else { fac n-1 };

@@ -21,12 +21,12 @@ let main! = {
     let words = tokenize.words sample;
     let counts = counter.tally words;
 
-    console.print! "words:      " (list.length words)
-    console.print! "distinct:   " (counter.distinct counts)
-    console.print! "total:      " (counter.total counts)
-    console.print! "count 'the':" (counter.count_of counts "the")
-    console.print! "count 'fox':" (counter.count_of counts "fox")
-    console.print! "first five: " (list.take 5 words)
+    console.print! ("words:      " + to_string (list.length words))
+    console.print! ("distinct:   " + to_string (counter.distinct counts))
+    console.print! ("total:      " + to_string (counter.total counts))
+    console.print! ("count 'the':" + to_string (counter.count_of counts "the"))
+    console.print! ("count 'fox':" + to_string (counter.count_of counts "fox"))
+    console.print! ("first five: " + to_string (list.take 5 words))
     console.print! ""
 
     let top5 = counter.top 5 counts;
@@ -36,7 +36,7 @@ let main! = {
     console.print! ""
 
     let lengths = list.map (fn w -> str.length w) words;
-    console.print! "lengths:    " (stats.describe_lengths lengths)
-    console.print! "longest:    " (stats.longest words)
-    console.print! "significant:" (list.take 4 (tokenize.significant 4 sample))
+    console.print! ("lengths:    " + to_string (stats.describe_lengths lengths))
+    console.print! ("longest:    " + to_string (stats.longest words))
+    console.print! ("significant:" + to_string (list.take 4 (tokenize.significant 4 sample)))
 };

@@ -52,7 +52,7 @@ A git dependency must be pinned with `tag`, `rev` or `branch`.
 ";
 
 let fail! message = {
-    console.error! "mind: " message
+    console.error! ("mind: " + to_string message)
     os.exit! 1
 };
 
@@ -74,8 +74,8 @@ let cmd_new! name = {
     util.write_file! (util.join name "main.dr")
         ("import std.console;\n\nlet main! = {\n    console.print! \"Hello from " + name + "\"\n};\n")
     util.write_file! (util.join name ".gitignore") "target/\n*.dream\n"
-    console.print! "created " name
-    console.print! "  cd " name " && mind run"
+    console.print! ("created " + to_string name)
+    console.print! ("  cd " + to_string name + " && mind run")
 };
 
 let report_build! m extra label = {
@@ -85,7 +85,7 @@ let report_build! m extra label = {
             os.exit! 1
         },
         [:ok, _] => {
-            console.print! label " " (manifest.name m) " v" (manifest.version m)
+            console.print! (to_string label + " " + to_string (manifest.name m) + " v" + to_string (manifest.version m))
             :ok
         },
     }
@@ -94,7 +94,7 @@ let report_build! m extra label = {
 let cmd_build! () = {
     let m = project! ();
     report_build! m [] "compiled"
-    console.print! "  " (build.image m)
+    console.print! ("  " + to_string (build.image m))
 };
 
 let cmd_check! () = {
@@ -132,13 +132,13 @@ let cmd_test! () = {
 
 let cmd_deps! () = {
     let m = project! ();
-    console.print! (manifest.name m) " v" (manifest.version m)
+    console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
     let ds = manifest.dependencies m;
     if list.is_empty ds { console.print! "  (no dependencies)" }
     let show! d = {
         match fetch.resolve! (manifest.root m) d {
-            [:ok, dir] => console.print! "  " (manifest.dep_name d) " -> " dir,
-            [:error, why] => console.print! "  " (manifest.dep_name d) " -> unresolved: " why,
+            [:ok, dir] => console.print! ("  " + to_string (manifest.dep_name d) + " -> " + to_string dir),
+            [:error, why] => console.print! ("  " + to_string (manifest.dep_name d) + " -> unresolved: " + to_string why),
         }
     };
     strict! (list.map show! ds)
@@ -151,7 +151,7 @@ let cmd_fetch! () = {
         [:error, why] => fail! why,
         [:ok, paths] => {
             let dirs = list.filter (fn p -> p != "-L") paths;
-            console.print! "fetched " (list.length dirs - 1) " dependencies"
+            console.print! ("fetched " + to_string (list.length dirs - 1) + " dependencies")
         },
     }
 };
@@ -161,7 +161,7 @@ let cmd_clean! () = {
     let dir = build.target_dir m;
     if io.exists! dir {
         os.exec! "rm" ["-rf", dir]
-        console.print! "removed " dir
+        console.print! ("removed " + to_string dir)
     } else {
         console.print! "nothing to clean"
     }

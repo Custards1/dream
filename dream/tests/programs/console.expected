@@ -1,8 +1,10 @@
 one
 two:   42
-many:  1 2 3 [4, 5]
-forced: 120 2 :atom c
+many:  1 2 [4, 5]
+forced: 120 :atom c
 split: abc
-piped: 720
+720
 line:  true
 indirect: 7
+a
+<error :not_a_function unit is not a function>

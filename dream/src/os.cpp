@@ -197,8 +197,21 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     auto finish = [&] {
         job->done.store(true, std::memory_order_release);
         if (sched) {
-            sched->note_io_wait(false);
+            // Wake first, then stop counting this process as an IO waiter.
+            //
+            // The order matters. `io_waiters` is what tells the deadlock check
+            // that a parked process is owed a wake-up from outside the
+            // scheduler. Clearing it first opens a window in which the process
+            // is neither counted as waiting nor yet runnable, and an idle
+            // worker looking in that window sees no runnable process, an empty
+            // queue and no IO waiters -- and declares a deadlock that is not
+            // one. With one worker the check runs every 500us and hit that
+            // window every time.
+            //
+            // This way round the count is merely released a moment late, which
+            // can only delay a real deadlock report, never invent one.
             sched->wake(pid);
+            sched->note_io_wait(false);
         }
     };
 

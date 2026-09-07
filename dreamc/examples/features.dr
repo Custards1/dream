@@ -39,7 +39,7 @@ let rec even n = if n == 0 { true } else { odd (n - 1) }
 let rec odd n  = if n == 0 { false } else { even (n - 1) }
 
 let report! label value = {
-    value |> console.print! label
+    console.print! (to_string label + to_string (value))
 };
 
 let main! = {

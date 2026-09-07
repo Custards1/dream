@@ -48,25 +48,25 @@ import std.array;
 import std.str;
 
 let main! = {
-    console.print! "circle:      " (circle.describe 2.0)
-    console.print! "square:      " (square.describe 4)
-    console.print! "default name:" (blob.describe 7)
-    console.print! "shared code: " (circle.bigger_than 2.0 10.0) " " (square.bigger_than 1 10)
+    console.print! ("circle:      " + to_string (circle.describe 2.0))
+    console.print! ("square:      " + to_string (square.describe 4))
+    console.print! ("default name:" + to_string (blob.describe 7))
+    console.print! ("shared code: " + to_string (circle.bigger_than 2.0 10.0) + " " + to_string (square.bigger_than 1 10))
 
     // The same generic `describe` produced all three lines above, specialized
     // three ways.
-    console.print! "all:         " (list.map (fn f -> f 2) [square.area, blob.area])
+    console.print! ("all:         " + to_string (list.map (fn f -> f 2) [square.area, blob.area]))
 
     // std.seq, through its two instances in the standard library.
-    console.print! "array.sum:   " (array.sum #[1, 2, 3, 4])
-    console.print! "array.any:   " (array.any (fn x -> x > 3) #[1, 2, 3, 4])
-    console.print! "array.join:  " (array.join " | " #[1, 2, 3])
-    console.print! "array.descr: " (array.describe #[1, 2, 3])
-    console.print! "str.count:   " (str.count (fn c -> c == 'o') "foo boo")
-    console.print! "str.minimum: " (str.minimum "dream")
-    console.print! "str.descr:   " (str.describe "dream")
+    console.print! ("array.sum:   " + to_string (array.sum #[1, 2, 3, 4]))
+    console.print! ("array.any:   " + to_string (array.any (fn x -> x > 3) #[1, 2, 3, 4]))
+    console.print! ("array.join:  " + to_string (array.join " | " #[1, 2, 3]))
+    console.print! ("array.descr: " + to_string (array.describe #[1, 2, 3]))
+    console.print! ("str.count:   " + to_string (str.count (fn c -> c == 'o') "foo boo"))
+    console.print! ("str.minimum: " + to_string (str.minimum "dream"))
+    console.print! ("str.descr:   " + to_string (str.describe "dream"))
 
     // `describe` is one function in `std.seq`, reading `name` from whichever
     // module it was specialized into.
-    console.print! "same code:   " (array.describe #[1]) " vs " (str.describe "a")
+    console.print! ("same code:   " + to_string (array.describe #[1]) + " vs " + to_string (str.describe "a"))
 };

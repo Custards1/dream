@@ -916,11 +916,36 @@ void step_return(Process& p) {
 
         case ContKind::BinFinish: {
             Op op = Op(c.a);
+            // Held across the call: comparing forces, and `force_whnf` leaves
+            // its own value in `p.result` on the way out.
+            Value rhs = p.result;
             Value out;
             bool ok = (op == Op::Eq || op == Op::Ne || op == Op::Lt || op == Op::Le ||
                        op == Op::Gt || op == Op::Ge)
-                          ? compare(p, op, c.v1, p.result, &out)
-                          : arith(p, op, c.v1, p.result, &out);
+                          ? compare(p, op, c.v1, rhs, &out)
+                          : arith(p, op, c.v1, rhs, &out);
+
+            // A nested force inside the operator hit a blocking operation and
+            // gave up (see `force_whnf`) -- comparing two lists whose elements
+            // are still `join!`s, say. Both operands are ordinary values and
+            // both operators force, so this is reachable without any effect
+            // being written at the comparison itself.
+            //
+            // The answer is not "this failed" but "not yet", so park and redo
+            // the whole operation when the scheduler wakes us. Forcing is
+            // memoised, so the retry pays only for what had not been forced
+            // yet. This is the same handshake `apply_native` performs for a
+            // native whose nested force gave up; the operators need their own
+            // because they are the machine rather than a native call.
+            //
+            // Without it `ok` is false with a `p.result` that was never an
+            // error, and the process dies with an error that has no kind and
+            // no message.
+            if (p.park_requested) {
+                push_cont(p, ContKind::BinFinish, c.a, 0, 0, c.v1);
+                p.result = rhs;  // the mode is already Return
+                return;
+            }
             if (ok) ret(p, out); else do_raise(p, out);
             return;
         }
