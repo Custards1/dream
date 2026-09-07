@@ -786,6 +786,19 @@ let pop_scope r =
         core.map_put (core.map_put fr :scopes (list.tail (scopes fr))) :next_slot freed
     }) r;
 
+/// Keep a slot out of circulation for the rest of the frame, after the scope
+/// that named it has gone.
+///
+/// Almost every binding is done with when its scope ends, and the slot goes
+/// back. A `catch` binder is the exception -- see the `:try` case below.
+let reserve_slot slot r =
+    update_frame (fn fr ->
+        core.map_put
+            (core.map_put fr :next_slot
+                (if slot + 1 > next_slot fr { slot + 1 } else { next_slot fr }))
+            :max_slots
+                (if slot + 1 > max_slots fr { slot + 1 } else { max_slots fr })) r;
+
 /// Bind one name in the innermost scope, giving it a slot. `_` is a wildcard:
 /// it takes a slot, because something has to be stored there, but binds no name,
 /// so nothing can reach it.
@@ -1142,11 +1155,21 @@ let rec check_expr c e r =
                    (end_func fi (check_expr c x (list.head started)))
         },
 
+        // The binder goes out of scope with the handler, but its *slot* stays
+        // reserved for the rest of the frame.
+        //
+        // A `try` is an expression, so it can be forced long after the
+        // statement that built it -- and when it is, the VM writes the raised
+        // value into this slot. Letting a later binding reuse it means that
+        // binding is overwritten by an error from a `try` it has nothing to do
+        // with, which is what `let x = try! .. catch e { .. };` did: `x` and
+        // `e` shared a slot, so `x` came out holding the error.
         [:try, body, binder, handler, span] => {
             let r1 = check_expr c body r;
             let scoped = push_scope r1;
             let bound = bind_one (ctx_mi c) (ctx_source c) binder span scoped;
-            pop_scope (check_expr c handler (list.head bound))
+            let walked = pop_scope (check_expr c handler (list.head bound));
+            reserve_slot (list.nth 1 bound) walked
         },
 
         // A lambda is not a declaration, so it cannot declare itself impure: it
@@ -1518,37 +1541,37 @@ when test {
         test.case "a parameter resolves to a slot in its own frame"
             $( test.eq! [:local, 0]
                         { let src = "let f x = x;";
-                          let got = at (resolved! src) 0 (str.find "x;" src);
+                          let got = at (resolved! src) 0 0 (str.find "x;" src);
                           [list.nth 0 got, list.nth 1 got] } ),
         test.case "a local records where it was bound"
             $( test.eq! true
                         { let src = "let f x = x;";
-                          let got = at (resolved! src) 0 (str.find "x;" src);
+                          let got = at (resolved! src) 0 0 (str.find "x;" src);
                           ast.span_start (list.nth 2 got) == str.find "x =" src } ),
         test.case "a second local gets the next slot"
             $( test.eq! [[:local, 0], [:local, 1]]
                         { let src = "let f a b = a + b;";
                           let r = resolved! src;
-                          list.map (fn o -> { let g = at r 0 o; [list.nth 0 g, list.nth 1 g] })
+                          list.map (fn o -> { let g = at r 0 0 o; [list.nth 0 g, list.nth 1 g] })
                                    [str.find "a +" src, str.find "b;" src] } ),
         test.case "a global resolves to its module and its index"
             $( test.eq! [:global, 0, "a", 0]
                         { let src = "let a = 1;\nlet f = a;";
-                          at (resolved! src) 0 (str.find "a;" src) } ),
+                          at (resolved! src) 0 0 (str.find "a;" src) } ),
         test.case "a builtin resolves as a builtin"
             $( test.eq! [:builtin, "len"]
                         { let src = "let f xs = len xs;";
-                          at (resolved! src) 0 (str.find "len" src) } ),
+                          at (resolved! src) 0 0 (str.find "len" src) } ),
         test.case "a host module's member is recorded with the module it came from"
             $( test.eq! [:member, [:native, "std.console", 0], "print!", ()]
                         { let src = "import std.console;\nlet f! x = console.print! x;";
-                          at (resolved! src) 0 (str.find "console.print!" src) } ),
+                          at (resolved! src) 0 0 (str.find "console.print!" src) } ),
 
         // --- captures ---
         test.case "a name from the enclosing function becomes a capture"
             $( test.eq! [:capture, 0]
                         { let src = "let f x = fn y -> x;";
-                          let g = at (resolved! src) 0 (str.find "x;" src);
+                          let g = at (resolved! src) 0 0 (str.find "x;" src);
                           [list.nth 0 g, list.nth 1 g] } ),
         test.case "the lambda records what it captures and where from"
             $( test.eq! [[:local, 0]]
@@ -1579,7 +1602,7 @@ when test {
         test.case "a lambda is recorded at the span that made it"
             $( test.eq! [:closure, 1]
                         { let src = "let f = fn x -> x;";
-                          at (resolved! src) 0 (str.find "fn x" src) } ),
+                          at (resolved! src) 0 0 (str.find "fn x" src) } ),
 
         // --- what a language server would ask ---
         test.case "a module's globals are listed in declaration order"
@@ -1590,12 +1613,12 @@ when test {
             $( test.eq! [[:global, 0, "a", 0], [:global, 0, "b", 1]]
                         { let src = "let a = 1;\nlet b = a;\nlet f = b;";
                           let r = resolved! src;
-                          [at r 0 (str.find "a;\nlet f" src), at r 0 (str.find "b;" src)] } ),
+                          [at r 0 0 (str.find "a;\nlet f" src), at r 0 0 (str.find "b;" src)] } ),
         test.case "an imported host module takes a global of its own"
             $( test.eq! [:global, 0, "console", 0]
                         { let src = "import std.console;\nlet f = console;";
                           // The use, not the mention inside the import.
-                          at (resolved! src) 0 (str.find "f = console" src + 4) } ),
+                          at (resolved! src) 0 0 (str.find "f = console" src + 4) } ),
         test.case "a definition can be found by name"
             $( test.true! { let src = "let a = 1;\nlet f = a;";
                             match definition (resolved! src) 0 "a" {
