@@ -328,18 +328,21 @@ dream_result dream_value_map_next(dream_value v, uint32_t* cursor, dream_value* 
                                 dream_value* value) {
     v = resolve(v);
     if (!is_obj(v, ObjType::Map) || !cursor) return DREAM_BAD;
-    auto* m = static_cast<MapObj*>(as_obj(v));
-    // The cursor walks slots, not entries, because the table is open addressed
-    // and its empty slots are interspersed.
-    for (uint32_t i = *cursor; i < m->cap; ++i) {
-        if (m->entries()[i * 2] == NIL_SLOT) continue;
-        if (key) *key = m->entries()[i * 2];
-        if (value) *value = m->entries()[i * 2 + 1];
-        *cursor = i + 1;
-        return DREAM_OK;
+    // The cursor counts entries. A trie has no flat slot array to index, and a
+    // path does not fit in the 32 bits this interface hands out, so each step
+    // walks to the nth entry. Maps that cross the C API are host-facing --
+    // configuration and results -- and small enough that this costs nothing
+    // worth a wider interface.
+    std::vector<std::pair<Value, Value>> entries;
+    map_collect(v, entries);
+    if (*cursor >= entries.size()) {
+        *cursor = uint32_t(entries.size());
+        return DREAM_BAD;
     }
-    *cursor = m->cap;
-    return DREAM_BAD;
+    if (key) *key = entries[*cursor].first;
+    if (value) *value = entries[*cursor].second;
+    *cursor += 1;
+    return DREAM_OK;
 }
 
 dream_value dream_value_error_kind(dream_value v) {
@@ -378,19 +381,15 @@ dream_result dream_array_set(dream_value array, uint32_t index, dream_value v) {
     return DREAM_OK;
 }
 
-dream_value dream_make_map(dream_process* p, uint32_t capacity_hint) {
-    uint32_t cap = 8;
-    while (cap < capacity_hint * 2) cap *= 2;
-    return reinterpret_cast<Process*>(p)->heap().make_map(cap);
+dream_value dream_make_map(dream_process* p, uint32_t) {
+    return reinterpret_cast<Process*>(p)->heap().make_map(0);
 }
 
 dream_value dream_map_insert(dream_process* p, dream_value map, dream_value key, dream_value v) {
     auto* proc = reinterpret_cast<Process*>(p);
-    map = resolve(map);
-    map_insert(*proc, map, key, v);
-    // Growing replaces the object and leaves an indirection, so hand back the
-    // handle the caller should keep.
-    return resolve(map);
+    // A put shares rather than mutates, so the answer is a different map and
+    // the caller has to keep it -- which is what this has always returned.
+    return map_insert(*proc, resolve(map), key, v);
 }
 
 dream_result dream_map_get(dream_process* p, dream_value map, dream_value key, dream_value* out) {

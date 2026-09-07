@@ -1,0 +1,267 @@
+// Command lines: one description of an option, read three ways.
+//
+// Every tool here grew the same three lists. One `match` pairs a spelling with
+// the field it sets, a second pairs a spelling with a line of help, and a third
+// -- usually implicit in the shape of the first -- says which spellings take a
+// value. Nothing keeps them in step. An option gains a short form and stops
+// being documented; a flag is documented and never parsed; `-o` at the end of
+// the line reads the next argument that is not there.
+//
+// So an option is described once. `parse!` reads the description, `usage` reads
+// the description, and there is no second place for them to disagree.
+//
+//     let opts = [
+//         cli.flag  "q" "quiet"   "print only what was asked for",
+//         cli.value "o" "output"  "PATH" "write the image here",
+//         cli.list  "L" "package-path" "DIR" "a package, or a directory of them",
+//     ];
+//     match cli.parse opts (os.args! ()) {
+//         [:error, why] => ..,
+//         [:ok, c] => cli.flag_set c "quiet",
+//     }
+//
+// A value may be written either way round -- `--output x` or `--output=x`, `-o
+// x` or `-ox` -- and `--` ends the options, so a positional that begins with a
+// dash can still be given.
+import std.core;
+import std.list;
+import std.str;
+
+// --- describing an option ----------------------------------------------------
+
+/// `short` may be `""`, for an option with no one-letter form. `long` is the
+/// name the parsed value is looked up under, so it is the one that must exist.
+let opt short long kind meta help =
+    %{ :short => short, :long => long, :kind => kind, :meta => meta, :help => help };
+
+let short o = core.map_get o :short "";
+let long o  = core.map_get o :long "";
+let kind o  = core.map_get o :kind :flag;
+let meta o  = core.map_get o :meta "";
+let help o  = core.map_get o :help "";
+
+/// Present or absent, and nothing else to say.
+let flag short long help = opt short long :flag "" help;
+
+/// Takes a value. Given twice, the last one wins -- which is what a reader of
+/// a command line expects, and what lets a wrapper script append an override.
+let value short long meta help = opt short long :value meta help;
+
+/// Takes a value and may be given again, collecting them in order. `-L` is the
+/// example: search paths are a list, and the order is part of the meaning.
+let list_of short long meta help = opt short long :list meta help;
+
+/// A heading in the usage message. It parses as nothing.
+let section title = opt "" "" :section "" title;
+
+let is_option o = kind o != :section;
+
+// --- what parsing produced ---------------------------------------------------
+
+let parsed values rest = %{ :values => values, :rest => rest };
+
+let values c = core.map_get c :values (core.map_new ());
+/// The arguments that were not options, in order.
+let rest c = core.map_get c :rest [];
+
+/// The value given for a `value` option, or `default`.
+let get default c name = core.map_get (values c) name default;
+
+/// Whether a `flag` was given.
+let flag_set c name = get false c name == true;
+
+/// Everything collected for a `list` option, in the order it was written.
+let all c name = get [] c name;
+
+// --- parsing -----------------------------------------------------------------
+
+let by_long os name = {
+    let hit = list.filter (fn o -> is_option o && long o == name) os;
+    if list.is_empty hit { () } else { list.head hit }
+};
+
+let by_short os c = {
+    let hit = list.filter (fn o -> is_option o && short o == c) os;
+    if list.is_empty hit { () } else { list.head hit }
+};
+
+/// Record one option's value. A `list` option appends; everything else assigns.
+let record c o v =
+    core.map_put c :values
+        (core.map_put (values c) (long o)
+             (if kind o == :list { list.append (core.map_get (values c) (long o) []) [v] }
+              else { v }));
+
+let add_rest c a = core.map_put c :rest (list.append (rest c) [a]);
+
+let missing o spelling =
+    [:error, spelling + " needs " + (if str.is_empty (meta o) { "a value" } else { meta o })];
+
+/// Everything after `--` is a positional, whatever it looks like.
+let rec take_rest c args =
+    match args {
+        [] => [:ok, c],
+        [a, ..more] => take_rest (add_rest c a) more,
+    };
+
+let rec walk os c args =
+    match args {
+        [] => [:ok, c],
+
+        // The end of the options, not an option itself.
+        ["--", ..more] => take_rest c more,
+
+        [a, ..more] =>
+            if str.starts_with "--" a {
+                // `--name=value` carries its own value; `--name` takes the next
+                // argument, and running out is an error rather than an empty
+                // string, because an empty string is a value someone may mean.
+                let body = str.slice 2 (str.byte_length a - 2) a;
+                let eq = str.find "=" body;
+                let name = if eq < 0 { body } else { str.slice 0 eq body };
+                let inline = if eq < 0 { () }
+                             else { str.slice (eq + 1) (str.byte_length body - eq - 1) body };
+                match by_long os name {
+                    () => [:error, "unknown option --" + name],
+                    o =>
+                        if kind o == :flag {
+                            if inline != () { [:error, "--" + name + " takes no value"] }
+                            else { walk os (record c o true) more }
+                        }
+                        else {
+                            match inline {
+                                () => match more {
+                                    [] => missing o ("--" + name),
+                                    [v, ..rest2] => walk os (record c o v) rest2,
+                                },
+                                v => walk os (record c o v) more,
+                            }
+                        },
+                }
+            }
+            else if str.starts_with "-" a && str.byte_length a > 1 {
+                let name = str.slice 1 1 a;
+                let attached = str.slice 2 (str.byte_length a - 2) a;
+                match by_short os name {
+                    () => [:error, "unknown option -" + name],
+                    o =>
+                        if kind o == :flag {
+                            if not (str.is_empty attached) { [:error, "-" + name + " takes no value"] }
+                            else { walk os (record c o true) more }
+                        }
+                        // `-oPATH` as well as `-o PATH`: the attached form is
+                        // what people write for short options.
+                        else if not (str.is_empty attached) { walk os (record c o attached) more }
+                        else {
+                            match more {
+                                [] => missing o ("-" + name),
+                                [v, ..rest2] => walk os (record c o v) rest2,
+                            }
+                        },
+                }
+            }
+            else { walk os (add_rest c a) more },
+    };
+
+/// `[:ok, parsed]`, or `[:error, message]` naming the option at fault.
+///
+/// A bare `-` is a positional: it means standard input to most programs, and
+/// it is never an option.
+let parse os args = walk os (parsed (core.map_new ()) []) args;
+
+// --- the usage message -------------------------------------------------------
+
+let rec pad_to n s = if str.byte_length s >= n { s } else { pad_to n (s + " ") };
+
+/// How an option is written, as the help should show it: both spellings when
+/// there are two, and the value's name when it takes one.
+let spelling o = {
+    let names = if str.is_empty (short o) { "    --" + long o }
+                else { "-" + short o + ", --" + long o };
+    if kind o == :flag { names } else { names + " " + meta o }
+};
+
+let line o =
+    if kind o == :section { "\n" + help o + ":" }
+    else { "  " + pad_to 26 (spelling o) + help o };
+
+/// The options, one per line, with a heading wherever a `section` was put.
+let options_help os = str.join_str "\n" (list.map line os);
+
+/// A whole usage message: what the program is, how it is called, its options.
+let usage program summary calling os =
+    program + " -- " + summary + "\n\nusage: " + calling + "\n" + options_help os + "\n";
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let specs = [
+        flag "q" "quiet" "say less",
+        value "o" "output" "PATH" "write here",
+        list_of "L" "package-path" "DIR" "a package root",
+        flag "" "version" "print the version",
+    ];
+
+    let ok args = match parse specs args { [:ok, c] => c, _ => () };
+    let why args = match parse specs args { [:error, m] => m, _ => "" };
+
+    let tests = [
+        // --- flags ---
+        test.case "a long flag is set"
+            $( test.true! (flag_set (ok ["--quiet"]) "quiet") ),
+        test.case "a short flag is set"
+            $( test.true! (flag_set (ok ["-q"]) "quiet") ),
+        test.case "an absent flag is not set"
+            $( test.false! (flag_set (ok []) "quiet") ),
+        test.case "an option with no short form still parses long"
+            $( test.true! (flag_set (ok ["--version"]) "version") ),
+        test.case "a flag given a value is refused"
+            $( test.eq! "--quiet takes no value" (why ["--quiet=1"]) ),
+
+        // --- values, both ways round ---
+        test.case "a value follows its option"
+            $( test.eq! "a.dream" (get () (ok ["-o", "a.dream"]) "output") ),
+        test.case "a value may be attached to the long form"
+            $( test.eq! "a.dream" (get () (ok ["--output=a.dream"]) "output") ),
+        test.case "a value may be attached to the short form"
+            $( test.eq! "a.dream" (get () (ok ["-oa.dream"]) "output") ),
+        test.case "the last value wins"
+            $( test.eq! "b" (get () (ok ["-o", "a", "-o", "b"]) "output") ),
+        test.case "an empty value is a value, not a mistake"
+            $( test.eq! "" (get () (ok ["--output="]) "output") ),
+
+        // --- lists keep their order ---
+        test.case "a list option collects"
+            $( test.eq! ["a", "b"] (all (ok ["-L", "a", "-L", "b"]) "package-path") ),
+        test.case "a list option is empty when never given"
+            $( test.eq! [] (all (ok []) "package-path") ),
+
+        // --- positionals ---
+        test.case "positionals keep their order"
+            $( test.eq! ["x", "y"] (rest (ok ["x", "-q", "y"])) ),
+        test.case "`--` ends the options"
+            $( test.eq! ["-q", "--output"] (rest (ok ["--", "-q", "--output"])) ),
+        test.case "a bare dash is a positional"
+            $( test.eq! ["-"] (rest (ok ["-"])) ),
+
+        // --- what is refused ---
+        test.case "an unknown long option is named"
+            $( test.eq! "unknown option --nope" (why ["--nope"]) ),
+        test.case "an unknown short option is named"
+            $( test.eq! "unknown option -z" (why ["-z"]) ),
+        test.case "an option that runs out of line says what it wanted"
+            $( test.eq! "-o needs PATH" (why ["-o"]) ),
+        test.case "a long option that runs out of line says so too"
+            $( test.eq! "--output needs PATH" (why ["--output"]) ),
+
+        // --- the usage message is the same description ---
+        test.case "usage shows both spellings and the value's name"
+            $( test.true! (str.contains_str "-o, --output PATH" (options_help specs)) ),
+        test.case "usage indents an option with no short form to line up"
+            $( test.true! (str.contains_str "    --version" (options_help specs)) ),
+        test.case "a section becomes a heading"
+            $( test.true! (str.contains_str "\nwhere to look:" (options_help [section "where to look"])) ),
+    ];
+}

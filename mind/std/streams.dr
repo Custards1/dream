@@ -1,0 +1,12 @@
+import std.io;
+import std.str;
+/// A short write is not an error, so writing means looping until it is all out.
+let rec write_all! handle text = {
+    let n = str.byte_length text;
+    if n == 0 { :done }
+    else {
+        let wrote = io.write! handle text;
+        if wrote >= n { :done } else { write_all! handle (str.slice wrote (n - wrote) text) }
+    }
+};
+

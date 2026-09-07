@@ -9,6 +9,8 @@ const char* obj_type_name(ObjType t) {
         case ObjType::Cons: return "list";
         case ObjType::Array: return "array";
         case ObjType::Map: return "map";
+        // Never user-visible: a leaf only ever hangs off a branch.
+        case ObjType::MapLeaf: return "map entry";
         case ObjType::Closure: return "function";
         case ObjType::Thunk: return "thunk";
         case ObjType::Blackhole: return "blackhole";
@@ -43,6 +45,7 @@ dream_type surface_type(Value v) {
         case ObjType::Cons: return DREAM_TYPE_LIST;
         case ObjType::Array: return DREAM_TYPE_ARRAY;
         case ObjType::Map: return DREAM_TYPE_MAP;
+        case ObjType::MapLeaf: return DREAM_TYPE_MAP;
         case ObjType::Module: return DREAM_TYPE_MODULE;
         case ObjType::ErrorBox: return DREAM_TYPE_ERROR;
         case ObjType::Pid: return DREAM_TYPE_PROCESS;

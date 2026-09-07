@@ -1,0 +1,235 @@
+// lucid -- a language server for Dream.
+//
+// A lucid dream is one you know you are inside of. This is the compiler, aware
+// of the program while you are still writing it.
+//
+// It is a separate tool rather than a mode of `dreams` or a command of `mind`,
+// and that costs nothing: Dream compiles whole programs, so importing the
+// compiler is importing a library. `lucid` links `dreams` in and calls its
+// resolver directly -- no subprocess per keystroke, no parsing the compiler's
+// own output back out of a pipe, and every table the compiler built is
+// available as a value rather than as text.
+//
+// What it answers, it answers out of those tables: diagnostics from the front
+// end, go-to-definition and hover from the resolution table, and the outline
+// from the list of what each module declares. None of it is a second
+// implementation of anything, which is the point -- an editor that disagrees
+// with the compiler is worse than an editor that says nothing.
+import std.cli;
+import std.console;
+import std.core;
+import std.io;
+import std.json;
+import std.list;
+import std.os;
+import std.str;
+
+import analysis;
+import rpc;
+
+let version = "0.1.0";
+
+// --- what the server is holding ------------------------------------------------
+
+/// The open documents, and where to look for packages. Everything else is
+/// recomputed per request: an analysis is cheap enough, and one that is kept is
+/// one that can be stale.
+let state docs roots = %{ :docs => docs, :roots => roots };
+
+let docs s  = core.map_get s :docs (core.map_new ());
+let roots s = core.map_get s :roots [];
+
+let with_doc path text s = core.map_put s :docs (core.map_put (docs s) path text);
+let without_doc path s = core.map_put s :docs (core.map_remove (docs s) path);
+let with_roots rs s = core.map_put s :roots rs;
+
+// --- reading the parts of a request ---------------------------------------------
+
+let text_document p = core.map_get p "textDocument" (core.map_new ());
+let uri_of p = core.map_get (text_document p) "uri" "";
+let path_of p = analysis.uri_to_path (uri_of p);
+
+let position_of p = core.map_get p "position" (core.map_new ());
+let line_of p = core.map_get (position_of p) "line" 0;
+let character_of p = core.map_get (position_of p) "character" 0;
+
+// --- diagnostics ------------------------------------------------------------------
+
+/// Publish what the front end said about every file it touched.
+///
+/// An empty list is published for the file being edited even when it has no
+/// problems, because that is how a diagnostic is *withdrawn*: a server that
+/// sends only what is broken leaves the last set of squiggles on screen after
+/// the code is fixed.
+let publish! out a path = {
+    let groups = analysis.diagnostics_by_path a;
+    let mentioned = list.map (fn g -> list.head g) groups;
+    let send! p ds =
+        rpc.write_message! out
+            (rpc.notification "textDocument/publishDiagnostics"
+                 %{ "uri" => analysis.path_to_uri p, "diagnostics" => ds });
+    list.map (fn g -> send! (list.head g) (list.nth 1 g)) groups |> strict!
+    if list.contains path mentioned { () } else { send! path [] }
+};
+
+/// Compile the document and say what is wrong with it.
+let refresh! out s path =
+    match path {
+        "" => (),
+        p => publish! out (analysis.analyse! p (roots s) (docs s)) p,
+    };
+
+// --- the requests -----------------------------------------------------------------
+
+/// What this server can do. Full document sync, because a language whose
+/// compiler is this fast has no reason to reassemble incremental edits.
+let capabilities =
+    %{ "capabilities" => %{ "textDocumentSync" => 1,
+                            "hoverProvider" => true,
+                            "definitionProvider" => true,
+                            "documentSymbolProvider" => true },
+       "serverInfo" => %{ "name" => "lucid", "version" => version } };
+
+/// The workspace root, as a package search path. An editor opens a directory,
+/// and that directory is where this project's packages are.
+let roots_from p = {
+    let folders = core.map_get p "workspaceFolders" ();
+    let from_folders =
+        match folders {
+            () => [],
+            fs => list.map (fn f -> analysis.uri_to_path (core.map_get f "uri" "")) fs,
+        };
+    match core.map_get p "rootUri" () {
+        () => from_folders,
+        u  => list.append from_folders [analysis.uri_to_path u],
+    }
+};
+
+let answer! out id result = rpc.write_message! out (rpc.response id result);
+
+/// One request or notification. Answers `[:go, state]` or `[:exit, code]`.
+let handle! out s m = {
+    let p = rpc.params m;
+    let path = path_of p;
+    match rpc.method m {
+        "initialize" => {
+            answer! out (rpc.id m) capabilities
+            [:go, with_roots (list.append (roots s) (roots_from p)) s]
+        },
+        "initialized" => [:go, s],
+
+        // The client asks to shut down, then tells us to go. Answering the
+        // first and waiting for the second is what the protocol asks for.
+        // Each of these needs its own line. Application is juxtaposition, so
+        // `answer! out id ()  [:go, s]` on one line is a call with four
+        // arguments rather than a call and then a result.
+        "shutdown" => {
+            answer! out (rpc.id m) ()
+            [:go, s]
+        },
+        "exit" => [:exit, 0],
+
+        "textDocument/didOpen" => {
+            let text = core.map_get (text_document p) "text" "";
+            let s2 = with_doc path text s;
+            refresh! out s2 path
+            [:go, s2]
+        },
+        "textDocument/didChange" => {
+            // Full sync: the last change carries the whole document.
+            let changes = core.map_get p "contentChanges" [];
+            let text = match list.reverse changes {
+                           [] => core.map_get (docs s) path "",
+                           [c, .._] => core.map_get c "text" "",
+                       };
+            let s2 = with_doc path text s;
+            refresh! out s2 path
+            [:go, s2]
+        },
+        "textDocument/didSave" => {
+            refresh! out s path
+            [:go, s]
+        },
+        "textDocument/didClose" => {
+            let s2 = without_doc path s;
+            // The file is back to whatever is on disk, and nothing here is
+            // responsible for it any more.
+            rpc.write_message! out
+                (rpc.notification "textDocument/publishDiagnostics"
+                     %{ "uri" => analysis.path_to_uri path, "diagnostics" => [] })
+            [:go, s2]
+        },
+
+        "textDocument/definition" => {
+            let a = analysis.analyse! path (roots s) (docs s);
+            answer! out (rpc.id m) (analysis.definition_at a (line_of p) (character_of p))
+            [:go, s]
+        },
+        "textDocument/hover" => {
+            let a = analysis.analyse! path (roots s) (docs s);
+            answer! out (rpc.id m) (analysis.hover_at a (line_of p) (character_of p))
+            [:go, s]
+        },
+        "textDocument/documentSymbol" => {
+            let a = analysis.analyse! path (roots s) (docs s);
+            answer! out (rpc.id m) (analysis.symbols a)
+            [:go, s]
+        },
+
+        // A request must be answered even when it is not understood, or the
+        // client waits for it forever. A notification must not be.
+        _ => {
+            if rpc.is_request m {
+                rpc.write_message! out
+                    (rpc.error_response (rpc.id m) (0 - 32601)
+                         ("no handler for " + to_string (rpc.method m)))
+            }
+            [:go, s]
+        },
+    }
+};
+
+let rec serve! inh out s =
+    match rpc.read_message! inh {
+        // End of input without `exit`: the client is gone, and so are we.
+        () => 0,
+        m => match handle! out s m {
+                 [:exit, code] => code,
+                 [:go, s2] => serve! inh out s2,
+             },
+    };
+
+// --- the command line --------------------------------------------------------------
+
+let opts = [
+    cli.list_of "L" "package-path" "DIR" "a package, or a directory holding packages",
+    cli.flag "h" "help" "this message",
+    cli.flag "" "version" "print the version",
+];
+
+let usage = cli.usage "lucid" "a language server for Dream"
+                      "lucid [options]   (it speaks LSP on stdin and stdout)" opts;
+
+/// The standard library, wherever this installation keeps it. An editor is not
+/// going to pass `-L` for it, and a project that cannot see `std` reports every
+/// import of it as an error.
+let stdlib_roots! () =
+    match os.env! "MIND_STDLIB" {
+        () => match os.env! "DREAM_PACKAGES" { () => [], p => [p] },
+        p => [p],
+    };
+
+let main! =
+    match cli.parse opts (os.args! ()) {
+        [:error, why] => {
+            console.error! ("lucid: " + to_string why)
+            os.exit! 2
+        },
+        [:ok, c] =>
+            if cli.flag_set c "help" { console.error! usage }
+            else if cli.flag_set c "version" { console.print! ("lucid " + version) }
+            else {
+                let roots = list.append (stdlib_roots! ()) (cli.all c "package-path");
+                os.exit! (serve! (io.stdin! ()) (io.stdout! ()) (state (core.map_new ()) roots))
+            },
+    };

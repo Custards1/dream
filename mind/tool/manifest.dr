@@ -29,6 +29,45 @@ let src m = util.join (root m) (toml.get "." (doc m) "package" "src");
 /// manifest says otherwise.
 let entry m = util.join (src m) (toml.get "main.dr" (doc m) "package" "entry");
 
+// --- `[build]`: how this package is compiled ---------------------------------
+//
+// Everything here has a command-line spelling too, and the command line wins.
+// The manifest is for what is true of the package wherever it is built -- a
+// `when` flag its code reads, a directory of host modules it needs -- and the
+// command line for what is true of one build.
+
+/// A list-valued key, tolerant of the one-item shorthand: `defines = "debug"`
+/// means the same as `defines = ["debug"]`, because a single item written as a
+/// list is the sort of thing only a config file makes you do.
+let build_list m key =
+    match toml.get () (doc m) "build" key {
+        () => [],
+        v => match v { [_, .._] => v, "" => [], one => [one] },
+    };
+
+/// `when` flags this package is always compiled with: `defines = ["fast"]`.
+let defines m = build_list m "defines";
+
+/// Extra directories to search for packages, relative to the manifest.
+let package_paths m = list.map (fn d -> util.join (root m) d) (build_list m "package-paths");
+
+/// Directories to search for loose modules: the compiler's `-I`.
+let includes m = list.map (fn d -> util.join (root m) d) (build_list m "includes");
+
+/// Modules the host registers at run time, so importing them compiles.
+let host_modules m = build_list m "host-modules";
+
+/// Arguments passed to the compiler as written, for whatever this does not
+/// name yet. An escape hatch, and deliberately last on the command line.
+let compiler_flags m = build_list m "flags";
+
+/// Which compiler to run. `()` when the manifest does not say, and the
+/// environment or the command line decides.
+let compiler m = toml.get () (doc m) "build" "compiler";
+
+/// Where the built image goes. `target/<name>.dream` unless the manifest says.
+let output m = toml.get () (doc m) "build" "output";
+
 /// `[[name, spec], ..]`, the spec being the inline table as written.
 let dependencies m = toml.entries (doc m) "dependencies";
 
@@ -100,6 +139,28 @@ when test {
         test.case "version defaults"
             $( test.eq! "0.0.0" (version (of "[package]\nname = \"d\"")) ),
         test.case "version"  $( test.eq! "1.2" (version (of "[package]\nname=\"d\"\nversion=\"1.2\"")) ),
+        // --- [build] ---
+        test.case "defines are read as a list"
+            $( test.eq! ["a", "b"] (defines (of "[build]\ndefines = [\"a\", \"b\"]")) ),
+        test.case "one define may be written without the brackets"
+            $( test.eq! ["a"] (defines (of "[build]\ndefines = \"a\"")) ),
+        test.case "an absent build section defines nothing"
+            $( test.eq! [] (defines (of "[package]\nname = \"d\"")) ),
+        test.case "package paths are relative to the manifest"
+            $( test.eq! ["/p/vendor"]
+                        (package_paths (make "/p" (toml.value (toml.parse
+                            "[build]\npackage-paths = [\"vendor\"]")))) ),
+        test.case "a manifest in the working directory adds no prefix"
+            $( test.eq! ["vendor"] (package_paths (of "[build]\npackage-paths = [\"vendor\"]")) ),
+        test.case "the compiler is unset unless the manifest says"
+            $( test.eq! () (compiler (of "[package]\nname = \"d\"")) ),
+        test.case "the compiler is what the manifest says"
+            $( test.eq! "dreams.dream" (compiler (of "[build]\ncompiler = \"dreams.dream\"")) ),
+        test.case "the output is unset unless the manifest says"
+            $( test.eq! () (output (of "[package]\nname = \"d\"")) ),
+        test.case "flags are passed through as written"
+            $( test.eq! ["-q"] (compiler_flags (of "[build]\nflags = [\"-q\"]")) ),
+
         test.case "src defaults to the manifest's directory"
             $( test.eq! "." (src (of "[package]\nname = \"d\"")) ),
         test.case "entry defaults to main.dr"

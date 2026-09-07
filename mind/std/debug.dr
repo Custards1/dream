@@ -1,0 +1,211 @@
+// Measuring a running program: where the time goes, and where the memory goes.
+//
+// A lazy language is hard to reason about by reading. A thunk built in one
+// place is forced in another, so the line that looks expensive often is not,
+// and the cost lands somewhere with nothing to see. Guessing is unusually
+// unreliable here, which is why this module exists: the answer should come from
+// the running program rather than from a story about it.
+//
+// Three numbers matter, and they answer different questions:
+//
+//   elapsed     how long it took. The one people ask for first, and the one
+//               most affected by whatever else the machine is doing.
+//   allocated   every byte handed out, garbage included. This is the honest
+//               measure of work done, and the one that exposes an accidentally
+//               quadratic algorithm -- it grows with the copying even when the
+//               live set does not.
+//   peak        the largest the program ever actually needed at once. What
+//               decides whether it finishes or runs out of memory.
+//
+// A program that allocates a hundred times its peak is copying; a program whose
+// peak is the problem is holding on to something.
+//
+// Everything here is impure, and deliberately so: a measurement is an
+// observation of the world, and a pure function that secretly looked at a clock
+// would be a lie the compiler could not catch.
+
+import std.console;
+import std.core;
+import std.list;
+import std.str;
+import std.vm;
+
+// --- readable quantities ------------------------------------------------------
+
+/// Nanoseconds as something a person can compare at a glance. Three
+/// significant figures is as much as a wall-clock measurement deserves.
+let show_duration ns =
+    if ns < 1000 { to_string ns + "ns" }
+    else if ns < 1000000 { to_string (ns / 1000) + "." + pad2 ((ns % 1000) / 10) + "us" }
+    else if ns < 1000000000 { to_string (ns / 1000000) + "." + pad2 ((ns % 1000000) / 10000) + "ms" }
+    else { to_string (ns / 1000000000) + "." + pad2 ((ns % 1000000000) / 10000000) + "s" };
+
+let pad2 n = if n < 10 { "0" + to_string n } else { to_string n };
+
+/// Bytes in the units people actually use.
+let show_bytes b =
+    if b < 1024 { to_string b + "B" }
+    else if b < 1048576 { to_string (b / 1024) + "." + pad2 ((b % 1024) * 100 / 1024) + "KB" }
+    else if b < 1073741824 { to_string (b / 1048576) + "." + pad2 ((b % 1048576) * 100 / 1048576) + "MB" }
+    else { to_string (b / 1073741824) + "." + pad2 ((b % 1073741824) * 100 / 1073741824) + "GB" };
+
+/// A count with thousands separated, because six digits in a row are unreadable.
+let show_count n = {
+    let rec group digits acc =
+        if list.length digits <= 3 { str.of_chars digits + acc }
+        else {
+            group (list.take (list.length digits - 3) digits)
+                  ("," + str.of_chars (list.drop (list.length digits - 3) digits) + acc)
+        };
+    if n < 0 { "-" + group (str.chars (to_string (0 - n))) "" }
+    else { group (str.chars (to_string n)) "" }
+};
+
+// --- readings -------------------------------------------------------------------
+
+/// Everything at one moment. Taken in a single call so that the numbers in a
+/// reading all describe the same instant.
+let now! () = vm.stats! ();
+
+let stat r key = core.map_get r key 0;
+
+/// What happened between two readings.
+let since before after =
+    %{ :elapsed => stat after :now_ns - stat before :now_ns,
+       :allocated => stat after :allocated - stat before :allocated,
+       :reductions => stat after :reductions - stat before :reductions,
+       :collections => stat after :collections - stat before :collections,
+       // A peak is a high-water mark rather than a difference: the interesting
+       // question is how big it got, not how much bigger.
+       :peak => stat after :peak_bytes,
+       :live => stat after :live_bytes };
+
+let elapsed d    = core.map_get d :elapsed 0;
+let allocated d  = core.map_get d :allocated 0;
+let reductions d = core.map_get d :reductions 0;
+let collections d = core.map_get d :collections 0;
+let peak d       = core.map_get d :peak 0;
+
+/// A reading as one line.
+let show d =
+    show_duration (elapsed d)
+    + "  " + show_bytes (allocated d) + " allocated"
+    + "  peak " + show_bytes (peak d)
+    + "  " + show_count (collections d) + " collections";
+
+// --- measuring something --------------------------------------------------------
+
+/// Force a value and report what that cost, then hand the value back.
+///
+/// The argument is an ordinary one, and ordinary arguments are lazy, so writing
+/// `measure! "load" (load! path)` hands over the unevaluated work and this
+/// forces it. That is the point: timing a lazy expression without forcing it
+/// measures how long it takes to build a suspension, which is never the
+/// question, and is why a naive measurement of lazy code reports nothing at all.
+///
+/// Forced here rather than in a spawned process, because a process has its own
+/// heap and the allocation would be measured on the wrong one.
+let measure! label value = {
+    let before = now! ();
+    let value = strict! value;
+    let after = now! ();
+    console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+                    + show (since before after))
+    value
+};
+
+let max a b = if a > b { a } else { b };
+
+/// The same, without printing: `[value, reading]`, for a caller collecting its
+/// own report.
+let timed! value = {
+    let before = now! ();
+    let forced = strict! value;
+    let after = now! ();
+    [forced, since before after]
+};
+
+/// Run something `n` times and report the total, and the average.
+///
+/// This one takes a function rather than a value, because a value is computed
+/// once and remembered -- that is what laziness is -- so running it again would
+/// measure a lookup. `bench! "parse" 100 (fn () -> parse text)`.
+let bench! label n f = {
+    let before = now! ();
+    let rec go! i last = if i <= 0 { last } else { go! (i - 1) (strict! (f ())) };
+    let value = go! n ();
+    let after = now! ();
+    let d = since before after;
+    console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+                    + show_count n + " x "
+                    + show_duration (elapsed d / max 1 n) + "  total " + show d)
+    value
+};
+
+// --- watching a program go past ---------------------------------------------------
+
+/// Print a value and return it, for putting into the middle of an expression
+/// without restructuring it. The classic debugging move, and the one a lazy
+/// language most needs a helper for: `to_string` forces enough to print.
+let trace! label value = {
+    console.error! ("  " + label + " = " + to_string value)
+    value
+};
+
+/// The same, forcing all the way down. `trace!` shows the outside of a lazy
+/// structure; this shows what is in it.
+let trace_deep! label value = {
+    console.error! ("  " + label + " = " + to_string (strict! value))
+    value
+};
+
+/// Say where the program has got to, and what it has cost so far. Handed the
+/// previous checkpoint, it reports the interval; handed `()`, it starts one.
+let checkpoint! label before = {
+    let after = now! ();
+    match before {
+        () => console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+                              + "start"),
+        b => console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+                             + show (since b after)),
+    }
+    after
+};
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a duration reads in the unit that suits it"
+            $( test.eq! ["500ns", "1.50us", "1.50ms", "1.50s"]
+                        [show_duration 500, show_duration 1500, show_duration 1500000,
+                         show_duration 1500000000] ),
+        test.case "bytes read in the unit that suits them"
+            $( test.eq! ["512B", "1.50KB", "1.50MB"]
+                        [show_bytes 512, show_bytes 1536, show_bytes 1572864] ),
+        test.case "a count is grouped in threes"
+            $( test.eq! ["1", "999", "1,000", "1,234,567"]
+                        [show_count 1, show_count 999, show_count 1000, show_count 1234567] ),
+        test.case "a negative count keeps its sign"
+            $( test.eq! "-1,234" (show_count (0 - 1234)) ),
+        test.case "a reading of nothing is a reading of nothing"
+            $( test.eq! [0, 0] { let r = now! ();
+                                 let d = since r r;
+                                 [elapsed d, allocated d] } ),
+        test.case "time only goes forwards"
+            $( test.true! { let a = now! ();
+                            let b = now! ();
+                            elapsed (since a b) >= 0 } ),
+        test.case "allocating shows up as allocation"
+            $( test.true! { let before = now! ();
+                            let junk = strict! (list.map (fn i -> [i, i]) (list.range 0 500));
+                            let after = now! ();
+                            allocated (since before after) > 0 } ),
+        test.case "measuring hands back what it measured"
+            $( test.eq! 42 (list.head (timed! 42)) ),
+        test.case "a trace returns its value unchanged"
+            $( test.eq! [1, 2] (trace! "x" [1, 2]) ),
+    ];
+}

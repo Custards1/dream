@@ -208,6 +208,15 @@ A value is one 64-bit word, tagged in the low bits:
 Integers get the one-bit tag because arithmetic is the hot path, and the
 tagging preserves order so the JIT can compare two tagged fixnums directly.
 
+Lists are cons cells and arrays are flat, both as you would expect. **Maps are a
+hash array mapped trie** — a tree branching 32 ways on five bits of the key's
+hash per level. That shape is chosen for the same reason the rest of the runtime
+is: a value here is never updated, only succeeded. A flat table would have to be
+copied on every `map_put` to leave the original standing, which makes building a
+map an entry at a time quadratic; a trie shares everything the change does not
+touch, so the update is `log32(n)` new nodes and the map it came from is
+untouched and still cheap to use.
+
 ---
 
 ## 4. Expressions
@@ -1065,6 +1074,12 @@ Anything that can be written in Dream is written in Dream.
   `[a.b]` headers, strings, numbers, booleans, arrays and inline tables. What is
   missing — `[[array-of-tables]]`, multi-line strings, dates — is an error
   naming the problem rather than a quietly wrong parse.
+- **`std.cli`** — command lines. An option is described once — a spelling, a
+  short form, whether it takes a value, and a line of help — and both the parser
+  and the usage message read that one description, so an option cannot be
+  parsed without being documented or documented without being parsed. Handles
+  `--name value`, `--name=value`, `-o value`, `-ovalue`, repeated options that
+  collect in order, and `--` to end the options.
 - **`std.test`** — the test framework. Each case runs in **its own process**, so
   a case that raises or loops is isolated, and the failure reaches the runner as
   an ordinary value through `join!` rather than having already unwound the
@@ -1176,6 +1191,7 @@ dreamc FILE [-o OUT.dream] [options]
 | `--modules` / `--packages` | report what the program pulls in |
 | `--dump` | disassemble the image by reading it back |
 | `--ast` | print the syntax tree |
+| `--shebang [LINE]` | prefix the image with a `#!` line and make it executable |
 | `--no-emit` | check only: scope, purity, verification |
 | `--no-debug` | omit debug info |
 
@@ -1226,6 +1242,18 @@ just test-all        # the above plus fuzzing, heap verification, no-JIT build
 dream              image.cpp loads and revalidates; interp.cpp reduces;
                     jit.cpp compiles the strict numeric spine
 ```
+
+`--shebang` writes an interpreter line before the image and sets the execute
+bit, so a compiled program can be run as a command:
+
+```
+dreamc hello.dr --shebang -o hello    # `#!/usr/bin/env dream` by default
+./hello
+```
+
+The VM skips a leading `#!` line on any image it loads, so such a file is still
+an ordinary image — `dream hello` works too. An image is binary and its magic
+number begins with `D`, so a leading `#` is never ambiguous.
 
 An image is a flat arena of 16-byte execution-tree nodes linked by index, so the
 VM can map the file and start forcing nodes without rebuilding a tree. The VM

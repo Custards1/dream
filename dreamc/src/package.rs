@@ -318,6 +318,9 @@ pub fn load_manifest(path: &Path) -> Result<Option<Package>, String> {
         let path = match value {
             TomlValue::Str(s) => Some(PathBuf::from(s)),
             TomlValue::Table(t) => t.get("path").map(PathBuf::from),
+            // A dependency is not a list; saying where it is found is not
+            // something a list can express.
+            TomlValue::List(_) => None,
         };
         deps.push(Dep { name: key.clone(), path });
     }
@@ -339,6 +342,7 @@ pub fn load_manifest(path: &Path) -> Result<Option<Package>, String> {
 pub enum TomlValue {
     Str(String),
     Table(HashMap<String, String>),
+    List(Vec<String>),
 }
 
 #[derive(Debug, Default)]
@@ -357,6 +361,7 @@ impl TomlDoc {
             .and_then(|(_, v)| match v {
                 TomlValue::Str(s) => Some(s.as_str()),
                 TomlValue::Table(_) => None,
+                TomlValue::List(_) => None,
             })
     }
 
@@ -440,6 +445,21 @@ fn parse_value(text: &str) -> Option<TomlValue> {
             table.insert(k, v);
         }
         return Some(TomlValue::Table(table));
+    }
+    // An array. Nothing here reads one -- dependencies are strings and inline
+    // tables -- but `mind` puts its build settings in the same file, and those
+    // are lists. Refusing to parse a value we have no use for turned every
+    // manifest carrying one into a warning on every compile.
+    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        let mut items = Vec::new();
+        for part in inner.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            items.push(unquote(part)?);
+        }
+        return Some(TomlValue::List(items));
     }
     unquote(text).map(TomlValue::Str)
 }

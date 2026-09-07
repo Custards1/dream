@@ -1,0 +1,437 @@
+// Packages: the grouping layer above modules.
+//
+// A module is one file. A package is a named group of them, marked by a
+// `mind.toml` at its root. The point is that grouping should not depend on
+// where a directory happens to sit relative to whoever imports it: a package
+// declares its own name, so `import std.list` means "the module `list` in the
+// package called `std`", wherever that package lives.
+//
+// Anything can be a package -- dropping a manifest into a directory is the
+// whole ceremony -- and a project is itself a package, so its own modules are
+// reachable both as `mypkg.util` and, from inside, as plain `util`.
+//
+// A `PackageSet` is built once and then only read, so it is an ordinary value
+// threaded through the loader rather than anything that has to be kept in step.
+// Adding appends, which is what makes an index into it stable while the set is
+// still growing -- the dependency walk below relies on that.
+
+import std.core;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+import std.toml;
+
+import dreams.path;
+
+/// The names a manifest may have. `dusk.toml` is the older spelling, still
+/// accepted so that a project does not have to be renamed to keep building.
+let manifest_names = ["mind.toml", "dusk.toml"];
+
+/// Extensions a module file may have. One, so far.
+let module_extensions = ["dr"];
+
+// --- a package --------------------------------------------------------------
+
+let make name version root src deps manifest =
+    %{ :name => name, :version => version, :root => root,
+       :src => src, :deps => deps, :manifest => manifest };
+
+let name p    = core.map_get p :name "";
+let version p = core.map_get p :version "0.0.0";
+/// The directory holding the manifest.
+let root p    = core.map_get p :root ".";
+/// Where this package's modules live -- `src` in the manifest.
+let src p     = core.map_get p :src ".";
+let deps p    = core.map_get p :deps [];
+let manifest p = core.map_get p :manifest "";
+
+/// A dependency: a name, and where to find it relative to the depending
+/// package's root. The path is `()` for a dependency given some other way,
+/// which is not supported yet and is reported rather than ignored.
+let dep name path = [name, path];
+let dep_name d = list.nth 0 d;
+let dep_path d = list.nth 1 d;
+
+// --- finding a module inside a package --------------------------------------
+
+let rec first_file! candidates =
+    match candidates {
+        [] => (),
+        [c, ..rest] => if path.is_file! c { c } else { first_file! rest },
+    };
+
+/// The file for a module path inside this package, if it exists.
+///
+/// `a.b` is `src/a/b.dr`, or `src/a/b/mod.dr` when the module has grown into a
+/// directory -- which is the point of looking for both: a module can become a
+/// directory without any of its importers changing.
+let module_file! p segments =
+    if list.is_empty segments { () }
+    else {
+        let base = path.join_all (src p) segments;
+        first_file! (list.append
+            (list.map (fn ext -> path.with_extension ext base) module_extensions)
+            (list.map (fn ext -> path.with_extension ext (path.join base "mod")) module_extensions))
+    };
+
+/// Directories that hold build output rather than source. Skipped when listing
+/// what a package provides, so `target/` does not turn up as a module.
+let is_noise dir = {
+    let n = path.basename dir;
+    str.starts_with "." n || n == "target" || str.starts_with "build" n
+};
+
+/// The dotted name of a module file inside `base`, or `()`. A file called
+/// `mod.dr` names the directory it sits in rather than itself, which is what
+/// makes `a/b/mod.dr` the module `a.b`.
+let module_name base file =
+    match path.relative_to base (path.drop_extension file) {
+        () => (),
+        segs =>
+            if list.is_empty segs { () }
+            else if list.last segs == "mod" && list.length segs > 1 {
+                str.join_str "." (list.take (list.length segs - 1) segs)
+            }
+            else { str.join_str "." segs },
+    };
+
+let rec collect_modules! base dir acc =
+    list.fold (fn found entry ->
+        if io.is_dir! entry {
+            if is_noise entry { found } else { collect_modules! base entry found }
+        }
+        else if list.contains (path.extension entry) module_extensions {
+            match module_name base entry {
+                () => found,
+                n  => core.cons n found,
+            }
+        }
+        else { found }) acc (path.list_dir! dir);
+
+/// Every module this package provides, as dotted paths, sorted. Used to explain
+/// a failed import in terms of what the package actually has.
+let modules! p = list.sort (collect_modules! (src p) (src p) []);
+
+// --- reading a manifest -----------------------------------------------------
+
+/// Why this name cannot be a package's, or `()`. A dot is what separates a
+/// package from the modules inside it, so a package called `a.b` would make
+/// `a.b.c` ambiguous -- module `c` of package `a.b`, or module `b.c` of `a`?
+let name_error n =
+    if str.contains_str "." n {
+        "package name `" + n + "` cannot contain a dot; "
+        + "dots separate a package from the modules inside it"
+    }
+    else { () };
+
+let rec manifest_in! dir names =
+    match names {
+        [] => (),
+        [n, ..rest] => {
+            let candidate = path.join dir n;
+            if path.is_file! candidate { candidate } else { manifest_in! dir rest }
+        },
+    };
+
+/// The manifest in `dir`, or `()`.
+let manifest_at! dir = manifest_in! dir manifest_names;
+
+/// A dependency's location, from either spelling: `dep = "../there"` and
+/// `dep = { path = "../there" }` mean the same thing.
+let dep_location spec =
+    match type_of spec {
+        :string => spec,
+        :map    => core.map_get spec "path" (),
+        _       => (),
+    };
+
+/// Load a manifest.
+///
+/// Three answers, not two. `[:none]` means the file is there but names no
+/// package: the directory groups packages rather than being one, which is a
+/// normal layout -- a workspace root -- and not a mistake, so it is not
+/// reported as one. `[:error, message]` is a manifest that is meant to be a
+/// package and cannot be read as one.
+let load_manifest! file =
+    match path.read_file! file {
+        () => [:error, "cannot read " + file],
+        text =>
+            match toml.parse text {
+                [:error, why] => [:error, file + ": " + why],
+                [:ok, doc] => {
+                    let root_dir = path.dirname file;
+                    match toml.get () doc "package" "name" {
+                        () => [:none],
+                        n =>
+                            match name_error n {
+                                () => {
+                                    // `src` defaults to a `src` directory when there
+                                    // is one, so both the flat and the conventional
+                                    // layout work without being configured.
+                                    let src_dir =
+                                        match toml.get () doc "package" "src" {
+                                            () => if io.is_dir! (path.join root_dir "src") {
+                                                      path.join root_dir "src"
+                                                  } else { root_dir },
+                                            s  => path.join root_dir s,
+                                        };
+                                    [:ok, make n (toml.get "0.0.0" doc "package" "version")
+                                              root_dir src_dir
+                                              (list.map (fn e -> dep (list.nth 0 e)
+                                                                     (dep_location (list.nth 1 e)))
+                                                        (toml.entries doc "dependencies"))
+                                              file]
+                                },
+                                why => [:error, file + ": " + why],
+                            },
+                    }
+                },
+            },
+    };
+
+// --- a set of packages ------------------------------------------------------
+
+let set packages by_name current notes =
+    %{ :packages => packages, :by_name => by_name, :current => current, :notes => notes };
+
+let empty = set [] (core.map_new ()) () [];
+
+let packages s = core.map_get s :packages [];
+let by_name s  = core.map_get s :by_name (core.map_new ());
+let notes s    = core.map_get s :notes [];
+
+let at s i = list.nth i (packages s);
+
+/// The package called `n`, or `()`.
+let find s n =
+    match core.map_get (by_name s) n () {
+        () => (),
+        i  => at s i,
+    };
+
+let current_index s = core.map_get s :current ()
+;
+/// The package the root file belongs to, or `()`.
+let current s =
+    match current_index s { () => (), i => at s i };
+
+let names s = list.sort (list.map (fn p -> name p) (packages s));
+
+let note message s = set (packages s) (by_name s) (current_index s)
+                         (list.append (notes s) [message]);
+
+/// Add a package, and say which index it ended up at: `[set, index]`.
+///
+/// A name already taken is not necessarily a clash. The same package is
+/// routinely reached two ways -- once as a path dependency (`../textstats`) and
+/// once under a `-L` root -- so what is compared is where the directories
+/// actually are, not how they were spelled. Only a genuinely different
+/// directory is worth a note, and even then the first one wins rather than the
+/// compilation stopping.
+let add! p s =
+    match core.map_get (by_name s) (name p) () {
+        () => {
+            let i = list.length (packages s);
+            [set (list.append (packages s) [p]) (core.map_put (by_name s) (name p) i)
+                 (current_index s) (notes s),
+             i]
+        },
+        existing =>
+            if path.same_file! (root (at s existing)) (root p) { [s, existing] }
+            else {
+                [note ("two packages are named `" + name p + "`: "
+                       + root (at s existing) + " and " + root p + "; using the first") s,
+                 existing]
+            },
+    };
+
+/// Add whatever `load_manifest!` answered, keeping a real error as a note.
+/// `[set, index]`, the index being `()` when nothing was added.
+let add_manifest! file s =
+    match load_manifest! file {
+        [:ok, p]      => add! p s,
+        [:none]       => [s, ()],
+        [:error, why] => [note why s, ()],
+    };
+
+/// Every package sitting directly inside `dir`. Subdirectories only: a root
+/// that groups packages holds them, it does not nest them arbitrarily deep.
+let packages_inside! dir s =
+    list.fold (fn acc entry ->
+        if io.is_dir! entry {
+            match manifest_at! entry {
+                () => acc,
+                m  => list.head (add_manifest! m acc),
+            }
+        }
+        else { acc }) s (path.list_dir! dir);
+
+/// A root given with `-L` may be a package itself, or a directory holding
+/// several. A manifest that names no package is the second case -- and so is no
+/// manifest at all -- so both look inside.
+let add_from_root! dir s =
+    match manifest_at! dir {
+        () => packages_inside! dir s,
+        m =>
+            match load_manifest! m {
+                [:ok, p]      => list.head (add! p s),
+                [:error, why] => note why s,
+                [:none]       => packages_inside! dir s,
+            },
+    };
+
+// --- discovery --------------------------------------------------------------
+
+/// Walk up from `dir` for the package containing the root file. A manifest that
+/// names no package does not stop the walk -- a real one may still enclose it.
+let rec find_enclosing! dir s =
+    match manifest_at! dir {
+        () => {
+            let up = path.dirname dir;
+            if up == dir || dir == "." { s }
+            else { find_enclosing! up s }
+        },
+        m =>
+            match load_manifest! m {
+                [:ok, p] => {
+                    let added = add! p s;
+                    set (packages (list.head added)) (by_name (list.head added))
+                        (list.nth 1 added) (notes (list.head added))
+                },
+                [:error, why] => note why s,
+                [:none] => {
+                    let up = path.dirname dir;
+                    if up == dir || dir == "." { s }
+                    else { find_enclosing! up s }
+                },
+            },
+    };
+
+/// One package's dependencies, added to the set.
+let add_deps! i s =
+    list.fold (fn acc d -> {
+        let owner = at acc i;
+        match dep_path d {
+            () => note ("package `" + name owner + "` depends on `" + dep_name d
+                        + "` but gives no path; only path dependencies are supported so far") acc,
+            rel => {
+                let where = path.join (root owner) rel;
+                match manifest_at! where {
+                    () => note ("package `" + name owner + "` depends on `" + dep_name d
+                                + "` at " + where + ", which has no manifest") acc,
+                    m => match load_manifest! m {
+                        [:ok, p]      => list.head (add! p acc),
+                        [:error, why] => note why acc,
+                        [:none] => note ("package `" + name owner + "` depends on `" + dep_name d
+                                         + "` at " + where + ", whose manifest names no package") acc,
+                    },
+                }
+            },
+        }
+    }) s (deps (at s i));
+
+/// Dependencies, transitively. The list is walked by index while it grows,
+/// which terminates because a package is only ever added once: `add!` returns
+/// the existing index for one already in the set.
+let rec close_deps! i s =
+    if i >= list.length (packages s) { s }
+    else { close_deps! (i + 1) (add_deps! i s) };
+
+/// Split a `:`-separated search path, the way `PATH` is written.
+let split_roots text =
+    list.filter (fn p -> not (str.is_empty p)) (str.split ":" text);
+
+/// Find the package containing `file`, its dependencies, and any packages
+/// reachable from the extra roots.
+let discover! file extra_roots = {
+    let roots = list.append extra_roots
+                            (match os.env! "DREAM_PACKAGES" { () => [], v => split_roots v });
+    let found = find_enclosing! (path.dirname file) empty;
+    close_deps! 0 (list.fold (fn acc r -> add_from_root! r acc) found roots)
+};
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let doc text = match toml.parse text { [:ok, d] => d, _ => core.map_new () };
+
+    // `load_manifest!` reads a file, so what is tested here is everything that
+    // does not: the naming rules, and the shapes read back out of a manifest.
+    let parsed text = {
+        let d = doc text;
+        make (toml.get "" d "package" "name") (toml.get "0.0.0" d "package" "version")
+             "/pkg" (path.join "/pkg" (toml.get "." d "package" "src"))
+             (list.map (fn e -> dep (list.nth 0 e) (dep_location (list.nth 1 e)))
+                       (toml.entries d "dependencies"))
+             "/pkg/mind.toml"
+    };
+
+    let two! = {
+        let a = make "a" "1.0.0" "/a" "/a" [] "/a/mind.toml";
+        let b = make "b" "0.1.0" "/b" "/b" [] "/b/mind.toml";
+        list.head (add! b (list.head (add! a empty)))
+    };
+
+    let tests = [
+        test.case "a manifest names its package"
+            $( test.eq! ["std", "0.1.0"]
+                        { let m = parsed "[package]\nname = \"std\"\nversion = \"0.1.0\"";
+                          [name m, version m] } ),
+        test.case "a version defaults rather than being required"
+            $( test.eq! "0.0.0" (version (parsed "[package]\nname = \"std\"")) ),
+        test.case "src is relative to the manifest"
+            $( test.eq! "/pkg/lib"
+                        (src (parsed "[package]\nname = \"p\"\nsrc = \"lib\"")) ),
+        test.case "both spellings of a path dependency mean the same thing"
+            $( test.eq! ["../there", "../there"]
+                        { let m = parsed ("[package]\nname = \"p\"\n[dependencies]\n"
+                                           + "x = \"../there\"\ny = { path = \"../there\" }");
+                          list.map (fn d -> dep_path d) (deps m) } ),
+        test.case "a dependency with no path has none"
+            $( test.eq! ()
+                        (dep_path (list.head (deps (parsed
+                            "[package]\nname = \"p\"\n[dependencies]\nx = { git = \"u\" }")))) ),
+        test.case "a package is found by name"
+            $( test.eq! ["a", ()] [name (find two! "a"), find two! "nope"] ),
+        test.case "the set lists its names, sorted"
+            $( test.eq! ["a", "b"] (names two!) ),
+        test.case "adding the same package twice keeps one"
+            $( test.eq! [1, 0]
+                        { let again = add! (make "a" "1.0.0" "/a" "/a" [] "/a/mind.toml")
+                                           (list.head (add! (make "a" "1.0.0" "/a" "/a" []
+                                                                  "/a/mind.toml") empty));
+                          [list.length (packages (list.head again)), list.nth 1 again] } ),
+        test.case "two packages of one name in two places is a note, not a failure"
+            $( test.eq! [1, 1]
+                        { let clash = list.head
+                             (add! (make "a" "1.0.0" "/elsewhere" "/elsewhere" [] "/elsewhere/mind.toml")
+                                   (list.head (add! (make "a" "1.0.0" "/a" "/a" [] "/a/mind.toml")
+                                                    empty)));
+                          [list.length (packages clash), list.length (notes clash)] } ),
+        test.case "a module file names itself"
+            $( test.eq! ["a.b", "list"] [module_name "/s" "/s/a/b.dr", module_name "/s" "/s/list.dr"] ),
+        test.case "mod.dr names the directory it sits in"
+            $( test.eq! "a.b" (module_name "/s" "/s/a/b/mod.dr") ),
+        // A `mod.dr` names the directory it is in, and at the source root there
+        // is no directory to name but the package itself -- which is already
+        // named. So it stays the module `mod`, rather than colliding with the
+        // package or vanishing.
+        test.case "a mod.dr at the source root names itself"
+            $( test.eq! "mod" (module_name "/s" "/s/mod.dr") ),
+        test.case "a file outside the source root is not a module of it"
+            $( test.eq! () (module_name "/s" "/other/a.dr") ),
+        test.case "build output is not source"
+            $( test.eq! [true, true, true, false]
+                        [is_noise "/p/target", is_noise "/p/build-dream", is_noise "/p/.git",
+                         is_noise "/p/src"] ),
+        test.case "a search path splits the way PATH does"
+            $( test.eq! ["a", "b"] (split_roots "a::b:") ),
+        test.case "an ordinary package name is allowed"
+            $( test.eq! [(), ()] [name_error "std", name_error "my_pkg"] ),
+        test.case "a package name may not contain a dot"
+            $( test.true! (str.contains_str "cannot contain a dot" (name_error "a.b")) ),
+    ];
+}

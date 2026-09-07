@@ -1,0 +1,1269 @@
+// Recursive descent with precedence climbing, over the lexer's token stream.
+//
+// The Rust parser this replaces walks an array and moves a cursor. There is no
+// cursor here. Every function takes the tokens still to read and answers
+// `[:ok, value, rest]` -- the same shape `std.json` and `std.toml` use -- so
+// the position is a value like any other, backtracking is just keeping the
+// list you already had, and nothing has to be undone on failure.
+//
+// It reads the lexer's **lazy** stream directly, so tokens are scanned as the
+// parser asks for them. A file that fails to parse on line 3 is never lexed
+// past line 3.
+//
+// Failure is `[:error, message, span]`. Nothing raises, so the parser is pure.
+//
+// The one piece of state that has to be threaded is the layout context, and it
+// is genuinely contextual rather than incidental:
+//
+//   nl        whether a line break ends a statement here -- false inside
+//             `(`, `[`, `$(`, `#[`, `%{`, true inside a block and at top level
+//   no_brace  whether `{` starts a block rather than an argument, which is how
+//             `if cond { .. }` knows the brace is the branch
+//   indent    the column the current statement began at; a line indented past
+//             it continues that statement rather than starting a new one
+
+import std.core;
+import std.list;
+import std.str;
+
+import dreams.ast;
+import dreams.lexer;
+
+// --- results ----------------------------------------------------------------
+
+let ok value rest = [:ok, value, rest];
+let err message span = [:error, message, span];
+
+let is_ok r = core.head r == :ok;
+let value_of r = list.nth 1 r;
+let rest_of r = list.nth 2 r;
+let message_of r = list.nth 1 r;
+let span_of r = list.nth 2 r;
+
+// --- the layout context -----------------------------------------------------
+
+let ctx nl no_brace indent = [nl, no_brace, indent];
+let ctx_nl c = list.nth 0 c;
+let ctx_no_brace c = list.nth 1 c;
+let ctx_indent c = list.nth 2 c;
+
+/// Inside a bracket group: newlines stop mattering, and a `{` is an argument
+/// again. `( .. )`, `[ .. ]`, `$( .. )`, `#[ .. ]` and `%{ .. }` all do this.
+/// Braces are deliberately not in that list -- a block is newline-sensitive.
+let grouped c = ctx false false (ctx_indent c);
+
+let no_brace c = ctx (ctx_nl c) true (ctx_indent c);
+let allow_brace c = ctx (ctx_nl c) false (ctx_indent c);
+
+let top = ctx true false 0;
+
+// --- tokens -----------------------------------------------------------------
+
+let at_end ts = list.is_empty ts;
+let peek ts = if at_end ts { () } else { list.head ts };
+let peek_kind ts = if at_end ts { :eof } else { lexer.kind (list.head ts) };
+let peek_value ts = if at_end ts { () } else { lexer.value (list.head ts) };
+let peek_span ts =
+    if at_end ts { ast.no_span }
+    else { ast.span_of (lexer.span_start (list.head ts)) (lexer.span_end (list.head ts)) };
+
+let at ts k = peek_kind ts == k;
+
+/// Keywords are ordinary identifiers that the parser recognises; the lexer has
+/// no idea they are special.
+let keywords = ["let", "rec", "if", "else", "import", "as", "catch", "true", "false",
+                "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
+                "match"];
+
+/// Those that can never begin an expression, so meeting one ends an argument
+/// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
+let non_starters = ["let", "rec", "else", "import", "as", "catch", "virtual", "derive",
+                    "when", "mod"];
+
+let rec has name names =
+    if list.is_empty names { false }
+    else if list.head names == name { true }
+    else { has name (list.tail names) };
+
+let is_kw ts word = at ts :ident && peek_value ts == word;
+let is_keyword name = has name keywords;
+
+/// The token after this one, for the single place that needs to look ahead:
+/// telling `.field` from a `.` that is something else.
+let peek2_kind ts = if at_end ts { :eof } else { peek_kind (list.tail ts) };
+
+/// Does the next token continue the statement being parsed, or start a new
+/// one? A line break ends a statement unless the line is indented past the
+/// statement it follows -- the same cue a reader goes by.
+let continues c ts =
+    if at_end ts { false }
+    else if not (ctx_nl c) { true }
+    else if not (lexer.starts_line (list.head ts)) { true }
+    else { lexer.col (list.head ts) > ctx_indent c };
+
+/// Parse `f` as a statement: its indentation is whatever column it starts at.
+let at_statement c ts = ctx (ctx_nl c) (ctx_no_brace c) (if at_end ts { 0 } else { lexer.col (list.head ts) });
+
+let describe ts =
+    if at_end ts { "the end of the file" }
+    else {
+        match peek_kind ts {
+            :ident => "`" + to_string (peek_value ts) + "`",
+            :int => "a number",
+            :float => "a number",
+            :str => "a string",
+            :char => "a character",
+            :atom => "an atom",
+            k => "`" + to_string k + "`",
+        }
+    };
+
+let expect ts k what =
+    if at ts k { ok () (list.tail ts) }
+    else { err ("expected " + what + ", found " + describe ts) (peek_span ts) };
+
+// --- expressions ------------------------------------------------------------
+
+let parse_expr c ts = parse_pipe c ts;
+
+/// `x |> f a` feeds `x` in as the last argument. Left-associative, and looser
+/// than every other operator.
+let rec parse_pipe c ts =
+    match parse_binary c 0 ts {
+        [:error, m, s] => err m s,
+        [:ok, lhs, rest] => pipe_tail c lhs rest,
+    };
+
+let rec pipe_tail c lhs ts =
+    // No indentation check: `|>` can never begin a statement, so a line that
+    // starts with one continues the line above whatever its indentation.
+    if not (at ts :pipe_into) { ok lhs ts }
+    else {
+        match parse_binary c 0 (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, rhs, rest] =>
+                pipe_tail c (ast.pipe_e lhs rhs (ast.span_to (ast.span lhs) (ast.span rhs))) rest,
+        }
+    };
+
+/// Precedence climbing. Every infix operator is left-associative, which is why
+/// the right side is parsed at one level tighter.
+let rec parse_binary c level ts =
+    match parse_unary c ts {
+        [:error, m, s] => err m s,
+        [:ok, lhs, rest] => binary_tail c level lhs rest,
+    };
+
+let rec binary_tail c level lhs ts = {
+    // As with the pipe: an infix operator cannot start a statement, so meeting
+    // one always continues the expression, however the line is indented.
+    //
+    //     let total = a
+    //         + b            // continues
+    //     + c                // continues too -- the indentation is irrelevant
+    let op = ast.infix_of (peek_kind ts);
+    if op == () { ok lhs ts }
+    else if ast.precedence op < level { ok lhs ts }
+    else {
+        match parse_binary c (ast.precedence op + 1) (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, rhs, rest] =>
+                binary_tail c level
+                            (ast.binary_e op lhs rhs (ast.span_to (ast.span lhs) (ast.span rhs)))
+                            rest,
+        }
+    }
+};
+
+/// A leading `-` or `not`. Both bind tighter than any infix operator and
+/// looser than application, so `not f x` is `not (f x)`.
+let rec parse_unary c ts = {
+    let start = peek_span ts;
+    if at ts :minus {
+        match parse_unary c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, e, rest] => ok (ast.unary_e :neg e (ast.span_to start (ast.span e))) rest,
+        }
+    }
+    else if is_kw ts "not" {
+        match parse_unary c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, e, rest] => ok (ast.unary_e :not e (ast.span_to start (ast.span e))) rest,
+        }
+    }
+    else { parse_apply c ts }
+};
+
+/// Application is juxtaposition, and binds tighter than every operator: the
+/// arguments are however many postfix expressions follow, so `fac n - 1` is
+/// `(fac n) - 1`.
+let rec parse_apply c ts =
+    match parse_postfix c ts {
+        [:error, m, s] => err m s,
+        [:ok, head, rest] =>
+            match gather_args c [] rest {
+                [:error, m, s] => err m s,
+                [:ok, args, rest2] =>
+                    if list.is_empty args { ok head rest2 }
+                    else {
+                        let last = list.last args;
+                        ok (ast.apply_e head args (ast.span_to (ast.span head) (ast.span last))) rest2
+                    },
+            },
+    };
+
+let rec gather_args c acc ts =
+    if not (can_start_arg c ts) { ok (list.reverse acc) ts }
+    else {
+        match parse_postfix c ts {
+            [:error, m, s] => err m s,
+            [:ok, a, rest] => gather_args c (core.cons a acc) rest,
+        }
+    };
+
+/// Can the next token begin another argument? A keyword that cannot start an
+/// expression ends the list, and so does a `{` where a brace means a block.
+let can_start_arg c ts =
+    if not (continues c ts) { false }
+    else {
+        match peek_kind ts {
+            :ident => not (has (peek_value ts) non_starters),
+            :int => true, :float => true, :str => true, :char => true, :atom => true,
+            :lparen => true, :lbracket => true,
+            :dollar_paren => true, :hash_bracket => true, :percent_brace => true,
+            :lbrace => not (ctx_no_brace c),
+            _ => false,
+        }
+    };
+
+/// `obj.field`. A `.` at the start of a line continues the expression whatever
+/// its indentation, since a line can never begin with one.
+let rec parse_postfix c ts =
+    match parse_primary c ts {
+        [:error, m, s] => err m s,
+        [:ok, e, rest] => field_tail c e rest,
+    };
+
+let rec field_tail c e ts =
+    if not (at ts :dot) { ok e ts }
+    else if peek2_kind ts != :ident { ok e ts }
+    else {
+        let nametok = list.head (list.tail ts);
+        let full = ast.span_to (ast.span e)
+                               (ast.span_of (lexer.span_start nametok) (lexer.span_end nametok));
+        field_tail c (ast.field_e e (lexer.value nametok) full) (list.tail (list.tail ts))
+    };
+
+// --- primaries --------------------------------------------------------------
+
+let rec parse_primary c ts = {
+    let sp = peek_span ts;
+    let rest = if at_end ts { ts } else { list.tail ts };
+    match peek_kind ts {
+        :eof   => err "unexpected end of file in an expression" sp,
+        :int   => ok (ast.int_e (peek_value ts) sp) rest,
+        :float => ok (ast.float_e (peek_value ts) sp) rest,
+        :str   => ok (ast.str_e (peek_value ts) sp) rest,
+        :char  => ok (ast.char_e (peek_value ts) sp) rest,
+        :atom  => ok (ast.atom_e (peek_value ts) sp) rest,
+
+        :lparen        => parse_paren c sp rest,
+        :lbracket      => parse_sequence c sp rest :rbracket (fn items span -> ast.list_e items span) "]",
+        :hash_bracket  => parse_sequence c sp rest :rbracket (fn items span -> ast.array_e items span) "]",
+        :percent_brace => parse_map c sp rest,
+        :dollar_paren  => parse_thunk c sp rest,
+        :lbrace        => parse_block c sp rest,
+
+        :ident => parse_ident c ts sp rest,
+        _      => err ("expected an expression, found " + describe ts) sp,
+    }
+};
+
+/// The keywords that begin an expression, and then plain names.
+let rec parse_ident c ts sp rest = {
+    let word = peek_value ts;
+    if word == "true"  { ok (ast.bool_e true sp) rest }
+    else if word == "false" { ok (ast.bool_e false sp) rest }
+    else if word == "if"    { parse_if c sp rest }
+    else if word == "fn"    { parse_lambda c sp rest }
+    else if word == "try!"  { parse_try c sp rest }
+    else if word == "match" { parse_match c sp rest }
+    else if word == "comp"  { parse_comp c false sp rest }
+    else if word == "comp!" { parse_comp c true sp rest }
+    else if has word non_starters {
+        err ("expected an expression, found the keyword `" + word + "`") sp
+    }
+    else { ok (ast.name_e word sp) rest }
+};
+
+/// `()` is unit; `( e )` is grouping. Inside the brackets newlines stop
+/// ending statements.
+let rec parse_paren c sp ts =
+    if at ts :rparen { ok (ast.unit_e (ast.span_to sp (peek_span ts))) (list.tail ts) }
+    else {
+        match parse_expr (grouped c) ts {
+            [:error, m, s] => err m s,
+            [:ok, e, rest] =>
+                match expect rest :rparen "`)`" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] => ok e rest2,
+                },
+        }
+    };
+
+/// `[a, b]`, `#[a, b]` -- a comma-separated list, trailing comma allowed.
+let rec parse_sequence c sp ts closer build what =
+    match comma_list (grouped c) [] ts closer what {
+        [:error, m, s] => err m s,
+        // `comma_list` hands back the closing bracket's span as well as the
+        // items, because by the time it returns the bracket has been consumed
+        // and the node's span has to reach to the end of it.
+        [:ok, [items, close], rest] => ok (build items (ast.span_to sp close)) rest,
+    };
+
+let rec comma_list c acc ts closer what =
+    if at ts closer { ok [list.reverse acc, peek_span ts] (list.tail ts) }
+    else {
+        match parse_expr c ts {
+            [:error, m, s] => err m s,
+            [:ok, e, rest] => {
+                let acc2 = core.cons e acc;
+                if at rest :comma { comma_list c acc2 (list.tail rest) closer what }
+                else if at rest closer { ok [list.reverse acc2, peek_span rest] (list.tail rest) }
+                else { err ("expected `,` or `" + what + "`, found " + describe rest) (peek_span rest) }
+            },
+        }
+    };
+
+/// `%{ k => v, .. }`. Keys are forced; values stay lazy.
+let rec parse_map c sp ts = map_entries (grouped c) [] ts sp;
+
+let rec map_entries c acc ts sp =
+    if at ts :rbrace { ok (ast.map_e (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts) }
+    else {
+        match parse_expr c ts {
+            [:error, m, s] => err m s,
+            [:ok, k, rest] =>
+                match expect rest :fat_arrow "`=>`" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        match parse_expr c rest2 {
+                            [:error, m, s] => err m s,
+                            [:ok, v, rest3] => {
+                                let acc2 = core.cons [k, v] acc;
+                                if at rest3 :comma { map_entries c acc2 (list.tail rest3) sp }
+                                else if at rest3 :rbrace {
+                                    ok (ast.map_e (list.reverse acc2) (ast.span_to sp (peek_span rest3)))
+                                       (list.tail rest3)
+                                }
+                                else { err ("expected `,` or `}`, found " + describe rest3) (peek_span rest3) }
+                            },
+                        },
+                },
+        }
+    };
+
+/// `$( e )` -- suspends `e`. Newline-insensitive inside, like any bracket.
+let rec parse_thunk c sp ts =
+    match parse_expr (grouped c) ts {
+        [:error, m, s] => err m s,
+        [:ok, e, rest] =>
+            match expect rest :rparen "`)` to close `$(`" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest2] => ok (ast.thunk_e e (ast.span_to sp (ast.span e))) rest2,
+            },
+    };
+
+// --- control forms ----------------------------------------------------------
+
+/// The condition is parsed with `{` meaning a block, so the brace that follows
+/// opens the branch rather than being read as one more argument.
+let rec parse_if c sp ts =
+    match parse_expr (no_brace c) ts {
+        [:error, m, s] => err m s,
+        [:ok, cond, rest] =>
+            match expect rest :lbrace "`{` after the condition of an `if`" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest2] =>
+                    match parse_block c (peek_span rest) rest2 {
+                        [:error, m, s] => err m s,
+                        [:ok, then_e, rest3] => parse_else c sp cond then_e rest3,
+                    },
+            },
+    };
+
+/// `else` continues the expression whatever its indentation, since a line can
+/// never begin with one.
+let rec parse_else c sp cond then_e ts =
+    if not (is_kw ts "else") { ok (ast.if_e cond then_e () (ast.span_to sp (ast.span then_e))) ts }
+    else {
+        let after = list.tail ts;
+        if is_kw after "if" {
+            match parse_if c (peek_span after) (list.tail after) {
+                [:error, m, s] => err m s,
+                [:ok, chained, rest] =>
+                    ok (ast.if_e cond then_e chained (ast.span_to sp (ast.span chained))) rest,
+            }
+        }
+        else {
+            match expect after :lbrace "`{` after `else`" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest] =>
+                    match parse_block c (peek_span after) rest {
+                        [:error, m, s] => err m s,
+                        [:ok, else_e, rest2] =>
+                            ok (ast.if_e cond then_e else_e (ast.span_to sp (ast.span else_e))) rest2,
+                    },
+            }
+        }
+    };
+
+/// `fn a b -> e`. The body runs as far as the grammar allows, so a lambda
+/// passed as a non-final argument has to be parenthesised.
+let rec parse_lambda c sp ts =
+    match lambda_params [] ts {
+        [:error, m, s] => err m s,
+        [:ok, params, rest] =>
+            if list.is_empty params { err "`fn` needs at least one parameter" sp }
+            else {
+                match parse_expr c rest {
+                    [:error, m, s] => err m s,
+                    [:ok, body, rest2] =>
+                        ok (ast.lambda_e params body (ast.span_to sp (ast.span body))) rest2,
+                }
+            },
+    };
+
+let rec lambda_params acc ts =
+    if at ts :arrow { ok (list.reverse acc) (list.tail ts) }
+    else if at ts :ident && not (is_keyword (peek_value ts)) {
+        lambda_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
+    }
+    else if at ts :lparen && peek2_kind ts == :rparen {
+        // `()` -- a slot that binds no name.
+        lambda_params (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
+    }
+    else if at ts :lparen {
+        match paren_params acc (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, acc2, rest] => lambda_params acc2 rest,
+        }
+    }
+    else { err ("expected a parameter or `->`, found " + describe ts) (peek_span ts) };
+
+/// `try! { body } catch e { handler }` -- the `catch` and its binder are both
+/// required, which is what makes the error land where the `try!` is.
+let rec parse_try c sp ts =
+    match expect ts :lbrace "`{` after `try!`" {
+        [:error, m, s] => err m s,
+        [:ok, _, rest] =>
+            match parse_block c sp rest {
+                [:error, m, s] => err m s,
+                [:ok, body, rest2] =>
+                    if not (is_kw rest2 "catch") {
+                        err "`try!` needs a `catch`" (peek_span rest2)
+                    } else {
+                        let after = list.tail rest2;
+                        if not (at after :ident) {
+                            err ("expected a name after `catch`, found " + describe after) (peek_span after)
+                        } else {
+                            let binder = peek_value after;
+                            match expect (list.tail after) :lbrace "`{` after the `catch` binder" {
+                                [:error, m, s] => err m s,
+                                [:ok, _, rest3] =>
+                                    match parse_block c sp rest3 {
+                                        [:error, m, s] => err m s,
+                                        [:ok, handler, rest4] =>
+                                            ok (ast.try_e body binder handler
+                                                          (ast.span_to sp (ast.span handler))) rest4,
+                                    },
+                            }
+                        }
+                    },
+            },
+    };
+
+/// `comp e` and `comp! e`. Both bind tighter than any operator and looser than
+/// application, so `comp f x` folds the whole call.
+let rec parse_comp c impure sp ts =
+    match parse_apply c ts {
+        [:error, m, s] => err m s,
+        [:ok, e, rest] => ok (ast.comp_e impure e (ast.span_to sp (ast.span e))) rest,
+    };
+
+// --- blocks -----------------------------------------------------------------
+//
+// A block is newline-sensitive: a line break ends a statement, and its value
+// is the last statement, or `()` when it is empty. A block may hold `let`
+// declarations, which scope to the statements after them.
+
+let rec parse_block c sp ts = block_stmts (allow_brace (ctx true (ctx_no_brace c) (ctx_indent c))) [] ts sp;
+
+let rec block_stmts c acc ts sp =
+    if at ts :semi { block_stmts c acc (list.tail ts) sp }
+    else if at ts :rbrace {
+        ok (ast.block_e (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts)
+    }
+    else if at_end ts { err "unterminated block: expected `}`" sp }
+    else {
+        match parse_statement (at_statement c ts) ts {
+            [:error, m, s] => err m s,
+            [:ok, st, rest] => block_stmts c (core.cons st acc) rest sp,
+        }
+    };
+
+/// A statement is a `let` declaration or an expression.
+let rec parse_statement c ts =
+    if is_kw ts "let" { parse_let c (peek_span ts) (list.tail ts) }
+    else { parse_expr c ts };
+
+/// `let name params = body`, with `rec` optional. A block-local `let` that
+/// refers to itself needs `rec`; a top-level one does not, because every
+/// top-level binding is a global and they are all mutually visible.
+let rec parse_let c sp ts = {
+    let is_rec = is_kw ts "rec";
+    let after_rec = if is_rec { list.tail ts } else { ts };
+    if not (at after_rec :ident) {
+        err ("expected a name after `let`, found " + describe after_rec) (peek_span after_rec)
+    }
+    else if is_keyword (peek_value after_rec) {
+        err ("`" + to_string (peek_value after_rec) + "` is a keyword and cannot be a name")
+            (peek_span after_rec)
+    }
+    else {
+        let name = peek_value after_rec;
+        match let_params [] (list.tail after_rec) {
+            [:error, m, s] => err m s,
+            [:ok, params, rest] =>
+                match expect rest :eq "`=` in a `let`" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        match parse_expr c rest2 {
+                            [:error, m, s] => err m s,
+                            [:ok, body, rest3] =>
+                                ok (ast.let_d name params body is_rec (ast.span_to sp (ast.span body)))
+                                   rest3,
+                        },
+                },
+        }
+    }
+};
+
+/// Parameters, up to whatever follows them. It stops rather than complaining,
+/// because what may legally follow depends on the caller: a `let` wants `=`,
+/// but `virtual let fold f init xs;` has no body at all and ends at the `;`.
+///
+/// Three spellings are accepted, and only the first is in the language
+/// reference. `f a b` is juxtaposition, the one everything is written in.
+/// `f ()` is a slot that occupies a position but binds no name. `f (a, b)` is
+/// a parenthesised list, which the reference does not mention at all -- but
+/// the Rust parser takes it, so a file that uses it compiles today and has to
+/// keep compiling.
+let rec let_params acc ts =
+    if at ts :ident && not (is_keyword (peek_value ts)) {
+        let_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
+    }
+    else if at ts :lparen && peek2_kind ts == :rparen {
+        let_params (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
+    }
+    else if at ts :lparen {
+        match paren_params acc (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, acc2, rest] => let_params acc2 rest,
+        }
+    }
+    else { ok (list.reverse acc) ts };
+
+/// The inside of `(a, b, c)`, already past the `(`.
+let rec paren_params acc ts =
+    if not (at ts :ident) || is_keyword (peek_value ts) {
+        err ("expected a parameter name, found " + describe ts) (peek_span ts)
+    }
+    else {
+        let acc2 = core.cons (ast.param (peek_value ts) (peek_span ts)) acc;
+        let rest = list.tail ts;
+        if at rest :comma { paren_params acc2 (list.tail rest) }
+        else if at rest :rparen { ok acc2 (list.tail rest) }
+        else { err ("expected `,` or `)` in a parameter list, found " + describe rest) (peek_span rest) }
+    };
+
+// --- match ------------------------------------------------------------------
+//
+// Arms are tried in source order and the first that matches wins. `=>` is
+// already the map separator and `{ }` already delimits every other control
+// form, so `match` introduces no new punctuation.
+
+let rec parse_match c sp ts =
+    match parse_expr (no_brace c) ts {
+        [:error, m, s] => err m s,
+        [:ok, scrutinee, rest] =>
+            match expect rest :lbrace "`{` after the subject of a `match`" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest2] =>
+                    match match_arms (grouped c) [] rest2 {
+                        [:error, m, s] => err m s,
+                        [:ok, arms, rest3] =>
+                            if list.is_empty arms { err "a `match` needs at least one arm" sp }
+                            else { ok (ast.match_e scrutinee arms (ast.span_to sp (peek_span rest2))) rest3 },
+                    },
+            },
+    };
+
+let rec match_arms c acc ts =
+    if at ts :rbrace { ok (list.reverse acc) (list.tail ts) }
+    else if at_end ts { err "unterminated `match`: expected `}`" (peek_span ts) }
+    else {
+        match parse_pattern c ts {
+            [:error, m, s] => err m s,
+            [:ok, pat, rest] =>
+                match arm_guard_and_body c pat rest {
+                    [:error, m, s] => err m s,
+                    [:ok, a, rest2] => {
+                        let acc2 = core.cons a acc;
+                        if at rest2 :comma { match_arms c acc2 (list.tail rest2) }
+                        else if at rest2 :rbrace { ok (list.reverse acc2) (list.tail rest2) }
+                        else { err ("expected `,` or `}` after a match arm, found " + describe rest2)
+                                   (peek_span rest2) }
+                    },
+                },
+        }
+    };
+
+/// `pattern if guard => body`. The guard runs only after the pattern matched,
+/// so it can use what the pattern bound.
+let rec arm_guard_and_body c pat ts = {
+    let guarded = is_kw ts "if";
+    match (if guarded { parse_expr (no_brace c) (list.tail ts) } else { ok () ts }) {
+        [:error, m, s] => err m s,
+        [:ok, guard, rest] =>
+            match expect rest :fat_arrow "`=>` in a match arm" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest2] =>
+                    match parse_expr c rest2 {
+                        [:error, m, s] => err m s,
+                        [:ok, body, rest3] =>
+                            ok (ast.arm pat guard body (ast.span_to (ast.span pat) (ast.span body))) rest3,
+                    },
+            },
+    }
+};
+
+// --- patterns ---------------------------------------------------------------
+
+let rec parse_pattern c ts =
+    match parse_pattern_atom c ts {
+        [:error, m, s] => err m s,
+        [:ok, p, rest] =>
+            // `p as name` binds the whole value as well as its parts.
+            if not (is_kw rest "as") { ok p rest }
+            else {
+                let after = list.tail rest;
+                if not (at after :ident) {
+                    err ("expected a name after `as`, found " + describe after) (peek_span after)
+                } else {
+                    ok (ast.as_p p (peek_value after) (ast.span_to (ast.span p) (peek_span after)))
+                       (list.tail after)
+                }
+            },
+    };
+
+let rec parse_pattern_atom c ts = {
+    let sp = peek_span ts;
+    let rest = if at_end ts { ts } else { list.tail ts };
+    match peek_kind ts {
+        :int   => ok (ast.literal_p (ast.int_e (peek_value ts) sp) sp) rest,
+        :float => ok (ast.literal_p (ast.float_e (peek_value ts) sp) sp) rest,
+        :str   => ok (ast.literal_p (ast.str_e (peek_value ts) sp) sp) rest,
+        :char  => ok (ast.literal_p (ast.char_e (peek_value ts) sp) sp) rest,
+        :atom  => ok (ast.literal_p (ast.atom_e (peek_value ts) sp) sp) rest,
+        :minus =>
+            // A negative number literal: `-1` is one pattern, not an operator.
+            if peek_kind rest == :int {
+                ok (ast.literal_p (ast.int_e (0 - peek_value rest) sp) sp) (list.tail rest)
+            } else if peek_kind rest == :float {
+                ok (ast.literal_p (ast.float_e (0.0 - peek_value rest) sp) sp) (list.tail rest)
+            } else { err "expected a number after `-` in a pattern" sp },
+        :lparen =>
+            if peek_kind rest == :rparen { ok (ast.literal_p (ast.unit_e sp) sp) (list.tail rest) }
+            else { err "expected `()` in a pattern" sp },
+        :lbracket     => pattern_sequence c sp rest :rbracket (fn i r s -> ast.list_p i r s) "]",
+        :hash_bracket => pattern_sequence c sp rest :rbracket (fn i r s -> ast.array_p i r s) "]",
+        :percent_brace => pattern_map c sp rest,
+        :ident =>
+            if peek_value ts == "true"  { ok (ast.literal_p (ast.bool_e true sp) sp) rest }
+            else if peek_value ts == "false" { ok (ast.literal_p (ast.bool_e false sp) sp) rest }
+            else if peek_value ts == "_" { ok (ast.wildcard_p sp) rest }
+            else if is_keyword (peek_value ts) {
+                err ("`" + to_string (peek_value ts) + "` is a keyword and cannot be a binding") sp
+            }
+            else { ok (ast.bind_p (peek_value ts) sp) rest },
+        _ => err ("expected a pattern, found " + describe ts) sp,
+    }
+};
+
+/// `[a, b]`, `[x, ..rest]`, `[x, ..]`. The rest is `()` when the length is
+/// fixed, `[name]` when it is bound, and `[()]` when it is ignored.
+let rec pattern_sequence c sp ts closer build what = pattern_items c [] ts closer build what sp;
+
+let rec pattern_items c acc ts closer build what sp =
+    if at ts closer { ok (build (list.reverse acc) () (ast.span_to sp (peek_span ts))) (list.tail ts) }
+    else if at ts :dot_dot {
+        let after = list.tail ts;
+        let named = at after :ident && not (is_keyword (peek_value after));
+        let rest_binding = if named { [peek_value after] } else { [()] };
+        let after2 = if named { list.tail after } else { after };
+        if at after2 closer {
+            ok (build (list.reverse acc) rest_binding (ast.span_to sp (peek_span after2)))
+               (list.tail after2)
+        }
+        else { err ("expected `" + what + "` after `..`, found " + describe after2) (peek_span after2) }
+    }
+    else {
+        match parse_pattern c ts {
+            [:error, m, s] => err m s,
+            [:ok, p, rest] => {
+                let acc2 = core.cons p acc;
+                if at rest :comma { pattern_items c acc2 (list.tail rest) closer build what sp }
+                else if at rest closer {
+                    ok (build (list.reverse acc2) () (ast.span_to sp (peek_span rest))) (list.tail rest)
+                }
+                else { err ("expected `,` or `" + what + "`, found " + describe rest) (peek_span rest) }
+            },
+        }
+    };
+
+/// `%{ :k => p }` -- keys the pattern does not mention are ignored.
+let rec pattern_map c sp ts = pattern_map_entries c [] ts sp;
+
+let rec pattern_map_entries c acc ts sp =
+    if at ts :rbrace { ok (ast.map_p (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts) }
+    else {
+        match parse_expr c ts {
+            [:error, m, s] => err m s,
+            [:ok, k, rest] =>
+                match expect rest :fat_arrow "`=>` in a map pattern" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        match parse_pattern c rest2 {
+                            [:error, m, s] => err m s,
+                            [:ok, p, rest3] => {
+                                let acc2 = core.cons [k, p] acc;
+                                if at rest3 :comma { pattern_map_entries c acc2 (list.tail rest3) sp }
+                                else if at rest3 :rbrace {
+                                    ok (ast.map_p (list.reverse acc2) (ast.span_to sp (peek_span rest3)))
+                                       (list.tail rest3)
+                                }
+                                else { err ("expected `,` or `}`, found " + describe rest3) (peek_span rest3) }
+                            },
+                        },
+                },
+        }
+    };
+
+// --- the entry point --------------------------------------------------------
+
+/// Parse one expression from source text. `[:ok, expr]` or
+/// `[:error, message, span]`.
+let parse_expression src =
+    match lexer.lex src {
+        [:error, m, offset] => err m (ast.span_of offset offset),
+        [:ok, ts] =>
+            match parse_expr top ts {
+                [:error, m, s] => err m s,
+                [:ok, e, rest] =>
+                    if at_end rest { [:ok, e] }
+                    else { err ("unexpected " + describe rest + " after the expression") (peek_span rest) },
+            },
+        _ => err "the lexer answered something unexpected" ast.no_span,
+    };
+
+// --- module items -----------------------------------------------------------
+//
+// What a file holds, and what a `mod` block holds -- they are the same list,
+// which is not a coincidence: the loader registers `mod util { .. }` inside
+// module `m` as the module `m.util`, so from that point on a submodule and a
+// file are the same thing to every later pass.
+
+let rec parse_item c ts = {
+    let sp = peek_span ts;
+    if is_kw ts "import"  { parse_import c sp (list.tail ts) }
+    else if is_kw ts "mod"     { parse_mod c sp (list.tail ts) }
+    else if is_kw ts "derive"  { parse_derive c sp (list.tail ts) }
+    else if is_kw ts "virtual" { parse_virtual c sp (list.tail ts) }
+    else if is_kw ts "when"    { parse_when c sp (list.tail ts) }
+    else if is_kw ts "let"     { parse_let c sp (list.tail ts) }
+    else {
+        err ("expected `import`, `derive`, `virtual`, `mod`, `when` or `let` at the top level, found "
+             + describe ts) sp
+    }
+};
+
+/// A dotted path: `std.list`. Answers `[segments, rest]`.
+let rec dotted_path acc ts =
+    if not (at ts :ident) { err ("expected a module name, found " + describe ts) (peek_span ts) }
+    else {
+        let acc2 = core.cons (peek_value ts) acc;
+        let rest = list.tail ts;
+        // Only follow the dot when a name comes after it -- `import a.{x}` has
+        // a brace there, and that is a member list, not another segment.
+        if at rest :dot && peek2_kind rest == :ident { dotted_path acc2 (list.tail rest) }
+        else { ok (list.reverse acc2) rest }
+    };
+
+/// `import std.list;`, `import std.list as l;`, `import std.list.{map, sum};`
+///
+/// The alias defaults to the last segment. A member list binds the members
+/// unqualified, and each one resolves exactly as `path.name` would -- which is
+/// what stops the two spellings ever disagreeing, including about purity.
+let rec parse_import c sp ts =
+    match dotted_path [] ts {
+        [:error, m, s] => err m s,
+        [:ok, segments, rest] =>
+            if at rest :dot && peek2_kind rest == :lbrace {
+                match import_names [] (list.tail (list.tail rest)) {
+                    [:error, m, s] => err m s,
+                    [:ok, names, rest2] =>
+                        ok (ast.import_d segments () names (ast.span_to sp (peek_span rest))) rest2,
+                }
+            }
+            else if is_kw rest "as" {
+                let after = list.tail rest;
+                if not (at after :ident) {
+                    err ("expected a name after `as`, found " + describe after) (peek_span after)
+                } else {
+                    ok (ast.import_d segments (peek_value after) ()
+                                     (ast.span_to sp (peek_span after)))
+                       (list.tail after)
+                }
+            }
+            else { ok (ast.import_d segments () () (ast.span_to sp (peek_span rest))) rest },
+    };
+
+/// `{ map, filter, sum as total }`
+let rec import_names acc ts =
+    if at ts :rbrace { ok (list.reverse acc) (list.tail ts) }
+    else if not (at ts :ident) {
+        err ("expected a member name, found " + describe ts) (peek_span ts)
+    }
+    else {
+        let name = peek_value ts;
+        let after = list.tail ts;
+        // `sum as total` renames as it goes.
+        let renamed = is_kw after "as";
+        let alias = if renamed && at (list.tail after) :ident { peek_value (list.tail after) } else { () };
+        let rest = if renamed { list.tail (list.tail after) } else { after };
+        let acc2 = core.cons [name, alias] acc;
+        if at rest :comma { import_names acc2 (list.tail rest) }
+        else if at rest :rbrace { ok (list.reverse acc2) (list.tail rest) }
+        else { err ("expected `,` or `}` in an import list, found " + describe rest) (peek_span rest) }
+    };
+
+/// `mod name { items }` -- a module written inside another.
+let rec parse_mod c sp ts =
+    if not (at ts :ident) { err ("expected a name after `mod`, found " + describe ts) (peek_span ts) }
+    else {
+        let name = peek_value ts;
+        match expect (list.tail ts) :lbrace "`{` after a `mod` name" {
+            [:error, m, s] => err m s,
+            [:ok, _, rest] =>
+                match item_list c [] rest true {
+                    [:error, m, s] => err m s,
+                    [:ok, items, rest2] => ok (ast.mod_d name items (ast.span_to sp sp)) rest2,
+                },
+        }
+    };
+
+/// `derive shapes.shape;` -- fills the holes a base module declared.
+let rec parse_derive c sp ts =
+    match dotted_path [] ts {
+        [:error, m, s] => err m s,
+        [:ok, segments, rest] => ok (ast.derive_d segments (ast.span_to sp sp)) rest,
+    };
+
+/// `virtual let area s;` -- a hole. With a body it has a default and filling
+/// it is optional. A virtual needs at least one parameter, because one without
+/// would be a constant rather than a hole.
+let rec parse_virtual c sp ts =
+    match expect ts :ident "`let` after `virtual`" {
+        [:error, m, s] => err m s,
+        [:ok, _, _] =>
+            if peek_value ts != "let" { err "expected `let` after `virtual`" (peek_span ts) }
+            else {
+                let after = list.tail ts;
+                if not (at after :ident) {
+                    err ("expected a name after `virtual let`, found " + describe after) (peek_span after)
+                } else {
+                    let name = peek_value after;
+                    match let_params [] (list.tail after) {
+                        [:error, m, s] => err m s,
+                        [:ok, params, rest] =>
+                            if list.is_empty params {
+                                err ("`" + name + "` has no parameters, so it is a constant rather "
+                                     + "than a hole to fill") sp
+                            }
+                            else if not (at rest :eq) {
+                                ok (ast.virtual_d name params () (ast.span_to sp sp)) rest
+                            }
+                            else {
+                                match parse_expr c (list.tail rest) {
+                                    [:error, m, s] => err m s,
+                                    [:ok, body, rest2] =>
+                                        ok (ast.virtual_d name params body
+                                                          (ast.span_to sp (ast.span body))) rest2,
+                                }
+                            },
+                    }
+                }
+            },
+    };
+
+/// `when cond { items }`, or `when cond item` for a single one.
+///
+/// A `when` is resolved before anything is loaded, so an import inside a false
+/// branch is never even followed.
+let rec parse_when c sp ts =
+    match parse_cfg_or c ts {
+        [:error, m, s] => err m s,
+        [:ok, cond, rest] =>
+            if at rest :lbrace {
+                match item_list c [] (list.tail rest) true {
+                    [:error, m, s] => err m s,
+                    [:ok, items, rest2] => ok (ast.when_d cond items (ast.span_to sp sp)) rest2,
+                }
+            }
+            else {
+                match parse_item c rest {
+                    [:error, m, s] => err m s,
+                    [:ok, item, rest2] => ok (ast.when_d cond [item] (ast.span_to sp sp)) rest2,
+                }
+            },
+    };
+
+// The condition vocabulary is deliberately the language's own: `&&`, `||`,
+// `not`, parentheses, `true`, `false`, a bare flag, or `setting == "value"`.
+
+let rec parse_cfg_or c ts =
+    match parse_cfg_and c ts {
+        [:error, m, s] => err m s,
+        [:ok, l, rest] =>
+            if not (at rest :or_or) { ok l rest }
+            else {
+                match parse_cfg_or c (list.tail rest) {
+                    [:error, m, s] => err m s,
+                    [:ok, r, rest2] => ok [:or, l, r] rest2,
+                }
+            },
+    };
+
+let rec parse_cfg_and c ts =
+    match parse_cfg_unary c ts {
+        [:error, m, s] => err m s,
+        [:ok, l, rest] =>
+            if not (at rest :and_and) { ok l rest }
+            else {
+                match parse_cfg_and c (list.tail rest) {
+                    [:error, m, s] => err m s,
+                    [:ok, r, rest2] => ok [:and, l, r] rest2,
+                }
+            },
+    };
+
+let rec parse_cfg_unary c ts =
+    if is_kw ts "not" {
+        match parse_cfg_unary c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, e, rest] => ok [:not, e] rest,
+        }
+    }
+    else if at ts :lparen {
+        match parse_cfg_or c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, e, rest] =>
+                match expect rest :rparen "`)` in a `when` condition" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] => ok e rest2,
+                },
+        }
+    }
+    else if is_kw ts "true"  { ok [:const, true] (list.tail ts) }
+    else if is_kw ts "false" { ok [:const, false] (list.tail ts) }
+    else if at ts :ident {
+        let name = peek_value ts;
+        let rest = list.tail ts;
+        // `os == "linux"` compares a setting; a bare name asks whether a flag
+        // is defined. A setting that has a value counts as defined.
+        if at rest :eq_eq && peek_kind (list.tail rest) == :str {
+            ok [:equals, name, peek_value (list.tail rest)] (list.tail (list.tail rest))
+        }
+        else { ok [:flag, name] rest }
+    }
+    else { err ("expected a `when` condition, found " + describe ts) (peek_span ts) };
+
+/// The items of a file, or of a `mod`/`when` body when `braced` is true.
+let rec item_list c acc ts braced =
+    if at ts :semi { item_list c acc (list.tail ts) braced }
+    else if braced && at ts :rbrace { ok (list.reverse acc) (list.tail ts) }
+    else if at_end ts {
+        if braced { err "unterminated block: expected `}`" (peek_span ts) }
+        else { ok (list.reverse acc) ts }
+    }
+    else {
+        match parse_item (at_statement c ts) ts {
+            [:error, m, s] => err m s,
+            [:ok, item, rest] => item_list c (core.cons item acc) rest braced,
+        }
+    };
+
+/// Parse a whole module from source text: `[:ok, items]`, or
+/// `[:error, message, span]`.
+let parse_module src =
+    match lexer.lex src {
+        [:error, m, offset] => err m (ast.span_of offset offset),
+        [:ok, ts] =>
+            match item_list top [] ts false {
+                [:error, m, s] => err m s,
+                [:ok, items, _] => [:ok, items],
+            },
+        _ => err "the lexer answered something unexpected" ast.no_span,
+    };
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    /// An expression's tree, written on one line without spans.
+    let shape src =
+        match parse_expression src {
+            [:ok, e] => ast.show e,
+            [:error, m, _] => "error: " + m,
+        };
+
+    /// A whole module's items, one line each.
+    let items src =
+        match parse_module src {
+            [:ok, its] => str.join_str " " (list.map (fn i -> ast.show i) its),
+            [:error, m, _] => "error: " + m,
+        };
+
+    /// The message of a module that must not parse.
+    let fails_module src =
+        match parse_module src {
+            [:ok, _] => "parsed when it should not have",
+            [:error, m, _] => m,
+        };
+
+    /// The message of a source that must not parse.
+    let fails src =
+        match parse_expression src {
+            [:ok, e] => "parsed when it should not have",
+            [:error, m, _] => m,
+        };
+
+    let tests = [
+        // --- literals ---
+        test.case "integer"   $( test.eq! "(int 42)" (shape "42") ),
+        test.case "float"     $( test.eq! "(float 1.5)" (shape "1.5") ),
+        test.case "string"    $( test.eq! "(str \"hi\")" (shape "\"hi\"") ),
+        test.case "atom"      $( test.eq! "(atom ok)" (shape ":ok") ),
+        test.case "char"      $( test.eq! "(char 'c')" (shape "'c'") ),
+        // A dump has to tell a string from a name.
+        test.case "a string is quoted in a dump"
+            $( test.eq! "(str \"a b\")" (shape "\"a b\"") ),
+        test.case "true"      $( test.eq! "(bool true)" (shape "true") ),
+        test.case "unit"      $( test.eq! "(unit)" (shape "()") ),
+        test.case "name"      $( test.eq! "(name x)" (shape "x") ),
+        // A trailing `!` is part of the name, not an operator.
+        test.case "an impure name keeps its bang"
+            $( test.eq! "(name print!)" (shape "print!") ),
+
+        // --- the rule that carries the most weight ---
+        //
+        // Application is juxtaposition and binds tighter than every operator,
+        // which is why a recursive call usually needs parentheses.
+        test.case "application binds tighter than an operator"
+            $( test.eq! "(binary sub (apply (name fac) (name n)) (int 1))" (shape "fac n - 1") ),
+        test.case "parentheses are what a recursive call wants"
+            $( test.eq! "(apply (name fac) (binary sub (name n) (int 1)))" (shape "fac (n - 1)") ),
+        test.case "operands of an operator are whole applications"
+            $( test.eq! "(binary add (apply (name f) (name a) (name b)) (apply (name g) (name c)))"
+                        (shape "f a b + g c") ),
+        test.case "application is curried into one node"
+            $( test.eq! "(apply (name f) (name a) (name b) (name c))" (shape "f a b c") ),
+
+        // --- precedence, loosest to tightest ---
+        test.case "* binds tighter than +"
+            $( test.eq! "(binary add (int 1) (binary mul (int 2) (int 3)))" (shape "1 + 2 * 3") ),
+        test.case "&& binds tighter than ||"
+            $( test.eq! "(binary or (name a) (binary and (name b) (name c)))" (shape "a || b && c") ),
+        test.case "comparison is looser than arithmetic"
+            $( test.eq! "(binary lt (binary add (name a) (int 1)) (name b))" (shape "a + 1 < b") ),
+        test.case "every operator is left-associative"
+            $( test.eq! "(binary sub (binary sub (int 1) (int 2)) (int 3))" (shape "1 - 2 - 3") ),
+        test.case "the pipe is looser than everything"
+            $( test.eq! "(pipe (binary add (name x) (int 1)) (apply (name f) (name a)))"
+                        (shape "x + 1 |> f a") ),
+        test.case "unary minus"
+            $( test.eq! "(unary neg (name x))" (shape "-x") ),
+        test.case "not is looser than application"
+            $( test.eq! "(unary not (apply (name f) (name x)))" (shape "not f x") ),
+
+        // --- member access ---
+        test.case "member access"
+            $( test.eq! "(field (name console) print!)" (shape "console.print!") ),
+        test.case "member access binds tighter than application"
+            $( test.eq! "(apply (field (name console) print!) (str \"hi\"))"
+                        (shape "console.print! \"hi\"") ),
+        test.case "nested members"
+            $( test.eq! "(field (field (name a) b) c)" (shape "a.b.c") ),
+
+        // --- collections ---
+        test.case "list"    $( test.eq! "(list (int 1) (int 2))" (shape "[1, 2]") ),
+        test.case "array"   $( test.eq! "(array (int 1))" (shape "#[1]") ),
+        test.case "map"     $( test.eq! "(map [(atom a) (int 1)])" (shape "%{ :a => 1 }") ),
+        test.case "empty list"  $( test.eq! "(list )" (shape "[]") ),
+        test.case "a trailing comma is allowed"
+            $( test.eq! "(list (int 1))" (shape "[1,]") ),
+        // Newlines never end a statement inside a bracket group.
+        test.case "a list may span lines"
+            $( test.eq! "(list (int 1) (int 2))" (shape "[1,\n 2]") ),
+
+        // --- control forms ---
+        test.case "if with else"
+            $( test.eq! "(if (name a) (block (name b)) (block (name c)))"
+                        (shape "if a { b } else { c }") ),
+        test.case "if without else"
+            $( test.eq! "(if (name a) (block (name b)))" (shape "if a { b }") ),
+        test.case "else if chains"
+            $( test.eq! "(if (name a) (block (int 1)) (if (name b) (block (int 2)) (block (int 3))))"
+                        (shape "if a { 1 } else if b { 2 } else { 3 }") ),
+        // The brace after the condition opens the branch; it is not one more
+        // argument to an application in the condition.
+        test.case "a condition does not swallow the branch brace"
+            $( test.eq! "(if (apply (name f) (name x)) (block (int 1)))" (shape "if f x { 1 }") ),
+        test.case "lambda"
+            $( test.eq! "(fn x (binary add (name x) (int 1)))" (shape "fn x -> x + 1") ),
+        test.case "lambda with several parameters"
+            $( test.eq! "(fn a b (binary mul (name a) (name b)))" (shape "fn a b -> a * b") ),
+        test.case "thunk"   $( test.eq! "(thunk (apply (name f) (name x)))" (shape "$( f x )") ),
+        test.case "try/catch"
+            $( test.eq! "(try (block (binary div (int 1) (int 0))) e (block (int 0)))"
+                        (shape "try! { 1 / 0 } catch e { 0 }") ),
+        test.case "comp"    $( test.eq! "(comp (apply (name f) (name x)))" (shape "comp f x") ),
+        test.case "comp!"   $( test.eq! "(comp! (apply (name f) (name x)))" (shape "comp! f x") ),
+
+        // --- blocks ---
+        test.case "an empty block"  $( test.eq! "(block)" (shape "{ }") ),
+        test.case "a block of statements"
+            $( test.eq! "(block (name a) (name b))" (shape "{ a\n  b }") ),
+        test.case "semicolons separate statements too"
+            $( test.eq! "(block (name a) (name b))" (shape "{ a; b }") ),
+        test.case "a block may declare a let"
+            $( test.eq! "(block (let x (int 1)) (name x))" (shape "{ let x = 1\n  x }") ),
+        test.case "a let with parameters is a function"
+            $( test.eq! "(block (let f a b (binary add (name a) (name b))))"
+                        (shape "{ let f a b = a + b }") ),
+        test.case "let rec is recorded"
+            $( test.eq! "(block (let rec go n (name n)))" (shape "{ let rec go n = n }") ),
+        // A line indented past the statement it follows continues it.
+        test.case "an indented line continues the statement above"
+            $( test.eq! "(block (apply (name f) (int 1) (int 2)))" (shape "{ f 1\n    2 }") ),
+        test.case "a line at the same indentation starts a new statement"
+            $( test.eq! "(block (apply (name f) (int 1)) (int 2))" (shape "{ f 1\n  2 }") ),
+        // An operator can never begin a statement, so a line starting with one
+        // continues the line above whatever its indentation.
+        test.case "a leading operator continues the line above"
+            $( test.eq! "(block (binary add (name a) (name b)))" (shape "{ a\n+ b }") ),
+
+        // --- match ---
+        test.case "match"
+            $( test.eq! "(match (name v) [(int 0) (atom zero)] [_ (atom other)])"
+                        (shape "match v { 0 => :zero, _ => :other }") ),
+        test.case "a binding pattern"
+            $( test.eq! "(match (name v) [n (name n)])" (shape "match v { n => n }") ),
+        test.case "a list pattern with a rest"
+            $( test.eq! "(match (name v) [[x ..rest] (name x)])"
+                        (shape "match v { [x, ..rest] => x }") ),
+        test.case "an unnamed rest"
+            $( test.eq! "(match (name v) [[x ..] (name x)])" (shape "match v { [x, ..] => x }") ),
+        test.case "an empty list pattern"
+            $( test.eq! "(match (name v) [[] (int 0)])" (shape "match v { [] => 0 }") ),
+        test.case "an array pattern"
+            $( test.eq! "(match (name v) [#[a b] (name a)])" (shape "match v { #[a, b] => a }") ),
+        test.case "a map pattern"
+            $( test.eq! "(match (name v) [%{(atom k) => p} (name p)])"
+                        (shape "match v { %{ :k => p } => p }") ),
+        test.case "an as pattern"
+            $( test.eq! "(match (name v) [(_ as whole) (name whole)])"
+                        (shape "match v { _ as whole => whole }") ),
+        test.case "a guard"
+            $( test.eq! "(match (name v) [n if (binary lt (name n) (int 0)) (atom neg)])"
+                        (shape "match v { n if n < 0 => :neg }") ),
+        test.case "a negative literal pattern"
+            $( test.eq! "(match (name v) [(int -1) (atom neg)])" (shape "match v { -1 => :neg }") ),
+        test.case "the subject does not swallow the arms brace"
+            $( test.eq! "(match (apply (name f) (name x)) [_ (int 1)])"
+                        (shape "match f x { _ => 1 }") ),
+
+        // --- parameters ---
+        //
+        // Three spellings, and only juxtaposition is in the reference. The
+        // parenthesised list is undocumented but the Rust parser takes it, so
+        // files in this repository already depend on it.
+        test.case "juxtaposed parameters"
+            $( test.eq! "(let f a b (name a))" (items "let f a b = a") ),
+        test.case "a unit parameter binds no name"
+            $( test.eq! "(let now! () (int 1))" (items "let now! () = 1") ),
+        test.case "a parenthesised parameter list"
+            $( test.eq! "(let f a b (name a))" (items "let f(a, b) = a") ),
+        test.case "a lambda takes the same shapes"
+            $( test.eq! "(fn a b (name a))" (shape "fn (a, b) -> a") ),
+
+        // --- module items ---
+        test.case "import"
+            $( test.eq! "(import std.list)" (items "import std.list;") ),
+        test.case "import with an alias"
+            $( test.eq! "(import std.list as l)" (items "import std.list as l;") ),
+        test.case "import of members"
+            $( test.eq! "(import std.list.{map filter})" (items "import std.list.{map, filter};") ),
+        test.case "a member may be renamed"
+            $( test.eq! "(import std.list.{sum as total})" (items "import std.list.{sum as total};") ),
+        test.case "a whole package"
+            $( test.eq! "(import std)" (items "import std;") ),
+        test.case "derive"
+            $( test.eq! "(derive std.seq)" (items "derive std.seq;") ),
+        test.case "a virtual with no body is a hole"
+            $( test.eq! "(virtual fold f init xs)" (items "virtual let fold f init xs;") ),
+        test.case "a virtual with a body has a default"
+            $( test.eq! "(virtual name xs (str \"sequence\"))"
+                        (items "virtual let name xs = \"sequence\";") ),
+        test.case "a virtual needs a parameter"
+            $( test.true! (str.contains_str "constant" (fails_module "virtual let x = 1;")) ),
+        test.case "mod"
+            $( test.eq! "(mod math (let square x (name x)))"
+                        (items "mod math { let square x = x }") ),
+        test.case "when with a flag"
+            $( test.eq! "(when (flag test) (let x (int 1)))" (items "when test { let x = 1 }") ),
+        test.case "when with a single item and no braces"
+            $( test.eq! "(when (flag release) (let x (int 1)))" (items "when release let x = 1;") ),
+        test.case "a when condition uses the language's own vocabulary"
+            $( test.eq! "(when (and (equals os \"linux\") (not (flag release))) (let x (int 1)))"
+                        (items "when os == \"linux\" && not release { let x = 1 }") ),
+        test.case "top-level lets need no rec"
+            $( test.eq! "(let go n (apply (name go) (name n)))" (items "let go n = go n") ),
+
+        // --- errors ---
+        test.case "an unclosed parenthesis"
+            $( test.true! (str.contains_str "expected `)`" (fails "(1 + 2")) ),
+        test.case "a missing catch"
+            $( test.eq! "`try!` needs a `catch`" (fails "try! { 1 }") ),
+        test.case "fn needs a parameter"
+            $( test.eq! "`fn` needs at least one parameter" (fails "fn -> 1") ),
+        test.case "a keyword is not an expression"
+            $( test.true! (str.contains_str "keyword" (fails "let")) ),
+        test.case "trailing tokens are reported"
+            $( test.true! (str.contains_str "unexpected" (fails "1 2 )")) ),
+        test.case "a lexical error is reported by the parser"
+            $( test.true! (str.contains_str "unterminated string" (fails "\"oops")) ),
+    ];
+}

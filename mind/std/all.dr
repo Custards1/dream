@@ -1,20 +1,21 @@
 // Every module in the standard library.
 //
-// `dreamc mind/std/all.dr --test` builds a runner from the `tests` each of
+// `dreams mind/std/all.dr --test` builds a runner from the `tests` each of
 // these exports, so adding a module here is all it takes for its tests to run.
 // Importing them is also a check in itself: a module that no longer compiles
 // fails the build rather than being quietly skipped.
 
 import std.array;
+import std.cli;
 import std.json;
 import std.list;
 import std.seq;
 import std.str;
 import std.toml;
 import std.test;
-
+import std.streams;
 /// The library's own version, so a program can report what it was built with.
 let version = "0.1.0";
 
 /// The modules this build provides.
-let modules = ["std.array", "std.core", "std.json", "std.list", "std.seq", "std.str", "std.test", "std.toml"];
+let modules = ["std.array", "std.cli", "std.core", "std.json", "std.list", "std.seq", "std.str", "std.test", "std.toml"];

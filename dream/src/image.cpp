@@ -139,8 +139,8 @@ bool StringRef::equals(const char* s) const {
 }
 
 Image::~Image() {
-    if (owns_mapping_ && data_) {
-        ::munmap(const_cast<uint8_t*>(data_), size_);
+    if (owns_mapping_ && mapping_) {
+        ::munmap(mapping_, mapping_size_);
     }
 }
 
@@ -167,8 +167,32 @@ bool Image::load_file(const std::string& path, std::string& error) {
         error = "cannot map " + path;
         return false;
     }
-    data_ = static_cast<const uint8_t*>(p);
-    size_ = static_cast<size_t>(st.st_size);
+    // The mapping is what gets unmapped, whatever the image turns out to start
+    // at: skipping a shebang below moves `data_` off the page boundary, and
+    // munmap only accepts the address it handed out.
+    mapping_ = p;
+    mapping_size_ = static_cast<size_t>(st.st_size);
+
+    // A shebang line, so that an image can be marked executable and run
+    // directly. `dreamc --shebang` writes one. Anything before the first
+    // newline is skipped; an image is binary and never starts with '#'
+    // otherwise, since the magic number begins with 'D'.
+    const uint8_t* start = static_cast<const uint8_t*>(p);
+    size_t size = static_cast<size_t>(st.st_size);
+    if (size > 0 && *start == '#') {
+        const void* nl = std::memchr(start, '\n', size);
+        if (nl == nullptr) {
+            error = path + " begins with `#` and has no newline, so it is not an image";
+            ::munmap(mapping_, mapping_size_);
+            mapping_ = nullptr;
+            return false;
+        }
+        size_t offset = static_cast<const uint8_t*>(nl) - start + 1;
+        start += offset;
+        size -= offset;
+    }
+    data_ = start;
+    size_ = size;
     owns_mapping_ = true;
     if (!parse(error)) {
         error = path + ": " + error;

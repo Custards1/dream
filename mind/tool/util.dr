@@ -62,7 +62,10 @@ let write_file! path text = {
         let left = str.byte_length text - offset;
         if left <= 0 { :done }
         else {
-            let wrote = io.write! (to_string h + to_string (str.slice offset left text));
+            // Two arguments, not one string built from both: `io.write!` is
+            // curried, so passing one leaves a function behind rather than
+            // failing here, and it fails as `offset + <function>` instead.
+            let wrote = io.write! h (str.slice offset left text);
             put! (offset + wrote)
         }
     };

@@ -143,19 +143,75 @@ cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | \
   grep -E 'error|warning:' | sed 's/^/    /' || true
 
 dream="$BUILD_DIR/bin/dream"
+MIND="$BUILD_DIR/bin/mind"
 [[ -x "$dream" ]] || die "cmake finished but $dream is missing"
 ok "$dream"
 ok "$BUILD_DIR/lib/libdream.so"
 
+step "Building the standard library (mind)"
+# `--shebang` writes the `#!` line and sets the execute bit, so `mind` is a
+# program you can run rather than an image you have to hand to the VM.
+$DREAMC -L mind/std --shebang -o "$MIND" mind/tool/main.dr
+
+[[ -x "$MIND" ]] || die "the compiler finished but $MIND is missing"
+ok "$MIND"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# --- the self-hosted compiler -----------------------------------------------
+#
+# `dreams` is the Dream compiler written in Dream, and it is built from an
+# image of itself that is checked in rather than from `dreamc`. The seed is
+# not a native binary: it needs the VM to run and nothing else, which is what
+# makes this step independent of the Rust compiler above -- and what will let
+# `dreamc` go away.
+
+step "Bootstrapping the self-hosted compiler (dreams)"
+SEED="dreams/bootstrap/dreams.dream"
+DREAMS="$BUILD_DIR/bin/dreams.dream"
+if [[ -f "$SEED" ]]; then
+  "$dream" "$SEED" -L mind -L . -o "$DREAMS" dreams/main.dr >/dev/null 2>&1 ||     die "the bootstrap image could not compile dreams"
+  if [[ $RUN_TESTS -eq 1 ]]; then
+    # A compiler that does not rebuild itself into the same bytes is not the
+    # compiler in this tree, whatever it claims. Nothing else here proves the
+    # source and the seed agree.
+    "$dream" "$DREAMS" -L mind -L . -o "$TMP/stage3.dream" dreams/main.dr >/dev/null 2>&1 ||       die "dreams could not compile itself"
+    cmp -s "$DREAMS" "$TMP/stage3.dream" ||       die "dreams does not reproduce itself: the seed and the source disagree"
+    ok "$DREAMS (reproduces itself byte for byte)"
+  else
+    ok "$DREAMS"
+  fi
+else
+  warn "no bootstrap image at $SEED; skipping the self-hosted compiler"
+  DREAMS=""
+fi
+
+# --- the language server ----------------------------------------------------
+#
+# Built with `dreams` when there is one, which is worth doing for its own sake:
+# `lucid` imports the compiler as a library, so compiling it is the self-hosted
+# compiler put through a real program rather than a test.
+
+step "Building the language server (lucid)"
+LUCID="$BUILD_DIR/bin/lucid.dream"
+if [[ -n "$DREAMS" ]]; then
+  "$dream" "$DREAMS" -L mind -L . -o "$LUCID" lucid/main.dr >/dev/null 2>&1 || \
+    die "dreams could not compile lucid"
+  ok "$LUCID (compiled by dreams)"
+else
+  $DREAMC lucid/main.dr -L mind -L . -o "$LUCID" >/dev/null 2>&1 || \
+    die "the compiler could not compile lucid"
+  ok "$LUCID"
+fi
+
 # --- smoke test -------------------------------------------------------------
 
 step "Checking the toolchain works"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/hello.dr" <<'DREAM'
 import std.console;
 let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
-let main! = { fac 10 |> console.print! "fac 10 = " }
+let main! = { console.print! ("fac 10 = " + to_string (fac 10)) }
 DREAM
 "$DREAMC" "$TMP/hello.dr" -o "$TMP/hello.dream" >/dev/null 2>&1 || die "the compiler could not compile a trivial program"
 result="$("$dream" "$TMP/hello.dream" 2>&1)" || die "the VM could not run a trivial program: $result"
@@ -177,6 +233,8 @@ if [[ -n "$PREFIX" ]]; then
   step "Installing into $PREFIX"
   cmake --install "$BUILD_DIR" --prefix "$PREFIX" >/dev/null
   install -Dm755 "$DREAMC" "$PREFIX/bin/dreamc"
+  [[ -n "$DREAMS" ]] && install -Dm644 "$DREAMS" "$PREFIX/share/dream/dreams.dream"
+  [[ -n "$LUCID" ]] && install -Dm644 "$LUCID" "$PREFIX/share/dream/lucid.dream"
   if [[ -d mind/std ]]; then
     mkdir -p "$PREFIX/share/dream"
     cp -r mind "$PREFIX/share/dream/"
@@ -192,6 +250,8 @@ printf '%sDream is built.%s\n' "$BOLD" "$RESET"
 printf '  compiler  %s\n' "$DREAMC"
 printf '  vm        %s\n' "$dream"
 printf '  library   %s\n' "$BUILD_DIR/lib/libdream.so"
+[[ -n "$DREAMS" ]] && printf '  dreams    %s\n' "$DREAMS"
+[[ -n "$LUCID" ]] && printf '  lucid     %s\n' "$LUCID"
 echo
 printf '  %s./%s program.dr -o program.dream && ./%s program.dream%s\n' \
        "$DIM" "$DREAMC" "$dream" "$RESET"

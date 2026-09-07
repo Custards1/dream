@@ -64,7 +64,10 @@ void* Heap::bump(size_t bytes) {
     }
     void* p = head->data + head->used;
     head->used += bytes;
-    if (!collecting_) allocated_ += bytes;
+    if (!collecting_) {
+        allocated_ += bytes;
+        total_allocated_ += bytes;
+    }
     return p;
 }
 
@@ -113,10 +116,23 @@ Value Heap::make_array(uint32_t len) {
     return from_obj(o);
 }
 
-Value Heap::make_map(uint32_t capacity) {
-    auto* o = static_cast<MapObj*>(alloc(ObjType::Map, 8 + size_t(capacity) * 2 * sizeof(Value)));
+Value Heap::make_map(uint32_t) {
+    return make_map_branch(0);
+}
+
+Value Heap::make_map_branch(uint32_t nslots) {
+    auto* o = static_cast<MapObj*>(alloc(ObjType::Map, 8 + size_t(nslots) * sizeof(Value)));
     o->count = 0;
-    o->cap = capacity;
+    o->bitmap = 0;
+    return from_obj(o);
+}
+
+Value Heap::make_map_leaf(uint64_t hash, Value key, Value value, Value next) {
+    auto* o = static_cast<MapLeafObj*>(alloc(ObjType::MapLeaf, 8 + 3 * sizeof(Value)));
+    o->hash = hash;
+    o->key = key;
+    o->value = value;
+    o->next = next;
     return from_obj(o);
 }
 
@@ -226,7 +242,15 @@ void Heap::scan_object(Obj* o) {
         }
         case ObjType::Map: {
             auto* m = static_cast<MapObj*>(o);
-            for (uint32_t i = 0; i < m->cap * 2; ++i) forward(&m->entries()[i]);
+            uint32_t n = map_bit_count(m->bitmap);
+            for (uint32_t i = 0; i < n; ++i) forward(&m->slots()[i]);
+            break;
+        }
+        case ObjType::MapLeaf: {
+            auto* l = static_cast<MapLeafObj*>(o);
+            forward(&l->key);
+            forward(&l->value);
+            forward(&l->next);
             break;
         }
         case ObjType::Closure: {
@@ -301,6 +325,7 @@ void Heap::collect(RootSource& roots) {
     size_t live = 0;
     for (Block* b = blocks_; b; b = b->next) live += b->used;
     live_after_gc_ = live;
+    if (live > peak_live_) peak_live_ = live;
     allocated_ = live;
     ++collections_;
 
@@ -415,19 +440,33 @@ struct VerifyWalk {
                     for (uint32_t i = 0; i < a->len; ++i) push(a->items()[i]);
                     break;
                 }
+                case ObjType::MapLeaf: {
+                    auto* l = static_cast<MapLeafObj*>(o);
+                    if (l->bytes < sizeof(Obj) + 8 + 3 * sizeof(Value)) {
+                        problem("map entry at " + addr(o) + " is too small");
+                        return;
+                    }
+                    push(l->key);
+                    push(l->value);
+                    push(l->next);
+                    break;
+                }
                 case ObjType::Map: {
                     auto* m = static_cast<MapObj*>(o);
-                    size_t need = sizeof(Obj) + 8 + size_t(m->cap) * 2 * sizeof(Value);
+                    uint32_t slots = map_bit_count(m->bitmap);
+                    size_t need = sizeof(Obj) + 8 + size_t(slots) * sizeof(Value);
                     if (m->bytes < need) {
-                        problem("map at " + addr(o) + " says it has capacity " +
-                                std::to_string(m->cap) + " but is too small");
+                        problem("map at " + addr(o) + " holds " +
+                                std::to_string(slots) + " children but is too small");
                         return;
                     }
-                    if (m->count > m->cap) {
-                        problem("map at " + addr(o) + " holds more entries than it has slots");
+                    // A branch with children must hold at least as many
+                    // entries as it has children, since every child holds one.
+                    if (m->count < slots) {
+                        problem("map at " + addr(o) + " counts fewer entries than it has children");
                         return;
                     }
-                    for (uint32_t i = 0; i < m->cap * 2; ++i) push(m->entries()[i]);
+                    for (uint32_t i = 0; i < slots; ++i) push(m->slots()[i]);
                     break;
                 }
                 case ObjType::Closure: {
@@ -561,15 +600,33 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
             return arr;
         }
         case ObjType::Map: {
+            // Copied branch for branch, so the shape -- and with it the
+            // lookups -- comes out identical on the other side.
             auto* src = static_cast<MapObj*>(o);
-            Value map = dest.make_map(src->cap);
+            uint32_t slots = map_bit_count(src->bitmap);
+            Value map = dest.make_map_branch(slots);
             seen.emplace_back(v, map);
-            static_cast<MapObj*>(as_obj(map))->count = src->count;
-            for (uint32_t i = 0; i < src->cap * 2; ++i) {
-                Value item = copy_value(dest, src->entries()[i], seen);
-                static_cast<MapObj*>(as_obj(map))->entries()[i] = item;
+            auto* out = static_cast<MapObj*>(as_obj(map));
+            out->count = src->count;
+            out->bitmap = src->bitmap;
+            for (uint32_t i = 0; i < slots; ++i) {
+                Value item = copy_value(dest, src->slots()[i], seen);
+                static_cast<MapObj*>(as_obj(map))->slots()[i] = item;
             }
             return map;
+        }
+        case ObjType::MapLeaf: {
+            auto* src = static_cast<MapLeafObj*>(o);
+            Value leaf = dest.make_map_leaf(src->hash, NIL_SLOT, NIL_SLOT, NIL_SLOT);
+            seen.emplace_back(v, leaf);
+            Value key = copy_value(dest, src->key, seen);
+            Value val = copy_value(dest, src->value, seen);
+            Value next = copy_value(dest, src->next, seen);
+            auto* out = static_cast<MapLeafObj*>(as_obj(leaf));
+            out->key = key;
+            out->value = val;
+            out->next = next;
+            return leaf;
         }
         case ObjType::ErrorBox: {
             auto* src = static_cast<ErrorObj*>(o);

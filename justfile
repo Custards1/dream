@@ -12,6 +12,7 @@ build_dir := "build-dream"
 dreamc := "target/debug/dreamc"
 dreamc_release := "target/release/dreamc"
 dream := build_dir / "bin/dream"
+seed := "dreams/bootstrap/dreams.dream"
 
 default: build
 
@@ -44,6 +45,35 @@ vm-no-jit:
 mind:
     mkdir -p build
     {{dreamc}} -L mind/std mind/tool/main.dr -o build/mind
+    ./patch_shebang.sh build/mind
+    chmod +x build/mind
+# The dreeams , itself a Dream program compiled by either itself or the soon unsupported dreamc.
+dreams:vm mind
+    mkdir -p build
+    cd dreams &&DREAMC= {{dream}} build/mind -L mind/std mind/tool/main.dr -o build/mind
+# The language server, built with whichever compiler `dreamc` points at.
+lucid:
+    mkdir -p build
+    {{dreamc}} lucid/main.dr -L mind -L . -o build/lucid.dream
+    @echo "built build/lucid.dream -- run it as: {{dream}} build/lucid.dream"
+
+# Build `dreams` from the checked-in image, with no `dreamc` in sight.
+#
+# The image is a fixpoint: compiling this source with it produces a
+# byte-identical copy of itself. To move the seed forward after changing the
+# compiler, run this and keep `build/dreams.dream`.
+bootstrap: vm
+    mkdir -p build
+    ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/main.dr
+
+# The seed must still reproduce itself from this source: what it builds must
+# build an identical third image. That equality is the whole guarantee -- it
+# says the compiler in the tree and the compiler in the image agree.
+bootstrap-check: vm
+    ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/main.dr
+    ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/main.dr
+    cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
+    @echo "the bootstrap image reproduces itself"
 
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
 test-mind: build
@@ -88,16 +118,25 @@ jit-ir FILE FN: build
     ./{{dreamc}} {{FILE}} -o /tmp/dream-jit.dream
     ./{{dream}} /tmp/dream-jit.dream --dump-jit {{FN}}
 
-install: release mind
+# A directly runnable program: the image carries a `#!` line and the execute
+# bit, and the VM skips the line when it loads it.
+run-script FILE OUT: build
+    ./{{dreamc}} {{FILE}} --shebang -o {{OUT}}
+    ./{{OUT}}
+
+install-artifacts:
     mv {{dreamc_release}} {{install_dir}}/bin || true
     mv {{dream}} {{install_dir}}/bin || true
-    mv build/mind {{install_dir}} || true
+    mv build/mind {{install_dir}}/bin || true
+
+install: release mind
+    just install-artifacts    
 
 
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -124,9 +163,73 @@ test-examples-std: build
     ./{{dream}} /tmp/dream-ex-tests.dream
 
 # `dreams`, the self-hosted compiler: the parts of it that exist so far.
+# Built from `main.dr` so that every module it reaches has its tests collected.
 test-dreams: build
-    {{dreamc}} dreams/lexer.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
+    {{dreamc}} dreams/main.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
     ./{{dream}} /tmp/dream-dreams-tests.dream
+
+# Every Dream file in the repository must parse. The corpus is the real test of
+# a parser: the standard library, the build tool, the examples, and `dreams`
+# itself, which is the one that has to keep working for this to go anywhere.
+#
+# `--parse` rather than the default, because the question here is whether each
+# file is well formed on its own -- a module in the middle of a package is not a
+# program, and following its imports would be asking something else.
+test-dreams-corpus: build
+    {{dreamc}} dreams/main.dr -L mind -L . -o /tmp/dreams.dream
+    @for f in mind/std/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
+              dream/tests/programs/*.dr dreams/*.dr; do \
+        ./{{dream}} /tmp/dreams.dream --parse "$f" || exit 1; \
+    done
+    @echo "every file in the corpus parses"
+    {{dreamc}} dreams/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
+    ./{{dream}} /tmp/dream-ast-tests.dream
+    {{dreamc}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
+    ./{{dream}} /tmp/dream-parser-tests.dream
+
+# `dreams`'s module loader against the one it replaces. Every program in the
+# repository must resolve to the same modules, in the same order, under both --
+# and the failures `dreamc` cannot report must be reported here.
+test-dreams-modules: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/modules.sh
+
+# `dreams`'s resolution and purity pass. Every program must get the same verdict
+# from both compilers, and the broken ones must be rejected for the same reason.
+test-dreams-scope: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/scope.sh
+
+# `dreams`'s lowering. Every program the reference compiler accepts must lower
+# to an execution tree, the compiler itself included -- which is the only
+# program here big enough to notice a quadratic mistake before it becomes an
+# out-of-memory.
+test-dreams-lower: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/lower.sh
+
+# The end of the pipeline: programs `dreams` compiled, run by the VM, checked
+# against the output recorded beside them. Every other `dreams` test asks
+# whether a stage agrees with something -- the reference compiler, or a recorded
+# shape. This one asks the only question that finally matters, and it is the
+# evidence that the self-hosted compiler works rather than merely agrees.
+test-dreams-compile: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/compile.sh
+
+# The VS Code extension's grammar, tokenized and checked against the scopes it
+# promises. Needs `npm install` in editors/vscode first.
+test-vscode:
+    cd editors/vscode && npm test
+
+# `lucid`'s own tests: positions, framing, and the URI/path boundary.
+test-lucid: build
+    {{dreamc}} lucid/main.dr --test -L mind -L . -o /tmp/lucid-tests.dream
+    ./{{dream}} /tmp/lucid-tests.dream
+
+# And one whole conversation with it, which is the only place the server is
+# checked as a running program rather than as a set of functions.
+test-lucid-session: build
+    dreamc={{dreamc}} dream={{dream}} MIND_STDLIB=mind lucid/tests/session.sh
+
+# The bootstrap: the seed reproduces itself from this source.
+test-bootstrap: bootstrap-check
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build

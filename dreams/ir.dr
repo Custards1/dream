@@ -1,0 +1,471 @@
+// The IR: a flat arena of fixed-size execution-tree nodes.
+//
+// The point of this representation is load speed. Every node is a 16-byte
+// record and every edge is an index into the same arena, so the node section of
+// an image is loadable by slicing bytes -- there are no pointers to relocate
+// and no tree to rebuild. Variadic children (block statements, call arguments,
+// list elements) live in a side pool addressed by an offset and a count.
+//
+// Because the VM evaluates lazily, the tree *is* the program: a node is forced
+// on demand, and the strict flag marks the points where evaluation order is
+// observable -- effects sequenced inside an impure block.
+//
+// Nothing here decides anything. This module owns the shape of the arena and
+// the arithmetic of appending to it; what to append is `lower`'s business.
+//
+// A note on how it is built. Appending to the end of a list costs the length of
+// the list, and a real program is tens of thousands of nodes, so building the
+// arena that way would be quadratic. Instead every pool is kept *reversed* --
+// pushing is a cons -- alongside the count that gives the next index. The
+// reversal happens once, at the end, in `finish`.
+
+import std.core;
+import std.list;
+import std.str;
+
+// --- opcodes -------------------------------------------------------------------
+//
+// Named by atom rather than by number, so that a dump reads and a mistake is a
+// missing name rather than a wrong integer. The numbers are the VM's and must
+// not be renumbered: they are what an image stores.
+
+let ops = [
+    [:nop, 0, "nop"],
+
+    // Leaves. `a` indexes the matching constant table unless noted.
+    [:const_int, 1, "int"], [:const_float, 2, "float"], [:const_str, 3, "str"],
+    /// `a` is the Unicode scalar value directly.
+    [:const_char, 4, "char"],
+    /// `a` is 0 or 1.
+    [:const_bool, 5, "bool"], [:const_atom, 6, "atom"], [:unit, 7, "unit"],
+
+    // References. `a` is a slot, capture index, global index or builtin id.
+    [:local, 8, "local"], [:capture, 9, "capture"],
+    [:global, 10, "global"], [:builtin, 11, "builtin"],
+
+    /// `a` = object node, `b` = string constant naming the field.
+    [:field, 12, "field"],
+    /// `a` = callee, `b` = kids offset, `c` = argument count.
+    [:apply, 13, "apply"],
+    /// `a` = cond, `b` = then, `c` = else (absent when there is none).
+    [:if, 14, "if"],
+    /// `a` = kids offset, `b` = statement count. The value is the last one.
+    [:block, 15, "block"],
+    /// `a` = local slot, `b` = value. Binds lazily inside a block.
+    [:bind, 16, "bind"],
+    /// `a` = function index; captures come from that function's descriptor.
+    [:make_closure, 17, "closure"],
+    /// `a` = function index of a generated zero-arity thunk.
+    [:make_thunk, 18, "thunk"],
+    /// `a` = body, `b` = handler, `c` = slot holding the caught error.
+    [:try, 19, "try"],
+    /// `a` = the node to force to weak head normal form.
+    [:force, 20, "force"],
+
+    [:add, 21, "add"], [:sub, 22, "sub"], [:mul, 23, "mul"],
+    [:div, 24, "div"], [:mod, 25, "mod"],
+    [:eq, 26, "eq"], [:ne, 27, "ne"], [:lt, 28, "lt"],
+    [:le, 29, "le"], [:gt, 30, "gt"], [:ge, 31, "ge"],
+    /// Short-circuiting: `b` is only forced when it has to be.
+    [:and, 32, "and"], [:or, 33, "or"],
+    [:neg, 34, "neg"], [:not, 35, "not"],
+
+    /// `a` = kids offset, `b` = element count.
+    [:make_list, 36, "list"], [:make_array, 37, "array"],
+    /// `a` = kids offset, `b` = pair count; kids are `k0, v0, k1, v1, ..`.
+    [:make_map, 38, "map"],
+];
+
+let rec find_op key at ops_left =
+    match ops_left {
+        [] => (),
+        [o, ..rest] => if list.nth at o == key { o } else { find_op key at rest },
+    };
+
+/// The VM's number for an opcode, or `()` if it is not one.
+let opcode op = match find_op op 0 ops { () => (), o => list.nth 1 o };
+
+/// The short name an opcode dumps as.
+let op_name op = match find_op op 0 ops { () => "?", o => list.nth 2 o };
+
+/// The opcode a number stands for, for reading an image back.
+let op_of_code n = match find_op n 1 ops { () => (), o => list.nth 0 o };
+
+// --- function flags -------------------------------------------------------------
+
+let fn_impure = 1;
+let fn_rec = 2;
+/// A parameterless binding: a zero-arity function.
+let fn_thunk = 4;
+/// ..and a pure one is a value the VM forces once and remembers, where an
+/// impure one is an action that has to run again on every call.
+let fn_global_value = 8;
+
+// --- global flags ---------------------------------------------------------------
+
+let g_exported = 1;
+let g_impure = 2;
+
+/// What a global points at.
+let global_function = 0;
+let global_module = 1;
+
+/// A module with a hole in it: it declares a virtual nobody filled.
+let m_abstract = 2;
+
+/// How a capture says where the enclosing frame keeps the value. The high bit
+/// means "in that frame's captures" rather than "in one of its slots".
+let cap_from_capture = 2147483648;
+
+let encode_capture from_capture index =
+    if from_capture { cap_from_capture + index } else { index };
+
+// --- node flags ------------------------------------------------------------------
+
+/// Must be forced where it appears; its effects are ordered.
+let f_strict = 1;
+/// Performs, or may perform, effects.
+let f_impure = 2;
+/// In tail position of its enclosing function.
+let f_tail = 4;
+
+let has_flag flags f = (flags / f) % 2 == 1;
+let add_flag flags f = if has_flag flags f { flags } else { flags + f };
+
+/// Sentinel for an absent edge. The VM spells it as an all-ones word; a
+/// distinct atom is safer here, where a stray arithmetic slip on a large
+/// integer would be silent and this is loud.
+let no_node = :none;
+
+let is_node n = n != no_node;
+
+// --- a node --------------------------------------------------------------------
+
+/// `[op, flags, a, b, c]`. The VM's record also carries a 16-bit `aux` field
+/// that nothing generates yet; it is written as zero and left out here rather
+/// than threaded through every constructor unused.
+let node op a b c = [op, 0, a, b, c];
+
+let node_op n    = list.nth 0 n;
+let node_flags n = list.nth 1 n;
+let node_a n     = list.nth 2 n;
+let node_b n     = list.nth 3 n;
+let node_c n     = list.nth 4 n;
+
+let leaf op = node op no_node no_node no_node;
+
+let with_flags flags n = [node_op n, flags, node_a n, node_b n, node_c n];
+
+let node_is_impure n = has_flag (node_flags n) f_impure;
+
+// --- the constant pools ---------------------------------------------------------
+//
+// One pool per type, each deduplicated: the same string written twice in a
+// program is one entry. A pool is `[reversed values, count, index by value]`.
+
+let pool_new = [[], 0, core.map_new ()];
+
+let pool_values p = list.nth 0 p;
+let pool_count p  = list.nth 1 p;
+let pool_index p  = list.nth 2 p;
+
+/// Intern a value: `[pool, index]`. The index is stable once given.
+let intern v p =
+    match core.map_get (pool_index p) v () {
+        () => {
+            let i = pool_count p;
+            [[core.cons v (pool_values p), i + 1, core.map_put (pool_index p) v i], i]
+        },
+        found => [p, found],
+    };
+
+let pool_list p = list.reverse (pool_values p);
+
+// --- the program ----------------------------------------------------------------
+//
+// A note on how the arena is built. The obvious representation is a list, and
+// it is the wrong one: appending to the end of a list costs its length, looking
+// up an index costs the index, and a real program is tens of thousands of nodes
+// -- so emitting one would be quadratic, and setting a flag on a node already
+// emitted would be quadratic again. Both happen constantly.
+//
+// So the pools are maps from index to value, with the count alongside to say
+// what the next index is. Pushing and reading are both cheap, a flag can be set
+// on a node long after it was emitted, and the whole thing is turned into flat
+// lists once, in `finish`, where the cost is paid a single time.
+
+let program = %{
+    :nodes => core.map_new (), :node_count => 0,
+    :kids => core.map_new (), :kid_count => 0,
+    :funcs => [], :globals => [], :modules => [], :imports => [],
+    :ints => pool_new, :floats => pool_new, :strs => pool_new, :atoms => pool_new,
+    // The function `main!` compiles to, and the names an image reports itself
+    // by. All three are filled in when the program is linked.
+    :entry => no_node, :module_name => 0, :source_name => 0,
+};
+
+let nodes p      = core.map_get p :nodes (core.map_new ());
+let node_count p = core.map_get p :node_count 0;
+let kids p       = core.map_get p :kids (core.map_new ());
+let kid_count p  = core.map_get p :kid_count 0;
+let funcs p      = core.map_get p :funcs [];
+let globals p    = core.map_get p :globals [];
+let prog_modules p = core.map_get p :modules [];
+let imports p    = core.map_get p :imports [];
+let entry p      = core.map_get p :entry no_node;
+let module_name p = core.map_get p :module_name 0;
+let source_name p = core.map_get p :source_name 0;
+
+let ints p   = core.map_get p :ints pool_new;
+let floats p = core.map_get p :floats pool_new;
+let strs p   = core.map_get p :strs pool_new;
+let atoms p  = core.map_get p :atoms pool_new;
+
+/// Force the arena's spine.
+///
+/// Everything in Dream is lazy, and a lazy structure built in a loop is a chain
+/// of thunks that all stay live until something forces the end of it -- which
+/// for a program of any size is far more memory than the program itself. So the
+/// spine is forced as it is built: each push collapses the step before it, and
+/// what stays live is the arena rather than the history of how it was made.
+///
+/// Only the spine. The values inside stay lazy, which is where laziness is
+/// actually wanted.
+let settle p = if len (nodes p) >= 0 && len (kids p) >= 0 { p } else { p };
+
+/// The node at an index. Every edge in the arena is one of these.
+let node_at i p = core.map_get (nodes p) i (leaf :nop);
+
+let kid_at i p = core.map_get (kids p) i no_node;
+
+/// Append a node: `[program, index]`.
+let push_node n p = {
+    let i = node_count p;
+    [settle (core.map_put (core.map_put p :nodes (core.map_put (nodes p) i n))
+                          :node_count (i + 1)),
+     i]
+};
+
+/// Append a run of children: `[program, offset]`. The run is contiguous, which
+/// is what lets a parent address it with one offset and a count.
+let push_kids xs p = {
+    let at = kid_count p;
+    let filled = list.fold (fn acc pair ->
+        core.map_put acc (at + list.nth 1 pair) (list.nth 0 pair))
+        (kids p) (list.zip xs (list.range 0 (list.length xs)));
+    [settle (core.map_put (core.map_put p :kids filled) :kid_count (at + list.length xs)), at]
+};
+
+let intern_int v p   = { let got = intern v (ints p);   [core.map_put p :ints (list.head got), list.nth 1 got] };
+let intern_float v p = { let got = intern v (floats p); [core.map_put p :floats (list.head got), list.nth 1 got] };
+let intern_str v p   = { let got = intern v (strs p);   [core.map_put p :strs (list.head got), list.nth 1 got] };
+
+/// An atom is stored as the string-table index of its name, because the runtime
+/// interns atoms by name when it loads an image. Interning the name first is
+/// what makes that index exist.
+let intern_atom v p = {
+    let named = intern_str v p;
+    let got = intern (list.nth 1 named) (atoms (list.head named));
+    [core.map_put (list.head named) :atoms (list.head got), list.nth 1 got]
+};
+
+/// Set a flag on a node already in the arena. Nodes are appended and never
+/// moved, so an index stays valid, and a flag discovered late -- that a call is
+/// in tail position, that a value turned out to be effectful -- can still be
+/// recorded where it belongs.
+let set_node_flag i f p = {
+    let n = node_at i p;
+    settle (core.map_put p :nodes
+                (core.map_put (nodes p) i (with_flags (add_flag (node_flags n) f) n)))
+};
+
+let node_flags_at i p = node_flags (node_at i p);
+
+/// Replace a node already in the arena.
+///
+/// Only compile-time evaluation needs this: the expression is lowered into a
+/// placeholder, and what it came to is only known once the program has been
+/// built and run. Everything else emits a node once and leaves it alone.
+let set_node i n p = settle (core.map_put p :nodes (core.map_put (nodes p) i n));
+
+// --- what the arena becomes -------------------------------------------------------
+
+/// Put every pool the right way round. Everything downstream -- the dump, and
+/// eventually the image writer -- reads this rather than the building form.
+let finish p = %{
+    :nodes => list.map (fn i -> node_at i p) (list.range 0 (node_count p)),
+    :kids => list.map (fn i -> kid_at i p) (list.range 0 (kid_count p)),
+    :funcs => funcs p, :globals => globals p,
+    :modules => prog_modules p, :imports => imports p,
+    :ints => pool_list (ints p), :floats => pool_list (floats p),
+    :strs => pool_list (strs p), :atoms => pool_list (atoms p),
+    :entry => entry p, :module_name => module_name p, :source_name => source_name p,
+};
+
+// --- reading it back --------------------------------------------------------------
+
+/// One node, as a line. The operands are shown the way the opcode uses them,
+/// because `a` meaning "a constant index" and `a` meaning "another node" look
+/// identical otherwise, and that is exactly the mistake worth catching.
+/// A string as it would be written in source. `to_string` is the identity on a
+/// plain string, which in a dump loses the one thing that tells a string
+/// constant from a name -- `str hi` and `local hi` should not look alike.
+let quoted s =
+    "\"" + str.join_str "" (list.map (fn ch ->
+        if ch == '"' { "\\\"" }
+        else if ch == '\\' { "\\\\" }
+        else if ch == '\n' { "\\n" }
+        else if ch == '\t' { "\\t" }
+        else { str.of_chars [ch] }) (str.chars s)) + "\"";
+
+let show_node img i n = {
+    let const_at pool at = {
+        let xs = core.map_get img pool [];
+        if at == no_node || at >= list.length xs { "?" } else { to_string (list.nth at xs) }
+    };
+    let operands =
+        match node_op n {
+            :const_int   => const_at :ints (node_a n),
+            :const_float => const_at :floats (node_a n),
+            :const_str   => quoted (const_at :strs (node_a n)),
+            :const_atom  => {
+                let ats = core.map_get img :atoms [];
+                let at = node_a n;
+                if at >= list.length ats { ":?" }
+                else { ":" + const_at :strs (list.nth at ats) }
+            },
+            :const_char  => "'" + str.of_chars [core.char_of_code (node_a n)] + "'",
+            :const_bool  => if node_a n == 1 { "true" } else { "false" },
+            :unit        => "",
+            :local       => "@" + to_string (node_a n),
+            :capture     => "^" + to_string (node_a n),
+            :global      => "g" + to_string (node_a n),
+            :builtin     => "b" + to_string (node_a n),
+            :field       => to_string (node_a n) + " ." + const_at :strs (node_b n),
+            :apply       => to_string (node_a n) + " kids@" + to_string (node_b n)
+                            + "x" + to_string (node_c n),
+            :block       => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
+            :make_list   => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
+            :make_array  => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
+            :make_map    => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
+            :bind        => "@" + to_string (node_a n) + " = " + to_string (node_b n),
+            :make_closure => "fn" + to_string (node_a n),
+            :make_thunk  => "fn" + to_string (node_a n),
+            _ => str.join_str " " (list.filter (fn x -> x != "")
+                     (list.map (fn e -> if is_node e { to_string e } else { "" })
+                               [node_a n, node_b n, node_c n])),
+        };
+    let marks = (if has_flag (node_flags n) f_strict { "!" } else { "" })
+              + (if has_flag (node_flags n) f_impure { "~" } else { "" })
+              + (if has_flag (node_flags n) f_tail { ">" } else { "" });
+    "  " + to_string i + "  " + op_name (node_op n)
+    + (if operands == "" { "" } else { " " + operands })
+    + (if marks == "" { "" } else { "  " + marks })
+};
+
+/// The whole arena, as text. This is what `--dump` prints, and what a test
+/// compares against: a tree written out one node per line is far easier to read
+/// in a failure than a nest of indices.
+let dump img =
+    str.join_str "\n"
+        (list.map (fn i -> show_node img i (list.nth i (core.map_get img :nodes [])))
+                  (list.range 0 (list.length (core.map_get img :nodes []))));
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let built = {
+        let a = push_node (leaf :unit) program;
+        let b = push_node (node :force (list.nth 1 a) no_node no_node) (list.head a);
+        list.head b
+    };
+
+    let tests = [
+        test.case "an opcode knows its number and its name"
+            $( test.eq! [13, "apply", :apply]
+                        [opcode :apply, op_name :apply, op_of_code 13] ),
+        test.case "every opcode has a distinct number"
+            $( test.eq! (list.length ops)
+                        (list.length (list.unique (list.map (fn o -> list.nth 1 o) ops))) ),
+        test.case "opcode numbers are the VM's, in order from zero"
+            $( test.eq! (list.range 0 (list.length ops)) (list.map (fn o -> list.nth 1 o) ops) ),
+        test.case "an unknown opcode is not invented"
+            $( test.eq! [(), ()] [opcode :nonsense, op_of_code 999] ),
+
+        test.case "flags are set and read back"
+            $( test.eq! [true, false, true]
+                        { let f = add_flag (add_flag 0 f_strict) f_tail;
+                          [has_flag f f_strict, has_flag f f_impure, has_flag f f_tail] } ),
+        test.case "setting a flag twice sets it once"
+            $( test.eq! f_strict (add_flag (add_flag 0 f_strict) f_strict) ),
+
+        test.case "nodes are numbered from zero as they are pushed"
+            $( test.eq! [0, 1]
+                        { let a = push_node (leaf :unit) program;
+                          let b = push_node (leaf :unit) (list.head a);
+                          [list.nth 1 a, list.nth 1 b] } ),
+        test.case "a node can be read back by its index"
+            $( test.eq! [:unit, :force]
+                        [node_op (node_at 0 built), node_op (node_at 1 built)] ),
+        test.case "a flag can be set on a node already in the arena"
+            $( test.true! (node_is_impure (node_at 0 (set_node_flag 0 f_impure built))) ),
+        test.case "setting a flag leaves the other nodes alone"
+            $( test.false! (node_is_impure (node_at 1 (set_node_flag 0 f_impure built))) ),
+
+        test.case "a run of children is contiguous, and says where it starts"
+            $( test.eq! [0, 3]
+                        { let a = push_kids [1, 2, 3] program;
+                          let b = push_kids [4] (list.head a);
+                          [list.nth 1 a, list.nth 1 b] } ),
+        test.case "children come back in the order they went in"
+            $( test.eq! [1, 2, 3, 4]
+                        { let a = push_kids [1, 2, 3] program;
+                          core.map_get (finish (list.head (push_kids [4] (list.head a)))) :kids [] } ),
+
+        test.case "a constant is interned once"
+            $( test.eq! [0, 0, 1]
+                        { let a = intern_str "x" program;
+                          let b = intern_str "x" (list.head a);
+                          let c = intern_str "y" (list.head b);
+                          [list.nth 1 a, list.nth 1 b, list.nth 1 c] } ),
+        test.case "the pool comes out in index order"
+            $( test.eq! ["x", "y"]
+                        { let a = intern_str "x" program;
+                          let b = intern_str "y" (list.head a);
+                          core.map_get (finish (list.head b)) :strs [] } ),
+        test.case "an atom is stored as the index of its name"
+            $( test.eq! [["ok"], [0]]
+                        { let got = intern_atom "ok" program;
+                          let p = list.head got;
+                          [core.map_get (finish p) :strs [], core.map_get (finish p) :atoms []] } ),
+        test.case "the same atom interns once"
+            $( test.eq! [0, 0]
+                        { let a = intern_atom "ok" program;
+                          let b = intern_atom "ok" (list.head a);
+                          [list.nth 1 a, list.nth 1 b] } ),
+        test.case "the pools are separate"
+            $( test.eq! [0, 0]
+                        { let a = intern_int 1 program;
+                          let b = intern_float 1.0 (list.head a);
+                          [list.nth 1 a, list.nth 1 b] } ),
+
+        test.case "a node keeps its index however many are added after it"
+            $( test.eq! :unit
+                        { let a = push_node (leaf :unit) program;
+                          let b = push_node (leaf :force) (list.head a);
+                          node_op (node_at (list.nth 1 a) (list.head b)) } ),
+        test.case "the arena comes out in the order it was built"
+            $( test.eq! [:unit, :force]
+                        (list.map (fn n -> node_op n) (core.map_get (finish built) :nodes [])) ),
+        test.case "a dump shows one node per line, with its index"
+            $( test.eq! ["  0  unit", "  1  force 0"] (str.split "\n" (dump (finish built))) ),
+        test.case "a dump shows a constant's value, not its index"
+            $( test.true! (str.contains_str "\"hi\""
+                   { let interned = intern_str "hi" program;
+                     let n = push_node (node :const_str (list.nth 1 interned) no_node no_node)
+                                       (list.head interned);
+                     dump (finish (list.head n)) }) ),
+    ];
+}

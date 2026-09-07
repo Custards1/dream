@@ -322,16 +322,16 @@ NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms) {
         NativeResult result = [&]() -> NativeResult {
             if (!job->error.empty()) return fail(p, "not_found", job->error);
             Value m = p.heap().make_map(8);
-            map_insert(p, resolve(m), make_atom(p.runtime().intern_atom("code")),
+            m = map_insert(p, m, make_atom(p.runtime().intern_atom("code")),
                        make_integer(p, int64_t(job->code)));
             m = resolve(m);
-            map_insert(p, resolve(m), make_atom(p.runtime().intern_atom("out")),
+            m = map_insert(p, m, make_atom(p.runtime().intern_atom("out")),
                        text(p, job->out));
             m = resolve(m);
-            map_insert(p, resolve(m), make_atom(p.runtime().intern_atom("err")),
+            m = map_insert(p, m, make_atom(p.runtime().intern_atom("err")),
                        text(p, job->err));
             m = resolve(m);
-            map_insert(p, resolve(m), make_atom(p.runtime().intern_atom("timed_out")),
+            m = map_insert(p, m, make_atom(p.runtime().intern_atom("timed_out")),
                        make_bool(job->timed_out));
             return NativeResult::ok(resolve(m));
         }();

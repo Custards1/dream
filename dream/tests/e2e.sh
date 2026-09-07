@@ -97,6 +97,46 @@ for src in "$HERE"/programs/*.dr; do
   pass=$((pass + 1))
 done
 
+# --- shebang images ---------------------------------------------------------
+#
+# `dreamc --shebang` writes an interpreter line before the image and sets the
+# execute bit. The VM skips such a line, so the file has to work both ways: run
+# as a command, and loaded as an ordinary image. Testing only the first would
+# miss an image the VM can no longer read.
+
+shebang_src="$(mktemp -d)"
+trap 'rm -rf "$shebang_src"' EXIT
+cat > "$shebang_src/hello.dr" <<'EOF'
+import std.console;
+let main! = console.print! "shebang";
+EOF
+
+if "$DREAMC" "$shebang_src/hello.dr" --shebang "$(cd "$(dirname "$dream")" && pwd)/$(basename "$dream")" \
+     -o "$shebang_src/hello" >/dev/null 2>&1; then
+  direct_out="$("$shebang_src/hello" 2>&1)"
+  loaded_out="$("$dream" "$shebang_src/hello" 2>&1)"
+  first_line="$(head -c 2 "$shebang_src/hello")"
+  if [[ ! -x "$shebang_src/hello" ]]; then
+    echo "FAIL shebang (the image was not made executable)"
+    fail=$((fail + 1))
+  elif [[ "$first_line" != "#!" ]]; then
+    echo "FAIL shebang (no interpreter line was written)"
+    fail=$((fail + 1))
+  elif [[ "$direct_out" != "shebang" ]]; then
+    echo "FAIL shebang (running it directly printed: $direct_out)"
+    fail=$((fail + 1))
+  elif [[ "$loaded_out" != "shebang" ]]; then
+    echo "FAIL shebang (loading it as an image printed: $loaded_out)"
+    fail=$((fail + 1))
+  else
+    echo "ok   shebang"
+    pass=$((pass + 1))
+  fi
+else
+  echo "FAIL shebang (could not compile with --shebang)"
+  fail=$((fail + 1))
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]
