@@ -143,9 +143,19 @@ cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | \
   grep -E 'error|warning:' | sed 's/^/    /' || true
 
 dream="$BUILD_DIR/bin/dream"
+MIND="$BUILD_DIR/bin/mind"
 [[ -x "$dream" ]] || die "cmake finished but $dream is missing"
 ok "$dream"
 ok "$BUILD_DIR/lib/libdream.so"
+
+step "Building the standard library (mind)"
+$DREAMC -L mind/std -o "$MIND" mind/tool/main.dr 
+
+[[ -x "$MIND" ]] || die "the compiler finished but $MIND is missing"
+ok "$MIND"
+
+cd dreams
+
 
 # --- smoke test -------------------------------------------------------------
 
