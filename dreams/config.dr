@@ -1,0 +1,158 @@
+// Compile-time configuration: what `when` conditions are tested against.
+//
+// A flag is either defined or not (`test`), and a setting has a value
+// (`os == "linux"`). Both come from the command line, except for the handful
+// the compiler knows about itself.
+//
+// Conditions are resolved while loading, before anything else looks at a
+// module, so a `when` that is off costs nothing: an `import` inside it is never
+// followed, and a module that only test builds need is never even read. That is
+// why this module sits below `modules` rather than beside the later passes --
+// by the time anything downstream sees a syntax tree, no `when` remains in it.
+//
+// Everything here is pure. The one thing that has to ask the outside world what
+// it is -- the platform -- does so in `defaults!`, which is the only impure
+// function in the file and is called once, at startup.
+
+import std.core;
+import std.list;
+import std.os;
+import std.str;
+
+// --- the configuration ------------------------------------------------------
+//
+// Flags and settings are kept apart because they answer different questions.
+// A setting *also* counts as defined, so `when os { .. }` is true while
+// `when nonsense { .. }` is false -- but a flag has no value to compare, and
+// `when test == "x"` should be false rather than an error.
+
+let make flags values = %{ :flags => flags, :values => values };
+
+let flags c = core.map_get c :flags (core.map_new ());
+let values c = core.map_get c :values (core.map_new ());
+
+/// A configuration with nothing defined. `defaults!` is what a compilation
+/// actually starts from; this is what a test starts from.
+let empty = make (core.map_new ()) (core.map_new ());
+
+let define name c = make (core.map_put (flags c) name true) (values c);
+
+let set key value c = make (flags c) (core.map_put (values c) key value);
+
+/// Accepts `name` or `name=value`, which is what `-D` takes. A `=` with
+/// nothing after it defines the setting as the empty string rather than being
+/// rejected: `-D features=` is a legitimate way to say "none".
+let define_arg arg c = {
+    let at = str.find "=" arg;
+    if at < 0 { define arg c }
+    else { set (str.slice 0 at arg) (str.slice (at + 1) (str.byte_length arg - at - 1) arg) c }
+};
+
+let rec define_args args c =
+    match args {
+        [] => c,
+        [a, ..rest] => define_args rest (define_arg a c),
+    };
+
+let is_defined name c = core.map_has (flags c) name;
+
+/// The value of a setting, or `()` when it has none.
+let value key c = core.map_get (values c) key ();
+
+// --- what the compiler knows about itself -----------------------------------
+
+/// The platform atom as the string a `when` compares against. `to_string` of an
+/// atom keeps the leading `:`, which is not what `os == "linux"` is written
+/// with, so the colon comes off here rather than at every comparison.
+let platform_name p = { let s = to_string p; str.slice 1 (str.byte_length s - 1) s };
+
+/// `os`, `arch` and `family`, filled in from the machine this is running on.
+///
+/// Only `os` can be asked for honestly: the VM reports the platform and
+/// nothing else, so `arch` is left undefined rather than guessed at. An
+/// undefined setting makes `when arch == "x86_64"` false, which is the safe
+/// way to be wrong -- the alternative is code compiled for the wrong machine.
+let defaults! () = {
+    let os_name = platform_name (os.platform ());
+    empty
+        |> set "os" os_name
+        |> set "family" (if os_name == "windows" { "windows" } else { "unix" })
+};
+
+// --- evaluating a condition -------------------------------------------------
+
+/// The vocabulary the parser produces for `when`: `true`/`false`, a bare flag,
+/// `setting == "value"`, and `not` / `&&` / `||` over those.
+let rec eval c cond =
+    match cond {
+        [:const, b]     => b,
+        // A setting that has a value counts as defined.
+        [:flag, name]   => is_defined name c || core.map_has (values c) name,
+        [:equals, k, v] => value k c == v,
+        [:not, inner]   => not (eval c inner),
+        [:and, l, r]    => eval c l && eval c r,
+        [:or, l, r]     => eval c l || eval c r,
+        // The parser cannot produce anything else. A condition it never made
+        // is not a reason to stop the compilation, but it must not silently
+        // switch code *on*.
+        _ => false,
+    };
+
+// --- reporting --------------------------------------------------------------
+
+/// Every flag and setting, one per line, sorted -- what `--print-cfg` shows.
+/// Settings are quoted so that a value with a space in it still reads as one.
+let describe c = {
+    let named = list.map (fn kv -> list.head kv) (core.map_pairs (flags c));
+    let valued = list.map (fn kv -> list.head kv + " = \"" + list.nth 1 kv + "\"")
+                          (core.map_pairs (values c));
+    list.sort (list.append named valued)
+};
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let with_flags = empty |> define "test" |> set "os" "linux";
+
+    let tests = [
+        test.case "a flag is defined once it is named"
+            $( test.eq! [true, false]
+                        [is_defined "test" with_flags, is_defined "release" with_flags] ),
+        test.case "a setting keeps its value"
+            $( test.eq! ["linux", ()] [value "os" with_flags, value "arch" with_flags] ),
+        test.case "-D takes a bare flag or a setting"
+            $( test.eq! [true, "x86_64"]
+                        [is_defined "release" (define_arg "release" empty),
+                         value "arch" (define_arg "arch=x86_64" empty)] ),
+        test.case "a setting may be defined as empty"
+            $( test.eq! "" (value "features" (define_arg "features=" empty)) ),
+        test.case "a value containing `=` keeps the rest of it"
+            $( test.eq! "a=b" (value "x" (define_arg "x=a=b" empty)) ),
+        test.case "true and false need nothing defined"
+            $( test.eq! [true, false] [eval empty [:const, true], eval empty [:const, false]] ),
+        test.case "a bare flag asks whether it is defined"
+            $( test.eq! [true, false]
+                        [eval with_flags [:flag, "test"], eval with_flags [:flag, "nope"]] ),
+        test.case "a setting counts as defined"
+            $( test.true! (eval with_flags [:flag, "os"]) ),
+        test.case "== compares a setting's value"
+            $( test.eq! [true, false, false]
+                        [eval with_flags [:equals, "os", "linux"],
+                         eval with_flags [:equals, "os", "macos"],
+                         eval with_flags [:equals, "arch", "x86_64"]] ),
+        test.case "not, && and || combine conditions"
+            $( test.eq! [false, true, true, false]
+                        [eval with_flags [:not, [:flag, "test"]],
+                         eval with_flags [:and, [:flag, "test"], [:equals, "os", "linux"]],
+                         eval with_flags [:or, [:flag, "nope"], [:flag, "test"]],
+                         eval with_flags [:and, [:flag, "test"], [:flag, "nope"]]] ),
+        test.case "an unknown condition is off rather than on"
+            $( test.false! (eval with_flags [:nonsense, "test"]) ),
+        test.case "describe lists flags and quoted settings, sorted"
+            $( test.eq! ["os = \"linux\"", "test"] (describe with_flags) ),
+        test.case "the platform's atom loses its colon"
+            $( test.eq! "linux" (platform_name :linux) ),
+    ];
+}

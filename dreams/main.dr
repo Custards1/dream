@@ -3,65 +3,33 @@
 // Built by `mind`, like any other Dream project: `mind build`, `mind test`,
 // `mind run -- FILE`. It has no build of its own and needs none.
 //
-// Only the lexer exists so far, so the one thing this can do is tokenize a
-// file and say what it found. That is deliberately a real command rather than
-// a stub: it reads a file off the disk, runs the lexer over it, and reports
-// errors the way the finished compiler will have to.
+// The front end exists so far: a file can be tokenized, parsed, and -- as of
+// the module loader -- followed through every file it imports, which is the
+// point at which this stops being about one file and starts being about a
+// program. What it cannot yet do is lower any of that to an image.
+//
+// Each stage is a real command rather than a stub, so each one is usable, and
+// testable, on the way to the next.
 
 import std.console;
 import std.core;
-import std.io;
 import std.list;
 import std.os;
 import std.str;
 
 import dreams.ast;
+import dreams.config;
+import dreams.diag;
 import dreams.lexer;
+import dreams.modules;
+import dreams.package;
 import dreams.parser;
-
-// --- reading ----------------------------------------------------------------
-
-let rec read_chunks! h acc = {
-    let chunk = io.read! h 65536;
-    if len chunk == 0 { str.join_str "" (list.reverse acc) }
-    else { read_chunks! h (core.cons chunk acc) }
-};
-
-/// The whole file, or `()` when it cannot be opened.
-let read_file! path = {
-    let opened = try! { io.open! path :read } catch e { () };
-    match opened {
-        () => (),
-        h => {
-            let text = read_chunks! h [];
-            io.close! h
-            text
-        }
-    }
-};
+import dreams.path;
 
 // --- reporting --------------------------------------------------------------
-//
-// A byte offset is what the lexer records, because that is what slices the
-// source back out. A person needs a line and a column, so the conversion
-// happens here, once, at the point of reporting -- and only for the offsets
-// actually reported, which is why it can afford to be a scan.
 
-/// The 1-based line and column of a byte offset: `[line, col]`.
-let line_col src offset = {
-    let rec walk i line col =
-        if i >= offset || i >= str.byte_length src { [line, col] }
-        else if core.str_byte src i == 10 { walk (i + 1) (line + 1) 1 }
-        else if core.str_byte src i >= 128 && core.str_byte src i < 192 { walk (i + 1) line col }
-        else { walk (i + 1) line (col + 1) };
-    walk 0 1 1
-};
-
-let report! path src message offset = {
-    let at = line_col src offset;
-    console.error! (path + ":" + to_string (list.head at) + ":" + to_string (list.nth 1 at)
-                    + ": error: " + message)
-};
+let report! path src message offset =
+    console.error! (diag.position path src offset + ": error: " + message);
 
 // --- commands ---------------------------------------------------------------
 
@@ -81,7 +49,7 @@ let tokenize! path src = {
                     report! path src (lexer.value t) (lexer.span_start t)
                     0 - 1
                 } else {
-                    let at = line_col src (lexer.span_start t);
+                    let at = diag.line_col src (lexer.span_start t);
                     console.print! (to_string (list.head at) + ":" + to_string (list.nth 1 at)
                                     + "  " + describe t)
                     put! rest (n + 1)
@@ -131,34 +99,141 @@ let check_parse! path src =
         },
     };
 
+// --- the whole program ------------------------------------------------------
+//
+// From here on a command is about a program rather than a file: the loader
+// follows every import from the root and reports what it found.
+
+let print_diags! l = {
+    let ds = modules.diags l;
+    if list.is_empty ds { () }
+    else { console.error! (diag.render_all (modules.files l) ds) }
+    if modules.failed l { 1 } else { 0 }
+};
+
+/// The modules a program pulls in, in the order a later pass must walk them:
+/// dependencies before whatever uses them. Each is shown with the file it came
+/// from, since the whole point of resolution is which file a name found.
+let show_modules! l = {
+    let width = list.fold (fn w m -> {
+        let n = str.byte_length (modules.module_name m);
+        if n > w { n } else { w }
+    }) 0 (modules.modules l);
+    list.map (fn m ->
+        console.print! (modules.module_name m
+                        + str.repeat (width - str.byte_length (modules.module_name m) + 2) " "
+                        + modules.module_path m))
+             (modules.modules l) |> strict!
+    if list.is_empty (modules.natives l) { () }
+    else { console.print! ("host: " + str.join_str ", " (modules.natives l)) }
+    print_diags! l
+};
+
+/// The packages a program can see, and what each provides. What to look at when
+/// an import cannot be resolved.
+let show_packages! ps = {
+    match package.current ps {
+        () => console.print! "current package: none",
+        cur => console.print! ("current package: " + package.name cur + " (" + package.root cur + ")"),
+    }
+    list.map (fn p ->
+        console.print! ("  " + package.name p + " " + package.version p + "  " + package.root p
+                        + "\n      modules: " + str.join_str ", " (package.modules! p)))
+             (package.packages ps) |> strict!
+    list.map (fn n -> console.error! ("warning: " + n)) (package.notes ps) |> strict!
+    0
+};
+
+// --- the command line -------------------------------------------------------
+
+let options = %{ :command => :check, :file => (), :roots => [], :defines => [],
+                 :test => false, :error => () };
+
+let opt o k = core.map_get o k ();
+let with_opt k v o = core.map_put o k v;
+let append_opt k v o = core.map_put o k (list.append (core.map_get o k []) [v]);
+
+/// Read the arguments into `options`. A flag taking a value consumes the next
+/// argument, and running out of arguments is an error rather than a silent
+/// default -- `-L` with nothing after it is a mistake worth naming.
+let rec parse_args args o =
+    match args {
+        [] => o,
+        ["--tokens", ..rest]  => parse_args rest (with_opt :command :tokens o),
+        ["--ast", ..rest]     => parse_args rest (with_opt :command :ast o),
+        ["--modules", ..rest] => parse_args rest (with_opt :command :modules o),
+        ["--packages", ..rest] => parse_args rest (with_opt :command :packages o),
+        ["--print-cfg", ..rest] => parse_args rest (with_opt :command :print_cfg o),
+        ["--test", ..rest]    => parse_args rest (with_opt :test true o),
+        ["--help", ..rest]    => parse_args rest (with_opt :command :help o),
+        ["-L"] => with_opt :error "-L needs a directory" o,
+        ["-L", dir, ..rest]   => parse_args rest (append_opt :roots dir o),
+        ["-D"] => with_opt :error "-D needs a flag" o,
+        ["-D", d, ..rest]     => parse_args rest (append_opt :defines d o),
+        [arg, ..rest] =>
+            if str.starts_with "-" arg { with_opt :error ("unknown option " + arg) o }
+            else if opt o :file != () { with_opt :error "only one file, please" o }
+            else { parse_args rest (with_opt :file arg o) },
+    };
+
 let usage! () = {
     console.error! "dreams -- the Dream compiler, in Dream"
     console.error! ""
-    console.error! "usage: dreams [--tokens | --ast] FILE"
+    console.error! "usage: dreams [options] FILE"
     console.error! ""
-    console.error! "  --tokens   print the tokens instead of only checking them"
-    console.error! "  --ast      print the syntax tree"
+    console.error! "  --tokens     print the tokens instead of only checking them"
+    console.error! "  --ast        print the syntax tree"
+    console.error! "  --modules    list the modules the program pulls in"
+    console.error! "  --packages   list the packages that were found"
+    console.error! "  --print-cfg  print the `when` flags that are defined"
+    console.error! "  --test       define `test` and add a runner for the tests each module exports"
+    console.error! "  -L DIR       a package, or a directory holding packages"
+    console.error! "  -D NAME[=V]  define a `when` flag, or set a `when` value"
     2
 };
 
-
-let run! args =
-    match args {
-        [] => usage! (),
-        ["--tokens", path] => with_source! path (fn src -> tokenize! path src),
-        ["--ast", path] => with_source! path (fn src -> ast! path src),
-        [path] => with_source! path (fn src -> check_parse! path src),
-        _ => usage! (),
-    };
-
-let with_source! path k = {
-    let src = read_file! path;
-    match src {
+/// Read the file and hand its text to `k`, or fail saying so. The parameter is
+/// `file` rather than `path` because `path` is a module here, and a parameter
+/// of that name would shadow it.
+let with_source! file k =
+    match path.read_file! file {
         () => {
-            console.error! ("dreams: cannot read " + to_string path)
+            console.error! ("dreams: cannot read " + file)
             1
         },
         text => k text,
+    };
+
+let configured! o =
+    config.define_args (opt o :defines)
+        (if opt o :test { config.define "test" (config.defaults! ()) }
+         else { config.defaults! () });
+
+let run! args = {
+    let o = parse_args args options;
+    match opt o :error {
+        () =>
+            match [opt o :command, opt o :file] {
+                [:help, _] => usage! (),
+                [:print_cfg, _] => {
+                    list.map (fn line -> console.print! line) (config.describe (configured! o))
+                        |> strict!
+                    0
+                },
+                [_, ()] => usage! (),
+                [:tokens, f]  => with_source! f (fn src -> tokenize! f src),
+                [:ast, f]     => with_source! f (fn src -> ast! f src),
+                [:check, f]   => with_source! f (fn src -> check_parse! f src),
+                [:packages, f] => show_packages! (package.discover! f (opt o :roots)),
+                [:modules, f] =>
+                    show_modules! (modules.load! f (opt o :roots) (configured! o)
+                                                 (opt o :test == true)),
+                _ => usage! (),
+            },
+        why => {
+            console.error! ("dreams: " + why)
+            usage! ()
+        },
     }
 };
 

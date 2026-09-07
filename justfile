@@ -97,7 +97,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -143,6 +143,12 @@ test-dreams-corpus: build
     ./{{dream}} /tmp/dream-ast-tests.dream
     {{dreamc}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
     ./{{dream}} /tmp/dream-parser-tests.dream
+
+# `dreams`'s module loader against the one it replaces. Every program in the
+# repository must resolve to the same modules, in the same order, under both --
+# and the failures `dreamc` cannot report must be reported here.
+test-dreams-modules: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/modules.sh
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
