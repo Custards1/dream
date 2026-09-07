@@ -510,10 +510,13 @@ let add_test_runner! l = {
     let src =
         if list.is_empty suites {
             // Still a valid program: it reports that there was nothing to run,
-            // which is more use than an image with no entry point.
+            // which is more use than an image with no entry point. One string,
+            // not two: `console.print!` is variadic, so a second argument would
+            // be a second thing printed, and generated code should not depend on
+            // that to read correctly.
             "import std.console;\n"
-            + "let main! = { console.print! \"no tests found \" "
-            + "\"(a module exports tests by defining `tests`)\" };\n"
+            + "let main! = { console.print! \"no tests found "
+            + "(a module exports tests by defining `tests`)\" };\n"
         }
         else {
             let alias s = "dreams_test_module_" + to_string (list.nth 1 s);

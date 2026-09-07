@@ -3,35 +3,50 @@
 // Built by `mind`, like any other Dream project: `mind build`, `mind test`,
 // `mind run -- FILE`. It has no build of its own and needs none.
 //
-// The front end exists so far: a file can be tokenized, parsed, and -- as of
-// the module loader -- followed through every file it imports, which is the
-// point at which this stops being about one file and starts being about a
-// program. What it cannot yet do is lower any of that to an image.
+// The front end is complete: a program is lexed, parsed, followed through every
+// file it imports, resolved, purity-checked, and lowered to execution trees.
+// What is missing is the image writer -- the arena exists, but nothing turns it
+// into bytes yet -- and `comp`, which needs a VM to evaluate on.
 //
-// Each stage is a real command rather than a stub, so each one is usable, and
-// testable, on the way to the next.
+// Every stage is a command rather than a stub, which is what makes each one
+// usable on the way to the next. Several of them exist because something other
+// than a batch compile wants them: `--symbols` and `--at` are questions an
+// editor asks, and they read the same tables lowering does.
 
 import std.console;
 import std.core;
 import std.list;
 import std.os;
 import std.str;
+import std.vm;
 
 import dreams.ast;
 import dreams.config;
 import dreams.diag;
+import dreams.ir;
 import dreams.lexer;
+import dreams.lower;
 import dreams.modules;
 import dreams.package;
 import dreams.parser;
 import dreams.path;
+import dreams.scope;
+
+let version = "0.1.0";
 
 // --- reporting --------------------------------------------------------------
 
-let report! path src message offset =
-    console.error! (diag.position path src offset + ": error: " + message);
+let report! file src message offset =
+    console.error! (diag.position file src offset + ": error: " + message);
 
-// --- commands ---------------------------------------------------------------
+/// Print what a pass had to say, and answer the exit code it earns.
+let print_diags! sources ds = {
+    if list.is_empty ds { () }
+    else { console.error! (diag.render_all sources ds) }
+    if diag.error_count ds > 0 { 1 } else { 0 }
+};
+
+// --- one file at a time -------------------------------------------------------
 
 let describe t =
     match lexer.value t {
@@ -40,13 +55,13 @@ let describe t =
     };
 
 /// Tokenize, and print one token per line with where it came from.
-let tokenize! path src = {
+let tokenize! file src = {
     let rec put! ts n =
         match ts {
             [] => n,
             [t, ..rest] =>
                 if lexer.is_error t {
-                    report! path src (lexer.value t) (lexer.span_start t)
+                    report! file src (lexer.value t) (lexer.span_start t)
                     0 - 1
                 } else {
                     let at = diag.line_col src (lexer.span_start t);
@@ -65,55 +80,41 @@ let tokenize! path src = {
     }
 };
 
-/// Lex without printing: the exit code is the whole answer.
-let check! path src =
-    match lexer.lex src {
-        [:ok, _] => 0,
-        [:error, message, offset] => {
-            report! path src message offset
-            1
-        },
-        _ => 1,
-    };
-
 /// Parse, and print the syntax tree one item per line.
-let ast! path src =
+let ast! file src =
     match parser.parse_module src {
         [:ok, items] => {
             list.map (fn i -> console.print! (ast.show i)) items |> strict!
             0
         },
         [:error, message, span] => {
-            report! path src message (ast.span_start span)
+            report! file src message (ast.span_start span)
             1
         },
     };
 
-/// Parse without printing: the exit code is the whole answer.
-let check_parse! path src =
+/// Parse without printing: the exit code is the whole answer. File-local, so it
+/// says nothing about imports -- which is exactly what a check on every keypress
+/// wants, and why it is worth keeping separate from `--check`.
+let parse_only! file src =
     match parser.parse_module src {
         [:ok, _] => 0,
         [:error, message, span] => {
-            report! path src message (ast.span_start span)
+            report! file src message (ast.span_start span)
             1
         },
     };
 
-// --- the whole program ------------------------------------------------------
-//
-// From here on a command is about a program rather than a file: the loader
-// follows every import from the root and reports what it found.
+// --- the whole program ---------------------------------------------------------
 
-let print_diags! l = {
-    let ds = modules.diags l;
-    if list.is_empty ds { () }
-    else { console.error! (diag.render_all (modules.files l) ds) }
-    if modules.failed l { 1 } else { 0 }
+/// Resolve and purity-check everything the root file reaches.
+let check_program! l = {
+    let ds = list.append (modules.diags l) (scope.check! l);
+    print_diags! (modules.files l) ds
 };
 
 /// The modules a program pulls in, in the order a later pass must walk them:
-/// dependencies before whatever uses them. Each is shown with the file it came
-/// from, since the whole point of resolution is which file a name found.
+/// dependencies before whatever uses them.
 let show_modules! l = {
     let width = list.fold (fn w m -> {
         let n = str.byte_length (modules.module_name m);
@@ -126,7 +127,7 @@ let show_modules! l = {
              (modules.modules l) |> strict!
     if list.is_empty (modules.natives l) { () }
     else { console.print! ("host: " + str.join_str ", " (modules.natives l)) }
-    print_diags! l
+    print_diags! (modules.files l) (modules.diags l)
 };
 
 /// The packages a program can see, and what each provides. What to look at when
@@ -144,32 +145,210 @@ let show_packages! ps = {
     0
 };
 
-// --- the command line -------------------------------------------------------
+/// The execution trees the program lowers to.
+let show_ir! l = {
+    let r = scope.resolve! l;
+    let low = lower.lower_program r;
+    let ds = list.append (modules.diags l) (lower.all_diags r low);
+    if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
+    else {
+        console.print! (lower.dump low)
+        print_diags! (modules.files l) ds
+    }
+};
 
-let options = %{ :command => :check, :file => (), :roots => [], :defines => [],
-                 :test => false, :error => () };
+/// What the program contains, counted. Useful on its own, and the quickest way
+/// to see that a change to the front end did not quietly change its output.
+let show_stats! l = {
+    let r = scope.resolve! l;
+    let img = lower.image (lower.lower_program r);
+    let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
+                                        + to_string n);
+    count! "modules" (list.length (modules.modules l))
+    count! "host" (list.length (modules.natives l))
+    count! "globals" (list.length (scope.defs r))
+    count! "functions" (list.length (scope.funcs r))
+    count! "nodes" (list.length (core.map_get img :nodes []))
+    count! "constants" (list.length (core.map_get img :ints [])
+                       + list.length (core.map_get img :floats [])
+                       + list.length (core.map_get img :strs [])
+                       + list.length (core.map_get img :atoms []))
+    count! "reductions" (vm.reductions! ())
+    print_diags! (modules.files l) (list.append (modules.diags l) (scope.r_diags r))
+};
+
+// --- questions an editor asks ----------------------------------------------------
+//
+// Neither of these compiles anything. They read the tables resolution already
+// built, which is the point of building them: an editor needs an answer about
+// one position, not an image.
+
+/// Which loaded module came from this file, or `()`.
+let module_of! l file = {
+    let want = path.absolute! file;
+    let hits = list.filter (fn i -> path.absolute! (modules.module_path (modules.module_at l i))
+                                    == want)
+                           (list.range 0 (list.length (modules.modules l)));
+    if list.is_empty hits { () } else { list.head hits }
+};
+
+/// What a file defines, one per line: the outline of a document.
+let show_symbols! l file = {
+    let r = scope.resolve! l;
+    match module_of! l file {
+        () => {
+            console.error! ("dreams: " + file + " is not part of this program")
+            1
+        },
+        mi => {
+            let m = modules.module_at l mi;
+            let src = diag.source_text (list.nth (modules.module_source m) (modules.files l));
+            list.map (fn d -> {
+                let at = diag.line_col src (ast.span_start (list.nth 3 d));
+                console.print! (to_string (list.head at) + ":" + to_string (list.nth 1 at)
+                                + "  " + list.nth 2 d)
+            }) (scope.module_defs r mi) |> strict!
+            0
+        },
+    }
+};
+
+/// Is this byte the middle of a name? Used to find where the name under a
+/// cursor begins, which is what the resolution table is keyed by.
+let is_name_byte b =
+    (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+    || b == 95 || b == 33;
+
+/// The start of the name containing `offset`. A cursor rests *in* a word, and
+/// the table is keyed by where the word starts, so this walks back to it.
+let name_start src offset = {
+    let rec back i =
+        if i <= 0 { 0 }
+        else if is_name_byte (core.str_byte src (i - 1)) { back (i - 1) }
+        else { i };
+    back offset
+};
+
+/// Say what is at a position, and where it came from. The primitive an editor
+/// needs for go-to-definition and for hover.
+let show_at! l file line col = {
+    let r = scope.resolve! l;
+    match module_of! l file {
+        () => {
+            console.error! ("dreams: " + file + " is not part of this program")
+            1
+        },
+        mi => {
+            let m = modules.module_at l mi;
+            let source = modules.module_source m;
+            let src = diag.source_text (list.nth source (modules.files l));
+            let at = name_start src (diag.offset_of src line col);
+            match scope.at r source at {
+                () => {
+                    console.print! "nothing resolved here"
+                    1
+                },
+                found => {
+                    let pos = diag.line_col src at;
+                    console.print! (to_string (list.head pos) + ":" + to_string (list.nth 1 pos)
+                                    + "  " + describe_resolution l r found)
+                    0
+                },
+            }
+        },
+    }
+};
+
+/// One resolution, in the terms a person reading it would use.
+let describe_resolution l r found =
+    match found {
+        [:local, slot, span] => "local, slot " + to_string slot
+                                + ", bound at byte " + to_string (ast.span_start span),
+        [:capture, idx, _] => "captured from an enclosing function, capture " + to_string idx,
+        [:global, mi, name, g] =>
+            "global `" + name + "` of module " + modules.module_name (modules.module_at l mi)
+            + ", index " + to_string g,
+        [:builtin, name] => "builtin `" + name + "`",
+        [:member, [:dream, target], field, g] =>
+            "`" + field + "` of module " + modules.module_name (modules.module_at l target)
+            + ", global " + to_string g,
+        [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
+        [:closure, fi] => "a closure over function " + to_string fi,
+        [:thunk, fi] => "a thunk over function " + to_string fi,
+        [:match, slot] => "the subject of a match, held in slot " + to_string slot,
+        other => to_string other,
+    };
+
+// --- the command line -----------------------------------------------------------
+
+let defaults = %{ :command => :check, :file => (), :roots => [], :includes => [],
+                  :defines => [], :hosts => [], :test => false, :quiet => false,
+                  :position => (), :error => () };
 
 let opt o k = core.map_get o k ();
 let with_opt k v o = core.map_put o k v;
 let append_opt k v o = core.map_put o k (list.append (core.map_get o k []) [v]);
 
-/// Read the arguments into `options`. A flag taking a value consumes the next
-/// argument, and running out of arguments is an error rather than a silent
-/// default -- `-L` with nothing after it is a mistake worth naming.
+/// `LINE:COL`, as `--at` takes it.
+let parse_position text = {
+    let parts = str.split ":" text;
+    if list.length parts != 2 { () }
+    else {
+        match [core.parse_int (list.nth 0 parts), core.parse_int (list.nth 1 parts)] {
+            [(), _] => (),
+            [_, ()] => (),
+            both => both,
+        }
+    }
+};
+
+/// Read the arguments. A flag that takes a value consumes the next argument,
+/// and running out is an error rather than a silent default: `-L` with nothing
+/// after it is a mistake worth naming.
 let rec parse_args args o =
     match args {
         [] => o,
-        ["--tokens", ..rest]  => parse_args rest (with_opt :command :tokens o),
-        ["--ast", ..rest]     => parse_args rest (with_opt :command :ast o),
-        ["--modules", ..rest] => parse_args rest (with_opt :command :modules o),
-        ["--packages", ..rest] => parse_args rest (with_opt :command :packages o),
+
+        // What to do.
+        ["--tokens", ..rest]    => parse_args rest (with_opt :command :tokens o),
+        ["--ast", ..rest]       => parse_args rest (with_opt :command :ast o),
+        ["--parse", ..rest]     => parse_args rest (with_opt :command :parse o),
+        ["--check", ..rest]     => parse_args rest (with_opt :command :check o),
+        ["--modules", ..rest]   => parse_args rest (with_opt :command :modules o),
+        ["--packages", ..rest]  => parse_args rest (with_opt :command :packages o),
+        ["--ir", ..rest]        => parse_args rest (with_opt :command :ir o),
+        ["--symbols", ..rest]   => parse_args rest (with_opt :command :symbols o),
+        ["--stats", ..rest]     => parse_args rest (with_opt :command :stats o),
         ["--print-cfg", ..rest] => parse_args rest (with_opt :command :print_cfg o),
-        ["--test", ..rest]    => parse_args rest (with_opt :test true o),
-        ["--help", ..rest]    => parse_args rest (with_opt :command :help o),
+        ["--version", ..rest]   => parse_args rest (with_opt :command :version o),
+        ["-h", ..rest]          => parse_args rest (with_opt :command :help o),
+        ["--help", ..rest]      => parse_args rest (with_opt :command :help o),
+        ["--at"] => with_opt :error "--at needs a LINE:COL" o,
+        ["--at", at, ..rest] =>
+            match parse_position at {
+                () => with_opt :error ("--at wants LINE:COL, not " + at) o,
+                p  => parse_args rest (with_opt :position p (with_opt :command :at o)),
+            },
+
+        // Where to look.
         ["-L"] => with_opt :error "-L needs a directory" o,
-        ["-L", dir, ..rest]   => parse_args rest (append_opt :roots dir o),
-        ["-D"] => with_opt :error "-D needs a flag" o,
-        ["-D", d, ..rest]     => parse_args rest (append_opt :defines d o),
+        ["-L", dir, ..rest] => parse_args rest (append_opt :roots dir o),
+        ["--package-path", dir, ..rest] => parse_args rest (append_opt :roots dir o),
+        ["-I"] => with_opt :error "-I needs a directory" o,
+        ["-I", dir, ..rest] => parse_args rest (append_opt :includes dir o),
+        ["--host-module"] => with_opt :error "--host-module needs a module path" o,
+        ["--host-module", m, ..rest] => parse_args rest (append_opt :hosts m o),
+
+        // What to compile it as.
+        ["-D"] => with_opt :error "-D needs a name or name=value" o,
+        ["-D", d, ..rest] => parse_args rest (append_opt :defines d o),
+        ["--define", d, ..rest] => parse_args rest (append_opt :defines d o),
+        ["--test", ..rest] => parse_args rest (with_opt :test true o),
+        ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
+        ["--debug-cfg", ..rest] => parse_args rest (append_opt :defines "debug" o),
+        ["-q", ..rest] => parse_args rest (with_opt :quiet true o),
+        ["--quiet", ..rest] => parse_args rest (with_opt :quiet true o),
+
         [arg, ..rest] =>
             if str.starts_with "-" arg { with_opt :error ("unknown option " + arg) o }
             else if opt o :file != () { with_opt :error "only one file, please" o }
@@ -177,24 +356,44 @@ let rec parse_args args o =
     };
 
 let usage! () = {
-    console.error! "dreams -- the Dream compiler, in Dream"
-    console.error! ""
-    console.error! "usage: dreams [options] FILE"
-    console.error! ""
-    console.error! "  --tokens     print the tokens instead of only checking them"
-    console.error! "  --ast        print the syntax tree"
-    console.error! "  --modules    list the modules the program pulls in"
-    console.error! "  --packages   list the packages that were found"
-    console.error! "  --print-cfg  print the `when` flags that are defined"
-    console.error! "  --test       define `test` and add a runner for the tests each module exports"
-    console.error! "  -L DIR       a package, or a directory holding packages"
-    console.error! "  -D NAME[=V]  define a `when` flag, or set a `when` value"
+    list.map (fn line -> console.error! line) [
+        "dreams " + version + " -- the Dream compiler, in Dream",
+        "",
+        "usage: dreams [options] FILE",
+        "",
+        "what to do (one of; the default is --check):",
+        "  --check        resolve every name and check purity, across the whole program",
+        "  --parse        parse this file alone, following no imports",
+        "  --tokens       print the tokens",
+        "  --ast          print the syntax tree",
+        "  --modules      list the modules the program pulls in",
+        "  --packages     list the packages that were found",
+        "  --ir           print the execution trees the program lowers to",
+        "  --symbols      list what this file defines, with where",
+        "  --at LINE:COL  say what is at a position, and where it came from",
+        "  --stats        count what the program contains",
+        "  --print-cfg    print the `when` flags that are defined",
+        "  --version      print the version",
+        "",
+        "where to look:",
+        "  -L, --package-path DIR   a package, or a directory holding packages",
+        "  -I, --include DIR        a directory to search for modules",
+        "  --host-module PATH       treat PATH as provided by the host",
+        "",
+        "what to compile it as:",
+        "  -D, --define NAME[=V]    define a `when` flag, or set a `when` value",
+        "  --test                   define `test`, and add a runner for the tests",
+        "                           each module exports",
+        "  --release                define `release`",
+        "  --debug-cfg              define `debug`",
+        "  -q, --quiet              print only what was asked for",
+    ] |> strict!
     2
 };
 
 /// Read the file and hand its text to `k`, or fail saying so. The parameter is
-/// `file` rather than `path` because `path` is a module here, and a parameter
-/// of that name would shadow it.
+/// `file` rather than `path` because `path` is a module here, and a parameter of
+/// that name would shadow it.
 let with_source! file k =
     match path.read_file! file {
         () => {
@@ -209,26 +408,48 @@ let configured! o =
         (if opt o :test { config.define "test" (config.defaults! ()) }
          else { config.defaults! () });
 
+/// Load the whole program the file is the root of. The include directories are
+/// search paths as well as package roots, which is what `-I` means.
+let load! o file =
+    modules.load! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
+                  (opt o :test == true);
+
+let run_command! o file =
+    match opt o :command {
+        :tokens    => with_source! file (fn src -> tokenize! file src),
+        :ast       => with_source! file (fn src -> ast! file src),
+        :parse     => with_source! file (fn src -> parse_only! file src),
+        :check     => check_program! (load! o file),
+        :modules   => show_modules! (load! o file),
+        :packages  => show_packages! (package.discover! file (opt o :roots)),
+        :ir        => show_ir! (load! o file),
+        :stats     => show_stats! (load! o file),
+        :symbols   => show_symbols! (load! o file) file,
+        :at        => show_at! (load! o file) file
+                               (list.nth 0 (opt o :position)) (list.nth 1 (opt o :position)),
+        _ => usage! (),
+    };
+
 let run! args = {
-    let o = parse_args args options;
+    let o = parse_args args defaults;
     match opt o :error {
         () =>
-            match [opt o :command, opt o :file] {
-                [:help, _] => usage! (),
-                [:print_cfg, _] => {
+            match opt o :command {
+                :help => usage! (),
+                :version => {
+                    console.print! ("dreams " + version)
+                    0
+                },
+                :print_cfg => {
                     list.map (fn line -> console.print! line) (config.describe (configured! o))
                         |> strict!
                     0
                 },
-                [_, ()] => usage! (),
-                [:tokens, f]  => with_source! f (fn src -> tokenize! f src),
-                [:ast, f]     => with_source! f (fn src -> ast! f src),
-                [:check, f]   => with_source! f (fn src -> check_parse! f src),
-                [:packages, f] => show_packages! (package.discover! f (opt o :roots)),
-                [:modules, f] =>
-                    show_modules! (modules.load! f (opt o :roots) (configured! o)
-                                                 (opt o :test == true)),
-                _ => usage! (),
+                _ =>
+                    match opt o :file {
+                        () => usage! (),
+                        file => run_command! o file,
+                    },
             },
         why => {
             console.error! ("dreams: " + why)

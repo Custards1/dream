@@ -1176,6 +1176,7 @@ dreamc FILE [-o OUT.dream] [options]
 | `--modules` / `--packages` | report what the program pulls in |
 | `--dump` | disassemble the image by reading it back |
 | `--ast` | print the syntax tree |
+| `--shebang [LINE]` | prefix the image with a `#!` line and make it executable |
 | `--no-emit` | check only: scope, purity, verification |
 | `--no-debug` | omit debug info |
 
@@ -1226,6 +1227,18 @@ just test-all        # the above plus fuzzing, heap verification, no-JIT build
 dream              image.cpp loads and revalidates; interp.cpp reduces;
                     jit.cpp compiles the strict numeric spine
 ```
+
+`--shebang` writes an interpreter line before the image and sets the execute
+bit, so a compiled program can be run as a command:
+
+```
+dreamc hello.dr --shebang -o hello    # `#!/usr/bin/env dream` by default
+./hello
+```
+
+The VM skips a leading `#!` line on any image it loads, so such a file is still
+an ordinary image — `dream hello` works too. An image is binary and its magic
+number begins with `D`, so a leading `#` is never ambiguous.
 
 An image is a flat arena of 16-byte execution-tree nodes linked by index, so the
 VM can map the file and start forcing nodes without rebuilding a tree. The VM

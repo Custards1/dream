@@ -88,6 +88,12 @@ jit-ir FILE FN: build
     ./{{dreamc}} {{FILE}} -o /tmp/dream-jit.dream
     ./{{dream}} /tmp/dream-jit.dream --dump-jit {{FN}}
 
+# A directly runnable program: the image carries a `#!` line and the execute
+# bit, and the VM skips the line when it loads it.
+run-script FILE OUT: build
+    ./{{dreamc}} {{FILE}} --shebang -o {{OUT}}
+    ./{{OUT}}
+
 install: release mind
     mv {{dreamc_release}} {{install_dir}}/bin || true
     mv {{dream}} {{install_dir}}/bin || true
@@ -97,7 +103,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -149,6 +155,11 @@ test-dreams-corpus: build
 # and the failures `dreamc` cannot report must be reported here.
 test-dreams-modules: build
     dreamc={{dreamc}} dream={{dream}} dreams/tests/modules.sh
+
+# `dreams`'s resolution and purity pass. Every program must get the same verdict
+# from both compilers, and the broken ones must be rejected for the same reason.
+test-dreams-scope: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/scope.sh
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build

@@ -20,6 +20,13 @@ type DreamValue = u64;
 const DREAM_OK: c_int = 1;
 
 /// Mirrors `dream_type` in include/dream/core.h.
+///
+/// Every variant has to be here, in this order, whether or not Rust code names
+/// it: `from_u32` transmutes the C enum straight into this one, so a missing or
+/// reordered variant would silently mistype a value. That is also why the
+/// unused ones are not dead code in any useful sense -- they are the shape of
+/// the C type -- so the lint is turned off rather than the variants removed.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum DreamType {

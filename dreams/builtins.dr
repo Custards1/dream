@@ -1,0 +1,71 @@
+// The builtins: names the language provides without any module providing them.
+//
+// A builtin is not imported and cannot be shadowed by an import -- resolution
+// reaches it only after every local, every capture and every global has failed,
+// so a `let len x = ..` in a module wins, but `import std.list.{head};` does not
+// silently take over `match_head`.
+//
+// The order is the order the VM knows them in. Nothing here depends on that
+// yet -- resolution only needs to know whether a name is one -- but the list is
+// kept in the runtime's order so that emission can use the position directly
+// when it arrives, rather than needing a second table that could disagree.
+
+import std.list;
+import std.str;
+
+/// Effects, and the handful of operations no module could define in Dream.
+let names = [
+    "spawn!",     // thunk -> process
+    "join!",      // process -> value
+    "send!",      // process -> value -> unit
+    "recv!",      // unit -> value
+    "self!",      // unit -> process
+    "raise!",     // value -> never
+    "type_of",    // value -> atom
+    "to_string",  // value -> string
+    "len",        // list|array|map|string -> integer
+    "strict!",    // value -> the same value, forced all the way down
+
+    // What `match` compiles to. Named so that they cannot be reached by
+    // accident: a builtin beats an imported name, so calling this one `head`
+    // would quietly shadow `import std.list.{head}` in every module that had
+    // both.
+    "match_is_cons",  // value -> bool, true for a non-empty list
+    "match_head",     // list -> its head, unforced
+    "match_tail",     // list -> its tail, unforced
+    "match_at",       // array -> index -> element, unforced
+    "match_key",      // map -> key -> [value] if present, [] if not
+];
+
+let is_builtin name = list.contains name names;
+
+/// The runtime's index for a builtin, or `()`. Emission will want this; nothing
+/// does yet.
+let id name = {
+    let at = list.index_of name names;
+    if at < 0 { () } else { at }
+};
+
+/// A name ending in `!` denotes something impure. That is the whole rule --
+/// there is no list of effectful builtins to keep in step with this one,
+/// because the spelling is the declaration.
+let is_impure_name name = str.ends_with "!" name;
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a builtin is known by name"
+            $( test.eq! [true, true, false]
+                        [is_builtin "len", is_builtin "match_head", is_builtin "map"] ),
+        test.case "a builtin's index is the runtime's"
+            $( test.eq! [0, 8, ()] [id "spawn!", id "len", id "nope"] ),
+        test.case "the `!` suffix is what makes a name impure"
+            $( test.eq! [true, false] [is_impure_name "spawn!", is_impure_name "len"] ),
+        test.case "the match builtins cannot be reached by an ordinary name"
+            $( test.false! (list.any (fn n -> not (str.starts_with "match_" n)
+                                               && str.starts_with "match" n) names) ),
+    ];
+}

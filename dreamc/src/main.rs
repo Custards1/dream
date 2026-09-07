@@ -21,6 +21,10 @@ struct Options {
     show_packages: bool,
     emit_file: bool,
     debug_info: bool,
+    /// Write a shebang line before the image and mark the file executable, so
+    /// it can be run directly. `None` writes none; `Some(line)` writes that
+    /// interpreter line.
+    shebang: Option<String>,
 }
 
 const USAGE: &str = "\
@@ -43,6 +47,8 @@ options:
       --dump            disassemble the image to stdout after compiling
       --modules         list the modules that went into the program
       --ast             print the parse tree of the root module
+      --shebang [LINE]  prefix the image with a `#!` line and make it
+                        executable (default: /usr/bin/env dream)
       --no-emit         check only; do not write a file
       --no-debug        omit the SPAN debug section
   -h, --help            show this message
@@ -58,7 +64,9 @@ unqualified.
 ";
 
 fn parse_args() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1);
+    // Peekable so that `--shebang` can take an optional argument: the next
+    // word is its interpreter line only when it is not another option.
+    let mut args = std::env::args().skip(1).peekable();
     let mut input = None;
     let mut opts = Options {
         input: PathBuf::new(),
@@ -74,6 +82,7 @@ fn parse_args() -> Result<Options, String> {
         show_modules: false,
         show_packages: false,
         emit_file: true,
+        shebang: None,
         debug_info: true,
     };
     while let Some(a) = args.next() {
@@ -113,6 +122,19 @@ fn parse_args() -> Result<Options, String> {
             "--modules" => opts.show_modules = true,
             "--dump" => opts.dump = true,
             "--ast" => opts.show_ast = true,
+            // The VM skips a leading `#!` line, so an image carrying one is
+            // both a valid image and a directly runnable file.
+            "--shebang" => {
+                opts.shebang = Some(match args.peek() {
+                    // A bare `--shebang` takes the usual interpreter line; an
+                    // argument that is not another option replaces it.
+                    Some(next) if !next.starts_with('-') => {
+                        let line = args.next().expect("just peeked");
+                        if line.starts_with("#!") { line } else { format!("#!{line}") }
+                    }
+                    _ => DEFAULT_SHEBANG.to_string(),
+                });
+            }
             "--no-emit" => opts.emit_file = false,
             "--no-debug" => opts.debug_info = false,
             other if other.starts_with('-') => return Err(format!("unknown option `{other}`")),
@@ -242,12 +264,26 @@ fn run(opts: &Options) -> Result<(), String> {
 
     if opts.emit_file {
         let out = opts.output.clone().unwrap_or_else(|| default_output(path));
-        std::fs::write(&out, &compiled.image)
+        let bytes = match &opts.shebang {
+            None => compiled.image.clone(),
+            Some(line) => {
+                let mut b = Vec::with_capacity(line.len() + 1 + compiled.image.len());
+                b.extend_from_slice(line.as_bytes());
+                b.push(b'\n');
+                b.extend_from_slice(&compiled.image);
+                b
+            }
+        };
+        std::fs::write(&out, &bytes)
             .map_err(|e| format!("error: cannot write {}: {e}\n", out.display()))?;
+        if opts.shebang.is_some() {
+            make_executable(&out)
+                .map_err(|e| format!("error: cannot make {} executable: {e}\n", out.display()))?;
+        }
         eprintln!(
             "compiled {display} -> {} ({} bytes, {} modules, {} nodes, {} functions)",
             out.display(),
-            compiled.image.len(),
+            bytes.len(),
             compiled.program.modules.len(),
             compiled.program.nodes.len(),
             compiled.program.funcs.len()
@@ -258,5 +294,26 @@ fn run(opts: &Options) -> Result<(), String> {
 
 fn default_output(input: &Path) -> PathBuf {
     input.with_extension("dream")
+}
+
+/// The interpreter line `--shebang` writes when it is not given one. `env` so
+/// that it finds whichever `dream` is on the PATH rather than one fixed place.
+const DEFAULT_SHEBANG: &str = "#!/usr/bin/env dream";
+
+/// Add the execute bit wherever the file is already readable, so the shebang is
+/// good for something. Umask is left to do its job -- this does not widen the
+/// permissions the file was created with.
+#[cfg(unix)]
+fn make_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    let mode = perms.mode();
+    perms.set_mode(mode | ((mode & 0o444) >> 2));
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
