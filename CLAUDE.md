@@ -12,6 +12,8 @@ runtime, and — in progress — its self-hosted compiler.
 | `mind/tool/` | `mind`, the build tool. Finds packages, shells out to a compiler. | Dream |
 | `mind/std/` | The standard library. | Dream |
 | `dreams/` | The self-hosted compiler. **The active work.** | Dream |
+| `lucid/` | The language server. Imports `dreams` as a library. | Dream |
+| `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
 | `docs/` | `language-spec.md`, `builtins.md`. | — |
 
@@ -86,10 +88,16 @@ are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
 | `test-dreams-lower` | Everything `dreamc` accepts also lowers |
 | `test-dreams-compile` | Programs `dreams` compiled, run, output compared |
 | `test-bootstrap` | The seed still reproduces itself byte for byte |
+| `test-lucid` | The language server's units: positions, framing, URIs |
+| `test-lucid-session` | One whole LSP conversation, against a running server |
 
 The four `dreams/tests/*.sh` scripts default to `target/debug/dreamc` and
 `build-dream/bin/dream`, so they run directly with no environment set. Override
 with `dreamc=... dream=... dreams/tests/scope.sh`.
+
+`just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
+is **not** in `just test`, because it needs `npm install` in `editors/vscode`
+first and the rest of the suite needs nothing from outside the repository.
 
 `just test-all` adds fuzzing, a heap-verified run, and a no-JIT build.
 
@@ -104,6 +112,28 @@ just modules FILE      # what it pulls in
 
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
+
+## The language server
+
+`lucid` is the compiler answering an editor's questions. It imports `dreams` and
+calls its resolver directly — there is no subprocess and no re-parsing of the
+compiler's output, because a whole-program language makes "import the compiler"
+an ordinary import.
+
+```
+just lucid          # build/lucid.dream, which the VS Code extension looks for
+```
+
+It analyses the editor's **buffer**, not the file on disk. That is what
+`modules.load_overlaid!` is for: a map of path to text the loader reads instead
+of the disk. Anything else would answer questions about a program the user is
+not looking at.
+
+Two things to know before changing it. A member access is recorded at the head
+of its chain — `helper.double` is keyed where `helper` begins — so a cursor on
+the field walks back over the dot. And the compiler counts **bytes** while LSP
+counts **UTF-16 code units**; `lucid/pos.dr` is the only place that conversion
+happens, and it should stay that way.
 
 ## The language, briefly
 
