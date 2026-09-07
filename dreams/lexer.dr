@@ -311,10 +311,54 @@ let operators = [
     [".", :dot], [",", :comma], [";", :semi], [":", :colon],
 ];
 
-let rec match_operator s i ops =
-    if list.is_empty ops { () }
-    else if starts_at s i (list.head (list.head ops)) 0 { list.head ops }
-    else { match_operator s i (list.tail ops) };
+/// The operator at `i`, as `[kind, width]`, or `()`.
+///
+/// Dispatch on the byte rather than a walk down `operators`, because
+/// punctuation is most of what a Dream file is made of and the table is the
+/// wrong shape to consult per token. A `,` is thirtieth in it, so every comma
+/// in the corpus cost thirty failed comparisons -- and in a lazy language each
+/// of those allocates: a thunk for `list.tail ops`, two for the `list.head`
+/// pair, and one more for every `j + 1` inside `starts_at`. Measured on equal
+/// lengths of source, punctuation lexed thirteen times slower than identifiers
+/// and allocated fifteen times as much, all of it here.
+///
+/// The table stays, because it is the readable statement of what the operators
+/// are, and a test checks this against it rather than trusting the two to agree.
+/// Grouping by first byte is also what makes "longest first" structural instead
+/// of a property of the table's order: the two-byte forms are tested inside the
+/// branch their first byte selects, so `..` cannot lose to `.`.
+let operator_at s i = {
+    let a = core.str_byte s i;
+    let b = core.str_byte s (i + 1);
+    if a == 40 { [:lparen, 1] }
+    else if a == 41 { [:rparen, 1] }
+    else if a == 91 { [:lbracket, 1] }
+    else if a == 93 { [:rbracket, 1] }
+    else if a == 123 { [:lbrace, 1] }
+    else if a == 125 { [:rbrace, 1] }
+    else if a == 44 { [:comma, 1] }
+    else if a == 59 { [:semi, 1] }
+    else if a == 58 { [:colon, 1] }
+    else if a == 43 { [:plus, 1] }
+    else if a == 42 { [:star, 1] }
+    else if a == 47 { [:slash, 1] }
+    else if a == 46 { if b == 46 { [:dot_dot, 2] } else { [:dot, 1] } }
+    else if a == 61 { if b == 61 { [:eq_eq, 2] }
+                      else if b == 62 { [:fat_arrow, 2] }
+                      else { [:eq, 1] } }
+    else if a == 45 { if b == 62 { [:arrow, 2] } else { [:minus, 1] } }
+    else if a == 60 { if b == 61 { [:le, 2] } else { [:lt, 1] } }
+    else if a == 62 { if b == 61 { [:ge, 2] } else { [:gt, 1] } }
+    else if a == 37 { if b == 123 { [:percent_brace, 2] } else { [:percent, 1] } }
+    else if a == 124 { if b == 62 { [:pipe_into, 2] }
+                       else if b == 124 { [:or_or, 2] }
+                       else { () } }
+    else if a == 38 { if b == 38 { [:and_and, 2] } else { () } }
+    else if a == 33 { if b == 61 { [:bang_eq, 2] } else { () } }
+    else if a == 36 { if b == 40 { [:dollar_paren, 2] } else { () } }
+    else if a == 35 { if b == 91 { [:hash_bracket, 2] } else { () } }
+    else { () }
+};
 
 // --- one token --------------------------------------------------------------
 
@@ -340,9 +384,9 @@ let token_at s i = {
         if list.head r == :error { r } else { [:char, list.nth 1 r, list.nth 2 r] }
     }
     else {
-        let op = match_operator s i operators;
+        let op = operator_at s i;
         if op == () { [:error, "unexpected character", i] }
-        else { [list.nth 1 op, (), i + str.byte_length (list.head op)] }
+        else { [list.head op, (), i + list.nth 1 op] }
     }
 };
 
@@ -490,6 +534,33 @@ when test {
     let one src = list.head (lex_ok src);
 
     let tests = [
+        // --- operators ---
+        //
+        // The dispatch and the table are two statements of the same thing, and
+        // the point of keeping both is that this notices when they drift: every
+        // entry must lex to its kind, and consume exactly its own bytes.
+        test.case "every operator in the table lexes to its kind"
+            $( test.eq! (list.map (fn e -> list.nth 1 e) operators)
+                        (list.map (fn e -> list.head (operator_at (list.head e) 0)) operators) ),
+        test.case "every operator in the table consumes its own bytes"
+            $( test.eq! (list.map (fn e -> str.byte_length (list.head e)) operators)
+                        (list.map (fn e -> list.nth 1 (operator_at (list.head e) 0)) operators) ),
+        // A two-byte operator must win over the one-byte one it starts with,
+        // which is what the table's "longest first" order used to buy.
+        test.case "a longer operator wins"
+            $( test.eq! [:dot_dot, :eq_eq, :fat_arrow, :arrow, :le, :ge, :percent_brace]
+                        (list.map (fn t -> list.head (operator_at t 0))
+                                  ["..", "==", "=>", "->", "<=", ">=", "%{"]) ),
+        test.case "a one-byte operator is still itself at the end of a file"
+            $( test.eq! [:dot, :eq, :minus, :lt, :gt, :percent]
+                        (list.map (fn t -> list.head (operator_at t 0))
+                                  [".", "=", "-", "<", ">", "%"]) ),
+        // `|`, `&` and `!` are not tokens on their own -- only doubled, or
+        // paired -- and neither is `$` or `#`.
+        test.case "half of a two-byte operator is not a token"
+            $( test.eq! [(), (), (), (), ()]
+                        (list.map (fn t -> operator_at t 0) ["|", "&", "!", "$", "#"]) ),
+
         // --- numbers ---
         test.case "decimal"        $( test.eq! [42] (values "42") ),
         test.case "separators"     $( test.eq! [1000] (values "1_000") ),

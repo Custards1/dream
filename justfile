@@ -44,7 +44,10 @@ vm-no-jit:
 mind:
     mkdir -p build
     {{dreamc}} -L mind/std mind/tool/main.dr -o build/mind
-
+# The dreeams , itself a Dream program compiled by either itself or the soon unsupported dreamc.
+dreams:vm mind
+    mkdir -p build
+    cd dreams && {{dream}} build/mind -L mind/std mind/tool/main.dr -o build/mind
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
 test-mind: build
     {{dreamc}} -L mind/std mind/tool/main.dr --test -o /tmp/dream-mind-tests.dream
@@ -94,10 +97,13 @@ run-script FILE OUT: build
     ./{{dreamc}} {{FILE}} --shebang -o {{OUT}}
     ./{{OUT}}
 
-install: release mind
+install-artifacts:
     mv {{dreamc_release}} {{install_dir}}/bin || true
     mv {{dream}} {{install_dir}}/bin || true
-    mv build/mind {{install_dir}} || true
+    mv build/mind {{install_dir}}/bin || true
+
+install: release mind
+    just install-artifacts    
 
 
 # --- testing ----------------------------------------------------------------

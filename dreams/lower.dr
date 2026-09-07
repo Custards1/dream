@@ -774,14 +774,29 @@ let find_entry ld r = {
 /// whatever uses them. Nothing here depends on that -- a global is an index by
 /// now, and an index does not care when it was filled in -- but keeping it means
 /// a dump reads in the order the program was written.
+/// Force what one body's lowering produced: the arena's two counts, and the
+/// table saying which node each function's body became.
+///
+/// `ir.settle` keeps the arena flat *within* a body, and that is not enough,
+/// because nothing forces the accumulator *between* them. Without this the pass
+/// answers a suspension per body, nine hundred of them stacked on each other,
+/// and forcing the last one walks the whole tower with every intermediate arena
+/// still live -- which is how lowering the compiler itself ran the machine out
+/// of memory. Forced here, what is carried from one body to the next is an
+/// arena, and the one before it is garbage.
+let settle_body l =
+    if ir.node_count (prog l) >= 0 && ir.kid_count (prog l) >= 0
+       && len (func_bodies l) >= 0 { l } else { l };
+
 let lower_program r = {
     let start = lowering r ir.program 0;
-    let walked = list.fold (fn acc b -> {
+    let walked = list.fold_strict (fn acc b -> {
         let src = list.nth 1 b;
         let d = list.nth 2 b;
         let fi = list.nth 3 b;
         let got = lower_expr (scope.decl_body d) (set_ctx (list.nth 0 b) (set_source src acc));
-        set_func_body fi (list.nth 1 got) (mark_tail (list.nth 1 got) (list.head got))
+        settle_body (set_func_body fi (list.nth 1 got)
+                                  (mark_tail (list.nth 1 got) (list.head got)))
     }) start (scope.bodies r);
 
     let fs = link_funcs r (func_bodies walked) walked;

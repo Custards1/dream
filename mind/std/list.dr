@@ -83,6 +83,38 @@ let rec filter keep xs =
 let rec fold f acc xs =
     if core.is_empty xs { acc } else { fold f (f acc (core.head xs)) (core.tail xs) };
 
+/// A left fold that forces each step before taking the next.
+///
+/// `fold` is lazy in its accumulator, which for a short list is exactly right
+/// and for a long one is a trap: nothing forces `f acc x` until the end, so the
+/// fold answers a chain of n suspended applications, and forcing that chain
+/// walks n frames deep with every intermediate still live. Folding a program's
+/// worth of anything -- the tens of thousands of nodes a compiler emits -- runs
+/// the machine out of memory long before it runs out of list.
+///
+/// The force is `type_of` in a *condition*, and both halves of that matter. It
+/// has to be `type_of` because that is the cheapest builtin that cannot answer
+/// without evaluating its argument. It has to be a condition because an
+/// argument is not evaluated: writing `fold_strict f (force (f acc x)) rest`
+/// looks strict and is not -- the call to `force` is itself suspended, and the
+/// chain builds exactly as before. A condition is the one place the language
+/// must evaluate something.
+///
+/// Which type it turns out to be is not used. `:nothing` is not one of the
+/// answers `type_of` gives, so the fold always continues; what is kept is that
+/// `next` is a value rather than one more link.
+///
+/// Only the head is forced. What is inside the accumulator stays lazy, which is
+/// where laziness earns its keep: `strict!` would walk the whole accumulator at
+/// every step and turn a linear fold into a quadratic one.
+let rec fold_strict f acc xs =
+    if core.is_empty xs { acc }
+    else {
+        let next = f acc (core.head xs);
+        if type_of next == :nothing { next }
+        else { fold_strict f next (core.tail xs) }
+    };
+
 let rec fold_right f acc xs =
     if core.is_empty xs { acc } else { f (core.head xs) (fold_right f acc (core.tail xs)) };
 
@@ -258,6 +290,23 @@ when test {
             $( test.eq! "abc" (fold (fn a b -> a + b) "" ["a", "b", "c"]) ),
         test.case "fold_right"
             $( test.eq! "abc" (fold_right (fn x acc -> x + acc) "" ["a", "b", "c"]) ),
+        test.case "fold_strict agrees with fold"
+            $( test.eq! (fold (fn a b -> a + b) 0 (range 0 100))
+                        (fold_strict (fn a b -> a + b) 0 (range 0 100)) ),
+        test.case "fold_strict is left to right"
+            $( test.eq! "abc" (fold_strict (fn a b -> a + b) "" ["a", "b", "c"]) ),
+        test.case "fold_strict over empty is the seed"
+            $( test.eq! 7 (fold_strict (fn a b -> a + b) 7 []) ),
+        // The reason it exists: a lazy fold over a list this long is a chain of
+        // suspensions deep enough to exhaust the stack when it is finally
+        // forced. This one keeps a value between steps, so it does not.
+        test.case "fold_strict survives a list a lazy fold would not"
+            $( test.eq! 19999900000 (fold_strict (fn a b -> a + b) 0 (range 0 200000)) ),
+        // The force must not double as the fold's stopping condition. Testing
+        // for `:unit` instead of an impossible atom would end the fold early
+        // the moment a step answered `()`.
+        test.case "fold_strict does not stop at a unit accumulator"
+            $( test.eq! 3 (fold_strict (fn a b -> if b == 1 { () } else { 3 }) 0 [1, 2]) ),
         test.case "take"                $( test.eq! [1, 2] (take 2 [1, 2, 3]) ),
         test.case "take more than there is" $( test.eq! [1] (take 5 [1]) ),
         test.case "drop"                $( test.eq! [3] (drop 2 [1, 2, 3]) ),

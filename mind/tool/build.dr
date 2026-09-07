@@ -2,7 +2,7 @@
 //
 // `mind` does not compile anything itself. Dream compiles whole programs, so
 // the compiler wants every package at once rather than a series of object
-// files -- which means a build is: find the packages, hand `dreamc` their
+// files -- which means a build is: find the packages, hand `dreams` their
 // directories, run it. There is nothing to cache and no link step.
 import std.core;
 import std.io;
