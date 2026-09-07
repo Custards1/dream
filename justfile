@@ -12,6 +12,7 @@ build_dir := "build-dream"
 dreamc := "target/debug/dreamc"
 dreamc_release := "target/release/dreamc"
 dream := build_dir / "bin/dream"
+seed := "dreams/bootstrap/dreams.dream"
 
 default: build
 
@@ -50,6 +51,24 @@ mind:
 dreams:vm mind
     mkdir -p build
     cd dreams &&DREAMC= {{dream}} build/mind -L mind/std mind/tool/main.dr -o build/mind
+# Build `dreams` from the checked-in image, with no `dreamc` in sight.
+#
+# The image is a fixpoint: compiling this source with it produces a
+# byte-identical copy of itself. To move the seed forward after changing the
+# compiler, run this and keep `build/dreams.dream`.
+bootstrap: vm
+    mkdir -p build
+    ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/main.dr
+
+# The seed must still reproduce itself from this source: what it builds must
+# build an identical third image. That equality is the whole guarantee -- it
+# says the compiler in the tree and the compiler in the image agree.
+bootstrap-check: vm
+    ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/main.dr
+    ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/main.dr
+    cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
+    @echo "the bootstrap image reproduces itself"
+
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
 test-mind: build
     {{dreamc}} -L mind/std mind/tool/main.dr --test -o /tmp/dream-mind-tests.dream
@@ -111,7 +130,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-bootstrap test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -187,6 +206,9 @@ test-dreams-lower: build
 # evidence that the self-hosted compiler works rather than merely agrees.
 test-dreams-compile: build
     dreamc={{dreamc}} dream={{dream}} dreams/tests/compile.sh
+
+# The bootstrap: the seed reproduces itself from this source.
+test-bootstrap: bootstrap-check
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
