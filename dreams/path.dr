@@ -1,0 +1,249 @@
+// File paths, as text.
+//
+// The compiler needs three things from a path: to build one (a module's dotted
+// name becomes a file name), to take one apart (a file's place inside a package
+// becomes its module name), and to tell whether two paths are the *same file*
+// -- because a module reached as `std.list` from outside and as `list` from
+// inside must be one module, not two, or it would be compiled twice and its
+// globals would not line up.
+//
+// The Rust compiler answers that last question with `fs::canonicalize`, which
+// asks the operating system and follows symbolic links. There is no such
+// builtin here, so `absolute!` does it textually: make the path absolute
+// against the working directory and fold away `.` and `..`. That is exact for
+// every layout a package can actually have, and differs only when a symbolic
+// link points into a package from outside it -- in which case the same file is
+// compiled twice under two names rather than anything being silently wrong.
+//
+// Everything is pure except `absolute!`, which is the only part that has to ask
+// where the process is standing.
+
+import std.core;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+let separator = "/";
+
+// --- taking a path apart ----------------------------------------------------
+
+let is_absolute p = str.starts_with "/" p;
+
+/// The non-empty pieces between the slashes. A leading slash is not one of
+/// them -- `is_absolute` is what remembers it -- so `of_segments` needs telling
+/// which kind of path it is rebuilding.
+let segments p = list.filter (fn s -> not (str.is_empty s)) (str.split separator p);
+
+let of_segments absolute segs = {
+    let body = str.join_str separator segs;
+    if absolute { separator + body } else { body }
+};
+
+/// Everything before the last `/`, or `"."` when there is none. The parent of
+/// `"/"` is itself, which is what stops a walk up the tree.
+let dirname p = {
+    let rec last_slash i best =
+        if i >= str.byte_length p { best }
+        else if str.slice i 1 p == separator { last_slash (i + 1) i }
+        else { last_slash (i + 1) best };
+    let at = last_slash 0 (0 - 1);
+    if at < 0 { "." }
+    else if at == 0 { separator }
+    else { str.slice 0 at p }
+};
+
+let basename p = {
+    let segs = segments p;
+    if list.is_empty segs { p } else { list.last segs }
+};
+
+/// `a/b` -- but an empty or `.` side is dropped rather than kept, because these
+/// paths are read by people in diagnostics and `././main.dr` helps nobody. An
+/// absolute right-hand side wins outright: it is already anchored.
+let join a b =
+    if str.is_empty b || b == "." { a }
+    else if str.is_empty a || a == "." { b }
+    else if is_absolute b { b }
+    else if str.ends_with separator a { a + b }
+    else { a + separator + b };
+
+let rec join_all base parts =
+    match parts {
+        [] => base,
+        [p, ..rest] => join_all (join base p) rest,
+    };
+
+// --- extensions -------------------------------------------------------------
+//
+// The dot has to be in the last segment to count: `../lib` has no extension,
+// and treating `.` and `..` as one is how a path walk loses a directory.
+
+let rec last_dot p i best =
+    if i >= str.byte_length p { best }
+    else if str.slice i 1 p == separator { last_dot p (i + 1) (0 - 1) }
+    else if str.slice i 1 p == "." { last_dot p (i + 1) i }
+    else { last_dot p (i + 1) best };
+
+/// The dot's offset, or `-1`. A leading dot names a hidden file rather than
+/// starting an extension, so `.gitignore` has none.
+let dot_at p = {
+    let at = last_dot p 0 (0 - 1);
+    let base_at = str.byte_length p - str.byte_length (basename p);
+    if at <= base_at { 0 - 1 } else { at }
+};
+
+/// The extension without its dot, or `""`.
+let extension p = {
+    let at = dot_at p;
+    if at < 0 { "" } else { str.slice (at + 1) (str.byte_length p - at - 1) p }
+};
+
+/// The path with any extension removed.
+let drop_extension p = {
+    let at = dot_at p;
+    if at < 0 { p } else { str.slice 0 at p }
+};
+
+let with_extension ext p = drop_extension p + "." + ext;
+
+/// The file name with neither directory nor extension: `a/b/list.dr` -> `list`.
+let stem p = drop_extension (basename p);
+
+// --- normalising ------------------------------------------------------------
+
+/// Fold away `.` and `..`. A `..` that would climb above the root of an
+/// absolute path is dropped, since `/..` is `/`; one at the front of a relative
+/// path is kept, since there is nothing yet to cancel it against.
+let normalize p = {
+    let absolute = is_absolute p;
+    let rec walk segs acc =
+        match segs {
+            [] => list.reverse acc,
+            [".", ..rest] => walk rest acc,
+            ["..", ..rest] =>
+                match acc {
+                    [] => walk rest (if absolute { [] } else { [".."] }),
+                    ["..", .._] => walk rest (core.cons ".." acc),
+                    [_, ..up] => walk rest up,
+                },
+            [s, ..rest] => walk rest (core.cons s acc),
+        };
+    let segs = walk (segments p) [];
+    if list.is_empty segs { if absolute { separator } else { "." } }
+    else { of_segments absolute segs }
+};
+
+/// The path as an absolute, normalised one: what stands in for `canonicalize`.
+let absolute! p = normalize (if is_absolute p { p } else { join (os.cwd! ()) p });
+
+/// Do these two paths name the same file? Compared after normalising, so
+/// `./a/../b/list.dr` and `b/list.dr` are one file rather than two.
+let same_file! a b = absolute! a == absolute! b;
+
+/// `p` with `base` removed from the front, or `()` when `p` is not inside
+/// `base`. Compared segment by segment, so `/a/bc` is not inside `/a/b`.
+let rec strip_prefix_segs base_segs segs =
+    match [base_segs, segs] {
+        [[], rest] => rest,
+        [_, []] => (),
+        [[b, ..bs], [s, ..ss]] => if b == s { strip_prefix_segs bs ss } else { () },
+    };
+
+/// The segments of `p` relative to directory `base`, or `()`. Both are
+/// normalised first, so this answers about files rather than about spelling.
+let relative_to base p = {
+    let b = normalize base;
+    let f = normalize p;
+    if is_absolute b != is_absolute f { () }
+    else { strip_prefix_segs (segments b) (segments f) }
+};
+
+// --- asking the file system -------------------------------------------------
+
+let is_file! p = io.exists! p && not (io.is_dir! p);
+
+/// The whole file as one string, or `()` when it cannot be opened. A missing
+/// file is an answer rather than a failure: the loader asks about files that
+/// may not be there, and an import that resolves to nothing is reported in
+/// terms of what was searched, not as a raised error.
+let rec read_chunks! h acc = {
+    let chunk = io.read! h 65536;
+    if len chunk == 0 { str.join_str "" (list.reverse acc) }
+    else { read_chunks! h (core.cons chunk acc) }
+};
+
+let read_file! p = {
+    let opened = try! { io.open! p :read } catch e { () };
+    match opened {
+        () => (),
+        h => {
+            let text = read_chunks! h [];
+            io.close! h
+            text
+        }
+    }
+};
+
+/// A directory's entries as full paths, or `[]` when it cannot be read. A
+/// missing directory is an ordinary answer here -- a search path that does not
+/// exist simply holds nothing.
+let list_dir! p = {
+    let names = try! { os.list_dir! p } catch e { [] };
+    list.map (fn n -> join p n) names
+};
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a path is absolute when it starts at the root"
+            $( test.eq! [true, false] [is_absolute "/a/b", is_absolute "a/b"] ),
+        test.case "segments drop the empties a slash leaves behind"
+            $( test.eq! ["a", "b"] (segments "/a//b/") ),
+        test.case "of_segments puts the root back"
+            $( test.eq! ["/a/b", "a/b"]
+                        [of_segments true ["a", "b"], of_segments false ["a", "b"]] ),
+        test.case "dirname stops at the root"
+            $( test.eq! ["/a", "/", ".", "a"]
+                        [dirname "/a/b", dirname "/a", dirname "b", dirname "a/b"] ),
+        test.case "basename is the last segment"
+            $( test.eq! ["b", "a"] [basename "/a/b", basename "a"] ),
+        test.case "join drops a dot rather than keeping it"
+            $( test.eq! ["main.dr", "a/b", "a/b"]
+                        [join "." "main.dr", join "a" "b", join "a/" "b"] ),
+        test.case "join to an absolute path keeps the absolute one"
+            $( test.eq! "/b" (join "a" "/b") ),
+        test.case "join_all walks a whole dotted path"
+            $( test.eq! "src/a/b" (join_all "src" ["a", "b"]) ),
+        test.case "an extension is the part after the last dot"
+            $( test.eq! ["dr", "", ""] [extension "a/list.dr", extension "a/list", extension "a.b/c"] ),
+        test.case "a leading dot names a hidden file, not an extension"
+            $( test.eq! ["", ".gitignore"] [extension ".gitignore", drop_extension ".gitignore"] ),
+        test.case "a relative path keeps its dots"
+            $( test.eq! ["", "../lib"] [extension "../lib", drop_extension "../lib"] ),
+        test.case "with_extension replaces what was there"
+            $( test.eq! ["a/list.dr", "a/list.dr"]
+                        [with_extension "dr" "a/list", with_extension "dr" "a/list.txt"] ),
+        test.case "a stem is the name alone"
+            $( test.eq! "list" (stem "a/b/list.dr") ),
+        test.case "normalize folds away . and .."
+            $( test.eq! ["/a/c", "b"] [normalize "/a/b/../c", normalize "./a/../b"] ),
+        test.case "normalize keeps a leading .. it cannot cancel"
+            $( test.eq! "../b" (normalize "../b") ),
+        test.case "normalize cannot climb above the root"
+            $( test.eq! "/" (normalize "/a/../..") ),
+        test.case "an emptied path is . or /"
+            $( test.eq! [".", "/"] [normalize "a/..", normalize "/"] ),
+        test.case "relative_to answers in segments"
+            $( test.eq! ["b", "c.dr"] (relative_to "/a" "/a/b/c.dr") ),
+        test.case "a path outside the base is not relative to it"
+            $( test.eq! [(), ()] [relative_to "/a/b" "/a/c", relative_to "/a" "b"] ),
+        test.case "a base is relative to itself, emptily"
+            $( test.eq! [] (relative_to "/a" "/a") ),
+        test.case "a longer name is not inside a shorter directory"
+            $( test.eq! () (relative_to "/a/b" "/a/bc") ),
+    ];
+}

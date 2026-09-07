@@ -49,7 +49,15 @@ public:
     Value make_string(const char* data, uint32_t len);
     Value make_cons(Value head, Value tail);
     Value make_array(uint32_t len);
+    /// An empty map: a branch with no children. The capacity argument is a
+    /// leftover of the open-addressed table and is ignored -- a trie sizes
+    /// itself -- but it is kept so that callers with a sensible hint need not
+    /// all change.
     Value make_map(uint32_t capacity);
+    /// A branch with room for `nslots` packed children. The caller fills in the
+    /// bitmap and the slots.
+    Value make_map_branch(uint32_t nslots);
+    Value make_map_leaf(uint64_t hash, Value key, Value value, Value next);
     Value make_closure(uint32_t func, uint32_t ncaps);
     Value make_thunk(uint32_t node, Value frame);
     Value make_frame(Value closure, uint32_t nslots);
@@ -71,6 +79,15 @@ public:
     size_t bytes_allocated() const { return allocated_; }
     size_t bytes_live() const { return live_after_gc_; }
     uint64_t collections() const { return collections_; }
+    /// Every byte this heap has ever handed out, collections included. What
+    /// `bytes_allocated` reports is reset by a collection, so it says how full
+    /// the heap is rather than how much work has gone through it -- and the
+    /// second question is the one that finds a program allocating quadratically.
+    uint64_t bytes_total() const { return total_allocated_; }
+    /// The largest the live set has ever been after a collection: the memory
+    /// the program actually needs, as opposed to the garbage it made getting
+    /// there.
+    size_t bytes_peak() const { return peak_live_; }
 
     /// Deep-copy `v` out of this heap into `dest`. Used for message sends and
     /// for spawning, which are the only two places a value crosses heaps.
@@ -112,6 +129,8 @@ private:
     Block* blocks_ = nullptr;   // current allocation space
     Block* to_blocks_ = nullptr;  // only non-null during a collection
     size_t allocated_ = 0;
+    uint64_t total_allocated_ = 0;
+    size_t peak_live_ = 0;
     size_t gc_threshold_;
     size_t initial_bytes_;
     size_t live_after_gc_ = 0;

@@ -206,6 +206,11 @@ private:
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
     bool owns_mapping_ = false;
+    /// What to hand back to munmap. A shebang line is skipped by advancing
+    /// `data_`, which then no longer points at the start of the mapping -- and
+    /// munmap takes the address it was given, page-aligned, or nothing.
+    void* mapping_ = nullptr;
+    size_t mapping_size_ = 0;
 
     uint16_t version_major_ = 0, version_minor_ = 0;
     uint32_t flags_ = 0, module_name_ = 0, source_name_ = 0, entry_ = NO_NODE;

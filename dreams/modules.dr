@@ -1,0 +1,680 @@
+// Module resolution and loading.
+//
+// Dream compiles whole programs. `import std.list` is resolved to a file, that
+// file is parsed, and its own imports are followed, until the entire reachable
+// program is in hand. Everything is then lowered into a single image.
+//
+// Whole-program compilation is what makes `derive` cheap: specializing a base
+// module's code against a deriving module's implementations needs the base
+// module's syntax tree, not just its signature. It also means a call to another
+// Dream module resolves to a global index at compile time rather than a name
+// lookup at run time.
+//
+// A module path that has no file behind it is assumed to be provided by the
+// host -- `std.console` is C++ in the VM, not Dream. Those are listed
+// explicitly so a typo in an import is an error rather than a mystery at run
+// time.
+//
+// The loader is a value, not an object. Every step takes one and answers
+// another, which is what lets the whole thing be pure of shared state while
+// still being thoroughly effectful about the file system: a step's input is the
+// previous step's output, so the data dependency alone fixes the order things
+// happen in. Nothing has to be undone, and there is no point at which half a
+// module is registered.
+
+import std.core;
+import std.list;
+import std.str;
+
+import dreams.ast;
+import dreams.config;
+import dreams.diag;
+import dreams.package;
+import dreams.parser;
+import dreams.path;
+
+/// Modules the VM provides natively. An `import` of one of these resolves to a
+/// runtime lookup rather than to Dream source. This must match the runtime's
+/// registry exactly.
+///
+/// An embedder can add to this list for one compilation with `--host-module`,
+/// which is what makes a program importing a module registered at run time
+/// compilable. It is deliberately not a wildcard: naming the module is what
+/// keeps a typo in an import an error rather than a mystery later.
+let native_modules =
+    ["std.console", "std.core", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.vm"];
+
+let is_native p = list.contains p native_modules;
+
+// --- a loaded module ---------------------------------------------------------
+
+/// `source` is an index into the loader's file list, so a diagnostic raised
+/// about this module can quote the line it came from.
+let loaded name file source items =
+    %{ :name => name, :path => file, :source => source, :items => items };
+
+let module_name m   = core.map_get m :name "";
+let module_path m   = core.map_get m :path "";
+let module_source m = core.map_get m :source 0;
+let module_items m  = core.map_get m :items [];
+
+// --- the loader --------------------------------------------------------------
+
+let loader packages cfg search_paths host_modules =
+    %{ :packages => packages, :config => cfg, :search_paths => search_paths,
+       :host_modules => host_modules,
+       // Dependencies first, so a later pass never meets a module before what
+       // it uses. That ordering is the reason a module is appended only once
+       // everything it imports has been.
+       :modules => [], :by_name => core.map_new (), :by_path => core.map_new (),
+       :files => [], :natives => [], :namespaces => [],
+       :diags => [], :visited => core.map_new (), :in_progress => [] };
+
+let packages l     = core.map_get l :packages package.empty;
+let config_of l    = core.map_get l :config config.empty;
+let search_paths l = core.map_get l :search_paths [];
+let host_modules l = core.map_get l :host_modules [];
+let modules l      = core.map_get l :modules [];
+let by_name l      = core.map_get l :by_name (core.map_new ());
+let by_path l      = core.map_get l :by_path (core.map_new ());
+let files l        = core.map_get l :files [];
+let natives l      = core.map_get l :natives [];
+let namespaces l   = core.map_get l :namespaces [];
+let diags l        = core.map_get l :diags [];
+let visited l      = core.map_get l :visited (core.map_new ());
+let in_progress l  = core.map_get l :in_progress [];
+
+let put k v l = core.map_put l k v;
+
+/// The index of a module, by any name it answers to, or `()`.
+let find l name = core.map_get (by_name l) name ();
+
+let module_at l i = list.nth i (modules l);
+
+/// Is this path provided by the runtime rather than by Dream source?
+let is_host l p = is_native p || list.contains p (host_modules l);
+
+let note d l = put :diags (list.append (diags l) [d]) l;
+
+/// Record a diagnostic against the file it was found in.
+let complain span message source l = note (diag.in_source source (diag.error span message)) l;
+
+let complain_note span message extra source l =
+    note (diag.in_source source (diag.with_note extra (diag.error span message))) l;
+
+let mark_visited name l = put :visited (core.map_put (visited l) name true) l;
+let is_visited l name = core.map_has (visited l) name;
+
+/// Native modules are recorded in first-seen order, because that order is the
+/// index a call to one is compiled to.
+let record_native p l =
+    if list.contains p (natives l) { l } else { put :natives (list.append (natives l) [p]) l };
+
+let enter name l = put :in_progress (list.append (in_progress l) [name]) l;
+let leave l = {
+    let stack = in_progress l;
+    put :in_progress (list.take (list.length stack - 1) stack) l
+};
+let is_loading l name = list.contains name (in_progress l);
+
+// --- resolving a name to a file ----------------------------------------------
+
+let dotted_segments p = list.filter (fn s -> not (str.is_empty s)) (str.split "." p);
+
+let rec search_for! bases rel =
+    match bases {
+        [] => (),
+        [base, ..rest] => {
+            let direct = path.with_extension "dr" (path.join_all base rel);
+            // `std/list/mod.dr` lets a module grow into a directory later
+            // without any of its importers changing.
+            let as_dir = path.join (path.join_all base rel) "mod.dr";
+            if path.is_file! direct { direct }
+            else if path.is_file! as_dir { as_dir }
+            else { search_for! rest rel }
+        },
+    };
+
+/// Turn a dotted path into a file.
+///
+/// The first segment may name a package, which is what makes grouping
+/// independent of layout: `std.list` is the module `list` in whichever
+/// directory calls itself `std`. Failing that, the whole path is a module
+/// inside the current package, so a project's own files are reachable without
+/// repeating its name. The bare search paths come last, so a project with no
+/// manifest still works.
+let resolve_path! l dotted = {
+    let segs = dotted_segments dotted;
+    let ps = packages l;
+    let in_package =
+        if list.length segs > 1 {
+            match package.find ps (list.head segs) {
+                () => (),
+                pkg => package.module_file! pkg (list.tail segs),
+            }
+        }
+        else {
+            // A package may also hold a module named after itself: `std`
+            // meaning `std/mod.dr` or `std/std.dr`.
+            match package.find ps (list.head segs) {
+                () => (),
+                pkg => match package.module_file! pkg ["mod"] {
+                    () => package.module_file! pkg [list.head segs],
+                    f  => f,
+                },
+            }
+        };
+    match in_package {
+        () => match match package.current ps {
+                        () => (),
+                        cur => package.module_file! cur segs,
+                    } {
+            () => search_for! (search_paths l) segs,
+            f  => f,
+        },
+        f => f,
+    }
+};
+
+/// Is `dep` a module already loaded under one of `current`'s enclosing scopes?
+/// `derive shape` inside `a.circle` means `a.shape`, the sibling, so the search
+/// walks outwards: `a.circle.shape`, then `a.shape`, then nothing. Answers with
+/// the qualified name it found.
+let rec local_module l scope dep = {
+    let candidate = scope + "." + dep;
+    if find l candidate != () { candidate }
+    else {
+        let segs = dotted_segments scope;
+        if list.length segs <= 1 { () }
+        else { local_module l (str.join_str "." (list.take (list.length segs - 1) segs)) dep }
+    }
+};
+
+/// The name a module is known by, regardless of how it was imported: the
+/// package it belongs to, plus its path inside that package.
+///
+/// Where the file actually *is* decides this, not how it was spelled. A
+/// dependency reached as `../greet` produces a path that literally begins with
+/// the depending package's directory, so comparing the text would claim the
+/// wrong owner. Nested packages are legal, so the innermost one wins: the
+/// longest source root still containing the file is its real owner.
+let canonical_name! l file fallback = {
+    let real = path.absolute! file;
+    let best = list.fold (fn found pkg -> {
+        let src = path.absolute! (package.src pkg);
+        match package.module_name src real {
+            () => found,
+            inside => {
+                let depth = list.length (path.segments src);
+                if list.head found >= depth { found }
+                else { [depth, package.name pkg + "." + inside] }
+            },
+        }
+    }) [0 - 1, ()] (package.packages (packages l));
+    match list.nth 1 best { () => fallback, name => name }
+};
+
+// --- explaining a failure ----------------------------------------------------
+
+let comma_list xs = if list.is_empty xs { "nothing" } else { str.join_str ", " xs };
+
+/// Explain a failed import in terms of what was actually searched. An import
+/// that cannot be resolved is nearly always a small mistake -- a typo, a
+/// missing `-L` -- and which of those it is shows in what the compiler could
+/// see, so that is what it says.
+let unresolved_note! l dotted = {
+    let ps = packages l;
+    let first = list.head (dotted_segments dotted);
+    match package.find ps first {
+        () => {
+            let hosts = list.append native_modules (host_modules l);
+            let head = "no package is named `" + first + "`, and no file matched.\n"
+                       + "Host-provided modules: " + comma_list hosts + ".";
+            let embedding =
+                if list.is_empty (host_modules l) {
+                    "\nAn embedder's own host module must be named with "
+                    + "`--host-module <path>` so that importing it compiles."
+                }
+                else { "" };
+            let known =
+                if list.is_empty (package.names ps) {
+                    "\nNo packages were found. A package is any directory with a "
+                    + "`mind.toml`; point at one with -L."
+                }
+                else { "\nKnown packages: " + comma_list (package.names ps) + "." };
+            let here = match package.current ps {
+                () => "",
+                cur => "\nCurrent package `" + package.name cur + "` provides: "
+                       + comma_list (package.modules! cur) + ".",
+            };
+            head + embedding + known + here
+        },
+        pkg => {
+            let rest = if str.starts_with (first + ".") dotted {
+                           str.slice (str.byte_length first + 1)
+                                     (str.byte_length dotted - str.byte_length first - 1) dotted
+                       }
+                       else { dotted };
+            "package `" + package.name pkg + "` was found at " + package.root pkg
+            + ", but has no module `" + rest + "`."
+            + "\nIt provides: " + comma_list (package.modules! pkg) + "."
+        },
+    }
+};
+
+// --- `when`, resolved before anything else looks at the module ---------------
+
+/// Flatten `when` items, keeping only the branches whose condition holds. Done
+/// as the file is read, so the rest of the compiler never sees a conditional
+/// item at all -- and an `import` inside a `when` that is off is never
+/// followed, so a module only test builds need is never even opened.
+let rec expand_items cfg items =
+    list.concat (list.map (fn item ->
+        match item {
+            [:when, cond, inner, _] =>
+                if config.eval cfg cond { expand_items cfg inner } else { [] },
+            other => [other],
+        }) items);
+
+// --- loading -----------------------------------------------------------------
+
+/// The dotted paths a module depends on, with the span to blame: its imports
+/// and its `derive`s, which resolve the same way.
+let dependencies items =
+    list.concat (list.map (fn item ->
+        match item {
+            [:import, segs, _, _, span] => [[str.join_str "." segs, span]],
+            [:derive, segs, span]       => [[str.join_str "." segs, span]],
+            _ => [],
+        }) items);
+
+/// The same cycle, wherever it is noticed. `modules must form a tree` is the
+/// whole explanation: they are compiled together into one image, so there is no
+/// point at which a half-built module could be handed to the one that needs it.
+let cycle at name from_source l =
+    complain_note at ("import cycle: " + str.join_str " -> " (in_progress l) + " -> " + name)
+                  "modules are compiled together, so their imports must form a tree"
+                  from_source l;
+
+let rec load_named! l dotted at from_source =
+    if is_host l dotted { record_native dotted (mark_visited dotted l) }
+    else if is_visited l dotted { l }
+    else if is_loading l dotted { cycle at dotted from_source l }
+    else {
+        match resolve_path! l dotted {
+            // No module by that name -- but a *package* by that name is
+            // `import std;`, which brings in everything the package provides.
+            () => {
+                let tried = load_package! l dotted at from_source;
+                if list.nth 1 tried { list.head tried }
+                else {
+                    complain_note at ("cannot find module `" + dotted + "`")
+                                  (unresolved_note! l dotted) from_source (list.head tried)
+                }
+            },
+            file => {
+                // Identity is the file. Already loaded under another spelling
+                // means another name for the same module, not another module.
+                let abs = path.absolute! file;
+                match core.map_get (by_path l) abs () {
+                    () => {
+                        let name = canonical_name! l file dotted;
+                        // The check above compares the name as *written*, which
+                        // is not enough on its own: a module being loaded is on
+                        // the stack under its canonical name, and `import b`
+                        // from inside `pkg.a` is spelled nothing like `pkg.a`.
+                        // Two files importing each other would then recurse
+                        // until the stack ran out. So the question is asked
+                        // again here, where the file has been resolved and can
+                        // be named the way the stack names it.
+                        if is_loading l name { cycle at name from_source l }
+                        else {
+                            let after = load_file! l file name at from_source;
+                            // The spelling the importer used becomes another
+                            // way to reach the module it found.
+                            let aliased = match find after name {
+                                () => after,
+                                i  => put :by_name (core.map_put (by_name after) dotted i) after,
+                            };
+                            mark_visited dotted aliased
+                        }
+                    },
+                    existing =>
+                        mark_visited dotted
+                            (put :by_name (core.map_put (by_name l) dotted existing) l),
+                }
+            },
+        }
+    };
+
+/// `import std;` where `std` names a package rather than a module: load every
+/// module the package provides, and record the name as a namespace so that
+/// `std.list` resolves through it.
+///
+/// Answers `[loader, found]`, so a caller can tell "there was no such package"
+/// from "the package was empty" and report the first as an unresolved import.
+let rec load_package! l dotted at from_source =
+    match package.find (packages l) dotted {
+        () => [l, false],
+        pkg => {
+            let members = package.modules! pkg;
+            if list.is_empty members {
+                [complain_note at ("package `" + dotted + "` provides no modules")
+                               "a package's modules are the `.dr` files under its `src`"
+                               from_source l,
+                 true]
+            }
+            else {
+                let seen = mark_visited dotted
+                    (put :namespaces (list.append (namespaces l) [dotted]) l);
+                [list.fold (fn acc m -> {
+                    let full = dotted + "." + m;
+                    // A module of the package that is already being loaded is
+                    // the one doing the importing: `mind/std/all.dr` says
+                    // `import std;`. That is asking for its siblings, not a
+                    // cycle.
+                    if is_loading acc full { acc } else { load_named! acc full at from_source }
+                 }) seen members,
+                 true]
+            }
+        },
+    };
+
+let rec load_file! l file name at from_source =
+    if is_visited l name { l }
+    else {
+        match path.read_file! file {
+            () => complain at ("cannot read " + file) from_source l,
+            text => load_text! l text file name file
+        }
+    };
+
+/// Register `mod child { .. }` as the module `parent.child`, and answer the
+/// import that replaces it in the parent: `[loader, item]`.
+///
+/// The submodule shares the parent's source file, so its diagnostics point at
+/// the right lines. It is deliberately *not* recorded by path: identity there
+/// is the file, and the file already belongs to the parent.
+let rec hoist_mod! l parent source m =
+    match m {
+        [:mod, child, items, span] => {
+            let full = parent + "." + child;
+            let stand_in = ast.import_d (dotted_segments full) child () span;
+            if find l full != () {
+                [complain span ("`" + child + "` is already a module here") source l, stand_in]
+            }
+            else {
+                // Its own `when`s and nested `mod`s, resolved the way a file's
+                // are: by the time this is recorded it is an ordinary module.
+                let kept = expand_items (config_of l) items;
+                let nested = list.fold (fn acc item ->
+                    match item {
+                        [:mod, _, _, _] => {
+                            let done = hoist_mod! (list.head acc) full source item;
+                            [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
+                        },
+                        other => [list.head acc, list.append (list.nth 1 acc) [other]],
+                    }) [l, []] kept;
+                let inner_items = list.nth 1 nested;
+
+                // A submodule may import, so follow those before it is recorded.
+                let followed = list.fold (fn acc d -> {
+                    let dep = list.head d;
+                    // Its own submodule, put there by the hoist above, or a
+                    // sibling reached by walking outwards: either way already
+                    // registered.
+                    if find acc dep != () || local_module acc full dep != () { acc }
+                    else { load_named! acc dep (list.nth 1 d) source }
+                }) (enter full (list.head nested)) (dependencies inner_items);
+
+                let recorded = leave followed;
+                let index = list.length (modules recorded);
+                [mark_visited full
+                    (put :by_name (core.map_put (by_name recorded) full index)
+                        (put :modules (list.append (modules recorded)
+                                                   [loaded full full source inner_items])
+                             recorded)),
+                 stand_in]
+            }
+        },
+        _ => [l, m],
+    };
+
+let rec load_text! l text display name file = {
+    let source = list.length (files l);
+    let read = put :files (list.append (files l) [diag.source display text]) l;
+    match parser.parse_module text {
+        [:error, message, span] => complain span message source read,
+        [:ok, items] => {
+            // Resolve `when` before anything else looks at the module.
+            let kept = expand_items (config_of read) items;
+
+            // A `mod name { .. }` is a module written inside another. Register
+            // it as `parent.name` and leave the parent importing it, so from
+            // here on a submodule and a file are the same thing to every later
+            // pass. Submodules go into the list first, which keeps the
+            // dependencies-first order.
+            let hoisted = list.fold (fn acc item ->
+                match item {
+                    [:mod, _, _, _] => {
+                        let done = hoist_mod! (list.head acc) name source item;
+                        [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
+                    },
+                    other => [list.head acc, list.append (list.nth 1 acc) [other]],
+                }) [enter name read, []] kept;
+            let items_out = list.nth 1 hoisted;
+
+            // Follow this module's own imports before recording it, so the
+            // module list comes out with dependencies first.
+            let followed = list.fold (fn acc d -> {
+                let dep = list.head d;
+                // `import io.{ .. }` inside a module declaring `mod io { .. }`
+                // means *that* submodule, already loaded, so there is nothing
+                // to search the file system for.
+                if local_module acc name dep != () { acc }
+                else { load_named! acc dep (list.nth 1 d) source }
+            }) (list.head hoisted) (dependencies items_out);
+
+            let recorded = leave followed;
+            let index = list.length (modules recorded);
+            mark_visited name
+                (put :by_path (core.map_put (by_path recorded) (path.absolute! file) index)
+                    (put :by_name (core.map_put (by_name recorded) name index)
+                        (put :modules (list.append (modules recorded)
+                                                   [loaded name file source items_out])
+                             recorded)))
+        },
+    }
+};
+
+// --- the test runner ---------------------------------------------------------
+
+/// Does this module export tests? A module opts in by defining `tests`, by
+/// convention inside a `when test { .. }` so that it costs nothing otherwise.
+let exports_tests m =
+    list.any (fn item ->
+        match item {
+            [:let, "tests", [], _, _, _] => true,
+            _ => false,
+        }) (module_items m);
+
+/// Build an entry point that runs the tests every loaded module exports.
+///
+/// Generating the runner from what was actually loaded means there is no
+/// registry to keep in step, and no test that is silently never run.
+let add_test_runner! l = {
+    let suites = list.filter (fn s -> s != ())
+        (list.map (fn i ->
+            if exports_tests (module_at l i) { [module_name (module_at l i), i] } else { () })
+         (list.range 0 (list.length (modules l))));
+    let src =
+        if list.is_empty suites {
+            // Still a valid program: it reports that there was nothing to run,
+            // which is more use than an image with no entry point. One string,
+            // not two: `console.print!` is variadic, so a second argument would
+            // be a second thing printed, and generated code should not depend on
+            // that to read correctly.
+            "import std.console;\n"
+            + "let main! = { console.print! \"no tests found "
+            + "(a module exports tests by defining `tests`)\" };\n"
+        }
+        else {
+            let alias s = "dreams_test_module_" + to_string (list.nth 1 s);
+            "// Generated by `--test`: runs the tests each module exports.\n"
+            + "import std.test as dreams_test_framework;\n"
+            + str.join_str "" (list.map (fn s -> "import " + list.head s + " as " + alias s + ";\n")
+                                        suites)
+            + "let main! = dreams_test_framework.main_of! [\n"
+            + str.join_str "" (list.map (fn s -> "    [\"" + list.head s + "\", "
+                                                 + alias s + ".tests],\n") suites)
+            + "];\n"
+        };
+    load_text! l src "<generated test runner>" "dreams.test_main" "<generated test runner>"
+};
+
+// --- the entry point ---------------------------------------------------------
+
+/// Load the root file and everything it reaches.
+///
+/// The loader comes back even when loading failed, because it carries the
+/// source files the diagnostics point into -- an error that cannot quote its
+/// own line is much less use.
+let load_root! l file test_mode = {
+    // Name the root the way any other module in its package would be, so that a
+    // module's identity does not depend on it being the entry point.
+    let name = canonical_name! l file (path.stem file);
+    let loaded_all = load_file! l file name ast.no_span 0;
+    if test_mode { add_test_runner! loaded_all } else { loaded_all }
+};
+
+/// The usual way in: discover packages around `file`, then load it.
+let load! file roots cfg test_mode =
+    load_root! (loader (package.discover! file roots) cfg roots []) file test_mode;
+
+let failed l = diag.error_count (diags l) > 0;
+
+/// Every module that was loaded, in the order a later pass must walk them:
+/// dependencies before what uses them.
+let names l = list.map (fn m -> module_name m) (modules l);
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    /// A loader with nothing found and nothing configured, which is what the
+    /// tests that do not touch the file system start from.
+    let bare cfg = loader package.empty cfg [] [];
+
+    /// Load one module from text, the way a file would be but without one.
+    let from_text! cfg src = load_text! (bare cfg) src "<test>" "t" "<test>";
+
+    let on = config.define "test" config.empty;
+
+    let items_of src = match parser.parse_module src { [:ok, items] => items, _ => [] };
+
+    let tests = [
+        // --- names ---
+        test.case "a dotted path is its segments"
+            $( test.eq! [["std", "list"], ["list"]]
+                        [dotted_segments "std.list", dotted_segments "list"] ),
+        test.case "the host's own modules are known by name"
+            $( test.eq! [true, false] [is_native "std.console", is_native "std.nope"] ),
+
+        // --- `when`, resolved as the file is read ---
+        test.case "a when that holds contributes its items"
+            $( test.eq! 1 (list.length (expand_items on (items_of "when test { let a = 1; }"))) ),
+        test.case "a when that does not hold contributes nothing"
+            $( test.eq! [] (expand_items config.empty (items_of "when test { let a = 1; }")) ),
+        test.case "a nested when is resolved too"
+            $( test.eq! 1 (list.length (expand_items on
+                   (items_of "when test { when test { let a = 1; } }"))) ),
+        test.case "an import inside a when that is off is never followed"
+            $( test.eq! [] (natives (from_text! config.empty "when test { import std.console; }")) ),
+        test.case "an import inside a when that holds is"
+            $( test.eq! ["std.console"] (natives (from_text! on "when test { import std.console; }")) ),
+
+        // --- what a module depends on ---
+        test.case "imports and derives are both dependencies"
+            $( test.eq! ["std.list", "std.seq"]
+                        (list.map (fn d -> list.head d)
+                                  (dependencies (items_of "import std.list;\nderive std.seq;"))) ),
+        test.case "a let is not a dependency"
+            $( test.eq! [] (dependencies (items_of "let a = 1;")) ),
+
+        // --- loading ---
+        test.case "a module is recorded under its name"
+            $( test.eq! ["t"] (names (from_text! on "let a = 1;")) ),
+        test.case "a host module is recorded rather than searched for"
+            $( test.eq! [["std.console"], ["t"]]
+                        { let l = from_text! on "import std.console;";
+                          [natives l, names l] } ),
+        test.case "the same host module twice is recorded once"
+            $( test.eq! ["std.console"]
+                        (natives (from_text! on "import std.console;\nimport std.console;")) ),
+        test.case "a parse error is a diagnostic, not a raise"
+            $( test.eq! 1 (list.length (diags (from_text! on "let = ;"))) ),
+        test.case "a module that failed to parse is not recorded"
+            $( test.eq! [] (names (from_text! on "let = ;")) ),
+        test.case "failure is what the diagnostics say it is"
+            $( test.eq! [true, false]
+                        [failed (from_text! on "let = ;"), failed (from_text! on "let a = 1;")] ),
+
+        // --- `mod`, hoisted to a module of its own ---
+        test.case "a mod becomes a module named for its parent"
+            $( test.eq! ["t.inner", "t"] (names (from_text! on "mod inner { let a = 1; }")) ),
+        test.case "a nested mod is hoisted the whole way out"
+            $( test.eq! ["t.a.b", "t.a", "t"]
+                        (names (from_text! on "mod a { mod b { let x = 1; } }")) ),
+        test.case "the parent is left importing what was hoisted out of it"
+            $( test.eq! [[:import, ["t", "inner"], "inner", ()]]
+                        (list.map (fn i -> list.take 4 i)
+                                  (module_items (module_at (from_text! on "mod inner { let a = 1; }")
+                                                           1))) ),
+        test.case "a mod's own imports are followed"
+            $( test.eq! ["std.console"]
+                        (natives (from_text! on "mod inner { import std.console; }")) ),
+        test.case "two mods of one name is an error, not a silent replacement"
+            $( test.eq! 1 (list.length (diags (from_text! on
+                   "mod a { let x = 1; }\nmod a { let y = 2; }"))) ),
+        test.case "a when inside a mod is resolved as a file's would be"
+            $( test.eq! [] (natives (from_text! config.empty
+                   "mod inner { when test { import std.console; } }")) ),
+
+        // --- the module a name is already loaded under ---
+        test.case "a sibling is found by walking outwards"
+            $( test.eq! ["a.shape", ()]
+                        { let l = put :by_name (core.map_put (core.map_new ()) "a.shape" 0)
+                                      (bare on);
+                          [local_module l "a.circle" "shape", local_module l "a.circle" "nope"] } ),
+        test.case "a module's own submodule is found first"
+            $( test.eq! "a.b.util"
+                        (local_module (put :by_name (core.map_put
+                                          (core.map_put (core.map_new ()) "a.b.util" 0)
+                                          "a.util" 1) (bare on))
+                                      "a.b" "util") ),
+
+        // --- the stack that catches a cycle ---
+        test.case "what is being loaded is what is on the stack"
+            $( test.eq! [true, false, false]
+                        { let l = enter "b" (enter "a" (bare on));
+                          [is_loading l "a", is_loading (leave l) "b", is_loading (bare on) "a"] } ),
+
+        // --- the generated test runner ---
+        test.case "a module exports tests by defining `tests`"
+            $( test.eq! [true, false, false]
+                        [exports_tests (loaded "m" "m" 0 (items_of "let tests = [];")),
+                         exports_tests (loaded "m" "m" 0 (items_of "let tests x = [];")),
+                         exports_tests (loaded "m" "m" 0 (items_of "let other = [];"))] ),
+        test.case "a runner is generated even when nothing exports tests"
+            $( test.eq! ["t", "dreams.test_main"]
+                        (names (add_test_runner! (from_text! on "let a = 1;"))) ),
+
+        // --- explaining a failure ---
+        test.case "a list of nothing says so rather than being blank"
+            $( test.eq! ["nothing", "a, b"] [comma_list [], comma_list ["a", "b"]] ),
+        test.case "an unresolved import says what was searched"
+            $( test.true! (str.contains_str "no package is named `nowhere`"
+                                            (unresolved_note! (bare on) "nowhere.at_all")) ),
+    ];
+}

@@ -3,6 +3,8 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
+#include <vector>
 #include <string>
 
 #include "runtime.hpp"
@@ -26,7 +28,13 @@ const BuiltinDef& builtin_def(uint32_t id);
 uint32_t builtin_count();
 
 /// Insert into an open-addressed map, growing it when it gets crowded.
-void map_insert(Process& p, Value map, Value key, Value value);
+/// `map` with `key` set to `value`. The map handed in is unchanged and stays
+/// valid: what comes back shares all of it but the path to the new entry.
+Value map_insert(Process& p, Value map, Value key, Value value);
+/// `map` without `key`, on the same terms.
+Value map_erase(Process& p, Value map, Value key);
+/// Every entry of a map, in the trie's order.
+void map_collect(Value node, std::vector<std::pair<Value, Value>>& out);
 /// Look up a key. Returns false when it is absent.
 bool map_lookup(Process& p, Value map, Value key, Value* out);
 

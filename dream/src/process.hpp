@@ -135,6 +135,14 @@ public:
     /// `io_pending`: a blocking native is re-entered from the top, and this is
     /// how the second entry knows which child it was waiting for.
     int64_t os_pending = -1;
+
+    /// Set when a nested force (`force_whnf`) was suspended because a blocking
+    /// native inside it asked to park. The force's continuations are left in
+    /// place to be resumed; `force_resume_at` is the index in `conts` where
+    /// the outer operation's retry must be spliced in, *below* them.
+    bool force_blocked = false;
+    size_t force_resume_at = 0;
+
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }
 

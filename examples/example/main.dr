@@ -1,0 +1,10 @@
+// The smallest package there is: a manifest and a `main!`.
+//
+// This is what `mind new` scaffolds, and what `examples/run.sh` expects to be
+// able to run -- a package with no entry point fails the example suite rather
+// than being skipped, which is the right way round.
+import std.console;
+
+let main! = {
+    console.print! "Hello from example"
+};

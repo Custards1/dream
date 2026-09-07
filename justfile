@@ -88,6 +88,12 @@ jit-ir FILE FN: build
     ./{{dreamc}} {{FILE}} -o /tmp/dream-jit.dream
     ./{{dream}} /tmp/dream-jit.dream --dump-jit {{FN}}
 
+# A directly runnable program: the image carries a `#!` line and the execute
+# bit, and the VM skips the line when it loads it.
+run-script FILE OUT: build
+    ./{{dreamc}} {{FILE}} --shebang -o {{OUT}}
+    ./{{OUT}}
+
 install: release mind
     mv {{dreamc_release}} {{install_dir}}/bin || true
     mv {{dream}} {{install_dir}}/bin || true
@@ -97,7 +103,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -124,9 +130,47 @@ test-examples-std: build
     ./{{dream}} /tmp/dream-ex-tests.dream
 
 # `dreams`, the self-hosted compiler: the parts of it that exist so far.
+# Built from `main.dr` so that every module it reaches has its tests collected.
 test-dreams: build
-    {{dreamc}} dreams/lexer.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
+    {{dreamc}} dreams/main.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
     ./{{dream}} /tmp/dream-dreams-tests.dream
+
+# Every Dream file in the repository must parse. The corpus is the real test of
+# a parser: the standard library, the build tool, the examples, and `dreams`
+# itself, which is the one that has to keep working for this to go anywhere.
+#
+# `--parse` rather than the default, because the question here is whether each
+# file is well formed on its own -- a module in the middle of a package is not a
+# program, and following its imports would be asking something else.
+test-dreams-corpus: build
+    {{dreamc}} dreams/main.dr -L mind -L . -o /tmp/dreams.dream
+    @for f in mind/std/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
+              dream/tests/programs/*.dr dreams/*.dr; do \
+        ./{{dream}} /tmp/dreams.dream --parse "$f" || exit 1; \
+    done
+    @echo "every file in the corpus parses"
+    {{dreamc}} dreams/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
+    ./{{dream}} /tmp/dream-ast-tests.dream
+    {{dreamc}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
+    ./{{dream}} /tmp/dream-parser-tests.dream
+
+# `dreams`'s module loader against the one it replaces. Every program in the
+# repository must resolve to the same modules, in the same order, under both --
+# and the failures `dreamc` cannot report must be reported here.
+test-dreams-modules: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/modules.sh
+
+# `dreams`'s resolution and purity pass. Every program must get the same verdict
+# from both compilers, and the broken ones must be rejected for the same reason.
+test-dreams-scope: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/scope.sh
+
+# `dreams`'s lowering. Every program the reference compiler accepts must lower
+# to an execution tree, the compiler itself included -- which is the only
+# program here big enough to notice a quadratic mistake before it becomes an
+# out-of-memory.
+test-dreams-lower: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/lower.sh
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build

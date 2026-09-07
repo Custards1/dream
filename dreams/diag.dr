@@ -1,0 +1,170 @@
+// Diagnostics: what the compiler says when something is wrong.
+//
+// A diagnostic carries a span, a message, an optional note, and which source
+// file the span belongs to. The file matters because Dream compiles whole
+// programs: by the time an import fails, several files are in hand, and a span
+// without a file names a byte offset in nothing.
+//
+// A span is a byte offset, because that is what slices the source back out. A
+// person needs a line and a column, so the conversion happens here, once, at
+// the point of rendering -- and only for the diagnostics actually rendered,
+// which is why it can afford to be a scan.
+//
+// Everything here is pure. Rendering produces a string; printing it is the
+// caller's business.
+
+import std.core;
+import std.list;
+import std.str;
+
+import dreams.ast;
+
+// --- a source file ----------------------------------------------------------
+
+/// The name to print and the text to point into.
+let source path text = [path, text];
+let source_path s = list.nth 0 s;
+let source_text s = list.nth 1 s;
+
+// --- a diagnostic -----------------------------------------------------------
+
+let error span message =
+    %{ :severity => :error, :span => span, :message => message, :note => (), :source => 0 };
+
+let warning span message =
+    %{ :severity => :warning, :span => span, :message => message, :note => (), :source => 0 };
+
+let severity d = core.map_get d :severity :error;
+let span d     = core.map_get d :span ast.no_span;
+let message d  = core.map_get d :message "";
+let note d     = core.map_get d :note ();
+let source_of d = core.map_get d :source 0;
+
+let with_note n d = core.map_put d :note n;
+
+/// Which file the span points into. Set as the diagnostic leaves the pass that
+/// made it, so that a pass working on one file at a time need not thread it.
+let in_source i d = core.map_put d :source i;
+
+let is_error d = severity d == :error;
+
+let error_count ds = list.count (fn d -> is_error d) ds;
+
+// --- rendering --------------------------------------------------------------
+
+/// The 1-based line and column of a byte offset, as `[line, col]`.
+///
+/// A continuation byte does not advance the column, so a column counts
+/// characters rather than bytes -- which is what a person reading the message
+/// is counting, and what an editor will put the cursor on.
+let line_col text offset = {
+    let rec walk i line col =
+        if i >= offset || i >= str.byte_length text { [line, col] }
+        else if core.str_byte text i == 10 { walk (i + 1) (line + 1) 1 }
+        else if core.str_byte text i >= 128 && core.str_byte text i < 192 { walk (i + 1) line col }
+        else { walk (i + 1) line (col + 1) };
+    walk 0 1 1
+};
+
+/// The byte offset of a 1-based line and column: the inverse of `line_col`.
+///
+/// An editor speaks in lines and columns and the compiler speaks in offsets, so
+/// something has to translate, and doing it here keeps the two spellings of a
+/// position in one place. A column past the end of its line clamps to the end
+/// of that line rather than running into the next one -- a cursor resting past
+/// the last character is a real position, not an error.
+let offset_of text line col = {
+    let n = str.byte_length text;
+    let rec to_line i at =
+        if at >= line || i >= n { i }
+        else if core.str_byte text i == 10 { to_line (i + 1) (at + 1) }
+        else { to_line (i + 1) at };
+    let start = to_line 0 1;
+    let rec forward i want =
+        if want <= 1 || i >= n || core.str_byte text i == 10 { i }
+        // A continuation byte is part of the character before it, so it does
+        // not cost a column.
+        else if core.str_byte text (i + 1) >= 128 && core.str_byte text (i + 1) < 192 {
+            forward (i + 2) (want - 1)
+        }
+        else { forward (i + 1) (want - 1) };
+    forward start col
+};
+
+/// `path:line:col`, the prefix every message carries.
+let position path text offset = {
+    let at = line_col text offset;
+    path + ":" + to_string (list.head at) + ":" + to_string (list.nth 1 at)
+};
+
+let label s = match s { :warning => "warning", _ => "error" };
+
+/// One diagnostic as the lines it prints as. A note is indented under its
+/// message so that the two read as one thing rather than two.
+let render sources d = {
+    let src = if source_of d < list.length sources { list.nth (source_of d) sources }
+              else { source "<unknown>" "" };
+    let head = position (source_path src) (source_text src) (ast.span_start (span d))
+               + ": " + label (severity d) + ": " + message d;
+    match note d {
+        () => [head],
+        n  => list.append [head] (list.map (fn line -> "    = " + line) (str.split "\n" n)),
+    }
+};
+
+/// Every diagnostic, as one block of text.
+let render_all sources ds =
+    str.join_str "\n" (list.concat (list.map (fn d -> render sources d) ds));
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let src = source "a.dr" "let x = 1;\nlet y = 2;\n";
+    let sources = [src];
+
+    let tests = [
+        test.case "an offset in the first line is line 1"
+            $( test.eq! [1, 1] (line_col (source_text src) 0) ),
+        test.case "a column counts from one"
+            $( test.eq! [1, 5] (line_col (source_text src) 4) ),
+        test.case "a newline starts the next line"
+            $( test.eq! [2, 1] (line_col (source_text src) 11) ),
+        test.case "an offset past the end stops at the end"
+            $( test.eq! [3, 1] (line_col (source_text src) 9999) ),
+        test.case "a column counts characters, not bytes"
+            $( test.eq! [1, 3] (line_col "ééx" 4) ),
+        test.case "a position names the file it points into"
+            $( test.eq! "a.dr:2:1" (position (source_path src) (source_text src) 11) ),
+        test.case "a diagnostic renders as one line"
+            $( test.eq! ["a.dr:1:5: error: bad"]
+                        (render sources (in_source 0 (error (ast.span_of 4 5) "bad"))) ),
+        test.case "a warning says so"
+            $( test.eq! ["a.dr:1:1: warning: hm"]
+                        (render sources (in_source 0 (warning (ast.span_of 0 1) "hm"))) ),
+        test.case "a note is indented under its message"
+            $( test.eq! ["a.dr:1:1: error: bad", "    = try this"]
+                        (render sources (with_note "try this" (error (ast.span_of 0 1) "bad"))) ),
+        test.case "a note spanning lines stays indented"
+            $( test.eq! ["a.dr:1:1: error: bad", "    = one", "    = two"]
+                        (render sources (with_note "one\ntwo" (error (ast.span_of 0 1) "bad"))) ),
+        test.case "a diagnostic pointing at no known file still renders"
+            $( test.eq! ["<unknown>:1:1: error: bad"]
+                        (render [] (error (ast.span_of 0 1) "bad")) ),
+        test.case "an offset and a line:col are the same position, two ways"
+            $( test.eq! [0, 11]
+                        [offset_of (source_text src) 1 1, offset_of (source_text src) 2 1] ),
+        test.case "a column moves along the line"
+            $( test.eq! 4 (offset_of (source_text src) 1 5) ),
+        test.case "a position round-trips through both spellings"
+            $( test.eq! [2, 5] (line_col (source_text src) (offset_of (source_text src) 2 5)) ),
+        test.case "a column past the end of a line stops at the line's end"
+            $( test.eq! [1, 11] (line_col (source_text src) (offset_of (source_text src) 1 99)) ),
+        test.case "a line past the end stops at the end of the text"
+            $( test.eq! (str.byte_length (source_text src))
+                        (offset_of (source_text src) 99 1) ),
+        test.case "only errors are counted"
+            $( test.eq! 1 (error_count [error ast.no_span "a", warning ast.no_span "b"]) ),
+    ];
+}

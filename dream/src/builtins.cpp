@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -68,71 +69,238 @@ bool key_equal(Value a, Value b) {
     return false;
 }
 
-void map_put_raw(MapObj* m, Value key, Value value) {
-    uint32_t mask = m->cap - 1;
-    uint32_t i = uint32_t(key_hash(key)) & mask;
-    for (;;) {
-        Value existing = m->entries()[i * 2];
-        if (existing == NIL_SLOT) {
-            m->entries()[i * 2] = key;
-            m->entries()[i * 2 + 1] = value;
-            ++m->count;
-            return;
-        }
-        if (key_equal(existing, key)) {
-            m->entries()[i * 2 + 1] = value;
-            return;
-        }
-        i = (i + 1) & mask;
+/// The number of entries a node holds, counting a whole subtree.
+uint32_t map_node_count(Value v) {
+    if (!is_ptr(v)) return 0;
+    Obj* o = as_obj(v);
+    if (o->type == ObjType::Map) return static_cast<MapObj*>(o)->count;
+    if (o->type != ObjType::MapLeaf) return 0;
+    uint32_t n = 0;
+    for (Value cur = v; is_obj(cur, ObjType::MapLeaf); cur = static_cast<MapLeafObj*>(as_obj(cur))->next) {
+        ++n;
     }
+    return n;
+}
+
+/// A leaf chain with `key` set to `value`. Replacing an existing key rebuilds
+/// the chain above it; adding a new one puts it at the front. Either way the
+/// chain the caller had is left untouched, which is the whole contract.
+Value map_leaf_assoc(Heap& h, Value leaf, uint64_t hash, Value key, Value value, bool* added) {
+    // Is the key already here? Walk first so that the common case -- it is not
+    // -- costs one pass and no allocation.
+    bool present = false;
+    for (Value cur = leaf; is_obj(cur, ObjType::MapLeaf); ) {
+        auto* l = static_cast<MapLeafObj*>(as_obj(cur));
+        if (key_equal(l->key, key)) { present = true; break; }
+        cur = l->next;
+    }
+    if (!present) {
+        *added = true;
+        return h.make_map_leaf(hash, key, value, leaf);
+    }
+    // Rebuild only as far as the entry that changed; the rest of the chain is
+    // shared.
+    Value rebuilt = NIL_SLOT;
+    std::vector<MapLeafObj*> before;
+    Value cur = leaf;
+    while (is_obj(cur, ObjType::MapLeaf)) {
+        auto* l = static_cast<MapLeafObj*>(as_obj(cur));
+        if (key_equal(l->key, key)) {
+            rebuilt = h.make_map_leaf(hash, key, value, l->next);
+            break;
+        }
+        before.push_back(l);
+        cur = l->next;
+    }
+    for (size_t i = before.size(); i > 0; --i) {
+        rebuilt = h.make_map_leaf(hash, before[i - 1]->key, before[i - 1]->value, rebuilt);
+    }
+    return rebuilt;
+}
+
+Value map_assoc(Heap& h, Value node, uint32_t shift, uint64_t hash, Value key, Value value,
+                bool* added);
+
+/// Two nodes with different hashes, put under a branch deep enough to tell them
+/// apart. They may agree for several levels, so this nests until they do not.
+Value map_split(Heap& h, uint32_t shift, uint64_t h1, Value n1, uint64_t h2, Value n2) {
+    uint32_t i1 = map_index(h1, shift);
+    uint32_t i2 = map_index(h2, shift);
+    if (i1 == i2) {
+        Value deeper = map_split(h, shift + MAP_BITS, h1, n1, h2, n2);
+        Value branch = h.make_map_branch(1);
+        auto* b = static_cast<MapObj*>(as_obj(branch));
+        b->bitmap = 1u << i1;
+        b->count = map_node_count(deeper);
+        b->slots()[0] = deeper;
+        return branch;
+    }
+    Value branch = h.make_map_branch(2);
+    auto* b = static_cast<MapObj*>(as_obj(branch));
+    b->bitmap = (1u << i1) | (1u << i2);
+    b->count = map_node_count(n1) + map_node_count(n2);
+    b->slots()[i1 < i2 ? 0 : 1] = n1;
+    b->slots()[i1 < i2 ? 1 : 0] = n2;
+    return branch;
+}
+
+/// `node` with `key` set to `value`, sharing everything the change does not
+/// touch. `added` says whether the map grew, so counts stay right without
+/// recounting a subtree.
+Value map_assoc(Heap& h, Value node, uint32_t shift, uint64_t hash, Value key, Value value,
+                bool* added) {
+    if (is_obj(node, ObjType::MapLeaf)) {
+        auto* l = static_cast<MapLeafObj*>(as_obj(node));
+        if (l->hash == hash) return map_leaf_assoc(h, node, hash, key, value, added);
+        // Different hashes: they belong under a branch, not in one chain.
+        *added = true;
+        Value fresh = h.make_map_leaf(hash, key, value, NIL_SLOT);
+        return map_split(h, shift, l->hash, node, hash, fresh);
+    }
+    auto* m = static_cast<MapObj*>(as_obj(node));
+    uint32_t bit = 1u << map_index(hash, shift);
+    uint32_t at = map_slot_of(m->bitmap, bit);
+    uint32_t slots = map_bit_count(m->bitmap);
+
+    if (m->bitmap & bit) {
+        Value child = m->slots()[at];
+        Value grown = map_assoc(h, child, shift + MAP_BITS, hash, key, value, added);
+        Value branch = h.make_map_branch(slots);
+        auto* b = static_cast<MapObj*>(as_obj(branch));
+        m = static_cast<MapObj*>(as_obj(node));
+        b->bitmap = m->bitmap;
+        b->count = m->count + (*added ? 1 : 0);
+        for (uint32_t i = 0; i < slots; ++i) b->slots()[i] = m->slots()[i];
+        b->slots()[at] = grown;
+        return branch;
+    }
+    // A slot nothing is using yet: widen by one and keep the children packed.
+    *added = true;
+    Value fresh = h.make_map_leaf(hash, key, value, NIL_SLOT);
+    Value branch = h.make_map_branch(slots + 1);
+    auto* b = static_cast<MapObj*>(as_obj(branch));
+    m = static_cast<MapObj*>(as_obj(node));
+    b->bitmap = m->bitmap | bit;
+    b->count = m->count + 1;
+    for (uint32_t i = 0; i < at; ++i) b->slots()[i] = m->slots()[i];
+    b->slots()[at] = fresh;
+    for (uint32_t i = at; i < slots; ++i) b->slots()[i + 1] = m->slots()[i];
+    return branch;
+}
+
+/// `node` without `key`. Answers NIL_SLOT when the node is left empty, so a
+/// parent can drop the slot rather than keep an empty branch forever.
+Value map_dissoc(Heap& h, Value node, uint32_t shift, uint64_t hash, Value key, bool* removed) {
+    if (is_obj(node, ObjType::MapLeaf)) {
+        auto* l = static_cast<MapLeafObj*>(as_obj(node));
+        if (l->hash != hash) return node;
+        std::vector<MapLeafObj*> keep;
+        bool found = false;
+        for (Value cur = node; is_obj(cur, ObjType::MapLeaf); ) {
+            auto* e = static_cast<MapLeafObj*>(as_obj(cur));
+            if (!found && key_equal(e->key, key)) { found = true; }
+            else { keep.push_back(e); }
+            cur = e->next;
+        }
+        if (!found) return node;
+        *removed = true;
+        Value rebuilt = NIL_SLOT;
+        for (size_t i = keep.size(); i > 0; --i) {
+            rebuilt = h.make_map_leaf(hash, keep[i - 1]->key, keep[i - 1]->value, rebuilt);
+        }
+        return rebuilt;
+    }
+    auto* m = static_cast<MapObj*>(as_obj(node));
+    uint32_t bit = 1u << map_index(hash, shift);
+    if (!(m->bitmap & bit)) return node;
+    uint32_t at = map_slot_of(m->bitmap, bit);
+    uint32_t slots = map_bit_count(m->bitmap);
+    Value shrunk = map_dissoc(h, m->slots()[at], shift + MAP_BITS, hash, key, removed);
+    if (!*removed) return node;
+
+    if (shrunk == NIL_SLOT) {
+        Value branch = h.make_map_branch(slots - 1);
+        auto* b = static_cast<MapObj*>(as_obj(branch));
+        m = static_cast<MapObj*>(as_obj(node));
+        b->bitmap = m->bitmap & ~bit;
+        b->count = m->count - 1;
+        for (uint32_t i = 0; i < at; ++i) b->slots()[i] = m->slots()[i];
+        for (uint32_t i = at + 1; i < slots; ++i) b->slots()[i - 1] = m->slots()[i];
+        // An empty branch below the root is not worth keeping.
+        return (b->bitmap == 0 && shift > 0) ? NIL_SLOT : branch;
+    }
+    Value branch = h.make_map_branch(slots);
+    auto* b = static_cast<MapObj*>(as_obj(branch));
+    m = static_cast<MapObj*>(as_obj(node));
+    b->bitmap = m->bitmap;
+    b->count = m->count - 1;
+    for (uint32_t i = 0; i < slots; ++i) b->slots()[i] = m->slots()[i];
+    b->slots()[at] = shrunk;
+    return branch;
 }
 
 }  // namespace
 
-void map_insert(Process& p, Value map, Value key, Value value) {
-    // Growing replaces the object, leaving an indirection behind, so a caller
-    // holding the old handle must be followed before anything else. Map
-    // literals never reach this -- they are sized to twice their entry count --
-    // but anything that inserts in a loop does.
+Value map_insert(Process& p, Value map, Value key, Value value) {
     map = resolve(map);
-    auto* m = static_cast<MapObj*>(as_obj(map));
-
-    // Keep the load factor under 3/4 so probe chains stay short.
-    if ((m->count + 1) * 4 >= m->cap * 3) {
-        Value grown = p.heap().make_map(m->cap * 2);
-        auto* g = static_cast<MapObj*>(as_obj(grown));
-        m = static_cast<MapObj*>(as_obj(map));
-        for (uint32_t i = 0; i < m->cap; ++i) {
-            Value k = m->entries()[i * 2];
-            if (k != NIL_SLOT) map_put_raw(g, k, m->entries()[i * 2 + 1]);
-        }
-        map_put_raw(g, key, value);
-        // The entries live inline after the header, so the object cannot grow
-        // in place. Turn the old one into an indirection to the new one, which
-        // is the same mechanism a forced thunk uses: every existing reference
-        // keeps working, and the collector collapses the hop.
-        as_obj(map)->type = ObjType::Indirect;
-        static_cast<IndirectObj*>(as_obj(map))->target = grown;
-        return;
-    }
-    map_put_raw(m, key, value);
+    if (!is_obj(map, ObjType::Map)) return map;
+    bool added = false;
+    return map_assoc(p.heap(), map, 0, key_hash(key), resolve(key), value, &added);
 }
 
-bool map_lookup(Process& p, Value map, Value key, Value* out) {
+Value map_erase(Process& p, Value map, Value key) {
     map = resolve(map);
-    if (!is_obj(map, ObjType::Map)) return false;
-    auto* m = static_cast<MapObj*>(as_obj(map));
-    if (m->cap == 0) return false;
-    uint32_t mask = m->cap - 1;
-    uint32_t i = uint32_t(key_hash(key)) & mask;
-    for (uint32_t probe = 0; probe < m->cap; ++probe) {
-        Value k = m->entries()[i * 2];
-        if (k == NIL_SLOT) return false;
-        if (key_equal(k, key)) {
-            *out = m->entries()[i * 2 + 1];
-            return true;
+    if (!is_obj(map, ObjType::Map)) return map;
+    bool removed = false;
+    Value out = map_dissoc(p.heap(), map, 0, key_hash(key), resolve(key), &removed);
+    // The root stays a branch even when the last entry goes.
+    return out == NIL_SLOT ? p.heap().make_map(0) : out;
+}
+
+/// Every entry, appended to `out`. The order is the trie's, which is to say the
+/// hash order -- unspecified, as the language promises.
+void map_collect(Value node, std::vector<std::pair<Value, Value>>& out) {
+    if (!is_ptr(node)) return;
+    Obj* o = as_obj(node);
+    if (o->type == ObjType::MapLeaf) {
+        for (Value cur = node; is_obj(cur, ObjType::MapLeaf); ) {
+            auto* l = static_cast<MapLeafObj*>(as_obj(cur));
+            out.emplace_back(l->key, l->value);
+            cur = l->next;
         }
-        i = (i + 1) & mask;
+        return;
+    }
+    if (o->type != ObjType::Map) return;
+    auto* m = static_cast<MapObj*>(o);
+    uint32_t slots = map_bit_count(m->bitmap);
+    for (uint32_t i = 0; i < slots; ++i) map_collect(m->slots()[i], out);
+}
+
+bool map_lookup(Process&, Value map, Value key, Value* out) {
+    uint64_t hash = key_hash(key);
+    Value node = resolve(map);
+    uint32_t shift = 0;
+    // Down five bits of hash at a time until the branch runs out or a leaf
+    // answers. Thirteen levels is the most a 64-bit hash can ask for.
+    while (is_ptr(node)) {
+        Obj* o = as_obj(node);
+        if (o->type == ObjType::MapLeaf) {
+            for (Value cur = node; is_obj(cur, ObjType::MapLeaf); ) {
+                auto* l = static_cast<MapLeafObj*>(as_obj(cur));
+                if (l->hash == hash && key_equal(l->key, key)) {
+                    if (out) *out = l->value;
+                    return true;
+                }
+                cur = l->next;
+            }
+            return false;
+        }
+        if (o->type != ObjType::Map) return false;
+        auto* m = static_cast<MapObj*>(o);
+        uint32_t bit = 1u << map_index(hash, shift);
+        if (!(m->bitmap & bit)) return false;
+        node = m->slots()[map_slot_of(m->bitmap, bit)];
+        shift += MAP_BITS;
     }
     return false;
 }
@@ -278,17 +446,14 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
         case ObjType::Map: {
             out->append("%{");
             p.stack.push_back(w);
-            uint32_t cap = static_cast<MapObj*>(as_obj(w))->cap;
+            std::vector<std::pair<Value, Value>> entries;
+            map_collect(p.stack.back(), entries);
             bool first = true;
-            for (uint32_t i = 0; i < cap; ++i) {
-                auto* m = static_cast<MapObj*>(as_obj(p.stack.back()));
-                if (m->entries()[i * 2] == NIL_SLOT) continue;
+            for (auto& [k, val] : entries) {
                 if (!first) out->append(", ");
                 first = false;
-                Value k = m->entries()[i * 2];
                 if (!stringify_into(p, k, out, true, depth + 1)) { p.stack.pop_back(); return false; }
                 out->append(" => ");
-                Value val = static_cast<MapObj*>(as_obj(p.stack.back()))->entries()[i * 2 + 1];
                 if (!stringify_into(p, val, out, true, depth + 1)) { p.stack.pop_back(); return false; }
             }
             p.stack.pop_back();
@@ -774,15 +939,9 @@ NativeResult vm_has_ffi(Process&, Value, Value*, uint32_t) {
 /// Build a map from key/value pairs, in one place so every report below has
 /// the same shape.
 Value info_map(Process& p, std::initializer_list<std::pair<const char*, Value>> pairs) {
-    // A map's capacity must be a power of two: lookup masks with `cap - 1`,
-    // and anything else turns probing into a loop that never terminates.
-    // Twice the entry count keeps the table from filling up.
-    uint32_t cap = 8;
-    while (cap < pairs.size() * 2) cap *= 2;
-    Value m = p.heap().make_map(cap);
+    Value m = p.heap().make_map(0);
     for (auto& [key, value] : pairs) {
-        map_insert(p, resolve(m), make_atom(p.runtime().intern_atom(key)), value);
-        m = resolve(m);
+        m = map_insert(p, m, make_atom(p.runtime().intern_atom(key)), value);
     }
     return m;
 }
@@ -939,6 +1098,61 @@ NativeResult vm_dump(Process& p, Value, Value*, uint32_t) {
 
 }  // namespace
 
+namespace {
+
+// --- measuring -------------------------------------------------------------
+//
+// A language with no clock can be timed only from outside it, which is no use
+// for finding which stage of a long compilation is the slow one. These are the
+// smallest set that answers "how long, how much, and how much of it was
+// garbage" -- the three questions worth asking before changing anything.
+
+/// Nanoseconds from a monotonic clock. Only differences mean anything: it does
+/// not count from any particular moment, and it never goes backwards, which is
+/// what makes it the right one to measure with.
+NativeResult vm_now_ns(Process& p, Value, Value*, uint32_t) {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    // A fixnum is 63 bits, which is 292 years of nanoseconds.
+    return NativeResult::ok(make_integer(p, int64_t(ns)));
+}
+
+/// Milliseconds since the epoch, for a log line someone has to read.
+NativeResult vm_wall_ms(Process& p, Value, Value*, uint32_t) {
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    return NativeResult::ok(make_integer(p, int64_t(ms)));
+}
+
+/// Every byte this process has ever allocated, collections included.
+NativeResult vm_allocated(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::ok(make_integer(p, int64_t(p.heap().bytes_total())));
+}
+
+/// The largest the live set has been after a collection.
+NativeResult vm_peak_bytes(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::ok(make_integer(p, int64_t(p.heap().bytes_peak())));
+}
+
+/// Everything worth knowing about this process at once, so that a measurement
+/// takes one call and cannot get its readings from different moments.
+NativeResult vm_stats(Process& p, Value, Value*, uint32_t) {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return NativeResult::ok(info_map(p, {
+        {"now_ns", make_integer(p, int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()))},
+        {"reductions", make_integer(p, int64_t(p.total_reductions))},
+        {"allocated", make_integer(p, int64_t(p.heap().bytes_total()))},
+        {"heap_bytes", make_integer(p, int64_t(p.heap().bytes_allocated()))},
+        {"live_bytes", make_integer(p, int64_t(p.heap().bytes_live()))},
+        {"peak_bytes", make_integer(p, int64_t(p.heap().bytes_peak()))},
+        {"collections", make_integer(p, int64_t(p.heap().collections()))},
+    }));
+}
+
+/// Defined further down, next to the error helpers it needs.
+NativeResult vm_eval_image(Process& p, Value self, Value* args, uint32_t n);
+}  // namespace
+
 ModuleDef make_vm_module() {
     return ModuleDef{"std.vm",
                      {
@@ -954,6 +1168,13 @@ ModuleDef make_vm_module() {
                          {"scheduler!", 1, 0b1, vm_scheduler},
                          {"io!", 1, 0b1, vm_io},
                          {"dump!", 1, 0b1, vm_dump},
+                         {"eval_image!", 1, 0b1, vm_eval_image},
+                         // measuring
+                         {"now_ns!", 1, 0b1, vm_now_ns},
+                         {"wall_ms!", 1, 0b1, vm_wall_ms},
+                         {"allocated!", 1, 0b1, vm_allocated},
+                         {"peak_bytes!", 1, 0b1, vm_peak_bytes},
+                         {"stats!", 1, 0b1, vm_stats},
                      }};
 }
 
@@ -1014,6 +1235,138 @@ StrObj* as_string(Value v) {
 
 NativeResult type_fail(Process& p, const char* what) {
     return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error, what));
+}
+
+/// Bring a value across from another runtime's heap.
+///
+/// Only data comes across, which is not a restriction so much as the definition
+/// of what a compile-time value is: the answer has to be something a compiler
+/// can write into an image, and a closure or a process is not. Atoms are
+/// re-interned by name, because an atom is an index into the runtime that made
+/// it and the two runtimes have never met.
+bool import_across(Process& dest, Runtime& src_rt, Value v, Value* out, int depth) {
+    if (depth > 64) return false;
+    v = resolve(v);
+    if (is_fixnum(v) || v == UNIT || v == NIL || is_bool(v) || is_char(v)) {
+        *out = v;
+        return true;
+    }
+    if (is_atom(v)) {
+        *out = make_atom(dest.runtime().intern_atom(src_rt.atom_name(uint32_t(imm_payload(v)))));
+        return true;
+    }
+    if (!is_ptr(v)) return false;
+    switch (as_obj(v)->type) {
+        case ObjType::Float:
+            *out = dest.heap().make_float(static_cast<FloatObj*>(as_obj(v))->value);
+            return true;
+        case ObjType::Str: {
+            auto* s = static_cast<StrObj*>(as_obj(v));
+            *out = dest.heap().make_string(s->data(), s->len);
+            return true;
+        }
+        case ObjType::Cons: {
+            // Built back to front so the copy is made without recursing down
+            // the spine, which for a long list is what would run out of stack.
+            std::vector<Value> items;
+            for (Value cur = v; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+                items.push_back(static_cast<ConsObj*>(as_obj(cur))->head);
+                if (items.size() > (1u << 24)) return false;
+            }
+            Value list = NIL;
+            for (size_t i = items.size(); i-- > 0;) {
+                Value item;
+                if (!import_across(dest, src_rt, items[i], &item, depth + 1)) return false;
+                list = dest.heap().make_cons(item, list);
+            }
+            *out = list;
+            return true;
+        }
+        case ObjType::Array: {
+            uint32_t n = static_cast<ArrayObj*>(as_obj(v))->len;
+            Value arr = dest.heap().make_array(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                Value item;
+                if (!import_across(dest, src_rt, static_cast<ArrayObj*>(as_obj(v))->items()[i],
+                                   &item, depth + 1)) {
+                    return false;
+                }
+                static_cast<ArrayObj*>(as_obj(arr))->items()[i] = item;
+            }
+            *out = arr;
+            return true;
+        }
+        case ObjType::Map: {
+            std::vector<std::pair<Value, Value>> entries;
+            map_collect(v, entries);
+            Value m = dest.heap().make_map(0);
+            for (auto& [k, val] : entries) {
+                Value ck, cv;
+                if (!import_across(dest, src_rt, k, &ck, depth + 1)) return false;
+                if (!import_across(dest, src_rt, val, &cv, depth + 1)) return false;
+                m = map_insert(dest, m, ck, cv);
+            }
+            *out = m;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/// Run an image and answer the value its entry point produced.
+///
+/// A compiler written in the language it compiles has a problem with
+/// compile-time evaluation: working out what an expression comes to means
+/// running it, and the only thing that knows how to run Dream is this. So it
+/// runs on a fresh VM -- its own runtime, image, heap and scheduler -- which is
+/// exactly what the expression would get at run time, and therefore cannot
+/// disagree with it. Writing a second evaluator for compile time is how the two
+/// come to disagree.
+/// Raise with a named kind, the way `std.os` does for its own failures.
+NativeResult comp_fail(Process& p, const char* kind, const std::string& message) {
+    return NativeResult::raise(raise_error(p, p.runtime().intern_atom(kind), message));
+}
+
+NativeResult vm_eval_image(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::Str)) return type_fail(p, "eval_image! needs an image as a string");
+    auto* s = static_cast<StrObj*>(as_obj(v));
+    std::string bytes(s->data(), s->len);
+
+    Runtime rt;
+    std::string message;
+    if (!rt.load_image_bytes(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+                             message)) {
+        return comp_fail(p, "bad_image", message);
+    }
+    uint32_t func = rt.image().entry();
+    if (func == NO_NODE) return comp_fail(p, "bad_image", "the image has no entry point");
+
+    // One worker: this runs inside a worker of the outer scheduler, and the
+    // work is one expression rather than a program worth parallelising.
+    Scheduler sched(rt, 1);
+    auto root = sched.create_process();
+    Value cl = root->heap().make_closure(func, 0);
+    prime_apply(*root, cl, 0);
+    sched.start();
+    sched.enqueue(root);
+    bool clean = sched.wait_for_all();
+    sched.stop();
+
+    if (root->failed || !clean) {
+        return comp_fail(p, "comp_failed", "the compile-time expression failed");
+    }
+    Value deep;
+    if (!force_deep(*root, root->exit_value, &deep)) {
+        return comp_fail(p, "comp_failed", "the compile-time expression raised");
+    }
+    Value imported;
+    if (!import_across(p, rt, deep, &imported, 0)) {
+        return comp_fail(p, "comp_failed",
+                    "a compile-time expression must produce data, not a function or a process");
+    }
+    return NativeResult::ok(imported);
 }
 
 /// Decode one UTF-8 scalar starting at `i`, advancing it. Invalid bytes are
@@ -1206,6 +1559,34 @@ NativeResult core_to_float(Process& p, Value, Value* args, uint32_t) {
     return type_fail(p, "to_float needs a number");
 }
 
+/// A float's eight bytes, little-endian.
+///
+/// A bit pattern will not fit in an integer here -- a fixnum is 63 bits and a
+/// double is 64 -- and rebuilding one out of halves invites exactly the sign
+/// and rounding mistakes that would make a written image differ from the value
+/// that went into it. Bytes are what a writer wants anyway.
+NativeResult core_float_bytes(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    double d;
+    if (is_fixnum(v)) d = double(fixnum_value(v));
+    else if (is_obj(v, ObjType::Float)) d = static_cast<FloatObj*>(as_obj(v))->value;
+    else return type_fail(p, "float_bytes needs a number");
+    unsigned char b[8];
+    std::memcpy(b, &d, 8);
+    return NativeResult::ok(p.heap().make_string(reinterpret_cast<const char*>(b), 8));
+}
+
+/// The inverse: the float those eight bytes spell.
+NativeResult core_float_of_bytes(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::Str)) return type_fail(p, "float_of_bytes needs a string");
+    auto* s = static_cast<StrObj*>(as_obj(v));
+    if (s->len < 8) return type_fail(p, "float_of_bytes needs eight bytes");
+    double d;
+    std::memcpy(&d, s->data(), 8);
+    return NativeResult::ok(p.heap().make_float(d));
+}
+
 NativeResult core_to_int(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (is_fixnum(v)) return NativeResult::ok(v);
@@ -1314,7 +1695,9 @@ NativeResult core_array_of_list(Process& p, Value, Value* args, uint32_t) {
     for (;;) {
         Value w;
         if (!force_whnf(p, cur, &w)) {
-            p.stack.resize(base);
+            // A suspended force keeps its working stack above ours; cutting it
+            // back would destroy the work that is waiting to be resumed.
+            if (!p.force_blocked) p.stack.resize(base);
             return NativeResult::raise(p.result);
         }
         if (is_nil(w)) break;
@@ -1375,60 +1758,26 @@ NativeResult core_map_has(Process& p, Value, Value* args, uint32_t) {
 NativeResult core_map_put(Process& p, Value, Value* args, uint32_t) {
     Value m = resolve(args[0]);
     if (!is_obj(m, ObjType::Map)) return type_fail(p, "map_put needs a map");
-    auto* src = static_cast<MapObj*>(as_obj(m));
-    // Copy, for the same reason arrays copy.
-    Value out = p.heap().make_map(src->cap);
-    src = static_cast<MapObj*>(as_obj(m));
-    for (uint32_t i = 0; i < src->cap; ++i) {
-        Value k = src->entries()[i * 2];
-        if (k == NIL_SLOT) continue;
-        Value val = src->entries()[i * 2 + 1];
-        map_insert(p, resolve(out), k, val);
-        out = resolve(out);
-        src = static_cast<MapObj*>(as_obj(m));
-    }
-    map_insert(p, resolve(out), args[1], args[2]);
-    return NativeResult::ok(resolve(out));
+    // Shares everything the new entry does not sit on: about log32(n) nodes are
+    // rebuilt and the rest of the map is the one that came in.
+    return NativeResult::ok(map_insert(p, m, args[1], args[2]));
 }
 
 NativeResult core_map_remove(Process& p, Value, Value* args, uint32_t) {
     Value m = resolve(args[0]);
     if (!is_obj(m, ObjType::Map)) return type_fail(p, "map_remove needs a map");
-    auto* src = static_cast<MapObj*>(as_obj(m));
-    Value out = p.heap().make_map(src->cap);
-    src = static_cast<MapObj*>(as_obj(m));
-    for (uint32_t i = 0; i < src->cap; ++i) {
-        Value k = src->entries()[i * 2];
-        if (k == NIL_SLOT) continue;
-        Value found;
-        // Rebuilt without the key rather than tombstoned: probe chains stay
-        // short and nothing has to know about deleted slots.
-        Value one = p.heap().make_map(8);
-        map_insert(p, one, k, UNIT);
-        bool same = map_lookup(p, one, args[1], &found);
-        if (same) {
-            src = static_cast<MapObj*>(as_obj(m));
-            continue;
-        }
-        Value val = static_cast<MapObj*>(as_obj(m))->entries()[i * 2 + 1];
-        map_insert(p, resolve(out), k, val);
-        out = resolve(out);
-        src = static_cast<MapObj*>(as_obj(m));
-    }
-    return NativeResult::ok(resolve(out));
+    return NativeResult::ok(map_erase(p, m, args[1]));
 }
 
 NativeResult core_map_pairs(Process& p, Value, Value* args, uint32_t) {
     Value m = resolve(args[0]);
     if (!is_obj(m, ObjType::Map)) return type_fail(p, "map_pairs needs a map");
-    uint32_t cap = static_cast<MapObj*>(as_obj(m))->cap;
+    std::vector<std::pair<Value, Value>> entries;
+    map_collect(m, entries);
     Value list = NIL;
-    for (uint32_t i = cap; i-- > 0;) {
-        auto* mo = static_cast<MapObj*>(as_obj(m));
-        Value k = mo->entries()[i * 2];
-        if (k == NIL_SLOT) continue;
-        Value v = mo->entries()[i * 2 + 1];
-        Value pair = p.heap().make_cons(k, p.heap().make_cons(v, NIL));
+    for (size_t i = entries.size(); i-- > 0;) {
+        Value pair = p.heap().make_cons(entries[i].first,
+                                        p.heap().make_cons(entries[i].second, NIL));
         list = p.heap().make_cons(pair, list);
     }
     return NativeResult::ok(list);
@@ -1501,6 +1850,8 @@ ModuleDef make_core_module() {
             {"char_of_code", 1, 0b1, core_char_of_code},
             // numbers
             {"to_float", 1, 0b1, core_to_float},
+            {"float_bytes", 1, 0b1, core_float_bytes},
+            {"float_of_bytes", 1, 0b1, core_float_of_bytes},
             {"to_int", 1, 0b1, core_to_int},
             {"parse_int", 1, 0b1, core_parse_int},
             {"parse_float", 1, 0b1, core_parse_float},

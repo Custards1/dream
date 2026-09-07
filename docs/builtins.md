@@ -100,7 +100,9 @@ Arrays are fixed-length, eagerly allocated sequences. Indexing is O(1). All upda
 
 ### Maps
 
-Maps are persistent hash maps. Keys are compared by value for flat types (integers, floats, strings, atoms, chars, bools, pids) and by identity for everything else. All updates return a new map.
+Maps are persistent hash maps — a hash array mapped trie, branching 32 ways on five bits of the key's hash at a time. Keys are compared by value for flat types (integers, floats, strings, atoms, chars, bools, pids) and by identity for everything else. All updates return a new map.
+
+Persistent means *shared*, not copied: `map_put` rebuilds only the path from the root to the entry it changes — about `log32(n)` nodes — and the map it was given keeps every other node and stays valid. So the ordinary functional way to build a map, folding `map_put` over a sequence, costs `O(n log n)` in total rather than the `O(n²)` a copy-on-write table would. `len` is constant time: every node knows how many entries hang below it.
 
 | Name | Signature | Description |
 |------|-----------|-------------|

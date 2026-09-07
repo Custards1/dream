@@ -1,0 +1,1608 @@
+// Resolution and purity: what every name means, and what may reach an effect.
+//
+// This is the first pass that looks *inside* a body. The loader answered which
+// files a program is made of; this answers what each name in them denotes, and
+// refuses the programs where that question has no good answer.
+//
+// Two jobs, done in one walk because they need the same information:
+//
+//   1. Resolution -- every name is a local, a name captured from an enclosing
+//      function, a global of this module, a member brought in by an import, or
+//      a builtin. A name that is none of those is an error here rather than a
+//      surprise at run time, and so is `list.nope`, which names a module that
+//      exists and a member that does not.
+//
+//   2. Purity -- a name ending in `!` denotes something impure, and a pure
+//      function may not reach one. That rule is what makes `pure_fn` and
+//      `impure_fn` different types rather than a naming convention.
+//
+// What this pass does *not* do is allocate slots or capture indices. Those are
+// emission's business, and leaving them out is what keeps this pass readable:
+// resolution only has to answer whether a name is in scope, not where the VM
+// will find it at run time.
+//
+// It runs in two phases over the whole program, because a module may use a name
+// from a module declared after it. Every module's environment is built first,
+// then every body is checked against the finished environments.
+
+import std.core;
+import std.list;
+import std.str;
+
+import dreams.ast;
+import dreams.builtins;
+import dreams.diag;
+import dreams.modules;
+
+// --- what a name in front of a dot can be ------------------------------------
+//
+// A Dream module is resolved at compile time -- `list.map` names one particular
+// global -- while a host module keeps a lookup at run time, because the host
+// owns its member table. A package is neither: it is a namespace holding
+// modules, and only what is inside one is a value.
+
+let dream_ref mi     = [:dream, mi];
+/// A host module keeps a global holding the module value, because its members
+/// are looked up at run time -- the host owns the table. The index travels with
+/// the reference so that a member reached through it needs nothing looked up
+/// again later.
+let native_ref path g = [:native, path, g];
+let group_ref prefix = [:group, prefix];
+
+let ref_kind r = core.head r;
+let ref_target r = list.nth 1 r;
+
+// --- a module's environment ---------------------------------------------------
+
+let env name source =
+    %{ :name => name, :source => source, :globals => core.map_new (),
+       :aliases => core.map_new (), :only => core.map_new (), :derives => () };
+
+let env_name e   = core.map_get e :name "";
+let env_source e = core.map_get e :source 0;
+let globals e    = core.map_get e :globals (core.map_new ());
+let aliases e    = core.map_get e :aliases (core.map_new ());
+let only e       = core.map_get e :only (core.map_new ());
+let derives e    = core.map_get e :derives ();
+
+/// A global is bound to `[kind, index]`. The index is the VM's: globals are
+/// numbered across the whole program, and a module's are contiguous, which is
+/// what lets an image record a module as a range rather than a list. The kind
+/// is for everything else -- diagnostics, and later a language server.
+let with_global n kind idx e = core.map_put e :globals (core.map_put (globals e) n [kind, idx]);
+
+/// The index a global was given, or `()`.
+let global_index e n = match core.map_get (globals e) n () { () => (), g => list.nth 1 g };
+
+let global_kind e n = match core.map_get (globals e) n () { () => (), g => list.nth 0 g };
+let with_alias n r e     = core.map_put e :aliases (core.map_put (aliases e) n r);
+let with_only n v e      = core.map_put e :only (core.map_put (only e) n v);
+let without_only n e     = core.map_put e :only (core.map_remove (only e) n);
+
+let has_global e n = core.map_has (globals e) n;
+let alias_of e n   = core.map_get (aliases e) n ();
+let only_of e n    = core.map_get (only e) n ();
+
+/// What a module exports, sorted -- for the message that says a member is not
+/// one of them. Naming what is actually there is most of a diagnostic's value.
+let exports e = list.sort (list.map (fn kv -> list.head kv) (core.map_pairs (globals e)));
+
+// --- diagnostics ---------------------------------------------------------------
+
+let err span message source ds =
+    list.append ds [diag.in_source source (diag.error span message)];
+
+let err_note span message note source ds =
+    list.append ds [diag.in_source source (diag.with_note note (diag.error span message))];
+
+// --- the pass state ------------------------------------------------------------
+
+/// `envs` is indexed by module, in the loader's order. `pending` is every body
+/// still to be checked, as `[ctx, source, decl]`, where `ctx` is the module
+/// whose names it resolves against and `source` the file it was written in. For
+/// a derived body those differ, and that difference is the whole of what
+/// `derive` means.
+/// Besides what each name means, declaring a program produces the tables an
+/// image is linked by: which globals exist and what each one points at, which
+/// host modules are imported, and which range of globals belongs to which
+/// module. They are built here because this is the pass that hands out the
+/// indices they are keyed by.
+let state = %{ :envs => [], :pending => [], :diags => [], :next_global => 0,
+               :imports => [], :global_recs => [], :module_recs => [] };
+
+let envs s    = core.map_get s :envs [];
+let next_global s = core.map_get s :next_global 0;
+
+/// Take the next global index: `[state, index]`. Handing them out here, while
+/// declarations are still being walked in order, is what keeps each module's
+/// globals contiguous.
+let take_global s = [core.map_put s :next_global (next_global s + 1), next_global s];
+
+let s_imports s     = core.map_get s :imports [];
+let s_global_recs s = core.map_get s :global_recs [];
+let s_module_recs s = core.map_get s :module_recs [];
+
+/// Reserve the import record for a host module: `[state, index]`. The index is
+/// what the module's global points at, because a host module is reached through
+/// the runtime rather than through a function of this program.
+let take_import path alias s =
+    [core.map_put s :imports (list.append (s_imports s) [[path, alias]]),
+     list.length (s_imports s)];
+
+/// `[index, name, kind, target]`. A function's target is its function index,
+/// which is not known until its body has been walked, so it is filled in at the
+/// end; a module's is its import index, which is known now.
+let record_global gi name kind target s =
+    core.map_put s :global_recs (list.append (s_global_recs s) [[gi, name, kind, target]]);
+let pending s = core.map_get s :pending [];
+let diags s   = core.map_get s :diags [];
+
+let env_at s mi = list.nth mi (envs s);
+
+let set_env mi e s =
+    core.map_put s :envs
+        (list.map (fn i -> if i == mi { e } else { list.nth i (envs s) })
+                  (list.range 0 (list.length (envs s))));
+
+let add_env e s     = core.map_put s :envs (list.append (envs s) [e]);
+let add_pending p s = core.map_put s :pending (list.append (pending s) [p]);
+
+let complain span message source s =
+    core.map_put s :diags (err span message source (diags s));
+
+let complain_note span message note source s =
+    core.map_put s :diags (err_note span message note source (diags s));
+
+// --- reading the syntax tree ---------------------------------------------------
+
+let dotted segs = str.join_str "." segs;
+
+/// The name an import or a derive binds when it does not say so: the last
+/// segment of the path as written. `import a.b.c;` binds `c`.
+let default_alias segs given = match given { () => list.last segs, a => a };
+
+let decl_name d   = list.nth 1 d;
+let decl_params d = list.nth 2 d;
+let decl_body d   = list.nth 3 d;
+let decl_rec d    = list.nth 4 d;
+let decl_span d   = list.nth 5 d;
+
+/// A declaration is impure when its name says so. There is no other marker --
+/// the spelling *is* the declaration, which is why a call site can tell without
+/// looking anything up.
+let decl_impure d = builtins.is_impure_name (decl_name d);
+
+let virtual_name v   = list.nth 1 v;
+let virtual_params v = list.nth 2 v;
+let virtual_body v   = list.nth 3 v;
+let virtual_span v   = list.nth 4 v;
+
+/// A virtual with a body has a default, which becomes an ordinary `let` of the
+/// module that did not implement it -- checked there, so the default sees that
+/// module's overrides rather than the ones where it was written.
+let virtual_as_let v =
+    ast.let_d (virtual_name v) (virtual_params v) (virtual_body v) false (virtual_span v);
+
+/// A virtual left open in the very module that declared it. It still *binds*
+/// the name, so the rest of that module resolves against it -- calling it is
+/// what raises, and a module meant to be derived from was never meant to be run
+/// directly. The body is a placeholder that is never checked, because there is
+/// nothing there that anyone wrote.
+let virtual_as_hole name v =
+    ast.let_d (virtual_name v) (virtual_params v)
+              (ast.apply_e (ast.name_e "raise!" (virtual_span v))
+                           [ast.str_e ("`" + virtual_name v + "` is a virtual of module `"
+                                       + name + "` with no implementation")
+                                      (virtual_span v)]
+                           (virtual_span v))
+              false (virtual_span v);
+
+/// The names a parameter list binds. A parameter may be `()`, a slot that binds
+/// nothing, which is what `let now! () = ..` uses.
+let param_names ps =
+    list.filter (fn n -> n != ()) (list.map (fn p -> ast.param_name p) ps);
+
+/// Does this tree mention `core`? Asked before any body is checked, because
+/// `std.core` is brought in automatically for a module that names it, and a
+/// module's globals have to be settled before the first one is looked up.
+///
+/// A structural search rather than a walk per node kind: the only thing that
+/// can be a use of `core` is a `[:name, "core", _]`, and no other node has that
+/// shape, so looking for it directly cannot drift out of step with the grammar.
+let rec mentions_name target e =
+    match e {
+        [:name, n, _] => n == target,
+        _ => if type_of e == :list { list.any (fn x -> mentions_name target x) e }
+             else { false },
+    };
+
+let item_mentions_core item =
+    match item {
+        [:let, _, _, body, _, _] => mentions_name "core" body,
+        [:virtual, _, _, body, _] => match body { () => false, b => mentions_name "core" b },
+        _ => false,
+    };
+
+// --- resolving a module path ---------------------------------------------------
+
+/// An import is resolved against the enclosing modules first, so that
+/// `import io.{ quiet };` inside a module declaring `mod io { .. }` means that
+/// submodule rather than a file called `io` somewhere else.
+let relative_path l mi p =
+    match modules.local_module l (modules.module_name (modules.module_at l mi)) p {
+        () => p,
+        found => found,
+    };
+
+// --- namespaces ----------------------------------------------------------------
+
+/// Every module name in the program, which is what a namespace is described in
+/// terms of: a package holds whatever modules were loaded under its prefix.
+let module_names l = list.map (fn m -> modules.module_name m) (modules.modules l);
+
+/// `field` inside a namespace: the module `prefix.field` if there is one,
+/// otherwise a deeper namespace if any module lives under it.
+let group_member l prefix field = {
+    let candidate = prefix + "." + field;
+    match modules.find l candidate {
+        () => {
+            let deeper = candidate + ".";
+            if list.any (fn n -> str.starts_with deeper n) (module_names l)
+               || list.contains candidate (modules.namespaces l) {
+                group_ref candidate
+            }
+            else { () }
+        },
+        target => dream_ref target,
+    }
+};
+
+/// What a namespace holds, for the note on a failed lookup: the names directly
+/// under it, without the ones further down -- `std.list` but not `std.list.x`.
+let group_contents l prefix = {
+    let at = str.byte_length prefix + 1;
+    let inside = list.unique (list.filter (fn rest -> not (str.contains_str "." rest))
+        (list.map (fn n -> str.slice at (str.byte_length n - at) n)
+                  (list.filter (fn n -> str.starts_with (prefix + ".") n) (module_names l))));
+    if list.is_empty inside { "it holds nothing" }
+    else { "it holds: " + str.join_str ", " (list.sort inside) }
+};
+
+// --- phase one: what each module binds ------------------------------------------
+
+let rec declare_import_names mi r p names span s =
+    list.fold (fn acc sel -> {
+        let e = env_at acc mi;
+        let bound = default_alias [list.nth 0 sel] (list.nth 1 sel);
+        if has_global e bound || only_of e bound != () {
+            complain span ("`" + bound + "` is already bound in this module") (env_source e) acc
+        }
+        else { set_env mi (with_only bound [r, list.nth 0 sel, p] e) acc }
+    }) s names;
+
+let declare_import l mi imp s = {
+    let e = env_at s mi;
+    let written = list.nth 1 imp;
+    let names = list.nth 3 imp;
+    let span = list.nth 4 imp;
+    let alias = default_alias written (list.nth 2 imp);
+    let p = relative_path l mi (dotted written);
+    // `import path.{ a, b }` binds members rather than the module, so the
+    // module's own name is never taken and cannot collide.
+    let takes_members = names != () && not (list.is_empty names);
+
+    if not takes_members && alias_of e alias != () {
+        complain span ("`" + alias + "` is already imported here") (env_source e) s
+    }
+    else {
+        match modules.find l p {
+            () =>
+                if list.contains p (modules.namespaces l) {
+                    // A whole package: a namespace, not a module and not a value.
+                    if takes_members {
+                        complain span ("`" + p + "` is a package, so `.{ .. }` has no members to take")
+                                 (env_source e) s
+                    }
+                    else { set_env mi (with_alias alias (group_ref p) e) s }
+                }
+                else {
+                    // Host-provided. The global holding the module value is
+                    // taken either way: `import std.io.{ open! };` still has to
+                    // reach the module at run time to ask it for `open!`.
+                    let got = take_global s;
+                    let g = list.nth 1 got;
+                    let brought = take_import p alias (list.head got);
+                    let noted = record_global g alias :module (list.nth 1 brought)
+                                              (list.head brought);
+                    if takes_members {
+                        declare_import_names mi (native_ref p g) p names span noted
+                    }
+                    else {
+                        // A value as well as a namespace, so a bare mention of
+                        // the alias yields the module itself.
+                        set_env mi (with_global alias :module g
+                                        (with_alias alias (native_ref p g) e))
+                                noted
+                    }
+                },
+            target =>
+                if takes_members { declare_import_names mi (dream_ref target) p names span s }
+                else { set_env mi (with_alias alias (dream_ref target) e) s },
+        }
+    }
+};
+
+let declare_derive l mi d s = {
+    let e = env_at s mi;
+    let written = list.nth 1 d;
+    let span = list.nth 2 d;
+    let p = relative_path l mi (dotted written);
+    match modules.find l p {
+        () => complain span ("cannot derive `" + p + "`: it is not a Dream module")
+                       (env_source e) s,
+        base =>
+            if derives e != () {
+                complain span "a module can derive only one other module" (env_source e) s
+            }
+            else {
+                // The base's aliases come along for anything this module has not
+                // bound itself, so the base's own code still resolves once it is
+                // copied in here.
+                let inherited = list.fold (fn acc kv ->
+                    if core.map_has (aliases acc) (list.head kv) { acc }
+                    else { with_alias (list.head kv) (list.nth 1 kv) acc })
+                    e (core.map_pairs (aliases (env_at s base)));
+                set_env mi (core.map_put (with_alias (default_alias written ()) (dream_ref base)
+                                                     inherited)
+                                         :derives base) s
+            },
+    }
+};
+
+/// The items a module contributes, base first: a derived module is checked as
+/// though the base's code had been written into it, which is what lets a virtual
+/// bind to the implementation rather than to the default.
+///
+/// Answers `[items, seen]`, each item paired with the module that owns it, so a
+/// diagnostic about inherited code points at the file it was written in.
+let rec effective_items l mi seen =
+    if list.contains mi seen { [[], seen] }
+    else {
+        let items = modules.module_items (modules.module_at l mi);
+        let bases = list.fold (fn acc item ->
+            match item {
+                [:derive, segs, _] =>
+                    match modules.find l (relative_path l mi (dotted segs)) {
+                        () => acc,
+                        base => {
+                            let got = effective_items l base (list.nth 1 acc);
+                            [list.append (list.head acc) (list.head got), list.nth 1 got]
+                        },
+                    },
+                _ => acc,
+            }) [[], core.cons mi seen] items;
+        [list.append (list.head bases) (list.map (fn i -> [mi, i]) items), list.nth 1 bases]
+    };
+
+/// `std.core` is available without an import: it is the one module every program
+/// reaches for, and writing the same line at the top of every file is ceremony
+/// rather than information.
+///
+/// Only when the module actually names `core`, so one that never touches it
+/// carries nothing extra; and only when it has not bound `core` itself, so an
+/// explicit import and a `let core = ..` both still win. Decided over the
+/// *effective* items, because inherited code needs the import as much as code
+/// written in place does.
+let declare_core mi items s = {
+    let e = env_at s mi;
+    let binds = core.map_has (aliases e) "core"
+                || list.any (fn oi ->
+                       match list.nth 1 oi {
+                           [:let, "core", _, _, _, _] => true,
+                           [:import, segs, alias, _, _] => default_alias segs alias == "core",
+                           _ => false,
+                       }) items;
+    if binds { s }
+    else if list.any (fn oi -> item_mentions_core (list.nth 1 oi)) items {
+        {
+            let got = take_global s;
+            let g = list.nth 1 got;
+            let brought = take_import "std.core" "core" (list.head got);
+            set_env mi (with_global "core" :module g
+                            (with_alias "core" (native_ref "std.core" g) e))
+                    (record_global g "core" :module (list.nth 1 brought) (list.head brought))
+        }
+    }
+    else { s }
+};
+
+/// Replace element `at` of `xs`.
+let replace_at at x xs =
+    list.map (fn i -> if i == at { x } else { list.nth i xs }) (list.range 0 (list.length xs));
+
+/// The `let`s a module ends up with, base first, a later one of the same name
+/// replacing an earlier one from a *different* module. Redefining a name from a
+/// module you derive is the point of deriving; redefining one from this very
+/// module is a mistake.
+let rec collect_lets l items acc s =
+    match items {
+        [] => [acc, s],
+        [oi, ..rest] => {
+            let owner = list.head oi;
+            match list.nth 1 oi {
+                [:let, n, _, _, _, _] => {
+                    let d = list.nth 1 oi;
+                    let at = list.index_of true (list.map (fn od -> decl_name (list.nth 1 od) == n) acc);
+                    if at < 0 { collect_lets l rest (list.append acc [[owner, d, true, ()]]) s }
+                    else if list.head (list.nth at acc) != owner {
+                        collect_lets l rest (replace_at at [owner, d, true, ()] acc) s
+                    }
+                    else {
+                        collect_lets l rest acc
+                            (complain (decl_span d) ("`" + n + "` is already bound in this module")
+                                      (modules.module_source (modules.module_at l owner)) s)
+                    }
+                },
+                _ => collect_lets l rest acc s,
+            }
+        },
+    };
+
+let rec collect_virtuals items acc =
+    match items {
+        [] => acc,
+        [oi, ..rest] =>
+            match list.nth 1 oi {
+                [:virtual, n, _, _, _] =>
+                    if list.any (fn ov -> virtual_name (list.nth 1 ov) == n) acc {
+                        collect_virtuals rest acc
+                    }
+                    else { collect_virtuals rest (list.append acc [oi]) },
+                _ => collect_virtuals rest acc,
+            },
+    };
+
+/// A virtual nobody implemented. Three outcomes, and which one depends on who
+/// left the hole open.
+let unimplemented l mi owner v lets s =
+    match virtual_body v {
+        // No body: a hole, and whether that is an error depends on who left it.
+        // This arm comes first because `()` is a value like any other -- a bare
+        // binder below it would match the hole too, and every virtual would
+        // look as though it had a default.
+        () =>
+            if owner == mi {
+                // The module that declared the hole. It stays abstract rather
+                // than failing to compile -- but the name is still bound, or
+                // the module's own code could not refer to what it declared.
+                // Raising is an effect, so the stub is allowed to perform one
+                // however pure the virtual it stands for was declared.
+                [list.append lets
+                     [[owner, virtual_as_hole (modules.module_name (modules.module_at l mi)) v,
+                       true, true]],
+                 s]
+            }
+            else {
+                [lets,
+                 complain_note (module_span l mi)
+                     ("module `" + modules.module_name (modules.module_at l mi)
+                      + "` derives `" + modules.module_name (modules.module_at l owner)
+                      + "` but does not implement `" + virtual_name v + "`")
+                     ("add `let " + virtual_name v + " "
+                      + str.join_str "" (list.map (fn p -> to_string (ast.param_name p) + " ")
+                                                  (virtual_params v))
+                      + "= ..`, or give the virtual a default body")
+                     (modules.module_source (modules.module_at l mi)) s]
+            },
+        // A default body: it becomes a `let` of the module that did not
+        // implement it, and is checked there.
+        _ => [list.append lets [[owner, virtual_as_let v, true, ()]], s],
+    };
+
+/// A `let` and an `import path.{ .. }` of the same name would both bind it, and
+/// the `let` would quietly win. Say so instead: which one the author meant is
+/// not something to guess at.
+let report_clashes mi span s = {
+    let e = env_at s mi;
+    let clashing = list.filter (fn n -> has_global e n)
+                               (list.map (fn kv -> list.head kv) (core.map_pairs (only e)));
+    list.fold (fn acc n -> {
+        let e2 = env_at acc mi;
+        let sel = only_of e2 n;
+        core.map_put
+            (complain_note span ("`" + n + "` is already bound in this module")
+                 ("it is imported from `" + list.nth 2 sel + "` and also defined here; rename one, "
+                  + "or use `" + list.nth 2 sel + "." + list.nth 1 sel + "` where the import is meant")
+                 (env_source e2) acc)
+            :envs (envs (set_env mi (without_only n e2) acc))
+    }) s clashing
+};
+
+/// The span to hang a module-wide complaint on: its first item, or nothing.
+let module_span l mi = {
+    let items = modules.module_items (modules.module_at l mi);
+    if list.is_empty items { ast.no_span } else { ast.span (list.head items) }
+};
+
+let declare_module l mi s0 = {
+    // Where this module's globals begin. They are contiguous because this is
+    // the only thing handing out indices and it finishes one module before it
+    // starts the next -- which is what lets an image record a module as a range
+    // rather than as a list.
+    let globals_from = next_global s0;
+    let m = modules.module_at l mi;
+    let s1 = add_env (env (modules.module_name m) (modules.module_source m)) s0;
+    let items = modules.module_items m;
+
+    // Aliases first: imports, then derives, which also bring the base module's
+    // aliases along.
+    let imported = list.fold (fn acc item ->
+        match item {
+            [:import, _, _, _, _] => declare_import l mi item acc,
+            _ => acc,
+        }) s1 items;
+    let derived = list.fold (fn acc item ->
+        match item {
+            [:derive, _, _] => declare_derive l mi item acc,
+            _ => acc,
+        }) imported items;
+
+    let effective = list.head (effective_items l mi []);
+    let with_core = declare_core mi effective derived;
+
+    let collected = collect_lets l effective [] with_core;
+    let virtuals = collect_virtuals effective [];
+
+    // Every virtual that nothing implemented, in declaration order.
+    let filled = list.fold (fn acc ov -> {
+        let v = list.nth 1 ov;
+        if list.any (fn od -> decl_name (list.nth 1 od) == virtual_name v) (list.head acc) { acc }
+        else { unimplemented l mi (list.head ov) v (list.head acc) (list.nth 1 acc) }
+    }) collected virtuals;
+
+    // Declare the globals, and queue every body for phase two.
+    let declared = list.fold (fn acc od -> {
+        let owner = list.head od;
+        let d = list.nth 1 od;
+        let e = env_at acc mi;
+        if has_global e (decl_name d) {
+            complain (decl_span d) ("`" + decl_name d + "` is already bound in this module")
+                     (modules.module_source (modules.module_at l owner)) acc
+        }
+        else {
+            let got = take_global acc;
+            let bound = set_env mi (with_global (decl_name d)
+                                        (if decl_impure d { :impure } else { :pure })
+                                        (list.nth 1 got) e)
+                                (record_global (list.nth 1 got) (decl_name d) :function ()
+                                               (list.head got));
+            if list.nth 2 od {
+                add_pending [mi, modules.module_source (modules.module_at l owner), d,
+                             list.nth 3 od] bound
+            }
+            else { bound }
+        }
+    }) (list.nth 1 filled) (list.head filled);
+
+    let checked = report_clashes mi (module_span l mi) declared;
+    // A module that declares a virtual is abstract: it has a hole in it, and
+    // running it directly would reach one.
+    core.map_put checked :module_recs
+        (list.append (s_module_recs checked)
+                     [[mi, globals_from, next_global checked - globals_from,
+                       not (list.is_empty virtuals), derives (env_at checked mi)]])
+};
+
+// --- frames ---------------------------------------------------------------------
+//
+// A frame is one function. The stack grows inwards, so the function being
+// resolved is at the front, and its enclosing functions follow.
+//
+// Resolution searches every frame, because a name in an enclosing function is
+// still reachable -- it is *captured*, and threading that capture down through
+// each frame in between is this pass's job rather than a later one's. Purity, by
+// contrast, asks only the innermost frame: whether *this* function may perform
+// an effect.
+//
+// A frame also allocates the slots its locals live in, and remembers the widest
+// the frame ever got, which is what the VM needs to size an activation record.
+
+let frame func impure display =
+    %{ :func => func, :scopes => [[]], :next_slot => 0, :max_slots => 0,
+       :cap_names => [], :caps => [], :impure => impure, :display => display };
+
+let frame_func f    = core.map_get f :func 0;
+let scopes f        = core.map_get f :scopes [];
+let next_slot f     = core.map_get f :next_slot 0;
+let max_slots f     = core.map_get f :max_slots 0;
+let cap_names f     = core.map_get f :cap_names [];
+let caps f          = core.map_get f :caps [];
+let frame_impure f  = core.map_get f :impure false;
+let frame_display f = core.map_get f :display "";
+
+/// A capture says where the enclosing frame keeps the value: in one of its own
+/// slots, or in one of *its* captures. Threading it down like this is what lets
+/// a closure three levels deep reach a name without any frame in between having
+/// to know why it is holding it.
+let cap_local slot   = [:local, slot];
+let cap_capture idx  = [:capture, idx];
+
+// --- the resolver's state --------------------------------------------------------
+//
+// One record threaded through the whole walk. Diagnostics are only half of what
+// comes out: `refs` records what every name occurrence turned out to mean, and
+// `funcs` records every function the program contains. Lowering reads both
+// rather than working them out again, and a language server can read them
+// without lowering anything at all.
+
+/// Functions are kept by index rather than in a list. A function is finished
+/// long after it is started -- `end_func` fills in the slots and captures its
+/// body turned out to need -- so they are written to as well as appended, and
+/// rebuilding a list to change one entry costs the length of the list every
+/// time. On a program with a thousand functions that is the difference between
+/// compiling and not.
+let resolver es = %{ :envs => es, :frames => [], :diags => [], :refs => core.map_new (),
+                     :binds => core.map_new (),
+                     :funcs => core.map_new (), :func_count => 0,
+                     :bodies => [], :defs => [] };
+
+let r_envs r   = core.map_get r :envs [];
+let r_imports r     = core.map_get r :imports [];
+let r_global_recs r = core.map_get r :global_recs [];
+let r_module_recs r = core.map_get r :module_recs [];
+
+/// A global that names a function nothing lowered. It can only happen for a
+/// virtual left open in the module that declared it -- there is nothing written
+/// to call -- and calling it is what raises.
+let no_function = ();
+let frames r   = core.map_get r :frames [];
+let r_diags r  = core.map_get r :diags [];
+let refs r     = core.map_get r :refs (core.map_new ());
+let binds r    = core.map_get r :binds (core.map_new ());
+let func_map r   = core.map_get r :funcs (core.map_new ());
+let func_count r = core.map_get r :func_count 0;
+
+/// One function by index.
+let func_at r i = core.map_get (func_map r) i (core.map_new ());
+
+/// Every function, in index order. Built on demand: what the walk needs is
+/// access by index, and what everything downstream wants is the sequence.
+let funcs r = list.map (fn i -> func_at r i) (list.range 0 (func_count r));
+let bodies r   = core.map_get r :bodies [];
+let defs r     = core.map_get r :defs [];
+
+let set_frames fs r = core.map_put r :frames fs;
+
+let on_front f xs = core.cons (f (list.head xs)) (list.tail xs);
+
+/// Replace the innermost frame.
+let update_frame f r =
+    if list.is_empty (frames r) { r } else { set_frames (on_front f (frames r)) r };
+
+/// Replace the frame `i` steps out from the innermost one.
+let rec update_frame_at i f fs =
+    if i <= 0 { on_front f fs }
+    else { core.cons (list.head fs) (update_frame_at (i - 1) f (list.tail fs)) };
+
+let frame_at r i = list.nth i (frames r);
+let frame_count r = list.length (frames r);
+
+/// Where a name occurrence is recorded.
+///
+/// A byte offset is unique within one file, and the file makes it unique within
+/// the program -- but not within a *resolution*. A body inherited through
+/// `derive` is walked once for every module that derives it, from the same file
+/// and the same offsets, and each walk resolves it differently: that is the
+/// whole point of deriving. So the module the body was resolved against is part
+/// of the key, or the last walk would quietly overwrite the others.
+let ref_key ctx source start = (ctx * 65536 + source) * 4294967296 + start;
+
+/// Record what a name occurrence means. This is the pass's real output: a
+/// diagnostic says what went wrong, but `refs` says what went *right*, which is
+/// what everything downstream actually needs.
+let record ctx source span what r =
+    core.map_put r :refs (core.map_put (refs r) (ref_key ctx source (ast.span_start span)) what);
+
+/// What was recorded at this occurrence, or `()`.
+let resolution r ctx source span =
+    core.map_get (refs r) (ref_key ctx source (ast.span_start span)) ();
+
+/// Where a *binding* put its value: `[name, slot]` for the binder at this span.
+///
+/// Kept apart from `refs`, which is about name *uses*. A binder and a use can
+/// share a span -- a `let` in a block is both the closure it makes and the name
+/// it binds -- and more importantly this is what frees lowering from having to
+/// walk patterns in the same order as this pass did. It asks where a binder's
+/// slot is; it does not recount.
+let record_bind ctx source span name slot r =
+    core.map_put r :binds (core.map_put (binds r) (ref_key ctx source (ast.span_start span))
+                                        [name, slot]);
+
+let binding r ctx source span =
+    core.map_get (binds r) (ref_key ctx source (ast.span_start span)) ();
+
+let note_diag d r = core.map_put r :diags (list.append (r_diags r) [d]);
+
+let complain_at span message source r =
+    note_diag (diag.in_source source (diag.error span message)) r;
+
+let complain_note_at span message note source r =
+    note_diag (diag.in_source source (diag.with_note note (diag.error span message))) r;
+
+// --- functions --------------------------------------------------------------------
+
+/// A function record: everything the VM needs about one function except its
+/// body, which lowering supplies.
+let func_rec name arity impure is_rec thunk span =
+    %{ :name => name, :arity => arity, :impure => impure, :rec => is_rec,
+       :thunk => thunk, :span => span, :slots => 0, :captures => [] };
+
+let func_name f  = core.map_get f :name "";
+let func_arity f = core.map_get f :arity 0;
+let func_slots f = core.map_get f :slots 0;
+let func_captures f = core.map_get f :captures [];
+let func_impure f = core.map_get f :impure false;
+
+/// Reserve a function and push a frame for it. The index is stable: functions
+/// are only ever appended, so it can be recorded at the call site before the
+/// body has been walked.
+/// Reserve a function and push a frame for it.
+///
+/// `impure` and `allow` are not the same question, and collapsing them is a
+/// mistake worth naming. `impure` is what the function *is* -- only a name
+/// ending in `!` makes one, and it is what a caller sees. `allow` is whether
+/// effects may happen while its body is walked. A lambda written inside an
+/// impure function may perform effects but is not itself impure; a thunk may
+/// always perform them, because suspending an effect is not performing one.
+let begin_func name arity impure allow is_rec thunk span r = {
+    let fi = func_count r;
+    let with_func =
+        core.map_put (core.map_put r :funcs
+                          (core.map_put (func_map r) fi
+                                        (func_rec name arity impure is_rec thunk span)))
+                     :func_count (fi + 1);
+    [set_frames (core.cons (frame fi allow name) (frames with_func)) with_func, fi]
+};
+
+/// Pop the frame and write what it learned -- how many slots the function needs
+/// and what it captures -- into the function record.
+let end_func fi r = {
+    let fr = list.head (frames r);
+    let finished = core.map_put (core.map_put (func_at r fi) :slots (max_slots fr))
+                                :captures (caps fr);
+    set_frames (list.tail (frames r))
+               (core.map_put r :funcs (core.map_put (func_map r) fi finished))
+};
+
+// --- scopes and slots --------------------------------------------------------------
+
+let push_scope r = update_frame (fn fr -> core.map_put fr :scopes (core.cons [] (scopes fr))) r;
+
+/// Leaving a scope frees its slots for the next one to reuse, but never lowers
+/// the high-water mark: `max_slots` is what the frame ever needed at once.
+let pop_scope r =
+    update_frame (fn fr -> {
+        let freed = list.fold (fn n sc -> n - list.length sc) (next_slot fr) [list.head (scopes fr)];
+        core.map_put (core.map_put fr :scopes (list.tail (scopes fr))) :next_slot freed
+    }) r;
+
+/// Bind one name in the innermost scope, giving it a slot. `_` is a wildcard:
+/// it takes a slot, because something has to be stored there, but binds no name,
+/// so nothing can reach it.
+let bind_one ctx source name span r = {
+    let fr = list.head (frames r);
+    let slot = next_slot fr;
+    let widened = if slot + 1 > max_slots fr { slot + 1 } else { max_slots fr };
+    [record_bind ctx source span name slot (update_frame (fn f ->
+        core.map_put (core.map_put
+            (if name == "_" { f }
+             else { core.map_put f :scopes (on_front (fn sc -> list.append sc [[name, slot, span]])
+                                                     (scopes f)) })
+            :next_slot (slot + 1))
+            :max_slots widened) r),
+     slot]
+};
+
+let rec bind_all ctx source bindings r =
+    match bindings {
+        [] => r,
+        [b, ..rest] =>
+            bind_all ctx source rest
+                (list.head (bind_one ctx source (list.nth 0 b) (list.nth 1 b) r)),
+    };
+
+/// A local's `[slot, span]` in one frame, innermost scope first, or `()`.
+let lookup_local fr name = {
+    let rec in_scopes ss =
+        match ss {
+            [] => (),
+            [sc, ..rest] => {
+                let hit = list.filter (fn e -> list.nth 0 e == name) sc;
+                if list.is_empty hit { in_scopes rest }
+                // A later binding of the same name in one scope shadows an
+                // earlier one, so the last match wins.
+                else { list.last hit }
+            },
+        };
+    in_scopes (scopes fr)
+};
+
+/// Thread `name` down from an enclosing frame, adding a capture to every frame
+/// along the way. Answers `[r, index]` -- the capture's index in frame `i` --
+/// or `[r, ()]` when no enclosing frame has it.
+let rec capture i name r =
+    if i >= frame_count r { [r, ()] }
+    else {
+        let fr = frame_at r i;
+        let at = list.index_of name (cap_names fr);
+        if at >= 0 { [r, at] }
+        else if i + 1 >= frame_count r { [r, ()] }
+        else {
+            let outer = frame_at r (i + 1);
+            let from = match lookup_local outer name {
+                () => {
+                    let up = capture (i + 1) name r;
+                    match list.nth 1 up {
+                        () => [list.head up, ()],
+                        ci => [list.head up, cap_capture ci],
+                    }
+                },
+                found => [r, cap_local (list.nth 1 found)],
+            };
+            match list.nth 1 from {
+                () => [list.head from, ()],
+                desc => {
+                    let r2 = list.head from;
+                    let idx = list.length (caps (frame_at r2 i));
+                    [set_frames (update_frame_at i (fn f ->
+                         core.map_put (core.map_put f :cap_names (list.append (cap_names f) [name]))
+                                      :caps (list.append (caps f) [desc]))
+                         (frames r2)) r2,
+                     idx]
+                },
+            }
+        }
+    };
+
+/// Where a name is, as far as the frame stack is concerned: a slot in this
+/// function, or a capture threaded in from an enclosing one.
+let resolve_in_frames name r =
+    if list.is_empty (frames r) { [r, ()] }
+    else {
+        match lookup_local (list.head (frames r)) name {
+            () => {
+                let got = capture 0 name r;
+                match list.nth 1 got {
+                    () => [list.head got, ()],
+                    ci => [list.head got, [:capture, ci, ast.no_span]],
+                }
+            },
+            found => [r, [:local, list.nth 1 found, list.nth 2 found]],
+        }
+    };
+
+/// Is the name bound by some enclosing function? Asked where only the answer
+/// matters and threading a capture would be wrong -- deciding whether `list` in
+/// `list.map` is a local or a module, for one.
+let in_scope r name =
+    list.any (fn fr -> lookup_local fr name != ()) (frames r);
+
+/// May an effect happen here? An empty stack means there is no function to be
+/// pure, which is the case for a compile-time expression.
+let impure_ok r =
+    if list.is_empty (frames r) { true } else { frame_impure (list.head (frames r)) };
+
+let display_of r =
+    if list.is_empty (frames r) { "" } else { frame_display (list.head (frames r)) };
+
+// --- phase two: resolving a body ---------------------------------------------------
+
+/// The context a body is resolved in: the whole program, the module whose names
+/// it resolves against, and the file it was written in. For a body inherited
+/// through `derive` those last two differ, and that difference is the whole of
+/// what `derive` means.
+let ctx l mi source = %{ :l => l, :mi => mi, :source => source };
+
+let ctx_l c      = core.map_get c :l ();
+let ctx_mi c     = core.map_get c :mi 0;
+let ctx_source c = core.map_get c :source 0;
+
+let ctx_env c r = list.nth (ctx_mi c) (r_envs r);
+let env_of c r i = list.nth i (r_envs r);
+
+let report c span message r = complain_at span message (ctx_source c) r;
+let report_note c span message note r = complain_note_at span message note (ctx_source c) r;
+
+/// Record that an effect happens here, rejecting it in a pure function.
+let note_effect c span what r =
+    if impure_ok r { r }
+    else {
+        report_note c span
+            ("cannot use " + what + " inside the pure function `" + display_of r + "`")
+            "mark the function impure by ending its name with `!`, e.g. `let f! x = ..`" r
+    };
+
+/// A member reached through a module: `list.map`, or `map` after
+/// `import std.list.{map}` -- the two resolve identically, which is what stops
+/// them from ever disagreeing, including about purity.
+let check_member c r_ref shown field span r = {
+    let r1 =
+        match r_ref {
+            [:dream, target] => {
+                let e = env_of c r target;
+                if has_global e field {
+                    // The global index, so lowering has nothing left to look
+                    // up: a cross-module call is one index by the time the
+                    // image is written, which is the whole point of compiling
+                    // the program as a whole.
+                    record (ctx_mi c) (ctx_source c) span
+                           [:member, r_ref, field, global_index e field] r
+                }
+                else {
+                    report_note c span
+                        ("module `" + shown + "` has no member `" + field + "`")
+                        (if list.is_empty (exports e) { "it exports nothing" }
+                         else { "it exports: " + str.join_str ", " (exports e) }) r
+                }
+            },
+            // The host owns its member table, so there is nothing to check the
+            // name against here; only its purity is this pass's business.
+            // A host module keeps its lookup until run time -- the host owns
+            // the member table -- so what is recorded is the module's own
+            // global and the field name to ask it for.
+            [:native, _, _] => record (ctx_mi c) (ctx_source c) span [:member, r_ref, field, ()] r,
+            // A namespace holds modules, not members. Reaching here means the
+            // name was used one level too shallow, as in `std.map` for
+            // `std.list.map`.
+            [:group, prefix] =>
+                report_note c span ("`" + prefix + "` is a package, not a module")
+                    (group_contents (ctx_l c) prefix + "; `" + field
+                     + "` would have to be inside one") r,
+            _ => r,
+        };
+    if builtins.is_impure_name field {
+        match r_ref {
+            [:dream, _] => note_effect c span ("the impure function `" + shown + "." + field + "`") r1,
+            _ => note_effect c span ("the impure member `" + field + "`") r1,
+        }
+    }
+    else { r1 }
+};
+
+/// `field` as a *submodule* of a module. A module's aliases hold everything it
+/// imported as well as what it declared, so the name alone is not enough:
+/// `text.str` must not reach `std.str` just because `text` imports it. Only a
+/// module actually named `parent.field` counts, which is exactly what
+/// `mod field { .. }` creates.
+let submodule c r target field =
+    match alias_of (env_of c r target) field {
+        [:dream, inner] =>
+            if modules.module_name (modules.module_at (ctx_l c) inner)
+               == modules.module_name (modules.module_at (ctx_l c) target) + "." + field {
+                dream_ref inner
+            }
+            else { () },
+        _ => (),
+    };
+
+/// If this expression names a module or a namespace rather than a value, which
+/// one -- and the spelling to show in a diagnostic. `[ref, shown]`, or `()`.
+let rec as_namespace c r e =
+    match e {
+        [:name, n, _] =>
+            if in_scope r n { () }
+            else { match alias_of (ctx_env c r) n { () => (), m => [m, n] } },
+        [:field, obj, field, _] =>
+            match as_namespace c r obj {
+                () => (),
+                base =>
+                    match list.head base {
+                        [:group, prefix] =>
+                            match group_member (ctx_l c) prefix field {
+                                () => (),
+                                inner => [inner, list.nth 1 base + "." + field],
+                            },
+                        [:dream, target] =>
+                            match submodule c r target field {
+                                () => (),
+                                inner => [inner, list.nth 1 base + "." + field],
+                            },
+                        // A host module's members are values, not namespaces.
+                        _ => (),
+                    },
+            },
+        _ => (),
+    };
+
+/// A module or a namespace written where a value belongs.
+let not_a_value c m shown span r =
+    report_note c span ("`" + shown + "` is a module, not a value")
+        (match m {
+             [:group, _] => "use a module inside it, as in `" + shown + ".something.member`",
+             _ => "use one of its members, as in `" + shown + ".something`",
+         }) r;
+
+let check_name c name span r = {
+    let e = ctx_env c r;
+    let found = resolve_in_frames name r;
+    let r0 = list.head found;
+    let r1 =
+        match list.nth 1 found {
+            // A local or a capture: recorded with where the VM will find it.
+            () =>
+                if has_global e name {
+                    record (ctx_mi c) (ctx_source c) span
+                           [:global, ctx_mi c, name, global_index e name] r0
+                }
+                else if builtins.is_builtin name {
+                    record (ctx_mi c) (ctx_source c) span [:builtin, name] r0
+                }
+                else {
+                    match only_of e name {
+                        // A member brought in by `import path.{ .. }` resolves
+                        // exactly as `path.member` would.
+                        () =>
+                            match alias_of e name {
+                                // A Dream module is a compile-time namespace,
+                                // not a value, so say that rather than claiming
+                                // the name does not exist.
+                                [:dream, _] => not_a_value c (dream_ref 0) name span r0,
+                                _ => report c span
+                                         ("cannot find `" + name + "` in this scope") r0,
+                            },
+                        sel => check_member c (list.nth 0 sel) (list.nth 2 sel) (list.nth 1 sel)
+                                            span r0,
+                    }
+                },
+            local => record (ctx_mi c) (ctx_source c) span local r0,
+        };
+    if builtins.is_impure_name name {
+        note_effect c span ("the impure function `" + name + "`") r1
+    }
+    else { r1 }
+};
+
+/// The names a pattern binds, each with the span that binds it, in the order
+/// they are written -- which is the order their slots are allocated in.
+let rec pattern_bindings p =
+    match p {
+        [:bind, n, span] => [[n, span]],
+        [:as_p, inner, n, span] => list.append (pattern_bindings inner) [[n, span]],
+        [:list_p, items, rest, span] =>
+            list.append (list.concat (list.map (fn i -> pattern_bindings i) items))
+                        (match rest { [n] => if n == () { [] } else { [[n, span]] }, _ => [] }),
+        [:array_p, items, rest, span] =>
+            list.append (list.concat (list.map (fn i -> pattern_bindings i) items))
+                        (match rest { [n] => if n == () { [] } else { [[n, span]] }, _ => [] }),
+        [:map_p, pairs, _] => list.concat (list.map (fn kv -> pattern_bindings (list.nth 1 kv)) pairs),
+        _ => [],
+    };
+
+let rec check_expr c e r =
+    match e {
+        [:name, n, span] => check_name c n span r,
+
+        [:field, obj, field, span] =>
+            match as_namespace c r obj {
+                () => {
+                    let r1 = check_expr c obj r;
+                    if builtins.is_impure_name field {
+                        note_effect c span ("the impure member `" + field + "`") r1
+                    }
+                    else { r1 }
+                },
+                base => {
+                    let m = list.head base;
+                    let shown = list.nth 1 base;
+                    // `math.deep` where `deep` is a submodule: a namespace one
+                    // level further in, and still not a value.
+                    let deeper = match m {
+                        [:dream, target] => submodule c r target field,
+                        [:group, prefix] => group_member (ctx_l c) prefix field,
+                        _ => (),
+                    };
+                    match deeper {
+                        () =>
+                            match m {
+                                [:group, prefix] =>
+                                    report_note c span
+                                        ("`" + shown + "` has no module `" + field + "`")
+                                        (group_contents (ctx_l c) prefix) r,
+                                _ => check_member c m shown field span r,
+                            },
+                        inner => not_a_value c inner (shown + "." + field) span r,
+                    }
+                },
+            },
+
+        [:apply, callee, args, _] =>
+            list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) args,
+        [:pipe, l, rhs, _] => check_expr c rhs (check_expr c l r),
+        [:unary, _, x, _] => check_expr c x r,
+        [:binary, _, l, rhs, _] => check_expr c rhs (check_expr c l r),
+        [:if, cond, t, el, _] => {
+            let r1 = check_expr c t (check_expr c cond r);
+            match el { () => r1, x => check_expr c x r1 }
+        },
+        // Whether effects are allowed here is recorded, because lowering needs
+        // it and cannot see it: a block's non-final statements are only worth
+        // forcing inside an impure function, and inside a pure one they are
+        // dead code worth saying so about.
+        [:block, stmts, span] =>
+            pop_scope (check_block c stmts
+                          (push_scope (record (ctx_mi c) (ctx_source c) span [:block, impure_ok r] r))),
+
+        // `$( .. )` is a value: building it is always allowed, and running it is
+        // what needs an impure context. So the thunk's own frame permits
+        // effects however pure the function around it is.
+        [:thunk, x, span] => {
+            let started = begin_func "<thunk>" 0 false true false true span r;
+            let fi = list.nth 1 started;
+            record (ctx_mi c) (ctx_source c) span [:thunk, fi]
+                   (end_func fi (check_expr c x (list.head started)))
+        },
+
+        [:try, body, binder, handler, span] => {
+            let r1 = check_expr c body r;
+            let scoped = push_scope r1;
+            let bound = bind_one (ctx_mi c) (ctx_source c) binder span scoped;
+            pop_scope (check_expr c handler (list.head bound))
+        },
+
+        // A lambda is not a declaration, so it cannot declare itself impure: it
+        // inherits whether effects are allowed from where it is written.
+        [:lambda, ps, body, span] => {
+            let started = begin_func "<lambda>" (list.length ps) false (impure_ok r) false false span r;
+            let fi = list.nth 1 started;
+            let bound = bind_all (ctx_mi c) (ctx_source c)
+                                 (list.map (fn p -> [ast.param_name p, list.nth 1 p]) ps)
+                                 (list.head started);
+            record (ctx_mi c) (ctx_source c) span [:closure, fi] (end_func fi (check_expr c body bound))
+        },
+
+        // A compile-time expression becomes a function of its own, because
+        // evaluating it means running it. It is walked with an empty frame
+        // stack: it runs before the program does, so there is no local for it
+        // to see, and saying so here is better than a mystery later.
+        [:comp, impure, x, span] => {
+            let outer = frames r;
+            let started = begin_func "<comp>" 0 impure impure false true span (set_frames [] r);
+            let fi = list.nth 1 started;
+            let walked = end_func fi (check_expr c x (list.head started));
+            record (ctx_mi c) (ctx_source c) span [:comp, fi, impure] (set_frames outer walked)
+        },
+        [:list, xs, _]  => list.fold (fn acc x -> check_expr c x acc) r xs,
+        [:array, xs, _] => list.fold (fn acc x -> check_expr c x acc) r xs,
+        [:map, pairs, _] =>
+            list.fold (fn acc kv -> check_expr c (list.nth 1 kv) (check_expr c (list.nth 0 kv) acc))
+                      r pairs,
+        // A `match` needs a slot of its own: every pattern but `_` looks at the
+        // subject, and the arms are tried in order, so it is evaluated once up
+        // front and held. Resolution hands out that slot rather than leaving
+        // lowering to invent one, because the frame's slot count is settled
+        // here and a slot invented later would not be counted.
+        [:match, scrutinee, arms, span] => {
+            let r1 = check_expr c scrutinee r;
+            let scoped = push_scope r1;
+            let held = bind_one (ctx_mi c) (ctx_source c) "_" span scoped;
+            let r2 = record (ctx_mi c) (ctx_source c) span [:match, list.nth 1 held] (list.head held);
+            pop_scope (list.fold (fn acc arm -> check_arm c arm acc) r2 arms)
+        },
+        _ => r,
+    };
+
+/// A block's statements. A `let` binds a name the statements after it can see,
+/// so the scope grows as the block is walked.
+let rec check_block c stmts r =
+    match stmts {
+        [] => r,
+        [st, ..rest] =>
+            match st {
+                [:let, n, ps, body, is_rec, span] => {
+                    // `let rec` puts the name in scope for its own body, so a
+                    // closure can refer to itself. The slot is allocated either
+                    // way -- what `rec` changes is only when the name reaches it.
+                    let pre = if is_rec { list.head (bind_one (ctx_mi c) (ctx_source c) n span r) } else { r };
+                    let r1 =
+                        if list.is_empty ps { check_expr c body pre }
+                        else {
+                            let started = begin_func n (list.length ps)
+                                                     (builtins.is_impure_name n)
+                                                     (builtins.is_impure_name n)
+                                                     is_rec false span pre;
+                            let fi = list.nth 1 started;
+                            let bound = bind_all (ctx_mi c) (ctx_source c)
+                                                 (list.map (fn p -> [ast.param_name p, list.nth 1 p]) ps)
+                                                 (list.head started);
+                            record (ctx_mi c) (ctx_source c) span [:closure, fi]
+                                   (end_func fi (check_expr c body bound))
+                        };
+                    check_block c rest
+                        (if is_rec { r1 } else { list.head (bind_one (ctx_mi c) (ctx_source c) n span r1) })
+                },
+                _ => check_block c rest (check_expr c st r),
+            },
+    };
+
+/// One `pattern => body`, with the pattern's names in scope for the guard as
+/// well as the body -- a guard exists to ask about what the pattern bound.
+let rec check_arm c arm r = {
+    let p = ast.arm_pattern arm;
+    let r1 = check_pattern c p r;
+    let scoped = push_scope r1;
+    let bound = bind_all (ctx_mi c) (ctx_source c) (pattern_bindings p) scoped;
+    let r2 = match ast.arm_guard arm { () => bound, g => check_expr c g bound };
+    pop_scope (check_expr c (ast.arm_body arm) r2)
+};
+
+/// A pattern binds names, but it also *compares*, and what it compares against
+/// is an expression -- resolved in the scope the `match` sits in, not the one
+/// the pattern creates, so a key cannot refer to what the pattern is about to
+/// bind. In practice that means a map pattern's key: the parser only ever puts
+/// a constant in a literal pattern, and a bare name binds rather than compares.
+/// Literals are walked anyway, so this stays correct if that ever changes.
+let rec check_pattern c p r =
+    match p {
+        [:literal, e, _] => check_expr c e r,
+        [:as_p, inner, _, _] => check_pattern c inner r,
+        [:list_p, items, _, _]  => list.fold (fn acc i -> check_pattern c i acc) r items,
+        [:array_p, items, _, _] => list.fold (fn acc i -> check_pattern c i acc) r items,
+        [:map_p, pairs, _] =>
+            list.fold (fn acc kv -> check_pattern c (list.nth 1 kv) (check_expr c (list.nth 0 kv) acc))
+                      r pairs,
+        _ => r,
+    };
+
+/// One queued body, resolved in the module whose names it sees. A global `let`
+/// is a function like any other -- a parameterless one is a zero-arity function
+/// the VM forces once, which is why it gets a frame rather than being treated
+/// as a bare expression.
+let check_body l p r = {
+    let mi = list.nth 0 p;
+    let source = list.nth 1 p;
+    let d = list.nth 2 p;
+    let c = ctx l mi source;
+    // A synthesized body may need to be impure whatever its name says: the stub
+    // that stands in for an unfilled virtual raises, and raising is an effect.
+    let impure = match list.nth 3 p { () => decl_impure d, forced => forced };
+    let started = begin_func (decl_name d) (list.length (decl_params d)) impure impure
+                             (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) r;
+    let fi = list.nth 1 started;
+    let bound = bind_all mi source
+                         (list.map (fn prm -> [ast.param_name prm, list.nth 1 prm]) (decl_params d))
+                         (list.head started);
+    let done = end_func fi (check_expr c (decl_body d) bound);
+    core.map_put done :bodies (list.append (bodies done) [[mi, source, d, fi]])
+};
+
+// --- the entry point ---------------------------------------------------------
+
+/// Resolve and purity-check a whole loaded program.
+///
+/// Answers the resolver: the diagnostics, and -- just as importantly -- what
+/// every name turned out to mean, every function the program contains, and
+/// which function holds each module's globals. Lowering reads all of that
+/// rather than deriving it a second time.
+let resolve! l = {
+    let declared = list.fold (fn acc mi -> declare_module l mi acc) state
+                             (list.range 0 (list.length (modules.modules l)));
+    let r0 = core.map_put
+                 (core.map_put
+                     (core.map_put (resolver (envs declared)) :imports (s_imports declared))
+                     :module_recs (s_module_recs declared))
+                 :diags (diags declared);
+    let named = core.map_put r0 :defs
+        (list.map (fn p -> [list.nth 0 p, list.nth 1 p, decl_name (list.nth 2 p),
+                            decl_span (list.nth 2 p)])
+                  (pending declared));
+    let walked = list.fold (fn acc p -> check_body l p acc) named (pending declared);
+
+    // A global that names a function could not say which function until the
+    // function existed, which is now. Joining here rather than threading a
+    // half-filled record through the walk keeps the walk about names.
+    let by_global = list.fold (fn acc b -> {
+        let e = list.nth (list.nth 0 b) (envs declared);
+        match global_index e (decl_name (list.nth 2 b)) {
+            () => acc,
+            gi => core.map_put acc gi (list.nth 3 b),
+        }
+    }) (core.map_new ()) (bodies walked);
+    core.map_put walked :global_recs
+        (list.map (fn g ->
+             match list.nth 2 g {
+                 :function => [list.nth 0 g, list.nth 1 g, :function,
+                               core.map_get by_global (list.nth 0 g) no_function],
+                 _ => g,
+             })
+             (s_global_recs declared))
+};
+
+/// Just the diagnostics, for a caller that only wants to know whether the
+/// program is well formed.
+let check! l = r_diags (resolve! l);
+
+// --- asking the resolver questions ---------------------------------------------
+//
+// What a language server needs is not a pass but a query: the user's cursor is
+// at a byte offset in a file, and the question is what the name there means and
+// where it came from. That is a lookup in `refs`, which is why the walk records
+// it rather than only complaining.
+
+/// What the name beginning at this byte offset resolves to, or `()`. The module
+/// is part of the question for the same reason it is part of the key.
+let at r ctx source offset = core.map_get (refs r) (ref_key ctx source offset) ();
+
+/// Where a global is defined: `[module, source, span]`, or `()`. The module a
+/// name belongs to is part of the question, because two modules may each define
+/// the same name.
+let definition r mi name = {
+    let hit = list.filter (fn d -> list.nth 0 d == mi && list.nth 2 d == name) (defs r);
+    if list.is_empty hit { () }
+    else { let d = list.head hit; [list.nth 0 d, list.nth 1 d, list.nth 3 d] }
+};
+
+/// Every global a module defines, in declaration order -- a document outline.
+let module_defs r mi = list.filter (fn d -> list.nth 0 d == mi) (defs r);
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+    import dreams.config;
+    import dreams.package;
+
+    /// A program built from source text rather than from files. Native imports
+    /// still resolve -- the host's modules need no file -- which is enough to
+    /// exercise purity, and a second module can be added under a name the first
+    /// one imports, which is enough to exercise members.
+    let bare! () = modules.loader package.empty config.empty [] [];
+
+    let with_module! l name src = modules.load_text! l src ("<" + name + ">") name ("<" + name + ">");
+
+    let checked! src = check! (with_module! (bare! ()) "t" src);
+
+    /// The whole resolver, for the tests that ask what it recorded rather than
+    /// what it complained about.
+    let resolved! src = resolve! (with_module! (bare! ()) "t" src);
+
+    /// Two modules: `a` as written, then `t`, which may import it.
+    let checked_two! a_src t_src =
+        check! (with_module! (with_module! (bare! ()) "a" a_src) "t" t_src);
+
+    let messages ds = list.map (fn d -> diag.message d) ds;
+    let first ds = if list.is_empty ds { "" } else { diag.message (list.head ds) };
+    let note_of ds = if list.is_empty ds { "" } else { to_string (diag.note (list.head ds)) };
+
+    let tests = [
+        // --- resolution ---
+        test.case "a name nothing binds is reported"
+            $( test.eq! "cannot find `nope` in this scope" (first (checked! "let main! = nope;")) ),
+        test.case "a global of this module is in scope"
+            $( test.eq! [] (checked! "let a = 1;\nlet main! = a;") ),
+        test.case "a builtin is in scope without being imported"
+            $( test.eq! [] (checked! "let main! = to_string (len [1]);") ),
+        test.case "a parameter is in scope in the body"
+            $( test.eq! [] (checked! "let f x = x;") ),
+        test.case "a parameter is not in scope outside it"
+            $( test.eq! "cannot find `x` in this scope"
+                        (first (checked! "let f x = x;\nlet g = x;")) ),
+        test.case "a lambda's parameter is in scope in its body"
+            $( test.eq! [] (checked! "let f = fn x -> x;") ),
+        test.case "a name from an enclosing function is reachable"
+            $( test.eq! [] (checked! "let f x = fn y -> x;") ),
+        test.case "`_` binds nothing, so it cannot be used"
+            $( test.eq! "cannot find `_` in this scope"
+                        (first (checked! "let f = match 1 { _ => _, };")) ),
+
+        // --- blocks ---
+        test.case "a let is in scope for the statements after it"
+            $( test.eq! [] (checked! "let f = { let a = 1; a };") ),
+        test.case "a plain let is not in scope in its own body"
+            $( test.eq! "cannot find `a` in this scope"
+                        (first (checked! "let f = { let a = a; a };")) ),
+        test.case "a let rec is in scope in its own body"
+            $( test.eq! [] (checked! "let f = { let rec go n = go n; go 1 };") ),
+        test.case "a block's let goes out of scope at the end of the block"
+            $( test.eq! "cannot find `a` in this scope"
+                        (first (checked! "let f = { { let a = 1; a } a };")) ),
+
+        // --- patterns ---
+        test.case "a pattern binds for the arm's body"
+            $( test.eq! [] (checked! "let f v = match v { [x, y] => x + y, };") ),
+        test.case "a `..rest` binds a name"
+            $( test.eq! [] (checked! "let f v = match v { [x, ..rest] => rest, };") ),
+        test.case "an unnamed `..` binds nothing"
+            $( test.eq! [] (checked! "let f v = match v { [x, ..] => x, };") ),
+        test.case "an `as` pattern binds the whole"
+            $( test.eq! [] (checked! "let f v = match v { ([x] as whole) => whole, };") ),
+        test.case "a guard sees what the pattern bound"
+            $( test.eq! [] (checked! "let f v = match v { [x] if x > 1 => x, };") ),
+        test.case "a pattern's names are gone in the next arm"
+            $( test.eq! "cannot find `x` in this scope"
+                        (first (checked! "let f v = match v { [x] => x, _ => x, };")) ),
+        // A bare name in a pattern *binds*; it never compares. The expression
+        // inside a pattern is the key of a map pattern, and it is resolved in
+        // the scope the `match` sits in rather than the one the pattern makes.
+        test.case "a bare name in a pattern binds rather than comparing"
+            $( test.eq! [] (checked! "let f v = match v { anything => anything, };") ),
+        test.case "a map pattern's key is an expression, resolved outside the arm"
+            $( test.eq! "cannot find `nope` in this scope"
+                        (first (checked! "let f v = match v { %{ nope => x } => x, };")) ),
+        test.case "a map pattern's key cannot see what the pattern binds"
+            $( test.eq! "cannot find `x` in this scope"
+                        (first (checked! "let f v = match v { %{ x => x } => x, };")) ),
+
+        // --- try ---
+        test.case "a catch binder is in scope in the handler"
+            $( test.eq! [] (checked! "let f! = try! { 1 } catch e { e };") ),
+        test.case "a catch binder is not in scope after the try"
+            $( test.eq! "cannot find `e` in this scope"
+                        (first (checked! "let f! = { try! { 1 } catch e { e } e };")) ),
+
+        // --- purity ---
+        test.case "a pure function may not reach an effect"
+            $( test.eq! "cannot use the impure function `go!` inside the pure function `f`"
+                        (first (checked! "let go! = 1;\nlet f = go!;")) ),
+        test.case "an impure function may"
+            $( test.eq! [] (checked! "let go! = 1;\nlet f! = go!;") ),
+        test.case "the note says how to fix it"
+            $( test.true! (str.contains_str "ending its name with `!`"
+                                            (note_of (checked! "let go! = 1;\nlet f = go!;"))) ),
+        test.case "a host module's impure member is an effect too"
+            $( test.eq! "cannot use the impure member `print!` inside the pure function `f`"
+                        (first (checked! "import std.console;\nlet f x = console.print! x;")) ),
+        test.case "a lambda inside a pure function is still pure"
+            $( test.true! (str.contains_str "inside the pure function `<lambda>`"
+                   (first (checked! "let go! = 1;\nlet f = fn x -> go!;"))) ),
+        test.case "a lambda inside an impure function may perform effects"
+            $( test.eq! [] (checked! "let go! = 1;\nlet f! = fn x -> go!;") ),
+        test.case "a thunk may be impure wherever it is written"
+            $( test.eq! [] (checked! "let go! = 1;\nlet f = $( go! );") ),
+        test.case "a local impure function may be declared inside a pure one"
+            $( test.eq! [] (checked! "let go! = 1;\nlet f = { let h! x = go!; 1 };") ),
+
+        // --- modules as values ---
+        test.case "a host module named alone is a value"
+            $( test.eq! [] (checked! "import std.console;\nlet f = console;") ),
+        test.case "a Dream module named alone is not"
+            $( test.eq! "`a` is a module, not a value"
+                        (first (checked_two! "let x = 1;" "import a;\nlet f = a;")) ),
+        test.case "a member of a Dream module resolves"
+            $( test.eq! [] (checked_two! "let x = 1;" "import a;\nlet f = a.x;") ),
+        test.case "a member a Dream module does not have is reported"
+            $( test.eq! "module `a` has no member `nope`"
+                        (first (checked_two! "let x = 1;" "import a;\nlet f = a.nope;")) ),
+        test.case "the note names what the module does export"
+            $( test.true! (str.contains_str "it exports: x"
+                   (note_of (checked_two! "let x = 1;" "import a;\nlet f = a.nope;"))) ),
+        test.case "a module that exports nothing says so"
+            $( test.true! (str.contains_str "it exports nothing"
+                   (note_of (checked_two! "" "import a;\nlet f = a.nope;"))) ),
+
+        // --- imports ---
+        test.case "an imported member resolves as the qualified name would"
+            $( test.eq! [] (checked_two! "let x = 1;" "import a.{x};\nlet f = x;") ),
+        test.case "an imported member may be renamed"
+            $( test.eq! [] (checked_two! "let x = 1;" "import a.{x as y};\nlet f = y;") ),
+        test.case "importing a member the module has not got is reported"
+            $( test.eq! "module `a` has no member `nope`"
+                        (first (checked_two! "let x = 1;" "import a.{nope};\nlet f = nope;")) ),
+        test.case "an import that collides with a let is reported"
+            $( test.true! (str.contains_str "already bound"
+                   (first (checked_two! "let x = 1;" "import a.{x};\nlet x = 2;"))) ),
+        test.case "importing the same alias twice is reported"
+            $( test.eq! "`console` is already imported here"
+                        (first (checked! "import std.console;\nimport std.console;")) ),
+        test.case "an impure member keeps its purity through an import list"
+            $( test.eq! "cannot use the impure function `a.go!` inside the pure function `f`"
+                        (first (checked_two! "let go! = 1;" "import a.{go!};\nlet f = go!;")) ),
+
+        // --- duplicates ---
+        test.case "two lets of one name in a module is an error"
+            $( test.eq! "`a` is already bound in this module"
+                        (first (checked! "let a = 1;\nlet a = 2;")) ),
+
+        // --- std.core, without being imported ---
+        test.case "a module that names core gets it without an import"
+            $( test.eq! [] (checked! "let f xs = core.head xs;") ),
+        test.case "a module that binds core itself keeps its own"
+            $( test.eq! [] (checked! "let core = 1;\nlet f = core;") ),
+        test.case "a module that never names core is given nothing"
+            $( test.eq! [] (checked! "let f x = x;") ),
+
+        // --- what the walk records ---
+        //
+        // Diagnostics are only half the output. The other half is what every
+        // name turned out to mean, which is what lowering reads instead of
+        // working it out again -- and what a language server will read to
+        // answer "what is this, and where does it come from".
+        test.case "a parameter resolves to a slot in its own frame"
+            $( test.eq! [:local, 0]
+                        { let src = "let f x = x;";
+                          let got = at (resolved! src) 0 (str.find "x;" src);
+                          [list.nth 0 got, list.nth 1 got] } ),
+        test.case "a local records where it was bound"
+            $( test.eq! true
+                        { let src = "let f x = x;";
+                          let got = at (resolved! src) 0 (str.find "x;" src);
+                          ast.span_start (list.nth 2 got) == str.find "x =" src } ),
+        test.case "a second local gets the next slot"
+            $( test.eq! [[:local, 0], [:local, 1]]
+                        { let src = "let f a b = a + b;";
+                          let r = resolved! src;
+                          list.map (fn o -> { let g = at r 0 o; [list.nth 0 g, list.nth 1 g] })
+                                   [str.find "a +" src, str.find "b;" src] } ),
+        test.case "a global resolves to its module and its index"
+            $( test.eq! [:global, 0, "a", 0]
+                        { let src = "let a = 1;\nlet f = a;";
+                          at (resolved! src) 0 (str.find "a;" src) } ),
+        test.case "a builtin resolves as a builtin"
+            $( test.eq! [:builtin, "len"]
+                        { let src = "let f xs = len xs;";
+                          at (resolved! src) 0 (str.find "len" src) } ),
+        test.case "a host module's member is recorded with the module it came from"
+            $( test.eq! [:member, [:native, "std.console", 0], "print!", ()]
+                        { let src = "import std.console;\nlet f! x = console.print! x;";
+                          at (resolved! src) 0 (str.find "console.print!" src) } ),
+
+        // --- captures ---
+        test.case "a name from the enclosing function becomes a capture"
+            $( test.eq! [:capture, 0]
+                        { let src = "let f x = fn y -> x;";
+                          let g = at (resolved! src) 0 (str.find "x;" src);
+                          [list.nth 0 g, list.nth 1 g] } ),
+        test.case "the lambda records what it captures and where from"
+            $( test.eq! [[:local, 0]]
+                        (func_captures (list.nth 1 (funcs (resolved! "let f x = fn y -> x;")))) ),
+        test.case "a capture is threaded through every frame in between"
+            $( test.eq! [[[:local, 0]], [[:capture, 0]]]
+                        { let r = resolved! "let f a = fn b -> fn c -> a;";
+                          [func_captures (list.nth 1 (funcs r)),
+                           func_captures (list.nth 2 (funcs r))] } ),
+        test.case "capturing the same name twice captures it once"
+            $( test.eq! 1 (list.length
+                   (func_captures (list.nth 1 (funcs (resolved! "let f x = fn y -> x + x;"))))) ),
+
+        // --- function records ---
+        test.case "a global let is a function with its parameters as slots"
+            $( test.eq! ["f", 2, 2]
+                        { let f = list.head (funcs (resolved! "let f a b = a;"));
+                          [func_name f, func_arity f, func_slots f] } ),
+        test.case "a block's lets need slots too"
+            $( test.eq! 3 (func_slots (list.head (funcs (resolved! "let f x = { let a = 1; let b = 2; a };")))) ),
+        test.case "sibling scopes reuse slots rather than growing the frame"
+            $( test.eq! 2 (func_slots (list.head (funcs
+                   (resolved! "let f x = { { let a = 1; a } { let b = 2; b } };")))) ),
+        test.case "a thunk is a function of its own"
+            $( test.eq! [2, "<thunk>"]
+                        { let r = resolved! "let f = $( 1 );";
+                          [list.length (funcs r), func_name (list.nth 1 (funcs r))] } ),
+        test.case "a lambda is recorded at the span that made it"
+            $( test.eq! [:closure, 1]
+                        { let src = "let f = fn x -> x;";
+                          at (resolved! src) 0 (str.find "fn x" src) } ),
+
+        // --- what a language server would ask ---
+        test.case "a module's globals are listed in declaration order"
+            $( test.eq! ["a", "b"]
+                        (list.map (fn d -> list.nth 2 d)
+                                  (module_defs (resolved! "let a = 1;\nlet b = 2;") 0)) ),
+        test.case "a module's globals are numbered from where the module starts"
+            $( test.eq! [[:global, 0, "a", 0], [:global, 0, "b", 1]]
+                        { let src = "let a = 1;\nlet b = a;\nlet f = b;";
+                          let r = resolved! src;
+                          [at r 0 (str.find "a;\nlet f" src), at r 0 (str.find "b;" src)] } ),
+        test.case "an imported host module takes a global of its own"
+            $( test.eq! [:global, 0, "console", 0]
+                        { let src = "import std.console;\nlet f = console;";
+                          // The use, not the mention inside the import.
+                          at (resolved! src) 0 (str.find "f = console" src + 4) } ),
+        test.case "a definition can be found by name"
+            $( test.true! { let src = "let a = 1;\nlet f = a;";
+                            match definition (resolved! src) 0 "a" {
+                                () => false,
+                                d => ast.span_start (list.nth 2 d) == 0,
+                            } } ),
+        test.case "a name nothing defines has no definition"
+            $( test.eq! () (definition (resolved! "let a = 1;") 0 "nope") ),
+    ];
+}
