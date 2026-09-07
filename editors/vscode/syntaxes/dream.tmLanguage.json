@@ -1,0 +1,191 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Dream",
+  "scopeName": "source.dream",
+  "patterns": [
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#string"
+    },
+    {
+      "include": "#char"
+    },
+    {
+      "include": "#atom"
+    },
+    {
+      "include": "#number"
+    },
+    {
+      "include": "#declaration"
+    },
+    {
+      "include": "#keyword"
+    },
+    {
+      "include": "#builtin"
+    },
+    {
+      "include": "#punctuation"
+    },
+    {
+      "include": "#impure"
+    },
+    {
+      "include": "#operator"
+    }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        {
+          "name": "comment.block.documentation.dream",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.double-slash.dream",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "string": {
+      "name": "string.quoted.double.dream",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.dream",
+          "match": "\\\\(u\\{[0-9A-Fa-f]+\\}|.)"
+        }
+      ]
+    },
+    "char": {
+      "name": "string.quoted.single.dream",
+      "match": "'(\\\\(u\\{[0-9A-Fa-f]+\\}|.)|[^'\\\\])'"
+    },
+    "atom": {
+      "comment": "An atom is a colon and a name: :ok, :error, :not_a_function.",
+      "name": "constant.other.symbol.dream",
+      "match": ":[A-Za-z_][A-Za-z0-9_]*!?"
+    },
+    "number": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.dream",
+          "match": "\\b0[xX][0-9A-Fa-f_]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.dream",
+          "match": "\\b0[bB][01_]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.dream",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][-+]?[0-9]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.dream",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        {
+          "comment": "The parser's list, exactly. `try!`, `comp!` and the rest carry their bang.",
+          "name": "keyword.control.dream",
+          "match": "\\b(if|else|match|catch|when)\\b|\\b(try!|comp!)"
+        },
+        {
+          "name": "keyword.declaration.dream",
+          "match": "\\b(let|rec|fn|import|as|mod|virtual|derive|comp)\\b"
+        },
+        {
+          "name": "constant.language.boolean.dream",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.dream",
+          "match": "\\bnot\\b"
+        }
+      ]
+    },
+    "builtin": {
+      "comment": "The names the language provides without a module: the VM's builtin table.",
+      "name": "support.function.builtin.dream",
+      "match": "\\b(spawn!|join!|send!|recv!|self!|raise!|strict!)|\\b(type_of|to_string|len)\\b"
+    },
+    "declaration": {
+      "comment": "The name a `let` introduces, so a definition stands out from a use.",
+      "match": "\\b(let)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
+      "captures": {
+        "1": {
+          "name": "keyword.declaration.dream"
+        },
+        "2": {
+          "name": "keyword.declaration.dream"
+        },
+        "3": {
+          "name": "entity.name.function.dream"
+        }
+      }
+    },
+    "impure": {
+      "comment": "A trailing `!` means impure, which is a real distinction in this language and worth seeing.",
+      "name": "entity.name.function.impure.dream",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*!"
+    },
+    "operator": {
+      "patterns": [
+        {
+          "name": "keyword.operator.pipe.dream",
+          "match": "\\|>"
+        },
+        {
+          "name": "keyword.operator.arrow.dream",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.comparison.dream",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.dream",
+          "match": "&&|\\|\\|"
+        },
+        {
+          "name": "keyword.operator.arithmetic.dream",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.assignment.dream",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.rest.dream",
+          "match": "\\.\\."
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "comment": "A thunk: $( .. )",
+          "name": "punctuation.definition.thunk.dream",
+          "match": "\\$\\("
+        },
+        {
+          "comment": "A map: %{ .. }",
+          "name": "punctuation.definition.map.dream",
+          "match": "%\\{"
+        },
+        {
+          "comment": "An array: #[ .. ]",
+          "name": "punctuation.definition.array.dream",
+          "match": "#\\["
+        }
+      ]
+    }
+  }
+}

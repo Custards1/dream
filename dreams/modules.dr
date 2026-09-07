@@ -68,7 +68,11 @@ let loader packages cfg search_paths host_modules =
        // everything it imports has been.
        :modules => [], :by_name => core.map_new (), :by_path => core.map_new (),
        :files => [], :natives => [], :namespaces => [],
-       :diags => [], :visited => core.map_new (), :in_progress => [] };
+       :diags => [], :visited => core.map_new (), :in_progress => [],
+       // Files whose contents come from memory rather than from disk. An
+       // editor holds a buffer that has not been saved -- often has never been
+       // saved -- and every question it asks is about the buffer.
+       :overlay => core.map_new () };
 
 let packages l     = core.map_get l :packages package.empty;
 let config_of l    = core.map_get l :config config.empty;
@@ -83,6 +87,9 @@ let namespaces l   = core.map_get l :namespaces [];
 let diags l        = core.map_get l :diags [];
 let visited l      = core.map_get l :visited (core.map_new ());
 let in_progress l  = core.map_get l :in_progress [];
+/// Path to text, for the files this loader should not read from disk.
+let overlay l      = core.map_get l :overlay (core.map_new ());
+let with_overlay o l = core.map_put l :overlay o;
 
 let put k v l = core.map_put l k v;
 
@@ -383,9 +390,15 @@ let rec load_package! l dotted at from_source =
 let rec load_file! l file name at from_source =
     if is_visited l name { l }
     else {
-        match path.read_file! file {
-            () => complain at ("cannot read " + file) from_source l,
-            text => load_text! l text file name file
+        // The overlay first: a file that is open in an editor is whatever the
+        // editor says it is, and what is on disk is out of date by definition.
+        match core.map_get (overlay l) file () {
+            () =>
+                match path.read_file! file {
+                    () => complain at ("cannot read " + file) from_source l,
+                    text => load_text! l text file name file
+                },
+            text => load_text! l text file name file,
         }
     };
 
@@ -550,6 +563,14 @@ let load_root! l file test_mode = {
 /// The usual way in: discover packages around `file`, then load it.
 let load! file roots cfg test_mode =
     load_root! (loader (package.discover! file roots) cfg roots []) file test_mode;
+
+/// The same, reading `ov` -- a map of path to text -- instead of the disk for
+/// the files it names. This is what a language server loads through: the
+/// program it must answer questions about is the one in the editor's buffers,
+/// which may differ from the one on disk in every file at once.
+let load_overlaid! file roots cfg test_mode ov =
+    load_root! (with_overlay ov (loader (package.discover! file roots) cfg roots []))
+               file test_mode;
 
 let failed l = diag.error_count (diags l) > 0;
 

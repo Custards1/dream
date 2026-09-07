@@ -187,6 +187,24 @@ else
   DREAMS=""
 fi
 
+# --- the language server ----------------------------------------------------
+#
+# Built with `dreams` when there is one, which is worth doing for its own sake:
+# `lucid` imports the compiler as a library, so compiling it is the self-hosted
+# compiler put through a real program rather than a test.
+
+step "Building the language server (lucid)"
+LUCID="$BUILD_DIR/bin/lucid.dream"
+if [[ -n "$DREAMS" ]]; then
+  "$dream" "$DREAMS" -L mind -L . -o "$LUCID" lucid/main.dr >/dev/null 2>&1 || \
+    die "dreams could not compile lucid"
+  ok "$LUCID (compiled by dreams)"
+else
+  $DREAMC lucid/main.dr -L mind -L . -o "$LUCID" >/dev/null 2>&1 || \
+    die "the compiler could not compile lucid"
+  ok "$LUCID"
+fi
+
 # --- smoke test -------------------------------------------------------------
 
 step "Checking the toolchain works"
@@ -216,6 +234,7 @@ if [[ -n "$PREFIX" ]]; then
   cmake --install "$BUILD_DIR" --prefix "$PREFIX" >/dev/null
   install -Dm755 "$DREAMC" "$PREFIX/bin/dreamc"
   [[ -n "$DREAMS" ]] && install -Dm644 "$DREAMS" "$PREFIX/share/dream/dreams.dream"
+  [[ -n "$LUCID" ]] && install -Dm644 "$LUCID" "$PREFIX/share/dream/lucid.dream"
   if [[ -d mind/std ]]; then
     mkdir -p "$PREFIX/share/dream"
     cp -r mind "$PREFIX/share/dream/"
@@ -232,6 +251,7 @@ printf '  compiler  %s\n' "$DREAMC"
 printf '  vm        %s\n' "$dream"
 printf '  library   %s\n' "$BUILD_DIR/lib/libdream.so"
 [[ -n "$DREAMS" ]] && printf '  dreams    %s\n' "$DREAMS"
+[[ -n "$LUCID" ]] && printf '  lucid     %s\n' "$LUCID"
 echo
 printf '  %s./%s program.dr -o program.dream && ./%s program.dream%s\n' \
        "$DIM" "$DREAMC" "$dream" "$RESET"

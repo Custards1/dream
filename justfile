@@ -51,6 +51,12 @@ mind:
 dreams:vm mind
     mkdir -p build
     cd dreams &&DREAMC= {{dream}} build/mind -L mind/std mind/tool/main.dr -o build/mind
+# The language server, built with whichever compiler `dreamc` points at.
+lucid:
+    mkdir -p build
+    {{dreamc}} lucid/main.dr -L mind -L . -o build/lucid.dream
+    @echo "built build/lucid.dream -- run it as: {{dream}} build/lucid.dream"
+
 # Build `dreams` from the checked-in image, with no `dreamc` in sight.
 #
 # The image is a fixpoint: compiling this source with it produces a
@@ -130,7 +136,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-bootstrap test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -206,6 +212,21 @@ test-dreams-lower: build
 # evidence that the self-hosted compiler works rather than merely agrees.
 test-dreams-compile: build
     dreamc={{dreamc}} dream={{dream}} dreams/tests/compile.sh
+
+# The VS Code extension's grammar, tokenized and checked against the scopes it
+# promises. Needs `npm install` in editors/vscode first.
+test-vscode:
+    cd editors/vscode && npm test
+
+# `lucid`'s own tests: positions, framing, and the URI/path boundary.
+test-lucid: build
+    {{dreamc}} lucid/main.dr --test -L mind -L . -o /tmp/lucid-tests.dream
+    ./{{dream}} /tmp/lucid-tests.dream
+
+# And one whole conversation with it, which is the only place the server is
+# checked as a running program rather than as a set of functions.
+test-lucid-session: build
+    dreamc={{dreamc}} dream={{dream}} MIND_STDLIB=mind lucid/tests/session.sh
 
 # The bootstrap: the seed reproduces itself from this source.
 test-bootstrap: bootstrap-check
