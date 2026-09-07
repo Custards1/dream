@@ -1,0 +1,162 @@
+// The surface syntax tree.
+//
+// A node is a list whose head is an atom naming its form, and whose last
+// element is always its span. That shape is chosen for `match`: a pass over
+// the tree is a `match` on the head, and the arms read as the grammar does.
+//
+//     match e {
+//         [:int, v, _]              => ..,
+//         [:apply, callee, args, _] => ..,
+//     }
+//
+// A span is `[start, end]` in **bytes**, which is what slices the source back
+// out for a diagnostic. The lexer produces them; nothing here interprets them.
+//
+// Everything in this module is pure and total: these are constructors and
+// accessors, and none of them can fail.
+
+import std.core;
+import std.list;
+
+// --- spans ------------------------------------------------------------------
+
+let span_of a b = [a, b];
+let span_start s = list.nth 0 s;
+let span_end s = list.nth 1 s;
+
+/// The span covering both, for a node built out of two others.
+let span_to a b = [span_start a, span_end b];
+
+let no_span = [0, 0];
+
+// --- expressions ------------------------------------------------------------
+//
+// The constructors exist so that the shape is written down once. A pass that
+// reads the tree matches on it directly rather than going through accessors.
+
+let int_e v span        = [:int, v, span];
+let float_e v span      = [:float, v, span];
+let char_e c span       = [:char, c, span];
+let bool_e b span       = [:bool, b, span];
+let str_e s span        = [:str, s, span];
+let atom_e name span    = [:atom, name, span];
+let unit_e span         = [:unit, span];
+
+/// A bare name. A trailing `!` is part of `name` and is what marks it impure.
+let name_e name span    = [:name, name, span];
+
+/// `obj.field` -- module member access, and nothing else.
+let field_e obj name span = [:field, obj, name, span];
+
+/// Curried application: `f a b` is one node with two arguments.
+let apply_e callee args span = [:apply, callee, args, span];
+
+/// `lhs |> f a`. Kept as its own node rather than desugared here, because
+/// lowering folds it into a *single* application -- which is what lets a
+/// variadic native take everything at the call site.
+let pipe_e lhs rhs span = [:pipe, lhs, rhs, span];
+
+let unary_e op e span      = [:unary, op, e, span];
+let binary_e op l r span   = [:binary, op, l, r, span];
+
+/// `else` is optional; a missing one is `()`.
+let if_e cond then_e else_e span = [:if, cond, then_e, else_e, span];
+
+/// `{ stmt* }` -- the value is the last statement, or `()` when empty.
+let block_e stmts span  = [:block, stmts, span];
+
+/// `$( e )` -- suspended, and a value in its own right.
+let thunk_e e span      = [:thunk, e, span];
+
+let try_e body binder handler span = [:try, body, binder, handler, span];
+let lambda_e params body span      = [:lambda, params, body, span];
+
+/// `comp e` is evaluated by the compiler; `comp! e` by running it on a VM.
+let comp_e impure e span = [:comp, impure, e, span];
+
+let list_e items span   = [:list, items, span];
+let array_e items span  = [:array, items, span];
+let map_e pairs span    = [:map, pairs, span];
+
+let match_e scrutinee arms span = [:match, scrutinee, arms, span];
+
+// --- reading a node ---------------------------------------------------------
+
+let kind e = core.head e;
+
+/// Every node keeps its span last, however many fields it has.
+let rec span e = {
+    let rec last xs = if core.is_empty (core.tail xs) { core.head xs } else { last (core.tail xs) };
+    last e
+};
+
+// --- operators --------------------------------------------------------------
+//
+// Named by atom rather than by number so that a dump of the tree reads.
+
+let binops = [
+    [:or_or, :or], [:and_and, :and],
+    [:eq_eq, :eq], [:bang_eq, :ne], [:lt, :lt], [:le, :le], [:gt, :gt], [:ge, :ge],
+    [:plus, :add], [:minus, :sub], [:star, :mul], [:slash, :div], [:percent, :mod],
+];
+
+/// Loosest to tightest, matching the table in the language reference. `|>` is
+/// looser than all of these and is handled on its own, and application binds
+/// tighter than any of them.
+let precedence op =
+    match op {
+        :or  => 0,
+        :and => 1,
+        :eq  => 2, :ne => 2, :lt => 2, :le => 2, :gt => 2, :ge => 2,
+        :add => 3, :sub => 3,
+        :mul => 4, :div => 4, :mod => 4,
+        _    => 0 - 1,
+    };
+
+/// The operator a token kind stands for, or `()` when it is not one.
+let rec binop_of token_kind ops =
+    if list.is_empty ops { () }
+    else if list.head (list.head ops) == token_kind { list.nth 1 (list.head ops) }
+    else { binop_of token_kind (list.tail ops) };
+
+let infix_of token_kind = binop_of token_kind binops;
+
+// --- declarations -----------------------------------------------------------
+
+/// A parameter is a name, or `()` -- a slot that binds nothing, which is what
+/// `let now! () = ..` uses.
+let param name span = [name, span];
+let param_name p = list.nth 0 p;
+
+/// `let name params = body`. `rec` is recorded even though a top-level `let`
+/// is always visible to itself, because it documents intent where it is used.
+let let_d name params body is_rec span = [:let, name, params, body, is_rec, span];
+
+let import_d path alias names span = [:import, path, alias, names, span];
+let mod_d name items span          = [:mod, name, items, span];
+let derive_d path span             = [:derive, path, span];
+let virtual_d name params body span = [:virtual, name, params, body, span];
+let when_d cond items span         = [:when, cond, items, span];
+
+// --- patterns ---------------------------------------------------------------
+//
+// A pattern forces exactly as much of the value as deciding takes, which is
+// what keeps `match` usable on a lazy structure. That is lowering's business;
+// here they are only recorded.
+
+let wildcard_p span     = [:wildcard, span];
+let bind_p name span    = [:bind, name, span];
+let literal_p e span    = [:literal, e, span];
+/// `rest` is `()` for a fixed-length pattern, `[name]` for `[a, ..rest]`, and
+/// `[()]` for a `..` that matches the rest without naming it.
+let list_p items rest span  = [:list_p, items, rest, span];
+let array_p items rest span = [:array_p, items, rest, span];
+let map_p pairs span        = [:map_p, pairs, span];
+let as_p inner name span    = [:as_p, inner, name, span];
+
+/// One `pattern => body`, with an optional guard checked after the pattern
+/// matched, so it can use what the pattern bound.
+let arm pattern guard body span = [pattern, guard, body, span];
+let arm_pattern a = list.nth 0 a;
+let arm_guard a   = list.nth 1 a;
+let arm_body a    = list.nth 2 a;

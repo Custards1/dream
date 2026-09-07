@@ -36,6 +36,24 @@ inline void push_cont(Process& p, ContKind k, uint32_t a, uint32_t b, uint32_t c
     p.conts.push_back(Cont{k, 0, 0, a, b, c, v1});
 }
 
+/// Arrange for an operation to be run again when the process is woken.
+///
+/// Normally that means pushing its continuation on top. But when a nested
+/// force inside the operation was *suspended* rather than abandoned (see
+/// `force_whnf`), the work it had already done is still on the continuation
+/// stack and has to finish first -- so the retry is spliced in underneath it.
+/// The operation is then re-run against a value that is already forced, which
+/// is what stops it repeating any effect the suspended work performed.
+inline void push_retry(Process& p, ContKind k, uint32_t a, uint32_t b, uint32_t c, Value v1) {
+    Cont retry{k, 0, 0, a, b, c, v1};
+    if (p.force_blocked) {
+        p.conts.insert(p.conts.begin() + std::ptrdiff_t(p.force_resume_at), retry);
+        p.force_blocked = false;
+    } else {
+        p.conts.push_back(retry);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Numbers
 // ---------------------------------------------------------------------------
@@ -362,7 +380,7 @@ void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint3
         case NativeOutcome::Block:
             // The native parked the process. Leave the arguments in place and
             // arrange to call it again when the scheduler wakes us.
-            push_cont(p, ContKind::NativeRetry, base, argc, 0, callee);
+            push_retry(p, ContKind::NativeRetry, base, argc, 0, callee);
             p.mode = Mode::Return;
             p.result = UNIT;
             break;
@@ -530,7 +548,8 @@ bool concat_lists(Process& p, Value a, Value b, Value* out) {
         Value w;
         if (!force_whnf(p, p.stack[base + 1], &w)) {
             *out = p.result;
-            p.stack.resize(base);
+            // Not when the force was only suspended: its stack is above ours.
+            if (!p.force_blocked) p.stack.resize(base);
             return false;
         }
         if (is_nil(w)) break;
@@ -918,12 +937,22 @@ void step_return(Process& p) {
             Op op = Op(c.a);
             // Held across the call: comparing forces, and `force_whnf` leaves
             // its own value in `p.result` on the way out.
+            Value lhs = c.v1;
             Value rhs = p.result;
+            // `b == 1` marks a retry that was spliced in below a suspended
+            // force (see below). That work finishes first and overwrites
+            // `p.result` on its way out, so both operands travelled here in a
+            // cell of their own instead.
+            if (c.b == 1) {
+                auto* pair = static_cast<ConsObj*>(as_obj(c.v1));
+                lhs = pair->head;
+                rhs = pair->tail;
+            }
             Value out;
             bool ok = (op == Op::Eq || op == Op::Ne || op == Op::Lt || op == Op::Le ||
                        op == Op::Gt || op == Op::Ge)
-                          ? compare(p, op, c.v1, rhs, &out)
-                          : arith(p, op, c.v1, rhs, &out);
+                          ? compare(p, op, lhs, rhs, &out)
+                          : arith(p, op, lhs, rhs, &out);
 
             // A nested force inside the operator hit a blocking operation and
             // gave up (see `force_whnf`) -- comparing two lists whose elements
@@ -942,9 +971,12 @@ void step_return(Process& p) {
             // error, and the process dies with an error that has no kind and
             // no message.
             if (p.park_requested) {
-                push_cont(p, ContKind::BinFinish, c.a, 0, 0, c.v1);
-                p.result = rhs;  // the mode is already Return
-                return;
+                // Both operands travel in a cell: this retry may be spliced in
+                // below a suspended force, and that work overwrites `p.result`
+                // before the retry is reached.
+                Value pair = p.heap().make_cons(lhs, rhs);
+                push_retry(p, ContKind::BinFinish, c.a, 1, 0, pair);
+                return;  // the mode is already Return
             }
             if (ok) ret(p, out); else do_raise(p, out);
             return;
@@ -1298,22 +1330,27 @@ bool force_whnf(Process& p, Value v, Value* out) {
     }
 
     if (blocked) {
-        // Everything this force pushed has to come back off, and the thunks it
-        // blackholed have to be un-blackholed. Blackholing only rewrites the
-        // object's type tag -- the node and frame are untouched -- so putting
-        // the tag back leaves a thunk that can be forced again from scratch.
+        // The force is *suspended*, not abandoned. Everything it pushed -- its
+        // continuations, its half-forced blackholed thunks, its stack -- stays
+        // exactly as it is, and the process resumes into it when the scheduler
+        // wakes it. `force_resume_at` records where the outer operation's
+        // retry belongs: underneath all of it.
         //
-        // Without this the retry walks straight into its own blackhole and
-        // reports `:loop value depends on itself`, which is the same bug
-        // wearing a different hat.
-        for (size_t i = p.conts.size(); i-- > floor;) {
-            const Cont& c = p.conts[i];
-            if (c.kind != ContKind::UpdateThunk) continue;
-            Obj* o = as_obj(c.v1);
-            if (o->type == ObjType::Blackhole) o->type = ObjType::Thunk;
-        }
-        p.conts.resize(floor);
-        p.stack.resize(stack_floor);
+        // This used to unwind instead: un-blackhole the thunks, drop the
+        // continuations, and let the outer native re-force from scratch. That
+        // is only sound while forcing is pure, and it is not. A computation
+        // that parks may already have performed effects, and re-forcing
+        // performs them again -- `strict! { print! "x"; join! p }` printed
+        // twice. Worse, `exec!` records its pending child in a single slot on
+        // the process, so a re-force made the *first* call take the result the
+        // *second* had started and begin another; that one never terminated.
+        //
+        // The machine state is left as the park set it (Return, on the
+        // blocking native's own retry), so nothing below restores it.
+        p.force_blocked = true;
+        p.force_resume_at = floor;
+        *out = p.result;
+        return false;
     }
 
     *out = p.result;
@@ -1341,10 +1378,10 @@ bool force_deep(Process& p, Value v, Value* out) {
             p.stack.push_back(head);
             Value tmp;
             auto* c = static_cast<ConsObj*>(as_obj(p.stack.back()));
-            if (!force_deep(p, c->head, &tmp)) { p.stack.pop_back(); *out = p.result; return false; }
+            if (!force_deep(p, c->head, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
             static_cast<ConsObj*>(as_obj(p.stack.back()))->head = tmp;
             c = static_cast<ConsObj*>(as_obj(p.stack.back()));
-            if (!force_deep(p, c->tail, &tmp)) { p.stack.pop_back(); *out = p.result; return false; }
+            if (!force_deep(p, c->tail, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
             static_cast<ConsObj*>(as_obj(p.stack.back()))->tail = tmp;
             *out = p.stack.back();
             p.stack.pop_back();
@@ -1356,7 +1393,7 @@ bool force_deep(Process& p, Value v, Value* out) {
             for (uint32_t i = 0; i < len; ++i) {
                 Value item = static_cast<ArrayObj*>(as_obj(p.stack.back()))->items()[i];
                 Value tmp;
-                if (!force_deep(p, item, &tmp)) { p.stack.pop_back(); *out = p.result; return false; }
+                if (!force_deep(p, item, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
                 static_cast<ArrayObj*>(as_obj(p.stack.back()))->items()[i] = tmp;
             }
             *out = p.stack.back();
@@ -1370,7 +1407,7 @@ bool force_deep(Process& p, Value v, Value* out) {
                 if (static_cast<MapObj*>(as_obj(p.stack.back()))->entries()[i * 2] == NIL_SLOT) continue;
                 Value item = static_cast<MapObj*>(as_obj(p.stack.back()))->entries()[i * 2 + 1];
                 Value tmp;
-                if (!force_deep(p, item, &tmp)) { p.stack.pop_back(); *out = p.result; return false; }
+                if (!force_deep(p, item, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
                 static_cast<MapObj*>(as_obj(p.stack.back()))->entries()[i * 2 + 1] = tmp;
             }
             *out = p.stack.back();

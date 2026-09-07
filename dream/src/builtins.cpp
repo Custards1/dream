@@ -1314,7 +1314,9 @@ NativeResult core_array_of_list(Process& p, Value, Value* args, uint32_t) {
     for (;;) {
         Value w;
         if (!force_whnf(p, cur, &w)) {
-            p.stack.resize(base);
+            // A suspended force keeps its working stack above ours; cutting it
+            // back would destroy the work that is waiting to be resumed.
+            if (!p.force_blocked) p.stack.resize(base);
             return NativeResult::raise(p.result);
         }
         if (is_nil(w)) break;

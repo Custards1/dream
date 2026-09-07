@@ -155,7 +155,7 @@ trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/hello.dr" <<'DREAM'
 import std.console;
 let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
-let main! = { fac 10 |> console.print! "fac 10 = " }
+let main! = { console.print! ("fac 10 = " + to_string (fac 10)) }
 DREAM
 "$DREAMC" "$TMP/hello.dr" -o "$TMP/hello.dream" >/dev/null 2>&1 || die "the compiler could not compile a trivial program"
 result="$("$dream" "$TMP/hello.dream" 2>&1)" || die "the VM could not run a trivial program: $result"

@@ -167,6 +167,15 @@ bool Image::load_file(const std::string& path, std::string& error) {
         error = "cannot map " + path;
         return false;
     }
+    #//check for shebang line, which is common in scripts. If the first character is '#', we treat it as a script and skip the shebang line.
+    if(* (char *) p == '#') {
+        char *newline = static_cast<char *>(std::memchr(p, '\n', st.st_size));
+        if (newline) {
+            size_t offset = newline - static_cast<char *>(p) + 1;
+            p = static_cast<uint8_t *>(p) + offset;
+            st.st_size -= offset;
+        }
+    }
     data_ = static_cast<const uint8_t*>(p);
     size_ = static_cast<size_t>(st.st_size);
     owns_mapping_ = true;

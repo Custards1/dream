@@ -1,0 +1,3 @@
+import std.console;
+let rec fac n = {if n <= 1 { 1 } else { n * fac (n - 1) }};
+let main! = {  console.write! "fac 10 = " (fac 5) }
