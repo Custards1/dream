@@ -111,7 +111,7 @@ install: release mind
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -179,6 +179,14 @@ test-dreams-scope: build
 # out-of-memory.
 test-dreams-lower: build
     dreamc={{dreamc}} dream={{dream}} dreams/tests/lower.sh
+
+# The end of the pipeline: programs `dreams` compiled, run by the VM, checked
+# against the output recorded beside them. Every other `dreams` test asks
+# whether a stage agrees with something -- the reference compiler, or a recorded
+# shape. This one asks the only question that finally matters, and it is the
+# evidence that the self-hosted compiler works rather than merely agrees.
+test-dreams-compile: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/compile.sh
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
