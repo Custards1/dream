@@ -1,0 +1,96 @@
+{
+  "name": "dream-lang",
+  "displayName": "Dream",
+  "description": "Dream language support: syntax, diagnostics, go to definition, hover and outline, from the Dream compiler itself.",
+  "version": "0.1.0",
+  "publisher": "dream",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:dream"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "dream",
+        "aliases": [
+          "Dream",
+          "dream"
+        ],
+        "extensions": [
+          ".dr"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "dream",
+        "scopeName": "source.dream",
+        "path": "./syntaxes/dream.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Dream",
+      "properties": {
+        "dream.vm.path": {
+          "type": "string",
+          "default": "dream",
+          "markdownDescription": "The Dream virtual machine. `lucid` is a compiled image rather than a native program, so it is run by the VM."
+        },
+        "dream.server.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The `lucid.dream` image to run as the language server. Left empty, the extension looks for `build/lucid.dream` and `build-dream/bin/lucid.dream` in the workspace, then `$LUCID_IMAGE`."
+        },
+        "dream.packagePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra directories to search for packages, passed to the server as `-L`. The workspace folder is always included."
+        },
+        "dream.stdlib.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The directory holding the `std` package. Left empty, `$MIND_STDLIB` is used if it is set."
+        },
+        "dream.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log the conversation with the language server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "dream.restartServer",
+        "title": "Restart Language Server",
+        "category": "Dream"
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  },
+  "scripts": {
+    "test": "node test/grammar.js"
+  }
+}

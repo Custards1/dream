@@ -1,0 +1,145 @@
+// Positions, which the two sides of this program count differently.
+//
+// The compiler works in **byte offsets**: a span is where a construct starts
+// and ends in the file's UTF-8 bytes, because that is what a lexer produces and
+// what makes a slice constant time.
+//
+// LSP works in **UTF-16 code units**, zero-based, split into a line and a
+// character. Not bytes, and not characters either: the unit is what the string
+// would cost in UTF-16, which is one for most of Unicode and two above U+FFFF.
+// An editor holding a document as UTF-16 can index into it directly with that,
+// which is why the protocol chose it.
+//
+// So every position crossing this boundary is converted, and it is done here so
+// that nothing else has to remember which of the three counts it is holding.
+// Getting it wrong is invisible in English and wrong in every other language --
+// the sort of bug that is reported as "go to definition is off by a bit".
+import std.core;
+import std.list;
+import std.str;
+
+/// How many bytes the character starting with this byte occupies, and how many
+/// UTF-16 units it becomes. Read from the UTF-8 lead byte alone, which is the
+/// point of UTF-8: `[bytes, units]`.
+///
+/// A continuation byte cannot start a character; treating it as one byte keeps
+/// this total on malformed input rather than looping.
+let step b =
+    if b < 128 { [1, 1] }
+    else if b < 192 { [1, 1] }
+    else if b < 224 { [2, 1] }
+    else if b < 240 { [3, 1] }
+    // Above U+FFFF: a surrogate pair, and two units.
+    else { [4, 2] };
+
+let is_newline text i = core.str_byte text i == 10;
+
+/// The byte offset where the given zero-based line begins.
+let rec line_start text line = {
+    let n = str.byte_length text;
+    let rec walk i seen =
+        if seen >= line { i }
+        else if i >= n { i }
+        else if is_newline text i { walk (i + 1) (seen + 1) }
+        else { walk (i + 1) seen };
+    walk 0 0
+};
+
+/// The byte offset of an LSP position, clamped to the end of its line and of
+/// the document. An editor may send a character past the end of a line -- a
+/// cursor at the end of a wrapped line, a stale position from a race -- and the
+/// answer to that is the end of the line, not a crash.
+let offset_of text line character = {
+    let n = str.byte_length text;
+    let start = line_start text line;
+    let rec walk i units =
+        if units >= character { i }
+        else if i >= n { i }
+        else if is_newline text i { i }
+        else {
+            match step (core.str_byte text i) {
+                [bytes, us] => walk (i + bytes) (units + us),
+            }
+        };
+    walk start 0
+};
+
+/// The LSP position of a byte offset: `[line, character]`, both zero-based.
+let position_of text offset = {
+    let n = str.byte_length text;
+    let stop = if offset > n { n } else { offset };
+    let rec walk i line units =
+        if i >= stop { [line, units] }
+        else if is_newline text i { walk (i + 1) (line + 1) 0 }
+        else {
+            match step (core.str_byte text i) {
+                [bytes, us] =>
+                    // A position inside a character belongs to that character,
+                    // not to the one after it.
+                    if i + bytes > stop { [line, units] }
+                    else { walk (i + bytes) line (units + us) },
+            }
+        };
+    walk 0 0 0
+};
+
+/// An LSP `Range`, as the JSON object it is sent as.
+let range text from until = {
+    let a = position_of text from;
+    let b = position_of text until;
+    %{ "start" => %{ "line" => list.head a, "character" => list.nth 1 a },
+       "end"   => %{ "line" => list.head b, "character" => list.nth 1 b } }
+};
+
+/// A range covering nothing, at the start of the document. For a diagnostic
+/// that has no span to point at, which is better than pointing somewhere wrong.
+let nowhere = %{ "start" => %{ "line" => 0, "character" => 0 },
+                 "end"   => %{ "line" => 0, "character" => 0 } };
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    // "héllo" -- é is two bytes, one UTF-16 unit.
+    let accented = "héllo";
+    // A character above U+FFFF: four bytes, two UTF-16 units.
+    let emoji = "a\u{1F600}b";
+
+    let tests = [
+        test.case "the first line starts at nothing"
+            $( test.eq! 0 (line_start "a\nb" 0) ),
+        test.case "a later line starts after its newline"
+            $( test.eq! 2 (line_start "a\nb" 1) ),
+        test.case "a line past the end clamps to the end"
+            $( test.eq! 3 (line_start "a\nb" 9) ),
+
+        test.case "an offset on the first line is the character count"
+            $( test.eq! 2 (offset_of "abc\ndef" 0 2) ),
+        test.case "an offset on a later line counts from that line"
+            $( test.eq! 5 (offset_of "abc\ndef" 1 1) ),
+        test.case "a character past the end of a line stops at the newline"
+            $( test.eq! 3 (offset_of "abc\ndef" 0 99) ),
+
+        // The part that is wrong in every implementation that assumes bytes.
+        test.case "a two-byte character is one unit"
+            $( test.eq! 3 (offset_of accented 0 2) ),
+        test.case "a character above U+FFFF is two units"
+            $( test.eq! 5 (offset_of emoji 0 3) ),
+
+        test.case "a byte offset becomes a line and a character"
+            $( test.eq! [1, 1] (position_of "abc\ndef" 5) ),
+        test.case "the position of a two-byte character counts one"
+            $( test.eq! [0, 2] (position_of accented 3) ),
+        test.case "the position after a character above U+FFFF counts two"
+            $( test.eq! [0, 3] (position_of emoji 5) ),
+        test.case "an offset past the end clamps"
+            $( test.eq! [1, 3] (position_of "abc\ndef" 999) ),
+
+        // The two directions must agree, or a jump lands somewhere else.
+        test.case "position and offset are inverses"
+            $( test.true! (list.all (fn o -> match position_of accented o {
+                                                 [l, c] => offset_of accented l c == o })
+                                    [0, 1, 3, 4, 5, 6]) ),
+    ];
+}

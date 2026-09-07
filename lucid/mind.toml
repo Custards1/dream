@@ -1,0 +1,9 @@
+[package]
+name = "lucid"
+version = "0.1.0"
+src = "."
+
+[build]
+package-paths = ["..", "../mind"]
+
+[dependencies]

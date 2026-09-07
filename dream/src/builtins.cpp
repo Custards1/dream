@@ -316,25 +316,36 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
 bool stringify_list(Process& p, Value v, std::string* out, int depth) {
     out->push_back('[');
     bool first = true;
-    Value cur = v;
+    // Rendering an element forces it, which can collect, so the rest of the
+    // list is carried on the value stack where the collector will update it.
+    const size_t base = p.stack.size();
+    p.stack.push_back(v);
     for (;;) {
         Value w;
-        if (!force_whnf(p, cur, &w)) return false;
+        if (!force_whnf(p, p.stack[base], &w)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return false;
+        }
         if (is_nil(w)) break;
         if (!is_obj(w, ObjType::Cons)) {
             // An improper tail: show it rather than pretend the list ended.
             out->append(" | ");
-            if (!stringify_into(p, w, out, true, depth + 1)) return false;
+            if (!stringify_into(p, w, out, true, depth + 1)) {
+                if (!p.force_blocked) p.stack.resize(base);
+                return false;
+            }
             break;
         }
         if (!first) out->append(", ");
         first = false;
-        auto* c = static_cast<ConsObj*>(as_obj(w));
-        Value head = c->head;
-        Value tail = c->tail;
-        if (!stringify_into(p, head, out, true, depth + 1)) return false;
-        cur = tail;
+        p.stack[base] = w;
+        if (!stringify_into(p, static_cast<ConsObj*>(as_obj(w))->head, out, true, depth + 1)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return false;
+        }
+        p.stack[base] = static_cast<ConsObj*>(as_obj(p.stack[base]))->tail;
     }
+    p.stack.resize(base);
     out->push_back(']');
     return true;
 }
@@ -1437,19 +1448,35 @@ NativeResult core_str_chars(Process& p, Value, Value* args, uint32_t) {
 
 NativeResult core_str_of_chars(Process& p, Value, Value* args, uint32_t) {
     std::string out;
-    Value cur = args[0];
+    // The same care as `str_of_bytes`: the rest of the list lives on the value
+    // stack, because forcing a character can collect and move the cell.
+    const size_t base = p.stack.size();
+    p.stack.push_back(args[0]);
     for (;;) {
         Value w;
-        if (!force_whnf(p, cur, &w)) return NativeResult::raise(p.result);
+        if (!force_whnf(p, p.stack[base], &w)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
         if (is_nil(w)) break;
-        if (!is_obj(w, ObjType::Cons)) return type_fail(p, "str_of_chars needs a list of chars");
-        auto* c = static_cast<ConsObj*>(as_obj(w));
+        if (!is_obj(w, ObjType::Cons)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_of_chars needs a list of chars");
+        }
+        p.stack[base] = w;
         Value head;
-        if (!force_whnf(p, c->head, &head)) return NativeResult::raise(p.result);
-        if (!is_char(head)) return type_fail(p, "str_of_chars needs a list of chars");
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(w))->head, &head)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (!is_char(head)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_of_chars needs a list of chars");
+        }
         utf8_encode(uint32_t(imm_payload(head)), &out);
-        cur = c->tail;
+        p.stack[base] = static_cast<ConsObj*>(as_obj(p.stack[base]))->tail;
     }
+    p.stack.resize(base);
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
 }
 
@@ -1464,25 +1491,50 @@ NativeResult core_str_of_chars(Process& p, Value, Value* args, uint32_t) {
 /// can produce binary output rather than only consume it.
 NativeResult core_str_of_bytes(Process& p, Value, Value* args, uint32_t) {
     std::string out;
-    Value cur = args[0];
+    // Forcing a byte runs Dream code, which can collect, and a collection moves
+    // every object it keeps. So the walk carries its position on the value
+    // stack -- which the collector updates -- rather than in a C++ local, and
+    // re-reads the cell after each force. Getting this wrong needs a list long
+    // enough to collect part way along, which is why it stayed hidden until a
+    // program compiled itself.
+    const size_t base = p.stack.size();
+    p.stack.push_back(args[0]);
     for (;;) {
         Value w;
-        if (!force_whnf(p, cur, &w)) return NativeResult::raise(p.result);
+        if (!force_whnf(p, p.stack[base], &w)) {
+            // A suspended force keeps its working stack above ours; cutting it
+            // back would destroy the work that is waiting to be resumed.
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
         if (is_nil(w)) break;
-        if (!is_obj(w, ObjType::Cons)) return type_fail(p, "str_of_bytes needs a list of integers");
-        auto* c = static_cast<ConsObj*>(as_obj(w));
+        if (!is_obj(w, ObjType::Cons)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_of_bytes needs a list of integers");
+        }
+        // The cell itself becomes the position, so the tail stays reachable
+        // while the head is forced.
+        p.stack[base] = w;
         Value head;
-        if (!force_whnf(p, c->head, &head)) return NativeResult::raise(p.result);
-        if (!is_fixnum(head)) return type_fail(p, "str_of_bytes needs a list of integers");
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(w))->head, &head)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (!is_fixnum(head)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_of_bytes needs a list of integers");
+        }
         int64_t b = fixnum_value(head);
         if (b < 0 || b > 255) {
+            p.stack.resize(base);
             return NativeResult::raise(raise_error(
                 p, well_known(p.runtime()).type_error,
                 "str_of_bytes needs bytes in 0..255, got " + std::to_string(b)));
         }
         out.push_back(char(uint8_t(b)));
-        cur = c->tail;
+        p.stack[base] = static_cast<ConsObj*>(as_obj(p.stack[base]))->tail;
     }
+    p.stack.resize(base);
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
 }
 

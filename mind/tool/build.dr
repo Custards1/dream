@@ -2,8 +2,9 @@
 //
 // `mind` does not compile anything itself. Dream compiles whole programs, so
 // the compiler wants every package at once rather than a series of object
-// files -- which means a build is: find the packages, hand `dreamc` their
+// files -- which means a build is: find the packages, hand `dreams` their
 // directories, run it. There is nothing to cache and no link step.
+import std.console;
 import std.core;
 import std.io;
 import std.list;
@@ -102,31 +103,126 @@ let search_paths! m = {
 let target_dir m = util.join (manifest.root m) "target";
 let image m = util.join (target_dir m) (manifest.name m + ".dream");
 
-/// Compile the package. `extra` carries flags like `--test`.
-let compile! m extra = {
+// --- what one build is --------------------------------------------------------
+//
+// A build is the manifest plus whatever this invocation added. Keeping that in
+// one value rather than in a widening list of parameters is what lets a new
+// option reach the compiler without every caller between here and the command
+// line learning its name.
+
+let options = %{ :compiler => (), :defines => [], :includes => [], :hosts => [],
+                 :paths => [], :flags => [], :output => (), :extra => [],
+                 :verbose => false };
+
+let with_option k v o = core.map_put o k v;
+let option o k default = core.map_get o k default;
+
+/// Where this build writes its image.
+let output_of m o =
+    match option o :output () {
+        () => match manifest.output m {
+            () => image m,
+            p  => util.join (manifest.root m) p,
+        },
+        p => p,
+    };
+
+let vm_command! () = match os.env! "DREAM" { () => "dream", v => v };
+
+/// Which compiler to run, in the order a person would expect to be obeyed:
+/// what this build asked for, then what the package asks for, then the
+/// environment, then whatever is called `dreamc` on the path.
+///
+/// `DREAMS` comes before `DREAMC` because it names the compiler that is
+/// replacing the other; a machine with both set is mid-migration and means the
+/// newer one.
+let choose_compiler! m explicit =
+    match explicit {
+        () => match manifest.compiler m {
+            () => match os.env! "DREAMS" {
+                () => match os.env! "DREAMC" { () => "dreamc", c => c },
+                d  => d,
+            },
+            c => c,
+        },
+        c => c,
+    };
+
+/// How to run it: `[program, arguments that come first]`.
+///
+/// `dreams` is the compiler written in Dream, so it is an image and not a
+/// native program: running it means handing it to the VM, which is also what
+/// runs `mind`. That is the whole difference between the two compilers from
+/// here, and it is a prefix rather than a mode -- anything named `.dream` is
+/// run this way, and everything else is executed directly.
+let compiler_command! chosen =
+    if str.ends_with ".dream" chosen { [vm_command! (), [chosen]] }
+    else { [chosen, []] };
+
+/// `[flag, a, flag, b, ..]` -- how a repeated option is written out.
+let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
+
+/// The whole command line for one build.
+///
+/// The package's settings come before this invocation's, because the compiler
+/// takes the last of a repeated option: putting the command line last is what
+/// makes it win.
+let compile_args! m o =
     match search_paths! m {
         [:error, why] => [:error, why],
-        [:ok, paths] => {
-            util.mkdir_p! (target_dir m)
-            let args = list.append [manifest.entry m]
-                                   (list.append paths
-                                                (list.append ["-o", image m] extra));
-            let compiler = match os.env! "DREAMC" { () => "dreamc", c => c };
-            let r = os.exec! compiler args;
-            let code = core.map_get r :code (0 - 1);
-            if code == 0 { [:ok, core.map_get r :out ""] }
-            else {
-                let err = core.map_get r :err "";
-                let out = core.map_get r :out "";
-                [:error, str.trim (err + out)]
+        [:ok, paths] => [:ok, list.concat [
+            [manifest.entry m],
+            paths,
+            repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
+            repeated "-I" (list.append (manifest.includes m) (option o :includes [])),
+            repeated "--host-module"
+                     (list.append (manifest.host_modules m) (option o :hosts [])),
+            repeated "-D" (list.append (manifest.defines m) (option o :defines [])),
+            ["-o", output_of m o],
+            manifest.compiler_flags m,
+            option o :extra [],
+            option o :flags [],
+        ]],
+    };
+
+/// The command as it would be typed, for `--verbose` and for a bug report.
+let command_line! m o =
+    match compile_args! m o {
+        [:error, why] => [:error, why],
+        [:ok, args] =>
+            match compiler_command! (choose_compiler! m (option o :compiler ())) {
+                [program, lead] => [:ok, str.join_str " " (list.cons program (list.append lead args))],
+            },
+    };
+
+/// Compile the package. `:extra` carries the flags a command adds itself, such
+/// as `--test`.
+let compile! m o = {
+    match compile_args! m o {
+        [:error, why] => [:error, why],
+        [:ok, args] => {
+            util.mkdir_p! (util.dirname (output_of m o))
+            match compiler_command! (choose_compiler! m (option o :compiler ())) {
+                [program, lead] => {
+                    if option o :verbose false {
+                        console.error! (str.join_str " " (list.cons program (list.append lead args)))
+                    }
+                    let r = os.exec! program (list.append lead args);
+                    let code = core.map_get r :code (0 - 1);
+                    if code == 0 { [:ok, core.map_get r :out ""] }
+                    else {
+                        let err = core.map_get r :err "";
+                        let out = core.map_get r :out "";
+                        [:error, str.trim (err + out)]
+                    }
+                },
             }
         },
     }
 };
 
 /// Run a built image, passing `args` to the program.
-let run_image! m args = {
-    let vm = match os.env! "DREAM" { () => "dream", v => v };
-    let r = os.exec! vm (list.cons (image m) args);
+let run_image! m o args = {
+    let r = os.exec! (vm_command! ()) (list.cons (output_of m o) args);
     [core.map_get r :code (0 - 1), core.map_get r :out "", core.map_get r :err ""]
 };

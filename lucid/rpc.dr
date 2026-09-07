@@ -1,0 +1,174 @@
+// JSON-RPC over stdio, framed the way LSP frames it.
+//
+// A message is a header block, a blank line, and exactly `Content-Length` bytes
+// of JSON:
+//
+//     Content-Length: 76\r\n
+//     \r\n
+//     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+//
+// The length is in **bytes**, not characters, which is the only part of this
+// worth being careful about: a header says how much to read, and reading a
+// character too few leaves the next message starting mid-JSON and every message
+// after it wrong. So the body is read by byte count until it is full, and a
+// short read is a short read rather than the end of anything -- a pipe is
+// entitled to hand over one byte at a time.
+import std.core;
+import std.io;
+import std.json;
+import std.list;
+import std.str;
+
+/// Read one byte at a time until the header block ends.
+///
+/// Headers are ASCII and short, so this is not worth buffering; and it must not
+/// over-read, because whatever follows the blank line is the body and belongs
+/// to the caller.
+let rec read_headers! h acc =
+    match io.read! h 1 {
+        "" => if str.is_empty acc { () } else { acc },
+        c => {
+            let grown = acc + c;
+            if str.ends_with "\r\n\r\n" grown { grown }
+            else if str.ends_with "\n\n" grown { grown }
+            else { read_headers! h grown }
+        },
+    };
+
+/// `Content-Length: N` from the header block, or `()`.
+let content_length headers = {
+    let lower = str.lower headers;
+    let at = str.find "content-length:" lower;
+    if at < 0 { () }
+    else {
+        let rest = str.slice (at + 15) (str.byte_length headers - at - 15) headers;
+        let line = match str.split "\n" rest { [] => "", [l, .._] => l };
+        let digits = str.trim line;
+        if str.is_empty digits { () } else { digits }
+    }
+};
+
+/// Decimal, because `to_int` is not something the language offers and a header
+/// is the one place a number arrives as text.
+let to_int text = {
+    let cs = str.chars (str.trim text);
+    let rec walk cs acc any =
+        match cs {
+            [] => if any { acc } else { () },
+            [c, ..rest] =>
+                if c >= '0' && c <= '9' {
+                    walk rest (acc * 10 + (core.char_code c - 48)) true
+                } else if any { acc } else { () },
+        };
+    walk cs 0 false
+};
+
+/// Read exactly `n` bytes. A pipe may hand over fewer than asked for, and
+/// stopping at the first short read is how a message gets truncated.
+let rec read_exactly! h n acc =
+    if n <= 0 { acc }
+    else {
+        match io.read! h n {
+            "" => acc,
+            chunk => read_exactly! h (n - str.byte_length chunk) (acc + chunk)
+        }
+    };
+
+/// The next message, as a parsed JSON value, or `()` at end of input.
+///
+/// A message that is not valid JSON is skipped rather than fatal: the stream is
+/// still framed correctly, so the next one can still be read, and a server that
+/// exits because an editor sent something odd is worse than one that ignores it.
+let rec read_message! h =
+    match read_headers! h "" {
+        () => (),
+        headers =>
+            match content_length headers {
+                () => read_message! h,
+                text =>
+                    match to_int text {
+                        () => read_message! h,
+                        n => {
+                            let body = read_exactly! h n "";
+                            match json.parse body {
+                                [:ok, v] => v,
+                                _ => read_message! h,
+                            }
+                        },
+                    },
+            },
+    };
+
+/// Write one message, header and all.
+let write_message! h v = {
+    let body = json.write v;
+    let framed = "Content-Length: " + to_string (str.byte_length body) + "\r\n\r\n" + body;
+    let rec put! offset = {
+        let left = str.byte_length framed - offset;
+        if left <= 0 { :done }
+        else {
+            let wrote = io.write! h (str.slice offset left framed);
+            if wrote <= 0 { :done } else { put! (offset + wrote) }
+        }
+    };
+    put! 0
+    io.flush! h
+};
+
+// --- the shapes a JSON-RPC message comes in ----------------------------------
+
+let field v name default = core.map_get v name default;
+
+let method m = field m "method" ();
+let id m = field m "id" ();
+let params m = field m "params" (core.map_new ());
+
+/// A request expects an answer and carries an id; a notification does not.
+let is_request m = id m != () && method m != ();
+
+let response id result =
+    %{ "jsonrpc" => "2.0", "id" => id, "result" => result };
+
+let error_response id code message =
+    %{ "jsonrpc" => "2.0", "id" => id,
+       "error" => %{ "code" => code, "message" => message } };
+
+let notification method params =
+    %{ "jsonrpc" => "2.0", "method" => method, "params" => params };
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a content length is read from the header"
+            $( test.eq! "76" (content_length "Content-Length: 76\r\n\r\n") ),
+        test.case "the header name is matched whatever its case"
+            $( test.eq! "5" (content_length "content-length: 5\r\n\r\n") ),
+        test.case "another header alongside it does not confuse it"
+            $( test.eq! "12" (content_length
+                   "Content-Type: application/json\r\nContent-Length: 12\r\n\r\n") ),
+        test.case "a header block with no length says so"
+            $( test.eq! () (content_length "Content-Type: x\r\n\r\n") ),
+
+        test.case "a decimal number is read"
+            $( test.eq! 1204 (to_int "1204") ),
+        test.case "surrounding space is ignored"
+            $( test.eq! 7 (to_int "  7  ") ),
+        test.case "text that is not a number says so"
+            $( test.eq! () (to_int "abc") ),
+
+        test.case "a request has an id and a method"
+            $( test.true! (is_request %{ "id" => 1, "method" => "initialize" }) ),
+        test.case "a notification has no id"
+            $( test.false! (is_request %{ "method" => "textDocument/didOpen" }) ),
+
+        test.case "a response carries the id it answers"
+            $( test.eq! 3 (field (response 3 (core.map_new ())) "id" ()) ),
+        test.case "an error response carries a code"
+            $( test.eq! (0 - 32601)
+                        (field (field (error_response 1 (0 - 32601) "no") "error" (core.map_new ()))
+                               "code" ()) ),
+    ];
+}

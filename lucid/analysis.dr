@@ -1,0 +1,323 @@
+// The questions an editor asks, answered out of the compiler's own tables.
+//
+// Nothing here re-implements anything. `dreams` already resolves every name to
+// what it means and records where each one was written, because that is what
+// lowering reads; a language server wants the same table, asked a different
+// way. So this module is a translation layer and not an analysis: from a
+// position in a buffer to a byte offset, from a byte offset to a resolution,
+// from a resolution back to a range.
+//
+// The one thing it adds is the overlay. A build compiles what is on disk; an
+// editor asks about what is in its buffers, which is a different program, and
+// often one that has never been saved.
+import std.core;
+import std.list;
+import std.str;
+
+import dreams.ast;
+import dreams.config;
+import dreams.diag;
+import dreams.modules;
+import dreams.scope;
+
+import pos;
+
+// --- documents ----------------------------------------------------------------
+//
+// A URI is what the protocol speaks and a path is what the compiler speaks.
+// `file:///a/b.dr` is the only scheme that can be compiled, so it is the only
+// one converted; anything else is left alone and will simply not be found.
+
+let uri_to_path uri =
+    if str.starts_with "file://" uri {
+        let rest = str.slice 7 (str.byte_length uri - 7) uri;
+        // `file://host/path` is not something to guess at, but `file:///path`
+        // is the ordinary form and its third slash is the root.
+        if str.starts_with "/" rest { rest } else { "/" + rest }
+    } else { uri };
+
+let path_to_uri path = if str.starts_with "/" path { "file://" + path } else { "file://" + path };
+
+// --- one analysis --------------------------------------------------------------
+
+/// Everything one question needs: the loaded program, what its names resolved
+/// to, and which module the file in question turned out to be.
+let analysis l r mi = %{ :loader => l, :resolved => r, :module => mi };
+
+let loader a   = core.map_get a :loader ();
+let resolved a = core.map_get a :resolved ();
+let module_of a = core.map_get a :module ();
+
+/// The index of the module loaded from this path, or `()`.
+///
+/// Compared as written rather than resolved: the overlay is keyed by the path
+/// the editor gave, and the loader records the path it was asked for.
+let module_index l path = {
+    let hits = list.filter (fn i -> modules.module_path (modules.module_at l i) == path)
+                           (list.range 0 (list.length (modules.modules l)));
+    if list.is_empty hits { () } else { list.head hits }
+};
+
+/// Compile `path` as the root of a program, reading `open_docs` -- a map of
+/// path to text -- instead of the disk wherever it has an entry.
+let analyse! path roots open_docs = {
+    let l = modules.load_overlaid! path roots (config.defaults! ()) false open_docs;
+    analysis l (scope.resolve! (l)) (module_index l path)
+};
+
+/// The text of a module as the compiler saw it, which is the buffer when there
+/// is one. Every offset below is into this, so it has to be the same string.
+let module_text a mi = {
+    let l = loader a;
+    diag.source_text (list.nth (modules.module_source (modules.module_at l mi)) (modules.files l))
+};
+
+// --- diagnostics ----------------------------------------------------------------
+
+/// LSP severities. Only two of the four are produced here.
+let severity_error = 1;
+let severity_warning = 2;
+
+/// One diagnostic, as LSP wants it.
+///
+/// A diagnostic belongs to the file it was raised in, which is not always the
+/// file being edited: a broken import is reported where the import is written,
+/// but a broken *module* is reported inside that module. So each one carries
+/// the source it came from and is published against that file.
+let lsp_diagnostic a d = {
+    let l = loader a;
+    let si = diag.source_of d;
+    let files = modules.files l;
+    let src = if si < list.length files { diag.source_text (list.nth si files) } else { "" };
+    let sp = diag.span d;
+    %{ "range" => pos.range src (ast.span_start sp) (ast.span_end sp),
+       "severity" => if diag.is_error d { severity_error } else { severity_warning },
+       "source" => "dreams",
+       "message" => match diag.note d {
+                        () => diag.message d,
+                        n  => diag.message d + "\n" + to_string n,
+                    } }
+};
+
+/// Which file a diagnostic is about, as a path.
+let diagnostic_path a d = {
+    let l = loader a;
+    let si = diag.source_of d;
+    let files = modules.files l;
+    if si < list.length files { diag.source_path (list.nth si files) } else { "" }
+};
+
+/// Everything the front end had to say, in one list.
+let all_diagnostics a =
+    list.append (modules.diags (loader a)) (scope.r_diags (resolved a));
+
+/// Diagnostics grouped by the file they belong to: `[[path, [diagnostic, ..]], ..]`.
+///
+/// Grouped rather than filtered because a server must publish an *empty* list
+/// for a file whose problems have gone away; sending only what is broken leaves
+/// the last set of squiggles on screen forever.
+let diagnostics_by_path a = {
+    let ds = all_diagnostics a;
+    let paths = list.unique (list.map (fn d -> diagnostic_path a d) ds);
+    list.map (fn p -> [p, list.map (fn d -> lsp_diagnostic a d)
+                                   (list.filter (fn d -> diagnostic_path a d == p) ds)])
+             paths
+};
+
+// --- what is under the cursor -----------------------------------------------------
+
+let is_name_byte b =
+    (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+    || b == 95 || b == 33;
+
+/// The start of the name containing `offset`. The resolution table is keyed by
+/// where a name begins, and a cursor rests in the middle of one.
+let name_start src offset = {
+    let rec back i =
+        if i <= 0 { 0 }
+        else if is_name_byte (core.str_byte src (i - 1)) { back (i - 1) }
+        else { i };
+    back offset
+};
+
+let name_end src offset = {
+    let n = str.byte_length src;
+    let rec forward i = if i >= n { i } else if is_name_byte (core.str_byte src i) { forward (i + 1) } else { i };
+    forward offset
+};
+
+let name_at src at = str.slice at (name_end src at - at) src;
+
+/// The head of the dotted chain a name is part of.
+///
+/// A member access is recorded at the start of the whole expression:
+/// `helper.double` is keyed where `helper` begins. But a reader points at the
+/// part they mean, and the part they mean is usually the field. So a name
+/// preceded by a dot asks its question at the head of the chain instead.
+let rec chain_start src at =
+    if at > 0 && core.str_byte src (at - 1) == 46 { chain_start src (name_start src (at - 1)) }
+    else { at };
+
+/// What the name under this position resolves to: `[start, end, resolution]`,
+/// or `()` when the cursor is not on a name that resolved.
+///
+/// The range answered is the name that was pointed at, not the chain it was
+/// found through: highlighting `helper.double` when the cursor is on `double`
+/// would be answering a question nobody asked.
+let at_position a line character =
+    match module_of a {
+        () => (),
+        mi => {
+            let src = module_text a mi;
+            let source = modules.module_source (modules.module_at (loader a) mi);
+            let here = name_start src (pos.offset_of src line character);
+            let span = [here, name_end src here];
+            match scope.at (resolved a) mi source here {
+                () =>
+                    match chain_start src here {
+                        // Already at the head: there is nowhere further back
+                        // to look, and nothing resolved here.
+                        head => if head == here { () }
+                                else {
+                                    match scope.at (resolved a) mi source head {
+                                        () => (),
+                                        found => [list.head span, list.nth 1 span, found],
+                                    }
+                                },
+                    },
+                found => [list.head span, list.nth 1 span, found],
+            }
+        },
+    };
+
+// --- go to definition -------------------------------------------------------------
+
+/// An LSP `Location` for a span in a module.
+let location a mi span = {
+    let l = loader a;
+    let m = modules.module_at l mi;
+    let src = diag.source_text (list.nth (modules.module_source m) (modules.files l));
+    %{ "uri" => path_to_uri (modules.module_path m),
+       "range" => pos.range src (ast.span_start span) (ast.span_end span) }
+};
+
+/// Where the thing under the cursor was written, or `()`.
+///
+/// A global is looked up in the table of what each module declares, which is
+/// the same table the outline is built from. A local carries its binder's span
+/// with it, so it needs no lookup at all -- which is the payoff of the resolver
+/// recording where a name was bound rather than only that it was.
+let definition_at a line character =
+    match at_position a line character {
+        () => (),
+        [_, _, found] =>
+            match found {
+                [:local, _, span] => match module_of a { () => (), mi => location a mi span },
+                [:global, mi, name, _] =>
+                    match scope.definition (resolved a) mi name {
+                        () => (),
+                        d => location a mi (list.nth 2 d),
+                    },
+                [:member, [:dream, target], field, _] =>
+                    match scope.definition (resolved a) target field {
+                        () => (),
+                        d => location a target (list.nth 2 d),
+                    },
+                // A builtin and a host module's member are not written in
+                // Dream, so there is nowhere to go.
+                _ => (),
+            },
+    };
+
+// --- hover ------------------------------------------------------------------------
+
+let describe a found =
+    match found {
+        [:local, slot, _] => "local, slot " + to_string slot,
+        [:capture, idx, _] => "captured from an enclosing function (capture " + to_string idx + ")",
+        [:global, mi, name, _] =>
+            "`" + name + "` -- a global of module `"
+            + modules.module_name (modules.module_at (loader a) mi) + "`",
+        [:builtin, name] => "`" + name + "` -- a builtin",
+        [:member, [:dream, target], field, _] =>
+            "`" + field + "` of module `"
+            + modules.module_name (modules.module_at (loader a) target) + "`",
+        [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
+        [:closure, _] => "a function",
+        [:thunk, _] => "a thunk",
+        [:match, _] => "the subject of a match",
+        other => to_string other,
+    };
+
+/// What to show when the pointer rests on a name, or `()`.
+let hover_at a line character =
+    match at_position a line character {
+        () => (),
+        [from, until, found] =>
+            match module_of a {
+                () => (),
+                mi => {
+                    let src = module_text a mi;
+                    %{ "contents" => %{ "kind" => "markdown",
+                                        "value" => describe a found },
+                       "range" => pos.range src from until }
+                },
+            },
+    };
+
+// --- the outline -------------------------------------------------------------------
+
+/// LSP `SymbolKind`. A Dream global is a function or a value and the resolver
+/// does not separate them here, so everything is reported as a variable rather
+/// than guessed at wrongly.
+let symbol_variable = 13;
+
+/// What this file declares, for the outline and for the symbol search.
+let symbols a =
+    match module_of a {
+        () => [],
+        mi => {
+            let src = module_text a mi;
+            list.map (fn d -> {
+                let span = list.nth 3 d;
+                let r = pos.range src (ast.span_start span) (ast.span_end span);
+                %{ "name" => list.nth 2 d,
+                   "kind" => symbol_variable,
+                   "range" => r,
+                   "selectionRange" => r }
+            }) (scope.module_defs (resolved a) mi)
+        },
+    };
+
+// --- tests ---------------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a file URI becomes a path"
+            $( test.eq! "/a/b.dr" (uri_to_path "file:///a/b.dr") ),
+        test.case "a path becomes a file URI"
+            $( test.eq! "file:///a/b.dr" (path_to_uri "/a/b.dr") ),
+        test.case "a URI round-trips"
+            $( test.eq! "file:///a/b.dr" (path_to_uri (uri_to_path "file:///a/b.dr")) ),
+        test.case "something that is not a file URI is left alone"
+            $( test.eq! "untitled:1" (uri_to_path "untitled:1") ),
+
+        test.case "the start of a name is found from inside it"
+            $( test.eq! 4 (name_start "let value = 1;" 6) ),
+        test.case "a cursor already at the start stays there"
+            $( test.eq! 4 (name_start "let value = 1;" 4) ),
+        test.case "a name ends where it stops being one"
+            $( test.eq! "value" (name_at "let value = 1;" 4) ),
+        test.case "an impure name keeps its bang"
+            $( test.eq! "go!" (name_at "let go! = 1;" 4) ),
+
+        test.case "a field asks its question at the head of the chain"
+            $( test.eq! 4 (chain_start "let helper.double = 1;" 11) ),
+        test.case "a chain of three still reaches the head"
+            $( test.eq! 0 (chain_start "a.b.c" 4) ),
+        test.case "a name that is not a field is its own head"
+            $( test.eq! 4 (chain_start "let value = 1;" 4) ),
+    ];
+}

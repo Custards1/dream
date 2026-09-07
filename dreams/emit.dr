@@ -50,13 +50,25 @@ let u32 v = [v % 256, byte_at v 256, byte_at v 65536, byte_at v 16777216];
 
 /// A 64-bit signed integer. Two's complement, so a negative one is written as
 /// what it would be if it were unsigned.
-let i64 v = {
-    let u = if v < 0 { v + 9223372036854775807 + 1 } else { v };
-    let low = u % 4294967296;
-    let high = (u / 4294967296) % 4294967296;
-    // A negative number's high word carries the sign bit back.
-    list.append (u32 low) (u32 (if v < 0 { high + 2147483648 } else { high }))
-};
+///
+/// The negative case is worked out from `-v` in 32-bit halves rather than by
+/// adding 2^64. The whole 64-bit range does not fit in a Dream integer, and a
+/// literal that large is read as a *float* -- which turns every byte computed
+/// from it into a float too, and an image is bytes or it is nothing. Nothing
+/// here may leave the range where integers are exact.
+let i64 v =
+    if v < 0 {
+        // -v, split into its low and high 32-bit halves.
+        let a = 0 - v;
+        let a_low = a % 4294967296;
+        let a_high = (a / 4294967296) % 4294967296;
+        // 2^64 - a, done as a subtraction with a borrow out of the low half.
+        let low = (4294967296 - a_low) % 4294967296;
+        let high = (4294967295 - a_high + (if a_low == 0 { 1 } else { 0 })) % 4294967296;
+        list.append (u32 low) (u32 high)
+    } else {
+        list.append (u32 (v % 4294967296)) (u32 ((v / 4294967296) % 4294967296))
+    };
 
 /// A node index, or the all-ones word that means there is none.
 let index i = if ir.is_node i { u32 i } else { u32 4294967295 };

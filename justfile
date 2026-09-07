@@ -12,6 +12,7 @@ build_dir := "build-dream"
 dreamc := "target/debug/dreamc"
 dreamc_release := "target/release/dreamc"
 dream := build_dir / "bin/dream"
+seed := "dreams/bootstrap/dreams.dream"
 
 default: build
 
@@ -44,6 +45,35 @@ vm-no-jit:
 mind:
     mkdir -p build
     {{dreamc}} -L mind/std mind/tool/main.dr -o build/mind
+    ./patch_shebang.sh build/mind
+    chmod +x build/mind
+# The dreeams , itself a Dream program compiled by either itself or the soon unsupported dreamc.
+dreams:vm mind
+    mkdir -p build
+    cd dreams &&DREAMC= {{dream}} build/mind -L mind/std mind/tool/main.dr -o build/mind
+# The language server, built with whichever compiler `dreamc` points at.
+lucid:
+    mkdir -p build
+    {{dreamc}} lucid/main.dr -L mind -L . -o build/lucid.dream
+    @echo "built build/lucid.dream -- run it as: {{dream}} build/lucid.dream"
+
+# Build `dreams` from the checked-in image, with no `dreamc` in sight.
+#
+# The image is a fixpoint: compiling this source with it produces a
+# byte-identical copy of itself. To move the seed forward after changing the
+# compiler, run this and keep `build/dreams.dream`.
+bootstrap: vm
+    mkdir -p build
+    ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/main.dr
+
+# The seed must still reproduce itself from this source: what it builds must
+# build an identical third image. That equality is the whole guarantee -- it
+# says the compiler in the tree and the compiler in the image agree.
+bootstrap-check: vm
+    ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/main.dr
+    ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/main.dr
+    cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
+    @echo "the bootstrap image reproduces itself"
 
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
 test-mind: build
@@ -94,16 +124,19 @@ run-script FILE OUT: build
     ./{{dreamc}} {{FILE}} --shebang -o {{OUT}}
     ./{{OUT}}
 
-install: release mind
+install-artifacts:
     mv {{dreamc_release}} {{install_dir}}/bin || true
     mv {{dream}} {{install_dir}}/bin || true
-    mv build/mind {{install_dir}} || true
+    mv build/mind {{install_dir}}/bin || true
+
+install: release mind
+    just install-artifacts    
 
 
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-examples
+test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -171,6 +204,32 @@ test-dreams-scope: build
 # out-of-memory.
 test-dreams-lower: build
     dreamc={{dreamc}} dream={{dream}} dreams/tests/lower.sh
+
+# The end of the pipeline: programs `dreams` compiled, run by the VM, checked
+# against the output recorded beside them. Every other `dreams` test asks
+# whether a stage agrees with something -- the reference compiler, or a recorded
+# shape. This one asks the only question that finally matters, and it is the
+# evidence that the self-hosted compiler works rather than merely agrees.
+test-dreams-compile: build
+    dreamc={{dreamc}} dream={{dream}} dreams/tests/compile.sh
+
+# The VS Code extension's grammar, tokenized and checked against the scopes it
+# promises. Needs `npm install` in editors/vscode first.
+test-vscode:
+    cd editors/vscode && npm test
+
+# `lucid`'s own tests: positions, framing, and the URI/path boundary.
+test-lucid: build
+    {{dreamc}} lucid/main.dr --test -L mind -L . -o /tmp/lucid-tests.dream
+    ./{{dream}} /tmp/lucid-tests.dream
+
+# And one whole conversation with it, which is the only place the server is
+# checked as a running program rather than as a set of functions.
+test-lucid-session: build
+    dreamc={{dreamc}} dream={{dream}} MIND_STDLIB=mind lucid/tests/session.sh
+
+# The bootstrap: the seed reproduces itself from this source.
+test-bootstrap: bootstrap-check
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
