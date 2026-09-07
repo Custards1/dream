@@ -778,13 +778,26 @@ let end_func fi r = {
 
 let push_scope r = update_frame (fn fr -> core.map_put fr :scopes (core.cons [] (scopes fr))) r;
 
-/// Leaving a scope frees its slots for the next one to reuse, but never lowers
-/// the high-water mark: `max_slots` is what the frame ever needed at once.
+/// Leaving a scope takes its names out of sight. It does *not* give the slots
+/// back.
+///
+/// Recycling them looks free -- only one arm of a `match` ever runs, so two
+/// arms could share -- but it is not, because the language is lazy. An arm's
+/// body can hand back a value that has not been evaluated yet, and that value
+/// reads its binders out of the frame when it finally is. If a later scope has
+/// taken those slots by then, it reads whatever that scope put there instead.
+/// A frame is as big as everything the function binds, which is what the
+/// reference compiler does too.
 let pop_scope r =
-    update_frame (fn fr -> {
-        let freed = list.fold (fn n sc -> n - list.length sc) (next_slot fr) [list.head (scopes fr)];
-        core.map_put (core.map_put fr :scopes (list.tail (scopes fr))) :next_slot freed
-    }) r;
+    update_frame (fn fr -> core.map_put fr :scopes (list.tail (scopes fr))) r;
+
+/// Bind a name to a slot that has already been taken, without taking another.
+let bind_at ctx source name slot span r =
+    record_bind ctx source span name slot
+        (update_frame (fn f ->
+            if name == "_" { f }
+            else { core.map_put f :scopes
+                       (on_front (fn sc -> list.append sc [[name, slot, span]]) (scopes f)) }) r);
 
 /// Keep a slot out of circulation for the rest of the frame, after the scope
 /// that named it has gone.
@@ -1225,7 +1238,25 @@ let rec check_block c stmts r =
                     // `let rec` puts the name in scope for its own body, so a
                     // closure can refer to itself. The slot is allocated either
                     // way -- what `rec` changes is only when the name reaches it.
-                    let pre = if is_rec { list.head (bind_one (ctx_mi c) (ctx_source c) n span r) } else { r };
+                    //
+                    // Taking the slot *before* walking the body is the whole
+                    // point, and not just tidiness. The VM puts the body's
+                    // thunk in this slot and then forces it, so anything the
+                    // body binds must land somewhere else: a binder inside the
+                    // body given this same slot overwrites the binding being
+                    // computed, and the `let` ends up holding whatever the
+                    // inner binder put there. That is what
+                    //
+                    //     let src = match .. { () => .., s => join root s };
+                    //
+                    // did -- `src` and `s` shared a slot, so `src` came out as
+                    // `s`. Walking the body first and binding after frees the
+                    // body's slots for the `let` to reuse, which is exactly
+                    // the collision.
+                    let taken = bind_one (ctx_mi c) (ctx_source c)
+                                         (if is_rec { n } else { "_" }) span r;
+                    let slot = list.nth 1 taken;
+                    let pre = list.head taken;
                     let r1 =
                         if list.is_empty ps { check_expr c body pre }
                         else {
@@ -1241,7 +1272,8 @@ let rec check_block c stmts r =
                                    (end_func fi (check_expr c body bound))
                         };
                     check_block c rest
-                        (if is_rec { r1 } else { list.head (bind_one (ctx_mi c) (ctx_source c) n span r1) })
+                        (if is_rec { r1 }
+                         else { bind_at (ctx_mi c) (ctx_source c) n slot span r1 })
                 },
                 _ => check_block c rest (check_expr c st r),
             },
@@ -1386,6 +1418,13 @@ when test {
     /// The whole resolver, for the tests that ask what it recorded rather than
     /// what it complained about.
     let resolved! src = resolve! (with_module! (bare! ()) "t" src);
+
+    /// The slot a binder was given, found by name in the recorded binds.
+    let binding_slot r name = {
+        let hits = list.filter (fn b -> list.head (list.nth 1 b) == name)
+                               (core.map_pairs (binds r));
+        if list.is_empty hits { () } else { list.nth 1 (list.nth 1 (list.head hits)) }
+    };
 
     /// Two modules: `a` as written, then `t`, which may import it.
     let checked_two! a_src t_src =
@@ -1592,9 +1631,20 @@ when test {
                           [func_name f, func_arity f, func_slots f] } ),
         test.case "a block's lets need slots too"
             $( test.eq! 3 (func_slots (list.head (funcs (resolved! "let f x = { let a = 1; let b = 2; a };")))) ),
-        test.case "sibling scopes reuse slots rather than growing the frame"
-            $( test.eq! 2 (func_slots (list.head (funcs
+        // Slots are not recycled when a scope ends. A value built in one scope
+        // can be handed back unevaluated and read its binders out of the frame
+        // later, by which time a sibling scope would have overwritten them.
+        test.case "a sibling scope gets its own slots rather than reusing them"
+            $( test.eq! 3 (func_slots (list.head (funcs
                    (resolved! "let f x = { { let a = 1; a } { let b = 2; b } };")))) ),
+        // The collision this prevents: the VM puts the body's thunk in the
+        // `let`'s slot and then forces it, so a binder inside the body must
+        // not be handed that same slot.
+        test.case "a binder inside a let's body does not take the let's slot"
+            $( test.true! { let r = resolved! "let f y = { let a = match y { [s] => s, _ => 0 }; a };";
+                            let outer = binding_slot r "a";
+                            let inner = binding_slot r "s";
+                            outer != () && inner != () && outer != inner } ),
         test.case "a thunk is a function of its own"
             $( test.eq! [2, "<thunk>"]
                         { let r = resolved! "let f = $( 1 );";
