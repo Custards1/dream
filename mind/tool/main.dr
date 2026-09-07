@@ -12,6 +12,7 @@
 // `mind` is written in Dream and compiled by `dreamc`, the same as any other
 // program here. It has no compiler of its own: Dream compiles whole programs,
 // so a build is "find the packages, hand them to `dreamc`, run it".
+import std.cli;
 import std.console;
 import std.core;
 import std.io;
@@ -24,10 +25,34 @@ import fetch;
 import manifest;
 import util;
 
-let usage = "mind -- the build tool for Dream
+let version = "0.1.0";
 
-usage: mind <command> [arguments]
+/// The options, described once. `cli` parses from this list and prints the
+/// help from the same list, so an option cannot be one without being the
+/// other.
+let opts = [
+    cli.section "where to look",
+    cli.value "C" "dir" "DIR" "the project to work on (default: here, or above)",
+    cli.value "o" "output" "PATH" "write the image here",
+    cli.list_of "L" "package-path" "DIR" "a package, or a directory holding packages",
+    cli.list_of "I" "include" "DIR" "a directory to search for modules",
+    cli.list_of "" "host-module" "PATH" "a module the host provides at run time",
 
+    cli.section "what to compile it as",
+    cli.list_of "D" "define" "NAME[=V]" "define a `when` flag, or set a `when` value",
+    cli.flag "" "release" "define `release`",
+    cli.flag "" "debug" "define `debug`",
+    cli.list_of "f" "flag" "ARG" "pass this to the compiler as written",
+
+    cli.section "how to build it",
+    cli.value "" "compiler" "PATH" "the compiler to run; a `.dream` is run by the VM",
+    cli.flag "v" "verbose" "print the compiler command before running it",
+    cli.flag "h" "help" "this message",
+    cli.flag "" "version" "print the version",
+];
+
+let commands = "
+commands:
   new <name>     create a project in ./<name>
   build          compile the project to target/<name>.dream
   run [args]     compile, then run it with the arguments given
@@ -35,9 +60,12 @@ usage: mind <command> [arguments]
   check          compile without writing an image
   fetch          download dependencies without building
   deps           list the packages this project resolves to
+  info           show what this build would run, without running it
   clean          remove target/
   help           this message
+";
 
+let notes = "
 A project is a directory with a `mind.toml`. Commands other than `new` look
 for one here or above, so they work from anywhere inside a project.
 
@@ -49,7 +77,29 @@ Dependencies are local directories or things to fetch, and there is no index:
   pkg  = { url = \"https://example.com/pkg.tar.gz\" }
 
 A git dependency must be pinned with `tag`, `rev` or `branch`.
-";
+
+What is true of the package wherever it is built belongs in the manifest, and
+every one of these has a command-line spelling that wins over it:
+
+  [build]
+  compiler     = \"dreams.dream\"   # an image is run by the VM; a program is run
+  defines      = [\"fast\"]         # `when` flags this package always compiles with
+  package-paths = [\"vendor\"]      # more -L roots, relative to the manifest
+  includes     = [\"shims\"]        # more -I directories
+  host-modules = [\"host.gpu\"]     # modules the host registers at run time
+  output       = \"build/app.dream\" # where the image goes
+  flags        = [\"-q\"]           # passed to the compiler as written
+
+The compiler is chosen in this order: --compiler, then [build] compiler, then
+$DREAMS, then $DREAMC, then `dreamc` on the path.
+
+`mind run -- ARGS` passes ARGS to the program rather than to mind.
+"
+
+let usage = "mind -- the build tool for Dream
+
+usage: mind <command> [options] [arguments]
+" + commands + cli.options_help opts + "\n" + notes;
 
 let fail! message = {
     console.error! ("mind: " + to_string message)
@@ -88,8 +138,8 @@ let cmd_new! name = {
     console.print! ("  cd " + to_string name + " && mind run")
 };
 
-let report_build! m extra label = {
-    match build.compile! m extra {
+let report_build! m o label = {
+    match build.compile! m o {
         [:error, why] => {
             console.error! why
             os.exit! 1
@@ -101,18 +151,9 @@ let report_build! m extra label = {
     }
 };
 
-let cmd_build! m = {
-    report_build! m [] "compiled"
-    console.print! ("  " + to_string (build.image m))
-};
-
-let cmd_check! m = {
-    report_build! m ["--no-emit"] "checked"
-};
-
-let cmd_run! m args = {
-    report_build! m [] "running"
-    let r = build.run_image! m args;
+/// Hand the program's output on as our own, and its exit code with it. A build
+/// tool that swallows the status of what it ran is no use in a script.
+let relay! r =
     match r {
         [code, out, err] => {
             if not (str.is_empty out) { console.write! out }
@@ -120,19 +161,39 @@ let cmd_run! m args = {
             if code != 0 { os.exit! code }
             :ok
         },
-    }
+    };
+
+let cmd_build! m o = {
+    report_build! m o "compiled"
+    console.print! ("  " + to_string (build.output_of m o))
 };
 
-let cmd_test! m = {
-    report_build! m ["--test"] "testing"
-    let r = build.run_image! m [];
-    match r {
-        [code, out, err] => {
-            if not (str.is_empty out) { console.write! out }
-            if not (str.is_empty err) { console.error! err }
-            if code != 0 { os.exit! code }
-            :ok
-        },
+let cmd_check! m o = {
+    report_build! m (build.with_option :extra ["--no-emit"] o) "checked"
+};
+
+let cmd_run! m o args = {
+    report_build! m o "running"
+    relay! (build.run_image! m o args)
+};
+
+let cmd_test! m o args = {
+    report_build! m (build.with_option :extra ["--test"] o) "testing"
+    relay! (build.run_image! m o args)
+};
+
+/// What this build would do, without doing it. The compiler is chosen from
+/// four places, so "which one is it going to run" is a real question, and the
+/// answer should not require reading the source of the build tool.
+let cmd_info! m o = {
+    console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
+    console.print! ("  root     " + to_string (manifest.root m))
+    console.print! ("  entry    " + to_string (manifest.entry m))
+    console.print! ("  output   " + to_string (build.output_of m o))
+    console.print! ("  compiler " + to_string (build.choose_compiler! m (build.option o :compiler ())))
+    match build.command_line! m o {
+        [:ok, line] => console.print! ("  command  " + line),
+        [:error, why] => console.error! ("  command  unavailable: " + to_string why),
     }
 };
 
@@ -206,25 +267,81 @@ let patch! filein fileout = filepatch! filein fileout "#!/bin/env dream\n"
 
 let cmd_patch! filein fileout = patch! filein $( if (fileout) {fileout} else {"./a.out"})
 
-let rec main_runner! project = {
-    let proj = project_in! project;
-    match os.args! () {
+/// Split `mind`'s own arguments from the program's at the first `--`.
+///
+/// `mind run -- --help` has to run the program with `--help`, not print ours.
+/// Doing this before the options are parsed is what keeps the two lines apart:
+/// after it, nothing on the left can be meant for the program.
+let rec split_at_dashes args =
+    match args {
+        [] => [[], []],
+        ["--", ..theirs] => [[], theirs],
+        [a, ..more] =>
+            match split_at_dashes more {
+                [mine, theirs] => [list.cons a mine, theirs],
+            },
+    };
+
+/// `--release` and `--debug` are `-D release` and `-D debug` spelled the way
+/// people reach for them.
+let defines_of c =
+    list.concat [cli.all c "define",
+                 if cli.flag_set c "release" { ["release"] } else { [] },
+                 if cli.flag_set c "debug" { ["debug"] } else { [] }];
+
+let options_of c =
+    list.fold (fn o kv -> build.with_option (list.head kv) (list.nth 1 kv) o)
+              build.options
+              [[:compiler, cli.get () c "compiler"],
+               [:output,   cli.get () c "output"],
+               [:paths,    cli.all c "package-path"],
+               [:includes, cli.all c "include"],
+               [:hosts,    cli.all c "host-module"],
+               [:flags,    cli.all c "flag"],
+               [:defines,  defines_of c],
+               [:verbose,  cli.flag_set c "verbose"]];
+
+let run_command! c theirs = {
+    let o = options_of c;
+    // The project is loaded inside the arm that needs one. `mind new` and
+    // `mind help` are answers you can give outside a project, and asking for a
+    // manifest before knowing the command made them fail where they should
+    // not.
+    let here = cli.get () c "dir";
+    match cli.rest c {
         [] => console.write! usage,
-        ["help", ..rest] => console.write! usage,
-        ["--help", ..rest] => console.write! usage,
-        ["-h", ..rest] => console.write! usage,
-        ["new", name, ..rest] => cmd_new! name,
-        ["new"] => fail! "new needs a project name",
-        ["build", ..rest] => cmd_build! proj,
-        ["-d",outfile,..rest] =>main_runner! outfile,
-        ["project",outfile,..rest] =>main_runner! outfile,
-        ["check", ..rest] => cmd_check! proj,
-        ["run", ..rest] => cmd_run! proj rest,
-        ["test", ..rest] => cmd_test! proj,
-        ["deps", ..rest] => cmd_deps! proj,
-        ["fetch", ..rest] => cmd_fetch! proj,
-        ["clean", ..rest] => cmd_clean! proj,
-        [other, ..rest] => fail! ("unknown command `" + to_string other + "`; try `mind help`"),
+        [cmd, ..args] =>
+            match cmd {
+                "help"  => console.write! usage,
+                "new"   => match args {
+                               [] => fail! "new needs a project name",
+                               [name, .._] => cmd_new! name,
+                           },
+                "build" => cmd_build! (project_in! here) o,
+                "check" => cmd_check! (project_in! here) o,
+                "run"   => cmd_run! (project_in! here) o (list.append args theirs),
+                "test"  => cmd_test! (project_in! here) o (list.append args theirs),
+                "deps"  => cmd_deps! (project_in! here),
+                "fetch" => cmd_fetch! (project_in! here),
+                "clean" => cmd_clean! (project_in! here),
+                "info"  => cmd_info! (project_in! here) o,
+                other   => fail! ("unknown command `" + to_string other + "`; try `mind help`"),
+            },
     }
 };
-let main! = main_runner! ()
+
+let main! =
+    match split_at_dashes (os.args! ()) {
+        [mine, theirs] =>
+            match cli.parse opts mine {
+                [:error, why] => {
+                    console.error! ("mind: " + to_string why)
+                    console.error! "try `mind help`"
+                    os.exit! 2
+                },
+                [:ok, c] =>
+                    if cli.flag_set c "help" { console.write! usage }
+                    else if cli.flag_set c "version" { console.print! ("mind " + version) }
+                    else { run_command! c theirs },
+            },
+    };
