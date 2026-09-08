@@ -162,21 +162,124 @@ let eq_const v k l = binary :eq v k l;
 
 // --- names ----------------------------------------------------------------------
 
+// --- wrappers ---------------------------------------------------------------------
+//
+// `scope` worked out which globals are wrappers -- one application of their own
+// parameters and literals, and nothing else. Here a saturated call of one
+// becomes the call it stands for, which removes a frame and a call per use.
+// Chained wrappers unwrap together: `at_end` is `list.is_empty` is
+// `core.is_empty`, and a call of the first emits the last.
+//
+// The depth cap is not a guess about how deep a chain goes -- two wrappers that
+// name each other would unwrap forever, and a compiler must terminate on a
+// program that will not run.
+
+/// What the callee of an application resolves to, when it is a name at all.
+let callee_resolution callee l =
+    match callee {
+        [:name, _, span]     => lookup span l,
+        [:field, _, _, span] => lookup span l,
+        _ => (),
+    };
+
+/// The call site's arguments, rebuilt as the wrapper's body arranged them.
+let wrapper_actuals plan args =
+    list.map (fn step ->
+        match step {
+            [:param, k] => list.nth k args,
+            [:const, e] => e,
+        }) plan;
+
+/// `[target, arguments]` when this is a saturated call of a wrapper, or `()`.
+///
+/// The arguments are syntax, not nodes: they are lowered at the call site
+/// exactly as they would have been, which is what keeps every one of them the
+/// same thunk in the same place.
+let rec unwrap found args fuel l =
+    if fuel <= 0 { () }
+    else {
+        match found {
+            [:global, _, _, g]           => unwrap_global found g args fuel l,
+            [:member, [:dream, _], _, g] => unwrap_global found g args fuel l,
+            _ => (),
+        }
+    };
+
+let unwrap_global found g args fuel l =
+    match core.map_get (scope.wrappers (res l)) g () {
+        () => (),
+        [target, plan, arity] =>
+            if list.length args != arity { () }
+            else {
+                let actual = wrapper_actuals plan args;
+                // The target may be a wrapper too, and unwrapping stops at
+                // whatever is not one -- which is the answer either way.
+                match unwrap target actual (fuel - 1) l {
+                    () => [target, actual],
+                    deeper => deeper,
+                }
+            },
+    };
+
+/// The callee of an application, given what it resolved to. A name or a member
+/// whose resolution is already in hand skips the second lookup; anything else
+/// is an ordinary expression.
+let lower_callee callee found l =
+    match callee {
+        [:name, n, span] =>
+            match found { () => lower_expr callee l, _ => lower_resolved n found span l },
+        [:field, _, field, span] =>
+            match found { () => lower_expr callee l, _ => lower_resolved field found span l },
+        _ => lower_expr callee l,
+    };
+
+/// The node for a wrapper's target, marked impure when the name it ends in
+/// says so -- the same rule `lower_name` applies to a name written by hand.
+let emit_target found l = {
+    let got = emit_resolution found l;
+    if builtins.is_impure_name (resolved_name found) {
+        [set_flag (list.nth 1 got) ir.f_impure (list.head got), list.nth 1 got]
+    }
+    else { got }
+};
+
+/// The name a resolution ends in, which is what says whether it is impure.
+let resolved_name found =
+    match found {
+        [:builtin, name] => name,
+        [:global, _, name, _] => name,
+        [:member, _, field, _] => field,
+        _ => "",
+    };
+
 /// A name, as `scope` already decided it. The only work left is which node
 /// shape carries the answer -- and marking it impure when the name says so, so
 /// that the VM sequences the effect rather than only the compiler knowing about
 /// it. `scope` refused the pure functions that reach an effect; this records
 /// which nodes *are* one.
-let lower_name name span l = {
-    let got = emit_name span l;
+let lower_name name span l = lower_resolved name (lookup span l) span l;
+
+/// The same, for a caller that has already asked what the name resolves to.
+/// Applications ask, because a call of a wrapper is rewritten and one that is
+/// not should not pay for the question twice.
+let lower_resolved name found span l = {
+    let got = emit_resolution_or found span l;
     if builtins.is_impure_name name {
         [set_flag (list.nth 1 got) ir.f_impure (list.head got), list.nth 1 got]
     }
     else { got }
 };
 
-let emit_name span l =
-    match lookup span l {
+let emit_name span l = emit_resolution (lookup span l) l;
+
+/// A recorded resolution, or -- when there is none -- whatever `emit_resolution`
+/// makes of that, which is the same unit placeholder it always was.
+let emit_resolution_or found span l = emit_resolution found l;
+
+/// One resolution, as the node that fetches it. Separate from `emit_name`
+/// because a wrapper's call site emits a resolution it did not read off a name.
+let emit_resolution found l =
+    match found {
         [:local, slot, _]   => emit (ir.node :local slot ir.no_node ir.no_node) l,
         [:capture, idx, _]  => emit (ir.node :capture idx ir.no_node ir.no_node) l,
         [:global, _, _, g]  => emit (ir.node :global g ir.no_node ir.no_node) l,
@@ -215,9 +318,22 @@ let rec lower_expr e l =
         [:field, _, _, span] => lower_field e span l,
 
         [:apply, callee, args, _] => {
-            let f = lower_expr callee l;
-            let done = lower_all args (list.head f);
-            emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
+            let found = callee_resolution callee l;
+            // A saturated call of a wrapper is the call it stands for. See
+            // "wrappers" in `scope`: the rewrite removes a frame that bound
+            // nothing but the arguments the inner call was going to get.
+            match unwrap found args 8 l {
+                [target, actual] => {
+                    let f = emit_target target l;
+                    let done = lower_all actual (list.head f);
+                    emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
+                },
+                _ => {
+                    let f = lower_callee callee found l;
+                    let done = lower_all args (list.head f);
+                    emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
+                },
+            }
         },
 
         // `x |> f a` is folded into the single call `f a x` rather than a call

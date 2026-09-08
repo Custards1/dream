@@ -173,6 +173,15 @@ What has already been learnt from them, so it is not learnt twice:
   six-element list, and reading one was a fifth of everything the compiler did.
 - A membership test over a list of names wants to be a map. The keyword check
   was a tenth of it.
+- A wrapper that only passes its arguments on -- `let head xs = core.head xs` --
+  is emitted as the call it stands for. `scope` records which globals are
+  wrappers (see "wrappers" there); `lower` rewrites saturated calls of them.
+  Roughly 13% of the reductions in a compile, and ~8% off any program that runs.
+  The rule is deliberately narrow: one application, every parameter passed on
+  exactly once, literals allowed. "At most once" is not enough -- an argument
+  the wrapper ignores would never be lowered, and a lambda in that position was
+  already given a function record, so the image would carry a function with no
+  body.
 - `strict!` is linear in *data*, not in paths, and only because objects carry a
   "deeply forced" bit -- see `AUX_DEEP_FORCED` in [dream/src/value.hpp](dream/src/value.hpp).
   Before that, forcing the compiler's own tables walked shared structure once

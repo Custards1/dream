@@ -400,6 +400,20 @@ Sharing is preserved by returning the *binding's* thunk rather than a fresh
 wrapper, and the allocation is skipped entirely when a node is already a value
 (constants, variable references, closures).
 
+### Wrappers
+
+A global whose body is one application of its own parameters -- `let head xs =
+core.head xs`, `let kind t = core.array_get t 0` -- is a **wrapper**, and a
+saturated call of one is compiled as the call it stands for. The frame that
+disappears bound nothing but the arguments the inner call was going to be
+given, and every argument stays the same thunk in the same place, so nothing is
+evaluated that was not before and nothing twice.
+
+The conditions are narrow on purpose: one application, every parameter passed
+on exactly once, and literals for the rest. A call that is not saturated is
+left alone, which is what keeps a variadic host function honest -- a variadic
+native means "everything at this call site".
+
 ### What this means for the JIT
 
 The JIT compiles only the strict numeric spine — arithmetic, comparisons,

@@ -253,12 +253,15 @@ let show_stats! l = {
 
 /// One stage: force it, and answer `[value, work, walk]` in milliseconds.
 ///
-/// The binding is separate from the forcing on purpose. `let value = thunk ()`
-/// builds a thunk and runs nothing -- that is what lazy means -- so the work
-/// happens at the `strict!` below it, which is where the clock is read. Binding
-/// and forcing on one line would time the building of the thunk and hand the
-/// real work to whoever forced it next, and every stage would look free except
-/// the last.
+/// The stage arrives here unevaluated, and nothing had to be written to make it
+/// so: an argument is a thunk, so `timed! (scope.resolve! l)` hands over the
+/// work rather than its result. That is the whole trick, and it is why there is
+/// no lambda here -- laziness already is the suspension a timer needs.
+///
+/// The `strict!` below is where the work happens, and where the clock is read.
+/// Forcing at the binding would time the building of a thunk and hand the real
+/// work to whoever forced it next, and every stage would look free except the
+/// last.
 ///
 /// Two readings, because one would be a lie. Forcing a stage walks everything
 /// it is built on -- an arena carries the resolution tables, which carry the
@@ -266,8 +269,7 @@ let show_stats! l = {
 /// `strict!` finds every thunk already forced and does nothing but walk, which
 /// is what the first one spent on ground already covered. The difference is
 /// this stage's own work, and it is the column to read.
-let timed! thunk = {
-    let value = thunk ();
+let timed! value = {
     let before = os.monotonic! ();
     strict! value
     let forced = os.monotonic! ();
@@ -287,15 +289,15 @@ let own_of t = {
 
 /// Time the whole pipeline, stage by stage, and write nothing.
 let show_time! o file = {
-    let load = timed! (fn () -> load! o file);
+    let load = timed! (load! o file);
     let l = value_of load;
-    let resolved = timed! (fn () -> scope.resolve! l);
+    let resolved = timed! (scope.resolve! l);
     let r = value_of resolved;
-    let linked = timed! (fn () -> lower.link! l r);
+    let linked = timed! (lower.link! l r);
     let low = value_of linked;
-    let built = timed! (fn () -> lower.image low);
+    let built = timed! (lower.image low);
     let img = value_of built;
-    let written = timed! (fn () -> emit.to_binary img);
+    let written = timed! (emit.to_binary img);
     let bytes = value_of written;
 
     let stages = [["parse", load], ["resolve", resolved], ["lower", linked],

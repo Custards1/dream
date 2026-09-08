@@ -1,0 +1,132 @@
+// Maps: the operations a hash trie makes cheap, named.
+//
+// `std.core` provides the five that have to be primitive -- `map_new`,
+// `map_get`, `map_has`, `map_put`, `map_remove` -- plus `map_pairs`, which is
+// the door out to ordinary values. Everything here is written in terms of
+// those, and exists because the primitives are the wrong grain for most code:
+// a program that wants "the value there, or this one, updated" writes three
+// calls and a conditional, and writes them again a hundred lines later.
+//
+// Two things are worth knowing before using any of it.
+//
+// **A map is a value.** `put` answers a new map and leaves the old one alone,
+// which is why it is cheap to keep both: the trie shares every branch the
+// change did not touch. Nothing here mutates anything, so a map handed to
+// another process, or held across a call, cannot change underneath.
+//
+// **Order is not part of a map.** `pairs`, `keys` and `values` answer in
+// whatever order the trie walks, which depends on the hashes and not on the
+// program. Anything that needs an order has to say which one -- `sorted_keys`
+// is here for the common case, and it is the only thing here that costs a
+// sort.
+import std.core;
+import std.list;
+
+// --- making one -------------------------------------------------------------
+
+let empty = core.map_new ();
+
+/// A map from `[key, value]` pairs. A later pair wins, which is what makes
+/// `from_pairs (list.append defaults overrides)` mean what it looks like.
+let from_pairs ps =
+    list.fold (fn m p -> core.map_put m (list.nth 0 p) (list.nth 1 p)) empty ps;
+
+/// The pairs of two maps, the second winning where they overlap.
+let merge a b = list.fold (fn m p -> core.map_put m (list.nth 0 p) (list.nth 1 p)) a (core.map_pairs b);
+
+// --- looking ----------------------------------------------------------------
+
+let get default m k = core.map_get m k default;
+let has m k = core.map_has m k;
+let pairs m = core.map_pairs m;
+let keys m = list.map (fn p -> list.nth 0 p) (core.map_pairs m);
+let values m = list.map (fn p -> list.nth 1 p) (core.map_pairs m);
+let size m = list.length (core.map_pairs m);
+let is_empty m = list.is_empty (core.map_pairs m);
+
+/// The keys in order. The only operation here that imposes one, and it costs a
+/// sort every time it is asked -- a map does not remember it.
+let sorted_keys m = list.sort (keys m);
+
+// --- changing ---------------------------------------------------------------
+
+let put m k v = core.map_put m k v;
+let remove m k = core.map_remove m k;
+
+/// Apply `f` to what is at `k`, or to `default` when nothing is:
+/// `update 0 (fn n -> n + 1) counts word` is the whole of counting.
+let update default f m k = core.map_put m k (f (core.map_get m k default));
+
+/// Add only if the key is absent, so a fold over pairs keeps the first.
+let put_new m k v = if core.map_has m k { m } else { core.map_put m k v };
+
+let map_values f m =
+    list.fold (fn acc p -> core.map_put acc (list.nth 0 p) (f (list.nth 1 p))) empty (core.map_pairs m);
+
+/// Keep the pairs `keep k v` answers true for.
+let filter keep m =
+    list.fold (fn acc p ->
+        if keep (list.nth 0 p) (list.nth 1 p) { core.map_put acc (list.nth 0 p) (list.nth 1 p) }
+        else { acc })
+        empty (core.map_pairs m);
+
+/// Fold over the pairs. In trie order, so a fold whose answer depends on the
+/// order is a bug waiting for a different set of keys.
+let fold f init m = list.fold (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (core.map_pairs m);
+
+/// Every key of `m` that `other` does not have.
+let without m other = filter (fn k _ -> not (core.map_has other k)) m;
+
+// --- sets, which are maps whose values say nothing ---------------------------
+//
+// A map with `true` for a value is how a set is written here. It is worth
+// having names for, because "is this one of them" over a list is a walk and
+// this is a hash -- and because a set written as a list of members reads
+// better at the definition than a map literal does.
+
+let set_of xs = list.fold (fn m x -> core.map_put m x true) empty xs;
+let member s x = core.map_has s x;
+let add s x = core.map_put s x true;
+let members s = keys s;
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let m = from_pairs [[:a, 1], [:b, 2]];
+
+    let tests = [
+        test.case "empty has nothing"      $( test.false! (has empty :a) ),
+        test.case "from_pairs"             $( test.eq! 1 (get 0 m :a) ),
+        test.case "a later pair wins"
+            $( test.eq! 2 (get 0 (from_pairs [[:a, 1], [:a, 2]]) :a) ),
+        test.case "a missing key answers the default"  $( test.eq! 0 (get 0 m :zz) ),
+        test.case "size"                   $( test.eq! 2 (size m) ),
+        test.case "is_empty"               $( test.true! (is_empty empty) ),
+        test.case "sorted_keys"            $( test.eq! [:a, :b] (sorted_keys m) ),
+        test.case "values follow the sorted keys"
+            $( test.eq! [1, 2] (list.map (fn k -> get 0 m k) (sorted_keys m)) ),
+
+        test.case "put leaves the original alone"
+            $( test.eq! [1, 9] [get 0 m :a, get 0 (put m :a 9) :a] ),
+        test.case "remove"                 $( test.false! (has (remove m :a) :a) ),
+        test.case "update an existing key"  $( test.eq! 2 (get 0 (update 0 (fn n -> n + 1) m :a) :a) ),
+        test.case "update a missing key starts from the default"
+            $( test.eq! 1 (get 0 (update 0 (fn n -> n + 1) m :zz) :zz) ),
+        test.case "put_new keeps the first" $( test.eq! 1 (get 0 (put_new m :a 9) :a) ),
+        test.case "map_values"             $( test.eq! [10, 20]
+                                                (list.map (fn k -> get 0 (map_values (fn v -> v * 10) m) k)
+                                                          (sorted_keys m)) ),
+        test.case "filter"                 $( test.eq! [:b] (sorted_keys (filter (fn _ v -> v > 1) m)) ),
+        test.case "fold sums the values"   $( test.eq! 3 (fold (fn n _ v -> n + v) 0 m) ),
+        test.case "merge, the second winning"
+            $( test.eq! 9 (get 0 (merge m (from_pairs [[:a, 9]])) :a) ),
+        test.case "without"                $( test.eq! [:b] (sorted_keys (without m (from_pairs [[:a, 1]]))) ),
+
+        test.case "a set remembers members" $( test.true! (member (set_of [1, 2]) 2) ),
+        test.case "a set has no others"     $( test.false! (member (set_of [1, 2]) 3) ),
+        test.case "add"                     $( test.true! (member (add (set_of []) :x) :x) ),
+        test.case "members"                 $( test.eq! [1, 2] (list.sort (members (set_of [2, 1]))) ),
+    ];
+}
