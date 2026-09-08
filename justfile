@@ -149,6 +149,13 @@ install-artifacts:
     cp build/mind {{install_dir}}/bin/ || true
     cp {{image}} {{install_dir}}/dreams.dream
     cp build/lucid.dream {{install_dir}}/lucid.dream || true
+    # The library ships with the compiler that was built against it. An
+    # installation whose `std` is older than its `dreams` is a compiler that
+    # cannot build anything using a function added since -- which is exactly
+    # how this recipe came to copy it: the installed `std` shadowed the one in
+    # the checkout and the compiler failed to build itself.
+    rm -rf {{install_dir}}/std
+    cp -r mind/std {{install_dir}}/std
 install-artifactsv2:
     mkdir -p {{install_dir}}
     cp {{dream}} {{install_dir}}/bin/dream || true

@@ -474,6 +474,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "dream: deadlock -- every process is waiting for a message that "
                      "cannot arrive\n");
+        // And who is waiting for what. A deadlock with no names is a report
+        // that a program is stuck, which the person running it already knew;
+        // the useful part is which process is parked on which thing.
+        sched.dump("deadlock");
         status = 1;
     } else if (root->failed) {
         std::string text;

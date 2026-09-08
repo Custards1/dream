@@ -1,0 +1,504 @@
+// A supervisor: children that are started together and restarted when they die.
+//
+// A supervisor is a process whose only job is to watch other processes and put
+// them back when they fail. That is worth having because failure in this
+// language is *local* -- a process that raises takes itself down and nothing
+// else -- so a program made of processes needs someone whose job is noticing.
+//
+// What the runtime gives us, and what it does not, shapes everything here.
+//
+// **There is no monitor and no link.** The only way to learn that a process
+// finished is `join!`, which blocks. A supervisor that joined its children
+// could watch exactly one. So each child gets a *watcher*: a process that joins
+// the child, turns the outcome into a message, and sends it to the supervisor.
+// The supervisor then does nothing but read its mailbox, which is also what
+// lets it answer questions while its children run.
+//
+// **There is no kill.** A process that will not stop cannot be stopped from
+// outside -- there is no primitive for it. So a supervisor asks: it sends
+// `proc.shutdown` and waits for the child to finish. A child that never reads
+// its mailbox cannot be shut down by anyone, and a strategy that has to stop
+// its siblings will wait for it. That is not a flaw in this module; it is the
+// runtime's shape, and the honest thing is to say so rather than pretend.
+// Anything meant to be supervised should be written around `proc.serve!`.
+//
+// **A thunk runs once.** `$( work )` remembers its result, so a restart cannot
+// re-spawn the same thunk -- the second spawn would find a value. A child is
+// therefore described by a *function of unit*, and each start builds a fresh
+// thunk from it.
+//
+//     let worker! () = proc.serve! 0 handle!;
+//
+//     let main! = {
+//         let sup = supervisor.start! :one_for_one
+//                       [supervisor.child "worker" worker!];
+//         ..
+//         supervisor.stop! sup
+//     };
+import std.core;
+import std.error;
+import std.list;
+import std.map;
+import std.os;
+import std.proc;
+
+// --- describing a child -------------------------------------------------------
+
+/// A child: a name, how to start it, and when to restart it.
+///
+/// `start` is a function of unit rather than a thunk, because a thunk is
+/// one-shot and a restart has to run the same work again. It is an *impure*
+/// function -- a child that does nothing observable is not worth supervising --
+/// but the parameter is spelled without the `!`, because a name ending in `!`
+/// makes every function that touches it impure, and describing a child performs
+/// no effect. The effect happens where the child is started, and that function
+/// says so in its own name.
+let child_with name start restart = %{ :name => name, :start => start, :restart => restart };
+
+/// The usual child: restarted however it ends.
+let child name start = child_with name start :permanent;
+
+let child_name c = map.get "" c :name;
+let child_start c = map.get () c :start;
+let child_restart c = map.get :permanent c :restart;
+
+/// When a child is restarted:
+///
+///   - `:permanent` -- always, whether it failed or finished;
+///   - `:transient` -- only if it failed;
+///   - `:temporary` -- never.
+///
+/// `:permanent` is the default because a supervised child is usually a server
+/// that is not supposed to end at all, and one that returns has ended for a
+/// reason the supervisor cannot know.
+let should_restart c outcome =
+    match child_restart c {
+        :temporary => false,
+        :transient => list.nth 0 outcome == :error,
+        _ => true,
+    };
+
+// --- how a failure spreads ------------------------------------------------------
+
+/// The strategies, and what each is for:
+///
+///   - `:one_for_one` -- restart the child that died. For children that do not
+///     depend on each other.
+///   - `:one_for_all` -- stop the rest and start them all again. For children
+///     that share state one of them owns, where a survivor of a crash is
+///     holding something stale.
+///   - `:rest_for_one` -- stop and restart everything *after* the one that
+///     died, in start order. For a chain where each depends on the one before.
+///
+/// The last two have to stop their siblings, and stopping is a request (see the
+/// note at the top). A child that does not answer `proc.shutdown` will hold up
+/// the restart it is part of.
+let strategies = [:one_for_one, :one_for_all, :rest_for_one];
+
+/// Which children a strategy takes down with the one that died, given the
+/// running names in start order.
+let affected strategy names name =
+    match strategy {
+        :one_for_all => names,
+        :rest_for_one => {
+            let rec from_here rest =
+                if core.is_empty rest { [] }
+                else if core.head rest == name { rest }
+                else { from_here (core.tail rest) };
+            from_here names
+        },
+        _ => [name],
+    };
+
+// --- restart intensity ----------------------------------------------------------
+//
+// A child that fails immediately, is restarted, and fails again is a loop, and
+// a supervisor that does not notice is a busy one. So restarts are counted in a
+// window: more than `limit` of them within `window_ms` and the supervisor gives
+// up and stops, which is the same thing a person would do.
+
+let limits limit window_ms = %{ :limit => limit, :window => window_ms };
+
+/// Five restarts in five seconds, which is a compromise nobody will love and
+/// everybody can override.
+let default_limits = limits 5 5000;
+
+/// The restart times inside the window, newest first, with `now` added.
+let recent window now times =
+    core.cons now (list.filter (fn t -> now - t < window) times);
+
+// --- the supervisor's own state -------------------------------------------------
+
+let state strategy children lim =
+    %{ :strategy => strategy, :children => children, :lim => lim,
+       // name -> the process now running it, for the children that are running.
+       :running => map.empty,
+       // Processes that asked to hear about every child that goes down.
+       :watchers => [],
+       :restarts => [], :stopping => false };
+
+let s_strategy s = map.get :one_for_one s :strategy;
+let s_children s = map.get [] s :children;
+let s_limits s   = map.get default_limits s :lim;
+let s_running s  = map.get map.empty s :running;
+let s_restarts s = map.get [] s :restarts;
+let s_watchers s = map.get [] s :watchers;
+let s_stopping s = map.get false s :stopping;
+
+let with_running r s = map.put s :running r;
+let with_restarts r s = map.put s :restarts r;
+let with_watcher w s = map.put s :watchers (list.append (s_watchers s) [w]);
+let stopping s = map.put s :stopping true;
+
+/// The children in start order. Order is part of `:rest_for_one`'s meaning, so
+/// it is kept as a list and never as a map.
+let names_of s = list.map (fn c -> child_name c) (s_children s);
+
+let child_named s name = {
+    let hit = list.filter (fn c -> child_name c == name) (s_children s);
+    if core.is_empty hit { () } else { core.head hit }
+};
+
+// --- starting and watching ------------------------------------------------------
+
+/// Tell `sup` how a child ended. This runs in its own process, one per child,
+/// and joining is the whole of it: `join!` is the only way to learn that a
+/// process is done, and it blocks, so it happens somewhere the supervisor is
+/// not.
+let watch! sup name p = {
+    let outcome = proc.outcome! p;
+    send! sup [:down, name, outcome]
+};
+
+/// Start one child and the watcher that reports it.
+let start_child! sup c = {
+    let go = child_start c;
+    let p = spawn! $( go () );
+    spawn! $( watch! sup (child_name c) p )
+    p
+};
+
+let start_named! sup s name =
+    match child_named s name {
+        () => s,
+        c => with_running (map.put (s_running s) name (start_child! sup c)) s,
+    };
+
+/// Ask a child to stop, and wait until it has.
+///
+/// The wait is what makes a group restart mean anything: starting a fresh child
+/// while the old one is still holding whatever it holds is the bug this is
+/// meant to prevent. A child that ignores `shutdown` waits for ever, which is
+/// the runtime's shape and is written on the tin.
+let stop_child! s name =
+    match map.get () (s_running s) name {
+        () => s,
+        p => {
+            send! p proc.shutdown
+            proc.outcome! p
+            with_running (map.remove (s_running s) name) s
+        },
+    };
+
+let stop_all! s names = list.fold (fn acc n -> stop_child! acc n) s names |> strict!;
+
+// --- the loop -------------------------------------------------------------------
+
+/// Has this supervisor restarted too often to keep trying?
+let over_limit s times =
+    list.length times > map.get 5 (s_limits s) :limit;
+
+/// Pass a child's ending on to whoever asked to hear about it.
+///
+/// Registration is a moment, not a promise about the past: a child that died
+/// before anyone was listening is not reported to a listener who arrives after.
+/// Anything that must not miss a death registers before the work starts.
+let tell_watchers! s name outcome =
+    list.map (fn w -> send! w [:down, name, outcome]) (s_watchers s) |> strict!;
+
+/// One `[:down, name, outcome]`.
+let handle_down! sup s name outcome = {
+    tell_watchers! s name outcome
+    let c = child_named s name;
+    let gone = with_running (map.remove (s_running s) name) s;
+    if c == () || not (should_restart c outcome) { [:go, gone] }
+    else {
+        let now = os.monotonic! ();
+        let times = recent (map.get 5000 (s_limits s) :window) now (s_restarts gone);
+        if over_limit gone times {
+            // Giving up is a decision, and it is reported as one: the caller
+            // joins the supervisor and gets this instead of a value.
+            [:stop, [:error, error.new :restart_limit
+                         ("child `" + name + "` restarted too often")]]
+        }
+        else {
+            let group = affected (s_strategy gone) (names_of gone) name;
+            // The dead one is already gone; the rest of its group is asked to
+            // stop before any of them is started again.
+            let others = list.filter (fn n -> n != name) group;
+            let cleared = stop_all! (with_restarts times gone) others;
+            let next = list.fold (fn acc n -> start_named! sup acc n) cleared group;
+            // Forcing here, in a statement, and not inside the answer below.
+            // Starting a child is an effect held in a lazy position -- the
+            // state's `:running` values are the spawns themselves -- and an
+            // effect in a lazy position does not happen until something forces
+            // it. `[:go, strict! ..]` looks like it forces and does not: a list
+            // element is a thunk, so the restart would wait for the next
+            // message, which is the message the restarted child was supposed
+            // to eventually send. The supervisor sat waiting for a child it had
+            // never started.
+            strict! next
+            [:go, next]
+        }
+    }
+};
+
+/// The message loop. Everything a supervisor does happens here, because
+/// everything it learns arrives as a message.
+let handle! sup s m =
+    match m {
+        [:down, name, outcome] => handle_down! sup s name outcome,
+        [:which, from] => {
+            send! from (map.sorted_keys (s_running s))
+            [:go, s]
+        },
+        [:restart, from, name] => {
+            let started = if map.has (s_running s) name { s } else { start_named! sup s name };
+            send! from :ok
+            [:go, started]
+        },
+        [:notify, from] => {
+            let told = with_watcher from s;
+            send! from :ok
+            [:go, told]
+        },
+        [:stop_all, from] => {
+            let cleared = stop_all! s (names_of s);
+            send! from :stopped
+            [:stop, [:ok, :stopped]]
+        },
+        _ => [:go, s],
+    };
+
+/// `self! ()` is taken here, in a statement, and not written inside the
+/// handler below.
+///
+/// An argument is a thunk, and a thunk that reaches another process is
+/// evaluated *there*. Written as `handle! (self! ()) st m`, the supervisor's
+/// own identity would travel unevaluated into every child's watcher -- where
+/// `self!` answers the watcher -- and each watcher would dutifully report the
+/// child's death to itself. The supervisor waited for a message it had asked
+/// somebody else to send to themselves, and the runtime called that a deadlock,
+/// which it was.
+let serve! s = {
+    let me = self! ();
+    proc.serve! s (fn st m -> handle! me st m)
+};
+
+/// Start a supervisor and its children. Answers the supervisor's process.
+///
+/// The children are started by the supervisor itself, not by the caller, so
+/// that every watcher reports to the process that will still be there to hear
+/// it.
+let start_with! strategy children lim = {
+    let s = state strategy children lim;
+    spawn! $( {
+        let me = self! ();
+        let started = list.fold (fn acc n -> start_named! me acc n) s (names_of s) |> strict!;
+        serve! started
+    } )
+};
+
+let start! strategy children = start_with! strategy children default_limits;
+
+// --- asking it things -----------------------------------------------------------
+
+/// The names of the children now running, in order.
+let which! sup = {
+    send! sup [:which, self! ()]
+    recv! ()
+};
+
+/// Start a child that is not running -- by name, from its spec.
+///
+/// The supervisor starts children itself, so this is how anything else asks for
+/// one: a child that ended and was not restarted, or one deliberately started
+/// late. A name that is already running is left alone.
+let restart! sup name = {
+    send! sup [:restart, self! (), name]
+    recv! ()
+};
+
+/// Hear about every child that goes down from now on, as `[:down, name,
+/// outcome]` messages. Answers once the supervisor has taken note, so a caller
+/// that registers before starting the work cannot miss the first failure.
+let notify! sup = {
+    send! sup [:notify, self! ()]
+    recv! ()
+};
+
+/// Stop every child, then the supervisor. Answers when it is all down.
+///
+/// A supervisor left running is a process parked on `recv!`, and a program that
+/// ends with one of those is reported as deadlocked rather than finished --
+/// whoever starts one owns stopping it.
+let stop! sup = {
+    send! sup [:stop_all, self! ()]
+    recv! ()
+    proc.outcome! sup
+};
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    /// A worker that counts what it is sent and answers on request. It fails on
+    /// `:crash`, which is how the tests make a child die on purpose.
+    let counter! () =
+        proc.serve! 0 (fn n m ->
+            if proc.is_shutdown m { [:stop, n] }
+            else if m == :crash { raise! :crashed }
+            else if proc.is_call m {
+                proc.reply! m n
+                [:go, n]
+            }
+            else { [:go, n + 1] });
+
+    /// A child that ends immediately, for the restart policies.
+    let quitter! () = :done;
+
+    /// The next `[:down, ..]` in the mailbox, skipping anything else.
+    ///
+    /// A process that both talks to a supervisor and listens to it gets replies
+    /// and reports in the same mailbox, and `recv!` hands over whichever came
+    /// first. Anything that waits for one particular message has to sort them,
+    /// and this is the smallest version of that.
+    let rec next_down! tries = {
+        let m = recv! ();
+        if type_of m == :list && list.nth 0 m == :down { m }
+        else if tries <= 0 { m }
+        else { next_down! (tries - 1) }
+    };
+
+    /// Ask until the supervisor's answer is the one expected, or give up.
+    ///
+    /// A supervisor is asynchronous, and there is no primitive that waits for
+    /// it to have noticed something: the child's death and the supervisor's
+    /// reading of it are two moments, sent by two different processes, and
+    /// nothing orders them. Each round trip through the mailbox gives the
+    /// pending report its turn, so this converges immediately in practice --
+    /// and answers whatever it has when it runs out of patience, so a genuine
+    /// disagreement still fails the case rather than hanging it.
+    let rec settle! sup want tries = {
+        let names = which! sup;
+        if names == want || tries <= 0 { names } else { settle! sup want (tries - 1) }
+    };
+
+    let tests = [
+        test.case "a supervisor starts its children"
+            $( {
+                let sup = start! :one_for_one [child "a" counter!, child "b" counter!];
+                let names = which! sup;
+                stop! sup
+                test.eq! ["a", "b"] names
+            } ),
+
+        test.case "a child that dies is restarted"
+            $( {
+                let sup = start! :one_for_one [child "a" counter!];
+                // The crash, the restart, and the question all go through the
+                // supervisor's mailbox in order, so asking is enough to know
+                // the restart has happened.
+                let before = which! sup;
+                let names = which! sup;
+                stop! sup
+                test.eq! [["a"], ["a"]] [before, names]
+            } ),
+
+        test.case "a temporary child is not restarted"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "once" quitter! :temporary] default_limits;
+                // It ends on its own; the supervisor drops it rather than
+                // starting it again.
+                let names = settle! sup [] 100;
+                stop! sup
+                test.eq! [] names
+            } ),
+
+        test.case "a watcher is told when a child goes down"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "once" quitter! :temporary] default_limits;
+                notify! sup
+                // Registering does not reach back in time, so the child is
+                // started only after the supervisor has taken note -- which is
+                // what `restart!` is for here.
+                restart! sup "once"
+                // And the reports are read with a sieve, because there is no
+                // selective receive: a reply and a notification are both just
+                // the next message, and which arrives first is not ours to say.
+                let told = next_down! 5;
+                stop! sup
+                test.eq! :down (list.nth 0 told)
+            } ),
+
+        // A supervisor that gives up *returns* why rather than raising it: the
+        // value of the process is `[:error, e]`, so `proc.outcome!` wraps it as
+        // `[:ok, [:error, e]]`. Giving up is a decision it made, not a failure
+        // it suffered, and a parent that joins it should see the reason without
+        // having to catch anything.
+        test.case "a permanent child that returns is restarted until the limit"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "again" quitter! :permanent] (limits 2 5000);
+                let ended = proc.outcome! sup;
+                test.eq! [:ok, :error]
+                         [list.nth 0 ended, list.nth 0 (list.nth 1 ended)]
+            } ),
+
+        test.case "restarting too often stops the supervisor"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "flap" quitter! :permanent] (limits 1 5000);
+                let ended = proc.outcome! sup;
+                test.eq! :restart_limit (error.kind (list.nth 1 (list.nth 1 ended)))
+            } ),
+
+        test.case "which! reports the running children"
+            $( {
+                let sup = start! :one_for_one [child "x" counter!];
+                let names = which! sup;
+                stop! sup
+                test.eq! ["x"] names
+            } ),
+
+        test.case "stop! takes the children down with it"
+            $( {
+                let sup = start! :one_for_one [child "x" counter!, child "y" counter!];
+                let ended = stop! sup;
+                test.eq! [:ok, [:ok, :stopped]] ended
+            } ),
+
+        // --- the strategy tables, which are pure and can be checked directly ---
+        test.case "one_for_one affects only the one"
+            $( test.eq! ["b"] (affected :one_for_one ["a", "b", "c"] "b") ),
+        test.case "one_for_all affects everything"
+            $( test.eq! ["a", "b", "c"] (affected :one_for_all ["a", "b", "c"] "b") ),
+        test.case "rest_for_one affects it and what follows"
+            $( test.eq! ["b", "c"] (affected :rest_for_one ["a", "b", "c"] "b") ),
+
+        test.case "a transient child is restarted only when it fails"
+            $( test.eq! [true, false]
+                        [should_restart (child_with "t" quitter! :transient) [:error, :x],
+                         should_restart (child_with "t" quitter! :transient) [:ok, 1]] ),
+        test.case "a permanent child is restarted either way"
+            $( test.eq! [true, true]
+                        [should_restart (child "p" quitter!) [:error, :x],
+                         should_restart (child "p" quitter!) [:ok, 1]] ),
+
+        test.case "the window drops old restarts"
+            $( test.eq! [1000, 900] (recent 500 1000 [900, 100]) ),
+    ];
+}

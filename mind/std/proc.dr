@@ -29,6 +29,7 @@
 // cannot be stopped from outside. Both are why the server loop below is written
 // around a handler that sees every message and decides.
 import std.core;
+import std.error;
 import std.list;
 
 // --- starting ---------------------------------------------------------------
@@ -54,7 +55,8 @@ let start_each! start! xs = start_all! (list.map (fn x -> $( start! x )) xs);
 /// wants results as they arrive wants a mailbox, not this.
 let wait_all! ps = list.map (fn p -> join! p) ps |> strict!;
 
-/// What a process came to, as a value: `[:ok, v]` or `[:error, reason]`.
+/// What a process came to, as a value: `[:ok, v]` or `[:error, e]`, where `e`
+/// is the error itself -- ask `std.error` for its kind or payload.
 ///
 /// `join!` re-raises what the process raised, which takes the joiner down with
 /// it. That is right for a caller that cannot continue without the answer, and
@@ -165,11 +167,19 @@ when test {
             $( test.eq! [2, 4, 6] (map! double [1, 2, 3]) ),
         test.case "outcome! of a value"
             $( test.eq! [:ok, 7] (outcome! (spawn! $( 7 ))) ),
+        // `catch` binds the error itself, not what was raised: `raise! :boom`
+        // wraps `:boom` in a box whose kind is the catch-all `:error` and whose
+        // payload is the atom. That is why the payload is what is compared
+        // here, and it is the reason `std.error` exists.
         test.case "outcome! of a failure is a value, not a raise"
-            $( test.eq! :boom (list.nth 1 (outcome! (spawn! $( raise! :boom )))) ),
+            $( test.eq! :boom (error.payload (list.nth 1 (outcome! (spawn! $( raise! :boom ))))) ),
         test.case "try_map! keeps going past a failure"
-            $( test.eq! [[:ok, 1], [:error, :bad]]
-                        (try_map! (fn x -> if x == 1 { 1 } else { raise! :bad }) [1, 2]) ),
+            $( {
+                let got = try_map! (fn x -> if x == 1 { 1 } else { raise! :bad }) [1, 2];
+                test.eq! [[:ok, 1], [:error, :bad]]
+                         [list.nth 0 got,
+                          [:error, error.payload (list.nth 1 (list.nth 1 got))]]
+            } ),
 
         test.case "call! gets an answer back"
             $( {
