@@ -65,17 +65,27 @@ let ends_with suffix s =
 
 let concat a b = a + b;
 
+/// One string from many, with nothing between them.
+///
+/// This is the linear way to build a string out of pieces, and the reason to
+/// reach for it: `a + b + c + ..` copies everything written so far on every
+/// step, so assembling n pieces costs n^2 bytes of copying. Anything that
+/// builds a large output a piece at a time -- an image, a rendered diagnostic,
+/// a dump of a program -- should collect the pieces and come here once.
+let concat_all parts = core.str_concat parts;
+
 /// The strings in `parts` with `sep` between them. `std.seq` supplies `join`,
 /// which renders each element with `to_string`; this one is for strings that
 /// are already strings and should not gain quotes.
-let join_str sep parts = {
-    let step acc s = if acc == () { s } else { acc + sep + s };
-    let joined = list.fold step () parts;
-    if joined == () { "" } else { joined }
-};
+let join_str sep parts =
+    match parts {
+        [] => "",
+        [first, ..rest] =>
+            core.str_concat (core.cons first (list.flat_map (fn s -> [sep, s]) rest)),
+    };
 
 /// `s` repeated `n` times.
-let rec repeat n s = if n <= 0 { "" } else { s + repeat (n - 1) s };
+let repeat n s = if n <= 0 { "" } else { core.str_concat (list.replicate n s) };
 
 /// The parts of `s` between each occurrence of `sep`, as a list of strings.
 /// An empty separator would not make progress, so it yields the whole string.

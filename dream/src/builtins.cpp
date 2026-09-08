@@ -593,6 +593,42 @@ NativeResult bi_raise(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::raise(p.heap().make_error(make_atom(well_known(p.runtime()).error), v));
 }
 
+/// `error_new kind payload` -- an error as a value, without raising it.
+///
+/// An error is a kind and a payload, and until these three existed a program
+/// could catch one and learn nothing from it: `catch e` bound a box with no way
+/// in, so the only thing to do with a failure was print it. With them, a caught
+/// error can be asked what went wrong and a program can raise a *typed* failure
+/// of its own -- `raise! (core.error_new :not_found path)` -- rather than
+/// raising a string and hoping the reader parses it.
+///
+/// Pure, all three: making and reading an error is not an effect. Only raising
+/// one is, which is why `raise!` keeps its `!` and these do not.
+NativeResult core_error_new(Process& p, Value, Value* args, uint32_t) {
+    Value kind = resolve(args[0]);
+    if (!is_atom(kind)) {
+        return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error,
+                                               "error_new needs an atom for the kind"));
+    }
+    return NativeResult::ok(p.heap().make_error(kind, args[1]));
+}
+
+/// The kind of an error, or `()` for anything else -- so a `match` on the kind
+/// needs no type test first.
+NativeResult core_error_kind(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::ErrorBox)) return NativeResult::ok(UNIT);
+    return NativeResult::ok(static_cast<ErrorObj*>(as_obj(v))->kind);
+}
+
+/// The payload of an error, or `()`. Unforced: a payload built lazily by the
+/// code that failed stays that way until someone looks.
+NativeResult core_error_payload(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::ErrorBox)) return NativeResult::ok(UNIT);
+    return NativeResult::ok(static_cast<ErrorObj*>(as_obj(v))->payload);
+}
+
 NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
     const char* name = "unknown";
     switch (surface_type(args[0])) {
@@ -959,10 +995,6 @@ Value info_map(Process& p, std::initializer_list<std::pair<const char*, Value>> 
 
 Value atom_of(Process& p, const char* name) {
     return make_atom(p.runtime().intern_atom(name));
-}
-
-Value text_of(Process& p, const std::string& s) {
-    return p.heap().make_string(s.data(), uint32_t(s.size()));
 }
 
 const char* status_name(ProcStatus s) {
@@ -1538,6 +1570,50 @@ NativeResult core_str_of_bytes(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
 }
 
+/// `str_concat parts` -- one string from a list of them.
+///
+/// Concatenating n strings by `+` is n copies of everything written so far,
+/// which is quadratic and is why anything that built a large output a piece at
+/// a time -- an image, a rendered diagnostic, a dump -- cost more in copying
+/// than in the work it was reporting on. This walks the list once and copies
+/// each part once.
+///
+/// The same care with the collector as `str_of_bytes`: forcing a part runs
+/// Dream code, which can collect and move every cell, so the position rides on
+/// the value stack rather than in a C++ local.
+NativeResult core_str_concat(Process& p, Value, Value* args, uint32_t) {
+    std::string out;
+    const size_t base = p.stack.size();
+    p.stack.push_back(args[0]);
+    for (;;) {
+        Value w;
+        if (!force_whnf(p, p.stack[base], &w)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (is_nil(w)) break;
+        if (!is_obj(w, ObjType::Cons)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_concat needs a list of strings");
+        }
+        p.stack[base] = w;
+        Value head;
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(w))->head, &head)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (!is_obj(head, ObjType::Str)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_concat needs a list of strings");
+        }
+        auto* part = static_cast<StrObj*>(as_obj(head));
+        out.append(part->data(), part->len);
+        p.stack[base] = static_cast<ConsObj*>(as_obj(p.stack[base]))->tail;
+    }
+    p.stack.resize(base);
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
 NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
     StrObj* s = as_string(args[0]);
     Value from = resolve(args[1]);
@@ -1894,6 +1970,13 @@ ModuleDef make_core_module() {
             {"str_chars", 1, 0b1, core_str_chars},
             {"str_of_chars", 1, 0b1, core_str_of_chars},
             {"str_of_bytes", 1, 0b1, core_str_of_bytes},
+            {"str_concat", 1, 0b1, core_str_concat},
+            // An error is a kind and a payload; these are the way in and out.
+            // `error_new`'s payload is left lazy, so the mask forces only the
+            // kind.
+            {"error_new", 2, 0b01, core_error_new},
+            {"error_kind", 1, 0b1, core_error_kind},
+            {"error_payload", 1, 0b1, core_error_payload},
             {"str_slice", 3, 0b111, core_str_slice},
             {"str_find", 3, 0b111, core_str_find},
             {"str_byte", 2, 0b11, core_str_byte},

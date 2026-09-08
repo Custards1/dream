@@ -9,13 +9,19 @@ name. Two programs implement it:
 
 | | |
 |-|-|
-| [`dreamc/`](../dreamc) | the compiler, in Rust — `.dr` source to a `.dream` image |
+| [`dreams/`](../dreams) | the compiler, written in Dream — `.dr` source to a `.dream` image |
 | [`dream/`](../dream) | the VM, `dream`, in C++ — interpreter, processes, LLVM JIT |
 | [`mind/`](../mind) | the standard library and build system, written in Dream |
+| [`dreamc/`](../dreamc) | the old compiler, in Rust, kept only as a second opinion |
+
+The compiler is written in the language it compiles and builds from an image of
+itself; `dreamc` compiled the first one and now only answers the differential
+tests. Where this document points at a Rust file for a canonical list, that is
+the older of two implementations that a test holds to each other.
 
 > **Status legend.** Everything in this document is implemented and covered by
-> tests unless it carries a **PROPOSED** marker. Only [§12 Pattern
-> matching](#12-pattern-matching-proposed) is so marked.
+> tests unless it carries a **PROPOSED** marker. Only [destructuring `let` and
+> parameters](#destructuring-let-and-parameters-proposed) is so marked.
 
 ---
 
@@ -32,7 +38,7 @@ name. Two programs implement it:
 9. [Processes](#9-processes)
 10. [Errors](#10-errors)
 11. [Compile-time evaluation](#11-compile-time-evaluation)
-12. [Pattern matching (PROPOSED)](#12-pattern-matching-proposed)
+12. [Pattern matching](#12-pattern-matching)
 13. [The standard library](#13-the-standard-library)
 14. [The toolchain](#14-the-toolchain)
 15. [Embedding](#15-embedding)
@@ -164,7 +170,8 @@ let main! = {
 ## 3. Values and types
 
 `type_of v` returns the type's name as an atom. The canonical list lives in
-[`dreamc/src/types.rs`](../dreamc/src/types.rs); the compiler, the VM's
+[`dreamc/src/types.rs`](../dreamc/src/types.rs), the older of the two
+implementations; the compiler, the VM's
 `type_of`, and this table are checked against it by tests rather than kept in
 step by hand.
 
@@ -393,6 +400,20 @@ Sharing is preserved by returning the *binding's* thunk rather than a fresh
 wrapper, and the allocation is skipped entirely when a node is already a value
 (constants, variable references, closures).
 
+### Wrappers
+
+A global whose body is one application of its own parameters -- `let head xs =
+core.head xs`, `let kind t = core.array_get t 0` -- is a **wrapper**, and a
+saturated call of one is compiled as the call it stands for. The frame that
+disappears bound nothing but the arguments the inner call was going to be
+given, and every argument stays the same thunk in the same place, so nothing is
+evaluated that was not before and nothing twice.
+
+The conditions are narrow on purpose: one application, every parameter passed
+on exactly once, and literals for the rest. A call that is not saturated is
+left alone, which is what keeps a variadic host function honest -- a variadic
+native means "everything at this call site".
+
 ### What this means for the JIT
 
 The JIT compiles only the strict numeric spine — arithmetic, comparisons,
@@ -552,7 +573,7 @@ has a value also counts as defined, so `when os { .. }` is true and
 
 Everything else comes from `-D name`, `-D name=value`, `--test` (defines
 `test`), `--release` (defines `release`), and `--debug-cfg` (defines `debug`).
-`dreamc --print-cfg` prints the lot.
+`dreams --print-cfg` prints the lot.
 
 ---
 
@@ -655,8 +676,8 @@ The package name is a **namespace, not a value**: `std` and `std.list` are
 compile-time names, and only `std.list.map` is something you can pass around.
 Mentioning either on its own is an error that says so.
 
-`-L DIR` adds a package search root; `dreamc FILE --packages` and
-`dreamc FILE --modules` report what a program pulls in.
+`-L DIR` adds a package search root; `dreams FILE --packages` and
+`dreams FILE --modules` report what a program pulls in.
 
 An **embedder's own host module** is declared with `--host-module PATH`, which
 is what lets `import host;` compile against a module registered through
@@ -804,12 +825,11 @@ the runtime.
 
 ---
 
-## 12. Pattern matching (PROPOSED)
+## 12. Pattern matching
 
-> **Not implemented.** There is no `match` token in the lexer, no `Pattern` node
-> in the AST, and no matching opcode in the IR. This section records the design
-> so it can be reviewed before it is built; everything else in this document
-> describes code that exists.
+`match` is implemented and is used throughout the compiler itself. The one part
+of the design still outstanding is destructuring in `let` and parameter lists,
+which is marked below.
 
 ### Syntax
 
@@ -887,7 +907,10 @@ one. This is the same bargain `if` already makes with its condition.
   checked in general. A `match` with no arm that matches raises `:match_error`
   carrying the unmatched value. A `_` arm is therefore the way to be total.
 
-### Destructuring `let` and parameters
+### Destructuring `let` and parameters (PROPOSED)
+
+> **Not implemented.** `let [a, b] = pair;` is a parse error today: `let` takes
+> a name. Everything else in this section is implemented.
 
 The same pattern grammar, restricted to **irrefutable** patterns (`_`, binders,
 `as`, and fixed-length `[..]` / `#[..]` / `%{..}` forms), extends `let` and
@@ -901,42 +924,31 @@ let f %{ :x => x, :y => y } = x + y;
 A refutable pattern in either position is a compile error, naming the pattern
 that could fail.
 
-### Implementation sketch
+### How it is compiled
 
-The work lands in five places, in this order:
+An arm is a decision chain of test-and-bind nodes, and the tests are ordinary
+builtins -- `match_is_cons`, `match_head`, `match_tail`, `match_at`,
+`match_key`. They are named that way on purpose: a builtin beats an imported
+name, so calling one of them `head` would quietly shadow
+`import std.list.{head}` in every module that had both.
 
-1. `lexer.rs` — one new token, `..` for the rest pattern. `match` itself needs
-   no token: keywords are ordinary `Ident`s that the parser recognises.
-2. `parser.rs` — add `"match"` to `KEYWORDS` and to `NON_STARTERS` (it cannot
-   begin an argument), then `parse_match` and `parse_pattern`. The scrutinee
-   needs the same `no_brace` treatment `if` already gets, so that the `{`
-   opening the arms is not read as an argument. `parse_pattern` can reuse the
-   existing `[`, `#[`, `%{` group handling verbatim.
-3. `ast.rs` — a `Pattern` enum, `ExprKind::Match { scrutinee, arms }`, and a
-   `pattern` field on `Param` and `LetDecl`.
-4. `lower.rs` — compile each arm to a decision chain of test-and-bind nodes.
-   Bindings become frame slots exactly as parameters do, so scope resolution
-   already handles them and the purity check needs no change.
-5. `interp.cpp` — the test opcodes, and `match_error` added to
-   `WellKnownAtoms`.
+The tests force exactly as far as the pattern looks. `[x, ..rest]` forces the
+cell to know whether it is one, and does not force `x`; that is what lets a
+`match`-written loop walk a list that is still being produced.
 
-No image-format change is required: the arms lower to existing node kinds plus
-a small number of new opcodes **appended** to the table in `ir.rs` — appended
-because the opcode's position is its identity, so inserting one would
+Bindings become frame slots exactly as parameters do, so scope resolution and
+the purity check needed no changes for `match`, and the image format needed
+none either: the arms lower to existing node kinds plus opcodes **appended** to
+the table, because an opcode's position is its identity and inserting one would
 invalidate every image already built.
-
-The e2e suite is the acceptance test: a `match`-based `sum` and a
-`match`-written tail-recursive loop must print the same thing under both tiers,
-and the lazy program must show that `[x, ..rest]` forces the cell without
-forcing `x`.
 
 ---
 
 ## 13. The standard library
 
-Two layers. **Native modules** are C++ in the VM and are listed explicitly in
-both halves — [`dreamc/src/modules.rs`](../dreamc/src/modules.rs) and the VM's
-registry — with a test proving the two agree. **Dream modules** live in
+Two layers. **Native modules** are C++ in the VM and are listed explicitly by
+both the compiler ([`dreams/modules.dr`](../dreams/modules.dr)) and the VM's
+registry, with a test proving the two agree. **Dream modules** live in
 [`mind/std/`](../mind/std) and are compiled like any other package.
 
 ### Builtins
@@ -962,12 +974,19 @@ Everything here is either a primitive the representation hides (a string's
 bytes, a map's buckets) or something that must be a single machine step for the
 rest of the library to be worth writing.
 
+`str_concat` is the second kind. Building a string out of n pieces with `+`
+copies everything written so far on every step, so it costs n² bytes of
+copying; `str_concat` walks the list once and copies each piece once. Anything
+that assembles a large output a piece at a time -- an image, a rendered
+diagnostic -- goes through it, and `std.str` builds `concat_all`, `join_str`
+and `repeat` on top of it.
+
 | Area | Members |
 |------|---------|
 | lists | `head` `tail` `cons` `is_empty` |
-| strings | `str_len` `str_chars` `str_of_chars` `str_slice` `str_find` `str_byte` |
+| strings | `str_len` `str_chars` `str_of_chars` `str_of_bytes` `str_concat` `str_slice` `str_find` `str_byte` |
 | chars | `char_code` `char_of_code` |
-| numbers | `to_float` `to_int` `parse_int` `parse_float` |
+| numbers | `to_float` `to_int` `parse_int` `parse_float` `float_bytes` `float_of_bytes` |
 | arrays | `array_new` `array_get` `array_set` `array_of_list` `array_to_list` |
 | maps | `map_new` `map_get` `map_has` `map_put` `map_remove` `map_pairs` |
 | ordering | `compare` |
@@ -1012,7 +1031,27 @@ waiting for a value.
 | `list_dir! path` | the names in a directory, sorted, without `.` and `..` |
 | `exec! program args` | run a child to completion → `%{ :code, :out, :err, :timed_out }` |
 | `exec_for! program args ms` | the same, killing the child after `ms` |
+| `replace! program args` | **become** `program`: this VM is gone and it takes over the process |
+| `monotonic! ()` | milliseconds from a fixed point, from a clock that never jumps |
+| `now! ()` | milliseconds since the Unix epoch, from the wall clock |
 | `pid! ()` · `platform ()` · `exit! code` | |
+
+`replace!` is `execvp`. `exec!` gives its child pipes and reads them to the end,
+which is right for a compiler and useless for anything that prompts, so a tool
+handing over to something interactive -- an editor, a shell, a REPL -- wants
+this instead: the child inherits the terminal because it inherits everything.
+
+`monotonic!` is for durations and `now!` is for stamps, and they are not
+interchangeable: the wall clock can jump, forwards or back. Timing anything in
+this language means forcing it first, because a stage that has not been forced
+has not run:
+
+```dream
+let value = stage ();          // builds a thunk; nothing has happened
+let before = os.monotonic! ();
+strict! value                  // this is where the work is
+let after = os.monotonic! ();
+```
 
 **`exec!` parks the process, not the worker.** Waiting for a child on a worker
 thread would block every process queued behind it, so the whole job — spawn,
@@ -1154,7 +1193,7 @@ when test {
 }
 ```
 
-`dreamc FILE --test` then scans **the modules it actually loaded** for that
+`dreams FILE --test` then scans **the modules it actually loaded** for that
 binding and generates an entry point that runs each suite it found. There is no
 registry to keep in step, and no test that is silently never run; a program with
 no `tests` anywhere still compiles, and reports that there was nothing to run.
@@ -1165,17 +1204,17 @@ runner catches.
 
 ```
 just test-std                       # the standard library's own suite
-dreamc mind/std/all.dr --test -L mind -o t.dream && dream t.dream
+dreams mind/std/all.dr --test -L mind -o t.dream && dream t.dream
 ```
 
 ---
 
 ## 14. The toolchain
 
-### `dreamc` — the compiler
+### `dreams` — the compiler
 
 ```
-dreamc FILE [-o OUT.dream] [options]
+dreams FILE [-o OUT.dream] [options]
 ```
 
 | Flag | |
@@ -1189,11 +1228,18 @@ dreamc FILE [-o OUT.dream] [options]
 | `--release` / `--debug-cfg` | define `release` / `debug` |
 | `--print-cfg` | print the flags that are defined |
 | `--modules` / `--packages` | report what the program pulls in |
-| `--dump` | disassemble the image by reading it back |
-| `--ast` | print the syntax tree |
+| `--ir` | print the execution trees the program lowers to |
+| `--ast` / `--tokens` | print the syntax tree, or the tokens |
+| `--parse` | parse this file alone, following no imports |
+| `--symbols` / `--at LINE:COL` | what a file declares; what is at a position |
+| `--stats` / `--time` | count what a program contains; say what each stage cost |
+| `-i`, `--repl` | an interactive session |
 | `--shebang [LINE]` | prefix the image with a `#!` line and make it executable |
-| `--no-emit` | check only: scope, purity, verification |
-| `--no-debug` | omit debug info |
+| `--check`, `--no-emit` | check only: scope and purity, across the whole program |
+
+A file is compiled without being told where the standard library is: a root
+file's own directory, `$MINDV2_PATH`, and the nearest enclosing `mind`
+directory holding a `std` are searched without being named.
 
 ### `dream` — the VM
 
@@ -1208,16 +1254,29 @@ dream PROGRAM.dream [options]
 | `--no-jit` | interpreter only |
 | `--jit-threshold N` | calls before a function is compiled (default 32) |
 | `--dump-jit FN` | print the LLVM IR generated for one function |
+| `-x`, `--exec NAME` | run `$MINDV2_PATH/NAME.dream`, and nothing from here |
 | `--dump` | disassemble the loaded image |
 | `--stats` | reductions and collections |
+| `--profile [N]` | count reductions per function and print the hottest |
+
+An image is named the way a program is: `dream mind` tries `mind`, then
+`mind.dream`, then both of those under `$MINDV2_PATH`. `-x` is the half of that
+without the working directory, so a stray file cannot shadow an installed
+program.
+
+`--profile` attributes every reduction to the function whose frame was current,
+which is how the compiler was made to say where its own time went. Natives do
+not reduce, so work done inside a builtin shows up against its caller.
 
 ### `just`
 
 ```
-just                 # build both halves
+just                 # the VM, then the compiler built from its own seed
 just run FILE        # compile and run
+just repl            # an interactive session
 just check FILE      # scope, purity and verification, no image
-just test            # compiler, VM, end-to-end, and standard-library tests
+just test            # VM, end-to-end, examples, library, compiler and server tests
+just test-reference  # the differential tests, which are what `dreamc` is still for
 just test-all        # the above plus fuzzing, heap verification, no-JIT build
 ```
 
@@ -1227,14 +1286,13 @@ just test-all        # the above plus fuzzing, heap verification, no-JIT build
 
 ```
 .dr source
-   │  lexer.rs      logos tokens, newline tracking
-   │  parser.rs     recursive descent, precedence climbing
-   │  modules.rs    whole-program module and package resolution
-   │  lower.rs      scope resolution, closure conversion, purity checking
-   │  consteval.rs  comp / comp!
-   │  ir.rs         node arena, opcodes, constant pool
-   │  verify.rs     structural validation
-   │  emit.rs       container writer
+   │  lexer.dr     a lazy token stream, newline and column tracking
+   │  parser.dr    recursive descent, precedence climbing
+   │  modules.dr   whole-program module and package resolution
+   │  scope.dr     name resolution, closure conversion, purity checking
+   │  lower.dr     execution trees, `derive` specialization, `comp`
+   │  ir.dr        node arena, opcodes, constant pool
+   │  emit.dr      container writer
    ▼
 .dream image        a flat arena of 16-byte nodes linked by index
    │                (format: dreamc/docs/bytecode-format.md)
@@ -1243,11 +1301,15 @@ dream              image.cpp loads and revalidates; interp.cpp reduces;
                     jit.cpp compiles the strict numeric spine
 ```
 
+Every one of those is a module of `dreams`, which is an ordinary Dream program,
+so the language server imports the front end as a library rather than parsing a
+compiler's output back out of a pipe.
+
 `--shebang` writes an interpreter line before the image and sets the execute
 bit, so a compiled program can be run as a command:
 
 ```
-dreamc hello.dr --shebang -o hello    # `#!/usr/bin/env dream` by default
+dreams hello.dr --shebang -o hello    # `#!/usr/bin/env dream` by default
 ./hello
 ```
 
@@ -1285,7 +1347,7 @@ dream_vm_free(vm);
 The Dream side is compiled with the module named, so that the import resolves:
 
 ```
-dreamc program.dr --host-module host -o program.dream
+dreams program.dr --host-module host -o program.dream
 ```
 
 [`dream/examples/embed.c`](../dream/examples/embed.c) is this example in full,

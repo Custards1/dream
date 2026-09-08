@@ -24,6 +24,8 @@ import std.list;
 import std.os;
 import std.str;
 
+import dreams.path;
+
 import analysis;
 import rpc;
 
@@ -203,6 +205,11 @@ let rec serve! inh out s =
 
 let opts = [
     cli.list_of "L" "package-path" "DIR" "a package, or a directory holding packages",
+    // An LSP client names the transport it started us on. `vscode-languageclient`
+    // appends `--stdio` to the command line by itself, and a server that rejects
+    // it dies before it has read a byte. Stdio is the only transport here, so the
+    // flag is accepted and means nothing.
+    cli.flag "" "stdio" "speak LSP on stdin and stdout (the default, and the only one)",
     cli.flag "h" "help" "this message",
     cli.flag "" "version" "print the version",
 ];
@@ -215,8 +222,8 @@ let usage = cli.usage "lucid" "a language server for Dream"
 /// import of it as an error.
 let stdlib_roots! () =
     match os.env! "MIND_STDLIB" {
-        () => match os.env! "DREAM_PACKAGES" { () => [], p => [p] },
-        p => [p],
+        () => match os.env! "DREAM_PACKAGES" { () => [], p => [path.expand_home! p] },
+        p => [path.expand_home! p],
     };
 
 let main! =

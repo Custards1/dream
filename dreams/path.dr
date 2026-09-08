@@ -134,6 +134,23 @@ let normalize p = {
     else { of_segments absolute segs }
 };
 
+/// A leading `~` means the home directory.
+///
+/// A shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
+/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
+/// called that, so a search path written that way silently finds nothing --
+/// which looks like a missing library rather than a quoted tilde. `~other`,
+/// which names another user's home, is left alone: guessing where that is would
+/// be worse than not answering.
+let expand_home! p =
+    if p == "~" || str.starts_with "~/" p {
+        match os.env! "HOME" {
+            () => p,
+            home => home + str.slice 1 (str.byte_length p - 1) p,
+        }
+    }
+    else { p };
+
 /// The path as an absolute, normalised one: what stands in for `canonicalize`.
 let absolute! p = normalize (if is_absolute p { p } else { join (os.cwd! ()) p });
 

@@ -1,2 +1,212 @@
+// Processes: the shapes the builtins leave to the caller.
+//
+// `spawn!`, `join!`, `send!`, `recv!` and `self!` are the whole of the
+// runtime's story about concurrency, and they are deliberately few. What is
+// missing from them is not power but shape: every program that uses them ends
+// up writing the same handful of things -- start these and collect the answers,
+// ask a question and wait for the reply, serve requests in a loop, find out
+// that a process died without dying with it.
+//
+// Three things about the runtime decide what can be written here.
+//
+// **A thunk runs once.** `$( work )` is a suspension that remembers its result,
+// so spawning the same thunk twice does not run it twice: the second spawn
+// finds a value. Anything that has to start the same work again -- a retry, a
+// supervisor's restart -- takes a *function* of unit and builds a fresh thunk
+// each time. That is why `restart!` and friends ask for `start!` rather than
+// for a thunk.
+//
+// **Spawning is lazy too.** `list.map (fn x -> spawn! $( f x )) xs` builds a
+// list of thunks and starts nothing; the processes begin one at a time as each
+// element is forced, which is the opposite of what the code looks like. Every
+// function here that starts more than one process forces the list first, and
+// that `strict!` is the difference between running in parallel and running in
+// sequence.
+//
+// **There is no selective receive and no way to kill.** `recv!` answers the
+// next message whatever it is, so a process expecting a reply must be prepared
+// for anything else that was sent to it; and a process that will not stop
+// cannot be stopped from outside. Both are why the server loop below is written
+// around a handler that sees every message and decides.
+import std.core;
+import std.error;
+import std.list;
 
+// --- starting ---------------------------------------------------------------
 
+/// Start every thunk now, and answer the processes in order.
+///
+/// The `strict!` is the whole function: without it the spawns are thunks and
+/// the work is serialized behind whoever forces them.
+let start_all! thunks = strict! (list.map (fn t -> spawn! t) thunks);
+
+/// Start `start! x` for each `x`, in parallel.
+///
+/// `start!` is a function rather than a thunk because a thunk is per-element
+/// here: `$( start! x )` inside the lambda is built fresh for every `x`, which
+/// is exactly what is wanted, and what makes this safe to call twice.
+let start_each! start! xs = start_all! (list.map (fn x -> $( start! x )) xs);
+
+// --- waiting ----------------------------------------------------------------
+
+/// Wait for every process, in order, and answer their values.
+///
+/// Order is the order of the list, not the order they finish: a caller that
+/// wants results as they arrive wants a mailbox, not this.
+let wait_all! ps = list.map (fn p -> join! p) ps |> strict!;
+
+/// What a process came to, as a value: `[:ok, v]` or `[:error, e]`, where `e`
+/// is the error itself -- ask `std.error` for its kind or payload.
+///
+/// `join!` re-raises what the process raised, which takes the joiner down with
+/// it. That is right for a caller that cannot continue without the answer, and
+/// wrong for anything supervising, so this is the other half.
+let outcome! p = try! {
+    // The join has to happen *inside* the `try!`, and a lazy position puts it
+    // outside: `[:ok, join! p]` builds a list holding an unforced join, the
+    // `try!` sees a perfectly good list, and the failure arrives at whoever
+    // forces the element -- long past the `catch`. Binding it is what forces
+    // it here, because a statement of an impure block is sequenced.
+    let value = join! p;
+    [:ok, value]
+} catch e { [:error, e] };
+
+let outcomes! ps = list.map (fn p -> outcome! p) ps |> strict!;
+
+/// Run these in parallel and answer their values, in order.
+let parallel! thunks = wait_all! (start_all! thunks);
+
+/// `list.map`, one process per element.
+///
+/// Worth it when `f` is slow and worth nothing when it is not: a process is
+/// cheap but not free, and a list of a million integers should be mapped in
+/// the ordinary way.
+let map! f xs = wait_all! (start_each! (fn x -> f x) xs);
+
+/// The same, keeping failures as values rather than raising them.
+let try_map! f xs = outcomes! (start_each! (fn x -> f x) xs);
+
+// --- talking ----------------------------------------------------------------
+//
+// A request carries the process to answer, because the runtime has no notion of
+// a sender: `recv!` hands over a message and nothing else. `[:call, from, body]`
+// is that convention written down, and `serve!` below understands it.
+
+let call_message from body = [:call, from, body];
+
+let is_call m = core.is_empty m == false && list.nth 0 m == :call;
+let call_from m = list.nth 1 m;
+let call_body m = list.nth 2 m;
+
+/// Send `body` to `target` and wait for the reply.
+///
+/// The reply is whatever arrives next. With no selective receive that is the
+/// best that can be promised, so this is for a process that is waiting on one
+/// answer and nothing else -- which is the usual case, and the reason to say
+/// so here rather than leave it to be discovered.
+let call! target body = {
+    send! target (call_message (self! ()) body)
+    recv! ()
+};
+
+/// Answer a request. The other half of `call!`.
+let reply! m value = send! (call_from m) value;
+
+// --- serving ----------------------------------------------------------------
+
+/// A message loop. `handle!` sees the state and one message and answers
+/// `[:go, state]` to continue or `[:stop, value]` to finish with that value.
+///
+/// This is what a supervised worker looks like: it is the only shape that can
+/// be asked to stop, because a process that is not reading its mailbox cannot
+/// be told anything at all.
+let rec serve! state handle! =
+    match handle! state (recv! ()) {
+        [:stop, value] => value,
+        [:go, next] => serve! next handle!,
+        // A handler that answers something else has a bug, and stopping with
+        // it is more useful than looping on it for ever.
+        other => other,
+    };
+
+/// The conventional stop message, so that a worker and whatever supervises it
+/// do not have to agree on a spelling.
+///
+/// Sending it matters more than it looks: a process parked on `recv!` is a
+/// process the runtime is still waiting for, and a program that ends with one
+/// of those ends with "every process is waiting for a message that cannot
+/// arrive" rather than with its answer. Whoever starts a server owns stopping
+/// it.
+let shutdown = :shutdown;
+
+let is_shutdown m = m == shutdown;
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let double x = x * 2;
+
+    /// A worker that adds up what it is sent and answers its total when asked
+    /// to stop. Every test below drives one of these, because a process that
+    /// only ever answers is the only kind a test can wait for.
+    let adder! () =
+        serve! 0 (fn total m ->
+            if is_shutdown m { [:stop, total] }
+            else if is_call m {
+                reply! m (total + call_body m)
+                [:go, total + call_body m]
+            }
+            else { [:go, total + m] });
+
+    let tests = [
+        test.case "parallel! answers in order"
+            $( test.eq! [1, 2, 3] (parallel! [$( 1 ), $( 2 ), $( 3 )]) ),
+        test.case "map! is a map"
+            $( test.eq! [2, 4, 6] (map! double [1, 2, 3]) ),
+        test.case "outcome! of a value"
+            $( test.eq! [:ok, 7] (outcome! (spawn! $( 7 ))) ),
+        // `catch` binds the error itself, not what was raised: `raise! :boom`
+        // wraps `:boom` in a box whose kind is the catch-all `:error` and whose
+        // payload is the atom. That is why the payload is what is compared
+        // here, and it is the reason `std.error` exists.
+        test.case "outcome! of a failure is a value, not a raise"
+            $( test.eq! :boom (error.payload (list.nth 1 (outcome! (spawn! $( raise! :boom ))))) ),
+        test.case "try_map! keeps going past a failure"
+            $( {
+                let got = try_map! (fn x -> if x == 1 { 1 } else { raise! :bad }) [1, 2];
+                test.eq! [[:ok, 1], [:error, :bad]]
+                         [list.nth 0 got,
+                          [:error, error.payload (list.nth 1 (list.nth 1 got))]]
+            } ),
+
+        test.case "call! gets an answer back"
+            $( {
+                let p = spawn! $( adder! () );
+                let answer = call! p 5;
+                send! p shutdown
+                join! p
+                test.eq! 5 answer
+            } ),
+        test.case "a server stops when it is told to"
+            $( {
+                let p = spawn! $( adder! () );
+                call! p 2
+                send! p shutdown
+                test.eq! 2 (join! p)
+            } ),
+        test.case "a server keeps its state between messages"
+            $( {
+                let p = spawn! $( adder! () );
+                call! p 1
+                let total = call! p 2;
+                // Stopped before the case ends: a server left parked on `recv!`
+                // outlives the test and the runtime reports the whole program
+                // as deadlocked.
+                send! p shutdown
+                join! p
+                test.eq! 3 total
+            } ),
+    ];
+}

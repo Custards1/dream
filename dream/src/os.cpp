@@ -446,11 +446,74 @@ NativeResult os_platform(Process& p, Value, Value*, uint32_t) {
 
 /// Stop the whole program. Every other process is abandoned where it stands,
 /// which is why this is worth reaching for only from the top of a program.
+/// `monotonic!` -- milliseconds from some fixed point in this process's life.
+///
+/// A steady clock, so it never jumps: the number it answers only ever grows,
+/// whatever happens to the wall clock. That is what makes a *difference*
+/// between two readings a duration, which is the only thing this is for --
+/// where the zero is has no meaning at all.
+///
+/// Timing anything in a lazy language means forcing it first. A phase that has
+/// not been forced has not run, so `let t = monotonic! ()` around an unforced
+/// value times the building of a thunk.
+NativeResult os_monotonic(Process& p, Value, Value*, uint32_t) {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return NativeResult::ok(
+        make_integer(p, int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now).count())));
+}
+
+/// `now!` -- milliseconds since the Unix epoch, from the wall clock.
+///
+/// This one can jump backwards, because the wall clock can: it is what to
+/// stamp a file or a log line with, and never what to measure a duration with.
+NativeResult os_now(Process& p, Value, Value*, uint32_t) {
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    return NativeResult::ok(
+        make_integer(p, int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now).count())));
+}
+
 NativeResult os_exit(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_fixnum(v)) return fail(p, "type_error", "exit! needs an exit code");
+    // Nothing runs after this, so anything the run owes its caller has to be
+    // said here. A profile that only printed on the way out of `main` would
+    // never print for a program that ends by exiting, which is most tools.
+    p.runtime().print_profile();
     std::fflush(nullptr);
     std::_Exit(int(fixnum_value(v)));
+}
+
+/// `replace! program args` -- become another program.
+///
+/// This is `execvp`: the image, the heap and every thread of this VM are gone,
+/// and the program named here takes over the process. Nothing comes back, so
+/// there is no result type and no `!`-suffixed thing to do with one -- the only
+/// way this returns is by failing.
+///
+/// `exec!` is the wrong tool for handing over to something *interactive*: it
+/// gives the child pipes and reads them to the end, so a program that prompts
+/// has nobody typing at it. A tool that runs an editor, a shell or a REPL wants
+/// this instead -- the child inherits the terminal, because it inherits
+/// everything.
+NativeResult os_replace(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "replace! needs a program name");
+    std::vector<std::string> argv{string_arg(args[0])};
+    if (!read_string_list(p, args[1], &argv)) {
+        if (p.park_requested) return NativeResult::block();
+        return fail(p, "type_error", "replace! needs a list of string arguments");
+    }
+
+    std::vector<char*> raw;
+    raw.reserve(argv.size() + 1);
+    for (std::string& a : argv) raw.push_back(a.data());
+    raw.push_back(nullptr);
+
+    // Anything still sitting in a stdio buffer would be lost with the address
+    // space, so it goes out first.
+    std::fflush(nullptr);
+    ::execvp(raw[0], raw.data());
+    return fail(p, "not_found",
+                std::string("cannot run `") + argv[0] + "`: " + std::strerror(errno));
 }
 
 }  // namespace
@@ -468,6 +531,9 @@ ModuleDef make_os_module() {
                          {"list_dir!", 1, 0b1, os_list_dir},
                          {"exec!", 2, 0b01, os_exec},
                          {"exec_for!", 3, 0b101, os_exec_for},
+                         {"replace!", 2, 0b01, os_replace},
+                         {"monotonic!", 1, 0b1, os_monotonic},
+                         {"now!", 1, 0b1, os_now},
                          {"pid!", 1, 0b1, os_pid},
                          {"platform", 1, 0b1, os_platform},
                          {"exit!", 1, 0b1, os_exit},

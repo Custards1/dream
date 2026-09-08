@@ -32,9 +32,14 @@ import dreams.modules;
 import dreams.package;
 import dreams.parser;
 import dreams.path;
+import dreams.repl;
 import dreams.scope;
 
 let version = "0.1.0";
+
+/// What `--shebang` writes when it is not given a line. `env` so that it finds
+/// whichever `dream` is on the PATH rather than one fixed place.
+let default_shebang = "#!/usr/bin/env dream";
 
 // --- reporting --------------------------------------------------------------
 
@@ -164,14 +169,20 @@ let show_ir! l = {
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out = {
+let build! l out shebang = {
     let r = scope.resolve! l;
     let low = lower.link! l r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
     else {
         let img = lower.image low;
-        let bytes = emit.to_binary img;
+        // The shebang goes in front of the image rather than into it: the VM
+        // skips a leading `#!` line when it loads a file, which is what makes
+        // one file both an image and a program.
+        let bytes = match shebang {
+                        () => emit.to_binary img,
+                        line => line + "\n" + emit.to_binary img,
+                    };
         let h = try! { io.open! out :write } catch e { () };
         match h {
             () => {
@@ -181,6 +192,10 @@ let build! l out = {
             handle => {
                 write_all! handle bytes
                 io.close! handle
+                // There is no `chmod` builtin, and the execute bit is the whole
+                // point of the `#!` line, so this is one place where shelling
+                // out is the implementation rather than a shortcut.
+                match shebang { () => (), _ => os.exec! "chmod" ["+x", out] }
                 console.error! ("compiled -> " + out + " (" + to_string (str.byte_length bytes)
                                 + " bytes, " + to_string (list.length (modules.modules l))
                                 + " modules, " + to_string (list.length (core.map_get img :nodes []))
@@ -220,6 +235,88 @@ let show_stats! l = {
                        + list.length (core.map_get img :atoms []))
     count! "reductions" (vm.reductions! ())
     print_diags! (modules.files l) (list.append (modules.diags l) (scope.r_diags r))
+};
+
+// --- where the time goes ----------------------------------------------------------
+//
+// A compiler that is slow is slow *somewhere*, and guessing where is how an
+// afternoon disappears into the wrong function. This runs the same pipeline a
+// build runs and says what each stage cost.
+//
+// Every reading is taken around a `strict!`, and that is not a detail: in a
+// lazy language a stage that has not been forced has not run. Timing
+// `modules.load! ..` unforced would time the building of one thunk and hand the
+// real work to whoever forced it next, so the numbers would say the front end
+// is free and the image writer is everything. Forcing each stage where it is
+// measured moves no work -- the next stage would have forced exactly this --
+// it only puts the cost where it was incurred.
+
+/// One stage: force it, and answer `[value, work, walk]` in milliseconds.
+///
+/// The stage arrives here unevaluated, and nothing had to be written to make it
+/// so: an argument is a thunk, so `timed! (scope.resolve! l)` hands over the
+/// work rather than its result. That is the whole trick, and it is why there is
+/// no lambda here -- laziness already is the suspension a timer needs.
+///
+/// The `strict!` below is where the work happens, and where the clock is read.
+/// Forcing at the binding would time the building of a thunk and hand the real
+/// work to whoever forced it next, and every stage would look free except the
+/// last.
+///
+/// Two readings, because one would be a lie. Forcing a stage walks everything
+/// it is built on -- an arena carries the resolution tables, which carry the
+/// syntax trees -- and all of that was forced by the stage before. The second
+/// `strict!` finds every thunk already forced and does nothing but walk, which
+/// is what the first one spent on ground already covered. The difference is
+/// this stage's own work, and it is the column to read.
+let timed! value = {
+    let before = os.monotonic! ();
+    strict! value
+    let forced = os.monotonic! ();
+    strict! value
+    let walked = os.monotonic! ();
+    [value, forced - before, walked - forced]
+};
+
+let value_of t = list.head t;
+let work_of t = list.nth 1 t;
+let walk_of t = list.nth 2 t;
+/// What this stage did that no stage before it had done.
+let own_of t = {
+    let d = work_of t - walk_of t;
+    if d < 0 { 0 } else { d }
+};
+
+/// Time the whole pipeline, stage by stage, and write nothing.
+let show_time! o file = {
+    let load = timed! (load! o file);
+    let l = value_of load;
+    let resolved = timed! (scope.resolve! l);
+    let r = value_of resolved;
+    let linked = timed! (lower.link! l r);
+    let low = value_of linked;
+    let built = timed! (lower.image low);
+    let img = value_of built;
+    let written = timed! (emit.to_binary img);
+    let bytes = value_of written;
+
+    let stages = [["parse", load], ["resolve", resolved], ["lower", linked],
+                  ["arena", built], ["emit", written]];
+    let total = list.fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
+    let pad n text = str.repeat (n - str.byte_length text) " " + text;
+    let line! label ms walk = {
+        let pct = if total <= 0 { 0 } else { ms * 100 / total };
+        console.print! (label + str.repeat (10 - str.byte_length label) " "
+                        + pad 6 (to_string ms) + " ms  " + pad 3 (to_string pct) + "%"
+                        + (match walk { () => "", w => "   (walk " + to_string w + " ms)" }))
+    };
+    list.map (fn st -> line! (list.head st) (own_of (list.nth 1 st))
+                             (walk_of (list.nth 1 st))) stages |> strict!
+    line! "total" total ()
+    console.print! ("image     " + to_string (str.byte_length bytes) + " bytes, "
+                    + to_string (list.length (modules.modules l)) + " modules, "
+                    + to_string (list.length (core.map_get img :nodes [])) + " nodes")
+    print_diags! (modules.files l) (list.append (modules.diags l) (lower.all_diags r low))
 };
 
 // --- questions an editor asks ----------------------------------------------------
@@ -364,7 +461,7 @@ let describe_resolution l r found =
 
 let defaults = %{ :command => :check, :file => (), :roots => [], :includes => [],
                   :defines => [], :hosts => [], :test => false, :quiet => false,
-                  :position => (), :output => (), :error => () };
+                  :position => (), :output => (), :shebang => (), :error => () };
 
 let opt o k = core.map_get o k ();
 let with_opt k v o = core.map_put o k v;
@@ -408,7 +505,20 @@ let rec parse_args args o =
         ["--ir", ..rest]        => parse_args rest (with_opt :command :ir o),
         ["--symbols", ..rest]   => parse_args rest (with_opt :command :symbols o),
         ["--stats", ..rest]     => parse_args rest (with_opt :command :stats o),
+        ["--time", ..rest]      => parse_args rest (with_opt :command :time o),
         ["--print-cfg", ..rest] => parse_args rest (with_opt :command :print_cfg o),
+        ["--repl", ..rest]      => parse_args rest (with_opt :command :repl o),
+        // The VM skips a leading `#!` line, so an image carrying one is both a
+        // valid image and a file that runs when it is executed. The line is
+        // optional: `--shebang` on its own writes the usual one, and anything
+        // that is not another option replaces it.
+        ["--shebang"] => with_opt :shebang default_shebang o,
+        ["--shebang", nxt, ..rest] =>
+            if str.starts_with "-" nxt { parse_args (list.cons nxt rest)
+                                                    (with_opt :shebang default_shebang o) }
+            else if str.starts_with "#!" nxt { parse_args rest (with_opt :shebang nxt o) }
+            else { parse_args rest (with_opt :shebang ("#!" + nxt) o) },
+        ["-i", ..rest]          => parse_args rest (with_opt :command :repl o),
         ["--version", ..rest]   => parse_args rest (with_opt :command :version o),
         ["-h", ..rest]          => parse_args rest (with_opt :command :help o),
         ["--help", ..rest]      => parse_args rest (with_opt :command :help o),
@@ -462,7 +572,11 @@ let usage! () = {
         "  --symbols      list what this file defines, with where",
         "  --at LINE:COL  say what is at a position, and where it came from",
         "  --stats        count what the program contains",
+        "  --time         compile the whole way and say what each stage cost",
+        "  --repl         an interactive session: read, compile, run, repeat",
         "  --print-cfg    print the `when` flags that are defined",
+        "  --shebang [LINE]  prefix the image with a `#!` line and make it executable",
+        "  -i, --repl     an interactive session: read, compile, run, repeat",
         "  --version      print the version",
         "",
         "where to look:",
@@ -510,14 +624,16 @@ let run_command! o file =
         :ast       => with_source! file (fn src -> ast! file src),
         :parse     => with_source! file (fn src -> parse_only! file src),
         :check     => check_program! (load! o file),
-        :build     => build! (load! o file) (opt o :output),
+        :build     => build! (load! o file) (opt o :output) (opt o :shebang),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),
         :stats     => show_stats! (load! o file),
+        :time      => show_time! o file,
         :symbols   => show_symbols! (load! o file) file,
         :at        => show_at! (load! o file) file
                                (list.nth 0 (opt o :position)) (list.nth 1 (opt o :position)),
+        :repl      => (),
         _ => usage! (),
     };
 
@@ -531,6 +647,8 @@ let run! args = {
                     console.print! ("dreams " + version)
                     0
                 },
+                :repl => repl.start! (list.append (opt o :roots) (opt o :includes))
+                                     (configured! o) version,
                 :print_cfg => {
                     list.map (fn line -> console.print! line) (config.describe (configured! o))
                         |> strict!

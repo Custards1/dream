@@ -117,9 +117,23 @@ const char* obj_type_name(ObjType t);
 struct Obj {
     ObjType type;
     uint8_t gc;   // scratch for the collector: mark bit / forwarded flag
-    uint16_t aux;
+    uint16_t aux;  // flags that survive collection; see AUX_DEEP_FORCED
     uint32_t bytes;
 };
+
+/// Everything under this object has been forced.
+///
+/// A value never changes once it is built, so this is true forever once it is
+/// true at all -- which is what lets a deep force skip a structure it has
+/// already walked. Without it, forcing walks *paths* rather than data, and a
+/// value shared n levels deep is walked 2^n times: the compiler's own tables,
+/// which share a syntax tree between every table that mentions it, took seconds
+/// to walk and no time at all to build.
+///
+/// It rides in `aux`, which the collector copies with the rest of the header,
+/// so it survives a collection. A host that reaches in and replaces a field of
+/// an object it did not just make must clear it.
+constexpr uint16_t AUX_DEEP_FORCED = 1;
 static_assert(sizeof(Obj) == 8, "object headers must stay one word");
 
 inline Obj* as_obj(Value v) { return reinterpret_cast<Obj*>(v); }

@@ -377,6 +377,10 @@ dream_result dream_array_set(dream_value array, uint32_t index, dream_value v) {
     if (!is_obj(array, ObjType::Array)) return DREAM_BAD;
     auto* a = static_cast<ArrayObj*>(as_obj(array));
     if (index >= a->len) return DREAM_BAD;
+    // A host writing into an array it did not just build may be putting an
+    // unforced value into one a deep force has already walked, so the promise
+    // that flag makes no longer holds.
+    a->aux &= uint16_t(~AUX_DEEP_FORCED);
     a->items()[index] = v;
     return DREAM_OK;
 }

@@ -1,0 +1,125 @@
+// Results: `[:ok, value]` and `[:error, reason]`, and what to do with them.
+//
+// This shape is already the convention everywhere in this library and the tools
+// built on it -- `json.parse`, `cli.parse`, `toml.parse`, the manifest reader --
+// and for one reason: raising is an effect. A pure function cannot raise, so a
+// pure parser cannot report a failure by raising; it has to *answer* one. That
+// is what makes this a value rather than an exception, and why the library
+// keeps returning it instead of moving to `try!`.
+//
+// The cost of a convention with no module behind it is that every caller
+// rewrites the same `match`. What follows is those matches, named. Nothing here
+// is clever -- the point is that `and_then` reads as "and then", so a pipeline
+// of steps that can each fail is written once and reads as the sequence it is.
+import std.core;
+import std.list;
+
+// --- making one ---------------------------------------------------------------
+
+let ok value = [:ok, value];
+let error reason = [:error, reason];
+
+let is_ok r = list.nth 0 r == :ok;
+let is_error r = list.nth 0 r == :error;
+
+/// The value, or `default` for an error. The usual way out of a result.
+let or_else default r = if is_ok r { list.nth 1 r } else { default };
+
+/// The reason, or `default` when there is none.
+let reason default r = if is_error r { list.nth 1 r } else { default };
+
+/// The value, raising the reason if there is not one. Impure by name, because
+/// raising is an effect -- which is the whole reason this module exists.
+let unwrap! r = if is_ok r { list.nth 1 r } else { raise! (list.nth 1 r) };
+
+// --- carrying on ----------------------------------------------------------------
+
+/// Change the value, leave an error alone.
+let map f r = if is_ok r { ok (f (list.nth 1 r)) } else { r };
+
+/// Change the reason, leave a value alone. What to use when a failure needs to
+/// be reported in the caller's terms rather than the callee's.
+let map_error f r = if is_error r { error (f (list.nth 1 r)) } else { r };
+
+/// The next step, which may itself fail. This is the one that makes a pipeline:
+///
+///     read path |> and_then parse |> and_then validate
+let and_then f r = if is_ok r { f (list.nth 1 r) } else { r };
+
+/// The first result if it is ok, otherwise the second. `r` is not forced when
+/// it does not have to be, so the fallback can be expensive.
+let or_try other r = if is_ok r { r } else { other };
+
+// --- several at once ------------------------------------------------------------
+
+/// `[:ok, values]` when every one is ok, or the first error.
+///
+/// Stops at the first failure, which for a lazy list means the ones after it
+/// are never computed -- validating a thousand things costs one when the first
+/// is wrong.
+let rec all rs =
+    if list.is_empty rs { ok [] }
+    else {
+        let first = list.head rs;
+        if is_error first { first }
+        else {
+            let rest = all (list.tail rs);
+            if is_error rest { rest }
+            else { ok (core.cons (list.nth 1 first) (list.nth 1 rest)) }
+        }
+    };
+
+/// The values of every ok, dropping the errors. For when a failure is worth
+/// skipping rather than stopping for.
+let oks rs = list.map (fn r -> list.nth 1 r) (list.filter is_ok rs);
+
+/// The reasons of every error.
+let errors rs = list.map (fn r -> list.nth 1 r) (list.filter is_error rs);
+
+/// `[:ok, v]` when `v` is not `()`, and `[:error, reason]` when it is. The
+/// bridge from the other convention this library uses -- a lookup that answers
+/// `()` for "nothing there".
+let of_option reason v = match v { () => error reason, found => ok found };
+
+/// And back: the value, or `()`.
+let to_option r = if is_ok r { list.nth 1 r } else { () };
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let double x = ok (x * 2);
+    let fail _ = error :nope;
+
+    let tests = [
+        test.case "ok"                  $( test.true! (is_ok (ok 1)) ),
+        test.case "error"               $( test.true! (is_error (error :e)) ),
+        test.case "or_else takes the value"   $( test.eq! 1 (or_else 0 (ok 1)) ),
+        test.case "or_else takes the default" $( test.eq! 0 (or_else 0 (error :e)) ),
+        test.case "reason"              $( test.eq! :e (reason () (error :e)) ),
+
+        test.case "map"                 $( test.eq! (ok 2) (map (fn x -> x * 2) (ok 1)) ),
+        test.case "map leaves an error" $( test.eq! (error :e) (map (fn x -> x * 2) (error :e)) ),
+        test.case "map_error"           $( test.eq! (error ":e") (map_error to_string (error :e)) ),
+        test.case "and_then chains"     $( test.eq! (ok 4) (and_then double (double 1)) ),
+        test.case "and_then stops at the first error"
+            $( test.eq! (error :nope) (and_then double (and_then fail (ok 1))) ),
+        test.case "or_try"              $( test.eq! (ok 2) (or_try (ok 2) (error :e)) ),
+
+        test.case "all, every one ok"   $( test.eq! (ok [1, 2]) (all [ok 1, ok 2]) ),
+        test.case "all, the first error wins"
+            $( test.eq! (error :a) (all [ok 1, error :a, error :b]) ),
+        test.case "all of nothing"      $( test.eq! (ok []) (all []) ),
+        test.case "oks"                 $( test.eq! [1, 2] (oks [ok 1, error :e, ok 2]) ),
+        test.case "errors"              $( test.eq! [:e] (errors [ok 1, error :e]) ),
+
+        test.case "of_option, present"  $( test.eq! (ok 5) (of_option :missing 5) ),
+        test.case "of_option, absent"   $( test.eq! (error :missing) (of_option :missing ()) ),
+        test.case "to_option"           $( test.eq! 5 (to_option (ok 5)) ),
+        test.case "to_option of an error" $( test.eq! () (to_option (error :e)) ),
+
+        test.case "unwrap! raises the reason" $( test.raises! $( unwrap! (error :e) ) ),
+        test.case "unwrap! answers the value" $( test.eq! 5 (unwrap! (ok 5)) ),
+    ];
+}

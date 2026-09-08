@@ -324,7 +324,7 @@ int Image::find_global(const char* name) const {
 // ---------------------------------------------------------------------------
 
 bool Image::validate(std::string& error) {
-    auto fail = [&](const char* what) {
+    auto fail = [&](const std::string& what) {
         error = what;
         return false;
     };
@@ -365,7 +365,14 @@ bool Image::validate(std::string& error) {
     for (uint32_t i = 0; i < n_funcs_; ++i) {
         const FuncRec& f = funcs_[i];
         if (f.name >= n_strs_) return fail("bad function name index");
-        if (f.body >= n_nodes_) return fail("function body is not a valid node");
+        if (f.body >= n_nodes_) {
+            // Which function, because a compiler that produced this needs to
+            // know where to look, and the number is the only handle it has.
+            return fail("function " + std::to_string(i) + " (`" +
+                        (f.name < n_strs_ ? str(f.name).str() : std::string("?")) +
+                        "`) has body node " + std::to_string(f.body) + ", but the image has " +
+                        std::to_string(n_nodes_) + " nodes");
+        }
         if (size_t(f.captures_off) + f.n_captures > n_kids_) return fail("capture list extends past the kids pool");
     }
     for (uint32_t i = 0; i < n_kids_; ++i) {

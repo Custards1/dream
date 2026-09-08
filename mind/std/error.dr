@@ -1,0 +1,134 @@
+// Errors: the kind, the payload, and how to make one of your own.
+//
+// The language has said since the beginning that an error is a **kind** (an
+// atom) and a **payload**, and `try! .. catch e` hands one over -- but until
+// `std.core` grew `error_kind` and `error_payload` there was no way in. A
+// caught error could be printed and nothing else, so every program that wanted
+// to tell one failure from another either matched on the text of a message or
+// gave up and treated all failures alike.
+//
+// That is what this module is for. With the kind readable, a failure is an
+// ordinary value to `match` on:
+//
+//     match error.kind e {
+//         :divide_by_zero => ..,
+//         :not_found      => ..,
+//         _               => raise! e,          // not ours; pass it on
+//     }
+//
+// and a program can raise failures of its own that are just as distinguishable
+// as the runtime's, rather than raising a string and hoping the reader parses
+// it back.
+//
+// Nothing here is impure except the two that raise. Reading an error is not an
+// effect; only causing one is.
+import std.core;
+import std.str;
+
+// --- reading ----------------------------------------------------------------
+
+/// The kind, or `()` for a value that is not an error -- so a `match` on the
+/// kind needs no type test in front of it.
+let kind e = core.error_kind e;
+
+/// The payload, or `()`. Whatever the raiser passed: `raise! "text"` makes the
+/// payload that text, and the runtime's own failures carry a message.
+let payload e = core.error_payload e;
+
+let is_error e = type_of e == :error;
+
+/// Is this that kind of failure? The question most `catch` blocks are really
+/// asking, and it is total: a non-error is not of any kind.
+let is_kind k e = core.error_kind e == k;
+
+/// Is it one of these kinds?
+let rec is_any kinds e =
+    if core.is_empty kinds { false }
+    else if is_kind (core.head kinds) e { true }
+    else { is_any (core.tail kinds) e };
+
+/// The payload as text, for a message a person will read. A payload that is
+/// already a string is used as it is, so a message does not gain quotes on its
+/// way to a log.
+let message e =
+    match payload e {
+        () => "",
+        p => if type_of p == :string { p } else { to_string p },
+    };
+
+/// `kind: message`, which is the line to print when there is nothing more
+/// useful to say.
+let describe e =
+    if not (is_error e) { to_string e }
+    else {
+        let m = message e;
+        if str.is_empty m { to_string (kind e) } else { to_string (kind e) + ": " + m }
+    };
+
+// --- making -----------------------------------------------------------------
+
+/// An error as a value. Making one is not raising one: this is how a failure is
+/// *returned* -- `[:error, error.new :not_found path]` -- from a pure function,
+/// which cannot raise at all.
+let new k p = core.error_new k p;
+
+/// Raise a failure of a named kind. The typed form of `raise!`, which wraps
+/// whatever it is given in the catch-all kind `:error`.
+let raise_as! k p = raise! (core.error_new k p);
+
+/// Re-raise something caught. Worth a name because a `catch` that handles some
+/// kinds has to pass the others on, and passing them on unchanged -- rather
+/// than wrapping them again -- is what keeps the original kind readable.
+let rethrow! e = raise! e;
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    /// Run a thunk in its own process and answer whatever it raised. In a
+    /// process, because a case that raises should not take the runner with it,
+    /// and `join!` is what turns the failure back into a value here.
+    let caught! body = try! { join! (spawn! body); () } catch e { e };
+
+    let tests = [
+        test.case "the runtime's own kind is readable"
+            $( test.eq! :divide_by_zero (kind (caught! $( 1 / 0 ))) ),
+        test.case "a raised value is wrapped in the catch-all kind"
+            $( test.eq! :error (kind (caught! $( raise! "boom" ))) ),
+        test.case "the payload comes back"
+            $( test.eq! "boom" (payload (caught! $( raise! "boom" ))) ),
+        test.case "a kind can be matched on"
+            $( test.eq! "divided"
+                        (match kind (caught! $( 1 / 0 )) {
+                             :divide_by_zero => "divided",
+                             _ => "something else",
+                         }) ),
+
+        test.case "is_kind"      $( test.true! (is_kind :divide_by_zero (caught! $( 1 / 0 ))) ),
+        test.case "is_kind of something that is not an error"
+            $( test.false! (is_kind :divide_by_zero 42) ),
+        test.case "is_any"
+            $( test.true! (is_any [:type_error, :divide_by_zero] (caught! $( 1 / 0 ))) ),
+        test.case "is_error"     $( test.true! (is_error (caught! $( 1 / 0 ))) ),
+        test.case "a value is not an error"  $( test.false! (is_error 42) ),
+
+        test.case "kind of a non-error is unit"  $( test.eq! () (kind 42) ),
+        test.case "payload of a non-error is unit" $( test.eq! () (payload 42) ),
+
+        test.case "a typed failure keeps its kind"
+            $( test.eq! :not_found (kind (caught! $( raise_as! :not_found "/tmp/x" ))) ),
+        test.case "and its payload"
+            $( test.eq! "/tmp/x" (payload (caught! $( raise_as! :not_found "/tmp/x" ))) ),
+        test.case "new makes one without raising it"
+            $( test.eq! :not_found (kind (new :not_found "x")) ),
+
+        test.case "message of a string payload has no quotes"
+            $( test.eq! "boom" (message (new :error "boom")) ),
+        test.case "message of another payload is rendered"
+            $( test.eq! ":nope" (message (new :error :nope)) ),
+        test.case "describe"     $( test.eq! ":not_found: /tmp/x" (describe (new :not_found "/tmp/x")) ),
+        test.case "describe of an empty payload is just the kind"
+            $( test.eq! ":stopped" (describe (new :stopped "")) ),
+    ];
+}

@@ -114,12 +114,23 @@ let precedence op =
     };
 
 /// The operator a token kind stands for, or `()` when it is not one.
-let rec binop_of token_kind ops =
-    if list.is_empty ops { () }
-    else if list.head (list.head ops) == token_kind { list.nth 1 (list.head ops) }
-    else { binop_of token_kind (list.tail ops) };
-
-let infix_of token_kind = binop_of token_kind binops;
+///
+/// A `match` rather than a walk of the table above. Every token the parser
+/// meets in an infix position is asked this, and a list scan spends a dozen
+/// cons cells and two calls per candidate to answer a question about one atom:
+/// it was seven percent of everything the compiler did. The table stays as the
+/// documentation of what an operator is; this is how it is looked up.
+let infix_of token_kind =
+    match token_kind {
+        :or_or   => :or,  :and_and => :and,
+        :eq_eq   => :eq,  :bang_eq => :ne,
+        :lt      => :lt,  :le      => :le,
+        :gt      => :gt,  :ge      => :ge,
+        :plus    => :add, :minus   => :sub,
+        :star    => :mul, :slash   => :div,
+        :percent => :mod,
+        _ => (),
+    };
 
 // --- declarations -----------------------------------------------------------
 

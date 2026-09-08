@@ -80,13 +80,19 @@ let keywords = ["let", "rec", "if", "else", "import", "as", "catch", "true", "fa
 let non_starters = ["let", "rec", "else", "import", "as", "catch", "virtual", "derive",
                     "when", "mod"];
 
-let rec has name names =
-    if list.is_empty names { false }
-    else if list.head names == name { true }
-    else { has name (list.tail names) };
+/// The lists above are the readable form; these are how they are asked. A
+/// linear scan answers "is this identifier a keyword" in a dozen reductions
+/// per candidate, and the parser asks it of every identifier in the program --
+/// it was a tenth of everything the compiler did. A map answers it in one
+/// hash, and the set is built once because a top-level binding is forced once.
+let set_of names = list.fold (fn m n -> core.map_put m n true) (core.map_new ()) names;
+
+let keyword_set = set_of keywords;
+let non_starter_set = set_of non_starters;
 
 let is_kw ts word = at ts :ident && peek_value ts == word;
-let is_keyword name = has name keywords;
+let is_keyword name = core.map_has keyword_set name;
+let is_non_starter name = core.map_has non_starter_set name;
 
 /// The token after this one, for the single place that needs to look ahead:
 /// telling `.field` from a `.` that is something else.
@@ -227,7 +233,7 @@ let can_start_arg c ts =
     if not (continues c ts) { false }
     else {
         match peek_kind ts {
-            :ident => not (has (peek_value ts) non_starters),
+            :ident => not (is_non_starter (peek_value ts)),
             :int => true, :float => true, :str => true, :char => true, :atom => true,
             :lparen => true, :lbracket => true,
             :dollar_paren => true, :hash_bracket => true, :percent_brace => true,
@@ -290,7 +296,7 @@ let rec parse_ident c ts sp rest = {
     else if word == "match" { parse_match c sp rest }
     else if word == "comp"  { parse_comp c false sp rest }
     else if word == "comp!" { parse_comp c true sp rest }
-    else if has word non_starters {
+    else if is_non_starter word {
         err ("expected an expression, found the keyword `" + word + "`") sp
     }
     else { ok (ast.name_e word sp) rest }

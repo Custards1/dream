@@ -274,6 +274,7 @@ import std.os;
 |------|-----------|-------------|
 | `exec!` | `program:string → args:list of string → map` | Runs `program` to completion and returns a map `%{ :code, :out, :err, :timed_out }`. `program` is resolved via `PATH`. Parks the calling process — not the worker thread — while the child runs. |
 | `exec_for!` | `program:string → args:list of string → timeout_ms:integer → map` | Same as `exec!` but kills the child after `timeout_ms` milliseconds. Sets `:timed_out true` in the result map when the deadline is hit, so the caller can distinguish that from an ordinary non-zero exit code. |
+| `replace!` | `program:string → args:list of string → never` | **Becomes** `program`: `execvp`, so this VM — image, heap and every thread — is gone and the named program takes over the process, inheriting the terminal and every open descriptor. Stdio is flushed first. It returns only by failing, raising `:not_found` when the program cannot be run. Use it to hand over to something interactive; `exec!` gives its child pipes, which is right for a compiler and useless for anything that prompts. |
 
 The result map fields:
 
@@ -288,6 +289,8 @@ The result map fields:
 
 | Name | Signature | Description |
 |------|-----------|-------------|
+| `monotonic!` | `unit → integer` | Milliseconds from a fixed point in this process's life, from a steady clock that never jumps. Only *differences* between two readings mean anything — that difference is a duration. Timing anything lazy means forcing it first: an unforced value has not run, so a reading around one times the building of a thunk. |
+| `now!` | `unit → integer` | Milliseconds since the Unix epoch, from the wall clock. It can jump, forwards or back, so it is what to stamp a log line with and never what to measure a duration with. |
 | `pid!` | `unit → integer` | The OS process ID of the running VM. |
 | `platform` | `unit → atom` | The current platform: `:linux`, `:macos`, `:windows`, or `:unknown`. |
 | `exit!` | `code:integer → never` | Terminates the entire VM immediately with the given exit code. Flushes stdio first. Never returns. |
@@ -837,7 +840,7 @@ when test {
 }
 ```
 
-`dreamc FILE --test` then scans **the modules it actually loaded** for that
+`dreams FILE --test` then scans **the modules it actually loaded** for that
 binding and generates an entry point that runs every suite it found. There is
 no registry to keep in step and no test that is silently never run; a program
 with no `tests` anywhere still compiles, and reports that there was nothing to
@@ -853,7 +856,7 @@ import std.all;
 
 Every module in the standard library, imported in one place. Two things use it.
 
-`dreamc mind/std/all.dr --test` builds a runner from the `tests` each of those
+`dreams mind/std/all.dr --test` builds a runner from the `tests` each of those
 modules exports, so **adding a module here is all it takes for its tests to
 run**. Importing them is also a check in itself: a module that no longer
 compiles fails the build rather than being quietly skipped.

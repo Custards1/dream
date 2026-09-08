@@ -40,14 +40,20 @@ import std.str;
 // is `()` for every piece of punctuation. On an `:error` token the payload is
 // the message.
 
-let make kind value start end starts_line col = [kind, value, start, end, starts_line, col];
+/// An array rather than a list, and that is a decision about cost. A token is
+/// read far more often than it is made -- the parser peeks at the same one from
+/// several places before it consumes it -- and a list field is reached by
+/// walking to it, so `col` cost five cells every time it was asked for. Reading
+/// a token was a fifth of everything the compiler did. An array indexes in
+/// constant time, and a token is exactly the fixed-shape record arrays are for.
+let make kind value start end starts_line col = #[kind, value, start, end, starts_line, col];
 
-let kind t        = list.nth 0 t;
-let value t       = list.nth 1 t;
-let span_start t  = list.nth 2 t;
-let span_end t    = list.nth 3 t;
-let starts_line t = list.nth 4 t;
-let col t         = list.nth 5 t;
+let kind t        = core.array_get t 0;
+let value t       = core.array_get t 1;
+let span_start t  = core.array_get t 2;
+let span_end t    = core.array_get t 3;
+let starts_line t = core.array_get t 4;
+let col t         = core.array_get t 5;
 
 let is_error t = kind t == :error;
 

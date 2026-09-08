@@ -15,6 +15,11 @@ import util;
 /// Where a package's manifest lives, and what it says.
 let make root doc = %{ :root => root, :doc => doc };
 
+/// No project at all: every setting at its default. A command that also works
+/// outside a project reads its settings through this, so "there is no manifest"
+/// is a manifest that says nothing rather than a second code path.
+let empty = make "." (core.map_new ());
+
 let root m = core.map_get m :root ".";
 let doc m = core.map_get m :doc (core.map_new ());
 

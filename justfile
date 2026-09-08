@@ -1,10 +1,14 @@
 # Dream: a lazily evaluated functional language.
 #
-#   dreamc/  the compiler (dreamc), in Rust   -- source to `.dream` bytecode
-#   dream/  the VM (dream), in C++          -- interpreter, green processes, LLVM JIT
+#   dreams/ the compiler, in Dream           -- source to `.dream` bytecode
+#   dream/  the VM (dream), in C++           -- interpreter, green processes, LLVM JIT
 #   mind/   the build system and standard library, in Dream
+#   dreamc/ the old compiler, in Rust        -- kept only as a second opinion
 #
-# `just` with no target builds both halves.
+# `just` with no target builds the VM and then the compiler with itself. Nothing
+# in that path is Rust: `dreams` builds from the checked-in seed, and the seed
+# needs the VM and nothing else. What `dreamc` is still here for is
+# `just test-reference`, which asks whether the two compilers agree.
 
 set positional-arguments
 install_dir :="~/.mindv2"
@@ -13,14 +17,20 @@ dreamc := "target/debug/dreamc"
 dreamc_release := "target/release/dreamc"
 dream := build_dir / "bin/dream"
 seed := "dreams/bootstrap/dreams.dream"
+image := "build/dreams.dream"
+# The compiler, as a command. `dreams` is an image rather than a native program,
+# so running it is handing it to the VM -- which is the only difference between
+# the two compilers from anywhere else in this file.
+dreams := dream + " " + image
 
 default: build
 
 # --- building ---------------------------------------------------------------
 
-build: compiler vm
+build: vm dreams
 
-# The compiler. The VM is C++ and is built by the `vm` recipe.
+# The reference compiler, in Rust. Not part of a normal build any more; what
+# needs it is `just test-reference`.
 compiler:
     cargo build --offline -p dreamc
 
@@ -41,20 +51,22 @@ vm-no-jit:
     cmake -S . -B build-nojit -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build build-nojit -j
 
-# The build tool, itself a Dream program compiled by dreamc.
-mind:
+# The compiler, built by the compiler: the checked-in seed compiles this source
+# into `build/dreams.dream`, which is what every other recipe here runs.
+dreams: vm
     mkdir -p build
-    {{dreamc}} -L mind/std mind/tool/main.dr -o build/mind
-    ./patch_shebang.sh build/mind
-    chmod +x build/mind
-# The dreeams , itself a Dream program compiled by either itself or the soon unsupported dreamc.
-dreams:vm mind
+    ./{{dream}} {{seed}} -L mind -L . -o {{image}} dreams/main.dr
+
+# The build tool, itself a Dream program.
+mind: dreams
     mkdir -p build
-    cd dreams &&DREAMC= {{dream}} build/mind -L mind/std mind/tool/main.dr -o build/mind
-# The language server, built with whichever compiler `dreamc` points at.
-lucid:
+    ./{{dreams}} -L mind/std mind/tool/main.dr --shebang -o build/mind
+
+# The language server. It imports `dreams` as a library, so it is the one
+# program here that is both built by the compiler and made of it.
+lucid: dreams
     mkdir -p build
-    {{dreamc}} lucid/main.dr -L mind -L . -o build/lucid.dream
+    ./{{dreams}} lucid/main.dr -L mind -L . -o build/lucid.dream
     @echo "built build/lucid.dream -- run it as: {{dream}} build/lucid.dream"
 
 # Build `dreams` from the checked-in image, with no `dreamc` in sight.
@@ -77,7 +89,7 @@ bootstrap-check: vm
 
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
 test-mind: build
-    {{dreamc}} -L mind/std mind/tool/main.dr --test -o /tmp/dream-mind-tests.dream
+    ./{{dreams}} -L mind/std mind/tool/main.dr --test -o /tmp/dream-mind-tests.dream
     ./{{dream}} /tmp/dream-mind-tests.dream
 
 clean:
@@ -89,54 +101,80 @@ clean:
 
 # --- running ----------------------------------------------------------------
 
+# An interactive session: read an entry, compile the session, run it.
+repl *ARGS: build
+    ./{{dreams}} --repl -L mind -L . {{ARGS}}
+
 # Compile and run a program: `just run examples/hello.dr`
 run FILE *ARGS: build
-    ./{{dreamc}} {{FILE}} -o /tmp/dream-run.dream
+    ./{{dreams}} {{FILE}} -o /tmp/dream-run.dream
     ./{{dream}} /tmp/dream-run.dream {{ARGS}}
 
 # Compile only.
-compile FILE *ARGS: compiler
-    ./{{dreamc}} {{FILE}} {{ARGS}}
+compile FILE *ARGS: dreams
+    ./{{dreams}} {{FILE}} {{ARGS}}
 
 # Type-, scope- and purity-check without writing an image.
-check FILE: compiler
-    ./{{dreamc}} {{FILE}} --no-emit
+check FILE: dreams
+    ./{{dreams}} {{FILE}} --no-emit
 
 # Show the execution trees a program compiles to.
 dump FILE: build
-    ./{{dreamc}} {{FILE}} -o /tmp/dream-dump.dream --no-emit --dump
+    ./{{dreams}} {{FILE}} --ir
 
 # Show the modules and packages a program pulls in.
-modules FILE: compiler
-    ./{{dreamc}} {{FILE}} --no-emit --modules
+modules FILE: dreams
+    ./{{dreams}} {{FILE}} --modules
 
-packages FILE: compiler
-    ./{{dreamc}} {{FILE}} --packages
+packages FILE: dreams
+    ./{{dreams}} {{FILE}} --packages
 
 # The LLVM IR generated for one function.
 jit-ir FILE FN: build
-    ./{{dreamc}} {{FILE}} -o /tmp/dream-jit.dream
+    ./{{dreams}} {{FILE}} -o /tmp/dream-jit.dream
     ./{{dream}} /tmp/dream-jit.dream --dump-jit {{FN}}
 
 # A directly runnable program: the image carries a `#!` line and the execute
 # bit, and the VM skips the line when it loads it.
 run-script FILE OUT: build
-    ./{{dreamc}} {{FILE}} --shebang -o {{OUT}}
+    ./{{dreams}} {{FILE}} --shebang -o {{OUT}}
     ./{{OUT}}
 
+# What an installation is: the VM and `mind` on the path, and the images beside
+# them in `$MINDV2_PATH` itself, which is where `dream -x NAME` looks. That is
+# what makes `dream -x dreams` and `dream -x lucid` work from anywhere.
 install-artifacts:
-    mv {{dreamc_release}} {{install_dir}}/bin || true
-    mv {{dream}} {{install_dir}}/bin || true
-    mv build/mind {{install_dir}}/bin || true
-
-install: release mind
-    just install-artifacts    
+    mkdir -p {{install_dir}}/bin
+    cp {{dream}} {{install_dir}}/bin/dream || true
+    cp build/mind {{install_dir}}/bin/ || true
+    cp {{image}} {{install_dir}}/dreams.dream
+    cp build/lucid.dream {{install_dir}}/lucid.dream || true
+    # The library ships with the compiler that was built against it. An
+    # installation whose `std` is older than its `dreams` is a compiler that
+    # cannot build anything using a function added since -- which is exactly
+    # how this recipe came to copy it: the installed `std` shadowed the one in
+    # the checkout and the compiler failed to build itself.
+    rm -rf {{install_dir}}/std
+    cp -r mind/std {{install_dir}}/std
+install-artifactsv2:
+    mkdir -p {{install_dir}}
+    cp {{dream}} {{install_dir}}/bin/dream || true
+    cp build/mind {{install_dir}}/mind,dresm || true
+    cp {{image}} {{install_dir}}/dreams.dream
+    cp build/lucid.dream {{install_dir}}/lucid.dream || true
+install: vm dreams mind lucid
+    just install-artifacts
 
 
 # --- testing ----------------------------------------------------------------
 
-# Everything.
-test: test-compiler test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-modules test-dreams-scope test-dreams-lower test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
+# Everything that does not need a second compiler to ask.
+test: test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
+
+# The differential tests: every verdict `dreams` reaches, reached again by
+# `dreamc`, and the two compared. This is the only thing the Rust compiler is
+# still here for, and it needs `just compiler` first.
+test-reference: test-compiler test-dreams-modules test-dreams-scope test-dreams-lower
 
 test-compiler:
     cargo test --offline -p dreamc
@@ -159,13 +197,13 @@ examples-bless: build
 # The example package's own tests, which also exercise `virtual`/`derive`
 # across files and a path dependency between two packages.
 test-examples-std: build
-    ./{{dreamc}} examples/textstats/main.dr --test -L mind -L examples -o /tmp/dream-ex-tests.dream
+    ./{{dreams}} examples/textstats/main.dr --test -L mind -L examples -o /tmp/dream-ex-tests.dream
     ./{{dream}} /tmp/dream-ex-tests.dream
 
 # `dreams`, the self-hosted compiler: the parts of it that exist so far.
 # Built from `main.dr` so that every module it reaches has its tests collected.
 test-dreams: build
-    {{dreamc}} dreams/main.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
+    ./{{dreams}} dreams/main.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
     ./{{dream}} /tmp/dream-dreams-tests.dream
 
 # Every Dream file in the repository must parse. The corpus is the real test of
@@ -176,33 +214,32 @@ test-dreams: build
 # file is well formed on its own -- a module in the middle of a package is not a
 # program, and following its imports would be asking something else.
 test-dreams-corpus: build
-    {{dreamc}} dreams/main.dr -L mind -L . -o /tmp/dreams.dream
     @for f in mind/std/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
               dream/tests/programs/*.dr dreams/*.dr; do \
-        ./{{dream}} /tmp/dreams.dream --parse "$f" || exit 1; \
+        ./{{dreams}} --parse "$f" || exit 1; \
     done
     @echo "every file in the corpus parses"
-    {{dreamc}} dreams/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
+    ./{{dreams}} dreams/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
     ./{{dream}} /tmp/dream-ast-tests.dream
-    {{dreamc}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
+    ./{{dreams}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
     ./{{dream}} /tmp/dream-parser-tests.dream
 
 # `dreams`'s module loader against the one it replaces. Every program in the
 # repository must resolve to the same modules, in the same order, under both --
 # and the failures `dreamc` cannot report must be reported here.
-test-dreams-modules: build
+test-dreams-modules: build compiler
     dreamc={{dreamc}} dream={{dream}} dreams/tests/modules.sh
 
 # `dreams`'s resolution and purity pass. Every program must get the same verdict
 # from both compilers, and the broken ones must be rejected for the same reason.
-test-dreams-scope: build
+test-dreams-scope: build compiler
     dreamc={{dreamc}} dream={{dream}} dreams/tests/scope.sh
 
 # `dreams`'s lowering. Every program the reference compiler accepts must lower
 # to an execution tree, the compiler itself included -- which is the only
 # program here big enough to notice a quadratic mistake before it becomes an
 # out-of-memory.
-test-dreams-lower: build
+test-dreams-lower: build compiler
     dreamc={{dreamc}} dream={{dream}} dreams/tests/lower.sh
 
 # The end of the pipeline: programs `dreams` compiled, run by the VM, checked
@@ -211,7 +248,7 @@ test-dreams-lower: build
 # shape. This one asks the only question that finally matters, and it is the
 # evidence that the self-hosted compiler works rather than merely agrees.
 test-dreams-compile: build
-    dreamc={{dreamc}} dream={{dream}} dreams/tests/compile.sh
+    dream={{dream}} seed={{seed}} dreams/tests/compile.sh
 
 # The VS Code extension's grammar, tokenized and checked against the scopes it
 # promises. Needs `npm install` in editors/vscode first.
@@ -220,20 +257,20 @@ test-vscode:
 
 # `lucid`'s own tests: positions, framing, and the URI/path boundary.
 test-lucid: build
-    {{dreamc}} lucid/main.dr --test -L mind -L . -o /tmp/lucid-tests.dream
+    ./{{dreams}} lucid/main.dr --test -L mind -L . -o /tmp/lucid-tests.dream
     ./{{dream}} /tmp/lucid-tests.dream
 
 # And one whole conversation with it, which is the only place the server is
 # checked as a running program rather than as a set of functions.
 test-lucid-session: build
-    dreamc={{dreamc}} dream={{dream}} MIND_STDLIB=mind lucid/tests/session.sh
+    dreams={{image}} dream={{dream}} MIND_STDLIB=mind lucid/tests/session.sh
 
 # The bootstrap: the seed reproduces itself from this source.
 test-bootstrap: bootstrap-check
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
-    ./{{dreamc}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
+    ./{{dreams}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
     ./{{dream}} /tmp/dream-std-tests.dream
 
 # Malformed images must be rejected, never crashed on.
@@ -254,5 +291,5 @@ test-races:
     dream=build-tsan/bin/dream dream/tests/e2e.sh
 
 # The slow, thorough set. What to run before believing a change is safe.
-test-all: test fuzz test-heap vm-no-jit
+test-all: test test-reference fuzz test-heap vm-no-jit
     @echo "all checks passed"

@@ -8,9 +8,34 @@ import std.str;
 // --- paths ------------------------------------------------------------------
 //
 // Textual, not resolved against the file system: `mind` passes paths to
-// `dreamc` and to `git`, both of which do their own resolving, so normalising
+// the compiler and to `git`, both of which do their own resolving, so normalising
 // here would only lose information -- a relative dependency path is meaningful
 // relative to the manifest that named it.
+
+/// A leading `~` means the home directory.
+///
+/// A shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
+/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
+/// called that, so a setting written that way silently finds nothing -- which
+/// reads as a missing library rather than as a quoted tilde. Every path that
+/// comes out of the environment goes through here. `~other`, which names
+/// another user's home, is left alone: guessing where that is would be worse
+/// than not answering.
+let expand_home! p =
+    if p == "~" || str.starts_with "~/" p {
+        match os.env! "HOME" {
+            () => p,
+            home => home + str.slice 1 (str.byte_length p - 1) p,
+        }
+    }
+    else { p };
+
+/// The value of an environment variable, with a leading `~` expanded, or `()`.
+let env_path! name =
+    match os.env! name {
+        () => (),
+        v => expand_home! v,
+    };
 
 /// `.` is dropped rather than kept, so a project at `.` gets `main.dr` and not
 /// `././main.dr` -- these paths end up in error messages and in the `-L` flags
@@ -90,7 +115,7 @@ when test {
     import std.test;
 
     let tests = [
-        // paths are textual: `mind` hands them to `dreamc` and to `git`, which
+        // paths are textual: `mind` hands them to the compiler and to `git`, which
         // do their own resolving, so normalising here would lose meaning.
         test.case "join"              $( test.eq! "a/b" (join "a" "b") ),
         test.case "join keeps one slash" $( test.eq! "a/b" (join "a/" "b") ),

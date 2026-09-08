@@ -1,5 +1,6 @@
 // The `dream` command: load a bytecode image and run it.
 
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -23,13 +24,18 @@ namespace {
 const char* USAGE =
     "dream -- the Dream virtual machine\n"
     "\n"
-    "usage: dream <image.dream> [options]\n"
+    "usage: dream <image> [options]\n"
+    "\n"
+    "<image> is a file, that file with `.dream` added, or either of those in\n"
+    "$MINDV2_PATH -- so `dream mind` runs ./mind.dream, or the installed one.\n"
     "\n"
     "options:\n"
+    "  -x, --exec <name>    run <name>.dream from $MINDV2_PATH, not from here\n"
     "  -e, --entry <name>   run this global instead of `main!`\n"
     "  -j, --workers <n>    scheduler threads (default: one per core)\n"
     "      --dump           disassemble the image and exit\n"
     "      --stats          print reduction and heap statistics\n"
+    "      --profile [n]    count reductions per function and print the hottest\n"
     "      --no-jit         stay in the interpreter\n"
     "      --jit-threshold <n>  calls before a function is compiled\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function\n"
@@ -190,47 +196,114 @@ bool is_directory(const std::string& path) {
     return std::filesystem::is_directory(path, ec);
 }
 
-std::string skip_file(std::string& path, const std::string& MINDV2_PATH,bool*file_ok) {
+/// Resolve the image to run.
+///
+/// `dream mind` should mean what `mind` means when it is typed on its own, so a
+/// name is tried four ways, nearest first:
+///
+///   1. as written, which is what a path is;
+///   2. with `.dream` added, so `dream mind` runs `./mind.dream` -- an image is
+///      a program, and naming its extension every time is noise;
+///   3. and 4., both of those under `$MINDV2_PATH`, where an installation keeps
+///      what it ships, the way a shell finds a binary on PATH.
+///
+/// The working directory comes before the installation, because a project's own
+/// build is what someone standing in it means. The installed lookup is for a
+/// bare name only: a path with a separator in it is a place, and answering it
+/// with a file from somewhere else would be a surprise. `dream -x NAME` is the
+/// other half of this -- the installation and nothing else.
+std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* file_ok) {
     *file_ok = true;
-    if(!std::filesystem::exists(path) || is_directory(path)) {
-        *file_ok = false;
-        //if the path is just a name, not a path with directories, lets check the dream path for it
-        if(path.find('/') == std::string::npos && path.find('\\') == std::string::npos ) {
-            if(!MINDV2_PATH.empty()) {
-                std::string full_path = std::string(MINDV2_PATH) + "/" + path;
 
-                if(std::filesystem::exists(full_path)) {
-                    *file_ok = true;
-                   return full_path;
-                }
-            }
-        } else {
-            std::fprintf(stderr, "dream: no such file `%s`\n", path.c_str());
-            *file_ok= false;
-            return "";
-        }
+    const bool is_bare_name =
+        path.find('/') == std::string::npos && path.find('\\') == std::string::npos;
+
+    std::vector<std::string> candidates{path, path + ".dream"};
+    if (is_bare_name && !MINDV2_PATH.empty()) {
+        candidates.push_back(MINDV2_PATH + "/" + path);
+        candidates.push_back(MINDV2_PATH + "/" + path + ".dream");
     }
-    return path;
+    for (const std::string& candidate : candidates) {
+        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
+    }
+
+    *file_ok = false;
+    return "";
+}
+
+/// `-x name`: the installed image called `name`, and nothing else.
+///
+/// This is the same lookup `skip_file` falls back to, without the fallback. A
+/// bare `dream lucid` prefers a file called `lucid` in the working directory,
+/// which is what a path should mean; `-x lucid` says the installation is the
+/// only place to look, so a stray file next to the caller cannot shadow an
+/// installed program.
+std::string installed_image(const std::string& name, const std::string& MINDV2_PATH,
+                            bool* file_ok) {
+    *file_ok = true;
+    if (MINDV2_PATH.empty()) {
+        std::fprintf(stderr,
+                     "dream: -x needs $MINDV2_PATH (or ~/.mindv2) to look in, to find `%s`\n",
+                     name.c_str());
+        *file_ok = false;
+        return "";
+    }
+    const std::string candidates[] = {
+        MINDV2_PATH + "/" + name,
+        MINDV2_PATH + "/" + name + ".dream",
+    };
+    for (const std::string& candidate : candidates) {
+        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
+    }
+    std::fprintf(stderr, "dream: no installed image `%s` in %s\n", name.c_str(),
+                 MINDV2_PATH.c_str());
+    *file_ok = false;
+    return "";
+}
+
+/// Where installed images live: `$MINDV2_PATH`, or `~/.mindv2` when that
+/// directory exists.
+///
+/// Returned by value throughout. The obvious way to write this -- keep a
+/// `const char*` and point it at a local string's `c_str()` -- leaves the
+/// pointer dangling the moment that string goes out of scope, which it does
+/// before the return. It survived only because a short string lives in the
+/// object itself and the stack slot happened to still hold the bytes.
+std::string home_dir() {
+    #if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+    #else
+    const char* home = std::getenv("HOME");
+    #endif
+    // `getenv` answers null for a variable that is not set, and constructing a
+    // `std::string` from null is undefined rather than empty.
+    return home ? std::string(home) : std::string();
+}
+
+/// A leading `~` means the home directory -- here, rather than only in a shell.
+///
+/// The shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
+/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
+/// called that, so every lookup under it silently found nothing, which reads as
+/// "the image is not installed" when it is sitting right there. A path is not
+/// text to this program, so expanding it is this program's job.
+std::string expand_home(const std::string& path) {
+    if (path.empty() || path[0] != '~') return path;
+    if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;  // `~other`, a user
+    const std::string home = home_dir();
+    if (home.empty()) return path;
+    return home + path.substr(1);
 }
 
 std::string get_mindv2_path() {
-    const char* MINDV2_PATH = std::getenv("MINDV2_PATH");
-    if(!MINDV2_PATH) {
-        #if defined(__linux__) || defined(__APPLE__)
-        std::string home = std::getenv("HOME");
-        std::string default_path = home + "/.mindv2";
-        if(std::filesystem::exists(default_path)) {
-            MINDV2_PATH = default_path.c_str();
-        }
-        #elif defined(_WIN32)
-        const char* userprofile = std::getenv("USERPROFILE");
-        std::string default_path = std::string(userprofile) + "\\.mindv2";
-        if(std::filesystem::exists(default_path)) {
-            MINDV2_PATH = default_path.c_str();
-        }
-        #endif
+    if (const char* from_env = std::getenv("MINDV2_PATH")) {
+        return expand_home(std::string(from_env));
     }
-    return MINDV2_PATH ? std::string(MINDV2_PATH) : "";
+    const std::string home = home_dir();
+    if (home.empty()) return "";
+    std::string candidate = home + "/.mindv2";
+    if (std::filesystem::exists(candidate)) return candidate;
+    return "";
 }
 
 int main(int argc, char** argv) {
@@ -238,10 +311,14 @@ int main(int argc, char** argv) {
     std::string dump_jit_fn;
     unsigned workers = 0;
     bool dump = false, stats = false, use_jit = true;
+    size_t profile_top = 0;
     uint32_t jit_threshold = 0;
 
     std::vector<std::string> program_args;
     bool past_image = false;
+    // `-x` has already resolved the image, so the working directory must not be
+    // consulted for it again.
+    bool installed = false;
     std::string MINDV2_PATH = get_mindv2_path(); 
     
     for (int i = 1; i < argc; ++i) {
@@ -261,6 +338,12 @@ int main(int argc, char** argv) {
         if (a == "-h" || a == "--help") {
             std::fputs(USAGE, stdout);
             return 0;
+        } else if (a == "-x" || a == "--exec") {
+            bool ok = true;
+            path = installed_image(next("--exec"), MINDV2_PATH, &ok);
+            if (!ok) return 1;
+            installed = true;
+            past_image = true;
         } else if (a == "-e" || a == "--entry") {
             entry = next("--entry");
         } else if (a == "-j" || a == "--workers") {
@@ -269,10 +352,16 @@ int main(int argc, char** argv) {
             dump = true;
         } else if (a == "--stats") {
             stats = true;
+        } else if (a == "--profile") {
+            // The count is optional: `--profile` alone shows a screenful.
+            profile_top = 25;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && std::isdigit(argv[i + 1][0])) {
+                profile_top = size_t(std::stoul(argv[++i]));
+            }
         } else if (a == "--no-jit") {
             use_jit = false;
         }else if (a == "-m" || a == "--mindv2") {
-            MINDV2_PATH = next("--mindv2");
+            MINDV2_PATH = expand_home(next("--mindv2"));
         } else if (a == "--jit-threshold") {
             jit_threshold = uint32_t(std::stoul(next("--jit-threshold")));
         } else if (a == "--dump-jit") {
@@ -296,10 +385,13 @@ int main(int argc, char** argv) {
         std::fputs(USAGE, stderr);
         return 2;
     }
-    bool file_ok=true;
-    path = skip_file(path, MINDV2_PATH,&file_ok);
-    if(!file_ok) {
-        std::fprintf(stderr, "dream: file not found: `%s`\n", path.c_str());
+    bool file_ok = true;
+    // The name as it was typed, because that is the one worth reporting: what
+    // the lookup answers on a miss is nothing at all.
+    const std::string asked = path;
+    if (!installed) path = skip_file(path, MINDV2_PATH, &file_ok);
+    if (!file_ok) {
+        std::fprintf(stderr, "dream: no such image `%s`\n", asked.c_str());
         return 1;
     }
 
@@ -310,6 +402,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dream: %s\n", error.c_str());
         return 1;
     }
+
+    if (profile_top) rt.enable_profile(profile_top);
 
     if (dump) {
         dump_image(rt.image());
@@ -380,6 +474,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "dream: deadlock -- every process is waiting for a message that "
                      "cannot arrive\n");
+        // And who is waiting for what. A deadlock with no names is a report
+        // that a program is stuck, which the person running it already knew;
+        // the useful part is which process is parked on which thing.
+        sched.dump("deadlock");
         status = 1;
     } else if (root->failed) {
         std::string text;
@@ -393,6 +491,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dream: uncaught error in %s\n", f.c_str());
         status = 1;
     }
+
+    rt.print_profile();
 
     if (stats) {
         std::fprintf(stderr,

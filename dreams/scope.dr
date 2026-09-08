@@ -669,6 +669,8 @@ let func_at r i = core.map_get (func_map r) i (core.map_new ());
 /// access by index, and what everything downstream wants is the sequence.
 let funcs r = list.map (fn i -> func_at r i) (list.range 0 (func_count r));
 let bodies r   = core.map_get r :bodies [];
+/// Global index -> `[target, plan, arity]` for every wrapper. See "wrappers".
+let wrappers r = core.map_get r :wrappers (core.map_new ());
 let defs r     = core.map_get r :defs [];
 
 let set_frames fs r = core.map_put r :frames fs;
@@ -1362,7 +1364,24 @@ let resolve! l = {
             gi => core.map_put acc gi (list.nth 3 b),
         }
     }) (core.map_new ()) (bodies walked);
-    core.map_put walked :global_recs
+    // Which globals are wrappers, so lowering can emit what they stand for.
+    let aliased = list.fold (fn acc b -> {
+        let mi = list.nth 0 b;
+        let source = list.nth 1 b;
+        let d = list.nth 2 b;
+        match global_index (list.nth mi (envs declared)) (decl_name d) {
+            () => acc,
+            gi =>
+                match wrapper_of walked mi source d {
+                    () => acc,
+                    found =>
+                        if target_global (list.head found) == gi { acc }
+                        else { core.map_put acc gi found },
+                },
+        }
+    }) (core.map_new ()) (bodies walked);
+
+    core.map_put (core.map_put walked :wrappers aliased) :global_recs
         (list.map (fn g ->
              match list.nth 2 g {
                  :function => [list.nth 0 g, list.nth 1 g, :function,
@@ -1370,6 +1389,144 @@ let resolve! l = {
                  _ => g,
              })
              (s_global_recs declared))
+};
+
+// --- wrappers ---------------------------------------------------------------------
+//
+// A wrapper that only passes its arguments on -- `let head xs = core.head xs`,
+// `let kind t = core.array_get t 0` -- costs a call and a frame at every use in
+// order to do nothing. A standard library is full of them, and so is a compiler:
+// reading one token through six of them was a fifth of everything this one did.
+//
+// So resolution records which globals are exactly that, and lowering emits the
+// call the wrapper stands for instead of a call to the wrapper. This is not
+// general inlining, and the narrowness is what makes it obviously sound. The
+// body must be one application whose arguments are the wrapper's own
+// parameters, each used at most once, and literals; the call site must pass
+// exactly as many arguments as the wrapper takes.
+//
+// Under those conditions the rewrite is an identity. The frame that disappears
+// bound nothing but the arguments the inner call was going to be given anyway,
+// and every argument stays the same thunk in the same place -- so nothing is
+// evaluated that was not evaluated before, and nothing twice. Requiring the
+// call to be saturated is what keeps a variadic host function honest: a
+// variadic native means "everything at this call site", and an unsaturated
+// call, or one with arguments to spare, is left alone.
+
+let literal_expr e =
+    match e {
+        [:int, _, _]   => true,
+        [:float, _, _] => true,
+        [:str, _, _]   => true,
+        [:char, _, _]  => true,
+        [:bool, _, _]  => true,
+        [:atom, _, _]  => true,
+        [:unit, _]     => true,
+        _ => false,
+    };
+
+/// Where `name` sits in a parameter list, or `-1`.
+let param_slot params name = {
+    let rec go i =
+        if i >= list.length params { 0 - 1 }
+        else if ast.param_name (list.nth i params) == name { i }
+        else { go (i + 1) };
+    go 0
+};
+
+/// One argument of a wrapper's body, as the call site will rebuild it:
+/// `[:param, k]` for "the caller's k-th argument", `[:const, expr]` for a
+/// literal, or `()` for anything that cannot be moved.
+let wrapper_arg params used e =
+    match e {
+        [:name, n, _] => {
+            let k = param_slot params n;
+            if k < 0 { () }
+            // A parameter used twice would put the caller's argument node in
+            // two places, and the same work would be done twice where the
+            // wrapper's frame did it once.
+            else if list.contains k used { () }
+            else { [:param, k] }
+        },
+        _ => if literal_expr e { [:const, e] } else { () },
+    };
+
+let rec wrapper_args params used args acc =
+    match args {
+        [] => list.reverse acc,
+        [a, ..rest] =>
+            match wrapper_arg params used a {
+                () => (),
+                [:param, k] => wrapper_args params (core.cons k used) rest
+                                          (core.cons [:param, k] acc),
+                plan => wrapper_args params used rest (core.cons plan acc),
+            },
+    };
+
+/// Does this plan pass on every parameter? Each appears at most once already,
+/// so counting them is enough.
+let params_all_used plan arity = {
+    let passed = list.filter (fn step -> list.head step == :param) plan;
+    list.length passed == arity
+};
+
+/// A target that can be named from another module's frame. A local or a capture
+/// cannot: it means something only inside the body it was written in.
+let wrapper_target_ok t =
+    match t {
+        [:builtin, _] => true,
+        [:member, [:native, _, _], _, _] => true,
+        [:member, [:dream, _], _, _] => true,
+        [:global, _, _, _] => true,
+        _ => false,
+    };
+
+/// The global a target names, or `()` -- used only to refuse a wrapper that
+/// stands for itself.
+let target_global t =
+    match t {
+        [:global, _, _, g] => g,
+        [:member, [:dream, _], _, g] => g,
+        _ => (),
+    };
+
+/// The call this declaration stands for: `[target, plan, arity]`, or `()`.
+let wrapper_of r mi source d = {
+    let params = decl_params d;
+    // A wrapper with no parameters is a constant, and a constant is evaluated
+    // once and shared. Rewriting its uses into the call it came from would do
+    // the work at every use instead.
+    if list.is_empty params { () }
+    else {
+        match decl_body d {
+            [:apply, callee, args, _] => {
+                let target = match callee {
+                                 [:name, _, span]     => resolution r mi source span,
+                                 [:field, _, _, span] => resolution r mi source span,
+                                 _ => (),
+                             };
+                if not (wrapper_target_ok target) { () }
+                else {
+                    match wrapper_args params [] args [] {
+                        () => (),
+                        plan =>
+                            // Every parameter, exactly once. "At most once" is
+                            // not enough: an argument the wrapper ignores would
+                            // be dropped at the call site and never lowered,
+                            // and a lambda in that position was given a
+                            // function record when it was resolved. A record
+                            // whose body was never emitted is a malformed
+                            // image -- the argument is dead, but the hole it
+                            // leaves is not.
+                            if params_all_used plan (list.length params) {
+                                [target, plan, list.length params]
+                            } else { () },
+                    }
+                }
+            },
+            _ => (),
+        }
+    }
 };
 
 /// Just the diagnostics, for a caller that only wants to know whether the
