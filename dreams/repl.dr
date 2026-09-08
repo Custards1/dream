@@ -34,6 +34,7 @@ import dreams.emit;
 import dreams.lower;
 import dreams.modules;
 import dreams.parser;
+import dreams.path;
 import dreams.scope;
 
 let prompt = "dream> ";
@@ -202,7 +203,7 @@ let compile! s body roots cfg source image = {
 
 /// The VM to run an image with. The same variable `mind` reads, because a
 /// session started from a build should reach the same VM the build did.
-let vm! () = match os.env! "DREAM" { () => "dream", v => v };
+let vm! () = match os.env! "DREAM" { () => "dream", v => path.expand_home! v };
 
 /// Run the image and relay what it said. Its stderr is our stderr and its
 /// stdout is our stdout -- the program's output is the answer, and a REPL that
@@ -257,7 +258,7 @@ let command_argument text = str.trim (str.slice (str.find " " text)
 /// Where this session's scratch files go. One pair per process, so two sessions
 /// on one machine do not compile over each other.
 let scratch! name =
-    (match os.env! "TMPDIR" { () => "/tmp", d => d })
+    (match os.env! "TMPDIR" { () => "/tmp", d => path.expand_home! d })
     + "/dream-repl-" + to_string (os.pid! ()) + name;
 
 /// Enter one declaration: keep it only if the session still compiles with it.

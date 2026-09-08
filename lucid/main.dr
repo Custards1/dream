@@ -24,6 +24,8 @@ import std.list;
 import std.os;
 import std.str;
 
+import dreams.path;
+
 import analysis;
 import rpc;
 
@@ -220,8 +222,8 @@ let usage = cli.usage "lucid" "a language server for Dream"
 /// import of it as an error.
 let stdlib_roots! () =
     match os.env! "MIND_STDLIB" {
-        () => match os.env! "DREAM_PACKAGES" { () => [], p => [p] },
-        p => [p],
+        () => match os.env! "DREAM_PACKAGES" { () => [], p => [path.expand_home! p] },
+        p => [path.expand_home! p],
     };
 
 let main! =

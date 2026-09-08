@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -43,6 +44,39 @@ Runtime::Runtime() : wk_(std::make_unique<WellKnownAtoms>()) {
     io_init();
 }
 
+void Runtime::enable_profile(size_t top) {
+    profiling_ = true;
+    profile_top_ = top;
+    // Sized from the image, so a function index is a slot and no lookup is
+    // needed on the hot path. An image loaded after this call is not profiled,
+    // which cannot happen: the image is loaded before anything runs.
+    std::vector<std::atomic<uint64_t>> fresh(image_ ? image_->func_count() : 0);
+    profile_.swap(fresh);
+}
+
+void Runtime::print_profile() const {
+    const size_t top = profile_top_;
+    if (!profiling_ || !image_) return;
+    std::vector<std::pair<uint64_t, uint32_t>> rows;
+    rows.reserve(profile_.size());
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < profile_.size(); ++i) {
+        uint64_t n = profile_[i].load(std::memory_order_relaxed);
+        total += n;
+        if (n) rows.push_back({n, i});
+    }
+    std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "; profile: %llu reductions in %zu functions\n",
+                 static_cast<unsigned long long>(total), rows.size());
+    for (size_t i = 0; i < rows.size() && i < top; ++i) {
+        StringRef name = image_->str(image_->func(rows[i].second).name);
+        double pct = total ? 100.0 * double(rows[i].first) / double(total) : 0.0;
+        std::fprintf(stderr, ";  %5.1f%%  %12llu  %.*s\n", pct,
+                     static_cast<unsigned long long>(rows[i].first),
+                     int(name.len), name.data);
+    }
+}
+
 Runtime::~Runtime() {
     // Stop the poller before the scheduler it wakes into can go away, and
     // close whatever descriptors the program left open.
@@ -54,6 +88,7 @@ bool Runtime::load_image_file(const std::string& path, std::string& error) {
     auto img = std::make_unique<Image>();
     if (!img->load_file(path, error)) return false;
     image_ = std::move(img);
+    size_caches();
     intern_image_atoms();
 
     // Best-effort: keep the source around so runtime errors can quote a line.
@@ -70,8 +105,20 @@ bool Runtime::load_image_bytes(const uint8_t* data, size_t size, std::string& er
     auto img = std::make_unique<Image>();
     if (!img->load_bytes(data, size, error)) return false;
     image_ = std::move(img);
+    size_caches();
     intern_image_atoms();
     return true;
+}
+
+/// The lookup caches are sized from the image, so a cache slot is an index and
+/// the fast path has nothing to search. Both are cleared by being rebuilt: an
+/// image replaced at run time is not something the runtime supports, but a
+/// second `load_image_*` on a fresh Runtime must not inherit a stale table.
+void Runtime::size_caches() {
+    std::vector<std::atomic<const ModuleDef*>> imports(image_ ? image_->import_count() : 0);
+    import_defs_.swap(imports);
+    std::vector<std::atomic<uint64_t>> fields(image_ ? image_->node_count() : 0);
+    field_cache_.swap(fields);
 }
 
 void Runtime::intern_image_atoms() {
@@ -81,6 +128,26 @@ void Runtime::intern_image_atoms() {
 }
 
 void Runtime::register_module(ModuleDef module) { modules_.push_back(std::move(module)); }
+
+const ModuleDef* Runtime::module_for_import(uint32_t import_index) {
+    if (import_index < import_defs_.size()) {
+        const ModuleDef* hit = import_defs_[import_index].load(std::memory_order_relaxed);
+        if (hit) return hit;
+    }
+    if (!image_ || import_index >= image_->import_count()) return nullptr;
+    StringRef path = image_->str(image_->import(import_index).path);
+    const ModuleDef* found = nullptr;
+    for (const auto& m : modules_) {
+        if (m.name.size() == path.len && std::memcmp(m.name.data(), path.data, path.len) == 0) {
+            found = &m;
+            break;
+        }
+    }
+    if (found && import_index < import_defs_.size()) {
+        import_defs_[import_index].store(found, std::memory_order_relaxed);
+    }
+    return found;
+}
 
 const ModuleDef* Runtime::find_module(const std::string& name) const {
     for (const auto& m : modules_) {

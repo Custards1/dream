@@ -59,10 +59,10 @@ let rec collect! m seen acc = {
 /// The last is a search rather than a fixed path because a build may be run
 /// from anywhere inside a project, exactly as `git` may be.
 let stdlib_root! () = {
-    let named = os.env! "MIND_STDLIB";
+    let named = util.env_path! "MIND_STDLIB";
     if named != () { named }
     else {
-        let home = match os.env! "MIND_HOME" { () => util.join (home_dir! ()) ".mind", h => h };
+        let home = match util.env_path! "MIND_HOME" { () => util.join (home_dir! ()) ".mind", h => h };
         let installed = util.join home "std";
         if io.is_dir! installed { home }
         else {
@@ -127,7 +127,7 @@ let output_of m o =
         p => p,
     };
 
-let vm_command! () = match os.env! "DREAM" { () => "dream", v => v };
+let vm_command! () = match util.env_path! "DREAM" { () => "dream", v => v };
 
 /// Which compiler to run, in the order a person would expect to be obeyed:
 /// what this build asked for, then what the package asks for, then the
@@ -145,8 +145,8 @@ let default_compiler = "dreams.dream";
 let choose_compiler! m explicit =
     match explicit {
         () => match manifest.compiler m {
-            () => match os.env! "DREAMS" {
-                () => match os.env! "DREAMC" { () => default_compiler, c => c },
+            () => match util.env_path! "DREAMS" {
+                () => match util.env_path! "DREAMC" { () => default_compiler, c => c },
                 d  => d,
             },
             c => c,

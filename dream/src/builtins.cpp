@@ -961,10 +961,6 @@ Value atom_of(Process& p, const char* name) {
     return make_atom(p.runtime().intern_atom(name));
 }
 
-Value text_of(Process& p, const std::string& s) {
-    return p.heap().make_string(s.data(), uint32_t(s.size()));
-}
-
 const char* status_name(ProcStatus s) {
     switch (s) {
         case ProcStatus::Runnable: return "runnable";
@@ -1538,6 +1534,50 @@ NativeResult core_str_of_bytes(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
 }
 
+/// `str_concat parts` -- one string from a list of them.
+///
+/// Concatenating n strings by `+` is n copies of everything written so far,
+/// which is quadratic and is why anything that built a large output a piece at
+/// a time -- an image, a rendered diagnostic, a dump -- cost more in copying
+/// than in the work it was reporting on. This walks the list once and copies
+/// each part once.
+///
+/// The same care with the collector as `str_of_bytes`: forcing a part runs
+/// Dream code, which can collect and move every cell, so the position rides on
+/// the value stack rather than in a C++ local.
+NativeResult core_str_concat(Process& p, Value, Value* args, uint32_t) {
+    std::string out;
+    const size_t base = p.stack.size();
+    p.stack.push_back(args[0]);
+    for (;;) {
+        Value w;
+        if (!force_whnf(p, p.stack[base], &w)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (is_nil(w)) break;
+        if (!is_obj(w, ObjType::Cons)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_concat needs a list of strings");
+        }
+        p.stack[base] = w;
+        Value head;
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(w))->head, &head)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (!is_obj(head, ObjType::Str)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_concat needs a list of strings");
+        }
+        auto* part = static_cast<StrObj*>(as_obj(head));
+        out.append(part->data(), part->len);
+        p.stack[base] = static_cast<ConsObj*>(as_obj(p.stack[base]))->tail;
+    }
+    p.stack.resize(base);
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
 NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
     StrObj* s = as_string(args[0]);
     Value from = resolve(args[1]);
@@ -1894,6 +1934,7 @@ ModuleDef make_core_module() {
             {"str_chars", 1, 0b1, core_str_chars},
             {"str_of_chars", 1, 0b1, core_str_of_chars},
             {"str_of_bytes", 1, 0b1, core_str_of_bytes},
+            {"str_concat", 1, 0b1, core_str_concat},
             {"str_slice", 3, 0b111, core_str_slice},
             {"str_find", 3, 0b111, core_str_find},
             {"str_byte", 2, 0b11, core_str_byte},

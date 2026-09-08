@@ -702,7 +702,16 @@ bool compare(Process& p, Op op, Value a, Value b, Value* out) {
 // Module member lookup
 // ---------------------------------------------------------------------------
 
-void resolve_field(Process& p, Value obj, uint32_t name_index) {
+/// `obj.member`, where `obj` is a host module.
+///
+/// This runs on every call of every `std.core` member, which in a program of
+/// any size means millions of times, so what it does *not* do matters. The
+/// module is found through a cache indexed by the import record, and which
+/// member was wanted is remembered against the node that asked -- packed as
+/// the import index and the member's position in one word, so a node that
+/// somehow meets a different module falls back to the search rather than
+/// reading the wrong member out of the right one.
+void resolve_field(Process& p, Value obj, uint32_t name_index, uint32_t node_index) {
     const Image& img = img_of(p);
     StringRef member = img.str(name_index);
 
@@ -711,19 +720,35 @@ void resolve_field(Process& p, Value obj, uint32_t name_index) {
         return;
     }
     auto* mod = static_cast<ModuleObj*>(as_obj(obj));
-    const ImportRec& ir = img.import(mod->import_index);
-    std::string path = img.str(ir.path).str();
+    const uint32_t imp = mod->import_index;
 
-    const ModuleDef* def = p.runtime().find_module(path);
+    const ModuleDef* def = p.runtime().module_for_import(imp);
     if (!def) {
         do_raise(p, raise_error(p, well_known(p.runtime()).no_such_member,
-                                "module `" + path + "` is not provided by this runtime"));
+                                "module `" + img.str(img.import(imp).path).str() +
+                                    "` is not provided by this runtime"));
         return;
     }
-    const NativeDef* m = def->find(member);
+
+    const NativeDef* m = nullptr;
+    const uint64_t cached = p.runtime().field_cache(node_index);
+    if (cached != 0 && uint32_t(cached >> 32) == imp + 1) {
+        const uint32_t at = uint32_t(cached);
+        if (at < def->members.size()) m = &def->members[at];
+    }
+    if (!m) {
+        for (uint32_t i = 0; i < def->members.size(); ++i) {
+            if (member.equals(def->members[i].name)) {
+                m = &def->members[i];
+                p.runtime().set_field_cache(node_index, (uint64_t(imp + 1) << 32) | i);
+                break;
+            }
+        }
+    }
     if (!m) {
         do_raise(p, raise_error(p, well_known(p.runtime()).no_such_member,
-                                "module `" + path + "` has no member `" + member.str() + "`"));
+                                "module `" + img.str(img.import(imp).path).str() +
+                                    "` has no member `" + member.str() + "`"));
         return;
     }
     Value name = p.heap().make_string(member.data, member.len);
@@ -794,7 +819,9 @@ void step_eval(Process& p) {
         case Op::Builtin: ret(p, make_builtin(n.a)); return;
 
         case Op::Field:
-            push_cont(p, ContKind::FieldOf, n.b, 0, 0, UNIT);
+            // The node index rides along so the member lookup can be cached
+            // against the site that asked for it.
+            push_cont(p, ContKind::FieldOf, n.b, p.node, 0, UNIT);
             eval_node(p, n.a, frame);
             return;
 
@@ -1028,7 +1055,7 @@ void step_return(Process& p) {
             return;
 
         case ContKind::FieldOf:
-            resolve_field(p, p.result, c.a);
+            resolve_field(p, p.result, c.a, c.b);
             return;
 
         case ContKind::NativeArg:
@@ -1230,6 +1257,15 @@ bool check_limits(Process& p) {
     return false;
 }
 
+/// The function whose frame is current, or `UINT32_MAX` when there is none --
+/// at the very start of a process, or inside a native.
+uint32_t current_func(Process& p) {
+    if (!is_ptr(p.frame)) return UINT32_MAX;
+    Value c = static_cast<FrameObj*>(as_obj(p.frame))->closure;
+    if (!is_obj(c, ObjType::Closure)) return UINT32_MAX;
+    return static_cast<ClosureObj*>(as_obj(c))->func;
+}
+
 void run_process(Process& p, int64_t budget) {
     p.reductions = budget;
     while (p.reductions > 0) {
@@ -1243,6 +1279,10 @@ void run_process(Process& p, int64_t budget) {
             case Mode::Eval:
                 --p.reductions;
                 ++p.total_reductions;
+                // Attributed to whichever function's frame is current, which
+                // is what makes a profile read like the source: a reduction
+                // belongs to the code that asked for it.
+                if (p.runtime().profiling()) p.runtime().note_reduction(current_func(p));
                 step_eval(p);
                 break;
             case Mode::Return:
@@ -1277,7 +1317,6 @@ bool force_whnf(Process& p, Value v, Value* out) {
     // process's own stacks still hold every root, so a collection during this
     // is as safe as one at the outer level.
     const size_t floor = p.conts.size();
-    const size_t stack_floor = p.stack.size();
     const Mode saved_mode = p.mode;
     const uint32_t saved_node = p.node;
     const Value saved_frame = p.frame;
@@ -1371,21 +1410,66 @@ bool force_deep(Process& p, Value v, Value* out) {
     Value head;
     if (!force_whnf(p, v, &head)) { *out = p.result; return false; }
     if (!is_ptr(head)) { *out = head; return true; }
+    // Walked already, by this call or by an earlier one. See AUX_DEEP_FORCED:
+    // this is what keeps a deep force linear in the data rather than in the
+    // number of paths through it.
+    if (as_obj(head)->aux & AUX_DEEP_FORCED) { *out = head; return true; }
+
+    const size_t base = p.stack.size();
+    auto unwind = [&](Value* out_) {
+        if (!p.force_blocked) p.stack.resize(base);
+        *out_ = p.result;
+        return false;
+    };
 
     switch (as_obj(head)->type) {
         case ObjType::Cons: {
-            // Keep the cell on the value stack: forcing the tail can collect,
-            // and a raw C++ pointer would not survive it.
+            // A list is a chain and is walked as one. Recursing on the tail
+            // would cost one C++ frame per element, and a list long enough to
+            // be worth forcing -- the bytes of an image, say -- runs out of
+            // stack long before it runs out of list.
+            //
+            // Every cell is kept on the value stack, both so the collector can
+            // see them while the heads are being forced and so they can be
+            // marked afterwards: a cell is deeply forced only once everything
+            // after it is, so the marking runs backwards, from the end.
             p.stack.push_back(head);
-            Value tmp;
-            auto* c = static_cast<ConsObj*>(as_obj(p.stack.back()));
-            if (!force_deep(p, c->head, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
-            static_cast<ConsObj*>(as_obj(p.stack.back()))->head = tmp;
-            c = static_cast<ConsObj*>(as_obj(p.stack.back()));
-            if (!force_deep(p, c->tail, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
-            static_cast<ConsObj*>(as_obj(p.stack.back()))->tail = tmp;
-            *out = p.stack.back();
-            p.stack.pop_back();
+            for (;;) {
+                Value tmp;
+                if (!force_deep(p, static_cast<ConsObj*>(as_obj(p.stack.back()))->head, &tmp)) {
+                    return unwind(out);
+                }
+                static_cast<ConsObj*>(as_obj(p.stack.back()))->head = tmp;
+
+                Value tail;
+                if (!force_whnf(p, static_cast<ConsObj*>(as_obj(p.stack.back()))->tail, &tail)) {
+                    return unwind(out);
+                }
+                static_cast<ConsObj*>(as_obj(p.stack.back()))->tail = tail;
+
+                const bool more = is_ptr(tail) && as_obj(tail)->type == ObjType::Cons
+                                  && !(as_obj(tail)->aux & AUX_DEEP_FORCED);
+                if (more) {
+                    p.stack.push_back(tail);
+                    continue;
+                }
+                // What ends the chain is not always `[]`: a tail may hold any
+                // value, and one that is not a cell still has to be forced.
+                if (!is_ptr(tail) || as_obj(tail)->type != ObjType::Cons) {
+                    Value done;
+                    if (!force_deep(p, tail, &done)) return unwind(out);
+                    static_cast<ConsObj*>(as_obj(p.stack.back()))->tail = done;
+                }
+                break;
+            }
+            // Nothing below allocates, so nothing moves: the cell at the
+            // bottom of this run is still the one that was pushed.
+            Value first = p.stack[base];
+            while (p.stack.size() > base) {
+                as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
+                p.stack.pop_back();
+            }
+            *out = first;
             return true;
         }
         case ObjType::Array: {
@@ -1394,9 +1478,10 @@ bool force_deep(Process& p, Value v, Value* out) {
             for (uint32_t i = 0; i < len; ++i) {
                 Value item = static_cast<ArrayObj*>(as_obj(p.stack.back()))->items()[i];
                 Value tmp;
-                if (!force_deep(p, item, &tmp)) { if (!p.force_blocked) p.stack.pop_back(); *out = p.result; return false; }
+                if (!force_deep(p, item, &tmp)) return unwind(out);
                 static_cast<ArrayObj*>(as_obj(p.stack.back()))->items()[i] = tmp;
             }
+            as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
             *out = p.stack.back();
             p.stack.pop_back();
             return true;
@@ -1411,14 +1496,11 @@ bool force_deep(Process& p, Value v, Value* out) {
             for (auto& [k, v] : entries) {
                 (void)k;
                 Value tmp;
-                if (!force_deep(p, v, &tmp)) {
-                    if (!p.force_blocked) p.stack.pop_back();
-                    *out = p.result;
-                    return false;
-                }
+                if (!force_deep(p, v, &tmp)) return unwind(out);
             }
             // Re-collect, because forcing may have allocated and the leaves
             // hold the forced values already through their own indirections.
+            as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
             *out = p.stack.back();
             p.stack.pop_back();
             return true;

@@ -589,7 +589,10 @@ let default_search_paths! file extra =
     list.concat [
         extra,
         [path.dirname file],
-        match os.env! "MINDV2_PATH" { () => [], v => package.split_roots v },
+        match os.env! "MINDV2_PATH" {
+            () => [],
+            v => list.map (fn r -> path.expand_home! r) (package.split_roots v),
+        },
         enclosing_minds! (path.dirname (path.absolute! file)) [],
     ];
 

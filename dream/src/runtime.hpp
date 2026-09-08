@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -85,6 +86,31 @@ public:
     /// Register a module the program can `import`. Must happen before running.
     void register_module(ModuleDef module);
     const ModuleDef* find_module(const std::string& name) const;
+
+    /// The host module an import record names, remembered after the first ask.
+    ///
+    /// Every `core.head xs` in a program goes through here, and the honest
+    /// lookup -- copy the path out of the image into a `std::string`, then walk
+    /// the registered modules comparing names -- allocated and scanned on every
+    /// single call. Modules cannot be registered once the program is running,
+    /// so the answer never changes, and one relaxed word per import record is
+    /// the whole cache. A racing pair of threads computes the same pointer.
+    const ModuleDef* module_for_import(uint32_t import_index);
+
+    /// Which member of that module a `.field` node named, likewise remembered.
+    /// The import index is stored with it, so a node that somehow sees a
+    /// different module falls back to the search rather than reading the wrong
+    /// member.
+    uint64_t field_cache(uint32_t node_index) const {
+        return node_index < field_cache_.size()
+                   ? field_cache_[node_index].load(std::memory_order_relaxed)
+                   : 0;
+    }
+    void set_field_cache(uint32_t node_index, uint64_t packed) {
+        if (node_index < field_cache_.size()) {
+            field_cache_[node_index].store(packed, std::memory_order_relaxed);
+        }
+    }
     const std::vector<ModuleDef>& modules() const { return modules_; }
 
     /// Atom names are global and stable, so they can be compared by index.
@@ -110,6 +136,28 @@ public:
     Scheduler* scheduler() { return scheduler_; }
     void set_scheduler(Scheduler* s) { scheduler_ = s; }
 
+    // --- the profile ---
+    //
+    // Where a program's time goes, counted in reductions and attributed to the
+    // function whose frame was current. Off unless asked for: the attribution
+    // costs two loads per reduction, which is small but not nothing, and a
+    // measurement that changes what it measures is worth switching off.
+    //
+    // The counters are relaxed atomics because every worker thread reduces at
+    // once and nothing here needs an order -- a profile is a shape, and a lost
+    // increment does not change one.
+    void enable_profile(size_t top);
+    bool profiling() const { return profiling_; }
+    void note_reduction(uint32_t func_index) {
+        if (func_index < profile_.size()) {
+            profile_[func_index].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    /// The hottest functions, most reductions first, on stderr. A no-op unless
+    /// profiling was asked for, so the places that have to call it -- the end
+    /// of a run, and `exit!`, which never returns to it -- can call it blind.
+    void print_profile() const;
+
     /// The JIT tier, or null when running interpreter-only.
     class Jit* jit() const { return jit_; }
     void set_jit(class Jit* j) { jit_ = j; }
@@ -122,6 +170,7 @@ public:
 
 private:
     void intern_image_atoms();
+    void size_caches();
 
     std::unique_ptr<Image> image_;
     std::string source_text_;
@@ -138,6 +187,11 @@ private:
 
     std::vector<std::string> program_args_;
     Scheduler* scheduler_ = nullptr;
+    std::vector<std::atomic<const ModuleDef*>> import_defs_;
+    std::vector<std::atomic<uint64_t>> field_cache_;
+    bool profiling_ = false;
+    size_t profile_top_ = 0;
+    std::vector<std::atomic<uint64_t>> profile_;
     class Jit* jit_ = nullptr;
     std::unique_ptr<struct WellKnownAtoms> wk_;
 };

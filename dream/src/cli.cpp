@@ -1,5 +1,6 @@
 // The `dream` command: load a bytecode image and run it.
 
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -34,6 +35,7 @@ const char* USAGE =
     "  -j, --workers <n>    scheduler threads (default: one per core)\n"
     "      --dump           disassemble the image and exit\n"
     "      --stats          print reduction and heap statistics\n"
+    "      --profile [n]    count reductions per function and print the hottest\n"
     "      --no-jit         stay in the interpreter\n"
     "      --jit-threshold <n>  calls before a function is compiled\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function\n"
@@ -267,21 +269,39 @@ std::string installed_image(const std::string& name, const std::string& MINDV2_P
 /// pointer dangling the moment that string goes out of scope, which it does
 /// before the return. It survived only because a short string lives in the
 /// object itself and the stack slot happened to still hold the bytes.
-std::string get_mindv2_path() {
-    if (const char* from_env = std::getenv("MINDV2_PATH")) {
-        return std::string(from_env);
-    }
+std::string home_dir() {
     #if defined(_WIN32)
     const char* home = std::getenv("USERPROFILE");
-    const char* sep = "\\";
     #else
     const char* home = std::getenv("HOME");
-    const char* sep = "/";
     #endif
     // `getenv` answers null for a variable that is not set, and constructing a
     // `std::string` from null is undefined rather than empty.
-    if (!home) return "";
-    std::string candidate = std::string(home) + sep + ".mindv2";
+    return home ? std::string(home) : std::string();
+}
+
+/// A leading `~` means the home directory -- here, rather than only in a shell.
+///
+/// The shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
+/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
+/// called that, so every lookup under it silently found nothing, which reads as
+/// "the image is not installed" when it is sitting right there. A path is not
+/// text to this program, so expanding it is this program's job.
+std::string expand_home(const std::string& path) {
+    if (path.empty() || path[0] != '~') return path;
+    if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;  // `~other`, a user
+    const std::string home = home_dir();
+    if (home.empty()) return path;
+    return home + path.substr(1);
+}
+
+std::string get_mindv2_path() {
+    if (const char* from_env = std::getenv("MINDV2_PATH")) {
+        return expand_home(std::string(from_env));
+    }
+    const std::string home = home_dir();
+    if (home.empty()) return "";
+    std::string candidate = home + "/.mindv2";
     if (std::filesystem::exists(candidate)) return candidate;
     return "";
 }
@@ -291,6 +311,7 @@ int main(int argc, char** argv) {
     std::string dump_jit_fn;
     unsigned workers = 0;
     bool dump = false, stats = false, use_jit = true;
+    size_t profile_top = 0;
     uint32_t jit_threshold = 0;
 
     std::vector<std::string> program_args;
@@ -331,10 +352,16 @@ int main(int argc, char** argv) {
             dump = true;
         } else if (a == "--stats") {
             stats = true;
+        } else if (a == "--profile") {
+            // The count is optional: `--profile` alone shows a screenful.
+            profile_top = 25;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && std::isdigit(argv[i + 1][0])) {
+                profile_top = size_t(std::stoul(argv[++i]));
+            }
         } else if (a == "--no-jit") {
             use_jit = false;
         }else if (a == "-m" || a == "--mindv2") {
-            MINDV2_PATH = next("--mindv2");
+            MINDV2_PATH = expand_home(next("--mindv2"));
         } else if (a == "--jit-threshold") {
             jit_threshold = uint32_t(std::stoul(next("--jit-threshold")));
         } else if (a == "--dump-jit") {
@@ -375,6 +402,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dream: %s\n", error.c_str());
         return 1;
     }
+
+    if (profile_top) rt.enable_profile(profile_top);
 
     if (dump) {
         dump_image(rt.image());
@@ -458,6 +487,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dream: uncaught error in %s\n", f.c_str());
         status = 1;
     }
+
+    rt.print_profile();
 
     if (stats) {
         std::fprintf(stderr,

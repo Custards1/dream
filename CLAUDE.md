@@ -146,6 +146,38 @@ other half — the installation and nothing else, so a file in the working
 directory cannot shadow an installed program. `just install` is what puts
 `dreams.dream` and `lucid.dream` there.
 
+## Making it faster
+
+Two tools, both of which had to exist before any of the recent speedups could
+be justified:
+
+```
+dreams --time FILE       # what each stage of a compile cost
+dream --profile [N] IMG  # the hottest functions, by reductions
+```
+
+`--time` forces each stage where it reads the clock, because a lazy stage that
+has not been forced has not run: bind and force on one line and every stage
+looks free except the last. `--profile` attributes each reduction to the
+function whose frame is current. Natives do not reduce, so work inside a builtin
+is charged to its caller -- which is why a member of a host module (`core.head`)
+can be expensive without appearing anywhere in the profile.
+
+What has already been learnt from them, so it is not learnt twice:
+
+- Building a string with `+` is quadratic. `str.concat_all` (and `join_str`,
+  `repeat`, built on it) copies each piece once. The image writer works in
+  strings for this reason: as a list of bytes it was four million objects to
+  produce a megabyte.
+- A record read more often than it is built wants to be an array. A token was a
+  six-element list, and reading one was a fifth of everything the compiler did.
+- A membership test over a list of names wants to be a map. The keyword check
+  was a tenth of it.
+- `strict!` is linear in *data*, not in paths, and only because objects carry a
+  "deeply forced" bit -- see `AUX_DEEP_FORCED` in [dream/src/value.hpp](dream/src/value.hpp).
+  Before that, forcing the compiler's own tables walked shared structure once
+  per path to it.
+
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
 

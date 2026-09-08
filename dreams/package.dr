@@ -346,7 +346,10 @@ let split_roots text =
 /// reachable from the extra roots.
 let discover! file extra_roots = {
     let roots = list.append extra_roots
-                            (match os.env! "DREAM_PACKAGES" { () => [], v => split_roots v });
+                            (match os.env! "DREAM_PACKAGES" {
+                                 () => [],
+                                 v => list.map (fn r -> path.expand_home! r) (split_roots v),
+                             });
     let found = find_enclosing! (path.dirname file) empty;
     close_deps! 0 (list.fold (fn acc r -> add_from_root! r acc) found roots)
 };

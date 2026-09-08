@@ -145,11 +145,16 @@ run-script FILE OUT: build
 # what makes `dream -x dreams` and `dream -x lucid` work from anywhere.
 install-artifacts:
     mkdir -p {{install_dir}}/bin
-    cp {{dream}} {{install_dir}}/bin/ || true
+    cp {{dream}} {{install_dir}}/bin/dream || true
     cp build/mind {{install_dir}}/bin/ || true
     cp {{image}} {{install_dir}}/dreams.dream
     cp build/lucid.dream {{install_dir}}/lucid.dream || true
-
+install-artifactsv2:
+    mkdir -p {{install_dir}}
+    cp {{dream}} {{install_dir}}/bin/dream || true
+    cp build/mind {{install_dir}}/mind,dresm || true
+    cp {{image}} {{install_dir}}/dreams.dream
+    cp build/lucid.dream {{install_dir}}/lucid.dream || true
 install: vm dreams mind lucid
     just install-artifacts
 

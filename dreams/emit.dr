@@ -18,6 +18,15 @@
 // compiler that compiles itself has to be able to compare the image it built
 // against the one that built it -- and "the same program" has to mean the same
 // bytes.
+//
+// Every piece here is a *string*, not a list of bytes, and that is a decision
+// about cost rather than about taste. A megabyte image as a list is a million
+// cons cells and a thunk behind most of them -- some four million objects for
+// the collector to copy, to produce 920 kilobytes. As strings it is one short
+// string per record, a few tens of thousands of them, joined once by
+// `str.concat_all`, which copies each part exactly once. The arithmetic below
+// still works a byte at a time, because that is what little-endian means; what
+// changed is that the bytes become a string as soon as they are a record.
 
 import std.core;
 import std.list;
@@ -26,7 +35,7 @@ import std.str;
 import dreams.ir;
 
 /// `DAGNCAAF`, as the loader looks for it.
-let magic = [68, 65, 71, 78, 67, 65, 65, 70];
+let magic = core.str_of_bytes [68, 65, 71, 78, 67, 65, 65, 70];
 
 let version_major = 0;
 let version_minor = 1;
@@ -44,9 +53,13 @@ let flag_debug = 1;
 
 let byte_at v n = (v / n) % 256;
 
-let u8 v = [v % 256];
-let u16 v = [v % 256, byte_at v 256];
-let u32 v = [v % 256, byte_at v 256, byte_at v 65536, byte_at v 16777216];
+/// Each of these answers a *string* of the bytes, built from a short list that
+/// dies immediately. `core.str_of_bytes` is what makes bytes rather than
+/// characters: a byte over 127 encoded as a character would be two bytes of
+/// UTF-8, and an image is bytes or it is nothing.
+let u8 v = core.str_of_bytes [v % 256];
+let u16 v = core.str_of_bytes [v % 256, byte_at v 256];
+let u32 v = core.str_of_bytes [v % 256, byte_at v 256, byte_at v 65536, byte_at v 16777216];
 
 /// A 64-bit signed integer. Two's complement, so a negative one is written as
 /// what it would be if it were unsigned.
@@ -65,9 +78,9 @@ let i64 v =
         // 2^64 - a, done as a subtraction with a borrow out of the low half.
         let low = (4294967296 - a_low) % 4294967296;
         let high = (4294967295 - a_high + (if a_low == 0 { 1 } else { 0 })) % 4294967296;
-        list.append (u32 low) (u32 high)
+        u32 low + u32 high
     } else {
-        list.append (u32 (v % 4294967296)) (u32 ((v / 4294967296) % 4294967296))
+        u32 (v % 4294967296) + u32 ((v / 4294967296) % 4294967296)
     };
 
 /// A node index, or the all-ones word that means there is none.
@@ -77,26 +90,20 @@ let index i = if ir.is_node i { u32 i } else { u32 4294967295 };
 /// that went in -- including a negative zero and every kind of NaN. The VM
 /// hands the eight bytes over rather than the compiler picking a double apart,
 /// because getting that wrong is silent.
-let f64 v = bytes_of_str (core.float_bytes v);
-
-/// A string's bytes. `str.chars` would decode UTF-8; this is about the bytes as
-/// they are stored, which is what goes into the image.
-let bytes_of_str s = {
-    let n = str.byte_length s;
-    let rec walk i acc = if i < 0 { acc } else { walk (i - 1) (core.cons (core.str_byte s i) acc) };
-    walk (n - 1) []
-};
+/// The VM hands over the eight bytes as a string already, so there is nothing
+/// left to do to them.
+let f64 v = core.float_bytes v;
 
 // --- sections ---------------------------------------------------------------------
 
-/// A section, with its length worked out once. Walking a list to find its
-/// length is cheap; walking the node section's is not, and it is asked for
-/// three times over -- in the table, in the layout, and in the padding.
+/// A section, with its length worked out once. A section body is a string, so
+/// its length is a field read rather than a walk -- and it is asked for three
+/// times over, in the table, in the layout, and in the padding.
 let section kind body count =
-    %{ :kind => kind, :body => body, :count => count, :len => list.length body };
+    %{ :kind => kind, :body => body, :count => count, :len => str.byte_length body };
 
 let sec_kind s  = core.map_get s :kind 0;
-let sec_body s  = core.map_get s :body [];
+let sec_body s  = core.map_get s :body "";
 let sec_count s = core.map_get s :count 0;
 let sec_len s   = core.map_get s :len 0;
 
@@ -120,17 +127,23 @@ let t_mods = tag 77 79 68 83;   // MODS
 
 // --- the records ---------------------------------------------------------------------
 
-let concat_map f xs = list.concat (list.map f xs);
+/// Every record of a section, joined once. The joining is what keeps this
+/// linear: a fold of `+` over fifty thousand records would copy the section so
+/// far on each one.
+let concat_map f xs = str.concat_all (list.map f xs);
 
 let node_bytes n =
-    list.append
-        (list.append (u8 (match ir.opcode (ir.node_op n) { () => 0, c => c }))
-                     (list.append (u8 (ir.node_flags n)) (u16 0)))
-        (list.append (index (ir.node_a n))
-                     (list.append (index (ir.node_b n)) (index (ir.node_c n))));
+    str.concat_all [
+        u8 (match ir.opcode (ir.node_op n) { () => 0, c => c }),
+        u8 (ir.node_flags n),
+        u16 0,
+        index (ir.node_a n),
+        index (ir.node_b n),
+        index (ir.node_c n),
+    ];
 
 let func_bytes f =
-    list.concat [
+    str.concat_all [
         u32 (core.map_get f :name 0),
         index (core.map_get f :body ir.no_node),
         u16 (core.map_get f :arity 0),
@@ -144,18 +157,17 @@ let func_bytes f =
     ];
 
 let global_bytes g =
-    list.concat [
+    str.concat_all [
         u32 (core.map_get g :name 0),
         u32 (core.map_get g :kind 0),
         index (core.map_get g :target ir.no_node),
         u32 (core.map_get g :flags 0),
     ];
 
-let import_bytes i =
-    list.append (u32 (core.map_get i :path 0)) (u32 (core.map_get i :alias 0));
+let import_bytes i = u32 (core.map_get i :path 0) + u32 (core.map_get i :alias 0);
 
 let module_bytes m =
-    list.concat [
+    str.concat_all [
         u32 (core.map_get m :name 0),
         u32 (core.map_get m :source 0),
         u32 (core.map_get m :globals_start 0),
@@ -167,27 +179,31 @@ let module_bytes m =
 /// Strings are an offset-and-length table into one contiguous blob, so that a
 /// loader can point at a string rather than copy it.
 let string_table strs = {
-    let offsets = list.nth 1 (list.fold (fn acc s ->
+    let offsets = list.reverse (list.nth 1 (list.fold_strict (fn acc s ->
         [list.head acc + str.byte_length s,
-         list.append (list.nth 1 acc) [[list.head acc, str.byte_length s]]])
-        [0, []] strs);
-    list.concat (list.map (fn e -> list.append (u32 (list.head e)) (u32 (list.nth 1 e))) offsets)
+         core.cons [list.head acc, str.byte_length s] (list.nth 1 acc)])
+        [0, []] strs));
+    concat_map (fn e -> u32 (list.head e) + u32 (list.nth 1 e)) offsets
 };
 
 // --- the whole image ------------------------------------------------------------------
 
 let align8 n = (n + 7) - ((n + 7) % 8);
 
-let rec pad_to at target acc = if at >= target { acc } else { pad_to (at + 1) target (core.cons 0 acc) };
+/// `n` zero bytes. Sections are eight-byte aligned so a loader can point a
+/// struct at one where it lies.
+let zeros n = str.repeat n (core.str_of_bytes [0]);
 
 /// Every section, in the order a reader meets them.
 let sections_of img = {
     let strs = core.map_get img :strs [];
-    let blob = concat_map (fn s -> bytes_of_str s) strs;
+    // The blob is the strings, one after another: nothing has to be done to a
+    // string to turn it into its own bytes.
+    let blob = str.concat_all strs;
     [section t_kint (concat_map (fn v -> i64 v) (core.map_get img :ints [])) (list.length (core.map_get img :ints [])),
      section t_kflt (concat_map (fn v -> f64 v) (core.map_get img :floats [])) (list.length (core.map_get img :floats [])),
      section t_kstr (string_table strs) (list.length strs),
-     section t_sblb blob (list.length blob),
+     section t_sblb blob (str.byte_length blob),
      section t_katm (concat_map (fn v -> u32 v) (core.map_get img :atoms [])) (list.length (core.map_get img :atoms [])),
      section t_node (concat_map (fn n -> node_bytes n) (core.map_get img :nodes [])) (list.length (core.map_get img :nodes [])),
      section t_kids (concat_map (fn k -> index k) (core.map_get img :kids [])) (list.length (core.map_get img :kids [])),
@@ -197,7 +213,7 @@ let sections_of img = {
      section t_mods (concat_map (fn m -> module_bytes m) (core.map_get img :modules [])) (list.length (core.map_get img :modules []))]
 };
 
-/// The image, as a list of bytes.
+/// The image, as bytes.
 ///
 /// Assembled by concatenating a list of pieces exactly once. The obvious way --
 /// appending each section to what has been written so far -- copies everything
@@ -217,7 +233,7 @@ let emit img = {
     let placed = list.nth 1 laid_out;
     let ends = align8 (list.head laid_out);
 
-    let header = list.concat [
+    let header = str.concat_all [
         magic,
         u16 version_major, u16 version_minor,
         u32 0,                                    // flags: no span section yet
@@ -227,28 +243,29 @@ let emit img = {
         u32 (list.length secs),
     ];
 
-    let table = list.concat (list.map (fn pair -> {
+    let table = concat_map (fn pair -> {
         let s = list.head pair;
-        list.concat [u32 (sec_kind s), u32 (list.nth 1 pair), u32 (sec_len s), u32 (sec_count s)]
-    }) (list.zip secs placed));
+        str.concat_all [u32 (sec_kind s), u32 (list.nth 1 pair), u32 (sec_len s), u32 (sec_count s)]
+    }) (list.zip secs placed);
 
     // Each section, preceded by the padding that puts it exactly where the
     // table said it would be. The pieces are collected and concatenated once,
     // at the end.
-    let assembled = list.fold (fn acc pair -> {
+    let assembled = list.fold_strict (fn acc pair -> {
         let s = list.head pair;
         let at = list.nth 1 pair;
         [at + sec_len s,
-         list.append (list.nth 1 acc) [list.replicate (at - list.head acc) 0, sec_body s]]
-    }) [list.length header + list.length table, []] (list.zip secs placed);
+         core.cons (sec_body s) (core.cons (zeros (at - list.head acc)) (list.nth 1 acc))]
+    }) [str.byte_length header + str.byte_length table, []] (list.zip secs placed);
 
     let written = list.head assembled;
-    let pieces = list.nth 1 assembled;
-    let tail_pad = [list.replicate (ends - written) 0];
-    list.concat (list.append (list.append [header, table] pieces) tail_pad)
+    // The pieces are collected front to back by consing, which puts them in
+    // reverse; the whole image is one concatenation of them.
+    let pieces = list.reverse (list.nth 1 assembled);
+    str.concat_all (list.concat [[header, table], pieces, [zeros (ends - written)]])
 };
 
-/// The image as a string, which is what `io.write!` takes. `str_of_bytes`
-/// builds it a byte at a time rather than encoding characters, which is the
+/// The image as a string, which is what `io.write!` takes. It is one already:
+/// every piece was built as bytes rather than as characters, which is the
 /// difference between binary and UTF-8.
-let to_binary img = core.str_of_bytes (emit img);
+let to_binary img = emit img;
