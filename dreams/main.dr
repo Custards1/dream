@@ -573,6 +573,7 @@ let usage! () = {
         "  --at LINE:COL  say what is at a position, and where it came from",
         "  --stats        count what the program contains",
         "  --time         compile the whole way and say what each stage cost",
+        "  --repl         an interactive session: read, compile, run, repeat",
         "  --print-cfg    print the `when` flags that are defined",
         "  --shebang [LINE]  prefix the image with a `#!` line and make it executable",
         "  -i, --repl     an interactive session: read, compile, run, repeat",
@@ -632,6 +633,7 @@ let run_command! o file =
         :symbols   => show_symbols! (load! o file) file,
         :at        => show_at! (load! o file) file
                                (list.nth 0 (opt o :position)) (list.nth 1 (opt o :position)),
+        :repl      => (),
         _ => usage! (),
     };
 

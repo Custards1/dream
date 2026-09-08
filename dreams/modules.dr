@@ -566,17 +566,24 @@ let load_root! l file test_mode = {
 ///
 /// A compiler that can only find the standard library when it is told to is a
 /// compiler every script has to be told about, so a root file gets three search
-/// paths for free:
+/// paths for free, and the order they are searched in is the point:
 ///
-///   - its own directory, so a program's siblings are modules of it;
-///   - every entry of `$MINDV2_PATH`, which is where an installation keeps what
-///     it ships;
-///   - the nearest enclosing `mind` directory that holds a `std`, so a checkout
-///     is its own installation and `dream/tests/programs/match.dr` can import
-///     `std.list` with no `-L` at all.
+///   1. its own directory, so a program's siblings are modules of it;
+///   2. the nearest enclosing `mind` directory that holds a `std`, so a
+///      checkout is its own installation and `dream/tests/programs/match.dr`
+///      can import `std.list` with no `-L` at all;
+///   3. every entry of `$MINDV2_PATH`, which is where an installation keeps
+///      what it ships.
 ///
-/// What the command line asked for comes first, because a search path given by
-/// hand is a decision and these are a convenience.
+/// The checkout beats the installation, and that is not a preference. With it
+/// the other way round, an installed library that has fallen behind silently
+/// shadows the one being edited: this compiler failed to build itself against
+/// its own standard library because an older copy of `std` was installed, and
+/// the error named a function that was right there in the file. A library that
+/// travels with the source it is being built against is the one that was meant.
+///
+/// What the command line asked for comes before all three, because a search
+/// path given by hand is a decision and these are a convenience.
 let rec enclosing_minds! dir acc = {
     let candidate = path.join dir "mind";
     let grown = if io.is_dir! (path.join candidate "std") { list.append acc [candidate] }
@@ -589,11 +596,11 @@ let default_search_paths! file extra =
     list.concat [
         extra,
         [path.dirname file],
+        enclosing_minds! (path.dirname (path.absolute! file)) [],
         match os.env! "MINDV2_PATH" {
             () => [],
             v => list.map (fn r -> path.expand_home! r) (package.split_roots v),
         },
-        enclosing_minds! (path.dirname (path.absolute! file)) [],
     ];
 
 /// The usual way in: discover packages around `file`, then load it.
