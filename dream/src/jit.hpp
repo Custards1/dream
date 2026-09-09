@@ -7,9 +7,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "value.hpp"
 
@@ -35,8 +37,24 @@ public:
     Jit(const Jit&) = delete;
     Jit& operator=(const Jit&) = delete;
 
+    /// The fast side of `on_enter`: one read of the compiled-body cache.
+    /// Returns true and stores the compiled body when this function has
+    /// already been compiled. When it returns false the caller must let the
+    /// interpreter run and call `on_enter` so the miss can count towards the
+    /// threshold. `cached_compiled` is defined inline so the interpreted path
+    /// -- where this runs on every function entry -- costs a single load and
+    /// no call into the JIT machinery; `on_enter` keeps the slow path cold.
+    bool cached_compiled(uint32_t func_index, CompiledFn* out) const {
+        if (func_index >= cached_.size()) return false;
+        CompiledFn fn = cached_[func_index].load(std::memory_order_acquire);
+        if (!fn) return false;
+        *out = fn;
+        return true;
+    }
+
     /// Count an entry into `func_index`; returns a compiled body once the
     /// function is hot and compilation has succeeded, otherwise nullptr.
+    /// The slow path: consult after `cached_compiled` has missed.
     CompiledFn on_enter(uint32_t func_index);
 
     /// Compile now, regardless of temperature. Returns nullptr on failure.
@@ -49,6 +67,14 @@ public:
     std::string dump_ir(uint32_t func_index);
 
 private:
+    /// Dense per-function entry counters and compiled-body cache, indexed by
+    /// image function index. They live on `Jit` rather than in `Impl` so
+    /// `cached_compiled`, which runs on every function entry, can read the
+    /// cache with a single load and no PIMPL indirection. Both are sized once,
+    /// in the constructor, after the image has loaded.
+    std::vector<std::atomic<uint32_t>> counts_;
+    std::vector<std::atomic<CompiledFn>> cached_;
+
     /// Caller must hold the JIT lock.
     CompiledFn compile_locked(uint32_t func_index, std::string* error);
 

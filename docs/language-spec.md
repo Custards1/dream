@@ -42,6 +42,7 @@ the older of two implementations that a test holds to each other.
 13. [The standard library](#13-the-standard-library)
 14. [The toolchain](#14-the-toolchain)
 15. [Embedding](#15-embedding)
+16. [Writing code that runs fast](#16-writing-code-that-runs-fast)
 
 ---
 
@@ -223,6 +224,34 @@ copied on every `map_put` to leave the original standing, which makes building a
 map an entry at a time quadratic; a trie shares everything the change does not
 touch, so the update is `log32(n)` new nodes and the map it came from is
 untouched and still cheap to use.
+
+The three container shapes differ in cost as much as in kind, and which one a
+value wants is usually decided by how it is read rather than by what it holds:
+
+- **A cons chain answers the head in one hop and everything else by walking.**
+  `nth`, `length` and `last` each pay one step per element; appending and
+  reading the end walk the whole chain. Building in front is O(1), which is
+  why the idiom everywhere in the standard library is to accumulate with
+  `core.cons` and reverse once at the end. A *lazy* chain costs a cell each
+  time a new element is forced, so a stream that will be walked twice builds
+  every cell of a tail that the second walk then forces again.
+- **An array reads any index in one hop — constant-time like a list's head.**
+  An array is the right shape for a fixed record that is read more than it is
+  built, because a list record reads every field by walking to it. The
+  compiler's token is the precedent: as a six-element list, reading one field
+  walked to its cell, and reading tokens was a fifth of everything the
+  compiler did. Arrays are built with `core.array_new` and `core.array_set`
+  (or `std.array.of_list`), so the more a record is built relative to read,
+  the less clear the win is.
+- **A membership test over a fixed set of names wants a map.** Checking a name
+  against a flat table of keywords was a tenth of the compiler's work; the
+  same check against `%{ }` is a probe of a trie.
+- **A string is a sequence of bytes with two costs.** Byte operations —
+  `core.str_len`, `core.str_byte`, `str.slice` on a byte offset — are O(1);
+  anything that counts or indexes by *character* (`str.length`, `str.chars`)
+  walks. The lexer counts columns in characters and spans in bytes for
+  exactly this reason, and a program that slices a string a lot wants to
+  thread offsets, not characters.
 
 ---
 
@@ -1384,3 +1413,100 @@ Four things are worth knowing:
 
 `dream_vm_native_module_count` / `_name` exist so a test can prove the
 compiler's list of native modules and the runtime's registry still agree.
+
+---
+
+## 16. Writing code that runs fast
+
+Everything above is how the language is meant to be written. This section is
+what actually costs, learned from making the compiler — itself an ordinary
+Dream program — report where its own time went. The rules are few, because the
+runtime charges by a few mechanisms, and each is described with the measurement
+that established it.
+
+Two instruments make the rest of this section possible:
+
+```
+dreams --time FILE        # what each stage of a compile cost
+dream --profile [N] IMG   # the hottest functions, by reductions
+```
+
+`--time` forces each stage where it reads the clock, because a lazy stage that
+has not been forced has not run. `--profile` attributes every reduction to the
+function whose frame is current, and **natives do not reduce** — the seconds
+inside a builtin are charged to its caller. That single rule explains three
+surprising facts about a profile: a thin member of a host module (`core.head`)
+can look hot while really being the native it calls; a function that wraps
+another function in a frame shows up as its own cost; and a function that does
+`array_get` three times in a row is paying three distinct charges it could have
+spent once.
+
+### Every value decides its own cost
+
+- **A list is read at the head.** `head`/`tail`/`core.cons` are one hop; `nth`,
+  `length`, `last`, and anything ending in `_at` walk. Accumulate with
+  `core.cons` and reverse once. Prefer a lazy chain precisely where the head is
+  the point — a stream — because a cell is allocated as it is forced and a
+  stream that goes unread costs nothing.
+- **A record is an array when it is read more than it is built.** Matching a
+  list pattern (`[:ok, v, rest]`) binds by walking the cells; matching an
+  array pattern length-checks and indexes. The compiler's token used to be a
+  six-element list and reading one was a fifth of everything the compiler
+  did — the arrayed token now reads any field in one hop, and the decision is
+  recorded at the top of [the lexer](../dreams/lexer.dr).
+- **Membership is a map; a table is a scan.** The keyword check was a tenth of
+  the compiler until keywords became a `%{ }` set. A *table* that is only ever
+  matched against — that is documentation in code — is still the right shape,
+  but then the lookup should be the `match`, not the table: the compiler
+  keeps an `operators` table for reading while `operator_at` dispatches on
+  the byte, and [ast.dr](../dreams/ast.dr) documents why the infix table is
+  consulted by `match` rather than by walking it.
+- **Count columns in characters and indexes in bytes.** Byte operations are the
+  O(1) ones on a string. Spanning and slicing by byte offset is how the lexer
+  gives a diagnostic its text back; character walks are the rare case.
+
+### Laziness is real, and it is the whole allocation story
+
+Every argument, list element, map value and binding is a thunk until forced.
+Two consequences matter for anything performance-shaped:
+
+- **Forcing a lazy stream complicates walking it.** A cell is memoized once
+  forced, but only that cell — the recursive tail is still a thunk. Walking a
+  stream once to *ask a question about it* and then again to *consume it*
+  forces every cell twice and, before every cell is a value, allocates it
+  twice. The compiler's parser used to force the whole token stream looking
+  for a lexical error and then parse it; the error is now a token of its own,
+  reported when the parse reaches it, and the redundant walk was five percent
+  of a whole compile.
+- **`strict!` is linear in data, not in paths.** Objects mark themselves
+  deeply forced once, so forcing the same shared structure from several
+  directions costs O(1) per object after the first. A function that `strict!`s
+  a value it does not know is shared pays once and forgets it.
+- **Natives are where the iron is, and thin accessors are free wrappers.** A
+  global whose body is one application of its parameters — `let head xs =
+  core.head xs` — is compiled as the call it stands for when it is applied
+  saturated (§5). The accessors that remain (`list.head`, `core.array_get`)
+  are natives; each costs one native call, and paying for several on the same
+  value — the peek-and-ask pattern — is what a profile shows. Fetch the value
+  once and ask all your questions of that one reference.
+
+### Errors are values in the shape of your data
+
+A function that returns a lazy structure cannot also return an error "up
+front" without forcing everything it was ashamed of — which is what kills the
+laziness. The lexer's answer is to make **errors tokens**: a failure is a
+`:error` token at the point it happened, the last cell of the stream, carrying
+its message and its span, and a consumer that pulls only the head never sees
+it. The rule generalizes: a component that walks a structure should put its
+error where the walk will meet it, and a walk that is only *looking for* an
+error is a walk that does not need to happen.
+
+### Repeating work is the only real bug
+
+Dream has no mutation, which removes a class of bug and imports one: a subvalue
+that is forced from two places computes twice, unless it was already forced
+(`strict!`, or because the result was a value). The wrapper rule of §5 is
+deliberately narrow — it records *which* globals are wrappers at scope time, so
+lowering can rewrite a saturated call *because* it knows the frame it stands
+for adds nothing. When a measurement shows a function hot for no apparent
+reason, the first question is whether a lazy list is being walked twice.

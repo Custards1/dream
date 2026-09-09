@@ -259,22 +259,22 @@ let handle! sup s m =
     match m {
         [:down, name, outcome] => handle_down! sup s name outcome,
         [:which, from] => {
-            send! from (map.sorted_keys (s_running s))
+            strict! (send! from (map.sorted_keys (s_running s)))
             [:go, s]
         },
         [:restart, from, name] => {
             let started = if map.has (s_running s) name { s } else { start_named! sup s name };
-            send! from :ok
+            strict! (send! from :ok)
             [:go, started]
         },
         [:notify, from] => {
             let told = with_watcher from s;
-            send! from :ok
+            strict! (send! from :ok)
             [:go, told]
         },
         [:stop_all, from] => {
             let cleared = stop_all! s (names_of s);
-            send! from :stopped
+            strict! (send! from :stopped)
             [:stop, [:ok, :stopped]]
         },
         _ => [:go, s],
@@ -291,7 +291,7 @@ let handle! sup s m =
 /// somebody else to send to themselves, and the runtime called that a deadlock,
 /// which it was.
 let serve! s = {
-    let me = self! ();
+    let me = strict! self! ();
     proc.serve! s (fn st m -> handle! me st m)
 };
 
@@ -303,7 +303,7 @@ let serve! s = {
 let start_with! strategy children lim = {
     let s = state strategy children lim;
     spawn! $( {
-        let me = self! ();
+        let me = strict! self! ();
         let started = list.fold (fn acc n -> start_named! me acc n) s (names_of s) |> strict!;
         serve! started
     } )
@@ -315,7 +315,7 @@ let start! strategy children = start_with! strategy children default_limits;
 
 /// The names of the children now running, in order.
 let which! sup = {
-    send! sup [:which, self! ()]
+    strict! (send! sup [:which, self! ()])
     recv! ()
 };
 
@@ -325,7 +325,7 @@ let which! sup = {
 /// one: a child that ended and was not restarted, or one deliberately started
 /// late. A name that is already running is left alone.
 let restart! sup name = {
-    send! sup [:restart, self! (), name]
+    strict! (send! sup [:restart, self! (), name])
     recv! ()
 };
 
@@ -333,7 +333,7 @@ let restart! sup name = {
 /// outcome]` messages. Answers once the supervisor has taken note, so a caller
 /// that registers before starting the work cannot miss the first failure.
 let notify! sup = {
-    send! sup [:notify, self! ()]
+    strict! (send! sup [:notify, self! ()])
     recv! ()
 };
 
@@ -343,7 +343,7 @@ let notify! sup = {
 /// ends with one of those is reported as deadlocked rather than finished --
 /// whoever starts one owns stopping it.
 let stop! sup = {
-    send! sup [:stop_all, self! ()]
+    strict! (send! sup [:stop_all, self! ()])
     recv! ()
     proc.outcome! sup
 };
@@ -351,159 +351,159 @@ let stop! sup = {
 // --- tests -------------------------------------------------------------------
 
 when test {
-    // import std.test;
+    import std.test;
 
-    // /// A worker that counts what it is sent and answers on request. It fails on
-    // /// `:crash`, which is how the tests make a child die on purpose.
-    // let counter! () =
-    //     proc.serve! 0 (fn n m ->
-    //         if proc.is_shutdown m { [:stop, n] }
-    //         else if m == :crash { raise! :crashed }
-    //         else if proc.is_call m {
-    //             proc.reply! m n
-    //             [:go, n]
-    //         }
-    //         else { [:go, n + 1] });
+    /// A worker that counts what it is sent and answers on request. It fails on
+    /// `:crash`, which is how the tests make a child die on purpose.
+    let counter! () =
+        proc.serve! 0 (fn n m ->
+            if proc.is_shutdown m { [:stop, n] }
+            else if m == :crash { raise! :crashed }
+            else if proc.is_call m {
+                proc.reply! m n
+                [:go, n]
+            }
+            else { [:go, n + 1] });
 
-    // /// A child that ends immediately, for the restart policies.
-    // let quitter! () = :done;
+    /// A child that ends immediately, for the restart policies.
+    let quitter! () = :done;
 
-    // /// Register for reports, say so, and answer the first one.
-    // ///
-    // /// It listens in a process of its own, and that is the point. A process
-    // /// that both asks a supervisor questions and listens to its reports gets
-    // /// replies and reports in one mailbox, and with no selective receive
-    // /// `recv!` hands over whichever arrived first -- so a sieve that waits for
-    // /// one particular message can swallow a reply somebody else was waiting
-    // /// for, and both sides stop. Here the report comes back as this process's
-    // /// *value*, through `join!`, which is a channel of exactly one message that
-    // /// nothing else can land in.
-    // let listener! sup parent = {
-    //     notify! sup
-    //     send! parent :ready
-    //     recv! ()
-    // };
+    /// Register for reports, say so, and answer the first one.
+    ///
+    /// It listens in a process of its own, and that is the point. A process
+    /// that both asks a supervisor questions and listens to its reports gets
+    /// replies and reports in one mailbox, and with no selective receive
+    /// `recv!` hands over whichever arrived first -- so a sieve that waits for
+    /// one particular message can swallow a reply somebody else was waiting
+    /// for, and both sides stop. Here the report comes back as this process's
+    /// *value*, through `join!`, which is a channel of exactly one message that
+    /// nothing else can land in.
+    let listener! sup parent = {
+        notify! sup
+        send! parent :ready
+        recv! ()
+    };
 
-    // /// Ask until the supervisor's answer is the one expected, or give up.
-    // ///
-    // /// A supervisor is asynchronous, and there is no primitive that waits for
-    // /// it to have noticed something: the child's death and the supervisor's
-    // /// reading of it are two moments, sent by two different processes, and
-    // /// nothing orders them. Each round trip through the mailbox gives the
-    // /// pending report its turn, so this converges immediately in practice --
-    // /// and answers whatever it has when it runs out of patience, so a genuine
-    // /// disagreement still fails the case rather than hanging it.
-    // let rec settle! sup want tries = {
-    //     let names = which! sup;
-    //     if names == want || tries <= 0 { names } else { settle! sup want (tries - 1) }
-    // };
+    /// Ask until the supervisor's answer is the one expected, or give up.
+    ///
+    /// A supervisor is asynchronous, and there is no primitive that waits for
+    /// it to have noticed something: the child's death and the supervisor's
+    /// reading of it are two moments, sent by two different processes, and
+    /// nothing orders them. Each round trip through the mailbox gives the
+    /// pending report its turn, so this converges immediately in practice --
+    /// and answers whatever it has when it runs out of patience, so a genuine
+    /// disagreement still fails the case rather than hanging it.
+    let rec settle! sup want tries = {
+        let names = which! sup;
+        if names == want || tries <= 0 { names } else { settle! sup want (tries - 1) }
+    };
 
-    // let tests = [
-    //     test.case "a supervisor starts its children"
-    //         $( {
-    //             let sup = start! :one_for_one [child "a" counter!, child "b" counter!];
-    //             let names = which! sup;
-    //             stop! sup
-    //             test.eq! ["a", "b"] names
-    //         } ),
+    let tests = [
+        test.case "a supervisor starts its children"
+            $( {
+                let sup = start! :one_for_one [child "a" counter!, child "b" counter!];
+                let names = which! sup;
+                stop! sup
+                test.eq! ["a", "b"] names
+            } ),
 
-    //     test.case "a child that dies is restarted"
-    //         $( {
-    //             let sup = start! :one_for_one [child "a" counter!];
-    //             // The crash, the restart, and the question all go through the
-    //             // supervisor's mailbox in order, so asking is enough to know
-    //             // the restart has happened.
-    //             let before = which! sup;
-    //             let names = which! sup;
-    //             stop! sup
-    //             test.eq! [["a"], ["a"]] [before, names]
-    //         } ),
+        test.case "a child that dies is restarted"
+            $( {
+                let sup = start! :one_for_one [child "a" counter!];
+                // The crash, the restart, and the question all go through the
+                // supervisor's mailbox in order, so asking is enough to know
+                // the restart has happened.
+                let before = which! sup;
+                let names = which! sup;
+                stop! sup
+                test.eq! [["a"], ["a"]] [before, names]
+            } ),
 
-    //     test.case "a temporary child is not restarted"
-    //         $( {
-    //             let sup = start_with! :one_for_one
-    //                           [child_with "once" quitter! :temporary] default_limits;
-    //             // It ends on its own; the supervisor drops it rather than
-    //             // starting it again.
-    //             let names = settle! sup [] 100;
-    //             stop! sup
-    //             test.eq! [] names
-    //         } ),
+        test.case "a temporary child is not restarted"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "once" quitter! :temporary] default_limits;
+                // It ends on its own; the supervisor drops it rather than
+                // starting it again.
+                let names = settle! sup [] 100;
+                stop! sup
+                test.eq! [] names
+            } ),
 
-    //     test.case "a watcher is told when a child goes down"
-    //         $( {
-    //             let sup = start_with! :one_for_one
-    //                           [child_with "once" quitter! :temporary] default_limits;
-    //             // `self! ()` is taken here, not inside the thunk: a thunk is
-    //             // evaluated by whoever forces it, and inside the spawn that is
-    //             // the listener, which would answer itself.
-    //             let me = self! ();
-    //             let l = spawn! $( listener! sup me );
-    //             // `:ready` means the listener is registered. Registration does
-    //             // not reach back in time, so the child is started only after
-    //             // that -- which is what `restart!` is for here.
-    //             recv! ()
-    //             restart! sup "once"
-    //             let told = join! l;
-    //             stop! sup
-    //             test.eq! :down (list.nth 0 told)
-    //         } ),
+        test.case "a watcher is told when a child goes down"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "once" quitter! :temporary] default_limits;
+                // `self! ()` is taken here, not inside the thunk: a thunk is
+                // evaluated by whoever forces it, and inside the spawn that is
+                // the listener, which would answer itself.
+                let me = self! ();
+                let l = spawn! $( listener! sup me );
+                // `:ready` means the listener is registered. Registration does
+                // not reach back in time, so the child is started only after
+                // that -- which is what `restart!` is for here.
+                recv! ()
+                restart! sup "once"
+                let told = join! l;
+                stop! sup
+                test.eq! :down (list.nth 0 told)
+            } ),
 
-    //     // A supervisor that gives up *returns* why rather than raising it: the
-    //     // value of the process is `[:error, e]`, so `proc.outcome!` wraps it as
-    //     // `[:ok, [:error, e]]`. Giving up is a decision it made, not a failure
-    //     // it suffered, and a parent that joins it should see the reason without
-    //     // having to catch anything.
-    //     test.case "a permanent child that returns is restarted until the limit"
-    //         $( {
-    //             let sup = start_with! :one_for_one
-    //                           [child_with "again" quitter! :permanent] (limits 2 5000);
-    //             let ended = proc.outcome! sup;
-    //             test.eq! [:ok, :error]
-    //                      [list.nth 0 ended, list.nth 0 (list.nth 1 ended)]
-    //         } ),
+        // A supervisor that gives up *returns* why rather than raising it: the
+        // value of the process is `[:error, e]`, so `proc.outcome!` wraps it as
+        // `[:ok, [:error, e]]`. Giving up is a decision it made, not a failure
+        // it suffered, and a parent that joins it should see the reason without
+        // having to catch anything.
+        test.case "a permanent child that returns is restarted until the limit"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "again" quitter! :permanent] (limits 2 5000);
+                let ended = proc.outcome! sup;
+                test.eq! [:ok, :error]
+                         [list.nth 0 ended, list.nth 0 (list.nth 1 ended)]
+            } ),
 
-    //     test.case "restarting too often stops the supervisor"
-    //         $( {
-    //             let sup = start_with! :one_for_one
-    //                           [child_with "flap" quitter! :permanent] (limits 1 5000);
-    //             let ended = proc.outcome! sup;
-    //             test.eq! :restart_limit (error.kind (list.nth 1 (list.nth 1 ended)))
-    //         } ),
+        test.case "restarting too often stops the supervisor"
+            $( {
+                let sup = start_with! :one_for_one
+                              [child_with "flap" quitter! :permanent] (limits 1 5000);
+                let ended = proc.outcome! sup;
+                test.eq! :restart_limit (error.kind (list.nth 1 (list.nth 1 ended)))
+            } ),
 
-    //     test.case "which! reports the running children"
-    //         $( {
-    //             let sup = start! :one_for_one [child "x" counter!];
-    //             let names = which! sup;
-    //             stop! sup
-    //             test.eq! ["x"] names
-    //         } ),
+        test.case "which! reports the running children"
+            $( {
+                let sup = start! :one_for_one [child "x" counter!];
+                let names = which! sup;
+                stop! sup
+                test.eq! ["x"] names
+            } ),
 
-    //     test.case "stop! takes the children down with it"
-    //         $( {
-    //             let sup = start! :one_for_one [child "x" counter!, child "y" counter!];
-    //             let ended = stop! sup;
-    //             test.eq! [:ok, [:ok, :stopped]] ended
-    //         } ),
+        test.case "stop! takes the children down with it"
+            $( {
+                let sup = start! :one_for_one [child "x" counter!, child "y" counter!];
+                let ended = stop! sup;
+                test.eq! [:ok, [:ok, :stopped]] ended
+            } ),
 
-    //     // --- the strategy tables, which are pure and can be checked directly ---
-    //     test.case "one_for_one affects only the one"
-    //         $( test.eq! ["b"] (affected :one_for_one ["a", "b", "c"] "b") ),
-    //     test.case "one_for_all affects everything"
-    //         $( test.eq! ["a", "b", "c"] (affected :one_for_all ["a", "b", "c"] "b") ),
-    //     test.case "rest_for_one affects it and what follows"
-    //         $( test.eq! ["b", "c"] (affected :rest_for_one ["a", "b", "c"] "b") ),
+        // --- the strategy tables, which are pure and can be checked directly ---
+        test.case "one_for_one affects only the one"
+            $( test.eq! ["b"] (affected :one_for_one ["a", "b", "c"] "b") ),
+        test.case "one_for_all affects everything"
+            $( test.eq! ["a", "b", "c"] (affected :one_for_all ["a", "b", "c"] "b") ),
+        test.case "rest_for_one affects it and what follows"
+            $( test.eq! ["b", "c"] (affected :rest_for_one ["a", "b", "c"] "b") ),
 
-    //     test.case "a transient child is restarted only when it fails"
-    //         $( test.eq! [true, false]
-    //                     [should_restart (child_with "t" quitter! :transient) [:error, :x],
-    //                      should_restart (child_with "t" quitter! :transient) [:ok, 1]] ),
-    //     test.case "a permanent child is restarted either way"
-    //         $( test.eq! [true, true]
-    //                     [should_restart (child "p" quitter!) [:error, :x],
-    //                      should_restart (child "p" quitter!) [:ok, 1]] ),
+        test.case "a transient child is restarted only when it fails"
+            $( test.eq! [true, false]
+                        [should_restart (child_with "t" quitter! :transient) [:error, :x],
+                         should_restart (child_with "t" quitter! :transient) [:ok, 1]] ),
+        test.case "a permanent child is restarted either way"
+            $( test.eq! [true, true]
+                        [should_restart (child "p" quitter!) [:error, :x],
+                         should_restart (child "p" quitter!) [:ok, 1]] ),
 
-    //     test.case "the window drops old restarts"
-    //         $( test.eq! [1000, 900] (recent 500 1000 [900, 100]) ),
-    // ];
+        test.case "the window drops old restarts"
+            $( test.eq! [1000, 900] (recent 500 1000 [900, 100]) ),
+    ];
 }

@@ -188,7 +188,12 @@ void enter(Process& p, Value v);
 void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value frame) {
     Jit* jit = p.runtime().jit();
     if (jit) {
-        if (CompiledFn fn = jit->on_enter(func_index)) {
+        CompiledFn fn = nullptr;
+        // The already-compiled case is a single inlined cache read, so a
+        // process whose functions never grow hot -- most of a compile -- pays
+        // nothing more for the JIT being present. Only a cache miss calls
+        // `on_enter`, which counts towards the threshold and compiles.
+        if (jit->cached_compiled(func_index, &fn) || (fn = jit->on_enter(func_index))) {
             int status = 0;
             // Compiled code spends the same budget the interpreter does, so
             // fold what it used into the process's total.
@@ -306,7 +311,6 @@ void do_apply(Process& p, Value callee, uint32_t argc) {
         return;
     }
 
-    //p.stack.resize(base);
     do_raise(p, raise_error(p, well_known(p.runtime()).not_a_function,
                             describe(p, callee) + " is not a function"));
 }
@@ -904,7 +908,8 @@ void step_eval(Process& p) {
             return;
         }
         case Op::MakeMap: {
-            p.stack.push_back(p.heap().make_map(0));
+            Value m = p.heap().make_map(0);
+            p.stack.push_back(m);
             advance_map(p, n.a, n.b, 0, frame);
             return;
         }
@@ -1221,6 +1226,22 @@ struct Limits {
     }
 };
 
+/// The raises behind the checks below, kept here rather than in the loops so
+/// the per-reduction path stays a couple of compares and the error-string
+/// construction stays in `.cold` clones.
+void raise_depth_limit(Process& p, const WellKnownAtoms& wk, size_t depth) {
+    do_raise(p, raise_error(p, wk.stack_overflow,
+                            "recursion too deep: " + std::to_string(depth) + " pending frames"));
+}
+void raise_stack_limit(Process& p, const WellKnownAtoms& wk, size_t depth) {
+    do_raise(p, raise_error(p, wk.stack_overflow,
+                            "value stack too deep: " + std::to_string(depth) + " entries"));
+}
+void raise_heap_limit(Process& p, const WellKnownAtoms& wk, size_t max_heap) {
+    do_raise(p, raise_error(p, wk.out_of_memory,
+                            "process heap grew past " + std::to_string(max_heap) + " bytes"));
+}
+
 /// Raise in `p` if it has outgrown what one process may use. Returns true when
 /// it did, so the caller can stop what it was doing.
 ///
@@ -1229,29 +1250,27 @@ struct Limits {
 /// apart, so a limit can only be overshot by a bounded amount. Making the
 /// allocator itself fail would mean every caller of `alloc` -- most of which
 /// hold raw object pointers -- had to cope with a null.
-bool check_limits(Process& p) {
+///
+/// The limits and well-known atoms are passed in because this runs once a
+/// reduction: reading them here would pay the thread-safe static initializer
+/// guard and a handful of loads on every step of every loop. The callers hoist
+/// them into local registers instead, which is what keeps this cheap enough to
+/// run unconditionally.
+static inline bool check_limits(Process& p, const WellKnownAtoms& wk,
+                                size_t max_conts, size_t max_stack, size_t max_heap) {
     if (p.mode == Mode::Raise) return false;  // already unwinding; let it finish
-    const Limits& l = Limits::get();
-    const WellKnownAtoms& wk = well_known(p.runtime());
-
-    if (p.conts.size() > l.conts) {
-        do_raise(p, raise_error(p, wk.stack_overflow,
-                                "recursion too deep: " + std::to_string(p.conts.size()) +
-                                    " pending frames"));
+    if (p.conts.size() > max_conts) {
+        raise_depth_limit(p, wk, p.conts.size());
         return true;
     }
-    if (p.stack.size() > l.stack) {
-        do_raise(p, raise_error(p, wk.stack_overflow,
-                                "value stack too deep: " + std::to_string(p.stack.size()) +
-                                    " entries"));
+    if (p.stack.size() > max_stack) {
+        raise_stack_limit(p, wk, p.stack.size());
         return true;
     }
     // Checked after a collection has had its chance, so this fires only for a
     // process whose *live* data is too big, not one that merely allocates fast.
-    if (p.heap().bytes_allocated() > l.heap_bytes && p.heap().bytes_live() > l.heap_bytes / 2) {
-        do_raise(p, raise_error(p, wk.out_of_memory,
-                                "process heap grew past " + std::to_string(l.heap_bytes) +
-                                    " bytes"));
+    if (p.heap().bytes_allocated() > max_heap && p.heap().bytes_live() > max_heap / 2) {
+        raise_heap_limit(p, wk, max_heap);
         return true;
     }
     return false;
@@ -1268,12 +1287,21 @@ uint32_t current_func(Process& p) {
 
 void run_process(Process& p, int64_t budget) {
     p.reductions = budget;
+    // The limits are loop-invariant over the whole run; read them once so the
+    // per-reduction check stays a couple of compares against registers, not a
+    // thread-safe static init guarded call.
+    const Limits lim = Limits::get();
+    const size_t max_conts = lim.conts;
+    const size_t max_stack = lim.stack;
+    const size_t max_heap = lim.heap_bytes;
+    const WellKnownAtoms& wk = well_known(p.runtime());
     while (p.reductions > 0) {
         // Safepoint. Every live value is reachable from the process's stacks,
         // its frame and its result -- nothing is stranded in a C++ local.
         if (p.heap().should_collect()) p.maybe_collect();
 
-        check_limits(p);
+        // A raised limit unwinds at the next dispatch, below.
+        if (check_limits(p, wk, max_conts, max_stack, max_heap)) continue;
 
         switch (p.mode) {
             case Mode::Eval:
@@ -1316,6 +1344,11 @@ bool force_whnf(Process& p, Value v, Value* out) {
     // Run a nested machine loop down to the current continuation depth. The
     // process's own stacks still hold every root, so a collection during this
     // is as safe as one at the outer level.
+    const Limits lim = Limits::get();
+    const size_t max_conts = lim.conts;
+    const size_t max_stack = lim.stack;
+    const size_t max_heap = lim.heap_bytes;
+    const WellKnownAtoms& wk = well_known(p.runtime());
     const size_t floor = p.conts.size();
     const Mode saved_mode = p.mode;
     const uint32_t saved_node = p.node;
@@ -1350,7 +1383,7 @@ bool force_whnf(Process& p, Value v, Value* out) {
         // that hold raw object pointers across the call, and moving their
         // objects out from under them is exactly what the "allocation never
         // collects" rule exists to prevent. The outer loop still collects.
-        check_limits(p);
+        if (check_limits(p, wk, max_conts, max_stack, max_heap)) continue;
 
         // A blocking native inside the value being forced -- `join!`, `recv!`,
         // a read on a socket -- asked to be parked. This loop cannot park: it

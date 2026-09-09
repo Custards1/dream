@@ -7,13 +7,16 @@
 // thread's view of an object. It is also what makes lazy thunk update safe
 // without atomics: only one process can ever force a given thunk.
 //
-// The collector is a Cheney-style copier. It runs only at interpreter
-// safepoints, where the live set is exactly the process's explicit stacks --
-// there is no native-stack scanning and no conservative guessing, because the
-// interpreter never keeps a Dream value in a C++ local across a safepoint.
+// The collector is an atomic mark-sweep: tri-color mark from the roots into a
+// worklist, then a sweep that threads every dead object's space onto a
+// segregated free list. Nothing moves, which is why collection is safe at an
+// interpreter safepoint with no native-stack scanning -- the live set is
+// exactly the process's explicit stacks, and every address stays valid across
+// a collection.
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -22,6 +25,9 @@
 #include "value.hpp"
 
 namespace dream {
+
+/// One free list per size class; the class table lives in heap.cpp.
+inline constexpr size_t kHeapClassCount = 55;
 
 class Heap;
 
@@ -72,8 +78,9 @@ public:
     /// Collect, tracing from `roots`. Safe only at an interpreter safepoint.
     void collect(RootSource& roots);
 
-    /// Move one reference into to-space. Called from `visit_roots` and while
-    /// scanning; updates `*slot` in place.
+    /// Mark the reference `*slot` holds. `forward` is the name a root source
+    /// and the scanner use to hand a reference to the collector; under
+    /// mark-sweep nothing moves, so the reference itself is never rewritten.
     void forward(Value* slot);
 
     size_t bytes_allocated() const { return allocated_; }
@@ -115,19 +122,36 @@ private:
         size_t size;
         size_t used;
         uint8_t* data;
+        /// True when the whole block is one big object's. Nothing else may be
+        /// carved into it, and sweep may then free the whole block without
+        /// stranding any live chunk.
+        bool big;
     };
 
     Block* new_block(size_t bytes);
     void free_blocks(Block* b);
-    void* bump(size_t bytes);
 
-    /// Copy one object into to-space if it is not there already.
-    Value evacuate(Value v);
-    /// Update the references inside an already-evacuated object.
+    /// Take `sz` bytes of new space: a fresh chunk carved off the tail of the
+    /// carve block (or a new block, or a split from the class lists).
+    Obj* carve(size_t sz);
+    /// An entire block dedicated to one large object.
+    Obj* carve_big(size_t sz);
+
+    /// Place one reference onto the live set. Shared by `forward` and the
+    /// collector itself; `out` stays null for a value already marked.
+    void mark_object(Value v);
+
+    /// Thread every dead object in every block onto the size-class free lists.
+    /// Also clears the mark bits of what survives and recounts the live set.
+    void sweep();
+
+    /// Update the references inside a marked object. Called from the sweep of
+    /// the worklist; `forward` below is what pushes each reference further out.
     void scan_object(Obj* o);
 
-    Block* blocks_ = nullptr;   // current allocation space
-    Block* to_blocks_ = nullptr;  // only non-null during a collection
+    std::array<Obj*, kHeapClassCount> free_lists_{};
+    Block* blocks_ = nullptr;
+    Block* carve_block_ = nullptr;
     size_t allocated_ = 0;
     uint64_t total_allocated_ = 0;
     size_t peak_live_ = 0;
@@ -135,9 +159,9 @@ private:
     size_t initial_bytes_;
     size_t live_after_gc_ = 0;
     uint64_t collections_ = 0;
-    bool collecting_ = false;
+    /// The grey set while collecting: objects marked but not yet scanned.
     std::vector<Obj*> scan_queue_;
-    /// Non-null while verifying: `forward` records roots rather than moving.
+    /// Non-null while verifying: `forward` records roots rather than marking.
     std::vector<Value>* recording_ = nullptr;
 };
 

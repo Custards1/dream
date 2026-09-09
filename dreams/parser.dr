@@ -69,6 +69,23 @@ let peek_span ts =
 
 let at ts k = peek_kind ts == k;
 
+/// The grammar asks several questions of the same token -- can it begin an
+/// argument, what kind is it, what is it worth, does its line continuation
+/// hold -- and each answer means one `list.head` and one array get when asked
+/// through the peekers above. A token is an array precisely so that asking
+/// becomes O(1); the peeks are the walk that remains. The decision points
+/// below fetch the token once and read its fields directly, which is the same
+/// `list.head` followed by the same array gets -- just not repeated.
+let kind_of t = lexer.kind t;
+
+/// Does this token continue the statement being parsed, or start a new one?
+/// A line break ends a statement unless the line is indented past the
+/// statement it follows -- the same cue a reader goes by.
+let token_continues c t =
+    if not (ctx_nl c) { true }
+    else if not (lexer.starts_line t) { true }
+    else { lexer.col t > ctx_indent c };
+
 /// Keywords are ordinary identifiers that the parser recognises; the lexer has
 /// no idea they are special.
 let keywords = ["let", "rec", "if", "else", "import", "as", "catch", "true", "false",
@@ -98,18 +115,11 @@ let is_non_starter name = core.map_has non_starter_set name;
 /// telling `.field` from a `.` that is something else.
 let peek2_kind ts = if at_end ts { :eof } else { peek_kind (list.tail ts) };
 
-/// Does the next token continue the statement being parsed, or start a new
-/// one? A line break ends a statement unless the line is indented past the
-/// statement it follows -- the same cue a reader goes by.
-let continues c ts =
-    if at_end ts { false }
-    else if not (ctx_nl c) { true }
-    else if not (lexer.starts_line (list.head ts)) { true }
-    else { lexer.col (list.head ts) > ctx_indent c };
-
 /// Parse `f` as a statement: its indentation is whatever column it starts at.
 let at_statement c ts = ctx (ctx_nl c) (ctx_no_brace c) (if at_end ts { 0 } else { lexer.col (list.head ts) });
 
+/// Name the next thing in the stream. A lexical error token carries its own
+/// message as its value, so it names itself.
 let describe ts =
     if at_end ts { "the end of the file" }
     else {
@@ -120,6 +130,7 @@ let describe ts =
             :str => "a string",
             :char => "a character",
             :atom => "an atom",
+            :error => to_string (peek_value ts),
             k => "`" + to_string k + "`",
         }
     };
@@ -209,17 +220,20 @@ let rec parse_apply c ts =
         [:ok, head, rest] =>
             match gather_args c [] rest {
                 [:error, m, s] => err m s,
+                // The arguments arrive reversed -- each one consed in front --
+                // so the head of the accumulated list is the last argument, and
+                // its span closes the application's without walking the list.
                 [:ok, args, rest2] =>
                     if list.is_empty args { ok head rest2 }
                     else {
-                        let last = list.last args;
-                        ok (ast.apply_e head args (ast.span_to (ast.span head) (ast.span last))) rest2
+                        ok (ast.apply_e head (list.reverse args)
+                            (ast.span_to (ast.span head) (ast.span (list.head args)))) rest2
                     },
             },
     };
 
 let rec gather_args c acc ts =
-    if not (can_start_arg c ts) { ok (list.reverse acc) ts }
+    if not (can_start_arg c ts) { ok acc ts }
     else {
         match parse_postfix c ts {
             [:error, m, s] => err m s,
@@ -229,18 +243,24 @@ let rec gather_args c acc ts =
 
 /// Can the next token begin another argument? A keyword that cannot start an
 /// expression ends the list, and so does a `{` where a brace means a block.
-let can_start_arg c ts =
-    if not (continues c ts) { false }
+let can_start_arg c ts = {
+    let t = peek ts;
+    // The old form asked its questions through the peekers -- did the line
+    // continue, then what kind, then what value -- and each question walked
+    // back to the same token. The token is fetched once, here.
+    if t == () { false }
+    else if not (token_continues c t) { false }
     else {
-        match peek_kind ts {
-            :ident => not (is_non_starter (peek_value ts)),
+        match kind_of t {
+            :ident => not (is_non_starter (lexer.value t)),
             :int => true, :float => true, :str => true, :char => true, :atom => true,
             :lparen => true, :lbracket => true,
             :dollar_paren => true, :hash_bracket => true, :percent_brace => true,
             :lbrace => not (ctx_no_brace c),
             _ => false,
         }
-    };
+    }
+};
 
 /// `obj.field`. A `.` at the start of a line continues the expression whatever
 /// its indentation, since a line can never begin with one.
@@ -252,42 +272,57 @@ let rec parse_postfix c ts =
 
 let rec field_tail c e ts =
     if not (at ts :dot) { ok e ts }
-    else if peek2_kind ts != :ident { ok e ts }
     else {
-        let nametok = list.head (list.tail ts);
-        let full = ast.span_to (ast.span e)
-                               (ast.span_of (lexer.span_start nametok) (lexer.span_end nametok));
-        field_tail c (ast.field_e e (lexer.value nametok) full) (list.tail (list.tail ts))
+        let after = list.tail ts;
+        // The original looked two tokens ahead through a peek that walked
+        // twice; the same answer is one head on the tail.
+        if at_end after { ok e ts }
+        else {
+            let nametok = list.head after;
+            if not (kind_of nametok == :ident) { ok e ts }
+            else {
+                let full = ast.span_to (ast.span e)
+                    (ast.span_of (lexer.span_start nametok) (lexer.span_end nametok));
+                field_tail c (ast.field_e e (lexer.value nametok) full) (list.tail after)
+            }
+        }
     };
 
 // --- primaries --------------------------------------------------------------
 
 let rec parse_primary c ts = {
-    let sp = peek_span ts;
-    let rest = if at_end ts { ts } else { list.tail ts };
-    match peek_kind ts {
-        :eof   => err "unexpected end of file in an expression" sp,
-        :int   => ok (ast.int_e (peek_value ts) sp) rest,
-        :float => ok (ast.float_e (peek_value ts) sp) rest,
-        :str   => ok (ast.str_e (peek_value ts) sp) rest,
-        :char  => ok (ast.char_e (peek_value ts) sp) rest,
-        :atom  => ok (ast.atom_e (peek_value ts) sp) rest,
+    let t = peek ts;
+    // One peek, once: kind, value and span all come from the token itself,
+    // where the peekers above would each have re-walked to it.
+    if t == () { err "unexpected end of file in an expression" ast.no_span }
+    else {
+        let sp = ast.span_of (lexer.span_start t) (lexer.span_end t);
+        let rest = list.tail ts;
+        match kind_of t {
+            :int   => ok (ast.int_e (lexer.value t) sp) rest,
+            :float => ok (ast.float_e (lexer.value t) sp) rest,
+            :str   => ok (ast.str_e (lexer.value t) sp) rest,
+            :char  => ok (ast.char_e (lexer.value t) sp) rest,
+            :atom  => ok (ast.atom_e (lexer.value t) sp) rest,
 
-        :lparen        => parse_paren c sp rest,
-        :lbracket      => parse_sequence c sp rest :rbracket (fn items span -> ast.list_e items span) "]",
-        :hash_bracket  => parse_sequence c sp rest :rbracket (fn items span -> ast.array_e items span) "]",
-        :percent_brace => parse_map c sp rest,
-        :dollar_paren  => parse_thunk c sp rest,
-        :lbrace        => parse_block c sp rest,
+            :lparen        => parse_paren c sp rest,
+            :lbracket      => parse_sequence c sp rest :rbracket (fn items span -> ast.list_e items span) "]",
+            :hash_bracket  => parse_sequence c sp rest :rbracket (fn items span -> ast.array_e items span) "]",
+            :percent_brace => parse_map c sp rest,
+            :dollar_paren  => parse_thunk c sp rest,
+            :lbrace        => parse_block c sp rest,
 
-        :ident => parse_ident c ts sp rest,
-        _      => err ("expected an expression, found " + describe ts) sp,
+            // A lexical error is the last token of a truly-bad input, and it
+            // reports itself: its value is the message, its span the point.
+            :error => err (lexer.value t) sp,
+            :ident => parse_ident c (lexer.value t) sp rest,
+            _      => err ("expected an expression, found " + describe ts) sp,
+        }
     }
 };
 
 /// The keywords that begin an expression, and then plain names.
-let rec parse_ident c ts sp rest = {
-    let word = peek_value ts;
+let rec parse_ident c word sp rest = {
     if word == "true"  { ok (ast.bool_e true sp) rest }
     else if word == "false" { ok (ast.bool_e false sp) rest }
     else if word == "if"    { parse_if c sp rest }
@@ -674,36 +709,49 @@ let rec parse_pattern c ts =
     };
 
 let rec parse_pattern_atom c ts = {
-    let sp = peek_span ts;
-    let rest = if at_end ts { ts } else { list.tail ts };
-    match peek_kind ts {
-        :int   => ok (ast.literal_p (ast.int_e (peek_value ts) sp) sp) rest,
-        :float => ok (ast.literal_p (ast.float_e (peek_value ts) sp) sp) rest,
-        :str   => ok (ast.literal_p (ast.str_e (peek_value ts) sp) sp) rest,
-        :char  => ok (ast.literal_p (ast.char_e (peek_value ts) sp) sp) rest,
-        :atom  => ok (ast.literal_p (ast.atom_e (peek_value ts) sp) sp) rest,
-        :minus =>
-            // A negative number literal: `-1` is one pattern, not an operator.
-            if peek_kind rest == :int {
-                ok (ast.literal_p (ast.int_e (0 - peek_value rest) sp) sp) (list.tail rest)
-            } else if peek_kind rest == :float {
-                ok (ast.literal_p (ast.float_e (0.0 - peek_value rest) sp) sp) (list.tail rest)
-            } else { err "expected a number after `-` in a pattern" sp },
-        :lparen =>
-            if peek_kind rest == :rparen { ok (ast.literal_p (ast.unit_e sp) sp) (list.tail rest) }
-            else { err "expected `()` in a pattern" sp },
-        :lbracket     => pattern_sequence c sp rest :rbracket (fn i r s -> ast.list_p i r s) "]",
-        :hash_bracket => pattern_sequence c sp rest :rbracket (fn i r s -> ast.array_p i r s) "]",
-        :percent_brace => pattern_map c sp rest,
-        :ident =>
-            if peek_value ts == "true"  { ok (ast.literal_p (ast.bool_e true sp) sp) rest }
-            else if peek_value ts == "false" { ok (ast.literal_p (ast.bool_e false sp) sp) rest }
-            else if peek_value ts == "_" { ok (ast.wildcard_p sp) rest }
-            else if is_keyword (peek_value ts) {
-                err ("`" + to_string (peek_value ts) + "` is a keyword and cannot be a binding") sp
-            }
-            else { ok (ast.bind_p (peek_value ts) sp) rest },
-        _ => err ("expected a pattern, found " + describe ts) sp,
+    let t = peek ts;
+    if t == () { err "unexpected end of file in a pattern" ast.no_span }
+    else {
+        let sp = ast.span_of (lexer.span_start t) (lexer.span_end t);
+        let rest = list.tail ts;
+        match kind_of t {
+            :int   => ok (ast.literal_p (ast.int_e (lexer.value t) sp) sp) rest,
+            :float => ok (ast.literal_p (ast.float_e (lexer.value t) sp) sp) rest,
+            :str   => ok (ast.literal_p (ast.str_e (lexer.value t) sp) sp) rest,
+            :char  => ok (ast.literal_p (ast.char_e (lexer.value t) sp) sp) rest,
+            :atom  => ok (ast.literal_p (ast.atom_e (lexer.value t) sp) sp) rest,
+            :minus =>
+                // A negative number literal: `-1` is one pattern, not an operator.
+                match peek rest {
+                    () => err "expected a number after `-` in a pattern" sp,
+                    m =>
+                        if kind_of m == :int {
+                            ok (ast.literal_p (ast.int_e (0 - lexer.value m) sp) sp) (list.tail rest)
+                        } else if kind_of m == :float {
+                            ok (ast.literal_p (ast.float_e (0.0 - lexer.value m) sp) sp) (list.tail rest)
+                        } else { err "expected a number after `-` in a pattern" sp },
+                },
+            :lparen =>
+                match peek rest {
+                    () => err "expected `()` in a pattern" sp,
+                    m =>
+                        if kind_of m == :rparen { ok (ast.literal_p (ast.unit_e sp) sp) (list.tail rest) }
+                        else { err "expected `()` in a pattern" sp },
+                },
+            :lbracket     => pattern_sequence c sp rest :rbracket (fn i r s -> ast.list_p i r s) "]",
+            :hash_bracket => pattern_sequence c sp rest :rbracket (fn i r s -> ast.array_p i r s) "]",
+            :percent_brace => pattern_map c sp rest,
+            :ident =>
+                if lexer.value t == "true"  { ok (ast.literal_p (ast.bool_e true sp) sp) rest }
+                else if lexer.value t == "false" { ok (ast.literal_p (ast.bool_e false sp) sp) rest }
+                else if lexer.value t == "_" { ok (ast.wildcard_p sp) rest }
+                else if is_keyword (lexer.value t) {
+                    err ("`" + to_string (lexer.value t) + "` is a keyword and cannot be a binding") sp
+                }
+                else { ok (ast.bind_p (lexer.value t) sp) rest },
+            :error => err (lexer.value t) sp,
+            _ => err ("expected a pattern, found " + describe ts) sp,
+        }
     }
 };
 
@@ -770,16 +818,18 @@ let rec pattern_map_entries c acc ts sp =
 
 /// Parse one expression from source text. `[:ok, expr]` or
 /// `[:error, message, span]`.
+///
+/// The lexer's stream already knows its errors: they are tokens, and every one
+/// arrives last. So there is nothing to pre-scan for -- the parse reports one
+/// the moment it reaches it, at an expression or pattern position. Walking the
+/// whole stream once for a lookup that the walk beneath already performs was
+/// five percent of a compile.
 let parse_expression src =
-    match lexer.lex src {
-        [:error, m, offset] => err m (ast.span_of offset offset),
-        [:ok, ts] =>
-            match parse_expr top ts {
-                [:error, m, s] => err m s,
-                [:ok, e, rest] =>
-                    if at_end rest { [:ok, e] }
-                    else { err ("unexpected " + describe rest + " after the expression") (peek_span rest) },
-            },
+    match parse_expr top (lexer.tokens src) {
+        [:error, m, s] => err m s,
+        [:ok, e, rest] =>
+            if at_end rest { [:ok, e] }
+            else { err ("unexpected " + describe rest + " after the expression") (peek_span rest) },
         _ => err "the lexer answered something unexpected" ast.no_span,
     };
 
@@ -792,7 +842,11 @@ let parse_expression src =
 
 let rec parse_item c ts = {
     let sp = peek_span ts;
-    if is_kw ts "import"  { parse_import c sp (list.tail ts) }
+    // A lexical error token is the last token of a bad input; a top-level item
+    // position is where every unresolved one comes to rest, so it reports
+    // itself here rather than being swallowed by a `describe`-and-stop.
+    if peek_kind ts == :error { err (peek_value ts) sp }
+    else if is_kw ts "import"  { parse_import c sp (list.tail ts) }
     else if is_kw ts "mod"     { parse_mod c sp (list.tail ts) }
     else if is_kw ts "derive"  { parse_derive c sp (list.tail ts) }
     else if is_kw ts "virtual" { parse_virtual c sp (list.tail ts) }
@@ -1022,14 +1076,13 @@ let rec item_list c acc ts braced =
 
 /// Parse a whole module from source text: `[:ok, items]`, or
 /// `[:error, message, span]`.
+///
+/// As with `parse_expression`, a lexical error is already a token in the
+/// stream, and a top-level item position is where it ends up.
 let parse_module src =
-    match lexer.lex src {
-        [:error, m, offset] => err m (ast.span_of offset offset),
-        [:ok, ts] =>
-            match item_list top [] ts false {
-                [:error, m, s] => err m s,
-                [:ok, items, _] => [:ok, items],
-            },
+    match item_list top [] (lexer.tokens src) false {
+        [:error, m, s] => err m s,
+        [:ok, items, _] => [:ok, items],
         _ => err "the lexer answered something unexpected" ast.no_span,
     };
 
