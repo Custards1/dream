@@ -7,15 +7,22 @@
 
 import std.array;
 import std.cli;
+import std.error;
 import std.json;
 import std.list;
+import std.map;
+import std.proc;
+import std.result;
 import std.seq;
 import std.str;
-import std.toml;
-import std.test;
 import std.streams;
+import std.supervisor;
+import std.test;
+import std.toml;
 /// The library's own version, so a program can report what it was built with.
 let version = "0.1.0";
 
 /// The modules this build provides.
-let modules = ["std.array", "std.cli", "std.core", "std.json", "std.list", "std.seq", "std.str", "std.test", "std.toml"];
+let modules = ["std.array", "std.cli", "std.core", "std.error", "std.json", "std.list",
+               "std.map", "std.proc", "std.result", "std.seq", "std.str", "std.streams",
+               "std.supervisor", "std.test", "std.toml"];

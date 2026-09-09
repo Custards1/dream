@@ -368,17 +368,20 @@ when test {
     /// A child that ends immediately, for the restart policies.
     let quitter! () = :done;
 
-    /// The next `[:down, ..]` in the mailbox, skipping anything else.
+    /// Register for reports, say so, and answer the first one.
     ///
-    /// A process that both talks to a supervisor and listens to it gets replies
-    /// and reports in the same mailbox, and `recv!` hands over whichever came
-    /// first. Anything that waits for one particular message has to sort them,
-    /// and this is the smallest version of that.
-    let rec next_down! tries = {
-        let m = recv! ();
-        if type_of m == :list && list.nth 0 m == :down { m }
-        else if tries <= 0 { m }
-        else { next_down! (tries - 1) }
+    /// It listens in a process of its own, and that is the point. A process
+    /// that both asks a supervisor questions and listens to its reports gets
+    /// replies and reports in one mailbox, and with no selective receive
+    /// `recv!` hands over whichever arrived first -- so a sieve that waits for
+    /// one particular message can swallow a reply somebody else was waiting
+    /// for, and both sides stop. Here the report comes back as this process's
+    /// *value*, through `join!`, which is a channel of exactly one message that
+    /// nothing else can land in.
+    let listener! sup parent = {
+        notify! sup
+        send! parent :ready
+        recv! ()
     };
 
     /// Ask until the supervisor's answer is the one expected, or give up.
@@ -431,15 +434,17 @@ when test {
             $( {
                 let sup = start_with! :one_for_one
                               [child_with "once" quitter! :temporary] default_limits;
-                notify! sup
-                // Registering does not reach back in time, so the child is
-                // started only after the supervisor has taken note -- which is
-                // what `restart!` is for here.
+                // `self! ()` is taken here, not inside the thunk: a thunk is
+                // evaluated by whoever forces it, and inside the spawn that is
+                // the listener, which would answer itself.
+                let me = self! ();
+                let l = spawn! $( listener! sup me );
+                // `:ready` means the listener is registered. Registration does
+                // not reach back in time, so the child is started only after
+                // that -- which is what `restart!` is for here.
+                recv! ()
                 restart! sup "once"
-                // And the reports are read with a sieve, because there is no
-                // selective receive: a reply and a notification are both just
-                // the next message, and which arrives first is not ours to say.
-                let told = next_down! 5;
+                let told = join! l;
                 stop! sup
                 test.eq! :down (list.nth 0 told)
             } ),

@@ -159,7 +159,7 @@ install-artifacts:
 install-artifactsv2:
     mkdir -p {{install_dir}}
     cp {{dream}} {{install_dir}}/bin/dream || true
-    cp build/mind {{install_dir}}/mind,dresm || true
+    cp build/mind {{install_dir}}/mind.dream || true
     cp {{image}} {{install_dir}}/dreams.dream
     cp build/lucid.dream {{install_dir}}/lucid.dream || true
 install: vm dreams mind lucid

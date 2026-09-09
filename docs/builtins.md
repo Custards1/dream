@@ -848,6 +848,173 @@ run.
 
 ---
 
+### `std.map`
+
+```dream
+import std.map;
+```
+
+Maps, and sets written as maps. `std.core` provides the operations that have to
+be primitive; this is the grain most code actually wants — "the value there, or
+this one, updated" is one call rather than three and a conditional.
+
+A map is a value: `put` answers a new map and leaves the old one alone, and the
+trie shares every branch the change did not touch. **Order is not part of a
+map** — `pairs`, `keys` and `values` answer in whatever order the trie walks,
+which depends on the hashes and not on the program. `sorted_keys` is the only
+thing here that imposes one, and it costs a sort every time.
+
+| Name | Description |
+|------|-------------|
+| `empty` | The empty map. |
+| `from_pairs ps` | A map from `[key, value]` pairs. A later pair wins. |
+| `merge a b` | Both, with `b` winning where they overlap. |
+| `get default m k` · `has m k` | Look up, with a default; membership. |
+| `pairs m` · `keys m` · `values m` · `size m` · `is_empty m` | What is in it. |
+| `sorted_keys m` | The keys in order, for output that has to be stable. |
+| `put m k v` · `remove m k` | A new map with that key set or gone. |
+| `update default f m k` | Apply `f` to what is there, or to `default`. Counting is `update 0 (fn n -> n + 1)`. |
+| `put_new m k v` | Add only if absent, so a fold keeps the first. |
+| `map_values f m` · `filter keep m` · `fold f init m` | Over the pairs. `fold` sees `acc k v`. |
+| `without m other` | Every key of `m` that `other` does not have. |
+| `set_of xs` · `member s x` · `add s x` · `members s` | A set is a map whose values say nothing. |
+
+### `std.result`
+
+```dream
+import std.result;
+```
+
+`[:ok, value]` and `[:error, reason]`, and what to do with them. This shape is
+already the convention across the library — `json.parse`, `cli.parse`,
+`toml.parse` — for one reason: **raising is an effect**, so a pure parser cannot
+report a failure by raising and has to answer one instead.
+
+| Name | Description |
+|------|-------------|
+| `ok v` · `error r` | Make one. |
+| `is_ok r` · `is_error r` | Which it is. |
+| `or_else default r` | The value, or `default`. The usual way out. |
+| `reason default r` | The reason, or `default`. |
+| `unwrap! r` | The value, raising the reason. Impure, because raising is. |
+| `map f r` · `map_error f r` | Change one side, leave the other. |
+| `and_then f r` | The next step, which may itself fail. This is what makes a pipeline read as one. |
+| `or_try other r` | The first if it is ok, otherwise the second. |
+| `all rs` | `[:ok, values]` when every one is ok, or the first error — and it stops there, so a lazy list of a thousand checks costs one when the first is wrong. |
+| `oks rs` · `errors rs` | The values, or the reasons, of the ones that were. |
+| `of_option reason v` · `to_option r` | Across from the other convention, where `()` means "nothing there". |
+
+### `std.error`
+
+```dream
+import std.error;
+```
+
+The **kind** and the **payload** of a failure. `try! .. catch e` binds the error
+itself, and until `std.core` grew `error_kind` and `error_payload` there was no
+way into one: a caught error could be printed and nothing else. With them a
+failure is an ordinary value to `match` on, and a program can raise failures as
+distinguishable as the runtime's own.
+
+```dream
+match error.kind e {
+    :divide_by_zero => ..,
+    :not_found      => ..,
+    _               => raise! e,        // not ours; pass it on
+}
+```
+
+| Name | Description |
+|------|-------------|
+| `kind e` · `payload e` | The atom and the value, or `()` for anything that is not an error — so a `match` needs no type test first. |
+| `is_error e` · `is_kind k e` · `is_any kinds e` | The questions a `catch` is usually asking. |
+| `message e` | The payload as text; a string payload is used as it is, so a message does not gain quotes. |
+| `describe e` | `kind: message`, the line to print when there is nothing better to say. |
+| `new k p` | An error as a value, without raising it — how a pure function *returns* a typed failure. |
+| `raise_as! k p` | Raise one of a named kind. The typed form of `raise!`, which otherwise wraps everything in `:error`. |
+| `rethrow! e` | Re-raise unchanged, which is what keeps the original kind readable. |
+
+### `std.proc`
+
+```dream
+import std.proc;
+```
+
+The shapes the process builtins leave to the caller. Three properties of the
+runtime decide what is here: **a thunk runs once** (so anything restartable
+takes a function of unit, not a thunk), **spawning is lazy** (so anything
+starting more than one process forces the list, and that `strict!` is the
+difference between parallel and sequential), and **there is no selective
+receive and no way to kill** (so a server is written around a handler that sees
+every message and decides).
+
+| Name | Description |
+|------|-------------|
+| `start_all! thunks` | Start every one *now* and answer the processes. |
+| `start_each! start! xs` | Start `start! x` for each `x`, in parallel. |
+| `wait_all! ps` | Join every one, in list order. |
+| `outcome! p` · `outcomes! ps` | `[:ok, v]` or `[:error, e]` — what `join!` would raise, as a value. |
+| `parallel! thunks` | Run these at once and answer their values in order. |
+| `map! f xs` · `try_map! f xs` | `list.map` with one process per element; the second keeps failures as values. |
+| `call! target body` · `reply! m value` | Request and reply. The request carries the process to answer, because `recv!` hands over a message and nothing else. |
+| `is_call m` · `call_from m` · `call_body m` | Reading a request. |
+| `serve! state handle!` | A message loop. `handle!` answers `[:go, state]` or `[:stop, value]`. |
+| `shutdown` · `is_shutdown m` | The conventional stop message, so a worker and its supervisor need not agree on a spelling. |
+
+A process parked on `recv!` is a process the runtime is still waiting for: a
+program that ends with one of those reports "every process is waiting for a
+message that cannot arrive" rather than its answer. **Whoever starts a server
+owns stopping it.**
+
+### `std.supervisor`
+
+```dream
+import std.supervisor;
+```
+
+Children started together and restarted when they die. Failure here is local —
+a process that raises takes itself down and nothing else — so a program made of
+processes needs someone whose job is noticing.
+
+```dream
+let worker! () = proc.serve! 0 handle!;
+
+let main! = {
+    let sup = supervisor.start! :one_for_one [supervisor.child "worker" worker!];
+    ..
+    supervisor.stop! sup
+};
+```
+
+| Name | Description |
+|------|-------------|
+| `child name start` · `child_with name start restart` | A child: a name, a **function of unit** to start it, and when to restart it. A thunk would not do — it runs once. |
+| `start! strategy children` · `start_with! strategy children limits` | Start a supervisor and its children; answers its process. |
+| `limits n window_ms` · `default_limits` | More than `n` restarts inside the window and the supervisor gives up. Default: five in five seconds. |
+| `which! sup` | The names running, in order. |
+| `restart! sup name` | Start a child that is not running. |
+| `notify! sup` | Hear about every child that goes down from now on, as `[:down, name, outcome]`. |
+| `stop! sup` | Stop every child, then the supervisor. |
+
+Restart policies: `:permanent` (always), `:transient` (only after a failure),
+`:temporary` (never). Strategies: `:one_for_one` (just that child),
+`:one_for_all` (stop the rest and start them all again), `:rest_for_one` (it and
+everything started after it).
+
+Two things the runtime's shape forces, and they are worth knowing before
+relying on any of this:
+
+- **There is no monitor.** The only way to learn that a process finished is
+  `join!`, which blocks, so each child gets a watcher process that joins it and
+  reports. The supervisor itself does nothing but read its mailbox.
+- **There is no kill.** A supervisor *asks* a child to stop, by sending
+  `proc.shutdown`, and waits. A child that never reads its mailbox cannot be
+  stopped by anyone, and a group strategy that has to stop its siblings will
+  wait for it. Anything meant to be supervised should be written around
+  `proc.serve!`.
+
+---
+
 ### `std.all`
 
 ```dream
@@ -868,8 +1035,10 @@ compiles fails the build rather than being quietly skipped.
 
 ```dream
 all.version     // "0.1.0"
-all.modules     // ["std.array", "std.core", "std.json", "std.list",
-                //  "std.seq", "std.str", "std.test", "std.toml"]
+all.modules     // ["std.array", "std.cli", "std.core", "std.error", "std.json",
+                //  "std.list", "std.map", "std.proc", "std.result", "std.seq",
+                //  "std.str", "std.streams", "std.supervisor", "std.test",
+                //  "std.toml"]
 ```
 
 `modules` is a hand-maintained list, so it names what the library intends to
