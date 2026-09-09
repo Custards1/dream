@@ -526,11 +526,16 @@ bool Heap::owns(const void* p, size_t bytes) const {
 }
 
 bool Heap::verify_after_gc() {
+    #if defined(DREAM_DEBUG) || defined(DREAM_VERIFY_HEAP)
     static const bool on = [] {
         const char* v = std::getenv("DREAM_VERIFY_HEAP");
         return v && *v && std::strcmp(v, "0") != 0;
     }();
     return on;
+    #else
+        return false;
+    #endif
+    
 }
 
 namespace {

@@ -13,7 +13,7 @@
 //     let opts = [
 //         cli.flag  "q" "quiet"   "print only what was asked for",
 //         cli.value "o" "output"  "PATH" "write the image here",
-//         cli.list  "L" "package-path" "DIR" "a package, or a directory of them",
+//         cli.list_of "L" "package-path" "DIR" "a package, or a directory of them",
 //     ];
 //     match cli.parse opts (os.args! ()) {
 //         [:error, why] => ..,
@@ -23,6 +23,32 @@
 // A value may be written either way round -- `--output x` or `--output=x`, `-o
 // x` or `-ox` -- and `--` ends the options, so a positional that begins with a
 // dash can still be given.
+//
+// The description carries more than a spelling. A constructor is enriched by
+// curried modifiers, `|>` reading from the option outward, so a contract is
+// written next to the option that keeps it:
+//
+//     cli.value "f" "format" "FMT" "how to render"
+//         |> cli.choices ["pretty", "json"]
+//         |> cli.default_to "pretty"
+//         |> cli.required
+//
+// One line holds the enforcement (a value must be one of the two), the fallback
+// (the default is recorded when the option is absent, so `get` needs no second
+// argument), and the help (all three show up in the usage message).
+//
+// A tool with subcommands describes the command line in two halves -- the
+// options every command shares, and each command's own. `commands` walks them
+// as one line: global options before the command name, then the command's:
+//
+//     let commands = [
+//         cli.command "build" "compile the project" [cli.flagg "c" "check" "check only"],
+//         cli.command "run"   "compile and run it"   [cli.list_of "L" "libs" "DIR" "search here"],
+//     ];
+//     match cli.commands global commands (os.args! ()) {
+//         [:error, why] => ..,
+//         [:ok, c] => cli.command_name c,   // the spelling that was used
+//     }
 import std.core;
 import std.list;
 import std.str;
@@ -51,10 +77,37 @@ let value short long meta help = opt short long :value meta help;
 /// example: search paths are a list, and the order is part of the meaning.
 let list_of short long meta help = opt short long :list meta help;
 
+/// Present or absent, and either way round: `--color` and `--no-color` are both
+/// spelled out, so a wrapper can force something off as easily as on. The
+/// recorded value is `true` or `false`; never given, it stays whatever `get`
+/// is called with (or a `default_to`).
+let toggle short long help = opt short long :toggle "" help;
+
+/// Repeatable, and the count is the value: `-v -v` and `--verbose --verbose`
+/// both record 2, and `-vv` is two as well. Reading the option back with
+/// `get 0 c "verbose"` is how verbosity is written.
+let count short long help = opt short long :count "" help;
+
 /// A heading in the usage message. It parses as nothing.
 let section title = opt "" "" :section "" title;
 
 let is_option o = kind o != :section;
+
+// --- enriching an option -----------------------------------------------------
+
+/// The value must be one of `cs`. Enforced at parse time and printed in the
+/// usage message, so the choices live next to the option that has them.
+let choices cs o = core.map_put o :choices cs;
+
+/// The option must be written. Satisfied by a `default_to`, which records a
+/// value as if it had been typed. Checked after the whole line is walked, so
+/// `--output a --output b` is present however it ends.
+let required o = core.map_put o :required true;
+
+/// The value recorded when the option is never written, printed as
+/// `(default X)` in the usage message. Makes `get` answer without a fallback
+/// argument, because the description carries the answer.
+let default_to v o = core.map_put o :default v;
 
 // --- what parsing produced ---------------------------------------------------
 
@@ -73,6 +126,19 @@ let flag_set c name = get false c name == true;
 /// Everything collected for a `list` option, in the order it was written.
 let all c name = get [] c name;
 
+// --- describing a subcommand -------------------------------------------------
+
+/// One entry in a `commands` table: the spelling, a line of help, and the
+/// options the command alone parses.
+let command name help opts = %{ :name => name, :help => help, :opts => opts };
+
+let command_name cm = core.map_get cm :name "";
+let command_help cm = core.map_get cm :help "";
+let command_opts cm = core.map_get cm :opts [];
+
+/// The command a `commands` parse chose, or `()` when there was no subcommand.
+let chosen c = core.map_get c :command ();
+
 // --- parsing -----------------------------------------------------------------
 
 let by_long os name = {
@@ -85,7 +151,17 @@ let by_short os c = {
     if list.is_empty hit { () } else { list.head hit }
 };
 
+let by_command cmds name = {
+    let hit = list.filter (fn cm -> command_name cm == name) cmds;
+    if list.is_empty hit { () } else { list.head hit }
+};
+
+let add_count c o n =
+    core.map_put c :values
+        (core.map_put (values c) (long o) ((core.map_get (values c) (long o) 0) + n));
+
 /// Record one option's value. A `list` option appends; everything else assigns.
+/// `count` is recorded through `add_count`, which knows how many to add.
 let record c o v =
     core.map_put c :values
         (core.map_put (values c) (long o)
@@ -97,6 +173,23 @@ let add_rest c a = core.map_put c :rest (list.append (rest c) [a]);
 let missing o spelling =
     [:error, spelling + " needs " + (if str.is_empty (meta o) { "a value" } else { meta o })];
 
+/// A `choices` option was given a value it does not know; say so, naming the
+/// option and the value and everything it would have accepted.
+let choice_ok o v = {
+    let cs = core.map_get o :choices [];
+    if list.is_empty cs { :ok }
+    else if list.contains v cs { :ok }
+    else { [:error, "--" + long o + " expects one of " + str.join_str ", " cs +
+           " (got " + to_string v + ")"] }
+};
+
+/// Carry one option's value into `c` once its `choices` have approved it.
+let use_value c o v rest =
+    match choice_ok o v {
+        :ok => [:ok, record c o v, rest],
+        [:error, m] => [:error, m],
+    };
+
 /// Everything after `--` is a positional, whatever it looks like.
 let rec take_rest c args =
     match args {
@@ -104,89 +197,251 @@ let rec take_rest c args =
         [a, ..more] => take_rest (add_rest c a) more,
     };
 
+/// `--no-` in front of a toggle's name is the toggle spelled off: `--color` and
+/// `--no-color` are two ways of writing one option. For anything else it is
+/// just an unknown option name.
+let unnegate name =
+    if str.starts_with "no-" name && str.byte_length name > 3 {
+        [:neg, str.slice 3 (str.byte_length name - 3) name]
+    } else {
+        [:plain, name]
+    };
+
+/// Handle the option spelled `a` (which starts with `-` and is not `-` or
+/// `--`), consuming its value from `rest` when it takes one and does not carry
+/// it inline. Returns `[:ok, c, rest']` -- what the option became, and the line
+/// it left -- or `[:error, why]`.
+let step os c a rest = {
+    if str.starts_with "--" a {
+        let body = str.slice 2 (str.byte_length a - 2) a;
+        let eq = str.find "=" body;
+        let name = if eq < 0 { body } else { str.slice 0 eq body };
+        let inline = if eq < 0 { () }
+                     else { str.slice (eq + 1) (str.byte_length body - eq - 1) body };
+        match by_long os name {
+            () => match unnegate name {
+                [:neg, real] =>
+                    match by_long os real {
+                        () => [:error, "unknown option --" + name],
+                        o =>
+                            if kind o == :toggle {
+                                if inline != () { [:error, "--" + name + " takes no value"] }
+                                else { [:ok, record c o false, rest] }
+                            }
+                            else { [:error, "unknown option --" + name] },
+                    },
+                [:plain, _] => [:error, "unknown option --" + name],
+            },
+            o =>
+                if kind o == :flag || kind o == :toggle {
+                    if inline != () { [:error, "--" + name + " takes no value"] }
+                    else { [:ok, record c o true, rest] }
+                }
+                else if kind o == :count {
+                    if inline != () { [:error, "--" + name + " takes no value"] }
+                    else { [:ok, add_count c o 1, rest] }
+                }
+                else {
+                    match inline {
+                        () => match rest {
+                            [] => missing o ("--" + name),
+                            [v, ..rest2] => use_value c o v rest2,
+                        },
+                        v => use_value c o v rest,
+                    }
+                },
+        }
+    }
+    else {
+        let name = str.slice 1 1 a;
+        let attached = str.slice 2 (str.byte_length a - 2) a;
+        match by_short os name {
+            () => [:error, "unknown option -" + name],
+            o =>
+                if kind o == :flag || kind o == :toggle {
+                    if not (str.is_empty attached) { [:error, "-" + name + " takes no value"] }
+                    else { [:ok, record c o true, rest] }
+                }
+                else if kind o == :count {
+                    // `-vv` is `-v -v`: an attached run of the same letter counts.
+                    match str.to_list name {
+                        [ch, ..] =>
+                            if list.all (fn x -> x == ch) (str.to_list attached) {
+                                [:ok, add_count c o (1 + str.byte_length attached), rest]
+                            }
+                            else { [:error, "unknown option -" + name] },
+                        _ => [:ok, add_count c o 1, rest],
+                    }
+                }
+                // `-oPATH` as well as `-o PATH`: the attached form is what
+                // people write for short options.
+                else if not (str.is_empty attached) { use_value c o attached rest }
+                else {
+                    match rest {
+                        [] => missing o ("-" + name),
+                        [v, ..rest2] => use_value c o v rest2,
+                    }
+                },
+        }
+    }
+};
+
 let rec walk os c args =
     match args {
         [] => [:ok, c],
-
         // The end of the options, not an option itself.
         ["--", ..more] => take_rest c more,
-
         [a, ..more] =>
-            if str.starts_with "--" a {
-                // `--name=value` carries its own value; `--name` takes the next
-                // argument, and running out is an error rather than an empty
-                // string, because an empty string is a value someone may mean.
-                let body = str.slice 2 (str.byte_length a - 2) a;
-                let eq = str.find "=" body;
-                let name = if eq < 0 { body } else { str.slice 0 eq body };
-                let inline = if eq < 0 { () }
-                             else { str.slice (eq + 1) (str.byte_length body - eq - 1) body };
-                match by_long os name {
-                    () => [:error, "unknown option --" + name],
-                    o =>
-                        if kind o == :flag {
-                            if inline != () { [:error, "--" + name + " takes no value"] }
-                            else { walk os (record c o true) more }
-                        }
-                        else {
-                            match inline {
-                                () => match more {
-                                    [] => missing o ("--" + name),
-                                    [v, ..rest2] => walk os (record c o v) rest2,
-                                },
-                                v => walk os (record c o v) more,
-                            }
-                        },
-                }
-            }
-            else if str.starts_with "-" a && str.byte_length a > 1 {
-                let name = str.slice 1 1 a;
-                let attached = str.slice 2 (str.byte_length a - 2) a;
-                match by_short os name {
-                    () => [:error, "unknown option -" + name],
-                    o =>
-                        if kind o == :flag {
-                            if not (str.is_empty attached) { [:error, "-" + name + " takes no value"] }
-                            else { walk os (record c o true) more }
-                        }
-                        // `-oPATH` as well as `-o PATH`: the attached form is
-                        // what people write for short options.
-                        else if not (str.is_empty attached) { walk os (record c o attached) more }
-                        else {
-                            match more {
-                                [] => missing o ("-" + name),
-                                [v, ..rest2] => walk os (record c o v) rest2,
-                            }
-                        },
+            // A bare `-` is a positional: it means standard input to most
+            // programs, and it is never an option.
+            if str.starts_with "-" a && str.byte_length a > 1 {
+                match step os c a more {
+                    [:error, m] => [:error, m],
+                    [:ok, c2, rest] => walk os c2 rest,
                 }
             }
             else { walk os (add_rest c a) more },
     };
 
+/// Every option's `default_to` value is recorded when the option was not
+/// written, so the parsed table can answer `get` with no fallback.
+let rec fill_default os c =
+    match os {
+        [] => c,
+        [o, ..more] =>
+            if is_option o && core.map_has o :default &&
+               not (core.map_has (values c) (long o)) {
+                let v = core.map_get o :default ();
+                let cc = core.map_put c :values (core.map_put (values c) (long o) v);
+                fill_default more cc
+            }
+            else { fill_default more c },
+    };
+
+/// A `required` option that was never written -- and has no default to stand in
+/// for it -- is an error in the line itself, named like the others.
+let rec missing_required os c =
+    match os {
+        [] => [:ok, ()],
+        [o, ..more] =>
+            if core.map_get o :required false == true &&
+               not (core.map_has (values c) (long o)) {
+                [:error, "missing required option --" + long o]
+            }
+            else { missing_required more c },
+    };
+
+/// Finish a parsed table: fill defaults, then complain about a required option
+/// still absent.
+let finalize os c = {
+    let c2 = fill_default os c;
+    match missing_required os c2 {
+        [:error, m] => [:error, m],
+        _ => [:ok, c2],
+    }
+};
+
 /// `[:ok, parsed]`, or `[:error, message]` naming the option at fault.
-///
-/// A bare `-` is a positional: it means standard input to most programs, and
-/// it is never an option.
-let parse os args = walk os (parsed (core.map_new ()) []) args;
+let parse os args =
+    match walk os (parsed (core.map_new ()) []) args {
+        [:error, m] => [:error, m],
+        [:ok, c] => finalize os c,
+    };
+
+let finish_command globals cmds c cmd args = {
+    match by_command cmds cmd {
+        () => [:error, "unknown command `" + cmd + "`"],
+        cm => {
+            // The command's own options, and the shared ones too: an option
+            // like `-o` is no less a global option for being written after the
+            // command name, so both tables stay open until the line ends.
+            let opts = list.append globals (command_opts cm);
+            match walk opts c args {
+                [:error, m] => [:error, m],
+                [:ok, c2] => match finalize opts c2 {
+                    [:error, m] => [:error, m],
+                    [:ok, c3] => [:ok, core.map_put c3 :command cm],
+                },
+            }
+        },
+    }
+};
+
+/// Subcommands. `globals` are the options every command shares, written before
+/// or after the command name; `cmds` names the commands and each one's own
+/// options and help. The first non-option argument names the command, and what
+/// follows is parsed against that command's options (the shared options
+/// included). The result is a `parsed` worth every getter, plus the chosen
+/// command in `:command` -- or none at all when the line never named one, so a
+/// tool that wants to show its usage on a bare command line can.
+let rec scan globals cmds c args =
+    match args {
+        [] => [:ok, c],
+        ["--", ..more] =>
+            match more {
+                [] => [:ok, c],
+                [cmd, ..rest] => finish_command globals cmds c cmd rest,
+            },
+        [a, ..more] =>
+            if str.starts_with "-" a && str.byte_length a > 1 {
+                match step globals c a more {
+                    [:error, m] => [:error, m],
+                    [:ok, c2, rest] => scan globals cmds c2 rest,
+                }
+            }
+            else { finish_command globals cmds c a more },
+    };
+
+let commands globals cmds args = scan globals cmds (parsed (core.map_new ()) []) args;
 
 // --- the usage message -------------------------------------------------------
 
 let rec pad_to n s = if str.byte_length s >= n { s } else { pad_to n (s + " ") };
 
 /// How an option is written, as the help should show it: both spellings when
-/// there are two, and the value's name when it takes one.
+/// there are two, and the value's name when it takes one. A `toggle` spells its
+/// negation in the help: `--[no-]color`.
 let spelling o = {
-    let names = if str.is_empty (short o) { "    --" + long o }
-                else { "-" + short o + ", --" + long o };
-    if kind o == :flag { names } else { names + " " + meta o }
+    let names =
+        if str.is_empty (short o) {
+            if kind o == :toggle { "    --[no-]" + long o } else { "    --" + long o }
+        }
+        else if kind o == :toggle { "-" + short o + ", --[no-]" + long o }
+        else { "-" + short o + ", --" + long o };
+    if kind o == :flag || kind o == :toggle || kind o == :count { names }
+    else { names + " " + meta o }
+};
+
+/// The help, plus whatever the description knows on top of the spelling: the
+/// choices an option is limited to, its default, and whether it is required.
+/// Each suffix only appears when the corresponding enrichment was written, so
+/// the help grows exactly as the contract grows.
+let suffixed_help o = {
+    let choices_text = {
+        let cs = core.map_get o :choices [];
+        if list.is_empty cs { "" } else { " (one of " + str.join_str ", " cs + ")" }
+    };
+    let default_text =
+        if core.map_has o :default {
+            " (default " + to_string (core.map_get o :default ()) + ")"
+        }
+        else { "" };
+    let required_text =
+        if core.map_get o :required false == true { " (required)" } else { "" };
+    help o + choices_text + default_text + required_text
 };
 
 let line o =
     if kind o == :section { "\n" + help o + ":" }
-    else { "  " + pad_to 26 (spelling o) + help o };
+    else { "  " + pad_to 26 (spelling o) + suffixed_help o };
 
 /// The options, one per line, with a heading wherever a `section` was put.
 let options_help os = str.join_str "\n" (list.map line os);
+
+/// One subcommand, as the help should show it.
+let command_line cm = "  " + pad_to 22 (command_name cm) + command_help cm;
+
+let commands_help cmds = str.join_str "\n" (list.map command_line cmds);
 
 /// A whole usage message: what the program is, how it is called, its options.
 let usage program summary calling os =
@@ -206,6 +461,33 @@ when test {
 
     let ok args = match parse specs args { [:ok, c] => c, _ => () };
     let why args = match parse specs args { [:error, m] => m, _ => "" };
+
+    let rich = [
+        value "f" "format" "FMT" "how to render"
+            |> choices ["pretty", "json"]
+            |> default_to "pretty",
+        count "v" "verbose" "say more, again",
+        toggle "c" "color" "colorize output",
+    ];
+
+    let rok args = match parse rich args { [:ok, c] => c, _ => () };
+    let rwhy args = match parse rich args { [:error, m] => m, _ => "" };
+
+    let req = [value "o" "output" "PATH" "write here" |> required];
+    let qok args = match parse req args { [:ok, c] => c, _ => () };
+    let qwhy args = match parse req args { [:error, m] => m, _ => "" };
+
+    // --- subcommand fixtures ---
+    let build_cmd = command "build" "compile the project"
+                        [flag "c" "check" "check only"];
+    let run_cmd = command "run" "compile and run it"
+                      [list_of "L" "libs" "DIR" "search here"];
+    let cmds = [build_cmd, run_cmd];
+
+    let gok args = match commands [value "d" "dir" "DIR" "the project"]
+                              cmds args { [:ok, c] => c, _ => () };
+    let gwhy args = match commands [value "d" "dir" "DIR" "the project"]
+                                cmds args { [:error, m] => m, _ => "" };
 
     let tests = [
         // --- flags ---
@@ -256,6 +538,75 @@ when test {
         test.case "a long option that runs out of line says so too"
             $( test.eq! "--output needs PATH" (why ["--output"]) ),
 
+        // --- choices ---
+        test.case "a choices option accepts a member"
+            $( test.eq! "json" (get "auto" (rok ["--format", "json"]) "format") ),
+        test.case "a choices option refuses a stranger, naming it"
+            $( test.eq! "--format expects one of pretty, json (got xml)"
+                          (rwhy ["--format", "xml"]) ),
+        test.case "a choice may come attached"
+            $( test.eq! "json" (get "auto" (rok ["--format=json"]) "format") ),
+
+        // --- defaults ---
+        test.case "an absent option reads its default"
+            $( test.eq! "pretty" (get "auto" (rok []) "format") ),
+        test.case "a written value beats the default"
+            $( test.eq! "json" (get "pretty" (rok ["-f", "json"]) "format") ),
+        test.case "the default shows in the help"
+            $( test.true! (str.contains_str "default pretty" (options_help rich)) ),
+
+        // --- required ---
+        test.case "a missing required option is named"
+            $( test.eq! "missing required option --output" (qwhy []) ),
+        test.case "writing a required option satisfies it"
+            $( test.eq! "x" (get () (qok ["-o", "x"]) "output") ),
+        test.case "the help marks a required option"
+            $( test.true! (str.contains_str "required" (options_help req)) ),
+
+        // --- count ---
+        test.case "a count option counts its repeats"
+            $( test.eq! 2 (get 0 (rok ["-v", "-v"]) "verbose") ),
+        test.case "a count option counts the long form"
+            $( test.eq! 2 (get 0 (rok ["--verbose", "--verbose"]) "verbose") ),
+        test.case "a count option accepts the attached short form"
+            $( test.eq! 3 (get 0 (rok ["-vvv"]) "verbose") ),
+        test.case "a count option reads zero when never given"
+            $( test.eq! 0 (get 0 (rok []) "verbose") ),
+
+        // --- toggles ---
+        test.case "a toggle reads true when spelled on"
+            $( test.true! (get false (rok ["--color"]) "color") ),
+        test.case "a toggle reads false when spelled off"
+            $( test.false! (get true (rok ["--no-color"]) "color") ),
+        test.case "a toggle's short form spells on"
+            $( test.true! (get false (rok ["-c"]) "color") ),
+        test.case "a toggle given a value is refused"
+            $( test.eq! "--color takes no value" (rwhy ["--color=1"]) ),
+        test.case "negating a plain flag is unknown"
+            $( test.eq! "unknown option --no-quiet" (why ["--no-quiet"]) ),
+
+        test.case "a subcommand parses its own options"
+            $( test.true! (flag_set (gok ["build", "--check"]) "check") ),
+        test.case "a subcommand's rest is the rest"
+            $( test.eq! ["x"] (rest (gok ["run", "x"])) ),
+        test.case "global options before the command still parse"
+            $( test.eq! "proj" (get () (gok ["-d", "proj", "build"]) "dir") ),
+        test.case "global options after the command still parse"
+            $( test.eq! "proj" (get () (gok ["build", "-d", "proj"]) "dir") ),
+        test.case "the chosen command is recorded"
+            $( test.eq! "build" (command_name (chosen (gok ["build"]))) ),
+        test.case "an unknown command is named"
+            $( test.eq! "unknown command `make`" (gwhy ["make"]) ),
+        test.case "no command chooses nothing, for the tool to say"
+            $( test.eq! () (chosen (gok [])) ),
+        test.case "an unknown option before the command is named"
+            $( test.eq! "unknown option --bogus" (gwhy ["--bogus", "build"]) ),
+        test.case "a command's choices still apply"
+            $( test.eq! "--format expects one of a, b (got c)"
+                          (match commands [] [command "t" "tool" [value "f" "format" "V" "v" |> choices ["a", "b"]]]
+                                         ["t", "-f", "c"]
+                           { [:error, m] => m, _ => "" }) ),
+
         // --- the usage message is the same description ---
         test.case "usage shows both spellings and the value's name"
             $( test.true! (str.contains_str "-o, --output PATH" (options_help specs)) ),
@@ -263,5 +614,11 @@ when test {
             $( test.true! (str.contains_str "    --version" (options_help specs)) ),
         test.case "a section becomes a heading"
             $( test.true! (str.contains_str "\nwhere to look:" (options_help [section "where to look"])) ),
+        test.case "usage spells a toggle's negation"
+            $( test.true! (str.contains_str "--[no-]color" (options_help rich)) ),
+        test.case "usage lists the choices"
+            $( test.true! (str.contains_str "one of pretty, json" (options_help rich)) ),
+        test.case "usage shows the commands"
+            $( test.true! (str.contains_str "build" (commands_help cmds)) ),
     ];
 }

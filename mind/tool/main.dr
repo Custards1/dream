@@ -51,20 +51,22 @@ let opts = [
     cli.flag "" "version" "print the version",
 ];
 
-let commands = "
-commands:
-  new <name>     create a project in ./<name>
-  build          compile the project to target/<name>.dream
-  run [args]     compile, then run it with the arguments given
-  test           compile with --test and run the result
-  check          compile without writing an image
-  repl           an interactive session, with this project's packages
-  fetch          download dependencies without building
-  deps           list the packages this project resolves to
-  info           show what this build would run, without running it
-  clean          remove target/
-  help           this message
-";
+/// The subcommands, described once: `cli.commands` chooses one by that name and
+/// the help prints from the same table. Commands that take arguments of their
+/// own -- `new <name>`, `run [args]` -- read them from the parsed rest.
+let command_spec = [
+    cli.command "new"   "create a project in ./<name>" [],
+    cli.command "build" "compile the project to target/<name>.dream" [],
+    cli.command "run"   "compile, then run it with the arguments given" [],
+    cli.command "test"  "compile with --test and run the result" [],
+    cli.command "check" "compile without writing an image" [],
+    cli.command "repl"  "an interactive session, with this project's packages" [],
+    cli.command "fetch" "download dependencies without building" [],
+    cli.command "deps"  "list the packages this project resolves to" [],
+    cli.command "info"  "show what this build would run, without running it" [],
+    cli.command "clean" "remove target/" [],
+    cli.command "help"  "this message" [],
+];
 
 let notes = "
 A project is a directory with a `mind.toml`. Commands other than `new` look
@@ -105,7 +107,9 @@ standard library.
 let usage = "mind -- the build tool for Dream
 
 usage: mind <command> [options] [arguments]
-" + commands + cli.options_help opts + "\n" + notes;
+
+commands:
+" + cli.commands_help command_spec + "\n\n" + cli.options_help opts + "\n" + notes;
 
 let fail! message = {
     console.error! ("mind: " + to_string message)
@@ -326,35 +330,33 @@ let run_command! c theirs = {
     // The project is loaded inside the arm that needs one. `mind new` and
     // `mind help` are answers you can give outside a project, and asking for a
     // manifest before knowing the command made them fail where they should
-    // not.
+    // not. The line never naming a command is the same answer: the usage.
     let here = cli.get () c "dir";
-    match cli.rest c {
-        [] => console.write! usage,
-        [cmd, ..args] =>
-            match cmd {
-                "help"  => console.write! usage,
-                "new"   => match args {
-                               [] => fail! "new needs a project name",
-                               [name, .._] => cmd_new! name,
-                           },
-                "build" => cmd_build! (project_in! here) o,
-                "check" => cmd_check! (project_in! here) o,
-                "run"   => cmd_run! (project_in! here) o (list.append args theirs),
-                "test"  => cmd_test! (project_in! here) o (list.append args theirs),
-                "deps"  => cmd_deps! (project_in! here),
-                "fetch" => cmd_fetch! (project_in! here),
-                "clean" => cmd_clean! (project_in! here),
-                "info"  => cmd_info! (project_in! here) o,
-                "repl"  => cmd_repl! here o,
-                other   => fail! ("unknown command `" + to_string other + "`; try `mind help`"),
-            },
+    match cli.chosen c {
+        () => console.write! usage,
+        cm => match cli.command_name cm {
+                  "help"  => console.write! usage,
+                  "new"   => match cli.rest c {
+                                 [] => fail! "new needs a project name",
+                                 [name, .._] => cmd_new! name,
+                             },
+                  "build" => cmd_build! (project_in! here) o,
+                  "check" => cmd_check! (project_in! here) o,
+                  "run"   => cmd_run! (project_in! here) o (list.append (cli.rest c) theirs),
+                  "test"  => cmd_test! (project_in! here) o (list.append (cli.rest c) theirs),
+                  "deps"  => cmd_deps! (project_in! here),
+                  "fetch" => cmd_fetch! (project_in! here),
+                  "clean" => cmd_clean! (project_in! here),
+                  "info"  => cmd_info! (project_in! here) o,
+                  "repl"  => cmd_repl! here o,
+              },
     }
 };
 
 let main! =
     match split_at_dashes (os.args! ()) {
         [mine, theirs] =>
-            match cli.parse opts mine {
+            match cli.commands opts command_spec mine {
                 [:error, why] => {
                     console.error! ("mind: " + to_string why)
                     console.error! "try `mind help`"
