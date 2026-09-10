@@ -744,12 +744,11 @@ let rec lower_arms arms held span l =
                              (list.head placed);
             let blocked = inherit (list.nth 1 block) (list.nth 1 taken) (list.head block);
 
-            // A guarded arm has already folded the rest of them into itself.
-            let otherwise =
-                match ast.arm_guard arm {
-                    () => lower_arms rest held span blocked,
-                    _  => emit_leaf :unit blocked,
-                };
+            // A guarded arm has folded the rest of them into its guard's false
+            // branch, but that does not cover a pattern that fails before the
+            // guard is ever asked: the rest must also be reachable from the
+            // pattern test's false path, guard or no guard.
+            let otherwise = lower_arms rest held span blocked;
             let made = emit (ir.node :if test (list.nth 1 block) (list.nth 1 otherwise))
                             (list.head otherwise);
             [set_flag test ir.f_strict
