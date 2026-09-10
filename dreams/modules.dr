@@ -74,7 +74,13 @@ let loader packages cfg search_paths host_modules =
        // Files whose contents come from memory rather than from disk. An
        // editor holds a buffer that has not been saved -- often has never been
        // saved -- and every question it asks is about the buffer.
-       :overlay => core.map_new () };
+       :overlay => core.map_new (),
+       // Files whose text has been parsed before: path -> [text, parse result].
+       // A language server reuses a module's parse across requests -- the only
+       // file that changes is the buffer being edited, and re-lexing and
+       // re-parsing every reachable module on every keystroke is the whole cost
+       // of answering one -- so a same-text hit skips the parse entirely.
+       :parsed => core.map_new () };
 
 let packages l     = core.map_get l :packages package.empty;
 let config_of l    = core.map_get l :config config.empty;
@@ -92,6 +98,12 @@ let in_progress l  = core.map_get l :in_progress [];
 /// Path to text, for the files this loader should not read from disk.
 let overlay l      = core.map_get l :overlay (core.map_new ());
 let with_overlay o l = core.map_put l :overlay o;
+/// Path to a `[text, parse result]` pair for a file that has been parsed
+/// before. Feeding a loader a previous loader's map is what makes two analyses
+/// of the same program parse nothing twice.
+let parsed l       = core.map_get l :parsed (core.map_new ());
+let with_parsed p l = core.map_put l :parsed p;
+let put_parsed file v l = with_parsed (core.map_put (parsed l) file v) l;
 
 let put k v l = core.map_put l k v;
 
@@ -394,13 +406,13 @@ let rec load_file! l file name at from_source =
     else {
         // The overlay first: a file that is open in an editor is whatever the
         // editor says it is, and what is on disk is out of date by definition.
-        match core.map_get (overlay l) file () {
-            () =>
-                match path.read_file! file {
-                    () => complain at ("cannot read " + file) from_source l,
-                    text => load_text! l text file name file
-                },
-            text => load_text! l text file name file,
+        let text = match core.map_get (overlay l) file () {
+            () => path.read_file! file,
+            t => t,
+        };
+        match text {
+            () => complain at ("cannot read " + file) from_source l,
+            text0 => load_text! l text0 file name file
         }
     };
 
@@ -458,11 +470,35 @@ let rec hoist_mod! l parent source m =
 let rec load_text! l text display name file = {
     let source = list.length (files l);
     let read = put :files (list.append (files l) [diag.source display text]) l;
-    match parser.parse_module text {
-        [:error, message, span] => complain span message source read,
+    // A same-text parse already in hand is reused rather than done again: an
+    // editor sends the whole buffer with every change, and every request after
+    // the change is about that same buffer.
+    match core.map_get (parsed l) file () {
+        [same, result] => {
+            if same == text { load_items! read source result display name file }
+            else {
+                let parsed = parser.parse_module text;
+                load_items! (put_parsed file [text, parsed] read) source parsed display name file
+            }
+        },
+        _ => {
+            let parsed = parser.parse_module text;
+            load_items! (put_parsed file [text, parsed] read) source parsed display name file
+        },
+    }
+};
+
+/// The part of loading that a same-text hit skips: registering an already
+/// parsed module. `parsed` is `parser.parse_module`'s answer -- `[:ok, items]`
+/// or `[:error, message, span]`. `source` is the file's index in the loader's
+/// list, counted before this file is added -- a file shares a source with the
+/// submodules written inside it, which means the pre-append count.
+let load_items! l source parsed display name file = {
+    match parsed {
+        [:error, message, span] => complain span message source l,
         [:ok, items] => {
             // Resolve `when` before anything else looks at the module.
-            let kept = expand_items (config_of read) items;
+            let kept = expand_items (config_of l) items;
 
             // A `mod name { .. }` is a module written inside another. Register
             // it as `parent.name` and leave the parent importing it, so from
@@ -476,7 +512,7 @@ let rec load_text! l text display name file = {
                         [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                     },
                     other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                }) [enter name read, []] kept;
+                }) [enter name l, []] kept;
             let items_out = list.nth 1 hoisted;
 
             // Follow this module's own imports before recording it, so the
@@ -613,8 +649,19 @@ let load! file roots cfg test_mode =
 /// program it must answer questions about is the one in the editor's buffers,
 /// which may differ from the one on disk in every file at once.
 let load_overlaid! file roots cfg test_mode ov =
-    load_root! (with_overlay ov (loader (package.discover! file roots) cfg
-                                        (default_search_paths! file roots) []))
+    load_overlaid_cached! file roots cfg test_mode ov (core.map_new ());
+
+/// `load_overlaid!` with the previous loader's parse cache carried in. Every
+/// file whose text has not changed since that loader parsed it is loaded from
+/// the cached result rather than lexed and parsed again; a language server that
+/// answers a running editor this way parses only the buffer being edited.
+///
+/// The map travels back out in the loader it produces -- `parsed` -- so the
+/// caller keeps passing what it got last time, and what it costs is one string
+/// compare per module per request.
+let load_overlaid_cached! file roots cfg test_mode ov parsed =
+    load_root! (with_parsed parsed (with_overlay ov (loader (package.discover! file roots) cfg
+                                                           (default_search_paths! file roots) [])))
                file test_mode;
 
 let failed l = diag.error_count (diags l) > 0;
