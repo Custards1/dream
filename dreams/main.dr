@@ -492,8 +492,8 @@ let rec parse_args args o =
         ["--ast", ..rest]       => parse_args rest (with_opt :command :ast o),
         ["--parse", ..rest]     => parse_args rest (with_opt :command :parse o),
         ["--check", ..rest]     => parse_args rest (with_opt :command :check o),
-        // `dreamc` spells this `--no-emit`. Both are accepted so that a build
-        // tool can ask either compiler the same question.
+        // `--no-emit` is kept as an alias for `--check`: a build tool that
+        // learned the one spelling should not have to learn the other.
         ["--no-emit", ..rest]   => parse_args rest (with_opt :command :check o),
         ["-o"] => with_opt :error "-o needs a path" o,
         ["-o", out, ..rest]     => parse_args rest (with_opt :output out

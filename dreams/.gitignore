@@ -1,5 +1,5 @@
 target/
 *.dream
 # ..except the bootstrap seed. It is a source artifact: the image the
-# self-hosted compiler is built from when there is no `dreamc`.
+# self-hosted compiler is built from.
 !bootstrap/*.dream

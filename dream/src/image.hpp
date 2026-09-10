@@ -15,7 +15,8 @@
 
 namespace dream {
 
-// Must match the compiler's `ir::Op`. See dreamc/docs/bytecode-format.md.
+// Must match the compiler's `ir::Op` in dreams/ir.dr.
+// See docs/bytecode-format.md for the container.
 enum class Op : uint8_t {
     Nop = 0,
     ConstInt = 1,

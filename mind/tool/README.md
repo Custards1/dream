@@ -2,9 +2,9 @@
 
 The build tool for Dream — what Cargo is to rustc.
 
-`mind` is itself written in Dream and compiled by `dreamc`, like any other
+`mind` is itself written in Dream and compiled by `dreams`, like any other
 program in this repository. It has no compiler of its own: Dream compiles whole
-programs, so a build is *find the packages, hand them to `dreamc`, run it*.
+programs, so a build is *find the packages, hand them to `dreams`, run it*.
 There is no object file, no link step, and nothing to cache.
 
 ```
@@ -69,7 +69,7 @@ business. It is also why `mind` needs no TLS in the VM.
 
 | | |
 |-|-|
-| `DREAMC` | the compiler to call (default: `dreamc` on `PATH`) |
+| `DREAMS` | the compiler to call (default: `dreams.dream` from `$MINDV2_PATH`) |
 | `DREAM` | the VM to run images with (default: `dream`) |
 | `MIND_STDLIB` | where the standard library lives (default: `mind`) |
 | `MIND_HOME` | where fetched packages are cached (default: `~/.mind`) |

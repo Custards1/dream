@@ -196,6 +196,8 @@ A binding of the same name shadows the builtin.
   is what lets it collect and force thunks without atomics. A VM that shares
   instead must blackhole or lock every thunk, because the compiler guarantees
   only that captures are indices — not that forcing is single-threaded.
-  The `process` object type is named in `dreamc/src/types.rs`.
+  The `process` object type is one of the VM's builtin object types; its
+  fields are documented in [builtins.md](builtins.md), and `type_of` names it
+  from `bi_type_of` in `dream/src/builtins.cpp`.
 - **Validation.** A loader should bounds-check every index against its
   section's `count` before use, since a `.dream` file may be untrusted.

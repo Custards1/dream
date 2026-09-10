@@ -3,24 +3,19 @@
 #   dreams/ the compiler, in Dream           -- source to `.dream` bytecode
 #   dream/  the VM (dream), in C++           -- interpreter, green processes, LLVM JIT
 #   mind/   the build system and standard library, in Dream
-#   dreamc/ the old compiler, in Rust        -- kept only as a second opinion
 #
 # `just` with no target builds the VM and then the compiler with itself. Nothing
 # in that path is Rust: `dreams` builds from the checked-in seed, and the seed
-# needs the VM and nothing else. What `dreamc` is still here for is
-# `just test-reference`, which asks whether the two compilers agree.
+# needs the VM and nothing else.
 
 set positional-arguments
 install_dir :="~/.mindv2"
 build_dir := "build-dream"
-dreamc := "target/debug/dreamc"
-dreamc_release := "target/release/dreamc"
 dream := build_dir / "bin/dream"
 seed := "dreams/bootstrap/dreams.dream"
 image := "build/dreams.dream"
 # The compiler, as a command. `dreams` is an image rather than a native program,
-# so running it is handing it to the VM -- which is the only difference between
-# the two compilers from anywhere else in this file.
+# so running it is handing it to the VM.
 dreams := dream + " " + image
 
 default: build
@@ -29,13 +24,7 @@ default: build
 
 build: vm dreams
 
-# The reference compiler, in Rust. Not part of a normal build any more; what
-# needs it is `just test-reference`.
-compiler:
-    cargo build --offline -p dreamc
-
 release:
-    cargo build --offline --release -p dreamc
     cmake -S . -B {{build_dir}} -DCMAKE_BUILD_TYPE=Release
     cmake --build {{build_dir}} -j
 
@@ -69,7 +58,7 @@ lucid: dreams
     ./{{dreams}} lucid/main.dr -L mind -L . -o build/lucid.dream
     @echo "built build/lucid.dream -- run it as: {{dream}} build/lucid.dream"
 
-# Build `dreams` from the checked-in image, with no `dreamc` in sight.
+# Build `dreams` from the checked-in image.
 #
 # The image is a fixpoint: compiling this source with it produces a
 # byte-identical copy of itself. To move the seed forward after changing the
@@ -93,7 +82,6 @@ test-mind: build
     ./{{dream}} /tmp/dream-mind-tests.dream
 
 clean:
-    cargo clean
     rm -rf {{build_dir}} build-nojit build-tsan
     rm build/mind
     find . -name '*.dream' -delete
@@ -168,16 +156,8 @@ install: vm dreams mind lucid
 
 # --- testing ----------------------------------------------------------------
 
-# Everything that does not need a second compiler to ask.
+# Everything.
 test: test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
-
-# The differential tests: every verdict `dreams` reaches, reached again by
-# `dreamc`, and the two compared. This is the only thing the Rust compiler is
-# still here for, and it needs `just compiler` first.
-test-reference: test-compiler test-dreams-modules test-dreams-scope test-dreams-lower
-
-test-compiler:
-    cargo test --offline -p dreamc
 
 test-vm: vm
     ./{{build_dir}}/bin/dream_tests
@@ -224,29 +204,10 @@ test-dreams-corpus: build
     ./{{dreams}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
     ./{{dream}} /tmp/dream-parser-tests.dream
 
-# `dreams`'s module loader against the one it replaces. Every program in the
-# repository must resolve to the same modules, in the same order, under both --
-# and the failures `dreamc` cannot report must be reported here.
-test-dreams-modules: build compiler
-    dreamc={{dreamc}} dream={{dream}} dreams/tests/modules.sh
-
-# `dreams`'s resolution and purity pass. Every program must get the same verdict
-# from both compilers, and the broken ones must be rejected for the same reason.
-test-dreams-scope: build compiler
-    dreamc={{dreamc}} dream={{dream}} dreams/tests/scope.sh
-
-# `dreams`'s lowering. Every program the reference compiler accepts must lower
-# to an execution tree, the compiler itself included -- which is the only
-# program here big enough to notice a quadratic mistake before it becomes an
-# out-of-memory.
-test-dreams-lower: build compiler
-    dreamc={{dreamc}} dream={{dream}} dreams/tests/lower.sh
-
 # The end of the pipeline: programs `dreams` compiled, run by the VM, checked
-# against the output recorded beside them. Every other `dreams` test asks
-# whether a stage agrees with something -- the reference compiler, or a recorded
-# shape. This one asks the only question that finally matters, and it is the
-# evidence that the self-hosted compiler works rather than merely agrees.
+# against the output recorded beside them. The other `dreams` tests ask whether
+# a stage agrees with a recorded shape; this one asks the only question that
+# finally matters, and it is the evidence that the self-hosted compiler works.
 test-dreams-compile: build
     dream={{dream}} seed={{seed}} dreams/tests/compile.sh
 
@@ -291,5 +252,5 @@ test-races:
     dream=build-tsan/bin/dream dream/tests/e2e.sh
 
 # The slow, thorough set. What to run before believing a change is safe.
-test-all: test test-reference fuzz test-heap vm-no-jit
+test-all: test fuzz test-heap vm-no-jit
     @echo "all checks passed"

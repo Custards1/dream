@@ -94,7 +94,7 @@ every one of these has a command-line spelling that wins over it:
   flags        = [\"-q\"]           # passed to the compiler as written
 
 The compiler is chosen in this order: --compiler, then [build] compiler, then
-$DREAMS, then $DREAMC, then `dreams.dream` from the installation. A name ending
+$DREAMS, then `dreams.dream` from the installation. A name ending
 in `.dream` is an image and is run by the VM; anything else is executed.
 
 `mind run -- ARGS` passes ARGS to the program rather than to mind.

@@ -7,7 +7,6 @@ runtime, and — in progress — its self-hosted compiler.
 
 | Directory | What it is | Written in |
 |---|---|---|
-| `dreamc/` | The old compiler, kept as a second opinion. | Rust |
 | `dream/` | The VM: interpreter, green processes, LLVM JIT. | C++ |
 | `mind/tool/` | `mind`, the build tool. Finds packages, shells out to a compiler. | Dream |
 | `mind/std/` | The standard library. | Dream |
@@ -15,30 +14,24 @@ runtime, and — in progress — its self-hosted compiler.
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
-| `docs/` | `language-spec.md`, `builtins.md`, `gc.md` (collector design). | — |
+| `docs/` | `language-spec.md`, `builtins.md`, `gc.md`, `bytecode-format.md`. | — |
 
 ## Where this is going
 
-`dreams` has replaced `dreamc`. The plan, in order:
+`dreams` is the compiler. The plan, in order:
 
-1. ~~`dreams` reaches parity with `dreamc`~~ — every stage agrees on the corpus.
+1. ~~`dreams` reaches parity with the compiler it replaces~~ — every stage agrees
+   on the corpus.
 2. ~~An old `dreams` build bootstraps the new one~~ — **done**: `dreams` compiles
    itself to a fixpoint.
-3. ~~`dreams` is the compiler~~ — **done**: nothing in a normal build or in
-   `just test` runs `dreamc`. `mind`, `lucid`, the examples, the end-to-end
-   programs and `dreams` itself are all compiled by `dreams`.
+3. ~~`dreams` is the compiler~~ — **done**: `mind`, `lucid`, the examples, the
+   end-to-end programs and `dreams` itself are all compiled by `dreams`; the
+   old Rust compiler, `dreamc`, is gone.
 4. `mind` moves into `dreams`: `dreams` grows a CLI in `mind`'s shape (project
    commands, not just file-at-a-time flags) and takes over its role. **Next.**
 
-`dreamc` is still in the tree for one reason: `just test-reference` asks both
-compilers the same questions — which modules a program resolves to, what its
-scope and purity verdicts are, whether it lowers — and compares the answers.
-That is a second opinion, not a dependency. When it stops earning its keep,
-`dreamc/` and the Rust workspace go.
-
 `dreams` builds from `dreams/bootstrap/dreams.dream`, an image of itself that is
-checked in. The seed needs the VM and nothing else, so building the compiler
-does not involve Rust:
+checked in. The seed needs the VM and nothing else:
 
 ```
 just dreams            # build/dreams.dream, the compiler every other recipe runs
@@ -51,10 +44,9 @@ identical image, and so does the stage after that. When you change the compiler,
 run `just bootstrap` and copy `build/dreams.dream` over the seed.
 
 `mind` finds its compiler through `--compiler`, then `[build] compiler`, then
-`$DREAMS`, then `$DREAMC`, then `dreams.dream` from the installation
-([mind/tool/build.dr:143](mind/tool/build.dr#L143)). A name ending in `.dream`
-is an image and is run by the VM; anything else is executed directly, which is
-how a native compiler still works there.
+`$DREAMS`, then `dreams.dream` from the installation
+([mind/tool/build.dr](mind/tool/build.dr#L139)). A name ending in `.dream`
+is an image and is run by the VM; anything else is executed directly.
 
 ## Building
 
@@ -64,7 +56,6 @@ just vm           # the VM only
 just dreams       # build/dreams.dream, the compiler
 just mind         # build/mind, the build tool
 just lucid        # build/lucid.dream, the language server
-just compiler     # dreamc, the reference compiler -- only `test-reference` wants it
 ```
 
 The binaries that matter:
@@ -98,16 +89,8 @@ are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
 | `test-lucid` | The language server's units: positions, framing, URIs |
 | `test-lucid-session` | One whole LSP conversation, against a running server |
 
-`just test-reference` is the group that still needs `dreamc`, and it is not part
-of `just test`: `test-compiler` (`cargo test -p dreamc`), `test-dreams-modules`
-(both loaders resolve the same modules in the same order), `test-dreams-scope`
-(both reach the same verdict, and reject for the same reason) and
-`test-dreams-lower` (everything `dreamc` accepts also lowers).
-
-The four `dreams/tests/*.sh` scripts run directly with no environment set.
-`compile.sh` needs only the VM and the seed; the other three are the differential
-ones and default to `target/debug/dreamc`. Override with
-`dreamc=... dream=... dreams/tests/scope.sh`.
+The `dreams/tests/*.sh` scripts run directly with no environment set; there is
+one left, `compile.sh`, and it needs only the VM and the seed.
 
 `just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
 is **not** in `just test`, because it needs `npm install` in `editors/vscode`

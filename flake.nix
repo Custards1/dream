@@ -14,8 +14,8 @@
       overlays.default = final: prev: {
         dream-stdlib = final.callPackage ./nix/dream-stdlib.nix { };
         dream-vm = final.callPackage ./nix/dream-vm.nix { };
-        dreamc = final.callPackage ./nix/dreamc.nix {
-          dreamStdlib = final.dream-stdlib;
+        dreams = final.callPackage ./nix/dreams.nix {
+          dreamVm = final.dream-vm;
         };
         dream = final.callPackage ./nix/dream.nix { };
       };
@@ -29,7 +29,7 @@
       in
       {
         packages = {
-          inherit (pkgs) dream dreamc dream-vm dream-stdlib;
+          inherit (pkgs) dream dreams dream-vm dream-stdlib;
           default = pkgs.dream;
 
           # The interpreter-only build. Worth having as a package rather than
@@ -40,13 +40,12 @@
         };
 
         apps = {
-          default = flake-utils.lib.mkApp { drv = pkgs.dream; name = "dreamc"; };
-          dreamc = flake-utils.lib.mkApp { drv = pkgs.dream; name = "dreamc"; };
+          default = flake-utils.lib.mkApp { drv = pkgs.dream; name = "dream"; };
           dream = flake-utils.lib.mkApp { drv = pkgs.dream; name = "dream"; };
         };
 
         checks = {
-          inherit (pkgs) dreamc dream-vm;
+          inherit (pkgs) dreams dream-vm;
           no-jit = pkgs.packages.dream-vm-no-jit or (pkgs.dream-vm.override { withJit = false; });
 
           # The end-to-end suite needs both halves at once, so it cannot live in
@@ -54,14 +53,14 @@
           # under the interpreter and the JIT and requires identical output.
           e2e = pkgs.runCommand "dream-e2e"
             {
-              nativeBuildInputs = [ pkgs.dreamc pkgs.dream-vm pkgs.bash ];
+              nativeBuildInputs = [ pkgs.dreams pkgs.dream-vm pkgs.bash ];
             }
             ''
               cp -r ${self}/dream/tests tests
               chmod -R +w tests
-              export DREAMC=${pkgs.dreamc}/bin/dreamc
+              export MINDV2_PATH=${pkgs.dreams}/lib/dream:${pkgs.dream-stdlib}/lib/dream/packages
+              export DREAMS=${pkgs.dreams}/lib/dream/dreams.dream
               export DREAM=${pkgs.dream-vm}/bin/dream
-              export DREAM_PACKAGES=${pkgs.dream-stdlib}/lib/dream/packages
               bash tests/e2e.sh
               touch $out
             '';
@@ -69,12 +68,15 @@
           # The standard library's own tests, compiled with `--test`.
           stdlib = pkgs.runCommand "dream-stdlib-tests"
             {
-              nativeBuildInputs = [ pkgs.dreamc pkgs.dream-vm ];
+              nativeBuildInputs = [ pkgs.dreams pkgs.dream-vm pkgs.bash ];
             }
             ''
-              dreamc ${pkgs.dream-stdlib}/lib/dream/packages/std/all.dr --test \
+              export DREAM=${pkgs.dream-vm}/bin/dream
+              export MINDV2_PATH=${pkgs.dreams}/lib/dream:${pkgs.dream-stdlib}/lib/dream/packages
+              $DREAM ${pkgs.dreams}/lib/dream/dreams.dream \
+                ${pkgs.dream-stdlib}/lib/dream/packages/std/all.dr --test \
                 -L ${pkgs.dream-stdlib}/lib/dream/packages -o tests.dream
-              dream tests.dream
+              $DREAM tests.dream
               touch $out
             '';
         };
@@ -85,20 +87,12 @@
           inputsFrom = [ pkgs.dream-vm ];
 
           nativeBuildInputs = with pkgs; [
-            cargo
-            rustc
-            clippy
-            rustfmt
             just
             ninja
             gdb
           ];
 
           shellHook = ''
-            # So `just run` and the tests find the standard library from the
-            # working tree rather than from the store: in a dev shell the
-            # source you are editing is the one that should win.
-            export DREAM_PACKAGES="$PWD/mind''${DREAM_PACKAGES:+:$DREAM_PACKAGES}"
             echo "dream: just --list, or ./build.sh"
           '';
         };

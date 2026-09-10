@@ -12,12 +12,10 @@ name. Two programs implement it:
 | [`dreams/`](../dreams) | the compiler, written in Dream — `.dr` source to a `.dream` image |
 | [`dream/`](../dream) | the VM, `dream`, in C++ — interpreter, processes, LLVM JIT |
 | [`mind/`](../mind) | the standard library and build system, written in Dream |
-| [`dreamc/`](../dreamc) | the old compiler, in Rust, kept only as a second opinion |
 
 The compiler is written in the language it compiles and builds from an image of
-itself; `dreamc` compiled the first one and now only answers the differential
-tests. Where this document points at a Rust file for a canonical list, that is
-the older of two implementations that a test holds to each other.
+itself. Where this document points at a source file for a canonical list, that
+is the implementation the VM is checked against by tests.
 
 > **Status legend.** Everything in this document is implemented and covered by
 > tests unless it carries a **PROPOSED** marker. Only [destructuring `let` and
@@ -171,10 +169,9 @@ let main! = {
 ## 3. Values and types
 
 `type_of v` returns the type's name as an atom. The canonical list lives in
-[`dreamc/src/types.rs`](../dreamc/src/types.rs), the older of the two
-implementations; the compiler, the VM's
-`type_of`, and this table are checked against it by tests rather than kept in
-step by hand.
+the VM's `bi_type_of` ([`dream/src/builtins.cpp`](../dream/src/builtins.cpp));
+the compiler lowers `type_of` to that builtin, and this table is checked
+against it by tests rather than kept in step by hand.
 
 ### Scalars
 
@@ -1305,7 +1302,6 @@ just run FILE        # compile and run
 just repl            # an interactive session
 just check FILE      # scope, purity and verification, no image
 just test            # VM, end-to-end, examples, library, compiler and server tests
-just test-reference  # the differential tests, which are what `dreamc` is still for
 just test-all        # the above plus fuzzing, heap verification, no-JIT build
 ```
 
@@ -1324,7 +1320,7 @@ just test-all        # the above plus fuzzing, heap verification, no-JIT build
    │  emit.dr      container writer
    ▼
 .dream image        a flat arena of 16-byte nodes linked by index
-   │                (format: dreamc/docs/bytecode-format.md)
+   │                (format: docs/bytecode-format.md)
    ▼
 dream              image.cpp loads and revalidates; interp.cpp reduces;
                     jit.cpp compiles the strict numeric spine

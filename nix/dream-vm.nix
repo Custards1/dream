@@ -4,6 +4,9 @@
 # because without them you lose the JIT tier and `std.ffi`, and a build without
 # them is the unusual case rather than the expected one -- but `withJit = false`
 # is a real configuration the VM supports, and the tests run under it.
+#
+# The compiler is `dreams`, built from the seed in its own derivation; the VM's
+# build does not see it.
 { lib
 , stdenv
 , cmake
@@ -37,9 +40,6 @@ stdenv.mkDerivation {
     ++ lib.optional withJit zlib;   # LLVM links against it
 
   cmakeFlags = [
-    # Cargo cannot fetch inside the sandbox, so the compiler is a package of
-    # its own; see nix/dreamc.nix.
-    "-DDREAM_BUILD_COMPILER=OFF"
     "-DDREAM_ENABLE_JIT=${if withJit then "ON" else "OFF"}"
     "-DDREAM_ENABLE_FFI=${if withFfi then "ON" else "OFF"}"
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"

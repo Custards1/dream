@@ -26,12 +26,10 @@ DO_CLEAN=0
 PREFIX=""
 ENABLE_JIT=ON
 ENABLE_FFI=ON
-CARGO_PROFILE=""      # empty means debug
-CARGO_DIR=debug
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --release)   BUILD_TYPE=Release; CARGO_PROFILE=--release; CARGO_DIR=release ;;
+    --release)   BUILD_TYPE=Release ;;
     --debug)     BUILD_TYPE=Debug ;;
     --no-tests)  RUN_TESTS=0 ;;
     --clean)     DO_CLEAN=1 ;;
@@ -76,7 +74,6 @@ need() {
 }
 
 need cmake "builds the VM"
-need cargo "builds the compiler"
 
 if command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1 || \
    command -v clang++ >/dev/null 2>&1; then
@@ -117,19 +114,8 @@ fi
 if [[ $DO_CLEAN -eq 1 ]]; then
   step "Cleaning"
   rm -rf "$BUILD_DIR" build-nojit build-tsan
-  cargo clean 2>/dev/null || true
-  ok "removed build directories and cargo artifacts"
+  ok "removed build directories"
 fi
-
-# --- compiler ---------------------------------------------------------------
-
-step "Building the compiler (dreamc)"
-# The compiler is the only Cargo project; the VM is C++ and is built below.
-cargo build --offline -p dreamc ${CARGO_PROFILE} 2>&1 | sed 's/^/    /' || \
-  cargo build -p dreamc ${CARGO_PROFILE} 2>&1 | sed 's/^/    /'
-DREAMC="target/${CARGO_DIR}/dreamc"
-[[ -x "$DREAMC" ]] || die "cargo finished but $DREAMC is missing"
-ok "$DREAMC"
 
 # --- VM ---------------------------------------------------------------------
 
@@ -137,73 +123,63 @@ step "Building the VM (libdream, dream)"
 cmake -S . -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
       -DDREAM_ENABLE_JIT="$ENABLE_JIT" \
-      -DDREAM_ENABLE_FFI="$ENABLE_FFI" \
-      -DDREAM_BUILD_COMPILER=OFF 2>&1 | sed -n 's/^-- Dream: /    /p'
+      -DDREAM_ENABLE_FFI="$ENABLE_FFI" 2>&1 | sed -n 's/^-- Dream: /    /p'
 cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | \
   grep -E 'error|warning:' | sed 's/^/    /' || true
 
 dream="$BUILD_DIR/bin/dream"
-MIND="$BUILD_DIR/bin/mind"
 [[ -x "$dream" ]] || die "cmake finished but $dream is missing"
 ok "$dream"
 ok "$BUILD_DIR/lib/libdream.so"
 
-step "Building the standard library (mind)"
-# `--shebang` writes the `#!` line and sets the execute bit, so `mind` is a
-# program you can run rather than an image you have to hand to the VM.
-$DREAMC -L mind/std --shebang -o "$MIND" mind/tool/main.dr
-
-[[ -x "$MIND" ]] || die "the compiler finished but $MIND is missing"
-ok "$MIND"
-
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-
-# --- the self-hosted compiler -----------------------------------------------
+# --- the self-hosted compiler ------------------------------------------------
 #
-# `dreams` is the Dream compiler written in Dream, and it is built from an
-# image of itself that is checked in rather than from `dreamc`. The seed is
-# not a native binary: it needs the VM to run and nothing else, which is what
-# makes this step independent of the Rust compiler above -- and what will let
-# `dreamc` go away.
+# `dreams` is the Dream compiler written in Dream, built from an image of
+# itself that is checked in. The seed needs the VM and nothing else; this
+# stage never touches a Rust compiler, because there is no longer one.
 
 step "Bootstrapping the self-hosted compiler (dreams)"
 SEED="dreams/bootstrap/dreams.dream"
+[[ -f "$SEED" ]] || die "no bootstrap image at $SEED"
 DREAMS="$BUILD_DIR/bin/dreams.dream"
-if [[ -f "$SEED" ]]; then
-  "$dream" "$SEED" -L mind -L . -o "$DREAMS" dreams/main.dr >/dev/null 2>&1 ||     die "the bootstrap image could not compile dreams"
-  if [[ $RUN_TESTS -eq 1 ]]; then
-    # A compiler that does not rebuild itself into the same bytes is not the
-    # compiler in this tree, whatever it claims. Nothing else here proves the
-    # source and the seed agree.
-    "$dream" "$DREAMS" -L mind -L . -o "$TMP/stage3.dream" dreams/main.dr >/dev/null 2>&1 ||       die "dreams could not compile itself"
-    cmp -s "$DREAMS" "$TMP/stage3.dream" ||       die "dreams does not reproduce itself: the seed and the source disagree"
-    ok "$DREAMS (reproduces itself byte for byte)"
-  else
-    ok "$DREAMS"
-  fi
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+"$dream" "$SEED" -L mind -L . -o "$DREAMS" dreams/main.dr >/dev/null 2>&1 || \
+  die "the bootstrap image could not compile dreams"
+if [[ $RUN_TESTS -eq 1 ]]; then
+  # A compiler that does not rebuild itself into the same bytes is not the
+  # compiler in this tree, whatever it claims. Nothing else here proves the
+  # source and the seed agree.
+  "$dream" "$DREAMS" -L mind -L . -o "$TMP/stage3.dream" dreams/main.dr >/dev/null 2>&1 || \
+    die "dreams could not compile itself"
+  cmp -s "$DREAMS" "$TMP/stage3.dream" || \
+    die "dreams does not reproduce itself: the seed and the source disagree"
+  ok "$DREAMS (reproduces itself byte for byte)"
 else
-  warn "no bootstrap image at $SEED; skipping the self-hosted compiler"
-  DREAMS=""
+  ok "$DREAMS"
 fi
+
+# --- mind -------------------------------------------------------------------
+
+step "Building the standard library and build tool (mind)"
+# `--shebang` writes the `#!` line and sets the execute bit, so `mind` is a
+# program you can run rather than an image you have to hand to the VM.
+MIND="$BUILD_DIR/bin/mind"
+"$dream" "$DREAMS" -L mind/std mind/tool/main.dr --shebang -o "$MIND" >/dev/null 2>&1 || \
+  die "dreams could not compile mind"
+[[ -x "$MIND" ]] || die "the compiler finished but $MIND is missing"
+ok "$MIND"
 
 # --- the language server ----------------------------------------------------
 #
-# Built with `dreams` when there is one, which is worth doing for its own sake:
 # `lucid` imports the compiler as a library, so compiling it is the self-hosted
 # compiler put through a real program rather than a test.
 
 step "Building the language server (lucid)"
 LUCID="$BUILD_DIR/bin/lucid.dream"
-if [[ -n "$DREAMS" ]]; then
-  "$dream" "$DREAMS" -L mind -L . -o "$LUCID" lucid/main.dr >/dev/null 2>&1 || \
-    die "dreams could not compile lucid"
-  ok "$LUCID (compiled by dreams)"
-else
-  $DREAMC lucid/main.dr -L mind -L . -o "$LUCID" >/dev/null 2>&1 || \
-    die "the compiler could not compile lucid"
-  ok "$LUCID"
-fi
+"$dream" "$DREAMS" -L mind -L . -o "$LUCID" lucid/main.dr >/dev/null 2>&1 || \
+  die "dreams could not compile lucid"
+ok "$LUCID (compiled by dreams)"
 
 # --- smoke test -------------------------------------------------------------
 
@@ -213,7 +189,8 @@ import std.console;
 let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
 let main! = { console.print! ("fac 10 = " + to_string (fac 10)) }
 DREAM
-"$DREAMC" "$TMP/hello.dr" -o "$TMP/hello.dream" >/dev/null 2>&1 || die "the compiler could not compile a trivial program"
+"$dream" "$DREAMS" "$TMP/hello.dr" -o "$TMP/hello.dream" >/dev/null 2>&1 || \
+  die "the compiler could not compile a trivial program"
 result="$("$dream" "$TMP/hello.dream" 2>&1)" || die "the VM could not run a trivial program: $result"
 [[ "$result" == "fac 10 = 3628800" ]] || die "unexpected result: $result"
 ok "compiled and ran a program end to end"
@@ -222,9 +199,8 @@ ok "compiled and ran a program end to end"
 
 if [[ $RUN_TESTS -eq 1 ]]; then
   step "Running tests"
-  cargo test --offline -p dreamc ${CARGO_PROFILE} 2>&1 | grep -E '^test result' | sed 's/^/    compiler: /'
   "$BUILD_DIR/bin/dream_tests" 2>&1 | tail -1 | sed 's/^/    vm: /'
-  DREAMC="$DREAMC" dream="$dream" dream/tests/e2e.sh 2>&1 | tail -1 | sed 's/^/    programs: /'
+  DREAMS="$DREAMS" dream="$dream" dream/tests/e2e.sh 2>&1 | tail -1 | sed 's/^/    programs: /'
 fi
 
 # --- install ----------------------------------------------------------------
@@ -232,27 +208,27 @@ fi
 if [[ -n "$PREFIX" ]]; then
   step "Installing into $PREFIX"
   cmake --install "$BUILD_DIR" --prefix "$PREFIX" >/dev/null
-  install -Dm755 "$DREAMC" "$PREFIX/bin/dreamc"
-  [[ -n "$DREAMS" ]] && install -Dm644 "$DREAMS" "$PREFIX/share/dream/dreams.dream"
-  [[ -n "$LUCID" ]] && install -Dm644 "$LUCID" "$PREFIX/share/dream/lucid.dream"
+  install -Dm755 "$MIND" "$PREFIX/bin/mind"
+  install -Dm644 "$DREAMS" "$PREFIX/share/dream/dreams.dream"
+  install -Dm644 "$LUCID" "$PREFIX/share/dream/lucid.dream"
   if [[ -d mind/std ]]; then
     mkdir -p "$PREFIX/share/dream"
     cp -r mind "$PREFIX/share/dream/"
   fi
   ok "installed"
-  note "add $PREFIX/bin to PATH, and set DREAM_PACKAGES=$PREFIX/share/dream/mind"
+  note "add $PREFIX/bin to PATH, and set MINDV2_PATH=$PREFIX/share/dream"
 fi
 
 # --- summary ----------------------------------------------------------------
 
 echo
 printf '%sDream is built.%s\n' "$BOLD" "$RESET"
-printf '  compiler  %s\n' "$DREAMC"
 printf '  vm        %s\n' "$dream"
 printf '  library   %s\n' "$BUILD_DIR/lib/libdream.so"
-[[ -n "$DREAMS" ]] && printf '  dreams    %s\n' "$DREAMS"
-[[ -n "$LUCID" ]] && printf '  lucid     %s\n' "$LUCID"
+printf '  dreams    %s\n' "$DREAMS"
+printf '  mind      %s\n' "$MIND"
+printf '  lucid     %s\n' "$LUCID"
 echo
-printf '  %s./%s program.dr -o program.dream && ./%s program.dream%s\n' \
-       "$DIM" "$DREAMC" "$dream" "$RESET"
+printf '  %s"$BUILD_DIR/bin/dream" "$DREAMS" program.dr -o program.dream%s\n' \
+       "$DIM" "$RESET"
 printf '  %sjust --list  for the other tasks%s\n' "$DIM" "$RESET"

@@ -1,6 +1,6 @@
 # The standard library: Dream source, not a build artefact.
 #
-# It is installed as data rather than compiled, because `dreamc` compiles whole
+# It is installed as data rather than compiled, because `dreams` compiles whole
 # programs -- there is no separate library image to link against, and a module
 # is only lowered as part of the program that imports it.
 { lib, stdenvNoCC }:

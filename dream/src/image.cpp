@@ -174,7 +174,7 @@ bool Image::load_file(const std::string& path, std::string& error) {
     mapping_size_ = static_cast<size_t>(st.st_size);
 
     // A shebang line, so that an image can be marked executable and run
-    // directly. `dreamc --shebang` writes one. Anything before the first
+    // directly. The compiler's `--shebang` writes one. Anything before the first
     // newline is skipped; an image is binary and never starts with '#'
     // otherwise, since the magic number begins with 'D'.
     const uint8_t* start = static_cast<const uint8_t*>(p);

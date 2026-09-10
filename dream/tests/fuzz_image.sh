@@ -19,17 +19,14 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DREAMC="${DREAMC:-}"
+DREAMS="${DREAMS:-}"
 dream="${dream:-}"
 ITERATIONS="${ITERATIONS:-400}"
 
-if [[ -z "$DREAMC" ]]; then
-  newest=""
-  for c in "$HERE/../../target/release/dreamc" "$HERE/../../target/debug/dreamc"; do
-    [[ -x "$c" ]] || continue
-    if [[ -z "$newest" || "$c" -nt "$newest" ]]; then newest="$c"; fi
+if [[ -z "$DREAMS" ]]; then
+  for c in "$HERE/../../build/dreams.dream" "$HERE/../../dreams/bootstrap/dreams.dream"; do
+    [[ -f "$c" ]] && DREAMS="$c" && break
   done
-  DREAMC="$newest"
 fi
 if [[ -z "$dream" ]]; then
   for c in "$HERE/../../build-dream/bin/dream" "$HERE/../build-dream/bin/dream" \
@@ -37,10 +34,15 @@ if [[ -z "$dream" ]]; then
     [[ -x "$c" ]] && dream="$c" && break
   done
 fi
-if [[ ! -x "${DREAMC:-}" || ! -x "${dream:-}" ]]; then
-  echo "fuzz: need both dreamc and dream; build them or set DREAMC/dream" >&2
+if [[ ! -x "${dream:-}" ]]; then
+  echo "fuzz: need the dream VM; build it or set dream" >&2
   exit 1
 fi
+if [[ -z "$DREAMS" ]]; then
+  echo "fuzz: cannot find a compiler; run \`just dreams\` or set DREAMS" >&2
+  exit 1
+fi
+if [[ "$DREAMS" == *.dream ]]; then compile=("$dream" "$DREAMS"); else compile=("$DREAMS"); fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -58,7 +60,7 @@ let main! = {
 }
 DREAM
 
-if ! "$DREAMC" "$SEED_SRC" -o "$WORK/seed.dream" >/dev/null 2>&1; then
+if ! "${compile[@]}" "$SEED_SRC" -L "$HERE/../../mind" -o "$WORK/seed.dream" >/dev/null 2>&1; then
   echo "fuzz: could not compile the seed program" >&2
   exit 1
 fi

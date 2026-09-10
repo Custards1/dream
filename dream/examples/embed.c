@@ -1,11 +1,12 @@
 /* Embedding the Dawn VM from C: load an image, register a host module, run it.
  *
  *   cc examples/embed.c -Iinclude -Lbuild/lib -ldawn -o embed
- *   dreamc program.dr --host-module host -o program.dream
+ *   dreams program.dr --host-module host -o program.dream
  *   LD_LIBRARY_PATH=build/lib ./embed program.dream
  *
  * `--host-module host` is what tells the compiler that `import host;` resolves
  * to a module this program registers at run time rather than to Dream source.
+ * `dreams` is an image; run it as `<vm> <dreams.dream> --host-module host ...`.
  */
 #include <stdio.h>
 #include <string.h>

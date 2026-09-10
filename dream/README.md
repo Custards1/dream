@@ -1,8 +1,8 @@
 # dream, the Dream VM
 
-A virtual machine for [Dream](../dreamc), a dynamically typed, lazily evaluated
-functional language -- see [docs/language-spec.md](../docs/language-spec.md) for
-the language itself. The VM has three parts worth knowing about:
+A virtual machine for [Dream](../docs/language-spec.md), a dynamically typed,
+lazily evaluated functional language. The VM has three parts worth knowing
+about:
 
 - a **lazy graph-reduction interpreter** written as an explicit state machine,
 - **green processes** with isolated heaps and copied messages, in the style of
@@ -45,7 +45,7 @@ let main! = {
     console.print! "dir has:  " (list.contains "mind" (os.list_dir! "."))
 };
 EOF
-./target/debug/dreamc $S/os1.dr -L mind -o $S/os1.dream >/dev/null 2>&1 && build-dream/bin/dream $S/os1.dream one twov
+./build-dream/bin/dream build/dreams.dream $S/os1.dr -L mind -o $S/os1.dream >/dev/null 2>&1 && build-dream/bin/dream $S/os1.dream one twov
 
 ## Why the interpreter is a state machine
 

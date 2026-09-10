@@ -1,11 +1,13 @@
 std:="./std"
 src := "tool/main.dr"
 output := "mind.dream"
+dream := "../build-dream/bin/dream"
+compiler := "../build/dreams.dream"
 
 clean:
    rm -f $(output) 
 build:
-    dreamc -L {{std}} -o {{output}} {{src}}
+    $(dream) $(compiler) -L {{std}} -o {{output}} {{src}}
 selfbuild:
     dream mind.dream
 run:

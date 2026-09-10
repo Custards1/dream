@@ -133,9 +133,6 @@ let vm_command! () = match util.env_path! "DREAM" { () => "dream", v => v };
 /// what this build asked for, then what the package asks for, then the
 /// environment, then the installed one.
 ///
-/// `DREAMS` comes before `DREAMC` because it names the compiler that replaced
-/// the other; a machine with both set is mid-migration and means the newer one.
-///
 /// The default is `dreams.dream` rather than a program on the path, because the
 /// compiler is an image now: the VM resolves a bare name against `$MINDV2_PATH`,
 /// so this finds whatever the installation put there. A native compiler is
@@ -145,10 +142,7 @@ let default_compiler = "dreams.dream";
 let choose_compiler! m explicit =
     match explicit {
         () => match manifest.compiler m {
-            () => match util.env_path! "DREAMS" {
-                () => match util.env_path! "DREAMC" { () => default_compiler, c => c },
-                d  => d,
-            },
+            () => match util.env_path! "DREAMS" { () => default_compiler, d => d },
             c => c,
         },
         c => c,

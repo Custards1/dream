@@ -28,20 +28,20 @@ fi
 
 # The compiler is `dreams`, which is an image rather than a native program: a
 # freshly built one if there is one, and otherwise the checked-in seed, which
-# needs nothing but the VM. `$DREAMC` still overrides, and a name that does not
-# end in `.dream` is run directly -- that is how a native compiler is still
-# usable here without this script knowing anything about which one it is.
-DREAMC="${DREAMC:-}"
-if [[ -z "$DREAMC" ]]; then
+# needs nothing but the VM. `$DREAMS` overrides the choice, and a name that
+# does not end in `.dream` is run directly -- that is how a native compiler is
+# still usable here without this script knowing anything about which one it is.
+DREAMS="${DREAMS:-}"
+if [[ -z "$DREAMS" ]]; then
   for c in "$ROOT/build/dreams.dream" "$ROOT/dreams/bootstrap/dreams.dream"; do
-    [[ -f "$c" ]] && DREAMC="$c" && break
+    [[ -f "$c" ]] && DREAMS="$c" && break
   done
 fi
-if [[ -z "$DREAMC" ]]; then
-  echo "examples: cannot find a compiler; run \`just dreams\` or set DREAMC" >&2
+if [[ -z "$DREAMS" ]]; then
+  echo "examples: cannot find a compiler; run \`just dreams\` or set DREAMS" >&2
   exit 1
 fi
-if [[ "$DREAMC" == *.dream ]]; then compile=("$dream" "$DREAMC"); else compile=("$DREAMC"); fi
+if [[ "$DREAMS" == *.dream ]]; then compile=("$dream" "$DREAMS"); else compile=("$DREAMS"); fi
 
 bless=0
 filter=""
