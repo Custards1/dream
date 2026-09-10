@@ -5,25 +5,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <unordered_set>
 
 namespace dream {
 
 namespace {
 constexpr size_t ALIGN = 8;
 inline size_t align_up(size_t n) { return (n + ALIGN - 1) & ~(ALIGN - 1); }
-
-/// The mark bit, written into a live object's header by the collector. There
-/// is no second colour to maintain: collection is atomic, so grey lives only
-/// on the worklist and a marked object is either grey (still queued) or black
-/// (scanned); sweep treats both the same.
-constexpr uint8_t GC_MARK = 1;
-/// Set on a chunk that sits on one of the size-class free lists. Sweep reads
-/// it to tell "dead since the last cycle, join a list now" from "already on a
-/// list, leave it alone": without the distinction a chunk that stays dead and
-/// unpopped across two collections would be pushed twice, making its free list
-/// point at itself, and every later pop from that list would hand out the same
-/// chunk for two different objects.
-constexpr uint8_t GC_FREE = 2;
 
 /// A free chunk is an object-shaped slot whose header still answers the chunk
 /// size (so the sweep can walk a block as a run of chunks) and whose first
@@ -75,13 +63,19 @@ uint32_t class_size(uint32_t bytes) {
 }  // namespace
 
 Heap::Heap(size_t initial_bytes)
-    : gc_threshold_(initial_bytes), initial_bytes_(initial_bytes) {
-    blocks_ = new_block(initial_bytes);
-    carve_block_ = blocks_;
+    : nursery_hi_(initial_bytes),
+      gc_threshold_(initial_bytes),
+      initial_bytes_(initial_bytes) {
+    // The nursery starts with one block; old space grows its own as objects
+    // survive into it. The constructor's block is the nursery's, so a process
+    // that dies young -- most programs -- never grows an old space at all.
+    nursery_.push_back(new_block(initial_bytes));
+    nursery_cursor_ = nursery_.back();
 }
 
 Heap::~Heap() {
     free_blocks(blocks_);
+    for (Block* b : nursery_) free_block(b);
 }
 
 Heap::Block* Heap::new_block(size_t bytes) {
@@ -100,20 +94,32 @@ Heap::Block* Heap::new_block(size_t bytes) {
     return b;
 }
 
+void Heap::free_block(Block* b) {
+    std::free(b->data);
+    std::free(b);
+}
+
 void Heap::free_blocks(Block* b) {
     while (b) {
         Block* next = b->next;
-        std::free(b->data);
-        std::free(b);
+        free_block(b);
         b = next;
     }
+}
+
+void Heap::free_nursery() {
+    for (Block* b : nursery_) free_block(b);
+    nursery_.clear();
+    nursery_cursor_ = nullptr;
+    nursery_bytes_ = 0;
 }
 
 Obj* Heap::carve(size_t sz) {
     // A same-sized chunk is already free: pop it. The free list holds only
     // chunks this size class knows, so the header is a valid run member; the
     // `GC_FREE` bit tells sweep that a dead chunk is already on a list and must
-    // not be pushed a second time.
+    // not be pushed a second time. Only the collector's promotes carve here,
+    // so a popped chunk is always about to become a tenured object.
     size_t i = class_index(static_cast<uint32_t>(sz));
     if (Obj* o = free_lists_[i]) {
         free_lists_[i] = free_next(o);
@@ -122,7 +128,7 @@ Obj* Heap::carve(size_t sz) {
     }
 
     // None free. Carve a fresh chunk off the tail of a block that has room --
-    // the current carve block first, then any other shared block (so the
+    // the current carve block first, then any other shared old block (so the
     // strands of space left when a run ends and a new one begins are still
     // used), then a brand-new block. Dedicated big-object blocks are never a
     // target: their headroom is reserved, and a chunk cut into one would be
@@ -160,20 +166,42 @@ Obj* Heap::carve_big(size_t sz) {
     return reinterpret_cast<Obj*>(b->data);
 }
 
+/// Bump-allocate from the nursery. Collection can never run mid-reduction, so
+/// no allocation-time safepoint is needed: the high-water mark only decides
+/// what the *next* safepoint check does. When the current block is full a
+/// fresh one is added -- never a collection, and never a failure.
+Obj* Heap::alloc_nursery(uint32_t sz) {
+    Block* b = nursery_cursor_;
+    if (b && (b->big || b->used + sz > b->size)) b = nullptr;
+    if (!b) {
+        b = new_block(sz);
+        b->next = nullptr;
+        nursery_.push_back(b);
+        nursery_cursor_ = b;
+    }
+    auto* o = reinterpret_cast<Obj*>(b->data + b->used);
+    b->used += sz;
+    nursery_bytes_ += sz;
+    allocated_ += sz;
+    return o;
+}
+
 Obj* Heap::alloc(ObjType type, size_t extra) {
     size_t bytes = align_up(sizeof(Obj) + extra);
     uint32_t sz;
     Obj* o;
     if (bytes > kMaxClassSize) {
+        // Large objects tenure immediately: they are rare, often long-lived,
+        // and copying one once to save the next copy is a bad swap.
         sz = static_cast<uint32_t>(bytes);
         o = carve_big(sz);
     } else {
         sz = class_size(static_cast<uint32_t>(bytes));
-        o = carve(sz);
+        o = alloc_nursery(sz);
     }
     std::memset(o, 0, sz);
     o->type = type;
-    o->gc = 0;
+    o->gc = bytes > kMaxClassSize ? GC_OLD : GC_YOUNG;
     o->aux = 0;
     o->bytes = sz;
     total_allocated_ += sz;
@@ -302,7 +330,8 @@ void Heap::mark_object(Value v) {
         static_cast<IndirectObj*>(o)->target = resolve(static_cast<IndirectObj*>(o)->target);
     }
 
-    o->gc = GC_MARK;
+    // The mark rides alongside the generation bit: an old object stays old.
+    o->gc |= GC_MARK;
     // An atom object (Float, Str, Pid) has no references to forward, so it is
     // grey only in name; it never needs the worklist.
     if (!is_atom_object(o->type)) scan_queue_.push_back(o);
@@ -324,7 +353,43 @@ void Heap::forward(Value* slot) {
         v = resolve(v);
         *slot = v;
     }
-    mark_object(v);
+    if (!is_ptr(v)) return;
+    Obj* o = as_obj(v);
+    // A young object is copied to old space and the slot rewritten to the
+    // copy. A forwarded one is a young object already copied this cycle; its
+    // first payload word holds the copy, so sharing survives promotion.
+    if (o->gc & GC_YOUNG) {
+        *slot = from_obj(promote(o));
+        return;
+    }
+    if (o->gc & GC_FORWARDED) {
+        *slot = forward_target(o);
+        return;
+    }
+    // Old object: only a major collection wants it marked; a minor scans the
+    // remembered set and promotes, and has no need to touch the rest.
+    if (full_trace_) mark_object(v);
+}
+
+/// Copy a nursery object to old space. The from-space chunk becomes a
+/// forwarding stub -- its generation bit flips to GC_FORWARDED and its first
+/// payload word points at the copy -- so the second reference to it is
+/// rewritten to the same copy and sharing survives. Promoted objects are
+/// marked too during a major collection, so the sweep keeps them.
+Obj* Heap::promote(Obj* o) {
+    uint32_t sz = o->bytes;
+    Obj* copy = carve(sz);
+    std::memcpy(copy, o, sz);
+    copy->gc = full_trace_ ? (GC_MARK | GC_OLD) : GC_OLD;
+    // Every class size is at least 16 bytes, so every chunk has a first
+    // payload word to park the forwarding pointer in. The from-space chunk is
+    // dead once the nursery is emptied, so the overwrite costs nothing.
+    *reinterpret_cast<Value*>(o + 1) = from_obj(copy);
+    o->gc = GC_FORWARDED;
+    promoted_bytes_ += sz;
+    total_allocated_ += sz;
+    if (!is_atom_object(o->type)) scan_queue_.push_back(copy);
+    return copy;
 }
 
 void Heap::scan_object(Obj* o) {
@@ -402,6 +467,10 @@ void Heap::scan_object(Obj* o) {
 }
 
 void Heap::collect(RootSource& roots) {
+    major_collect(roots);
+}
+
+void Heap::major_collect(RootSource& roots) {
     // Every object that survives lands on the worklist at some point, so it
     // wants room for a big fraction of everything that was alive. The queue
     // retains its capacity across collects, but the live set grows, so a
@@ -413,23 +482,31 @@ void Heap::collect(RootSource& roots) {
     if (scan_queue_.capacity() < allocated_ / size_t(16) + 1)
         scan_queue_.reserve(allocated_ / size_t(16) + 1);
     scan_queue_.clear();
+    full_trace_ = true;
 
-    // Mark. The roots are grey before anything else; scanning turns them
-    // black and enqueues everything they point at, until the worklist drains
-    // and the grey set is empty.
+    // Mark. `forward` promotes every reachable young object -- copying it to
+    // old space -- and marks the old ones. The roots are grey before anything
+    // else; scanning turns them black and enqueues everything they point at,
+    // until the worklist drains and the grey set is empty.
     roots.visit_roots(*this);
     while (!scan_queue_.empty()) {
         Obj* o = scan_queue_.back();
         scan_queue_.pop_back();
         scan_object(o);
     }
+    full_trace_ = false;
 
-    // Sweep. Every block's chunk headers tile the block, so one walk over
+    // Sweep. Every old block's chunk headers tile the block, so one walk over
     // each block sees every object: the marked ones stay put (and lose their
     // mark, for the next cycle), the rest go on their size class's free list.
+    // Everything reachable in the nursery was promoted, so the whole nursery
+    // is dead and is handed back.
     sweep();
+    free_nursery();
+    remembered_.clear();
 
     ++collections_;
+    ++major_collections_;
 
     // Collect again once the heap has grown well past what survived, so that
     // programs with a large live set do not collect continuously. The `live * 2`
@@ -439,15 +516,47 @@ void Heap::collect(RootSource& roots) {
     // little that survives wastes a copy of everything it ever builds if it
     // collects on every doubling.
     gc_threshold_ = live_after_gc_ * 3 + initial_bytes_;
+    // The nursery scales with the live set too: a process that holds a lot
+    // wants a bigger nursery before it pays for a minor collection.
+    nursery_hi_ = live_after_gc_ / 4 + initial_bytes_;
 
-    if (verify_after_gc()) {
-        std::string problem = verify(roots);
-        if (!problem.empty()) {
-            std::fprintf(stderr, "dream: heap corrupted after collection %llu: %s\n",
-                         static_cast<unsigned long long>(collections_), problem.c_str());
-            std::abort();
-        }
+    verify_collect(roots, false);
+}
+
+void Heap::minor_collect(RootSource& roots) {
+    if (scan_queue_.capacity() < allocated_ / size_t(16) + 1)
+        scan_queue_.reserve(allocated_ / size_t(16) + 1);
+    scan_queue_.clear();
+
+    // Trace. Roots have their young values promoted directly; each remembered
+    // old object is scanned so a young value it was made to point at is
+    // promoted too. Promotion copies reach every other young object through
+    // the promoted one, so when the worklist drains, everything reachable is
+    // in old space and the nursery is empty by construction.
+    roots.visit_roots(*this);
+    for (Obj* o : remembered_) scan_object(o);
+    while (!scan_queue_.empty()) {
+        Obj* o = scan_queue_.back();
+        scan_queue_.pop_back();
+        scan_object(o);
     }
+
+    // Every nursery block is now dead space; reset them all so the next bump
+    // allocation starts fresh. (Blocks with headroom are kept, not freed --
+    // the process will fill them again immediately.)
+    for (Block* b : nursery_) b->used = 0;
+    allocated_ -= nursery_bytes_;
+    nursery_bytes_ = 0;
+    remembered_.clear();
+
+    ++collections_;
+    ++minor_collections_;
+    if (allocated_ > peak_live_) peak_live_ = allocated_;
+
+    // A minor never touches old space, so `live_after_gc_` still says what the
+    // last full collection measured; `bytes_allocated` reports the whole live
+    // picture. The check a minor adds is that nothing reachable is young.
+    verify_collect(roots, true);
 }
 
 void Heap::sweep() {
@@ -463,15 +572,14 @@ void Heap::sweep() {
             // carved into it, so freeing it cannot strand a live chunk.
             Obj* o = reinterpret_cast<Obj*>(b->data);
             if (o->gc & GC_MARK) {
-                o->gc = 0;
+                o->gc &= ~GC_MARK;
                 live += o->bytes;
                 prev = b;
             } else {
                 if (prev) prev->next = next;
                 else blocks_ = next;
                 if (carve_block_ == b) carve_block_ = nullptr;
-                std::free(b->data);
-                std::free(b);
+                free_block(b);
             }
             b = next;
             continue;
@@ -486,7 +594,9 @@ void Heap::sweep() {
             pos += sz;
             bool marked = (o->gc & GC_MARK) != 0;
             if (marked) {
-                o->gc = 0;
+                // Tenured objects keep their generation bit; only the cycle's
+                // mark is cleared.
+                o->gc &= ~GC_MARK;
                 live += sz;
             } else if (o->gc & GC_FREE) {
                 // Alive on a list from an earlier cycle, untouched since. The
@@ -510,6 +620,16 @@ void Heap::sweep() {
     allocated_ = live;
 }
 
+void Heap::verify_collect(RootSource& roots, bool expect_no_young) {
+    if (!verify_after_gc()) return;
+    std::string problem = verify_internal(roots, expect_no_young);
+    if (!problem.empty()) {
+        std::fprintf(stderr, "dream: heap corrupted after collection %llu: %s\n",
+                     static_cast<unsigned long long>(collections_), problem.c_str());
+        std::abort();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
@@ -520,6 +640,10 @@ bool Heap::owns(const void* p, size_t bytes) const {
         auto start = reinterpret_cast<uintptr_t>(b->data);
         // Only the used part counts: an object cannot legitimately live in the
         // unallocated tail of a block.
+        if (addr >= start && addr + bytes <= start + b->used) return true;
+    }
+    for (Block* b : nursery_) {
+        auto start = reinterpret_cast<uintptr_t>(b->data);
         if (addr >= start && addr + bytes <= start + b->used) return true;
     }
     return false;
@@ -542,10 +666,11 @@ namespace {
 
 struct VerifyWalk {
     const Heap& heap;
+    bool no_young;
     std::string error;
     std::vector<Value> work;
     std::vector<Value> parents;
-    std::vector<const Obj*> seen;
+
 
     bool problem(const std::string& what) {
         if (error.empty()) error = what;
@@ -567,6 +692,10 @@ struct VerifyWalk {
 
     bool check_object(Value v, Value parent) {
         Obj* o = as_obj(v);
+        if (no_young && (o->gc & GC_YOUNG)) {
+            return problem("a minor collection left a young object reachable at " +
+                           addr(o));
+        }
         if (reinterpret_cast<uintptr_t>(o) % 8 != 0) {
             return problem("object at " + addr(o) + " is not 8-byte aligned");
         }
@@ -595,6 +724,11 @@ struct VerifyWalk {
     }
 
     void run() {
+        // `seen` needs O(1) membership: the walk meets every live object once,
+        // and a vector + linear find would make verification itself
+        // quadratic -- survivable when a collection happens a handful of times,
+        // not when a generational collector verifies after every minor.
+        std::unordered_set<const Obj*> seen;
         while (!work.empty() && error.empty()) {
             Value v = work.back();
             work.pop_back();
@@ -602,9 +736,8 @@ struct VerifyWalk {
             parents.pop_back();
             if (!is_ptr(v)) continue;
             Obj* o = as_obj(v);
-            if (std::find(seen.begin(), seen.end(), o) != seen.end()) continue;
+            if (!seen.insert(o).second) continue;
             if (!check_object(v, parent)) return;
-            seen.push_back(o);
 
             switch (o->type) {
                 case ObjType::Cons: {
@@ -720,6 +853,10 @@ struct VerifyWalk {
 }  // namespace
 
 std::string Heap::verify(RootSource& roots) {
+    return verify_internal(roots, false);
+}
+
+std::string Heap::verify_internal(RootSource& roots, bool no_young) {
     // Gather the roots without moving anything. `forward` is the only way a
     // root source hands over its references, so it doubles as a recorder while
     // `recording_` is set.
@@ -728,7 +865,7 @@ std::string Heap::verify(RootSource& roots) {
     roots.visit_roots(*this);
     recording_ = nullptr;
 
-    VerifyWalk walk{*this, {}, {}, {}, {}};
+    VerifyWalk walk{*this, no_young, {}, {}, {}};
     for (Value v : collected) walk.push(v, 0);
     walk.run();
     return walk.error;

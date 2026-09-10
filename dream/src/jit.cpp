@@ -248,7 +248,7 @@ private:
 
     // Declarations of the runtime helpers.
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_type_error_,
-        rt_reduction_slot_, rt_frame_slots_;
+        rt_reduction_slot_, rt_frame_slots_, rt_frame_store_;
 };
 
 llvm::Function* Emitter::emit(const std::string& name) {
@@ -272,6 +272,9 @@ llvm::Function* Emitter::emit(const std::string& name) {
         "dream_rt_reduction_slot", llvm::FunctionType::get(ptr_, {ptr_}, false));
     rt_frame_slots_ = mod_.getOrInsertFunction(
         "dream_rt_frame_slots", llvm::FunctionType::get(ptr_, {i64_}, false));
+    rt_frame_store_ = mod_.getOrInsertFunction(
+        "dream_rt_frame_store",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i64_, i32_, i64_}, false));
 
     auto* fty = llvm::FunctionType::get(i64_, {ptr_, i64_, ptr_}, false);
     fn_ = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, name, mod_);
@@ -694,11 +697,13 @@ llvm::Value* Emitter::self_call(const Node& n) {
 
     b_.SetInsertPoint(yield_bb);
     // Publish the loop-carried values back to the frame and hand control to
-    // the interpreter, which resumes at the top of this body.
-    llvm::Value* slot_base = b_.CreateCall(rt_frame_slots_, {frame_});
+    // the interpreter, which resumes at the top of this body. The store runs
+    // the write barrier: the frame may be old, the value young, and the next
+    // minor collection has to know the edge exists.
     for (uint32_t i = 0; i < f_.slots; ++i) {
-        llvm::Value* dst = b_.CreateGEP(i64_, slot_base, {i64(i)});
-        b_.CreateStore(b_.CreateLoad(i64_, slots_[i]), dst);
+        b_.CreateCall(rt_frame_store_,
+                      {proc_, frame_, llvm::ConstantInt::get(i32_, i),
+                       b_.CreateLoad(i64_, slots_[i])});
     }
     b_.CreateStore(llvm::ConstantInt::get(i32_, JIT_YIELD), status_);
     b_.CreateRet(i64(UNIT));
@@ -758,6 +763,7 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_type_error", reinterpret_cast<void*>(&dream_rt_type_error));
     add("dream_rt_reduction_slot", reinterpret_cast<void*>(&dream_rt_reduction_slot));
     add("dream_rt_frame_slots", reinterpret_cast<void*>(&dream_rt_frame_slots));
+    add("dream_rt_frame_store", reinterpret_cast<void*>(&dream_rt_frame_store));
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms)))) {
         if (error) *error = llvm::toString(std::move(err));
         lljit.reset();

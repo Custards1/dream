@@ -1189,6 +1189,9 @@ NativeResult vm_stats(Process& p, Value, Value*, uint32_t) {
         {"live_bytes", make_integer(p, int64_t(p.heap().bytes_live()))},
         {"peak_bytes", make_integer(p, int64_t(p.heap().bytes_peak()))},
         {"collections", make_integer(p, int64_t(p.heap().collections()))},
+        {"minor_collections", make_integer(p, int64_t(p.heap().minor_collections()))},
+        {"major_collections", make_integer(p, int64_t(p.heap().major_collections()))},
+        {"bytes_promoted", make_integer(p, int64_t(p.heap().bytes_promoted()))},
     }));
 }
 

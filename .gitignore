@@ -9,6 +9,7 @@ build/
 build-dream/
 build-nojit/
 build-tsan/
+build-verify/
 CMakeFiles/
 out/
 target/

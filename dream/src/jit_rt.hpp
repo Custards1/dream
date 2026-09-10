@@ -39,4 +39,9 @@ int64_t* dream_rt_reduction_slot(dream::Process* p);
 /// Slots of the frame, for writing loop-carried values back when yielding.
 dream::Value* dream_rt_frame_slots(dream::Value frame);
 
+/// Store into a frame slot with the write barrier: the yield spill is the one
+/// place compiled code writes a possibly-young value into a possibly-old
+/// frame, and the next minor collection has to know the edge exists.
+void dream_rt_frame_store(dream::Process* p, dream::Value frame, uint32_t index, dream::Value v);
+
 }  // extern "C"

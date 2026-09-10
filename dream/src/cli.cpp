@@ -496,10 +496,12 @@ int main(int argc, char** argv) {
 
     if (stats) {
         std::fprintf(stderr,
-                     "; %" PRIu64 " reductions, %" PRIu64 " collections in the root process, "
+                     "; %" PRIu64 " reductions, %" PRIu64 " major + %" PRIu64 " minor "
+                     "collections (%" PRIu64 " bytes promoted) in the root process, "
                      "%u workers, jit %s\n",
-                     sched.total_reductions(), root->heap().collections(), workers,
-                     jit_owner ? "on" : "off");
+                     sched.total_reductions(), root->heap().major_collections(),
+                     root->heap().minor_collections(), root->heap().bytes_promoted(),
+                     workers, jit_owner ? "on" : "off");
         if (jit_owner) {
             std::fprintf(stderr, "; %" PRIu64 " functions compiled\n",
                          jit_owner->compiled_count());

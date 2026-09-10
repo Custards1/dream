@@ -486,6 +486,9 @@ void advance_block(Process& p, uint32_t kids_off, uint32_t count, uint32_t index
                 bound = thunk_for(p, sn.b, frame);
             }
             fo->slots()[sn.a] = bound;
+            // A frame may have outlived its call -- one held by a long-lived
+            // thunk -- so the bind can point an old object at a young one.
+            p.heap().remember_if_old(fo, bound);
             // A binding is lazy unless the compiler marked it strict, which it
             // does exactly when the bound expression has effects that must
             // happen where they were written.
@@ -848,7 +851,9 @@ void step_eval(Process& p) {
 
         case Op::Bind: {
             auto* fo = static_cast<FrameObj*>(as_obj(frame));
-            fo->slots()[n.a] = thunk_for(p, n.b, frame);
+            Value bound = thunk_for(p, n.b, frame);
+            fo->slots()[n.a] = bound;
+            p.heap().remember_if_old(fo, bound);
             ret(p, UNIT);
             return;
         }
@@ -937,6 +942,10 @@ void step_return(Process& p) {
         case ContKind::UpdateThunk: {
             // Overwrite the thunk in place so every sharer sees the result.
             Obj* o = as_obj(c.v1);
+            // A thunk that has survived into old space now gains a young
+            // target, so the write barrier notes the edge for the next minor
+            // collection.
+            p.heap().remember_if_old(o, p.result);
             o->type = ObjType::Indirect;
             static_cast<IndirectObj*>(o)->target = p.result;
             return;  // stay in Return: the value flows to the next continuation
@@ -1101,6 +1110,7 @@ bool unwind(Process& p, size_t floor) {
             p.stack.resize(c.c);
             auto* fo = static_cast<FrameObj*>(as_obj(c.v1));
             fo->slots()[c.b] = p.result;
+            p.heap().remember_if_old(fo, p.result);
             eval_node(p, c.a, c.v1);
             return true;
         }
@@ -1468,17 +1478,23 @@ bool force_deep(Process& p, Value v, Value* out) {
             // after it is, so the marking runs backwards, from the end.
             p.stack.push_back(head);
             for (;;) {
+                // The cells are walked in place: the one on top of the stack
+                // held its head before we started, and forcing can collect at
+                // any step, so its address is re-read after each force.
+                auto* cell = static_cast<ConsObj*>(as_obj(p.stack.back()));
                 Value tmp;
-                if (!force_deep(p, static_cast<ConsObj*>(as_obj(p.stack.back()))->head, &tmp)) {
+                if (!force_deep(p, cell->head, &tmp)) {
                     return unwind(out);
                 }
-                static_cast<ConsObj*>(as_obj(p.stack.back()))->head = tmp;
+                cell->head = tmp;
+                p.heap().remember_if_old(cell, tmp);
 
                 Value tail;
-                if (!force_whnf(p, static_cast<ConsObj*>(as_obj(p.stack.back()))->tail, &tail)) {
+                if (!force_whnf(p, cell->tail, &tail)) {
                     return unwind(out);
                 }
-                static_cast<ConsObj*>(as_obj(p.stack.back()))->tail = tail;
+                cell->tail = tail;
+                p.heap().remember_if_old(cell, tail);
 
                 const bool more = is_ptr(tail) && as_obj(tail)->type == ObjType::Cons
                                   && !(as_obj(tail)->aux & AUX_DEEP_FORCED);
@@ -1492,6 +1508,8 @@ bool force_deep(Process& p, Value v, Value* out) {
                     Value done;
                     if (!force_deep(p, tail, &done)) return unwind(out);
                     static_cast<ConsObj*>(as_obj(p.stack.back()))->tail = done;
+                    p.heap().remember_if_old(
+                        static_cast<ConsObj*>(as_obj(p.stack.back())), done);
                 }
                 break;
             }
@@ -1509,10 +1527,12 @@ bool force_deep(Process& p, Value v, Value* out) {
             p.stack.push_back(head);
             uint32_t len = static_cast<ArrayObj*>(as_obj(head))->len;
             for (uint32_t i = 0; i < len; ++i) {
-                Value item = static_cast<ArrayObj*>(as_obj(p.stack.back()))->items()[i];
+                auto* a = static_cast<ArrayObj*>(as_obj(p.stack.back()));
+                Value item = a->items()[i];
                 Value tmp;
                 if (!force_deep(p, item, &tmp)) return unwind(out);
-                static_cast<ArrayObj*>(as_obj(p.stack.back()))->items()[i] = tmp;
+                a->items()[i] = tmp;
+                p.heap().remember_if_old(a, tmp);
             }
             as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
             *out = p.stack.back();

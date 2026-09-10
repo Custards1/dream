@@ -1390,7 +1390,7 @@ The surface falls into six groups:
 | configuration | `dream_vm_set_workers` `dream_vm_set_jit` `dream_vm_register_module` |
 | running | `dream_vm_run` `dream_vm_run_value` `dream_vm_result_text` `dream_vm_failed` |
 | reading values | `dream_value_type` and the `dream_value_*` accessors; `dream_force` `dream_vm_force_deep` |
-| building values | `dream_make_*`, `dream_array_set`, `dream_map_insert`, `dream_map_get` |
+| building values | `dream_make_*`, `dream_array_set` (takes the owning process), `dream_map_insert`, `dream_map_get` |
 | introspection | `dream_vm_reductions` `dream_vm_collections` `dream_vm_process_count` `dream_vm_module_count` `dream_vm_native_module_count` |
 
 Four things are worth knowing:

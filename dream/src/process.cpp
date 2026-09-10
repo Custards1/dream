@@ -83,7 +83,16 @@ Process::Process(Runtime& rt, uint64_t id) : rt_(rt), id_(id), heap_(64 * 1024) 
 
 Process::~Process() = default;
 
-void Process::maybe_collect() { heap_.collect(*this); }
+void Process::maybe_collect() {
+    // An old space past its threshold wants the full collection; a nursery
+    // past its mark just wants the minor one. A major handles the minor's job
+    // too (it promotes everything reachable), so when both are due the full
+    // collection wins.
+    if (heap_.major_due())
+        heap_.major_collect(*this);
+    else
+        heap_.minor_collect(*this);
+}
 
 void Process::visit_roots(Heap& heap) {
     // Everything the machine can still reach lives in these five places. That

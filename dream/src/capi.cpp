@@ -372,15 +372,17 @@ dream_value dream_make_array(dream_process* p, uint32_t len) {
     return reinterpret_cast<Process*>(p)->heap().make_array(len);
 }
 
-dream_result dream_array_set(dream_value array, uint32_t index, dream_value v) {
+dream_result dream_array_set(dream_process* p, dream_value array, uint32_t index, dream_value v) {
     array = resolve(array);
     if (!is_obj(array, ObjType::Array)) return DREAM_BAD;
     auto* a = static_cast<ArrayObj*>(as_obj(array));
     if (index >= a->len) return DREAM_BAD;
     // A host writing into an array it did not just build may be putting an
     // unforced value into one a deep force has already walked, so the promise
-    // that flag makes no longer holds.
+    // that flag makes no longer holds -- and the target may be old while the
+    // value is young, which the next minor collection needs to hear about.
     a->aux &= uint16_t(~AUX_DEEP_FORCED);
+    reinterpret_cast<Process*>(p)->heap().remember_if_old(a, v);
     a->items()[index] = v;
     return DREAM_OK;
 }

@@ -15,7 +15,7 @@ runtime, and — in progress — its self-hosted compiler.
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
-| `docs/` | `language-spec.md`, `builtins.md`. | — |
+| `docs/` | `language-spec.md`, `builtins.md`, `gc.md` (collector design). | — |
 
 ## Where this is going
 

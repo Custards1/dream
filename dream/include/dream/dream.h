@@ -105,7 +105,9 @@ uint64_t dream_value_process_id(dream_value v);
 dream_value dream_make_list_empty(void);
 dream_value dream_make_cons(dream_process* p, dream_value head, dream_value tail);
 dream_value dream_make_array(dream_process* p, uint32_t len);
-dream_result dream_array_set(dream_value array, uint32_t index, dream_value v);
+/* `p` owns `array`, which the C API needs so the written value's reachability
+   is tracked between collections. */
+dream_result dream_array_set(dream_process* p, dream_value array, uint32_t index, dream_value v);
 dream_value dream_make_map(dream_process* p, uint32_t capacity_hint);
 /* Returns the map to use afterwards: inserting may replace the object. */
 dream_value dream_map_insert(dream_process* p, dream_value map, dream_value key, dream_value v);

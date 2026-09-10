@@ -42,4 +42,15 @@ Value* dream_rt_frame_slots(Value frame) {
     return static_cast<FrameObj*>(as_obj(frame))->slots();
 }
 
+/// Store `v` into slot `index` of a frame, running the write barrier. A
+/// compiled function's own slots live in registers, so the interpreter's
+/// per-store barrier in Op::Bind never sees them; the spill back to the heap
+/// frame at a yield is where an old-to-young edge can appear, and where the
+/// next minor collection has to be told about it.
+void dream_rt_frame_store(Process* p, Value frame, uint32_t index, Value v) {
+    auto* f = static_cast<FrameObj*>(as_obj(frame));
+    p->heap().remember_if_old(f, v);
+    f->slots()[index] = v;
+}
+
 }  // extern "C"

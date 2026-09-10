@@ -182,6 +182,96 @@ static void test_gc_handles_cycles() {
     CHECK_EQ(static_cast<ConsObj*>(as_obj(rb))->tail, ra);
 }
 
+static void test_minor_collection_promotes_reachable() {
+    std::printf("minor collection promotes the reachable young\n");
+    Heap h(4096);
+    VectorRoots roots;
+
+    // All young. A chain of conses is held live; thousands of floats are not.
+    Value list = NIL;
+    for (int i = 0; i < 50; ++i) list = h.make_cons(h.make_float(double(i)), list);
+    for (int i = 0; i < 5000; ++i) (void)h.make_float(double(i));
+    roots.values.push_back(list);
+
+    CHECK(as_obj(list)->gc & GC_YOUNG);
+    h.minor_collect(roots);
+    CHECK_EQ(h.minor_collections(), uint64_t(1));
+    CHECK_EQ(h.major_collections(), uint64_t(0));
+
+    // The reachable chain survived, now tenured, in order.
+    Value cur = roots.values[0];
+    for (int i = 49; i >= 0; --i) {
+        CHECK(is_ptr(cur) && (as_obj(cur)->gc & GC_OLD));
+        CHECK(is_obj(static_cast<ConsObj*>(as_obj(cur))->head, ObjType::Float));
+        CHECK_EQ(static_cast<FloatObj*>(as_obj(
+            static_cast<ConsObj*>(as_obj(cur))->head))->value, double(i));
+        cur = static_cast<ConsObj*>(as_obj(cur))->tail;
+    }
+    CHECK(is_nil(cur));
+    CHECK_EQ(h.verify(roots), std::string());
+}
+
+static void test_minor_collection_leaves_old_space_alone() {
+    std::printf("minor collection leaves old space alone\n");
+    Heap h(4096);
+    VectorRoots roots;
+
+    // Tenure a chain, then drop every reference to it.
+    Value keep = NIL;
+    for (int i = 0; i < 10; ++i) keep = h.make_cons(h.make_float(double(i)), keep);
+    roots.values.push_back(keep);
+    h.minor_collect(roots);
+    Value kept = roots.values[0];
+    roots.values.clear();
+
+    // Reclaiming old objects is a major's job. A minor sweeps nothing, so the
+    // dead chain survives untouched.
+    uint64_t majors_before = h.major_collections();
+    h.minor_collect(roots);
+    CHECK_EQ(h.major_collections(), majors_before);
+    CHECK(h.owns(as_obj(kept), object_size(as_obj(kept))));
+
+    // A major actually lets it go: the live set falls to nothing, and the
+    // following trace shows a heap with no holes in it.
+    h.collect(roots);
+    CHECK_EQ(h.major_collections(), majors_before + 1);
+    CHECK_EQ(h.bytes_live(), size_t(0));
+    CHECK_EQ(h.verify(roots), std::string());
+}
+
+static void test_write_barrier_keeps_old_to_young() {
+    std::printf("write barrier keeps an old-to-young edge live\n");
+    Heap h(4096);
+    VectorRoots roots;
+
+    // An old array, tenured by a minor while still empty. The root is
+    // rewritten to the promoted copy; the local taken before stayed put.
+    Value arr = h.make_array(1);
+    roots.values.push_back(arr);
+    h.minor_collect(roots);
+    arr = roots.values[0];
+    CHECK(as_obj(arr)->gc & GC_OLD);
+
+    // A fresh young float that only the old array points at -- exactly the
+    // edge only the remembered set knows about.
+    Value fresh = h.make_float(9.5);
+    auto* a = static_cast<ArrayObj*>(as_obj(arr));
+    a->items()[0] = fresh;                  // the mutator's in-place store
+    h.remember_if_old(as_obj(arr), fresh);  // and the barrier it must call
+    CHECK_EQ(h.verify(roots), std::string());
+
+    h.minor_collect(roots);
+
+    // The float survived, promoted, and the store now points at the copy.
+    // Without the barrier the array would have been scanned from the roots
+    // alone, never seen the float, and lost the reference.
+    Value slot = static_cast<ArrayObj*>(as_obj(arr))->items()[0];
+    CHECK(is_obj(slot, ObjType::Float));
+    CHECK(as_obj(slot)->gc & GC_OLD);
+    CHECK_EQ(static_cast<FloatObj*>(as_obj(slot))->value, 9.5);
+    CHECK_EQ(h.verify(roots), std::string());
+}
+
 static void test_heap_verifier_accepts_a_healthy_heap() {
     std::printf("heap verifier accepts a healthy heap\n");
     Heap h(4096);
@@ -467,6 +557,9 @@ int main() {
     test_gc_preserves_sharing();
     test_gc_collapses_indirections();
     test_gc_handles_cycles();
+    test_minor_collection_promotes_reachable();
+    test_minor_collection_leaves_old_space_alone();
+    test_write_barrier_keeps_old_to_young();
     test_heap_verifier_accepts_a_healthy_heap();
     test_heap_verifier_catches_corruption();
     test_heap_verifier_follows_every_object_kind();
