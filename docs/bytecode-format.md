@@ -63,7 +63,7 @@ Unknown section kinds must be skipped, not treated as an error.
 | `FUNC` | 32 bytes (below)                                    | function records |
 | `GLBL` | 16 bytes (below)                                    | module-level bindings |
 | `IMPT` | `u32 path, u32 alias`                               | imports; both are `KSTR` indices |
-| `SPAN` | `u32 start, u32 end`                                | per-node source spans, parallel to `NODE` |
+| `SPAN` | `u32 start, u32 end`                                 | per-node source spans, parallel to `NODE` |
 
 Atoms are interned separately from strings so the VM can compare them by
 identity: two occurrences of `:ok` anywhere in a module share one atom index.

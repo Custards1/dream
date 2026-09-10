@@ -56,6 +56,7 @@ let ctx l = core.map_get l :ctx 0;
 let l_diags l = core.map_get l :diags [];
 
 let set_prog p l = core.map_put l :prog p;
+let set_res r l = core.map_put l :r r;
 let set_source i l = core.map_put l :source i;
 let set_ctx i l = core.map_put l :ctx i;
 
@@ -809,7 +810,16 @@ let place_captures caps l = {
 /// The function records, as an image stores them. The two halves of a function
 /// meet here: `scope` knows its name, arity, frame size and captures, and
 /// lowering knows which node its body turned out to be.
-let link_funcs r bodies l =
+let link_funcs r bodies l = link_funcs_from r bodies l 0;
+
+/// `link_funcs`, from function index `from` onward, appending to an image
+/// `funcs` list the caller already carries. A session links only what one entry
+/// added, so the records before them -- and the capture runs their functions
+/// placed -- are never rebuilt. `link_funcs` is this with `from` 0 on the empty
+/// list, which is why the two share the fold below.
+let link_funcs_from r bodies l from = {
+    let zip = list.zip (list.drop from (scope.funcs r))
+                       (list.range from (list.length (scope.funcs r)));
     list.fold (fn acc pair -> {
         let f = list.nth 0 pair;
         let fi = list.nth 1 pair;
@@ -833,9 +843,15 @@ let link_funcs r bodies l =
                  :captures_off => list.nth 1 placed,
                  :span_start => ast.span_start (core.map_get f :span ast.no_span),
                  :span_end => ast.span_end (core.map_get f :span ast.no_span) }]]
-    }) [l, []] (list.zip (scope.funcs r) (list.range 0 (list.length (scope.funcs r))));
+    }) [l, []] zip
+};
 
-let link_globals r l =
+let link_globals r l = link_globals_from r l 0;
+
+/// `link_globals`, from global record `from` onward, appending to a carried
+/// image `globals` list -- the sibling of `link_funcs_from`, same reason.
+let link_globals_from r l from = {
+    let fresh = list.drop from (scope.r_global_recs r);
     list.fold (fn acc g -> {
         let named = strk (list.nth 1 g) (list.head acc);
         let is_module = list.nth 2 g == :module;
@@ -847,7 +863,8 @@ let link_globals r l =
                  :flags => ir.g_exported
                            + (if builtins.is_impure_name (list.nth 1 g) { ir.g_impure }
                               else { 0 }) }]]
-    }) [l, []] (scope.r_global_recs r);
+    }) [l, []] fresh
+};
 
 let link_imports r l =
     list.fold (fn acc i -> {
@@ -874,13 +891,15 @@ let link_modules ld r l =
 
 /// The function `main!` compiles to, or nothing. The entry point is a global of
 /// the root module, which is the last one loaded -- everything else was loaded
-/// because it reached it.
+/// because it reached it. The *last* `main!` body wins: a session recompiles
+/// its entry point every entry on top of a carried resolution, so the newest
+/// body is the one appended last, and a fresh compile has exactly one anyway.
 let find_entry ld r = {
     let last = list.length (modules.modules ld) - 1;
     let hits = list.filter (fn b -> list.nth 0 b == last
                                     && scope.decl_name (list.nth 2 b) == "main!")
                            (scope.bodies r);
-    if list.is_empty hits { ir.no_node } else { list.nth 3 (list.head hits) }
+    if list.is_empty hits { ir.no_node } else { list.nth 3 (list.last hits) }
 };
 
 /// Lower every body the resolver queued, then link what comes out.
@@ -903,16 +922,24 @@ let settle_body l =
     if ir.node_count (prog l) >= 0 && ir.kid_count (prog l) >= 0
        && len (func_bodies l) >= 0 { l } else { l };
 
-let lower_program r = {
-    let start = lowering r ir.program 0;
-    let walked = list.fold_strict (fn acc b -> {
+/// Lower a slice of the resolver's bodies into an arena that may already hold
+/// the rest of the program. The narrow heart of the walk in `lower_program`:
+/// that pass calls it over everything it resolved, from an empty start, and a
+/// session calls it over the one body an entry added, into the arena it
+/// carried. Nodes are appended and a node's index never moves, so a carried
+/// arena is safe for exactly the reason the whole-program arena always was.
+let lower_from r low bodies =
+    list.fold_strict (fn acc b -> {
         let src = list.nth 1 b;
         let d = list.nth 2 b;
         let fi = list.nth 3 b;
         let got = lower_expr (scope.decl_body d) (set_ctx (list.nth 0 b) (set_source src acc));
         settle_body (set_func_body fi (list.nth 1 got)
                                   (mark_tail (list.nth 1 got) (list.head got)))
-    }) start (scope.bodies r);
+    }) (set_res r low) bodies;
+
+let lower_program r = {
+    let walked = lower_from r (lowering r ir.program 0) (scope.bodies r);
 
     let fs = link_funcs r (func_bodies walked) walked;
     let gs = link_globals r (list.head fs);

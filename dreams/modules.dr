@@ -598,6 +598,36 @@ let load_root! l file test_mode = {
     if test_mode { add_test_runner! loaded_all } else { loaded_all }
 };
 
+/// The session form of `load_root!`: a loader that already holds a program is
+/// given the root file again, and the root is re-read in place at the *same*
+/// index. Nothing else is touched -- a dependency stays visited, so its parse,
+/// its `by_name`/`by_path` entries and its position in the module list all
+/// survive. That is the whole point: a REPL compiles one entry at a time onto a
+/// carried loader instead of discovering and loading everything from scratch on
+/// every entry.
+///
+/// The old root has to be unmounted first, or it would be appended a second
+/// time and the module list would grow by one -- and with it, every module's
+/// index. Unmounting is exactly the three places the root is recorded: the
+/// module list (it is last), the by-name and by-path maps that point at it, and
+/// the visited mark that would otherwise make `load_file!` skip the re-read.
+let reload_root! l file test_mode = {
+    let name = canonical_name! l file (path.stem file);
+    match find l name {
+        () => load_root! l file test_mode,
+        root_index => {
+            let mods = modules l;
+            let deps = list.take (list.length mods - 1) mods;
+            let unmounted =
+                put :modules deps
+                    (put :by_name (core.map_remove (by_name l) name)
+                        (put :by_path (core.map_remove (by_path l) (path.absolute! file))
+                            (put :visited (core.map_remove (visited l) name) l)));
+            load_file! unmounted file name ast.no_span 0
+        }
+    }
+};
+
 /// Where a module is looked for when nothing said where to look.
 ///
 /// A compiler that can only find the standard library when it is told to is a

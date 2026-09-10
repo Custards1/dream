@@ -524,6 +524,65 @@ let module_span l mi = {
     if list.is_empty items { ast.no_span } else { ast.span (list.head items) }
 };
 
+/// Declare one global `let`: take a global index, bind the name, and queue its
+/// body for phase two. This is the loop `declare_module` folds over its lets,
+/// factored out because a session needs exactly the same for one statement of
+/// its root module -- and the order of a module's globals is decided in this one
+/// place, so session mode cannot take a different one without meaning different
+/// indices.
+let declare_one_let l mi od s = {
+    let owner = list.head od;
+    let d = list.nth 1 od;
+    let e = env_at s mi;
+    if has_global e (decl_name d) {
+        complain (decl_span d) ("`" + decl_name d + "` is already bound in this module")
+                 (modules.module_source (modules.module_at l owner)) s
+    }
+    else {
+        let got = take_global s;
+        let bound = set_env mi (with_global (decl_name d)
+                                    (if decl_impure d { :impure } else { :pure })
+                                    (list.nth 1 got) e)
+                            (record_global (list.nth 1 got) (decl_name d) :function ()
+                                           (list.head got));
+        if list.nth 2 od {
+            add_pending [mi, modules.module_source (modules.module_at l owner), d,
+                         list.nth 3 od] bound
+        }
+        else { bound }
+    }
+};
+
+/// Declare the items of a module that the caller has sliced out of its
+/// `:items` -- a session statement at a time. Same rules as `declare_module`:
+/// imports first, then `core`, then the `let`s. What it does not do is record
+/// the module: that happens once the module's globals are known, which a
+/// session does when it links rather than here.
+///
+/// A module being declared a second time carries its environment -- the name a
+/// fresh declaration binds is old news to an accumulation. Only the file index
+/// is refreshed, because a session re-reads its root each entry and the file it
+/// was parsed from moves.
+let declare_items! l mi items s0 = {
+    let s1 =
+        if list.length (envs s0) > mi { s0 }
+        else { add_env (env (modules.module_name (modules.module_at l mi))
+                            (modules.module_source (modules.module_at l mi))) s0 };
+    let s2 = set_env mi (core.map_put (env_at s1 mi) :source
+                                       (modules.module_source (modules.module_at l mi))) s1;
+    let pairs = list.map (fn i -> [mi, i]) items;
+    let imported = list.fold (fn acc item ->
+        match item {
+            [:import, _, _, _, _] => declare_import l mi item acc,
+            _ => acc,
+        }) s2 items;
+    let with_core = declare_core mi pairs imported;
+    let collected = collect_lets l pairs [] with_core;
+    let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
+                             (list.nth 1 collected) (list.head collected);
+    report_clashes mi (module_span l mi) declared
+};
+
 let declare_module l mi s0 = {
     // Where this module's globals begin. They are contiguous because this is
     // the only thing handing out indices and it finishes one module before it
@@ -561,28 +620,8 @@ let declare_module l mi s0 = {
     }) collected virtuals;
 
     // Declare the globals, and queue every body for phase two.
-    let declared = list.fold (fn acc od -> {
-        let owner = list.head od;
-        let d = list.nth 1 od;
-        let e = env_at acc mi;
-        if has_global e (decl_name d) {
-            complain (decl_span d) ("`" + decl_name d + "` is already bound in this module")
-                     (modules.module_source (modules.module_at l owner)) acc
-        }
-        else {
-            let got = take_global acc;
-            let bound = set_env mi (with_global (decl_name d)
-                                        (if decl_impure d { :impure } else { :pure })
-                                        (list.nth 1 got) e)
-                                (record_global (list.nth 1 got) (decl_name d) :function ()
-                                               (list.head got));
-            if list.nth 2 od {
-                add_pending [mi, modules.module_source (modules.module_at l owner), d,
-                             list.nth 3 od] bound
-            }
-            else { bound }
-        }
-    }) (list.nth 1 filled) (list.head filled);
+    let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
+                             (list.nth 1 filled) (list.head filled);
 
     let checked = report_clashes mi (module_span l mi) declared;
     // A module that declares a virtual is abstract: it has a hole in it, and
@@ -1334,25 +1373,33 @@ let check_body l p r = {
 
 // --- the entry point ---------------------------------------------------------
 
-/// Resolve and purity-check a whole loaded program.
+/// Declare every module a loader holds, in the loader's order. A fresh compile
+/// does this and then checks everything; session mode declares a slice of its
+/// root on top of the carried result for a warm start.
+let declare! l =
+    list.fold (fn acc mi -> declare_module l mi acc) state
+              (list.range 0 (list.length (modules.modules l)));
+
+/// Resolve the newly-declared part of a program on top of a carried resolution.
 ///
-/// Answers the resolver: the diagnostics, and -- just as importantly -- what
-/// every name turned out to mean, every function the program contains, and
-/// which function holds each module's globals. Lowering reads all of that
-/// rather than deriving it a second time.
-let resolve! l = {
-    let declared = list.fold (fn acc mi -> declare_module l mi acc) state
-                             (list.range 0 (list.length (modules.modules l)));
-    let r0 = core.map_put
-                 (core.map_put
-                     (core.map_put (resolver (envs declared)) :imports (s_imports declared))
-                     :module_recs (s_module_recs declared))
-                 :diags (diags declared);
-    let named = core.map_put r0 :defs
-        (list.map (fn p -> [list.nth 0 p, list.nth 1 p, decl_name (list.nth 2 p),
-                            decl_span (list.nth 2 p)])
-                  (pending declared));
-    let walked = list.fold (fn acc p -> check_body l p acc) named (pending declared);
+/// `declared` is the scope state after the new declarations; `r0` the resolver
+/// everything up to them produced, with its shared tables already filled in;
+/// `from` how many queued bodies belong to earlier declarations and only need
+/// their indices this time; `s_pre` the scope state as it was before this
+/// declaration, whose global records say how many globals already had records.
+///
+/// A fresh compile calls this the way `resolve!` always has -- `from` 0, `s_pre`
+/// the empty `state` -- so one function serves both, and a session cannot take
+/// a different path from a build of the same text.
+let resolve_from! l declared r0 from s_pre = {
+    let base = core.map_put (core.map_put r0 :envs (envs declared)) :frames [];
+    let new_pending = list.drop from (pending declared);
+    let named = core.map_put base :defs
+        (list.append (defs base)
+                     (list.map (fn p -> [list.nth 0 p, list.nth 1 p, decl_name (list.nth 2 p),
+                                         decl_span (list.nth 2 p)])
+                               new_pending));
+    let walked = list.fold (fn acc p -> check_body l p acc) named new_pending;
 
     // A global that names a function could not say which function until the
     // function existed, which is now. Joining here rather than threading a
@@ -1381,14 +1428,39 @@ let resolve! l = {
         }
     }) (core.map_new ()) (bodies walked);
 
-    core.map_put (core.map_put walked :wrappers aliased) :global_recs
-        (list.map (fn g ->
-             match list.nth 2 g {
-                 :function => [list.nth 0 g, list.nth 1 g, :function,
-                               core.map_get by_global (list.nth 0 g) no_function],
-                 _ => g,
-             })
-             (s_global_recs declared))
+    // Only the globals this declaration added get records, and they go on the
+    // end of the ones already in the carried resolution.
+    let fresh =
+        list.drop (list.length (s_global_recs s_pre)) (s_global_recs declared);
+    let filled = list.map (fn g ->
+         match list.nth 2 g {
+             :function => [list.nth 0 g, list.nth 1 g, :function,
+                           core.map_get by_global (list.nth 0 g) no_function],
+             _ => g,
+         }) fresh;
+
+    core.map_put
+        (core.map_put walked :wrappers
+            (list.fold (fn acc kv ->
+                 core.map_put acc (list.head kv) (list.nth 1 kv))
+                       (wrappers r0) (core.map_pairs aliased)))
+        :global_recs (list.append (r_global_recs r0) filled)
+};
+
+/// Resolve and purity-check a whole loaded program.
+///
+/// Answers the resolver: the diagnostics, and -- just as importantly -- what
+/// every name turned out to mean, every function the program contains, and
+/// which function holds each module's globals. Lowering reads all of that
+/// rather than deriving it a second time.
+let resolve! l = {
+    let declared = declare! l;
+    let r0 = core.map_put
+                 (core.map_put
+                     (core.map_put (resolver (envs declared)) :imports (s_imports declared))
+                     :module_recs (s_module_recs declared))
+                 :diags (diags declared);
+    resolve_from! l declared r0 0 state
 };
 
 // --- wrappers ---------------------------------------------------------------------
