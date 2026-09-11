@@ -202,16 +202,23 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
         p->status.store(p->failed ? ProcStatus::Failed : ProcStatus::Finished,
                         std::memory_order_release);
         waiters.swap(p->waiters);
-    }
 
-    // Record the failure only when nobody is waiting for it. A joiner receives
-    // the error as a value and decides what it means; reporting it as well
-    // would turn a handled failure into a spurious complaint.
-    if (p->failed && !had_waiters) {
-        std::string text;
-        stringify(*p, p->result, &text);
-        std::lock_guard<std::mutex> g(failures_mutex_);
-        failures_.emplace(p->id(), "process " + std::to_string(p->id()) + ": " + text);
+        // Record the failure only when nobody is waiting for it. A joiner
+        // receives the error as a value and decides what it means; reporting it
+        // as well would turn a handled failure into a spurious complaint. The
+        // insert stays under the waiters lock, because that is the lock a
+        // joiner takes to confess a process done: a joiner that reads the
+        // failed status here must also see the record just made. Recording
+        // outside the lock let a join that ran in the gap erase nothing -- the
+        // done status was set and the failure not yet recorded -- and the
+        // handled failure was then reported at shutdown as uncaught, whenever
+        // the timer happened to put the join exactly there.
+        if (p->failed && !had_waiters) {
+            std::string text;
+            stringify(*p, p->result, &text);
+            std::lock_guard<std::mutex> gf(failures_mutex_);
+            failures_.emplace(p->id(), "process " + std::to_string(p->id()) + ": " + text);
+        }
     }
 
     live_.fetch_sub(1, std::memory_order_acq_rel);
