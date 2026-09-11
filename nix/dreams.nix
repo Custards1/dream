@@ -29,6 +29,11 @@ stdenvNoCC.mkDerivation {
 
   nativeBuildInputs = [ dreamVm ];
 
+  # The build writes straight into $out; the stdenv default `make install`
+  # would otherwise run the CMake-generated Makefile at the repository root
+  # (which wants cmake that is not here).
+  dontInstall = true;
+
   # The compiler must still reproduce itself from this source: the image the
   # seed builds and the image that image builds must be byte-identical. That
   # equality is what says the compiler in the tree and the compiler in the

@@ -2,8 +2,11 @@
 
 The design lives in [session-mode.md](session-mode.md). This file says where the
 implementation actually is, so the work can be picked up from here without
-re-deriving it. Today: **the refactors `session.dr` needs are in and green; the
-session module itself is not yet written.**
+re-deriving it. Today: **`dreams/session.dr` is written and wired into `repl.dr`,
+the live session works end to end, and `just test` is green. The two issues the
+last session left are fixed — the first-entry crash and the `compile!` shape
+mismatch (below). The seed has not been re-bootstrapped yet; see "Ground
+rules".**
 
 ## Ground rules
 
@@ -25,160 +28,180 @@ survive. `modules.load!` is untouched.
   `:source`, imports fold, `declare_core`, `collect_lets`, `declare_one_let`
   fold, `report_clashes`. It does **not** record the module — a session does that
   at link time.
-- `resolve!` replaced by `declare!`, `resolve_from! l declared r0 from s_pre`, and
-  a `resolve!` wrapper = `resolve_from! l declared r0 0 state` (scope.dr:1379-1464).
-  `resolve_from!` appends: new pending bodies, `:defs`, `:wrappers` (onto the
-  carried `wrappers r0`), and fills only `drop (len (s_global_recs s_pre))
-  (s_global_recs declared)`. `from` is how many pending bodies belong to earlier
-  declarations; `s_pre` is the scope state before this declaration.
+- `declare!` (scope.dr:1379), `resolve_from! l declared r0 from s_pre`
+  (scope.dr:1394), and a `resolve!` wrapper (scope.dr:1456) =
+  `resolve_from! l declared r0 0 state`. `resolve_from!` appends: new pending
+  bodies, `:defs`, `:wrappers` (onto the carried `wrappers r0`), and fills only
+  `drop (len (s_global_recs s_pre)) (s_global_recs declared)`. `from` is how
+  many pending bodies belong to earlier declarations; `s_pre` is the scope state
+  before this declaration.
 
 ### lower.dr
 - `set_res r l` (lower.dr:59).
-- `link_funcs_from r bodies l from` / `link_globals_from r l from` (lower.dr:820,
-  853), with `link_funcs`/`link_globals` as `... from 0` wrappers.
-- `lower_from r low bodies` (lower.dr:931) — walks a slice of resolved bodies into
+- `link_funcs_from r bodies l from` / `link_globals_from r l from` (lower.dr:849,
+  882), with `link_funcs`/`link_globals` as `... from 0` wrappers (lower.dr:842,
+  878).
+- `lower_from r low bodies` (lower.dr:960) — walks a slice of resolved bodies into
   a carried arena (forces with `fold_strict`, `set_res r` first). Sets `:r`, so
   the *first* call must set the resolver, not just the bodies.
-- `find_entry ld r` now `list.last hits` (lower.dr:897) — the last `main!` body
-  wins, which is what session mode's per-entry transient `main!` needs.
+- `find_entry ld r` (lower.dr:926) is now `list.last hits` (lower.dr:931) — the
+  last `main!` body wins, which is what session mode's per-entry transient
+  `main!` needs.
 
-Both refactors build warning-free from the seed and `test-dreams` is fully green.
+All of it builds warning-free from the seed and `just test-dreams` is fully
+green (10 `when test` cases in session.dr, 11 in repl.dr).
 
-## The compile! pipeline (settled design)
+## The module as it is (dreams/session.dr)
 
-New file `dreams/session.dr`, importing std.console, std.core, std.list, std.str,
-dreams.ast, dreams.diag, dreams.emit, dreams.ir, dreams.lower, dreams.modules,
-dreams.parser, dreams.path, dreams.scope. (Repl already imports ast/diag/emit/
-lower/modules/parser/path/scope + std.*; session.dr needs them for parsing the
-entry text and finalizing.)
+`session.dr` imports std.core, std.io, std.list, std.str; then dreams.diag,
+dreams.emit, dreams.ir, dreams.lower, dreams.modules, dreams.parser,
+dreams.scope. `dreams.ast` and `dreams.path` are not needed — the plan's
+earlier import list was wrong about those (repl's helpers stay out; `io.open!`
+is used directly for writing).
 
-### The engine record
-```
-%{ :loader, :state, :resolver, :low, :base, :root_globals_from,
-   :funcs, :globals, :imports, :modules, :base_text }
-```
-`() means "no carried state" (a fresh session, or after a full rebuild). Image
-lists live here, not in `low.prog`. The root is always the last loader module,
-so no `root_mi` field. `base` = how many root items are already declared (imports
-+ defs lets). `base_text` = `str.join_str "\n" (imports ++ defs)` of the session
-that produced this engine.
+### The two carried records
+- **`engine`** (session.dr:99) — `%{ :loader, :state, :resolver, :low, :base,
+  :root_globals_from, :funcs, :globals, :imports, :modules, :base_text }`, the
+  whole of the disposable compiler state one entry carries to the next. `()`
+  means "nothing carried". Root is always the last loader module, so no
+  `root_mi` field. `base` = how many root items are already declared (imports +
+  defs lets). `base_text` = `str.join_str "\n" (imports ++ defs)` of the session
+  that produced this engine.
+- **`pre`** (session.dr:185) — the per-entry lowering context, `%{ :s_pre,
+  :resolver, :low, :root_globals_from, :funcs, :globals, :imports, :modules,
+  :booted }`. `s_pre` is the scope state before this entry's declarations, which
+  is how `resolve_from!` learns what the entry added; `booted` says whether
+  module records must be linked freshly (a boot) or travel in the engine (a
+  carried entry). The plan's engine record plus this is the whole difference
+  from the design doc.
 
-### Entry routing
-`compile! roots cfg source image text base_text engine base`
-→ `[`[:ok, image], engine', base']` or `[[:error, msg], engine, base]` (engine
-unchanged on error).
+### Routing: `route text base_text engine base` (session.dr:161)
+Parses the text and answers one of three ways in:
+- `:reboot` — `engine == ()`, or `base_text` no longer starts the text (an
+  import was inserted before the definitions). Goes to `boot!`.
+- `[:proceed, items]` — the header held and every item in the slice is a `let`
+  (`carried_ok`, session.dr:146). Goes to `proceed!`.
+- `:fresh` — the text will not parse, or the slice is not all `let`s (`mod`,
+  `when`, `virtual`, `derive`, a second import). Goes to `fresh_build!`.
 
-1. `write_file! source text` (failure → error, engine unchanged).
-2. `engine == ()` → **boot**.
-3. else if `not (str.starts_with base_text text)` → **full rebuild** (a new
-   import changed the header — reload_root! can't discover a new dependency).
-4. else parse `text` (`parser.parse_module`), `count = len items`,
-   `slice = items[base..count-1)`, `main_item = items[count-1]`.
-5. if any slice item is not `[:let]` → **full rebuild** (`mod`, `when`, `virtual`,
-   `derive`, a second import... all land here; fragile cases).
-6. else → **case A** (data below, with `slice` possibly `[]` for an expression
-   entry — an empty slice is fine and valid).
+`entry_partition items base` (session.dr:135) splits the parsed items into
+`[slice, main_item]` — everything `base` does not cover, and the last item,
+which is always the transient `main!`.
 
-**Boot** (engine never carried before): fresh `modules.load! source roots cfg
-false`, then the case-A steps 1-3 with `s_pre = scope.state`, `from = 0`,
-`r0` freshly seeded, `f_from = g_from = bodies0 = 0`. The entry's imports/defs
-are all in the slice; `base` starts at 0.
+### The three ways in
+- **`boot!`** (session.dr:311) — first entry or header changed. Fresh
+  `modules.load!`, declare the dependencies (`declare_module` fold), seed `r0`
+  the way `scope.resolve!` does (resolver + envs, `:imports`, `:module_recs`
+  from the state, `:diags => []`), `lower.lowering r0 ir.program 0`, then
+  `declare_items!` + `resolve_from!` for the slice. Everything up to the
+  transient `main!` becomes the carried engine, so the *next* entry is
+  incremental.
+- **`proceed!`** (session.dr:348) — the common case. `reload_root!`, then the
+  same declare/resolve/lower/link steps on top of the carried engine.
+  `compile_slice!` (session.dr:196) is the shared heart: resolve the defs, lower
+  and link them, stuff the linked lists into the prog long enough for
+  `settle_comps!`, check diagnostics, and answer the engine to carry. `base`
+  grows by the slice length.
+- **`fresh_build!`** (session.dr:372) — a full build that carries nothing:
+  `modules.load!` + `scope.resolve!` + `lower.link!`, answer `[:ok, image, (),
+  0]` or an error, so the session re-boots next entry.
 
-**Full rebuild**: `modules.load!` + `scope.resolve!` + `lower.link!`, return
-`[[:ok, image], (), 0]` (or error). Every later entry until the session changes
-again re-boots.
+`compile! roots cfg source image text base_text engine base` (session.dr:389)
+writes the source then dispatches on `route`.
 
-### Case A steps (one entry, defs then transient main)
+### The transient `main!`
+`main_step!` (session.dr:253) declares and resolves the entry's `main!` on top
+of the carried engine, lowers *only that body*, links its funcs/globals, settles
+comps, and hands off to `finalize!` (session.dr:289), which builds the root
+module record (globals from `engine_root_from`, count = `len globals2 -
+root_globals_from`) and writes the image. The `main!` is deliberately not part
+of what is carried — its indices are only good for this image; the next entry's
+`main!` is a fresh global.
 
-Prep:
-- `l = modules.reload_root! engine.loader source false`
-- `mi = len (modules.modules l) - 1` (root is last)
-- `state_pre = engine.state`; `r0 = engine.resolver`; `low0 = engine.low`
-- `root_globals_from = engine.root_globals_from` (boot: `scope.next_global state_deps`)
-- `f_from = scope.func_count r0` (boot: 0)
-- `g_from = len engine.globals` (boot: 0)
-- `bodies0 = len (scope.bodies r0)` (boot: 0)
-- carried imports = `engine.imports`; carried modules = `engine.modules`
-- `base_text` passed at boot = the current session's header; store it in engine'.
+## Where it was: the two issues (both fixed)
 
-1. **Declare+resolve defs:** `state1 = scope.declare_items! l mi slice state_pre`;
-   `r1 = scope.resolve_from! l state1 r0 (len (pending state_pre)) state_pre`.
-   (Boot: `state_deps = list.fold (declare_module l i) scope.state
-   (list.range 0 mi)`; seed `r0` exactly as `scope.resolve!` does (resolver + envs,
-   `:imports`, `:module_recs`, `:diags` from `state_deps`); `low0 =
-   lower.lowering r0 ir.program 0`; then `state1 = declare_items!` on `state_deps`,
-   `resolve_from! l state1 r0 0 scope.state`.)
-2. **Lower+link defs:** `n_low = lower.lower_from r1 low0 (drop bodies0
-   (scope.bodies r1))`; `[lf1, funcs1] = link_funcs_from r1 (func_bodies n_low)
-   n_low f_from`; `[lg1, globals1] = link_globals_from r1 (head lf1) g_from`;
-   `[li1, imports_all] = link_imports r1 (head lg1)`; `imports1 = carried ++
-   (drop (len carried) imports_all)`.
-3. **Module recs:** boot only, `lower.link_modules l r1 (head li1)` → carried
-   modules for PRE. (Case A carries them unchanged.)
-4. **Stuff + settle:** put `:funcs <= funcs1`, `:globals <= globals1`,
-   `:imports <= imports1` into `prog (head li1)` temporarily — the comp-eval
-   image is `ir.finish` of that prog — then `low1 = lower.settle_comps!
-   (set_prog p1 (head li1))`. The defs comps *must* be settled here: the carried
-   PRE arena must hold values, not placeholders.
-5. **Defs diagnostics:** if `error_count (modules.diags l ++ scope.r_diags r1 ++
-   lower.l_diags low1) > 0` → `[[:error, render], engine, base]` now (no main
-   step, engine untouched).
-6. **PRE capture:** `engine1 = %{ loader => l, state => state1, resolver => r1,
-   low => low1, base => base + len slice, root_globals_from,
-   funcs => funcs1, globals => globals1, imports => imports1,
-   modules => deps_recs, base_text }`. This is what a successful entry carries;
-   `main!` is declared *on top of it* and discarded.
-7. **Main step:** `state2 = declare_items! l mi [main_item] state1`;
-   `r2 = resolve_from! l state2 r1 (len (pending state1)) state1`;
-   `lower_from r2 low1 (drop (len (bodies r1)) (bodies r2))` → settle, link
-   funcs from `scope.func_count r1`, globals from `len globals1`. Note main's
-   global/function indices are retained and reused by the next entry's `main!`
-   — each emitted image is self-consistent.
-8. **Finalize:** root rec =
-   `%{ :name => intern(module_name root_mod), :source => intern(module_path
-   root_mod), :globals_start => root_globals_from, :globals_count =>
-   len globals2 - root_globals_from, :flags => 0, :derives => ir.no_node }`.
-   `p = prog low2` with `:modules <= deps_recs ++ [root_rec]`,
-   `:entry <= lower.find_entry l r2`, `:module_name`, `:source_name`.
-   `ds = modules.diags l ++ scope.r_diags r2 ++ lower.l_diags low2`
-   (render via `diag.render_all`, path via `as_session` — repl's helper, moved
-   here). Success requires writing the image with `emit.to_binary (ir.finish p)`.
+The unit tests pass because they only exercise the pure, routing-level pieces.
+Until this last session the live session did not work, for two reasons:
 
-### Known accepted divergences
+1. **The first entry crashed with `head needs a non-empty list`, dying in
+   `finalize!`.** `printf 'let a = 1;' | dream build/dreams.dream --repl` booted
+   through all seventeen debug traces (T1–T13) and died inside
+   `finalize!`. The root cause is a copy-paste from `lower.link!`: that
+   function gets the lowering record as `list.head ms` because `ms` is the
+   `[l, recs]` pair that `link_modules` returns, but `finalize!`'s `low2`
+   parameter *is* the lowering record itself. `lower.strk (modules.module_name
+   root) (list.head low2)` asked `core.head` for the head of a map record —
+   and `core.head` raises exactly that "not a list" error for any non-list
+   (dream/src/builtins.cpp:903-907). The fix is `... root) low2`. It is a
+   laziness trap to remember: nothing forces `low2` until a read reaches it,
+   so the crash surfaced only at the bottom of `finalize!` (forcing
+   `ir.node_count`), nowhere near where the bad `head` was written.
+2. **`compile!`'s answer did not match what `repl.dr` matches.** `boot!` and
+   `proceed!` returned `[:ok, img, en, engine_base en]` (four elements), and
+   errors returned `[:error, msg, engine, base]`; `define!` (repl.dr:241) and
+   `evaluate!` (repl.dr:257) match `[[:ok, _], en, nb]` / `[[:error, why], _, _]`
+   (three elements — the design's `[[:ok, image], engine', base']`). It stayed
+   latent only because the first-entry crash fired before `compile!` returned.
+   Fixed by giving the *outer* answer the nested shape while keeping the inner
+   `compile_slice!`/`main_step!` 2-element results: `boot!`/`proceed!` wrap
+   them as `[[:ok, img], en, engine_base en]` / `[[:error, msg], engine, base]`,
+   and `fresh_build!`/`compile!` match the same contract. A subtlety that bit
+   during the fix: the *inner* `match` arms (`compile_slice!` → `[:ok, en]`,
+   `main_step!` → `[:ok, img]`) must stay 2-element, or a legitimate error
+   result becomes a `:match_error` instead of a rendered diagnostic.
+
+The debug scaffolding is gone: the seventeen `console.error!` traces (T1–T13)
+and the temporary `// TEMP import std.console` were removed, and `finalize!`
+is its presentable form. `just test-dreams` and the full `just test` are green.
+
+## repl.dr wiring (done)
+
+- `write_all!`/`write_file!`/`as_session` moved to session.dr (63, 75, 89);
+  repl imports `dreams.session as session_mod` (repl.dr:36) and calls
+  `session_mod.as_session` in its tests.
+- Session record is now four fields — `session imports defs engine base`
+  (repl.dr:53) — with `engine` defaulting to `()` and `base` to 0;
+  `empty_session = session base_imports [] () 0` (repl.dr:60).
+- `define!` (repl.dr:238) builds `grown`, calls `session_mod.compile!` with
+  `(program grown quiet_main) / (base_text grown) / (engine s) / (base s)`, and
+  returns `grown` updated with the new engine/base on `[:ok, _]`, `s` untouched
+  on error. Same shape for `evaluate!` (repl.dr:256), which also runs the image.
+- `:reset` (repl.dr:315) answers `[:go, empty_session]`; `step!` is unchanged in
+  shape.
+
+## Known accepted divergences
+
 - An entry's `main!` is a fresh global/function each time; a *definition* or
   `comp` that names `main!` can error where a fresh build would not.
 - Comp value nodes land after the new bodies' nodes (not interleaved) — the
   reason byte-equality is off the table.
-
-## repl.dr wiring (next)
-
-- Move `write_all!`/`write_file!`/`as_session` into session.dr (repl currently
-  defines them at repl.dr:160-186); repl imports `dreams.session`.
-- **Collision:** repl has local `let session imports defs = ...` (repl.dr:51), and
-  `import dreams.session;` would bind `session` too → import with an alias
-  (`import dreams.session as session_mod;` or rename the record helpers).
-- Session record gains `:engine`/`:base`:
-  `let session imports defs engine base = %{ ... }`;
-  `empty_session = session base_imports [] () 0`.
-- `define!` (repl.dr:269): build `grown`, then
-  text = `program grown quiet_main`, base_text = header of `grown`, call
-  `session_mod.compile!`; on `[:ok, _]` return `grown` updated with engine'/base';
-  on error print and keep `s` untouched.
-- `evaluate!` (repl.dr:283) must **return the session** (currently `()`), updating
-  engine/base on a successful compile even though the defs are unchanged — an
-  expression entry can be the one that booted, and its PRE is what makes the next
-  entry incremental. `step!` (repl.dr:345) becomes `[:go, evaluate! ...]`.
-- `:reset` (repl.dr:331) → `empty_session` (engine `()`, base 0).
-- repl tests: `as_session` case moves with the helper (call it via the alias);
-  `program`/`defs`/`imports` tests unchanged.
+- **New import ≠ cheap case B.** The design prices a header change as
+  re-resolving just the root segment (session-mode.md, "Case B"). The
+  implementation chose `:reboot` instead: one full recompile that carries
+  nothing, whose by-product is the engine up to the transient `main!`, so the
+  *next* entry is incremental again. Simpler to reason about; the whole text is
+  reparsed once.
 
 ## Breadcrumbs
-- `list.all`, `list.take`, `list.drop`, `list.fold_strict`, `list.last` all exist
-  in mind/std/list.dr (verified).
-- `parser.parse_module` → `[:ok, items]` / `[:error, m, offset]`.
-- `ir.program`/`ir.finish` (ir.dr:197, 295); `lower.strk` for interning names.
-- `lower.link_modules ld r l` returns `[l, recs]`, rec shape at lower.dr:885 —
-  mirror it for the root rec.
+
+- `list.all`, `list.take`, `list.drop`, `list.fold_strict`, `list.last` all
+  exist in mind/std/list.dr; `str.starts_with` in mind/std/str.dr (verified).
+- `parser.parse_module` → `[:ok, items]` / `[:error, m, offset]` (parser.dr:1082).
+- `ir.program` (ir.dr:197), `ir.finish` (ir.dr:295), `ir.no_node` (ir.dr:138);
+  `lower.strk` (lower.dr:823) for interning names.
+- `lower.link_imports` (lower.dr:898), `lower.link_modules` (lower.dr:907) —
+  rec shapes there; the root rec is built by hand in `finalize!` to mirror them.
 - Caller that must keep working: `lucid/analysis.dr:65` uses `scope.resolve!`.
-- `just test-dreams` collects `when test` in repl.dr (10 cases) and the new
-  session.dr module once it exists.
+- `just test-dreams` collects `when test` in repl.dr (11 cases) and session.dr
+  (10 cases).
+- The compiler a `dream` run uses must come from a rebuild after `session.dr`
+  edits: `./build-dream/bin/dream dreams/bootstrap/dreams.dream -o
+  build/dreams.dream -L mind -L . dreams/main.dr` (writing to `build/dreams.dream`
+  and reading from it in one command truncates the input; write to a temp path
+  and copy).
+- Live session check-cases that work now: `let a = 1;` then `let b = a + 1;`
+  then `b` (prints 2); `:list` shows the program; redefining `a` renders
+  `` `a` is already bound in this module `` as a session diagnostic; `:reset`
+  empties it and a fresh `a` then fails resolution until redefined. A runtime
+  error in an entry (e.g. `a b` where `a` is 1) is relayed from the child VM's
+  stderr and the session survives.

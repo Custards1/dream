@@ -179,7 +179,15 @@ let eq_const v k l = binary :eq v k l;
 let callee_resolution callee l =
     match callee {
         [:name, _, span]     => lookup span l,
-        [:field, _, _, span] => lookup span l,
+        [:field, _, field, span] =>
+            // As in `lower_field`, the dotted span may resolve to the base
+            // value rather than the member -- a field of a value is not a
+            // callee resolution, and a call of one must lower as an ordinary
+            // expression (and must not be taken for a wrapper's target).
+            match lookup span l {
+                () => (),
+                found => if resolved_name found == field { found } else { () },
+            },
         _ => (),
     };
 
@@ -230,7 +238,14 @@ let lower_callee callee found l =
         [:name, n, span] =>
             match found { () => lower_expr callee l, _ => lower_resolved n found span l },
         [:field, _, field, span] =>
-            match found { () => lower_expr callee l, _ => lower_resolved field found span l },
+            match found {
+                () => lower_expr callee l,
+                _ =>
+                    // A resolution naming the base rather than the field is
+                    // nothing to do with a callee; the call is ordinary.
+                    if resolved_name found == field { lower_resolved field found span l }
+                    else { lower_expr callee l },
+            },
         _ => lower_expr callee l,
     };
 
@@ -460,24 +475,38 @@ let rec lower_seq op items l = {
     [inherit (list.nth 1 made) (list.nth 1 done) (list.head made), list.nth 1 made]
 };
 
+/// A runtime field read: the object is a value and the field is looked up on
+/// it when the program runs.
+let lower_value_field obj field l = {
+    let o = lower_expr obj l;
+    let named = ir.intern_str field (prog (list.head o));
+    let made = emit (ir.node :field (list.nth 1 o) (list.nth 1 named) ir.no_node)
+                    (set_prog (list.head named) (list.head o));
+    [inherit (list.nth 1 made) [list.nth 1 o] (list.head made), list.nth 1 made]
+};
+
 /// A module member written with a dot. When the object is a namespace the whole
 /// thing is one name, already resolved; otherwise it is a field of a value.
+///
+/// The field node's span begins where the base name's does -- the parser widens
+/// the primary's span over the dotted name -- so the lookup above may answer
+/// the *base's* resolution rather than the member's. Only a namespace member's
+/// resolution names the field it ends in; a resolution naming anything else is
+/// the base value leaking through, and the field is read at run time.
 let rec lower_field e span l =
     match lookup span l {
         () =>
             match e {
-                [:field, obj, field, _] => {
-                    let o = lower_expr obj l;
-                    let named = ir.intern_str field (prog (list.head o));
-                    let made = emit (ir.node :field (list.nth 1 o) (list.nth 1 named) ir.no_node)
-                                    (set_prog (list.head named) (list.head o));
-                    [inherit (list.nth 1 made) [list.nth 1 o] (list.head made), list.nth 1 made]
-                },
+                [:field, obj, field, _] => lower_value_field obj field l,
                 _ => emit_leaf :unit l,
             },
-        // The whole dotted name is one resolved thing; the field's own
-        // spelling is what decides whether reaching it is an effect.
-        _ => match e { [:field, _, field, _] => lower_name field span l, _ => emit_leaf :unit l },
+        found =>
+            match e {
+                [:field, obj, field, _] =>
+                    if resolved_name found == field { lower_name field span l }
+                    else { lower_value_field obj field l },
+                _ => emit_leaf :unit l,
+            },
     };
 
 let rec lower_block stmts span l = {

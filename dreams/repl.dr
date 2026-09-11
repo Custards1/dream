@@ -3,24 +3,27 @@
 // A REPL for a whole-program language is not the usual loop. There is no
 // environment to extend one binding at a time: a Dream program is compiled all
 // at once, from a root file, and the meaning of a name depends on every other
-// name in the program. So this keeps the only thing that can be kept -- the
-// *text* of what has been defined -- and compiles the whole of it again on
-// every entry. The session is a source file being written a line at a time, and
-// each entry is a full build of it.
+// name in the program. So this keeps the only thing a reusable runtime cannot --
+// the *text* of what has been defined -- and both halves of the session are
+// text: the imports, which lock what the session's names mean, and the
+// definitions the entries have accumulated.
 //
-// That sounds expensive and is not: the compiler is the one running the loop,
-// so a rebuild is a few thousand nodes through passes that already exist, with
-// no process to start and no file to find. What it buys is that the REPL cannot
-// disagree with the compiler about anything, because it *is* the compiler --
-// a name means here exactly what it would mean in a file.
+// The compiler is the one running the loop, so a new entry need not rebuild
+// everything. `dreams.session` compiles only the entry onto the state the
+// previous one left behind: the resolved names, the lowered arena, the linked
+// tables, the loader holding the parse. A definition keeps its meaning because
+// its text does -- and, unlike a value, so does the compile-time state that
+// names it, because the compiler really is still running between entries. Only
+// when an entry changes the imports is the whole program re-read, and even then
+// the result is carried forward, so the entry after that is incremental again.
 //
 // Running the result is the one thing that must leave: an image needs a VM, and
 // this is a Dream program rather than the VM itself. So an entry that produces
 // a value is run as a child VM (`$DREAM`, or `dream` on the path) and its
 // output relayed. The consequence is worth stating plainly, because it is
 // visible from the prompt: nothing *runtime* survives between entries. A
-// definition persists because its text does; a value does not, and neither does
-// a file left open or a process left running.
+// definition keeps its meaning; its value does not, and neither does a file
+// left open or a process left running.
 import std.console;
 import std.core;
 import std.io;
@@ -28,14 +31,9 @@ import std.list;
 import std.os;
 import std.str;
 
-import dreams.ast;
-import dreams.diag;
-import dreams.emit;
-import dreams.lower;
-import dreams.modules;
 import dreams.parser;
 import dreams.path;
-import dreams.scope;
+import dreams.session as session_mod;
 
 let prompt = "dream> ";
 let continued = "  ...> ";
@@ -45,14 +43,23 @@ let continued = "  ...> ";
 // Two lists of source lines, kept apart because imports must come first in a
 // module. `std.console` is always there: the loop prints the value of every
 // entry, so it is part of the program whether or not anyone asked for it.
+//
+// The `engine` and `base` are `dreams.session`'s carry, keyed to this text: the
+// compile-time state the previous entry left behind, and how many of the root
+// module's items it already declared. `()` and 0 are "nothing carried yet".
 
 let base_imports = ["import std.console;"];
 
-let session imports defs = %{ :imports => imports, :defs => defs };
+let session imports defs engine base =
+    %{ :imports => imports, :defs => defs, :engine => engine, :base => base };
 let imports s = core.map_get s :imports base_imports;
 let defs s    = core.map_get s :defs [];
+let engine s  = core.map_get s :engine ();
+let base s    = core.map_get s :base 0;
 
-let empty_session = session base_imports [];
+let empty_session = session base_imports [] () 0;
+
+let with_engine e b s = core.map_put (core.map_put s :engine e) :base b;
 
 /// An import already in the session is not added twice -- a module imported
 /// twice is an error, and typing the same line again is not a mistake worth
@@ -63,9 +70,14 @@ let with_import i s =
 
 let with_def d s = core.map_put s :defs (list.append (defs s) [d]);
 
+/// Everything before the entry point: the imports and the definitions. This is
+/// the prefix a session grows, and `dreams.session` carries it so it can tell
+/// "an entry added a line after the definitions" from "one was inserted before
+/// them" -- the first proceeds, the second re-reads the whole program.
+let base_text s = str.join_str "\n" (list.concat [imports s, defs s]) + "\n";
+
 /// The program the session currently is, with `body` as its entry point.
-let program s body =
-    str.join_str "\n" (list.concat [imports s, defs s, [body]]) + "\n";
+let program s body = base_text s + body + "\n";
 
 /// What an entry that is an expression compiles to. The value is bound and then
 /// matched rather than printed directly, so that `()` -- what an entry made
@@ -156,51 +168,6 @@ let rec read_entry! h acc =
 
 // --- compiling and running ------------------------------------------------------
 
-/// A short write is not an error, so writing means looping until it is all out.
-let rec write_all! handle text = {
-    let n = str.byte_length text;
-    if n == 0 { :done }
-    else {
-        let wrote = io.write! handle text;
-        if wrote >= n { :done } else { write_all! handle (str.slice wrote (n - wrote) text) }
-    }
-};
-
-/// `true` if the file was written. The REPL's scratch files live wherever the
-/// system puts temporary files, and a session that cannot write one has nowhere
-/// to compile to, which is worth saying rather than crashing on.
-let write_file! path text =
-    match try! { io.open! path :write } catch e { () } {
-        () => false,
-        h => {
-            write_all! h text
-            io.close! h
-            true
-        },
-    };
-
-/// The scratch file's name is an implementation detail, and a diagnostic that
-/// names it is telling the reader about the REPL rather than about their
-/// program. The line and column are worth keeping -- they point into the
-/// session as `:list` prints it -- so only the path is replaced.
-let as_session path text = str.join_str "session" (str.split path text);
-
-/// Compile the session, with `body` as its entry point.
-/// `[:ok, image]`, or `[:error, rendered diagnostics]`.
-let compile! s body roots cfg source image = {
-    if write_file! source (program s body) { () }
-    else { console.error! ("dreams: cannot write " + source) }
-    let l = modules.load! source roots cfg false;
-    let r = scope.resolve! l;
-    let low = lower.link! l r;
-    let ds = list.append (modules.diags l) (lower.all_diags r low);
-    if diag.error_count ds > 0 {
-        [:error, as_session source (diag.render_all (modules.files l) ds)]
-    }
-    else if write_file! image (emit.to_binary (lower.image low)) { [:ok, image] }
-    else { [:error, "dreams: cannot write " + image] }
-};
-
 /// The VM to run an image with. The same variable `mind` reads, because a
 /// session started from a build should reach the same VM the build did.
 let vm! () = match os.env! "DREAM" { () => "dream", v => path.expand_home! v };
@@ -263,27 +230,40 @@ let scratch! name =
 
 /// Enter one declaration: keep it only if the session still compiles with it.
 ///
-/// The check is a whole build rather than a parse, because a definition that
-/// parses and does not resolve would otherwise sit in the session breaking
-/// every entry after it, and the line that broke things would be long gone.
+/// The check is a compile rather than a parse, because a definition that parses
+/// and does not resolve would otherwise sit in the session breaking every entry
+/// after it, and the line that broke things would be long gone. Failure leaves
+/// the session exactly as it was; success joins the new text to it and carries
+/// the compile-time state `dreams.session` produced.
 let define! s text roots cfg source image = {
     let grown = if declarative text && first_word text == "import" { with_import (str.trim text) s }
                 else { with_def text s };
-    match compile! grown quiet_main roots cfg source image {
-        [:error, why] => {
+    match session_mod.compile! roots cfg source image (program grown quiet_main)
+                               (base_text grown) (engine s) (base s) {
+        [[:error, why], _, _] => {
             console.error! why
             s
         },
-        [:ok, _] => grown,
+        [[:ok, _], en, nb] => with_engine en nb grown,
     }
 };
 
 /// Evaluate one expression: compile the session with it as the entry point and
-/// run what comes out.
+/// run what comes out. The entry's own `main!` is compiled on top of the
+/// carried state and thrown away -- an expression changes what the session
+/// *prints*, not what it means -- so the session comes back only with the
+/// state a definition-less entry leaves.
 let evaluate! s text roots cfg source image =
-    match compile! s (echo text) roots cfg source image {
-        [:error, why] => console.error! why,
-        [:ok, img] => run! img,
+    match session_mod.compile! roots cfg source image (program s (echo text))
+                               (base_text s) (engine s) (base s) {
+        [[:error, why], _, _] => {
+            console.error! why
+            s
+        },
+        [[:ok, img], en, nb] => {
+            run! img
+            with_engine en nb s
+        },
     };
 
 let rec load_lines! s lines roots cfg source image =
@@ -291,7 +271,11 @@ let rec load_lines! s lines roots cfg source image =
         [] => s,
         [line, ..rest] =>
             if str.is_empty (str.trim line) { load_lines! s rest roots cfg source image }
-            else { load_lines! (define! s line roots cfg source image) rest roots cfg source image },
+            else {
+                let s2 = define! s line roots cfg source image;
+                strict! s2
+                load_lines! s2 rest roots cfg source image
+            },
     };
 
 /// A file's declarations, entered as though typed. Items are separated by blank
@@ -340,10 +324,22 @@ let step! s text roots cfg source image =
             [:go, s]
         }
     }
-    else if declarative text { [:go, define! s text roots cfg source image] }
+    else if declarative text {
+        // A definition or an expression is a session inside a lazy pair element,
+        // where `define!`'s compile would wait for who knows what to force it --
+        // the loop only ever needs its `[:go, s2]` result. Forcing here, in a
+        // statement, makes the compile part of entering the entry: `[:go,
+        // strict! ..]` would force only to shallow head normal form and leave
+        // the work inside. (The same shape bit `supervisor` -- the supervisor
+        // sat waiting for a child nobody had started.)
+        let d = define! s text roots cfg source image;
+        strict! d
+        [:go, d]
+    }
     else {
-        evaluate! s text roots cfg source image
-        [:go, s]
+        let e = evaluate! s text roots cfg source image;
+        strict! e
+        [:go, e]
     };
 
 let rec loop! h s roots cfg source image = {
@@ -425,7 +421,7 @@ when test {
         // diagnostic must keep is where in the session the compiler was.
         test.case "a diagnostic names the session rather than the scratch file"
             $( test.eq! "session:3:15: error: nope"
-                        (as_session "/tmp/dream-repl-7.dr"
+                        (session_mod.as_session "/tmp/dream-repl-7.dr"
                                     "/tmp/dream-repl-7.dr:3:15: error: nope") ),
     ];
 }

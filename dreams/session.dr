@@ -1,0 +1,434 @@
+// Session mode: compile a whole program one entry at a time.
+//
+// A REPL for a whole-program language is not the usual loop, and the cost of
+// rebuilding everything on every entry is the whole of the problem this module
+// exists for. The compiler is the program running the loop, so it can carry its
+// own state from one entry to the next instead of throwing it away -- and that
+// is where the pieces are: the resolved names, the lowered arena, the linked
+// tables, the loader holding the parse. An entry then compiles only what it
+// added, onto the carried result.
+//
+// What is carried is chosen so that an index never changes meaning. Globals are
+// numbered in the order they are declared and a module's are contiguous, so an
+// entry appends to the global records, the function records, the node arena and
+// the loader's module list exactly as a fresh build would; nothing is ever
+// renumbered. What is NOT carried is the transient `main!` an entry is compiled
+// with: it is declared on top of the carried resolution and thrown away, so the
+// next entry's `main!` is a fresh global with the index machine's blessing.
+//
+// Correctness here is "indices never change meaning", not byte-identity with a
+// fresh build -- a compile-time value's nodes land after the entry's own nodes
+// instead of interleaved with them, which is the only visible difference.
+//
+// Three ways into a compiler front end, chosen by what an entry did:
+//
+//   - `boot!`    a session with nothing carried, or one whose prefix no longer
+//                starts the new program. The prefix is the whole text up to the
+//                appended entry point, so appending a `let` keeps it while
+//                adding an import -- which sits before the definitions rather
+//                than after them -- breaks it. The whole text is compiled from
+//                a fresh load, and the by-product -- the state up to but not
+//                including the transient `main!` -- is carried forward, so the
+//                *next* entry is incremental. Changes and first entries take
+//                the same path on purpose: guessing which imports shared an old
+//                parse is where a batch compile would silently go wrong.
+//   - `proceed!` the header is unchanged and the entry only adds `let`s --
+//                the common case. The root is re-read in place, the new lets
+//                are declared and resolved on top of the carried state, and the
+//                arena and tables grow a little.
+//   - `fresh`    a full build that carries nothing: an entry that will not
+//                parse, or one whose slice is not lets (`mod`, `when`,
+//                `virtual`, `derive`) -- anything that can change which modules
+//                exist or what one exports, which a carried parse cannot know.
+
+import std.core;
+import std.io;
+import std.list;
+import std.str;
+
+import dreams.diag;
+import dreams.emit;
+import dreams.ir;
+import dreams.lower;
+import dreams.modules;
+import dreams.parser;
+import dreams.scope;
+
+// --- writing and naming ---------------------------------------------------------
+
+/// A short write is not an error, so writing means looping until it is all out.
+let rec write_all! handle text = {
+    let n = str.byte_length text;
+    if n == 0 { :done }
+    else {
+        let wrote = io.write! handle text;
+        if wrote >= n { :done } else { write_all! handle (str.slice wrote (n - wrote) text) }
+    }
+};
+
+/// `true` if the file was written. The REPL's scratch files live wherever the
+/// system puts temporary files, and a session that cannot write one has nowhere
+/// to compile to, which is worth saying rather than crashing on.
+let write_file! path text =
+    match try! { io.open! path :write } catch e { () } {
+        () => false,
+        h => {
+            write_all! h text
+            io.close! h
+            true
+        },
+    };
+
+/// The scratch file's name is an implementation detail, and a diagnostic that
+/// names it is telling the reader about the REPL rather than about their
+/// program. The line and column are worth keeping -- they point into the
+/// session as `:list` prints it -- so only the path is replaced.
+let as_session path text = str.join_str "session" (str.split path text);
+
+// --- what is carried ---------------------------------------------------------------
+//
+// The engine is the whole of the compiler's disposable state, one record. `()`
+// is the type of "nothing": a fresh session, or the state after a full
+// `fresh` build that chose to carry nothing. The image lists are accumulated
+// here rather than inside `low.prog` because each entry links only its own
+// additions and appends them to what came before.
+
+let engine loader state resolver low base root_globals_from funcs globals imports modules base_text =
+    %{ :loader => loader, :state => state, :resolver => resolver, :low => low,
+       :base => base, :root_globals_from => root_globals_from,
+       :funcs => funcs, :globals => globals, :imports => imports,
+       :modules => modules, :base_text => base_text };
+
+let engine_loader e    = core.map_get e :loader ();
+let engine_state e     = core.map_get e :state scope.state;
+let engine_resolver e  = core.map_get e :resolver ();
+let engine_low e       = core.map_get e :low ();
+let engine_base e      = core.map_get e :base 0;
+let engine_root_from e = core.map_get e :root_globals_from 0;
+let engine_funcs e     = core.map_get e :funcs [];
+let engine_globals e   = core.map_get e :globals [];
+let engine_imports e   = core.map_get e :imports [];
+let engine_modules e   = core.map_get e :modules [];
+let engine_base_text e = core.map_get e :base_text "";
+
+let pre_s_pre e    = core.map_get e :s_pre scope.state;
+let pre_resolver e = core.map_get e :resolver ();
+let pre_low e      = core.map_get e :low ();
+let pre_root_from e = core.map_get e :root_globals_from 0;
+let pre_funcs e    = core.map_get e :funcs [];
+let pre_globals e  = core.map_get e :globals [];
+let pre_imports e  = core.map_get e :imports [];
+let pre_modules e  = core.map_get e :modules [];
+let pre_booted e   = core.map_get e :booted false;
+
+// --- the shape of an entry ---------------------------------------------------------
+
+/// Split a parsed module into what an entry adds and what it is compiled for:
+/// `[slice, main_item]`. `base` counts root items already declared by earlier
+/// entries (imports plus keeps), so the slice is everything between them and
+/// the last item, which is the transient `main!`. An empty slice is the shape
+/// of an expression entry -- the defs are unchanged, only the entry point is
+/// new.
+let entry_partition items base = {
+    let count = list.length items;
+    [list.take (count - 1 - base) (list.drop base items), list.last items]
+};
+
+/// Whether a slice can be compiled onto a carried resolution: every item an
+/// entry adds below its transient `main!` must be a `let`. An import is not
+/// expected here because adding one changes the header and re-boots before an
+/// entry gets this far, and the rest -- `mod`, `when`, `virtual`, `derive` --
+/// can change which modules exist or what one exports, so they start a fresh
+/// build rather than being guessed at.
+let carried_ok slice =
+    list.all (fn item ->
+        match item {
+            [:let, _, _, _, _, _] => true,
+            _ => false,
+        }) slice;
+
+/// Which way to compile an entry, decided before anything is loaded:
+/// `:reboot` -- nothing carried, or the prefix the engine stands for no longer
+/// starts the new program. The engine's `base_text` is the whole of what the
+/// session was *before* this entry's transient `main!`, so appending a `let`
+/// keeps the prefix and proceeds, while adding an import -- which is inserted
+/// before the definitions rather than after them -- breaks it and reboots.
+/// `[:proceed, items]` is the prefix holding and the entry only adding `let`s;
+/// `:fresh` is a text that will not parse, or a slice that needs a full build.
+let route text base_text engine base =
+    match parser.parse_module text {
+        [:error, _, _] => :fresh,
+        [:ok, items] =>
+            if engine == () { :reboot }
+            else if not (str.starts_with (engine_base_text engine) text) { :reboot }
+            else if carried_ok (list.head (entry_partition items base)) { [:proceed, items] }
+            else { :fresh },
+    };
+
+// --- the pipeline -------------------------------------------------------------------
+//
+// One entry, from the loaded parser onward. Everything below was already
+// decided by `route`; what is left is to declare the new names, resolve and
+// lower the bodies that came with them, link the tables an image needs, and
+// write the image -- and to do it in an order that leaves the parts worth
+// keeping standing.
+
+/// The carried context an entry lowers into. `s_pre` is the scope state as it
+/// was before this entry's declarations -- a fresh build passes the empty
+/// `state`, and a carried one the state the previous entry kept -- so that
+/// `resolve_from!` can say which globals the new declarations added. `booted`
+/// distinguishes the two ways in: a boot's module records must be linked from
+/// the fresh resolution, while a carried session's travel in the engine.
+let pre s_pre resolver low root_globals_from funcs globals imports modules booted =
+    %{ :s_pre => s_pre, :resolver => resolver, :low => low,
+       :root_globals_from => root_globals_from, :funcs => funcs,
+       :globals => globals, :imports => imports, :modules => modules,
+       :booted => booted };
+
+/// Declare, resolve, lower and link one entry's `slice` of definitions on top
+/// of a carried context. On success answers the engine to carry -- the state up
+/// to but not including the transient `main!` -- which is why `base_next` and
+/// `base_text` arrive from the caller: the engine records them for the next
+/// entry.
+let rec compile_slice! l mi state1 pre base_next base_text source = {
+    let from = list.length (scope.pending (pre_s_pre pre));
+    let r1 = scope.resolve_from! l state1 (pre_resolver pre) from (pre_s_pre pre);
+    let n_low = lower.lower_from r1 (pre_low pre)
+        (list.drop (list.length (scope.bodies (pre_resolver pre))) (scope.bodies r1));
+    let lf = lower.link_funcs_from r1 (lower.func_bodies n_low) n_low
+                 (scope.func_count (pre_resolver pre));
+    let lg = lower.link_globals_from r1 (list.head lf) (list.length (pre_globals pre));
+    let li = lower.link_imports r1 (list.head lg);
+
+    let funcs1 = list.append (pre_funcs pre) (list.nth 1 lf);
+    let globals1 = list.append (pre_globals pre) (list.nth 1 lg);
+    // Imports are interned by name, so a carried entry's re-derivation is the
+    // same list again and `drop` says nothing was added; a boot's is everything.
+    let imports1 =
+        list.append (pre_imports pre)
+            (list.drop (list.length (pre_imports pre)) (list.nth 1 li));
+
+    // The linked lists go into the program only long enough for the compile-time
+    // expressions to be evaluated against a complete image.
+    let stuffed = core.map_put (core.map_put (core.map_put (lower.prog (list.head li))
+                            :funcs funcs1) :globals globals1) :imports imports1;
+    let settled = lower.settle_comps! (lower.set_prog stuffed (list.head li));
+    // Nothing may re-evaluate these: the values are nodes in the arena now, and
+    // re-running a `comp!` would be an effect happening a second time.
+    let low1 = core.map_put settled :pending_comp [];
+
+    let ds = list.append (list.append (modules.diags l) (scope.diags state1))
+                         (list.append (scope.r_diags r1) (lower.l_diags low1));
+    if diag.error_count ds > 0 {
+        [:error, as_session source (diag.render_all (modules.files l) ds)]
+    }
+    else {
+        let deps_recs =
+            if pre_booted pre {
+                let lmb = lower.link_modules l r1 (list.head li);
+                list.nth 1 lmb
+            }
+            else { pre_modules pre };
+        [:ok, engine l state1 r1 low1 base_next (pre_root_from pre) funcs1 globals1
+                    imports1 deps_recs base_text]
+    }
+};
+
+/// The last step of an entry: declare, resolve and lower the transient `main!`
+/// on top of what the slice left behind, then build the image. The `main!` is
+/// deliberately not part of what is carried -- it is new every entry, and its
+/// global and function indices are retained only long enough to be this image's
+/// own.
+let rec main_step! l mi main_item en source image = {
+    let state2 = scope.declare_items! l mi [main_item] (engine_state en);
+    let r2 = scope.resolve_from! l state2 (engine_resolver en)
+                (list.length (scope.pending (engine_state en))) (engine_state en);
+    let n_main = lower.lower_from r2 (engine_low en)
+        (list.drop (list.length (scope.bodies (engine_resolver en))) (scope.bodies r2));
+    let lm = lower.link_funcs_from r2 (lower.func_bodies n_main) n_main
+                 (scope.func_count (engine_resolver en));
+    let lg = lower.link_globals_from r2 (list.head lm) (list.length (engine_globals en));
+    let funcs2 = list.append (engine_funcs en) (list.nth 1 lm);
+    let globals2 = list.append (engine_globals en) (list.nth 1 lg);
+    let p2 = core.map_put (core.map_put (lower.prog (list.head lg))
+                            :funcs funcs2) :globals globals2;
+    let low2 = lower.settle_comps! (lower.set_prog p2 (list.head lg));
+
+    let ds = list.append (list.append (modules.diags l) (scope.diags state2))
+                         (list.append (scope.r_diags r2) (lower.l_diags low2));
+    if diag.error_count ds > 0 {
+        [:error, as_session source (diag.render_all (modules.files l) ds)]
+    }
+    else {
+        finalize! l mi en low2 r2 funcs2 globals2 source image
+    }
+};
+
+/// Put the root module's record and entry point into the finished program and
+/// write the image. The root is a range of globals that began at
+/// `root_globals_from` and has only ever grown, so an image records it as a
+/// start and a count; everything before it belongs to the carried modules,
+/// whose records are already linked.
+let finalize! l mi en low2 r2 funcs2 globals2 source image = {
+    let root = modules.module_at l mi;
+    let named = lower.strk (modules.module_name root) low2;
+    let sourced = lower.strk (modules.module_path root) (list.head named);
+    let root_rec =
+        %{ :name => list.nth 1 named, :source => list.nth 1 sourced,
+           :globals_start => engine_root_from en,
+           :globals_count => list.length globals2 - engine_root_from en,
+           :flags => 0, :derives => ir.no_node };
+    let p =
+        core.map_put (core.map_put (core.map_put (core.map_put
+                            (lower.prog (list.head sourced))
+                            :modules (list.append (engine_modules en) [root_rec]))
+                            :entry (lower.find_entry l r2))
+                            :module_name (list.nth 1 named))
+                            :source_name (list.nth 1 sourced);
+    if write_file! image (emit.to_binary (ir.finish p)) { [:ok, image] }
+    else { [:error, "dreams: cannot write " + image] }
+};
+
+/// A first entry, or one whose header changed. The whole text is loaded and
+/// declared from scratch -- nothing is relied on from an earlier parse -- and
+/// everything up to the transient `main!` becomes the carried engine.
+let boot! roots cfg source image text base_text engine base = {
+    let l = modules.load! source roots cfg false;
+    let mi = list.length (modules.modules l) - 1;
+    let state_deps =
+        list.fold (fn acc i -> scope.declare_module l i acc)
+                  scope.state (list.range 0 mi);
+    let part = entry_partition (modules.module_items (modules.module_at l mi)) 0;
+    let slice = list.head part;
+    let main_item = list.nth 1 part;
+    let state1 = scope.declare_items! l mi slice state_deps;
+    // The seed a fresh resolution starts from -- the resolver gets this
+    // module's envs and the imports the declarations handed out, but not their
+    // diagnostics: those are checked from the scope state itself, which is how
+    // a carried entry sees its own declaration errors too.
+    let r0 =
+        core.map_put (core.map_put (core.map_put (scope.resolver (scope.envs state1))
+                            :imports (scope.s_imports state1))
+                            :module_recs (scope.s_module_recs state1))
+                            :diags [];
+    let low0 = lower.lowering r0 ir.program 0;
+    let pre_ = pre scope.state r0 low0 (scope.next_global state_deps) [] [] [] [] true;
+    match compile_slice! l mi state1 pre_ (list.length slice)
+                         base_text source {
+        [:error, msg] => [[:error, msg], engine, base],
+        [:ok, en] =>
+            match main_step! l mi main_item en source image {
+                [:error, msg] => [[:error, msg], engine, base],
+                [:ok, img] => [[:ok, img], en, engine_base en],
+            },
+    }
+};
+
+/// An entry on top of a carried engine: the header is unchanged, so the root is
+/// re-read in place and only the new `let`s are compiled.
+let proceed! source image items engine base_text base = {
+    let l = modules.reload_root! (engine_loader engine) source false;
+    let mi = list.length (modules.modules l) - 1;
+    let part = entry_partition items base;
+    let slice = list.head part;
+    let main_item = list.nth 1 part;
+    let state1 = scope.declare_items! l mi slice (engine_state engine);
+    let pre_ = pre (engine_state engine) (engine_resolver engine) (engine_low engine)
+                    (engine_root_from engine) (engine_funcs engine) (engine_globals engine)
+                    (engine_imports engine) (engine_modules engine) false;
+    match compile_slice! l mi state1 pre_
+                         (base + list.length slice) base_text source {
+        [:error, msg] => [[:error, msg], engine, base],
+        [:ok, en] =>
+            match main_step! l mi main_item en source image {
+                [:error, msg] => [[:error, msg], engine, base],
+                [:ok, img] => [[:ok, img], en, engine_base en],
+            },
+    }
+};
+
+/// A full build that carries nothing: the text will not parse, or its slice is
+/// not `let`s. Whatever mission there was, the whole of it is compiled the
+/// ordinary way, and the session re-boots on the next entry.
+let fresh_build! roots cfg source image text engine base = {
+    let l = modules.load! source roots cfg false;
+    let r = scope.resolve! l;
+    let low = lower.link! l r;
+    let ds = list.append (modules.diags l) (lower.all_diags r low);
+    if diag.error_count ds > 0 {
+        [[:error, as_session source (diag.render_all (modules.files l) ds)], engine, base]
+    }
+    else if write_file! image (emit.to_binary (lower.image low)) { [[:ok, image], (), 0] }
+    else { [[:error, "dreams: cannot write " + image], engine, base] }
+};
+
+/// Compile the session as it now stands, with `text` (the whole program) and
+/// `base_text` (its header) before any entry moves the compilation forward.
+/// Answers `[[:ok, image], engine', base']` on success and
+/// `[[:error, rendered], engine, base]` on failure, the engine and base
+/// unchanged so the session they stand for is unchanged too.
+let compile! roots cfg source image text base_text engine base =
+    match write_file! source text {
+        false => [[:error, "dreams: cannot write " + source], engine, base],
+        true =>
+            match route text base_text engine base {
+                :reboot => boot! roots cfg source image text base_text engine base,
+                [:proceed, items] => proceed! source image items engine base_text base,
+                :fresh => fresh_build! roots cfg source image text engine base,
+            },
+    };
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        // --- the shape of an entry ---
+        test.case "an empty partition is an empty slice and one main"
+            $( test.eq! [[], [:b]] (entry_partition [[:a], [:b]] 1) ),
+        test.case "a partition cuts the declared prefix from the slice"
+            $( test.eq! [[[:b]], [:c]] (entry_partition [[:a], [:b], [:c]] 1) ),
+        test.case "a slice of only lets can be carried"
+            $( test.eq! true
+                        (carried_ok [[:let, "x", [], (), false, ()],
+                                     [:let, "y", [], (), false, ()]]) ),
+        test.case "anything but a let sends a slice to a fresh build"
+            $( test.eq! false
+                        (carried_ok [[:import, ["std"], (), (), ()],
+                                     [:let, "y", [], (), false, ()]]) ),
+
+        // --- routing ---
+        test.case "no carried engine re-boots"
+            $( test.eq! :reboot (route "let main! = ();" "let main! = ();" () 0) ),
+        test.case "an import inserted before the definitions re-boots"
+            $( test.eq! :reboot
+                        (route "import std.console;\nimport std.io;\nlet a = 1;\nlet main! = ();"
+                               "import std.console;\nimport std.io;\nlet a = 1;"
+                               (engine () () () () 2 0 [] [] [] []
+                                       "import std.console;\nlet a = 1;") 2) ),
+        test.case "an appended definition proceeds"
+            $( match route "import std.console;\nlet a = 1;\nlet b = 2;\nlet main! = ();"
+                           "import std.console;\nlet a = 1;\nlet b = 2;"
+                           (engine () () () () 2 0 [] [] [] []
+                                   "import std.console;\nlet a = 1;") 2 {
+                   [:proceed, _] => true,
+                   _ => false,
+               } ),
+        test.case "a text that does not parse is a fresh build"
+            $( test.eq! :fresh
+                        (route "let main! = let x" "let a = 1;"
+                               (engine () () () () 1 0 [] [] [] [] "let a = 1;") 1) ),
+        test.case "a slice that is not lets is a fresh build"
+            $( test.eq! :fresh
+                        (route "mod m {\n    let x = 1;\n}\nlet main! = ();" ""
+                               (engine () () () () 0 0 [] [] [] [] "") 0) ),
+
+        // The scratch file is this REPL's business, not the reader's: what a
+        // diagnostic must keep is where in the session the compiler was.
+        test.case "a diagnostic names the session rather than the scratch file"
+            $( test.eq! "session:3:15: error: nope"
+                        (as_session "/tmp/dream-repl-7.dr"
+                                    "/tmp/dream-repl-7.dr:3:15: error: nope") ),
+    ];
+}

@@ -230,6 +230,13 @@ module rewalked, nothing else**.
 
 ### Case B — the header changed: a new `import`
 
+> *Implemented differently.* The session picks a whole-program `:reboot` for a
+> header change instead of this truncate-the-root-segment path: one full
+> recompile that carries nothing, whose by-product is the engine up to the
+> transient `main!`, so the next entry is incremental again
+> ([session-work.md](session-work.md), "Known accepted divergences"). This
+> section stays as the cheaper design, in case the reboot cost ever matters.
+
 A new import is a new dependency, and dependencies are loaded *before* the root.
 Inserting one between the previous dependencies and the root shifts the root's
 module index and its `globals_start`. The design rule for this case is narrow:
