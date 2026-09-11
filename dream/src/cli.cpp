@@ -196,73 +196,8 @@ bool is_directory(const std::string& path) {
     return std::filesystem::is_directory(path, ec);
 }
 
-/// Resolve the image to run.
-///
-/// `dream mind` should mean what `mind` means when it is typed on its own, so a
-/// name is tried four ways, nearest first:
-///
-///   1. as written, which is what a path is;
-///   2. with `.dream` added, so `dream mind` runs `./mind.dream` -- an image is
-///      a program, and naming its extension every time is noise;
-///   3. and 4., both of those under `$MINDV2_PATH`, where an installation keeps
-///      what it ships, the way a shell finds a binary on PATH.
-///
-/// The working directory comes before the installation, because a project's own
-/// build is what someone standing in it means. The installed lookup is for a
-/// bare name only: a path with a separator in it is a place, and answering it
-/// with a file from somewhere else would be a surprise. `dream -x NAME` is the
-/// other half of this -- the installation and nothing else.
-std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* file_ok) {
-    *file_ok = true;
-
-    const bool is_bare_name =
-        path.find('/') == std::string::npos && path.find('\\') == std::string::npos;
-
-    std::vector<std::string> candidates{path, path + ".dream"};
-    if (is_bare_name && !MINDV2_PATH.empty()) {
-        candidates.push_back(MINDV2_PATH + "/" + path);
-        candidates.push_back(MINDV2_PATH + "/" + path + ".dream");
-    }
-    for (const std::string& candidate : candidates) {
-        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
-    }
-
-    *file_ok = false;
-    return "";
-}
-
-/// `-x name`: the installed image called `name`, and nothing else.
-///
-/// This is the same lookup `skip_file` falls back to, without the fallback. A
-/// bare `dream lucid` prefers a file called `lucid` in the working directory,
-/// which is what a path should mean; `-x lucid` says the installation is the
-/// only place to look, so a stray file next to the caller cannot shadow an
-/// installed program.
-std::string installed_image(const std::string& name, const std::string& MINDV2_PATH,
-                            bool* file_ok) {
-    *file_ok = true;
-    if (MINDV2_PATH.empty()) {
-        std::fprintf(stderr,
-                     "dream: -x needs $MINDV2_PATH (or ~/.mindv2) to look in, to find `%s`\n",
-                     name.c_str());
-        *file_ok = false;
-        return "";
-    }
-    const std::string candidates[] = {
-        MINDV2_PATH + "/" + name,
-        MINDV2_PATH + "/" + name + ".dream",
-    };
-    for (const std::string& candidate : candidates) {
-        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
-    }
-    std::fprintf(stderr, "dream: no installed image `%s` in %s\n", name.c_str(),
-                 MINDV2_PATH.c_str());
-    *file_ok = false;
-    return "";
-}
-
-/// Where installed images live: `$MINDV2_PATH`, or `~/.mindv2` when that
-/// directory exists.
+/// Where installed images live: the directories in `$MINDV2_PATH`, or
+/// `~/.mindv2` when that directory exists.
 ///
 /// Returned by value throughout. The obvious way to write this -- keep a
 /// `const char*` and point it at a local string's `c_str()` -- leaves the
@@ -295,9 +230,107 @@ std::string expand_home(const std::string& path) {
     return home + path.substr(1);
 }
 
+/// `$MINDV2_PATH` is a list of directories, like PATH, not one directory: the
+/// toolchain wrapper sets it to what an installation ships in whatever store
+/// paths those live in, joined by the platform list separator, so the compiler
+/// image and the standard library can sit apart from each other. A plain
+/// `~/.mindv2` is a single-element list. Each element gets the `~` treatment
+/// here too, because a tilde inside a joined list is hidden from the shell.
+std::vector<std::string> mindv2_dirs(const std::string& path) {
+    std::vector<std::string> dirs;
+    if (path.empty()) return dirs;
+    const char sep =
+        #if defined(_WIN32)
+        ';'
+        #else
+        ':'
+        #endif
+        ;
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const std::size_t end = path.find(sep, start);
+        if (end == std::string::npos) {
+            dirs.push_back(expand_home(path.substr(start)));
+            break;
+        }
+        if (end > start) dirs.push_back(expand_home(path.substr(start, end - start)));
+        start = end + 1;
+    }
+    return dirs;
+}
+
+/// Resolve the image to run.
+///
+/// `dream mind` should mean what `mind` means when it is typed on its own, so a
+/// name is tried four ways, nearest first:
+///
+///   1. as written, which is what a path is;
+///   2. with `.dream` added, so `dream mind` runs `./mind.dream` -- an image is
+///      a program, and naming its extension every time is noise;
+///   3. and 4., both of those under `$MINDV2_PATH`, where an installation keeps
+///      what it ships, the way a shell finds a binary on PATH.
+///
+/// The working directory comes before the installation, because a project's own
+/// build is what someone standing in it means. The installed lookup is for a
+/// bare name only: a path with a separator in it is a place, and answering it
+/// with a file from somewhere else would be a surprise. `dream -x NAME` is the
+/// other half of this -- the installation and nothing else.
+std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* file_ok) {
+    *file_ok = true;
+
+    const bool is_bare_name =
+        path.find('/') == std::string::npos && path.find('\\') == std::string::npos;
+
+    std::vector<std::string> candidates{path, path + ".dream"};
+    if (is_bare_name && !MINDV2_PATH.empty()) {
+        for (const std::string& dir : mindv2_dirs(MINDV2_PATH)) {
+            candidates.push_back(dir + "/" + path);
+            candidates.push_back(dir + "/" + path + ".dream");
+        }
+    }
+    for (const std::string& candidate : candidates) {
+        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
+    }
+
+    *file_ok = false;
+    return "";
+}
+
+/// `-x name`: the installed image called `name`, and nothing else.
+///
+/// This is the same lookup `skip_file` falls back to, without the fallback. A
+/// bare `dream lucid` prefers a file called `lucid` in the working directory,
+/// which is what a path should mean; `-x lucid` says the installation is the
+/// only place to look, so a stray file next to the caller cannot shadow an
+/// installed program.
+std::string installed_image(const std::string& name, const std::string& MINDV2_PATH,
+                            bool* file_ok) {
+    *file_ok = true;
+    if (MINDV2_PATH.empty()) {
+        std::fprintf(stderr,
+                     "dream: -x needs $MINDV2_PATH (or ~/.mindv2) to look in, to find `%s`\n",
+                     name.c_str());
+        *file_ok = false;
+        return "";
+    }
+    for (const std::string& dir : mindv2_dirs(MINDV2_PATH)) {
+        const std::string candidates[] = {
+            dir + "/" + name,
+            dir + "/" + name + ".dream",
+        };
+        for (const std::string& candidate : candidates) {
+            if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
+        }
+    }
+    std::fprintf(stderr, "dream: no installed image `%s` in %s\n", name.c_str(),
+                 MINDV2_PATH.c_str());
+    *file_ok = false;
+    return "";
+}
+
 std::string get_mindv2_path() {
     if (const char* from_env = std::getenv("MINDV2_PATH")) {
-        return expand_home(std::string(from_env));
+        return std::string(from_env);
     }
     const std::string home = home_dir();
     if (home.empty()) return "";

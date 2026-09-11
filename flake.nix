@@ -17,6 +17,14 @@
         dreams = final.callPackage ./nix/dreams.nix {
           dreamVm = final.dream-vm;
         };
+        mind = final.callPackage ./nix/mind.nix {
+          dreamVm = final.dream-vm;
+          dreams = final.dreams;
+        };
+        lucid = final.callPackage ./nix/lucid.nix {
+          dreamVm = final.dream-vm;
+          dreams = final.dreams;
+        };
         dream = final.callPackage ./nix/dream.nix { };
       };
     }
@@ -29,7 +37,7 @@
       in
       {
         packages = {
-          inherit (pkgs) dream dreams dream-vm dream-stdlib;
+          inherit (pkgs) dream dreams mind lucid dream-vm dream-stdlib;
           default = pkgs.dream;
 
           # The interpreter-only build. Worth having as a package rather than
@@ -45,7 +53,7 @@
         };
 
         checks = {
-          inherit (pkgs) dreams dream-vm;
+          inherit (pkgs) dreams mind lucid dream-vm;
           no-jit = pkgs.packages.dream-vm-no-jit or (pkgs.dream-vm.override { withJit = false; });
 
           # The end-to-end suite needs both halves at once, so it cannot live in

@@ -10,12 +10,15 @@ stdenvNoCC.mkDerivation {
 
   src = lib.cleanSourceWith {
     src = ../.;
+    # The build output directories change constantly and none of them affect
+    # this build, so they are dropped by name -- but only *directories*: a
+    # source file whose name begins with `build` (build.sh, mind/tool/build.dr)
+    # is part of the tree and must stay.
     filter = path: type:
       let base = baseNameOf path;
-      in !(lib.hasPrefix "build" base)
-         && base != "target"
-         && base != ".git"
-         && base != "result";
+      in type != "directory"
+         || (!(lib.hasPrefix "build" base)
+             && base != "target" && base != ".git" && base != "result");
   };
 
   nativeBuildInputs = [ dreamVm ];
