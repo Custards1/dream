@@ -256,6 +256,9 @@ happens, and it should stay that way.
 - A `!` suffix marks an impure name. Purity is checked: a pure function cannot
   call an impure one. This is enforced across imports.
 - `$( expr )` is a thunk.
+- `let [a, b] = pair` and `let f %{ :x => x } = ..` destructure with `match`'s
+  patterns, lazily: the pattern is checked once, when a name it binds is first
+  used. A literal in such a pattern is a compile error — that is a `match`.
 - Evaluation is lazy; `strict!` forces.
 - `when test { .. }` holds a module's tests, collected by compiling with
   `--test`. Tests are `test.case "name" $( test.eq! expected actual )`.

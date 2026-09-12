@@ -1,7 +1,6 @@
 # The Dream Language
 
-A reference for the Dream language as it is actually implemented, plus one
-clearly-marked section for a design that is not implemented yet.
+A reference for the Dream language as it is actually implemented.
 
 Dream is **dynamically typed**, **lazily evaluated**, and **functional**, with
 green processes for concurrency and a purity rule enforced by the spelling of a
@@ -17,9 +16,7 @@ The compiler is written in the language it compiles and builds from an image of
 itself. Where this document points at a source file for a canonical list, that
 is the implementation the VM is checked against by tests.
 
-> **Status legend.** Everything in this document is implemented and covered by
-> tests unless it carries a **PROPOSED** marker. Only [destructuring `let` and
-> parameters](#destructuring-let-and-parameters-proposed) is so marked.
+> **Status.** Everything in this document is implemented and covered by tests.
 
 ---
 
@@ -496,6 +493,8 @@ let name = expr;                    // a value
 let f a b = expr;                   // a function, curried
 let rec loop n = ...;               // may refer to itself
 let impure! x = ...;                // impure, by the trailing `!`
+let [a, b] = pair;                  // the names a pattern binds -- see §12
+let area %{ :w => w, :h => h } = w * h;   // a parameter may be a pattern too
 ```
 
 `let` appears both at top level (as an item) and inside a block (as a
@@ -853,9 +852,8 @@ the runtime.
 
 ## 12. Pattern matching
 
-`match` is implemented and is used throughout the compiler itself. The one part
-of the design still outstanding is destructuring in `let` and parameter lists,
-which is marked below.
+`match` is implemented and is used throughout the compiler itself, and `let`
+and parameter lists take its patterns apart the same way.
 
 ### Syntax
 
@@ -886,6 +884,7 @@ first that matches wins.
 | `#[a, ..rest]` | an array of at least one element |
 | `%{ :k => v }` | a map containing key `:k`; other keys ignored |
 | `p as name` | `p`, also binding the whole value to `name` |
+| `(p)` | `p`; parentheses only group |
 
 Patterns nest. A name may be bound at most once per arm.
 
@@ -933,22 +932,49 @@ one. This is the same bargain `if` already makes with its condition.
   checked in general. A `match` with no arm that matches raises `:match_error`
   carrying the unmatched value. A `_` arm is therefore the way to be total.
 
-### Destructuring `let` and parameters (PROPOSED)
+### Destructuring `let` and parameters
 
-> **Not implemented.** `let [a, b] = pair;` is a parse error today: `let` takes
-> a name. Everything else in this section is implemented.
-
-The same pattern grammar, restricted to **irrefutable** patterns (`_`, binders,
-`as`, and fixed-length `[..]` / `#[..]` / `%{..}` forms), extends `let` and
-parameter lists:
+A `let` and a parameter take the patterns an arm takes, and bind the names in
+them:
 
 ```dream
-let [a, b] = pair;
-let f %{ :x => x, :y => y } = x + y;
+let [first, ..rest] = xs;
+let %{ :x => x, :y => y } = point;
+let [a, b] as pair = line;
+
+let add [a, b] = a + b;                   // a parameter
+let area %{ :w => w, :h => h } = w * h;
+let f ([x, ..] as whole, n) = ...;        // an `as` goes in the parenthesised list
+list.map (fn [k, v] -> k * v) pairs       // and a lambda's parameters too
 ```
 
-A refutable pattern in either position is a compile error, naming the pattern
-that could fail.
+**It is as lazy as any `let`.** Nothing is forced where the destructuring is
+written. The first time a name it binds is used, the *whole* pattern is checked
+against the value -- forcing what a `match` arm would, the cells of a list but
+not its elements -- and a value that does not fit raises `:match_error`. The
+check runs once however many of the names are used, and a destructuring none of
+whose names is used never looks at its value:
+
+```dream
+let [x, y] = [1 / 0, 2];      // y is 2; x is never read, so nothing divides
+let [only] = [1, 2];          // compiles; using `only` raises :match_error
+```
+
+A value with effects is still bound where it is written, as a plain `let`'s is.
+At the top level each name is a global of its own, and a module that `derive`s
+may override any one of them like any other global.
+
+Three patterns are compile errors, because none could mean what it looks like:
+
+- **A literal anywhere in it** -- `let [:ok, v] = r` -- since a `let` has no
+  other arm to fall through to. A pattern that asks a question is a `match`.
+- **No shape to take apart** -- `let (x as y) = v` -- since that only names the
+  value, which a name already does.
+- **No names bound** -- `let [_, _] = pair` -- since the check waits for a name
+  to be used, and would never happen.
+
+A shape that does not fit, `let [a, b] = [1]`, is not one of them: Dream is
+dynamically typed, so that is found out when a name is used.
 
 ### How it is compiled
 
@@ -967,6 +993,17 @@ the purity check needed no changes for `match`, and the image format needed
 none either: the arms lower to existing node kinds plus opcodes **appended** to
 the table, because an opcode's position is its identity and inserting one would
 invalidate every image already built.
+
+A destructuring is that same test with the value itself as the only arm's body.
+One slot holds the value, as a plain `let`'s would; a second holds it
+*checked* -- `if test { value } else { raise! :match_error }`, bound lazily --
+and each name is bound, lazily too, to its part of the second, read with the
+same builtins. Reading any name forces the checked slot first, which is how the
+check happens once and before anything is read. At the top level the checked
+value is a hidden global instead, which being forced once and remembered gives
+the same property; it is named after its pattern, as `<let [a b]>`, which no
+source can write. A pattern parameter's argument is already in its slot, so it
+takes only the second.
 
 ---
 

@@ -144,6 +144,9 @@ let carried_ok slice =
     list.all (fn item ->
         match item {
             [:let, _, _, _, _, _] => true,
+            // A destructuring is `let`s by the time it is declared -- a hidden
+            // global and one per name -- so it carries exactly as they do.
+            [:let_p, _, _, _] => true,
             _ => false,
         }) slice;
 

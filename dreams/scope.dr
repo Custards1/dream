@@ -84,8 +84,11 @@ let alias_of e n   = core.map_get (aliases e) n ();
 let only_of e n    = core.map_get (only e) n ();
 
 /// What a module exports, sorted -- for the message that says a member is not
-/// one of them. Naming what is actually there is most of a diagnostic's value.
-let exports e = list.sort (list.map (fn kv -> list.head kv) (core.map_pairs (globals e)));
+/// one of them. Naming what is actually there is most of a diagnostic's value,
+/// and the global behind a destructuring is not there to be named.
+let exports e =
+    list.sort (list.filter (fn n -> not (is_hidden_name n))
+                           (list.map (fn kv -> list.head kv) (core.map_pairs (globals e))));
 
 // --- diagnostics ---------------------------------------------------------------
 
@@ -219,6 +222,8 @@ let rec mentions_name target e =
 let item_mentions_core item =
     match item {
         [:let, _, _, body, _, _] => mentions_name "core" body,
+        // A map pattern's keys are expressions too.
+        [:let_p, pattern, body, _] => mentions_name "core" body || mentions_name "core" pattern,
         [:virtual, _, _, body, _] => match body { () => false, b => mentions_name "core" b },
         _ => false,
     };
@@ -399,6 +404,8 @@ let declare_core mi items s = {
                 || list.any (fn oi ->
                        match list.nth 1 oi {
                            [:let, "core", _, _, _, _] => true,
+                           [:let_p, pattern, _, _] =>
+                               list.any (fn b -> list.head b == "core") (pattern_bindings pattern),
                            [:import, segs, alias, _, _] => default_alias segs alias == "core",
                            _ => false,
                        }) items;
@@ -430,22 +437,73 @@ let rec collect_lets l items acc s =
         [oi, ..rest] => {
             let owner = list.head oi;
             match list.nth 1 oi {
-                [:let, n, _, _, _, _] => {
-                    let d = list.nth 1 oi;
-                    let at = list.index_of true (list.map (fn od -> decl_name (list.nth 1 od) == n) acc);
-                    if at < 0 { collect_lets l rest (list.append acc [[owner, d, true, ()]]) s }
-                    else if list.head (list.nth at acc) != owner {
-                        collect_lets l rest (replace_at at [owner, d, true, ()] acc) s
-                    }
-                    else {
-                        collect_lets l rest acc
-                            (complain (decl_span d) ("`" + n + "` is already bound in this module")
-                                      (modules.module_source (modules.module_at l owner)) s)
-                    }
+                [:let, _, _, _, _, _] => {
+                    let got = collect_let l owner (list.nth 1 oi) acc s;
+                    collect_lets l rest (list.head got) (list.nth 1 got)
+                },
+                [:let_p, _, _, _] => {
+                    let got = list.fold (fn g d -> collect_let l owner d (list.head g) (list.nth 1 g))
+                                        [acc, s] (expand_let_pattern (list.nth 1 oi));
+                    collect_lets l rest (list.head got) (list.nth 1 got)
                 },
                 _ => collect_lets l rest acc s,
             }
         },
+    };
+
+/// One `let` into the collection: `[acc, s]`.
+let collect_let l owner d acc s = {
+    let n = decl_name d;
+    let at = list.index_of true (list.map (fn od -> decl_name (list.nth 1 od) == n) acc);
+    if at < 0 { [list.append acc [[owner, d, true, ()]], s] }
+    else if list.head (list.nth at acc) != owner { [replace_at at [owner, d, true, ()] acc, s] }
+    // A hidden global repeats only where the names beside it repeat, and those
+    // are reported in the terms the source was written in.
+    else if is_hidden_name n { [acc, s] }
+    else {
+        [acc, complain (decl_span d) ("`" + n + "` is already bound in this module")
+                       (modules.module_source (modules.module_at l owner)) s]
+    }
+};
+
+// --- destructuring at the top level ---------------------------------------------
+//
+// A top-level `let` is a global, and a destructuring one binds several, so it
+// becomes several `let`s: a hidden global holding the value checked against the
+// pattern, and a global for each name, reading its part of the hidden one. A
+// global is forced once and remembered, so the check runs once however many of
+// the names a program uses -- the job the checked slot does for a destructuring
+// inside a function (see "destructuring" below).
+//
+// The hidden global is named after its pattern, in a spelling no source can
+// write, so nothing can name it and a profile still says what it is. Two
+// destructurings that render alike bind the same names: in one module the
+// second is already an error through those names, and across a `derive` the
+// later replaces the earlier together with every name it binds, which is the
+// override that was meant.
+
+let hidden_name pattern = "<let " + ast.show_pattern pattern + ">";
+
+let is_hidden_name n = str.starts_with "<" n;
+
+/// The hidden global's body: the value, checked against the pattern.
+let destructure_e pattern body span = [:destructure, pattern, body, span];
+
+/// One name's body: its part of the hidden global's value, which part being
+/// the one the name was written at.
+let destructured_e hidden pattern name_span = [:destructured, hidden, pattern, name_span];
+
+let expand_let_pattern item =
+    match item {
+        [:let_p, pattern, body, span] => {
+            let hidden = hidden_name pattern;
+            core.cons (ast.let_d hidden [] (destructure_e pattern body span) false span)
+                      (list.map (fn b -> ast.let_d (list.nth 0 b) []
+                                                   (destructured_e hidden pattern (list.nth 1 b))
+                                                   false (list.nth 1 b))
+                                (pattern_bindings pattern))
+        },
+        _ => [item],
     };
 
 let rec collect_virtuals items acc =
@@ -1134,16 +1192,19 @@ let check_name c name span r = {
 let rec pattern_bindings p =
     match p {
         [:bind, n, span] => [[n, span]],
-        [:as_p, inner, n, span] => list.append (pattern_bindings inner) [[n, span]],
-        [:list_p, items, rest, span] =>
+        [:as_p, inner, n, name_span, _] => list.append (pattern_bindings inner) [[n, name_span]],
+        [:list_p, items, rest, _] =>
             list.append (list.concat (list.map (fn i -> pattern_bindings i) items))
-                        (match rest { [n] => if n == () { [] } else { [[n, span]] }, _ => [] }),
-        [:array_p, items, rest, span] =>
+                        (rest_bindings rest),
+        [:array_p, items, rest, _] =>
             list.append (list.concat (list.map (fn i -> pattern_bindings i) items))
-                        (match rest { [n] => if n == () { [] } else { [[n, span]] }, _ => [] }),
+                        (rest_bindings rest),
         [:map_p, pairs, _] => list.concat (list.map (fn kv -> pattern_bindings (list.nth 1 kv)) pairs),
         _ => [],
     };
+
+/// A named `..rest` binds where its name is written, not where its list starts.
+let rest_bindings rest = match rest { [n, name_span] => [[n, name_span]], _ => [] };
 
 let rec check_expr c e r =
     match e {
@@ -1231,9 +1292,7 @@ let rec check_expr c e r =
         [:lambda, ps, body, span] => {
             let started = begin_func "<lambda>" (list.length ps) false (impure_ok r) false false span r;
             let fi = list.nth 1 started;
-            let bound = bind_all (ctx_mi c) (ctx_source c)
-                                 (list.map (fn p -> [ast.param_name p, list.nth 1 p]) ps)
-                                 (list.head started);
+            let bound = bind_params c ps (list.head started);
             record (ctx_mi c) (ctx_source c) span [:closure, fi] (end_func fi (check_expr c body bound))
         },
 
@@ -1265,6 +1324,20 @@ let rec check_expr c e r =
             let r2 = record (ctx_mi c) (ctx_source c) span [:match, list.nth 1 held] (list.head held);
             pop_scope (list.fold (fn acc arm -> check_arm c arm acc) r2 arms)
         },
+
+        // The hidden global behind a top-level destructuring. Its value takes a
+        // slot, as a `match` subject does, because the pattern reads it more
+        // than once and it is evaluated once.
+        [:destructure, pattern, body, span] => {
+            let held = bind_one (ctx_mi c) (ctx_source c) "_" span r;
+            check_destructure c pattern "a `let`"
+                (check_pattern c pattern (check_expr c body (list.head held)))
+        },
+        // One name of a top-level destructuring. Lowering reads its part out of
+        // the hidden global, which it finds by name, and the keys that part is
+        // found by were resolved with the hidden global's body -- so there is
+        // nothing left here to resolve.
+        [:destructured, _, _, _] => r,
         _ => r,
     };
 
@@ -1306,15 +1379,26 @@ let rec check_block c stmts r =
                                                      (builtins.is_impure_name n)
                                                      is_rec false span pre;
                             let fi = list.nth 1 started;
-                            let bound = bind_all (ctx_mi c) (ctx_source c)
-                                                 (list.map (fn p -> [ast.param_name p, list.nth 1 p]) ps)
-                                                 (list.head started);
+                            let bound = bind_params c ps (list.head started);
                             record (ctx_mi c) (ctx_source c) span [:closure, fi]
                                    (end_func fi (check_expr c body bound))
                         };
                     check_block c rest
                         (if is_rec { r1 }
                          else { bind_at (ctx_mi c) (ctx_source c) n slot span r1 })
+                },
+                // `let [a, b] = pair`. The value takes a slot as a plain `let`'s
+                // does, and before its body is walked for the same reason; the
+                // value checked against the pattern takes another, which every
+                // name reads its part from. A map pattern's keys are resolved
+                // where the `let` is, before any name it binds is in scope.
+                [:let_p, pattern, body, span] => {
+                    let held = bind_one (ctx_mi c) (ctx_source c) "_" span r;
+                    let walked = check_destructure c pattern "a `let`"
+                        (check_pattern c pattern (check_expr c body (list.head held)));
+                    let checked = bind_one (ctx_mi c) (ctx_source c) "_" (checked_span pattern) walked;
+                    check_block c rest
+                        (bind_all (ctx_mi c) (ctx_source c) (pattern_bindings pattern) (list.head checked))
                 },
                 _ => check_block c rest (check_expr c st r),
             },
@@ -1340,7 +1424,7 @@ let rec check_arm c arm r = {
 let rec check_pattern c p r =
     match p {
         [:literal, e, _] => check_expr c e r,
-        [:as_p, inner, _, _] => check_pattern c inner r,
+        [:as_p, inner, _, _, _] => check_pattern c inner r,
         [:list_p, items, _, _]  => list.fold (fn acc i -> check_pattern c i acc) r items,
         [:array_p, items, _, _] => list.fold (fn acc i -> check_pattern c i acc) r items,
         [:map_p, pairs, _] =>
@@ -1348,6 +1432,116 @@ let rec check_pattern c p r =
                       r pairs,
         _ => r,
     };
+
+// --- destructuring ----------------------------------------------------------------
+//
+// `let [a, b] = pair`, and a parameter written as a pattern, take a value apart
+// with the patterns `match` uses -- parsed, bound and tested by the same code.
+// Only the moment of the test differs. A `let` is lazy, and one that destructures
+// is no exception: nothing is looked at until a name it binds is used, and then
+// the whole pattern is checked, once however many of its names are used, raising
+// `:match_error` when the value does not fit, as a `match` with no arm for it
+// would.
+//
+// That is the slot a destructuring takes beyond its names: the value, checked.
+// Every name reads its part out of that slot, so no name is read before the
+// check has run, and the check runs the first time only.
+
+/// The pattern under any `as`, which is what says whether there is a shape here
+/// to take apart at all.
+let rec pattern_shape p = match p { [:as_p, inner, _, _, _] => pattern_shape inner, _ => p };
+
+let takes_apart p =
+    match pattern_shape p {
+        [:list_p, _, _, _]  => true,
+        [:array_p, _, _, _] => true,
+        [:map_p, _, _]      => true,
+        _ => false,
+    };
+
+/// Where the checked value's slot is recorded: at the shape's closing bracket.
+/// A binder is recorded where its name starts, a pattern parameter where its
+/// pattern starts, a destructuring `let`'s value where the `let` starts -- and no
+/// name starts at a `]` or a `}`.
+let checked_span p = {
+    let e = ast.span_end (ast.span (pattern_shape p));
+    ast.span_of (e - 1) e
+};
+
+/// The first part of a pattern that asks a question -- a literal -- or `()`.
+let rec refutable_part p =
+    match p {
+        [:literal, _, _]        => p,
+        [:as_p, inner, _, _, _] => refutable_part inner,
+        [:list_p, items, _, _]  => first_refutable items,
+        [:array_p, items, _, _] => first_refutable items,
+        [:map_p, pairs, _]      => first_refutable (list.map (fn kv -> list.nth 1 kv) pairs),
+        _ => (),
+    };
+
+let rec first_refutable ps =
+    match ps {
+        [] => (),
+        [p, ..rest] => match refutable_part p { () => first_refutable rest, found => found },
+    };
+
+/// A literal pattern as it is written, for a message that names it.
+let literal_text e =
+    match e {
+        [:atom, n, _]  => ":" + n,
+        [:str, s, _]   => ast.quote_str s,
+        [:char, ch, _] => "'" + str.of_chars [ch] + "'",
+        [:unit, _]     => "()",
+        [_, v, _]      => to_string v,
+        _ => "this literal",
+    };
+
+/// Refuse what a destructuring cannot do; `what` names the position.
+///
+/// A `let` and a parameter have nowhere to go when a value does not fit, so a
+/// pattern that asks a question -- a literal anywhere in it -- belongs in a
+/// `match`, where another arm can take the answer no. A shape can still fail to
+/// fit, and that raises; what cannot be written is a pattern whose point is to
+/// be declined. The other two are mistakes: a pattern with no shape only names
+/// a value, and one that binds nothing would never be checked, because the
+/// check waits for a name to be used.
+let check_destructure c p what r =
+    match refutable_part p {
+        () =>
+            if not (takes_apart p) {
+                report_note c (ast.span p)
+                    ("the pattern of " + what + " has to take apart a list, an array or a map")
+                    "to bind a value whole, give it a name" r
+            }
+            else if list.is_empty (pattern_bindings p) {
+                report_note c (ast.span p)
+                    "this pattern binds no names, so nothing would ever check it"
+                    "a destructuring is checked when a name it binds is first used; `match` checks a shape now" r
+            }
+            else { r },
+        lit =>
+            report_note c (ast.span lit)
+                ("`" + literal_text (list.nth 1 lit) + "` could fail to match, and " + what
+                 + " has no other arm to try")
+                "use `match`, with an arm for whatever else the value can be" r,
+    };
+
+/// A parameter list. Every parameter takes its slot in order, which is where its
+/// argument arrives; then each one written as a pattern binds its names out of
+/// that slot, with a slot for the checked argument, as a destructuring `let` has.
+/// A pattern's keys see the parameters, and not the names it is about to bind.
+let bind_params c ps r =
+    list.fold (fn acc p ->
+        match ast.param_pattern p {
+            () => acc,
+            pattern => {
+                let walked = check_destructure c pattern "a parameter" (check_pattern c pattern acc);
+                let checked = bind_one (ctx_mi c) (ctx_source c) "_" (checked_span pattern) walked;
+                bind_all (ctx_mi c) (ctx_source c) (pattern_bindings pattern) (list.head checked)
+            },
+        })
+        (bind_all (ctx_mi c) (ctx_source c) (list.map (fn p -> [ast.param_name p, list.nth 1 p]) ps) r)
+        ps;
 
 /// One queued body, resolved in the module whose names it sees. A global `let`
 /// is a function like any other -- a parameterless one is a zero-arity function
@@ -1364,9 +1558,7 @@ let check_body l p r = {
     let started = begin_func (decl_name d) (list.length (decl_params d)) impure impure
                              (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) r;
     let fi = list.nth 1 started;
-    let bound = bind_all mi source
-                         (list.map (fn prm -> [ast.param_name prm, list.nth 1 prm]) (decl_params d))
-                         (list.head started);
+    let bound = bind_params c (decl_params d) (list.head started);
     let done = end_func fi (check_expr c (decl_body d) bound);
     core.map_put done :bodies (list.append (bodies done) [[mi, source, d, fi]])
 };
@@ -1394,11 +1586,14 @@ let declare! l =
 let resolve_from! l declared r0 from s_pre = {
     let base = core.map_put (core.map_put r0 :envs (envs declared)) :frames [];
     let new_pending = list.drop from (pending declared);
+    // The global behind a destructuring is how one was compiled, not something
+    // anyone defined, so it stays out of an outline.
     let named = core.map_put base :defs
         (list.append (defs base)
                      (list.map (fn p -> [list.nth 0 p, list.nth 1 p, decl_name (list.nth 2 p),
                                          decl_span (list.nth 2 p)])
-                               new_pending));
+                               (list.filter (fn p -> not (is_hidden_name (decl_name (list.nth 2 p))))
+                                            new_pending)));
     let walked = list.fold (fn acc p -> check_body l p acc) named new_pending;
 
     // A global that names a function could not say which function until the
@@ -1721,6 +1916,56 @@ when test {
         test.case "a map pattern's key cannot see what the pattern binds"
             $( test.eq! "cannot find `x` in this scope"
                         (first (checked! "let f v = match v { %{ x => x } => x, };")) ),
+        // A named rest and an `as` alias were both recorded where their list
+        // starts -- one position for two names, and so one slot.
+        test.case "a named rest and an as alias get slots of their own"
+            $( test.true! { let r = resolved! "let f v = match v { [x, ..rest] as whole => whole, _ => 0 };";
+                            let a = binding_slot r "rest";
+                            let b = binding_slot r "whole";
+                            a != () && b != () && a != b } ),
+
+        // --- destructuring ---
+        test.case "a destructuring let binds its names for the statements after it"
+            $( test.eq! [] (checked! "let f p = { let [a, %{ :k => b }] = p; a + b };") ),
+        test.case "a destructuring let's names are not in scope in its own value"
+            $( test.eq! "cannot find `a` in this scope"
+                        (first (checked! "let f = { let [a] = [a]; a };")) ),
+        test.case "a top-level destructuring binds globals"
+            $( test.eq! [] (checked! "let [a, ..rest] = [1, 2];\nlet f = a + len rest;") ),
+        test.case "a top-level destructuring's names clash as any let's do"
+            $( test.eq! ["`a` is already bound in this module"]
+                        (messages (checked! "let [a, b] = [1, 2];\nlet a = 3;")) ),
+        test.case "a pattern parameter binds for the body"
+            $( test.eq! [] (checked! "let f [a, b] %{ :k => c } = a + b + c;") ),
+        test.case "a lambda's pattern parameter binds for its body"
+            $( test.eq! [] (checked! "let f = fn [x, ..rest] -> rest;") ),
+        test.case "a key in a pattern parameter sees the parameters before it"
+            $( test.eq! [] (checked! "let f k %{ k => v } = v;") ),
+        test.case "a key cannot see what its destructuring binds"
+            $( test.eq! "cannot find `x` in this scope"
+                        (first (checked! "let f p = { let %{ x => x } = p; x };")) ),
+        test.case "a literal in a destructuring let is refused"
+            $( test.eq! "`:ok` could fail to match, and a `let` has no other arm to try"
+                        (first (checked! "let f p = { let [:ok, v] = p; v };")) ),
+        test.case "a literal in a pattern parameter is refused"
+            $( test.eq! "`0` could fail to match, and a parameter has no other arm to try"
+                        (first (checked! "let f [0, x] = x;")) ),
+        test.case "a literal in a top-level destructuring is refused"
+            $( test.eq! "`\"x\"` could fail to match, and a `let` has no other arm to try"
+                        (first (checked! "let [\"x\", y] = [\"x\", 1];")) ),
+        test.case "a destructuring has to take something apart"
+            $( test.true! (str.contains_str "a list, an array or a map"
+                                            (first (checked! "let f p = { let (x as y) = p; x };"))) ),
+        test.case "a destructuring that binds nothing is refused"
+            $( test.eq! "this pattern binds no names, so nothing would ever check it"
+                        (first (checked! "let f p = { let [_, _] = p; 1 };")) ),
+        test.case "the global behind a destructuring is not an export"
+            $( test.true! (str.contains_str "it exports: x, y"
+                   (note_of (checked_two! "let [x, y] = [1, 2];" "import a;\nlet f = a.nope;"))) ),
+        test.case "the global behind a destructuring is not in an outline"
+            $( test.eq! ["a", "b", "f"]
+                        (list.map (fn d -> list.nth 2 d)
+                                  (module_defs (resolved! "let [a, b] = [1, 2];\nlet f = a;") 0)) ),
 
         // --- try ---
         test.case "a catch binder is in scope in the handler"

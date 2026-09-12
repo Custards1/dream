@@ -490,6 +490,12 @@ let rec lambda_params acc ts =
             [:ok, acc2, rest] => lambda_params acc2 rest,
         }
     }
+    else if starts_param_pattern ts {
+        match param_pattern ts {
+            [:error, m, s] => err m s,
+            [:ok, p, rest] => lambda_params (core.cons p acc) rest,
+        }
+    }
     else { err ("expected a parameter or `->`, found " + describe ts) (peek_span ts) };
 
 /// `try! { body } catch e { handler }` -- the `catch` and its binder are both
@@ -564,7 +570,14 @@ let rec parse_statement c ts =
 let rec parse_let c sp ts = {
     let is_rec = is_kw ts "rec";
     let after_rec = if is_rec { list.tail ts } else { ts };
-    if not (at after_rec :ident) {
+    if starts_let_pattern after_rec {
+        if is_rec {
+            err "a destructuring `let` cannot be `rec`: it has no one name to refer to itself by"
+                (peek_span ts)
+        }
+        else { parse_let_pattern c sp after_rec }
+    }
+    else if not (at after_rec :ident) {
         err ("expected a name after `let`, found " + describe after_rec) (peek_span after_rec)
     }
     else if is_keyword (peek_value after_rec) {
@@ -590,6 +603,29 @@ let rec parse_let c sp ts = {
     }
 };
 
+/// What can begin the pattern of a destructuring `let`: a list, an array or a
+/// map, or a parenthesised pattern.
+let starts_let_pattern ts =
+    at ts :lbracket || at ts :hash_bracket || at ts :percent_brace || at ts :lparen;
+
+/// `let [a, b] = pair`. Only the shape is read here. Which patterns a `let` may
+/// take is resolution's question, because a pattern that could fail to match
+/// has more to say about itself than a parse error can.
+let rec parse_let_pattern c sp ts =
+    match parse_pattern (grouped c) ts {
+        [:error, m, s] => err m s,
+        [:ok, pattern, rest] =>
+            match expect rest :eq "`=` after the pattern of a `let`" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest2] =>
+                    match parse_expr c rest2 {
+                        [:error, m, s] => err m s,
+                        [:ok, body, rest3] =>
+                            ok (ast.let_pattern_d pattern body (ast.span_to sp (ast.span body))) rest3,
+                    },
+            },
+    };
+
 /// Parameters, up to whatever follows them. It stops rather than complaining,
 /// because what may legally follow depends on the caller: a `let` wants `=`,
 /// but `virtual let fold f init xs;` has no body at all and ends at the `;`.
@@ -600,6 +636,11 @@ let rec parse_let c sp ts = {
 /// a parenthesised list, which the reference does not mention at all -- but
 /// the Rust parser takes it, so a file that uses it compiles today and has to
 /// keep compiling.
+///
+/// Any of them may hold a pattern -- `f [a, b]`, `f %{ :k => v }` -- which
+/// takes its argument apart. An `as` around one is written inside the
+/// parenthesised list, `f ([a, b] as pair)`, where the brackets say where it
+/// ends; in a row of juxtaposed parameters nothing would.
 let rec let_params acc ts =
     if at ts :ident && not (is_keyword (peek_value ts)) {
         let_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
@@ -613,19 +654,43 @@ let rec let_params acc ts =
             [:ok, acc2, rest] => let_params acc2 rest,
         }
     }
+    else if starts_param_pattern ts {
+        match param_pattern ts {
+            [:error, m, s] => err m s,
+            [:ok, p, rest] => let_params (core.cons p acc) rest,
+        }
+    }
     else { ok (list.reverse acc) ts };
 
-/// The inside of `(a, b, c)`, already past the `(`.
+/// Can this token begin a parameter that is a pattern? Only a bracketed shape:
+/// a name is already a parameter, and a `(` is the parenthesised list.
+let starts_param_pattern ts = at ts :lbracket || at ts :hash_bracket || at ts :percent_brace;
+
+/// A parameter that takes its argument apart: `[a, b]`, `#[a, b]`, `%{ :k => v }`.
+let rec param_pattern ts =
+    match parse_pattern_atom (grouped top) ts {
+        [:error, m, s] => err m s,
+        [:ok, p, rest] => ok (ast.pattern_param p (ast.span p)) rest,
+    };
+
+/// The inside of `(a, b, c)`, already past the `(`. Each element is a pattern,
+/// and a name or `_` is the parameter it always was.
 let rec paren_params acc ts =
-    if not (at ts :ident) || is_keyword (peek_value ts) {
-        err ("expected a parameter name, found " + describe ts) (peek_span ts)
-    }
-    else {
-        let acc2 = core.cons (ast.param (peek_value ts) (peek_span ts)) acc;
-        let rest = list.tail ts;
-        if at rest :comma { paren_params acc2 (list.tail rest) }
-        else if at rest :rparen { ok acc2 (list.tail rest) }
-        else { err ("expected `,` or `)` in a parameter list, found " + describe rest) (peek_span rest) }
+    match parse_pattern (grouped top) ts {
+        [:error, m, s] => err m s,
+        [:ok, p, rest] => {
+            let acc2 = core.cons (param_of p) acc;
+            if at rest :comma { paren_params acc2 (list.tail rest) }
+            else if at rest :rparen { ok acc2 (list.tail rest) }
+            else { err ("expected `,` or `)` in a parameter list, found " + describe rest) (peek_span rest) }
+        },
+    };
+
+let param_of p =
+    match p {
+        [:bind, n, sp]  => ast.param n sp,
+        [:wildcard, sp] => ast.param "_" sp,
+        _ => ast.pattern_param p (ast.span p),
     };
 
 // --- match ------------------------------------------------------------------
@@ -702,7 +767,8 @@ let rec parse_pattern c ts =
                 if not (at after :ident) {
                     err ("expected a name after `as`, found " + describe after) (peek_span after)
                 } else {
-                    ok (ast.as_p p (peek_value after) (ast.span_to (ast.span p) (peek_span after)))
+                    ok (ast.as_p p (peek_value after) (peek_span after)
+                                 (ast.span_to (ast.span p) (peek_span after)))
                        (list.tail after)
                 }
             },
@@ -733,10 +799,22 @@ let rec parse_pattern_atom c ts = {
                 },
             :lparen =>
                 match peek rest {
-                    () => err "expected `()` in a pattern" sp,
+                    () => err "expected a pattern after `(`" sp,
                     m =>
                         if kind_of m == :rparen { ok (ast.literal_p (ast.unit_e sp) sp) (list.tail rest) }
-                        else { err "expected `()` in a pattern" sp },
+                        else {
+                            // `( p )` only groups. It is how an `as` is written
+                            // where its end would otherwise be unclear -- in a
+                            // parameter list, or around one element of a list.
+                            match parse_pattern (grouped c) rest {
+                                [:error, m2, s] => err m2 s,
+                                [:ok, p, rest2] =>
+                                    match expect rest2 :rparen "`)` to close a pattern" {
+                                        [:error, m2, s] => err m2 s,
+                                        [:ok, _, rest3] => ok p rest3,
+                                    },
+                            }
+                        },
                 },
             :lbracket     => pattern_sequence c sp rest :rbracket (fn i r s -> ast.list_p i r s) "]",
             :hash_bracket => pattern_sequence c sp rest :rbracket (fn i r s -> ast.array_p i r s) "]",
@@ -764,7 +842,7 @@ let rec pattern_items c acc ts closer build what sp =
     else if at ts :dot_dot {
         let after = list.tail ts;
         let named = at after :ident && not (is_keyword (peek_value after));
-        let rest_binding = if named { [peek_value after] } else { [()] };
+        let rest_binding = if named { [peek_value after, peek_span after] } else { [()] };
         let after2 = if named { list.tail after } else { after };
         if at after2 closer {
             ok (build (list.reverse acc) rest_binding (ast.span_to sp (peek_span after2)))
@@ -1263,6 +1341,33 @@ when test {
         test.case "the subject does not swallow the arms brace"
             $( test.eq! "(match (apply (name f) (name x)) [_ (int 1)])"
                         (shape "match f x { _ => 1 }") ),
+        test.case "parentheses group a pattern"
+            $( test.eq! "(match (name v) [[([x ..] as first) y] (name first)])"
+                        (shape "match v { [([x, ..] as first), y] => first }") ),
+
+        // --- destructuring ---
+        //
+        // A `let` and a parameter take the patterns a `match` arm takes. Which
+        // of them are allowed there is resolution's business, not the parser's.
+        test.case "a let may take a pattern"
+            $( test.eq! "(let [a b] (name p))" (items "let [a, b] = p;") ),
+        test.case "a block's let may take a pattern"
+            $( test.eq! "(block (let [x ..rest] (name xs)) (name rest))"
+                        (shape "{ let [x, ..rest] = xs\n  rest }") ),
+        test.case "a let may take a map apart"
+            $( test.eq! "(let %{(atom x) => x (atom y) => y} (name p))"
+                        (items "let %{ :x => x, :y => y } = p;") ),
+        test.case "a let's pattern may carry an as"
+            $( test.eq! "(let ([a] as whole) (name p))" (items "let [a] as whole = p;") ),
+        test.case "a destructuring let cannot be rec"
+            $( test.true! (str.contains_str "cannot be `rec`" (fails_module "let rec [a] = p;")) ),
+        test.case "a parameter may be a pattern"
+            $( test.eq! "(let f [a b] c (name a))" (items "let f [a, b] c = a;") ),
+        test.case "a lambda's parameter may be a pattern"
+            $( test.eq! "(fn %{(atom k) => v} (name v))" (shape "fn %{ :k => v } -> v") ),
+        test.case "an as in a parameter is written in the parenthesised list"
+            $( test.eq! "(let f ([a b] as pair) c (name pair))"
+                        (items "let f ([a, b] as pair, c) = pair;") ),
 
         // --- parameters ---
         //

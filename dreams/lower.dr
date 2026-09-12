@@ -399,8 +399,8 @@ let rec lower_expr e l =
         // a function is a body node and a descriptor, not a separate arena --
         // and what is emitted in their place is the instruction that makes one
         // at run time.
-        [:lambda, _, body, span] => lower_function span :make_closure body l,
-        [:thunk, body, span] => lower_function span :make_thunk body l,
+        [:lambda, ps, body, span] => lower_function span :make_closure ps body l,
+        [:thunk, body, span] => lower_function span :make_thunk [] body l,
 
         [:try, body, _, handler, span] => {
             let b = lower_expr body l;
@@ -437,15 +437,20 @@ let rec lower_expr e l =
                 _ => emit_leaf :unit l,
             },
 
+        // What a top-level destructuring became in `scope`: the hidden global
+        // holding the checked value, and a global per name.
+        [:destructure, pattern, body, span] => lower_destructure pattern body span l,
+        [:destructured, hidden, pattern, name_span] => lower_destructured hidden pattern name_span l,
+
         _ => emit_leaf :unit l,
     };
 
 /// A nested function: lower its body, remember which node that was, and emit
 /// the instruction that builds the closure or thunk.
-let rec lower_function span op body l =
+let rec lower_function span op ps body l =
     match lookup span l {
         [_, fi] => {
-            let inner = lower_expr body l;
+            let inner = lower_body ps body l;
             let done = set_func_body fi (list.nth 1 inner)
                                      (mark_tail (list.nth 1 inner) (list.head inner));
             let made = emit (ir.node op fi ir.no_node ir.no_node) done;
@@ -459,6 +464,34 @@ let rec lower_function span op body l =
         },
         _ => emit_leaf :unit l,
     };
+
+/// A function's body, with its pattern parameters taken apart in front of it.
+/// Such a parameter's argument arrives in its slot like any other -- a function's
+/// parameters are its first slots, in order -- and its names are bound out of
+/// that slot before the body runs. They are bound lazily, as a destructuring
+/// `let` binds them, so naming an argument's parts makes a function no stricter
+/// in it.
+let lower_body ps body l =
+    if not (list.any (fn p -> has_pattern p) ps) { lower_expr body l }
+    else {
+        let bound = list.fold (fn acc pair ->
+            match ast.param_pattern (list.nth 0 pair) {
+                () => acc,
+                pattern => {
+                    let arg = emit (ir.node :local (list.nth 1 pair) ir.no_node ir.no_node) (list.head acc);
+                    let parts = destructure pattern (list.nth 1 arg) (list.head arg);
+                    [list.head parts, list.append (list.nth 1 acc) (list.nth 1 parts)]
+                },
+            }) [l, []] (list.zip ps (list.range 0 (list.length ps)));
+        let inner = lower_expr body (list.head bound);
+        let stmts = list.append (list.nth 1 bound) [list.nth 1 inner];
+        let placed = kids stmts (list.head inner);
+        let made = emit (ir.node :block (list.nth 1 placed) (list.length stmts) ir.no_node)
+                        (list.head placed);
+        [inherit (list.nth 1 made) stmts (list.head made), list.nth 1 made]
+    };
+
+let has_pattern p = match ast.param_pattern p { () => false, _ => true };
 
 /// Lower a list of expressions, keeping their order: `[lowering, indices]`.
 let rec lower_all es l =
@@ -510,6 +543,9 @@ let rec lower_field e span l =
     };
 
 let rec lower_block stmts span l = {
+    // A statement lowers to one node, except a destructuring `let`, which
+    // lowers to several binds. So each node travels with the statement it came
+    // from, which is what a warning about a discarded value points at.
     let done = list.fold (fn acc st ->
         match st {
             [:let, n, ps, body, _, sp] => {
@@ -517,24 +553,26 @@ let rec lower_block stmts span l = {
                     if list.is_empty ps { lower_expr body (list.head acc) }
                     // A local `let f x = ..` is a function like any other: it
                     // was numbered by `scope` and its body is lowered here.
-                    else { lower_function sp :make_closure body (list.head acc) };
+                    else { lower_function sp :make_closure ps body (list.head acc) };
                 let held = match slot_at sp (list.head value) { () => 0, s => s };
-                let made = emit (ir.node :bind held (list.nth 1 value) ir.no_node)
-                                (list.head value);
-                let i = list.nth 1 made;
-                let inherited = inherit i [list.nth 1 value] (list.head made);
-                // Binding an effectful expression sequences it here rather than
-                // at first use, so effects happen in written order.
-                let ordered =
-                    if is_impure_node (list.nth 1 value) inherited {
-                        set_flag (list.nth 1 value) ir.f_strict (set_flag i ir.f_strict inherited)
-                    }
-                    else { inherited };
-                [ordered, list.append (list.nth 1 acc) [i]]
+                let bound = bind_value held (list.nth 1 value) (list.head value);
+                [list.head bound, list.append (list.nth 1 acc) [[list.nth 1 bound, st]]]
+            },
+            // The value is held exactly as a plain `let` holds it, and the names
+            // are bound out of it -- see "destructuring".
+            [:let_p, pattern, body, sp] => {
+                let value = lower_expr body (list.head acc);
+                let held = match slot_at sp (list.head value) { () => 0, s => s };
+                let bound = bind_value held (list.nth 1 value) (list.head value);
+                let reader = emit (ir.node :local held ir.no_node ir.no_node) (list.head bound);
+                let parts = destructure pattern (list.nth 1 reader) (list.head reader);
+                [list.head parts,
+                 list.append (list.nth 1 acc)
+                     (list.map (fn k -> [k, st]) (core.cons (list.nth 1 bound) (list.nth 1 parts)))]
             },
             _ => {
                 let got = lower_expr st (list.head acc);
-                [list.head got, list.append (list.nth 1 acc) [list.nth 1 got]]
+                [list.head got, list.append (list.nth 1 acc) [[list.nth 1 got, st]]]
             },
         }) [l, []] stmts;
     // A non-final statement contributes nothing but its effects. Inside an
@@ -543,9 +581,10 @@ let rec lower_block stmts span l = {
     // a pure one there are no effects to have, so it is dead code -- and
     // forcing it would only risk raising an error the program never asked for.
     let impure_here = match lookup span (list.head done) { [:block, yes] => yes, _ => false };
-    let stmt_nodes = list.nth 1 done;
+    let pairs = list.nth 1 done;
+    let stmt_nodes = list.map (fn pair -> list.nth 0 pair) pairs;
     let sequenced =
-        if list.length stmt_nodes <= 1 { list.head done }
+        if list.length pairs <= 1 { list.head done }
         else {
             list.fold (fn acc pair -> {
                 let k = list.nth 0 pair;
@@ -560,14 +599,25 @@ let rec lower_block stmts span l = {
                          "this statement's value is discarded, and a pure expression has no other effect"
                          "only the final expression of a block is used" acc
                 }
-            }) (list.head done)
-              (list.zip (list.take (list.length stmt_nodes - 1) stmt_nodes)
-                        (list.take (list.length stmts - 1) stmts))
+            }) (list.head done) (list.take (list.length pairs - 1) pairs)
         };
     let placed = kids stmt_nodes sequenced;
     let made = emit (ir.node :block (list.nth 1 placed) (list.length stmt_nodes) ir.no_node)
                     (list.head placed);
     [inherit (list.nth 1 made) stmt_nodes (list.head made), list.nth 1 made]
+};
+
+/// A block's bind: `[lowering, node]`. Lazy, unless the value has effects --
+/// binding an effectful expression sequences it here rather than at first use,
+/// so effects happen in written order.
+let bind_value slot value l = {
+    let made = emit (ir.node :bind slot value ir.no_node) l;
+    let i = list.nth 1 made;
+    let inherited = inherit i [value] (list.head made);
+    if is_impure_node value inherited {
+        [set_flag value ir.f_strict (set_flag i ir.f_strict inherited), i]
+    }
+    else { [inherited, i] }
 };
 
 // --- patterns ---------------------------------------------------------------------
@@ -586,14 +636,14 @@ let rec pattern_test p subject binds l =
             let t = const_bool true l;
             [list.head t, list.nth 1 t, list.append binds [[span, subject]]]
         },
-        [:as_p, inner, _, span] =>
-            pattern_test inner subject (list.append binds [[span, subject]]) l,
+        [:as_p, inner, _, name_span, _] =>
+            pattern_test inner subject (list.append binds [[name_span, subject]]) l,
         [:literal, e, _] => {
             let k = lower_expr e l;
             let cmp = eq_const subject (list.nth 1 k) (list.head k);
             [list.head cmp, list.nth 1 cmp, binds]
         },
-        [:list_p, items, rest, span]  => list_test items rest subject binds span l,
+        [:list_p, items, rest, _]     => list_test items rest subject binds l,
         [:array_p, items, rest, span] => array_test items rest subject binds span l,
         [:map_p, pairs, span] => map_test pairs subject binds span l,
         _ => { let t = const_bool true l; [list.head t, list.nth 1 t, binds] },
@@ -610,7 +660,7 @@ let rec is_type name subject l = {
     eq_const (list.nth 1 ty) (list.nth 1 want) (list.head want)
 };
 
-let rec list_test items rest subject binds span l = {
+let rec list_test items rest subject binds l = {
     let typed = is_type "list" subject l;
     // Walked one cell at a time, so nothing beyond what the pattern names is
     // ever forced.
@@ -635,7 +685,8 @@ let rec list_test items rest subject binds span l = {
     match rest {
         // `..` takes whatever is left, including nothing, so there is no
         // further test -- only a binding, when it was named.
-        [name] => [l1, test, if name == () { bs } else { list.append bs [[span, cursor]] }],
+        [()] => [l1, test, bs],
+        [_, name_span] => [l1, test, list.append bs [[name_span, cursor]]],
         // A fixed-length list: what is left must be the end.
         _ => {
             let cons_test = call_builtin "match_is_cons" [cursor] l1;
@@ -671,13 +722,10 @@ let rec array_test items rest subject binds span l = {
     // `#[a, ..rest]` names the remainder, which an array cannot hand back
     // without copying, so it is reported rather than silently allocating.
     match rest {
-        [name] =>
-            if name == () { done }
-            else {
-                [complain span ("`.." + name + "` cannot name the rest of an array")
-                          (list.nth 0 done),
-                 list.nth 1 done, list.nth 2 done]
-            },
+        [name, _] =>
+            [complain span ("`.." + name + "` cannot name the rest of an array")
+                      (list.nth 0 done),
+             list.nth 1 done, list.nth 2 done],
         _ => done,
     }
 };
@@ -698,6 +746,146 @@ let rec map_test pairs subject binds span l = {
         [list.head both, list.nth 1 both, list.nth 2 inner]
     }) [list.head typed, list.nth 1 typed, binds] pairs
 };
+
+// --- destructuring ----------------------------------------------------------------
+//
+// A destructuring `let`, a pattern parameter and a top-level destructuring all
+// come to the same two steps. The value is checked against the pattern by the
+// very test a `match` arm makes, and bound, checked, to a slot of its own; then
+// each name is bound to its part of *that* slot. Every one of those binds is lazy,
+// so nothing happens until a name is used -- and reading any name's part forces
+// the checked slot first, which runs the check once for all of them.
+
+/// The value if it fits the pattern, and a raise of `:match_error` if it does
+/// not: a `match` whose one arm hands the value back.
+let check_value pattern value l = {
+    let tested = pattern_test pattern value [] l;
+    let test = list.nth 1 tested;
+    let kind = const_atom "match_error" (list.nth 0 tested);
+    let raised = call_builtin "raise!" [list.nth 1 kind] (list.head kind);
+    let failing = set_flag (list.nth 1 raised) ir.f_strict (list.head raised);
+    let made = emit (ir.node :if test value (list.nth 1 raised)) failing;
+    [set_flag test ir.f_strict
+        (inherit (list.nth 1 made) [test, value, list.nth 1 raised] (list.head made)),
+     list.nth 1 made]
+};
+
+/// The binds a destructuring comes to, given a node that reads the value:
+/// `[lowering, binds]`. The first holds the checked value, and each of the rest
+/// binds a name to its part of the first.
+let destructure pattern value l = {
+    let checked = check_value pattern value l;
+    let slot = match slot_at (scope.checked_span pattern) (list.head checked) { () => 0, s => s };
+    let held = emit (ir.node :bind slot (list.nth 1 checked) ir.no_node) (list.head checked);
+    let reader = emit (ir.node :local slot ir.no_node ir.no_node) (list.head held);
+    let parts = extract pattern (list.nth 1 reader) (fn _ -> true) [] (list.head reader);
+    list.fold (fn acc part -> {
+        let s = match slot_at (list.nth 0 part) (list.head acc) { () => 0, found => found };
+        let made = emit (ir.node :bind s (list.nth 1 part) ir.no_node) (list.head acc);
+        [list.head made, list.append (list.nth 1 acc) [list.nth 1 made]]
+    }) [list.nth 0 parts, [list.nth 1 held]] (list.nth 1 parts)
+};
+
+/// The parts of a value a pattern names, as `[lowering, binds]` with each bind
+/// `[span, node]` -- what `pattern_test` answers, without the test, which has
+/// already been made. Only what `want` asks for is walked to: a name of a
+/// top-level destructuring is a global of its own and reads its one part, not
+/// every part.
+///
+/// These are the accessors a `match` uses. They force the cells on the way,
+/// which the check already forced, and never the part itself.
+let rec extract p subject want binds l =
+    match p {
+        [:bind, _, span] =>
+            [l, if want span { list.append binds [[span, subject]] } else { binds }],
+        [:as_p, inner, _, name_span, _] =>
+            extract inner subject want
+                    (if want name_span { list.append binds [[name_span, subject]] } else { binds }) l,
+        [:list_p, items, rest, _] => extract_list items rest subject want binds l,
+        [:array_p, items, _, _] =>
+            list.fold (fn acc pair ->
+                if not (wants want (list.nth 0 pair)) { acc }
+                else {
+                    let at = const_int (list.nth 1 pair) (list.nth 0 acc);
+                    let element = call_builtin "match_at" [subject, list.nth 1 at] (list.head at);
+                    extract (list.nth 0 pair) (list.nth 1 element) want (list.nth 1 acc)
+                            (list.head element)
+                }) [l, binds] (list.zip items (list.range 0 (list.length items))),
+        [:map_p, pairs, _] =>
+            list.fold (fn acc kv ->
+                if not (wants want (list.nth 1 kv)) { acc }
+                else {
+                    let k = lower_expr (list.nth 0 kv) (list.nth 0 acc);
+                    let found = call_builtin "match_key" [subject, list.nth 1 k] (list.head k);
+                    let held = call_builtin "match_head" [list.nth 1 found] (list.head found);
+                    extract (list.nth 1 kv) (list.nth 1 held) want (list.nth 1 acc) (list.head held)
+                }) [l, binds] pairs,
+        _ => [l, binds],
+    };
+
+/// A list a cell at a time, and no further than the last part wanted.
+let rec extract_list items rest cursor want binds l =
+    match items {
+        [] =>
+            match rest {
+                [_, name_span] =>
+                    [l, if want name_span { list.append binds [[name_span, cursor]] } else { binds }],
+                _ => [l, binds],
+            },
+        [item, ..more] => {
+            let got =
+                if not (wants want item) { [l, binds] }
+                else {
+                    let head = call_builtin "match_head" [cursor] l;
+                    extract item (list.nth 1 head) want binds (list.head head)
+                };
+            if not (list.any (fn i -> wants want i) more || rest_wanted want rest) { got }
+            else {
+                let tail = call_builtin "match_tail" [cursor] (list.head got);
+                extract_list more rest (list.nth 1 tail) want (list.nth 1 got) (list.head tail)
+            }
+        },
+    };
+
+/// Does this pattern bind anything `want` asks for?
+let wants want p = list.any (fn b -> want (list.nth 1 b)) (scope.pattern_bindings p);
+
+let rest_wanted want rest = match rest { [_, name_span] => want name_span, _ => false };
+
+/// The hidden global behind a top-level destructuring: the value, held, and then
+/// checked. Shaped as a `match` is -- a strict bind of the subject, then the test
+/// -- because it is only ever forced by a name that needs the check, and a global
+/// remembers what it came to.
+let lower_destructure pattern body span l = {
+    let value = lower_expr body l;
+    let held = match slot_at span (list.head value) { () => 0, s => s };
+    let bind = emit (ir.node :bind held (list.nth 1 value) ir.no_node) (list.head value);
+    let i = list.nth 1 bind;
+    let sequenced = set_flag i ir.f_strict (inherit i [list.nth 1 value] (list.head bind));
+    let reader = emit (ir.node :local held ir.no_node ir.no_node) sequenced;
+    let checked = check_value pattern (list.nth 1 reader) (list.head reader);
+    let placed = kids [i, list.nth 1 checked] (list.head checked);
+    let made = emit (ir.node :block (list.nth 1 placed) 2 ir.no_node) (list.head placed);
+    [inherit (list.nth 1 made) [i, list.nth 1 checked] (list.head made), list.nth 1 made]
+};
+
+/// One name of a top-level destructuring: its part of the hidden global. The
+/// hidden global is found by name in the module this body was resolved against,
+/// which under `derive` is the deriving module -- whose hidden global it is.
+let lower_destructured hidden pattern name_span l =
+    match scope.global_index (list.nth (ctx l) (scope.r_envs (res l))) hidden {
+        () => emit_leaf :unit l,
+        g => {
+            let value = emit (ir.node :global g ir.no_node ir.no_node) l;
+            let parts = extract pattern (list.nth 1 value)
+                                (fn s -> ast.span_start s == ast.span_start name_span)
+                                [] (list.head value);
+            match list.nth 1 parts {
+                [part] => [list.nth 0 parts, list.nth 1 part],
+                _ => emit_leaf :unit (list.nth 0 parts),
+            }
+        },
+    };
 
 // --- match --------------------------------------------------------------------
 
@@ -962,7 +1150,8 @@ let lower_from r low bodies =
         let src = list.nth 1 b;
         let d = list.nth 2 b;
         let fi = list.nth 3 b;
-        let got = lower_expr (scope.decl_body d) (set_ctx (list.nth 0 b) (set_source src acc));
+        let got = lower_body (scope.decl_params d) (scope.decl_body d)
+                             (set_ctx (list.nth 0 b) (set_source src acc));
         settle_body (set_func_body fi (list.nth 1 got)
                                   (mark_tail (list.nth 1 got) (list.head got)))
     }) (set_res r low) bodies;
