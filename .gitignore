@@ -11,6 +11,7 @@ build-nojit/
 build-tsan/
 build-verify/
 CMakeFiles/
+benchmark/
 out/
 target/
 result/

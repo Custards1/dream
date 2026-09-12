@@ -243,20 +243,10 @@ let sort_on key xs = sort_by (fn a b -> core.compare (key a) (key b) < 0) xs;
 let to_array xs = core.array_of_list xs;
 let of_array a = core.array_to_list a;
 
-/// Force every element. Lists are lazy, so this is the only way to be sure the
-/// work has happened -- before a `send!`, say.
-let rec force xs =
-    if core.is_empty xs { [] }
-    else {
-        let x = core.head xs;
-        // `to_string` forces the element without needing to know its type.
-        let _ = to_string x;
-        core.cons x (force (core.tail xs))
-    };
 
 // --- tests ------------------------------------------------------------------
 //
-// Compiled only by `dawnc --test`, which builds an entry point that runs the
+// Compiled with --test`, which builds an entry point that runs the
 // `tests` every loaded module exports.
 
 when test {
