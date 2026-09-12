@@ -389,6 +389,12 @@ void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint3
             p.stack.resize(base);
             do_raise(p, r.value);
             break;
+        case NativeOutcome::Enter:
+            // Something the native found and did not force. Forced here, as the
+            // continuation of the call, however deep its evaluation goes.
+            p.stack.resize(base);
+            enter(p, r.value);
+            break;
         case NativeOutcome::Block:
             // The native parked the process. Leave the arguments in place and
             // arrange to call it again when the scheduler wakes us.

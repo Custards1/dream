@@ -755,50 +755,42 @@ NativeResult bi_strict(Process& p, Value, Value* args, uint32_t) {
 //
 // These exist so pattern matching needs no new opcodes and no import: a
 // builtin is resolved by id, so `match` works in a module that imports
-// nothing. Each returns the piece *unforced*, because a pattern must force
-// only as much as deciding takes -- `[x, ..rest]` looks at the first cell and
-// neither `x` nor `rest`.
+// nothing. A pattern forces only as much as deciding takes -- `[x, ..rest]`
+// looks at the first cell and neither `x` nor `rest` -- so each hands back the
+// piece it found without forcing it, and the machine forces the piece if and
+// when something wants it (`NativeResult::enter`).
+//
+// They used to force it themselves, which is not the same thing. Forcing inside
+// a native runs a nested machine loop on the C++ stack, and a piece whose own
+// evaluation reads through another pattern nests again: a list rebuilt a few
+// hundred thousand times from the rest of the one before was a segmentation
+// fault the first time its end was read. Their arguments arrive forced by the
+// same machine, through the strictness mask, rather than by a force of their own.
 
-NativeResult bi_match_is_cons(Process& p, Value, Value* args, uint32_t) {
-    Value v;
-    if (!force_whnf(p, args[0], &v)) return NativeResult::raise(p.result);
-    return NativeResult::ok(make_bool(is_obj(v, ObjType::Cons)));
+NativeResult bi_match_is_cons(Process&, Value, Value* args, uint32_t) {
+    return NativeResult::ok(make_bool(is_obj(resolve(args[0]), ObjType::Cons)));
 }
 
 NativeResult bi_match_head(Process& p, Value, Value* args, uint32_t) {
-    Value v;
-    if (!force_whnf(p, args[0], &v)) return NativeResult::raise(p.result);
+    Value v = resolve(args[0]);
     if (!is_obj(v, ObjType::Cons)) {
         return NativeResult::raise(
             raise_error(p, well_known(p.runtime()).type_error, "match_head needs a list cell"));
     }
-    // Forced: a native's return value goes straight into the machine's
-    // result, which every continuation takes to be already reduced. Handing
-    // back the raw slot leaks a thunk -- `type_of` on one answers `:unknown`.
-    Value head;
-    if (!force_whnf(p, static_cast<ConsObj*>(as_obj(v))->head, &head)) {
-        return NativeResult::raise(p.result);
-    }
-    return NativeResult::ok(head);
+    return NativeResult::enter(static_cast<ConsObj*>(as_obj(v))->head);
 }
 
 NativeResult bi_match_tail(Process& p, Value, Value* args, uint32_t) {
-    Value v;
-    if (!force_whnf(p, args[0], &v)) return NativeResult::raise(p.result);
+    Value v = resolve(args[0]);
     if (!is_obj(v, ObjType::Cons)) {
         return NativeResult::raise(
             raise_error(p, well_known(p.runtime()).type_error, "match_tail needs a list cell"));
     }
-    Value tail;
-    if (!force_whnf(p, static_cast<ConsObj*>(as_obj(v))->tail, &tail)) {
-        return NativeResult::raise(p.result);
-    }
-    return NativeResult::ok(tail);
+    return NativeResult::enter(static_cast<ConsObj*>(as_obj(v))->tail);
 }
 
 NativeResult bi_match_at(Process& p, Value, Value* args, uint32_t) {
-    Value v;
-    if (!force_whnf(p, args[0], &v)) return NativeResult::raise(p.result);
+    Value v = resolve(args[0]);
     Value i = resolve(args[1]);
     if (!is_obj(v, ObjType::Array) || !is_fixnum(i)) {
         return NativeResult::raise(
@@ -810,26 +802,22 @@ NativeResult bi_match_at(Process& p, Value, Value* args, uint32_t) {
         return NativeResult::raise(raise_error(p, p.runtime().intern_atom("out_of_bounds"),
                                                "match_at is outside the array"));
     }
-    Value element;
-    if (!force_whnf(p, a->items()[k], &element)) return NativeResult::raise(p.result);
-    return NativeResult::ok(element);
+    return NativeResult::enter(a->items()[k]);
 }
 
 /// `[value]` when the key is there, `[]` when it is not -- one call rather
 /// than a `has` followed by a `get`, so the map is looked up once and there is
-/// no sentinel that a real value could collide with.
+/// no sentinel that a real value could collide with. The value goes into the
+/// cell as the map holds it, and `match_head` hands it on unforced.
 NativeResult bi_match_key(Process& p, Value, Value* args, uint32_t) {
-    Value m;
-    if (!force_whnf(p, args[0], &m)) return NativeResult::raise(p.result);
+    Value m = resolve(args[0]);
     if (!is_obj(m, ObjType::Map)) {
         return NativeResult::raise(
             raise_error(p, well_known(p.runtime()).type_error, "match_key needs a map"));
     }
     Value found;
     if (!map_lookup(p, m, args[1], &found)) return NativeResult::ok(NIL);
-    Value held;
-    if (!force_whnf(p, found, &held)) return NativeResult::raise(p.result);
-    return NativeResult::ok(p.heap().make_cons(held, NIL));
+    return NativeResult::ok(p.heap().make_cons(found, NIL));
 }
 
 const BuiltinDef BUILTINS[] = {
@@ -846,13 +834,15 @@ const BuiltinDef BUILTINS[] = {
     // would be handed something already reduced to weak head normal form by
     // the caller and could not report a raise from inside it.
     {"strict!", 1, 0b0, bi_strict},
-    // Mask 0 throughout: these force what they must themselves, and handing
-    // back an unforced piece is the point.
-    {"match_is_cons", 1, 0b0, bi_match_is_cons},
-    {"match_head", 1, 0b0, bi_match_head},
-    {"match_tail", 1, 0b0, bi_match_tail},
-    {"match_at", 2, 0b0, bi_match_at},
-    {"match_key", 2, 0b10, bi_match_key},
+    // The container and the key are forced to WHNF for them, by the machine's
+    // own continuation (never by a force of their own, which would run a
+    // nested machine loop on the C++ stack); the piece they hand back stays
+    // unforced, because that is the point.
+    {"match_is_cons", 1, 0b1, bi_match_is_cons},
+    {"match_head", 1, 0b1, bi_match_head},
+    {"match_tail", 1, 0b1, bi_match_tail},
+    {"match_at", 2, 0b11, bi_match_at},
+    {"match_key", 2, 0b11, bi_match_key},
 };
 
 }  // namespace
@@ -929,17 +919,19 @@ NativeResult math_floor(Process& p, Value, Value* args, uint32_t) {
         raise_error(p, well_known(p.runtime()).type_error, "floor needs a number"));
 }
 
+// A list's cells store their head and tail as thunks. Both of these *find*
+// their half of the cell and hand it back unforced; the machine forces it as
+// the continuation of the call, however deep that goes. Forcing it here, as
+// the old code did, ran a nested machine loop on the C++ stack, and a tail
+// rebuilt a few hundred thousand times from the tail of the one before was a
+// segmentation fault the first time the list's length was read.
 NativeResult list_head(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_obj(v, ObjType::Cons)) {
         return NativeResult::raise(
             raise_error(p, well_known(p.runtime()).type_error, "head needs a non-empty list"));
     }
-    Value out;
-    if (!force_whnf(p, static_cast<ConsObj*>(as_obj(v))->head, &out)) {
-        return NativeResult::raise(p.result);
-    }
-    return NativeResult::ok(out);
+    return NativeResult::enter(static_cast<ConsObj*>(as_obj(v))->head);
 }
 
 NativeResult list_tail(Process& p, Value, Value* args, uint32_t) {
@@ -948,11 +940,7 @@ NativeResult list_tail(Process& p, Value, Value* args, uint32_t) {
         return NativeResult::raise(
             raise_error(p, well_known(p.runtime()).type_error, "tail needs a non-empty list"));
     }
-    Value out;
-    if (!force_whnf(p, static_cast<ConsObj*>(as_obj(v))->tail, &out)) {
-        return NativeResult::raise(p.result);
-    }
-    return NativeResult::ok(out);
+    return NativeResult::enter(static_cast<ConsObj*>(as_obj(v))->tail);
 }
 
 NativeResult list_cons(Process& p, Value, Value* args, uint32_t) {
@@ -1883,13 +1871,12 @@ NativeResult core_array_get(Process& p, Value, Value* args, uint32_t) {
             p, p.runtime().intern_atom("out_of_bounds"),
             "index " + std::to_string(k) + " is outside an array of " + std::to_string(a->len)));
     }
-    // Forced, like `head` and `tail`: an array's elements are stored as thunks,
-    // and a native's return value goes straight into `p.result`, which the
-    // machine takes to be in weak head normal form. Handing back the raw slot
-    // would leak a thunk into an operator's operand.
-    Value out;
-    if (!force_whnf(p, a->items()[k], &out)) return NativeResult::raise(p.result);
-    return NativeResult::ok(out);
+    // The element, unforced. An array's elements are stored as thunks; the
+    // machine forces whichever one is handed back as the continuation of the
+    // call (`NativeResult::enter`). Forcing it here, as the old code did,
+    // nested a machine loop on the C++ stack, and one read whose value read
+    // another grew the C++ stack as deep as the chain of reads was long.
+    return NativeResult::enter(a->items()[k]);
 }
 
 NativeResult core_array_set(Process& p, Value, Value* args, uint32_t) {
@@ -1967,12 +1954,11 @@ NativeResult core_map_get(Process& p, Value, Value* args, uint32_t) {
     if (!is_obj(m, ObjType::Map)) return type_fail(p, "map_get needs a map");
     Value found;
     // A map's values stay lazy, and so does the default -- an unused default
-    // should cost nothing -- so whichever one is returned is forced here rather
-    // than handed back as a thunk. See the note in `core_array_get`.
-    Value out;
+    // should cost nothing. Whichever one is returned is handed back unforced
+    // and forced by the machine as the continuation of the call, for the same
+    // reason `core_array_get` gives.
     if (!map_lookup(p, m, args[1], &found)) found = args[2];
-    if (!force_whnf(p, found, &out)) return NativeResult::raise(p.result);
-    return NativeResult::ok(out);
+    return NativeResult::enter(found);
 }
 
 NativeResult core_map_has(Process& p, Value, Value* args, uint32_t) {
