@@ -23,11 +23,14 @@ inline void set_free_next(Obj* o, Obj* next) {
     reinterpret_cast<Value*>(o + 1)[0] = reinterpret_cast<Value>(next);
 }
 
-/// True for the object kinds whose payload holds no references -- Float, Str
-/// and Pid carry only raw bytes or a host id. Marking one is a no-op, so the
-/// collector need not put it on the worklist; the mark bit alone keeps it.
+/// True for the object kinds whose payload holds no references -- Float, Str,
+/// Pid and BigStr carry only raw bytes, a host id, or a pointer into the
+/// image, which is not heap memory and is never collected. Marking one is a
+/// no-op, so the collector need not put it on the worklist; the mark bit alone
+/// keeps it.
 inline bool is_atom_object(ObjType t) {
-    return t == ObjType::Float || t == ObjType::Str || t == ObjType::Pid;
+    return t == ObjType::Float || t == ObjType::Str || t == ObjType::Pid ||
+           t == ObjType::BigStr;
 }
 
 /// Allocation rounds every object up to one of these sizes, and every chunk in
@@ -226,6 +229,16 @@ Value Heap::make_string(const char* data, uint32_t len) {
     // concatenation builds its result in one allocation.
     if (len && data) std::memcpy(o->data(), data, len);
     o->data()[len] = '\0';
+    return from_obj(o);
+}
+
+Value Heap::make_bigstr(const char* data, uint64_t len) {
+    // Sized from the struct rather than counted by hand: unlike a StrObj there
+    // is no trailing payload here, so the whole object is its fields.
+    auto* o = static_cast<BigStrObj*>(alloc(ObjType::BigStr, sizeof(BigStrObj) - sizeof(Obj)));
+    o->len = len;
+    o->hash = 0;
+    o->data = data;
     return from_obj(o);
 }
 
@@ -843,6 +856,17 @@ struct VerifyWalk {
                     }
                     break;
                 }
+                case ObjType::BigStr: {
+                    // Its bytes are not in the heap, so there is nothing here
+                    // to measure against its length -- only that it points
+                    // somewhere at all. A null view would be read as an empty
+                    // string forever rather than failing where it was made.
+                    if (static_cast<BigStrObj*>(o)->data == nullptr) {
+                        problem("big string at " + addr(o) + " points nowhere");
+                        return;
+                    }
+                    break;
+                }
                 default:
                     break;
             }
@@ -896,6 +920,12 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
         case ObjType::Str: {
             auto* s = static_cast<StrObj*>(o);
             return dest.make_string(s->data(), s->len);
+        }
+        case ObjType::BigStr: {
+            // The view crosses, not the bytes. They live in the image, which
+            // every heap of this runtime shares and none of them owns.
+            auto* b = static_cast<BigStrObj*>(o);
+            return dest.make_bigstr(b->data, b->len);
         }
         case ObjType::Pid:
             return dest.make_pid(static_cast<PidObj*>(o)->id);

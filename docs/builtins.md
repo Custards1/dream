@@ -20,9 +20,9 @@ These are resolved by the compiler without any import. They can be shadowed by a
 | `recv!` | `unit → value` | Takes the next message from this process's mailbox. Parks until one arrives. |
 | `self!` | `unit → process` | Returns the current process's handle. |
 | `raise!` | `value → never` | Raises `value` as an error. If `value` is already an error box it is re-raised as-is; otherwise it is wrapped in one. Never returns. |
-| `type_of` | `value → atom` | Returns an atom naming the type of its argument: `:integer`, `:float`, `:char`, `:bool`, `:unit`, `:string`, `:atom`, `:list`, `:array`, `:map`, `:module`, `:error`, `:process`, `:pure_fn`, or `:impure_fn`. |
-| `to_string` | `value → string` | Renders any value as a human-readable string. Lists print as `[a, b, c]`, arrays as `#[a, b, c]`, maps as `%{:k => v}`, strings are quoted, chars as `'c'`. |
-| `len` | `list\|array\|map\|string → integer` | Returns the number of elements (list), slots (array), entries (map), or bytes (string). Raises `:type_error` for anything else. For lists, walks the entire spine. |
+| `type_of` | `value → atom` | Returns an atom naming the type of its argument: `:integer`, `:float`, `:char`, `:bool`, `:unit`, `:string`, `:atom`, `:list`, `:array`, `:map`, `:module`, `:error`, `:process`, `:pure_fn`, `:impure_fn`, or `:bigstr` (a view into the image's payload — see [Large data](#large-data) below; deliberately *not* `:string`, so that no code path written for a string is handed one). |
+| `to_string` | `value → string` | Renders any value as a human-readable string. Lists print as `[a, b, c]`, arrays as `#[a, b, c]`, maps as `%{:k => v}`, strings are quoted, chars as `'c'`. Raises `:type_error` on a bigstr, which by definition may not fit in a string; one nested inside a larger value renders as `<big string, N bytes>` rather than losing the rest of the structure. |
+| `len` | `list\|array\|map\|string\|bigstr → integer` | Returns the number of elements (list), slots (array), entries (map), or bytes (string or bigstr). Raises `:type_error` for anything else. For lists, walks the entire spine. |
 | `strict!` | `value → value` | Forces `value` all the way to normal form (deeply, not just to weak head normal form), then returns it unchanged. Use this when laziness would defer an effect — `list.map (fn x -> spawn! ..) xs` builds thunks; `strict! (list.map ...)` runs the spawns immediately. |
 
 ### Pattern-match internals
@@ -62,13 +62,14 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `str_len` | `string → integer` | The byte length of the string. |
-| `str_chars` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). |
+| `str_len` | `string\|bigstr → integer` | The byte length of the string. |
+| `str_chars` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). Raises `:type_error` on a bigstr. |
 | `str_of_chars` | `list of char → string` | Encodes a list of characters into a UTF-8 string. |
 | `str_of_bytes` | `list of integer → string` | Builds a string from raw byte values, each `0`–`255`. The inverse of `str_byte`, and the way to produce **binary** output: `str_of_chars` UTF-8-encodes its input, so byte `0x80` would become two bytes. Raises `:type_error` for a non-integer or a value outside `0`–`255`. A `0` byte is an ordinary byte and does not end the string. |
-| `str_slice` | `string → start:integer → len:integer → string` | Returns `len` bytes starting at byte offset `start`. Clamped silently — running past the end is how string-walking loops finish. |
-| `str_find` | `haystack:string → needle:string → from:integer → integer` | Returns the byte offset of the first occurrence of `needle` at or after `from`, or `-1` if not found. |
-| `str_byte` | `string → index:integer → integer` | The raw byte value (0–255) at byte `index`, or `-1` if out of range. |
+| `str_slice` | `string\|bigstr → start:integer → len:integer → string\|bigstr` | Returns `len` bytes starting at byte offset `start`. Clamped silently — running past the end is how string-walking loops finish. A slice of a bigstr is another bigstr view, however small: no copy, at any size. |
+| `str_find` | `haystack:string → needle:string → from:integer → integer` | Returns the byte offset of the first occurrence of `needle` at or after `from`, or `-1` if not found. Raises `:type_error` on a bigstr. |
+| `str_byte` | `string\|bigstr → index:integer → integer` | The raw byte value (0–255) at byte `index`, or `-1` if out of range. |
+| `str_concat` | `list of string → string` | Joins the parts, copying each exactly once. Raises `:type_error` on a bigstr. |
 
 ### Chars
 
@@ -117,7 +118,64 @@ Persistent means *shared*, not copied: `map_put` rebuilds only the path from the
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Works on flat types in this rank order: integers and floats (numerically), chars, bools, atoms, strings, unit. Values of different types order by their type rank. |
+| `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Works on flat types in this rank order: integers and floats (numerically), chars, bools, atoms, strings, unit. A bigstr ranks with the strings and compares by its bytes. Values of different types order by their type rank. |
+
+### Large data
+
+The payload region of the image: bytes put there at compile time with
+`dreams --payload FILE`, one entry per file in the order given. See
+[bytecode-format.md](bytecode-format.md) for the `LDAT` and `PAYL` sections
+these read.
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `data_count` | `unit → integer` | How many large data this image carries. `0` for an image built without `--payload`, which is every ordinary image. |
+| `data_at` | `integer → bigstr` | Datum `i`, as a **bigstr**: a length and a pointer into the mapped image. Constant time and copies nothing, whatever its size. Raises `:type_error` for an index outside `0 .. data_count () - 1`. |
+
+Both are pure. The payload is fixed when the image is written and nothing can
+alter it, so asking for datum `i` is a function of `i` in the way `str_byte` is
+a function of its index.
+
+**What a bigstr is for.** A `.dream` file addresses itself with 32-bit offsets,
+so the file and every string in it stop at 4 GiB. A bigstr is the exception: it
+is not a string but a *view*, and it is never copied — not when it is made, not
+when the collector promotes it, and not when `spawn!` hands it to another
+process, all of which share the pointer because the bytes belong to the
+runtime's image and outlive every process in it.
+
+Operations that need only to read it all work, and none of them copies:
+
+| Works | |
+|-------|--|
+| `len`, `str.byte_length` | the 64-bit length, as an integer |
+| `str.byte` | one byte; pointer arithmetic |
+| `str.slice` | another view, clamped like the string case |
+| `==`, `!=`, `<`, `<=`, `>`, `>=` | by bytes |
+| a map key | hashed once, then remembered on the value |
+| `io.write!` | written straight from the mapping, with no intermediate buffer |
+
+Operations that would have to *build* a string out of it raise `:type_error`
+with a message naming what to reach for instead: `+`, `to_string`,
+`str.concat_all`, `str.find` and `str.chars`. Each would copy the bytes into the
+heap and each would be capped at the 4 GiB a string can count, which between
+them is the reason the payload is not a string in the first place.
+
+**A bigstr and a string of the same bytes are equal, and hash alike.** That is
+what makes the first thing anyone writes — `str.slice 0 4 data == "%PDF"` — mean
+what it looks like. `type_of` still tells them apart, so a branch written for
+`:string` is never handed one.
+
+```dream
+import std.core;
+import std.io;
+
+let main! = {
+    let data = core.data_at 0;
+    if str.slice 0 4 data == "%PDF" {
+        io.write! (io.stdout! ()) data       // the whole of it, never in memory
+    } else { console.error! "not a PDF" }
+};
+```
 
 ---
 
@@ -482,6 +540,7 @@ UTF-8 text. Derives `std.seq`, so it also exposes `sum`, `any`, `all`, `contains
 | `of_chars cs` | String from a list of characters. |
 | `first_or default s` | First character, or `default`. |
 | `slice from count s` | `count` bytes from byte offset `from`. Clamped silently. |
+| `byte i s` | The byte at offset `i` as an integer, or `-1`. Works on a bigstr, where it is the way in. |
 | `find needle s` | Byte offset of `needle` in `s`, or `-1`. |
 | `find_from from needle s` | Byte offset of `needle` at or after `from`, or `-1`. |
 | `contains_str needle s` | `true` if `needle` appears anywhere in `s`. |

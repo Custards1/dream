@@ -50,6 +50,7 @@ trap 'rm -rf "$WORK"' EXIT
 SEED_SRC="$WORK/seed.dr"
 cat > "$SEED_SRC" <<'DREAM'
 import std.console;
+import std.core;
 let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
 let table = %{ :a => [1, 2, 3], :b => #[4.5] };
 let pair a b = fn x -> a + b + x;
@@ -57,10 +58,19 @@ let main! = {
     console.print! "fac: " (fac 10)
     console.print! "tab: " (len table)
     console.print! "fun: " (pair 1 2 3)
+    console.print! "dat: " (len (core.data_at 0))
 }
 DREAM
 
-if ! "${compile[@]}" "$SEED_SRC" -L "$HERE/../../mind" -o "$WORK/seed.dream" >/dev/null 2>&1; then
+# The seed carries a payload, so that `LDAT` and `PAYL` are among the sections
+# being mutated. They are the one part of the container addressed in 64 bits,
+# which makes them the one part where a length can be made to wrap rather than
+# merely to be too large -- exactly the arithmetic an attacker reaches for, and
+# not something the other sections can exercise on its behalf.
+printf 'fuzz payload bytes' > "$WORK/payload.bin"
+
+if ! "${compile[@]}" "$SEED_SRC" -L "$HERE/../../mind" \
+       --payload "$WORK/payload.bin" -o "$WORK/seed.dream" >/dev/null 2>&1; then
   echo "fuzz: could not compile the seed program" >&2
   exit 1
 fi

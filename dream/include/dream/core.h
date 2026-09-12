@@ -53,7 +53,12 @@ typedef enum dream_type {
     DREAM_TYPE_ERROR,
     /* A green process: isolated heap, mailbox, scheduler slot. */
     DREAM_TYPE_PROCESS,
-    DREAM_TYPE_UNKNOWN
+    DREAM_TYPE_UNKNOWN,
+    /* A read-only view into the image's payload region, which may be larger
+     * than the 4 GiB the rest of the container can address. Appended after
+     * DREAM_TYPE_UNKNOWN rather than filed beside DREAM_TYPE_STRING, because
+     * every value here is already compiled into somebody's embedder. */
+    DREAM_TYPE_BIGSTR
 } dream_type;
 
 /* `thread` was the original spelling in the language spec and is kept as an

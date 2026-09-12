@@ -63,7 +63,10 @@ Unknown section kinds must be skipped, not treated as an error.
 | `FUNC` | 32 bytes (below)                                    | function records |
 | `GLBL` | 16 bytes (below)                                    | module-level bindings |
 | `IMPT` | `u32 path, u32 alias`                               | imports; both are `KSTR` indices |
+| `MODS` | 24 bytes (below)                                    | module records: which globals belong to which module |
 | `SPAN` | `u32 start, u32 end`                                 | per-node source spans, parallel to `NODE` |
+| `LDAT` | `u64 offset, u64 length`                            | large-data table, into `PAYL` |
+| `PAYL` | `u64 byte_length` header, then the bytes            | the payload; last in the file |
 
 Atoms are interned separately from strings so the VM can compare them by
 identity: two occurrences of `:ok` anywhere in a module share one atom index.
@@ -163,6 +166,80 @@ can capture its own binding before it is filled in.
 | 4      | 4    | `kind`   | 0 = function, 1 = module |
 | 8      | 4    | `target` | `FUNC` index, or `IMPT` index for a module |
 | 12     | 4    | `flags`  | `0x01` exported, `0x02` impure |
+
+### Module record (24 bytes)
+
+| Offset | Size | Field           | Notes |
+|-------:|-----:|-----------------|-------|
+| 0      | 4    | `name`          | `KSTR` index |
+| 4      | 4    | `source`        | `KSTR` index; the original source path |
+| 8      | 4    | `globals_start` | first global index belonging to this module |
+| 12     | 4    | `globals_count` | |
+| 16     | 4    | `flags`         | `0x01` host-provided, `0x02` declares virtuals |
+| 20     | 4    | `derives`       | `MODS` index of the derived module, or `NO_NODE` |
+
+Compilation is whole-program, so an image carries every module it needs, and a
+module's globals form a contiguous range `globals_start .. globals_start +
+globals_count`. The range is what lets a reader say which global belongs to
+which module without every `GLBL` record carrying a module id of its own — and
+it is the identity that survives a merge of two images, which is why the record
+is here rather than being reconstructible from the rest.
+
+## Large data (`LDAT` and `PAYL`)
+
+Everything above is addressed with `u32`: a section table entry is `u32 offset,
+u32 length`, a `KSTR` record is `u32 offset, u32 length`, and the VM's `StrObj`
+counts its bytes in a `uint32_t`. Between them they cap a `.dream` file, and any
+string in it, at 4 GiB. That is plenty for a program and nothing for the datum a
+program is *about* — a corpus, a model, an asset. The payload is the one region
+allowed past that line, and two properties keep it from disturbing anything
+else:
+
+- **Nothing already in the file moves.** Everything up to and including `LDAT`
+  stays inside its `u32` addresses. Only the payload crosses, because it is the
+  last thing in the file and nothing else has to name a position inside it.
+- **Loading does not copy it.** A large datum materializes as a *view* into the
+  mapped image, not as a heap string. That is the whole point: the region may be
+  larger than the address space the rest of the format can describe, and larger
+  than memory.
+
+Both sections are additive. A reader that knows neither skips them as unknown
+kinds, exactly as it does any section it does not recognise, so an image that
+never uses its payload runs anywhere.
+
+**`PAYL`** is the payload: an 8-byte little-endian `byte_length`, then that many
+raw bytes. Its section-table entry is ordinary — `offset` names the header (a
+start below 2^32, since everything precedes it), `length` is `8`, the honest
+size of the section as laid out, and `count` is `0`. The real size is the `u64`
+at the section start, and it may exceed 4 GiB. The payload ends the file and its
+bytes are not padded.
+
+**`LDAT`** is the table of payload descriptors, `u64 offset, u64 length`, with
+offsets counted from the start of the payload bytes (`PAYL.offset + 8`). It
+exists so that a `u32` index can name a datum without a 64-bit offset appearing
+at every use. Descriptors are consecutive and unpadded.
+
+Neither may appear without the other: a table describing nothing, or bytes
+nothing can name, is an image that was built wrong.
+
+**Validation.** `count * 16 <= length` for `LDAT`; each descriptor must satisfy
+`offset + length <= byte_length` in 64-bit arithmetic, written as a subtraction
+because that addition is the one sum in the container that can wrap; and the
+payload must satisfy `PAYL.offset + 8 + byte_length <= file size`.
+
+**No opcode names it.** The payload is a host-level feature: nothing in `NODE`,
+`KIDS`, `FUNC` or `KSTR` points at it. A program reaches it through the
+`std.core` members `data_count` and `data_at` (see [builtins.md](builtins.md)),
+which is what keeps the addition additive — the format needed no new opcode and
+no wider index.
+
+**What a reader hands back.** `data_at i` is O(1) and copies nothing: it is a
+length and a pointer into the mapping. The reference VM materializes it as a
+`BigStrObj`, which the collector treats as an atom object — no internal
+references — so promotion is a byte copy and a `spawn!` heap copy shares the
+view. That is sound because the bytes live in the program image, which is
+immutable and outlives every process. A value of this kind cannot cross
+*runtimes* (`std.vm`), where the pointer would name someone else's mapping.
 
 ## Builtins
 

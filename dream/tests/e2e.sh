@@ -137,6 +137,108 @@ else
   fail=$((fail + 1))
 fi
 
+# --- payloads ---------------------------------------------------------------
+#
+# `--payload` puts a file's bytes in the image past everything the rest of the
+# container can address, and `core.data_at` hands them back as a view rather
+# than a string. Its own block rather than a program in the loop above, because
+# it is the compile that differs: the flag, and the files it names.
+#
+# What this is really checking is that nothing copies. There is no way to assert
+# that from inside the language, so it is checked from the outside instead: the
+# bytes must survive the round trip through the image exactly, including the
+# ones that are not valid UTF-8 and would not survive being decoded.
+
+payload_dir="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$shebang_src" "$payload_dir"' EXIT
+
+printf 'the quick brown fox' > "$payload_dir/a.bin"
+# Deliberately not text: a byte no decoder would let through unchanged.
+printf 'head\x00\x80\xfftail' > "$payload_dir/b.bin"
+
+cat > "$payload_dir/payload.dr" <<'EOF'
+// `std.core` and no more: the programs here are compiled without a package
+// path, so `std.str` -- which is Dream source in `mind/std` -- is not reachable.
+// `str.byte` and `str.slice` are one-line wrappers over these two anyway.
+import std.console;
+import std.core;
+import std.io;
+
+let main! = {
+    let a = core.data_at 0;
+    let b = core.data_at 1;
+    console.print! ("count " + to_string (core.data_count ()))
+    console.print! ("type " + to_string (type_of a))
+    console.print! ("lens " + to_string (len a) + " " + to_string (len b))
+    console.print! ("byte " + to_string (core.str_byte a 4))
+    console.print! ("slice " + to_string (core.str_slice a 4 5 == "quick"))
+    console.print! ("whole " + to_string (a == "the quick brown fox"))
+    console.print! ("order " + to_string (b < a))
+    // A slice is a view too, so slicing one again must land in the same place.
+    console.print! ("again " + to_string (core.str_slice (core.str_slice a 4 9) 0 5 == "quick"))
+    // The bytes cross a process boundary as a view, not as a copy.
+    console.print! ("child " + to_string (join! (spawn! $( len b ))))
+    // Concatenating one is refused, and the message says what to do instead.
+    console.print! ("refused " + to_string (type_of (try! { a + "x" } catch e { e })))
+    io.write! (io.stdout! ()) b
+};
+EOF
+
+{
+  printf 'count 2\ntype :bigstr\nlens 19 11\nbyte 113\nslice true\nwhole true\n'
+  printf 'order true\nagain true\nchild 11\nrefused :error\n'
+  cat "$payload_dir/b.bin"
+} > "$payload_dir/expected"
+
+if "${compile[@]}" "$payload_dir/payload.dr" \
+     --payload "$payload_dir/a.bin" --payload "$payload_dir/b.bin" \
+     -o "$payload_dir/payload.dream" >"$payload_dir/compile" 2>&1; then
+  # Through files rather than `$(...)`: the payload this program writes out
+  # contains a NUL, and a command substitution drops it -- which would quietly
+  # turn the one check that proves the bytes are untouched into a check that
+  # they are untouched apart from the interesting one.
+  "$dream" "$payload_dir/payload.dream" >"$payload_dir/jit.out" 2>&1
+  "$dream" --no-jit "$payload_dir/payload.dream" >"$payload_dir/int.out" 2>&1
+  # The payload is the last thing in the file, unpadded, in the order given.
+  tail_bytes="$(tail -c 30 "$payload_dir/payload.dream" | od -An -tx1 | tr -d ' \n')"
+  want_bytes="$(cat "$payload_dir/a.bin" "$payload_dir/b.bin" | od -An -tx1 | tr -d ' \n')"
+  if ! cmp -s "$payload_dir/jit.out" "$payload_dir/int.out"; then
+    echo "FAIL payload (the two tiers disagree)"
+    diff <(od -c "$payload_dir/int.out") <(od -c "$payload_dir/jit.out") | sed 's/^/    /'
+    fail=$((fail + 1))
+  elif ! cmp -s "$payload_dir/jit.out" "$payload_dir/expected"; then
+    echo "FAIL payload (output)"
+    diff <(od -c "$payload_dir/expected") <(od -c "$payload_dir/jit.out") | sed 's/^/    /'
+    fail=$((fail + 1))
+  elif [[ "$tail_bytes" != "$want_bytes" ]]; then
+    echo "FAIL payload (the image does not end with the payload bytes)"
+    echo "    want $want_bytes"
+    echo "    got  $tail_bytes"
+    fail=$((fail + 1))
+  else
+    echo "ok   payload"
+    pass=$((pass + 1))
+  fi
+else
+  echo "FAIL payload (could not compile with --payload)"
+  sed 's/^/    /' "$payload_dir/compile"
+  fail=$((fail + 1))
+fi
+
+# A build with no payload must write the bytes it wrote before the feature
+# existed. That is what the bootstrap's byte-equality rests on, so it is worth
+# asserting directly rather than only noticing when the seed stops reproducing.
+"${compile[@]}" "$shebang_src/hello.dr" -o "$payload_dir/plain1.dream" >/dev/null 2>&1
+"${compile[@]}" "$shebang_src/hello.dr" -o "$payload_dir/plain2.dream" >/dev/null 2>&1
+if cmp -s "$payload_dir/plain1.dream" "$payload_dir/plain2.dream" &&
+   ! grep -qa 'PAYL' "$payload_dir/plain1.dream"; then
+  echo "ok   no-payload build carries no payload sections"
+  pass=$((pass + 1))
+else
+  echo "FAIL no-payload build (a PAYL section appeared, or the build is not deterministic)"
+  fail=$((fail + 1))
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

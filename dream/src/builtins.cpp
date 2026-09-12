@@ -24,14 +24,19 @@ namespace {
 
 uint64_t key_hash(Value v) {
     v = resolve(v);
+    // A big string hashes by the same walk over the same bytes, so it lands in
+    // the bucket its contents earn and a plain string of those bytes finds it.
+    // The answer is kept on the object: everything else here is a few machine
+    // words, and this one can be a gigabyte.
+    if (is_ptr(v) && as_obj(v)->type == ObjType::BigStr) {
+        auto* b = static_cast<BigStrObj*>(as_obj(v));
+        if (b->hash == 0) b->hash = bytes_hash(Bytes{b->data, b->len});
+        return b->hash;
+    }
+    Bytes bytes;
     if (is_ptr(v) && as_obj(v)->type == ObjType::Str) {
-        auto* s = static_cast<StrObj*>(as_obj(v));
-        uint64_t h = 1469598103934665603ull;
-        for (uint32_t i = 0; i < s->len; ++i) {
-            h ^= uint8_t(s->data()[i]);
-            h *= 1099511628211ull;
-        }
-        return h ? h : 1;
+        string_bytes(v, &bytes);
+        return bytes_hash(bytes);
     }
     uint64_t h = v;
     if (is_ptr(v) && as_obj(v)->type == ObjType::Float) {
@@ -54,12 +59,11 @@ bool key_equal(Value a, Value b) {
     if (!is_ptr(a) || !is_ptr(b)) return false;
     Obj* x = as_obj(a);
     Obj* y = as_obj(b);
+    // Before the type test, because the two string representations are one
+    // kind of key: they hash alike, so they must compare alike.
+    Bytes sa, sb;
+    if (string_bytes(a, &sa) && string_bytes(b, &sb)) return bytes_equal(sa, sb);
     if (x->type != y->type) return false;
-    if (x->type == ObjType::Str) {
-        auto* s = static_cast<StrObj*>(x);
-        auto* t = static_cast<StrObj*>(y);
-        return s->len == t->len && std::memcmp(s->data(), t->data(), s->len) == 0;
-    }
     if (x->type == ObjType::Float) {
         return static_cast<FloatObj*>(x)->value == static_cast<FloatObj*>(y)->value;
     }
@@ -417,6 +421,13 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
             out->append(buf);
             return true;
         }
+        case ObjType::BigStr:
+            // `to_string` refuses outright; here the value is being rendered
+            // inside something larger, where raising would lose the rest of the
+            // structure. A placeholder says which value it was and how big.
+            out->append("<big string, " +
+                        std::to_string(static_cast<BigStrObj*>(as_obj(w))->len) + " bytes>");
+            return true;
         case ObjType::Str: {
             auto* s = static_cast<StrObj*>(as_obj(w));
             if (!quoted) {
@@ -638,6 +649,11 @@ NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
         case DREAM_TYPE_BOOL: name = "bool"; break;
         case DREAM_TYPE_UNIT: name = "unit"; break;
         case DREAM_TYPE_STRING: name = "string"; break;
+        // Deliberately not `:string`. A big string is one only in what its
+        // bytes mean; handing it to a `:string` branch means handing that
+        // branch a value it may not concatenate, render or decode, and the
+        // point of a distinct name is that such a branch is never reached.
+        case DREAM_TYPE_BIGSTR: name = "bigstr"; break;
         case DREAM_TYPE_ATOM: name = "atom"; break;
         case DREAM_TYPE_LIST: name = "list"; break;
         case DREAM_TYPE_ARRAY: name = "array"; break;
@@ -665,6 +681,15 @@ NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
 }
 
 NativeResult bi_to_string(Process& p, Value, Value* args, uint32_t) {
+    // Its whole point is that it does not fit in a string; rendering it would
+    // build the copy the type exists to avoid, and would be capped at 4 GiB
+    // while doing so.
+    if (is_obj(resolve(args[0]), ObjType::BigStr)) {
+        return NativeResult::raise(raise_error(
+            p, well_known(p.runtime()).type_error,
+            "to_string cannot render a big string: it is a view into the image, larger than a "
+            "string may be. Take a `str.slice` of it, or hand the whole of it to `io.write!`."));
+    }
     std::string s;
     if (!stringify(p, args[0], &s)) return NativeResult::raise(p.result);
     return NativeResult::ok(p.heap().make_string(s.data(), uint32_t(s.size())));
@@ -677,6 +702,10 @@ NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
         n = 0;
     } else if (is_obj(v, ObjType::Str)) {
         n = static_cast<StrObj*>(as_obj(v))->len;
+    } else if (is_obj(v, ObjType::BigStr)) {
+        // A fixnum is 63 bits, so a payload would have to be four exabytes
+        // before this could not say how long it is.
+        n = int64_t(static_cast<BigStrObj*>(as_obj(v))->len);
     } else if (is_obj(v, ObjType::Array)) {
         n = static_cast<ArrayObj*>(as_obj(v))->len;
     } else if (is_obj(v, ObjType::Map)) {
@@ -1279,6 +1308,23 @@ StrObj* as_string(Value v) {
     return is_obj(v, ObjType::Str) ? static_cast<StrObj*>(as_obj(v)) : nullptr;
 }
 
+/// The one refusal a big string earns, worded the same everywhere it is made.
+///
+/// These are the operations that would have to *build* a string out of one --
+/// concatenating, searching, decoding to characters. Each would copy the bytes
+/// into the heap and each would be capped at the 4 GiB a `StrObj` can count,
+/// which between them is the whole reason the payload is not a string. So the
+/// error names what a big string can do instead, because a caller who reached
+/// for `str.find` wants a way through, not a diagnosis.
+NativeResult bigstr_refused(Process& p, const char* what) {
+    return NativeResult::raise(raise_error(
+        p, well_known(p.runtime()).type_error,
+        std::string(what) +
+            " cannot take a big string: it is a view into the image, larger than a string may "
+            "be. `len`, `str.byte`, `str.slice`, `==` and `io.write!` all work on one without "
+            "copying it."));
+}
+
 NativeResult type_fail(Process& p, const char* what) {
     return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error, what));
 }
@@ -1463,12 +1509,13 @@ void utf8_encode(uint32_t cp, std::string* out) {
 // --- strings ---
 
 NativeResult core_str_len(Process& p, Value, Value* args, uint32_t) {
-    StrObj* s = as_string(args[0]);
-    if (!s) return type_fail(p, "str_len needs a string");
-    return NativeResult::ok(make_fixnum(s->len));
+    Bytes b;
+    if (!string_bytes(args[0], &b)) return type_fail(p, "str_len needs a string");
+    return NativeResult::ok(make_fixnum(int64_t(b.len)));
 }
 
 NativeResult core_str_chars(Process& p, Value, Value* args, uint32_t) {
+    if (is_obj(resolve(args[0]), ObjType::BigStr)) return bigstr_refused(p, "str_chars");
     StrObj* s = as_string(args[0]);
     if (!s) return type_fail(p, "str_chars needs a string");
     // Decoded back to front so the list comes out in order without reversing.
@@ -1605,6 +1652,10 @@ NativeResult core_str_concat(Process& p, Value, Value* args, uint32_t) {
             if (!p.force_blocked) p.stack.resize(base);
             return NativeResult::raise(p.result);
         }
+        if (is_obj(head, ObjType::BigStr)) {
+            p.stack.resize(base);
+            return bigstr_refused(p, "str_concat");
+        }
         if (!is_obj(head, ObjType::Str)) {
             p.stack.resize(base);
             return type_fail(p, "str_concat needs a list of strings");
@@ -1618,10 +1669,10 @@ NativeResult core_str_concat(Process& p, Value, Value* args, uint32_t) {
 }
 
 NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
-    StrObj* s = as_string(args[0]);
+    Bytes b;
     Value from = resolve(args[1]);
     Value count = resolve(args[2]);
-    if (!s || !is_fixnum(from) || !is_fixnum(count)) {
+    if (!string_bytes(args[0], &b) || !is_fixnum(from) || !is_fixnum(count)) {
         return type_fail(p, "str_slice needs a string, a start and a length");
     }
     // Clamped rather than raising: slicing past the end is how every loop that
@@ -1629,13 +1680,21 @@ NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
     int64_t start = fixnum_value(from);
     int64_t n = fixnum_value(count);
     if (start < 0) start = 0;
-    if (start > s->len) start = s->len;
+    if (uint64_t(start) > b.len) start = int64_t(b.len);
     if (n < 0) n = 0;
-    if (start + n > s->len) n = s->len - start;
-    return NativeResult::ok(p.heap().make_string(s->data() + start, uint32_t(n)));
+    if (uint64_t(start) + uint64_t(n) > b.len) n = int64_t(b.len - uint64_t(start));
+    // A slice of a big string is another window on the same bytes, not a copy
+    // of them -- which is what lets a program walk a payload it could not hold.
+    if (is_obj(resolve(args[0]), ObjType::BigStr)) {
+        return NativeResult::ok(p.heap().make_bigstr(b.data + start, uint64_t(n)));
+    }
+    return NativeResult::ok(p.heap().make_string(b.data + start, uint32_t(n)));
 }
 
 NativeResult core_str_find(Process& p, Value, Value* args, uint32_t) {
+    if (is_obj(resolve(args[0]), ObjType::BigStr) || is_obj(resolve(args[1]), ObjType::BigStr)) {
+        return bigstr_refused(p, "str_find");
+    }
     StrObj* hay = as_string(args[0]);
     StrObj* needle = as_string(args[1]);
     Value from = resolve(args[2]);
@@ -1657,12 +1716,14 @@ NativeResult core_str_find(Process& p, Value, Value* args, uint32_t) {
 }
 
 NativeResult core_str_byte(Process& p, Value, Value* args, uint32_t) {
-    StrObj* s = as_string(args[0]);
+    Bytes b;
     Value i = resolve(args[1]);
-    if (!s || !is_fixnum(i)) return type_fail(p, "str_byte needs a string and an index");
+    if (!string_bytes(args[0], &b) || !is_fixnum(i)) {
+        return type_fail(p, "str_byte needs a string and an index");
+    }
     int64_t k = fixnum_value(i);
-    if (k < 0 || k >= s->len) return NativeResult::ok(make_fixnum(-1));
-    return NativeResult::ok(make_fixnum(uint8_t(s->data()[k])));
+    if (k < 0 || uint64_t(k) >= b.len) return NativeResult::ok(make_fixnum(-1));
+    return NativeResult::ok(make_fixnum(uint8_t(b.data[k])));
 }
 
 // --- chars ---
@@ -1927,7 +1988,7 @@ NativeResult core_compare(Process& p, Value, Value* args, uint32_t) {
         if (is_char(v)) return 1;
         if (is_bool(v)) return 2;
         if (is_atom(v)) return 3;
-        if (is_obj(v, ObjType::Str)) return 4;
+        if (is_stringish(v)) return 4;
         if (is_unit(v)) return 5;
         return 6;
     };
@@ -1947,14 +2008,45 @@ NativeResult core_compare(Process& p, Value, Value* args, uint32_t) {
         const std::string& y = p.runtime().atom_name(uint32_t(imm_payload(b)));
         cmp = x < y ? -1 : (x > y ? 1 : 0);
     } else if (ra == 4) {
-        auto* x = static_cast<StrObj*>(as_obj(a));
-        auto* y = static_cast<StrObj*>(as_obj(b));
-        uint32_t n = x->len < y->len ? x->len : y->len;
-        cmp = std::memcmp(x->data(), y->data(), n);
-        if (cmp == 0) cmp = x->len < y->len ? -1 : (x->len > y->len ? 1 : 0);
-        cmp = cmp < 0 ? -1 : (cmp > 0 ? 1 : 0);
+        Bytes x, y;
+        string_bytes(a, &x);
+        string_bytes(b, &y);
+        cmp = bytes_compare(x, y);
     }
     return NativeResult::ok(make_fixnum(cmp));
+}
+
+// --- large data ---
+//
+// The payload region is the one part of an image the container addresses in 64
+// bits (docs/bytecode-format.md, `LDAT`/`PAYL`). It holds whatever the program
+// is *about* rather than what the program is -- a corpus, a model, an asset --
+// and it is reached from here and nowhere else: no opcode names it, so an image
+// that never asks for its payload is an image any reader can run.
+//
+// Both of these are pure. The payload is fixed when the image is written and
+// nothing can alter it, so asking for datum `i` is a function of `i` in exactly
+// the way `str_byte` is a function of its index.
+
+NativeResult core_data_count(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::ok(make_fixnum(int64_t(p.runtime().image().data_count())));
+}
+
+NativeResult core_data_at(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_fixnum(v)) return type_fail(p, "data_at needs an index");
+    int64_t i = fixnum_value(v);
+    const Image& img = p.runtime().image();
+    if (i < 0 || uint64_t(i) >= img.data_count()) {
+        return NativeResult::raise(raise_error(
+            p, well_known(p.runtime()).type_error,
+            "data_at " + std::to_string(i) + ": this image carries " +
+                std::to_string(img.data_count()) +
+                " large data. They are declared at compile time with `dreams --payload`."));
+    }
+    // O(1) and no copy: the value is a length and a pointer into the mapping.
+    uint32_t k = uint32_t(i);
+    return NativeResult::ok(p.heap().make_bigstr(img.data_bytes(k), img.data_length(k)));
 }
 
 }  // namespace
@@ -2006,6 +2098,9 @@ ModuleDef make_core_module() {
             {"map_put", 3, 0b011, core_map_put},
             {"map_remove", 2, 0b11, core_map_remove},
             {"map_pairs", 1, 0b1, core_map_pairs},
+            // large data
+            {"data_count", 1, 0b1, core_data_count},
+            {"data_at", 1, 0b1, core_data_at},
             // ordering
             {"compare", 2, 0b11, core_compare},
         }};

@@ -68,6 +68,10 @@ public:
     // Convenience constructors for the common shapes.
     Value make_float(double v);
     Value make_string(const char* data, uint32_t len);
+    /// A view onto bytes the heap does not own -- the image's payload region.
+    /// Nothing is copied, so `data` must outlive every heap that can reach it;
+    /// today the only such bytes are the `Runtime`'s mapped image.
+    Value make_bigstr(const char* data, uint64_t len);
     Value make_cons(Value head, Value tail);
     Value make_array(uint32_t len);
     /// An empty map: a branch with no children. The capacity argument is a

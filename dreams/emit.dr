@@ -83,6 +83,14 @@ let i64 v =
         u32 (v % 4294967296) + u32 ((v / 4294967296) % 4294967296)
     };
 
+/// An unsigned 64-bit number, as eight bytes.
+///
+/// The same arithmetic as the positive half of `i64`, said separately because
+/// what it writes is a *length* -- a payload's, or a datum's position inside
+/// one -- and a length is never negative. Nothing a payload table holds comes
+/// near the range where a Dream integer stops being exact.
+let u64 v = u32 (v % 4294967296) + u32 ((v / 4294967296) % 4294967296);
+
 /// A node index, or the all-ones word that means there is none.
 let index i = if ir.is_node i { u32 i } else { u32 4294967295 };
 
@@ -124,6 +132,8 @@ let t_glbl = tag 71 76 66 76;   // GLBL
 let t_impt = tag 73 77 80 84;   // IMPT
 let t_span = tag 83 80 65 78;   // SPAN
 let t_mods = tag 77 79 68 83;   // MODS
+let t_ldat = tag 76 68 65 84;   // LDAT
+let t_payl = tag 80 65 89 76;   // PAYL
 
 // --- the records ---------------------------------------------------------------------
 
@@ -194,12 +204,54 @@ let align8 n = (n + 7) - ((n + 7) % 8);
 /// struct at one where it lies.
 let zeros n = str.repeat n (core.str_of_bytes [0]);
 
+// --- large data ---------------------------------------------------------------------
+//
+// A payload is the one thing in an image the compiler never holds. Every other
+// section is built here as a string, and a Dream string counts its bytes in 32
+// bits -- which is the very limit the payload exists to get past. So what the
+// compiler lays out is the *table*: how long each datum is, and therefore where
+// it starts. The bytes themselves are copied from their files straight into the
+// output, by whoever is doing the writing, after everything here has been
+// written. See `copy_payloads!` in main.dr.
+
+/// The running offset of each datum, from the start of the payload bytes.
+///
+/// Consecutive and unpadded: a datum is found by the offset the table records
+/// and nothing about the next one depends on where this one ended up, so there
+/// is nothing for alignment to buy.
+let data_offsets lens =
+    list.reverse (list.nth 1 (list.fold_strict (fn acc n ->
+        [list.head acc + n, core.cons (list.head acc) (list.nth 1 acc)])
+        [0, []] lens));
+
+/// `LDAT` and `PAYL`, or nothing at all.
+///
+/// Nothing at all is the important half. A build with no payload must write the
+/// bytes it wrote before any of this existed -- that is what the bootstrap
+/// compares, and an empty section pair would break the equality without
+/// carrying anything.
+let data_sections lens =
+    if list.is_empty lens { [] }
+    else {
+        let offsets = data_offsets lens;
+        let total = list.fold (fn n len -> n + len) 0 lens;
+        // `PAYL`'s body is its eight-byte length header and no more. The bytes
+        // follow it in the file but not in the section, because the section
+        // table counts in 32 bits and the payload may not fit there. The real
+        // size is the header, which is why it is written at all.
+        [section t_ldat (concat_map (fn e -> u64 (list.head e) + u64 (list.nth 1 e))
+                                    (list.zip offsets lens))
+                 (list.length lens),
+         section t_payl (u64 total) 0]
+    };
+
 /// Every section, in the order a reader meets them.
 let sections_of img = {
     let strs = core.map_get img :strs [];
     // The blob is the strings, one after another: nothing has to be done to a
     // string to turn it into its own bytes.
     let blob = str.concat_all strs;
+    let base =
     [section t_kint (concat_map (fn v -> i64 v) (core.map_get img :ints [])) (list.length (core.map_get img :ints [])),
      section t_kflt (concat_map (fn v -> f64 v) (core.map_get img :floats [])) (list.length (core.map_get img :floats [])),
      section t_kstr (string_table strs) (list.length strs),
@@ -210,7 +262,11 @@ let sections_of img = {
      section t_func (concat_map (fn f -> func_bytes f) (core.map_get img :funcs [])) (list.length (core.map_get img :funcs [])),
      section t_glbl (concat_map (fn g -> global_bytes g) (core.map_get img :globals [])) (list.length (core.map_get img :globals [])),
      section t_impt (concat_map (fn i -> import_bytes i) (core.map_get img :imports [])) (list.length (core.map_get img :imports [])),
-     section t_mods (concat_map (fn m -> module_bytes m) (core.map_get img :modules [])) (list.length (core.map_get img :modules []))]
+     section t_mods (concat_map (fn m -> module_bytes m) (core.map_get img :modules [])) (list.length (core.map_get img :modules []))];
+    // The payload goes last, and must: its bytes are written after everything
+    // the table describes, and they are the one part of the file whose size a
+    // `u32` offset could not reach.
+    list.append base (data_sections (core.map_get img :payloads []))
 };
 
 /// The image, as bytes.

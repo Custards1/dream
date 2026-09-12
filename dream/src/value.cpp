@@ -6,6 +6,7 @@ const char* obj_type_name(ObjType t) {
     switch (t) {
         case ObjType::Float: return "float";
         case ObjType::Str: return "string";
+        case ObjType::BigStr: return "big string";
         case ObjType::Cons: return "list";
         case ObjType::Array: return "array";
         case ObjType::Map: return "map";
@@ -42,6 +43,7 @@ dream_type surface_type(Value v) {
     switch (as_obj(v)->type) {
         case ObjType::Float: return DREAM_TYPE_FLOAT;
         case ObjType::Str: return DREAM_TYPE_STRING;
+        case ObjType::BigStr: return DREAM_TYPE_BIGSTR;
         case ObjType::Cons: return DREAM_TYPE_LIST;
         case ObjType::Array: return DREAM_TYPE_ARRAY;
         case ObjType::Map: return DREAM_TYPE_MAP;

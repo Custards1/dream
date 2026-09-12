@@ -164,18 +164,87 @@ let show_ir! l = {
     }
 };
 
+// --- payloads -----------------------------------------------------------------
+//
+// `--payload FILE` puts a file's bytes in the image, past everything the rest
+// of the container can address. What the compiler handles is the *table* --
+// where each datum starts and how long it is -- and never the bytes: a Dream
+// string counts its length in 32 bits, which is the very limit the payload
+// exists to get past. So a file is measured before the layout and copied after
+// it, and at no point is it a value.
+
+/// How much of a payload is in memory at once. Anything would do; a megabyte
+/// is large enough that the loop is not the cost and small enough to be free.
+let payload_chunk = 1048576;
+
+/// How many bytes are in this file, or `()` if it cannot be read.
+///
+/// Asked before anything is laid out, because the answer is what the `LDAT`
+/// record will say -- the image commits to a length before a byte is written.
+let payload_size! path =
+    match try! { io.open! path :read } catch e { () } {
+        () => (),
+        h => {
+            let n = try! { io.size! h } catch e { () };
+            strict! n
+            io.close! h
+            n
+        },
+    };
+
+/// Copy exactly `n` bytes of `path` into an open handle.
+///
+/// Exactly `n`, rather than "until the end": `n` is what `io.size!` reported
+/// when the table was laid out, and the table is already written. A file that
+/// has grown since would run past the length the image records, and one that
+/// has shrunk cannot fill it -- which is the case this answers `false` for,
+/// rather than writing a short payload nothing would notice until it was read.
+let copy_payload! out path n =
+    match try! { io.open! path :read } catch e { () } {
+        () => false,
+        h => {
+            let rec go! left =
+                if left <= 0 { true }
+                else {
+                    let want = if left < payload_chunk { left } else { payload_chunk };
+                    match io.read! h want {
+                        "" => false,
+                        chunk => {
+                            write_all! out chunk
+                            go! (left - str.byte_length chunk)
+                        },
+                    }
+                };
+            let ok = go! n;
+            strict! ok
+            io.close! h
+            ok
+        },
+    };
+
 /// Compile the program and write the image.
 ///
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out shebang = {
+let build! l out shebang payloads = {
     let r = scope.resolve! l;
     let low = lower.link! l r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
+    let sizes = list.map (fn pth -> payload_size! pth) payloads;
+    strict! sizes
+    let unreadable = list.filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
+    else if not (list.is_empty unreadable) {
+        console.error! ("dreams: cannot read payload " + list.head (list.head unreadable))
+        1
+    }
     else {
-        let img = lower.image low;
+        // The sizes ride in the image record rather than being handed to the
+        // writer separately, because they are part of what the image *is*: the
+        // section table cannot be laid out without them.
+        let img = core.map_put (lower.image low) :payloads sizes;
+        let payload_bytes = list.fold (fn n k -> n + k) 0 sizes;
         // The shebang goes in front of the image rather than into it: the VM
         // skips a leading `#!` line when it loads a file, which is what makes
         // one file both an image and a program.
@@ -191,17 +260,36 @@ let build! l out shebang = {
             },
             handle => {
                 write_all! handle bytes
+                // The payload goes on the end, straight from the files it came
+                // from. The section table already names where it starts and how
+                // long each datum is, which is why the sizes had to be taken
+                // before any of this was laid out.
+                let copied = list.fold_strict
+                                 (fn ok pair ->
+                                      ok && copy_payload! handle (list.head pair) (list.nth 1 pair))
+                                 true (list.zip payloads sizes);
                 io.close! handle
                 // There is no `chmod` builtin, and the execute bit is the whole
                 // point of the `#!` line, so this is one place where shelling
                 // out is the implementation rather than a shortcut.
                 match shebang { () => (), _ => os.exec! "chmod" ["+x", out] }
-                console.error! ("compiled -> " + out + " (" + to_string (str.byte_length bytes)
+                if not copied {
+                    console.error! ("dreams: a payload was shorter than it measured; "
+                                    + out + " is incomplete")
+                    1
+                } else {
+                    console.error! ("compiled -> " + out + " ("
+                                + to_string (str.byte_length bytes + payload_bytes)
                                 + " bytes, " + to_string (list.length (modules.modules l))
                                 + " modules, " + to_string (list.length (core.map_get img :nodes []))
                                 + " nodes, " + to_string (list.length (core.map_get img :funcs []))
-                                + " functions)")
-                print_diags! (modules.files l) ds
+                                + " functions"
+                                + (if list.is_empty payloads { "" }
+                                   else { ", " + to_string (list.length payloads) + " payloads, "
+                                          + to_string payload_bytes + " payload bytes" })
+                                + ")")
+                    print_diags! (modules.files l) ds
+                }
             },
         }
     }
@@ -461,7 +549,8 @@ let describe_resolution l r found =
 
 let defaults = %{ :command => :check, :file => (), :roots => [], :includes => [],
                   :defines => [], :hosts => [], :test => false, :quiet => false,
-                  :position => (), :output => (), :shebang => (), :error => () };
+                  :position => (), :output => (), :shebang => (), :payloads => [],
+                  :error => () };
 
 let opt o k = core.map_get o k ();
 let with_opt k v o = core.map_put o k v;
@@ -537,6 +626,8 @@ let rec parse_args args o =
         ["-I", dir, ..rest] => parse_args rest (append_opt :includes dir o),
         ["--host-module"] => with_opt :error "--host-module needs a module path" o,
         ["--host-module", m, ..rest] => parse_args rest (append_opt :hosts m o),
+        ["--payload"] => with_opt :error "--payload needs a path" o,
+        ["--payload", f, ..rest] => parse_args rest (append_opt :payloads f o),
 
         // What to compile it as.
         ["-D"] => with_opt :error "-D needs a name or name=value" o,
@@ -583,6 +674,8 @@ let usage! () = {
         "  -L, --package-path DIR   a package, or a directory holding packages",
         "  -I, --include DIR        a directory to search for modules",
         "  --host-module PATH       treat PATH as provided by the host",
+        "  --payload FILE           put FILE's bytes in the image, reachable as",
+        "                           `core.data_at N` in the order given",
         "",
         "what to compile it as:",
         "  -D, --define NAME[=V]    define a `when` flag, or set a `when` value",
@@ -624,7 +717,7 @@ let run_command! o file =
         :ast       => with_source! file (fn src -> ast! file src),
         :parse     => with_source! file (fn src -> parse_only! file src),
         :check     => check_program! (load! o file),
-        :build     => build! (load! o file) (opt o :output) (opt o :shebang),
+        :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :payloads),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),

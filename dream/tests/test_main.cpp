@@ -449,6 +449,236 @@ static void test_image_rejects_bad_input() {
     CHECK(!img3.load_bytes(good, sizeof good, err));
 }
 
+// ---------------------------------------------------------------------------
+// Large data: the LDAT/PAYL pair
+//
+// Building an image by hand, because that is the only way to write the ones a
+// loader must *reject* -- the compiler cannot be asked for a malformed file.
+// The shape is what `dreams/emit.dr` writes: a 32-byte header, a table of
+// 16-byte entries, then each section on an 8-byte boundary.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct ImageBuilder {
+    struct Sec {
+        const char* kind;
+        std::vector<uint8_t> body;
+        uint32_t count;
+        /// What the table claims, when a test wants it to differ from the body.
+        uint32_t declared_length;
+    };
+    std::vector<Sec> secs;
+
+    void add(const char* kind, std::vector<uint8_t> body, uint32_t count) {
+        uint32_t len = uint32_t(body.size());
+        secs.push_back(Sec{kind, std::move(body), count, len});
+    }
+    /// The same, but the table lies about how long the section is.
+    void add_claiming(const char* kind, std::vector<uint8_t> body, uint32_t count,
+                      uint32_t declared) {
+        secs.push_back(Sec{kind, std::move(body), count, declared});
+    }
+
+    static void put32(std::vector<uint8_t>& out, uint32_t v) {
+        for (int i = 0; i < 4; ++i) out.push_back(uint8_t(v >> (8 * i)));
+    }
+    static void put64(std::vector<uint8_t>& out, uint64_t v) {
+        for (int i = 0; i < 8; ++i) out.push_back(uint8_t(v >> (8 * i)));
+    }
+
+    std::vector<uint8_t> build() const {
+        const size_t table_end = 32 + secs.size() * 16;
+        // Where each section lands, once the table that names them is sized.
+        std::vector<uint32_t> at;
+        size_t cursor = (table_end + 7) & ~size_t(7);
+        for (const Sec& s : secs) {
+            at.push_back(uint32_t(cursor));
+            cursor = (cursor + s.body.size() + 7) & ~size_t(7);
+        }
+
+        std::vector<uint8_t> out;
+        out.insert(out.end(), {'D', 'A', 'G', 'N', 'C', 'A', 'A', 'F'});
+        put32(out, 0 | (1u << 16));           // version 0.1
+        put32(out, 0);                        // flags
+        put32(out, 0);                        // module_name
+        put32(out, 0);                        // source_name
+        put32(out, 0xFFFFFFFFu);              // entry: none
+        put32(out, uint32_t(secs.size()));
+        for (size_t i = 0; i < secs.size(); ++i) {
+            const Sec& s = secs[i];
+            put32(out, uint32_t(uint8_t(s.kind[0])) | (uint32_t(uint8_t(s.kind[1])) << 8) |
+                           (uint32_t(uint8_t(s.kind[2])) << 16) |
+                           (uint32_t(uint8_t(s.kind[3])) << 24));
+            put32(out, at[i]);
+            put32(out, s.declared_length);
+            put32(out, s.count);
+        }
+        for (size_t i = 0; i < secs.size(); ++i) {
+            out.resize(at[i], 0);
+            out.insert(out.end(), secs[i].body.begin(), secs[i].body.end());
+        }
+        return out;
+    }
+};
+
+/// A one-string table, which the header's module and source names point at.
+/// Every image needs it; nothing here is testing strings.
+void add_minimum(ImageBuilder& b) {
+    std::vector<uint8_t> kstr;
+    ImageBuilder::put32(kstr, 0);
+    ImageBuilder::put32(kstr, 0);
+    b.add("KSTR", kstr, 1);
+    b.add("SBLB", {}, 0);
+}
+
+/// `LDAT` from a list of (offset, length), and a `PAYL` holding `bytes`.
+void add_payload(ImageBuilder& b, const std::vector<std::pair<uint64_t, uint64_t>>& table,
+                 const std::string& bytes) {
+    std::vector<uint8_t> ldat;
+    for (auto& [off, len] : table) {
+        ImageBuilder::put64(ldat, off);
+        ImageBuilder::put64(ldat, len);
+    }
+    b.add("LDAT", ldat, uint32_t(table.size()));
+
+    std::vector<uint8_t> payl;
+    ImageBuilder::put64(payl, bytes.size());
+    payl.insert(payl.end(), bytes.begin(), bytes.end());
+    // The section is its 8-byte header; the bytes after it are the payload and
+    // are not part of what the table measures.
+    b.add_claiming("PAYL", payl, 0, 8);
+}
+
+}  // namespace
+
+static void test_payload_sections() {
+    std::printf("large data\n");
+    std::string err;
+
+    // A payload that is there, correct, and reachable.
+    {
+        ImageBuilder b;
+        add_minimum(b);
+        add_payload(b, {{0, 5}, {5, 6}}, "helloworld!");
+        std::vector<uint8_t> bytes = b.build();
+        Image img;
+        CHECK(img.load_bytes(bytes.data(), bytes.size(), err));
+        CHECK_EQ(img.data_count(), 2u);
+        CHECK_EQ(img.data_length(0), uint64_t(5));
+        CHECK_EQ(std::string(img.data_bytes(0), 5), std::string("hello"));
+        CHECK_EQ(std::string(img.data_bytes(1), 6), std::string("world!"));
+    }
+
+    // An image with no payload at all is the ordinary case and must stay one.
+    {
+        ImageBuilder b;
+        add_minimum(b);
+        std::vector<uint8_t> bytes = b.build();
+        Image img;
+        CHECK(img.load_bytes(bytes.data(), bytes.size(), err));
+        CHECK_EQ(img.data_count(), 0u);
+    }
+
+    // Each section is meaningless without the other: a table describing
+    // nothing, or bytes nothing can name.
+    {
+        ImageBuilder b;
+        add_minimum(b);
+        std::vector<uint8_t> ldat;
+        ImageBuilder::put64(ldat, 0);
+        ImageBuilder::put64(ldat, 4);
+        b.add("LDAT", ldat, 1);
+        std::vector<uint8_t> bytes = b.build();
+        Image img;
+        CHECK(!img.load_bytes(bytes.data(), bytes.size(), err));
+        CHECK(err.find("without a PAYL") != std::string::npos);
+    }
+    {
+        ImageBuilder b;
+        add_minimum(b);
+        std::vector<uint8_t> payl;
+        ImageBuilder::put64(payl, 4);
+        payl.insert(payl.end(), {'a', 'b', 'c', 'd'});
+        b.add_claiming("PAYL", payl, 0, 8);
+        std::vector<uint8_t> bytes = b.build();
+        Image img;
+        CHECK(!img.load_bytes(bytes.data(), bytes.size(), err));
+        CHECK(err.find("without an LDAT") != std::string::npos);
+    }
+
+    // A datum reaching past the end of the payload.
+    {
+        ImageBuilder b;
+        add_minimum(b);
+        add_payload(b, {{3, 10}}, "hello");
+        std::vector<uint8_t> bytes = b.build();
+        Image img;
+        CHECK(!img.load_bytes(bytes.data(), bytes.size(), err));
+        CHECK(err.find("past the payload") != std::string::npos);
+    }
+
+    // The offset alone is past the end, and `offset + length` would wrap were
+    // it added rather than subtracted -- which is the sum this check exists for.
+    {
+        ImageBuilder b;
+        add_minimum(b);
+        add_payload(b, {{~uint64_t(0) - 2, 8}}, "hello");
+        std::vector<uint8_t> bytes = b.build();
+        Image img;
+        CHECK(!img.load_bytes(bytes.data(), bytes.size(), err));
+        CHECK(err.find("past the payload") != std::string::npos);
+    }
+
+    // A payload the file is too short to hold: the header says more bytes
+    // follow than there are.
+    {
+        ImageBuilder b;
+        add_minimum(b);
+        add_payload(b, {{0, 5}}, "hello");
+        std::vector<uint8_t> bytes = b.build();
+        // Rewrite the payload's length header to claim a gigabyte.
+        size_t payl_at = bytes.size() - 8 - 5;
+        for (int i = 0; i < 8; ++i) {
+            bytes[payl_at + i] = uint8_t((uint64_t(1) << 30) >> (8 * i));
+        }
+        Image img;
+        CHECK(!img.load_bytes(bytes.data(), bytes.size(), err));
+        CHECK(err.find("past end of file") != std::string::npos);
+    }
+}
+
+static void test_bigstr_values() {
+    std::printf("big strings\n");
+    // The bytes are not heap memory, which is the whole point: a view can be
+    // made, promoted and copied between heaps without any of them moving.
+    static const char corpus[] = "the quick brown fox";
+    Heap a, b;
+    Value v = a.make_bigstr(corpus, 19);
+    CHECK_EQ(surface_type(v), DREAM_TYPE_BIGSTR);
+
+    Bytes bytes;
+    CHECK(string_bytes(v, &bytes));
+    CHECK_EQ(bytes.len, uint64_t(19));
+    CHECK_EQ(bytes.data, corpus);
+
+    // A plain string of the same bytes is equal to it and hashes with it,
+    // which is what lets `str.slice payload == "quick"` mean anything.
+    Value s = a.make_string(corpus, 19);
+    Bytes sb;
+    CHECK(string_bytes(s, &sb));
+    CHECK(bytes_equal(bytes, sb));
+    CHECK_EQ(bytes_hash(bytes), bytes_hash(sb));
+    CHECK_EQ(bytes_compare(bytes, sb), 0);
+
+    // Crossing to another heap copies the view, not the bytes.
+    Value cv = Heap::copy_between(b, v);
+    CHECK(is_obj(cv, ObjType::BigStr));
+    CHECK_EQ(static_cast<BigStrObj*>(as_obj(cv))->data, corpus);
+    CHECK_EQ(static_cast<BigStrObj*>(as_obj(cv))->len, uint64_t(19));
+    CHECK(as_obj(cv) != as_obj(v));
+}
+
 static void test_atom_interning() {
     std::printf("atom interning\n");
     Runtime rt;
@@ -565,6 +795,8 @@ int main() {
     test_heap_verifier_follows_every_object_kind();
     test_cross_heap_copy();
     test_image_rejects_bad_input();
+    test_payload_sections();
+    test_bigstr_values();
     test_atom_interning();
     test_builtin_table_matches_compiler();
     test_maps();

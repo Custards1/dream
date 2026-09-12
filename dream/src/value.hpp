@@ -93,6 +93,7 @@ inline constexpr bool truthy(Value v) { return v == TRUE_V; }
 enum class ObjType : uint8_t {
     Float = 0,
     Str,
+    BigStr,    // a view into the image's payload; see BigStrObj
     Cons,      // lazy list cell
     Array,
     Map,       // a branch of the hash trie; every map value is one of these
@@ -149,6 +150,30 @@ struct StrObj : Obj {
     uint32_t hash;
     char* data() { return reinterpret_cast<char*>(this + 1); }
     const char* data() const { return reinterpret_cast<const char*>(this + 1); }
+};
+
+/// A window onto the program image's payload region.
+///
+/// A `StrObj` counts its bytes in a `uint32_t` and carries them in its own
+/// allocation, which caps a string at 4 GiB and costs a copy at every
+/// materialization, every promotion and every `spawn!`. Neither is acceptable
+/// for the datum a program is *about* -- a corpus, a model, an asset -- so a
+/// big string is not a string at all. It is a length and a pointer into the
+/// mapped image, and building one is O(1).
+///
+/// Sharing the pointer is safe precisely because it does not point into a
+/// heap: the bytes belong to the `Runtime`'s image, which is immutable and
+/// outlives every process in it. A copy between heaps therefore copies the
+/// view, not the bytes. What it may *not* cross is a runtime boundary
+/// (`std.vm`), where the pointer would name someone else's mapping.
+///
+/// `hash` is 0 until something asks, because a map key is the only thing that
+/// needs it and walking a gigabyte to answer a question nobody asked is the
+/// cost this type exists to refuse.
+struct BigStrObj : Obj {
+    uint64_t len;
+    uint64_t hash;
+    const char* data;
 };
 
 /// A cons cell. Both fields may be thunks: `[expensive_a, expensive_b]`
@@ -318,6 +343,73 @@ inline bool is_whnf(Value v) {
         default:
             return true;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Strings, in either representation
+// ---------------------------------------------------------------------------
+
+/// The bytes behind a string value, and how many of them there are.
+///
+/// A `Str` carries its bytes in its own allocation; a `BigStr` points at the
+/// image's payload. Every operation that only *reads* a string -- compare,
+/// hash, index, slice, write -- wants the pointer and the length and has no
+/// business knowing which of the two it was handed, so it asks here once
+/// instead of switching on the type at each site. The length is 64-bit
+/// because one of the two kinds can be.
+struct Bytes {
+    const char* data = nullptr;
+    uint64_t len = 0;
+};
+
+/// True when the value is a string of either representation.
+inline bool is_stringish(Value v) {
+    v = resolve(v);
+    if (!is_ptr(v)) return false;
+    ObjType t = as_obj(v)->type;
+    return t == ObjType::Str || t == ObjType::BigStr;
+}
+
+/// The bytes of a string value, or false when it is not one.
+inline bool string_bytes(Value v, Bytes* out) {
+    v = resolve(v);
+    if (!is_ptr(v)) return false;
+    Obj* o = as_obj(v);
+    if (o->type == ObjType::Str) {
+        auto* s = static_cast<StrObj*>(o);
+        *out = Bytes{s->data(), s->len};
+        return true;
+    }
+    if (o->type == ObjType::BigStr) {
+        auto* b = static_cast<BigStrObj*>(o);
+        *out = Bytes{b->data, b->len};
+        return true;
+    }
+    return false;
+}
+
+/// Lexicographic byte order, shorter first on a shared prefix. -1, 0 or 1.
+inline int bytes_compare(const Bytes& a, const Bytes& b) {
+    uint64_t n = a.len < b.len ? a.len : b.len;
+    int c = n ? std::memcmp(a.data, b.data, size_t(n)) : 0;
+    if (c != 0) return c < 0 ? -1 : 1;
+    return a.len < b.len ? -1 : (a.len > b.len ? 1 : 0);
+}
+
+inline bool bytes_equal(const Bytes& a, const Bytes& b) {
+    return a.len == b.len && (a.len == 0 || std::memcmp(a.data, b.data, size_t(a.len)) == 0);
+}
+
+/// FNV-1a over the bytes, never zero -- zero is what a cached hash uses to mean
+/// "not worked out yet". Both string representations hash through this, so a
+/// `BigStr` slice and the literal it matches land in the same map bucket.
+inline uint64_t bytes_hash(const Bytes& b) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t i = 0; i < b.len; ++i) {
+        h ^= uint8_t(b.data[i]);
+        h *= 1099511628211ull;
+    }
+    return h ? h : 1;
 }
 
 dream_type surface_type(Value v);

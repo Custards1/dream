@@ -132,14 +132,18 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
     if (!is_ptr(fa) || !is_ptr(fb)) return false;
     Obj* oa = as_obj(fa);
     Obj* ob = as_obj(fb);
+
+    // Strings compare by their bytes, and a big string is a string whose bytes
+    // happen to live in the image. Deciding otherwise would make
+    // `str.slice 0 4 payload == "%PDF"` -- the first thing anyone does with a
+    // payload -- quietly false, which is a worse surprise than the two
+    // representations being visible to `type_of`.
+    Bytes xs, ys;
+    if (string_bytes(fa, &xs) && string_bytes(fb, &ys)) return bytes_equal(xs, ys);
+
     if (oa->type != ob->type) return false;
 
     switch (oa->type) {
-        case ObjType::Str: {
-            auto* x = static_cast<StrObj*>(oa);
-            auto* y = static_cast<StrObj*>(ob);
-            return x->len == y->len && std::memcmp(x->data(), y->data(), x->len) == 0;
-        }
         case ObjType::Cons: {
             auto* x = static_cast<ConsObj*>(oa);
             auto* y = static_cast<ConsObj*>(ob);
@@ -602,6 +606,18 @@ bool arith(Process& p, Op op, Value a, Value b, Value* out) {
         return true;
     }
 
+    // A big string is deliberately not concatenable. Joining one would have to
+    // produce a `StrObj`, which copies the bytes into the heap and caps them at
+    // 4 GiB -- undoing both halves of what the payload is for. The error names
+    // the two ways out rather than leaving the caller to guess.
+    if (is_obj(a, ObjType::BigStr) || is_obj(b, ObjType::BigStr)) {
+        *out = type_error(p, std::string("cannot apply `") + op_name(op) +
+                                 "` to a big string: it is a view into the image, not heap "
+                                 "memory. Take a `str.slice` of it, or hand the whole of it "
+                                 "to `io.write!`.");
+        return false;
+    }
+
     if (!is_number(a) || !is_number(b)) {
         *out = type_error(p, std::string("cannot apply `") + op_name(op) + "` to " +
                                  describe(p, a) + " and " + describe(p, b));
@@ -678,12 +694,11 @@ bool compare(Process& p, Op op, Value a, Value b, Value* out) {
             double x = to_double(a), y = to_double(b);
             cmp = x < y ? -1 : (x > y ? 1 : 0);
         }
-    } else if (is_obj(a, ObjType::Str) && is_obj(b, ObjType::Str)) {
-        auto* x = static_cast<StrObj*>(as_obj(a));
-        auto* y = static_cast<StrObj*>(as_obj(b));
-        uint32_t n = x->len < y->len ? x->len : y->len;
-        cmp = std::memcmp(x->data(), y->data(), n);
-        if (cmp == 0) cmp = x->len < y->len ? -1 : (x->len > y->len ? 1 : 0);
+    } else if (is_stringish(a) && is_stringish(b)) {
+        Bytes x, y;
+        string_bytes(a, &x);
+        string_bytes(b, &y);
+        cmp = bytes_compare(x, y);
     } else if (is_char(a) && is_char(b)) {
         uint64_t x = imm_payload(a), y = imm_payload(b);
         cmp = x < y ? -1 : (x > y ? 1 : 0);

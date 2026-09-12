@@ -85,6 +85,10 @@ std::string string_arg(Value v) {
     return std::string(s->data(), s->len);
 }
 
+/// Deliberately false for a big string. Everything that asks goes on to call
+/// `string_arg`, which materializes a `std::string` -- a path a payload must
+/// never take. `write!` is the one place that wants the bytes rather than a
+/// string, and it asks `string_bytes` instead.
 bool is_string(Value v) { return is_obj(resolve(v), ObjType::Str); }
 
 // ---------------------------------------------------------------------------
@@ -503,12 +507,17 @@ NativeResult io_write(Process& p, Value, Value* args, uint32_t) {
     if (!h.open(args[0])) {
         return fail(p, "io_closed", "this handle is closed, or was never opened");
     }
-    if (!is_string(args[1])) return fail(p, "type_error", "write! needs a string");
-    auto* str = static_cast<StrObj*>(as_obj(resolve(args[1])));
-    if (str->len == 0) return NativeResult::ok(make_fixnum(0));
+    Bytes str;
+    if (!string_bytes(args[1], &str)) return fail(p, "type_error", "write! needs a string");
+    if (str.len == 0) return NativeResult::ok(make_fixnum(0));
 
     for (;;) {
-        ssize_t put = ::write(h.fd(), str->data(), str->len);
+        // A big string is written from where it lies in the mapped image, with
+        // no intermediate buffer -- the kernel reads the pages, so a payload
+        // larger than memory costs no memory to write. `write` takes a size_t
+        // and answers how much it took, and a short write is the caller's loop
+        // either way, so nothing here has to know which kind it was handed.
+        ssize_t put = ::write(h.fd(), str.data, size_t(str.len));
         if (put >= 0) return NativeResult::ok(make_fixnum(int64_t(put)));
         if (errno == EINTR) continue;
         if ((errno == EAGAIN || errno == EWOULDBLOCK) && h.pollable()) {

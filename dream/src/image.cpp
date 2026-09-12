@@ -38,6 +38,11 @@ inline uint32_t rd32(const uint8_t* p) {
     std::memcpy(&v, p, 4);
     return v;
 }
+inline uint64_t rd64(const uint8_t* p) {
+    uint64_t v;
+    std::memcpy(&v, p, 8);
+    return v;
+}
 
 struct SectionInfo {
     uint32_t kind, offset, length, count;
@@ -284,6 +289,19 @@ bool Image::parse(std::string& error) {
         } else if (s.kind == tag("MODS")) {
             if (!fits(sizeof(ModuleRec))) { error = "MODS section is short"; return false; }
             modules_ = reinterpret_cast<const ModuleRec*>(base); n_modules_ = s.count;
+        } else if (s.kind == tag("LDAT")) {
+            if (!fits(sizeof(DataRec))) { error = "LDAT section is short"; return false; }
+            large_ = reinterpret_cast<const DataRec*>(base); n_large_ = s.count;
+        } else if (s.kind == tag("PAYL")) {
+            // The section table entry describes only the 8-byte header -- the
+            // honest size of what the layout reserved. The payload itself
+            // follows and may be larger than a `u32` can count, so its length
+            // is that header and nowhere else.
+            if (s.length < 8) { error = "PAYL section is short"; return false; }
+            payload_len_ = rd64(base);
+            payload_off_ = s.offset;
+            payload_ = reinterpret_cast<const char*>(base + 8);
+            has_payload_ = true;
         } else if (s.kind == tag("SPAN")) {
             if (!fits(sizeof(SpanRec))) { error = "SPAN section is short"; return false; }
             spans_ = reinterpret_cast<const SpanRec*>(base); n_spans_ = s.count;
@@ -362,6 +380,30 @@ bool Image::validate(std::string& error) {
             return fail("module derives an out-of-range module");
         }
     }
+    // Large data. The two sections are one feature and each is meaningless
+    // alone: a table of descriptors with nothing to describe, or a region of
+    // bytes nothing can name. An image carrying one and not the other was
+    // built wrong, and saying so here is cheaper than a null deref later.
+    if ((large_ != nullptr) != has_payload_) {
+        return fail(large_ ? "LDAT section without a PAYL section"
+                           : "PAYL section without an LDAT section");
+    }
+    if (has_payload_) {
+        // The one sum in the container that can leave a `u32` behind, so it is
+        // the one done in 64 bits and written as a subtraction -- adding the
+        // length to the offset is exactly what would wrap.
+        const size_t header_end = payload_off_ + 8;
+        if (header_end > size_ || payload_len_ > uint64_t(size_ - header_end)) {
+            return fail("the payload extends past end of file");
+        }
+        for (uint32_t i = 0; i < n_large_; ++i) {
+            const DataRec& d = large_[i];
+            if (d.offset > payload_len_ || d.length > payload_len_ - d.offset) {
+                return fail("large datum " + std::to_string(i) + " extends past the payload");
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < n_funcs_; ++i) {
         const FuncRec& f = funcs_[i];
         if (f.name >= n_strs_) return fail("bad function name index");

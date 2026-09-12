@@ -49,6 +49,14 @@ let first_or default s = list.first_or default (core.str_chars s);
 /// it, which is why the offsets to pass are the ones `find` returns.
 let slice from count s = core.str_slice s from count;
 
+/// The byte at offset `i`, as an integer, or `-1` when there is none.
+///
+/// Clamped the same way `slice` is, and for the same reason. This is the way
+/// into a big string (`core.data_at`), which has no `chars` and no `find`:
+/// indexing it is pointer arithmetic and costs nothing, while anything that
+/// would build a string out of it is refused.
+let byte i s = core.str_byte s i;
+
 /// The byte offset of `needle` at or after byte offset `from`, or `-1`.
 let find_from from needle s = core.str_find s needle from;
 

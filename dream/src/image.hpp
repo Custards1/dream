@@ -117,6 +117,18 @@ struct SpanRec {
     uint32_t end;
 };
 
+/// One large datum: where it starts in the payload, and how long it is.
+///
+/// Both are 64-bit, which is the whole point. Everything else in the container
+/// is addressed by `u32`, so the file and every string in it stop at 4 GiB;
+/// the payload is the one region allowed past that line, and this is the only
+/// record that can name a position inside it.
+struct DataRec {
+    uint64_t offset;
+    uint64_t length;
+};
+static_assert(sizeof(DataRec) == 16, "large-data records are 16 bytes on disk");
+
 /// One module of a whole-program image. Compilation is whole-program, so an
 /// image carries every module it needs and records which globals belong to
 /// which -- for diagnostics, tooling, and reflection.
@@ -182,6 +194,16 @@ public:
     const ImportRec& import(uint32_t i) const { return imports_[i]; }
     const ModuleRec& module(uint32_t i) const { return modules_[i]; }
     uint32_t module_count() const { return n_modules_; }
+
+    /// Large data: the payload region, addressed by 64-bit numbers.
+    ///
+    /// A datum is handed out as a pointer into the mapping rather than as
+    /// bytes. Copying is what the whole feature exists to avoid: the payload
+    /// may be larger than the address space the rest of the format can name,
+    /// and the mapping outlives every process that looks at it.
+    uint32_t data_count() const { return n_large_; }
+    const char* data_bytes(uint32_t i) const { return payload_ + large_[i].offset; }
+    uint64_t data_length(uint32_t i) const { return large_[i].length; }
     /// The module a global belongs to, or -1.
     int module_of_global(uint32_t global_index) const;
     /// Source span for a node, or {0,0} when the image carries no debug info.
@@ -228,6 +250,16 @@ private:
     const ImportRec* imports_ = nullptr;     uint32_t n_imports_ = 0;
     const SpanRec* spans_ = nullptr;         uint32_t n_spans_ = 0;
     const ModuleRec* modules_ = nullptr;     uint32_t n_modules_ = 0;
+    const DataRec* large_ = nullptr;         uint32_t n_large_ = 0;
+
+    /// The payload bytes, and where its `u64` length header sits. The offset
+    /// is kept because validation has to prove the payload ends inside the
+    /// file, and that is the only sum in the container that can overflow a
+    /// `u32`.
+    const char* payload_ = nullptr;
+    uint64_t payload_len_ = 0;
+    size_t payload_off_ = 0;
+    bool has_payload_ = false;
 };
 
 }  // namespace dream

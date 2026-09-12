@@ -164,8 +164,7 @@ nothing is loaded:
 
 - The bytecode format: no new opcode, no section, no wider index. Merging is a
   loader concern. (The `MODS` section, which a merge leans on for module
-  identity, is documented separately as a proposal in
-  `docs/bytecode-format-proposed.md`.)
+  identity, is documented in `docs/bytecode-format.md`.)
 - `mind`'s whole-program build, the bootstrap seed, and the byte-equality
   guarantee: a single compiled program still produces one image. Linking is an
   explicit, separate act.
