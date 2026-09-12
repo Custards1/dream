@@ -27,6 +27,7 @@ enum class NativeOutcome : uint8_t {
     Value,       // `value` is the result
     Raise,       // `value` is an error to raise
     Block,       // the process parked itself; re-enter when it is woken
+    Enter,       // `value` is the result, not yet forced; the machine forces it
 };
 
 struct NativeResult {
@@ -36,6 +37,13 @@ struct NativeResult {
     static NativeResult ok(Value v) { return {NativeOutcome::Value, v}; }
     static NativeResult raise(Value v) { return {NativeOutcome::Raise, v}; }
     static NativeResult block() { return {NativeOutcome::Block, UNIT}; }
+    /// The result, unforced, for the machine to force as the continuation of
+    /// the call. A native that hands back something it found -- a list's head,
+    /// a map's value -- answers this rather than forcing it. Forcing inside a
+    /// native runs a nested machine loop on the C++ stack, and a value whose own
+    /// evaluation reads through another such native nests again, as deep as the
+    /// chain of reads is long; entered by the machine, that depth is heap.
+    static NativeResult enter(Value v) { return {NativeOutcome::Enter, v}; }
 };
 
 /// A host function. `callee` is the value being applied: for a module member

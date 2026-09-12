@@ -35,7 +35,9 @@ These are emitted by the compiler for `match` expressions. They are technically 
 | `match_head v` | Returns the head of a cons cell, unforced. |
 | `match_tail v` | Returns the tail of a cons cell, unforced. |
 | `match_at v i` | Returns element `i` of array `v`, unforced. |
-| `match_key map key` | Returns `[value]` if `key` is in `map`, `[]` if absent. |
+| `match_key map key` | Returns `[value]` if `key` is in `map`, `[]` if absent; the value unforced. |
+
+Each takes its arguments forced by the machine, through its strictness mask, and hands back what it found without forcing it: the machine forces the piece as the continuation of the call. That is what lets a chain of reads through patterns — a list rebuilt many times from the rest of the one before — go as deep as the heap allows rather than as deep as the C++ stack. The `std.native` members that hand back a stored value (`head`, `tail`, `array_get`, `map_get`) answer the same way.
 
 ---
 
