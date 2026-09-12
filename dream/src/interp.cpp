@@ -14,7 +14,7 @@ namespace dream {
 
 namespace {
 
-inline const Image& img_of(Process& p) { return p.runtime().image(); }
+inline const Image& img_of(Process& p) { return *p.code; }
 
 inline void eval_node(Process& p, uint32_t node, Value frame) {
     p.mode = Mode::Eval;
@@ -95,6 +95,44 @@ namespace {
     return raise_error(p, well_known(p.runtime()).type_error, msg);
 }
 
+/// The `StrObj` for image string constant `index`, made once per process.
+///
+/// A literal is immutable and a program cannot observe which copy of it it
+/// holds -- strings compare and hash by their bytes -- so evaluating `"("` in
+/// a loop has no business allocating. Nothing in the VM ever writes into a
+/// string it did not just make (concatenation and slicing both build a fresh
+/// one), which is what makes sharing safe rather than merely cheap.
+///
+/// The cache is a process root, so a shared literal survives collection and
+/// keeps its identity across one.
+inline Value literal_string(Process& p, uint32_t index) {
+    if (index < p.string_cache.size()) {
+        Value hit = p.string_cache[index];
+        if (hit != NIL_SLOT) return hit;
+    } else {
+        p.string_cache.assign(img_of(p).string_count(), NIL_SLOT);
+    }
+    StringRef s = img_of(p).str(index);
+    Value v = p.heap().make_string(s.data, s.len);
+    if (index < p.string_cache.size()) p.string_cache[index] = v;
+    return v;
+}
+
+/// The boxed float for image float constant `index`, made once per process.
+/// Same argument as `literal_string`: immutable, no observable identity, and
+/// otherwise one allocation every time the constant is reached.
+inline Value literal_float(Process& p, uint32_t index) {
+    if (index < p.float_cache.size()) {
+        Value hit = p.float_cache[index];
+        if (hit != NIL_SLOT) return hit;
+    } else {
+        p.float_cache.assign(img_of(p).float_count(), NIL_SLOT);
+    }
+    Value v = p.heap().make_float(img_of(p).real(index));
+    if (index < p.float_cache.size()) p.float_cache[index] = v;
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // Structural equality
 //
@@ -118,8 +156,12 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
         *raised = true;
         return false;
     }
-    Value fa, fb;
-    if (!force_whnf(p, a, &fa) || !force_whnf(p, b, &fb)) {
+    // `resolve` and the WHNF test are inline; `force_whnf` is a call into a
+    // nested machine loop. Both operands of a comparison have usually been
+    // forced by the machine already, so ask before calling.
+    Value fa = resolve(a), fb = resolve(b);
+    if ((!is_whnf(fa) && !force_whnf(p, fa, &fa)) ||
+        (!is_whnf(fb) && !force_whnf(p, fb, &fb))) {
         *raised = true;
         return false;
     }
@@ -192,12 +234,11 @@ void enter(Process& p, Value v);
 void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value frame) {
     Jit* jit = p.runtime().jit();
     if (jit) {
-        CompiledFn fn = nullptr;
-        // The already-compiled case is a single inlined cache read, so a
-        // process whose functions never grow hot -- most of a compile -- pays
-        // nothing more for the JIT being present. Only a cache miss calls
-        // `on_enter`, which counts towards the threshold and compiles.
-        if (jit->cached_compiled(func_index, &fn) || (fn = jit->on_enter(func_index))) {
+        // One inlined, lock-free read of the tier table (see `Jit::tier`), so
+        // a process whose functions never grow hot -- most of a compile --
+        // pays a load and a branch for the JIT being present.
+        CompiledFn fn = jit->tier(func_index);
+        if (fn) {
             int status = 0;
             // Compiled code spends the same budget the interpreter does, so
             // fold what it used into the process's total.
@@ -261,7 +302,7 @@ void do_apply(Process& p, Value callee, uint32_t argc) {
             return;
         }
 
-        Value fr = p.heap().make_frame(callee, f.slots);
+        Value fr = p.heap().make_frame_filling(callee, f.slots, arity);
         auto* fo = static_cast<FrameObj*>(as_obj(fr));
         for (uint32_t i = 0; i < arity; ++i) fo->slots()[i] = p.stack[base + i];
 
@@ -739,48 +780,216 @@ bool compare(Process& p, Op op, Value a, Value b, Value* out) {
 /// the import index and the member's position in one word, so a node that
 /// somehow meets a different module falls back to the search rather than
 /// reading the wrong member out of the right one.
-void resolve_field(Process& p, Value obj, uint32_t name_index, uint32_t node_index) {
+/// The slow half: find the member, number it, and build its function value.
+/// Reached once per call site, and then never again.
+[[gnu::noinline]] bool member_value_slow(Process& p, uint32_t imp, uint32_t name_index,
+                                         uint32_t node_index, Value* out) {
     const Image& img = img_of(p);
     StringRef member = img.str(name_index);
-
-    if (!is_obj(obj, ObjType::Module)) {
-        do_raise(p, type_error(p, describe(p, obj) + " has no member `" + member.str() + "`"));
-        return;
-    }
-    auto* mod = static_cast<ModuleObj*>(as_obj(obj));
-    const uint32_t imp = mod->import_index;
-
     const ModuleDef* def = p.runtime().module_for_import(imp);
     if (!def) {
-        do_raise(p, raise_error(p, well_known(p.runtime()).no_such_member,
-                                "module `" + img.str(img.import(imp).path).str() +
-                                    "` is not provided by this runtime"));
-        return;
+        *out = raise_error(p, well_known(p.runtime()).no_such_member,
+                           "module `" + img.str(img.import(imp).path).str() +
+                               "` is not provided by this runtime");
+        return false;
+    }
+    uint32_t at = UINT32_MAX;
+    for (uint32_t i = 0; i < def->members.size(); ++i) {
+        if (member.equals(def->members[i].name)) {
+            at = i;
+            break;
+        }
+    }
+    if (at == UINT32_MAX) {
+        *out = raise_error(p, well_known(p.runtime()).no_such_member,
+                           "module `" + img.str(img.import(imp).path).str() +
+                               "` has no member `" + member.str() + "`");
+        return false;
     }
 
-    const NativeDef* m = nullptr;
-    const uint64_t cached = p.runtime().field_cache(node_index);
-    if (cached != 0 && uint32_t(cached >> 32) == imp + 1) {
-        const uint32_t at = uint32_t(cached);
-        if (at < def->members.size()) m = &def->members[at];
+    // The value handed back is decided by which member this is and nothing
+    // else, so this process builds it once. What that replaces is two
+    // allocations -- a copy of the name and a `NativeObj` -- at every call of
+    // every `std` member, which in a program of any size is most of what the
+    // allocator does.
+    const uint32_t id = def->member_base + at;
+    if (p.native_cache.empty()) {
+        p.native_cache.assign(p.runtime().native_member_count(), NIL_SLOT);
     }
-    if (!m) {
-        for (uint32_t i = 0; i < def->members.size(); ++i) {
-            if (member.equals(def->members[i].name)) {
-                m = &def->members[i];
-                p.runtime().set_field_cache(node_index, (uint64_t(imp + 1) << 32) | i);
-                break;
+    // The site remembers the *cache slot*, not the member's position in its
+    // module: that is what lets the fast path answer without asking which
+    // module this import names. The import index rides along, so a node that
+    // somehow meets a different module falls back here rather than reading
+    // the wrong member out of the right one.
+    p.runtime().set_field_cache(node_index, (uint64_t(imp + 1) << 32) | id);
+
+    if (id < p.native_cache.size() && p.native_cache[id] != NIL_SLOT) {
+        *out = p.native_cache[id];
+        return true;
+    }
+    const NativeDef& m = def->members[at];
+    Value name = p.heap().make_string(member.data, member.len);
+    Value fn = make_native(p, m.fn, name, m.arity, m.strict_mask, m.user);
+    if (id < p.native_cache.size()) p.native_cache[id] = fn;
+    *out = fn;
+    return true;
+}
+
+/// `obj.member`, where `obj` is a host module.
+///
+/// This runs on every call of every `std.core` member, which in a program of
+/// any size means millions of times, so what it does *not* do matters. Warm,
+/// it is three loads and a compare: the module's import index out of the
+/// object, the cache slot out of the site that asked, and the function value
+/// out of this process's table. No name is copied, no module is searched, and
+/// nothing is allocated.
+inline bool member_value(Process& p, Value obj, uint32_t name_index, uint32_t node_index,
+                         Value* out) {
+    if (!is_obj(obj, ObjType::Module)) {
+        *out = type_error(p, describe(p, obj) + " has no member `" +
+                                 img_of(p).str(name_index).str() + "`");
+        return false;
+    }
+    const uint32_t imp = static_cast<ModuleObj*>(as_obj(obj))->import_index;
+    const uint64_t cached = p.runtime().field_cache(node_index);
+    if (uint32_t(cached >> 32) == imp + 1) {
+        const uint32_t id = uint32_t(cached);
+        if (id < p.native_cache.size()) {
+            Value hit = p.native_cache[id];
+            if (hit != NIL_SLOT) {
+                *out = hit;
+                return true;
             }
         }
     }
-    if (!m) {
-        do_raise(p, raise_error(p, well_known(p.runtime()).no_such_member,
-                                "module `" + img.str(img.import(imp).path).str() +
-                                    "` has no member `" + member.str() + "`"));
-        return;
+    return member_value_slow(p, imp, name_index, node_index, out);
+}
+
+void resolve_field(Process& p, Value obj, uint32_t name_index, uint32_t node_index) {
+    Value v;
+    if (member_value(p, obj, name_index, node_index, &v)) ret(p, v);
+    else do_raise(p, v);
+}
+
+// ---------------------------------------------------------------------------
+// Operands that need no evaluation
+//
+// The machine's general shape is "push a continuation, evaluate the part,
+// come back" -- which is what makes it interruptible and what keeps its depth
+// on the heap. But a great many operands are not expressions at all. A global,
+// a builtin, a parameter, a member of an imported module: each of these is a
+// *read*, and running it through the machine costs a continuation, a reduction
+// and a return trip to learn what a load would have said. These two answer
+// "can I just read it?", and the sites that ask fall back to the general path
+// whenever the answer is no.
+// ---------------------------------------------------------------------------
+
+/// The module a node names, when it names one already in normal form.
+bool module_operand(Process& p, const Image& img, uint32_t node, Value frame, Value* out) {
+    const Node& n = img.node(node);
+    if (Op(n.op) == Op::Global) {
+        const GlobalRec& g = img.global(n.a);
+        if (g.kind != GLOBAL_MODULE) return false;
+        *out = global_value(p, n.a);
+        return true;
     }
-    Value name = p.heap().make_string(member.data, member.len);
-    ret(p, make_native(p, m->fn, name, m->arity, m->strict_mask, m->user));
+    // A module can also sit in a slot -- `import a.{b}` binds one, and so does
+    // passing a module to a function.
+    Value v;
+    if (Op(n.op) == Op::Local) {
+        v = static_cast<FrameObj*>(as_obj(frame))->slots()[n.a];
+    } else if (Op(n.op) == Op::Capture) {
+        auto* fo = static_cast<FrameObj*>(as_obj(frame));
+        v = static_cast<ClosureObj*>(as_obj(fo->closure))->caps()[n.a];
+    } else {
+        return false;
+    }
+    if (v == NIL_SLOT) return false;
+    v = resolve(v);
+    if (!is_obj(v, ObjType::Module)) return false;
+    *out = v;
+    return true;
+}
+
+/// The value of a node that already is one: a constant, or a binding whose
+/// contents are in weak head normal form.
+///
+/// This is what lets an operator finish where it starts. `acc + x` over two
+/// bound locals is the whole of a fold's inner loop, and running each side
+/// through the machine costs a continuation, an Eval and a Return to discover
+/// that the slot held a number all along -- five steps to add two integers.
+/// A local still holding a thunk answers false, and the general path forces it
+/// exactly as before, so nothing is evaluated here that was not evaluated
+/// there.
+bool operand_value(Process& p, const Image& img, uint32_t node, Value frame, Value* out) {
+    const Node& n = img.node(node);
+    switch (Op(n.op)) {
+        case Op::ConstInt: *out = make_integer(p, img.integer(n.a)); return true;
+        case Op::ConstFloat: *out = literal_float(p, n.a); return true;
+        case Op::ConstStr: *out = literal_string(p, n.a); return true;
+        case Op::ConstChar: *out = make_char(uint32_t(n.a)); return true;
+        case Op::ConstBool: *out = make_bool(n.a != 0); return true;
+        case Op::ConstAtom: *out = make_atom(p.runtime().image_atom(n.a)); return true;
+        case Op::Unit: *out = UNIT; return true;
+        case Op::Builtin: *out = make_builtin(n.a); return true;
+        case Op::Local: {
+            Value v = static_cast<FrameObj*>(as_obj(frame))->slots()[n.a];
+            // An unbound slot is an error the general path reports; saying so
+            // in two places would be saying it differently in two places.
+            if (v == NIL_SLOT) return false;
+            v = resolve(v);
+            if (!is_whnf(v)) return false;
+            *out = v;
+            return true;
+        }
+        case Op::Capture: {
+            auto* fo = static_cast<FrameObj*>(as_obj(frame));
+            Value v = resolve(static_cast<ClosureObj*>(as_obj(fo->closure))->caps()[n.a]);
+            if (!is_whnf(v)) return false;
+            *out = v;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/// The callee a node names, when naming it needs no evaluation. `*out` is
+/// `NIL_SLOT` for a local that has not been bound yet, which is the caller's
+/// error to report.
+bool callee_operand(Process& p, const Image& img, uint32_t node, Value frame, Value* out) {
+    const Node& n = img.node(node);
+    switch (Op(n.op)) {
+        case Op::Local:
+            *out = static_cast<FrameObj*>(as_obj(frame))->slots()[n.a];
+            return true;
+        case Op::Capture: {
+            auto* fo = static_cast<FrameObj*>(as_obj(frame));
+            *out = static_cast<ClosureObj*>(as_obj(fo->closure))->caps()[n.a];
+            return true;
+        }
+        case Op::Builtin:
+            *out = make_builtin(n.a);
+            return true;
+        case Op::Global: {
+            const GlobalRec& g = img.global(n.a);
+            // A parameterless global is a memoized value or an action to
+            // perform, and both have rules of their own; only a function with
+            // parameters is a closure that is simply there.
+            if (g.kind != GLOBAL_FUNCTION || img.func(g.target).arity == 0) return false;
+            *out = global_value(p, n.a);
+            return true;
+        }
+        case Op::Field: {
+            Value obj;
+            if (!module_operand(p, img, n.a, frame, &obj)) return false;
+            // A member that cannot be resolved is left to the general path,
+            // which raises the same error where the machine can see it.
+            return member_value(p, obj, n.b, node, out);
+        }
+        default:
+            return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +1019,7 @@ bool get_fallback(Process& p, uint32_t at, Value frame) {
     return true;
 }
 
-inline uint32_t out_of_bounds_atom(Process& p) { return p.runtime().intern_atom("out_of_bounds"); }
+inline uint32_t out_of_bounds_atom(Process& p) { return well_known(p.runtime()).out_of_bounds; }
 
 /// Step `remaining` more cells down a list and answer the head found there. A
 /// tail that is not a value yet is entered with a continuation to come back to,
@@ -895,7 +1104,7 @@ void container_get(Process& p, uint32_t at, Value container, Value key, Value fr
             return;
         }
         if (get_fallback(p, at, frame)) return;
-        do_raise(p, raise_error(p, p.runtime().intern_atom("no_such_key"),
+        do_raise(p, raise_error(p, well_known(p.runtime()).no_such_key,
                                 "the map has no key " + describe(p, key)));
         return;
     }
@@ -982,6 +1191,137 @@ void container_set(Process& p, uint32_t at, Value container, Value key, Value fr
     list_set(p, at, container, uint32_t(k), uint32_t(k), frame);
 }
 
+// ---------------------------------------------------------------------------
+// Finishing an operator
+//
+// Each of these is the tail of a continuation, factored out so that the same
+// code runs whether the operands arrived through the machine or were read
+// straight out of the frame (see `operand_value`).
+// ---------------------------------------------------------------------------
+
+void finish_binary(Process& p, Op op, Value lhs, Value rhs) {
+    // Two fixnums is what an operator almost always has, and answering it here
+    // skips the whole of `arith` and `compare`: the list, string and big-string
+    // cases each of them tries first, and the `values_equal` recursion behind
+    // `==`. Overflow and division by zero fall through to the general code
+    // rather than being handled twice.
+    if (is_fixnum(lhs) && is_fixnum(rhs)) {
+        const int64_t x = fixnum_value(lhs), y = fixnum_value(rhs);
+        int64_t r;
+        switch (op) {
+            case Op::Add:
+                if (!__builtin_add_overflow(x, y, &r) && fixnum_fits(r)) {
+                    ret(p, make_fixnum(r));
+                    return;
+                }
+                break;
+            case Op::Sub:
+                if (!__builtin_sub_overflow(x, y, &r) && fixnum_fits(r)) {
+                    ret(p, make_fixnum(r));
+                    return;
+                }
+                break;
+            case Op::Mul:
+                if (!__builtin_mul_overflow(x, y, &r) && fixnum_fits(r)) {
+                    ret(p, make_fixnum(r));
+                    return;
+                }
+                break;
+            case Op::Div:
+            case Op::Mod:
+                if (y != 0) {
+                    ret(p, make_fixnum(op == Op::Div ? x / y : x % y));
+                    return;
+                }
+                break;
+            case Op::Eq: ret(p, make_bool(x == y)); return;
+            case Op::Ne: ret(p, make_bool(x != y)); return;
+            case Op::Lt: ret(p, make_bool(x < y)); return;
+            case Op::Le: ret(p, make_bool(x <= y)); return;
+            case Op::Gt: ret(p, make_bool(x > y)); return;
+            case Op::Ge: ret(p, make_bool(x >= y)); return;
+            default: break;
+        }
+    }
+    Value out;
+    bool ok = (op == Op::Eq || op == Op::Ne || op == Op::Lt || op == Op::Le ||
+               op == Op::Gt || op == Op::Ge)
+                  ? compare(p, op, lhs, rhs, &out)
+                  : arith(p, op, lhs, rhs, &out);
+
+    // A nested force inside the operator hit a blocking operation and
+    // gave up (see `force_whnf`) -- comparing two lists whose elements
+    // are still `join!`s, say. Both operands are ordinary values and
+    // both operators force, so this is reachable without any effect
+    // being written at the comparison itself.
+    //
+    // The answer is not "this failed" but "not yet", so park and redo
+    // the whole operation when the scheduler wakes us. Forcing is
+    // memoised, so the retry pays only for what had not been forced
+    // yet. This is the same handshake `apply_native` performs for a
+    // native whose nested force gave up; the operators need their own
+    // because they are the machine rather than a native call.
+    //
+    // Without it `ok` is false with a `p.result` that was never an
+    // error, and the process dies with an error that has no kind and
+    // no message.
+    if (p.park_requested) {
+        // Both operands travel in a cell: this retry may be spliced in
+        // below a suspended force, and that work overwrites `p.result`
+        // before the retry is reached.
+        Value pair = p.heap().make_cons(lhs, rhs);
+        push_retry(p, ContKind::BinFinish, uint32_t(op), 1, 0, pair);
+        return;  // the mode is already Return
+    }
+    if (ok) ret(p, out); else do_raise(p, out);
+}
+
+/// `if cond { a } else { b }`, with the condition in hand.
+void take_branch(Process& p, Value cond, uint32_t then_node, uint32_t else_node, Value frame) {
+    if (!is_bool(cond)) {
+        do_raise(p, type_error(p, "`if` needs a bool, got " + describe(p, cond)));
+        return;
+    }
+    if (truthy(cond)) {
+        eval_node(p, then_node, frame);
+    } else if (else_node == NO_NODE) {
+        ret(p, UNIT);
+    } else {
+        eval_node(p, else_node, frame);
+    }
+}
+
+/// `a && b` and `a || b`, with the left operand in hand. The right is entered
+/// only when the left has not already decided the answer.
+void finish_logic(Process& p, Op op, Value lhs, uint32_t right_node, Value frame) {
+    if (!is_bool(lhs)) {
+        do_raise(p, type_error(p, std::string("`") + op_name(op) + "` needs a bool, got " +
+                                      describe(p, lhs)));
+        return;
+    }
+    if (op == Op::And && !truthy(lhs)) { ret(p, FALSE_V); return; }
+    if (op == Op::Or && truthy(lhs)) { ret(p, TRUE_V); return; }
+    eval_node(p, right_node, frame);
+}
+
+/// `-x` and `not x`, with the operand in hand.
+void finish_unary(Process& p, Op op, Value v) {
+    if (op == Op::Neg) {
+        if (is_fixnum(v)) { ret(p, make_integer(p, -fixnum_value(v))); return; }
+        if (is_obj(v, ObjType::Float)) {
+            ret(p, p.heap().make_float(-static_cast<FloatObj*>(as_obj(v))->value));
+            return;
+        }
+        do_raise(p, type_error(p, "cannot negate " + describe(p, v)));
+        return;
+    }
+    if (!is_bool(v)) {
+        do_raise(p, type_error(p, "`not` needs a bool, got " + describe(p, v)));
+        return;
+    }
+    ret(p, make_bool(!truthy(v)));
+}
+
 void step_eval(Process& p) {
     const Image& img = img_of(p);
     const Node& n = img.node(p.node);
@@ -989,20 +1329,16 @@ void step_eval(Process& p) {
 
     switch (Op(n.op)) {
         case Op::ConstInt: ret(p, make_integer(p, img.integer(n.a))); return;
-        case Op::ConstFloat: ret(p, p.heap().make_float(img.real(n.a))); return;
-        case Op::ConstStr: {
-            StringRef s = img.str(n.a);
-            ret(p, p.heap().make_string(s.data, s.len));
-            return;
-        }
+        case Op::ConstFloat: ret(p, literal_float(p, n.a)); return;
+        case Op::ConstStr: ret(p, literal_string(p, n.a)); return;
         case Op::ConstChar: ret(p, make_char(uint32_t(n.a))); return;
         case Op::ConstBool: ret(p, make_bool(n.a != 0)); return;
-        case Op::ConstAtom: {
+        case Op::ConstAtom:
             // Image atom indices are remapped onto the runtime's global table,
             // so atoms from different modules with the same name compare equal.
-            ret(p, make_atom(p.runtime().intern_atom(img.atom_name(n.a).str())));
+            // The map is built at load; here it is one array read.
+            ret(p, make_atom(p.runtime().image_atom(n.a)));
             return;
-        }
         case Op::Unit: ret(p, UNIT); return;
 
         case Op::Local: {
@@ -1041,27 +1377,83 @@ void step_eval(Process& p) {
         }
         case Op::Builtin: ret(p, make_builtin(n.a)); return;
 
-        case Op::Field:
-            // The node index rides along so the member lookup can be cached
-            // against the site that asked for it.
-            push_cont(p, ContKind::FieldOf, n.b, p.node, 0, UNIT);
-            eval_node(p, n.a, frame);
-            return;
-
-        case Op::Apply: {
-            const uint32_t* kids = img.kids_at(n.b);
-            for (uint32_t i = 0; i < n.c; ++i) {
-                p.stack.push_back(thunk_for(p, kids[i], frame));
+        case Op::Field: {
+            // `mod.member`, where `mod` is a module named at the top level, is
+            // what every call of a `std` function looks like -- and a module
+            // value is a per-process constant, so there is nothing here to
+            // evaluate. Resolving it in place saves the pair of steps the
+            // general path costs: one Eval to reach the module, one Return to
+            // come back with it.
+            Value obj;
+            if (!module_operand(p, img, n.a, frame, &obj)) {
+                // The node index rides along so the member lookup can be
+                // cached against the site that asked for it.
+                push_cont(p, ContKind::FieldOf, n.b, p.node, 0, UNIT);
+                eval_node(p, n.a, frame);
+                return;
             }
-            push_cont(p, ContKind::ApplyTo, n.c, 0, 0, UNIT);
-            eval_node(p, n.a, frame);
+            resolve_field(p, obj, n.b, p.node);
             return;
         }
 
-        case Op::If:
-            push_cont(p, ContKind::IfBranch, n.b, n.c, 0, frame);
-            eval_node(p, n.a, frame);
+        case Op::Apply: {
+            const uint32_t* kids = img.kids_at(n.b);
+            // Almost every call names its callee -- a global, a builtin, a
+            // parameter, a member of an imported module -- and naming one is
+            // a read, not an evaluation. Reading it here goes straight to the
+            // application; the general path would push a continuation, spend a
+            // reduction evaluating the name, and come back to do this anyway.
+            Value callee;
+            if (!callee_operand(p, img, n.a, frame, &callee)) {
+                for (uint32_t i = 0; i < n.c; ++i) {
+                    p.stack.push_back(thunk_for(p, kids[i], frame));
+                }
+                push_cont(p, ContKind::ApplyTo, n.c, 0, 0, UNIT);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            if (callee == NIL_SLOT) {
+                do_raise(p, type_error(p, "binding used before it was bound"));
+                return;
+            }
+            // A saturated call to a function we already have: the arguments
+            // are the frame's first slots, so build the frame and write them
+            // there. The general path pushes each one onto the value stack for
+            // `do_apply` to copy out again and erase -- three passes over the
+            // arguments where a call needs one.
+            Value fn = resolve(callee);
+            if (is_obj(fn, ObjType::Closure)) {
+                auto* cl = static_cast<ClosureObj*>(as_obj(fn));
+                const FuncRec& f = img.func(cl->func);
+                if (f.arity == n.c && n.c > 0) {
+                    Value fr = p.heap().make_frame_filling(fn, f.slots, f.arity);
+                    auto* fo = static_cast<FrameObj*>(as_obj(fr));
+                    // Safe to hold `fo` across these: allocation never
+                    // collects, which is the rule the whole machine rests on.
+                    for (uint32_t i = 0; i < n.c; ++i) {
+                        fo->slots()[i] = thunk_for(p, kids[i], frame);
+                    }
+                    enter_function(p, cl->func, f, fr);
+                    return;
+                }
+            }
+            for (uint32_t i = 0; i < n.c; ++i) {
+                p.stack.push_back(thunk_for(p, kids[i], frame));
+            }
+            do_apply(p, fn, n.c);
             return;
+        }
+
+        case Op::If: {
+            Value cond;
+            if (!operand_value(p, img, n.a, frame, &cond)) {
+                push_cont(p, ContKind::IfBranch, n.b, n.c, 0, frame);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            take_branch(p, cond, n.b, n.c, frame);
+            return;
+        }
 
         case Op::Block: advance_block(p, n.a, n.b, 0, frame); return;
 
@@ -1094,20 +1486,44 @@ void step_eval(Process& p) {
 
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
-        case Op::Eq: case Op::Ne:
-            push_cont(p, ContKind::BinRight, n.op, n.b, 0, frame);
-            eval_node(p, n.a, frame);
+        case Op::Eq: case Op::Ne: {
+            Value lhs;
+            if (!operand_value(p, img, n.a, frame, &lhs)) {
+                push_cont(p, ContKind::BinRight, n.op, n.b, 0, frame);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            Value rhs;
+            if (!operand_value(p, img, n.b, frame, &rhs)) {
+                push_cont(p, ContKind::BinFinish, n.op, 0, 0, lhs);
+                eval_node(p, n.b, frame);
+                return;
+            }
+            finish_binary(p, Op(n.op), lhs, rhs);
             return;
+        }
 
-        case Op::And: case Op::Or:
-            push_cont(p, ContKind::LogicRight, n.op, n.b, 0, frame);
-            eval_node(p, n.a, frame);
+        case Op::And: case Op::Or: {
+            Value lhs;
+            if (!operand_value(p, img, n.a, frame, &lhs)) {
+                push_cont(p, ContKind::LogicRight, n.op, n.b, 0, frame);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            finish_logic(p, Op(n.op), lhs, n.b, frame);
             return;
+        }
 
-        case Op::Neg: case Op::Not:
-            push_cont(p, ContKind::UnaryFinish, n.op, 0, 0, UNIT);
-            eval_node(p, n.a, frame);
+        case Op::Neg: case Op::Not: {
+            Value v;
+            if (!operand_value(p, img, n.a, frame, &v)) {
+                push_cont(p, ContKind::UnaryFinish, n.op, 0, 0, UNIT);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            finish_unary(p, Op(n.op), v);
             return;
+        }
 
         case Op::MakeList: {
             const uint32_t* kids = img.kids_at(n.a);
@@ -1137,10 +1553,28 @@ void step_eval(Process& p) {
 
         // The container and then the key, each forced where everything else
         // is: by the machine, with a continuation, and not underneath a native.
-        case Op::Get: case Op::Set:
-            push_cont(p, ContKind::IndexKey, 0, p.node, 0, frame);
-            eval_node(p, n.a, frame);
+        // Neither is usually an expression, though -- `xs.[0]` is a binding and
+        // a literal -- so both are read directly when they can be.
+        case Op::Get: case Op::Set: {
+            Value container;
+            if (!operand_value(p, img, n.a, frame, &container)) {
+                push_cont(p, ContKind::IndexKey, 0, p.node, 0, frame);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            Value key;
+            if (!operand_value(p, img, n.b, frame, &key)) {
+                // The container waits on the value stack, where the collector
+                // can see it, while the key is forced.
+                p.stack.push_back(container);
+                push_cont(p, ContKind::IndexApply, 0, p.node, 0, frame);
+                eval_node(p, n.b, frame);
+                return;
+            }
+            if (Op(n.op) == Op::Get) container_get(p, p.node, container, key, frame);
+            else container_set(p, p.node, container, key, frame);
             return;
+        }
 
         case Op::Nop: ret(p, UNIT); return;
         default:
@@ -1149,55 +1583,68 @@ void step_eval(Process& p) {
     }
 }
 
-void step_return(Process& p) {
-    if (p.conts.empty()) {
-        p.mode = Mode::Halted;
+/// Hand `p.result` to the top continuation.
+///
+/// `floor` is the depth this loop belongs to: `run_process` owns the whole
+/// stack and passes zero, and a nested force (`force_whnf`) owns only what it
+/// pushed and passes the depth it found. It matters because of the thunk
+/// updates below, which are the one continuation this runs several of in a
+/// row -- and running one that belongs to the machine *outside* would be
+/// finishing someone else's work under them.
+void step_return(Process& p, size_t floor) {
+  // Thunk updates are handled here rather than by returning to the machine for
+  // each one. Forcing a value nested n deep leaves n of them stacked, and each
+  // is a single store -- so what the machine would be dispatching between is
+  // one write and the next.
+  for (;;) {
+    if (p.conts.size() <= floor) {
+        if (p.conts.empty()) p.mode = Mode::Halted;
         return;
     }
     Cont c = p.conts.back();
     p.conts.pop_back();
+
+    if (c.kind == ContKind::UpdateThunk) {
+        // Overwrite the thunk in place so every sharer sees the result.
+        Obj* o = as_obj(c.v1);
+        // A thunk that has survived into old space now gains a young target,
+        // so the write barrier notes the edge for the next minor collection.
+        p.heap().remember_if_old(o, p.result);
+        o->type = ObjType::Indirect;
+        static_cast<IndirectObj*>(o)->target = p.result;
+        continue;  // the value flows on to the next continuation
+    }
 
     switch (c.kind) {
         case ContKind::Halt:
             p.mode = Mode::Halted;
             return;
 
-        case ContKind::UpdateThunk: {
-            // Overwrite the thunk in place so every sharer sees the result.
-            Obj* o = as_obj(c.v1);
-            // A thunk that has survived into old space now gains a young
-            // target, so the write barrier notes the edge for the next minor
-            // collection.
-            p.heap().remember_if_old(o, p.result);
-            o->type = ObjType::Indirect;
-            static_cast<IndirectObj*>(o)->target = p.result;
-            return;  // stay in Return: the value flows to the next continuation
-        }
+        case ContKind::UpdateThunk:
+            p.unreachable("thunk update is handled above");
 
         case ContKind::ApplyTo:
             do_apply(p, p.result, c.a);
             return;
 
-        case ContKind::IfBranch: {
-            Value cond = p.result;
-            if (!is_bool(cond)) {
-                do_raise(p, type_error(p, "`if` needs a bool, got " + describe(p, cond)));
+        case ContKind::IfBranch:
+            take_branch(p, p.result, c.a, c.b, c.v1);
+            return;
+
+        case ContKind::BinRight: {
+            // The right operand is often a constant or a bound local, in which
+            // case the operator finishes here rather than after another round
+            // trip through the machine.
+            Value lhs = p.result;
+            Value rhs;
+            if (!operand_value(p, img_of(p), c.b, c.v1, &rhs)) {
+                push_cont(p, ContKind::BinFinish, c.a, 0, 0, lhs);
+                eval_node(p, c.b, c.v1);
                 return;
             }
-            if (truthy(cond)) {
-                eval_node(p, c.a, c.v1);
-            } else if (c.b == NO_NODE) {
-                ret(p, UNIT);
-            } else {
-                eval_node(p, c.b, c.v1);
-            }
+            finish_binary(p, Op(c.a), lhs, rhs);
             return;
         }
-
-        case ContKind::BinRight:
-            push_cont(p, ContKind::BinFinish, c.a, 0, 0, p.result);
-            eval_node(p, c.b, c.v1);
-            return;
 
         case ContKind::BinFinish: {
             Op op = Op(c.a);
@@ -1214,73 +1661,17 @@ void step_return(Process& p) {
                 lhs = pair->head;
                 rhs = pair->tail;
             }
-            Value out;
-            bool ok = (op == Op::Eq || op == Op::Ne || op == Op::Lt || op == Op::Le ||
-                       op == Op::Gt || op == Op::Ge)
-                          ? compare(p, op, lhs, rhs, &out)
-                          : arith(p, op, lhs, rhs, &out);
-
-            // A nested force inside the operator hit a blocking operation and
-            // gave up (see `force_whnf`) -- comparing two lists whose elements
-            // are still `join!`s, say. Both operands are ordinary values and
-            // both operators force, so this is reachable without any effect
-            // being written at the comparison itself.
-            //
-            // The answer is not "this failed" but "not yet", so park and redo
-            // the whole operation when the scheduler wakes us. Forcing is
-            // memoised, so the retry pays only for what had not been forced
-            // yet. This is the same handshake `apply_native` performs for a
-            // native whose nested force gave up; the operators need their own
-            // because they are the machine rather than a native call.
-            //
-            // Without it `ok` is false with a `p.result` that was never an
-            // error, and the process dies with an error that has no kind and
-            // no message.
-            if (p.park_requested) {
-                // Both operands travel in a cell: this retry may be spliced in
-                // below a suspended force, and that work overwrites `p.result`
-                // before the retry is reached.
-                Value pair = p.heap().make_cons(lhs, rhs);
-                push_retry(p, ContKind::BinFinish, c.a, 1, 0, pair);
-                return;  // the mode is already Return
-            }
-            if (ok) ret(p, out); else do_raise(p, out);
+            finish_binary(p, op, lhs, rhs);
             return;
         }
 
-        case ContKind::LogicRight: {
-            Value lhs = p.result;
-            if (!is_bool(lhs)) {
-                do_raise(p, type_error(p, std::string("`") + op_name(Op(c.a)) +
-                                              "` needs a bool, got " + describe(p, lhs)));
-                return;
-            }
-            // Short-circuit: the right operand is never even entered when the
-            // left already decides the answer.
-            if (Op(c.a) == Op::And && !truthy(lhs)) { ret(p, FALSE_V); return; }
-            if (Op(c.a) == Op::Or && truthy(lhs)) { ret(p, TRUE_V); return; }
-            eval_node(p, c.b, c.v1);
+        case ContKind::LogicRight:
+            finish_logic(p, Op(c.a), p.result, c.b, c.v1);
             return;
-        }
 
-        case ContKind::UnaryFinish: {
-            Value v = p.result;
-            if (Op(c.a) == Op::Neg) {
-                if (is_fixnum(v)) { ret(p, make_integer(p, -fixnum_value(v))); return; }
-                if (is_obj(v, ObjType::Float)) {
-                    ret(p, p.heap().make_float(-static_cast<FloatObj*>(as_obj(v))->value));
-                    return;
-                }
-                do_raise(p, type_error(p, "cannot negate " + describe(p, v)));
-                return;
-            }
-            if (!is_bool(v)) {
-                do_raise(p, type_error(p, "`not` needs a bool, got " + describe(p, v)));
-                return;
-            }
-            ret(p, make_bool(!truthy(v)));
+        case ContKind::UnaryFinish:
+            finish_unary(p, Op(c.a), p.result);
             return;
-        }
 
         case ContKind::BlockNext:
             advance_block(p, c.a, c.b, c.c, c.v1);
@@ -1312,13 +1703,22 @@ void step_return(Process& p) {
             return;
         }
 
-        case ContKind::IndexKey:
-            // The container is in hand. It waits on the value stack, where the
-            // collector can see it, while the key is forced.
-            p.stack.push_back(p.result);
-            push_cont(p, ContKind::IndexApply, 0, c.b, 0, c.v1);
-            eval_node(p, img_of(p).node(c.b).b, c.v1);
+        case ContKind::IndexKey: {
+            Value container = p.result;
+            Value key;
+            const Node& idx = img_of(p).node(c.b);
+            if (!operand_value(p, img_of(p), idx.b, c.v1, &key)) {
+                // The container waits on the value stack, where the collector
+                // can see it, while the key is forced.
+                p.stack.push_back(container);
+                push_cont(p, ContKind::IndexApply, 0, c.b, 0, c.v1);
+                eval_node(p, idx.b, c.v1);
+                return;
+            }
+            if (Op(idx.op) == Op::Get) container_get(p, c.b, container, key, c.v1);
+            else container_set(p, c.b, container, key, c.v1);
             return;
+        }
 
         case ContKind::IndexApply: {
             Value container = p.stack.back();
@@ -1339,6 +1739,8 @@ void step_return(Process& p) {
             list_set(p, c.b, p.result, c.a, c.c, c.v1);
             return;
     }
+    return;
+  }
 }
 
 /// Unwind to the nearest catch at or above `floor`. Returns false when the
@@ -1381,9 +1783,11 @@ Value thunk_for(Process& p, uint32_t node, Value frame) {
     // allocation and, for a variable, would break sharing with the binding.
     switch (Op(n.op)) {
         case Op::ConstInt: return make_integer(p, img.integer(n.a));
+        case Op::ConstStr: return literal_string(p, n.a);
+        case Op::ConstFloat: return literal_float(p, n.a);
         case Op::ConstChar: return make_char(uint32_t(n.a));
         case Op::ConstBool: return make_bool(n.a != 0);
-        case Op::ConstAtom: return make_atom(p.runtime().intern_atom(img.atom_name(n.a).str()));
+        case Op::ConstAtom: return make_atom(p.runtime().image_atom(n.a));
         case Op::Unit: return UNIT;
         case Op::Builtin: return make_builtin(n.a);
         case Op::Local: {
@@ -1574,7 +1978,7 @@ void run_process(Process& p, int64_t budget) {
                 step_eval(p);
                 break;
             case Mode::Return:
-                step_return(p);
+                step_return(p, 0);
                 break;
             case Mode::Raise:
                 if (!unwind(p, 0)) {
@@ -1588,6 +1992,17 @@ void run_process(Process& p, int64_t budget) {
                 p.exit_value = p.result;
                 return;
         }
+
+        // Hand the value that came back to whoever was waiting for it, and
+        // keep doing so while there is nothing else to do.
+        //
+        // A Return step is bookkeeping, not work: it pops the continuation
+        // stack it walks, so a run of them is bounded by the depth already
+        // there and cannot spin. Leaving the safepoint check out of that run
+        // costs at most a slightly late collection -- a safepoint is a place
+        // collection *may* happen, not one where it must -- and saves the
+        // check on more than half of all the steps a program takes.
+        while (p.mode == Mode::Return && !p.park_requested) step_return(p, 0);
 
         // A blocking builtin asked to be parked; stop here and let the
         // scheduler complete the handshake.
@@ -1630,7 +2045,7 @@ bool force_whnf(Process& p, Value v, Value* out) {
             ++p.total_reductions;
             step_eval(p);
         } else {
-            step_return(p);
+            step_return(p, floor);
         }
 
         // The limit check the outer loop has, but *not* its collection.

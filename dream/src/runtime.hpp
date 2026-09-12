@@ -10,6 +10,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -76,6 +77,12 @@ struct NativeDef {
 struct ModuleDef {
     std::string name;
     std::vector<NativeDef> members;
+    /// Where this module's members start in the runtime-wide numbering of
+    /// host members. Assigned by `register_module`, so `member_base + i` is a
+    /// small dense id for one member of one module -- which is what lets a
+    /// process cache the function value it hands out for it in a flat array
+    /// rather than rebuilding it at every call. See `Process::native_cache`.
+    uint32_t member_base = 0;
     const NativeDef* find(const StringRef& member) const;
 };
 
@@ -123,9 +130,23 @@ public:
 
     /// Atom names are global and stable, so they can be compared by index.
     /// Atoms from the image are interned first, then any created at run time.
-    uint32_t intern_atom(const std::string& name);
+    uint32_t intern_atom(std::string_view name);
     const std::string& atom_name(uint32_t index) const;
     uint32_t atom_count() const;
+
+    /// The runtime id of image atom `i`.
+    ///
+    /// Every `:ok` a program evaluates lands here, so what this must not do is
+    /// what it used to: copy the name out of the image into a `std::string`,
+    /// take the atom table's mutex, and hash it. Image atoms are all interned
+    /// once at load, and the image is immutable, so the answer is decided
+    /// before anything runs and this is a single array read. On a fold whose
+    /// body mentions one atom that was forty million string constructions.
+    uint32_t image_atom(uint32_t i) const { return image_atom_ids_[i]; }
+
+    /// How many host module members exist across every registered module: the
+    /// size a process's native cache needs to be.
+    uint32_t native_member_count() const { return native_member_count_; }
 
     // --- process table ---
     std::shared_ptr<Process> spawn_process();
@@ -166,6 +187,18 @@ public:
     /// of a run, and `exit!`, which never returns to it -- can call it blind.
     void print_profile() const;
 
+    // --- what the run cost ---
+    //
+    // Reductions and collections, on stderr, for `--stats`. It lives here
+    // rather than in the CLI for the same reason the profile does: a program
+    // that ends with `os.exit!` -- which is every tool, `dreams` included --
+    // never comes back to `main`, so anything only `main` printed was never
+    // printed for the runs anyone actually measures.
+    void enable_stats() { stats_ = true; }
+    bool stats_enabled() const { return stats_; }
+    /// A no-op unless `--stats` was asked for.
+    void print_stats() const;
+
     /// The JIT tier, or null when running interpreter-only.
     class Jit* jit() const { return jit_; }
     void set_jit(class Jit* j) { jit_ = j; }
@@ -187,7 +220,16 @@ private:
 
     mutable std::mutex atoms_mutex_;
     std::vector<std::string> atom_names_;
-    std::unordered_map<std::string, uint32_t> atom_ids_;
+    /// Transparent hashing, so a lookup by `string_view` does not have to
+    /// build a `std::string` it is going to throw away.
+    struct SvHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
+    };
+    std::unordered_map<std::string, uint32_t, SvHash, std::equal_to<>> atom_ids_;
+    /// Image atom index -> runtime atom id, filled at load. See `image_atom`.
+    std::vector<uint32_t> image_atom_ids_;
+    uint32_t native_member_count_ = 0;
 
     mutable std::shared_mutex processes_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<Process>> processes_;
@@ -198,6 +240,7 @@ private:
     std::vector<std::atomic<const ModuleDef*>> import_defs_;
     std::vector<std::atomic<uint64_t>> field_cache_;
     bool profiling_ = false;
+    bool stats_ = false;
     size_t profile_top_ = 0;
     std::vector<std::atomic<uint64_t>> profile_;
     class Jit* jit_ = nullptr;
@@ -205,6 +248,11 @@ private:
 };
 
 /// Well-known atoms, interned at startup so the runtime can name them cheaply.
+///
+/// Anything a hot path would otherwise name with a C string literal belongs
+/// here: `intern_atom` takes the atom table's mutex and hashes the name, which
+/// is the wrong price to pay per reduction. `type_of` alone asked for one
+/// twenty million times in a ten-million-element fold.
 struct WellKnownAtoms {
     uint32_t error;
     uint32_t divide_by_zero;
@@ -218,6 +266,12 @@ struct WellKnownAtoms {
     uint32_t normal;
     uint32_t timeout;
     uint32_t ok;
+    uint32_t out_of_bounds;
+    uint32_t no_such_key;
+    /// The name `type_of` answers for each surface type, indexed by
+    /// `dream_type`. `DREAM_TYPE_PURE_FN` is the pure one; an impure function
+    /// reports `impure_fn`, which is the entry after it.
+    uint32_t types[DREAM_TYPE_BIGSTR + 1];
 };
 const WellKnownAtoms& well_known(Runtime& rt);
 

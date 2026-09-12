@@ -142,6 +142,7 @@ set(DREAM_SOURCES
   src/value.cpp
   src/image.cpp
   src/heap.cpp
+  src/gc_pool.cpp
   src/process.cpp
   src/interp.cpp
   src/builtins.cpp
@@ -180,6 +181,35 @@ if(DREAM_HAVE_FFI)
 endif()
 
 target_compile_options(dream PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+# ---------------------------------------------------------------------------
+# Codegen for the interpreter
+#
+# The VM is a shared library, and that costs more than it looks. By default a
+# compiler must assume any global function in a `.so` can be interposed at load
+# time by a definition from somewhere else, so every cross-TU call inside the
+# library goes through the PLT and none of them can be inlined -- and the
+# interpreter is nothing but cross-TU calls on its hot path (`force_whnf`,
+# `well_known`, `builtin_def`, every `Heap::` constructor). Nothing here is
+# meant to be interposed, so say so: `-fno-semantic-interposition` lets the
+# calls bind directly and inline.
+#
+# `-O3` over the `-O2` a RelWithDebInfo build would pick, because the reduction
+# loop is exactly the shape -O3's extra inlining and unswitching are for, and
+# `just` builds RelWithDebInfo -- so the default build is the one that has to be
+# fast.
+include(CheckCXXCompilerFlag)
+foreach(flag -fno-semantic-interposition -fno-plt)
+  string(MAKE_C_IDENTIFIER "HAVE${flag}" flag_var)
+  check_cxx_compiler_flag(${flag} ${flag_var})
+  if(${flag_var})
+    target_compile_options(dream PRIVATE ${flag})
+  endif()
+endforeach()
+target_compile_options(dream PRIVATE
+  $<$<CONFIG:RelWithDebInfo>:-O3>
+  $<$<CONFIG:Release>:-O3>)
+
 
 if(DREAM_HAVE_LLVM)
   target_compile_definitions(dream PRIVATE DREAM_HAVE_LLVM=1

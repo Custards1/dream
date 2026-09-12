@@ -145,13 +145,21 @@ directory cannot shadow an installed program. `just install` is what puts
 
 ## Making it faster
 
-Two tools, both of which had to exist before any of the recent speedups could
+Three tools, all of which had to exist before any of the speedups below could
 be justified:
 
 ```
 dreams --time FILE       # what each stage of a compile cost
 dream --profile [N] IMG  # the hottest functions, by reductions
+dream --stats IMG        # reductions, collections, bytes allocated and
+                         # promoted, and milliseconds stopped in collection
 ```
+
+A VM option goes **before** the image: `dream --stats build/dreams.dream ...`,
+because everything after the image name belongs to the program. All three
+report from `os.exit!` as well as from the end of `main`, which matters because
+every tool here ends by exiting -- a number only printed on the way out of
+`main` is never printed for the runs worth measuring.
 
 `--time` forces each stage where it reads the clock, because a lazy stage that
 has not been forced has not run: bind and force on one line and every stage
@@ -185,6 +193,66 @@ What has already been learnt from them, so it is not learnt twice:
   "deeply forced" bit -- see `AUX_DEEP_FORCED` in [dream/src/value.hpp](dream/src/value.hpp).
   Before that, forcing the compiler's own tables walked shared structure once
   per path to it.
+- **A linear walk the machine can do is worth ten of the same walk in Dream.**
+  This is the largest single lesson so far: `list.append` and `list.nth`,
+  written as the obvious recursions, were between them *a third of a
+  self-compile*. Both are now the operation they stand for -- `xs + ys` and
+  `xs.[n else ()]` -- and `list.length` is the `len` builtin. Same complexity,
+  a tenth of the constant, because a recursion pays a call, a frame and a
+  couple of natives per element where an opcode pays one machine step for the
+  whole walk. The same argument gave the lexer `core.str_span` and
+  `core.str_upto`: a byte class scanned a byte at a time in Dream is a dozen
+  reductions per byte, and a line's indentation is one operation.
+  Before reaching for a recursion over a list or a string, ask what opcode or
+  builtin already means it.
+- **What the profile says and what it costs are different questions.**
+  `--profile` counts reductions and attributes them to the function whose frame
+  is current, which is what found `append` and `nth`. It says nothing about the
+  runtime's own time -- collection, allocation, the dispatch loop -- so a C++
+  profile is the other half. On the self-compile the split is roughly 60%
+  interpreter, 20% collector, 20% natives.
+- **What the runtime rebuilt per call, and no longer does.** Each of these was
+  found the same way, by counting calls rather than guessing: evaluating a
+  `:name` constant interned the atom by *name*, taking a mutex and hashing a
+  `std::string`, forty million times in one fold -- image atoms are mapped to
+  runtime ids once, at load. Calling any `std` member built a `StrObj` for the
+  name and a `NativeObj` around the function pointer at *every call* -- both
+  are decided by which member it is, so a process builds each once
+  (`Process::native_cache`). A string or float literal allocated a fresh object
+  every time it was reached; both are immutable and now have one copy per
+  process. And the allocator answered "which size class?" with a binary search
+  three hundred million times, where the table inverts into 512 bytes.
+- **Naming a thing is a read, not an evaluation.** The machine's shape is "push
+  a continuation, evaluate the part, come back", which is what makes it
+  interruptible -- but a global, a builtin, a parameter, a member of an
+  imported module and a constant are none of them expressions. `operand_value`
+  and `callee_operand` in [dream/src/interp.cpp](dream/src/interp.cpp) answer
+  "can I just read it?", and the operators, `if`, `.[ ]` and every call site
+  ask before falling back to the general path. `acc + x` over two bound locals
+  went from five machine steps to one.
+- **The JIT must be free when it is not helping.** A function LLVM had refused
+  took the JIT's global mutex and two hash lookups on *every entry, for ever*,
+  to be told again that it could not be compiled -- in a program that enters a
+  hundred and eighty million functions that is not a slow path, it is the
+  program. The tier decision is now one inlined atomic load with three states
+  (compiled, rejected, still cold): see `Jit::tier`. The JIT is roughly neutral
+  on the benchmarks either way, which is its own finding.
+- **A quarter of a self-compile was the collector, and now a ninth is.**
+  `--stats` reports the pause, which is what made the question askable: 831 ms
+  of a 3197 ms compile. The collection of one process now divides across a
+  pool of threads -- promotion behind a claim, marking behind an atomic mark
+  bit, the sweep by block -- which takes it to 304 ms and the compile to
+  2700 ms. [docs/gc.md](docs/gc.md) is the design and the log; what is worth
+  carrying away from it is that the three bugs which made the first parallel
+  collector *slower* than the serial one were all the same mistake -- paying a
+  synchronization cost per object instead of per batch -- and that none of
+  them were visible by reading the code.
+- **The VM is a shared library, and that is not free.** Without
+  `-fno-semantic-interposition` a compiler must assume any global function in a
+  `.so` can be interposed at load time, so every cross-TU call goes through the
+  PLT and none of them inline -- and the interpreter's hot path is nothing but
+  cross-TU calls. Link-time optimization on top of that was measured and bought
+  nothing, so it is not enabled.
 
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.

@@ -85,6 +85,19 @@ let str_find haystack needle from = native.str_find haystack needle from;
 /// The byte at `index`, or `-1` outside the string.
 let str_byte s index = native.str_byte s index;
 
+/// The first byte at or after `from` that is *not* in `set`, or the length of
+/// `s` when there is none. `set` is a string, read as the set of its bytes.
+///
+/// The whole run of a byte class in one operation. Written out in Dream --
+/// a recursion over `str_byte` and a comparison chain -- it is a dozen
+/// reductions per byte, and the run it skips is usually a line's indentation
+/// or an identifier, which is exactly the shape a lexer spends its time on.
+let str_span s from set = native.str_span s from set;
+
+/// The first byte at or after `from` that *is* in `set`, or the length of `s`.
+/// The other half of `str_span`: run *to* a delimiter rather than past a class.
+let str_upto s from set = native.str_upto s from set;
+
 // --- characters -----------------------------------------------------------------
 
 let char_code c = native.char_code c;

@@ -83,6 +83,7 @@ size_t Mailbox::size() const {
 Process::Process(Runtime& rt, uint64_t id) : rt_(rt), id_(id), heap_(64 * 1024) {
     stack.reserve(64);
     conts.reserve(64);
+    code = rt.has_image() ? &rt.image() : nullptr;
 }
 
 Process::~Process() = default;
@@ -109,6 +110,15 @@ void Process::visit_roots(Heap& heap) {
     for (Cont& c : conts) heap.forward(&c.v1);
     for (Value& g : globals) {
         if (g != NIL_SLOT) heap.forward(&g);
+    }
+    for (Value& v : native_cache) {
+        if (v != NIL_SLOT) heap.forward(&v);
+    }
+    for (Value& v : string_cache) {
+        if (v != NIL_SLOT) heap.forward(&v);
+    }
+    for (Value& v : float_cache) {
+        if (v != NIL_SLOT) heap.forward(&v);
     }
 }
 

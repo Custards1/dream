@@ -10,7 +10,9 @@ build-dream/
 build-nojit/
 build-tsan/
 build-verify/
+build-heap/
 CMakeFiles/
+benchmark/
 out/
 target/
 result/

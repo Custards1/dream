@@ -778,32 +778,32 @@ Jit::Jit(Runtime& rt) : impl_(std::make_unique<Impl>(rt)) {
     const size_t funcs = impl_->rt.image().func_count();
     counts_ = std::vector<std::atomic<uint32_t>>(funcs);
     cached_ = std::vector<std::atomic<CompiledFn>>(funcs);
+    threshold_.store(impl_->threshold, std::memory_order_relaxed);
     rt.set_jit(this);
 }
 Jit::~Jit() { impl_->rt.set_jit(nullptr); }
 
-void Jit::set_threshold(uint32_t calls) { impl_->threshold = calls; }
+void Jit::set_threshold(uint32_t calls) {
+    impl_->threshold = calls;
+    threshold_.store(calls, std::memory_order_relaxed);
+}
 uint32_t Jit::threshold() const { return impl_->threshold; }
 uint64_t Jit::compiled_count() const { return impl_->compiled_count; }
 
 CompiledFn Jit::on_enter(uint32_t func_index) {
-    // Count towards the threshold, then compile the first time it is crossed.
-    // This is the slow path -- `cached_compiled` has already been consulted by
-    // the interpreter on the fast path and missed, so a lock here is confined
-    // to one miss per function, not one per entry.
+    // Reached once per function: `tier` has counted the entries inline and
+    // this is the one that crossed the threshold. The answer is written back
+    // into `cached_` either way -- a compiled body, or the rejected marker --
+    // so no later entry comes anywhere near this lock.
     std::lock_guard<std::mutex> g(impl_->mutex);
     auto it = impl_->compiled.find(func_index);
     if (it != impl_->compiled.end()) return it->second;
     if (impl_->rejected.count(func_index)) return nullptr;
 
-    if (func_index < counts_.size()) {
-        uint32_t n = counts_[func_index].fetch_add(1, std::memory_order_relaxed);
-        if (n + 1 < impl_->threshold) return nullptr;
-    }
-
     CompiledFn fn = compile_locked(func_index, nullptr);
     if (!fn) {
         impl_->rejected.insert(func_index);
+        cached_[func_index].store(rejected(), std::memory_order_release);
         return nullptr;
     }
     cached_[func_index].store(fn, std::memory_order_release);

@@ -37,24 +37,35 @@ public:
     Jit(const Jit&) = delete;
     Jit& operator=(const Jit&) = delete;
 
-    /// The fast side of `on_enter`: one read of the compiled-body cache.
-    /// Returns true and stores the compiled body when this function has
-    /// already been compiled. When it returns false the caller must let the
-    /// interpreter run and call `on_enter` so the miss can count towards the
-    /// threshold. `cached_compiled` is defined inline so the interpreted path
-    /// -- where this runs on every function entry -- costs a single load and
-    /// no call into the JIT machinery; `on_enter` keeps the slow path cold.
-    bool cached_compiled(uint32_t func_index, CompiledFn* out) const {
-        if (func_index >= cached_.size()) return false;
+    /// The tier to enter `func_index` with: a compiled body, or null for the
+    /// interpreter.
+    ///
+    /// This runs on *every function entry*, so it is inline, takes no lock,
+    /// and crosses into the compiler only on the one entry that makes a
+    /// function hot. What makes that possible is that `cached_` holds three
+    /// states rather than two -- a compiled body, the rejected marker, or null
+    /// while the function is still cold -- so one atomic load answers the
+    /// question. With only "compiled" and "everything else", a function LLVM
+    /// had refused took the JIT's global mutex and two hash lookups on every
+    /// entry, for ever, to be told again that it could not be compiled; in a
+    /// program that enters a hundred and eighty million functions that is not
+    /// a slow path, it is the program.
+    CompiledFn tier(uint32_t func_index) {
+        if (func_index >= cached_.size()) return nullptr;
         CompiledFn fn = cached_[func_index].load(std::memory_order_acquire);
-        if (!fn) return false;
-        *out = fn;
-        return true;
+        if (fn) return reinterpret_cast<uintptr_t>(fn) == kRejectedBits ? nullptr : fn;
+        // Counting is a heuristic, so it is a relaxed load and store rather
+        // than a read-modify-write: two racing workers may lose a count
+        // between them, and a function compiled one entry late is not an
+        // observable difference.
+        const uint32_t n = counts_[func_index].load(std::memory_order_relaxed) + 1;
+        counts_[func_index].store(n, std::memory_order_relaxed);
+        if (n < threshold_.load(std::memory_order_relaxed)) return nullptr;
+        return on_enter(func_index);
     }
 
-    /// Count an entry into `func_index`; returns a compiled body once the
-    /// function is hot and compilation has succeeded, otherwise nullptr.
-    /// The slow path: consult after `cached_compiled` has missed.
+    /// The entry that made `func_index` hot: compile it, or mark it rejected
+    /// so `tier` never asks again. The slow path, and the only one that locks.
     CompiledFn on_enter(uint32_t func_index);
 
     /// Compile now, regardless of temperature. Returns nullptr on failure.
@@ -67,6 +78,12 @@ public:
     std::string dump_ir(uint32_t func_index);
 
 private:
+    /// What `cached_` holds for a function compilation has been tried on and
+    /// failed. Any value that cannot be a function pointer would do; one is
+    /// the cheapest to compare against.
+    static constexpr uintptr_t kRejectedBits = 1;
+    static CompiledFn rejected() { return reinterpret_cast<CompiledFn>(kRejectedBits); }
+
     /// Dense per-function entry counters and compiled-body cache, indexed by
     /// image function index. They live on `Jit` rather than in `Impl` so
     /// `cached_compiled`, which runs on every function entry, can read the
@@ -74,6 +91,9 @@ private:
     /// in the constructor, after the image has loaded.
     std::vector<std::atomic<uint32_t>> counts_;
     std::vector<std::atomic<CompiledFn>> cached_;
+    /// Mirrors the threshold inside `Impl`, so `tier` can read it without
+    /// reaching through the PIMPL.
+    std::atomic<uint32_t> threshold_{0};
 
     /// Caller must hold the JIT lock.
     CompiledFn compile_locked(uint32_t func_index, std::string* error);

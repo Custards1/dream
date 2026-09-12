@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "builtins.hpp"
+#include "gc_pool.hpp"
 #include "heap.hpp"
 #include "image.hpp"
 #include "process.hpp"
@@ -269,6 +270,139 @@ static void test_write_barrier_keeps_old_to_young() {
     CHECK(is_obj(slot, ObjType::Float));
     CHECK(as_obj(slot)->gc & GC_OLD);
     CHECK_EQ(static_cast<FloatObj*>(as_obj(slot))->value, 9.5);
+    CHECK_EQ(h.verify(roots), std::string());
+}
+
+// ---------------------------------------------------------------------------
+// The parallel collector
+//
+// A collection is divided across the helper threads only when there is enough
+// of it to be worth the handshake, so these heaps are deliberately large: a
+// smaller one would quietly test the single-threaded collector a second time.
+// When the pool has no threads to give -- one core, or DREAM_GC_THREADS=1 --
+// there is nothing here to test and the case says so rather than passing.
+// ---------------------------------------------------------------------------
+
+/// True when the pool can divide a collection at all.
+static bool parallel_collection_available(const char* what) {
+    if (GcPool::instance().capacity() >= 2) return true;
+    std::printf("  skipped (%s): the pool has no threads to give\n", what);
+    return false;
+}
+
+static void test_parallel_collection_preserves_sharing() {
+    std::printf("a parallel collection preserves sharing\n");
+    if (!parallel_collection_available("parallel sharing")) return;
+
+    Heap h(64 * 1024);
+    VectorRoots roots;
+
+    // The shape here is the whole point, so it is worth saying what it is for.
+    //
+    // Several threads must reach the *same young object at the same moment*,
+    // or the claim in `promote` is never tested: whoever gets there first
+    // promotes it and everyone after finds a forwarding pointer, which is the
+    // easy case. A list will not do it -- scanning one cell yields exactly one
+    // more, so a chain is traced by one thread however many are watching.
+    //
+    // So: a few hundred floats, and many arrays that each name all of them in
+    // the same order. Every array is a separate piece of work, the trace hands
+    // them out as it finds them, and the threads then walk in step through the
+    // same few hundred objects. If two of them may copy one object, they will.
+    const uint32_t kFloats = 400;
+    const int kArrays = 600;
+
+    std::vector<Value> floats;
+    for (uint32_t i = 0; i < kFloats; ++i) floats.push_back(h.make_float(double(i)));
+    for (int a = 0; a < kArrays; ++a) {
+        Value arr = h.make_array(kFloats);
+        for (uint32_t i = 0; i < kFloats; ++i)
+            static_cast<ArrayObj*>(as_obj(arr))->items()[i] = floats[i];
+        roots.values.push_back(arr);
+    }
+
+    h.minor_collect(roots);
+    CHECK(h.parallel_rounds() > 0);
+
+    // One object copied twice would be two objects: the arrays that named it
+    // would come back pointing at different floats, and a thunk forced through
+    // one of them would still look unforced through the other. Every array
+    // must agree with the first, slot for slot.
+    //
+    // This checks the *outcome*, which is what a test can check. It cannot be
+    // relied on to catch the claim in `promote` going missing: the window
+    // between reading an object's generation bits and publishing its copy is
+    // tens of nanoseconds, and losing a race that narrow on purpose is not
+    // something a test can arrange. What catches that is `just test-races` --
+    // ThreadSanitizer reports the missing claim as the data race it is, on the
+    // first collection it sees.
+    auto* first = static_cast<ArrayObj*>(as_obj(roots.values[0]));
+    for (int a = 1; a < kArrays; ++a) {
+        auto* arr = static_cast<ArrayObj*>(as_obj(roots.values[size_t(a)]));
+        for (uint32_t i = 0; i < kFloats; ++i) {
+            if (arr->items()[i] != first->items()[i]) {
+                CHECK_EQ(arr->items()[i], first->items()[i]);
+                a = kArrays;  // one report is enough
+                break;
+            }
+        }
+    }
+    // And each of them is still the float it was, tenured.
+    for (uint32_t i = 0; i < kFloats; ++i) {
+        Value v = first->items()[i];
+        CHECK(is_obj(v, ObjType::Float));
+        CHECK(as_obj(v)->gc & GC_OLD);
+        CHECK_EQ(static_cast<FloatObj*>(as_obj(v))->value, double(i));
+    }
+    CHECK_EQ(h.verify(roots), std::string());
+}
+
+static void test_parallel_major_collects_across_threads() {
+    std::printf("a parallel major collection marks and sweeps across threads\n");
+    if (!parallel_collection_available("parallel major")) return;
+
+    Heap h(64 * 1024);
+    VectorRoots roots;
+
+    // Enough live data to be worth dividing, with a cycle in it -- the mark
+    // has to claim each object exactly once however many threads reach it --
+    // and enough garbage beside it that the sweep has something to reclaim.
+    Value keep = NIL;
+    for (int i = 0; i < 60000; ++i) keep = h.make_cons(h.make_float(double(i)), keep);
+    Value cycle = h.make_cons(UNIT, NIL);
+    static_cast<ConsObj*>(as_obj(cycle))->tail = cycle;
+    roots.values.push_back(keep);
+    roots.values.push_back(cycle);
+    for (int i = 0; i < 60000; ++i) (void)h.make_cons(h.make_float(double(i)), NIL);
+
+    h.major_collect(roots);
+    CHECK(h.parallel_rounds() > 0);
+    CHECK_EQ(h.major_collections(), uint64_t(1));
+    CHECK_EQ(h.verify(roots), std::string());
+
+    // Everything kept is there, in order, and nothing else is: what a major
+    // reports live is the chain and the cycle and no part of the garbage.
+    Value cur = roots.values[0];
+    for (int i = 59999; i >= 0; --i) {
+        auto* cell = static_cast<ConsObj*>(as_obj(cur));
+        CHECK_EQ(static_cast<FloatObj*>(as_obj(cell->head))->value, double(i));
+        cur = cell->tail;
+    }
+    CHECK(is_nil(cur));
+    Value c = roots.values[1];
+    CHECK_EQ(static_cast<ConsObj*>(as_obj(c))->tail, c);
+
+    // 60000 cells and 60000 floats, tenured; the garbage was the same again
+    // and is gone. The bound is loose on purpose -- what matters is that the
+    // sweep freed a whole generation of it rather than a little.
+    size_t live = h.bytes_live();
+    CHECK(live > 60000 * 2 * 16);
+    CHECK(live < 60000 * 2 * 48);
+
+    // A second major with nothing held finds the whole heap dead.
+    roots.values.clear();
+    h.major_collect(roots);
+    CHECK_EQ(h.bytes_live(), size_t(0));
     CHECK_EQ(h.verify(roots), std::string());
 }
 
@@ -790,6 +924,8 @@ int main() {
     test_minor_collection_promotes_reachable();
     test_minor_collection_leaves_old_space_alone();
     test_write_barrier_keeps_old_to_young();
+    test_parallel_collection_preserves_sharing();
+    test_parallel_major_collects_across_threads();
     test_heap_verifier_accepts_a_healthy_heap();
     test_heap_verifier_catches_corruption();
     test_heap_verifier_follows_every_object_kind();

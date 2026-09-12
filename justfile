@@ -239,17 +239,25 @@ fuzz ITERATIONS="400": build
     ITERATIONS={{ITERATIONS}} dream/tests/fuzz_image.sh
 
 # Run the test programs with the heap verified after every collection.
+#
+# `DREAM_GC_PAR_MIN=0` divides every collection across the helper threads
+# however small it is. These programs are far too small to reach the size at
+# which that is worth doing, so without it the verifier would only ever see
+# the single-threaded collector.
 test-heap: build
-    DREAM_VERIFY_HEAP=1 dream/tests/e2e.sh
+    DREAM_VERIFY_HEAP=1 DREAM_GC_PAR_MIN=0 dream/tests/e2e.sh
 
-# Data races, on the concurrency-heavy programs.
+# Data races, on the concurrency-heavy programs -- and on the collector, which
+# is the other thing here that runs on several threads. `DREAM_GC_PAR_MIN=0`
+# is what puts every collection in every program through the parallel path;
+# see docs/gc.md.
 test-races:
     cmake -S . -B build-tsan -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
       -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
       -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
     cmake --build build-tsan -j
-    dream=build-tsan/bin/dream dream/tests/e2e.sh
+    DREAM_GC_PAR_MIN=0 dream=build-tsan/bin/dream dream/tests/e2e.sh
 
 # The slow, thorough set. What to run before believing a change is safe.
 test-all: test fuzz test-heap vm-no-jit

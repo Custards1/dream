@@ -116,9 +116,11 @@ let rec char_len s i stop acc =
 
 /// A `//` comment runs to the end of the line. The newline is left for the
 /// caller, so that it still counts as a line break before the next token.
-let rec drop_line s i =
-    if core.str_byte s i == eof || core.str_byte s i == newline { i }
-    else { drop_line s (i + 1) };
+///
+/// One scan, in the runtime: `str_upto` answers the end of the string when
+/// there is no newline left, which is exactly where an unterminated last line
+/// ends.
+let drop_line s i = core.str_upto s i "\n";
 
 /// A `/* */` comment, which does not nest. An unterminated one is an error
 /// naming where it opened -- the alternative is to lex the `/` and the `*` as
@@ -129,10 +131,20 @@ let rec drop_block s i col opened =
     else if core.str_byte s i == 42 && core.str_byte s (i + 1) == 47 { [i + 2, col + 2] }
     else { drop_block s (i + 1) (col + 1) opened };
 
+/// The bytes that are whitespace within a line. A newline is not one of them:
+/// it resets the column and records that a break was crossed, which is the one
+/// thing trivia carries to the parser.
+let inline_space = " \t\r\u{c}";
+
 let rec skip_trivia s i col nl = {
     let b = core.str_byte s i;
     if b == newline { skip_trivia s (i + 1) 1 true }
-    else if b == space || b == tab || b == cr || b == ff { skip_trivia s (i + 1) (col + 1) nl }
+    else if b == space || b == tab || b == cr || b == ff {
+        // The whole run at once. Indentation is most of what this function
+        // ever skips, and a byte at a time it was a reduction each.
+        let j = core.str_span s i inline_space;
+        skip_trivia s j (col + (j - i)) nl
+    }
     else if b == 47 && core.str_byte s (i + 1) == 47 {
         let j = drop_line s (i + 2);
         skip_trivia s j (col + char_len s i j 0) nl
@@ -291,7 +303,12 @@ let number s i = {
 
 // --- identifiers ------------------------------------------------------------
 
-let rec ident_run s i = if is_alnum (core.str_byte s i) { ident_run s (i + 1) } else { i };
+/// Every byte an identifier may hold, as a set for `str_span`. Spelled out
+/// rather than tested with `is_alnum`, because the point is to hand the whole
+/// run to the runtime instead of asking about one byte at a time.
+let ident_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+
+let ident_run s i = core.str_span s i ident_bytes;
 
 /// An identifier, including a trailing `!` when there is one -- the `!` is part
 /// of the name and is what marks the binding impure. It is taken greedily, so

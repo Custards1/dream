@@ -223,12 +223,17 @@ The three container shapes differ in cost as much as in kind, and which one a
 value wants is usually decided by how it is read rather than by what it holds:
 
 - **A cons chain answers the head in one hop and everything else by walking.**
-  `nth`, `length` and `last` each pay one step per element; appending and
-  reading the end walk the whole chain. Building in front is O(1), which is
-  why the idiom everywhere in the standard library is to accumulate with
-  `core.cons` and reverse once at the end. A *lazy* chain costs a cell each
-  time a new element is forced, so a stream that will be walked twice builds
-  every cell of a tail that the second walk then forces again.
+  `nth`, `length`, `last` and `append` are all linear in the list: reading the
+  end or joining two of them walks the whole chain. What differs is *where*
+  the walk happens. `nth` is `xs.[n]`, `length` is `len`, and `append` is `+`,
+  so each of those is one machine operation over the spine rather than a
+  reduction per cell -- which is worth about a factor of ten and is why the
+  standard library defines them that way rather than by recursion. `last` and
+  anything ending in `_at` still walk in Dream. Building in front is O(1),
+  which is why the idiom everywhere in the standard library is to accumulate
+  with `core.cons` and reverse once at the end. A *lazy* chain costs a cell
+  each time a new element is forced, so a stream that will be walked twice
+  builds every cell of a tail that the second walk then forces again.
 - **An array reads any index in one hop — constant-time like a list's head.**
   An array is the right shape for a fixed record that is read more than it is
   built, because a list record reads every field by walking to it. The
@@ -1519,10 +1524,17 @@ spent once.
 ### Every value decides its own cost
 
 - **A list is read at the head.** `head`/`tail`/`core.cons` are one hop; `nth`,
-  `length`, `last`, and anything ending in `_at` walk. Accumulate with
+  `length`, `last`, `append`, and anything ending in `_at` walk. Accumulate with
   `core.cons` and reverse once. Prefer a lazy chain precisely where the head is
   the point — a stream — because a cell is allocated as it is forced and a
   stream that goes unread costs nothing.
+- **A walk the machine can do is worth ten of the same walk in Dream.** A
+  linear operation written as a recursion pays a call, a frame and a couple of
+  natives per element; the same walk behind an opcode or a builtin pays one
+  machine step for the whole of it. `list.nth` is `xs.[n else ()]`,
+  `list.length` is `len`, `list.append` is `+`, and a lexer's byte classes are
+  `core.str_span` and `core.str_upto` — spelling those four out as recursions
+  instead was a third of a self-compile.
 - **A record is an array when it is read more than it is built.** Matching a
   list pattern (`[:ok, v, rest]`) binds by walking the cells; matching an
   array pattern length-checks and indexes. The compiler's token used to be a

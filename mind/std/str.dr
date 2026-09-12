@@ -57,6 +57,20 @@ let slice from count s = core.str_slice s from count;
 /// would build a string out of it is refused.
 let byte i s = core.str_byte s i;
 
+/// Past the run of bytes from `set` that starts at byte offset `from`: the
+/// offset of the first byte that is not one of them, or `byte_length s`.
+///
+/// `set` is a string read as the set of its bytes, so `span " \t" i s` skips
+/// indentation and `span "0123456789" i s` skips a run of digits. The scan
+/// happens in the runtime, which is the point: doing it a byte at a time in
+/// Dream costs a call and a comparison chain per byte.
+let span set from s = core.str_span s from set;
+
+/// The offset of the first byte from `set` at or after `from`, or
+/// `byte_length s` when there is none -- so `upto "\n" i s` is the end of the
+/// line whether or not the text ends with one.
+let upto set from s = core.str_upto s from set;
+
 /// The byte offset of `needle` at or after byte offset `from`, or `-1`.
 let find_from from needle s = core.str_find s needle from;
 
@@ -162,6 +176,13 @@ when test {
         test.case "length"           $( test.eq! 5 (length "hello") ),
         test.case "length of empty"  $( test.eq! 0 (length "") ),
         test.case "byte_length"      $( test.eq! 5 (byte_length "hello") ),
+        test.case "span skips the class"      $( test.eq! 3 (span " \t" 0 "  \tx") ),
+        test.case "span of nothing stays put" $( test.eq! 2 (span " " 2 "  x ") ),
+        test.case "span off the end"          $( test.eq! 3 (span " " 0 "   ") ),
+        test.case "span past the end"         $( test.eq! 9 (span " " 9 "abc") ),
+        test.case "upto finds the delimiter"  $( test.eq! 3 (upto "\n" 0 "abc\ndef") ),
+        test.case "upto with no delimiter"    $( test.eq! 3 (upto "\n" 0 "abc") ),
+        test.case "upto takes any of the set" $( test.eq! 1 (upto "xy" 0 "ay") ),
         test.case "length counts characters" $( test.eq! 5 (length "h\u{e9}llo") ),
         test.case "byte_length counts bytes" $( test.eq! 6 (byte_length "h\u{e9}llo") ),
         test.case "is_empty"         $( test.true! (is_empty "") ),

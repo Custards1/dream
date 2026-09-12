@@ -434,6 +434,9 @@ int main(int argc, char** argv) {
     }
 
     Runtime rt;
+    // The runtime reports the run's cost, not this function: a program that
+    // ends with `os.exit!` never comes back here, and every tool does.
+    if (stats) rt.enable_stats();
     rt.set_program_args(std::move(program_args));
     std::string error;
     if (!rt.load_image_file(path, error)) {
@@ -531,19 +534,15 @@ int main(int argc, char** argv) {
     }
 
     rt.print_profile();
-
+    rt.print_stats();
     if (stats) {
-        std::fprintf(stderr,
-                     "; %" PRIu64 " reductions, %" PRIu64 " major + %" PRIu64 " minor "
-                     "collections (%" PRIu64 " bytes promoted) in the root process, "
-                     "%u workers, jit %s\n",
-                     sched.total_reductions(), root->heap().major_collections(),
-                     root->heap().minor_collections(), root->heap().bytes_promoted(),
-                     workers, jit_owner ? "on" : "off");
+        // What the runtime cannot know: how this particular invocation was set
+        // up.
+        std::fprintf(stderr, "; %u workers, jit %s", workers, jit_owner ? "on" : "off");
         if (jit_owner) {
-            std::fprintf(stderr, "; %" PRIu64 " functions compiled\n",
-                         jit_owner->compiled_count());
+            std::fprintf(stderr, ", %" PRIu64 " functions compiled", jit_owner->compiled_count());
         }
+        std::fputc('\n', stderr);
     }
     return status;
 }

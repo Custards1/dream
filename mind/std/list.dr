@@ -25,16 +25,35 @@ let cons x xs = core.cons x xs;
 
 let first_or default xs = if core.is_empty xs { default } else { core.head xs };
 
-let rec length_from acc xs =
-    if core.is_empty xs { acc } else { length_from (acc + 1) (core.tail xs) };
+/// `acc` plus the length of `xs`. The accumulating form `length` was written
+/// in terms of; both walk the spine in the machine now.
+let length_from acc xs = acc + len xs;
 
 /// Forces the whole spine, so it does not terminate on an infinite list.
-let length xs = length_from 0 xs;
+///
+/// `len` is the builtin, which walks the spine in the machine. Counting the
+/// cells in Dream instead was a call, an `is_empty` and a `tail` each -- and
+/// `sort` asks for a length at every level of its recursion, so the corpus
+/// paid for it in the thousands.
+let length xs = len xs;
 
-let rec nth n xs =
-    if core.is_empty xs { () }
-    else if n <= 0 { core.head xs }
-    else { nth (n - 1) (core.tail xs) };
+/// The element at `n`, counting from zero, or `()` when there is none.
+///
+/// `xs.[n else ()]` is the `get` opcode, so the walk down the spine happens in
+/// the machine: one operation for the whole of it. Said the obvious way -- a
+/// recursion over `is_empty`, `head` and `tail` -- it was six machine steps per
+/// cell, and since a record in this compiler is a short list read by position
+/// (`span_start s` is `nth 0 s`), that recursion was a sixth of everything a
+/// compile did.
+///
+/// The body is one `get` of the parameters, which makes it a wrapper: a
+/// saturated call of it is emitted as the opcode, with no call at all.
+///
+/// An index below zero is out of range and answers `()`, as an index past the
+/// end does. The recursion this replaces treated any `n <= 0` as the head,
+/// which was an accident of how it counted down rather than anything anyone
+/// asked for -- and the opposite of what a caller guarding on `()` expects.
+let nth n xs = xs.[n else ()];
 
 let last xs = {
     let rec go xs =
@@ -44,8 +63,23 @@ let last xs = {
 
 // --- building ---------------------------------------------------------------
 
-let rec append xs ys =
-    if core.is_empty xs { ys } else { core.cons (core.head xs) (append (core.tail xs) ys) };
+/// `xs` followed by `ys`.
+///
+/// This is what `+` on two lists means, so it is written as `+`: the spine of
+/// `xs` is copied by the machine in one operation and its end pointed at `ys`,
+/// with `ys` and every element left untouched. Spelling it out instead --
+/// `core.cons (core.head xs) (append (core.tail xs) ys)` -- built a cons and a
+/// suspended call per cell, and was a fifth of the work in a self-compile,
+/// most of it reached through `concat`.
+///
+/// The one thing the recursion could do that this cannot is append to an
+/// infinite list: `+` walks the whole of `xs` when it is forced, where the
+/// recursion produced a cell at a time. Nothing lazy is lost on the right --
+/// `ys` is never looked at -- so `concat` over an endless list of lists still
+/// works, and only an endless list on the *left* is now a hang rather than an
+/// answer. Nothing in this repository appends to one, and an infinite left
+/// operand makes `ys` unreachable by definition.
+let append xs ys = xs + ys;
 
 let rec reverse_from acc xs =
     if core.is_empty xs { acc } else { reverse_from (core.cons (core.head xs) acc) (core.tail xs) };
@@ -243,20 +277,10 @@ let sort_on key xs = sort_by (fn a b -> core.compare (key a) (key b) < 0) xs;
 let to_array xs = core.array_of_list xs;
 let of_array a = core.array_to_list a;
 
-/// Force every element. Lists are lazy, so this is the only way to be sure the
-/// work has happened -- before a `send!`, say.
-let rec force xs =
-    if core.is_empty xs { [] }
-    else {
-        let x = core.head xs;
-        // `to_string` forces the element without needing to know its type.
-        let _ = to_string x;
-        core.cons x (force (core.tail xs))
-    };
 
 // --- tests ------------------------------------------------------------------
 //
-// Compiled only by `dawnc --test`, which builds an entry point that runs the
+// Compiled with --test`, which builds an entry point that runs the
 // `tests` every loaded module exports.
 
 when test {
@@ -272,10 +296,17 @@ when test {
         test.case "first_or"            $( test.eq! 1 (first_or :none [1]) ),
         test.case "nth"                 $( test.eq! 3 (nth 2 [1, 2, 3]) ),
         test.case "nth past the end"    $( test.eq! () (nth 9 [1, 2, 3]) ),
+        test.case "nth of empty"        $( test.eq! () (nth 0 []) ),
+        test.case "nth below zero"      $( test.eq! () (nth (0 - 1) [1, 2, 3]) ),
         test.case "last"                $( test.eq! 3 (last [1, 2, 3]) ),
 
         test.case "append"              $( test.eq! [1, 2, 3] (append [1] [2, 3]) ),
         test.case "append to empty"     $( test.eq! [1] (append [] [1]) ),
+        test.case "append nothing"      $( test.eq! [1] (append [1] []) ),
+        // The right side is never walked, which is what lets `concat` run
+        // down a list of lists that has no end.
+        test.case "append keeps the right lazy"
+            $( test.eq! 1 (head (append [1] (map (fn x -> x / 0) (range 0 3)))) ),
         test.case "reverse"             $( test.eq! [3, 2, 1] (reverse [1, 2, 3]) ),
         test.case "reverse of empty"    $( test.empty! (reverse []) ),
         test.case "range"               $( test.eq! [1, 2, 3] (range 1 4) ),
