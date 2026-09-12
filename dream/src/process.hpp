@@ -150,6 +150,15 @@ public:
 
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }
+    const Heap& heap() const { return heap_; }
+
+    /// The image this process runs, cached at construction.
+    ///
+    /// Reaching it the honest way -- `p.runtime().image()` -- is two dependent
+    /// loads before the one that reads the node, and the machine asks for a
+    /// node on every step. An image is loaded before any process exists and is
+    /// never replaced, so the indirection buys nothing.
+    const Image* code = nullptr;
 
     // --- machine state ---
     Mode mode = Mode::Halted;
@@ -171,6 +180,37 @@ public:
     /// a memoized top-level value lives in whichever heap forced it, and heaps
     /// are private. Code is shared; data is not -- as in BEAM.
     std::vector<Value> globals;
+
+    /// One slot per host module member, indexed by `ModuleDef::member_base + i`.
+    ///
+    /// `native.tail xs` used to build two objects before it could call
+    /// anything: a string for the member's name and a `NativeObj` around the
+    /// function pointer. Both are decided by which member it is and nothing
+    /// else, so the same pair was allocated again at every call -- in a fold
+    /// over ten million elements, forty million objects that were all equal.
+    /// The value belongs to this heap, so the cache does too, and it is a root.
+    std::vector<Value> native_cache;
+
+    /// One slot per image string constant: the `StrObj` this process hands out
+    /// for it. A literal is immutable and has no identity a program can
+    /// observe, so one copy per process does what a fresh copy per evaluation
+    /// did, without the allocation. A root, like the others here.
+    ///
+    /// Per-process, and sized by the whole program's string table, which is
+    /// the same bargain `globals` above makes: a table this process may only
+    /// use a corner of, in exchange for the lookup being an index. It is
+    /// allocated on the first literal a process reaches, so a process that
+    /// evaluates none pays nothing, and the table is small even for a large
+    /// program -- the compiler's own image has 1752 strings against 1118
+    /// globals. If a workload ever wants hundreds of thousands of processes
+    /// each touching a corner of a huge string table, this and `globals` want
+    /// bounding together.
+    std::vector<Value> string_cache;
+
+    /// The same for float constants, which are boxed and so cost an
+    /// allocation each: a loop over `1.0 / x` allocated one per iteration for
+    /// a value the image already held.
+    std::vector<Value> float_cache;
 
     /// Set once the process stops; `failed` distinguishes a raised error.
     Value exit_value = UNIT;

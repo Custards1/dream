@@ -51,29 +51,77 @@ static_assert(std::size(kClassSizes) == kHeapClassCount,
               "the free list array must match the size-class table");
 constexpr uint32_t kMaxClassSize = kClassSizes[kHeapClassCount - 1];
 
-/// The index of the smallest class that holds `bytes`. `bytes` must be a class
-/// size itself for the exact lookup that sweep does; for allocation the caller
-/// rounds up first.
-size_t class_index(uint32_t bytes) {
-    const uint32_t* it = std::lower_bound(kClassSizes, kClassSizes + kHeapClassCount, bytes);
-    return static_cast<size_t>(it - kClassSizes);
+/// Every class size is a multiple of 8 and the largest is 4096, so the whole
+/// table inverts into 512 bytes: `kClassOf[bytes / 8]` is the class index of
+/// anything that size, rounded up. Built once, at load.
+///
+/// This replaces a binary search. Allocation is the single most frequent thing
+/// the VM does -- three hundred million times in one fold -- and six dependent
+/// branches to answer a question with 512 possible inputs is the wrong shape.
+struct ClassTable {
+    uint8_t of[(kMaxClassSize / 8) + 1];
+    constexpr ClassTable() : of{} {
+        size_t cls = 0;
+        for (size_t words = 0; words <= kMaxClassSize / 8; ++words) {
+            while (kClassSizes[cls] < words * 8) ++cls;
+            of[words] = uint8_t(cls);
+        }
+    }
+};
+constexpr ClassTable kClassOf{};
+static_assert(kHeapClassCount <= 256, "a class index has to fit in the table's byte");
+
+/// The index of the smallest class that holds `bytes`. `bytes` must be a
+/// multiple of 8 no larger than the top class -- every caller has already
+/// rounded up, and sweep only ever asks about a chunk it found in the heap.
+inline size_t class_index(uint32_t bytes) {
+    return kClassOf.of[bytes >> 3];
 }
 
 /// The class size that holds `bytes`: the class, rounding up.
-uint32_t class_size(uint32_t bytes) {
+inline uint32_t class_size(uint32_t bytes) {
     return kClassSizes[class_index(bytes)];
 }
 }  // namespace
 
+/// How large a nursery may grow, and where the number comes from.
+///
+/// A nursery is a bet that most objects die young, and its size is how long
+/// they are given to do it. Too small and a collection promotes objects that
+/// were about to die anyway -- which is the expensive mistake, because
+/// promotion is a copy and everything it copies has to be scanned and then
+/// swept later. Too large and the collection's working set falls out of cache
+/// and every process pays for memory it is not using.
+///
+/// So the size is not chosen: it is *earned*. Every process starts at 64 KB,
+/// and only one that keeps promoting a large share of what it allocates grows
+/// -- doubling each time, up to this. A language that expects hundreds of
+/// thousands of processes cannot afford a large nursery by default, and a
+/// compiler churning through a syntax tree cannot afford a small one; letting
+/// the survival rate decide gives each of them what it needs.
+///
+/// The default cap is 32 MiB, which is where the self-compile stops improving.
+/// `DREAM_NURSERY_MAX` overrides it, for measuring the next workload.
+static size_t nursery_max_bytes() {
+    static const size_t value = [] {
+        if (const char* env = std::getenv("DREAM_NURSERY_MAX")) {
+            long long n = std::atoll(env);
+            if (n > 0) return size_t(n);
+        }
+        return size_t(32) << 20;
+    }();
+    return value;
+}
+
 Heap::Heap(size_t initial_bytes)
     : nursery_hi_(initial_bytes),
+      nursery_max_(nursery_max_bytes()),
       gc_threshold_(initial_bytes),
       initial_bytes_(initial_bytes) {
     // The nursery starts with one block; old space grows its own as objects
     // survive into it. The constructor's block is the nursery's, so a process
     // that dies young -- most programs -- never grows an old space at all.
     nursery_.push_back(new_block(initial_bytes));
-    nursery_cursor_ = nursery_.back();
 }
 
 Heap::~Heap() {
@@ -113,7 +161,7 @@ void Heap::free_blocks(Block* b) {
 void Heap::free_nursery() {
     for (Block* b : nursery_) free_block(b);
     nursery_.clear();
-    nursery_cursor_ = nullptr;
+    nursery_at_ = 0;
     nursery_bytes_ = 0;
 }
 
@@ -171,17 +219,38 @@ Obj* Heap::carve_big(size_t sz) {
 
 /// Bump-allocate from the nursery. Collection can never run mid-reduction, so
 /// no allocation-time safepoint is needed: the high-water mark only decides
-/// what the *next* safepoint check does. When the current block is full a
-/// fresh one is added -- never a collection, and never a failure.
+/// what the *next* safepoint check does. When the current block is full the
+/// next one is taken, and when there is no next one a fresh block is added --
+/// never a collection, and never a failure.
 Obj* Heap::alloc_nursery(uint32_t sz) {
-    Block* b = nursery_cursor_;
-    if (b && (b->big || b->used + sz > b->size)) b = nullptr;
-    if (!b) {
-        b = new_block(sz);
+    if (nursery_at_ < nursery_.size()) {
+        Block* b = nursery_[nursery_at_];
+        if (b->used + sz <= b->size) {
+            auto* o = reinterpret_cast<Obj*>(b->data + b->used);
+            b->used += sz;
+            nursery_bytes_ += sz;
+            allocated_ += sz;
+            return o;
+        }
+    }
+    return grow_nursery(sz);
+}
+
+Obj* Heap::grow_nursery(uint32_t sz) {
+    // Step past the blocks with no room. A minor collection empties every
+    // block and rewinds to the first, so the ones behind us have already been
+    // refilled; a major frees them all, and then there are none at all.
+    while (nursery_at_ < nursery_.size()) {
+        Block* b = nursery_[nursery_at_];
+        if (b->used + sz <= b->size) break;
+        ++nursery_at_;
+    }
+    if (nursery_at_ == nursery_.size()) {
+        Block* b = new_block(sz);
         b->next = nullptr;
         nursery_.push_back(b);
-        nursery_cursor_ = b;
     }
+    Block* b = nursery_[nursery_at_];
     auto* o = reinterpret_cast<Obj*>(b->data + b->used);
     b->used += sz;
     nursery_bytes_ += sz;
@@ -189,25 +258,35 @@ Obj* Heap::alloc_nursery(uint32_t sz) {
     return o;
 }
 
-Obj* Heap::alloc(ObjType type, size_t extra) {
+Obj* Heap::alloc_bare(ObjType type, size_t extra) {
     size_t bytes = align_up(sizeof(Obj) + extra);
     uint32_t sz;
     Obj* o;
+    uint8_t gen;
     if (bytes > kMaxClassSize) {
         // Large objects tenure immediately: they are rare, often long-lived,
         // and copying one once to save the next copy is a bad swap.
         sz = static_cast<uint32_t>(bytes);
         o = carve_big(sz);
+        gen = GC_OLD;
     } else {
         sz = class_size(static_cast<uint32_t>(bytes));
         o = alloc_nursery(sz);
+        gen = GC_YOUNG;
     }
-    std::memset(o, 0, sz);
+    // The header is written whole rather than cleared and then filled: these
+    // four fields are the whole of it.
     o->type = type;
-    o->gc = bytes > kMaxClassSize ? GC_OLD : GC_YOUNG;
+    o->gc = gen;
     o->aux = 0;
     o->bytes = sz;
     total_allocated_ += sz;
+    return o;
+}
+
+Obj* Heap::alloc(ObjType type, size_t extra) {
+    Obj* o = alloc_bare(type, extra);
+    std::memset(o + 1, 0, size_t(o->bytes) - sizeof(Obj));
     return o;
 }
 
@@ -216,13 +295,13 @@ Obj* Heap::alloc(ObjType type, size_t extra) {
 // ---------------------------------------------------------------------------
 
 Value Heap::make_float(double v) {
-    auto* o = static_cast<FloatObj*>(alloc(ObjType::Float, sizeof(double)));
+    auto* o = static_cast<FloatObj*>(alloc_bare(ObjType::Float, sizeof(double)));
     o->value = v;
     return from_obj(o);
 }
 
 Value Heap::make_string(const char* data, uint32_t len) {
-    auto* o = static_cast<StrObj*>(alloc(ObjType::Str, 8 + size_t(len) + 1));
+    auto* o = static_cast<StrObj*>(alloc_bare(ObjType::Str, 8 + size_t(len) + 1));
     o->len = len;
     o->hash = 0;
     // A null `data` reserves room to be filled by the caller, which is how
@@ -235,7 +314,7 @@ Value Heap::make_string(const char* data, uint32_t len) {
 Value Heap::make_bigstr(const char* data, uint64_t len) {
     // Sized from the struct rather than counted by hand: unlike a StrObj there
     // is no trailing payload here, so the whole object is its fields.
-    auto* o = static_cast<BigStrObj*>(alloc(ObjType::BigStr, sizeof(BigStrObj) - sizeof(Obj)));
+    auto* o = static_cast<BigStrObj*>(alloc_bare(ObjType::BigStr, sizeof(BigStrObj) - sizeof(Obj)));
     o->len = len;
     o->hash = 0;
     o->data = data;
@@ -243,7 +322,7 @@ Value Heap::make_bigstr(const char* data, uint64_t len) {
 }
 
 Value Heap::make_cons(Value head, Value tail) {
-    auto* o = static_cast<ConsObj*>(alloc(ObjType::Cons, 2 * sizeof(Value)));
+    auto* o = static_cast<ConsObj*>(alloc_bare(ObjType::Cons, 2 * sizeof(Value)));
     o->head = head;
     o->tail = tail;
     return from_obj(o);
@@ -267,7 +346,7 @@ Value Heap::make_map_branch(uint32_t nslots) {
 }
 
 Value Heap::make_map_leaf(uint64_t hash, Value key, Value value, Value next) {
-    auto* o = static_cast<MapLeafObj*>(alloc(ObjType::MapLeaf, 8 + 3 * sizeof(Value)));
+    auto* o = static_cast<MapLeafObj*>(alloc_bare(ObjType::MapLeaf, 8 + 3 * sizeof(Value)));
     o->hash = hash;
     o->key = key;
     o->value = value;
@@ -283,17 +362,30 @@ Value Heap::make_closure(uint32_t func, uint32_t ncaps) {
 }
 
 Value Heap::make_thunk(uint32_t node, Value frame) {
-    auto* o = static_cast<ThunkObj*>(alloc(ObjType::Thunk, 8 + sizeof(Value)));
+    auto* o = static_cast<ThunkObj*>(alloc_bare(ObjType::Thunk, 8 + sizeof(Value)));
     o->node = node;
+    o->pad = 0;
     o->frame = frame;
     return from_obj(o);
 }
 
 Value Heap::make_frame(Value closure, uint32_t nslots) {
+    return make_frame_filling(closure, nslots, 0);
+}
+
+Value Heap::make_frame_filling(Value closure, uint32_t nslots, uint32_t filled) {
     auto* o = static_cast<FrameObj*>(
-        alloc(ObjType::Frame, sizeof(Value) + 8 + size_t(nslots) * sizeof(Value)));
+        alloc_bare(ObjType::Frame, sizeof(Value) + 8 + size_t(nslots) * sizeof(Value)));
     o->closure = closure;
     o->nslots = nslots;
+    o->pad = 0;
+    // The slots the caller is about to write need no clearing; the rest must
+    // read as `NIL_SLOT`, and so must the padding to the size class, which the
+    // collector walks as part of the object.
+    Value* slots = o->slots();
+    auto* from = reinterpret_cast<uint8_t*>(slots + filled);
+    auto* end = reinterpret_cast<uint8_t*>(o) + o->bytes;
+    if (end > from) std::memset(from, 0, size_t(end - from));
     return from_obj(o);
 }
 
@@ -306,14 +398,14 @@ Value Heap::make_pap(Value fn, uint32_t nargs) {
 }
 
 Value Heap::make_error(Value kind, Value payload) {
-    auto* o = static_cast<ErrorObj*>(alloc(ObjType::ErrorBox, 2 * sizeof(Value)));
+    auto* o = static_cast<ErrorObj*>(alloc_bare(ObjType::ErrorBox, 2 * sizeof(Value)));
     o->kind = kind;
     o->payload = payload;
     return from_obj(o);
 }
 
 Value Heap::make_pid(uint64_t id) {
-    auto* o = static_cast<PidObj*>(alloc(ObjType::Pid, sizeof(uint64_t)));
+    auto* o = static_cast<PidObj*>(alloc_bare(ObjType::Pid, sizeof(uint64_t)));
     o->id = id;
     return from_obj(o);
 }
@@ -350,7 +442,7 @@ void Heap::mark_object(Value v) {
     if (!is_atom_object(o->type)) scan_queue_.push_back(o);
 }
 
-void Heap::forward(Value* slot) {
+void Heap::forward_slow(Value* slot) {
     // While verifying, `forward` records roots instead of marking them.
     if (recording_) {
         recording_->push_back(*slot);
@@ -483,6 +575,20 @@ void Heap::collect(RootSource& roots) {
     major_collect(roots);
 }
 
+/// A minor collection's cost is what it promoted, not what it looked at: the
+/// nursery is emptied for nothing whatever is in it. So a collection that
+/// copied out a large share of the nursery was simply too early -- most of
+/// what it copied would have died had it waited -- and the answer is a bigger
+/// nursery, not a cleverer collection. A quarter is the line: above it the
+/// nursery doubles, below it nothing changes, and a process whose garbage
+/// really is long-lived stops at the cap rather than growing for ever.
+void Heap::grow_nursery_if_crowded(size_t promoted, size_t looked_at) {
+    if (nursery_hi_ >= nursery_max_) return;
+    if (promoted * 4 <= looked_at) return;
+    nursery_hi_ *= 2;
+    if (nursery_hi_ > nursery_max_) nursery_hi_ = nursery_max_;
+}
+
 void Heap::major_collect(RootSource& roots) {
     // Every object that survives lands on the worklist at some point, so it
     // wants room for a big fraction of everything that was alive. The queue
@@ -530,8 +636,11 @@ void Heap::major_collect(RootSource& roots) {
     // collects on every doubling.
     gc_threshold_ = live_after_gc_ * 3 + initial_bytes_;
     // The nursery scales with the live set too: a process that holds a lot
-    // wants a bigger nursery before it pays for a minor collection.
+    // wants a bigger nursery before it pays for a minor collection. The cap
+    // is the same one the survival rate grows towards, so a process cannot
+    // reach a nursery through this that it could not have earned.
     nursery_hi_ = live_after_gc_ / 4 + initial_bytes_;
+    if (nursery_hi_ > nursery_max_) nursery_hi_ = nursery_max_;
 
     verify_collect(roots, false);
 }
@@ -540,6 +649,8 @@ void Heap::minor_collect(RootSource& roots) {
     if (scan_queue_.capacity() < allocated_ / size_t(16) + 1)
         scan_queue_.reserve(allocated_ / size_t(16) + 1);
     scan_queue_.clear();
+    const uint64_t promoted_before = promoted_bytes_;
+    const size_t looked_at = nursery_bytes_;
 
     // Trace. Roots have their young values promoted directly; each remembered
     // old object is scanned so a young value it was made to point at is
@@ -554,10 +665,11 @@ void Heap::minor_collect(RootSource& roots) {
         scan_object(o);
     }
 
-    // Every nursery block is now dead space; reset them all so the next bump
-    // allocation starts fresh. (Blocks with headroom are kept, not freed --
-    // the process will fill them again immediately.)
+    // Every nursery block is now dead space; reset them all and rewind to the
+    // first, so the next bump allocation refills the blocks we already have.
+    // (They are kept, not freed -- the process will fill them again at once.)
     for (Block* b : nursery_) b->used = 0;
+    nursery_at_ = 0;
     allocated_ -= nursery_bytes_;
     nursery_bytes_ = 0;
     remembered_.clear();
@@ -565,6 +677,7 @@ void Heap::minor_collect(RootSource& roots) {
     ++collections_;
     ++minor_collections_;
     if (allocated_ > peak_live_) peak_live_ = allocated_;
+    grow_nursery_if_crowded(size_t(promoted_bytes_ - promoted_before), looked_at);
 
     // A minor never touches old space, so `live_after_gc_` still says what the
     // last full collection measured; `bytes_allocated` reports the whole live

@@ -65,6 +65,22 @@ public:
     /// Collection happens at safepoints instead.
     Obj* alloc(ObjType type, size_t extra);
 
+    /// The same, without clearing the payload. For the constructors below that
+    /// write every field they own.
+    ///
+    /// The clear is pure waste for those: a thunk is twenty-four bytes and all
+    /// twenty-four are written immediately afterwards. Anything whose payload a
+    /// *caller* fills in later -- a frame's unbound slots, an array handed to a
+    /// host -- must still arrive zeroed, because until it is filled the
+    /// collector may walk it, and an unwritten slot has to read as `NIL_SLOT`.
+    Obj* alloc_bare(ObjType type, size_t extra);
+
+    /// A frame whose first `filled` slots the caller is about to write. Only
+    /// the rest is cleared -- an unwritten slot must read as `NIL_SLOT`,
+    /// because that is what "not bound yet" is -- and the caller's own stores
+    /// do the work the clear would have done twice.
+    Value make_frame_filling(Value closure, uint32_t nslots, uint32_t filled);
+
     // Convenience constructors for the common shapes.
     Value make_float(double v);
     Value make_string(const char* data, uint32_t len);
@@ -111,7 +127,33 @@ public:
     /// and the scanner use to hand a reference to the collector; promotion is
     /// the one place a reference is rewritten, because the young object it
     /// held is copied to old space.
-    void forward(Value* slot);
+    ///
+    /// A collection asks this ninety million times in one self-compile, and
+    /// for most slots the answer is nothing: the slot holds an immediate -- a
+    /// fixnum, an atom, `()` -- or an object that is already old, which a
+    /// minor collection has no business touching. Both of those are decided
+    /// here in a couple of instructions; everything that actually has work to
+    /// do goes out of line.
+    void forward(Value* slot) {
+        if (recording_) {
+            forward_slow(slot);
+            return;
+        }
+        Value v = *slot;
+        if (!is_ptr(v)) return;
+        Obj* o = as_obj(v);
+        if (o->gc & (GC_YOUNG | GC_FORWARDED)) {
+            forward_slow(slot);
+            return;
+        }
+        // An Indirect is folded away by the slow path, which rewrites the slot
+        // with what it resolves to.
+        if (o->type == ObjType::Indirect) {
+            forward_slow(slot);
+            return;
+        }
+        if (full_trace_ && !(o->gc & GC_MARK)) mark_object(v);
+    }
 
     /// The write barrier. The mutator calls this on an in-place store into an
     /// existing object, so that a minor collection can still find every
@@ -186,6 +228,18 @@ private:
     Obj* carve_big(size_t sz);
     /// Bump-allocate `sz` bytes from the nursery blocks.
     Obj* alloc_nursery(uint32_t sz);
+    /// Add a block to the nursery and allocate from it. The cold half of
+    /// `alloc_nursery`, reached only when no existing block has room.
+    Obj* grow_nursery(uint32_t sz);
+
+    /// Widen the nursery when a collection promoted a large share of what it
+    /// looked at. Called at the end of a minor collection.
+    void grow_nursery_if_crowded(size_t promoted, size_t looked_at);
+
+    /// The half of `forward` that has something to do: a young object to
+    /// promote, one already promoted this cycle, an indirection to fold away,
+    /// or a root being recorded by the verifier.
+    void forward_slow(Value* slot);
 
     /// Place one reference onto the live set. Shared by `forward` and the
     /// collector itself; `out` stays null for a value already marked.
@@ -224,10 +278,17 @@ private:
     /// one is copied to old space at the next collection, after which the
     /// blocks are reset empty (or freed whole by a major).
     std::vector<Block*> nursery_;
-    Block* nursery_cursor_ = nullptr;
+    /// Which block is being bumped in. An *index*, not a pointer, because a
+    /// minor collection empties every block and allocation has to start over
+    /// at the first one: a cursor left at the end would add a block per
+    /// collection and never touch the ones it had just emptied, so the nursery
+    /// grew by its whole size at every minor until the next major freed it.
+    size_t nursery_at_ = 0;
     size_t nursery_bytes_ = 0;
     /// The nursery's high-water mark: past it, a minor collection is due.
     size_t nursery_hi_;
+    /// How large the nursery may grow. See `grow_nursery_if_crowded`.
+    size_t nursery_max_;
     /// Old objects the mutator has been made to point at young ones. Drained
     /// (not deduplicated) by scanning each entry at the next minor collection.
     std::vector<Obj*> remembered_;

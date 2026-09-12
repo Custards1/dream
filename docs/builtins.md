@@ -75,6 +75,8 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 | `str_slice` | `string\|bigstr → start:integer → len:integer → string\|bigstr` | Returns `len` bytes starting at byte offset `start`. Clamped silently — running past the end is how string-walking loops finish. A slice of a bigstr is another bigstr view, however small: no copy, at any size. |
 | `str_find` | `haystack:string → needle:string → from:integer → integer` | Returns the byte offset of the first occurrence of `needle` at or after `from`, or `-1` if not found. Raises `:type_error` on a bigstr. |
 | `str_byte` | `string\|bigstr → index:integer → integer` | The raw byte value (0–255) at byte `index`, or `-1` if out of range. |
+| `str_span` | `string\|bigstr → from:integer → set:string → integer` | The byte offset of the first byte at or after `from` that is **not** in `set`, or the string's byte length when there is none. `set` is read as the set of its bytes, so `str_span s i " \t"` skips indentation and `str_span s i digits` skips a number. A whole run of a byte class in one operation — the same walk written in Dream is a call and a comparison chain per byte, which is what a lexer spends its time on. |
+| `str_upto` | `string\|bigstr → from:integer → set:string → integer` | The other way round: the offset of the first byte at or after `from` that **is** in `set`, or the byte length when there is none — so `str_upto s i "\n"` is the end of the line whether or not the text ends with one. |
 | `str_concat` | `list of string → string` | Joins the parts, copying each exactly once. Raises `:type_error` on a bigstr. |
 
 ### Chars
@@ -473,9 +475,9 @@ A lazy singly-linked list. Most operations work on infinite lists. Functions tha
 | `is_empty xs` | `true` if empty. |
 | `first_or default xs` | First element, or `default` if empty. |
 | `length xs` | Forces the entire spine. Does not terminate on infinite lists. |
-| `nth n xs` | Element at index `n` (0-based), or `unit` if out of range. |
+| `nth n xs` | Element at index `n` (0-based), or `unit` if out of range — including a negative `n`. This is `xs.[n else ()]`, so a saturated call is the `get` opcode. |
 | `last xs` | Last element, or `unit` if empty. Forces the entire spine. |
-| `append xs ys` | Concatenates two lists. Lazy — `ys` is not touched until the end of `xs` is reached. |
+| `append xs ys` | Concatenates two lists; this is what `xs + ys` means. `ys` and every element are left untouched, but the spine of `xs` is walked when the result is forced, so appending to an *infinite* left-hand list does not terminate. |
 | `reverse xs` | Forces the entire spine. |
 | `range from until` | `[from, from+1, ..., until-1]`. The end is exclusive. |
 | `from n` | Infinite list `n, n+1, n+2, ...` |
@@ -518,7 +520,7 @@ to continue from.
 
 | Name | Description |
 |------|-------------|
-| `length_from acc xs` | `acc` plus the length of `xs`. `length` is `length_from 0`. |
+| `length_from acc xs` | `acc` plus the length of `xs`. |
 | `reverse_from acc xs` | `xs` reversed, with `acc` left on the end: `reverse_from [9] [1,2,3]` is `[3, 2, 1, 9]`. This is `reverse` and `append` in one pass. |
 | `index_of_from i x xs` | Index of the first `x`, counting as if `xs` started at index `i`; `-1` if absent. `i` is an offset added to the answer, **not** a position to start searching from. |
 | `min_by_from best less xs` | The smallest of `best` and the elements of `xs`, by the comparator `less a b → bool`. Returns `best` unchanged on an empty list, which is how `minimum`/`maximum` get a seed without a special case for one-element lists. |
@@ -549,6 +551,8 @@ UTF-8 text. Derives `std.seq`, so it also exposes `sum`, `any`, `all`, `contains
 | `byte i s` | The byte at offset `i` as an integer, or `-1`. Works on a bigstr, where it is the way in. |
 | `find needle s` | Byte offset of `needle` in `s`, or `-1`. |
 | `find_from from needle s` | Byte offset of `needle` at or after `from`, or `-1`. |
+| `span set from s` | Past the run of bytes from `set` starting at byte offset `from`: the offset of the first byte that is not one of them, or `byte_length s`. `set` is a string read as the set of its bytes. |
+| `upto set from s` | The offset of the first byte from `set` at or after `from`, or `byte_length s` when there is none. |
 | `contains_str needle s` | `true` if `needle` appears anywhere in `s`. |
 | `starts_with prefix s` | `true` if `s` begins with `prefix`. |
 | `ends_with suffix s` | `true` if `s` ends with `suffix`. |

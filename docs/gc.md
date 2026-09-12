@@ -29,14 +29,32 @@ The heap is **generational**: two generations inside one process heap, a
 
 - **Nursery allocation.** New objects bump-allocate from dedicated nursery
   blocks. Collection can never run mid-reduction, so bump allocation is safe:
-  nothing decides anything about a safepoint at allocation time. When a nursery
-  block runs out, a fresh block is added (never a collection, and never a
-  failure); the high-water mark is what *a safepoint check* uses to decide a
-  minor collection is due. Nursery-soared objects carry a `GC_YOUNG` bit; the
-  rest carry `GC_OLD`. Both live in the `gc` byte alongside `GC_MARK` and
-  `GC_FREE`. Large objects (past the top of the class table, 4 KiB) allocate
-  straight into old space and tenure immediately: they are rare, often
-  long-lived, and copying one once to "save" the next copy is a bad swap.
+  nothing decides anything about a safepoint at allocation time. When the
+  current nursery block runs out the *next* one is taken, and only when there
+  is no next one is a block added (never a collection, and never a failure);
+  the high-water mark is what *a safepoint check* uses to decide a minor
+  collection is due. The cursor is an index rather than a pointer for exactly
+  that reason -- a minor collection empties every block and rewinds it to the
+  first, and a cursor left at the end would allocate a fresh block per
+  collection while the ones it had just emptied went untouched. Nursery-soared
+  objects carry a `GC_YOUNG` bit; the rest carry `GC_OLD`. Both live in the
+  `gc` byte alongside `GC_MARK` and `GC_FREE`. Large objects (past the top of
+  the class table, 4 KiB) allocate straight into old space and tenure
+  immediately: they are rare, often long-lived, and copying one once to "save"
+  the next copy is a bad swap.
+- **How big the nursery is.** Not chosen -- *earned*. A nursery is a bet that
+  most objects die young, and its size is how long they are given to do it: too
+  small and a collection promotes objects that were about to die anyway, which
+  is the expensive mistake, because promotion is a copy and everything copied
+  has to be scanned now and swept later. Too large and the collection's working
+  set leaves cache, and every process pays for memory it is not using -- which
+  a language expecting hundreds of thousands of processes cannot afford as a
+  default. So every heap starts at 64 KiB, and a minor collection that promoted
+  more than a quarter of what it looked at doubles it, up to 32 MiB
+  (`DREAM_NURSERY_MAX`). A process that allocates little never grows at all; a
+  compiler chewing through a syntax tree reaches the cap in the first second.
+  32 MiB is where the self-compile stops improving: below it collections are
+  more frequent for the same promotion, above it the extra memory buys nothing.
 - **Trigger.** `run_process` checks `should_collect()` (old space past its
   threshold, or nursery past its high-water mark) once per reduction, at the
   top of the loop ([interp.cpp:1301](dream/src/interp.cpp#L1301)). This is the
@@ -103,6 +121,16 @@ The heap is **generational**: two generations inside one process heap, a
   It is cheap, it never needs a lock, and the remembered set is per-heap. `dst`
   is logged only once per store; the set is drained (not deduplicated) at minor
   collection by scanning each logged object for young fields.
+
+- **Handing a reference to the collector.** `forward` is asked about every slot
+  of every object it promotes and every root, which in one self-compile is tens
+  of millions of times, and for most of them the answer is nothing: the slot
+  holds an immediate, or an object that is already old and that a minor
+  collection has no business touching. Both are decided inline in `heap.hpp`;
+  only a young object, one already forwarded this cycle, an indirection to fold
+  away, or the verifier recording a root reaches `forward_slow`. That split was
+  worth about a sixth of a compile on its own, because the inline half is two
+  instructions and the call it replaced was not.
 
 - **What this buys.** A minor collection touches only the young generation.
   Roughly 95% of the work in a typical compile is parse, and parse is
@@ -223,12 +251,23 @@ C++ local escapes, is what `--verify` will be asked to test first.
   surviving only through the barrier (the last is exactly the reference a
   careful reader must trust the barrier for), plus `DREAM_VERIFY_HEAP` walking
   the graph after every collection.
-- **Measure before Phase 2:** the bench compile numbers recorded when the
-  design was written (~12.6M reductions, 29 collections) predate the
-  generational split; rerun `dream --stats` and record the new minor/major
-  split, then decide whether Phase 2's concurrency is worth its coordination.
+- **Measured (2026-09-12).** `dream --stats` on the self-compile: 214M
+  reductions, 13 major and 48 minor collections, 1.54 GB allocated, 369 MB
+  promoted, 320 MB live at the heap's peak. `--stats` reports this from `os.exit!` as
+  well as from the end of `main`, which is what made the numbers reachable at
+  all: `dreams` ends by exiting, so anything only `main` printed was never
+  printed for the run anyone measures.
+
+  The number to read is the promotion: 369 MB out of 1.54 GB, against a peak
+  live set of 320 MB. Almost everything promoted is *still live when the
+  compile ends*, so it is not premature promotion and no nursery size fixes it
+  -- growing the cap to 128 MB moves promotion by a tenth and wall time not at
+  all. The collector's remaining cost is scanning what genuinely survives,
+  which is a reason to allocate less rather than to collect differently.
 - **Next:** Phase 2, starting with stop-the-world parallel mark/sweep across
-  idle workers (step 1 above), then the handshake.
+  idle workers (step 1 above), then the handshake. On the numbers above a
+  compile spends roughly a fifth of its time collecting, nearly all of it in
+  the scan of promoted objects -- which is the part step 1 parallelizes.
 
 The VM-side Phase 1 work sits alongside compiler work done in the same session:
 a `dreams` bug in lowered guarded match arms (a guarded arm's failing pattern

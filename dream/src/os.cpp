@@ -476,9 +476,12 @@ NativeResult os_exit(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_fixnum(v)) return fail(p, "type_error", "exit! needs an exit code");
     // Nothing runs after this, so anything the run owes its caller has to be
-    // said here. A profile that only printed on the way out of `main` would
-    // never print for a program that ends by exiting, which is most tools.
+    // said here. A measurement that only printed on the way out of `main`
+    // would never print for a program that ends by exiting, which is most
+    // tools -- `dreams` among them, so `--stats` on a compile said nothing at
+    // all until this line existed.
     p.runtime().print_profile();
+    p.runtime().print_stats();
     std::fflush(nullptr);
     std::_Exit(int(fixnum_value(v)));
 }

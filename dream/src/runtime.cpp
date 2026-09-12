@@ -30,6 +30,21 @@ Runtime::Runtime() : wk_(std::make_unique<WellKnownAtoms>()) {
     wk_->normal = intern_atom("normal");
     wk_->timeout = intern_atom("timeout");
     wk_->ok = intern_atom("ok");
+    wk_->out_of_bounds = intern_atom("out_of_bounds");
+    wk_->no_such_key = intern_atom("no_such_key");
+    // The names `type_of` answers with, in `dream_type` order. Interned once
+    // here rather than at every call: a fold that asks the type of its
+    // accumulator asks once per element.
+    static const char* const kTypeNames[] = {
+        "integer", "float",  "char",   "bool",   "unit",    "string",
+        "atom",    "list",   "array",  "map",    "pure_fn", "impure_fn",
+        "module",  "error",  "process", "unknown", "bigstr",
+    };
+    static_assert(std::size(kTypeNames) == DREAM_TYPE_BIGSTR + 1,
+                  "every surface type needs a name");
+    for (size_t i = 0; i < std::size(kTypeNames); ++i) {
+        wk_->types[i] = intern_atom(kTypeNames[i]);
+    }
 
     register_module(make_console_module());
     register_module(make_math_module());
@@ -87,6 +102,39 @@ void Runtime::print_profile() const {
     }
 }
 
+void Runtime::print_stats() const {
+    if (!stats_) return;
+    uint64_t reductions = scheduler_ ? scheduler_->total_reductions() : 0;
+    uint64_t major = 0, minor = 0, promoted = 0, allocated = 0;
+    size_t peak = 0;
+    // Every process, not just the root: a program that does its work in
+    // children -- which is what green processes are for -- would otherwise
+    // report a heap that never did anything.
+    //
+    // A counter belongs to the worker running its process, and this may be
+    // called from `os.exit!` while other workers are still running theirs, so
+    // a number here can be one collection out of date. That is the same
+    // bargain `std.vm.process_info!` makes for the same reason: a measurement
+    // is worth having slightly stale, and worth nothing if taking it needs an
+    // atomic on the allocation path.
+    for (const auto& p : all_processes()) {
+        const Heap& h = p->heap();
+        major += h.major_collections();
+        minor += h.minor_collections();
+        promoted += h.bytes_promoted();
+        allocated += h.bytes_total();
+        peak += h.bytes_peak();
+    }
+    std::fprintf(stderr,
+                 "; %llu reductions, %llu major + %llu minor collections\n"
+                 "; %llu bytes allocated, %llu promoted, %zu live at each heap's peak\n",
+                 static_cast<unsigned long long>(reductions),
+                 static_cast<unsigned long long>(major),
+                 static_cast<unsigned long long>(minor),
+                 static_cast<unsigned long long>(allocated),
+                 static_cast<unsigned long long>(promoted), peak);
+}
+
 Runtime::~Runtime() {
     // Stop the poller before the scheduler it wakes into can go away, and
     // close whatever descriptors the program left open.
@@ -131,13 +179,27 @@ void Runtime::size_caches() {
     field_cache_.swap(fields);
 }
 
+/// Intern every atom the image names, and remember the answer per index.
+///
+/// The map is the point: after this, evaluating a `:name` constant is one
+/// array read. Doing it the other way -- interning at each use -- meant a
+/// `std::string`, a mutex and a hash on a path that runs once per reduction.
 void Runtime::intern_image_atoms() {
-    for (uint32_t i = 0; i < image_->atom_count(); ++i) {
-        intern_atom(image_->atom_name(i).str());
+    const uint32_t n = image_->atom_count();
+    image_atom_ids_.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        StringRef name = image_->atom_name(i);
+        image_atom_ids_[i] = intern_atom(std::string_view(name.data, name.len));
     }
 }
 
-void Runtime::register_module(ModuleDef module) { modules_.push_back(std::move(module)); }
+void Runtime::register_module(ModuleDef module) {
+    // Number this module's members into the runtime-wide sequence, so a
+    // process can cache the function value for each in a flat array.
+    module.member_base = native_member_count_;
+    native_member_count_ += uint32_t(module.members.size());
+    modules_.push_back(std::move(module));
+}
 
 const ModuleDef* Runtime::module_for_import(uint32_t import_index) {
     if (import_index < import_defs_.size()) {
@@ -166,13 +228,14 @@ const ModuleDef* Runtime::find_module(const std::string& name) const {
     return nullptr;
 }
 
-uint32_t Runtime::intern_atom(const std::string& name) {
+uint32_t Runtime::intern_atom(std::string_view name) {
     std::lock_guard<std::mutex> g(atoms_mutex_);
+    // Transparent lookup: no `std::string` is built unless the name is new.
     auto it = atom_ids_.find(name);
     if (it != atom_ids_.end()) return it->second;
     uint32_t id = uint32_t(atom_names_.size());
-    atom_names_.push_back(name);
-    atom_ids_.emplace(name, id);
+    atom_names_.emplace_back(name);
+    atom_ids_.emplace(atom_names_.back(), id);
     return id;
 }
 

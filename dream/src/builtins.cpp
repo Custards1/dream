@@ -641,43 +641,26 @@ NativeResult core_error_payload(Process& p, Value, Value* args, uint32_t) {
 }
 
 NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
-    const char* name = "unknown";
-    switch (surface_type(args[0])) {
-        case DREAM_TYPE_INTEGER: name = "integer"; break;
-        case DREAM_TYPE_FLOAT: name = "float"; break;
-        case DREAM_TYPE_CHAR: name = "char"; break;
-        case DREAM_TYPE_BOOL: name = "bool"; break;
-        case DREAM_TYPE_UNIT: name = "unit"; break;
-        case DREAM_TYPE_STRING: name = "string"; break;
-        // Deliberately not `:string`. A big string is one only in what its
-        // bytes mean; handing it to a `:string` branch means handing that
-        // branch a value it may not concatenate, render or decode, and the
-        // point of a distinct name is that such a branch is never reached.
-        case DREAM_TYPE_BIGSTR: name = "bigstr"; break;
-        case DREAM_TYPE_ATOM: name = "atom"; break;
-        case DREAM_TYPE_LIST: name = "list"; break;
-        case DREAM_TYPE_ARRAY: name = "array"; break;
-        case DREAM_TYPE_MAP: name = "map"; break;
-        case DREAM_TYPE_MODULE: name = "module"; break;
-        case DREAM_TYPE_ERROR: name = "error"; break;
-        case DREAM_TYPE_PROCESS: name = "process"; break;
-        case DREAM_TYPE_PURE_FN: {
-            // Tell the two function types apart via the function record, which
-            // is where the compiler recorded the `!` on the name.
-            Value v = resolve(args[0]);
-            bool impure = false;
-            if (is_obj(v, ObjType::Closure)) {
-                auto* c = static_cast<ClosureObj*>(as_obj(v));
-                impure = (p.runtime().image().func(c->func).flags & FN_IMPURE) != 0;
-            } else {
-                impure = true;  // builtins and host natives perform effects
-            }
-            name = impure ? "impure_fn" : "pure_fn";
-            break;
+    // The names are interned at startup and looked up by `dream_type`, not
+    // built here: this is the cheapest builtin that forces its argument, so
+    // it is what strict folds use to force one, and it runs once per element.
+    // Interning the name at each call took the atom table's mutex and hashed
+    // a string constant twenty million times in a ten-million-element fold.
+    const WellKnownAtoms& wk = well_known(p.runtime());
+    dream_type t = surface_type(args[0]);
+    if (t == DREAM_TYPE_PURE_FN) {
+        // Tell the two function types apart via the function record, which is
+        // where the compiler recorded the `!` on the name.
+        Value v = resolve(args[0]);
+        bool impure = true;  // builtins and host natives perform effects
+        if (is_obj(v, ObjType::Closure)) {
+            auto* c = static_cast<ClosureObj*>(as_obj(v));
+            impure = (p.runtime().image().func(c->func).flags & FN_IMPURE) != 0;
         }
-        default: break;
+        if (impure) t = DREAM_TYPE_IMPURE_FN;
     }
-    return NativeResult::ok(make_atom(p.runtime().intern_atom(name)));
+    if (unsigned(t) > unsigned(DREAM_TYPE_BIGSTR)) t = DREAM_TYPE_UNKNOWN;
+    return NativeResult::ok(make_atom(wk.types[t]));
 }
 
 NativeResult bi_to_string(Process& p, Value, Value* args, uint32_t) {
@@ -1733,6 +1716,76 @@ NativeResult core_str_find(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_fixnum(-1));
 }
 
+// --- byte scanning ---
+//
+// A lexer's inner loop is "advance while the byte is one of these", and said in
+// Dream that is a recursion: a call, a `str_byte`, and a comparison chain per
+// byte. Skipping the indentation of one line cost a dozen reductions and the
+// allocations that go with them, and the compiler's own source is mostly
+// indentation and comments. These two answer the whole run at once.
+//
+// The set is a string because a set of bytes is what it is, and because that
+// keeps the pair general: `span s i " \t"` and `span s i alnum_bytes` are the
+// same operation. It is turned into a 256-bit table first, so a long set costs
+// no more per byte than a short one, and the setup is four stores and one per
+// member -- less than a single round trip through the machine.
+
+struct ByteSet {
+    uint64_t bits[4] = {0, 0, 0, 0};
+    explicit ByteSet(const Bytes& b) {
+        for (uint64_t i = 0; i < b.len; ++i) {
+            uint8_t c = uint8_t(b.data[i]);
+            bits[c >> 6] |= uint64_t(1) << (c & 63);
+        }
+    }
+    bool has(uint8_t c) const { return (bits[c >> 6] >> (c & 63)) & 1; }
+};
+
+/// Where a scan starts and stops, or false when the arguments are not a
+/// string, a set and an offset.
+bool scan_args(Process& p, Value* args, Bytes* text, Bytes* set, uint64_t* from) {
+    Value i = resolve(args[1]);
+    if (!string_bytes(args[0], text) || !is_fixnum(i) || !string_bytes(args[2], set)) return false;
+    int64_t k = fixnum_value(i);
+    *from = k < 0 ? 0 : uint64_t(k);
+    return true;
+}
+
+/// The first byte at or after `i` that is *not* in `set`, or the length of the
+/// string when there is none -- so a scan that reaches the end needs no more
+/// special-casing than `str_byte` does, which answers -1 there.
+NativeResult core_str_span(Process& p, Value, Value* args, uint32_t) {
+    Bytes text, set;
+    uint64_t i;
+    if (!scan_args(p, args, &text, &set, &i)) {
+        return type_fail(p, "str_span needs a string, an offset and a set of bytes");
+    }
+    const ByteSet in(set);
+    while (i < text.len && in.has(uint8_t(text.data[i]))) ++i;
+    return NativeResult::ok(make_fixnum(int64_t(i)));
+}
+
+/// The first byte at or after `i` that *is* in `set`, or the length of the
+/// string when there is none.
+NativeResult core_str_upto(Process& p, Value, Value* args, uint32_t) {
+    Bytes text, set;
+    uint64_t i;
+    if (!scan_args(p, args, &text, &set, &i)) {
+        return type_fail(p, "str_upto needs a string, an offset and a set of bytes");
+    }
+    // One byte is the common case -- the newline that ends a comment -- and
+    // `memchr` is worth several times a byte-at-a-time loop for it.
+    if (set.len == 1 && i < text.len) {
+        const void* hit = std::memchr(text.data + i, uint8_t(set.data[0]), size_t(text.len - i));
+        return NativeResult::ok(
+            make_fixnum(int64_t(hit ? uint64_t(static_cast<const char*>(hit) - text.data)
+                                    : text.len)));
+    }
+    const ByteSet in(set);
+    while (i < text.len && !in.has(uint8_t(text.data[i]))) ++i;
+    return NativeResult::ok(make_fixnum(int64_t(i)));
+}
+
 NativeResult core_str_byte(Process& p, Value, Value* args, uint32_t) {
     Bytes b;
     Value i = resolve(args[1]);
@@ -2096,6 +2149,8 @@ ModuleDef make_core_module() {
             {"str_slice", 3, 0b111, core_str_slice},
             {"str_find", 3, 0b111, core_str_find},
             {"str_byte", 2, 0b11, core_str_byte},
+            {"str_span", 3, 0b111, core_str_span},
+            {"str_upto", 3, 0b111, core_str_upto},
             // chars
             {"char_code", 1, 0b1, core_char_code},
             {"char_of_code", 1, 0b1, core_char_of_code},
