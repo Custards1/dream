@@ -106,6 +106,7 @@ void Runtime::print_stats() const {
     if (!stats_) return;
     uint64_t reductions = scheduler_ ? scheduler_->total_reductions() : 0;
     uint64_t major = 0, minor = 0, promoted = 0, allocated = 0;
+    uint64_t minor_ns = 0, major_ns = 0, rounds = 0;
     size_t peak = 0;
     // Every process, not just the root: a program that does its work in
     // children -- which is what green processes are for -- would otherwise
@@ -122,17 +123,24 @@ void Runtime::print_stats() const {
         major += h.major_collections();
         minor += h.minor_collections();
         promoted += h.bytes_promoted();
+        minor_ns += h.nanos_minor();
+        major_ns += h.nanos_major();
+        rounds += h.parallel_rounds();
         allocated += h.bytes_total();
         peak += h.bytes_peak();
     }
     std::fprintf(stderr,
                  "; %llu reductions, %llu major + %llu minor collections\n"
-                 "; %llu bytes allocated, %llu promoted, %zu live at each heap's peak\n",
+                 "; %llu bytes allocated, %llu promoted, %zu live at each heap's peak\n"
+                 "; %.0f ms stopped in collection (%.0f major, %.0f minor),"
+                 " %llu rounds divided across threads\n",
                  static_cast<unsigned long long>(reductions),
                  static_cast<unsigned long long>(major),
                  static_cast<unsigned long long>(minor),
                  static_cast<unsigned long long>(allocated),
-                 static_cast<unsigned long long>(promoted), peak);
+                 static_cast<unsigned long long>(promoted), peak,
+                 double(major_ns + minor_ns) / 1e6, double(major_ns) / 1e6,
+                 double(minor_ns) / 1e6, static_cast<unsigned long long>(rounds));
 }
 
 Runtime::~Runtime() {

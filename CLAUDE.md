@@ -151,7 +151,8 @@ be justified:
 ```
 dreams --time FILE       # what each stage of a compile cost
 dream --profile [N] IMG  # the hottest functions, by reductions
-dream --stats IMG        # reductions, collections, bytes allocated and promoted
+dream --stats IMG        # reductions, collections, bytes allocated and
+                         # promoted, and milliseconds stopped in collection
 ```
 
 A VM option goes **before** the image: `dream --stats build/dreams.dream ...`,
@@ -236,6 +237,16 @@ What has already been learnt from them, so it is not learnt twice:
   program. The tier decision is now one inlined atomic load with three states
   (compiled, rejected, still cold): see `Jit::tier`. The JIT is roughly neutral
   on the benchmarks either way, which is its own finding.
+- **A quarter of a self-compile was the collector, and now a ninth is.**
+  `--stats` reports the pause, which is what made the question askable: 831 ms
+  of a 3197 ms compile. The collection of one process now divides across a
+  pool of threads -- promotion behind a claim, marking behind an atomic mark
+  bit, the sweep by block -- which takes it to 304 ms and the compile to
+  2700 ms. [docs/gc.md](docs/gc.md) is the design and the log; what is worth
+  carrying away from it is that the three bugs which made the first parallel
+  collector *slower* than the serial one were all the same mistake -- paying a
+  synchronization cost per object instead of per batch -- and that none of
+  them were visible by reading the code.
 - **The VM is a shared library, and that is not free.** Without
   `-fno-semantic-interposition` a compiler must assume any global function in a
   `.so` can be interposed at load time, so every cross-TU call goes through the

@@ -2,9 +2,9 @@
 
 Where the VM's memory management is, and where it is going. This file is the
 design for the collector `dreams` grows into -- generational first, then
-concurrent -- and the log of how far each stage has got. If you are resuming
-work on the collector, read this first and then the "Where we are" section at
-the end.
+parallel, then concurrent -- and the log of how far each stage has got. If you
+are resuming work on the collector, read this first and then the "Where we
+are" section at the end.
 
 The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp`.
 
@@ -12,7 +12,9 @@ The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp
 
 - [x] Design written (2026-09-09).
 - [x] Phase 1 -- generational collection within a process heap (2026-09-09).
-- [ ] Phase 2 -- concurrent marking.
+- [x] Phase 2, step 1 -- the collection of one process divided across several
+      threads, still stopping that process (2026-09-12).
+- [ ] Phase 2, step 3 -- marking that overlaps the process's own reductions.
 - [ ] Later -- moving (copying or compacting) collection.
 
 ## The collector today
@@ -126,11 +128,13 @@ The heap is **generational**: two generations inside one process heap, a
   of every object it promotes and every root, which in one self-compile is tens
   of millions of times, and for most of them the answer is nothing: the slot
   holds an immediate, or an object that is already old and that a minor
-  collection has no business touching. Both are decided inline in `heap.hpp`;
-  only a young object, one already forwarded this cycle, an indirection to fold
-  away, or the verifier recording a root reaches `forward_slow`. That split was
-  worth about a sixth of a compile on its own, because the inline half is two
-  instructions and the call it replaced was not.
+  collection has no business touching. Both are decided inline, in
+  `forward_in`; only a young object, one already forwarded this cycle, or an
+  indirection to fold away reaches `forward_slow`. That split was worth about a
+  sixth of a compile on its own, because the inline half is two instructions
+  and the call it replaced was not. (`forward` itself, the entry point a
+  `RootSource` uses, is an ordinary call: it dispatches to one of the two
+  compiled shapes of `forward_in`, and the roots are a few thousand.)
 
 - **What this buys.** A minor collection touches only the young generation.
   Roughly 95% of the work in a typical compile is parse, and parse is
@@ -139,15 +143,97 @@ The heap is **generational**: two generations inside one process heap, a
   -- the syntax tree, the module tables, the interned-name maps that are still
   needed at the end -- to find a handful of nursery-sized garbage, the common
   collection now copies only what has been allocated since the last one.
-  `--stats` reports minor vs major collections and bytes promoted, because a
-  stall you cannot measure has not been diagnosed yet.
+  `--stats` reports minor vs major collections, bytes promoted, and the
+  milliseconds the process spent stopped in each kind, because a stall you
+  cannot measure has not been diagnosed yet.
 
 Nothing in old space ever moves, which is what makes collection safe at an
 interpreter safepoint with no native-stack scanning: nothing the interpreter
 holds in a C++ local ever moves (`alloc` never collects, and a major collection
 moves nothing at all). `DREAM_VERIFY_HEAP=1` re-traces the whole graph after
 every collection and aborts on the first inconsistency; after a minor the walk
-additionally requires that no reachable object is still young.
+additionally requires that no reachable object is still young. (That switch
+used to be compiled out unless the build defined `DREAM_DEBUG` or
+`DREAM_VERIFY_HEAP`, which no build here ever did -- so `just test-heap`
+verified nothing for as long as it existed. It is a runtime check now, read
+once into a `bool`, because one predictable branch per collection is not worth
+a switch that is off by accident.)
+
+## Collecting on more than one thread
+
+A collection is divided across several threads when there is enough of it to
+be worth the handshake. Everything above still holds -- the same generations,
+the same promotion, the same sweep -- and the process being collected is still
+stopped from its first reduction to its last. What changes is how many threads
+are inside the pause.
+
+- **Whose threads.** A small pool of its own
+  ([gc_pool.hpp](dream/src/gc_pool.hpp)), started on first use and asleep
+  otherwise. The plan below asks for "idle workers join in", and this is that
+  with the workers kept apart from the scheduler's: waking a scheduler worker
+  for
+  something that is not a process would put the collector inside the run
+  queue's handshake, the deadlock detector's idle count and `wait_for_all`,
+  and would leave the unit tests and an embedding host -- neither of which has
+  a scheduler -- with no collector threads at all. What the scheduler does
+  decide is *how many*: it hands the pool a pointer to its own count of idle
+  workers, and a collection recruits no more helpers than there are cores
+  nobody is using. A machine whose workers are all busy running processes
+  collects on one thread, which is the right answer.
+- **One heap at a time.** The pool is taken by whichever heap is collecting;
+  a second one does not queue for it, because queueing would make one
+  process's collection wait on another's and the waiting is the thing being
+  removed. It collects by itself instead. Every parallel path falls back on
+  the single-threaded one, which is always correct.
+- **How the work divides.** Each thread has its own grey set and its own
+  old-space chunks to promote into. A thread whose queue is long gives half of
+  it away to a stack the round shares; a thread with nothing takes a batch
+  back. The trace is over when every thread has arrived and all of them have
+  run out at once -- a grey object can only be on a thread's queue or on the
+  shared stack, and then neither holds one. The sweep divides more simply:
+  blocks are independent, so a thread takes the next one by an atomic
+  increment, and only the block list itself -- rebuilt once at the end -- is
+  anybody's to touch.
+- **Promoting from several threads.** Two threads reaching one young object
+  must not both copy it: two copies would be two objects, and a thunk forced
+  through one of them would still look unforced through the other. So
+  promotion is claimed: a compare-and-exchange flips the object's `gc` byte
+  from `GC_YOUNG` to `GC_BUSY`, the winner copies and then *release*-stores
+  `GC_FORWARDED`, and a loser spins until it sees that bit and uses the same
+  copy. The claim is also why the object's header is copied field by field
+  rather than inside the payload `memcpy`: `gc` is the one byte of an object
+  that another thread may be writing at that moment, so nothing may read it
+  plainly.
+- **Publishing a copy.** A promoted object is reached two ways -- through the
+  forwarding stub, and through whichever slot the collector rewrote to point
+  at it -- and both need the same edge. The stub has it from the release above.
+  The slot gets it because every slot the collector reads and writes during a
+  parallel round is read with `acquire` and written with `release`. Without
+  that a thread can see the pointer before it sees the bytes, and read a
+  header that still says whatever the chunk held before it was reused. On
+  x86-64 those are the same two instructions a plain load and store compile
+  to; saying which is not a cost, it is the difference between a collector
+  that works and one that works on this machine. `resolve` gets a collector's
+  copy for the same reason (`gc_resolve`), because the chain it walks is made
+  of exactly those slots.
+- **The mark is the claim too.** During a major, `GC_MARK` is set with an
+  atomic `fetch_or` and only the thread that saw the bit change scans the
+  object. So an object several threads reach is still scanned once.
+- **What does not divide.** A list. Scanning one cell yields exactly one more,
+  so the queue stays at length one however many threads are watching it, and
+  the trace is serial by construction. The collector notices this by itself --
+  nothing ever grows long enough to share, the other threads find no work and
+  go back to sleep -- which is the behaviour wanted, but it is worth knowing
+  that the shape of the heap, not the number of cores, is what decides whether
+  a pause shrinks.
+
+Three knobs, all read once:
+
+| Variable | What it does |
+|---|---|
+| `DREAM_GC_THREADS` | The most threads one collection may use, the collecting one included. Default `min(hardware_concurrency, 8)`; `1` turns the helpers off. |
+| `DREAM_GC_PAR_MIN` | Bytes of work under which a collection is not divided. Default 1 MiB for a minor, four times that for a major. `0` divides every collection however small, which is how the race detector gets to see the parallel collector on a program small enough to run under one. |
+| `DREAM_GC_TRACE` | Report every collection on stderr as it happens, with the per-thread split of a parallel round. `--stats` gives the totals; this gives their shape. |
 
 ## What a new design must not break
 
@@ -164,68 +250,119 @@ additionally requires that no reachable object is still young.
   reference at the safepoint is a root and must be rewritten; today the roots
   are exactly the locations in the root source, plus the remembered set, and
   short-lived C++ locals that never span a safepoint.
-- Only one process ever touches a heap's objects, so no barrier needs to be
-  atomic. The collection of one process must never stop another process:
-  that is what "never stops the world" means here.
+- Only one process ever touches a heap's objects, so the *mutator's* barrier
+  needs no atomic: the collector's threads are the only place atomics appear,
+  and they run only while the mutator is stopped. The collection of one
+  process must never stop another process: that is what "never stops the
+  world" means here, and it is why the thread pool is taken rather than
+  queued for.
+- A young object is promoted exactly once. Everything the language says about
+  sharing rests on it, and with several threads promoting it is a claim rather
+  than a fact -- see `GC_BUSY`. A missing claim is not something a test can
+  catch: the window is tens of nanoseconds wide. `just test-races` is what
+  catches it, and does.
 - A `Blackhole` and an `Indirect` are written into the *same* object size as
   the `Thunk` they replace (`static_assert` in
   [value.hpp](dream/src/value.hpp#L250)). Promotion must not change the shapes
   that this in-place overwrite relies on, and it does not: a chunk is copied
   with its bytes and sizes exactly as they were.
 
-## Why generational, why concurrent
+## Why generational, why parallel, why concurrent
 
 The generational argument is above and measured: parse is allocation-soup, and
 a minor collection's cost tracks what has been allocated since the last one,
-not the whole program. Concurrency keeps a process's GC pause from growing
-with its live set. That is a different and harder problem than parallelism: a
-worker is the only thread that may touch a process, so overlap means a *second*
-thread reading the heap while the worker mutates it. Phase 2 is where that
-coordination happens.
+not the whole program.
 
-Both matter most for the long-lived, allocation-heavy processes -- the
+Parallelism divides a pause by the number of threads that can be spared for
+it, and costs the mutator nothing, because the mutator is stopped either way.
+It is the cheap half: the only thing it needs from the language is that the
+roots are precise and that nothing moves except by promotion, both of which
+Phase 1 already required.
+
+Concurrency is the expensive half, and buys something different: it keeps a
+process's pause from growing with its live set at all, rather than dividing
+it. A worker is the only thread that may touch a process, so overlap means a
+second thread reading the heap while the worker mutates it -- and that is a
+coordination problem with the interpreter, not with the collector.
+
+All three matter most for the long-lived, allocation-heavy processes -- the
 compiler, the language server -- that made the decision to start here.
 
-## Phase 2 -- concurrent marking
+## Phase 2 -- step 1 done, the handshake still to come
 
-The honest shape: marking must overlap the *reductions of the owning process*,
-which requires a second thread reading the heap while the worker mutates it.
-The current design is not ready for that, because the worker may flip
-`o->type` between `Thunk`, `Blackhole` and `Indirect` -- the marker reading a
-type while it changes is a torn read, and torn reads are precisely the class
-of bug `DREAM_VERIFY_HEAP` exists to catch.
-
-The plan is a stop-for-sweep collector:
-
-- **Start** at a safepoint: the worker snapshots the roots and hands the heap
-  to a shared collector thread, then goes back to running the process.
-- **During marking** the worker keeps allocating and mutating. The mark
-  adopts snapshot semantics: it traces what was reachable when it started.
-  To stay sound it needs
-  - new allocations marked black (they are younger than the snapshot),
-  - the write barrier, while marking, to re-enqueue any value stored into an
-    object that has already been marked,
-  - and type flips (`Thunk`/`Blackhole`/`Indirect`) to be atomic or ordered
-    so the marker reads a whole type.
-- **Sweep** still stops the process: it mutates the block list and the free
-  lists, which are the things a running mutator touches. So the pause becomes
-  "sweep, plus the handshake," and the pause no longer grows with the live set
-  that survives.
-
-Simpler stepping stones if the handshake proves too much, in increasing order
-of ambition:
+The plan was three steps, in increasing order of ambition:
 
 1. **Parallel, still stopping**: when a process collects at its safepoint,
    idle workers join in -- parallel mark, parallel sweep across blocks. Wall
-   time shrinks, pause semantics unchanged, zero atomics.
+   time shrinks, pause semantics unchanged.
 2. **Incremental, same thread**: spend a budget of the mark per safepoint,
-   carrying the grey set across slices. No second thread, no atomics, but no
-   overlap with reductions either -- the pause is spread, not hidden.
-3. The stop-for-sweep design above.
+   carrying the grey set across slices. No second thread and no atomics, but
+   no overlap with reductions either -- the pause is spread, not hidden.
+3. **Stop-for-sweep**: marking overlaps the owning process's own reductions.
 
-Phase 2 starts as (1), which is a strictly additive step that shares the
-mutator coordination of nothing, and graduates to (3) when the atomics and
-the barrier are in place.
+Step 1 is done, and is described under "Collecting on more than one thread"
+above. Step 2 is not planned: it spreads a pause without shortening it, and
+step 1 shortens it, so the only reason to want step 2 was as a stepping stone
+to step 3 and it is not one.
+
+### What step 1 cost to get right
+
+Three things, each of which cost more than the parallelism was worth until it
+was found -- the first of them enough to make the parallel collector slower
+than the serial one -- and each found by measuring rather than by reading the
+code. They are recorded because every one of them is the same mistake in a
+different place: paying a coordination cost per object instead of per batch,
+or paying it at all when nobody was waiting.
+
+- **A lock per promoted object.** A thread promotes out of its own batch of
+  free chunks and refills the batch under a lock. When a size class had no
+  free chunks at all -- which is the common case once the free lists have been
+  drained -- every single promotion took the lock to be told so again. A
+  per-thread "this class is dry" bit fixed it, and is sound because nothing
+  puts a chunk back on a list until the round is over. This one change was the
+  difference between a parallel minor collection a quarter longer than the
+  serial one and one a little over half its length.
+- **Sleeping on an empty queue.** A thread that ran out of work waited on a
+  condition variable. The thread that was about to hand work over was running
+  *now*, so the wait was usually a fraction of a microsecond and the futex
+  round trip was tens of them; on the smaller collections the helpers were
+  still being woken when the trace ended. They spin first and sleep only after
+  a couple of thousand spins, which keeps a long serial tail from burning
+  seven cores to watch one.
+- **Asking the wrong question before sharing.** Handing work over was keyed on
+  the length of the local queue -- share when it exceeds some floor. But the
+  cost of sharing is the wake-up, and the floor cannot see whether anyone
+  needs waking. Keyed on "is any thread idle?" instead, with a much lower
+  floor, the same collections went from 502 ms to 304 ms.
+
+### What step 3 would still take
+
+Marking must overlap the *reductions of the owning process*, which means a
+thread reading the heap while the worker mutates it. What step 1 built is
+useful here and not sufficient: the threads, the work splitting, the claim
+protocol and the atomic mark bit all stay, but the mutator is no longer
+stopped, and that is the hard half.
+
+- **Start** at a safepoint: the worker snapshots the roots and hands the heap
+  to the collector threads, then goes back to running the process.
+- **During marking** the worker keeps allocating and mutating. The mark adopts
+  snapshot semantics: it traces what was reachable when it started. To stay
+  sound it needs
+  - new allocations marked black (they are younger than the snapshot),
+  - the write barrier, while marking, to re-enqueue any value stored into an
+    object that has already been marked,
+  - and the type flips (`Thunk`/`Blackhole`/`Indirect`) to be atomic or
+    ordered, so the marker reads a whole type. This is the one the current
+    design is furthest from: the mutator writes `o->type` in place, and while
+    the collector only reads it, a torn read is exactly the class of bug
+    `DREAM_VERIFY_HEAP` exists to catch.
+- **Sweep** still stops the process: it mutates the block list and the free
+  lists, which are the things a running mutator touches. So the pause becomes
+  "sweep, plus the handshake" -- and the sweep is already the cheap half and
+  already divided, which is worth knowing before starting: on the self-compile
+  a parallel sweep is about a third of a major and a major is about half the
+  collector's time, so step 3's best case is removing roughly the mark, and
+  the mark is what step 1 already cut by a factor of two and a half.
 
 ## Later -- moving collections
 
@@ -246,28 +383,74 @@ C++ local escapes, is what `--verify` will be asked to test first.
   JIT spill slot, C API), minor collection at the existing safepoint via the
   nursery high-water mark, promotion preserving `aux` and the cached hash,
   majors sweeping nursery blocks whole, and `--stats` reporting minor vs major
-  collections and bytes promoted. Covered by unit tests for the promotion path,
-  the "a minor leaves old space alone" property, and an old-to-young edge
-  surviving only through the barrier (the last is exactly the reference a
-  careful reader must trust the barrier for), plus `DREAM_VERIFY_HEAP` walking
-  the graph after every collection.
-- **Measured (2026-09-12).** `dream --stats` on the self-compile: 214M
-  reductions, 13 major and 48 minor collections, 1.54 GB allocated, 369 MB
-  promoted, 320 MB live at the heap's peak. `--stats` reports this from `os.exit!` as
-  well as from the end of `main`, which is what made the numbers reachable at
-  all: `dreams` ends by exiting, so anything only `main` printed was never
-  printed for the run anyone measures.
+  collections and bytes promoted.
+- **Done:** Phase 2 step 1 -- one process's collection divided across a pool of
+  threads, still stopping that process. Parallel promotion behind a claim,
+  parallel mark behind an atomic mark bit, parallel sweep by block, per-thread
+  chunk lists and carve blocks so that promotion needs no lock per object, and
+  a fallback to the single-threaded collector whenever the pool cannot help.
 
-  The number to read is the promotion: 369 MB out of 1.54 GB, against a peak
-  live set of 320 MB. Almost everything promoted is *still live when the
-  compile ends*, so it is not premature promotion and no nursery size fixes it
-  -- growing the cap to 128 MB moves promotion by a tenth and wall time not at
-  all. The collector's remaining cost is scanning what genuinely survives,
-  which is a reason to allocate less rather than to collect differently.
-- **Next:** Phase 2, starting with stop-the-world parallel mark/sweep across
-  idle workers (step 1 above), then the handshake. On the numbers above a
-  compile spends roughly a fifth of its time collecting, nearly all of it in
-  the scan of promoted objects -- which is the part step 1 parallelizes.
+  Covered by unit tests for the promotion path, the "a minor leaves old space
+  alone" property, an old-to-young edge surviving only through the barrier
+  (that last is exactly the reference a careful reader must trust the barrier
+  for), and two cases that build a heap large enough to be collected in
+  parallel and check that sharing and the live set come through it intact --
+  plus `DREAM_VERIFY_HEAP` walking the graph after every collection, and
+  `just test-races` over the whole end-to-end suite with `DREAM_GC_PAR_MIN=0`,
+  which puts every collection in every program through the parallel path.
+  ThreadSanitizer earned its place here: it found the two ordering bugs in the
+  first working version -- a promoted copy published into a slot without a
+  release, and `resolve` walking those slots without an acquire -- neither of
+  which the verifier or a byte-identical bootstrap could see.
+- **Measured (2026-09-12), before.** `dream --stats` on the self-compile: 214M
+  reductions, 14 major and 45 minor collections, 1.50 GB allocated, 338 MB
+  promoted, 276 MB live at the heap's peak, and **831 ms of a 3197 ms compile
+  stopped in collection** -- 26% of the whole run, 344 ms of it in majors and
+  487 ms in minors. `--stats` reports this from `os.exit!` as well as from the
+  end of `main`, which is what made the numbers reachable at all: `dreams`
+  ends by exiting, so anything only `main` printed was never printed for the
+  run anyone measures. The pause figure is new here, and is the reason any of
+  the rest of this could be judged.
+
+  The number to read alongside it is the promotion: 338 MB out of 1.50 GB,
+  against a peak live set of 276 MB. Almost everything promoted is *still live
+  when the compile ends*, so it is not premature promotion and no nursery size
+  fixes it -- growing the cap to 128 MB moves promotion by a tenth and wall
+  time not at all. The collector's cost is scanning what genuinely survives,
+  which is a reason to allocate less rather than to collect differently -- and,
+  since it is work that has to happen, a reason to do it on more than one
+  thread.
+
+- **Measured (2026-09-12), after.** The same compile, same schedule of
+  collections (14 major, 45 minor, byte-identical output), varying only how
+  many threads a collection may use:
+
+  | Threads | Stopped in collection | Wall |
+  |---|---|---|
+  | 1 | 831 ms (344 major, 487 minor) | 3194 ms |
+  | 2 | 562 ms (263, 299) | 2947 ms |
+  | 4 | 395 ms (193, 201) | 2773 ms |
+  | 6 | 325 ms (163, 162) | 2735 ms |
+  | 8 | 304 ms (153, 151) | 2700 ms |
+  | 16 | 303 ms (141, 162) | 2759 ms |
+
+  The unmodified collector runs the same compile in 3197 ms, and the new one
+  at one thread in 3194 ms: the serial path is the serial path, which is the
+  first thing to check of a change like this. At eight threads the collector
+  costs **2.7x less** and the compile is **16% shorter**.
+
+  Two things the table says that the totals do not. The curve flattens well
+  before the core count -- eight and sixteen threads are the same compile --
+  because tracing is bound by memory and not by arithmetic, which is why eight
+  is the default cap and the threads past it are better spent on processes.
+  And the *pause* falls further than the wall time does, which is the number
+  that matters for `lucid`: what a user notices is the longest stall, not the
+  throughput.
+
+- **Next:** Phase 2 step 3, the handshake that lets marking overlap the
+  process's own reductions. What it needs is written down above; the honest
+  estimate of what it is worth is there too, and it is smaller now than it was
+  before step 1.
 
 The VM-side Phase 1 work sits alongside compiler work done in the same session:
 a `dreams` bug in lowered guarded match arms (a guarded arm's failing pattern

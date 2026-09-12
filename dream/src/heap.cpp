@@ -1,11 +1,18 @@
 #include "heap.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
+#include <thread>
 #include <unordered_set>
+
+#include "gc_pool.hpp"
 
 namespace dream {
 
@@ -70,6 +77,28 @@ struct ClassTable {
 };
 constexpr ClassTable kClassOf{};
 static_assert(kHeapClassCount <= 256, "a class index has to fit in the table's byte");
+
+/// Set from DREAM_GC_TRACE: report every collection on stderr as it happens.
+/// Read once, because the collector asks twice per collection and the answer
+/// cannot change. `--stats` gives the totals; this gives the shape of them,
+/// which is what says whether a pause is one long collection or forty short
+/// ones, and whether the threads that joined in found anything to do.
+static bool gc_trace() {
+    static const bool on = [] {
+        const char* v = std::getenv("DREAM_GC_TRACE");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+/// A monotonic clock read, in nanoseconds. Two of these per collection is
+/// nothing against the collection itself, and a pause nobody measured is a
+/// pause nobody has diagnosed.
+inline uint64_t now_nanos() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
 
 /// The index of the smallest class that holds `bytes`. `bytes` must be a
 /// multiple of 8 no larger than the top class -- every caller has already
@@ -142,6 +171,7 @@ Heap::Block* Heap::new_block(size_t bytes) {
     b->size = size;
     b->used = 0;
     b->big = false;
+    b->dead = false;
     return b;
 }
 
@@ -421,59 +451,355 @@ Value Heap::make_module(uint32_t import_index, Value name) {
 // Collection
 // ---------------------------------------------------------------------------
 
-void Heap::mark_object(Value v) {
+/// One collector thread's private state, for the length of one collection.
+///
+/// Everything a tracing thread touches often lives here rather than in the
+/// heap: the grey set it is working through, the old-space chunks it promotes
+/// into, and the counters it will add to the heap's when it is finished. That
+/// is what lets a parallel round take a lock only when a thread runs out of
+/// something -- a batch of free chunks, a block to carve, work to do -- rather
+/// than once per object.
+struct Heap::GcCtx {
+    /// The grey set: marked or promoted, not yet scanned. A serial collection
+    /// points this at the heap's own queue, which keeps its capacity from one
+    /// collection to the next; a parallel one gives every thread its own and
+    /// balances them through the round's shared stack.
+    std::vector<Obj*>* q = nullptr;
+    std::vector<Obj*> own;
+    /// Objects still to scan before this thread next asks whether anyone else
+    /// has run out of work. Checking on every object would put a shared
+    /// counter on the hottest loop in the collector to answer a question whose
+    /// answer changes a few thousand times a second.
+    int check_in = 0;
+
+    /// Old space to promote into, private to this thread: chunks split off the
+    /// heap's free lists a batch at a time, and a block of its own to carve
+    /// from when they run out. Both are handed back when the round ends.
+    Block* carve_block = nullptr;
+    Obj* free_head[kHeapClassCount] = {};
+    Obj* free_tail[kHeapClassCount] = {};
+    /// Size classes whose shared list was found empty. Nothing puts a chunk
+    /// back on a list until the round is over, so "empty" stays true once it
+    /// is true -- and without remembering it, every promotion of a shape the
+    /// heap has none of spare would take the allocation lock to be told so
+    /// again, which is a lock per object and the whole cost of the round.
+    bool free_dry[kHeapClassCount] = {};
+
+    /// Added to the heap's counters when the round ends. Kept apart until then
+    /// so that no collector thread ever writes a heap-wide number.
+    size_t allocated = 0;
+    uint64_t promoted = 0;
+    uint64_t total = 0;
+    size_t live = 0;
+    /// Objects this thread took off a queue and scanned. Counted only in a
+    /// parallel round, where the question it answers -- did the work divide?
+    /// -- is the only one worth asking about a collector thread.
+    uint64_t scanned = 0;
+};
+
+/// What a parallel round shares. It lives on the collecting thread's stack for
+/// the length of the round and nowhere else.
+struct Heap::GcRound {
+    /// Guards the shared stack below, and the counters that decide when the
+    /// trace is over.
+    std::mutex mutex;
+    std::condition_variable cv;
+    /// Guards the heap's free lists and its block list. A separate lock from
+    /// the one above, and not for tidiness: a thread refills its chunk lists
+    /// while promoting, which is exactly when the other threads are handing
+    /// work around, and one lock for both would have promotion waiting on the
+    /// load balancer thousands of times a collection.
+    std::mutex alloc_mutex;
+
+    /// Work no thread has claimed. A thread with a long queue gives half of it
+    /// away and a thread with none takes a batch back, which is the whole of
+    /// the load balancing: the shape of a heap is not known before it is
+    /// traced, so the only honest way to divide the trace is to divide it as
+    /// it is found.
+    std::vector<Obj*> stack;
+    /// `stack.size()`, readable without the lock.
+    std::atomic<size_t> shared{0};
+    /// Threads that have run out of work and not yet found any. A tracing
+    /// thread reads this far more often than it changes, which is why it is an
+    /// atomic beside the count under the lock rather than the count itself.
+    ///
+    /// This, and not the size of the local queue, is the question worth
+    /// asking before giving work away: handing over a hundred objects costs a
+    /// lock, a copy and possibly a wake-up, and is worth it exactly when
+    /// somebody would otherwise be doing nothing.
+    std::atomic<unsigned> idle{0};
+
+    /// Threads that have reached the body, and threads that still have work.
+    /// Both are guarded by `mutex`, and it matters that they are: a thread
+    /// claiming work from the stack and a thread declaring itself out of work
+    /// have to be ordered against each other, or the second could conclude
+    /// that everyone is idle in the moment before the first says otherwise.
+    ///
+    /// The trace is over when every thread has arrived and every one of them
+    /// has run out at once -- a grey object could only be on a thread's own
+    /// queue or on the shared stack, and then neither holds one. Counting
+    /// arrivals is what makes a thread that was slow to wake safe: until it
+    /// has said it is here, the others may not conclude anything.
+    unsigned size = 0;
+    unsigned arrived = 0;
+    unsigned active = 0;
+    /// Threads asleep waiting for work. A thread giving work away wakes the
+    /// others only when there is someone to wake: a `notify_all` nobody is
+    /// listening for is a system call for nothing, and sharing happens often
+    /// enough that the nothings add up to more than the collection.
+    unsigned waiting = 0;
+    /// Read while spinning, so it cannot be guarded by the lock alone.
+    std::atomic<bool> done{false};
+
+    std::vector<GcCtx> ctxs;
+
+    /// The old blocks, snapshotted so that a parallel sweep can hand them out
+    /// by index, and the list can be rebuilt afterwards by the one thread that
+    /// owns it.
+    std::vector<Block*> blocks;
+    std::atomic<size_t> next_block{0};
+};
+
+namespace {
+
+/// Read an object's collector byte. In a parallel round another thread may be
+/// claiming the same object at this moment, so the read has to be spelled as
+/// an atomic one -- on the machines this runs on it is the same instruction,
+/// and saying so is what makes the claim protocol below mean anything.
+template <bool Par>
+inline uint8_t read_gc(Obj* o) {
+    if constexpr (Par)
+        return std::atomic_ref<uint8_t>(o->gc).load(std::memory_order_acquire);
+    else
+        return o->gc;
+}
+
+/// The same for a reference the collector is about to rewrite.
+///
+/// Two threads can reach one slot: an object logged twice in the remembered
+/// set is scanned twice, and both scans write the same answer into it. That
+/// much would be benign on every machine here. The ordering is not: the value
+/// written is usually a copy the writing thread has *just* made, and a slot is
+/// how the rest of the collection finds it. Without the release the reader can
+/// see the pointer before it sees the bytes -- and then read a header that is
+/// still whatever the chunk held before it was reused. The pair below is the
+/// second way a promoted object is published; the forwarding stub in `promote`
+/// is the first, and both need the same edge for the same reason.
+///
+/// On x86-64 these are the same two instructions a plain load and store
+/// compile to. Saying which is not a cost; it is the difference between a
+/// collector that works and one that works on this machine.
+template <bool Par>
+inline Value read_slot(Value* slot) {
+    if constexpr (Par)
+        return std::atomic_ref<Value>(*slot).load(std::memory_order_acquire);
+    else
+        return *slot;
+}
+
+template <bool Par>
+inline void write_slot(Value* slot, Value v) {
+    if constexpr (Par)
+        std::atomic_ref<Value>(*slot).store(v, std::memory_order_release);
+    else
+        *slot = v;
+}
+
+/// `resolve`, for a collector thread.
+///
+/// The chain it walks is made of ordinary object fields, and in a parallel
+/// round another thread may have written the last link a moment ago -- so
+/// every hop is an acquiring read, which is what makes the object behind it
+/// safe to look at at all. The mutator's `resolve` in value.hpp is the same
+/// walk without that, which is right for the mutator: it is stopped.
+template <bool Par>
+inline Value gc_resolve(Value v) {
+    if constexpr (!Par) {
+        return resolve(v);
+    } else {
+        while (is_ptr(v) && as_obj(v)->type == ObjType::Indirect) {
+            v = std::atomic_ref<Value>(static_cast<IndirectObj*>(as_obj(v))->target)
+                    .load(std::memory_order_acquire);
+        }
+        return v;
+    }
+}
+
+/// One spin of a wait that is expected to be over almost immediately.
+inline void spin_once() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+/// How long a local queue may get before half of it is offered to the others
+/// whatever they are doing, how short it may be and still be worth splitting
+/// for a thread that has nothing, and how much an idle thread takes back at a
+/// time. All three are in objects.
+///
+/// The floor is low because the cost it guards against is not the copy but the
+/// wake-up, and `idle` above already answers whether anyone needs waking. What
+/// no floor can help with is a trace with no parallelism in it: a list is the
+/// honest example -- scanning one cell yields exactly one more, so the queue
+/// stays at length one however many threads are watching it, and the right
+/// thing for the others to do is go back to sleep.
+constexpr size_t kShareAbove = 4096;
+constexpr size_t kShareMin = 32;
+constexpr size_t kTakeBatch = 512;
+/// Objects scanned between two looks at whether anyone else is idle.
+constexpr int kCheckEvery = 64;
+/// How long a thread with nothing to do waits before it sleeps, in spins.
+///
+/// The thread that is about to hand work over is running *now*, so the wait is
+/// usually a fraction of a microsecond -- and a futex round trip is tens of
+/// them. Sleeping immediately is what made the smaller collections run on one
+/// thread while seven others were still being woken: by the time they were up
+/// the trace was over. Sleeping eventually is what keeps a long serial tail
+/// -- a list, whose trace has no parallelism in it at all -- from burning
+/// seven cores to watch one.
+constexpr unsigned kIdleSpins = 2000;
+/// Chunks split off a shared free list in one go.
+constexpr unsigned kFreeBatch = 256;
+
+}  // namespace
+
+/// How much work makes the handshake worth it. Waking a pool of threads and
+/// joining them again costs tens of microseconds, so a collection that would
+/// have finished inside that is better done alone -- and most collections in
+/// most processes are exactly that. A minor is measured by the nursery it is
+/// about to empty, a major by the whole heap it is about to walk, and the
+/// major's floor is four times the minor's because a major also sweeps.
+///
+/// `DREAM_GC_PAR_MIN` moves the floor. Zero puts every collection through the
+/// parallel path however small it is, which is how the race detector gets to
+/// see the parallel collector on a program small enough to run under it.
+static size_t parallel_floor(bool minor) {
+    static const size_t base = [] {
+        if (const char* env = std::getenv("DREAM_GC_PAR_MIN")) {
+            long long n = std::atoll(env);
+            if (n >= 0) return size_t(n);
+        }
+        return size_t(1) << 20;
+    }();
+    return minor ? base : base * 4;
+}
+
+Value Heap::await_forward(Obj* o) {
+    std::atomic_ref<uint8_t> gc(o->gc);
+    unsigned spins = 0;
+    while ((gc.load(std::memory_order_acquire) & GC_FORWARDED) == 0) {
+        if (++spins < 64) {
+            spin_once();
+        } else {
+            // The claim covers one memcpy of at most four kilobytes, so
+            // getting this far means the claiming thread lost its core rather
+            // than that the copy is slow. Stand aside for it.
+            std::this_thread::yield();
+            spins = 0;
+        }
+    }
+    return forward_target(o);
+}
+
+template <bool Par>
+void Heap::mark_object(GcCtx& c, Value v) {
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
-    if (o->gc & GC_MARK) return;
+    if constexpr (Par) {
+        // The mark is the claim: whoever sets the bit owns the scan, so an
+        // object two threads reach at once is still scanned exactly once.
+        uint8_t prev = std::atomic_ref<uint8_t>(o->gc).fetch_or(
+            GC_MARK, std::memory_order_acq_rel);
+        if (prev & GC_MARK) return;
+    } else {
+        if (o->gc & GC_MARK) return;
+        o->gc |= GC_MARK;
+    }
 
     // Collapse indirection chains while marking. A long-running loop that
     // repeatedly updates thunks would otherwise accumulate hops that cost
     // time on every read; a collection is the natural place to shorten them.
-    // No one else observes the heap in the middle of a collection, so writing
-    // through one Indirect from here cannot race a reader.
+    // Only the thread that claimed the mark writes here, and the mutator is
+    // stopped, so this is still the single writer it was.
     if (o->type == ObjType::Indirect) {
-        static_cast<IndirectObj*>(o)->target = resolve(static_cast<IndirectObj*>(o)->target);
+        auto* ind = static_cast<IndirectObj*>(o);
+        write_slot<Par>(&ind->target, gc_resolve<Par>(read_slot<Par>(&ind->target)));
     }
 
-    // The mark rides alongside the generation bit: an old object stays old.
-    o->gc |= GC_MARK;
     // An atom object (Float, Str, Pid) has no references to forward, so it is
     // grey only in name; it never needs the worklist.
-    if (!is_atom_object(o->type)) scan_queue_.push_back(o);
+    if (!is_atom_object(o->type)) c.q->push_back(o);
 }
 
-void Heap::forward_slow(Value* slot) {
-    // While verifying, `forward` records roots instead of marking them.
-    if (recording_) {
-        recording_->push_back(*slot);
+template <bool Par>
+void Heap::forward_in(GcCtx& c, Value* slot) {
+    Value v = read_slot<Par>(slot);
+    if (!is_ptr(v)) return;
+    Obj* o = as_obj(v);
+    uint8_t gc = read_gc<Par>(o);
+    if (gc & (GC_YOUNG | GC_FORWARDED | GC_BUSY)) {
+        forward_slow<Par>(c, slot);
         return;
     }
+    // An Indirect is folded away by the slow path, which rewrites the slot
+    // with what it resolves to.
+    if (o->type == ObjType::Indirect) {
+        forward_slow<Par>(c, slot);
+        return;
+    }
+    if (full_trace_ && !(gc & GC_MARK)) mark_object<Par>(c, v);
+}
+
+template <bool Par>
+void Heap::forward_slow(GcCtx& c, Value* slot) {
     // A slot may hold an Indirect whose work is done. The copying collector
     // folded these by copying through them into the slot, so every reachable
     // slot came out of a collection holding the real value; readers rely on
     // that, not on resolving at the point of use. Nothing moves here, so the
     // way to keep the promise is to write the resolved value into the slot.
-    Value v = *slot;
+    Value v = read_slot<Par>(slot);
     if (is_ptr(v) && as_obj(v)->type == ObjType::Indirect) {
-        v = resolve(v);
-        *slot = v;
+        v = gc_resolve<Par>(v);
+        write_slot<Par>(slot, v);
     }
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
+    uint8_t gc = read_gc<Par>(o);
     // A young object is copied to old space and the slot rewritten to the
     // copy. A forwarded one is a young object already copied this cycle; its
     // first payload word holds the copy, so sharing survives promotion.
-    if (o->gc & GC_YOUNG) {
-        *slot = from_obj(promote(o));
+    if (gc & GC_YOUNG) {
+        if constexpr (Par) {
+            // Claim it before copying it. Two copies of one object would be
+            // two objects, and everything the language says about sharing --
+            // that forcing a thunk is visible to everyone holding it -- would
+            // stop being true across a collection.
+            uint8_t expect = GC_YOUNG;
+            if (!std::atomic_ref<uint8_t>(o->gc).compare_exchange_strong(
+                    expect, uint8_t(GC_YOUNG | GC_BUSY),
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                write_slot<Par>(slot, await_forward(o));
+                return;
+            }
+        }
+        write_slot<Par>(slot, from_obj(promote<Par>(c, o)));
         return;
     }
-    if (o->gc & GC_FORWARDED) {
-        *slot = forward_target(o);
+    if (gc & GC_FORWARDED) {
+        write_slot<Par>(slot, forward_target(o));
         return;
+    }
+    if constexpr (Par) {
+        if (gc & GC_BUSY) {
+            write_slot<Par>(slot, await_forward(o));
+            return;
+        }
     }
     // Old object: only a major collection wants it marked; a minor scans the
     // remembered set and promotes, and has no need to touch the rest.
-    if (full_trace_) mark_object(v);
+    if (full_trace_) mark_object<Par>(c, v);
 }
 
 /// Copy a nursery object to old space. The from-space chunk becomes a
@@ -481,94 +807,401 @@ void Heap::forward_slow(Value* slot) {
 /// payload word points at the copy -- so the second reference to it is
 /// rewritten to the same copy and sharing survives. Promoted objects are
 /// marked too during a major collection, so the sweep keeps them.
-Obj* Heap::promote(Obj* o) {
+///
+/// In a parallel round the caller has already claimed `o`, and the flip to
+/// GC_FORWARDED is what publishes the copy: every write below it is ordered
+/// before the release, so a thread that sees the bit sees a finished object.
+template <bool Par>
+Obj* Heap::promote(GcCtx& c, Obj* o) {
     uint32_t sz = o->bytes;
-    Obj* copy = carve(sz);
-    std::memcpy(copy, o, sz);
-    copy->gc = full_trace_ ? (GC_MARK | GC_OLD) : GC_OLD;
+    Obj* copy = gc_carve<Par>(c, sz);
+    // The header travels field by field rather than inside the payload copy,
+    // because `o->gc` is the one byte of the object that is not this thread's
+    // to read plainly: another thread may be attempting the claim on it at
+    // this very moment, and a plain read against an atomic write is a race
+    // whatever the bytes turn out to be. Everything else -- `aux`, the cached
+    // hash in the first payload word, the bytes themselves -- travels exactly
+    // as it was, which is what `AUX_DEEP_FORCED` and the string hash rely on.
+    copy->type = o->type;
+    copy->aux = o->aux;
+    copy->bytes = sz;
+    copy->gc = full_trace_ ? uint8_t(GC_MARK | GC_OLD) : uint8_t(GC_OLD);
+    std::memcpy(copy + 1, o + 1, size_t(sz) - sizeof(Obj));
     // Every class size is at least 16 bytes, so every chunk has a first
     // payload word to park the forwarding pointer in. The from-space chunk is
     // dead once the nursery is emptied, so the overwrite costs nothing.
     *reinterpret_cast<Value*>(o + 1) = from_obj(copy);
-    o->gc = GC_FORWARDED;
-    promoted_bytes_ += sz;
-    total_allocated_ += sz;
-    if (!is_atom_object(o->type)) scan_queue_.push_back(copy);
+    if constexpr (Par) {
+        std::atomic_ref<uint8_t>(o->gc).store(GC_FORWARDED, std::memory_order_release);
+    } else {
+        o->gc = GC_FORWARDED;
+    }
+    c.promoted += sz;
+    c.total += sz;
+    if (!is_atom_object(o->type)) c.q->push_back(copy);
     return copy;
 }
 
-void Heap::scan_object(Obj* o) {
+template <bool Par>
+void Heap::scan_object(GcCtx& c, Obj* o) {
     switch (o->type) {
         case ObjType::Cons: {
-            auto* c = static_cast<ConsObj*>(o);
-            forward(&c->head);
-            forward(&c->tail);
+            auto* x = static_cast<ConsObj*>(o);
+            forward_in<Par>(c, &x->head);
+            forward_in<Par>(c, &x->tail);
             break;
         }
         case ObjType::Array: {
             auto* a = static_cast<ArrayObj*>(o);
-            for (uint32_t i = 0; i < a->len; ++i) forward(&a->items()[i]);
+            for (uint32_t i = 0; i < a->len; ++i) forward_in<Par>(c, &a->items()[i]);
             break;
         }
         case ObjType::Map: {
             auto* m = static_cast<MapObj*>(o);
             uint32_t n = map_bit_count(m->bitmap);
-            for (uint32_t i = 0; i < n; ++i) forward(&m->slots()[i]);
+            for (uint32_t i = 0; i < n; ++i) forward_in<Par>(c, &m->slots()[i]);
             break;
         }
         case ObjType::MapLeaf: {
             auto* l = static_cast<MapLeafObj*>(o);
-            forward(&l->key);
-            forward(&l->value);
-            forward(&l->next);
+            forward_in<Par>(c, &l->key);
+            forward_in<Par>(c, &l->value);
+            forward_in<Par>(c, &l->next);
             break;
         }
         case ObjType::Closure: {
-            auto* c = static_cast<ClosureObj*>(o);
-            for (uint32_t i = 0; i < c->ncaps; ++i) forward(&c->caps()[i]);
+            auto* x = static_cast<ClosureObj*>(o);
+            for (uint32_t i = 0; i < x->ncaps; ++i) forward_in<Par>(c, &x->caps()[i]);
             break;
         }
         case ObjType::Thunk:
         case ObjType::Blackhole: {
             auto* t = static_cast<ThunkObj*>(o);
-            forward(&t->frame);
+            forward_in<Par>(c, &t->frame);
             break;
         }
         case ObjType::Indirect: {
             auto* ind = static_cast<IndirectObj*>(o);
-            forward(&ind->target);
+            forward_in<Par>(c, &ind->target);
             break;
         }
         case ObjType::Pap: {
             auto* p = static_cast<PapObj*>(o);
-            forward(&p->fn);
-            for (uint32_t i = 0; i < p->nargs; ++i) forward(&p->args()[i]);
+            forward_in<Par>(c, &p->fn);
+            for (uint32_t i = 0; i < p->nargs; ++i) forward_in<Par>(c, &p->args()[i]);
             break;
         }
         case ObjType::Frame: {
             auto* f = static_cast<FrameObj*>(o);
-            forward(&f->closure);
-            for (uint32_t i = 0; i < f->nslots; ++i) forward(&f->slots()[i]);
+            forward_in<Par>(c, &f->closure);
+            for (uint32_t i = 0; i < f->nslots; ++i) forward_in<Par>(c, &f->slots()[i]);
             break;
         }
         case ObjType::ErrorBox: {
             auto* e = static_cast<ErrorObj*>(o);
-            forward(&e->kind);
-            forward(&e->payload);
+            forward_in<Par>(c, &e->kind);
+            forward_in<Par>(c, &e->payload);
             break;
         }
         case ObjType::Module: {
-            forward(&static_cast<ModuleObj*>(o)->name);
+            forward_in<Par>(c, &static_cast<ModuleObj*>(o)->name);
             break;
         }
         case ObjType::Native: {
-            forward(&static_cast<NativeObj*>(o)->name);
+            forward_in<Par>(c, &static_cast<NativeObj*>(o)->name);
             break;
         }
         // Float, Str and Pid hold no references.
         default:
             break;
     }
+}
+
+void Heap::forward(Value* slot) {
+    // While verifying, `forward` records roots instead of marking them.
+    if (recording_) {
+        recording_->push_back(*slot);
+        return;
+    }
+    if (parallel_)
+        forward_in<true>(*root_ctx_, slot);
+    else
+        forward_in<false>(*root_ctx_, slot);
+}
+
+// ---------------------------------------------------------------------------
+// Promoting into old space from several threads at once
+// ---------------------------------------------------------------------------
+
+bool Heap::refill_free(GcCtx& c, size_t cls) {
+    if (c.free_dry[cls]) return false;
+    std::lock_guard<std::mutex> g(round_->alloc_mutex);
+    Obj* head = free_lists_[cls];
+    if (!head) {
+        c.free_dry[cls] = true;
+        return false;
+    }
+    // Take a bounded batch rather than the whole chain: the whole chain would
+    // leave every other thread carving fresh blocks while the space it was
+    // holding went unused.
+    Obj* tail = head;
+    for (unsigned n = 1; n < kFreeBatch && free_next(tail); ++n) tail = free_next(tail);
+    free_lists_[cls] = free_next(tail);
+    set_free_next(tail, nullptr);
+    c.free_head[cls] = head;
+    c.free_tail[cls] = tail;
+    return true;
+}
+
+Heap::Block* Heap::thread_block(uint32_t sz) {
+    // A block per thread, not a cursor shared between them. The waste is the
+    // tail of each thread's last block, which the next serial carve finds and
+    // fills; the alternative is a lock on every object promoted.
+    std::lock_guard<std::mutex> g(round_->alloc_mutex);
+    Block* b = new_block(sz);
+    b->next = blocks_;
+    blocks_ = b;
+    return b;
+}
+
+void Heap::merge_free_lists(Obj** head, Obj** tail) {
+    for (size_t i = 0; i < kHeapClassCount; ++i) {
+        if (!head[i]) continue;
+        set_free_next(tail[i], free_lists_[i]);
+        free_lists_[i] = head[i];
+        head[i] = nullptr;
+        tail[i] = nullptr;
+    }
+}
+
+template <bool Par>
+Obj* Heap::gc_carve(GcCtx& c, uint32_t sz) {
+    if constexpr (!Par) {
+        return carve(sz);
+    } else {
+        size_t i = class_index(sz);
+        Obj* o = c.free_head[i];
+        if (!o && refill_free(c, i)) o = c.free_head[i];
+        if (o) {
+            c.free_head[i] = free_next(o);
+            if (!c.free_head[i]) c.free_tail[i] = nullptr;
+            c.allocated += sz;
+            return o;
+        }
+        Block* b = c.carve_block;
+        if (!b || b->used + sz > b->size) {
+            b = thread_block(sz);
+            c.carve_block = b;
+        }
+        o = reinterpret_cast<Obj*>(b->data + b->used);
+        b->used += sz;
+        c.allocated += sz;
+        return o;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dividing the trace
+// ---------------------------------------------------------------------------
+
+void Heap::share_work(GcCtx& c) {
+    std::vector<Obj*>& q = *c.q;
+    size_t give = q.size() / 2;
+    if (give == 0) return;
+    bool wake;
+    {
+        std::lock_guard<std::mutex> g(round_->mutex);
+        // The *bottom* half. Work found early is nearer the roots, so it
+        // stands for a larger subgraph than the leaves on top, and a thread
+        // that takes it has something to do for a while.
+        round_->stack.insert(round_->stack.end(), q.begin(), q.begin() + ptrdiff_t(give));
+        round_->shared.store(round_->stack.size(), std::memory_order_relaxed);
+        wake = round_->waiting > 0;
+    }
+    q.erase(q.begin(), q.begin() + ptrdiff_t(give));
+    if (wake) round_->cv.notify_all();
+}
+
+/// Move a batch off the shared stack into `c`. The caller holds the lock.
+static void claim_batch(std::vector<Obj*>& stack, std::atomic<size_t>& shared,
+                        std::vector<Obj*>& into, size_t batch) {
+    size_t take = std::min(stack.size(), batch);
+    into.insert(into.end(), stack.end() - ptrdiff_t(take), stack.end());
+    stack.resize(stack.size() - take);
+    shared.store(stack.size(), std::memory_order_relaxed);
+}
+
+bool Heap::take_work(GcCtx& c) {
+    GcRound& r = *round_;
+    // `idle` is this thread's half of `r.active`: it has said it has nothing
+    // to do and has not taken it back. Every change of it happens under the
+    // lock, because it is what the end of the trace is decided from.
+    bool idle = false;
+    unsigned spins = 0;
+    for (;;) {
+        if (r.shared.load(std::memory_order_acquire) != 0) {
+            std::lock_guard<std::mutex> g(r.mutex);
+            if (!r.stack.empty()) {
+                if (idle) {
+                    ++r.active;
+                    r.idle.fetch_sub(1, std::memory_order_relaxed);
+                    idle = false;
+                }
+                claim_batch(r.stack, r.shared, *c.q, kTakeBatch);
+                return true;
+            }
+        }
+        if (!idle) {
+            // Out of work, and so is the shared stack. Say so; when the last
+            // thread that has arrived says so too, there is nowhere a grey
+            // object could still be and the trace is over.
+            std::unique_lock<std::mutex> lk(r.mutex);
+            idle = true;
+            r.idle.fetch_add(1, std::memory_order_relaxed);
+            if (--r.active == 0 && r.arrived == r.size) {
+                r.done.store(true, std::memory_order_release);
+                lk.unlock();
+                r.cv.notify_all();
+                return false;
+            }
+            continue;
+        }
+        if (r.done.load(std::memory_order_acquire)) return false;
+        if (++spins < kIdleSpins) {
+            spin_once();
+            continue;
+        }
+        // Long enough. Sleep, and let whoever finds work wake us.
+        std::unique_lock<std::mutex> lk(r.mutex);
+        ++r.waiting;
+        r.cv.wait(lk, [&] {
+            return r.done.load(std::memory_order_relaxed) || !r.stack.empty();
+        });
+        --r.waiting;
+        if (r.done.load(std::memory_order_relaxed)) return false;
+        ++r.active;
+        r.idle.fetch_sub(1, std::memory_order_relaxed);
+        claim_batch(r.stack, r.shared, *c.q, kTakeBatch);
+        return true;
+    }
+}
+
+template <bool Par>
+void Heap::drain(GcCtx& c) {
+    std::vector<Obj*>& q = *c.q;
+    for (;;) {
+        while (!q.empty()) {
+            Obj* o = q.back();
+            q.pop_back();
+            scan_object<Par>(c, o);
+            if constexpr (Par) {
+                ++c.scanned;
+                if (--c.check_in <= 0) {
+                    c.check_in = kCheckEvery;
+                    // Give work away when somebody is waiting for it, or when
+                    // the local queue has grown past what one thread can be
+                    // expected to get through on its own.
+                    if (q.size() >= kShareAbove ||
+                        (q.size() >= kShareMin &&
+                         round_->idle.load(std::memory_order_relaxed) != 0)) {
+                        share_work(c);
+                    }
+                }
+            }
+        }
+        if constexpr (!Par) {
+            return;
+        } else {
+            if (!take_work(c)) return;
+        }
+    }
+}
+
+bool Heap::trace_in_parallel(RootSource& roots, bool minor) {
+    size_t work = minor ? nursery_bytes_ : allocated_;
+    if (work < parallel_floor(minor)) return false;
+    GcPool& pool = GcPool::instance();
+    if (pool.capacity() < 2) return false;
+
+    GcRound round;
+    round.ctxs.resize(pool.capacity());
+    round_ = &round;
+    parallel_ = true;
+
+    bool ran = pool.run(pool.capacity(), [&](unsigned index, unsigned count) {
+        GcCtx& c = round.ctxs[index];
+        c.q = &c.own;
+        c.check_in = kCheckEvery;
+        {
+            std::lock_guard<std::mutex> g(round.mutex);
+            round.size = count;
+            ++round.arrived;
+            ++round.active;
+        }
+        // The roots are the collecting thread's own business: they are few,
+        // and they are the only part of the heap that lives outside it.
+        if (index == 0) {
+            root_ctx_ = &c;
+            roots.visit_roots(*this);
+            root_ctx_ = nullptr;
+        }
+        if (minor) {
+            // The remembered set divides by index. An object logged twice is
+            // scanned twice, possibly by two threads at once -- which is why
+            // a slot the collector rewrites is read and written atomically.
+            size_t n = remembered_.size();
+            size_t lo = n * index / count;
+            size_t hi = n * (index + 1) / count;
+            for (size_t k = lo; k < hi; ++k) scan_object<true>(c, remembered_[k]);
+        }
+        drain<true>(c);
+    });
+
+    parallel_ = false;
+    round_ = nullptr;
+    if (ran && gc_trace()) {
+        std::fprintf(stderr, ";   traced by");
+        for (GcCtx& c : round.ctxs) {
+            if (c.scanned) std::fprintf(stderr, " %llu", (unsigned long long)c.scanned);
+        }
+        std::fprintf(stderr, " objects per thread\n");
+    }
+    if (ran) {
+        for (GcCtx& c : round.ctxs) {
+            merge_free_lists(c.free_head, c.free_tail);
+            allocated_ += c.allocated;
+            promoted_bytes_ += c.promoted;
+            total_allocated_ += c.total;
+        }
+        ++parallel_collections_;
+    }
+    return ran;
+}
+
+void Heap::trace_alone(RootSource& roots, bool minor) {
+    // Every object that survives lands on the worklist at some point, so it
+    // wants room for a big fraction of everything that was alive. The queue
+    // retains its capacity across collects, but the live set grows, so a
+    // fresh peak collection reallocates it once -- then again at the next
+    // peak. Giving it a generous head start floors the size of the span it
+    // holds, so each collection amortizes the growth instead of reallocating
+    // a handful of times mid-collect. Nothing here is exact; it only has to
+    // be in the right decade.
+    if (scan_queue_.capacity() < allocated_ / size_t(16) + 1)
+        scan_queue_.reserve(allocated_ / size_t(16) + 1);
+    scan_queue_.clear();
+
+    GcCtx c;
+    c.q = &scan_queue_;
+    root_ctx_ = &c;
+    roots.visit_roots(*this);
+    root_ctx_ = nullptr;
+    if (minor) {
+        for (Obj* o : remembered_) scan_object<false>(c, o);
+    }
+    drain<false>(c);
+    promoted_bytes_ += c.promoted;
+    total_allocated_ += c.total;
 }
 
 void Heap::collect(RootSource& roots) {
@@ -590,37 +1223,23 @@ void Heap::grow_nursery_if_crowded(size_t promoted, size_t looked_at) {
 }
 
 void Heap::major_collect(RootSource& roots) {
-    // Every object that survives lands on the worklist at some point, so it
-    // wants room for a big fraction of everything that was alive. The queue
-    // retains its capacity across collects, but the live set grows, so a
-    // fresh peak collection reallocates it once -- then again at the next
-    // peak. Giving it a generous head start floors the size of the span it
-    // holds, so each collection amortizes the growth instead of reallocating
-    // a handful of times mid-collect. Nothing here is exact; it only has to
-    // be in the right decade.
-    if (scan_queue_.capacity() < allocated_ / size_t(16) + 1)
-        scan_queue_.reserve(allocated_ / size_t(16) + 1);
-    scan_queue_.clear();
-    full_trace_ = true;
+    const uint64_t started = now_nanos();
 
     // Mark. `forward` promotes every reachable young object -- copying it to
     // old space -- and marks the old ones. The roots are grey before anything
     // else; scanning turns them black and enqueues everything they point at,
     // until the worklist drains and the grey set is empty.
-    roots.visit_roots(*this);
-    while (!scan_queue_.empty()) {
-        Obj* o = scan_queue_.back();
-        scan_queue_.pop_back();
-        scan_object(o);
-    }
+    full_trace_ = true;
+    if (!trace_in_parallel(roots, /*minor=*/false)) trace_alone(roots, /*minor=*/false);
     full_trace_ = false;
+    const uint64_t marked = now_nanos();
 
     // Sweep. Every old block's chunk headers tile the block, so one walk over
     // each block sees every object: the marked ones stay put (and lose their
     // mark, for the next cycle), the rest go on their size class's free list.
     // Everything reachable in the nursery was promoted, so the whole nursery
     // is dead and is handed back.
-    sweep();
+    if (!sweep_in_parallel()) sweep();
     free_nursery();
     remembered_.clear();
 
@@ -642,28 +1261,26 @@ void Heap::major_collect(RootSource& roots) {
     nursery_hi_ = live_after_gc_ / 4 + initial_bytes_;
     if (nursery_hi_ > nursery_max_) nursery_hi_ = nursery_max_;
 
+    major_nanos_ += now_nanos() - started;
+    if (gc_trace())
+        std::fprintf(stderr, "; major: %zu live, %.2f ms mark, %.2f ms sweep\n",
+                     live_after_gc_, double(marked - started) / 1e6,
+                     double(now_nanos() - marked) / 1e6);
     verify_collect(roots, false);
 }
 
 void Heap::minor_collect(RootSource& roots) {
-    if (scan_queue_.capacity() < allocated_ / size_t(16) + 1)
-        scan_queue_.reserve(allocated_ / size_t(16) + 1);
-    scan_queue_.clear();
+    const uint64_t started = now_nanos();
     const uint64_t promoted_before = promoted_bytes_;
     const size_t looked_at = nursery_bytes_;
+    const size_t remembered_n = remembered_.size();
 
     // Trace. Roots have their young values promoted directly; each remembered
     // old object is scanned so a young value it was made to point at is
     // promoted too. Promotion copies reach every other young object through
     // the promoted one, so when the worklist drains, everything reachable is
     // in old space and the nursery is empty by construction.
-    roots.visit_roots(*this);
-    for (Obj* o : remembered_) scan_object(o);
-    while (!scan_queue_.empty()) {
-        Obj* o = scan_queue_.back();
-        scan_queue_.pop_back();
-        scan_object(o);
-    }
+    if (!trace_in_parallel(roots, /*minor=*/true)) trace_alone(roots, /*minor=*/true);
 
     // Every nursery block is now dead space; reset them all and rewind to the
     // first, so the next bump allocation refills the blocks we already have.
@@ -678,6 +1295,11 @@ void Heap::minor_collect(RootSource& roots) {
     ++minor_collections_;
     if (allocated_ > peak_live_) peak_live_ = allocated_;
     grow_nursery_if_crowded(size_t(promoted_bytes_ - promoted_before), looked_at);
+    minor_nanos_ += now_nanos() - started;
+    if (gc_trace())
+        std::fprintf(stderr, "; minor: %zu nursery, %llu promoted, %zu remembered, %.2f ms\n",
+                     looked_at, (unsigned long long)(promoted_bytes_ - promoted_before),
+                     remembered_n, double(now_nanos() - started) / 1e6);
 
     // A minor never touches old space, so `live_after_gc_` still says what the
     // last full collection measured; `bytes_allocated` reports the whole live
@@ -685,65 +1307,132 @@ void Heap::minor_collect(RootSource& roots) {
     verify_collect(roots, true);
 }
 
+// ---------------------------------------------------------------------------
+// Sweeping
+// ---------------------------------------------------------------------------
+
+void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live) {
+    if (b->big) {
+        // A dedicated block carries exactly one big object. It never joins
+        // a size class (its size is past the table), so the choice is
+        // keep it or hand the whole block back. Nothing else was ever
+        // carved into it, so freeing it cannot strand a live chunk.
+        Obj* o = reinterpret_cast<Obj*>(b->data);
+        if (o->gc & GC_MARK) {
+            o->gc &= ~GC_MARK;
+            live += o->bytes;
+        } else {
+            b->dead = true;
+        }
+        return;
+    }
+
+    // A shared block: its chunks tile it exactly, so one walk sees every
+    // object and always ends precisely at `used`.
+    size_t pos = 0;
+    while (pos < b->used) {
+        auto* o = reinterpret_cast<Obj*>(b->data + pos);
+        uint32_t sz = o->bytes;
+        pos += sz;
+        if (o->gc & GC_MARK) {
+            // Tenured objects keep their generation bit; only the cycle's
+            // mark is cleared.
+            o->gc &= ~GC_MARK;
+            live += sz;
+        } else if (o->gc & GC_FREE) {
+            // Alive on a list from an earlier cycle, untouched since. The
+            // free bit is what keeps us from pushing it a second time; it
+            // still points off its list head. Leave the header alone.
+        } else {
+            o->gc = GC_FREE;
+            size_t i = class_index(sz);
+            set_free_next(o, head[i]);
+            if (!head[i]) tail[i] = o;
+            head[i] = o;
+        }
+    }
+}
+
 void Heap::sweep() {
+    Obj* head[kHeapClassCount] = {};
+    Obj* tail[kHeapClassCount] = {};
     size_t live = 0;
     Block* prev = nullptr;
     for (Block* b = blocks_; b;) {
         Block* next = b->next;
-
-        if (b->big) {
-            // A dedicated block carries exactly one big object. It never joins
-            // a size class (its size is past the table), so the choice is
-            // keep it or hand the whole block back. Nothing else was ever
-            // carved into it, so freeing it cannot strand a live chunk.
-            Obj* o = reinterpret_cast<Obj*>(b->data);
-            if (o->gc & GC_MARK) {
-                o->gc &= ~GC_MARK;
-                live += o->bytes;
-                prev = b;
-            } else {
-                if (prev) prev->next = next;
-                else blocks_ = next;
-                if (carve_block_ == b) carve_block_ = nullptr;
-                free_block(b);
-            }
-            b = next;
-            continue;
+        sweep_block(b, head, tail, live);
+        if (b->dead) {
+            if (prev) prev->next = next;
+            else blocks_ = next;
+            if (carve_block_ == b) carve_block_ = nullptr;
+            free_block(b);
+        } else {
+            prev = b;
         }
-
-        // A shared block: its chunks tile it exactly, so one walk sees every
-        // object and always ends precisely at `used`.
-        size_t pos = 0;
-        while (pos < b->used) {
-            auto* o = reinterpret_cast<Obj*>(b->data + pos);
-            uint32_t sz = o->bytes;
-            pos += sz;
-            bool marked = (o->gc & GC_MARK) != 0;
-            if (marked) {
-                // Tenured objects keep their generation bit; only the cycle's
-                // mark is cleared.
-                o->gc &= ~GC_MARK;
-                live += sz;
-            } else if (o->gc & GC_FREE) {
-                // Alive on a list from an earlier cycle, untouched since. The
-                // free bit is what keeps us from pushing it a second time; it
-                // still points off its list head. Leave the header alone.
-            } else {
-                o->gc = GC_FREE;
-                size_t i = class_index(sz);
-                set_free_next(o, free_lists_[i]);
-                free_lists_[i] = o;
-            }
-        }
-        prev = b;
         b = next;
     }
+    merge_free_lists(head, tail);
     Block* cb = blocks_;
     while (cb && cb->big) cb = cb->next;
     carve_block_ = cb;
     live_after_gc_ = live;
     if (live > peak_live_) peak_live_ = live;
     allocated_ = live;
+}
+
+bool Heap::sweep_in_parallel() {
+    if (allocated_ < parallel_floor(/*minor=*/false)) return false;
+    GcPool& pool = GcPool::instance();
+    if (pool.capacity() < 2) return false;
+
+    // A sweep divides itself: the blocks are independent, a thread that
+    // finishes one takes the next, and nothing needs a lock until the lists
+    // are put back together. The one thing a thread may not do is touch the
+    // block list, which is why a dead big block is flagged and unlinked
+    // afterwards rather than where it is found.
+    GcRound round;
+    round.ctxs.resize(pool.capacity());
+    for (Block* b = blocks_; b; b = b->next) round.blocks.push_back(b);
+    round_ = &round;
+
+    bool ran = pool.run(pool.capacity(), [&](unsigned index, unsigned) {
+        GcCtx& c = round.ctxs[index];
+        for (;;) {
+            size_t i = round.next_block.fetch_add(1, std::memory_order_relaxed);
+            if (i >= round.blocks.size()) break;
+            sweep_block(round.blocks[i], c.free_head, c.free_tail, c.live);
+        }
+    });
+    round_ = nullptr;
+    if (!ran) return false;
+
+    size_t live = 0;
+    for (GcCtx& c : round.ctxs) {
+        merge_free_lists(c.free_head, c.free_tail);
+        live += c.live;
+    }
+
+    Block* head = nullptr;
+    Block* tail = nullptr;
+    for (Block* b : round.blocks) {
+        if (b->dead) {
+            free_block(b);
+            continue;
+        }
+        b->next = nullptr;
+        if (tail) tail->next = b;
+        else head = b;
+        tail = b;
+    }
+    blocks_ = head;
+    Block* cb = blocks_;
+    while (cb && cb->big) cb = cb->next;
+    carve_block_ = cb;
+    live_after_gc_ = live;
+    if (live > peak_live_) peak_live_ = live;
+    allocated_ = live;
+    ++parallel_collections_;
+    return true;
 }
 
 void Heap::verify_collect(RootSource& roots, bool expect_no_young) {
@@ -776,16 +1465,17 @@ bool Heap::owns(const void* p, size_t bytes) const {
 }
 
 bool Heap::verify_after_gc() {
-    #if defined(DREAM_DEBUG) || defined(DREAM_VERIFY_HEAP)
+    // Read once and answered from a bool thereafter, so that the collector
+    // pays one predictable branch for it. It used to be compiled out unless
+    // the build defined `DREAM_DEBUG` or `DREAM_VERIFY_HEAP` -- which no build
+    // here ever did, so the environment variable did nothing and `just
+    // test-heap` verified nothing. A branch per collection is not a cost worth
+    // a switch that is off by accident.
     static const bool on = [] {
         const char* v = std::getenv("DREAM_VERIFY_HEAP");
         return v && *v && std::strcmp(v, "0") != 0;
     }();
     return on;
-    #else
-        return false;
-    #endif
-    
 }
 
 namespace {

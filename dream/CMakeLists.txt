@@ -142,6 +142,7 @@ set(DREAM_SOURCES
   src/value.cpp
   src/image.cpp
   src/heap.cpp
+  src/gc_pool.cpp
   src/process.cpp
   src/interp.cpp
   src/builtins.cpp

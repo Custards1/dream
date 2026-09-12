@@ -8,6 +8,7 @@
 #include <chrono>
 
 #include "builtins.hpp"
+#include "gc_pool.hpp"
 #include "interp.hpp"
 
 namespace dream {
@@ -26,6 +27,10 @@ Scheduler::~Scheduler() { stop(); }
 
 void Scheduler::start() {
     if (running_.exchange(true)) return;
+    // A collection may borrow threads, but only as many as there are workers
+    // with nothing to run: the cores a process is using are not the
+    // collector's to take. See gc_pool.hpp.
+    GcPool::instance().set_idle_hint(&idle_workers_);
     for (unsigned i = 0; i < workers_.size(); ++i) {
         workers_[i]->thread = std::thread([this, i] { worker_loop(i); });
     }
@@ -33,6 +38,7 @@ void Scheduler::start() {
 
 void Scheduler::stop() {
     if (!running_.exchange(false)) return;
+    GcPool::instance().set_idle_hint(nullptr);
     work_cv_.notify_all();
     for (auto& w : workers_) {
         if (w->thread.joinable()) w->thread.join();
