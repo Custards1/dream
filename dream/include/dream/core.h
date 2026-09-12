@@ -35,7 +35,7 @@ typedef uint64_t dream_value;
 #define DREAM_VARIADIC 0xFFFFFFFFu
 
 /* The language's surface types, as reported by `type_of`.
- * The canonical list lives in dawnc/src/types.rs; these must stay in step. */
+ * The list in dreams must stay in step. */
 typedef enum dream_type {
     DREAM_TYPE_INTEGER = 0,
     DREAM_TYPE_FLOAT,
