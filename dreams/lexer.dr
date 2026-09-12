@@ -152,12 +152,13 @@ let rec skip_trivia s i col nl = {
 
 /// The `\u{HEX}` form. `[text, next]`, or `()` if it is malformed.
 ///
-/// A scalar above `0x10FFFF` is not a character, and `char_of_code` would
-/// raise on it -- which a pure lexer may not do -- so the range is checked
-/// here and a bad one is reported like any other malformed escape.
+/// A scalar above `0x10FFFF` is not a character, nor is a surrogate (`0xD800`
+/// to `0xDFFF`, half of a UTF-16 pair), and `char_of_code` would raise on
+/// either -- which a pure lexer may not do -- so the range is checked here and
+/// a bad one is reported like any other malformed escape.
 let rec hex_body s i acc seen =
     if core.str_byte s i == 125 {
-        if seen == 0 || acc > 1114111 { () }
+        if seen == 0 || acc > 1114111 || (acc >= 55296 && acc <= 57343) { () }
         else { [str.of_chars [core.char_of_code acc], i + 1] }
     }
     else if digit_value (core.str_byte s i) 16 >= 0 {
@@ -613,6 +614,10 @@ when test {
             $( test.eq! "unterminated string" (lex_error "\"oops") ),
         test.case "a bad unicode escape is an error"
             $( test.eq! "expected \\u{HEX}" (lex_error "\"\\u0041\"") ),
+        test.case "a surrogate escape is an error"
+            $( test.eq! "expected \\u{HEX}" (lex_error "\"\\u{D800}\"") ),
+        test.case "the scalar before the surrogates is not"
+            $( test.eq! ["\u{D7FF}"] (values "\"\\u{D7FF}\"") ),
         test.case "unterminated char"
             $( test.eq! "unterminated character literal" (lex_error "'ab'") ),
 

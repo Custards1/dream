@@ -63,7 +63,7 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `str_len` | `string\|bigstr → integer` | The byte length of the string. |
-| `str_chars` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). Raises `:type_error` on a bigstr. |
+| `str_chars` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). Bytes that do not spell a Unicode scalar value — a stray or truncated sequence, an overlong form, a surrogate, anything past U+10FFFF — each become U+FFFD, one per byte, so every char it yields is one `char_of_code` would accept. Raises `:type_error` on a bigstr. |
 | `str_of_chars` | `list of char → string` | Encodes a list of characters into a UTF-8 string. |
 | `str_of_bytes` | `list of integer → string` | Builds a string from raw byte values, each `0`–`255`. The inverse of `str_byte`, and the way to produce **binary** output: `str_of_chars` UTF-8-encodes its input, so byte `0x80` would become two bytes. Raises `:type_error` for a non-integer or a value outside `0`–`255`. A `0` byte is an ordinary byte and does not end the string. |
 | `str_slice` | `string\|bigstr → start:integer → len:integer → string\|bigstr` | Returns `len` bytes starting at byte offset `start`. Clamped silently — running past the end is how string-walking loops finish. A slice of a bigstr is another bigstr view, however small: no copy, at any size. |

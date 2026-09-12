@@ -1463,22 +1463,52 @@ NativeResult vm_eval_image(Process& p, Value, Value* args, uint32_t) {
 
 /// Decode one UTF-8 scalar starting at `i`, advancing it. Invalid bytes are
 /// returned as U+FFFD and consume one byte, so decoding always terminates.
+///
+/// Every char this produces is a Unicode scalar value, which is what a `char`
+/// is and what `char_of_code` insists on. The shape of the bytes is not enough
+/// for that: `C0 AF` has the shape of a two-byte sequence and spells `/` in
+/// more bytes than it needs, `ED A0 80` spells a surrogate, and `F4 90 80 80`
+/// spells a codepoint past U+10FFFF. An overlong form is the dangerous one --
+/// it lets a `/`, a quote or a NUL through anything that checked the bytes
+/// before decoding them -- and all three are ruled out by the same means: the
+/// lead byte narrows the range the *second* byte may take (RFC 3629, section 4).
 uint32_t utf8_next(const char* data, uint32_t len, uint32_t* i) {
-    auto byte = [&](uint32_t k) { return uint8_t(data[k]); };
-    uint32_t c = byte(*i);
-    uint32_t need = c < 0x80 ? 0 : (c >> 5) == 0x6 ? 1 : (c >> 4) == 0xE ? 2 : (c >> 3) == 0x1E ? 3 : 0xFF;
-    if (need == 0xFF || *i + need >= len + (need ? 0 : 1)) {
-        ++*i;
-        return 0xFFFD;
-    }
-    if (need == 0) {
+    uint8_t c = uint8_t(data[*i]);
+    if (c < 0x80) {
         ++*i;
         return c;
     }
-    uint32_t cp = c & (0x3F >> need);
+    uint32_t need;
+    uint32_t cp;
+    uint8_t lo = 0x80;
+    uint8_t hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) {
+        need = 1;
+        cp = c & 0x1F;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+        need = 2;
+        cp = c & 0x0F;
+        if (c == 0xE0) lo = 0xA0;  // below is overlong
+        if (c == 0xED) hi = 0x9F;  // above is a surrogate
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        need = 3;
+        cp = c & 0x07;
+        if (c == 0xF0) lo = 0x90;  // below is overlong
+        if (c == 0xF4) hi = 0x8F;  // above is past U+10FFFF
+    } else {
+        // A continuation byte with no lead, or a lead (C0, C1, F5..FF) that
+        // could only begin an overlong form or something past U+10FFFF.
+        ++*i;
+        return 0xFFFD;
+    }
+    // Counted as what is left rather than as `*i + need`, which cannot wrap.
+    if (len - *i <= need) {
+        ++*i;
+        return 0xFFFD;
+    }
     for (uint32_t k = 1; k <= need; ++k) {
-        uint32_t cc = byte(*i + k);
-        if ((cc & 0xC0) != 0x80) {
+        uint8_t cc = uint8_t(data[*i + k]);
+        if (cc < (k == 1 ? lo : 0x80) || cc > (k == 1 ? hi : 0xBF)) {
             ++*i;
             return 0xFFFD;
         }
@@ -1738,7 +1768,12 @@ NativeResult core_char_of_code(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_fixnum(v)) return type_fail(p, "char_of_code needs an integer");
     int64_t c = fixnum_value(v);
-    if (c < 0 || c > 0x10FFFF) return type_fail(p, "that is not a Unicode scalar value");
+    // A surrogate is half of a UTF-16 pair and not a character. Encoded as
+    // UTF-8 it is bytes that `str_chars` will not decode back, so letting one
+    // through here would break the round trip between the two.
+    if (c < 0 || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) {
+        return type_fail(p, "that is not a Unicode scalar value");
+    }
     return NativeResult::ok(make_char(uint32_t(c)));
 }
 

@@ -67,6 +67,27 @@ let rec hex4 cs n acc =
         if d < 0 { () } else { hex4 (list.tail cs) (n - 1) (acc * 16 + d) }
     };
 
+/// The character a `\uXXXX` escape stands for, and what follows it:
+/// `[char, rest]`.
+///
+/// Four hex digits cannot reach past U+FFFF, so JSON spells a character above
+/// it as two escapes, a UTF-16 surrogate pair. Half of a pair is not a
+/// character and `char_of_code` refuses one, so the halves are joined here. A
+/// half with no partner becomes U+FFFD -- what `str_chars` makes of bytes that
+/// do not spell a character -- rather than failing the whole document.
+let unicode_escape code cs =
+    if code < 55296 || code > 57343 { [core.char_of_code code, cs] }
+    else if code > 56319 || list.take 2 cs != ['\\', 'u'] { [core.char_of_code 65533, cs] }
+    else {
+        let low = hex4 (list.drop 2 cs) 4 0;
+        if low == () { [core.char_of_code 65533, cs] }
+        else if list.head low < 56320 || list.head low > 57343 { [core.char_of_code 65533, cs] }
+        else {
+            [core.char_of_code (65536 + (code - 55296) * 1024 + (list.head low - 56320)),
+             list.head (list.tail low)]
+        }
+    };
+
 /// The body of a string, after the opening quote. `acc` collects characters in
 /// reverse, because consing is constant time and reversing once at the end is
 /// cheaper than appending at every step.
@@ -93,9 +114,8 @@ let rec string_body cs acc =
                 let h = hex4 after 4 0;
                 if h == () { () }
                 else {
-                    let code = list.head h;
-                    let tail_after = list.head (list.tail h);
-                    string_body tail_after (list.cons (core.char_of_code code) acc)
+                    let u = unicode_escape (list.head h) (list.head (list.tail h));
+                    string_body (list.head (list.tail u)) (list.cons (list.head u) acc)
                 }
             }
             else { () }
@@ -320,6 +340,10 @@ when test {
         test.case "escaped solidus" $( test.eq! "a/b" (parsed "\"a\\/b\"") ),
         test.case "unicode escape"  $( test.eq! "A" (parsed "\"\\u0041\"") ),
         test.case "non-ascii escape" $( test.eq! "\u{e9}" (parsed "\"\\u00e9\"") ),
+        test.case "surrogate pair"  $( test.eq! "\u{1f600}" (parsed "\"\\ud83d\\ude00\"") ),
+        test.case "lone high surrogate" $( test.eq! "\u{fffd}A" (parsed "\"\\ud83dA\"") ),
+        test.case "high then not low" $( test.eq! "\u{fffd}A" (parsed "\"\\ud83d\\u0041\"") ),
+        test.case "lone low surrogate" $( test.eq! "\u{fffd}" (parsed "\"\\ude00\"") ),
 
         // structures
         test.case "empty array"    $( test.eq! [] (parsed "[]") ),
