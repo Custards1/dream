@@ -150,6 +150,11 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
             dump_node(img, n.a, depth + 1, out);
             dump_node(img, n.b, depth + 1, out);
             break;
+        case Op::Get: case Op::Set:
+            dump_node(img, n.a, depth + 1, out);
+            dump_node(img, n.b, depth + 1, out);
+            if (n.c != NO_NODE) dump_node(img, n.c, depth + 1, out);
+            break;
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or:

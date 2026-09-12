@@ -80,6 +80,15 @@ let map_e pairs span    = [:map, pairs, span];
 
 let match_e scrutinee arms span = [:match, scrutinee, arms, span];
 
+/// `c.[k]`, and `c.[k else d]` with something to answer when nothing is at the
+/// key -- `()` when there is not. A map is read by key, an array or a list by
+/// position.
+let get_e container key fallback span = [:get, container, key, fallback, span];
+
+/// `c.[k => v]` -- the container changed at `k`. The one it was given is left
+/// alone, as every value is.
+let set_e container key value span = [:set, container, key, value, span];
+
 // --- reading a node ---------------------------------------------------------
 
 let kind e = core.head e;
@@ -292,6 +301,9 @@ let rec show e =
         [:array, xs, _]     => "(array " + show_all xs + ")",
         [:map, pairs, _]    => "(map " + show_pairs pairs + ")",
         [:match, s, arms, _] => "(match " + show s + " " + show_arms arms + ")",
+        [:get, c, k, f, _]  =>
+            "(get " + show c + " " + show k + (match f { () => "", x => " " + show x }) + ")",
+        [:set, c, k, v, _]  => "(set " + show c + " " + show k + " " + show v + ")",
         [:let, n, ps, b, is_rec, _] =>
             "(let " + (if is_rec { "rec " } else { "" }) + n
             + (if list.is_empty ps { "" } else { " " + show_params ps }) + " " + show b + ")",

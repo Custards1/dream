@@ -205,29 +205,6 @@ let virtual_as_hole name v =
 let param_names ps =
     list.filter (fn n -> n != ()) (list.map (fn p -> ast.param_name p) ps);
 
-/// Does this tree mention `core`? Asked before any body is checked, because
-/// `std.core` is brought in automatically for a module that names it, and a
-/// module's globals have to be settled before the first one is looked up.
-///
-/// A structural search rather than a walk per node kind: the only thing that
-/// can be a use of `core` is a `[:name, "core", _]`, and no other node has that
-/// shape, so looking for it directly cannot drift out of step with the grammar.
-let rec mentions_name target e =
-    match e {
-        [:name, n, _] => n == target,
-        _ => if type_of e == :list { list.any (fn x -> mentions_name target x) e }
-             else { false },
-    };
-
-let item_mentions_core item =
-    match item {
-        [:let, _, _, body, _, _] => mentions_name "core" body,
-        // A map pattern's keys are expressions too.
-        [:let_p, pattern, body, _] => mentions_name "core" body || mentions_name "core" pattern,
-        [:virtual, _, _, body, _] => match body { () => false, b => mentions_name "core" b },
-        _ => false,
-    };
-
 // --- resolving a module path ---------------------------------------------------
 
 /// An import is resolved against the enclosing modules first, so that
@@ -398,7 +375,13 @@ let rec effective_items l mi seen =
 /// explicit import and a `let core = ..` both still win. Decided over the
 /// *effective* items, because inherited code needs the import as much as code
 /// written in place does.
-let declare_core mi items s = {
+///
+/// `std.core` is Dream source, and the loader has already brought it in for any
+/// module that names `core` (`modules.needs_core`), so the name is an alias of
+/// that module, as an import's would be. Where there was no standard library to
+/// find it in, the loader settled for the host's module of the same name, and
+/// `core` is that instead.
+let declare_core l mi items s = {
     let e = env_at s mi;
     let binds = core.map_has (aliases e) "core"
                 || list.any (fn oi ->
@@ -410,14 +393,17 @@ let declare_core mi items s = {
                            _ => false,
                        }) items;
     if binds { s }
-    else if list.any (fn oi -> item_mentions_core (list.nth 1 oi)) items {
-        {
-            let got = take_global s;
-            let g = list.nth 1 got;
-            let brought = take_import "std.core" "core" (list.head got);
-            set_env mi (with_global "core" :module g
-                            (with_alias "core" (native_ref "std.core" g) e))
-                    (record_global g "core" :module (list.nth 1 brought) (list.head brought))
+    else if list.any (fn oi -> modules.item_mentions_core (list.nth 1 oi)) items {
+        match modules.find l "std.core" {
+            () => {
+                let got = take_global s;
+                let g = list.nth 1 got;
+                let brought = take_import "std.core" "core" (list.head got);
+                set_env mi (with_global "core" :module g
+                                (with_alias "core" (native_ref "std.core" g) e))
+                        (record_global g "core" :module (list.nth 1 brought) (list.head brought))
+            },
+            target => set_env mi (with_alias "core" (dream_ref target) e) s,
         }
     }
     else { s }
@@ -634,7 +620,7 @@ let declare_items! l mi items s0 = {
             [:import, _, _, _, _] => declare_import l mi item acc,
             _ => acc,
         }) s2 items;
-    let with_core = declare_core mi pairs imported;
+    let with_core = declare_core l mi pairs imported;
     let collected = collect_lets l pairs [] with_core;
     let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
                              (list.nth 1 collected) (list.head collected);
@@ -665,7 +651,7 @@ let declare_module l mi s0 = {
         }) imported items;
 
     let effective = list.head (effective_items l mi []);
-    let with_core = declare_core mi effective derived;
+    let with_core = declare_core l mi effective derived;
 
     let collected = collect_lets l effective [] with_core;
     let virtuals = collect_virtuals effective [];
@@ -1325,6 +1311,13 @@ let rec check_expr c e r =
             pop_scope (list.fold (fn acc arm -> check_arm c arm acc) r2 arms)
         },
 
+        [:get, container, key, fallback, _] => {
+            let r1 = check_expr c key (check_expr c container r);
+            match fallback { () => r1, f => check_expr c f r1 }
+        },
+        [:set, container, key, value, _] =>
+            check_expr c value (check_expr c key (check_expr c container r)),
+
         // The hidden global behind a top-level destructuring. Its value takes a
         // slot, as a `match` subject does, because the pattern reads it more
         // than once and it is evaluated once.
@@ -1791,10 +1784,27 @@ let wrapper_of r mi source d = {
                     }
                 }
             },
+            // One `get` or `set` of the parameters is a wrapper as well --
+            // `let map_get m k d = m.[k else d]` -- and a call of it becomes
+            // that operation on the call's own arguments.
+            [:get, container, key, fallback, _] =>
+                op_wrapper params :get (match fallback { () => [container, key], f => [container, key, f] }),
+            [:set, container, key, value, _] => op_wrapper params :set [container, key, value],
             _ => (),
         }
     }
 };
+
+/// A wrapper whose body is one container operation: `[[:op, kind], plan, arity]`.
+/// The plan is the operands in order, and each is held to the rule a call's
+/// arguments are: a parameter used exactly once, or a literal.
+let op_wrapper params kind operands =
+    match wrapper_args params [] operands [] {
+        () => (),
+        plan =>
+            if params_all_used plan (list.length params) { [[:op, kind], plan, list.length params] }
+            else { () },
+    };
 
 /// Just the diagnostics, for a caller that only wants to know whether the
 /// program is well formed.
@@ -2127,6 +2137,24 @@ when test {
             $( test.eq! [:closure, 1]
                         { let src = "let f = fn x -> x;";
                           at (resolved! src) 0 0 (str.find "fn x" src) } ),
+
+        // --- wrappers ---
+        test.case "a body that is one get of its parameters is a wrapper"
+            $( test.eq! [:op, :get]
+                        (match core.map_pairs (wrappers (resolved! "let get m k d = m.[k else d];")) {
+                             [[_, w]] => list.head w,
+                             other => other,
+                         }) ),
+        test.case "so is one set"
+            $( test.eq! [:op, :set]
+                        (match core.map_pairs (wrappers (resolved! "let put m k v = m.[k => v];")) {
+                             [[_, w]] => list.head w,
+                             other => other,
+                         }) ),
+        // The rule a call's arguments are held to: a parameter used twice would
+        // put one argument's work in two places.
+        test.case "a get that uses a parameter twice is not"
+            $( test.eq! [] (core.map_pairs (wrappers (resolved! "let get m k = m.[k else k];"))) ),
 
         // --- what a language server would ask ---
         test.case "a module's globals are listed in declaration order"

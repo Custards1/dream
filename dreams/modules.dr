@@ -44,9 +44,65 @@ import dreams.path;
 /// compilable. It is deliberately not a wildcard: naming the module is what
 /// keeps a typo in an import an error rather than a mystery later.
 let native_modules =
-    ["std.console", "std.core", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.vm"];
+    ["std.console", "std.ffi", "std.io", "std.math", "std.native", "std.net", "std.os", "std.vm"];
 
 let is_native p = list.contains p native_modules;
+
+/// Modules that are Dream source where the source can be found, and the host's
+/// where it cannot. `std.core` is written in Dream (`mind/std/core.dr`), but the
+/// VM still answers to the name: every image built before it moved imports it
+/// that way, and a program compiled with no standard library on the path -- a
+/// script in `/tmp`, the VM's own test programs -- still has a `core` to reach.
+let host_fallbacks = ["std.core"];
+
+// --- `core`, without an import ----------------------------------------------------
+//
+// A module that names `core` and does not bind it gets `std.core` as though it
+// had imported it. The loader has to know that, and not only resolution: the
+// module is a file to load, and a dependency is loaded before whatever needs it,
+// which is what keeps a program's modules in dependency order with the root last.
+
+/// Does this tree mention `core`?
+///
+/// A structural search rather than a walk per node kind: the only thing that can
+/// be a use of `core` is a `[:name, "core", _]`, and no other node has that
+/// shape, so looking for it directly cannot drift out of step with the grammar.
+let rec mentions_name target e =
+    match e {
+        [:name, n, _] => n == target,
+        _ => if type_of e == :list { list.any (fn x -> mentions_name target x) e }
+             else { false },
+    };
+
+let item_mentions_core item =
+    match item {
+        [:let, _, _, body, _, _] => mentions_name "core" body,
+        // A map pattern's keys are expressions too.
+        [:let_p, pattern, body, _] => mentions_name "core" body || mentions_name "core" pattern,
+        [:virtual, _, _, body, _] => match body { () => false, b => mentions_name "core" b },
+        _ => false,
+    };
+
+/// Does a module with these items need `std.core` brought in? It names `core`,
+/// it does not bind the name itself, and it is not `std.core`, which would be
+/// importing itself. Resolution asks the same question more carefully, of what a
+/// module inherits as well as what it says; an answer that differs costs a
+/// module loaded for nothing, or `core` meaning the host's module, and neither
+/// changes what a program does.
+let needs_core name items =
+    name != "std.core"
+    && not (list.any (fn item ->
+                match item {
+                    [:let, "core", _, _, _, _] => true,
+                    [:import, segs, alias, _, _] =>
+                        (match alias { () => list.last segs, a => a }) == "core",
+                    _ => false,
+                }) items)
+    && list.any (fn item -> item_mentions_core item) items;
+
+/// A module's dependencies, `std.core` first when it needs one it did not write.
+let with_core name items deps =
+    if needs_core name items { core.cons ["std.core", ast.no_span] deps } else { deps };
 
 // --- a loaded module ---------------------------------------------------------
 
@@ -323,6 +379,8 @@ let rec load_named! l dotted at from_source =
     else if is_loading l dotted { cycle at dotted from_source l }
     else {
         match resolve_path! l dotted {
+            // No file, for a module the host provides when there is none.
+            () if list.contains dotted host_fallbacks => record_native dotted (mark_visited dotted l),
             // No module by that name -- but a *package* by that name is
             // `import std;`, which brings in everything the package provides.
             () => {
@@ -452,7 +510,7 @@ let rec hoist_mod! l parent source m =
                     // registered.
                     if find acc dep != () || local_module acc full dep != () { acc }
                     else { load_named! acc dep (list.nth 1 d) source }
-                }) (enter full (list.head nested)) (dependencies inner_items);
+                }) (enter full (list.head nested)) (with_core full inner_items (dependencies inner_items));
 
                 let recorded = leave followed;
                 let index = list.length (modules recorded);
@@ -524,7 +582,7 @@ let load_items! l source parsed display name file = {
                 // to search the file system for.
                 if local_module acc name dep != () { acc }
                 else { load_named! acc dep (list.nth 1 d) source }
-            }) (list.head hoisted) (dependencies items_out);
+            }) (list.head hoisted) (with_core name items_out (dependencies items_out));
 
             let recorded = leave followed;
             let index = list.length (modules recorded);

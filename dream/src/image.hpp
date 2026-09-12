@@ -44,6 +44,10 @@ enum class Op : uint8_t {
     And = 32, Or = 33,
     Neg = 34, Not = 35,
     MakeList = 36, MakeArray = 37, MakeMap = 38,
+    // Reading and changing a container: a map by key, an array or a list by
+    // position. Opcodes rather than natives so the element handed back is
+    // forced by the machine, not underneath a native call.
+    Get = 39, Set = 40,
     Count
 };
 

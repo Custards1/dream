@@ -174,6 +174,8 @@ What has already been learnt from them, so it is not learnt twice:
   is emitted as the call it stands for. `scope` records which globals are
   wrappers (see "wrappers" there); `lower` rewrites saturated calls of them.
   Roughly 13% of the reductions in a compile, and ~8% off any program that runs.
+  A body that is one `get` or `set` of the parameters is a wrapper too
+  (`let map_get m k d = m.[k else d]`), and a call of it is the opcode.
   The rule is deliberately narrow: one application, every parameter passed on
   exactly once, literals allowed. "At most once" is not enough -- an argument
   the wrapper ignores would never be lowered, and a lambda in that position was
@@ -259,6 +261,11 @@ happens, and it should stay that way.
 - `let [a, b] = pair` and `let f %{ :x => x } = ..` destructure with `match`'s
   patterns, lazily: the pattern is checked once, when a name it binds is first
   used. A literal in such a pattern is a compile error — that is a `match`.
+- `c.[k]`, `c.[k else d]` and `c.[k => v]` read and change a map (by key), an
+  array or a list (by position). They are opcodes (`get`, `set`), and
+  `core.head`/`map_get`/`map_put`/`array_get`/`array_set` are written as them in
+  [mind/std/core.dr](mind/std/core.dr). `std.core` is Dream; what it cannot say
+  it re-exports from the host module `std.native`.
 - Evaluation is lazy; `strict!` forces.
 - `when test { .. }` holds a module's tests, collected by compiling with
   `--test`. Tests are `test.case "name" $( test.eq! expected actual )`.

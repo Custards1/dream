@@ -33,7 +33,17 @@ Runtime::Runtime() : wk_(std::make_unique<WellKnownAtoms>()) {
 
     register_module(make_console_module());
     register_module(make_math_module());
-    register_module(make_core_module());
+    // `std.core` is Dream source now (mind/std/core.dr), and what it cannot
+    // say for itself it reaches through `std.native`. The host keeps answering
+    // to the old name as well: every image built before the move imports the
+    // module by it, the bootstrap seed among them, and so does a program
+    // compiled where no standard library can be found.
+    {
+        ModuleDef core = make_core_module();
+        register_module(core);
+        core.name = "std.native";
+        register_module(std::move(core));
+    }
     register_module(make_vm_module());
     register_module(make_ffi_module());
     register_module(make_io_module());

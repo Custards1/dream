@@ -781,6 +781,201 @@ void resolve_field(Process& p, Value obj, uint32_t name_index, uint32_t node_ind
 // One step
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Containers: `get` and `set`
+//
+// One pair of operations over every container a program builds: a map by key,
+// an array or a list by position. They are opcodes rather than natives because
+// of what a native must do with the element it hands back. A native's result
+// has to be a value, and an element is usually still a thunk, so a native
+// forces it underneath itself -- in a nested machine loop, on the C++ stack. A
+// map field updated twenty thousand times and never read is twenty thousand of
+// those nested inside each other the first time it is read, which was deep
+// enough to run the 8 MiB stack of a Nix builder out while the compiler compiled
+// itself. Here the element is entered like any other value, so its depth is
+// continuations: heap, with a limit that raises rather than a guard page.
+// ---------------------------------------------------------------------------
+
+/// Nothing at the key. When the `get` has a fallback, evaluate it and say so.
+bool get_fallback(Process& p, uint32_t at, Value frame) {
+    const Node& n = img_of(p).node(at);
+    if (n.c == NO_NODE) return false;
+    eval_node(p, n.c, frame);
+    return true;
+}
+
+inline uint32_t out_of_bounds_atom(Process& p) { return p.runtime().intern_atom("out_of_bounds"); }
+
+/// Step `remaining` more cells down a list and answer the head found there. A
+/// tail that is not a value yet is entered with a continuation to come back to,
+/// so a long lazy list is walked by the machine rather than by recursion.
+void list_get(Process& p, uint32_t at, Value cur, uint32_t remaining, uint32_t index, Value frame) {
+    for (;;) {
+        cur = resolve(cur);
+        if (!is_obj(cur, ObjType::Cons)) {
+            if (get_fallback(p, at, frame)) return;
+            do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                    "index " + std::to_string(index) +
+                                        " is past the end of a list of " +
+                                        std::to_string(index - remaining)));
+            return;
+        }
+        auto* cell = static_cast<ConsObj*>(as_obj(cur));
+        if (remaining == 0) {
+            enter(p, cell->head);
+            return;
+        }
+        --remaining;
+        Value tail = resolve(cell->tail);
+        if (!is_whnf(tail)) {
+            push_cont(p, ContKind::GetWalk, remaining, at, index, frame);
+            enter(p, tail);
+            return;
+        }
+        cur = tail;
+    }
+}
+
+/// Step `remaining` more cells down a list, keeping every cell passed on the
+/// value stack, and answer the list with the element at `index` replaced. The
+/// cells in front of it are new; everything behind it is shared, and so is
+/// every element but the one replaced.
+void list_set(Process& p, uint32_t at, Value cur, uint32_t remaining, uint32_t index, Value frame) {
+    for (;;) {
+        cur = resolve(cur);
+        const uint32_t walked = index - remaining;
+        if (!is_obj(cur, ObjType::Cons)) {
+            p.stack.resize(p.stack.size() - walked);
+            do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                    "index " + std::to_string(index) +
+                                        " is past the end of a list of " + std::to_string(walked)));
+            return;
+        }
+        if (remaining == 0) {
+            Value value = thunk_for(p, img_of(p).node(at).c, frame);
+            Value out = p.heap().make_cons(value, static_cast<ConsObj*>(as_obj(cur))->tail);
+            for (uint32_t i = 0; i < index; ++i) {
+                Value head = static_cast<ConsObj*>(as_obj(p.stack.back()))->head;
+                out = p.heap().make_cons(head, out);
+                p.stack.pop_back();
+            }
+            ret(p, out);
+            return;
+        }
+        p.stack.push_back(cur);
+        --remaining;
+        Value tail = resolve(static_cast<ConsObj*>(as_obj(cur))->tail);
+        if (!is_whnf(tail)) {
+            push_cont(p, ContKind::SetWalk, remaining, at, index, frame);
+            enter(p, tail);
+            return;
+        }
+        cur = tail;
+    }
+}
+
+inline bool is_sequence(Value v) {
+    return is_obj(v, ObjType::Array) || is_nil(v) || is_obj(v, ObjType::Cons);
+}
+
+/// `c.[k]` and `c.[k else d]`, with the container and the key both in hand.
+void container_get(Process& p, uint32_t at, Value container, Value key, Value frame) {
+    container = resolve(container);
+    key = resolve(key);
+    if (is_obj(container, ObjType::Map)) {
+        Value found;
+        if (map_lookup(p, container, key, &found)) {
+            enter(p, found);
+            return;
+        }
+        if (get_fallback(p, at, frame)) return;
+        do_raise(p, raise_error(p, p.runtime().intern_atom("no_such_key"),
+                                "the map has no key " + describe(p, key)));
+        return;
+    }
+    if (!is_sequence(container)) {
+        do_raise(p, type_error(p, "`.[ ]` reads a map, an array or a list, not " +
+                                      describe(p, container)));
+        return;
+    }
+    if (!is_fixnum(key)) {
+        do_raise(p, type_error(p, "a position is an integer, not " + describe(p, key)));
+        return;
+    }
+    const int64_t k = fixnum_value(key);
+    if (is_obj(container, ObjType::Array)) {
+        auto* a = static_cast<ArrayObj*>(as_obj(container));
+        if (k >= 0 && k < int64_t(a->len)) {
+            enter(p, a->items()[k]);
+            return;
+        }
+        if (get_fallback(p, at, frame)) return;
+        do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                "index " + std::to_string(k) + " is outside an array of " +
+                                    std::to_string(a->len)));
+        return;
+    }
+    if (k < 0 || k > int64_t(0xFFFFFFFFu)) {
+        if (get_fallback(p, at, frame)) return;
+        do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                "index " + std::to_string(k) + " is not a position in a list"));
+        return;
+    }
+    list_get(p, at, container, uint32_t(k), uint32_t(k), frame);
+}
+
+/// `c.[k => v]`, with the container and the key in hand. The value is stored
+/// unforced, as a map literal's values are.
+void container_set(Process& p, uint32_t at, Value container, Value key, Value frame) {
+    container = resolve(container);
+    key = resolve(key);
+    const uint32_t value_node = img_of(p).node(at).c;
+    if (is_obj(container, ObjType::Map)) {
+        Value value = thunk_for(p, value_node, frame);
+        ret(p, map_insert(p, container, key, value));
+        return;
+    }
+    if (!is_sequence(container)) {
+        do_raise(p, type_error(p, "`.[ => ]` changes a map, an array or a list, not " +
+                                      describe(p, container)));
+        return;
+    }
+    if (!is_fixnum(key)) {
+        do_raise(p, type_error(p, "a position is an integer, not " + describe(p, key)));
+        return;
+    }
+    const int64_t k = fixnum_value(key);
+    if (is_obj(container, ObjType::Array)) {
+        const uint32_t n = static_cast<ArrayObj*>(as_obj(container))->len;
+        if (k < 0 || k >= int64_t(n)) {
+            do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                    "index " + std::to_string(k) + " is outside an array of " +
+                                        std::to_string(n)));
+            return;
+        }
+        // A copy: the array given is a value, and someone else may hold it.
+        // A large array is allocated straight into old space, so every store
+        // into it goes through the barrier.
+        Value value = thunk_for(p, value_node, frame);
+        Value out = p.heap().make_array(n);
+        auto* src = static_cast<ArrayObj*>(as_obj(container));
+        auto* dst = static_cast<ArrayObj*>(as_obj(out));
+        for (uint32_t i = 0; i < n; ++i) {
+            Value item = uint32_t(k) == i ? value : src->items()[i];
+            dst->items()[i] = item;
+            p.heap().remember_if_old(dst, item);
+        }
+        ret(p, out);
+        return;
+    }
+    if (k < 0 || k > int64_t(0xFFFFFFFFu)) {
+        do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                "index " + std::to_string(k) + " is not a position in a list"));
+        return;
+    }
+    list_set(p, at, container, uint32_t(k), uint32_t(k), frame);
+}
+
 void step_eval(Process& p) {
     const Image& img = img_of(p);
     const Node& n = img.node(p.node);
@@ -933,6 +1128,13 @@ void step_eval(Process& p) {
             advance_map(p, n.a, n.b, 0, frame);
             return;
         }
+
+        // The container and then the key, each forced where everything else
+        // is: by the machine, with a continuation, and not underneath a native.
+        case Op::Get: case Op::Set:
+            push_cont(p, ContKind::IndexKey, 0, p.node, 0, frame);
+            eval_node(p, n.a, frame);
+            return;
 
         case Op::Nop: ret(p, UNIT); return;
         default:
@@ -1103,6 +1305,33 @@ void step_return(Process& p) {
             advance_map(p, c.a, c.b, c.c + 1, c.v1);
             return;
         }
+
+        case ContKind::IndexKey:
+            // The container is in hand. It waits on the value stack, where the
+            // collector can see it, while the key is forced.
+            p.stack.push_back(p.result);
+            push_cont(p, ContKind::IndexApply, 0, c.b, 0, c.v1);
+            eval_node(p, img_of(p).node(c.b).b, c.v1);
+            return;
+
+        case ContKind::IndexApply: {
+            Value container = p.stack.back();
+            p.stack.pop_back();
+            if (Op(img_of(p).node(c.b).op) == Op::Get) {
+                container_get(p, c.b, container, p.result, c.v1);
+            } else {
+                container_set(p, c.b, container, p.result, c.v1);
+            }
+            return;
+        }
+
+        case ContKind::GetWalk:
+            list_get(p, c.b, p.result, c.a, c.c, c.v1);
+            return;
+
+        case ContKind::SetWalk:
+            list_set(p, c.b, p.result, c.a, c.c, c.v1);
+            return;
     }
 }
 

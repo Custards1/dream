@@ -279,13 +279,56 @@ let rec field_tail c e ts =
         if at_end after { ok e ts }
         else {
             let nametok = list.head after;
-            if not (kind_of nametok == :ident) { ok e ts }
+            if kind_of nametok == :lbracket { parse_index c e (list.tail after) }
+            else if not (kind_of nametok == :ident) { ok e ts }
             else {
                 let full = ast.span_to (ast.span e)
                     (ast.span_of (lexer.span_start nametok) (lexer.span_end nametok));
                 field_tail c (ast.field_e e (lexer.value nametok) full) (list.tail after)
             }
         }
+    };
+
+/// `c.[k]`, `c.[k else d]` and `c.[k => v]`: a container read at a key, read
+/// with something to answer when the key is not there, and changed at a key.
+/// One spelling for maps, arrays and lists, because it is one pair of
+/// operations on all three -- the container decides what a key means.
+///
+/// The dot is what tells indexing from application: `f [0]` passes a list to
+/// `f`, and `xs.[0]` reads one. Inside, the brackets group as every bracket in
+/// the language does. It is postfix, so it binds as tightly as `.field` and
+/// chains the same way: `grid.[y].[x]`.
+let rec parse_index c e ts =
+    match parse_expr (grouped c) ts {
+        [:error, m, s] => err m s,
+        [:ok, key, rest] =>
+            if at rest :rbracket {
+                field_tail c (ast.get_e e key () (ast.span_to (ast.span e) (peek_span rest)))
+                           (list.tail rest)
+            }
+            else if is_kw rest "else" {
+                index_operand c e (list.tail rest) (fn d span -> ast.get_e e key d span)
+            }
+            else if at rest :fat_arrow {
+                index_operand c e (list.tail rest) (fn v span -> ast.set_e e key v span)
+            }
+            else {
+                err ("expected `]`, `else` or `=>` after the key in `.[ ]`, found " + describe rest)
+                    (peek_span rest)
+            },
+    };
+
+/// What follows the `else` of `.[k else d]` or the `=>` of `.[k => v]`, up to
+/// the closing bracket.
+let rec index_operand c e ts build =
+    match parse_expr (grouped c) ts {
+        [:error, m, s] => err m s,
+        [:ok, operand, rest] =>
+            match expect rest :rbracket "`]` to close `.[`" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest2] =>
+                    field_tail c (build operand (ast.span_to (ast.span e) (peek_span rest))) rest2,
+            },
     };
 
 // --- primaries --------------------------------------------------------------
@@ -1253,6 +1296,22 @@ when test {
                         (shape "console.print! \"hi\"") ),
         test.case "nested members"
             $( test.eq! "(field (field (name a) b) c)" (shape "a.b.c") ),
+
+        // --- reading and changing a container ---
+        test.case "a container read at a key"
+            $( test.eq! "(get (name m) (atom k))" (shape "m.[:k]") ),
+        test.case "a read with a fallback"
+            $( test.eq! "(get (name m) (atom k) (int 0))" (shape "m.[:k else 0]") ),
+        test.case "a container changed at a key"
+            $( test.eq! "(set (name m) (atom k) (binary add (name v) (int 1)))" (shape "m.[:k => v + 1]") ),
+        test.case "indexing chains and binds tighter than application"
+            $( test.eq! "(apply (name f) (get (get (name grid) (name y)) (name x)))"
+                        (shape "f grid.[y].[x]") ),
+        // The dot is the whole difference.
+        test.case "without the dot a bracket is still an argument"
+            $( test.eq! "(apply (name f) (list (int 0)))" (shape "f [0]") ),
+        test.case "an index needs its closing bracket"
+            $( test.true! (str.contains_str "`]`" (fails "m.[:k")) ),
 
         // --- collections ---
         test.case "list"    $( test.eq! "(list (int 1) (int 2))" (shape "[1, 2]") ),

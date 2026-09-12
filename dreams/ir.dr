@@ -74,6 +74,14 @@ let ops = [
     [:make_list, 36, "list"], [:make_array, 37, "array"],
     /// `a` = kids offset, `b` = pair count; kids are `k0, v0, k1, v1, ..`.
     [:make_map, 38, "map"],
+
+    /// `a` = container, `b` = key, `c` = what to answer when nothing is at that
+    /// key, or absent to raise instead. A map by key; an array or a list by
+    /// position.
+    [:get, 39, "get"],
+    /// `a` = container, `b` = key, `c` = the new value, stored unforced. The
+    /// answer is the container changed at that key; the one given is untouched.
+    [:set, 40, "set"],
 ];
 
 let rec find_op key at ops_left =
@@ -351,6 +359,11 @@ let show_node img i n = {
             :bind        => "@" + to_string (node_a n) + " = " + to_string (node_b n),
             :make_closure => "fn" + to_string (node_a n),
             :make_thunk  => "fn" + to_string (node_a n),
+            :get         => to_string (node_a n) + "[" + to_string (node_b n)
+                            + (if is_node (node_c n) { " else " + to_string (node_c n) } else { "" })
+                            + "]",
+            :set         => to_string (node_a n) + "[" + to_string (node_b n) + " => "
+                            + to_string (node_c n) + "]",
             _ => str.join_str " " (list.filter (fn x -> x != "")
                      (list.map (fn e -> if is_node e { to_string e } else { "" })
                                [node_a n, node_b n, node_c n])),

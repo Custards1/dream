@@ -86,6 +86,13 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
             out.push_back(n.a);
             out.push_back(n.b);
             break;
+        case Op::Get: case Op::Set:
+            // A `get`'s fallback is optional, and absent is `NO_NODE`, which
+            // the walks skip as they skip an `if` with no `else`.
+            out.push_back(n.a);
+            out.push_back(n.b);
+            out.push_back(n.c);
+            break;
         default:
             break;
     }
@@ -134,6 +141,8 @@ const char* op_name(Op op) {
         case Op::MakeList: return "list";
         case Op::MakeArray: return "array";
         case Op::MakeMap: return "map";
+        case Op::Get: return "get";
+        case Op::Set: return "set";
         default: return "<bad op>";
     }
 }
@@ -476,6 +485,13 @@ bool Image::validate(std::string& error) {
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or:
                 if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad binary operand");
+                break;
+            case Op::Get:
+                if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad get operand");
+                if (n.c != NO_NODE && !node_ok(n.c)) return fail("bad get fallback");
+                break;
+            case Op::Set:
+                if (!node_ok(n.a) || !node_ok(n.b) || !node_ok(n.c)) return fail("bad set operand");
                 break;
             default: break;
         }

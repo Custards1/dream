@@ -31,6 +31,10 @@ const char* cont_kind_name(ContKind k) {
         case ContKind::NativeArg: return "native_arg";
         case ContKind::NativeRetry: return "native_retry";
         case ContKind::MapEntry: return "map_entry";
+        case ContKind::IndexKey: return "index_key";
+        case ContKind::IndexApply: return "index_apply";
+        case ContKind::GetWalk: return "get_walk";
+        case ContKind::SetWalk: return "set_walk";
     }
     return "?";
 }

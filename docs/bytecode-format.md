@@ -122,8 +122,20 @@ lazy VM cannot work out for itself:
 | 34–35 | `neg` `not` | operand | | |
 | 36–37 | `list` `array` | `KIDS` offset | element count | |
 | 38 | `map` | `KIDS` offset | pair count (`2n` kids: `k0 v0 k1 v1 …`) | |
+| 39 | `get` | container | key | fallback, or `NO_NODE` |
+| 40 | `set` | container | key | value |
 
 A `block` evaluates to its last statement. An empty block evaluates to unit.
+
+`get` and `set` are generic over containers: a map by key, an array or a list by
+position. Both force the container and then the key. A `get` enters the element
+it finds -- the machine forces it, not the operation -- and, when there is none,
+evaluates its fallback, or raises `:no_such_key` for a map and `:out_of_bounds`
+for an array or a list when it has none. A `set` stores its value unforced and
+answers a new container: a copy of an array, the changed path of a map's trie,
+or the cells of a list in front of the position, with everything behind it
+shared. The container it was given is unchanged. A list is walked a cell at a
+time on the continuation stack, never recursively.
 
 ### Function record (32 bytes)
 

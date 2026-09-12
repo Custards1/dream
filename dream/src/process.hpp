@@ -44,6 +44,11 @@ enum class ContKind : uint8_t {
     NativeArg,   // a = stack base, b = argc, c = index just forced, v1 = callee
     NativeRetry, // a = stack base, b = argc, v1 = callee; re-invoke after a block
     MapEntry,    // a = stack base, b = pair count, c = index, v1 = the map
+    IndexKey,    // b = the get/set node, v1 = frame; the container is the result
+    IndexApply,  // b = the get/set node, v1 = frame; the container is on the value stack
+    GetWalk,     // a = cells still to step over, b = the get node, c = the index, v1 = frame
+    SetWalk,     // a = cells still to step over, b = the set node, c = the index,
+                 // v1 = frame; the cells stepped over so far are on the value stack
 };
 
 struct Cont {

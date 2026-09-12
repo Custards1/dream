@@ -1,0 +1,119 @@
+// The core of the standard library: what every module reaches for, and what a
+// module gets as `core` without importing it.
+//
+// Most of it cannot be written in Dream at all. A string's bytes, a character's
+// code, the digits of a float are the host's to know, and they come from
+// `std.native`, the module the VM provides. Each is re-exported here as a
+// wrapper, and a wrapper costs nothing: `core.str_len s` is compiled as the call
+// of `native.str_len` it stands for.
+//
+// Five are not the host's. Reading and changing a container are part of the
+// language -- `c.[k]`, `c.[k else d]` and `c.[k => v]` -- so `head`, `map_get`,
+// `map_put`, `array_get` and `array_set` are written as exactly that, and a call
+// of one compiles to the operation. That was not done for tidiness. A native has
+// to hand back a value, so a native reading a lazy map field forced it on the C++
+// stack, and a record updated some twenty thousand times before it was read --
+// the compiler's own table of names -- ran an 8 MiB stack out. The operation is
+// forced by the machine instead, where depth costs heap.
+//
+// This module is what `core` means, so it must never name `core` itself: that
+// would be importing itself.
+
+import std.native;
+
+// --- lists ----------------------------------------------------------------------
+
+/// The first element: `xs.[0]`, so `:out_of_bounds` on an empty list. Read as
+/// the operation for the reason the container functions below are -- a stack
+/// kept as a list and rebuilt at its head on every change is the same chain of
+/// lazy reads as a field updated in a loop, and the compiler's own stack of
+/// scopes was the next such chain after its maps.
+let head xs = xs.[0];
+/// Everything after the first element.
+let tail xs = native.tail xs;
+/// `x` in front of `xs`, both left lazy.
+let cons x xs = native.cons x xs;
+let is_empty xs = native.is_empty xs;
+
+// --- containers -----------------------------------------------------------------
+//
+// The language's own operations, so they are not particular about the container:
+// `map_get` reads an array by position as readily as a map by key.
+
+/// The value at `k`, or `default` when there is none. `default` is evaluated
+/// only when it is the answer.
+let map_get m k default = m.[k else default];
+/// `m` with `k` bound to `v`, which stays lazy. `m` itself is untouched.
+let map_put m k v = m.[k => v];
+/// The element at position `i`; `:out_of_bounds` past either end.
+let array_get a i = a.[i];
+/// A copy of `a` with position `i` replaced.
+let array_set a i v = a.[i => v];
+
+// --- maps -----------------------------------------------------------------------
+
+/// A map with nothing in it. Takes `()`, as an action would, so that each call
+/// is a call.
+let map_new u = native.map_new u;
+let map_has m k = native.map_has m k;
+let map_remove m k = native.map_remove m k;
+/// Every `[key, value]`, in no promised order.
+let map_pairs m = native.map_pairs m;
+
+// --- arrays ---------------------------------------------------------------------
+
+/// `length` slots, each holding `fill`.
+let array_new length fill = native.array_new length fill;
+let array_of_list xs = native.array_of_list xs;
+let array_to_list a = native.array_to_list a;
+
+// --- strings --------------------------------------------------------------------
+//
+// Byte-indexed, all of them: a byte offset is what is O(1) on a string.
+
+let str_len s = native.str_len s;
+let str_chars s = native.str_chars s;
+let str_of_chars chars = native.str_of_chars chars;
+let str_of_bytes bytes = native.str_of_bytes bytes;
+/// Every string in a list, joined, copying each once. Building a string with
+/// `+` a piece at a time copies everything so far at every step.
+let str_concat pieces = native.str_concat pieces;
+/// `len` bytes from byte offset `start`, clamped to the string.
+let str_slice s start len = native.str_slice s start len;
+/// The byte offset of `needle` at or after `from`, or `-1`.
+let str_find haystack needle from = native.str_find haystack needle from;
+/// The byte at `index`, or `-1` outside the string.
+let str_byte s index = native.str_byte s index;
+
+// --- characters -----------------------------------------------------------------
+
+let char_code c = native.char_code c;
+let char_of_code code = native.char_of_code code;
+
+// --- numbers --------------------------------------------------------------------
+
+let to_float n = native.to_float n;
+let to_int n = native.to_int n;
+let parse_int s = native.parse_int s;
+let parse_float s = native.parse_float s;
+let float_bytes f = native.float_bytes f;
+let float_of_bytes bytes = native.float_of_bytes bytes;
+
+// --- errors ---------------------------------------------------------------------
+
+/// An error with a kind and a payload; the payload stays lazy.
+let error_new kind payload = native.error_new kind payload;
+let error_kind e = native.error_kind e;
+let error_payload e = native.error_payload e;
+
+// --- ordering -------------------------------------------------------------------
+
+/// `-1`, `0` or `1`: a total order over the flat types.
+let compare a b = native.compare a b;
+
+// --- large data -----------------------------------------------------------------
+
+/// How many payload data this image carries.
+let data_count u = native.data_count u;
+/// Payload datum `i`, as a view into the image rather than a copy.
+let data_at i = native.data_at i;

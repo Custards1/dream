@@ -47,11 +47,15 @@ Primitives that the language cannot express in itself — things the runtime rep
 import std.core;
 ```
 
+`std.core` is Dream source, [`mind/std/core.dr`](../mind/std/core.dr), and a module that names `core` gets it without an import. Almost every member is a one-line wrapper over the host module **`std.native`**, which holds the C++ implementations, and a wrapper compiles to the call it stands for. Five are not: `head`, `map_get`, `map_put`, `array_get` and `array_set` are written as the language's container operations — `xs.[0]`, `m.[k else d]`, `m.[k => v]`, `a.[i]`, `a.[i => v]` — so a call of one compiles to the `get` or `set` opcode, and like the operations they accept any container.
+
+The VM still answers to `std.core` as a host module with the full set of natives. Images built before `std.core` moved import it by that name, and a program compiled with no standard library on its path falls back to it.
+
 ### Lists
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `head` | `list → value` | The first element. Raises `:type_error` on an empty list. |
+| `head` | `list → value` | `xs.[0]`: the first element, forced to WHNF. Raises `:out_of_bounds` on an empty list. |
 | `tail` | `list → list` | Everything after the first element. Raises `:type_error` on an empty list. |
 | `cons` | `value → list → list` | A new cons cell with the given head and tail. Both sides stay lazy. |
 | `is_empty` | `list → bool` | `true` if the list is `[]`. |
@@ -94,8 +98,8 @@ Arrays are fixed-length, eagerly allocated sequences. Indexing is O(1). All upda
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `array_new` | `length:integer → fill:value → array` | Creates a new array of `length` slots, each initialized to `fill`. |
-| `array_get` | `array → index:integer → value` | Returns the element at `index` (forced to WHNF). Raises `:out_of_bounds` if index is out of range. |
-| `array_set` | `array → index:integer → value → array` | Returns a new array with the element at `index` replaced. The original is unchanged. Raises `:out_of_bounds` if out of range. |
+| `array_get` | `array → index:integer → value` | `a.[index]`. Returns the element at `index` (forced to WHNF). Raises `:out_of_bounds` if index is out of range. |
+| `array_set` | `array → index:integer → value → array` | `a.[index => value]`. Returns a new array with the element at `index` replaced; `value` stays lazy. The original is unchanged. Raises `:out_of_bounds` if out of range. |
 | `array_of_list` | `list → array` | Converts a list to an array. Elements remain lazy. |
 | `array_to_list` | `array → list` | Converts an array to a list. Elements remain lazy. |
 
@@ -108,9 +112,9 @@ Persistent means *shared*, not copied: `map_put` rebuilds only the path from the
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `map_new` | `unit → map` | Creates a new empty map. |
-| `map_get` | `map → key → default → value` | Returns the value for `key`, or `default` if not present. Both `key` and `default` are forced to WHNF. |
+| `map_get` | `map → key → default → value` | `m.[key else default]`. Returns the value for `key`, forced to WHNF, or `default` if not present. `key` is forced; `default` is evaluated only when it is the answer. |
 | `map_has` | `map → key → bool` | Returns `true` if `key` is in the map. |
-| `map_put` | `map → key → value → map` | Returns a new map with `key` mapped to `value`. The original is unchanged. |
+| `map_put` | `map → key → value → map` | `m.[key => value]`. Returns a new map with `key` mapped to `value`, which stays lazy. The original is unchanged. |
 | `map_remove` | `map → key → map` | Returns a new map with `key` removed. |
 | `map_pairs` | `map → list` | Returns a list of `[key, value]` pairs in unspecified order. |
 

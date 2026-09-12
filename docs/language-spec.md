@@ -387,13 +387,36 @@ strict! { let a = expensive (); [a, a * 2] }
 
 **`obj.field` is module-member access and nothing else.** The field name may
 carry a trailing `!` (`console.print!`). It is not map or record indexing —
-applying it to anything but a module raises `:no_such_member`. Maps are read
-with `core.map_get`, arrays with `core.array_get`:
+applying it to anything but a module raises `:no_such_member`.
+
+### Reading and changing a container
 
 ```dream
-core.map_get point :r ()        // the value at `:r`, or the default `()`
-core.array_get arr 0
+point.[:r]                    // the value at `:r`; `:no_such_key` when there is none
+point.[:r else 0]             // ..or `0`, evaluated only when it is the answer
+point.[:r => 5]               // a map like `point` with `:r` bound to 5
+arr.[0]                       // an array or a list, by position
+grid.[y].[x => 0]             // postfix, so it chains like `.field`
 ```
+
+`.[ ]` is one pair of operations over every container: a map is read and changed
+by key, an array or a list by position, and a position past either end of a
+sequence raises `:out_of_bounds`. The dot is what tells it from application —
+`f [0]` passes a list to `f`, and `xs.[0]` reads one.
+
+A change answers a new container and leaves the one it was given alone, as
+every value is left alone. A map shares everything the change did not touch; an
+array is copied; a list rebuilds the cells in front of the position and shares
+the rest. So a record that is changed often wants to be a map, and one that is
+only read wants to be an array.
+
+Nothing is forced that the operation does not need. The container and the key
+are; the element read is the answer, so it is forced as any answer is, and its
+neighbours are not; a fallback is evaluated only when it is used; and the value
+a change stores stays a thunk. `[1 / 0, 7].[1]` is `7`.
+
+They are opcodes, not functions, and that is what makes reading a lazy field
+safe at any depth: see [`std.core`](#stdcore--what-the-language-cannot-express-in-itself).
 
 ---
 
@@ -431,6 +454,10 @@ saturated call of one is compiled as the call it stands for. The frame that
 disappears bound nothing but the arguments the inner call was going to be
 given, and every argument stays the same thunk in the same place, so nothing is
 evaluated that was not before and nothing twice.
+
+A body that is one `get` or `set` of the parameters is a wrapper under the same
+rule — `let map_get m k d = m.[k else d]` — and a saturated call of it compiles
+to the operation itself.
 
 The conditions are narrow on purpose: one application, every parameter passed
 on exactly once, and literals for the rest. A call that is not saturated is
@@ -1036,6 +1063,21 @@ Resolved directly, without an import, unless shadowed by a binding:
 Everything here is either a primitive the representation hides (a string's
 bytes, a map's buckets) or something that must be a single machine step for the
 rest of the library to be worth writing.
+
+It is Dream source all the same — [`mind/std/core.dr`](../mind/std/core.dr),
+reached as `core` without an import. Nearly every member is a one-line wrapper
+over the host module `std.native`, where the C++ is, and a wrapper compiles to
+the call it stands for. `head`, `map_get`, `map_put`, `array_get` and
+`array_set` are not the host's: they are written as `.[ ]` ([§4](#reading-and-changing-a-container)),
+so a call of one is the opcode. That matters for more than speed. A native has
+to hand back a value, so a native reading a lazy field forced it underneath
+itself, on the C++ stack, and a record updated twenty thousand times before it
+was read was twenty thousand nested forces — which is how the compiler's own
+table of names ran an 8 MiB stack out. An opcode leaves the forcing to the
+machine, whose depth is heap and whose limit raises `:stack_overflow`.
+
+The VM still answers to `std.core` as a host module, for images built before it
+moved and for a program compiled with no standard library to find.
 
 `str_concat` is the second kind. Building a string out of n pieces with `+`
 copies everything written so far on every step, so it costs n² bytes of

@@ -164,8 +164,24 @@ let route text base_text engine base =
         [:ok, items] =>
             if engine == () { :reboot }
             else if not (str.starts_with (engine_base_text engine) text) { :reboot }
+            else if brings_core engine items base { :reboot }
             else if carried_ok (list.head (entry_partition items base)) { [:proceed, items] }
             else { :fresh },
+    };
+
+/// Does this entry name `core` in a session that has not loaded it? `core` needs
+/// no import, but it is a module all the same, and the loader brings it in ahead
+/// of the root -- which moves the root, and everything carried was numbered with
+/// the root where it was. So the first mention is a new import in all but
+/// spelling, and re-boots the way a new import does. A session built with no
+/// standard library settled for the host's module, and has nothing to load.
+let brings_core engine items base =
+    match engine_loader engine {
+        // Nothing carried to compare against. A real engine always has a
+        // loader, but routing is asked about stand-ins as well.
+        () => false,
+        l => modules.find l "std.core" == () && not (list.contains "std.core" (modules.natives l))
+             && list.any (fn item -> modules.item_mentions_core item) (list.drop base items),
     };
 
 // --- the pipeline -------------------------------------------------------------------

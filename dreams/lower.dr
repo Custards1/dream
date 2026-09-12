@@ -199,6 +199,16 @@ let wrapper_actuals plan args =
             [:const, e] => e,
         }) plan;
 
+/// The container operation a wrapper stands for, rebuilt around a call's own
+/// arguments. They are syntax rather than nodes, so each is lowered exactly
+/// where it would have been -- the same promise the call rewrite makes.
+let op_expr kind operands span =
+    match kind {
+        :get => ast.get_e (list.nth 0 operands) (list.nth 1 operands)
+                          (if list.length operands > 2 { list.nth 2 operands } else { () }) span,
+        _    => ast.set_e (list.nth 0 operands) (list.nth 1 operands) (list.nth 2 operands) span,
+    };
+
 /// `[target, arguments]` when this is a saturated call of a wrapper, or `()`.
 ///
 /// The arguments are syntax, not nodes: they are lowered at the call site
@@ -333,12 +343,14 @@ let rec lower_expr e l =
         [:name, n, span] => lower_name n span l,
         [:field, _, _, span] => lower_field e span l,
 
-        [:apply, callee, args, _] => {
+        [:apply, callee, args, span] => {
             let found = callee_resolution callee l;
             // A saturated call of a wrapper is the call it stands for. See
             // "wrappers" in `scope`: the rewrite removes a frame that bound
             // nothing but the arguments the inner call was going to get.
             match unwrap found args 8 l {
+                // ..and a wrapper around a `get` or a `set` is that operation.
+                [[:op, kind], actual] => lower_expr (op_expr kind actual span) l,
                 [target, actual] => {
                     let f = emit_target target l;
                     let done = lower_all actual (list.head f);
@@ -436,6 +448,29 @@ let rec lower_expr e l =
                 },
                 _ => emit_leaf :unit l,
             },
+
+        // A container read or changed at a key. A `get`'s fallback is lowered
+        // where it is written and only evaluated when the key is missing; a
+        // `set`'s value is stored unforced, as a map literal's values are.
+        [:get, container, key, fallback, _] => {
+            let a = lower_expr container l;
+            let b = lower_expr key (list.head a);
+            let f = match fallback {
+                () => [list.head b, ir.no_node],
+                x  => lower_expr x (list.head b),
+            };
+            let made = emit (ir.node :get (list.nth 1 a) (list.nth 1 b) (list.nth 1 f)) (list.head f);
+            [inherit (list.nth 1 made) [list.nth 1 a, list.nth 1 b, list.nth 1 f] (list.head made),
+             list.nth 1 made]
+        },
+        [:set, container, key, value, _] => {
+            let a = lower_expr container l;
+            let b = lower_expr key (list.head a);
+            let v = lower_expr value (list.head b);
+            let made = emit (ir.node :set (list.nth 1 a) (list.nth 1 b) (list.nth 1 v)) (list.head v);
+            [inherit (list.nth 1 made) [list.nth 1 a, list.nth 1 b, list.nth 1 v] (list.head made),
+             list.nth 1 made]
+        },
 
         // What a top-level destructuring became in `scope`: the hidden global
         // holding the checked value, and a global per name.
