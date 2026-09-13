@@ -324,6 +324,18 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
                 eval_node(p, f.body, frame);
                 return;
             }
+            if (status == JitBailed) {
+                // An entry guard did not hold: a slot the compiled body carries
+                // as an unboxed double was handed something that is not a float
+                // in hand. Nothing has been spent and nothing written, so the
+                // interpreter runs this one call -- and the tier stays, because
+                // unlike running out of machine stack this is a property of the
+                // call rather than of the function. The guard costs a load and
+                // two branches, so a function that bails every time is no
+                // slower than one that was never compiled.
+                eval_node(p, f.body, frame);
+                return;
+            }
             // Yielded: the compiled loop spent its budget and wrote its
             // loop-carried state back to the frame. Fall through to the
             // interpreter, which resumes the body and lets the scheduler
