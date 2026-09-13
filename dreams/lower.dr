@@ -383,7 +383,15 @@ let rec lower_expr e l =
         [:atom, n, _]  => const_atom n l,
         [:unit, _]     => emit_leaf :unit l,
 
-        [:name, n, span] => lower_name n span l,
+        // A name `scope` staged stands for the stage that was bound to it and
+        // read here once. The `let` that bound it is gone from the block
+        // below, so this is the only place the body is written -- which is the
+        // whole of what staging does when the pipeline turns out not to fuse.
+        [:name, n, span] =>
+            match scope.staging (res l) (ctx l) (source l) span {
+                [:body, body] => lower_expr body l,
+                _ => lower_name n span l,
+            },
         [:field, _, _, span] => lower_field e span l,
 
         // A pipeline `scope` decided to fuse is a loop and a call of it, and
@@ -614,6 +622,12 @@ let rec lower_block stmts span l = {
     // from, which is what a warning about a discarded value points at.
     let done = list.fold (fn acc st ->
         match st {
+            // A `let` whose body was written where it is read binds nothing and
+            // lowers to nothing. It contributes no node, so it is not a
+            // statement whose value could be discarded either.
+            [:let, _, _, _, _, sp] if scope.staging (res l) (ctx l) (source l) sp == :elided =>
+                acc,
+
             [:let, n, ps, body, _, sp] => {
                 let value =
                     if list.is_empty ps { lower_expr body (list.head acc) }

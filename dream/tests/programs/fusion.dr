@@ -78,6 +78,65 @@ let stays_lazy = list.fold (fn acc x -> if x == 2 { 7 } else { acc / 0 }) 1 (lis
 let counted! () = list.fold_strict (fn acc x -> { console.print! ("saw " + to_string x); acc + x })
                                 0 (list.range 1 4);
 
+// --- a stage that was given a name -------------------------------------------
+//
+// The rule is one syntactic *use*, not "no binding". A `let` read exactly once
+// is nobody else's list, so writing its body where it is read is the same
+// program -- and that is how pipelines are actually written.
+
+// The shape `mapfilter` in the benchmark has: every stage named, each read
+// once. It fuses into exactly the loop the direct spelling would.
+let named_stages n = {
+    let squares = list.map (fn x -> x * x) (list.range 1 (n + 1));
+    let odds = list.filter (fn x -> x % 2 == 1) squares;
+    list.fold_strict (fn acc x -> acc + x) 0 odds
+};
+
+// `n` means something else after the second `let`, so the stage stays where it
+// was written. Moved, `xs` would read the 99 and count to 100 rather than to 6,
+// and the answer would be 5049 instead of 114.
+let shadowed n = { let xs = list.range 1 (n + 1); let n = 99; list.sum xs + n };
+
+// Two reads is a shared list: built once and walked twice, as written.
+let shared n = { let xs = list.range 1 (n + 1); list.sum xs + list.length xs };
+
+// Two `let`s of one name. The read belongs to the second.
+let rebound n = { let xs = list.range 1 (n + 1); let xs = list.range 1 3; list.sum xs };
+
+// Read inside a lambda, which is a frame of its own. A stage moved into one
+// would want the enclosing frame as a capture, and a fused loop is a global
+// and has none.
+let in_a_lambda n = {
+    let xs = list.range 1 (n + 1);
+    list.map (fn k -> list.sum xs + k) [0, 100]
+};
+
+// `n` is read exactly once in this block -- by the line *above* its own `let`,
+// where it still means the parameter. A stage is only written where it is read
+// when the read comes after the binding; this one answered 21 before it did.
+let read_above n = {
+    let a = list.sum (list.range 1 (n + 1));
+    let n = list.sum (list.range 1 4);
+    a
+};
+
+// `length` is no sink this pass knows, so nothing fuses here. The binding is
+// still read where it was written, and the answer is the same either way.
+let no_sink n = { let xs = list.range 1 (n + 1); list.length xs };
+
+// An impure `let` is a statement, not a binding: a block forces it in the order
+// it is written, so moving it would move the effect. `dreams` writes a payload
+// exactly this way -- a fold of impure writes, bound to a name, read after the
+// handle is closed -- and staging it put every write after the close. The order
+// these print in is what holds that line.
+let ordered! () = {
+    let counted = list.fold_strict
+                      (fn acc x -> { console.print! ("step " + to_string x); acc + x })
+                      0 (list.range 1 4);
+    console.print! "after"
+    counted
+};
+
 let main! = {
     console.print! [folded, folded_hard, summed, multiplied, renamed, repeated];
     console.print! joined;
@@ -86,4 +145,7 @@ let main! = {
     console.print! big_float;
     console.print! impostor;
     console.print! (counted! ());
+    console.print! [named_stages 10, shadowed 5, shared 10, rebound 10, no_sink 10, read_above 10];
+    console.print! (in_a_lambda 4);
+    console.print! (ordered! ());
 };

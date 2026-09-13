@@ -2546,24 +2546,36 @@ bool force_deep(Process& p, Value v, Value* out) {
             // marked afterwards: a cell is deeply forced only once everything
             // after it is, so the marking runs backwards, from the end.
             p.stack.push_back(head);
+            // The cell being walked waits on the value stack so that a
+            // collection can find it and rewrite the reference -- which means
+            // no C++ pointer to it may outlive a force. The object moves, and
+            // a pointer taken before the force still names the block it moved
+            // out of. So the cell is re-read from the stack at every single
+            // use rather than once per turn round the loop, and this is the
+            // only way to touch it.
+            //
+            // Storing through a stale one does not fault where it happens,
+            // which is what made this expensive to find. It writes into
+            // whatever that block has since been recycled into, and since
+            // `ConsObj::head` and `ThunkObj::node` share an offset, the shape
+            // the damage usually takes is a thunk whose node is the low half
+            // of a pointer. The machine jumps to it some thousands of
+            // reductions later and dies a long way from here.
+            auto cell = [&] { return static_cast<ConsObj*>(as_obj(p.stack.back())); };
             for (;;) {
-                // The cells are walked in place: the one on top of the stack
-                // held its head before we started, and forcing can collect at
-                // any step, so its address is re-read after each force.
-                auto* cell = static_cast<ConsObj*>(as_obj(p.stack.back()));
                 Value tmp;
-                if (!force_deep(p, cell->head, &tmp)) {
+                if (!force_deep(p, cell()->head, &tmp)) {
                     return unwind(out);
                 }
-                value_slot_store(&cell->head, tmp);
-                p.heap().remember_if_old(cell, tmp);
+                value_slot_store(&cell()->head, tmp);
+                p.heap().remember_if_old(cell(), tmp);
 
                 Value tail;
-                if (!force_whnf(p, cell->tail, &tail)) {
+                if (!force_whnf(p, cell()->tail, &tail)) {
                     return unwind(out);
                 }
-                value_slot_store(&cell->tail, tail);
-                p.heap().remember_if_old(cell, tail);
+                value_slot_store(&cell()->tail, tail);
+                p.heap().remember_if_old(cell(), tail);
 
                 const bool more = is_ptr(tail) && as_obj(tail)->type == ObjType::Cons
                                   && !(as_obj(tail)->aux & AUX_DEEP_FORCED);
@@ -2594,14 +2606,18 @@ bool force_deep(Process& p, Value v, Value* out) {
         }
         case ObjType::Array: {
             p.stack.push_back(head);
-            uint32_t len = static_cast<ArrayObj*>(as_obj(head))->len;
+            // Re-read on both sides of the force, for the reason the list
+            // above is: the array is on the value stack precisely so that a
+            // collection may move it, and a pointer that spans the force is a
+            // pointer to where it used to be. The length is safe to keep --
+            // it is a number, and an array's does not change.
+            auto arr = [&] { return static_cast<ArrayObj*>(as_obj(p.stack.back())); };
+            const uint32_t len = arr()->len;
             for (uint32_t i = 0; i < len; ++i) {
-                auto* a = static_cast<ArrayObj*>(as_obj(p.stack.back()));
-                Value item = a->items()[i];
                 Value tmp;
-                if (!force_deep(p, item, &tmp)) return unwind(out);
-                value_slot_store(&a->items()[i], tmp);
-                p.heap().remember_if_old(a, tmp);
+                if (!force_deep(p, arr()->items()[i], &tmp)) return unwind(out);
+                value_slot_store(&arr()->items()[i], tmp);
+                p.heap().remember_if_old(arr(), tmp);
             }
             as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
             *out = p.stack.back();

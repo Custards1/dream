@@ -693,7 +693,8 @@ let declare_module l mi s0 = {
 
 let frame func impure display =
     %{ :func => func, :scopes => [[]], :next_slot => 0, :max_slots => 0,
-       :cap_names => [], :caps => [], :impure => impure, :display => display };
+       :cap_names => [], :caps => [], :impure => impure, :display => display,
+       :staged => core.map_new () };
 
 let frame_func f    = core.map_get f :func 0;
 let scopes f        = core.map_get f :scopes [];
@@ -703,6 +704,14 @@ let cap_names f     = core.map_get f :cap_names [];
 let caps f          = core.map_get f :caps [];
 let frame_impure f  = core.map_get f :impure false;
 let frame_display f = core.map_get f :display "";
+
+/// The stages this frame has bound a name to and will write where they are
+/// read. It hangs off the frame rather than off the resolver so that it stops
+/// at a function boundary without anyone having to remember to clear it: a
+/// lambda inside the block gets a new frame, and a stage moved into one would
+/// need the enclosing frame's names as captures -- which is the one thing a
+/// fused loop, being a global, has none of.
+let frame_staged f = core.map_get f :staged (core.map_new ());
 
 /// A capture says where the enclosing frame keeps the value: in one of its own
 /// slots, or in one of *its* captures. Threading it down like this is what lets
@@ -789,6 +798,43 @@ let fusion r ctx source span =
         () => (),
         p => if fuse.plan_span p == span { p } else { () },
     };
+
+/// What the current frame has staged, and how to change it. Both answer
+/// through the innermost frame, so a block installs its own and puts the
+/// enclosing one back when it ends.
+let staged_now r =
+    if list.is_empty (frames r) { core.map_new () } else { frame_staged (list.head (frames r)) };
+
+let set_staged m r = update_frame (fn f -> core.map_put f :staged m) r;
+
+/// The stage a name stands for here, or `()`. A name is only ever staged in
+/// the frame it was written in, so this is one lookup and no walk.
+let staged_use r n = core.map_get (staged_now r) n ();
+
+/// The same, asked by a `let` about itself: is *this* statement the one whose
+/// body was moved? Two `let`s in a block may share a name, and only the one
+/// whose span matches is the one that was staged.
+let staged_here r n span =
+    match staged_use r n {
+        () => (),
+        st => if fuse.staged_span st == span { st } else { () },
+    };
+
+// What lowering has to be told, because it must make the same decision and
+// must not remake it: a `let` that no longer binds anything, and a name that
+// stands for the body of one. A pass that disagreed with this one would either
+// lower a stage twice or build a loop over a name nothing bound.
+
+let staged_table r = core.map_get r :staged (core.map_new ());
+
+let record_staged ctx source span what r =
+    core.map_put r :staged
+        (core.map_put (staged_table r) (ref_key ctx source (ast.span_start span)) what);
+
+/// `[:body, expr]` where a name stands for a stage written elsewhere,
+/// `:elided` at the `let` that used to bind it, or `()`.
+let staging r ctx source span =
+    core.map_get (staged_table r) (ref_key ctx source (ast.span_start span)) ();
 
 let set_frames fs r = core.map_put r :frames fs;
 
@@ -1228,7 +1274,16 @@ let rest_bindings rest = match rest { [n, name_span] => [[n, name_span]], _ => [
 
 let rec check_expr c e r =
     match e {
-        [:name, n, span] => check_name c n span r,
+        // A name the block staged is not a binding to look up -- there is
+        // none, because the `let` was skipped. It *is* the stage, walked here
+        // in the frame it was written in, where every name in it still means
+        // what it meant.
+        [:name, n, span] =>
+            match staged_use r n {
+                () => check_name c n span r,
+                st => record_staged (ctx_mi c) (ctx_source c) span [:body, fuse.staged_body st]
+                          (check_expr c (fuse.staged_body st) r),
+            },
 
         [:field, obj, field, span] =>
             match as_namespace c r obj {
@@ -1283,9 +1338,16 @@ let rec check_expr c e r =
         // it and cannot see it: a block's non-final statements are only worth
         // forcing inside an impure function, and inside a pure one they are
         // dead code worth saying so about.
-        [:block, stmts, span] =>
-            pop_scope (check_block c stmts
-                          (push_scope (record (ctx_mi c) (ctx_source c) span [:block, impure_ok r] r))),
+        [:block, stmts, span] => {
+            // A block may name a stage of a pipeline and read it once, which is
+            // the direct form with a name on it -- see "a stage that was given
+            // a name" in `fuse`. The names it stages are in scope for the whole
+            // block and no longer, so the enclosing frame's are put back after.
+            let saved = staged_now r;
+            let entered = stage_block c stmts
+                              (record (ctx_mi c) (ctx_source c) span [:block, impure_ok r] r);
+            set_staged saved (pop_scope (check_block c stmts (push_scope entered)))
+        },
 
         // `$( .. )` is a value: building it is always allowed, and running it is
         // what needs an impure context. So the thunk's own frame permits
@@ -1382,6 +1444,14 @@ let rec check_block c stmts r =
         [] => r,
         [st, ..rest] =>
             match st {
+                // A `let` whose body is written where it is read binds nothing
+                // and is not walked here. The one place that reads it walks it,
+                // in this same frame -- so walking it here as well would give
+                // its lambdas a second set of slots and a second function
+                // record, and only one of the two would ever be lowered.
+                [:let, n, _, _, _, span] if staged_here r n span != () =>
+                    check_block c rest r,
+
                 [:let, n, ps, body, is_rec, span] => {
                     // `let rec` puts the name in scope for its own body, so a
                     // closure can refer to itself. The slot is allocated either
@@ -2034,6 +2104,53 @@ let fuse_shape c r callee args =
         }
     };
 
+/// The stages a block names and reads once, put where every name inside it can
+/// find them.
+///
+/// The decision is syntax and nothing else -- one use, no rebinding in between
+/// -- so it does not depend on whether the pipeline turns out to fuse. That is
+/// deliberate: a block is staged before it is walked, and whether the `range`
+/// in it is really `std.list`'s is not known until the use site is reached. A
+/// staged `let` that never fuses is still the same program, one binding
+/// shorter, and lowering writes its body where the name was.
+let stage_block c stmts r = {
+    let found = fuse.staged_lets (fn body -> stage_shaped r body) stmts;
+    if list.is_empty found { r }
+    else {
+        let seen = list.fold (fn acc st -> core.map_put acc (fuse.staged_name st) st)
+                             (staged_now r) found;
+        set_staged seen
+            (list.fold (fn acc st ->
+                record_staged (ctx_mi c) (ctx_source c) (fuse.staged_span st) :elided acc)
+             r found)
+    }
+};
+
+/// Is a `let`'s body worth counting uses for? A call whose callee is spelled
+/// like a `std.list` member -- the same cheap question `fuse_shape` asks before
+/// resolving anything, and asked here for the same reason: every block in the
+/// program passes through this, and almost none of them contain a pipeline.
+///
+/// And nothing impure, which is not an optimization guard but the rule that
+/// makes moving one sound at all. A pure `let` is lazy: it is not evaluated
+/// where it is written, so writing it somewhere else changes nothing. An
+/// impure one is a *statement*, forced in the order the block gives, and
+/// moving it moves the effect. `dreams` built a payload that way --
+///
+///     let copied = list.fold_strict (fn ok p -> ok && copy_payload! handle ..) ..;
+///     io.close! handle
+///
+/// -- and staging `copied` put every write after the close, which the runtime
+/// answered with `:io_closed`. Purity is spelling in this language, so the
+/// test is the one `step_ok` already makes.
+let stage_shaped r body =
+    match body {
+        [:apply, callee, _, _] =>
+            spelled_like_a_role r callee
+            && not (list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body)),
+        _ => false,
+    };
+
 /// Is this callee even spelled like something that could fuse? Answered before
 /// anything is resolved, because most applications in a program are not.
 let spelled_like_a_role r e =
@@ -2092,6 +2209,15 @@ let rec peel c r e acc fuel =
                                  (core.cons [stag, list.nth 0 cargs] acc) (fuel - 1)
                         },
                     _ => (),
+                },
+            // A stage the block gave a name to and reads exactly once. The
+            // binding is not a barrier between the producer and the consumer;
+            // it is the same pipeline written over two lines, and `fuse`'s
+            // `staged_lets` is what established that moving it changes nothing.
+            [:name, n, _] =>
+                match staged_use r n {
+                    () => (),
+                    st => peel c r (fuse.staged_body st) acc (fuel - 1),
                 },
             _ => (),
         }
@@ -2279,6 +2405,14 @@ let rec check_chain c e r =
                 // written, so they are resolved in this frame like any other.
                 _ => list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) cargs,
             },
+        // Through a staged name as well, and for the reason the chain is
+        // walked at all: the source's arguments are evaluated at the fused
+        // call, so they have to be resolved in this frame. Walking the body
+        // here rather than where the `let` stood is what the staging rule
+        // bought -- nothing it names is bound again in between, so the two
+        // positions resolve alike.
+        [:name, n, _] =>
+            match staged_use r n { () => r, st => check_chain c (fuse.staged_body st) r },
         _ => r,
     };
 
