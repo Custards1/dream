@@ -29,6 +29,7 @@ const char* cont_kind_name(ContKind k) {
         case ContKind::Catch: return "catch";
         case ContKind::FieldOf: return "field_of";
         case ContKind::NativeArg: return "native_arg";
+        case ContKind::NativeArgs: return "native_args";
         case ContKind::NativeRetry: return "native_retry";
         case ContKind::MapEntry: return "map_entry";
         case ContKind::IndexKey: return "index_key";

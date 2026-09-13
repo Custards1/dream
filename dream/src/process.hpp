@@ -42,6 +42,8 @@ enum class ContKind : uint8_t {
     Catch,       // a = handler node, b = slot, c = value-stack depth, v1 = frame
     FieldOf,     // a = string index of the member name
     NativeArg,   // a = stack base, b = argc, c = index just forced, v1 = callee
+    NativeArgs,  // a = the call node, c = index just evaluated, v1 = frame; the
+                 // arguments filled in so far are the top of the value stack
     NativeRetry, // a = stack base, b = argc, v1 = callee; re-invoke after a block
     MapEntry,    // a = stack base, b = pair count, c = index, v1 = the map
     IndexKey,    // b = the get/set node, v1 = frame; the container is the result
