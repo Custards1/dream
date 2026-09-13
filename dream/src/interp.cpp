@@ -1817,6 +1817,29 @@ bool unwind(Process& p, size_t floor) {
 // Public entry points
 // ---------------------------------------------------------------------------
 
+/// `DREAM_PROBE_THUNK`: count the suspensions a run makes, by the kind of
+/// expression suspended, and report them with `--stats`.
+///
+/// `--stats` says how much of a program's allocation is thunks; this says what
+/// they are *of*, which is the question that decides what to do about it. On a
+/// self-compile it is what showed that two node kinds -- `apply` and `get` --
+/// were 90% of every thunk made, and so that an in-range array read and an
+/// already-built list prefix were worth handling in `thunk_for` while the rest
+/// waits for a strictness analysis. One predictable branch per suspension, and
+/// only on the path that was about to allocate anyway.
+std::atomic<uint64_t> g_thunk_counts[64];
+const bool g_probe_thunk = std::getenv("DREAM_PROBE_THUNK") != nullptr;
+
+void dbg_dump_thunks() {
+    if (!g_probe_thunk) return;
+    for (size_t i = 0; i < 64; ++i) {
+        uint64_t c = g_thunk_counts[i].load();
+        if (c > 50000)
+            std::fprintf(stderr, "; thunked %-14s %llu\n", op_name(Op(i)),
+                         (unsigned long long)c);
+    }
+}
+
 Value thunk_for(Process& p, uint32_t node, Value frame) {
     const Image& img = img_of(p);
     const Node& n = img.node(node);
@@ -1889,8 +1912,75 @@ Value thunk_for(Process& p, uint32_t node, Value frame) {
             }
             break;
         }
+        case Op::Get: {
+            // `a.[i]` on an array already in hand, at an index inside it, is a
+            // load. Suspending one is the second most common thunk a compile
+            // makes -- 2.6M of them -- because a record here is an array and
+            // reading a field of one is how everything downstream of the lexer
+            // talks about a token.
+            //
+            // Safe for the same reason the arithmetic above is: `operand_value`
+            // reads an operand only when it is *already* in normal form, so
+            // nothing is forced early, and an in-range read of an array cannot
+            // raise. Out of range falls through to the thunk, which is what
+            // knows about `else d` and about raising.
+            //
+            // Only an array. A *list* index walks the spine, and walking forces
+            // it -- on a lazy or infinite list that is a different program, not
+            // a cheaper one. A map lookup hashes and compares the key, and for
+            // a compound key that forces too. Neither belongs here.
+            //
+            // What comes back is the element as it is stored, thunk and all,
+            // exactly as `Op::Local` hands back a slot: it is the same value
+            // the suspension would have produced, and whoever forces it updates
+            // the array's own copy, so sharing improves rather than suffers.
+            Value c, k;
+            if (!operand_value(p, img, n.a, frame, &c) ||
+                !operand_value(p, img, n.b, frame, &k) || !is_fixnum(k)) {
+                break;
+            }
+            const int64_t i = fixnum_value(k);
+            if (i < 0) break;
+            if (is_obj(c, ObjType::Array)) {
+                auto* a = static_cast<ArrayObj*>(as_obj(c));
+                if (i < int64_t(a->len)) {
+                    Value v = a->items()[i];
+                    if (v != NIL_SLOT) return v;
+                }
+                break;
+            }
+            // A list, walked only as far as it has already been built.
+            //
+            // Indexing a list is a walk, and a walk normally *forces* -- which
+            // is why this cannot simply do what the array case does: on a lazy
+            // or infinite list, forcing the spine early is a different program.
+            // So the walk follows only cells that are already in normal form
+            // and gives up the moment it would have to force one, which makes
+            // it a pointer chase and nothing more. `list.nth` is
+            // `xs.[n else ()]` and is how the compiler reads every record that
+            // is still a list, so most of these are index 0, 1 or 2 into a
+            // spine that was built several stages ago.
+            //
+            // The depth is capped because this runs whether or not the callee
+            // ever looks at the argument. A short walk is cheaper than the
+            // Thunk it replaces; a long one would be work done on spec.
+            if (is_obj(c, ObjType::Cons) && i <= 8) {
+                Value cur = c;
+                for (int64_t step = 0; step < i; ++step) {
+                    Value tail = resolve(static_cast<ConsObj*>(as_obj(cur))->tail);
+                    if (!is_obj(tail, ObjType::Cons)) { cur = UNIT; break; }
+                    cur = tail;
+                }
+                if (is_obj(cur, ObjType::Cons)) {
+                    Value v = static_cast<ConsObj*>(as_obj(cur))->head;
+                    if (v != NIL_SLOT) return v;
+                }
+            }
+            break;
+        }
         default: break;
     }
+    if (g_probe_thunk) g_thunk_counts[size_t(n.op) & 63].fetch_add(1, std::memory_order_relaxed);
     return p.heap().make_thunk(node, frame);
 }
 

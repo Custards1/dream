@@ -291,6 +291,66 @@ What has already been learnt from them, so it is not learnt twice:
   cross-TU calls. Link-time optimization on top of that was measured and bought
   nothing, so it is not enabled.
 
+### Where the remaining time and memory are, and the plan
+
+Measured 2026-09-12, after the round of work that took the self-compile from
+2.78 s to 2.02 s and its peak RSS from 859 MB to 499 MB. Both numbers now have
+one dominant cause each, and neither is the collector.
+
+**Memory is fragmentation, not policy.** The last full collection of a
+self-compile finds 182 MB live in 386 MB of blocks, and only 422 of 5848 blocks
+are entirely empty -- a 64 KiB block holds around 1300 objects and 45% of them
+survive, so no block ever empties and sweeping cannot hand anything back. Four
+different trigger policies were tried and all landed within 10% of each other;
+`--stats` says why, by printing what was *allocated* at the high-water mark
+alongside what was held (88% of it). The only thing that reaches a hole is a
+collector that moves: compaction, or the opportunistic evacuation of sparse
+blocks. See [docs/gc.md](docs/gc.md), "What is left: the holes".
+
+**Time is the call, not the work.** `--stats` breaks allocation down by kind:
+frames 35%, thunks 31%. Two thirds of everything a compile allocates is the
+machinery of calling and suspending, not the data. Counting the thunks by what
+they suspend:
+
+| suspended node | count | what it is |
+|---|---|---|
+| `apply` | 8.2M | an argument that is a function call |
+| `get` | 2.6M -> 0.98M | an argument that is `c.[k]` or `c.[k else d]` |
+| everything else | 1.2M | `set`, `global`, `list`, `add`, `block`, `sub` |
+
+`DREAM_PROBE_THUNK=1` with `--stats` is what prints that table: suspensions by
+the kind of expression suspended. `--stats` alone says how much of a program's
+allocation is thunks; this says what they are *of*, which is the question that
+decides what to do about it.
+
+So the order of work, most valuable first:
+
+1. ~~**`get` arguments that cannot fail.**~~ **Done.** An in-range read of an
+   array in normal form is a load, and the already-built prefix of a list is a
+   pointer chase; `thunk_for` does both instead of suspending them. Neither
+   needs a strictness analysis, for the same reason the arithmetic case does
+   not: `operand_value` reads an operand only when it is already in normal
+   form, and the list walk follows only cells that are already in normal form
+   and gives up the instant it would have to force one -- which is what keeps
+   an infinite list infinite. The depth is capped at eight because the walk
+   runs whether or not the callee looks at the argument. `get` thunks fell from
+   2.6M to 0.98M and a self-compile lost 6% of its allocation.
+   `dream/tests/programs/lazy_args.dr` holds the line on all of it.
+2. **A strictness analysis, for the `apply` thunks.** This is the big one and
+   the only one that needs real analysis: a parameter the callee is certain to
+   force does not need a thunk. The pieces are mostly in place -- natives
+   already declare a `strict_mask`, and a `FuncRec` has a reserved word to put
+   one in -- but the call path has to grow a way to evaluate an argument before
+   the call, which is what `ContKind::NativeArg` already does for natives.
+3. **Frames, which are the other 35%.** A frame that never escapes its call
+   could live on a stack rather than in the heap. This needs escape analysis
+   and is the largest piece of the three.
+
+The benchmark to judge 2 and 3 by is `fib`, where frames and thunks are the
+entire program: `fib 32` is 0.56 s against CPython 3.13's 0.21 s. A
+tail-recursive loop is already 7x *faster* than CPython, because the JIT
+compiles it -- the gap is entirely in calls the JIT does not get to.
+
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
 

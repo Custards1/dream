@@ -126,7 +126,10 @@ void Runtime::print_profile() const {
     }
 }
 
+void dbg_dump_thunks();
+
 void Runtime::print_stats() const {
+    dbg_dump_thunks();
     if (!stats_) return;
     uint64_t reductions = scheduler_ ? scheduler_->total_reductions() : 0;
     uint64_t major = 0, minor = 0, promoted = 0, allocated = 0;
