@@ -1,0 +1,380 @@
+// Deforestation: what `std.list`'s combinators mean to a fusion pass.
+//
+// `fold f acc (list.range 1 n)` builds n cons cells and throws each one away a
+// step after building it. The list is not the answer and nobody else can see
+// it, so it need not exist: the producer's next element can be handed straight
+// to the consumer, and what is left is a loop over a counter.
+//
+// That much is an optimization. The reason it is *this* optimization is what
+// the loop turns into. Written out, the fused form of the line above is
+//
+//     let rec loop i hi acc = if i >= hi { acc } else { loop (i + 1) hi (acc + i) };
+//
+// which is a strict numeric tail loop -- exactly the shape the JIT already
+// compiles, and which already runs an order of magnitude faster than the same
+// work threaded through a list. So the point of removing the list is not the
+// cells saved. It is that what remains is something the tier below can take.
+//
+// This module is only the vocabulary: which member of `std.list` plays which
+// role, and the shape of the plan the two passes agree on. Recognising a
+// pipeline is `scope`'s, because only a resolved name can say that the `range`
+// in front of you really is `std.list`'s; building the loop is `lower`'s,
+// because that is where nodes are made.
+
+import std.core;
+import std.list;
+import std.str;
+
+// --- the vocabulary ---------------------------------------------------------
+//
+// A pipeline is a *source* that produces elements and a *sink* that consumes
+// them. Each entry is `[member name, tag, arity]`, where the arity is the
+// saturated call this pass will look at and nothing else: an unsaturated call
+// is a partial application, which is a value rather than a loop.
+//
+// The list is deliberately short. Every member named here has to have its loop
+// written out by hand in `lower`, and a member whose loop is not written is
+// simply not fused -- the call it was always compiled to still works.
+
+/// Sources: a call that produces a list out of nothing.
+let sources = [
+    // `range from until` counts up to but not including `until`.
+    ["range", :range, 2],
+    // `replicate n x` is the same counter, counting down, handing back the
+    // same value every time -- the *same* value, not a copy, which is what the
+    // fused loop has to preserve as well.
+    ["replicate", :replicate, 2],
+];
+
+/// Steps: a call that turns a list into another list, one element at a time.
+///
+/// A step is not a loop of its own. It is a *stage*, spliced into the one loop
+/// the sink drives: `map`'s function becomes the expression the next stage
+/// reads, and `filter`'s becomes a condition around the rest of the body.
+let steps = [
+    ["map", :map, 2],
+    ["filter", :filter, 2],
+];
+
+/// Sinks: a call that folds a list down to one value.
+///
+/// The tag says which accumulator shape the loop gets. `:fold` takes the step
+/// from a lambda written at the call site; `:add` and `:mul` are the step,
+/// because `sum` and `product` are folds whose function nobody wrote down.
+let sinks = [
+    ["fold",        :fold, 3, false],
+    ["fold_strict", :fold, 3, true],
+    ["sum",         :add,  1, false],
+    ["product",     :mul,  1, false],
+];
+
+/// What a member of `std.list` is to this pass, or `()`:
+/// `[:source, tag, arity]`, `[:step, tag, arity]` or `[:sink, tag, arity, strict]`.
+let role_of name = {
+    let src = found_in sources name;
+    let stp = found_in steps name;
+    let snk = found_in sinks name;
+    if src != () { [:source, list.nth 1 src, list.nth 2 src] }
+    else if stp != () { [:step, list.nth 1 stp, list.nth 2 stp] }
+    else if snk != () { [:sink, list.nth 1 snk, list.nth 2 snk, list.nth 3 snk] }
+    else { () }
+};
+
+let found_in table name = {
+    let hit = list.filter (fn s -> list.nth 0 s == name) table;
+    if list.is_empty hit { () } else { list.head hit }
+};
+
+/// Every name this pass knows, which is what a caller building the index of
+/// global to role has to ask about.
+let member_names =
+    list.append (list.map (fn s -> list.nth 0 s) sources)
+                (list.append (list.map (fn s -> list.nth 0 s) steps)
+                             (list.map (fn s -> list.nth 0 s) sinks));
+
+let role_kind r = core.head r;
+let role_tag r = list.nth 1 r;
+let role_arity r = list.nth 2 r;
+let role_strict r = list.nth 3 r;
+
+// --- the plan ---------------------------------------------------------------
+//
+// What `scope` decided and `lower` builds. The expressions in it are syntax,
+// not nodes, and every name in them has already been resolved -- the bounds and
+// the seed against the frame the pipeline was written in, the step against the
+// loop's own frame. Lowering each where it belongs is what keeps the rewrite
+// honest: nothing is evaluated that was not evaluated before, and nothing
+// twice.
+
+/// `source` is `[tag, argument expressions]`; `step` is `[:ast, expr]` for a
+/// fold whose function was written at the call site, or `[:op, tag]` for `sum`
+/// and `product`.
+let plan span fi gi source seed step strict guards subst elem =
+    %{ :span => span, :fi => fi, :gi => gi, :source => source,
+       :seed => seed, :step => step, :strict => strict,
+       :guards => guards, :subst => subst, :elem => elem };
+
+let plan_span p   = core.map_get p :span [0, 0];
+let plan_fi p     = core.map_get p :fi 0;
+let plan_gi p     = core.map_get p :gi 0;
+let plan_source p = core.map_get p :source [];
+let plan_seed p   = core.map_get p :seed ();
+let plan_step p   = core.map_get p :step [];
+let plan_strict p = core.map_get p :strict false;
+/// The conditions the `filter`s became, in the order the elements meet them.
+let plan_guards p = core.map_get p :guards [];
+/// `[slot, expression]` for each stage whose output has no slot of its own.
+/// See "a stage that has no slot" below.
+let plan_subst p  = core.map_get p :subst [];
+/// The slot the element the sink sees is read from -- the source's own, when
+/// no `map` came between them.
+let plan_elem p   = core.map_get p :elem cursor_slot;
+
+/// Where the loop keeps things. Every fused loop has the same three
+/// parameters, whichever source it came from: a cursor the source advances, a
+/// second value the source carries unchanged -- `range`'s limit, `replicate`'s
+/// element -- and the accumulator. Three rather than two so that a `range`'s
+/// limit is a parameter and not a capture: the JIT compiles a function of its
+/// arguments, and a capture is a frame it would have to keep.
+let cursor_slot = 0;
+let carried_slot = 1;
+let acc_slot = 2;
+let arity = 3;
+
+/// Which slot holds the element a source hands to its consumer.
+let element_slot tag = if tag == :replicate { carried_slot } else { cursor_slot };
+
+// --- a stage that has no slot -----------------------------------------------
+//
+// The source's element is a slot: `range` hands over its cursor, `replicate`
+// the value it carries, and a stage's parameter can simply be bound to it.
+// What `map` produces is not a slot -- it is an expression -- and there is
+// nowhere in the loop to put it. A `let` would want a slot the *frame* holds,
+// and a compiled frame's slots are registers, so a loop with a `let` in it is
+// a loop the JIT declines: the one thing this pass exists to avoid.
+//
+// So a `map`'s output is given a slot that is never written, and every read of
+// it is lowered as the expression instead. The substitution is by occurrence,
+// which is what makes it honest about laziness: the expression lands in
+// exactly the position the element was used in, so it is forced where the
+// element would have been forced and suspended where it would have been
+// suspended. What it does not preserve is *sharing* -- the original built one
+// thunk per element and every use read it, and this recomputes.
+//
+// Which is why there is a budget. `duplication` counts how many times each
+// stage's body would be written out, and a body written more than once has to
+// be arithmetic and small -- cheaper to compute twice than the cons cell it is
+// replacing. Anything else is left as the pipeline it was.
+
+/// How many times a name is written in an expression.
+///
+/// An over-count, because `mentioned` does not track binders: a body that
+/// shadows the parameter is charged for uses that are not the parameter's.
+/// Over-counting can only refuse a fusion that would have been affordable.
+let uses name e = list.length (list.filter (fn n -> n == name) (mentioned e));
+
+/// The node count of an expression built only from names, literals, operators
+/// and `if`, or `-1` when it is built from anything else. One walk answers
+/// both questions this asks, because they are asked together: is this cheap
+/// enough to write down twice, and is it small enough to want to.
+let rec arith_size e =
+    match e {
+        [:name, _, _] => 1,
+        [:unary, _, x, _] => grown [arith_size x],
+        [:binary, _, a, b, _] => grown [arith_size a, arith_size b],
+        [:if, cond, t, el, _] =>
+            grown [arith_size cond, arith_size t,
+                   match el { () => 0, x => arith_size x }],
+        _ => if is_literal e { 1 } else { 0 - 1 },
+    };
+
+/// One more than the parts, or `-1` if any part was not arithmetic.
+let grown parts =
+    if list.any (fn n -> n < 0) parts { 0 - 1 } else { 1 + list.sum parts };
+
+let is_literal e =
+    match e {
+        [:int, _, _]   => true,
+        [:float, _, _] => true,
+        [:str, _, _]   => true,
+        [:char, _, _]  => true,
+        [:bool, _, _]  => true,
+        [:atom, _, _]  => true,
+        [:unit, _]     => true,
+        _ => false,
+    };
+
+/// How many times an element may be written out, and how big a stage that is
+/// written out more than once may be. Both are judgement rather than theory:
+/// the thing being saved is a cons cell, a tail thunk and a frame, so a couple
+/// of extra multiplications are a bargain and a couple of extra calls are not.
+let max_duplication = 8;
+let max_repeated_size = 12;
+
+/// Can the loop these stages describe be written out at a sensible size?
+///
+/// Worked backwards, from the sink to the source, because that is the
+/// direction duplication travels: a stage's body is written once for every
+/// place its output is read. A `map` multiplies -- its input is read once per
+/// occurrence of its parameter, in each copy of its body. A `filter` adds --
+/// the element is read by the condition as well as by everything after it.
+let affordable steps sink_uses = {
+    let rec go ss t =
+        match ss {
+            [] => true,
+            [st, ..rest] => {
+                let body = step_body st;
+                let u = uses (step_param st) body;
+                if list.nth 0 st == :filter {
+                    if t + u > max_duplication { false } else { go rest (t + u) }
+                }
+                else {
+                    let size = arith_size body;
+                    if t > 1 && (size < 0 || size > max_repeated_size) { false }
+                    else if t * u > max_duplication { false }
+                    else { go rest (t * u) }
+                }
+            },
+        };
+    go (list.reverse steps) sink_uses
+};
+
+/// A stage is `[tag, the lambda it was written with]`.
+let step_lambda st = list.nth 1 st;
+let step_body st = list.nth 2 (step_lambda st);
+let step_params st = list.nth 1 (step_lambda st);
+let step_param st = param_name_of (list.nth 0 (step_params st));
+
+// --- the name a fused loop goes by ------------------------------------------
+//
+// It is a global, because that is the only callee the JIT recognises as a self
+// call -- see `check_self_call` in dream/src/jit.cpp -- and a global has a
+// name. The angle brackets are the convention for a global nobody wrote: it is
+// kept out of a module's exports and out of an outline for the same reason the
+// hidden global behind a destructuring is.
+
+let loop_name tag = "<fused " + tag_name tag + ">";
+
+/// An atom's name without its colon. `to_string` keeps the colon, which is
+/// right everywhere else and wrong in the middle of a sentence.
+let tag_name tag = { let s = to_string tag; str.slice 1 (str.byte_length s - 1) s };
+
+// --- what a body mentions ---------------------------------------------------
+//
+// Two questions get asked of a fold's function before it is fused, and one
+// walk answers both: every name it writes down, and every field it reaches
+// through a dot.
+//
+// The first question is whether it names anything impure. A fused loop is a
+// global function whose name nobody wrote, so it is pure by spelling, and an
+// effect inside it would be an effect the machine no longer sequences -- a
+// `print!` in a fold would move, or be discarded as a pure statement whose
+// value is unused. Rather than work out where it would end up, a body that
+// mentions an effect is simply not fused.
+//
+// The second is whether it reaches a name from the frame around it. The loop
+// is a *global*, because that is the only self call the JIT compiles, and a
+// global has no captures to reach an enclosing frame with. A body that names
+// one is not fused either -- which is a real restriction and the obvious next
+// thing to lift, by making each such name one more parameter the loop passes
+// round unchanged.
+//
+// The walk is deliberately blunt: it collects every name in the expression,
+// including ones a binder inside it shadows. Over-collecting can only refuse a
+// fusion that would have been sound, and the alternative -- tracking binders
+// through every shape the syntax comes in -- is a second resolver.
+
+let rec mentioned e =
+    match e {
+        [:name, n, _] => [n],
+        [:field, obj, field, _] => core.cons field (mentioned obj),
+        [:apply, callee, args, _] => list.append (mentioned callee) (mentioned_all args),
+        [:pipe, a, b, _] => list.append (mentioned a) (mentioned b),
+        [:unary, _, x, _] => mentioned x,
+        [:binary, _, a, b, _] => list.append (mentioned a) (mentioned b),
+        [:if, cond, t, el, _] =>
+            list.append (list.append (mentioned cond) (mentioned t))
+                        (match el { () => [], x => mentioned x }),
+        [:block, stmts, _] => mentioned_stmts stmts,
+        [:thunk, x, _] => mentioned x,
+        [:try, body, binder, handler, _] =>
+            core.cons binder (list.append (mentioned body) (mentioned handler)),
+        [:lambda, ps, body, _] =>
+            list.append (list.map (fn p -> param_name_of p) ps) (mentioned body),
+        [:comp, _, x, _] => mentioned x,
+        [:list, xs, _]  => mentioned_all xs,
+        [:array, xs, _] => mentioned_all xs,
+        [:map, pairs, _] => mentioned_all (list.concat pairs),
+        [:match, scrutinee, arms, _] =>
+            list.append (mentioned scrutinee) (mentioned_arms arms),
+        [:get, c, k, fallback, _] =>
+            list.append (list.append (mentioned c) (mentioned k))
+                        (match fallback { () => [], f => mentioned f }),
+        [:set, c, k, v, _] =>
+            list.append (list.append (mentioned c) (mentioned k)) (mentioned v),
+        _ => [],
+    };
+
+let mentioned_all es = list.concat (list.map (fn e -> mentioned e) es);
+
+/// A parameter is `[name, span]`, or `[(), span, pattern]` when it is written
+/// as a pattern. A pattern parameter has no name of its own, and the names it
+/// binds are found by walking it -- which is why a fold whose function takes
+/// one is refused outright rather than scanned.
+let param_name_of p = match list.nth 0 p { () => "", n => n };
+
+let rec mentioned_stmts stmts =
+    list.concat (list.map (fn st ->
+        match st {
+            [:let, n, ps, body, _, _] =>
+                core.cons n (list.append (list.map (fn p -> param_name_of p) ps) (mentioned body)),
+            [:let_p, pattern, body, _] => list.append (pattern_names pattern) (mentioned body),
+            _ => mentioned st,
+        }) stmts);
+
+let rec mentioned_arms arms =
+    list.concat (list.map (fn a ->
+        list.append (pattern_names (list.nth 0 a))
+                    (list.append (match list.nth 1 a { () => [], g => mentioned g })
+                                 (mentioned (list.nth 2 a)))) arms);
+
+/// Every name a pattern writes down, binders and the keys it compares by.
+let rec pattern_names p =
+    match p {
+        [:bind, n, _] => [n],
+        [:literal, e, _] => mentioned e,
+        [:as_p, inner, n, _, _] => core.cons n (pattern_names inner),
+        [:list_p, items, rest, _]  =>
+            list.append (list.concat (list.map (fn i -> pattern_names i) items)) (rest_name rest),
+        [:array_p, items, rest, _] =>
+            list.append (list.concat (list.map (fn i -> pattern_names i) items)) (rest_name rest),
+        [:map_p, pairs, _] =>
+            list.concat (list.map (fn kv ->
+                list.append (mentioned (list.nth 0 kv)) (pattern_names (list.nth 1 kv))) pairs),
+        _ => [],
+    };
+
+let rest_name rest = match rest { [n, _] => [n], _ => [] };
+
+// --- tests ------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a source is recognised by name"
+            $( test.eq! [:source, :range, 2] (role_of "range") ),
+        test.case "a sink is recognised by name"
+            $( test.eq! [:sink, :fold, 3, true] (role_of "fold_strict") ),
+        test.case "a member with no role is not invented"
+            $( test.eq! () (role_of "sort") ),
+        test.case "every name has a role"
+            $( test.true! (list.all (fn n -> role_of n != ()) member_names) ),
+        test.case "a range hands its cursor to the consumer"
+            $( test.eq! cursor_slot (element_slot :range) ),
+        test.case "a replicate hands the value it carries"
+            $( test.eq! carried_slot (element_slot :replicate) ),
+        test.case "the loop's name says nobody wrote it"
+            $( test.eq! "<fused range>" (loop_name :range) ),
+    ];
+}
