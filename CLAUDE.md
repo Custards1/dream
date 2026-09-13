@@ -336,15 +336,46 @@ So the order of work, most valuable first:
    runs whether or not the callee looks at the argument. `get` thunks fell from
    2.6M to 0.98M and a self-compile lost 6% of its allocation.
    `dream/tests/programs/lazy_args.dr` holds the line on all of it.
-2. **A strictness analysis, for the `apply` thunks.** This is the big one and
-   the only one that needs real analysis: a parameter the callee is certain to
-   force does not need a thunk. The pieces are mostly in place -- natives
-   already declare a `strict_mask`, and a `FuncRec` has a reserved word to put
-   one in -- but the call path has to grow a way to evaluate an argument before
-   the call, which is what `ContKind::NativeArg` already does for natives.
-3. **Frames, which are the other 35%.** A frame that never escapes its call
+2. **NOT a strictness analysis.** This was the obvious next step and it was
+   written, measured and thrown away; the numbers are here so it is not written
+   again. Two versions were built against the image at load -- no compiler
+   change and no image-format change are needed, because the VM has the whole
+   IR -- and both were counted against a self-compile without changing
+   behaviour:
+
+   - The **sound** one answers for a single parameter: the one forced before
+     anything else that could raise. That restriction is what makes acting on
+     it invisible, because a caller evaluating such an argument raises exactly
+     the error the callee would have raised, in the same place. It would
+     remove **21,271** of the 8.2M `apply` thunks. 0.26%.
+   - The **unsound** one is the classic set -- every parameter the body forces
+     if nothing raises -- which is what most lazy languages ship under
+     "imprecise exceptions" and which Dream cannot, because it has typed errors
+     and `catch`. It would remove **44,912**. 0.55%.
+
+   Both are worthless here, and the reason is visible once the thunks are
+   attributed to where they are *made* rather than to what they suspend:
+
+   | made at | count | |
+   |---|---|---|
+   | a strict argument of a **native** | 3.09M | the mask already says so -- no analysis involved |
+   | a `let` bound in a block | 2.14M | `let x = f y` |
+   | an argument of a saturated call to a known function | 1.48M | the only place an analysis would apply |
+   | a list, array or map literal's element | 0.54M | |
+
+   The one worth taking is the first, and it needs no analysis at all: a
+   native declares which arguments it forces, and the machine builds a Thunk
+   for one anyway, which `resume_native` then immediately blackholes,
+   evaluates and overwrites. The Thunk is a temporary that carries `(node,
+   frame)` through a protocol that could carry them in the continuation
+   instead. Worth roughly 6% of allocation; it is a change to the hottest path
+   in the machine, so it wants doing carefully rather than quickly.
+
+3. **Frames, which are the other 36%.** A frame that never escapes its call
    could live on a stack rather than in the heap. This needs escape analysis
-   and is the largest piece of the three.
+   and is the largest piece of the three -- and note that eliminating the
+   arithmetic thunks already removed one of the main reasons a frame escapes,
+   since a suspended argument captures the frame it was built in.
 
 The benchmark to judge 2 and 3 by is `fib`, where frames and thunks are the
 entire program: `fib 32` is 0.56 s against CPython 3.13's 0.21 s. A

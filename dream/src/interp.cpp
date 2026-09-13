@@ -12,6 +12,9 @@
 
 namespace dream {
 
+std::atomic<uint64_t> g_thunk_counts[64];
+const bool g_probe_thunk = std::getenv("DREAM_PROBE_THUNK") != nullptr;
+
 namespace {
 
 inline const Image& img_of(Process& p) { return *p.code; }
@@ -1827,8 +1830,6 @@ bool unwind(Process& p, size_t floor) {
 /// already-built list prefix were worth handling in `thunk_for` while the rest
 /// waits for a strictness analysis. One predictable branch per suspension, and
 /// only on the path that was about to allocate anyway.
-std::atomic<uint64_t> g_thunk_counts[64];
-const bool g_probe_thunk = std::getenv("DREAM_PROBE_THUNK") != nullptr;
 
 void dbg_dump_thunks() {
     if (!g_probe_thunk) return;
