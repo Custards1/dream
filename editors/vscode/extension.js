@@ -8,6 +8,7 @@
 // program the compiler has already read, and a second opinion is how an editor
 // comes to disagree with the build.
 
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -61,6 +62,25 @@ function findServer(config, folders) {
   if (process.env.MINDV2_PATH) {
     candidates.push(path.join(expandPath(process.env.MINDV2_PATH), 'lucid.dream'));
     candidates.push(path.join(expandPath(process.env.MINDV2_PATH), 'lucid'));
+  }
+
+  // Ask the VM itself. A toolchain wrapper -- the nix flake's `dream` -- sets
+  // `$MINDV2_PATH` only inside its own process, so an editor cannot read it
+  // from its own environment, and the wrapper is where the installation is
+  // guaranteed to be right. `dream --mindv2-path` prints it; a VM too old to
+  // have the flag, or missing entirely, is caught and simply adds nothing.
+  const vm = expandPath(config.get('vm.path')) || 'dream';
+  try {
+    const out = execFileSync(vm, ['--mindv2-path'], { encoding: 'utf8' });
+    for (const dir of out.trim().split(path.delimiter)) {
+      if (!dir) continue;
+      const root = expandPath(dir);
+      candidates.push(path.join(root, 'lucid.dream'));
+      candidates.push(path.join(root, 'lucid'));
+    }
+  } catch (err) {
+    // The other candidates still stand; the later spawn failure is a real
+    // message instead of a silent nothing.
   }
 
   return candidates.find((c) => fs.existsSync(c));
