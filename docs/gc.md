@@ -336,8 +336,9 @@ large enough that none of it collects mid-walk prints the same bytes.
 Two things, both measured, both recorded so the next reader does not spend the
 afternoon proving them again.
 
-**Collecting more often does not help.** Not at all. The old-space threshold
-is `live * 3`, and tightening it buys nothing:
+**Collecting more often does not help.** Not at all, and this was tested four
+ways. The old-space threshold is `live * 3`; tightening the multiplier buys
+nothing:
 
 | `live x N` | Held from the OS | Peak RSS | Stopped in collection |
 |---|---|---|---|
@@ -346,9 +347,21 @@ is `live * 3`, and tightening it buys nothing:
 | 1.5 | 383 MB | 502 MB | 295 ms |
 | 1.25 | 376 MB | 504 MB | 340 ms |
 
-Three times the majors, 36% more time stopped, and 9% of the memory back. The
-reason is the section below: what the heap is holding is not garbage waiting to
-be found, it is holes.
+Three times the majors, 36% more time stopped, 9% of the memory back. Capping
+the *absolute* growth between majors instead (`live + min(live*2, N)`) behaves
+the same -- at a 64 MB cap, held falls to 375 MB and RSS does not fall at all.
+Turning the concurrent mark off, which is the one window in which a process is
+forbidden to collect, changes neither.
+
+The reason is in the second number `--stats` now prints: **88% of the peak is
+allocated**. 363 MB of the 421 MB the heap holds at its high-water mark is
+objects that exist -- live, or merely not yet proven dead -- and only 58 MB is
+headroom and holes. A trigger can only recover the 58 MB, which is why every
+trigger policy lands in the same place. What makes the *allocated* figure so
+much larger than the ~182 MB that is genuinely live is that a tighter threshold
+collects sooner, leaves its holes behind, and the holes are not consumed before
+the next collection needs new blocks: the equilibrium simply re-forms one
+collection earlier.
 
 **A bigger nursery does not help either.** Survival through a minor runs 32-58%,
 which looks like a nursery too small to let things die -- but it is not.
@@ -363,7 +376,9 @@ OS (`--stats` reports this now) and the rest is the VM's own floor -- about
 38 MB of it before a program has run at all -- plus the C++ side.
 
 The last full collection of a self-compile finds **182 MB live in 386 MB of
-blocks**: 47% occupancy. Only 422 of 5848 blocks are *entirely* empty, so
+blocks**: 47% occupancy, with 182 MB of that sitting on the free lists (45 MB
+of it in the 24-byte class, 46 MB in the 288-byte class, and the rest spread
+over twenty more). Only 422 of 5848 blocks are *entirely* empty, so
 sweeping cannot hand the memory back -- a 64 KiB block holds around 1300 small
 objects, and with 45% of them surviving, essentially no block ever empties. The
 dead space is interleaved with the live, one chunk at a time, on 55 segregated

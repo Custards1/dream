@@ -168,7 +168,10 @@ Heap::Block* Heap::new_block(size_t bytes) {
     b->big = false;
     b->dead = false;
     block_bytes_ += size;
-    if (block_bytes_ > peak_block_bytes_) peak_block_bytes_ = block_bytes_;
+    if (block_bytes_ > peak_block_bytes_) {
+        peak_block_bytes_ = block_bytes_;
+        peak_allocated_ = allocated_;
+    }
     return b;
 }
 

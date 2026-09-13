@@ -290,6 +290,15 @@ public:
     /// free lists, and the blocks a sweep emptied but cannot hand back because
     /// something else in them is still alive.
     size_t bytes_peak_held() const { return peak_block_bytes_; }
+    /// What was *allocated* at the moment the heap held the most -- objects
+    /// that existed, live or merely not yet proven dead. Reported beside the
+    /// held figure because the gap between the two is the collector's own
+    /// waste (headroom and holes), and the gap between *this* and the live set
+    /// is what a different trigger policy could in principle recover. On the
+    /// self-compile it is 88% of the peak, which is what says the peak is a
+    /// heap full of objects rather than a heap full of holes -- and so why
+    /// four different threshold policies all failed to move it. See docs/gc.md.
+    size_t bytes_alloc_at_peak() const { return peak_allocated_; }
 
     /// Deep-copy `v` out of this heap into `dest`. Used for message sends and
     /// for spawning, which are the only two places a value crosses heaps.
@@ -483,6 +492,7 @@ private:
     /// Bytes currently malloc'd for blocks, and the most there have ever been.
     size_t block_bytes_ = 0;
     size_t peak_block_bytes_ = 0;
+    size_t peak_allocated_ = 0;
     size_t gc_threshold_;
     size_t initial_bytes_;
     size_t live_after_gc_ = 0;
