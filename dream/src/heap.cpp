@@ -153,11 +153,6 @@ Heap::Heap(size_t initial_bytes)
     nursery_.push_back(new_block(initial_bytes));
 }
 
-Heap::~Heap() {
-    free_blocks(blocks_);
-    for (Block* b : nursery_) free_block(b);
-}
-
 Heap::Block* Heap::new_block(size_t bytes) {
     size_t size = bytes < initial_bytes_ ? initial_bytes_ : bytes;
     auto* b = static_cast<Block*>(std::malloc(sizeof(Block)));
@@ -305,11 +300,25 @@ Obj* Heap::alloc_bare(ObjType type, size_t extra) {
         gen = GC_YOUNG;
     }
     // The header is written whole rather than cleared and then filled: these
-    // four fields are the whole of it.
+    // four fields are the whole of it. `gc` is published last, because it is
+    // what a concurrent mark's helper looks at first -- the other bytes must
+    // all be there by the time the byte that says "reachable" is.
+    //
+    // A big object allocated during a concurrent mark is born *marked*: born
+    // grey, it could be scanned by a helper before its caller has filled the
+    // payload in. So it carries GC_MARK, and is logged for the finalize to
+    // scan when the fills are done. The young objects it is filled with can
+    // wait for that scan; a helper would have skipped them anyway, because
+    // young objects are precisely what a concurrent mark leaves to the final.
     o->type = type;
-    o->gc = gen;
     o->aux = 0;
     o->bytes = sz;
+    if (marking_ && bytes > kMaxClassSize) {
+        std::atomic_ref<uint8_t>(o->gc).store(GC_OLD | GC_MARK, std::memory_order_release);
+        mark_born_.push_back(o);
+    } else {
+        std::atomic_ref<uint8_t>(o->gc).store(gen, std::memory_order_relaxed);
+    }
     total_allocated_ += sz;
     return o;
 }
@@ -574,6 +583,24 @@ inline uint8_t read_gc(Obj* o) {
         return o->gc;
 }
 
+/// Read an object's type byte. In a parallel round another thread may be
+/// claiming the object's `gc` at this moment -- but that is not the byte
+/// being read here, and the mutator, which is stopped in a parallel round,
+/// writes no headers then. What needs saying is the *concurrent* mark, where
+/// the mutator is very much running and can flip a live thunk's type (to
+/// Blackhole, to Indirect, back) while a helper scans: a plain read against
+/// that atomic store is a data race, and reading a type mid-store is reading
+/// a byte that is whole one way or the other anyway.
+template <bool Par>
+inline ObjType read_type(Obj* o) {
+    if constexpr (Par)
+        return static_cast<ObjType>(
+            std::atomic_ref<uint8_t>(reinterpret_cast<uint8_t&>(o->type))
+                .load(std::memory_order_acquire));
+    else
+        return o->type;
+}
+
 /// The same for a reference the collector is about to rewrite.
 ///
 /// Two threads can reach one slot: an object logged twice in the remembered
@@ -665,6 +692,20 @@ constexpr unsigned kFreeBatch = 256;
 
 }  // namespace
 
+/// Keep the actual destructor here: it joins a concurrent mark in flight --
+/// the helpers may be picking their way through an object in this heap at
+/// this very moment, so they must stand down before a single block below is
+/// freed -- and `mark_round_`'s `unique_ptr` needs the round's shape complete,
+/// which it only is once `GcRound` has been defined above.
+Heap::~Heap() {
+    if (marking_) {
+        marking_ = false;
+        GcPool::instance().join();
+    }
+    free_blocks(blocks_);
+    for (Block* b : nursery_) free_block(b);
+}
+
 /// How much work makes the handshake worth it. Waking a pool of threads and
 /// joining them again costs tens of microseconds, so a collection that would
 /// have finished inside that is better done alone -- and most collections in
@@ -733,8 +774,70 @@ void Heap::mark_object(GcCtx& c, Value v) {
     if (!is_atom_object(o->type)) c.q->push_back(o);
 }
 
-template <bool Par>
+bool Heap::claim_mark(Obj* o) {
+    // The concurrent mark's claim, and its rule in one line: old objects only.
+    // Young ones move at the finalize, so a mark on one would name a corpse;
+    // they are reached again there, from the live roots. The mark is the claim
+    // exactly as in `mark_object`, except there is no `Par` shape to speak for:
+    // the seed and the helpers may as well all use the atomic, since it is the
+    // same instruction and only turns up during a mark.
+    auto gc = std::atomic_ref<uint8_t>(o->gc);
+    uint8_t g = gc.load(std::memory_order_acquire);
+    if (g & GC_YOUNG) return false;
+    if (g & GC_MARK) return false;
+    uint8_t prev = gc.fetch_or(GC_MARK, std::memory_order_acq_rel);
+    return (prev & GC_MARK) == 0 && !(prev & GC_YOUNG);
+}
+
+bool Heap::mark_ref(GcCtx& c, Value v) {
+    if (!is_ptr(v)) return false;
+    Obj* o = as_obj(v);
+    if (!claim_mark(o)) return false;
+    // The type is read atomically because the mutator is running: it may be
+    // flipping a live thunk's type (to Blackhole, to Indirect, back) at this
+    // very moment, and a helper reading the byte plainly against that store is
+    // a data race. The byte is whole one way or the other either way, but the
+    // says-so is what ThreadSanitizer needs.
+    //
+    // Atom objects have nothing to scan; the mark bit alone keeps them.
+    if (!is_atom_object(read_type<true>(o))) c.q->push_back(o);
+    return true;
+}
+
+/// Hand one store's object to the concurrent mark's helpers and note it for
+/// the finalize. The caller has already established that a mark is running and
+/// the object carries the mark, so the work is purely the bookkeeping that
+/// turns "the helpers may have finished with this neighbourhood" into "it will
+/// be walked again": `mark_log_` is the finalize's memory of it, and the
+/// round's shared stack gets it at once, so a helper that is still awake takes
+/// it now instead of the finalize taking it later.
+void Heap::log_mutation(Obj* dst) {
+    mark_log_.push_back(dst);
+    GcRound* r = round_;
+    if (!r) return;
+    bool wake;
+    {
+        std::lock_guard<std::mutex> g(r->mutex);
+        // The trace may have finished a moment ago, with every helper asleep;
+        // work pushed now would sit there until the finalize's join, useless.
+        // The finalize re-walks `mark_log_` either way, so it is safe to let
+        // the object wait for it.
+        if (r->done.load(std::memory_order_relaxed)) return;
+        r->stack.push_back(dst);
+        r->shared.store(r->stack.size(), std::memory_order_relaxed);
+        wake = r->waiting > 0;
+    }
+    if (wake) r->cv.notify_all();
+}
+
+template <bool Par, bool Con>
 void Heap::forward_in(GcCtx& c, Value* slot) {
+    // A concurrent mark does not promote -- young objects are the finalize's
+    // job -- so its "forwarding" is marking, and nothing more.
+    if constexpr (Con) {
+        mark_ref(c, read_slot<Par>(slot));
+        return;
+    }
     Value v = read_slot<Par>(slot);
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
@@ -842,73 +945,83 @@ Obj* Heap::promote(GcCtx& c, Obj* o) {
     return copy;
 }
 
-template <bool Par>
+template <bool Par, bool Con>
 void Heap::scan_object(GcCtx& c, Obj* o) {
-    switch (o->type) {
+    // Each reference is either forwarded (the copying collector: promote a
+    // young one, mark an old one, fold an indirection) or, when `Con`, merely
+    // marked -- the concurrent mark's whole scan. Everything else is shared,
+    // which is why the switch below is the same list of fields either way.
+    auto forward = [&](Value* slot) {
+        if constexpr (Con)
+            mark_ref(c, read_slot<Par>(slot));
+        else
+            forward_in<Par, Con>(c, slot);
+    };
+    switch (read_type<Par>(o)) {
         case ObjType::Cons: {
             auto* x = static_cast<ConsObj*>(o);
-            forward_in<Par>(c, &x->head);
-            forward_in<Par>(c, &x->tail);
+            forward(&x->head);
+            forward(&x->tail);
             break;
         }
         case ObjType::Array: {
             auto* a = static_cast<ArrayObj*>(o);
-            for (uint32_t i = 0; i < a->len; ++i) forward_in<Par>(c, &a->items()[i]);
+            for (uint32_t i = 0; i < a->len; ++i) forward(&a->items()[i]);
             break;
         }
         case ObjType::Map: {
             auto* m = static_cast<MapObj*>(o);
             uint32_t n = map_bit_count(m->bitmap);
-            for (uint32_t i = 0; i < n; ++i) forward_in<Par>(c, &m->slots()[i]);
+            for (uint32_t i = 0; i < n; ++i) forward(&m->slots()[i]);
             break;
         }
         case ObjType::MapLeaf: {
             auto* l = static_cast<MapLeafObj*>(o);
-            forward_in<Par>(c, &l->key);
-            forward_in<Par>(c, &l->value);
-            forward_in<Par>(c, &l->next);
+            forward(&l->key);
+            forward(&l->value);
+            forward(&l->next);
             break;
         }
         case ObjType::Closure: {
             auto* x = static_cast<ClosureObj*>(o);
-            for (uint32_t i = 0; i < x->ncaps; ++i) forward_in<Par>(c, &x->caps()[i]);
+            for (uint32_t i = 0; i < x->ncaps; ++i) forward(&x->caps()[i]);
             break;
         }
         case ObjType::Thunk:
         case ObjType::Blackhole: {
             auto* t = static_cast<ThunkObj*>(o);
-            forward_in<Par>(c, &t->frame);
+            forward(&t->frame);
             break;
         }
         case ObjType::Indirect: {
             auto* ind = static_cast<IndirectObj*>(o);
-            forward_in<Par>(c, &ind->target);
+            forward(&ind->target);
             break;
         }
         case ObjType::Pap: {
             auto* p = static_cast<PapObj*>(o);
-            forward_in<Par>(c, &p->fn);
-            for (uint32_t i = 0; i < p->nargs; ++i) forward_in<Par>(c, &p->args()[i]);
+            forward(&p->fn);
+            for (uint32_t i = 0; i < p->nargs; ++i) forward(&p->args()[i]);
             break;
         }
         case ObjType::Frame: {
             auto* f = static_cast<FrameObj*>(o);
-            forward_in<Par>(c, &f->closure);
-            for (uint32_t i = 0; i < f->nslots; ++i) forward_in<Par>(c, &f->slots()[i]);
+            forward(&f->closure);
+            for (uint32_t i = 0; i < f->nslots; ++i) forward(&f->slots()[i]);
             break;
         }
         case ObjType::ErrorBox: {
             auto* e = static_cast<ErrorObj*>(o);
-            forward_in<Par>(c, &e->kind);
-            forward_in<Par>(c, &e->payload);
+            forward(&e->kind);
+            forward(&e->payload);
             break;
         }
         case ObjType::Module: {
-            forward_in<Par>(c, &static_cast<ModuleObj*>(o)->name);
+            forward(&static_cast<ModuleObj*>(o)->name);
             break;
         }
         case ObjType::Native: {
-            forward_in<Par>(c, &static_cast<NativeObj*>(o)->name);
+            forward(&static_cast<NativeObj*>(o)->name);
             break;
         }
         // Float, Str and Pid hold no references.
@@ -924,9 +1037,9 @@ void Heap::forward(Value* slot) {
         return;
     }
     if (parallel_)
-        forward_in<true>(*root_ctx_, slot);
+        forward_in<true, false>(*root_ctx_, slot);
     else
-        forward_in<false>(*root_ctx_, slot);
+        forward_in<false, false>(*root_ctx_, slot);
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,14 +1199,14 @@ bool Heap::take_work(GcCtx& c) {
     }
 }
 
-template <bool Par>
+template <bool Par, bool Con>
 void Heap::drain(GcCtx& c) {
     std::vector<Obj*>& q = *c.q;
     for (;;) {
         while (!q.empty()) {
             Obj* o = q.back();
             q.pop_back();
-            scan_object<Par>(c, o);
+            scan_object<Par, Con>(c, o);
             if constexpr (Par) {
                 ++c.scanned;
                 if (--c.check_in <= 0) {
@@ -1152,9 +1265,9 @@ bool Heap::trace_in_parallel(RootSource& roots, bool minor) {
             size_t n = remembered_.size();
             size_t lo = n * index / count;
             size_t hi = n * (index + 1) / count;
-            for (size_t k = lo; k < hi; ++k) scan_object<true>(c, remembered_[k]);
+            for (size_t k = lo; k < hi; ++k) scan_object<true, false>(c, remembered_[k]);
         }
-        drain<true>(c);
+        drain<true, false>(c);
     });
 
     parallel_ = false;
@@ -1197,9 +1310,9 @@ void Heap::trace_alone(RootSource& roots, bool minor) {
     roots.visit_roots(*this);
     root_ctx_ = nullptr;
     if (minor) {
-        for (Obj* o : remembered_) scan_object<false>(c, o);
+        for (Obj* o : remembered_) scan_object<false, false>(c, o);
     }
-    drain<false>(c);
+    drain<false, false>(c);
     promoted_bytes_ += c.promoted;
     total_allocated_ += c.total;
 }
@@ -1260,6 +1373,10 @@ void Heap::major_collect(RootSource& roots) {
     // reach a nursery through this that it could not have earned.
     nursery_hi_ = live_after_gc_ / 4 + initial_bytes_;
     if (nursery_hi_ > nursery_max_) nursery_hi_ = nursery_max_;
+    // A major has just emptied the nursery and refitted both thresholds, so
+    // whatever a minor last measured is about a heap that no longer exists.
+    // Give the generational bet its odds back and let the next minor judge.
+    minor_pays_ = true;
 
     major_nanos_ += now_nanos() - started;
     if (gc_trace())
@@ -1294,7 +1411,14 @@ void Heap::minor_collect(RootSource& roots) {
     ++collections_;
     ++minor_collections_;
     if (allocated_ > peak_live_) peak_live_ = allocated_;
-    grow_nursery_if_crowded(size_t(promoted_bytes_ - promoted_before), looked_at);
+    // What this minor cost against what it recovered. A nursery that was
+    // nearly all survivors is one a minor cannot help with -- it copies the
+    // lot into old space and the lot dies there -- and `major_due` reads this
+    // to stop choosing minors in that case. The same ratio, at a different
+    // threshold, is what decides the nursery should grow.
+    const size_t promoted_now = size_t(promoted_bytes_ - promoted_before);
+    minor_pays_ = promoted_now * 4 <= looked_at * 3;
+    grow_nursery_if_crowded(promoted_now, looked_at);
     minor_nanos_ += now_nanos() - started;
     if (gc_trace())
         std::fprintf(stderr, "; minor: %zu nursery, %llu promoted, %zu remembered, %.2f ms\n",
@@ -1305,6 +1429,176 @@ void Heap::minor_collect(RootSource& roots) {
     // last full collection measured; `bytes_allocated` reports the whole live
     // picture. The check a minor adds is that nothing reachable is young.
     verify_collect(roots, true);
+}
+
+// ---------------------------------------------------------------------------
+// A major whose marking overlaps the mutator
+// ---------------------------------------------------------------------------
+//
+// Phase 2's step 3: the pool that a parallel collection borrows to shorten its
+// pause also works *during* the pause on a major's marking. A heap that is due
+// for a full collection snapshots its roots, hands the snapshot to the helper
+// threads, and keeps running -- the helpers walk old objects; the mutator
+// keeps allocating and storing; `should_collect` insists the only collection
+// the mutator may do meanwhile is the finalize of the one in flight. What the
+// helpers grey is a picture of the old graph as it was at the safepoint; the
+// finalize re-walks exactly what changed after it (see below), so the two
+// together divide the marking, with the younger, hotter half on the helpers
+// and the delta -- usually small -- at the finalize.
+
+bool Heap::start_concurrent_mark(RootSource& roots) {
+    // Overlapping the mark costs a pool round and, for every store into an old
+    // object while the helpers run, a couple of atomic loads and a log. A heap
+    // that could have finished its marking inside the handshake pays all of
+    // that for nothing, so size is the gate -- the same per-arg idea as
+    // `parallel_floor`, with a heavier thumb on the scale. `DREAM_GC_CONCURRENT=1`
+    // forces every major through this path (the race detector's door in), and
+    // `=0` switches it off regardless of size.
+    static const int mode = [] {
+        if (const char* v = std::getenv("DREAM_GC_CONCURRENT")) {
+            if (std::strcmp(v, "1") == 0) return 1;
+            if (std::strcmp(v, "0") == 0) return 0;
+        }
+        return -1;
+    }();
+    if (mode == 0) return false;
+    if (mode < 0 && allocated_ < (size_t(1) << 24)) return false;
+    GcPool& pool = GcPool::instance();
+    if (pool.capacity() < 2) return false;
+    const unsigned want = pool.capacity();
+
+    // The round must outlive this call: the helpers work on it after the
+    // function has returned, and the barrier feeds it until the finalize. It
+    // lives on the heap, not the stack, for exactly that reason.
+    if (!mark_round_) mark_round_ = std::make_unique<GcRound>();
+    GcRound& round = *mark_round_;
+    // `GcRound` is a stack-shaped object (see `trace_in_parallel`), so a roll
+    // like this has to reset every field one by one rather than start fresh.
+    round.stack.clear();
+    round.shared.store(0, std::memory_order_relaxed);
+    round.idle.store(0, std::memory_order_relaxed);
+    round.arrived = 0;
+    round.active = 0;
+    round.waiting = 0;
+    round.done.store(false, std::memory_order_relaxed);
+    round.ctxs.assign(want, GcCtx());
+    // The caller does not run the body, so the round belongs to the helpers
+    // alone; each announces the count it was given when it arrives.
+    round.size = 0;
+    round_ = &round;
+    marking_ = true;
+    mark_done_.store(false, std::memory_order_relaxed);
+    concurrent_started_ = now_nanos();
+
+    // Snapshot the roots at this safepoint, while they are still the
+    // mutator's. `forward` doubles as a recorder when `recording_` is set -- the
+    // same trick `verify_internal` uses, this time collecting entry points
+    // rather than walking anything.
+    mark_roots_.clear();
+    recording_ = &mark_roots_;
+    roots.visit_roots(*this);
+    recording_ = nullptr;
+
+    // Seed the grey set: every old root is claimed and handed to the shared
+    // stack, so the first helper to wake finds something to draw from. Nothing
+    // races here -- the helpers have not been told the round exists yet.
+    for (Value v : mark_roots_) {
+        if (!is_ptr(v)) continue;
+        Obj* o = as_obj(v);
+        if (claim_mark(o) && !is_atom_object(o->type)) round.stack.push_back(o);
+    }
+    round.shared.store(round.stack.size(), std::memory_order_relaxed);
+
+    // The helpers' job for this round: arrive, drain the graph, say done. A
+    // member -- not a stack object -- for the same reason the round itself is:
+    // the pool invokes it from another thread after this function has gone.
+    mark_body_ = [this](unsigned index, unsigned count) {
+        GcCtx& c = mark_round_->ctxs[index];
+        c.q = &c.own;
+        c.check_in = kCheckEvery;
+        {
+            std::lock_guard<std::mutex> g(mark_round_->mutex);
+            mark_round_->size = count - 1;  // the caller is not among us
+            ++mark_round_->arrived;
+            ++mark_round_->active;
+        }
+        drain<true, true>(c);
+        mark_done_.store(true, std::memory_order_relaxed);
+    };
+    if (!pool.start(want, mark_body_)) {
+        // The pool declined between our check and the launch -- another heap
+        // took it, or the scheduler's idle hint moved. Back the sealed round
+        // out so the caller can do the usual thing, and leave no trace.
+        marking_ = false;
+        round_ = nullptr;
+        mark_round_.reset();
+        mark_roots_.clear();
+        mark_log_.clear();
+        mark_born_.clear();
+        return false;
+    }
+    return true;
+}
+
+void Heap::finalize_concurrent_mark(RootSource& roots) {
+    const uint64_t started = now_nanos();
+    const uint64_t overlap_ns = now_nanos() - concurrent_started_;
+
+    // The mutator may not collect while the helpers have old space open, so the
+    // finalize's first act is to take the helpers away. They work on this
+    // heap's memory, and the sweep below is about to reconsider all of it.
+    marking_ = false;
+    GcPool::instance().join();
+
+    // The snapshot was read while the helpers were still running, so it may
+    // name young objects this finalize is about to move. Let it go before the
+    // nursery is emptied.
+    mark_roots_.clear();
+
+    // Re-walk what the overlap could not have seen: the old objects the
+    // mutator stored into while the helpers were working (a child can arrive
+    // after its parent was scanned), and the old objects born during the mark,
+    // whose fresh payloads were filled in after their headers were published.
+    // Both go on the remembered set, which the minor-shaped trace below scans
+    // first -- and which is sitting ready for exactly that walk.
+    remembered_.insert(remembered_.end(), mark_log_.begin(), mark_log_.end());
+    mark_log_.clear();
+    remembered_.insert(remembered_.end(), mark_born_.begin(), mark_born_.end());
+    mark_born_.clear();
+    mark_round_.reset();
+    round_ = nullptr;
+
+    // Everything the helpers greyed lay in the seeded graph; the mutator has
+    // moved on since, so what is left for the trace is the delta, and the
+    // trace skips whatever already carries the mark. This is the rest of a
+    // major -- promote the young through the remembered set, sweep, empty the
+    // nursery, call it done -- with the minor's tail shape on top of the
+    // major's mark.
+    full_trace_ = true;
+    if (!trace_in_parallel(roots, /*minor=*/true)) trace_alone(roots, /*minor=*/true);
+    full_trace_ = false;
+    if (!sweep_in_parallel()) sweep();
+    free_nursery();
+    remembered_.clear();
+    ++collections_;
+    ++major_collections_;
+    ++concurrent_marks_;
+
+    gc_threshold_ = live_after_gc_ * 3 + initial_bytes_;
+    nursery_hi_ = live_after_gc_ / 4 + initial_bytes_;
+    if (nursery_hi_ > nursery_max_) nursery_hi_ = nursery_max_;
+    // As in `major_collect`: the nursery is empty and both thresholds are
+    // newly fitted, so the last minor's verdict is about a heap that is gone.
+    minor_pays_ = true;
+
+    const uint64_t final_ns = now_nanos() - started;
+    major_nanos_ += final_ns;
+    concurrent_nanos_ += overlap_ns;
+    if (gc_trace())
+        std::fprintf(stderr,
+                     "; concurrent major: %zu live, %.2f ms overlap + %.2f ms stop\n",
+                     live_after_gc_, double(overlap_ns) / 1e6, double(final_ns) / 1e6);
+    verify_collect(roots, false);
 }
 
 // ---------------------------------------------------------------------------

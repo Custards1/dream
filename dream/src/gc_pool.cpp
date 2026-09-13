@@ -74,12 +74,12 @@ void GcPool::helper_loop(unsigned index) {
     }
 }
 
-bool GcPool::run(unsigned want, const std::function<void(unsigned, unsigned)>& body) {
-    if (capacity_ < 2 || want < 2) return false;
+unsigned GcPool::launch(unsigned want, const std::function<void(unsigned, unsigned)>& body) {
+    if (capacity_ < 2 || want < 2) return 0;
     // One heap at a time. The alternative -- queueing -- would make one
     // process's collection wait on another's, which is exactly the stall this
     // is here to shorten.
-    if (busy_.exchange(true, std::memory_order_acquire)) return false;
+    if (busy_.exchange(true, std::memory_order_acquire)) return 0;
 
     unsigned size = std::min(want, capacity_);
     if (idle_hint_) {
@@ -90,7 +90,7 @@ bool GcPool::run(unsigned want, const std::function<void(unsigned, unsigned)>& b
     }
     if (size < 2) {
         busy_.store(false, std::memory_order_release);
-        return false;
+        return 0;
     }
 
     {
@@ -102,16 +102,27 @@ bool GcPool::run(unsigned want, const std::function<void(unsigned, unsigned)>& b
         ++generation_;
     }
     start_cv_.notify_all();
+    return size;
+}
 
-    body(0, size);
+bool GcPool::start(unsigned want, const std::function<void(unsigned, unsigned)>& body) {
+    return launch(want, body) != 0;
+}
 
-    {
-        std::unique_lock<std::mutex> lk(mutex_);
-        done_cv_.wait(lk, [&] { return pending_ == 0; });
-        body_ = nullptr;
-        round_size_ = 0;
-    }
+void GcPool::join() {
+    std::unique_lock<std::mutex> lk(mutex_);
+    if (round_size_ == 0) return;
+    done_cv_.wait(lk, [&] { return pending_ == 0; });
+    body_ = nullptr;
+    round_size_ = 0;
     busy_.store(false, std::memory_order_release);
+}
+
+bool GcPool::run(unsigned want, const std::function<void(unsigned, unsigned)>& body) {
+    unsigned size = launch(want, body);
+    if (size == 0) return false;
+    body(0, size);
+    join();
     return true;
 }
 

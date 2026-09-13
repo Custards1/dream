@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -344,6 +345,41 @@ inline bool is_whnf(Value v) {
             return true;
     }
 }
+
+// ---------------------------------------------------------------------------
+// The few writes that escape a single thread
+// ---------------------------------------------------------------------------
+
+/// The mutator only rewrites a live object's header byte or a slot in a couple
+/// of places -- a thunk flipped to a blackhole and back, a frame slot bound, a
+/// forced cell's fields -- but during a concurrent mark a helper thread can be
+/// reading that same byte at the same moment. The reads the helpers make are
+/// already atomics (see `read_slot`/`read_gc` in heap.cpp); these are the
+/// writes they need to say the same thing, so that the pair is not a data race
+/// and a scan never sees half of an update.
+///
+/// Plain reads stay plain everywhere: a reader that is not the single writer is
+/// fine, the racing is between a helper's atomic read and this write. `relaxed`
+/// is enough for a header flip or a slot store -- the slot only needs to be one
+/// whole value one way or the other. The one exception is the thunk update,
+/// which publishes an `Indirect` after storing its target; that uses
+/// `obj_type_store_release` and has to put the target in first (see
+/// `step_return` in interp.cpp).
+inline void obj_type_store(Obj* o, ObjType t) {
+    std::atomic_ref<uint8_t>(reinterpret_cast<uint8_t&>(o->type))
+        .store(static_cast<uint8_t>(t), std::memory_order_relaxed);
+}
+inline void obj_type_store_release(Obj* o, ObjType t) {
+    std::atomic_ref<uint8_t>(reinterpret_cast<uint8_t&>(o->type))
+        .store(static_cast<uint8_t>(t), std::memory_order_release);
+}
+inline void value_slot_store(Value* slot, Value v) {
+    std::atomic_ref<Value>(*slot).store(v, std::memory_order_relaxed);
+}
+/// A plain read of an object's type. Every read can be plain -- the writes
+/// that need atomics are the ones above, and a read racing with nothing (there
+/// is only one writer of a given object's type) needs no saying either way.
+inline ObjType obj_type(Obj* o) { return o->type; }
 
 // ---------------------------------------------------------------------------
 // Strings, in either representation

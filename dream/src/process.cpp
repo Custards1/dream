@@ -89,14 +89,22 @@ Process::Process(Runtime& rt, uint64_t id) : rt_(rt), id_(id), heap_(64 * 1024) 
 Process::~Process() = default;
 
 void Process::maybe_collect() {
-    // An old space past its threshold wants the full collection; a nursery
-    // past its mark just wants the minor one. A major handles the minor's job
-    // too (it promotes everything reachable), so when both are due the full
-    // collection wins.
-    if (heap_.major_due())
-        heap_.major_collect(*this);
-    else
+    // A mark the helpers are still on is not a state to launch anything from:
+    // starting a second collection while the first's helpers were walking old
+    // space would be two collectors on one heap. The one legal move is to
+    // finalize what the helpers did -- which also folds in whatever minor a
+    // full collection would have owed, so the nursery emergency resolves here
+    // too. An old space past its threshold *starts* the concurrent mark when
+    // it can, and falls back to the whole-world major when the helpers are
+    // busy elsewhere or the heap is too small to gain from them. A nursery
+    // past its mark just gets the minor.
+    if (heap_.marking()) {
+        heap_.finalize_concurrent_mark(*this);
+    } else if (heap_.major_due()) {
+        if (!heap_.start_concurrent_mark(*this)) heap_.major_collect(*this);
+    } else {
         heap_.minor_collect(*this);
+    }
 }
 
 void Process::visit_roots(Heap& heap) {

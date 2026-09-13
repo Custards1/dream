@@ -19,8 +19,11 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -115,8 +118,55 @@ public:
 
     /// True when the process should collect at its next safepoint: old space
     /// past its threshold, or the nursery past its high-water mark.
-    bool should_collect() const { return major_due() || minor_due(); }
-    bool major_due() const { return allocated_ >= gc_threshold_; }
+    ///
+    /// With a concurrent mark in flight neither triggers a *new* collection --
+    /// the helpers may be walking an old object's fields at this very moment,
+    /// so the only collection this process may do is the finalize of the one
+    /// it already owes. The finalize becomes due when the helpers have drained,
+    /// or when the nursery has outgrown twice its high-water mark (the normal
+    /// mark, which would have triggered a minor, is not worth the handshake;
+    /// twice the normal mark is). The doubling is capped at the nursery's
+    /// maximum so it cannot handshake for a grow that was not allowed.
+    bool should_collect() const {
+        if (marking_)
+            return mark_done_.load(std::memory_order_relaxed) ||
+                   nursery_bytes_ >= std::min(nursery_max_, nursery_hi_ * 2);
+        return major_due() || minor_due();
+    }
+    /// Bytes held in old space: everything allocated that the nursery is not
+    /// still holding. `allocated_` counts both generations, because it is what
+    /// says how full the heap is; this is the half a major is about.
+    size_t old_bytes() const {
+        return allocated_ >= nursery_bytes_ ? allocated_ - nursery_bytes_ : 0;
+    }
+
+    /// Old space past the threshold the last full collection fitted to it.
+    ///
+    /// The nursery is deliberately not in that comparison -- `gc_threshold_`
+    /// is fitted to what a major found live in *old* space, so counting the
+    /// nursery against it measures a quantity a minor is about to empty
+    /// against one only a major can move. On the self-compile, separating them
+    /// took the majors from 176 ms to 16 ms: a major that fires while the
+    /// nursery is full promotes the whole of it first, so the conflation was
+    /// not just miscounting, it was picking the expensive collection.
+    ///
+    /// The second clause is what the first one costs. A nursery can be
+    /// hundreds of megabytes past its high-water mark by the time a safepoint
+    /// comes round, because a deep force (`strict!`) runs the interpreter in a
+    /// nested loop that may not collect -- a native above it holds raw
+    /// pointers, which is the "alloc never collects" rule -- and the safepoint
+    /// after it lands at the one instant when everything just allocated is
+    /// still live. A minor there is a copy with no collection in it: it
+    /// promotes the lot, and the lot dies immediately afterwards. So when the
+    /// last minor promoted more than three quarters of what it looked at, the
+    /// nursery is treated as old space's problem again and the whole heap is
+    /// the trigger. A `strict!` in a loop collected 2.4x faster for it, and
+    /// the compile does not notice, because its minors promote about a
+    /// quarter.
+    bool major_due() const {
+        if (old_bytes() >= gc_threshold_) return true;
+        return !minor_pays_ && allocated_ >= gc_threshold_;
+    }
     bool minor_due() const { return nursery_bytes_ >= nursery_hi_; }
 
     /// Full collection: promote every reachable young object and mark-sweep
@@ -128,6 +178,36 @@ public:
     /// nursery into old space, leaving it empty. The trace starts from the
     /// roots and the remembered set; old space is neither marked nor swept.
     void minor_collect(RootSource& roots);
+
+    /// Phase 2's step 3: a major whose *marking* overlaps the mutator.
+    ///
+    /// `start_concurrent_mark` snapshots the roots at this safepoint, seeds
+    /// the helper threads with them, and returns at once -- the helpers mark
+    /// the old objects they can reach while the mutator keeps running, and
+    /// skip young ones, which move and so cannot be marked ahead of time.
+    /// `finalize_concurrent_mark` then does what a major does: finish the
+    /// graph with one more pass over what the overlap could have missed, sweep,
+    /// and empty the nursery.
+    ///
+    /// The mutator runs no collection of any kind between the two calls --
+    /// `should_collect` says "finalize" when `marking()` is true, and nothing
+    /// else. `finalize_concurrent_mark` is the one legal way out.
+    ///
+    /// `start_concurrent_mark` returns false when the helpers cannot help (the
+    /// heap is too small, the pool has no threads, another heap owns it); the
+    /// caller then collects in the old whole-world way and the pair is not
+    /// entered. `marking()` is the third state, told from the two methods by
+    /// who is asking: `should_collect`/`maybe_collect` drive it, and the rest
+    /// of the runtime only ever reads `marking()` to pick the legal next move.
+    bool start_concurrent_mark(RootSource& roots);
+    void finalize_concurrent_mark(RootSource& roots);
+    /// True between `start_concurrent_mark` and `finalize_concurrent_mark`.
+    bool marking() const { return marking_; }
+    /// True once the helpers have drained their last batch: the mark is done
+    /// and only the finalize's housekeeping is owed. Read by `should_collect`
+    /// to make the finalize prompt when nothing more can be gained from the
+    /// overlap, so a heap does not drift on with a finished mark behind it.
+    bool mark_done() const { return mark_done_.load(std::memory_order_relaxed); }
 
     /// Hand one root to the collector: mark what `*slot` holds, and rewrite
     /// the slot when promotion moves it. This is the entry point a
@@ -145,9 +225,25 @@ public:
     /// existing object, so that a minor collection can still find every
     /// old-to-young reference. Cheap, and never needs a lock: only the owning
     /// process writes its own heap.
+    ///
+    /// The reads are atomics because the one byte being read is the same one a
+    /// concurrent mark's helper claims with `fetch_or` at the same moment --
+    /// same instruction as a plain load, but a plain load against an atomic
+    /// write is a data race whether or not it matters.
+    ///
+    /// During a concurrent mark the same store can also uncover a subgraph the
+    /// helpers have already drawn: an object is logged the first time a store
+    /// lands in one that is marked, so the finalize re-walks it -- and the
+    /// work is handed to the helpers now, so the re-walk happens concurrently
+    /// rather than at the finalize. A store into an object the helpers have
+    /// not marked yet needs none of this: their scan, when it comes, sees it.
     void remember_if_old(Obj* dst, Value value) {
-        if ((dst->gc & GC_OLD) && is_ptr(value) && (as_obj(value)->gc & GC_YOUNG))
+        uint8_t dgc = std::atomic_ref<uint8_t>(dst->gc).load(std::memory_order_acquire);
+        if ((dgc & GC_OLD) && is_ptr(value) &&
+            (std::atomic_ref<uint8_t>(as_obj(value)->gc).load(std::memory_order_acquire) &
+             GC_YOUNG))
             remembered_.push_back(dst);
+        if (marking_ && (dgc & GC_MARK)) log_mutation(dst);
     }
 
     size_t bytes_allocated() const { return allocated_; }
@@ -167,6 +263,14 @@ public:
     /// that those two numbers come apart.
     uint64_t nanos_minor() const { return minor_nanos_; }
     uint64_t nanos_major() const { return major_nanos_; }
+    /// Nanoseconds the mutator spent running *over* a concurrent mark -- the
+    /// window in which the helpers were working in the background. Not stopped
+    /// time; it is reported beside the stopped time precisely so the two can
+    /// be told apart.
+    uint64_t nanos_concurrent() const { return concurrent_nanos_; }
+    /// Full collections whose marking ran on the helper threads rather than on
+    /// the collecting thread alone.
+    uint64_t concurrent_marks() const { return concurrent_marks_; }
     /// Every byte this heap has ever handed out, collections included. What
     /// `bytes_allocated` reports is reset by a collection, so it says how full
     /// the heap is rather than how much work has gone through it -- and the
@@ -256,18 +360,32 @@ private:
     // copy that other threads wait for. Both are instantiated in heap.cpp.
 
     /// Mark what `*slot` holds, rewriting the slot if promotion moves it.
-    template <bool Par> void forward_in(GcCtx& c, Value* slot);
+    /// `Con` is the concurrent-mark shape: instead of promoting and absorbing,
+    /// it hands each reference to `mark_ref`, which marks what the helpers may
+    /// reach and skips the young.
+    template <bool Par, bool Con> void forward_in(GcCtx& c, Value* slot);
     /// The half of `forward_in` that has something to do: a young object to
     /// promote, one already promoted this cycle, or an indirection to fold
     /// away.
     template <bool Par> void forward_slow(GcCtx& c, Value* slot);
     /// Place one reference onto the live set.
     template <bool Par> void mark_object(GcCtx& c, Value v);
+    /// The concurrent mark's own claim on one reference. Unlike `mark_object`
+    /// it will not touch a young object -- those move at the finalize, and a
+    /// mark on a soon-to-be-corpse is a mark on nothing -- and it collapses no
+    /// indirection chains, because a chain it "fixed" would be a write the
+    /// mutator is reading. It is called by the helpers on every reference they
+    /// scan and by nothing else.
+    bool mark_ref(GcCtx& c, Value v);
+    /// Claim an old object for the concurrent mark: set GC_MARK, say whether
+    /// this caller won. Shared by `mark_ref` and the seed in
+    /// `start_concurrent_mark`.
+    static bool claim_mark(Obj* o);
     /// Copy a nursery object to old space and leave a forwarding pointer
     /// behind, so that the second reference to it finds the same copy.
     template <bool Par> Obj* promote(GcCtx& c, Obj* o);
     /// Update the references inside one object, pushing each further out.
-    template <bool Par> void scan_object(GcCtx& c, Obj* o);
+    template <bool Par, bool Con> void scan_object(GcCtx& c, Obj* o);
     /// Take `sz` bytes of old space to promote into. Serially that is the
     /// heap's own `carve`; in parallel it is the thread's private chunk lists
     /// and its private carve block, so that promotion needs no lock per
@@ -275,7 +393,7 @@ private:
     template <bool Par> Obj* gc_carve(GcCtx& c, uint32_t sz);
     /// Drain the thread's own queue, taking from and giving to the round's
     /// shared stack, until every thread has run out of work at once.
-    template <bool Par> void drain(GcCtx& c);
+    template <bool Par, bool Con> void drain(GcCtx& c);
 
     /// The old-space copy a forwarded nursery object points at, read back out
     /// of its first payload word.
@@ -375,8 +493,59 @@ private:
     GcRound* round_ = nullptr;
     /// The grey set while collecting: objects marked but not yet scanned.
     std::vector<Obj*> scan_queue_;
+    /// Whether the last minor collection was worth doing: it promoted no more
+    /// than three quarters of what it looked at, so the nursery was mostly
+    /// garbage and copying the survivors bought something. False after a minor
+    /// that promoted nearly everything -- see `major_due`, which then stops
+    /// preferring a minor. Starts true: a heap that has never collected has no
+    /// evidence against the generational bet.
+    bool minor_pays_ = true;
+
     /// Non-null while verifying: `forward` records roots rather than marking.
     std::vector<Value>* recording_ = nullptr;
+
+    /// Note a store into a marked object during a concurrent mark: the object
+    /// goes on the re-walk list (`mark_log_`, drained by the finalize) and on
+    /// the helpers' shared stack, so its newly uncovered subgraph is drawn in
+    /// the background rather than at the finalize. The caller -- `remember_if_old`
+    /// -- has already checked that a mark is running and the object is marked.
+    void log_mutation(Obj* dst);
+
+    /// True while a concurrent mark's helpers are out. Nothing else in the
+    /// heap may collect then, which is what `should_collect` enforces.
+    bool marking_ = false;
+    /// Set by a helper the moment its drain returns, meaning the mark's last
+    /// batch was the last anywhere: the finalize has nothing further to gain
+    /// by waiting. Written by the helpers, read by the process's own thread.
+    std::atomic<bool> mark_done_{false};
+    /// The roots, snapshotted at the safepoint where `start_concurrent_mark`
+    /// was called. The helpers see the heap as it was then, not as it becomes
+    /// while they work; young values in the snapshot are skipped and are
+    /// re-found by the finalize's walk of the live roots. Kept until the
+    /// finalize, because the values answer for objects the helpers still hold.
+    std::vector<Value> mark_roots_;
+    /// Old objects a store reached while a mark was running and the helpers
+    /// had moved past. The finalize scans these once more.
+    std::vector<Obj*> mark_log_;
+    /// Old objects allocated during a mark. They are born marked -- grey would
+    /// let a helper scan a half-built body -- and each carries a fresh young
+    /// payload written after its header was published, so marking them while
+    /// still building would miss the point. The finalize scans these once, at
+    /// the end, when the fills are all done.
+    std::vector<Obj*> mark_born_;
+    /// The concurrent mark's round, alive from `start_concurrent_mark` until
+    /// the finalize's join. It must outlive `start_concurrent_mark`'s stack,
+    /// and the finalize may be many reductions later.
+    std::unique_ptr<GcRound> mark_round_;
+    /// The mark's body, bound to the heap and the round. Same lifetime as
+    /// `mark_round_`: the pool calls it on another thread, so it must be a
+    /// member rather than a stack object the start function would leave.
+    std::function<void(unsigned, unsigned)> mark_body_;
+    uint64_t concurrent_marks_ = 0;
+    uint64_t concurrent_nanos_ = 0;
+    /// The clock reading taken when the helpers were launched; the overlap
+    /// window is the difference to the start of the finalize.
+    uint64_t concurrent_started_ = 0;
 };
 
 /// The size in bytes of an object, from its header.

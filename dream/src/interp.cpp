@@ -400,7 +400,7 @@ void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint3
                                         "value depends on itself"));
                 return;
             }
-            as_obj(thunk)->type = ObjType::Blackhole;
+            obj_type_store(as_obj(thunk), ObjType::Blackhole);
             push_cont(p, ContKind::UpdateThunk, 0, 0, 0, thunk);
             eval_node(p, t->node, t->frame);
             return;
@@ -499,7 +499,7 @@ void enter(Process& p, Value v) {
         Value fr = th->frame;
         // Blackhole first: if evaluating this thunk reaches it again, we have
         // a value defined in terms of itself and must say so rather than spin.
-        as_obj(v)->type = ObjType::Blackhole;
+        obj_type_store(as_obj(v), ObjType::Blackhole);
         push_cont(p, ContKind::UpdateThunk, 0, 0, 0, v);
         eval_node(p, node, fr);
         return;
@@ -536,9 +536,9 @@ void advance_block(Process& p, uint32_t kids_off, uint32_t count, uint32_t index
             } else {
                 bound = thunk_for(p, sn.b, frame);
             }
-            fo->slots()[sn.a] = bound;
             // A frame may have outlived its call -- one held by a long-lived
             // thunk -- so the bind can point an old object at a young one.
+            value_slot_store(&fo->slots()[sn.a], bound);
             p.heap().remember_if_old(fo, bound);
             // A binding is lazy unless the compiler marked it strict, which it
             // does exactly when the bound expression has effects that must
@@ -1460,7 +1460,7 @@ void step_eval(Process& p) {
         case Op::Bind: {
             auto* fo = static_cast<FrameObj*>(as_obj(frame));
             Value bound = thunk_for(p, n.b, frame);
-            fo->slots()[n.a] = bound;
+            value_slot_store(&fo->slots()[n.a], bound);
             p.heap().remember_if_old(fo, bound);
             ret(p, UNIT);
             return;
@@ -1610,8 +1610,12 @@ void step_return(Process& p, size_t floor) {
         // A thunk that has survived into old space now gains a young target,
         // so the write barrier notes the edge for the next minor collection.
         p.heap().remember_if_old(o, p.result);
-        o->type = ObjType::Indirect;
-        static_cast<IndirectObj*>(o)->target = p.result;
+        // The target goes in before the type flips, so the flip -- which is
+        // what a concurrent mark's helper reads first -- cannot be seen with
+        // the target still unset. The flip store is the one that releases.
+        std::atomic_ref<Value>(static_cast<IndirectObj*>(o)->target)
+            .store(p.result, std::memory_order_relaxed);
+        obj_type_store_release(o, ObjType::Indirect);
         continue;  // the value flows on to the next continuation
     }
 
@@ -1755,13 +1759,13 @@ bool unwind(Process& p, size_t floor) {
             // a later `try!` can attempt it again and see the same error,
             // rather than finding a blackhole and reporting a false loop.
             Obj* o = as_obj(c.v1);
-            if (o->type == ObjType::Blackhole) o->type = ObjType::Thunk;
+            if (obj_type(o) == ObjType::Blackhole) obj_type_store(o, ObjType::Thunk);
             continue;
         }
         if (c.kind == ContKind::Catch) {
             p.stack.resize(c.c);
             auto* fo = static_cast<FrameObj*>(as_obj(c.v1));
-            fo->slots()[c.b] = p.result;
+            value_slot_store(&fo->slots()[c.b], p.result);
             p.heap().remember_if_old(fo, p.result);
             eval_node(p, c.a, c.v1);
             return true;
@@ -2151,14 +2155,14 @@ bool force_deep(Process& p, Value v, Value* out) {
                 if (!force_deep(p, cell->head, &tmp)) {
                     return unwind(out);
                 }
-                cell->head = tmp;
+                value_slot_store(&cell->head, tmp);
                 p.heap().remember_if_old(cell, tmp);
 
                 Value tail;
                 if (!force_whnf(p, cell->tail, &tail)) {
                     return unwind(out);
                 }
-                cell->tail = tail;
+                value_slot_store(&cell->tail, tail);
                 p.heap().remember_if_old(cell, tail);
 
                 const bool more = is_ptr(tail) && as_obj(tail)->type == ObjType::Cons
@@ -2172,9 +2176,9 @@ bool force_deep(Process& p, Value v, Value* out) {
                 if (!is_ptr(tail) || as_obj(tail)->type != ObjType::Cons) {
                     Value done;
                     if (!force_deep(p, tail, &done)) return unwind(out);
-                    static_cast<ConsObj*>(as_obj(p.stack.back()))->tail = done;
-                    p.heap().remember_if_old(
-                        static_cast<ConsObj*>(as_obj(p.stack.back())), done);
+                    auto* last = static_cast<ConsObj*>(as_obj(p.stack.back()));
+                    value_slot_store(&last->tail, done);
+                    p.heap().remember_if_old(last, done);
                 }
                 break;
             }
@@ -2196,7 +2200,7 @@ bool force_deep(Process& p, Value v, Value* out) {
                 Value item = a->items()[i];
                 Value tmp;
                 if (!force_deep(p, item, &tmp)) return unwind(out);
-                a->items()[i] = tmp;
+                value_slot_store(&a->items()[i], tmp);
                 p.heap().remember_if_old(a, tmp);
             }
             as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;

@@ -50,7 +50,7 @@ Value* dream_rt_frame_slots(Value frame) {
 void dream_rt_frame_store(Process* p, Value frame, uint32_t index, Value v) {
     auto* f = static_cast<FrameObj*>(as_obj(frame));
     p->heap().remember_if_old(f, v);
-    f->slots()[index] = v;
+    value_slot_store(&f->slots()[index], v);
 }
 
 }  // extern "C"

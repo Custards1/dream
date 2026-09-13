@@ -406,6 +406,98 @@ static void test_parallel_major_collects_across_threads() {
     CHECK_EQ(h.verify(roots), std::string());
 }
 
+static void test_concurrent_mark_period() {
+    std::printf("a concurrent mark overlaps the mutator\n");
+    if (GcPool::instance().capacity() < 2) {
+        std::printf("  skipped (concurrent mark): the pool has no threads to give\n");
+        return;
+    }
+    // The mode is read once, by the first `start_concurrent_mark` call, so the
+    // knob must be set before this test's own call -- which is also the
+    // binary's first. Forcing it is what makes the size gate below not matter.
+    setenv("DREAM_GC_CONCURRENT", "1", 1);
+
+    Heap h(64 * 1024);
+    VectorRoots roots;
+
+    // Tenure a wide graph first: a concurrent mark is a *major*'s marking, so
+    // there has to be an old graph for the helpers to draw. The shape is the
+    // same as the parallel-sharing test's -- many arrays naming the same
+    // floats -- because the mark divides across threads at exactly these
+    // widths.
+    const uint32_t kFloats = 200;
+    const int kArrays = 300;
+    std::vector<Value> floats;
+    for (uint32_t i = 0; i < kFloats; ++i) floats.push_back(h.make_float(double(i)));
+    for (int a = 0; a < kArrays; ++a) {
+        Value arr = h.make_array(kFloats);
+        for (uint32_t i = 0; i < kFloats; ++i)
+            static_cast<ArrayObj*>(as_obj(arr))->items()[i] = floats[i];
+        roots.values.push_back(arr);
+    }
+    h.minor_collect(roots);
+
+    // Everything that survived is old; grow a little more on top of it so the
+    // graph is not its own seed's shadow.
+    std::vector<Value> extra;
+    for (int a = 0; a < 8; ++a) {
+        Value arr = h.make_array(2);
+        static_cast<ArrayObj*>(as_obj(arr))->items()[0] = roots.values[size_t(a)];
+        static_cast<ArrayObj*>(as_obj(arr))->items()[1] = h.make_float(-1.0);
+        extra.push_back(arr);
+        roots.values.push_back(arr);
+    }
+
+    CHECK_EQ(h.marking(), false);
+    CHECK(h.start_concurrent_mark(roots));
+    CHECK_EQ(h.marking(), true);
+
+    // The helpers are walking the graph while the mutator keeps going: more
+    // old-to-young stores -- the barrier logs each one -- and young garbage
+    // for the finalize to be wrong about if it guesses. Indices are stepped
+    // from 5 so that array 0 is never written: the check below walks it whole.
+    // Both the store and the barrier are the runtime's own spellings: a plain
+    // store here would race the helpers' atomic read of the same slot, which
+    // is precisely the race `value_slot_store` exists to make unused.
+    for (int a = 5; a < kArrays; a += 7) {
+        auto* arr = static_cast<ArrayObj*>(as_obj(roots.values[size_t(a)]));
+        Value fresh = h.make_cons(make_fixnum(a), h.make_float(0.5));
+        value_slot_store(&arr->items()[0], fresh);
+        h.remember_if_old(arr, fresh);
+        (void)h.make_cons(make_fixnum(a), NIL);  // young garbage
+    }
+
+    // Finalize; everything the delta reached must come back old.
+    h.finalize_concurrent_mark(roots);
+    CHECK_EQ(h.marking(), false);
+    CHECK_EQ(h.concurrent_marks(), uint64_t(1));
+    CHECK_EQ(h.major_collections(), uint64_t(1));
+
+    // The original floats survived the overlap, tenured, in the same order.
+    auto* first = static_cast<ArrayObj*>(as_obj(roots.values[0]));
+    for (uint32_t i = 0; i < kFloats; ++i) {
+        Value v = first->items()[i];
+        CHECK(is_obj(v, ObjType::Float));
+        CHECK(as_obj(v)->gc & GC_OLD);
+        CHECK_EQ(static_cast<FloatObj*>(as_obj(v))->value, double(i));
+    }
+
+    // The stores made during the mark landed, and what they pointed at was
+    // found by the barrier log and promoted rather than freed.
+    for (int a = 5; a < kArrays; a += 7) {
+        auto* arr = static_cast<ArrayObj*>(as_obj(roots.values[size_t(a)]));
+        Value popped = arr->items()[0];
+        if (!is_ptr(popped) || as_obj(popped)->gc & GC_YOUNG) {
+            CHECK(is_ptr(popped));
+            CHECK(!(as_obj(popped)->gc & GC_YOUNG));
+            continue;
+        }
+        CHECK_EQ(fixnum_value(static_cast<ConsObj*>(as_obj(popped))->head),
+                 int64_t(a));
+    }
+    CHECK_EQ(h.verify(roots), std::string());
+}
+
 static void test_heap_verifier_accepts_a_healthy_heap() {
     std::printf("heap verifier accepts a healthy heap\n");
     Heap h(4096);
@@ -926,6 +1018,7 @@ int main() {
     test_write_barrier_keeps_old_to_young();
     test_parallel_collection_preserves_sharing();
     test_parallel_major_collects_across_threads();
+    test_concurrent_mark_period();
     test_heap_verifier_accepts_a_healthy_heap();
     test_heap_verifier_catches_corruption();
     test_heap_verifier_follows_every_object_kind();

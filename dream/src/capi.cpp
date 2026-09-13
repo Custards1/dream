@@ -383,7 +383,7 @@ dream_result dream_array_set(dream_process* p, dream_value array, uint32_t index
     // value is young, which the next minor collection needs to hear about.
     a->aux &= uint16_t(~AUX_DEEP_FORCED);
     reinterpret_cast<Process*>(p)->heap().remember_if_old(a, v);
-    a->items()[index] = v;
+    value_slot_store(&a->items()[index], v);
     return DREAM_OK;
 }
 

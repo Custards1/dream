@@ -50,6 +50,22 @@ public:
     /// a requirement.
     bool run(unsigned want, const std::function<void(unsigned, unsigned)>& body);
 
+    /// The other half of a collection, and how a concurrent mark uses the pool.
+    /// `start` launches the same round `run` would, but the caller does not
+    /// take part -- it hands the body to the helpers and returns at once, so
+    /// the mutator can keep running while they work. `join` is what waits for
+    /// them, and is a no-op when no round is in flight. Only the heap that
+    /// started the round may join it: `busy_` sees to that, the same as `run`.
+    ///
+    /// The body must not assume the caller ran it. It is run on helper indexes
+    /// 1..count-1 only, and `count` is the whole round including the caller's
+    /// slot -- a round of one helper, say, arrives as index 1 of 2.
+    bool start(unsigned want, const std::function<void(unsigned, unsigned)>& body);
+    /// Wait for the round `start` launched on the helpers to finish. A no-op
+    /// when no round is running. This is also what a heap that is going away
+    /// mid-mark calls, so the helpers finish on memory that is still theirs.
+    void join();
+
     /// The most threads a collection may use, the caller included. Zero means
     /// helpers are switched off entirely (`DREAM_GC_THREADS=1`).
     unsigned capacity() const { return capacity_; }
@@ -69,6 +85,11 @@ private:
     void helper_loop(unsigned index);
     /// Start helper threads until there are at least `n` of them.
     void ensure_threads(unsigned n);
+    /// The shared front of `start` and `run`: negotiate how many threads the
+    /// round may have and launch its helpers. Returns the number of threads --
+    /// the caller's slot included -- or zero when the pool declined, in which
+    /// case the caller must do the work on its own thread.
+    unsigned launch(unsigned want, const std::function<void(unsigned, unsigned)>& body);
 
     unsigned capacity_ = 0;
     const std::atomic<unsigned>* idle_hint_ = nullptr;

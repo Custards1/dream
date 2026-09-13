@@ -14,7 +14,8 @@ The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp
 - [x] Phase 1 -- generational collection within a process heap (2026-09-09).
 - [x] Phase 2, step 1 -- the collection of one process divided across several
       threads, still stopping that process (2026-09-12).
-- [ ] Phase 2, step 3 -- marking that overlaps the process's own reductions.
+- [x] Phase 2, step 3 -- a major's marking overlaps the process's own
+      reductions (2026-09-12).
 - [ ] Later -- moving (copying or compacting) collection.
 
 ## The collector today
@@ -288,7 +289,7 @@ coordination problem with the interpreter, not with the collector.
 All three matter most for the long-lived, allocation-heavy processes -- the
 compiler, the language server -- that made the decision to start here.
 
-## Phase 2 -- step 1 done, the handshake still to come
+## Phase 2 -- both steps done
 
 The plan was three steps, in increasing order of ambition:
 
@@ -335,34 +336,62 @@ or paying it at all when nobody was waiting.
   needs waking. Keyed on "is any thread idle?" instead, with a much lower
   floor, the same collections went from 502 ms to 304 ms.
 
-### What step 3 would still take
+### What step 3 took
 
-Marking must overlap the *reductions of the owning process*, which means a
-thread reading the heap while the worker mutates it. What step 1 built is
-useful here and not sufficient: the threads, the work splitting, the claim
-protocol and the atomic mark bit all stay, but the mutator is no longer
-stopped, and that is the hard half.
+Marking now overlaps the *reductions of the owning process*: a pool thread
+reads the heap while the worker mutates it. What step 1 built carried over
+entirely -- the threads, the work splitting, the claim protocol, the atomic
+mark bit -- but the mutator is no longer stopped, and that is the whole of
+the difference. The design it settled on:
 
-- **Start** at a safepoint: the worker snapshots the roots and hands the heap
-  to the collector threads, then goes back to running the process.
-- **During marking** the worker keeps allocating and mutating. The mark adopts
-  snapshot semantics: it traces what was reachable when it started. To stay
-  sound it needs
-  - new allocations marked black (they are younger than the snapshot),
-  - the write barrier, while marking, to re-enqueue any value stored into an
-    object that has already been marked,
-  - and the type flips (`Thunk`/`Blackhole`/`Indirect`) to be atomic or
-    ordered, so the marker reads a whole type. This is the one the current
-    design is furthest from: the mutator writes `o->type` in place, and while
-    the collector only reads it, a torn read is exactly the class of bug
-    `DREAM_VERIFY_HEAP` exists to catch.
-- **Sweep** still stops the process: it mutates the block list and the free
-  lists, which are the things a running mutator touches. So the pause becomes
-  "sweep, plus the handshake" -- and the sweep is already the cheap half and
-  already divided, which is worth knowing before starting: on the self-compile
-  a parallel sweep is about a third of a major and a major is about half the
-  collector's time, so step 3's best case is removing roughly the mark, and
-  the mark is what step 1 already cut by a factor of two and a half.
+- **Snapshot semantics, young skipped.** At a safepoint the process snapshots
+  its roots and seeds the helpers with them; the helpers grey the old graph as
+  it was then. Young objects are skipped -- they move at the finalize, so a
+  mark on one would name a corpse -- and are reached again there, from the live
+  roots. A big object born during the mark has its payload filled in after its
+  header is published, so it is born *marked* rather than grey (a helper could
+  otherwise scan a half-built body) and is logged for the finalize to scan
+  once the fills are done.
+- **The write barrier pays the delta.** The mutator keeps storing while the
+  helpers work. A store into an object they have not marked yet needs nothing:
+  their scan is still to come and will see it. A store into one they have
+  already drawn must re-enqueue it, or an edge the snapshot never had is lost.
+  `remember_if_old` already sits on every in-place store the runtime makes
+  (interpreter, JIT spill slot, C API); during a mark it logs the object on a
+  re-walk list *and* hands it to the helpers' shared stack at once, so the
+  newly uncovered subgraph is drawn in the background rather than at the
+  finalize. The finalize re-walks the log either way, because a store can land
+  after the last helper has gone to sleep.
+- **The store sites the helpers read became atomic.** Everything a helper can
+  read while the mutator writes it needs spelling out: the slot stores (frame
+  binds, `force_deep`'s in-place decorations, the JIT spill store, the C API),
+  and -- the one the earlier design note always suspected -- the type byte a
+  thunk flips to Blackhole, to Indirect, and back, which a helper reads to
+  decide what a grey object holds. Reads stay plain where the mutator is the
+  only writer; only helper-read/mutator-write pairs are atomic
+  (`value_slot_store`/`read_slot<true>`). The one *ordering* edge is the thunk
+  update: the target goes in first, and the type flip that publishes it goes
+  second with a release, so a helper that sees an Indirect sees its target.
+- **The finalize is a minor's shape on a major's mark.** The process may not
+  run its own collection of any kind between start and finalize --
+  `should_collect` says "finalize" the moment a mark is in flight, and twice
+  the usual nursery mark is the only other prompt. The finalize joins the
+  helpers, then is the rest of a major: one more trace from the *living* roots
+  over the remembered set (an old object already carrying the mark costs a
+  claim-skip, so the graph is not walked again), the sweep, the nursery
+  emptied, the thresholds refit. The paused phase is that trace plus the
+  sweep -- and the sweep is the part that has to stop anyway, since it
+  rebuilds the lists the mutator allocates from.
+
+Two things cost more than the reading of the design above suggests. The
+round's `size` counts participants, and when the caller does not run the body
+it must count the helpers *minus* the caller -- an off-by-one is a trace that
+never finishes, waiting for an arrival that was never promised. And the type
+byte is read atomically by a helper not because a torn byte matters -- it is
+whole one way or the other -- but because a plain read against the mutator's
+atomic store is the data race ThreadSanitizer is paid to find. It found that
+race first in the test's own mutation loop before the runtime was even
+involved: the mutator's *own* store sites had to use the atomic spelling too.
 
 ## Later -- moving collections
 
@@ -402,6 +431,28 @@ C++ local escapes, is what `--verify` will be asked to test first.
   first working version -- a promoted copy published into a slot without a
   release, and `resolve` walking those slots without an acquire -- neither of
   which the verifier or a byte-identical bootstrap could see.
+- **Done:** Phase 2 step 3 -- a major's *marking* overlaps the process's own
+  reductions. The pool's helpers seed from a roots snapshot taken at the
+  safepoint and mark the old graph as it then was; young objects wait for the
+  finalize, hot-payload big objects are born marked; the write barrier logs
+  every store that lands in a marked object and hands it to the helpers at
+  once; the store sites the helpers can read are atomic, with the thunk
+  update's publish-release the one ordered edge; and the finalize -- the only
+  collection the process may run while a mark is in flight -- joins the
+  helpers and does the rest of the major in one pass over the delta.
+  `DREAM_GC_CONCURRENT` forces (1), disables (0), or lets size decide (default)
+  whether a major takes the path, and `--stats` reports overlapped majors and
+  the overlap window separately from the stopped time.
+
+  Covered by a unit test that tenures a wide graph, starts a mark, mutates it
+  while the helpers are out, finalizes and walks the result; by `test-heap`,
+  which with `DREAM_GC_CONCURRENT=1` puts every major of every end-to-end
+  program through the path under `DREAM_VERIFY_HEAP`; and by `test-races`,
+  which runs the same suite under ThreadSanitizer. The detector's first
+  verdict on the first version was a real catch, and a telling one: the plain
+  store in the unit test's own mutation loop raced the helpers' atomic read
+  of the same slot -- the exact spelling `value_slot_store` exists to enforce,
+  before any of the runtime's own sites were even in the picture.
 - **Measured (2026-09-12), before.** `dream --stats` on the self-compile: 214M
   reductions, 14 major and 45 minor collections, 1.50 GB allocated, 338 MB
   promoted, 276 MB live at the heap's peak, and **831 ms of a 3197 ms compile
@@ -447,10 +498,26 @@ C++ local escapes, is what `--verify` will be asked to test first.
   that matters for `lucid`: what a user notices is the longest stall, not the
   throughput.
 
-- **Next:** Phase 2 step 3, the handshake that lets marking overlap the
-  process's own reductions. What it needs is written down above; the honest
-  estimate of what it is worth is there too, and it is smaller now than it was
-  before step 1.
+- **Measured (2026-09-12), after step 3.** The same self-compile, byte-identical
+  output either way, so the two configurations differ only in whether a major
+  may hand its marking to the helpers:
+
+  | Config | Stopped in collection | Wall |
+  |---|---|---|
+  | Off (`DREAM_GC_CONCURRENT=0`) | 324 ms (165 major, 159 minor) | 2618 ms |
+  | On (default heuristic) | 312 ms (164 major, 148 minor) | 2529 ms |
+
+  Five of the fourteen majors ran their marking on the helpers, with 10 ms of
+  it off the critical path. That smallness is the honest finding, and the
+  number that says what step 3 is worth: the mark was already parallel, so the
+  overlap only hides the remainder, and the finalize owes a pass over the
+  delta that can cost nearly what the overlap saved on a small major. The size
+  gate exists for exactly that reason -- the early, small majors of a compile
+  still collect the old way, and the late big ones are where the 90 ms comes
+  from.
+
+- **Next:** moving collections -- the design for which is written down under
+  "Later" below.
 
 The VM-side Phase 1 work sits alongside compiler work done in the same session:
 a `dreams` bug in lowered guarded match arms (a guarded arm's failing pattern
