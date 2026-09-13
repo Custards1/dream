@@ -316,6 +316,7 @@ Obj* Heap::alloc_bare(ObjType type, size_t extra) {
     // scan when the fills are done. The young objects it is filled with can
     // wait for that scan; a helper would have skipped them anyway, because
     // young objects are precisely what a concurrent mark leaves to the final.
+    by_type_[size_t(type) & 31] += sz;
     o->type = type;
     o->aux = 0;
     o->bytes = sz;

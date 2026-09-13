@@ -174,6 +174,32 @@ void Runtime::print_stats() const {
                  double(major_ns + minor_ns) / 1e6, double(major_ns) / 1e6,
                  double(minor_ns) / 1e6, static_cast<unsigned long long>(rounds),
                  static_cast<unsigned long long>(concurrent), double(concurrent_ns) / 1e6);
+
+    // Where the bytes went, by object kind. A lazy language's garbage is mostly
+    // thunks and frames, and the share of each is what says whether the next
+    // thing worth writing is a strictness analysis or something else entirely.
+    std::array<uint64_t, 32> kinds{};
+    for (const auto& p : all_processes()) {
+        const auto& t = p->heap().bytes_by_type();
+        for (size_t i = 0; i < kinds.size(); ++i) kinds[i] += t[i];
+    }
+    std::vector<std::pair<uint64_t, size_t>> rows;
+    uint64_t all = 0;
+    for (size_t i = 0; i < kinds.size(); ++i) {
+        all += kinds[i];
+        if (kinds[i]) rows.push_back({kinds[i], i});
+    }
+    if (!all) return;
+    std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::string line = "; allocated by kind:";
+    for (size_t i = 0; i < rows.size() && i < 8; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, " %s %.0f%%",
+                      obj_type_name(ObjType(rows[i].second)),
+                      100.0 * double(rows[i].first) / double(all));
+        line += buf;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 
 Runtime::~Runtime() {

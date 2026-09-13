@@ -299,6 +299,7 @@ public:
     /// heap full of objects rather than a heap full of holes -- and so why
     /// four different threshold policies all failed to move it. See docs/gc.md.
     size_t bytes_alloc_at_peak() const { return peak_allocated_; }
+    const std::array<uint64_t, 32>& bytes_by_type() const { return by_type_; }
 
     /// Deep-copy `v` out of this heap into `dest`. Used for message sends and
     /// for spawning, which are the only two places a value crosses heaps.
@@ -491,6 +492,11 @@ private:
     size_t peak_live_ = 0;
     /// Bytes currently malloc'd for blocks, and the most there have ever been.
     size_t block_bytes_ = 0;
+    /// Bytes handed out, by object kind. Where a program's garbage actually
+    /// comes from -- a lazy language's answer is usually "thunks and frames",
+    /// and knowing the share is what says whether a strictness analysis would
+    /// be worth writing. One add per allocation, indexed by the type byte.
+    std::array<uint64_t, 32> by_type_{};
     size_t peak_block_bytes_ = 0;
     size_t peak_allocated_ = 0;
     size_t gc_threshold_;
