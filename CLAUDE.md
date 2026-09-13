@@ -343,20 +343,10 @@ What has already been learnt from them, so it is not learnt twice:
   allocated 240 MB to do work that takes **43 ms and 122 KB**. So the nested
   loop re-arms the budget and records the slice as spent (`Process::slice_spent`)
   instead, and `run_process` ends the slice when the force returns. Note what
-  this means about the claim below it: a tail loop was only 7x faster than
-  CPython when nothing was forcing it, and a program that prints its answer is
-  forcing it.
-- **Known, and older than any of this: a compiled function forcing a long
-  thunk chain overflows the *machine* stack and dies with SIGSEGV rather than
-  raising.** `let rec f acc i = f (g acc i) (i + 1)` with a lazy accumulator
-  builds a chain of ten million suspensions -- the trap `list.fold_strict`
-  exists to avoid -- and forcing it is supposed to raise `:stack_overflow` at
-  `DREAM_MAX_DEPTH`, which is what the interpreter does. But if the step is a
-  function the JIT compiled, forcing the chain goes through `load_slot` ->
-  `dream_rt_force` -> `force_whnf`, which is a C++ frame *per link*, and the
-  8 MB thread stack runs out first. Reproduced against the unmodified JIT, so
-  it is not new; the fix is for the compiled slot force to hand a chain back to
-  the interpreter rather than recurse, and it has not been written.
+  this means about every JIT number taken before it: "a tail loop is 7x faster
+  than CPython", which these notes carried for months, was only true when
+  nothing was forcing the loop -- and a program that prints its answer is
+  forcing it. It is true now.
 - **`strict!` is the native that most needed to vouch.** `VouchesForGc` exists
   because a native running unbounded Dream work underneath itself pins the heap,
   and `strict!` is how a program says "do the whole of this now" -- so the work
@@ -373,6 +363,46 @@ What has already been learnt from them, so it is not learnt twice:
   PLT and none of them inline -- and the interpreter's hot path is nothing but
   cross-TU calls. Link-time optimization on top of that was measured and bought
   nothing, so it is not enabled.
+
+### Known and not fixed: compiled code forcing a long thunk chain crashes
+
+A JIT-compiled function that forces a long chain of suspensions dies with
+**SIGSEGV** where the interpreter raises `:stack_overflow`. Found 2026-09-13,
+reproduced against the JIT exactly as it was before it learnt self recursion, so
+it is not new -- but nothing here had looked for it before.
+
+```
+import std.console;
+let rec loop_f f i n acc = if i > n { acc } else { loop_f f (i + 1) n (f acc i) };
+let main! = { console.print! (loop_f (fn a b -> a + b) 1 10000000 0) };
+```
+
+`acc` is lazy, so this builds ten million suspended applications rather than
+adding anything -- the trap `list.fold_strict` exists to avoid, and its note in
+[mind/std/list.dr](mind/std/list.dr) explains it. Forcing that chain is supposed
+to raise at `DREAM_MAX_DEPTH`, and with `--no-jit` it does, exactly:
+
+```
+dream: uncaught error: <error :stack_overflow recursion too deep: 4194305 pending frames>
+```
+
+With the JIT it segfaults. The reason is one line of the machine: the
+interpreter forces a slot by pushing a **continuation**, so its recursion is
+heap and its limit is a number it can check, while compiled code forces a slot
+by *calling* -- `load_slot` -> `force` -> `dream_rt_force` -> `force_whnf`,
+which runs a whole nested machine loop, which enters the compiled body again for
+the next link. One C++ frame per link of the chain, against an 8 MB thread
+stack. The lambda here is the whole trigger: `fn a b -> a + b` is arithmetic
+over two strict parameters, which is precisely what this tier compiles.
+
+The fix is not the depth argument that bounds compiled *self* recursion, because
+the recursion here goes out through the runtime and back in. What it wants is
+the same move `Jit::deoptimize` makes, on a different trigger: count the nested
+`force_whnf` loops on a process, and have `enter_function` decline the compiled
+tier past some depth. From there the interpreter handles the rest of the chain,
+pushing continuations instead of C++ frames, and the walk finishes on the heap
+where its limit can be enforced. That counter does not exist yet -- `force_pins`
+is about vouching, not depth -- and none of it is written.
 
 ### Measured, and not kept
 

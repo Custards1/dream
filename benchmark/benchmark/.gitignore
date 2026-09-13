@@ -1,0 +1,5 @@
+target/
+*.dream
+# Stray output from redirecting a run's stderr by hand; `run.sh` keeps its
+# own under target/.
+err.txt

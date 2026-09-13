@@ -1,0 +1,143 @@
+// A CPU benchmark, in Dream. bench.py is the same work in Python; run.sh
+// builds this image with the build tool (`dream -x mind build`) and compares
+// the two.
+//
+// Each benchmark is one pure function of a fixed size. Timing follows the
+// rule the docs are explicit about: `os.monotonic!` is milliseconds from a
+// steady clock, and timing anything lazy means forcing it first -- a thunk
+// that has not been forced has not run. The work sits in a `strict!` between
+// the two readings, and it is a statement of an impure block, so the compiler
+// runs it where the code reads as if it runs:
+//
+//     let before = os.monotonic! ();
+//     strict! work                       -- the work happens here
+//     let after  = os.monotonic! ();
+//
+// Timings go to stderr, one `name<TAB>milliseconds` line per benchmark, and
+// the `Result` blocks to stdout -- the same split `bench.py` makes, so that
+// `run.sh` can diff the two runtimes' stdout for agreement and read the
+// timings off stderr.
+//
+// Sizes are chosen so each run takes on the order of half a second to a few
+// seconds -- enough that the milliseconds clock has something to measure and
+// not so much that a round of run.sh drags.
+
+import std.console;
+import std.core;
+import std.list;
+import std.os;
+import std.debug;
+// --- the workloads ----------------------------------------------------------
+//
+// `fib` and `collatz_steps` are classic recursion. `sum`, `pi` and `mapfilter`
+// fold over a `range`: `list.fold_strict`, not `list.fold`, because a plain
+// fold sits on a chain of suspended accumulators and forces it all at the end
+// (see the note above `fold_strict` in mind/std/list.dr). `strbuild` builds a
+// string the linear way (`core.str_concat` copies each piece once) and reports
+// its length, so the result is a small integer and the 2.4 MB string is not
+// printed.
+
+let rec fib n = if n < 2 { n } else { fib (n - 1) + fib (n - 2) };
+
+let rec collatz_steps n =
+    if n == 1 { 0 } else {
+        1 + collatz_steps (if n % 2 == 0 { n / 2 } else { 3 * n + 1 })
+    };
+
+let fold = list.fold_strict;
+
+
+let collatz_total n = fold
+    (fn acc x -> acc + collatz_steps x)
+    0
+    (list.range 1 (n + 1));
+
+let sum_range n = fold (fn acc x -> acc + x) 0 (list.range 1 (n + 1));
+
+let pi_terms n = fold
+    (fn acc k -> acc
+        + 1.0 / core.to_float (4 * k - 3)
+        - 1.0 / core.to_float (4 * k - 1))
+    0.0
+    (list.range 1 (n + 1));
+
+let strbuild n = core.str_len (core.str_concat (list.replicate n "hello "));
+
+let mapfilter n = {
+    let squares = list.map (fn x -> x * x) (list.range 1 (n + 1));
+    let odds = list.filter (fn x -> x % 2 == 1) squares;
+    list.fold_strict (fn acc x -> acc + x) 0 odds
+};
+
+let fib_n = 32;
+let sum_n = 10_000_000;
+let collatz_n = 100_000;
+let pi_n = 2_000_000;
+let strbuild_n = 400_000;
+let mapfilter_n = 500_000;
+
+// --- timing -----------------------------------------------------------------
+
+/// Time `work`, print `name<TAB>milliseconds`, and answer what it produced.
+///
+/// The `strict!` has to be a *statement between the two readings*, which is
+/// the rule the header above states and this function used to break: wrapping
+/// the whole block in one `strict!` and reading the clock inside it times
+/// nothing, because `let x = work ()` is pure and therefore lazy -- the work
+/// happens when the pair is forced, which is after the second reading. Every
+/// benchmark here reported `0`.
+let bench! name work = {
+    let before = os.monotonic! ();
+    let x = work ();
+    strict! x
+    let after = os.monotonic! ();
+    // On stderr, which is where `bench.py` puts its timings too. That is what
+    // leaves stdout holding nothing but the `Result` blocks, so `run.sh` can
+    // diff the two runtimes' stdout against each other and read the timings
+    // off stderr separately. Built as one string after the second reading:
+    // three `write!`s and a `print! ()` put a stray `()` on the end of every
+    // line, which is not something a diff should have to know about.
+    console.error! (name + "\t" + to_string (after - before))
+    x
+};
+
+
+let rec show! item vale = {
+    let vali = strict! vale;
+    console.print! "Result"
+    console.print! item
+    console.print! "\t"
+    console.print! vali
+};
+let result! name value = show! name value;
+
+let main! = {
+    let args = os.args! ();
+    let run_all = core.is_empty args;
+    let want name = run_all || list.contains name args;
+
+    if want "fib" {
+        bench! "fib" (fn () -> fib fib_n)
+        result! "fib" (fib fib_n)
+    }
+    if want "sum" {
+        bench! "sum" (fn () -> sum_range sum_n)
+        result! "sum" (sum_range sum_n)
+    }
+    if want "collatz" {
+        bench! "collatz" (fn () -> collatz_total collatz_n)
+        result! "collatz" (collatz_total collatz_n)
+    }
+    if want "pi" {
+        bench! "pi" (fn () -> pi_terms pi_n)
+        result! "pi" (pi_terms pi_n)
+    }
+    if want "strbuild" {
+        bench! "strbuild" (fn () -> strbuild strbuild_n)
+        result! "strbuild" (strbuild strbuild_n)
+    }
+    if want "mapfilter" {
+        bench! "mapfilter" (fn () ->mapfilter mapfilter_n)
+        result! "mapfilter" (mapfilter mapfilter_n)
+    }
+};
