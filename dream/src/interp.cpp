@@ -1849,6 +1849,46 @@ Value thunk_for(Process& p, uint32_t node, Value frame) {
             if (build_closure(p, n.a, frame, &cl)) return cl;
             break;
         }
+        case Op::Add:
+        case Op::Sub:
+        case Op::Mul: {
+            // `f (n - 1)`: one arithmetic step on two numbers already in hand.
+            //
+            // Suspending it costs a Thunk now and, when the callee looks at it,
+            // a Blackhole write, an Indirect write, a continuation and a
+            // reduction -- to save an add. On a self-compile thunks are 31% of
+            // everything allocated and frames another 34%, and on `fib` the two
+            // of them are the entire program, so this is the cheapest shape of
+            // the biggest cost there is.
+            //
+            // It is not a strictness analysis and needs none, because nothing
+            // here can be observed. `operand_value` reads an operand only when
+            // it is *already* in weak head normal form -- it never forces, so
+            // no evaluation is brought forward. Two fixnums added, subtracted
+            // or multiplied cannot raise, cannot diverge and cannot depend on
+            // anything; overflow and every other shape fall through to the
+            // thunk. So the only difference is that an argument the callee
+            // never looks at has been computed, which is one machine
+            // instruction and no change in meaning.
+            //
+            // Division is deliberately absent: `x / 0` raises, and a raise the
+            // program would not otherwise have reached is exactly the
+            // observable difference this must not make.
+            Value a, b;
+            if (operand_value(p, img, n.a, frame, &a) && is_fixnum(a) &&
+                operand_value(p, img, n.b, frame, &b) && is_fixnum(b)) {
+                const int64_t x = fixnum_value(a), y = fixnum_value(b);
+                int64_t r;
+                bool over = true;
+                switch (Op(n.op)) {
+                    case Op::Add: over = __builtin_add_overflow(x, y, &r); break;
+                    case Op::Sub: over = __builtin_sub_overflow(x, y, &r); break;
+                    default: over = __builtin_mul_overflow(x, y, &r); break;
+                }
+                if (!over && fixnum_fits(r)) return make_fixnum(r);
+            }
+            break;
+        }
         default: break;
     }
     return p.heap().make_thunk(node, frame);

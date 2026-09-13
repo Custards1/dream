@@ -217,6 +217,19 @@ What has already been learnt from them, so it is not learnt twice:
   right), but every number derived from the count was. The JIT does 57.8M
   reductions where the interpreter does 60.6M, which is the honest measure of
   what it saves and was not previously knowable.
+- **65% of what a program allocates is the call, not the work.** `--stats` says
+  so by kind: on a self-compile, frames 34% and thunks 31%; on `fib 32` those
+  two *are* the program. The cheapest part of that bill is an argument that is
+  one addition, subtraction or multiplication of numbers already in hand --
+  `f (n - 1)` -- which used to cost a Thunk, a Blackhole write, an Indirect
+  write, a continuation and a reduction to save an add. `thunk_for` computes
+  those instead, and `fib 32` lost 43% of its allocation and 35% of its time.
+  It needs no strictness analysis and is not one: `operand_value` reads an
+  operand only when it is *already* in normal form, so nothing is forced early,
+  and two fixnums added cannot raise or diverge. Division is excluded because
+  `x / 0` raises, and overflow falls back to the thunk --
+  `dream/tests/programs/lazy_args.dr` is what holds that line. The remaining
+  thunks are calls and data, and those *would* need the analysis.
 - **A linear walk the machine can do is worth ten of the same walk in Dream.**
   This is the largest single lesson so far: `list.append` and `list.nth`,
   written as the obvious recursions, were between them *a third of a

@@ -1,0 +1,43 @@
+// An argument is evaluated when it is used, and not before -- including when
+// the machine is allowed to compute it early.
+//
+// `thunk_for` does not suspend an argument that is one addition, subtraction or
+// multiplication of two numbers it already has: a Thunk, a Blackhole write, an
+// Indirect write, a continuation and a reduction, to save an add. On `fib` that
+// suspension was 43% of everything the program allocated.
+//
+// The reason it is allowed to is that nothing about it can be observed, and
+// that is exactly what this file checks. Computing an argument early is
+// invisible only while it cannot raise, cannot diverge and cannot force
+// anything, so division is left out (`x / 0` raises), overflow falls back to a
+// thunk, and an operand that is not already a number is not read at all. Each
+// case below would print an error instead of a number if that line were
+// crossed.
+import std.console;
+import std.core;
+
+/// Never looks at its argument. Under call-by-need nothing in it is evaluated.
+let ignore x = 42;
+
+let rec count_down n acc = if n == 0 { acc } else { count_down (n - 1) (acc + 1) };
+
+let main! = {
+    // Division by zero: raises when forced, so it must not be forced.
+    console.print! (to_string (ignore (1 / 0)))
+    console.print! (to_string (ignore (7 % 0)))
+    // A type error: `-` on a string raises, so the operand must not be read.
+    console.print! (to_string (ignore ("a" - 1)))
+    // Overflow: the eager path must decline it rather than raise or wrap.
+    let big = 4611686018427387903;
+    console.print! (to_string (ignore (big * big)))
+    console.print! (to_string (ignore (big + big)))
+    // An operand that is itself unevaluated work must stay unevaluated.
+    console.print! (to_string (ignore ((1 / 0) + 1)))
+
+    // And when the argument *is* used, the answer is the arithmetic, whether it
+    // was suspended or computed early.
+    console.print! (to_string (count_down 1000 0))
+    console.print! (to_string (big + 1 - 1 == big))
+    // Overflow still overflows into the right answer, not a wrapped one.
+    console.print! (to_string (ignore (big * 2) + core.str_len "ok"))
+};
