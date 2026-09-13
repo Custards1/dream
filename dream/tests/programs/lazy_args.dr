@@ -27,6 +27,11 @@ let rec forever n = core.cons n (forever (n + 1));
 /// A list whose third element raises when forced.
 let landmine = core.cons 1 (core.cons 2 (core.cons (1 / 0) []));
 
+/// A call, so that passing one as an argument to a native is passing the shape
+/// `fill_native_args` exists for: an argument that has to be evaluated and
+/// cannot be read.
+let shout s = core.str_concat [s, "!"];
+
 let main! = {
     // Division by zero: raises when forced, so it must not be forced.
     console.print! (to_string (ignore (1 / 0)))
@@ -66,4 +71,28 @@ let main! = {
     console.print! (to_string (arr.[1] + arr.[2]))
     console.print! (to_string (arr.[7 else 0]))
     console.print! (to_string (ignore (arr.[7])))
+
+    // A native's own arguments. A native declares which of them it forces, and
+    // those are evaluated where they stand rather than suspended and forced one
+    // step later (`fill_native_args`). The ones it does not declare are
+    // suspended exactly as before. Both halves of that have to be invisible.
+    //
+    // A strict argument that is a call, and one whose argument is itself a
+    // native call -- the second re-enters the same path with the argument list
+    // half filled.
+    console.print! (to_string (core.str_len (shout "ok")))
+    console.print! (to_string (core.str_len (core.str_concat [shout "a", "bc"])))
+    // A strict argument that raises raises where it stood, and `try!` sees the
+    // error the suspension would have delivered.
+    console.print! (to_string (try! { core.str_len (to_string (1 / 0)) } catch e { :caught }))
+    // A lazy argument is still lazy: `cons` forces neither of its own, so a
+    // cell whose tail raises can be built and its head read.
+    console.print! (to_string ((core.cons 5 (1 / 0)).[0]))
+    // The callee is read back out of its node once per argument evaluated, so
+    // it has to be the same native however it was named -- as a member of a
+    // module above, as a local here, as a capture below.
+    let ts = to_string;
+    console.print! (ts (shout "local"))
+    let via_capture = fn s -> ts (shout s);
+    console.print! (via_capture "capture")
 };

@@ -33,6 +33,14 @@ the first thing to read before touching either.
    old Rust compiler, `dreamc`, is gone.
 4. `mind` moves into `dreams`: `dreams` grows a CLI in `mind`'s shape (project
    commands, not just file-at-a-time flags) and takes over its role. **Next.**
+5. **`dreams` learns to fuse.** So far it is a compiler that translates; the
+   first optimization that is genuinely its own -- rather than the VM's -- is
+   deforestation: a pipeline of `std.list` combinators becomes one loop and the
+   list between them is never built. The design, the soundness rules and what it
+   is worth are under "The plan: deforestation" in *Making it faster*; the short
+   version is that it is the only route measured so far that takes the folding
+   benchmarks past CPython, and it takes them there by handing the JIT a loop it
+   can already compile.
 
 `dreams` builds from `dreams/bootstrap/dreams.dream`, an image of itself that is
 checked in. The seed needs the VM and nothing else:
@@ -153,6 +161,7 @@ dreams --time FILE       # what each stage of a compile cost
 dream --profile [N] IMG  # the hottest functions, by reductions
 dream --stats IMG        # reductions, collections, bytes allocated and
                          # promoted, and milliseconds stopped in collection
+benchmark/benchmark/run.sh   # six workloads, Dream against CPython
 ```
 
 A VM option goes **before** the image: `dream --stats build/dreams.dream ...`,
@@ -230,6 +239,24 @@ What has already been learnt from them, so it is not learnt twice:
   `x / 0` raises, and overflow falls back to the thunk --
   `dream/tests/programs/lazy_args.dr` is what holds that line. The remaining
   thunks are calls and data, and those *would* need the analysis.
+- **A native's strict arguments are evaluated, not suspended.** A native
+  declares which of its arguments it forces and `resume_native` forces exactly
+  those -- but the call site had already built a Thunk for every argument it
+  passed, so for a strict one that Thunk was a temporary and nothing else:
+  blackholed, evaluated and overwritten with an Indirect on the very next step,
+  never shared with anyone, an allocation and two writes spent carrying
+  `(node, frame)` four steps. The machine's own continuation carries them
+  instead -- `fill_native_args` and `ContKind::NativeArgs` in
+  [dream/src/interp.cpp](dream/src/interp.cpp), which read the callee back out
+  of its own node rather than carrying it, on the same grounds `BinRight` reads
+  its right operand after forcing its left. A self-compile makes 3.35M fewer
+  thunks (10.3M -> 7.0M) and allocates 6.3% less (1256 MB -> 1177 MB) for an
+  identical reduction count and a byte-identical image. A strict argument of a
+  shape `thunk_for` already answers without allocating -- a constant, a bound
+  local, `n - 1`, an in-range array read -- is still left to it, because
+  computing one of those is cheaper than evaluating it. What the change did
+  *not* do is make the self-compile finish sooner, and why not is the next
+  section, which is the more useful half of this entry.
 - **A linear walk the machine can do is worth ten of the same walk in Dream.**
   This is the largest single lesson so far: `list.append` and `list.nth`,
   written as the obvious recursions, were between them *a third of a
@@ -272,8 +299,11 @@ What has already been learnt from them, so it is not learnt twice:
   to be told again that it could not be compiled -- in a program that enters a
   hundred and eighty million functions that is not a slow path, it is the
   program. The tier decision is now one inlined atomic load with three states
-  (compiled, rejected, still cold): see `Jit::tier`. The JIT is roughly neutral
-  on the benchmarks either way, which is its own finding.
+  (compiled, rejected, still cold): see `Jit::tier`. When that was written the
+  JIT was roughly neutral on the benchmarks either way, which was its own
+  finding at the time; it is not true any more, and the two entries below say
+  why -- what was neutral was a tier that could only compile a loop, and could
+  not stay inside one for more than 4000 iterations.
 - **A quarter of a self-compile was the collector, and now a ninth is.**
   `--stats` reports the pause, which is what made the question askable: 831 ms
   of a 3197 ms compile. The collection of one process now divides across a
@@ -284,12 +314,144 @@ What has already been learnt from them, so it is not learnt twice:
   collector *slower* than the serial one were all the same mistake -- paying a
   synchronization cost per object instead of per batch -- and that none of
   them were visible by reading the code.
+- **The JIT compiles self recursion, not just self tail calls.** A tail call
+  was a loop back-edge and everything else fell to the interpreter, which meant
+  the two functions closest to being fast -- `fib` and `collatz_steps` -- were
+  the two it refused. `fib (n - 1) + fib (n - 2)` is now a *machine* call, which
+  requires the body to be a function of its arguments rather than of a heap
+  frame: such a function is emitted twice, an inner body taking its parameters
+  by value and an outer entry matching `CompiledFn` that unpacks the frame once.
+  `fib 32` went from 593 ms to 45 ms and from **451 MB of allocation to 4.8 KB**
+  -- 100% of what it allocated was frames, and a machine call has none. Against
+  CPython 3.13 that is 0.20x where it was 2.8x. `collatz` went 1949 ms -> 265 ms.
+  What it costs is machine stack, which is fixed where a heap continuation is
+  not, so a compiled recursion carries its depth and returns `JIT_DEEP` rather
+  than overflow; `enter_function` then runs the call interpreted and stops
+  offering the compiled body (`Jit::deoptimize`), because a function that
+  recurses deeper than the stack allows does it on every call. `recursion.dr`
+  and `runaway.dr` are what hold that line -- `sum_to 100000` and a `blow` that
+  never returns both still answer exactly what they answered before.
+- **A compiled loop under a nested force yielded on every single iteration.**
+  This is the largest thing a wall clock ever hid here. A compiled loop spends a
+  reduction per iteration and yields to the interpreter when the budget runs
+  out. But a *nested* force -- `force_whnf`, which is what `strict!`, `print!`
+  and `to_string` all run -- cannot hand the process back, because the natives
+  above it are waiting on the C++ stack, so it spends the budget below zero and
+  leaves it there. After 4000 iterations `next > 0` is false for ever and every
+  iteration yields: a heap frame allocated, the interpreter re-entered, the
+  compiled body re-called. A ten-million-iteration loop took 429 ms and
+  allocated 240 MB to do work that takes **43 ms and 122 KB**. So the nested
+  loop re-arms the budget and records the slice as spent (`Process::slice_spent`)
+  instead, and `run_process` ends the slice when the force returns. Note what
+  this means about every JIT number taken before it: "a tail loop is 7x faster
+  than CPython", which these notes carried for months, was only true when
+  nothing was forcing the loop -- and a program that prints its answer is
+  forcing it. It is true now.
+- **`strict!` is the native that most needed to vouch.** `VouchesForGc` exists
+  because a native running unbounded Dream work underneath itself pins the heap,
+  and `strict!` is how a program says "do the whole of this now" -- so the work
+  under it is not a detail of one native, it is the program. Without the vouch a
+  fold of ten million elements grew a **2.3 GB nursery that no safepoint could
+  reach**; with it the same fold holds 300 KB and runs 8-12% faster. The reason
+  it could not simply be added is `force_deep`: its map case collected the
+  entries into a `std::vector<Value>` and forced them one by one, and a
+  collection rewrites what it can see -- which a C++ vector is not. The entries
+  wait on the value stack now, like every list `force_deep` already walked there.
 - **The VM is a shared library, and that is not free.** Without
   `-fno-semantic-interposition` a compiler must assume any global function in a
   `.so` can be interposed at load time, so every cross-TU call goes through the
   PLT and none of them inline -- and the interpreter's hot path is nothing but
   cross-TU calls. Link-time optimization on top of that was measured and bought
   nothing, so it is not enabled.
+
+### Known and not fixed: compiled code forcing a long thunk chain crashes
+
+A JIT-compiled function that forces a long chain of suspensions dies with
+**SIGSEGV** where the interpreter raises `:stack_overflow`. Found 2026-09-13,
+reproduced against the JIT exactly as it was before it learnt self recursion, so
+it is not new -- but nothing here had looked for it before.
+
+```
+import std.console;
+let rec loop_f f i n acc = if i > n { acc } else { loop_f f (i + 1) n (f acc i) };
+let main! = { console.print! (loop_f (fn a b -> a + b) 1 10000000 0) };
+```
+
+`acc` is lazy, so this builds ten million suspended applications rather than
+adding anything -- the trap `list.fold_strict` exists to avoid, and its note in
+[mind/std/list.dr](mind/std/list.dr) explains it. Forcing that chain is supposed
+to raise at `DREAM_MAX_DEPTH`, and with `--no-jit` it does, exactly:
+
+```
+dream: uncaught error: <error :stack_overflow recursion too deep: 4194305 pending frames>
+```
+
+With the JIT it segfaults. The reason is one line of the machine: the
+interpreter forces a slot by pushing a **continuation**, so its recursion is
+heap and its limit is a number it can check, while compiled code forces a slot
+by *calling* -- `load_slot` -> `force` -> `dream_rt_force` -> `force_whnf`,
+which runs a whole nested machine loop, which enters the compiled body again for
+the next link. One C++ frame per link of the chain, against an 8 MB thread
+stack. The lambda here is the whole trigger: `fn a b -> a + b` is arithmetic
+over two strict parameters, which is precisely what this tier compiles.
+
+The fix is not the depth argument that bounds compiled *self* recursion, because
+the recursion here goes out through the runtime and back in. What it wants is
+the same move `Jit::deoptimize` makes, on a different trigger: count the nested
+`force_whnf` loops on a process, and have `enter_function` decline the compiled
+tier past some depth. From there the interpreter handles the rest of the chain,
+pushing continuations instead of C++ frames, and the walk finishes on the heap
+where its limit can be enforced. That counter does not exist yet -- `force_pins`
+is about vouching, not depth -- and none of it is written.
+
+### Measured, and not kept
+
+- **The outer loop's run of Return steps, added to the nested loop.**
+  `run_process` skips its safepoint over a run of Return steps, which is worth
+  having because more than half of all steps are Returns. The nested loop
+  (`force_whnf`) has no such run, and since that is the loop a program actually
+  lives in, adding one looked free. It is 8% *slower* on a fold -- identical
+  reductions, identical collections, identical bytes -- because a Return under a
+  fold rarely comes in a run, so the extra loop condition is paid per step and
+  the skipped checks are never skipped.
+- **A bigger nursery for a program that allocates hard.** A fold that allocates
+  4 GB collects tens of thousands of times with the default 64 KB nursery, so a
+  floor on it looked obviously right. Measured at 64 KB, 256 KB, 1 MB, 4 MB and
+  16 MB, the collection count falls from 70,459 to 276 and the wall clock does
+  not move at all (4.0-4.4 s either way). The collector is 2-4% of that
+  workload; what it costs is not what it collects.
+
+### Two things that will lie to you about a change to the interpreter
+
+Both of these were found on 2026-09-13, by a change that plainly does less work
+and did not finish sooner -- the native arguments above. Neither is about that
+change; both are about what a wall clock on this machine can and cannot resolve.
+
+**Code placement moves a benchmark by 3%, in either direction.** `step_eval` is
+one switch over every opcode, and adding a case to it re-allocates registers and
+re-pads the whole function. Adding the native-argument path moved `fib` by 3% --
+`fib`, which never reaches the new code, and whose `thunk_for` is a
+byte-for-byte identical instruction stream in both builds. So 3% is the noise
+floor for *any* edit to that function, and a CPU-benchmark result smaller than
+that is about where the code landed rather than what it does. Diff the
+instruction streams before believing one:
+`objdump -dC build-dream/lib/libdream.so`.
+
+**The collector's thresholds are geometric, so allocating less can mean marking
+more.** `gc_threshold_` is refitted to `live * 3` after every major, so a run's
+majors form a geometric series and the last one dominates everything before it.
+Allocate 6% less and every crossing moves: on the self-compile the series went
+from `60K, 253K, 889K, 3.9M, 13.9M, 41.9M, 111M` live to
+`60K, 277K, 1.1M, 4.8M, 19.9M, 68.9M, 143M` -- seven majors either way, 238 MB
+marked instead of 172 MB, and the last two majors getting almost no overlap out
+of the concurrent mark where the shorter series got 24 ms. That is +3% on the
+self-compile's wall clock and +250 ms of helper-thread CPU, and it is phase, not
+cost: the same two binaries compiling `lucid` are within 1% of each other, and
+the same self-compile with the collector's threads and the JIT out of the
+picture (`DREAM_GC_THREADS=1 dream --no-jit -j 1 ...`) is *faster* -- 2% on the
+best of seven runs, 1% on their mean, which is about as much as this machine can
+resolve. `DREAM_GC_TRACE=1` prints the series, and it is the first thing to look
+at when something that does less work takes longer.
 
 ### Where the remaining time and memory are, and the plan
 
@@ -308,15 +470,17 @@ collector that moves: compaction, or the opportunistic evacuation of sparse
 blocks. See [docs/gc.md](docs/gc.md), "What is left: the holes".
 
 **Time is the call, not the work.** `--stats` breaks allocation down by kind:
-frames 35%, thunks 31%. Two thirds of everything a compile allocates is the
-machinery of calling and suspending, not the data. Counting the thunks by what
-they suspend:
+frames 40%, thunks 20%. Three fifths of everything a compile allocates is the
+machinery of calling and suspending, not the data -- and the two have traded
+places as each round of this work removed thunks and left the frames a larger
+share of a smaller total. Counting the thunks by what they suspend, before and
+after the two rounds so far:
 
 | suspended node | count | what it is |
 |---|---|---|
-| `apply` | 8.2M | an argument that is a function call |
+| `apply` | 8.2M -> 5.1M | an argument that is a function call |
 | `get` | 2.6M -> 0.98M | an argument that is `c.[k]` or `c.[k else d]` |
-| everything else | 1.2M | `set`, `global`, `list`, `add`, `block`, `sub` |
+| everything else | 1.2M -> 0.92M | `set`, `global`, `list`, `add`, `block`, `sub` |
 
 `DREAM_PROBE_THUNK=1` with `--stats` is what prints that table: suspensions by
 the kind of expression suspended. `--stats` alone says how much of a program's
@@ -358,29 +522,196 @@ So the order of work, most valuable first:
 
    | made at | count | |
    |---|---|---|
-   | a strict argument of a **native** | 3.09M | the mask already says so -- no analysis involved |
+   | ~~a strict argument of a **native**~~ | ~~3.09M~~ | **done** -- the mask said so all along |
    | a `let` bound in a block | 2.14M | `let x = f y` |
    | an argument of a saturated call to a known function | 1.48M | the only place an analysis would apply |
    | a list, array or map literal's element | 0.54M | |
 
-   The one worth taking is the first, and it needs no analysis at all: a
-   native declares which arguments it forces, and the machine builds a Thunk
-   for one anyway, which `resume_native` then immediately blackholes,
-   evaluates and overwrites. The Thunk is a temporary that carries `(node,
-   frame)` through a protocol that could carry them in the continuation
-   instead. Worth roughly 6% of allocation; it is a change to the hottest path
-   in the machine, so it wants doing carefully rather than quickly.
+   The one worth taking was the first, and it needed no analysis at all: a
+   native declares which arguments it forces, and the machine built a Thunk for
+   one anyway, which `resume_native` then immediately blackholed, evaluated and
+   overwrote. That is done -- see "A native's strict arguments are evaluated,
+   not suspended" above. It was worth the 6% of allocation predicted here and
+   3.35M of the thunks, which is more than this table's 3.09M because the
+   `global`, `list` and `block` shapes turn up in that position too. It was
+   worth none of the wall clock, for reasons that are not about the change and
+   are written up under "Two things that will lie to you".
 
-3. **Frames, which are the other 36%.** A frame that never escapes its call
-   could live on a stack rather than in the heap. This needs escape analysis
-   and is the largest piece of the three -- and note that eliminating the
-   arithmetic thunks already removed one of the main reasons a frame escapes,
-   since a suspended argument captures the frame it was built in.
+   What is left in the table is what an analysis would have to reach, and the
+   measurements above say it would reach almost none of it.
 
-The benchmark to judge 2 and 3 by is `fib`, where frames and thunks are the
-entire program: `fib 32` is 0.56 s against CPython 3.13's 0.21 s. A
-tail-recursive loop is already 7x *faster* than CPython, because the JIT
-compiles it -- the gap is entirely in calls the JIT does not get to.
+3. **Frames, which are now 40%.** **Half done, from the other end.** A frame
+   that never escapes its call could live on a stack rather than in the heap.
+   That still needs escape analysis in the interpreter and is still the largest
+   piece of the three -- but the JIT reaches one important case of it without
+   any: a function it compiles has no frame at all, because its slots are
+   registers, and now that a self call can be a machine call rather than a loop
+   back-edge, a whole recursion can run with no frame anywhere. `fib 32` went
+   from 451 MB to 4.8 KB for exactly that reason. What is left is every call the
+   JIT cannot take, which is every call that allocates -- see the next section.
+
+### Where it stands against CPython, and what the remaining gap is made of
+
+`benchmark/benchmark/run.sh` runs the six workloads of `main.dr` against the
+transliteration of them in `bench.py`, best of `--repeat` runs each, and prints
+the ratio. On this machine, 2026-09-13, best of five against CPython 3.13 (below
+1.00x is Dream ahead; "was" is the same measurement taken before any of the work
+in this section):
+
+| workload | dream | python | ratio | was |
+|---|---|---|---|---|
+| `fib` | 39 ms | 209 ms | **0.19x** | 2.62x |
+| `collatz` | 231 ms | 707 ms | **0.33x** | 2.83x |
+| `pi` | 1321 ms | 226 ms | 5.8x | 6.55x |
+| `sum` | 4032 ms | 309 ms | 13.0x | 14.3x |
+| `mapfilter` | 390 ms | 30 ms | 13.1x | 14.8x |
+| `strbuild` | 77 ms | 0.94 ms | 82x | 72x |
+
+`strbuild` is the one that went the wrong way, and it is worth knowing why: it
+is the workload here whose data is *live* rather than garbage -- a 400,000-cell
+list held from one end while a native walks it from the other -- so letting
+`strict!` collect (above) buys it a 2 MB smaller peak for 20 ms of copying. The
+folds, whose every cell dies the instant it is read, get 8-12% back for the same
+change. That is the generational bet losing one hand and winning three. Its 82x
+should not be read as a runtime comparison at all, either way: `"hello " * n` in
+Python is a single C memcpy loop, and the Dream line beside it builds a
+400,000-element list and concatenates it. Same answer, different algorithm.
+
+The split is not six results, it is two. `fib` and `collatz` are recursion over
+numbers, the JIT compiles them, and Dream is three to five times faster than
+CPython. The other four fold over a list `list.range` builds one cell at a time,
+and there Dream is an order of magnitude behind. It is worth knowing exactly
+what that order of magnitude is made of, because the answer says what would have
+to change. Timing the same ten-million-element loop with one thing added at a
+time, per element:
+
+| | ns | what the step adds |
+|---|---|---|
+| a compiled loop | 4.6 | nothing: registers and a back-edge |
+| an interpreted loop | 164 | frames, dispatch, the strictness dance |
+| + a closure call | +52 | one more frame, entered and returned |
+| + a lazy list | +256 | a `range` frame, a cons, a tail thunk, forcing it |
+
+So the lazy list is three fifths of it, and the interpreter is the rest. Neither
+is a constant factor anyone can tune away: producing one cons cell per element
+costs a frame, a cell and a suspension **because that is what the program says**,
+where `for x in range(...)` in CPython costs an increment in C. Closing it needs
+one of two things, and both are projects rather than edits:
+
+- **Deforestation**, in `dreams` -- the next section, and the one to do.
+- **A JIT that can allocate.** The tier's scope is "the strict numeric spine"
+  and the reason is not ambition, it is the collector: a compiled frame keeps
+  its slots in registers the collector cannot find or rewrite, which is what
+  `PinsTheHeap` says. So compiled code may not allocate, and a fold allocates
+  three objects an element. Giving compiled frames a stack map is what would
+  lift that, and it would lift the interpreter's 164 ns as well. It is the
+  larger and riskier of the two, and the one below does not need it.
+
+### The plan: deforestation
+
+**The claim.** `fold f acc (list.range 1 n)` builds ten million cons cells and
+throws each one away a step after building it. Removing the list removes three
+fifths of what the four slow workloads cost -- but that is not the interesting
+part. The interesting part is what the loop *becomes*, and it is the reason this
+is the plan rather than one more optimization:
+
+```
+    fold (fn acc x -> acc + x) 0 (list.range 1 (n + 1))
+```
+
+fused, with the literal lambda inlined into the loop it now controls, is
+
+```
+    let rec loop i acc = if i > n { acc } else { loop (i + 1) (acc + i) };
+```
+
+and that is a strict numeric tail loop -- which the JIT already compiles, and
+which already runs at **4.6 ns an element against CPython's ~31**. So the route
+from 13x behind to ahead is not "make the list cheaper". It is "produce no list,
+and hand the JIT something it can already take". Every piece but the fusion pass
+exists: the measurement of the loop at 4.6 ns is line 1 of the decomposition
+above, taken on this machine with this VM.
+
+**Two ways to do it, and which one first.**
+
+*Shortcut fusion* (`foldr`/`build`, as Haskell does it) is the general answer:
+write every producer as `build`, every consumer as a `foldr`, and let one
+rewrite rule cancel them. It fuses any producer with any consumer, and it costs
+a rewrite-rule mechanism in the compiler plus a rewrite of `mind/std/list.dr`
+into a shape nobody reading it would recognise. It is also poor at exactly what
+this codebase does most -- left folds and `zip`.
+
+*A pass over the known combinators* is the first cut: recognise a pipeline of
+saturated calls to `std.list` members and emit one loop.
+
+| role | members |
+|---|---|
+| source | `range`, `replicate`, `from`, `repeat`, a list literal |
+| step | `map`, `filter`, `take`, `drop`, `take_while`, `enumerate`, `zip` |
+| sink | `fold`, `fold_strict`, `length`, `any`, `all`, `contains`, `count`, `sum`, `product`, `minimum`, `maximum` |
+
+`mapfilter` is source + two steps + sink and is the shape this is for. No
+library change, no new mechanism, and it covers every workload measured above.
+
+**Where it goes.** After `scope`, because the pass must know that the `range` it
+is looking at really is `std.list`'s and has not been shadowed or rebound --
+that is a question only a resolved name answers. And in `lower`, beside the
+wrapper rewriting, which is already this kind of pass: `scope` records a fact
+about a global and `lower` rewrites saturated calls in light of it (see
+"wrappers" in [dreams/scope.dr](dreams/scope.dr) and
+[dreams/lower.dr](dreams/lower.dr)).
+
+**What makes it sound**, which in a lazy language is most of the work:
+
+- **The list must not be named.** Fusion applies only where the producer's
+  result is written directly as the consumer's argument. `let xs = range 1 n;`
+  followed by two uses of `xs` is a *shared* list, and fusing it would build it
+  twice -- turning one traversal into two, and a finite memory cost into an
+  unbounded recomputation. One syntactic use, no binding, or no fusion.
+- **Fuse the spine, not the elements.** `map f xs` suspends `f x`; the fused
+  loop must still build that thunk where the original did, unless the sink
+  forces it. Fusing the spine is where all the saving is anyway -- the cell, the
+  tail thunk and the producer's frame -- and leaving the elements alone means
+  the rule needs no strictness analysis and cannot change what raises.
+- **The order and the count of effects must not move.** A fused loop runs the
+  producer's step exactly when the consumer asks for the next cell, which is the
+  order it ran in before. Say it as a rule and check it: the fused form must
+  force the same things, in the same order, the same number of times.
+- **An infinite source must stay infinite.** `from` and `repeat` fuse only with
+  a sink or step that stops -- `take`, `take_while`, `any`, `contains`. A fused
+  `fold` over an infinite source must still diverge, which it does naturally,
+  but `take 5 (from 0)` must not become a loop that runs first and takes after.
+- **A sink that the JIT can then take is the point**, so the emitted loop wants
+  to be a self tail call with every parameter forced on every path -- which is
+  the JIT's own admission test (`Analyzer::run`). Inlining a *literal* lambda
+  argument into the loop is what makes that true rather than nearly true; a
+  lambda passed by name is a closure parameter, which is not forced, and the
+  loop stays interpreted. Inlining a literal is the cheaper half and should come
+  with the pass rather than after it.
+
+**How to know it worked.** `--stats` should say `list 0%` for a fused pipeline
+and the `frame` share should fall with it; `DREAM_PROBE_THUNK=1` should show the
+`apply` suspensions that were `range`'s tails gone; `benchmark/benchmark/run.sh`
+should move `sum`, `pi` and `mapfilter` and leave `fib` and `collatz` alone. The
+corpus and the tests are the correctness check, and the bootstrap is the
+sharpest of them -- a compiler that fuses will compile *itself* differently, so
+`just bootstrap` has to reach a fixpoint again and the seed has to move with it.
+
+**What it is worth, honestly.** Removing the list takes `sum` from ~420 ns an
+element to ~210, which is 4.1 s to ~2.0 s against CPython's 0.31 s: **necessary
+and not sufficient.** The rest of the distance is the second bullet above --
+the fused loop has to reach the JIT. Fusion that stops short of a
+JIT-compilable loop is a 2x; fusion that reaches one is a win. Build it with
+that as the target and measure it that way.
+
+Judge any change by more than one workload, and read the two traps below first:
+on this machine `fib` alone cannot tell a 3% change from where the code landed.
+
+One thing to expect when the JIT compiles a recursive function: **`--stats` will
+report far fewer reductions than it used to**, because a compiled self call
+spends one where the interpreter spent ten. `fib 32` reports 14.1M against the
+interpreter's 70.5M. The two totals `--stats --profile 1` prints still agree
+with each other, which is the check that matters.
 
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.

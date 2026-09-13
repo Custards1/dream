@@ -42,8 +42,8 @@ enum class ContKind : uint8_t {
     Catch,       // a = handler node, b = slot, c = value-stack depth, v1 = frame
     FieldOf,     // a = string index of the member name
     NativeArg,   // a = stack base, b = argc, c = index just forced, v1 = callee
-    NativeArgs,  // a = the call node, c = index just evaluated, v1 = frame; the
-                 // arguments filled in so far are the top of the value stack
+    NativeArgs,  // a = the call node, b = stack base, c = index just evaluated,
+                 // v1 = frame; the arguments filled in so far sit at the base
     NativeRetry, // a = stack base, b = argc, v1 = callee; re-invoke after a block
     MapEntry,    // a = stack base, b = pair count, c = index, v1 = the map
     IndexKey,    // b = the get/set node, v1 = frame; the container is the result
@@ -220,6 +220,21 @@ public:
     std::atomic<ProcStatus> status{ProcStatus::Runnable};
     int64_t reductions = 0;
     uint64_t total_reductions = 0;
+    /// The budget `run_process` was given, so a nested force can re-arm it.
+    int64_t slice = 4000;
+    /// The slice ran out while a nested force was running.
+    ///
+    /// A nested force cannot hand the process back -- the natives above it are
+    /// waiting on the C++ stack for a value -- so the budget is not something
+    /// it can spend down to zero and stop at. Left alone it goes arbitrarily
+    /// negative, and then everything that asks "is there budget left?" is told
+    /// "no" for ever. That is not a counter being untidy: a JIT-compiled loop
+    /// reached through `strict!` yielded on *every* iteration for it, giving
+    /// back the heap frame the compilation exists to remove and re-entering
+    /// the interpreter once per element. So the nested loop re-arms the budget
+    /// and sets this instead, and `run_process` ends the slice the moment the
+    /// force it was under returns.
+    bool slice_spent = false;
 
     Mailbox mailbox;
 

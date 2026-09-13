@@ -11,6 +11,7 @@ bool Jit::available() { return false; }
 Jit::Jit(Runtime&) : impl_(nullptr) {}
 Jit::~Jit() = default;
 CompiledFn Jit::on_enter(uint32_t) { return nullptr; }
+void Jit::deoptimize(uint32_t) {}
 CompiledFn Jit::compile_locked(uint32_t, std::string* error) {
     if (error) *error = "this build has no JIT: LLVM was not found at configure time";
     return nullptr;

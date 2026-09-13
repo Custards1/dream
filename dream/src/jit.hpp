@@ -24,9 +24,21 @@ class Process;
 ///
 /// `status` reports what happened: 0 the return value is a result, 1 it is an
 /// error to raise, 2 the reduction budget ran out mid-loop and the frame holds
-/// the loop-carried state, so the caller should resume the body from the top.
-/// That last case is what keeps compiled loops preemptible.
+/// the loop-carried state, so the caller should resume the body from the top,
+/// and 3 compiled self recursion ran out of machine stack and the call has to
+/// be interpreted instead. The third case is not a failure -- a compiled body
+/// is arithmetic and has written nothing down -- and the second is what keeps
+/// compiled loops preemptible.
 using CompiledFn = Value (*)(Process* p, Value frame, int* status);
+
+/// The `status` values above, named. The emitter's copies are in jit.cpp,
+/// where they have to be constants the IR can use; these are what reads one.
+enum JitStatus {
+    JitOk = 0,
+    JitRaised = 1,
+    JitYielded = 2,
+    JitTooDeep = 3,
+};
 
 class Jit {
 public:
@@ -67,6 +79,12 @@ public:
     /// The entry that made `func_index` hot: compile it, or mark it rejected
     /// so `tier` never asks again. The slow path, and the only one that locks.
     CompiledFn on_enter(uint32_t func_index);
+
+    /// Stop offering the compiled body for `func_index`. Called when compiled
+    /// self recursion ran out of machine stack: the interpreter, whose
+    /// recursion is on the heap, takes that function over for the rest of the
+    /// run. One relaxed store on a path taken at most once per function.
+    void deoptimize(uint32_t func_index);
 
     /// Compile now, regardless of temperature. Returns nullptr on failure.
     CompiledFn compile(uint32_t func_index, std::string* error);

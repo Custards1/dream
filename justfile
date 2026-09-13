@@ -195,7 +195,7 @@ test-dreams: build
 # program, and following its imports would be asking something else.
 test-dreams-corpus: build
     @for f in mind/std/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
-              dream/tests/programs/*.dr dreams/*.dr; do \
+              dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr; do \
         ./{{dreams}} --parse "$f" || exit 1; \
     done
     @echo "every file in the corpus parses"

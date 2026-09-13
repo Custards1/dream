@@ -723,7 +723,21 @@ NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
 /// would leave the effects exactly where they were.
 ///
 /// It is impure by name, which is right: forcing is when effects happen.
+///
+/// And it vouches (`VouchesForGc`), which of all the natives here it is the
+/// one that most had to. `strict!` is how a program says "do the whole of this
+/// now", so the work underneath it is not a detail of one native -- it is the
+/// program. Without the vouch none of it could reach a safepoint: a benchmark
+/// folding ten million elements inside `strict!` grew a 2.3 GB nursery that no
+/// collection could touch, because the rule is that a nested force may collect
+/// only when every C++ frame above it has said its locals survive one. This
+/// frame's do: `args` is read before the force and never again, and everything
+/// the force needs is on the value stack or in the process. It is the same
+/// claim `core.str_of_chars` and `str.concat_all` already make, reached
+/// through the same audited chain -- `run_process`, `step_eval`,
+/// `resume_native` -- and it is what `force_deep`'s map case was rewritten for.
 NativeResult bi_strict(Process& p, Value, Value* args, uint32_t) {
+    VouchesForGc vouch(p);
     Value out;
     if (!force_deep(p, args[0], &out)) {
         // Either the value raised, or a blocking operation inside it gave up
