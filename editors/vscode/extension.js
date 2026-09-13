@@ -9,31 +9,59 @@
 // comes to disagree with the build.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const vscode = require('vscode');
-const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
+const { LanguageClient, State, TransportKind } = require('vscode-languageclient/node');
 
 let client;
+
+/// A path from a setting may be written for a human: `~` and `$HOME` mean what
+/// they mean in a shell. The settings say `$MINDV2_PATH`, so a value that names
+/// one of those variables literally should not be looked up verbatim. Iterated,
+/// because `$MINDV2_PATH` might itself be written as `~/.mindv2`.
+function expandPath(s) {
+  if (!s) return s;
+  for (let i = 0; i < 3; i++) {
+    let changed = false;
+    s = s.replace(/\$(\w+)|\$\{(\w+)\}/g, (m, bare, braced) => {
+      const v = process.env[bare || braced];
+      if (v === undefined) return m;
+      changed = true;
+      return v;
+    });
+    s = s.replace(/^~(?=\/|$)/, () => {
+      changed = true;
+      return os.homedir();
+    });
+    if (!changed) break;
+  }
+  return s;
+}
 
 /// Where the server image might be, in the order worth trying.
 ///
 /// `lucid` is a compiled image rather than a native program, so this is looking
 /// for a file to hand the VM, not for something on PATH.
 function findServer(config, folders) {
-  const configured = config.get('server.path');
-  if (configured) return configured;
-const candidates = [];
-  if (process.env.MINDV2_PATH) candidates.push(path.join(process.env.MINDV2_PATH, 'lucid.dream'));
-if (process.env.MINDV2_PATH) candidates.push(path.join(process.env.MINDV2_PATH, 'lucid'));
+  const configured = expandPath(config.get('server.path'));
+  if (configured && fs.existsSync(configured)) return configured;
+  const candidates = [];
 
-  if (process.env.LUCID_IMAGE) candidates.push(process.env.LUCID_IMAGE);
-  
+  // A workspace that is (or contains a build of) the Dream checkout has the
+  // freshest image -- the one the developer just built -- so it wins over the
+  // installation.
   for (const folder of folders || []) {
     const root = folder.uri.fsPath;
     candidates.push(path.join(root, 'build', 'lucid.dream'));
-    candidates.push(path.join(root, 'build-dream', 'bin', 'lucid.dream'));
+    candidates.push(path.join(root, 'build-drain', 'bin', 'lucid.dream'));
   }
-  
+
+  if (process.env.LUCID_IMAGE) candidates.push(expandPath(process.env.LUCID_IMAGE));
+  if (process.env.MINDV2_PATH) {
+    candidates.push(path.join(expandPath(process.env.MINDV2_PATH), 'lucid.dream'));
+    candidates.push(path.join(expandPath(process.env.MINDV2_PATH), 'lucid'));
+  }
 
   return candidates.find((c) => fs.existsSync(c));
 }
@@ -60,12 +88,18 @@ function activate(context) {
   if (!server) {
     vscode.window.showWarningMessage(
       'Dream: no language server image found. Build one with `just lucid`, ' +
-        'or set `dream.server.path` to a `lucid.dream`.'
-    );
+        'install it with `just install` (putting `~/.mindv2` on your ' +
+        '$MINDV2_PATH), or set `dream.server.path` to a `lucid.dream`.',
+      'Settings'
+    ).then((pick) => {
+      if (pick === 'Settings') vscode.commands.executeCommand('workbench.action.openSettings', '@ext:dream.dream-lang');
+    });
     return;
   }
 
-  const vm = config.get('vm.path') || 'dream';
+  // The VM has to be found too, and not finding it is the same failure from
+  // the user's side: an editor that shows nothing.
+  const vm = expandPath(config.get('vm.path')) || 'dream';
   const args = [server];
   for (const root of packagePaths(config, folders)) args.push('-L', root);
 
@@ -87,13 +121,32 @@ function activate(context) {
     }
   );
 
+  // A server that dies before it ever ran -- the VM was not on PATH, the image
+  // was refused, the process crashed on startup -- is indistinguishable from no
+  // extension at all unless it says so. The client's start promise rejects on a
+  // failed spawn; a process that starts and dies immediately shows up as never
+  // reaching `Running`.
+  let everRan = false;
+  client.onDidChangeState((e) => {
+    if (e.newState === State.Running) everRan = true;
+    else if (e.newState === State.Stopped && !everRan) {
+      vscode.window.showErrorMessage(
+        'Dream: the language server exited before starting. Open the "Dream Language Server" output channel and check that `dream.vm.path` names the VM and the image is a build of `lucid`.'
+      );
+    }
+  });
+
   context.subscriptions.push(
     vscode.commands.registerCommand('dream.restartServer', async () => {
       if (client) await client.restart();
     })
   );
 
-  client.start();
+  client.start().catch((err) => {
+    vscode.window.showErrorMessage(
+      'Dream: could not start the language server: ' + err + '. Check `dream.vm.path` and that `' + vm + '` runs the Dream VM.'
+    );
+  });
 }
 
 function deactivate() {
