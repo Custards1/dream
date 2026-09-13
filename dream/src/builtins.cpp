@@ -1531,6 +1531,7 @@ NativeResult core_str_chars(Process& p, Value, Value* args, uint32_t) {
 
 NativeResult core_str_of_chars(Process& p, Value, Value* args, uint32_t) {
     std::string out;
+    VouchesForGc vouch(p);
     // The same care as `str_of_bytes`: the rest of the list lives on the value
     // stack, because forcing a character can collect and move the cell.
     const size_t base = p.stack.size();
@@ -1574,6 +1575,10 @@ NativeResult core_str_of_chars(Process& p, Value, Value* args, uint32_t) {
 /// can produce binary output rather than only consume it.
 NativeResult core_str_of_bytes(Process& p, Value, Value* args, uint32_t) {
     std::string out;
+    // Safe against a collection, and so allowed to cause one: see
+    // `VouchesForGc`. A list of bytes long enough to be worth this native is
+    // long enough that forcing it must be able to collect.
+    VouchesForGc vouch(p);
     // Forcing a byte runs Dream code, which can collect, and a collection moves
     // every object it keeps. So the walk carries its position on the value
     // stack -- which the collector updates -- rather than in a C++ local, and
@@ -1634,6 +1639,12 @@ NativeResult core_str_of_bytes(Process& p, Value, Value* args, uint32_t) {
 /// the value stack rather than in a C++ local.
 NativeResult core_str_concat(Process& p, Value, Value* args, uint32_t) {
     std::string out;
+    // ...which is also what lets the walk collect. This is the native that
+    // made the case for `VouchesForGc`: joining the pieces of the compiler's
+    // own image forces a lazy list long enough to allocate 354 MB, and with
+    // the heap pinned not one byte of it could be reclaimed until the call
+    // returned. Nothing below is held in a C++ local across a force.
+    VouchesForGc vouch(p);
     const size_t base = p.stack.size();
     p.stack.push_back(args[0]);
     for (;;) {

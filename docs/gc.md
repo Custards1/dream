@@ -16,7 +16,12 @@ The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp
       threads, still stopping that process (2026-09-12).
 - [x] Phase 2, step 3 -- a major's marking overlaps the process's own
       reductions (2026-09-12).
-- [ ] Later -- moving (copying or compacting) collection.
+- [x] A nested force collects when the frames below it have vouched for their
+      locals, which is what took peak RSS from 859 MB to 511 MB (2026-09-12).
+      See "Collecting underneath a native".
+- [ ] Later -- moving (copying or compacting) collection. This is now the
+      whole of what is left: 182 MB live sits in 386 MB of blocks, and no
+      threshold reaches a hole.
 
 ## The collector today
 
@@ -240,8 +245,9 @@ Three knobs, all read once:
 
 - `alloc` must still never collect. Whatever the collector becomes, a native
   or the interpreter holding a raw `Value` across several allocations must
-  never lose it mid-call. Collection may only start at the per-reduction
-  safepoint in `run_process`.
+  never lose it mid-call. Collection starts at the per-reduction safepoint in
+  `run_process`, and -- under the rule below -- at the one inside a nested
+  force.
 - The header stays one word: `type(1) gc(1) aux(2) bytes(4)`, and `aux` is
   what carries `AUX_DEEP_FORCED`, which a `deep_force` relies on surviving a
   collection. Anything the collector does to an object must preserve `aux`
@@ -267,6 +273,108 @@ Three knobs, all read once:
   [value.hpp](dream/src/value.hpp#L250)). Promotion must not change the shapes
   that this in-place overwrite relies on, and it does not: a chunk is copied
   with its bytes and sizes exactly as they were.
+
+## Collecting underneath a native
+
+A native that walks a lazy structure forces the next piece by running the
+machine underneath itself, on the C++ stack (`force_whnf`). For most of the
+VM's life that nested loop could not collect, and the comment saying so was
+right about the reason: a native holding a raw `Value` across the force would
+have had its object promoted out from under it.
+
+The price was not paid in correctness. It was paid in **memory**, and the bill
+was large enough to be the single biggest thing in a self-compile's peak. One
+`str.concat_all` over the compiler's own image allocated **354 MB of nursery**
+that no safepoint could reach, and a minor collection at the end of it found
+87% of that already dead. Peak RSS was 859 MB against a live set of about
+180 MB; the nursery spike alone was 414 MB of it.
+
+So the rule is earned rather than assumed:
+
+> A nested force may collect exactly when every C++ frame between it and
+> `run_process` has said its locals survive one.
+
+A frame says so with `VouchesForGc` ([interp.hpp](dream/src/interp.hpp)), and
+the promise it makes is specific: anything it holds across a force lives in
+`p.stack` or `p.pins`, where the collector rewrites it, and is re-read
+afterwards rather than kept in a C++ local. `force_whnf` *consumes* the vouch
+and clears it, so what the forced expression goes on to reach starts unvouched
+like anything else; a force nobody vouched for raises `Process::force_pins`
+for as long as it runs, and a collection needs that counter at zero. That last
+part is what makes the rule hold for a *chain* of frames: an unvouched native
+with a vouched one inside it still cannot collect, which is the right answer,
+because the unvouched frame's locals are what would break.
+
+`Process::pins` is the other half -- a vector of `Value` the collector visits
+like any other root, for the handful of frames that genuinely cannot keep a
+reference anywhere else. There are two: the callee a native call must still
+name if the native parks, and the spare arguments `do_apply` sets aside when a
+native is over-applied.
+
+Four walks vouch today, and all four were already written for it -- they kept
+their position on the value stack and re-read the cell after every force, with
+comments saying why. They are `str_concat`, `str_of_bytes`, `str_of_chars` and
+the list `+` (`concat_lists`). What changed is that the discipline they were
+already keeping now buys something.
+
+What it bought, on the self-compile: peak RSS **859 MB -> 511 MB**, the
+nursery's worst overshoot **414 MB -> 34 MB**, and the compile got *faster*
+(2.78 s -> 2.66 s) rather than slower, because a heap that fits is a heap that
+does not page and does not scan what it is about to throw away. The image is
+byte-identical.
+
+`dream/tests/programs/collect_under_native.dr` is the regression test: every
+list it hands to a native is built *by the walk that consumes it*, and its
+`.env` shrinks the nursery so that a program small enough to be a test still
+collects ninety times inside those natives. It runs under `test-heap`, so the
+verifier walks the graph after each of them, and under `test-races`. The
+answers do not depend on when collection happens -- running it with a nursery
+large enough that none of it collects mid-walk prints the same bytes.
+
+### What this does *not* fix
+
+Two things, both measured, both recorded so the next reader does not spend the
+afternoon proving them again.
+
+**Collecting more often does not help.** Not at all. The old-space threshold
+is `live * 3`, and tightening it buys nothing:
+
+| `live x N` | Held from the OS | Peak RSS | Stopped in collection |
+|---|---|---|---|
+| 3.0 (today) | 415 MB | 519 MB | 250 ms |
+| 2.0 | 390 MB | 519 MB | 263 ms |
+| 1.5 | 383 MB | 502 MB | 295 ms |
+| 1.25 | 376 MB | 504 MB | 340 ms |
+
+Three times the majors, 36% more time stopped, and 9% of the memory back. The
+reason is the section below: what the heap is holding is not garbage waiting to
+be found, it is holes.
+
+**A bigger nursery does not help either.** Survival through a minor runs 32-58%,
+which looks like a nursery too small to let things die -- but it is not.
+Doubling the cap to 64 MB moves promotion from 369 MB to 363 MB and costs
+23 MB of RSS; 256 MB moves it to 348 MB and costs 221 MB. The survivors are
+long-lived, and 32 MB stays the right cap.
+
+### What is left: the holes
+
+After the change, peak RSS is 511 MB, of which 412 MB is blocks held from the
+OS (`--stats` reports this now) and the rest is the VM's own floor -- about
+38 MB of it before a program has run at all -- plus the C++ side.
+
+The last full collection of a self-compile finds **182 MB live in 386 MB of
+blocks**: 47% occupancy. Only 422 of 5848 blocks are *entirely* empty, so
+sweeping cannot hand the memory back -- a 64 KiB block holds around 1300 small
+objects, and with 45% of them surviving, essentially no block ever empties. The
+dead space is interleaved with the live, one chunk at a time, on 55 segregated
+free lists that can neither merge nor move.
+
+That is fragmentation, and the only real answer to it is a collector that
+moves old objects: compaction, or the opportunistic evacuation of sparse
+blocks. Which is what "Later -- moving collections" below is about, and the
+vouching rule above is most of what it needs, because "every frame between here
+and `run_process` has vouched" is exactly the precondition for moving an
+object a C++ frame might be holding.
 
 ## Why generational, why parallel, why concurrent
 
@@ -516,8 +624,18 @@ C++ local escapes, is what `--verify` will be asked to test first.
   still collect the old way, and the late big ones are where the 90 ms comes
   from.
 
+- **Done:** a nested force collects when every C++ frame between it and
+  `run_process` has vouched for its locals (`VouchesForGc`, `Process::pins`).
+  Peak RSS on the self-compile 859 MB -> 511 MB, the nursery's worst overshoot
+  414 MB -> 34 MB, wall time 2.78 s -> 2.66 s, image byte-identical. Covered by
+  `dream/tests/programs/collect_under_native.dr` under `test-heap` and
+  `test-races`, and by the whole suite. Two things it does *not* fix are
+  written down under "Collecting underneath a native", with the numbers:
+  collecting more often, and a bigger nursery. Neither helps, and both cost.
+
 - **Next:** moving collections -- the design for which is written down under
-  "Later" below.
+  "Later" below, and which is now the only lever left on memory. The 47%
+  occupancy of old space at the end of a self-compile is the number to beat.
 
 The VM-side Phase 1 work sits alongside compiler work done in the same session:
 a `dreams` bug in lowered guarded match arms (a guarded arm's failing pattern

@@ -108,13 +108,20 @@ void Process::maybe_collect() {
 }
 
 void Process::visit_roots(Heap& heap) {
-    // Everything the machine can still reach lives in these five places. That
+    // Everything the machine can still reach lives in these few places. That
     // is the whole payoff of keeping process state out of the C++ stack: the
-    // root set is a list, not a stack walk.
+    // root set is a list, not a stack walk. `pins` is the one concession, and
+    // it exists so that the handful of C++ frames that genuinely do hold a
+    // `Value` across a collection can be written down rather than reasoned
+    // about -- see `Process::pins`.
     heap.forward(&frame);
     heap.forward(&result);
     heap.forward(&exit_value);
     for (Value& v : stack) heap.forward(&v);
+    // Usually empty: a native call pins its callee only when that callee is a
+    // host object rather than a builtin immediate, and nothing else pins at all
+    // unless a native has been over-applied.
+    for (Value& v : pins) heap.forward(&v);
     for (Cont& c : conts) heap.forward(&c.v1);
     for (Value& g : globals) {
         if (g != NIL_SLOT) heap.forward(&g);

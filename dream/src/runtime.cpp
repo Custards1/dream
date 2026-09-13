@@ -108,7 +108,7 @@ void Runtime::print_stats() const {
     uint64_t major = 0, minor = 0, promoted = 0, allocated = 0;
     uint64_t minor_ns = 0, major_ns = 0, rounds = 0;
     uint64_t concurrent = 0, concurrent_ns = 0;
-    size_t peak = 0;
+    size_t peak = 0, held = 0;
     // Every process, not just the root: a program that does its work in
     // children -- which is what green processes are for -- would otherwise
     // report a heap that never did anything.
@@ -131,10 +131,12 @@ void Runtime::print_stats() const {
         concurrent_ns += h.nanos_concurrent();
         allocated += h.bytes_total();
         peak += h.bytes_peak();
+        held += h.bytes_peak_held();
     }
     std::fprintf(stderr,
                  "; %llu reductions, %llu major + %llu minor collections\n"
-                 "; %llu bytes allocated, %llu promoted, %zu live at each heap's peak\n"
+                 "; %llu bytes allocated, %llu promoted, %zu live at each heap's peak\n"\
+                 "; %zu bytes held from the OS at each heap's peak\n"
                  "; %.0f ms stopped in collection (%.0f major, %.0f minor),"
                  " %llu rounds divided across threads\n"
                  "; %llu majors with their marking overlapped,"
@@ -143,7 +145,7 @@ void Runtime::print_stats() const {
                  static_cast<unsigned long long>(major),
                  static_cast<unsigned long long>(minor),
                  static_cast<unsigned long long>(allocated),
-                 static_cast<unsigned long long>(promoted), peak,
+                 static_cast<unsigned long long>(promoted), peak, held,
                  double(major_ns + minor_ns) / 1e6, double(major_ns) / 1e6,
                  double(minor_ns) / 1e6, static_cast<unsigned long long>(rounds),
                  static_cast<unsigned long long>(concurrent), double(concurrent_ns) / 1e6);

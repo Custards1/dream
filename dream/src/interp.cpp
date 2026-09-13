@@ -344,12 +344,16 @@ void do_apply(Process& p, Value callee, uint32_t argc) {
             // Apply exactly `arity`, then apply the result to the rest.
             push_cont(p, ContKind::ApplyTo, argc - arity, 0, 0, UNIT);
             // The extra arguments sit above the ones we are about to consume,
-            // so move them out of the way first.
-            std::vector<Value> extra(p.stack.begin() + long(base + arity), p.stack.end());
+            // so move them out of the way first -- into `pins` rather than a
+            // C++ vector, because the native is about to run Dream code that
+            // may collect and these are live references like any other.
+            const size_t spilled = p.pins.size();
+            p.pins.insert(p.pins.end(), p.stack.begin() + long(base + arity), p.stack.end());
             p.stack.resize(base + arity);
             resume_native(p, callee, uint32_t(base), arity, 0);
             // Re-push the leftovers underneath the pending ApplyTo.
-            p.stack.insert(p.stack.end(), extra.begin(), extra.end());
+            p.stack.insert(p.stack.end(), p.pins.begin() + long(spilled), p.pins.end());
+            p.pins.resize(spilled);
             return;
         }
         resume_native(p, callee, uint32_t(base), arity, 0);
@@ -407,7 +411,17 @@ void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint3
         }
     }
 
+    // The callee is named again after the call -- `NativeRetry` has to record
+    // which native to re-enter -- so it has to survive one. A builtin is an
+    // immediate and cannot move; a host native is an object, and although it
+    // is reachable from `native_cache` and so can never be *freed* under us,
+    // a minor collection would promote it and leave this copy pointing at the
+    // forwarded husk. Pinning is a push and a pop, and only on the host path.
+    const bool pinned = !is_builtin(callee);
+    Pin callee_pin(p, pinned ? callee : UNIT);
+
     NativeResult r = fn(p, callee, p.stack.data() + base, argc);
+    if (pinned) callee = callee_pin.get();
 
     // A nested force inside the native hit a blocking operation and gave up
     // (see `force_whnf`). Whatever the native decided to return is built on a
@@ -602,7 +616,10 @@ bool concat_lists(Process& p, Value a, Value b, Value* out) {
     }
     // Forcing the spine can collect, so the working set lives on the process
     // stack rather than in C++ locals: slot 0 holds the tail to append, slot 1
-    // is the cursor, and the heads pile up above them.
+    // is the cursor, and the heads pile up above them. Which is the promise
+    // `VouchesForGc` wants, so this walk makes it: appending two long lists
+    // forces a whole spine, and that has to be able to collect.
+    VouchesForGc vouch(p);
     const size_t base = p.stack.size();
     p.stack.push_back(b);
     p.stack.push_back(a);
@@ -2020,9 +2037,19 @@ bool force_whnf(Process& p, Value v, Value* out) {
         *out = v;
         return true;
     }
-    // Run a nested machine loop down to the current continuation depth. The
-    // process's own stacks still hold every root, so a collection during this
-    // is as safe as one at the outer level.
+    // Run a nested machine loop down to the current continuation depth.
+    //
+    // Whether it may collect is decided here and nowhere else. The caller
+    // either vouched for its own locals or did not (`VouchesForGc`); a force
+    // nobody vouched for raises `force_pins` for as long as it runs, and a
+    // collection needs every frame in the chain to have vouched, which is
+    // exactly `force_pins == 0`. The flag is consumed rather than inherited:
+    // what this force goes on to reach starts unvouched, because a vouch is a
+    // claim about the frame that made it.
+    const bool vouched = p.force_vouched;
+    p.force_vouched = false;
+    if (!vouched) ++p.force_pins;
+
     const Limits lim = Limits::get();
     const size_t max_conts = lim.conts;
     const size_t max_stack = lim.stack;
@@ -2031,8 +2058,14 @@ bool force_whnf(Process& p, Value v, Value* out) {
     const size_t floor = p.conts.size();
     const Mode saved_mode = p.mode;
     const uint32_t saved_node = p.node;
-    const Value saved_frame = p.frame;
-    const Value saved_result = p.result;
+
+    // The machine state this loop is about to overwrite. It is two live
+    // references, and a collection inside the loop would move both -- so they
+    // are pinned rather than kept in a local, and read back below. Cheap, and
+    // only on the path that actually runs a loop: a value already in WHNF
+    // returned above without touching any of this.
+    Pin saved_frame(p, p.frame);
+    Pin saved_result(p, p.result);
 
     enter(p, v);
     bool ok = true;
@@ -2052,17 +2085,16 @@ bool force_whnf(Process& p, Value v, Value* out) {
             step_return(p, floor);
         }
 
-        // The limit check the outer loop has, but *not* its collection.
-        // Without this a runaway recursion reached through a native --
-        // `console.print!` forcing a value that recurses for ever -- grows
-        // until the allocator throws, because this loop is where that forcing
-        // happens.
-        //
-        // Collecting here would be a bug: `force_whnf` is called from natives
-        // that hold raw object pointers across the call, and moving their
-        // objects out from under them is exactly what the "allocation never
-        // collects" rule exists to prevent. The outer loop still collects.
+        // The outer loop's limit check, and -- when the whole chain of frames
+        // below `run_process` has vouched -- its safepoint too. Without the
+        // limit check a runaway recursion reached through a native
+        // (`console.print!` forcing a value that recurses for ever) grows until
+        // the allocator throws, because this loop is where that forcing
+        // happens. Without the safepoint a native that walks a long lazy
+        // structure allocates for as long as the walk takes with nothing able
+        // to collect any of it, which is the same failure a size away.
         if (check_limits(p, wk, max_conts, max_stack, max_heap)) continue;
+        if (p.force_pins == 0 && p.heap().should_collect()) p.maybe_collect();
 
         // A blocking native inside the value being forced -- `join!`, `recv!`,
         // a read on a socket -- asked to be parked. This loop cannot park: it
@@ -2080,6 +2112,13 @@ bool force_whnf(Process& p, Value v, Value* out) {
             break;
         }
     }
+
+    // Both counters back as they were. The vouch is restored rather than left
+    // consumed because a native that forces in a loop vouches once: taking it
+    // away after the first force would quietly pin the rest of the walk, which
+    // is the bug this whole mechanism exists to remove.
+    if (!vouched) --p.force_pins;
+    p.force_vouched = vouched;
 
     if (blocked) {
         // The force is *suspended*, not abandoned. Everything it pushed -- its
@@ -2109,9 +2148,9 @@ bool force_whnf(Process& p, Value v, Value* out) {
     Value error = p.result;
     p.mode = saved_mode;
     p.node = saved_node;
-    p.frame = saved_frame;
+    p.frame = saved_frame.get();
     if (ok) {
-        p.result = saved_result;
+        p.result = saved_result.get();
     } else {
         p.result = error;
     }

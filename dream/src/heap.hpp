@@ -280,6 +280,16 @@ public:
     /// the program actually needs, as opposed to the garbage it made getting
     /// there.
     size_t bytes_peak() const { return peak_live_; }
+    /// The most this heap has ever held *from the OS*: every block it had
+    /// malloc'd at once, nursery and old space together, whether or not the
+    /// objects in them were live.
+    ///
+    /// This is the number a person watching `top` sees, and it is not
+    /// `bytes_peak`. The difference between them is everything the collector
+    /// is carrying and not using -- headroom above the live set, chunks on the
+    /// free lists, and the blocks a sweep emptied but cannot hand back because
+    /// something else in them is still alive.
+    size_t bytes_peak_held() const { return peak_block_bytes_; }
 
     /// Deep-copy `v` out of this heap into `dest`. Used for message sends and
     /// for spawning, which are the only two places a value crosses heaps.
@@ -470,6 +480,9 @@ private:
     size_t allocated_ = 0;
     uint64_t total_allocated_ = 0;
     size_t peak_live_ = 0;
+    /// Bytes currently malloc'd for blocks, and the most there have ever been.
+    size_t block_bytes_ = 0;
+    size_t peak_block_bytes_ = 0;
     size_t gc_threshold_;
     size_t initial_bytes_;
     size_t live_after_gc_ = 0;

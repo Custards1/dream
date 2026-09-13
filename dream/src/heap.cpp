@@ -167,10 +167,13 @@ Heap::Block* Heap::new_block(size_t bytes) {
     b->used = 0;
     b->big = false;
     b->dead = false;
+    block_bytes_ += size;
+    if (block_bytes_ > peak_block_bytes_) peak_block_bytes_ = block_bytes_;
     return b;
 }
 
 void Heap::free_block(Block* b) {
+    block_bytes_ -= b->size;
     std::free(b->data);
     std::free(b);
 }
@@ -1380,8 +1383,9 @@ void Heap::major_collect(RootSource& roots) {
 
     major_nanos_ += now_nanos() - started;
     if (gc_trace())
-        std::fprintf(stderr, "; major: %zu live, %.2f ms mark, %.2f ms sweep\n",
-                     live_after_gc_, double(marked - started) / 1e6,
+        std::fprintf(stderr,
+                     "; major: %zu live, %zu held, %.2f ms mark, %.2f ms sweep\n",
+                     live_after_gc_, block_bytes_, double(marked - started) / 1e6,
                      double(now_nanos() - marked) / 1e6);
     verify_collect(roots, false);
 }
@@ -1421,9 +1425,10 @@ void Heap::minor_collect(RootSource& roots) {
     grow_nursery_if_crowded(promoted_now, looked_at);
     minor_nanos_ += now_nanos() - started;
     if (gc_trace())
-        std::fprintf(stderr, "; minor: %zu nursery, %llu promoted, %zu remembered, %.2f ms\n",
+        std::fprintf(stderr,
+                     "; minor: %zu nursery, %llu promoted, %zu remembered, %zu held, %.2f ms\n",
                      looked_at, (unsigned long long)(promoted_bytes_ - promoted_before),
-                     remembered_n, double(now_nanos() - started) / 1e6);
+                     remembered_n, block_bytes_, double(now_nanos() - started) / 1e6);
 
     // A minor never touches old space, so `live_after_gc_` still says what the
     // last full collection measured; `bytes_allocated` reports the whole live
@@ -1596,8 +1601,10 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     concurrent_nanos_ += overlap_ns;
     if (gc_trace())
         std::fprintf(stderr,
-                     "; concurrent major: %zu live, %.2f ms overlap + %.2f ms stop\n",
-                     live_after_gc_, double(overlap_ns) / 1e6, double(final_ns) / 1e6);
+                     "; concurrent major: %zu live, %zu held, "
+                     "%.2f ms overlap + %.2f ms stop\n",
+                     live_after_gc_, block_bytes_, double(overlap_ns) / 1e6,
+                     double(final_ns) / 1e6);
     verify_collect(roots, false);
 }
 

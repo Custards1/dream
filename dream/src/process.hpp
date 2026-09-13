@@ -148,6 +148,41 @@ public:
     bool force_blocked = false;
     size_t force_resume_at = 0;
 
+    /// Whether a nested force may collect, and what it costs to say so.
+    ///
+    /// `force_whnf` runs the machine underneath a native, on the C++ stack, and
+    /// for most of the VM's life it could not collect there: a native holding a
+    /// raw `Value` across the call would have had its object promoted out from
+    /// under it. The cost of that rule was not a bug but a *size* -- a native
+    /// that walks a long lazy list runs unbounded Dream work with the heap
+    /// pinned, and one `str.concat_all` over the image was measured allocating
+    /// 354 MB of nursery that no safepoint could reach. 87% of it was garbage.
+    ///
+    /// So the rule is now earned rather than assumed. Collection is legal in a
+    /// nested force exactly when every C++ frame between it and `run_process`
+    /// has said its locals can survive one -- which means keeping them on
+    /// `stack` or in `pins` and re-reading, never in a C++ local. A frame says
+    /// so with `VouchesForGc` (interp.hpp); `force_pins` counts the frames that
+    /// have *not*, and a collection needs it at zero.
+    ///
+    /// `force_vouched` is how the claim reaches `force_whnf`: the guard sets
+    /// it, the force consumes it, and clears it for everything it goes on to
+    /// reach -- because a vouch is about the frame that made it and says
+    /// nothing about the natives that run below.
+    bool force_vouched = false;
+    uint32_t force_pins = 0;
+
+    /// Values a C++ frame is holding across a call that can collect.
+    ///
+    /// The interpreter keeps no machine state on the C++ stack, which is the
+    /// whole reason the root set is a list rather than a stack walk. The
+    /// exceptions are few and all of them are here: the callee a native call
+    /// must still name when the native parks, and the spare arguments
+    /// `do_apply` sets aside when a native is over-applied. The collector
+    /// visits this like any other root and rewrites what it finds, so the
+    /// frame reads its value back out rather than trusting the copy it kept.
+    std::vector<Value> pins;
+
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }
     const Heap& heap() const { return heap_; }
