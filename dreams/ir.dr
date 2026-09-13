@@ -84,20 +84,33 @@ let ops = [
     [:set, 40, "set"],
 ];
 
-let rec find_op key at ops_left =
-    match ops_left {
-        [] => (),
-        [o, ..rest] => if list.nth at o == key { o } else { find_op key at rest },
-    };
+// The table above is the readable form; these are the three ways it is
+// actually asked about. A linear scan of it was the single largest thing in a
+// self-compile -- 20 million reductions, a quarter of the whole -- because
+// `opcode` is asked once per node the lowerer emits and `op_of_code` once per
+// node an image is read back from, and each answer walked an average of twenty
+// three-element lists to find one atom. A list searched more often than it is
+// built wants to be a map, and these are built once: a module's `let` is a
+// global, and a global is created on first use and then kept.
+//
+// (That cost was invisible until `--profile` learnt to attribute the
+// reductions a nested force makes, which is most of them. It named
+// `check_expr` before that, and `check_expr` was not the problem.)
+let op_codes = list.fold (fn m o -> core.map_put m (list.nth 0 o) (list.nth 1 o))
+                         (core.map_new ()) ops;
+let op_names = list.fold (fn m o -> core.map_put m (list.nth 0 o) (list.nth 2 o))
+                         (core.map_new ()) ops;
+let op_of_codes = list.fold (fn m o -> core.map_put m (list.nth 1 o) (list.nth 0 o))
+                            (core.map_new ()) ops;
 
 /// The VM's number for an opcode, or `()` if it is not one.
-let opcode op = match find_op op 0 ops { () => (), o => list.nth 1 o };
+let opcode op = core.map_get op_codes op ();
 
 /// The short name an opcode dumps as.
-let op_name op = match find_op op 0 ops { () => "?", o => list.nth 2 o };
+let op_name op = core.map_get op_names op "?";
 
 /// The opcode a number stands for, for reading an image back.
-let op_of_code n = match find_op n 1 ops { () => (), o => list.nth 0 o };
+let op_of_code n = core.map_get op_of_codes n ();
 
 // --- function flags -------------------------------------------------------------
 

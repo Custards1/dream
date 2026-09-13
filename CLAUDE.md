@@ -168,6 +168,14 @@ function whose frame is current. Natives do not reduce, so work inside a builtin
 is charged to its caller -- which is why a member of a host module (`core.head`)
 can be expensive without appearing anywhere in the profile.
 
+A profile is only worth as much as its coverage, and this one's was wrong twice
+over until 2026-09-12. The reductions a *nested* force makes -- which is most of
+a compile, because `dreams` forces at every stage boundary -- were counted but
+never attributed, and a JIT-compiled body was invisible however hot it got. The
+first of those was hiding a quarter of a self-compile in one function. Check the
+two totals agree: `--stats --profile 1` prints the attributed sum and the run's
+own count, and they should be the same number.
+
 What has already been learnt from them, so it is not learnt twice:
 
 - Building a string with `+` is quadratic. `str.concat_all` (and `join_str`,
@@ -193,6 +201,22 @@ What has already been learnt from them, so it is not learnt twice:
   "deeply forced" bit -- see `AUX_DEEP_FORCED` in [dream/src/value.hpp](dream/src/value.hpp).
   Before that, forcing the compiler's own tables walked shared structure once
   per path to it.
+- **A list searched more often than it is built wants to be a map** -- and the
+  reason this appears twice in these notes is that it was found twice. The
+  keyword check was the first. The second was `ir.find_op`, a linear scan of
+  the 41-entry opcode table run once per node the lowerer emits and once per
+  node an image is read back from: **a quarter of a self-compile**, 20M
+  reductions, gone by indexing the same table three ways at module level. It
+  had been there all along and no profile had ever named it, because the
+  profiler could not see the loop it ran in.
+- **The JIT was charging three reductions for every one it ran.** `--stats` said
+  194M reductions for a compile that does 58M, because a compiled body folded
+  the whole fall in the budget into the total -- including the reductions the
+  interpreter it re-entered had already counted, and again for every compiled
+  frame above them. Scheduling was never affected (the budget itself was always
+  right), but every number derived from the count was. The JIT does 57.8M
+  reductions where the interpreter does 60.6M, which is the honest measure of
+  what it saves and was not previously knowable.
 - **A linear walk the machine can do is worth ten of the same walk in Dream.**
   This is the largest single lesson so far: `list.append` and `list.nth`,
   written as the obvious recursions, were between them *a third of a

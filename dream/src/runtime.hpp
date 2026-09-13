@@ -177,9 +177,13 @@ public:
     // increment does not change one.
     void enable_profile(size_t top);
     bool profiling() const { return profiling_; }
-    void note_reduction(uint32_t func_index) {
+    void note_reduction(uint32_t func_index) { note_reductions(func_index, 1); }
+    /// The same for a run of reductions charged at once, which is how a
+    /// JIT-compiled body reports what it spent: it does not come back between
+    /// iterations, so it cannot be counted one at a time.
+    void note_reductions(uint32_t func_index, uint64_t n) {
         if (func_index < profile_.size()) {
-            profile_[func_index].fetch_add(1, std::memory_order_relaxed);
+            profile_[func_index].fetch_add(n, std::memory_order_relaxed);
         }
     }
     /// The hottest functions, most reductions first, on stderr. A no-op unless

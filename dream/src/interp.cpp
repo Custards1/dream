@@ -241,10 +241,24 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
         if (fn) {
             int status = 0;
             // Compiled code spends the same budget the interpreter does, so
-            // fold what it used into the process's total.
+            // fold what it used into the process's total -- but only what *it*
+            // spent. A compiled body re-enters the interpreter for anything it
+            // cannot do itself, and those reductions have already counted
+            // themselves; charging the whole fall in the budget counted them
+            // twice, and twice again for every compiled frame above them. On a
+            // self-compile that reported 194M reductions where the same work
+            // without the JIT reports 61M, which made `--stats` and every
+            // number derived from it meaningless whenever the JIT was on.
             const int64_t before = p.reductions;
+            const uint64_t before_total = p.total_reductions;
             Value r = fn(&p, frame, &status);
-            p.total_reductions += uint64_t(before - p.reductions);
+            const uint64_t spent = uint64_t(before - p.reductions);
+            const uint64_t nested = p.total_reductions - before_total;
+            const uint64_t own = spent > nested ? spent - nested : 0;
+            p.total_reductions += own;
+            // And attributed, which nothing did before: a function the JIT
+            // compiled was invisible to `--profile` however hot it was.
+            if (own && p.runtime().profiling()) p.runtime().note_reductions(func_index, own);
             if (status == 0) { ret(p, r); return; }
             if (status == 1) { do_raise(p, r); return; }
             // Yielded: the compiled loop spent its budget and wrote its
@@ -2080,6 +2094,13 @@ bool force_whnf(Process& p, Value v, Value* out) {
         if (p.mode == Mode::Eval) {
             --p.reductions;
             ++p.total_reductions;
+            // Attributed like any other reduction. Leaving this out made the
+            // profiler blind to most of a compile: `dreams` forces at every
+            // stage boundary, so the machine spends the bulk of its life in
+            // *this* loop rather than the outer one -- 179M of a self-compile's
+            // 214M reductions -- and a profile that cannot see them names the
+            // wrong functions.
+            if (p.runtime().profiling()) p.runtime().note_reduction(current_func(p));
             step_eval(p);
         } else {
             step_return(p, floor);
