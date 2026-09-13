@@ -94,6 +94,16 @@ let str_byte s index = native.str_byte s index;
 /// or an identifier, which is exactly the shape a lexer spends its time on.
 let str_span s from set = native.str_span s from set;
 
+/// `n` bytes of the integer `v`, little-endian, as a string. Two's complement
+/// for a negative `v`; `n` must be between zero and eight.
+///
+/// What a binary format is made of. Written out in Dream a field is a little
+/// list -- `str_of_bytes [v % 256, (v / 256) % 256, ..]` -- which is a cons
+/// cell and a thunk per byte, a frame per arithmetic call, and a nested force
+/// to read them all back: about 210 bytes of heap for four bytes of output.
+/// This is the four bytes.
+let str_le v n = native.str_le v n;
+
 /// The first byte at or after `from` that *is* in `set`, or the length of `s`.
 /// The other half of `str_span`: run *to* a delimiter rather than past a class.
 let str_upto s from set = native.str_upto s from set;

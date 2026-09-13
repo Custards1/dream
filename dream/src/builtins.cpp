@@ -1808,6 +1808,40 @@ NativeResult core_str_byte(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_fixnum(uint8_t(b.data[k])));
 }
 
+/// `str_le v n` -- `n` bytes of `v`, little-endian, as a string.
+///
+/// A binary format is written a field at a time, and a field written in Dream
+/// was a list: `core.str_of_bytes [v % 256, byte_at v 256, ..]`. Four cons
+/// cells, four thunks for the lazily-computed elements, a frame apiece, and a
+/// nested machine loop inside `str_of_bytes` to force them again -- about 210
+/// bytes of heap to produce four bytes of output, which on one self-compile
+/// was 128 MB of garbage, the largest single source in the compiler. This is
+/// the same four bytes and no list.
+///
+/// Little-endian because every machine this runs on is, and two's complement
+/// for a negative `v`, which is what an `i64` field in an image holds. `n`
+/// beyond eight is a mistake rather than a wider number: a Dream integer is
+/// sixty-four bits and a ninth byte could only ever be sign.
+NativeResult core_str_le(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    Value n = resolve(args[1]);
+    if (!is_fixnum(v) || !is_fixnum(n)) {
+        return type_fail(p, "str_le needs an integer and a width");
+    }
+    int64_t width = fixnum_value(n);
+    if (width < 0 || width > 8) {
+        return NativeResult::raise(raise_error(
+            p, well_known(p.runtime()).type_error,
+            "str_le writes between zero and eight bytes, not " + std::to_string(width)));
+    }
+    // Through `uint64_t` so that a negative value is its two's complement and
+    // the shift is defined.
+    uint64_t bits = static_cast<uint64_t>(fixnum_value(v));
+    char buf[8];
+    for (int64_t i = 0; i < width; ++i) buf[i] = char(uint8_t(bits >> (8 * i)));
+    return NativeResult::ok(p.heap().make_string(buf, uint32_t(width)));
+}
+
 // --- chars ---
 
 NativeResult core_char_code(Process& p, Value, Value* args, uint32_t) {
@@ -2160,6 +2194,7 @@ ModuleDef make_core_module() {
             {"str_slice", 3, 0b111, core_str_slice},
             {"str_find", 3, 0b111, core_str_find},
             {"str_byte", 2, 0b11, core_str_byte},
+            {"str_le", 2, 0b11, core_str_le},
             {"str_span", 3, 0b111, core_str_span},
             {"str_upto", 3, 0b111, core_str_upto},
             // chars

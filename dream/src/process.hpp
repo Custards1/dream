@@ -183,6 +183,16 @@ public:
     /// frame reads its value back out rather than trusting the copy it kept.
     std::vector<Value> pins;
 
+    /// Bytes already charged to some function by the allocation profile.
+    ///
+    /// A step's allocation is measured as the heap's total before and after,
+    /// and a step that enters a native which forces runs whole machine loops
+    /// underneath itself -- every one of which measures and charges the same
+    /// bytes again. So each level subtracts what the levels below it have
+    /// already claimed, and this is the running tally they claim into. Only
+    /// touched while profiling.
+    uint64_t alloc_attributed = 0;
+
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }
     const Heap& heap() const { return heap_; }

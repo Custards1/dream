@@ -186,9 +186,22 @@ public:
             profile_[func_index].fetch_add(n, std::memory_order_relaxed);
         }
     }
-    /// The hottest functions, most reductions first, on stderr. A no-op unless
-    /// profiling was asked for, so the places that have to call it -- the end
-    /// of a run, and `exit!`, which never returns to it -- can call it blind.
+    /// Bytes allocated while `func_index`'s frame was current.
+    ///
+    /// Reductions say where the time goes; this says where the *garbage* comes
+    /// from, and the two do not have to agree. A function that allocates twice
+    /// what it needs costs the collector as much as it costs the interpreter,
+    /// and nothing before this could point at one -- `--stats` gave a program's
+    /// total and no way to divide it.
+    void note_alloc(uint32_t func_index, uint64_t bytes) {
+        if (func_index < alloc_.size()) {
+            alloc_[func_index].fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
+    /// The hottest functions, most reductions first, and then the ones that
+    /// allocate most, on stderr. A no-op unless profiling was asked for, so the
+    /// places that have to call it -- the end of a run, and `exit!`, which
+    /// never returns to it -- can call it blind.
     void print_profile() const;
 
     // --- what the run cost ---
@@ -247,6 +260,7 @@ private:
     bool stats_ = false;
     size_t profile_top_ = 0;
     std::vector<std::atomic<uint64_t>> profile_;
+    std::vector<std::atomic<uint64_t>> alloc_;
     class Jit* jit_ = nullptr;
     std::unique_ptr<struct WellKnownAtoms> wk_;
 };

@@ -53,13 +53,18 @@ let flag_debug = 1;
 
 let byte_at v n = (v / n) % 256;
 
-/// Each of these answers a *string* of the bytes, built from a short list that
-/// dies immediately. `core.str_of_bytes` is what makes bytes rather than
-/// characters: a byte over 127 encoded as a character would be two bytes of
-/// UTF-8, and an image is bytes or it is nothing.
-let u8 v = core.str_of_bytes [v % 256];
-let u16 v = core.str_of_bytes [v % 256, byte_at v 256];
-let u32 v = core.str_of_bytes [v % 256, byte_at v 256, byte_at v 65536, byte_at v 16777216];
+/// Each of these answers a *string* of the bytes. `core.str_le` is what makes
+/// bytes rather than characters: a byte over 127 encoded as a character would
+/// be two bytes of UTF-8, and an image is bytes or it is nothing.
+///
+/// These were `core.str_of_bytes` over a list literal, which is the obvious
+/// way to say it and was the single largest allocator in the compiler -- a
+/// cons cell and a thunk per byte, a frame for each `byte_at`, and a nested
+/// force inside `str_of_bytes` to read them back, for 128 MB of garbage per
+/// self-compile. `str_le` is the same field with no list in the middle.
+let u8 v = core.str_le v 1;
+let u16 v = core.str_le v 2;
+let u32 v = core.str_le v 4;
 
 /// A 64-bit signed integer. Two's complement, so a negative one is written as
 /// what it would be if it were unsigned.

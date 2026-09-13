@@ -630,10 +630,16 @@ bool concat_lists(Process& p, Value a, Value b, Value* out) {
     }
     // Forcing the spine can collect, so the working set lives on the process
     // stack rather than in C++ locals: slot 0 holds the tail to append, slot 1
-    // is the cursor, and the heads pile up above them. Which is the promise
-    // `VouchesForGc` wants, so this walk makes it: appending two long lists
-    // forces a whole spine, and that has to be able to collect.
-    VouchesForGc vouch(p);
+    // is the cursor, and the heads pile up above them.
+    //
+    // It does *not* vouch (`VouchesForGc`), though everything below it is
+    // written for one. This is not reached through `resume_native` the way a
+    // native is -- it is the `+` operator, reached from `arith`, which
+    // `finish_binop` calls while holding both operands in C++ locals and which
+    // JIT-compiled code calls while holding its entire frame in machine
+    // registers. Neither of those survives a collection, and the frame that
+    // cannot survive one is the frame that decides. Vouching here made
+    // `effects_once` hang about one run in twelve.
     const size_t base = p.stack.size();
     p.stack.push_back(b);
     p.stack.push_back(a);
@@ -1977,11 +1983,42 @@ static inline bool check_limits(Process& p, const WellKnownAtoms& wk,
 
 /// The function whose frame is current, or `UINT32_MAX` when there is none --
 /// at the very start of a process, or inside a native.
+/// Charge one step's *own* allocation to `fi`.
+///
+/// The bytes a step allocates are the heap's total before and after -- but a
+/// step that enters a native which forces runs whole machine loops underneath
+/// itself, and each of those has already charged its own bytes. Subtract what
+/// they claimed, and claim the rest. Without this a self-compile's allocation
+/// profile totalled 36 GB against a heap that handed out 1.5 GB.
+inline void note_own_alloc(Process& p, uint32_t fi, uint64_t a0, uint64_t n0) {
+    const uint64_t delta = p.heap().bytes_total() - a0;
+    const uint64_t nested = p.alloc_attributed - n0;
+    const uint64_t own = delta > nested ? delta - nested : 0;
+    if (own) {
+        p.runtime().note_alloc(fi, own);
+        p.alloc_attributed += own;
+    }
+}
+
 uint32_t current_func(Process& p) {
     if (!is_ptr(p.frame)) return UINT32_MAX;
     Value c = static_cast<FrameObj*>(as_obj(p.frame))->closure;
     if (!is_obj(c, ObjType::Closure)) return UINT32_MAX;
     return static_cast<ClosureObj*>(as_obj(c))->func;
+}
+
+/// `step_return` with its allocation charged to whoever is returning.
+///
+/// A Return step is not a reduction -- it spends no budget, and the profile's
+/// first table is right not to count it -- but it does allocate: it is where a
+/// thunk's result is published and where the list builder conses. Leaving it
+/// out put a third of a compile's bytes in no function at all.
+inline void step_return_counted(Process& p, size_t floor) {
+    const uint32_t fi = current_func(p);
+    const uint64_t a0 = p.heap().bytes_total();
+    const uint64_t n0 = p.alloc_attributed;
+    step_return(p, floor);
+    note_own_alloc(p, fi, a0, n0);
 }
 
 void run_process(Process& p, int64_t budget) {
@@ -1994,6 +2031,10 @@ void run_process(Process& p, int64_t budget) {
     const size_t max_stack = lim.stack;
     const size_t max_heap = lim.heap_bytes;
     const WellKnownAtoms& wk = well_known(p.runtime());
+    // Profiling never turns on mid-run, so this is a register for the whole
+    // loop rather than a load per step. That matters most for the Return run
+    // below, which is more than half of all the steps a program takes.
+    const bool prof = p.runtime().profiling();
     while (p.reductions > 0) {
         // Safepoint. Every live value is reachable from the process's stacks,
         // its frame and its result -- nothing is stranded in a C++ local.
@@ -2009,11 +2050,23 @@ void run_process(Process& p, int64_t budget) {
                 // Attributed to whichever function's frame is current, which
                 // is what makes a profile read like the source: a reduction
                 // belongs to the code that asked for it.
-                if (p.runtime().profiling()) p.runtime().note_reduction(current_func(p));
-                step_eval(p);
+                if (prof) {
+                    // The frame is read before the step, because the step is
+                    // what changes it, and the bytes after, because they are
+                    // what the step allocated.
+                    const uint32_t fi = current_func(p);
+                    const uint64_t a0 = p.heap().bytes_total();
+                    const uint64_t n0 = p.alloc_attributed;
+                    p.runtime().note_reduction(fi);
+                    step_eval(p);
+                    note_own_alloc(p, fi, a0, n0);
+                } else {
+                    step_eval(p);
+                }
                 break;
             case Mode::Return:
-                step_return(p, 0);
+                if (prof) step_return_counted(p, 0);
+                else step_return(p, 0);
                 break;
             case Mode::Raise:
                 if (!unwind(p, 0)) {
@@ -2037,7 +2090,11 @@ void run_process(Process& p, int64_t budget) {
         // costs at most a slightly late collection -- a safepoint is a place
         // collection *may* happen, not one where it must -- and saves the
         // check on more than half of all the steps a program takes.
-        while (p.mode == Mode::Return && !p.park_requested) step_return(p, 0);
+        if (prof) {
+            while (p.mode == Mode::Return && !p.park_requested) step_return_counted(p, 0);
+        } else {
+            while (p.mode == Mode::Return && !p.park_requested) step_return(p, 0);
+        }
 
         // A blocking builtin asked to be parked; stop here and let the
         // scheduler complete the handshake.
@@ -2069,6 +2126,7 @@ bool force_whnf(Process& p, Value v, Value* out) {
     const size_t max_stack = lim.stack;
     const size_t max_heap = lim.heap_bytes;
     const WellKnownAtoms& wk = well_known(p.runtime());
+    const bool prof = p.runtime().profiling();
     const size_t floor = p.conts.size();
     const Mode saved_mode = p.mode;
     const uint32_t saved_node = p.node;
@@ -2100,8 +2158,18 @@ bool force_whnf(Process& p, Value v, Value* out) {
             // *this* loop rather than the outer one -- 179M of a self-compile's
             // 214M reductions -- and a profile that cannot see them names the
             // wrong functions.
-            if (p.runtime().profiling()) p.runtime().note_reduction(current_func(p));
-            step_eval(p);
+            if (prof) {
+                const uint32_t fi = current_func(p);
+                const uint64_t a0 = p.heap().bytes_total();
+                const uint64_t n0 = p.alloc_attributed;
+                p.runtime().note_reduction(fi);
+                step_eval(p);
+                note_own_alloc(p, fi, a0, n0);
+            } else {
+                step_eval(p);
+            }
+        } else if (prof) {
+            step_return_counted(p, floor);
         } else {
             step_return(p, floor);
         }

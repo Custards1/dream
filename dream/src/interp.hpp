@@ -61,6 +61,15 @@ bool force_whnf(Process& p, Value v, Value* out);
 /// Declare it at the top of the region that forces, not around each call: the
 /// flag is restored on destruction, so a native that forces in a loop vouches
 /// once.
+///
+/// One rule about *where* it may go, learnt the hard way. A native called
+/// through `resume_native` has a known chain above it -- `run_process`,
+/// `step_eval`, `do_apply`, `resume_native` -- and that chain is audited. A
+/// helper the *machine* reaches directly does not: `concat_lists` is the list
+/// `+`, and the operator path above it holds both operands in C++ locals, as
+/// does any JIT-compiled frame that got there through `dream_rt_arith`. So
+/// vouching is for natives, and a helper reached from the machine vouches only
+/// if every path to it has been walked. See `PinsTheHeap`.
 struct VouchesForGc {
     Process& p;
     const bool saved;
@@ -70,6 +79,30 @@ struct VouchesForGc {
     ~VouchesForGc() { p.force_vouched = saved; }
     VouchesForGc(const VouchesForGc&) = delete;
     VouchesForGc& operator=(const VouchesForGc&) = delete;
+};
+
+/// The opposite claim: "whatever anyone below me says, a collection here would
+/// lose something."
+///
+/// Compiled code is why this exists. A JIT-compiled function keeps its slots in
+/// machine registers -- that is what compiling it is *for* -- and the collector
+/// has no way to find them, let alone rewrite them, so a collection underneath
+/// a compiled frame loses every value that frame is holding. Such a frame
+/// cannot vouch; and it cannot rely on nobody below it vouching either, because
+/// the runtime helpers it calls run the machine (`dream_rt_arith` on two lists
+/// is `concat_lists`, which forces a whole spine). So it says so, and
+/// `force_pins` makes the answer stick however deep the call goes.
+///
+/// This is not hypothetical. Vouching for `concat_lists` -- which is written
+/// correctly and keeps everything on the value stack -- made `effects_once`
+/// hang about one run in twelve, because the compiled frame above it, not the
+/// native below it, was what could not survive the collection.
+struct PinsTheHeap {
+    Process& p;
+    explicit PinsTheHeap(Process& proc) : p(proc) { ++p.force_pins; }
+    ~PinsTheHeap() { --p.force_pins; }
+    PinsTheHeap(const PinsTheHeap&) = delete;
+    PinsTheHeap& operator=(const PinsTheHeap&) = delete;
 };
 
 /// One `Value` held somewhere the collector can rewrite it, for as long as the

@@ -311,17 +311,33 @@ reference anywhere else. There are two: the callee a native call must still
 name if the native parks, and the spare arguments `do_apply` sets aside when a
 native is over-applied.
 
-Four walks vouch today, and all four were already written for it -- they kept
-their position on the value stack and re-read the cell after every force, with
-comments saying why. They are `str_concat`, `str_of_bytes`, `str_of_chars` and
-the list `+` (`concat_lists`). What changed is that the discipline they were
-already keeping now buys something.
+Three natives vouch today, and all three were already written for it -- they
+kept their position on the value stack and re-read the cell after every force,
+with comments saying why. They are `str_concat`, `str_of_bytes` and
+`str_of_chars`. What changed is that the discipline they were already keeping
+now buys something.
+
+**Where a vouch may go**, which is the part that is easy to get wrong. A native
+reached through `resume_native` has a known chain above it -- `run_process`,
+`step_eval`, `do_apply`, `resume_native` -- and that chain is audited: the two
+frames in it that hold a `Value` across the call keep it in `pins`. A helper the
+*machine* reaches directly does not. `concat_lists` is the list `+`; it is
+written exactly as the three above are, and it still must not vouch, because
+`finish_binop` calls it holding both operands in C++ locals, and JIT-compiled
+code calls it through `dream_rt_arith` holding its entire frame **in machine
+registers**, which the collector cannot see, cannot rewrite, and has no way to
+even know about. The frame that cannot survive a collection is the frame that
+decides, and it is not always the one nearest the force.
+
+`PinsTheHeap` is the other half of the rule and exists for that case: the three
+`dream_rt_*` helpers that can run the machine raise `force_pins` for their
+duration, so a compiled frame is an unvouched frame by construction and stays
+one however deep the call goes or whatever somebody vouches for later.
 
 What it bought, on the self-compile: peak RSS **859 MB -> 511 MB**, the
 nursery's worst overshoot **414 MB -> 34 MB**, and the compile got *faster*
-(2.78 s -> 2.66 s) rather than slower, because a heap that fits is a heap that
-does not page and does not scan what it is about to throw away. The image is
-byte-identical.
+rather than slower, because a heap that fits is a heap that does not page and
+does not scan what it is about to throw away. The image is byte-identical.
 
 `dream/tests/programs/collect_under_native.dr` is the regression test: every
 list it hands to a native is built *by the walk that consumes it*, and its

@@ -77,6 +77,8 @@ void Runtime::enable_profile(size_t top) {
     // which cannot happen: the image is loaded before anything runs.
     std::vector<std::atomic<uint64_t>> fresh(image_ ? image_->func_count() : 0);
     profile_.swap(fresh);
+    std::vector<std::atomic<uint64_t>> fresh_alloc(image_ ? image_->func_count() : 0);
+    alloc_.swap(fresh_alloc);
 }
 
 void Runtime::print_profile() const {
@@ -96,6 +98,28 @@ void Runtime::print_profile() const {
     for (size_t i = 0; i < rows.size() && i < top; ++i) {
         StringRef name = image_->str(image_->func(rows[i].second).name);
         double pct = total ? 100.0 * double(rows[i].first) / double(total) : 0.0;
+        std::fprintf(stderr, ";  %5.1f%%  %12llu  %.*s\n", pct,
+                     static_cast<unsigned long long>(rows[i].first),
+                     int(name.len), name.data);
+    }
+
+    // And the same by bytes. A function can be cheap in reductions and
+    // expensive in garbage -- one allocation in a loop the machine walks in a
+    // single step -- so the two orders are worth reading side by side.
+    rows.clear();
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < alloc_.size(); ++i) {
+        uint64_t n = alloc_[i].load(std::memory_order_relaxed);
+        bytes += n;
+        if (n) rows.push_back({n, i});
+    }
+    if (!bytes) return;
+    std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "; allocated: %llu bytes in %zu functions\n",
+                 static_cast<unsigned long long>(bytes), rows.size());
+    for (size_t i = 0; i < rows.size() && i < top; ++i) {
+        StringRef name = image_->str(image_->func(rows[i].second).name);
+        double pct = 100.0 * double(rows[i].first) / double(bytes);
         std::fprintf(stderr, ";  %5.1f%%  %12llu  %.*s\n", pct,
                      static_cast<unsigned long long>(rows[i].first),
                      int(name.len), name.data);

@@ -12,7 +12,13 @@ using namespace dream;
 
 extern "C" {
 
+// A compiled frame holds its slots in registers the collector cannot see, so
+// nothing reached from one may collect -- see `PinsTheHeap` in interp.hpp. Each
+// helper below that can run the machine says so. `force_whnf` would pin anyway
+// for want of a vouch, but saying it here is what keeps the guarantee if
+// someone later vouches for something `arith` or `compare` reaches.
 int dream_rt_force(Process* p, Value v, Value* out) {
+    PinsTheHeap pinned(*p);
     Value result;
     if (!force_whnf(*p, v, &result)) {
         *out = p->result;
@@ -23,10 +29,12 @@ int dream_rt_force(Process* p, Value v, Value* out) {
 }
 
 int dream_rt_arith(Process* p, int32_t op, Value a, Value b, Value* out) {
+    PinsTheHeap pinned(*p);
     return jit_arith(*p, Op(op), a, b, out) ? 1 : 0;
 }
 
 int dream_rt_compare(Process* p, int32_t op, Value a, Value b, Value* out) {
+    PinsTheHeap pinned(*p);
     return jit_compare(*p, Op(op), a, b, out) ? 1 : 0;
 }
 
