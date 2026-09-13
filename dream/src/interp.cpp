@@ -232,6 +232,45 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
 
 void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint32_t from);
 void enter(Process& p, Value v);
+bool callee_operand(Process& p, const Image& img, uint32_t node, Value frame, Value* out);
+
+/// The kinds of node `thunk_for` can answer with a value instead of a
+/// suspension. A strict argument shaped like one of these is left to it: those
+/// are the cheap cases it exists for, and most of them cost no allocation at
+/// all. Everything else -- a call, a block, a member, a conditional -- it
+/// always suspends, and a suspension the native is about to force on the very
+/// next step is what `fill_native_args` is about.
+///
+/// The two lists are allowed to drift. A kind named here that `thunk_for`
+/// suspends anyway is a thunk built where one need not have been, which is
+/// what every call did before this existed; a kind missing from here is an
+/// argument the machine evaluates rather than computes, which is what the
+/// general path does. Neither is a change in meaning, which is why this can
+/// stay a plain list rather than a second copy of the rules.
+inline bool thunk_for_may_answer(Op op) {
+    switch (op) {
+        case Op::ConstInt: case Op::ConstStr: case Op::ConstFloat:
+        case Op::ConstChar: case Op::ConstBool: case Op::ConstAtom:
+        case Op::Unit: case Op::Builtin: case Op::Local: case Op::Capture:
+        case Op::MakeClosure: case Op::MakeThunk:
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::Get:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// A builtin is an immediate carrying an index into a static table; a host
+/// native is an object carrying the same two numbers. Every caller wants one
+/// or both of them and none of them care which kind it has.
+inline uint32_t native_arity(Value callee) {
+    if (is_builtin(callee)) return builtin_def(uint32_t(imm_payload(callee))).arity;
+    return static_cast<NativeObj*>(as_obj(callee))->arity;
+}
+inline uint32_t native_strict_mask(Value callee) {
+    if (is_builtin(callee)) return builtin_def(uint32_t(imm_payload(callee))).strict_mask;
+    return static_cast<NativeObj*>(as_obj(callee))->strict_mask;
+}
 
 /// Enter a function body, taking the compiled tier when one is available.
 void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value frame) {
@@ -255,15 +294,36 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             const int64_t before = p.reductions;
             const uint64_t before_total = p.total_reductions;
             Value r = fn(&p, frame, &status);
-            const uint64_t spent = uint64_t(before - p.reductions);
+            // Clamped, because a nested force underneath this call may have
+            // re-armed the budget (`Process::slice_spent`), which leaves more
+            // in it than there was to start with.
+            const int64_t fell = before - p.reductions;
+            const uint64_t spent = fell > 0 ? uint64_t(fell) : 0;
             const uint64_t nested = p.total_reductions - before_total;
             const uint64_t own = spent > nested ? spent - nested : 0;
             p.total_reductions += own;
             // And attributed, which nothing did before: a function the JIT
             // compiled was invisible to `--profile` however hot it was.
             if (own && p.runtime().profiling()) p.runtime().note_reductions(func_index, own);
-            if (status == 0) { ret(p, r); return; }
-            if (status == 1) { do_raise(p, r); return; }
+            if (status == JitOk) { ret(p, r); return; }
+            if (status == JitRaised) { do_raise(p, r); return; }
+            if (status == JitTooDeep) {
+                // Compiled self recursion ran out of machine stack. The body
+                // is arithmetic, so nothing has happened that has to be undone
+                // -- the call simply has not been made yet, and the
+                // interpreter, whose recursion is heap continuations bounded
+                // by `DREAM_MAX_DEPTH`, makes it instead.
+                //
+                // And it takes the function over for good. A function that
+                // recurses deeper than the machine stack allows does it on
+                // every call, and each attempt would run a megabyte of frames
+                // before finding out; worse, the interpreted recursion would
+                // re-enter the compiled tier at every level and do it again
+                // per level. One store here is what keeps the fallback linear.
+                jit->deoptimize(func_index);
+                eval_node(p, f.body, frame);
+                return;
+            }
             // Yielded: the compiled loop spent its budget and wrote its
             // loop-carried state back to the frame. Fall through to the
             // interpreter, which resumes the body and lets the scheduler
@@ -332,17 +392,7 @@ void do_apply(Process& p, Value callee, uint32_t argc) {
     }
 
     if (is_builtin(callee) || is_obj(callee, ObjType::Native)) {
-        uint32_t arity, mask;
-        if (is_builtin(callee)) {
-            const BuiltinDef& bd = builtin_def(uint32_t(imm_payload(callee)));
-            arity = bd.arity;
-            mask = bd.strict_mask;
-        } else {
-            auto* nat = static_cast<NativeObj*>(as_obj(callee));
-            arity = nat->arity;
-            mask = nat->strict_mask;
-        }
-        (void)mask;
+        const uint32_t arity = native_arity(callee);
         if (arity == NATIVE_VARIADIC) {
             // Takes the whole application. There is nothing to under- or
             // over-apply: `print! a b c` hands the native all three.
@@ -475,6 +525,62 @@ void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint3
             p.result = UNIT;
             break;
     }
+}
+
+/// Evaluate a native's arguments where they stand, suspending only the lazy
+/// ones, and then call it.
+///
+/// A native declares which of its arguments it forces, and `resume_native`
+/// forces exactly those -- but by then each one is already a Thunk, because the
+/// call site builds a Thunk for every argument it passes. For a strict argument
+/// that Thunk is a temporary and nothing else: `resume_native` immediately
+/// blackholes it, evaluates it, and overwrites it with an Indirect, so an
+/// allocation, two writes and a continuation have been spent carrying `(node,
+/// frame)` four steps. It is never shared, either, because the native forces it
+/// before it can hand it to anyone. On a self-compile three million of the ten
+/// million thunks a compile makes are exactly this.
+///
+/// So the machine's own continuation carries what the Thunk carried: the call
+/// node says which arguments are left and where to find them, and the frame is
+/// what they are evaluated in. Nothing is forced here that `resume_native`
+/// would not have forced, and in the same order, so an argument that raises
+/// raises in the same place and with the same error -- this is a change of
+/// representation, not of strictness. A lazy argument is suspended exactly as
+/// before.
+///
+/// The callee is read again on the way back rather than carried across, because
+/// a `Cont` has one value field and the frame is in it. Reading it is cheap and
+/// it is the same callee: naming one is a read, not an evaluation (see
+/// `callee_operand`), and a frame's slots do not change while one of its own
+/// sub-expressions is being evaluated -- the same assumption `BinRight` makes
+/// when it reads its right operand after forcing its left. It is also what
+/// keeps this safe across a collection, which a carried copy would not be.
+void fill_native_args(Process& p, uint32_t call_node, Value callee, uint32_t base,
+                      uint32_t from, Value frame) {
+    const Image& img = img_of(p);
+    const Node& n = img.node(call_node);
+    const uint32_t* kids = img.kids_at(n.b);
+    const uint32_t mask = native_strict_mask(callee);
+    // The same rule `resume_native` states, for the same reason: a variadic
+    // native has no fixed argument positions for a 32-bit mask to describe, so
+    // it forces all of them.
+    const bool all_strict = native_arity(callee) == NATIVE_VARIADIC;
+
+    for (uint32_t i = from; i < n.c; ++i) {
+        // A lazy argument is suspended exactly as before, and so is a strict
+        // one of a shape `thunk_for` answers without allocating -- computing
+        // those is cheaper than evaluating them, and taking them away from it
+        // would undo its work rather than add to it.
+        const bool strict = all_strict || (i < 32 && (mask & (1u << i)));
+        if (!strict || thunk_for_may_answer(Op(img.node(kids[i]).op))) {
+            p.stack.push_back(thunk_for(p, kids[i], frame));
+            continue;
+        }
+        push_cont(p, ContKind::NativeArgs, call_node, base, i, frame);
+        eval_node(p, kids[i], frame);
+        return;
+    }
+    resume_native(p, callee, base, n.c, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,6 +1583,16 @@ void step_eval(Process& p) {
                     return;
                 }
             }
+            // A saturated call to a native: its strict arguments are
+            // evaluated where they stand rather than suspended and forced one
+            // step later. See `fill_native_args`.
+            if (is_builtin(fn) || is_obj(fn, ObjType::Native)) {
+                const uint32_t arity = native_arity(fn);
+                if (arity == n.c || arity == NATIVE_VARIADIC) {
+                    fill_native_args(p, p.node, fn, uint32_t(p.stack.size()), 0, frame);
+                    return;
+                }
+            }
             for (uint32_t i = 0; i < n.c; ++i) {
                 p.stack.push_back(thunk_for(p, kids[i], frame));
             }
@@ -1734,6 +1850,19 @@ void step_return(Process& p, size_t floor) {
             p.stack[c.a + c.c] = p.result;
             resume_native(p, c.v1, c.a, c.b, c.c + 1);
             return;
+
+        case ContKind::NativeArgs: {
+            // The argument just evaluated joins the ones already at the base,
+            // and the rest carry on from there.
+            p.stack.push_back(p.result);
+            const Image& img = img_of(p);
+            Value callee;
+            if (!callee_operand(p, img, img.node(c.a).a, c.v1, &callee)) {
+                p.unreachable("the callee of a native call stopped being a name");
+            }
+            fill_native_args(p, c.a, resolve(callee), c.b, c.c + 1, c.v1);
+            return;
+        }
 
         case ContKind::NativeRetry:
             resume_native(p, c.v1, c.a, c.b, 0);
@@ -2154,6 +2283,8 @@ inline void step_return_counted(Process& p, size_t floor) {
 
 void run_process(Process& p, int64_t budget) {
     p.reductions = budget;
+    p.slice = budget;
+    p.slice_spent = false;
     // The limits are loop-invariant over the whole run; read them once so the
     // per-reduction check stays a couple of compares against registers, not a
     // thread-safe static init guarded call.
@@ -2166,7 +2297,10 @@ void run_process(Process& p, int64_t budget) {
     // loop rather than a load per step. That matters most for the Return run
     // below, which is more than half of all the steps a program takes.
     const bool prof = p.runtime().profiling();
-    while (p.reductions > 0) {
+    // `slice_spent` is how a nested force says the budget ran out while it was
+    // running: it re-armed the counter so that what reads it keeps working,
+    // and this is where the slice it could not end actually ends.
+    while (p.reductions > 0 && !p.slice_spent) {
         // Safepoint. Every live value is reachable from the process's stacks,
         // its frame and its result -- nothing is stranded in a C++ local.
         if (p.heap().should_collect()) p.maybe_collect();
@@ -2315,6 +2449,13 @@ bool force_whnf(Process& p, Value v, Value* out) {
         // to collect any of it, which is the same failure a size away.
         if (check_limits(p, wk, max_conts, max_stack, max_heap)) continue;
         if (p.force_pins == 0 && p.heap().should_collect()) p.maybe_collect();
+        // The slice ran out somewhere this loop cannot stop. See
+        // `Process::slice_spent`: re-arm it, and let `run_process` end the
+        // slice when this force finally returns.
+        if (p.reductions <= 0) {
+            p.slice_spent = true;
+            p.reductions = p.slice;
+        }
 
         // A blocking native inside the value being forced -- `join!`, `recv!`,
         // a read on a socket -- asked to be parked. This loop cannot park: it
@@ -2472,15 +2613,29 @@ bool force_deep(Process& p, Value v, Value* out) {
             // The leaves are collected once and then forced in place. A leaf
             // may be shared with another version of the map, which is fine:
             // forcing a thunk yields the same value to everyone holding it.
+            //
+            // The values wait on the value stack rather than in a C++ vector,
+            // for the reason every list above is walked there: forcing one of
+            // them can collect, and a collection rewrites what it can see. A
+            // vector of `Value` is not something it can see, so the entries
+            // after the one being forced would be husks of objects that had
+            // moved. That was safe only while a deep force could not collect,
+            // and `strict!` vouching (see `bi_strict`) is exactly what makes
+            // it collect.
             std::vector<std::pair<Value, Value>> entries;
             map_collect(p.stack.back(), entries);
+            const size_t first = p.stack.size();
             for (auto& [k, v] : entries) {
                 (void)k;
-                Value tmp;
-                if (!force_deep(p, v, &tmp)) return unwind(out);
+                p.stack.push_back(v);
             }
-            // Re-collect, because forcing may have allocated and the leaves
-            // hold the forced values already through their own indirections.
+            const size_t count = entries.size();
+            entries.clear();
+            for (size_t i = 0; i < count; ++i) {
+                Value tmp;
+                if (!force_deep(p, p.stack[first + i], &tmp)) return unwind(out);
+            }
+            p.stack.resize(first);
             as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
             *out = p.stack.back();
             p.stack.pop_back();

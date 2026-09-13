@@ -1,20 +1,40 @@
 // The LLVM JIT tier.
 //
 // Scope, and why it is drawn where it is: this compiles the strict numeric
-// spine of a function -- arithmetic, comparisons, branches, and self tail
-// recursion -- and leaves everything else to the interpreter. The limit is not
-// laziness in general but a soundness requirement. Compiled code evaluates a
-// self tail call's arguments eagerly, and doing that to an argument the callee
-// would never have forced can raise an error in a program that was going to
-// terminate quietly. So a function is only compiled when a strictness analysis
-// proves every parameter is forced on every path. Anything else stays
-// interpreted, where laziness is explicit and free.
+// spine of a function -- arithmetic, comparisons, branches, and self recursion
+// -- and leaves everything else to the interpreter. The limit is not laziness
+// in general but a soundness requirement. Compiled code evaluates a self call's
+// arguments eagerly, and doing that to an argument the callee would never have
+// forced can raise an error in a program that was going to terminate quietly.
+// So a function is only compiled when a strictness analysis proves every
+// parameter is forced on every path. Anything else stays interpreted, where
+// laziness is explicit and free.
+//
+// Self recursion comes in two shapes and they are compiled differently. A tail
+// call is a loop back-edge: the parameters are overwritten and control jumps to
+// the top, which is what lets a compiled loop run in constant space and yield
+// to the scheduler at every iteration. A *non-tail* call -- `fib (n - 1) +
+// fib (n - 2)` -- is a machine call, which means the body has to be a function
+// of its arguments rather than of a heap frame. So such a function is emitted
+// twice over: an inner body taking its parameters by value, and an outer entry
+// matching `CompiledFn` that unpacks the frame once and calls it. The frame the
+// interpreter would have allocated per call disappears entirely, which on `fib`
+// is the whole program -- 100% of what it allocates is frames.
+//
+// What that costs is written down in `kStackBudget`: a machine call uses
+// machine stack, and machine stack is a fixed resource where a heap
+// continuation is not. Compiled recursion therefore carries its depth and
+// gives up -- `JIT_DEEP` -- rather than overflow, and the interpreter, whose
+// recursion is on the heap and bounded by `DREAM_MAX_DEPTH`, takes the call
+// over. That is a fallback, not an error: the program sees what it would have
+// seen with no JIT at all.
 //
 // The fast paths are inline; every slow path calls the interpreter's own
 // helper, so the two tiers cannot drift apart on what an operation means.
 
 #include "jit.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -40,13 +60,43 @@ namespace dream {
 
 namespace {
 
-/// Status codes a compiled body returns through its out-parameter.
+/// Status codes a compiled body returns through its out-parameter. The same
+/// four as `JitStatus` in jit.hpp, spelled again here because the emitter needs
+/// them as constants it can put in the IR.
 constexpr int JIT_OK = 0;
 constexpr int JIT_RAISED = 1;
 /// The reduction budget ran out mid-loop. The loop-carried values have been
 /// written back to the frame, so the interpreter can pick the iteration up
 /// from the top of the body -- an OSR exit that keeps JIT code preemptible.
 constexpr int JIT_YIELD = 2;
+/// Compiled self recursion ran out of machine stack. Nothing has been written
+/// anywhere and no effect has happened -- the compiled body is arithmetic and
+/// nothing else -- so the caller may simply run the call interpreted instead.
+constexpr int JIT_DEEP = 3;
+
+/// How much machine stack one chain of compiled self calls may use.
+///
+/// The interpreter's recursion is heap continuations and its limit is
+/// `DREAM_MAX_DEPTH` -- four million of them. A compiled non-tail call is a
+/// machine call, and a machine stack is typically eight megabytes for the
+/// whole thread, shared with every interpreter loop and native above and below
+/// this one. So compiled recursion gets a budget rather than the limit, and
+/// hands the call back when it is spent. A megabyte is deep enough that no
+/// ordinary program reaches it -- `fib 32` goes 32 deep -- and shallow enough
+/// that several nested chains still fit.
+constexpr uint32_t kStackBudget = 1u << 20;
+/// What one compiled frame is assumed to cost, on top of eight bytes per slot,
+/// for turning that budget into a count of calls.
+///
+/// It is a guess, because how much stack LLVM gives a function is decided after
+/// this code is written and there is no cheap way to ask. So it is a guess made
+/// in the direction where being wrong is harmless: too high and the recursion
+/// hands itself back to the interpreter earlier than it had to, which costs a
+/// little speed on a recursion nobody writes; too low and it overflows the
+/// machine stack, which is a crash. `fib` recurses 32 deep and an ordinary
+/// tree walk tens; a function that needs thousands is one the interpreter
+/// should have anyway.
+constexpr uint32_t kFrameOverhead = 128;
 
 bool op_is_supported(Op op) {
     switch (op) {
@@ -72,6 +122,10 @@ using SlotSet = uint64_t;  // one bit per slot; functions with >64 slots are ski
 struct Analysis {
     bool compilable = false;
     SlotSet strict_params = 0;
+    /// The body calls itself somewhere other than tail position, so it is
+    /// emitted as a function of its arguments rather than of a frame. See the
+    /// note at the top of this file.
+    bool recurses = false;
 };
 
 class Analyzer {
@@ -90,8 +144,17 @@ public:
         // self tail call would evaluate something the interpreter never would.
         if ((strict & params) != params) return a;
 
+        // A body that reads a slot no parameter owns has state the frame
+        // holds and the argument list does not, so it cannot be emitted as a
+        // function of its arguments. In practice nothing reaches this: the
+        // only thing that writes such a slot is `Op::Bind`, and a block
+        // containing one is refused above. It is checked rather than argued
+        // because the argument is about the compiler, not about this file.
+        if (recurses_ && reads_beyond_params_) return a;
+
         a.compilable = true;
         a.strict_params = strict;
+        a.recurses = recurses_;
         return a;
     }
 
@@ -104,6 +167,7 @@ private:
 
         if (op == Op::Apply) return check_self_call(n, depth);
         if (!op_is_supported(op)) return false;
+        if (op == Op::Local && n.a >= f_.arity) reads_beyond_params_ = true;
 
         switch (op) {
             case Op::If:
@@ -129,10 +193,11 @@ private:
         }
     }
 
-    /// The only call we compile is this function calling itself in tail
-    /// position with a full argument list, which becomes a loop back-edge.
+    /// The only call we compile is this function calling itself with a full
+    /// argument list. In tail position that becomes a loop back-edge; anywhere
+    /// else it becomes a machine call, which is what `recurses_` records --
+    /// the two need different shapes of function around them.
     bool check_self_call(const Node& n, int depth) {
-        if (!(n.flags & F_TAIL)) return false;
         if (n.c != f_.arity) return false;
         const Node& callee = img_.node(n.a);
         if (Op(callee.op) != Op::Global) return false;
@@ -141,6 +206,7 @@ private:
         for (uint32_t i = 0; i < n.c; ++i) {
             if (!check(img_.kid(n.b + i), depth + 1)) return false;
         }
+        if (!(n.flags & F_TAIL)) recurses_ = true;
         return true;
     }
 
@@ -191,6 +257,8 @@ private:
     const Image& img_;
     uint32_t fi_;
     const FuncRec& f_;
+    bool recurses_ = false;
+    bool reads_beyond_params_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -199,12 +267,25 @@ private:
 
 class Emitter {
 public:
-    Emitter(llvm::LLVMContext& ctx, llvm::Module& mod, const Image& img, uint32_t fi)
-        : ctx_(ctx), mod_(mod), img_(img), fi_(fi), f_(img.func(fi)), b_(ctx) {}
+    Emitter(llvm::LLVMContext& ctx, llvm::Module& mod, const Image& img, uint32_t fi,
+            bool recurses)
+        : ctx_(ctx), mod_(mod), img_(img), fi_(fi), f_(img.func(fi)),
+          recurses_(recurses), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
 
 private:
+    void declare_helpers();
+    /// The body, as a function of `(proc, depth, frame, a0..an, status)`. Only
+    /// emitted for a body that calls itself outside tail position; the frame
+    /// comes along for the yield at depth zero and is untouched otherwise.
+    llvm::Function* emit_body(const std::string& name);
+    /// The `CompiledFn` the interpreter enters: unpack the frame once, and
+    /// call `body` with depth zero.
+    llvm::Function* emit_entry(const std::string& name, llvm::Function* body);
+    /// Today's shape, for a body whose only self calls are tail calls: one
+    /// function, slots read out of the frame, a loop and nothing else.
+    llvm::Function* emit_loop(const std::string& name);
     llvm::Value* node(uint32_t idx);
     llvm::Value* binary(const Node& n);
     llvm::Value* logic(const Node& n);
@@ -212,6 +293,14 @@ private:
     llvm::Value* conditional(const Node& n);
     llvm::Value* block(const Node& n);
     llvm::Value* self_call(const Node& n);
+    llvm::Value* tail_call(const Node& n, const std::vector<llvm::Value*>& args);
+    llvm::Value* recursive_call(const std::vector<llvm::Value*>& args);
+    /// Spend one reduction on a call. Answers what is left, so the tail path
+    /// can test it; the recursive path ignores it.
+    llvm::Value* spend_reduction();
+    /// Write the loop-carried parameters back to the heap frame and return
+    /// `JIT_YIELD`, so the interpreter resumes the body from the top.
+    void emit_yield();
     llvm::Value* load_slot(uint32_t slot);
     llvm::Value* force(llvm::Value* v);
 
@@ -229,6 +318,8 @@ private:
     const Image& img_;
     uint32_t fi_;
     const FuncRec& f_;
+    /// Emitted as a function of its arguments rather than of a frame.
+    const bool recurses_;
     llvm::IRBuilder<> b_;
 
     llvm::Type* i64_ = nullptr;
@@ -240,6 +331,12 @@ private:
     llvm::Argument* proc_ = nullptr;
     llvm::Argument* frame_ = nullptr;
     llvm::Argument* status_ = nullptr;
+    /// How many compiled frames of this function are already on the machine
+    /// stack. Null in the loop shape, which has none. It is an argument rather
+    /// than a counter in the process because an argument needs no restoring on
+    /// the way out: a deopt unwinds through every frame at once, and a counter
+    /// would have to be put back by each of them.
+    llvm::Argument* depth_ = nullptr;
 
     llvm::BasicBlock* loop_header_ = nullptr;
     std::vector<llvm::Value*> slots_;   // allocas, one per frame slot
@@ -252,6 +349,19 @@ private:
 };
 
 llvm::Function* Emitter::emit(const std::string& name) {
+    declare_helpers();
+    if (!recurses_) return emit_loop(name);
+    llvm::Function* body = emit_body(name + ".rec");
+    if (!body) return nullptr;
+    llvm::Function* entry = emit_entry(name, body);
+    if (!entry) {
+        body->eraseFromParent();
+        return nullptr;
+    }
+    return entry;
+}
+
+void Emitter::declare_helpers() {
     i64_ = llvm::Type::getInt64Ty(ctx_);
     i32_ = llvm::Type::getInt32Ty(ctx_);
     i1_ = llvm::Type::getInt1Ty(ctx_);
@@ -275,7 +385,9 @@ llvm::Function* Emitter::emit(const std::string& name) {
     rt_frame_store_ = mod_.getOrInsertFunction(
         "dream_rt_frame_store",
         llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i64_, i32_, i64_}, false));
+}
 
+llvm::Function* Emitter::emit_loop(const std::string& name) {
     auto* fty = llvm::FunctionType::get(i64_, {ptr_, i64_, ptr_}, false);
     fn_ = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, name, mod_);
     proc_ = fn_->getArg(0);
@@ -321,6 +433,109 @@ llvm::Function* Emitter::emit(const std::string& name) {
         return nullptr;
     }
     return fn_;
+}
+
+llvm::Function* Emitter::emit_body(const std::string& name) {
+    // `(proc, depth, frame, a0..an, status)`. The parameters arrive as values
+    // rather than through the frame, which is the whole point: a self call
+    // allocates nothing, and the only frame in the picture is the one the
+    // interpreter already made for the outermost call.
+    std::vector<llvm::Type*> params{ptr_, i32_, i64_};
+    params.insert(params.end(), f_.arity, i64_);
+    params.push_back(ptr_);
+    auto* fty = llvm::FunctionType::get(i64_, params, false);
+    // Internal, so LLVM is free to inline the first level or two of the
+    // recursion into itself and to pick its own calling convention for it.
+    fn_ = llvm::Function::Create(fty, llvm::Function::InternalLinkage, name, mod_);
+    proc_ = fn_->getArg(0);
+    depth_ = fn_->getArg(1);
+    frame_ = fn_->getArg(2);
+    status_ = fn_->getArg(uint32_t(params.size()) - 1);
+    proc_->setName("proc");
+    depth_->setName("depth");
+    frame_->setName("frame");
+    status_->setName("status");
+
+    auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
+    b_.SetInsertPoint(entry);
+
+    // Allocas first and in the entry block, which is where LLVM looks for the
+    // ones it can promote to registers.
+    slots_.resize(f_.slots);
+    for (uint32_t i = 0; i < f_.slots; ++i) {
+        slots_[i] = b_.CreateAlloca(i64_, nullptr, "slot" + std::to_string(i));
+    }
+    for (uint32_t i = 0; i < f_.arity; ++i) {
+        b_.CreateStore(fn_->getArg(3 + i), slots_[i]);
+    }
+    // Slots past the parameters belong to `let` bindings, and a body with one
+    // is not compiled at all -- the analysis refuses a block containing a
+    // `Bind`, and refuses outright to use this shape if any slot beyond the
+    // parameters is even read. They are allocated so slot indices line up and
+    // left alone.
+    for (uint32_t i = f_.arity; i < f_.slots; ++i) b_.CreateStore(i64(UNIT), slots_[i]);
+    reduction_slot_ = b_.CreateCall(rt_reduction_slot_, {proc_}, "reductions");
+
+    // Out of machine stack: hand the call back. See `kStackBudget`.
+    const uint32_t limit =
+        std::max(64u, kStackBudget / (kFrameOverhead + 8 * std::max(1u, uint32_t(f_.slots))));
+    auto* deep = llvm::BasicBlock::Create(ctx_, "deep", fn_);
+    loop_header_ = llvm::BasicBlock::Create(ctx_, "loop", fn_);
+    b_.CreateCondBr(b_.CreateICmpUGE(depth_, llvm::ConstantInt::get(i32_, limit)), deep,
+                    loop_header_);
+
+    b_.SetInsertPoint(deep);
+    b_.CreateStore(llvm::ConstantInt::get(i32_, JIT_DEEP), status_);
+    b_.CreateRet(i64(UNIT));
+
+    b_.SetInsertPoint(loop_header_);
+    llvm::Value* result = node(f_.body);
+    if (failed_) {
+        fn_->eraseFromParent();
+        return nullptr;
+    }
+    if (result) {
+        b_.CreateStore(llvm::ConstantInt::get(i32_, JIT_OK), status_);
+        b_.CreateRet(result);
+    } else if (!b_.GetInsertBlock()->getTerminator()) {
+        b_.CreateUnreachable();
+    }
+
+    if (llvm::verifyFunction(*fn_, &llvm::errs())) {
+        fn_->eraseFromParent();
+        return nullptr;
+    }
+    return fn_;
+}
+
+llvm::Function* Emitter::emit_entry(const std::string& name, llvm::Function* body) {
+    auto* fty = llvm::FunctionType::get(i64_, {ptr_, i64_, ptr_}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, name, mod_);
+    llvm::Argument* proc = fn->getArg(0);
+    llvm::Argument* frame = fn->getArg(1);
+    llvm::Argument* status = fn->getArg(2);
+    proc->setName("proc");
+    frame->setName("frame");
+    status->setName("status");
+
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
+    llvm::Value* slot_base = b_.CreateCall(rt_frame_slots_, {frame}, "slots");
+    std::vector<llvm::Value*> args{proc, llvm::ConstantInt::get(i32_, 0), frame};
+    for (uint32_t i = 0; i < f_.arity; ++i) {
+        llvm::Value* src = b_.CreateGEP(i64_, slot_base, {i64(i)});
+        args.push_back(b_.CreateLoad(i64_, src));
+    }
+    args.push_back(status);
+    // The arguments are handed over unforced; the body forces each slot on
+    // first read exactly as the loop shape does, so an argument the body never
+    // looks at is never touched here either.
+    b_.CreateRet(b_.CreateCall(body, args));
+
+    if (llvm::verifyFunction(*fn, &llvm::errs())) {
+        fn->eraseFromParent();
+        return nullptr;
+    }
+    return fn;
 }
 
 void Emitter::emit_raise(llvm::Value* error) {
@@ -683,34 +898,95 @@ llvm::Value* Emitter::self_call(const Node& n) {
         args[i] = node(img_.kid(n.b + i));
         if (failed_ || !args[i]) return nullptr;
     }
-    for (uint32_t i = 0; i < n.c; ++i) b_.CreateStore(args[i], slots_[i]);
+    if (n.flags & F_TAIL) return tail_call(n, args);
+    return recursive_call(args);
+}
 
-    // Spend a reduction and check the budget, so a compiled loop is just as
-    // preemptible as an interpreted one.
+llvm::Value* Emitter::spend_reduction() {
     llvm::Value* left = b_.CreateLoad(i64_, reduction_slot_);
     llvm::Value* next = b_.CreateSub(left, i64(1));
     b_.CreateStore(next, reduction_slot_);
+    return next;
+}
 
-    auto* yield_bb = llvm::BasicBlock::Create(ctx_, "yield", fn_);
-    auto* cont_bb = llvm::BasicBlock::Create(ctx_, "iterate", fn_);
-    b_.CreateCondBr(b_.CreateICmpSGT(next, i64(0)), cont_bb, yield_bb);
-
-    b_.SetInsertPoint(yield_bb);
+void Emitter::emit_yield() {
     // Publish the loop-carried values back to the frame and hand control to
     // the interpreter, which resumes at the top of this body. The store runs
     // the write barrier: the frame may be old, the value young, and the next
     // minor collection has to know the edge exists.
-    for (uint32_t i = 0; i < f_.slots; ++i) {
+    //
+    // Only the parameters in the recursive shape: the slots past them are
+    // never read there, and the frame already holds whatever the interpreter
+    // put in them.
+    const uint32_t n = recurses_ ? f_.arity : f_.slots;
+    for (uint32_t i = 0; i < n; ++i) {
         b_.CreateCall(rt_frame_store_,
                       {proc_, frame_, llvm::ConstantInt::get(i32_, i),
                        b_.CreateLoad(i64_, slots_[i])});
     }
     b_.CreateStore(llvm::ConstantInt::get(i32_, JIT_YIELD), status_);
     b_.CreateRet(i64(UNIT));
+}
+
+/// A tail call is the loop back-edge: overwrite the parameters and jump.
+llvm::Value* Emitter::tail_call(const Node& n, const std::vector<llvm::Value*>& args) {
+    for (uint32_t i = 0; i < n.c; ++i) b_.CreateStore(args[i], slots_[i]);
+
+    // Spend a reduction and check the budget, so a compiled loop is just as
+    // preemptible as an interpreted one.
+    llvm::Value* next = spend_reduction();
+
+    auto* yield_bb = llvm::BasicBlock::Create(ctx_, "yield", fn_);
+    auto* cont_bb = llvm::BasicBlock::Create(ctx_, "iterate", fn_);
+    llvm::Value* carry_on = b_.CreateICmpSGT(next, i64(0));
+    if (recurses_) {
+        // A yield leaves the interpreter to resume *this* invocation from the
+        // top of the body -- which it can only do for the outermost one. Below
+        // that there are compiled frames on the machine stack waiting for a
+        // value, and returning to the interpreter would abandon them. So the
+        // loop keeps going instead, and the slice ends when the whole chain
+        // comes back. The budget still falls, so nothing runs unaccounted.
+        carry_on = b_.CreateOr(carry_on,
+                               b_.CreateICmpNE(depth_, llvm::ConstantInt::get(i32_, 0)));
+    }
+    b_.CreateCondBr(carry_on, cont_bb, yield_bb);
+
+    b_.SetInsertPoint(yield_bb);
+    emit_yield();
 
     b_.SetInsertPoint(cont_bb);
     b_.CreateBr(loop_header_);
     return nullptr;  // control transferred
+}
+
+/// A call anywhere else is a machine call, one frame deeper.
+///
+/// Its status is the callee's: `JIT_RAISED` and `JIT_DEEP` both mean this
+/// invocation has nothing left to say, and the value in hand is the callee's
+/// -- an error, or the placeholder a deopt returns -- so it is returned as it
+/// stands. Only `JIT_OK` carries on. That is the same shape every slow-path
+/// call in this file already has, which is why there is no unwinding to do:
+/// a compiled body has no effects to undo and nothing written down but its own
+/// registers.
+llvm::Value* Emitter::recursive_call(const std::vector<llvm::Value*>& args) {
+    spend_reduction();
+
+    std::vector<llvm::Value*> call{
+        proc_, b_.CreateAdd(depth_, llvm::ConstantInt::get(i32_, 1)), frame_};
+    call.insert(call.end(), args.begin(), args.end());
+    call.push_back(status_);
+    llvm::Value* r = b_.CreateCall(fn_, call);
+
+    auto* ok_bb = llvm::BasicBlock::Create(ctx_, "call.ok", fn_);
+    auto* out_bb = llvm::BasicBlock::Create(ctx_, "call.out", fn_);
+    llvm::Value* st = b_.CreateLoad(i32_, status_);
+    b_.CreateCondBr(b_.CreateICmpEQ(st, llvm::ConstantInt::get(i32_, JIT_OK)), ok_bb, out_bb);
+
+    b_.SetInsertPoint(out_bb);
+    b_.CreateRet(r);
+
+    b_.SetInsertPoint(ok_bb);
+    return r;
 }
 
 }  // namespace
@@ -810,6 +1086,17 @@ CompiledFn Jit::on_enter(uint32_t func_index) {
     return fn;
 }
 
+void Jit::deoptimize(uint32_t func_index) {
+    if (func_index >= cached_.size()) return;
+    // Only the tier table is touched. The compiled body stays in `compiled`
+    // and stays valid -- `--dump-jit` and a second runtime over the same image
+    // still want it -- but no entry will reach it again, which is the point:
+    // the recursion that ran out of machine stack would run out of it every
+    // time, and each attempt would throw away the work it did before finding
+    // out.
+    cached_[func_index].store(rejected(), std::memory_order_release);
+}
+
 CompiledFn Jit::compile(uint32_t func_index, std::string* error) {
     std::lock_guard<std::mutex> g(impl_->mutex);
     return compile_locked(func_index, error);
@@ -832,7 +1119,7 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     mod->setDataLayout(impl_->lljit->getDataLayout());
 
     std::string name = "dream_fn_" + std::to_string(func_index);
-    Emitter em(*ctx, *mod, img, func_index);
+    Emitter em(*ctx, *mod, img, func_index, a.recurses);
     if (!em.emit(name)) {
         if (error) *error = "code generation failed";
         return nullptr;
@@ -880,7 +1167,7 @@ std::string Jit::dump_ir(uint32_t func_index) {
     }
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
-    Emitter em(*ctx, *mod, img, func_index);
+    Emitter em(*ctx, *mod, img, func_index, a.recurses);
     if (!em.emit("dream_fn_" + std::to_string(func_index))) {
         return "; code generation failed\n";
     }
