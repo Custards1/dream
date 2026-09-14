@@ -123,7 +123,6 @@ let main! = {
     let args = os.args! ();
     let run_all = core.is_empty args;
     let want name = run_all || list.contains name args;
-
     if want "fib" {
         bench! "fib" (fn () -> fib fib_n)
         result! "fib" (fib fib_n)

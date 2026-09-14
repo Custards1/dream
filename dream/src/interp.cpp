@@ -19,6 +19,18 @@ namespace {
 
 inline const Image& img_of(Process& p) { return *p.code; }
 
+/// A nested `force_whnf` loop is in progress on this process's machine stack.
+/// See `Process::force_nest` and `kMaxForceNestForCompiled`: the depth is what
+/// `enter_function` reads before offering the compiled tier, because each link
+/// of a lazy chain a *compiled* body forces is a C++ frame.
+struct ForceNest {
+    Process& p;
+    explicit ForceNest(Process& proc) : p(proc) { ++p.force_nest; }
+    ~ForceNest() { --p.force_nest; }
+    ForceNest(const ForceNest&) = delete;
+    ForceNest& operator=(const ForceNest&) = delete;
+};
+
 inline void eval_node(Process& p, uint32_t node, Value frame) {
     p.mode = Mode::Eval;
     p.node = node;
@@ -273,9 +285,29 @@ inline uint32_t native_strict_mask(Value callee) {
 }
 
 /// Enter a function body, taking the compiled tier when one is available.
+/// The depth of nested `force_whnf` loops past which `enter_function` stops
+/// offering the compiled tier. See `Process::force_nest`: interpreted code
+/// nests forces only as deep as natives on the same C++ chain actually sit one
+/// inside another (a `strict!` over nested natives, tens at most), while a
+/// *compiled* chain of lazy links spends one C++ frame per link and would blow
+/// the machine stack long before `DREAM_MAX_DEPTH`. Small enough to keep the
+/// interpreter in charge of anything pathological, large enough that every
+/// healthy program nests well under it.
+constexpr uint32_t kMaxForceNestForCompiled = 256;
+
 void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value frame) {
     Jit* jit = p.runtime().jit();
-    if (jit) {
+    // When a nested force is already deep on the process's machine stack, the
+    // compiled tier is not offered at all. A compiled body forces a slot by
+    // *calling*, so a chain of lazy links under a force is a C++ frame per link
+    // -- one compiled body, one `dream_rt_force`, one `force_whnf` -- and a
+    // long enough chain overflows the machine stack before `DREAM_MAX_DEPTH` is
+    // anywhere in sight. The interpreter makes those frames on the heap and can
+    // reach its limit, so it takes the chain over. Interpreted code never nests
+    // this deep (each of its forces returns before the next), which is what
+    // lets a small bound here be free for every healthy program. See
+    // `Process::force_nest` and "Known and not fixed" in CLAUDE.md.
+    if (jit && p.force_nest <= kMaxForceNestForCompiled) {
         // One inlined, lock-free read of the tier table (see `Jit::tier`), so
         // a process whose functions never grow hot -- most of a compile --
         // pays a load and a branch for the JIT being present.
@@ -2380,6 +2412,7 @@ void run_process(Process& p, int64_t budget) {
 }
 
 bool force_whnf(Process& p, Value v, Value* out) {
+    ForceNest nest(p);
     v = resolve(v);
     if (is_whnf(v)) {
         *out = v;

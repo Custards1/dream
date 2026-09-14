@@ -31,9 +31,7 @@ the first thing to read before touching either.
 3. ~~`dreams` is the compiler~~ — **done**: `mind`, `lucid`, the examples, the
    end-to-end programs and `dreams` itself are all compiled by `dreams`; the
    old Rust compiler, `dreamc`, is gone.
-4. `mind` moves into `dreams`: `dreams` grows a CLI in `mind`'s shape (project
-   commands, not just file-at-a-time flags) and takes over its role. **Next.**
-5. ~~**`dreams` learns to fuse.**~~ **Done.** The first optimization that is
+4. ~~**`dreams` learns to fuse.**~~ **Done.** The first optimization that is
    genuinely the compiler's own rather than the VM's: a pipeline of `std.list`
    combinators becomes one loop, and the list between them is never built. It
    did what it was built to do and it did it the way the plan said -- not by
@@ -599,7 +597,7 @@ this section, "pre-fusion" is after the JIT work and before deforestation):
 | `fib` | 40 ms | 207 ms | **0.19x** | 0.19x | 2.62x |
 | `collatz` | 205 ms | 687 ms | **0.30x** | 0.33x | 2.83x |
 | `mapfilter` | 22 ms | 30 ms | **0.75x** | 13.1x | 14.8x |
-| `pi` | 708 ms | 229 ms | 3.1x | 5.8x | 6.55x |
+| `pi` | 31 ms | 243 ms | **0.13x** | 5.8x | 6.55x |
 | `strbuild` | 73 ms | 1.0 ms | 70x | 82x | 72x |
 
 Four of the six are now ahead of CPython, and the two that are not are each
@@ -647,10 +645,16 @@ one of two things, and both were projects rather than edits:
 - **A JIT that can allocate.** The tier's scope is "the strict numeric spine"
   and the reason is not ambition, it is the collector: a compiled frame keeps
   its slots in registers the collector cannot find or rewrite, which is what
-  `PinsTheHeap` says. So compiled code may not allocate, and a fold allocates
-  three objects an element. Giving compiled frames a stack map is what would
-  lift that, and it would lift the interpreter's 164 ns as well. It is the
-  larger and riskier of the two, and the one below does not need it.
+  `PinsTheHeap` says. So compiled code may not allocate, and until fusion
+  removed it, a fold allocated three objects an element. What a compiled loop
+  cannot do is *build* -- a list, a string, a map -- because building allocates
+  and allocating means the collector will eventually run under it. The plan
+  below is the response to this bullet, and it deliberately does **not** walk
+  the machine stack with stack maps: a compiled frame is already a root (the
+  interpreter put it on the value stack), so the move is to spill slots into
+  that frame at every point where the collector can run and read them back
+  after. That works with the concurrent collector and its helper threads, which
+  a stack-map walk of the running thread's stack would not.
 
 ### Deforestation
 
@@ -743,12 +747,16 @@ and `zip`.
   closure call in the loop body, and a loop that calls a closure is a loop the
   JIT declines.
 
-**What it did not reach.** `pi` fuses and is still 3.1x CPython, because its
-loop is floating point: boxed floats are 44% of what it allocates, compiled code
-may not allocate, and so the JIT refuses a loop that is otherwise exactly its
-shape. Nothing more in `dreams` will move it; it wants the stack maps under "A
-JIT that can allocate" above. That is the honest boundary of this work -- fusion
-removes the list, and what is left is whatever the loop itself costs.
+**What it did not reach.** This used to say `pi`. `pi` fuses *and* compiles now:
+loops that fuse no longer allocate per element, so the remaining row was a loop
+whose *values* were floating point, and `float-unboxin` unboxed the accumulator
+-- the last box a fused float loop made was the one it carried across a yield,
+once per slice rather than once per element. The honest boundary left is loops
+whose values are **objects** -- a list builder, a string fold, a map fold --
+because compiled code may not allocate. That is the plan below, not a fusion gap.
+
+Nothing more in `dreams` will move those; they want the JIT work under "A JIT
+that can allocate" above.
 
 **When changing it**, the bootstrap is the sharpest test there is: a compiler
 that fuses compiles *itself* differently, so `just bootstrap` has to reach a
@@ -767,6 +775,73 @@ with each other, which is the check that matters.
 
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
+
+### A JIT that can allocate -- the plan
+
+*The plan below was drafted by an AI coding assistant (2026-09-13), not by the
+human author of these notes. It is a proposal, not a record: update it as the
+work changes it, the way every other section here records what was learnt.*
+
+**The shape of the problem, measured.** A compiled frame is already a root: the
+interpreter pushes the frame object on the value stack and passes it into
+`CompiledFn`, and the collector finds it and rewrites it. What makes compiled
+code unsafe is that its live values live in LLVM allocas (registers), *not in
+that frame*. So a collection underneath a compiled frame loses whatever the
+frame's canonical copy no longer agrees with -- which is why the four runtime
+helpers pin the heap and the tier refuses every function that allocates. The
+route chosen here: make the frame the source of truth at every point where the
+collector can run -- **spill slots into the frame before a collect-capable
+helper, reload from it after** -- and de-pin the helpers. No machine-stack
+walking, which is what keeps this sound with the concurrent collector's helper
+threads: they never see the process's stack, but they never need to, because the
+roots are the frames on the value stack.
+
+**What the goal concretely is.** Let the JIT compile self-recursive loops whose
+values are objects: forward list builders (`list.replicate`, manual `upto`-style
+recursions), string-concat folds, map-building folds. `pi` is not the driver any
+more -- see the table and "What it did not reach" above; it is already compiled.
+The work is all in `dream/src`; there is no compiler change, so no bootstrap
+moves.
+
+**The draft of it in stages:**
+
+- **Fix the known compiled-force SIGSEGV first.** The compile a long thunk chain
+  crashes (below) is made more reachable by everything after this, because each
+  stage sends more nested forces out through the runtime. Fix: a `force_nest`
+  counter on the process, incremented at the top of `force_whnf`, and
+  `enter_function` declines the compiled tier past a bound, handing the rest of
+  the chain to the interpreter whose recursion is heap continuations. Same shape
+  and trigger as the `JitTooDeep` deopt.
+- **Spill/reload and de-pin.** Before each call to `dream_rt_force/arith/
+  compare/arith_f`, emit stores of every slot into the frame through
+  `dream_rt_frame_store` (write barrier for old-to-young edges); after the call
+  returns, reload every slot from the frame, because a mid-call collection moved
+  objects and the frame is what got rewritten. The helper's operands are rooted
+  the native way -- on `p.stack`/`p.pins`, with a `VouchesForGc` -- so they cost
+  nothing extra to keep straight. `arith` and `compare` themselves are untouched;
+  the rooting lives in the `dream_rt_*` layer (`jit_arith` is a bare passthrough).
+- **Admit object-allocating self-recursion.** Widen `op_is_supported` and the
+  emitter for the shape `is_self_call` already bounds: `Op::Cons` via a
+  `dream_rt_cons` helper that calls the interpreter's own list-building path
+  (building stays lazy -- a tail thunk stays a thunk), `Op::Bind` as a store
+  into the slot the way the interpreter writes a frame slot, and a second,
+  distinct native class beside the eight inline numeric ones: natives compiled
+  code *calls*, arguments pushed onto the value stack exactly as `resume_native`
+  does, spill/reload around the call. Object values ride the existing `Ty::Any`
+  tagged path; only `Ty::Float` is ever unboxed.
+- **Generalize the callable set only if measurement justifies it.** The claim
+  "call any host native exactly as the interpreter enters it, with the compiled
+  caller's slots spilled" inherits the interpreter's safety per native, so the
+  vetting can shrink from an allowlist to a property. Declined until the staged
+  version is on the floor and its numbers are in.
+
+**What each stage has to prove.** A repeated `pi` row that does not move (a
+regression there is a spill paid on the hot path instead of only at true
+boundaries); new rows for list builder, string fold and map fold, judged
+JIT-on against JIT-off (the placement-noise floor applies); equivalence between
+the tiers under `just test-all` (heap-verified run plus fuzzer) for the new
+`consbuild`, `strfold` and `mapfold` cases; and the long-thunk-chain repro
+raising `:stack_overflow` byte-identically with and without `--no-jit`.
 
 ## Large data in an image
 

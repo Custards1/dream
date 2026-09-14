@@ -174,6 +174,18 @@ public:
     bool force_vouched = false;
     uint32_t force_pins = 0;
 
+    /// Nested `force_whnf` loops currently on the process's machine stack.
+    ///
+    /// Interpreted code never nests them -- each force is a heap continuation
+    /// and the loop returns between links -- so a deep count is a *compiled*
+    /// signature: a compiled body forces a slot by calling, and `fetch -> force
+    /// -> force_whnf` runs a whole nested machine, which re-enters another
+    /// compiled body, which forces again. One real C++ frame per link, against
+    /// a fixed machine stack, which is the SIGSEGV under "Known and not fixed"
+    /// below. `enter_function` declines the compiled tier past a bound, and the
+    /// interpreter, whose recursion is heap continuations, finishes the chain.
+    uint32_t force_nest = 0;
+
     /// Values a C++ frame is holding across a call that can collect.
     ///
     /// The interpreter keeps no machine state on the C++ stack, which is the

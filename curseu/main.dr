@@ -1,0 +1,21 @@
+import std.console;
+
+import std.list;
+let fac n = match n {
+    0 => 1,
+    _ => n * fac (n - 1)
+};
+
+let doSomething! handle = {
+    let result = fac 5;
+    console.print! "Hello from doSomething"
+    send! handle (fac 5);
+    console.print! "doSomething sent"
+};
+let main! = {
+    let handle = strict! spawn! doSomething!;
+    console.print! "Hello from curseu"
+    let result = strict! recv! handle
+    console.print! "Hello from curseu, received " + to_string result
+    join! handle;
+};
