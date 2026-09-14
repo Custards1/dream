@@ -176,6 +176,7 @@ public:
 
     /// Nested `force_whnf` loops currently on the process's machine stack.
     ///
+
     /// Interpreted code never nests them deeply -- each force is a heap
     /// continuation and the loop returns between links -- so a deep count is a
     /// *compiled* signature: a compiled body forces a slot by calling, and

@@ -295,6 +295,16 @@ inline uint32_t native_strict_mask(Value callee) {
 constexpr uint32_t kMaxForceNestForCompiled = 256;
 
 /// Enter a function body, taking the compiled tier when one is available.
+/// The depth of nested `force_whnf` loops past which `enter_function` stops
+/// offering the compiled tier. See `Process::force_nest`: interpreted code
+/// nests forces only as deep as natives on the same C++ chain actually sit one
+/// inside another (a `strict!` over nested natives, tens at most), while a
+/// *compiled* chain of lazy links spends one C++ frame per link and would blow
+/// the machine stack long before `DREAM_MAX_DEPTH`. Small enough to keep the
+/// interpreter in charge of anything pathological, large enough that every
+/// healthy program nests well under it.
+constexpr uint32_t kMaxForceNestForCompiled = 256;
+
 void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value frame) {
     Jit* jit = p.runtime().jit();
     // When a nested force is already deep on the process's machine stack, the
@@ -306,8 +316,12 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
     // reach its limit, so it takes the chain over. Interpreted code never nests
     // this deep (each of its forces returns before the next), which is what
     // lets a small bound here be free for every healthy program. See
+
+    // `Process::force_nest` and "Known and not fixed" in CLAUDE.md.
+
     // `Process::force_nest`, `dream/tests/programs/force_chain.dr`, and "Fixed:
     // compiled code forcing a long thunk chain crashed" in CLAUDE.md.
+
     if (jit && p.force_nest <= kMaxForceNestForCompiled) {
         // One inlined, lock-free read of the tier table (see `Jit::tier`), so
         // a process whose functions never grow hot -- most of a compile --
