@@ -1,0 +1,161 @@
+// curseu.readline -- GNU readline for Dream.
+//
+// readline is bound through std.ffi and reshaped so that a Dream caller never
+// sees a C type. The two places the C API is awkward are handled here:
+//
+//   - `readline` returns a malloc'd buffer. The wrapper reads it with
+//     `ffi.read_cstr!` and frees it with `ffi.free!`, so Dream gets a string
+//     and a leak is a bug in this module, not in the caller.
+//   - `history_list` returns a `HIST_ENTRY**`, an array of structs ending in a
+//     null pointer. The FFI can read a byte at a time, so `history_lines!`
+//     walks the array by assembling the 8-byte addresses itself.
+//
+// Every member is bound once, behind the lazy `session` thunk, and the FFI
+// registry keeps it for the life of the process. `bind!` raises if a symbol is
+// missing, so the first use of any member is also the point where an ABI
+// mismatch shows up, with the symbol named.
+//
+// What is deliberately not here is completion: `rl_attempted_completion_function`
+// is a callback field, and std.ffi has no function-pointer type to fill it
+// with. Everything that can be bound without a callback is.
+import std.console;
+import std.core;
+import std.ffi;
+import std.list;
+import std.os;
+import std.vm;
+
+/// Test the process can even attempt FFI. The real test is forcing `session`.
+let available! () = vm.has_ffi ();
+
+// --- loading the library ----------------------------------------------------
+
+let candidates = ["libreadline.so.8", "libreadline.so", "libreadline.so.6", "libreadline.so.5"];
+
+/// Open the library. `CURSEU_READLINE` names an absolute path and wins over
+/// everything -- the escape hatch for systems like NixOS whose loader cannot
+/// find a shared object by name. Otherwise the by-name candidates are tried,
+/// which is what `nix-shell -p readline` makes work.
+let open_lib! () = {
+    let try_one! name = try! { ffi.open! name } catch e { console.error! ("    " + name + ": " + to_string e); 0 };
+    let rec try_names! ns = match ns {
+        [] => {
+            console.error! "curseu: could not open GNU readline"
+            console.error! "  run inside `nix-shell -p readline`, or set CURSEU_READLINE to the library"
+            os.exit! 1
+        },
+        [name, ..rest] => {
+            let h = try_one! name;
+            if h > 0 { h } else { try_names! rest }
+        },
+    };
+    match os.env! "CURSEU_READLINE" {
+        () => try_names! candidates,
+        path => {
+            let h = try_one! path;
+            if h > 0 { h } else {
+                console.error! ("curseu: CURSEU_READLINE points at `" + path + "`, which did not open")
+                os.exit! 1
+            }
+        },
+    }
+};
+
+// --- the bound members ------------------------------------------------------
+
+let bind_all! () = {
+    let lib = open_lib! ();
+    console.print! "    [probe] bind_all! ran";
+    let b! symbol args ret = ffi.bind! lib symbol args ret;
+    %{
+        :readline          => b! "readline"                []                  :ptr,
+        :add_history       => b! "add_history"             [:cstr]             :void,
+        :clear_history     => b! "clear_history"           []                  :void,
+        :using_history     => b! "using_history"           []                  :void,
+        :stifle_history    => b! "stifle_history"          [:i32]              :void,
+        :unstifle_history  => b! "unstifle_history"        []                  :i32,
+        :history_list      => b! "history_list"            []                  :ptr,
+        :initialize        => b! "rl_initialize"           []                  :i32,
+        :parse_and_bind    => b! "rl_parse_and_bind"       [:cstr]             :i32,
+        :set_prompt        => b! "rl_set_prompt"           [:cstr]             :i32,
+        :replace_line      => b! "rl_replace_line"         [:cstr, :i32]       :void,
+        :insert_text       => b! "rl_insert_text"          [:cstr]             :i32,
+        :clear_screen      => b! "rl_clear_screen"         []                  :i32,
+        :on_new_line       => b! "rl_on_new_line"          []                  :i32,
+        :redisplay         => b! "rl_redisplay"            []                  :i32,
+        :vi_mode           => b! "rl_vi_editing_mode"      []                  :i32,
+        :emacs_mode        => b! "rl_emacs_editing_mode"   []                  :i32,
+    }
+};
+
+/// One thunk, forced on first use of any member. Suspending the impure call is
+/// allowed -- a thunk may perform effects -- and forcing it once memoizes the
+/// whole record, so the library is opened exactly once and every member is
+/// bound exactly once.
+///
+/// The wrappers below all begin with `let s = strict! session;`. A thunk
+/// suspends as a function of no arguments, and the `.[ ]` opcode reads its
+/// container as it finds it -- so a suspended session is a function, not a map,
+/// and the map has to be materialized before it can be indexed. `strict!`
+/// forces the memoized thunk, which is a read once it has run once.
+let session = $( bind_all! () );
+
+// --- the public API ---------------------------------------------------------
+
+/// One line, with readline's editing. Returns `()` at end of input, which is
+/// what readline answers with a null pointer. The malloc'd buffer readline
+/// returns is read and freed here; the caller gets a plain string.
+let read_line! prompt = {
+    let s = strict! session;
+    let p = s.[:readline] prompt;
+    let line = ffi.read_cstr! p;
+    ffi.free! p;
+    line
+};
+
+let add_history! line = (strict! session).[:add_history] line;
+let clear_history! () = (strict! session).[:clear_history] ();
+let using_history! () = (strict! session).[:using_history] ();
+let stifle_history! n = (strict! session).[:stifle_history] n;
+let unstifle_history! () = (strict! session).[:unstifle_history] ();
+
+/// The history, oldest first, as plain Dream strings. Walks the `HIST_ENTRY**`
+/// that `history_list` returns: each slot is a pointer to an entry whose first
+/// field is the line, and both pointers are read byte by byte through
+/// `ffi.read_u8!` -- the FFI's finest granularity.
+let history_lines! () = {
+    let s = strict! session;
+    let arr = s.[:history_list] ();
+    let rec ptr_at! base off = {
+        let rec go! i acc = if i >= 8 { acc } else { go! (i + 1) (acc * 256 + ffi.read_u8! base (off + i)) };
+        go! 0 0
+    };
+    let rec walk! i acc = {
+        let entry = ptr_at! arr (i * 8);
+        if entry == 0 { list.reverse acc }
+        else {
+            let line = ffi.read_cstr! (ptr_at! entry 0);
+            walk! (i + 1) (core.cons line acc)
+        }
+    };
+    if arr == 0 { [] } else { walk! 0 [] }
+};
+
+/// One call: history on, then GNU readline's own initialization. TERM must be
+/// sane before this runs -- see `curseu.main.ensure_term!`.
+let initialize! () = {
+    let s = strict! session;
+    s.[:using_history] ();
+    s.[:initialize] ();
+    ()
+};
+
+let parse_and_bind! s0 = (strict! session).[:parse_and_bind] s0;
+let set_prompt! s0 = (strict! session).[:set_prompt] s0;
+let replace_line! s0 = (strict! session).[:replace_line] s0 1;
+let insert_text! s0 = (strict! session).[:insert_text] s0;
+let clear_screen! () = (strict! session).[:clear_screen] ();
+let on_new_line! () = (strict! session).[:on_new_line] ();
+let redisplay! () = (strict! session).[:redisplay] ();
+let vi_mode! () = (strict! session).[:vi_mode] ();
+let emacs_mode! () = (strict! session).[:emacs_mode] ();

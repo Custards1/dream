@@ -1,32 +1,179 @@
+// curseu -- GNU readline, bound through std.ffi, made to feel at home in Dream.
+//
+// Interactive, it is a small prompt with a few line commands, which is enough
+// to exercise the binding for real: keys, history, editing modes. With
+// `--check` it skips the prompt and runs a battery of checks against the FFI
+// surface itself -- sizeof, alloc/free, byte round trips, and that every
+// readline symbol bound -- so the "test of std.ffi" half is runnable without
+// a terminal in front of it.
+//
+//     nix-shell -p readline --run "dream -x mind run"            # interact
+//     nix-shell -p readline --run "dream -x mind run -- --check" # the ffis test
 import std.console;
+import std.core;
 import std.ffi;
 import std.list;
-let fac n = match n {
-    0 => 1,
-    _ => n * fac (n - 1)
+import std.os;
+import std.vm;
+
+import readline;
+
+// --- the terminal -----------------------------------------------------------
+
+/// ghostty names its terminal `xterm-ghostty`, which has no entry in this
+/// box's terminfo database; readline's bundled ncurses would fail to look up
+/// the screensize. `xterm-256color` is the same terminal minus the extensions,
+/// and setting it before any member is used costs nothing on a machine that
+/// knows its own TERM. The readline module leaves the environment alone, so it
+/// can be imported without surprising anyone.
+let ensure_term! () = {
+    match os.env! "TERM" {
+        () => os.set_env! "TERM" "xterm-256color",
+        t => if t == "xterm-ghostty" { os.set_env! "TERM" "xterm-256color" } else { () },
+    }
 };
 
-let doSomething! handle = {
-    let result = fac 5;
-    console.print! "Hello from doSomething"
-    send! handle (fac 5);
-    console.print! "doSomething sent"
+// --- the FFI self-test ------------------------------------------------------
+
+/// One check, printed, returning whether it passed so the caller can count.
+let check! name ok = {
+    if ok { console.print! ("  ok    " + name) }
+    else  { console.print! ("  FAIL  " + name) };
+    ok
 };
-let unsafe_string! data = {
-    let ptr = ffi.calloc(1 100);
-    
-    ffi.memcpy(ptr "Hello from unsafe_string, you said: "  24)
-    
-    ptr
-}
 
+/// Eight bytes allocated with `calloc` are all zero -- the runtime zeroes, not
+/// the lib, because there is no lib until the round trip below proves one.
+let check_zeroed! () = {
+    let b = ffi.alloc! 8;
+    let ok = list.all (fn i -> ffi.read_u8! b i == 0) [0, 1, 2, 3, 4, 5, 6, 7];
+    ffi.free! b;
+    ok
+};
 
-let main! = console.print! unsafe_string! "Hello from curseu"
-let main2! = {
-    let handle = strict! spawn! doSomething!;
-    console.print! "Hello from curseu"
+let check_words! () = {
+    let b = ffi.alloc! 4;
+    ffi.write_u8! b 2 0xA5;
+    let ok = ffi.read_u8! b 2 == 0xA5 && ffi.read_u8! b 0 == 0;
+    ffi.free! b;
+    ok
+};
 
-    let result = strict! recv! handle
-    console.print! "Hello from curseu, received " + to_string result
-    join! handle;
+/// `read_cstr!` stops at the NUL byte and never goes past it -- a C string
+/// written by hand through `write_u8!`, read back, and the buffer freed.
+let check_cstr! () = {
+    let b = ffi.alloc! 32;
+    ffi.write_u8! b 0 104;
+    ffi.write_u8! b 1 105;
+    ffi.write_u8! b 2 0;
+    let ok = ffi.read_cstr! b == "hi";
+    ffi.free! b;
+    ok
+};
+
+/// Forcing `session` opens the library and binds every member. A missing
+/// symbol makes `bind!` raise, so a null line here is the whole ABI check.
+let check_session! () =
+    try! { strict! readline.session; true }
+    catch e { console.error! ("    " + to_string e); false };
+
+let check_parse! () =
+    try! {
+        let a = readline.session;
+        console.print! ("    [1] session type      = " + to_string (type_of a));
+        let m1 = a ();
+        console.print! ("    [2] apply #1 gives    = " + to_string (type_of m1));
+        let m2 = a ();
+        console.print! ("    [3] apply #2 gives    = " + to_string (type_of m2));
+        let c = m2.[:parse_and_bind];
+        console.print! ("    [4] bound member type = " + to_string (type_of c));
+        let r = c "set bell-style none";
+        console.print! ("    [5] call result       = " + to_string r)
+        r == 0
+    }
+    catch e { console.error! ("    " + to_string e); false };
+
+let check_prompt! () =
+    try! { type_of (readline.set_prompt! "curseu> ") == :integer }
+    catch e { console.error! ("    " + to_string e); false };
+
+let run_checks! () = {
+    console.print! "curseu: std.ffi self-test"
+    let checks = [
+        ["vm.has_ffi () answers true",  fn () -> vm.has_ffi ()],
+        ["sizeof :i32 is 4",            fn () -> ffi.sizeof :i32 == 4],
+        ["sizeof :ptr is 8",            fn () -> ffi.sizeof :ptr == 8],
+        ["sizeof :cstr is 8",           fn () -> ffi.sizeof :cstr == 8],
+        ["alloc! zero-fills 8 bytes",   fn () -> check_zeroed! ()],
+        ["write_u8!/read_u8! round trip", fn () -> check_words! ()],
+        ["read_cstr! round trip",       fn () -> check_cstr! ()],
+        ["readline binds every member", fn () -> check_session! ()],
+        ["rl_parse_and_bind answers",   fn () -> check_parse! ()],
+        ["rl_set_prompt answers",       fn () -> check_prompt! ()],
+    ];
+    list.fold
+        (fn acc [name, body] -> {
+            let ok = body ();
+            if not ok { console.error! "    (failed)" };
+            acc + (if check! name ok { 0 } else { 1 })
+        })
+        0 checks
+};
+
+// --- the prompt -------------------------------------------------------------
+
+let show_history! () = {
+    let entries = readline.history_lines! ();
+    if list.is_empty entries { console.print! "  (no history)" }
+    else {
+        let rec show! i xs = match xs {
+            [] => (),
+            [x, ..rest] => {
+                console.print! ("  " + to_string i + "  " + x)
+                show! (i + 1) rest
+            },
+        };
+        show! 1 entries
+    }
+};
+
+let handle! s = {
+    if s == ":quit" { os.exit! 0 }
+    else if s == ":history" { show_history! () }
+    else if s == ":clear" { readline.clear_history! (); console.print! "  history cleared" }
+    else if s == ":emacs" { readline.emacs_mode! (); console.print! "  editing mode: emacs" }
+    else if s == ":vi" { readline.vi_mode! (); console.print! "  editing mode: vi" }
+    else { console.print! ("  you said: " + s) }
+};
+
+let rec repl! n = {
+    let line = readline.read_line! "curseu> ";
+    match line {
+        () => console.print! "",
+        s => {
+            handle! s
+            repl! (n + 1)
+        },
+    }
+};
+
+let welcome = "curseu -- GNU readline bound through std.ffi. Try :history  :clear  :emacs  :vi  :quit";
+
+let main! = {
+    ensure_term! ();
+    let args = os.args! ();
+    if list.contains "--check" args {
+        let failed = run_checks! ();
+        console.print! ("curseu: " + to_string failed + " check(s) failed")
+        os.exit! (if failed > 0 { 1 } else { 0 })
+    }
+    else if readline.available! () {
+        readline.initialize! ();
+        console.print! welcome
+        repl! 0
+    }
+    else {
+        console.error! "curseu: this VM was built without libffi, so std.ffi cannot run"
+        os.exit! 1
+    }
 };

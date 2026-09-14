@@ -244,6 +244,11 @@ using SlotSet = uint64_t;  // one bit per slot; functions with >64 slots are ski
 
 struct Analysis {
     bool compilable = false;
+    /// Why not, when not: every rule that refused, comma-separated, for
+    /// `DREAM_JIT_TRACE`. The question this tier is asked most often is not
+    /// "is it fast" but "why was my loop not taken", and without this the only
+    /// way to answer it was to read the analyzer against a dump of the IR.
+    std::string reason;
     SlotSet strict_params = 0;
     /// The body calls itself somewhere other than tail position, so it is
     /// emitted as a function of its arguments rather than of a frame. See the
@@ -265,14 +270,15 @@ public:
 
     Analysis run() {
         Analysis a;
-        if (f_.slots > 64 || f_.arity == 0) return a;
-        if (!check(f_.body, 0)) return a;
+        if (f_.arity == 0) { a.reason = "no parameters"; return a; }
+        if (f_.slots > 64) { a.reason = "more than 64 slots"; return a; }
+        if (!check(f_.body, 0)) { a.reason = joined(); return a; }
 
         SlotSet strict = strict_of(f_.body, 0);
         SlotSet params = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
         // Every parameter must be forced on every path, or compiling the
         // self tail call would evaluate something the interpreter never would.
-        if ((strict & params) != params) return a;
+        if ((strict & params) != params) { a.reason = "a parameter is not forced on every path"; return a; }
 
         // A body that reads a slot no parameter owns has state the frame
         // holds and the argument list does not, so it cannot be emitted as a
@@ -280,7 +286,10 @@ public:
         // only thing that writes such a slot is `Op::Bind`, and a block
         // containing one is refused above. It is checked rather than argued
         // because the argument is about the compiler, not about this file.
-        if (recurses_ && reads_beyond_params_) return a;
+        if (recurses_ && reads_beyond_params_) {
+            a.reason = "non-tail recursion over a slot no parameter owns";
+            return a;
+        }
 
         a.compilable = true;
         a.strict_params = strict;
@@ -299,35 +308,56 @@ public:
     }
 
 private:
+    /// Record a rule that refused, and answer false.
+    ///
+    /// Every one is kept, not just the first, and `check` goes on walking after
+    /// one fails -- which is why the operand chains below combine with `&`
+    /// rather than `&&`. The question the trace exists to answer is "what would
+    /// it take to compile this function", and a body whose first refusal is a
+    /// `let` and whose second is a call of another module is two projects away,
+    /// not one. Only the full set can tell those apart.
+    bool no(const char* why) {
+        for (const char* w : why_) {
+            if (w == why) return false;
+        }
+        why_.push_back(why);
+        return false;
+    }
+
     /// Is this node, and everything under it, something we can emit?
     bool check(uint32_t node, int depth) {
-        if (depth > 256) return false;
+        if (depth > 256) return no("body nested deeper than 256");
         const Node& n = img_.node(node);
         Op op = Op(n.op);
 
         if (op == Op::Apply) return check_apply(n, depth);
-        if (!op_is_supported(op)) return false;
+        if (!op_is_supported(op)) return no(op_name(op));
         if (op == Op::Local && n.a >= f_.arity) reads_beyond_params_ = true;
 
         switch (op) {
             case Op::If:
-                return check(n.a, depth + 1) && check(n.b, depth + 1) &&
+                return check(n.a, depth + 1) & check(n.b, depth + 1) &
                        (n.c == NO_NODE || check(n.c, depth + 1));
-            case Op::Block:
+            case Op::Block: {
+                bool ok = true;
                 for (uint32_t i = 0; i < n.b; ++i) {
                     uint32_t stmt = img_.kid(n.a + i);
                     // A `let` inside the body would need a thunk built against
                     // the frame, but the frame's slots live in registers here.
-                    if (Op(img_.node(stmt).op) == Op::Bind) return false;
-                    if (!check(stmt, depth + 1)) return false;
+                    if (Op(img_.node(stmt).op) == Op::Bind) {
+                        ok = no("a let in a block");
+                        continue;
+                    }
+                    ok = check(stmt, depth + 1) & ok;
                 }
-                return true;
+                return ok;
+            }
             case Op::Force: case Op::Neg: case Op::Not:
                 return check(n.a, depth + 1);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or:
-                return check(n.a, depth + 1) && check(n.b, depth + 1);
+                return check(n.a, depth + 1) & check(n.b, depth + 1);
             default:
                 return true;
         }
@@ -349,18 +379,15 @@ private:
     /// compiled code makes rather than calls. Anything else refuses the whole
     /// function, because the tier has no way to enter an arbitrary callee.
     bool check_apply(const Node& n, int depth) {
-        if (is_self_call(n)) {
-            for (uint32_t i = 0; i < n.c; ++i) {
-                if (!check(img_.kid(n.b + i), depth + 1)) return false;
-            }
-            if (!(n.flags & F_TAIL)) recurses_ = true;
-            return true;
+        bool ok = true;
+        if (!is_self_call(n) && known_native(rt_, img_, n.a, n.c) == KnownNative::None) {
+            ok = no(call_shape(n));
         }
-        if (known_native(rt_, img_, n.a, n.c) == KnownNative::None) return false;
         for (uint32_t i = 0; i < n.c; ++i) {
-            if (!check(img_.kid(n.b + i), depth + 1)) return false;
+            ok = check(img_.kid(n.b + i), depth + 1) & ok;
         }
-        return true;
+        if (ok && is_self_call(n) && !(n.flags & F_TAIL)) recurses_ = true;
+        return ok;
     }
 
     /// Slots definitely forced when this node is reduced to WHNF.
@@ -587,6 +614,38 @@ private:
     std::vector<uint32_t> call_sites_;
     bool recurses_ = false;
     bool reads_beyond_params_ = false;
+    std::vector<const char*> why_;
+
+    /// Every rule that refused, in the order the walk met them.
+    std::string joined() const {
+        std::string out;
+        for (const char* w : why_) {
+            if (!out.empty()) out += ", ";
+            out += w;
+        }
+        return out.empty() ? std::string("unknown") : out;
+    }
+
+    /// What a call this tier cannot take is, in one phrase. The distinction
+    /// that matters is between a call of *this* function with the wrong shape
+    /// -- which a compiler change could fix -- and a call of something else,
+    /// which wants a tier that can enter an arbitrary callee.
+    const char* call_shape(const Node& n) const {
+        const Node& callee = img_.node(n.a);
+        switch (Op(callee.op)) {
+            case Op::Global: {
+                const GlobalRec& g = img_.global(callee.a);
+                if (g.kind == GLOBAL_FUNCTION && g.target == fi_) {
+                    return n.c < f_.arity ? "a partial self call" : "an over-applied self call";
+                }
+                return "a call of another global";
+            }
+            case Op::Field: return "a call of a module member";
+            case Op::Local: return "a call of a local";
+            case Op::Capture: return "a call of a capture";
+            default: return "a call of an expression";
+        }
+    }
 
 public:
     /// The type of one node, given what is known about the slots. Public
@@ -1892,10 +1951,42 @@ CompiledFn Jit::on_enter(uint32_t func_index) {
     if (!fn) {
         impl_->rejected.insert(func_index);
         cached_[func_index].store(rejected(), std::memory_order_release);
+        trace_decision(func_index, false);
         return nullptr;
     }
     cached_[func_index].store(fn, std::memory_order_release);
+    trace_decision(func_index, true);
     return fn;
+}
+
+/// `DREAM_JIT_TRACE=1`: one line per function that got hot enough to be
+/// offered to this tier, saying whether it was taken and, when it was not,
+/// which rule refused it.
+///
+/// The set this prints is the one worth reading: a function nobody calls
+/// `threshold()` times is never offered and never appears, so what comes out
+/// is the hot functions the tier turned down and nothing else. It is the
+/// measurement that says whether a change to the *compiler* -- which decides
+/// what shapes exist in an image at all -- put more of a program in reach.
+void Jit::trace_decision(uint32_t func_index, bool taken) {
+    static const bool on = [] {
+        const char* v = getenv("DREAM_JIT_TRACE");
+        return v && *v && v[0] != '0';
+    }();
+    if (!on) return;
+    const Image& img = impl_->rt.image();
+    const FuncRec& f = img.func(func_index);
+    StringRef name = img.str(f.name);
+    std::string label = name.str();
+    if (label.empty()) label = "<anonymous>";
+    if (taken) {
+        fprintf(stderr, "jit: fn#%u %s/%u compiled\n", func_index, label.c_str(),
+                unsigned(f.arity));
+        return;
+    }
+    Analysis a = Analyzer(impl_->rt, img, func_index).run();
+    fprintf(stderr, "jit: fn#%u %s/%u refused: %s\n", func_index, label.c_str(),
+            unsigned(f.arity), a.reason.empty() ? "unknown" : a.reason.c_str());
 }
 
 void Jit::deoptimize(uint32_t func_index) {

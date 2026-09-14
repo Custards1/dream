@@ -117,6 +117,9 @@ private:
 
     /// Caller must hold the JIT lock.
     CompiledFn compile_locked(uint32_t func_index, std::string* error);
+    /// `DREAM_JIT_TRACE=1`: report what this tier did with a function that got
+    /// hot, and why. See the definition.
+    void trace_decision(uint32_t func_index, bool taken);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
