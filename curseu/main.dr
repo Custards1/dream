@@ -1,5 +1,5 @@
 import std.console;
-
+import std.ffi;
 import std.list;
 let fac n = match n {
     0 => 1,
@@ -12,9 +12,20 @@ let doSomething! handle = {
     send! handle (fac 5);
     console.print! "doSomething sent"
 };
-let main! = {
+let unsafe_string! data = {
+    let ptr = ffi.calloc(1 100);
+    
+    ffi.memcpy(ptr "Hello from unsafe_string, you said: "  24)
+    
+    ptr
+}
+
+
+let main! = console.print! unsafe_string! "Hello from curseu"
+let main2! = {
     let handle = strict! spawn! doSomething!;
     console.print! "Hello from curseu"
+
     let result = strict! recv! handle
     console.print! "Hello from curseu, received " + to_string result
     join! handle;

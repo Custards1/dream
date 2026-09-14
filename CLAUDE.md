@@ -805,21 +805,12 @@ moves.
 
 **The draft of it in stages:**
 
-- **Fix the known compiled-force SIGSEGV first.** The compile a long thunk chain
-  crashes (below) is made more reachable by everything after this, because each
-  stage sends more nested forces out through the runtime. Fix: a `force_nest`
-  counter on the process, incremented at the top of `force_whnf`, and
-  `enter_function` declines the compiled tier past a bound, handing the rest of
-  the chain to the interpreter whose recursion is heap continuations. Same shape
-  and trigger as the `JitTooDeep` deopt.
-- **Spill/reload and de-pin.** Before each call to `dream_rt_force/arith/
-  compare/arith_f`, emit stores of every slot into the frame through
-  `dream_rt_frame_store` (write barrier for old-to-young edges); after the call
-  returns, reload every slot from the frame, because a mid-call collection moved
-  objects and the frame is what got rewritten. The helper's operands are rooted
-  the native way -- on `p.stack`/`p.pins`, with a `VouchesForGc` -- so they cost
-  nothing extra to keep straight. `arith` and `compare` themselves are untouched;
-  the rooting lives in the `dream_rt_*` layer (`jit_arith` is a bare passthrough).
+- ~~**Fix the known compiled-force SIGSEGV first.**~~ **Done** -- `force_nest`
+  on the process, `enter_function` declines the compiled tier past
+  `kMaxForceNestForCompiled`. See the section below, which is now a record.
+- **Spill/reload and de-pin.** **Written, measured, and reverted.** It works and
+  it does not pay for itself; the next entry is the whole of what was learnt,
+  and the two things to try before writing it again.
 - **Admit object-allocating self-recursion.** Widen `op_is_supported` and the
   emitter for the shape `is_self_call` already bounds: `Op::Cons` via a
   `dream_rt_cons` helper that calls the interpreter's own list-building path
@@ -842,6 +833,97 @@ JIT-on against JIT-off (the placement-noise floor applies); equivalence between
 the tiers under `just test-all` (heap-verified run plus fuzzer) for the new
 `consbuild`, `strfold` and `mapfold` cases; and the long-thunk-chain repro
 raising `:stack_overflow` byte-identically with and without `--no-jit`.
+
+### Spilling compiled frames: measured, and not kept
+
+Built and reverted 2026-09-13. The mechanism was correct -- every tier-agreement
+test passed -- and it cost 21% on `fib` and 40% on `mapfilter`, so it is not in
+the tree. All of it is written down because the three things the plan above got
+wrong are the three things anyone doing this again would get wrong, and because
+the reason for the cost is not the one anybody would guess.
+
+**Where the roots live.** Not in the heap frame, which is what the plan said.
+Two reasons. In the recursive shape *every depth shares one frame* -- it is
+passed down and only depth zero ever yields through it -- so a frame spilled at
+depth three is the frame depth two reloads from. And a frame slot needs
+`dream_rt_frame_store` for the write barrier, which is a call per slot. So it is
+`Process::jit_roots` instead: a plain array the collector walks, `top` bumped by
+compiled code itself with no call and no allocation.
+
+**What has to be spilled is not just the slots.** The plan said slots. An
+operand already evaluated while the operand beside it is still being evaluated
+is a live reference in a register and nothing else -- `a + f b` is the shape,
+and so is every argument of a self call but the last. Those are held in allocas
+by `Emitter::RootSet`, a stack that mirrors the emitter's own recursive descent,
+and they travel with the slots. The frame reference is one of them too: a
+collection moves the frame, and the yield writes through it afterwards.
+
+**`arith` and `compare` cannot be de-pinned, and the plan was wrong to say they
+could.** Making the *caller* safe is not enough: `arith` on two lists is
+`concat_lists`, which forces a whole spine holding both operands in C++ locals,
+and `arith` holds them too. Rooting at the `dream_rt_*` boundary does not reach
+either. So only `dream_rt_force` vouches -- which is the one that mattered
+anyway, being the helper a compiled loop spends unbounded time under. The other
+three keep `PinsTheHeap`, and their comments now name the real cause.
+
+**One thing the interpreter had to give up.** `enter_function` held the frame in
+a C++ local across the compiled call, and three of the five outcomes hand that
+frame straight to `eval_node`. It is `Pin`ned now.
+
+**The cost, and the reason.** Best of five on this machine, against the same
+build with the spill emission switched off:
+
+| | baseline | spilling | |
+|---|---|---|---|
+| `fib` | 39 ms | 47 ms | +21% |
+| `mapfilter` | 25 ms | 35 ms | +40% |
+| `pi` | 32 ms | 35 ms | +9% |
+| `collatz` | 205 ms | 219 ms | +7% |
+| `sum` | 49 ms | 50 ms | +2% |
+| `strbuild` | 81 ms | 82 ms | +1% |
+
+`mapfilter` is the one that explains it, and it explains it in a way no guess
+would have reached: **its spill code never runs**. Its slots hold fixnums, so
+every `force` takes the inline fast path and the slow block is dead. The
+optimized IR says what happens instead -- the reload writes *every* root, so
+each of the twelve force sites in that loop body contributes a fresh PHI per
+root at its join, and the loop carries a web of fifty-odd PHIs where it used to
+carry four. The register allocator pays for that on the path that does run.
+So the cost is not the stores; it is that a reload site is a *merge point for
+everything the frame holds*.
+
+Two rounds of tuning went in before the numbers above: the capacity check
+hoisted to the function entry (a frame's region base is invariant, so no spill
+site has to go and find it), and `dream_rt_roots_state` and
+`dream_rt_reduction_slot` marked as the pure address computations they are, so
+LLVM sinks them to the paths that use them rather than emitting both at every
+entry of a recursive body. Those took `pi` from +34% to +9% and `mapfilter` from
++56% to +40%. What is left is the PHI web, and tuning will not move it.
+
+**So the next step is to make the sites fewer, not the spill cheaper.** Two
+candidates, both of which stand on their own merits:
+
+- **Force the parameters at entry and stop forcing them in the body.** The
+  analyzer already proves every parameter is forced on every path -- that is the
+  admission test -- and `Analyzer::force_order`/`entry_forces` already computes
+  the definite prefix of the order for the float slots. Extend that to every
+  tagged slot it can pin down, and `load_slot` needs no force at all for those.
+  A tail call only ever writes values that are already in WHNF, so from the
+  second iteration on *no* slot needs forcing. For a fused loop that removes
+  every spill site from the hot loop rather than making it cheaper.
+- **Restart the iteration instead of reloading.** A compiled loop body is pure,
+  and re-forcing an updated thunk is a resolve. So on a collection the loop
+  could branch back to its header with the reloaded values, which collapses
+  every per-site PHI into the loop header's existing ones. It needs a collection
+  counter on the process to test against, or it re-forces for ever.
+
+Neither was worth doing on spec, which is why this was reverted rather than
+carried: nothing compiled allocates yet, so all the spill buys today is that a
+compiled loop forcing a long lazy structure can collect instead of growing a
+nursery no safepoint can reach -- real, but not visible in any measurement here,
+and not worth 40% of `mapfilter` to have early. Do the site-count work first;
+then this becomes cheap enough to be worth having, and stage three has something
+to stand on.
 
 ## Large data in an image
 
