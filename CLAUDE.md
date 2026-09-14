@@ -440,6 +440,14 @@ the heap where its limit can be enforced. Interpreted code never nests forces
 deeply -- each one returns before the next -- so the bound costs every healthy
 program one compare on function entry and nothing else.
 
+The bound is free, which was worth measuring rather than asserting because
+`enter_function` runs on every single call: one `uint32_t` load and a compare,
+folded into the branch that was already testing whether the JIT exists. The six
+benchmark workloads A/B'd against the same build without it on the same machine
+came back 44/51/216/30/82/25 ms before and 43/49/217/29/82/25 after -- inside
+the placement noise floor in "Two things that will lie to you about a change to
+the interpreter" in every row.
+
 What makes the test cheap enough to keep is `force_chain.env`: a small
 `DREAM_MAX_DEPTH` and a 200,000-link chain, which is comfortably past the
 roughly 16,000 links eight megabytes of stack allowed and finishes in a fraction
