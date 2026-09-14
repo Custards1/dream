@@ -40,6 +40,7 @@ const char* USAGE =
     "      --jit-threshold <n>  calls before a function is compiled\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function\n"
     "      --mindv2         mindv2 path override\n"
+    "      --mindv2-path    print the effective $MINDV2_PATH and exit\n"
     "  -h, --help           show this message\n";
 void dump_node(const Image& img, uint32_t idx, int depth, std::string& out);
 
@@ -400,6 +401,14 @@ int main(int argc, char** argv) {
             use_jit = false;
         }else if (a == "-m" || a == "--mindv2") {
             MINDV2_PATH = expand_home(next("--mindv2"));
+        } else if (a == "--mindv2-path") {
+            // The toolchain wrapper sets `$MINDV2_PATH` inside its own process,
+            // so a caretaker (an editor extension, a shell script) cannot read
+            // it from its own environment. Printing what the VM would resolve
+            // names and packages under is how it is asked: the VM is the one
+            // place the installed path is guaranteed to be right.
+            std::printf("%s\n", MINDV2_PATH.c_str());
+            return 0;
         } else if (a == "--jit-threshold") {
             jit_threshold = uint32_t(std::stoul(next("--jit-threshold")));
         } else if (a == "--dump-jit") {

@@ -174,6 +174,20 @@ public:
     bool force_vouched = false;
     uint32_t force_pins = 0;
 
+    /// Nested `force_whnf` loops currently on the process's machine stack.
+    ///
+    /// Interpreted code never nests them deeply -- each force is a heap
+    /// continuation and the loop returns between links -- so a deep count is a
+    /// *compiled* signature: a compiled body forces a slot by calling, and
+    /// `load_slot -> force -> dream_rt_force -> force_whnf` runs a whole nested
+    /// machine, which re-enters another compiled body, which forces again. One
+    /// real C++ frame per link of a lazy chain, against a fixed machine stack.
+    /// That was the SIGSEGV under "Fixed: compiled code forcing a long thunk
+    /// chain crashed" in CLAUDE.md; `enter_function` declines the compiled tier
+    /// past `kMaxForceNestForCompiled`, and the interpreter, whose recursion is
+    /// heap continuations and so has a limit it can check, finishes the chain.
+    uint32_t force_nest = 0;
+
     /// Values a C++ frame is holding across a call that can collect.
     ///
     /// The interpreter keeps no machine state on the C++ stack, which is the

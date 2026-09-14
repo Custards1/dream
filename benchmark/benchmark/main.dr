@@ -61,6 +61,14 @@ let pi_terms n = fold
     0.0
     (list.range 1 (n + 1));
 
+let pi_terms2 n = {
+    let accum = fn acc k -> acc
+        + 1.0 / core.to_float (4 * k - 3)
+        - 1.0 / core.to_float (4 * k - 1);
+    let range = list.range 1 (n + 1);
+    fold accum 0.0 range
+}
+
 let strbuild n = core.str_len (core.str_concat (list.replicate n "hello "));
 
 let mapfilter n = {

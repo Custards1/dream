@@ -31,16 +31,15 @@ the first thing to read before touching either.
 3. ~~`dreams` is the compiler~~ — **done**: `mind`, `lucid`, the examples, the
    end-to-end programs and `dreams` itself are all compiled by `dreams`; the
    old Rust compiler, `dreamc`, is gone.
-4. `mind` moves into `dreams`: `dreams` grows a CLI in `mind`'s shape (project
-   commands, not just file-at-a-time flags) and takes over its role. **Next.**
-5. **`dreams` learns to fuse.** So far it is a compiler that translates; the
-   first optimization that is genuinely its own -- rather than the VM's -- is
-   deforestation: a pipeline of `std.list` combinators becomes one loop and the
-   list between them is never built. The design, the soundness rules and what it
-   is worth are under "The plan: deforestation" in *Making it faster*; the short
-   version is that it is the only route measured so far that takes the folding
-   benchmarks past CPython, and it takes them there by handing the JIT a loop it
-   can already compile.
+4. ~~**`dreams` learns to fuse.**~~ **Done.** The first optimization that is
+   genuinely the compiler's own rather than the VM's: a pipeline of `std.list`
+   combinators becomes one loop, and the list between them is never built. It
+   did what it was built to do and it did it the way the plan said -- not by
+   making the list cheaper but by producing no list, so that what remains is a
+   loop the JIT already compiles. `sum` went from 13.0x CPython to **0.15x**
+   and `mapfilter` from 13.1x to **0.75x**. What it is, what makes it sound,
+   and the one workload it does not finish are under "Deforestation" in
+   *Making it faster*.
 
 `dreams` builds from `dreams/bootstrap/dreams.dream`, an image of itself that is
 checked in. The seed needs the VM and nothing else:
@@ -364,12 +363,47 @@ What has already been learnt from them, so it is not learnt twice:
   cross-TU calls. Link-time optimization on top of that was measured and bought
   nothing, so it is not enabled.
 
-### Known and not fixed: compiled code forcing a long thunk chain crashes
+### Two collector bugs that presented as a segfault a long way from home
 
-A JIT-compiled function that forces a long chain of suspensions dies with
-**SIGSEGV** where the interpreter raises `:stack_overflow`. Found 2026-09-13,
+Both were found in 2026-09 by a crash the fuzzer reached and nothing else did,
+and both are the same species: a reference the collector could not see or could
+not fix. Neither faults where the mistake is, which is what made them expensive.
+
+**A pointer must not span a force.** `force_deep` walks a list in place. The
+cell waits on the value stack precisely so that a collection can find it *and
+rewrite the reference* -- the object moves. So a `ConsObj*` taken before a force
+names the block the cell moved out of, and storing through it writes into
+whatever that block was recycled into. `ConsObj::head` and `ThunkObj::node`
+share an offset, so the usual shape of the damage is a thunk whose node field is
+the low half of a pointer; the machine jumps to it some thousands of reductions
+later and dies somewhere unrelated. The cell is now re-read from the stack at
+every single use (`cell()` in [dream/src/interp.cpp](dream/src/interp.cpp)), and
+the array case beside it does the same.
+
+**An object born old is remembered at birth.** An allocation over
+`kMaxClassSize` is born in the old generation, and what its caller fills it with
+is young -- `make_array` hands back an array and the caller writes the elements
+straight in. That is an old-to-young edge made by no store the write barrier
+ever sees, so the next minor collection does not scan the array and frees the
+elements it cannot find; a 3000-cell array of unforced thunks comes back holding
+whatever the nursery has since put there. Such objects are pushed onto the
+remembered set in `alloc_bare` ([dream/src/heap.cpp](dream/src/heap.cpp)). One
+entry covers the whole object, and only allocations large enough to tenure pay
+it. Nothing can collect between the allocation and the fill -- a collection runs
+only at a safepoint, and there is none inside a reduction -- which is what makes
+filling one safe without a barrier at every fill site.
+
+The verifier now names the object's type and what it was reached *from* when it
+reports a young object surviving a minor, because "a minor collection left a
+young object reachable" without a path is a fact you cannot act on.
+
+### Fixed: compiled code forcing a long thunk chain crashed
+
+A JIT-compiled function that forced a long chain of suspensions died with
+**SIGSEGV** where the interpreter raised `:stack_overflow`. Found 2026-09-13,
 reproduced against the JIT exactly as it was before it learnt self recursion, so
-it is not new -- but nothing here had looked for it before.
+it was never new -- nothing here had looked for it before. Fixed the same day;
+`dream/tests/programs/force_chain.dr` is what holds the line.
 
 ```
 import std.console;
@@ -380,29 +414,47 @@ let main! = { console.print! (loop_f (fn a b -> a + b) 1 10000000 0) };
 `acc` is lazy, so this builds ten million suspended applications rather than
 adding anything -- the trap `list.fold_strict` exists to avoid, and its note in
 [mind/std/list.dr](mind/std/list.dr) explains it. Forcing that chain is supposed
-to raise at `DREAM_MAX_DEPTH`, and with `--no-jit` it does, exactly:
+to raise at `DREAM_MAX_DEPTH`, and with `--no-jit` it always did, exactly:
 
 ```
 dream: uncaught error: <error :stack_overflow recursion too deep: 4194305 pending frames>
 ```
 
-With the JIT it segfaults. The reason is one line of the machine: the
+With the JIT it segfaulted. The reason was one line of the machine: the
 interpreter forces a slot by pushing a **continuation**, so its recursion is
 heap and its limit is a number it can check, while compiled code forces a slot
 by *calling* -- `load_slot` -> `force` -> `dream_rt_force` -> `force_whnf`,
 which runs a whole nested machine loop, which enters the compiled body again for
 the next link. One C++ frame per link of the chain, against an 8 MB thread
-stack. The lambda here is the whole trigger: `fn a b -> a + b` is arithmetic
-over two strict parameters, which is precisely what this tier compiles.
+stack. The lambda was the whole trigger: `fn a b -> a + b` is arithmetic over
+two strict parameters, which is precisely what this tier compiles.
 
 The fix is not the depth argument that bounds compiled *self* recursion, because
-the recursion here goes out through the runtime and back in. What it wants is
-the same move `Jit::deoptimize` makes, on a different trigger: count the nested
-`force_whnf` loops on a process, and have `enter_function` decline the compiled
-tier past some depth. From there the interpreter handles the rest of the chain,
-pushing continuations instead of C++ frames, and the walk finishes on the heap
-where its limit can be enforced. That counter does not exist yet -- `force_pins`
-is about vouching, not depth -- and none of it is written.
+the recursion here goes out through the runtime and back in. It is the same move
+`Jit::deoptimize` makes, on a different trigger: `Process::force_nest` counts
+the nested `force_whnf` loops on the process's machine stack, and
+`enter_function` stops offering the compiled tier past
+`kMaxForceNestForCompiled` (256). From there the interpreter handles the rest of
+the chain, pushing continuations instead of C++ frames, and the walk finishes on
+the heap where its limit can be enforced. Interpreted code never nests forces
+deeply -- each one returns before the next -- so the bound costs every healthy
+program one compare on function entry and nothing else.
+
+The bound is free, which was worth measuring rather than asserting because
+`enter_function` runs on every single call: one `uint32_t` load and a compare,
+folded into the branch that was already testing whether the JIT exists. The six
+benchmark workloads A/B'd against the same build without it on the same machine
+came back 44/51/216/30/82/25 ms before and 43/49/217/29/82/25 after -- inside
+the placement noise floor in "Two things that will lie to you about a change to
+the interpreter" in every row.
+
+What makes the test cheap enough to keep is `force_chain.env`: a small
+`DREAM_MAX_DEPTH` and a 200,000-link chain, which is comfortably past the
+roughly 16,000 links eight megabytes of stack allowed and finishes in a fraction
+of a second. Note that the crash was *not* catchable -- `try!` did not see it --
+which is why the e2e harness running every program under both tiers is the right
+place for it: what it asserts is that the two tiers agree, and a segfault on one
+side is the loudest possible disagreement.
 
 ### Measured, and not kept
 
@@ -555,17 +607,25 @@ So the order of work, most valuable first:
 `benchmark/benchmark/run.sh` runs the six workloads of `main.dr` against the
 transliteration of them in `bench.py`, best of `--repeat` runs each, and prints
 the ratio. On this machine, 2026-09-13, best of five against CPython 3.13 (below
-1.00x is Dream ahead; "was" is the same measurement taken before any of the work
-in this section):
+1.00x is Dream ahead; "was" is the same measurement before any of the work in
+this section, "pre-fusion" is after the JIT work and before deforestation):
 
-| workload | dream | python | ratio | was |
-|---|---|---|---|---|
-| `fib` | 39 ms | 209 ms | **0.19x** | 2.62x |
-| `collatz` | 231 ms | 707 ms | **0.33x** | 2.83x |
-| `pi` | 1321 ms | 226 ms | 5.8x | 6.55x |
-| `sum` | 4032 ms | 309 ms | 13.0x | 14.3x |
-| `mapfilter` | 390 ms | 30 ms | 13.1x | 14.8x |
-| `strbuild` | 77 ms | 0.94 ms | 82x | 72x |
+| workload | dream | python | ratio | pre-fusion | was |
+|---|---|---|---|---|---|
+| `sum` | 47 ms | 316 ms | **0.15x** | 13.0x | 14.3x |
+| `fib` | 40 ms | 207 ms | **0.19x** | 0.19x | 2.62x |
+| `collatz` | 205 ms | 687 ms | **0.30x** | 0.33x | 2.83x |
+| `mapfilter` | 22 ms | 30 ms | **0.75x** | 13.1x | 14.8x |
+| `pi` | 31 ms | 243 ms | **0.13x** | 5.8x | 6.55x |
+| `strbuild` | 73 ms | 1.0 ms | 70x | 82x | 72x |
+
+Four of the six are now ahead of CPython, and the two that are not are each
+behind for a reason that has nothing to do with lists. `pi` **is** fused -- it
+builds no list at all -- and is still 3.1x, because its loop is floating point:
+44% of what it allocates is boxed floats, so the JIT declines it (compiled code
+may not allocate) and a fused but interpreted loop is what is left. That is the
+"JIT that can allocate" bullet below, not a fusion gap. `strbuild` is a
+different algorithm on each side and always was.
 
 `strbuild` is the one that went the wrong way, and it is worth knowing why: it
 is the workload here whose data is *live* rather than garbage -- a 400,000-cell
@@ -577,13 +637,12 @@ should not be read as a runtime comparison at all, either way: `"hello " * n` in
 Python is a single C memcpy loop, and the Dream line beside it builds a
 400,000-element list and concatenates it. Same answer, different algorithm.
 
-The split is not six results, it is two. `fib` and `collatz` are recursion over
-numbers, the JIT compiles them, and Dream is three to five times faster than
-CPython. The other four fold over a list `list.range` builds one cell at a time,
-and there Dream is an order of magnitude behind. It is worth knowing exactly
-what that order of magnitude is made of, because the answer says what would have
-to change. Timing the same ten-million-element loop with one thing added at a
-time, per element:
+The decomposition that made the case for fusion is kept here because it is what
+predicted the result, and it predicted it closely. Before fusion the split was
+two, not six: `fib` and `collatz` were recursion over numbers that the JIT
+compiled, and the other four folded over a list `list.range` built one cell at a
+time, an order of magnitude behind. Timing the same ten-million-element loop
+with one thing added at a time, per element:
 
 | | ns | what the step adds |
 |---|---|---|
@@ -595,25 +654,36 @@ time, per element:
 So the lazy list is three fifths of it, and the interpreter is the rest. Neither
 is a constant factor anyone can tune away: producing one cons cell per element
 costs a frame, a cell and a suspension **because that is what the program says**,
-where `for x in range(...)` in CPython costs an increment in C. Closing it needs
-one of two things, and both are projects rather than edits:
+where `for x in range(...)` in CPython costs an increment in C. Closing it needed
+one of two things, and both were projects rather than edits:
 
-- **Deforestation**, in `dreams` -- the next section, and the one to do.
+- ~~**Deforestation**, in `dreams`~~ -- **done**, the next section. A fused
+  `sum` runs the top line of that table rather than the bottom one: 4.6 ns an
+  element instead of 420, which is the whole of the distance between 13.0x and
+  0.15x.
 - **A JIT that can allocate.** The tier's scope is "the strict numeric spine"
   and the reason is not ambition, it is the collector: a compiled frame keeps
   its slots in registers the collector cannot find or rewrite, which is what
-  `PinsTheHeap` says. So compiled code may not allocate, and a fold allocates
-  three objects an element. Giving compiled frames a stack map is what would
-  lift that, and it would lift the interpreter's 164 ns as well. It is the
-  larger and riskier of the two, and the one below does not need it.
+  `PinsTheHeap` says. So compiled code may not allocate, and until fusion
+  removed it, a fold allocated three objects an element. What a compiled loop
+  cannot do is *build* -- a list, a string, a map -- because building allocates
+  and allocating means the collector will eventually run under it. The plan
+  below is the response to this bullet, and it deliberately does **not** walk
+  the machine stack with stack maps: a compiled frame is already a root (the
+  interpreter put it on the value stack), so the move is to spill slots into
+  that frame at every point where the collector can run and read them back
+  after. That works with the concurrent collector and its helper threads, which
+  a stack-map walk of the running thread's stack would not.
 
-### The plan: deforestation
+### Deforestation
 
-**The claim.** `fold f acc (list.range 1 n)` builds ten million cons cells and
-throws each one away a step after building it. Removing the list removes three
-fifths of what the four slow workloads cost -- but that is not the interesting
-part. The interesting part is what the loop *becomes*, and it is the reason this
-is the plan rather than one more optimization:
+**What it does.** `fold f acc (list.range 1 n)` built ten million cons cells and
+threw each one away a step after building it. It no longer builds any: a
+pipeline of `std.list` combinators is recognised as one loop, and the loop is
+emitted as a global the JIT can take. `sum` went from 4032 ms to 47 ms and
+`mapfilter` from 390 ms to 22 ms, both from behind CPython to ahead of it.
+
+The saving is not the cells. It is what the loop *becomes*:
 
 ```
     fold (fn acc x -> acc + x) 0 (list.range 1 (n + 1))
@@ -622,87 +692,96 @@ is the plan rather than one more optimization:
 fused, with the literal lambda inlined into the loop it now controls, is
 
 ```
-    let rec loop i acc = if i > n { acc } else { loop (i + 1) (acc + i) };
+    let rec loop i hi acc = if i >= hi { acc } else { loop (i + 1) hi (acc + i) };
 ```
 
-and that is a strict numeric tail loop -- which the JIT already compiles, and
-which already runs at **4.6 ns an element against CPython's ~31**. So the route
-from 13x behind to ahead is not "make the list cheaper". It is "produce no list,
-and hand the JIT something it can already take". Every piece but the fusion pass
-exists: the measurement of the loop at 4.6 ns is line 1 of the decomposition
-above, taken on this machine with this VM.
+a strict numeric tail loop, which is exactly what the JIT compiles. So the route
+from 13x behind to ahead was never "make the list cheaper" but "produce no list,
+and hand the JIT something it can already take" -- 4.6 ns an element instead of
+420. A fused pipeline reports `list 0%` under `--stats` and `1 functions
+compiled`; that pair is the check that it worked, and it is worth making, because
+fusing without reaching the JIT is only a 2x.
 
-**Two ways to do it, and which one first.**
+**Where it lives.** Three files. [dreams/fuse.dr](dreams/fuse.dr) is the
+vocabulary -- which member plays which role, the shape of the plan, and the
+syntactic rules. [dreams/scope.dr](dreams/scope.dr) decides *whether*, because
+only a resolved name can say that the `range` in front of you really is
+`std.list`'s and not a parameter, a shadow or another module's; the question
+becomes "is this the global index `std.list` gave `range`?", which has one
+answer. [dreams/lower.dr](dreams/lower.dr) builds the loop, beside the wrapper
+rewriting it resembles.
 
-*Shortcut fusion* (`foldr`/`build`, as Haskell does it) is the general answer:
-write every producer as `build`, every consumer as a `foldr`, and let one
-rewrite rule cancel them. It fuses any producer with any consumer, and it costs
-a rewrite-rule mechanism in the compiler plus a rewrite of `mind/std/list.dr`
-into a shape nobody reading it would recognise. It is also poor at exactly what
-this codebase does most -- left folds and `zip`.
+**What it covers.** Sources `range` and `replicate`; steps `map` and `filter`;
+sinks `fold`, `fold_strict`, `sum` and `product`. Everything the original plan
+listed beyond that -- `from`, `repeat`, `take`, `zip`, `length`, `any` -- is
+*not* implemented, and a member whose loop is not written simply does not fuse:
+the call it always compiled to still works. Adding one means writing its loop by
+hand in `lower`, which is the price of not having a `build`/`foldr` mechanism.
 
-*A pass over the known combinators* is the first cut: recognise a pipeline of
-saturated calls to `std.list` members and emit one loop.
-
-| role | members |
-|---|---|
-| source | `range`, `replicate`, `from`, `repeat`, a list literal |
-| step | `map`, `filter`, `take`, `drop`, `take_while`, `enumerate`, `zip` |
-| sink | `fold`, `fold_strict`, `length`, `any`, `all`, `contains`, `count`, `sum`, `product`, `minimum`, `maximum` |
-
-`mapfilter` is source + two steps + sink and is the shape this is for. No
-library change, no new mechanism, and it covers every workload measured above.
-
-**Where it goes.** After `scope`, because the pass must know that the `range` it
-is looking at really is `std.list`'s and has not been shadowed or rebound --
-that is a question only a resolved name answers. And in `lower`, beside the
-wrapper rewriting, which is already this kind of pass: `scope` records a fact
-about a global and `lower` rewrites saturated calls in light of it (see
-"wrappers" in [dreams/scope.dr](dreams/scope.dr) and
-[dreams/lower.dr](dreams/lower.dr)).
+Shortcut fusion (`foldr`/`build`, as Haskell does it) remains the general
+answer if this ever needs to fuse arbitrary producers with arbitrary consumers.
+It was not taken: it costs a rewrite-rule mechanism plus a rewrite of
+[mind/std/list.dr](mind/std/list.dr) into a shape nobody reading it would
+recognise, and it is poor at exactly what this codebase does most -- left folds
+and `zip`.
 
 **What makes it sound**, which in a lazy language is most of the work:
 
-- **The list must not be named.** Fusion applies only where the producer's
-  result is written directly as the consumer's argument. `let xs = range 1 n;`
-  followed by two uses of `xs` is a *shared* list, and fusing it would build it
-  twice -- turning one traversal into two, and a finite memory cost into an
-  unbounded recomputation. One syntactic use, no binding, or no fusion.
+- **The list must be read exactly once.** This is the rule that took two goes.
+  It was first written as "the list must not be named" -- fuse only where the
+  producer is written directly as the consumer's argument -- and that refused
+  the shape the pass was built for, because `mapfilter` names its stages:
+  `let squares = ..; let odds = ..; fold .. odds`. The reason behind the rule is
+  sharing, and sharing needs *two* reads. A binding read once is nobody else's
+  list, so its body is written where it is read and the pipeline fuses. See "a
+  stage that was given a name" in [dreams/fuse.dr](dreams/fuse.dr). Moving one
+  is only sound with all four of: read once in the whole block, that read below
+  the binding, that read in the same frame, and nothing the body names rebound
+  in between. Three of those four were found by a test failing, and they are in
+  `dream/tests/programs/fusion.dr` so they stay found.
+- **An impure `let` is a statement, not a binding.** A pure `let` is lazy: it is
+  not evaluated where it is written, so writing it elsewhere changes nothing. An
+  impure one is forced in the order the block gives. `dreams` writes a payload
+  as `let copied = list.fold_strict (fn ok p -> ok && copy_payload! handle ..)
+  ..; io.close! handle`, and moving that binding put every write *after* the
+  close -- which the runtime answered with `:io_closed`, in the one e2e test
+  that builds a payload. Purity is spelling in this language, so the guard is
+  one `is_impure_name` over the body.
 - **Fuse the spine, not the elements.** `map f xs` suspends `f x`; the fused
-  loop must still build that thunk where the original did, unless the sink
-  forces it. Fusing the spine is where all the saving is anyway -- the cell, the
-  tail thunk and the producer's frame -- and leaving the elements alone means
-  the rule needs no strictness analysis and cannot change what raises.
-- **The order and the count of effects must not move.** A fused loop runs the
-  producer's step exactly when the consumer asks for the next cell, which is the
-  order it ran in before. Say it as a rule and check it: the fused form must
-  force the same things, in the same order, the same number of times.
-- **An infinite source must stay infinite.** `from` and `repeat` fuse only with
-  a sink or step that stops -- `take`, `take_while`, `any`, `contains`. A fused
-  `fold` over an infinite source must still diverge, which it does naturally,
-  but `take 5 (from 0)` must not become a loop that runs first and takes after.
-- **A sink that the JIT can then take is the point**, so the emitted loop wants
-  to be a self tail call with every parameter forced on every path -- which is
-  the JIT's own admission test (`Analyzer::run`). Inlining a *literal* lambda
-  argument into the loop is what makes that true rather than nearly true; a
-  lambda passed by name is a closure parameter, which is not forced, and the
-  loop stays interpreted. Inlining a literal is the cheaper half and should come
-  with the pass rather than after it.
+  loop still builds that thunk where the original did. Fusing the spine is where
+  the saving is anyway -- the cell, the tail thunk and the producer's frame --
+  and leaving the elements alone means the rule needs no strictness analysis and
+  cannot change what raises.
+- **The order and count of effects must not move.** A fold whose function
+  performs an effect is not fused at all: a fused loop is a global whose name is
+  pure, and the machine would stop sequencing it.
+- **A fold that was lazy in its accumulator stays lazy.** `fold` and
+  `fold_strict` fuse to the same loop with one difference, and the seed of an
+  empty source is handed back unforced.
+- **The loop has to reach the JIT**, which is the point. It is emitted as a
+  global -- the only callee the JIT recognises as a self call -- with three
+  parameters and no captures, so that a `range`'s limit is an argument rather
+  than a frame the JIT would have to keep. A fold's function must be a lambda
+  written at the call site, because it is inlined; passed by name it would be a
+  closure call in the loop body, and a loop that calls a closure is a loop the
+  JIT declines.
 
-**How to know it worked.** `--stats` should say `list 0%` for a fused pipeline
-and the `frame` share should fall with it; `DREAM_PROBE_THUNK=1` should show the
-`apply` suspensions that were `range`'s tails gone; `benchmark/benchmark/run.sh`
-should move `sum`, `pi` and `mapfilter` and leave `fib` and `collatz` alone. The
-corpus and the tests are the correctness check, and the bootstrap is the
-sharpest of them -- a compiler that fuses will compile *itself* differently, so
-`just bootstrap` has to reach a fixpoint again and the seed has to move with it.
+**What it did not reach.** This used to say `pi`. `pi` fuses *and* compiles now:
+loops that fuse no longer allocate per element, so the remaining row was a loop
+whose *values* were floating point, and `float-unboxin` unboxed the accumulator
+-- the last box a fused float loop made was the one it carried across a yield,
+once per slice rather than once per element. The honest boundary left is loops
+whose values are **objects** -- a list builder, a string fold, a map fold --
+because compiled code may not allocate. That is the plan below, not a fusion gap.
 
-**What it is worth, honestly.** Removing the list takes `sum` from ~420 ns an
-element to ~210, which is 4.1 s to ~2.0 s against CPython's 0.31 s: **necessary
-and not sufficient.** The rest of the distance is the second bullet above --
-the fused loop has to reach the JIT. Fusion that stops short of a
-JIT-compilable loop is a 2x; fusion that reaches one is a win. Build it with
-that as the target and measure it that way.
+Nothing more in `dreams` will move those; they want the JIT work under "A JIT
+that can allocate" above.
+
+**When changing it**, the bootstrap is the sharpest test there is: a compiler
+that fuses compiles *itself* differently, so `just bootstrap` has to reach a
+fixpoint again and the seed has to move with it. Build the seed with the
+relative `-L` paths the recipe uses -- an image records them, so an absolute
+path bakes your home directory into the checked-in seed.
 
 Judge any change by more than one workload, and read the two traps below first:
 on this machine `fib` alone cannot tell a 3% change from where the code landed.
@@ -715,6 +794,154 @@ with each other, which is the check that matters.
 
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
+
+### A JIT that can allocate -- the plan
+
+*The plan below was drafted by an AI coding assistant (2026-09-13), not by the
+human author of these notes. It is a proposal, not a record: update it as the
+work changes it, the way every other section here records what was learnt.*
+
+**The shape of the problem, measured.** A compiled frame is already a root: the
+interpreter pushes the frame object on the value stack and passes it into
+`CompiledFn`, and the collector finds it and rewrites it. What makes compiled
+code unsafe is that its live values live in LLVM allocas (registers), *not in
+that frame*. So a collection underneath a compiled frame loses whatever the
+frame's canonical copy no longer agrees with -- which is why the four runtime
+helpers pin the heap. (The draft also said the tier "refuses every function that
+allocates". That is not what the tier checks and not why those functions are
+refused; see the second correction below.) The
+route chosen here: make something the collector rewrites the source of truth at
+every point where the collector can run -- **root the live slots before a
+collect-capable helper, read them back after** -- and de-pin the helpers. No
+machine-stack walking, which is what keeps this sound with the concurrent
+collector's helper threads: they never see the process's stack, but they never
+need to, because the roots are the process's own. The draft of this said "spill
+into the frame", and that is wrong for a recursing function -- see the first
+correction under that stage below, which is the single most useful thing in
+this section.
+
+**What the goal concretely is.** Let the JIT compile self-recursive loops whose
+values are objects: forward list builders (`list.replicate`, manual `upto`-style
+recursions), string-concat folds, map-building folds. `pi` is not the driver any
+more -- see the table and "What it did not reach" above; it is already compiled.
+The work is all in `dream/src`; there is no compiler change, so no bootstrap
+moves.
+
+**The draft of it in stages**, with one caveat about their order. The two
+corrections below say that the de-pinning stage is not a prerequisite for the
+widening stage, and the two together say something about sequence: done in the
+drafted order, de-pinning lands machinery that no workload exercises, because
+the tier as it stands is numeric and the forces it makes are shallow. There is
+nothing to measure it with until the tier is wider, and "what each stage has to
+prove" cannot be satisfied for it in isolation. Widening first gives de-pinning
+a workload to be judged by.
+
+- ~~**Fix the known compiled-force SIGSEGV first.**~~ **Done** (2026-09-13). A
+  `force_nest` counter on the process, incremented at the top of `force_whnf`,
+  and `enter_function` declining the compiled tier past
+  `kMaxForceNestForCompiled`. Same shape and trigger as the `JitTooDeep` deopt.
+  It was right that this had to come first, and for the reason given: every
+  stage after it sends more nested forces out through the runtime. See "Fixed:
+  compiled code forcing a long thunk chain crashed" above, and
+  `dream/tests/programs/force_chain.dr`, which is the tier-agreement test that
+  holds it.
+- **Spill/reload and de-pin.** Before each call to `dream_rt_force/arith/
+  compare/arith_f`, root every live slot somewhere the collector rewrites;
+  after the call returns, read them back, because a mid-call collection moved
+  objects. Then the helpers stop pinning. **Two corrections to this stage, both
+  found by reading the emitter rather than by writing any of it, and both of
+  which would have cost a day each to find the other way:**
+
+  - **The frame cannot be the spill target for a recursing function.** This is
+    the one that matters. In the recursive shape (`Emitter::emit_body`) the
+    frame is *not* per-invocation: `recursive_call` passes the same `frame_`
+    argument down at every depth, because the whole point of that shape is that
+    a self call allocates nothing and the only frame in the picture is the one
+    the interpreter made for the outermost call. So a depth-N invocation
+    spilling its slots into that frame overwrites the depth-0 loop-carried
+    state, and the `emit_yield` that reads it back at depth 0 resumes the
+    iteration with the wrong values. Spilling to the frame is sound only in the
+    loop shape (`emit_loop`), where there is exactly one invocation. What the
+    recursive shape wants is a *stack*, and there is already one the collector
+    rewrites: `p.pins` (see `Pin` in [dream/src/interp.hpp](dream/src/interp.hpp)),
+    which is precisely the mechanism a C++ frame uses to hold a `Value` across a
+    force. Push the live slots, call, read back, pop. That also covers the case
+    the frame never could: an intermediate LLVM temporary -- the left operand of
+    `a + b` while the right is being forced -- which is live in a register and
+    has no slot to be spilled into at all.
+  - **Nothing here is a prerequisite for allocating.** The stage below reads as
+    if de-pinning were what unlocks it. It is not. Allocation never collects: a
+    collection runs only at a safepoint, and there are exactly two
+    (`run_process`'s and `force_whnf`'s, the latter gated on `force_pins == 0`),
+    neither of which an allocation passes through. `dream_rt_float` already
+    allocates from compiled code for this reason and says so. What the pinning
+    actually buys is that a collection cannot happen *underneath* a compiled
+    frame while its values are in registers -- and de-pinning is what a compiled
+    loop needs before it can force a long lazy structure without the nursery
+    growing for the whole walk, which is the `strict!` failure in "Making it
+    faster" a size away. So this stage is about memory under nested forcing, not
+    about permission to allocate, and the stage below does not have to wait for
+    it.
+
+- **Admit object-allocating self-recursion.** The draft read as though this
+  were a widening of `op_is_supported`. It is not, and the gate that actually
+  refuses a list builder is worth knowing before any of it is written.
+
+  Take the shape the stage is for:
+
+  ```
+  let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (core.cons i acc) };
+  ```
+
+  Three separate things are true about it, and only the third is the blocker:
+
+  - There is no `Op::Cons`. A list literal is `Op::MakeList`; a prepend is the
+    `core.cons` **native**. So the list case is not an opcode at all, it is the
+    old draft's third bullet, "natives compiled code calls".
+  - `core.cons` is the easiest native in the table to admit: strict mask `0b0`,
+    and a body that is one `make_cons` (`list_cons` in
+    [dream/src/builtins.cpp](dream/src/builtins.cpp)). It forces nothing, raises
+    nothing and allocates -- which, per the correction above, compiled code is
+    already allowed to do.
+  - **`Analyzer::run` refuses the function, and would still refuse it with
+    `core.cons` admitted.** Every parameter must be forced on every path, and
+    `acc` is not: `strict_of` of the `if` is the condition's `{i, n}` union the
+    *intersection* of the two arms, the `then` arm gives `{acc}`, the `else` arm
+    gives `{i, n}` because a native contributes only what its strict mask
+    claims and cons's claims nothing -- so the intersection is empty and `acc`
+    never joins the set. Measured rather than argued: compiling the loop above
+    beside a numeric one and running it under `--stats` reports `1 functions
+    compiled`, and the one is the numeric loop.
+
+  So the stage is a change to the tier's *soundness argument*, not to a table.
+  The rule "every parameter is forced on every path" is what licenses compiling
+  a self tail call by evaluating its argument expressions eagerly. What a list
+  builder needs is the weaker licence: a parameter may be non-strict provided
+  every self-call argument in that position is *eagerly safe* -- cannot raise,
+  diverge, or perform an effect -- which `core.cons i acc` is, because it builds
+  a cell around two values it does not look at. Both halves have to move
+  together with `load_slot`, which today *forces* every slot it reads: that is
+  exactly what must not happen to a lazy cons's argument, so an unforced read is
+  needed beside it -- and `strict_of` counting a slot read as a force is only
+  true *because* `load_slot` forces. Change one without the other and the
+  strictness claim the whole tier rests on quietly stops being true.
+
+  What bounds the nursery once this lands is the yield: a compiled loop spends
+  its slice and returns to the interpreter, which collects at its safepoint, so
+  a loop that allocates per iteration allocates for one slice and no more.
+- **Generalize the callable set only if measurement justifies it.** The claim
+  "call any host native exactly as the interpreter enters it, with the compiled
+  caller's slots spilled" inherits the interpreter's safety per native, so the
+  vetting can shrink from an allowlist to a property. Declined until the staged
+  version is on the floor and its numbers are in.
+
+**What each stage has to prove.** A repeated `pi` row that does not move (a
+regression there is a spill paid on the hot path instead of only at true
+boundaries); new rows for list builder, string fold and map fold, judged
+JIT-on against JIT-off (the placement-noise floor applies); equivalence between
+the tiers under `just test-all` (heap-verified run plus fuzzer) for the new
+`consbuild`, `strfold` and `mapfold` cases; and -- done -- the long-thunk-chain
+repro raising `:stack_overflow` byte-identically with and without `--no-jit`.
 
 ## Large data in an image
 

@@ -316,6 +316,22 @@ Obj* Heap::alloc_bare(ObjType type, size_t extra) {
     // scan when the fills are done. The young objects it is filled with can
     // wait for that scan; a helper would have skipped them anyway, because
     // young objects are precisely what a concurrent mark leaves to the final.
+    //
+    // With no mark running the same object has the same problem for a simpler
+    // reason: it is born *old*, and what its caller fills it with is young.
+    // That is an old-to-young edge made by no store the barrier ever sees --
+    // `make_array` hands back an array and the caller writes the elements
+    // straight into it -- so the next minor collection would not scan the
+    // array, and the elements it cannot see are elements it frees. A 3000-cell
+    // array of unforced thunks loses every one of them, and what the program
+    // gets back is whatever the nursery has since put there.
+    //
+    // So an object born old is remembered at birth. One entry covers the whole
+    // object however many slots it has, it is paid only by allocations over
+    // `kMaxClassSize` -- which tenure precisely because they are rare -- and it
+    // is what makes filling one safe without a barrier at every fill site.
+    // Nothing can collect between the allocation and the fill: a collection
+    // runs only at a safepoint, and there is none inside a reduction.
     by_type_[size_t(type) & 31] += sz;
     o->type = type;
     o->aux = 0;
@@ -325,6 +341,7 @@ Obj* Heap::alloc_bare(ObjType type, size_t extra) {
         mark_born_.push_back(o);
     } else {
         std::atomic_ref<uint8_t>(o->gc).store(gen, std::memory_order_relaxed);
+        if (gen == GC_OLD) remembered_.push_back(o);
     }
     total_allocated_ += sz;
     return o;
@@ -1814,8 +1831,15 @@ struct VerifyWalk {
     bool check_object(Value v, Value parent) {
         Obj* o = as_obj(v);
         if (no_young && (o->gc & GC_YOUNG)) {
+            std::string via = "root";
+            if (is_ptr(parent)) {
+                Obj* pp = as_obj(parent);
+                via = addr(pp) + " type " + std::to_string(static_cast<int>(pp->type)) +
+                      " gc " + std::to_string(static_cast<int>(pp->gc));
+            }
             return problem("a minor collection left a young object reachable at " +
-                           addr(o));
+                           addr(o) + " type " + std::to_string(static_cast<int>(o->type)) +
+                           " (reached from " + via + ")");
         }
         if (reinterpret_cast<uintptr_t>(o) % 8 != 0) {
             return problem("object at " + addr(o) + " is not 8-byte aligned");

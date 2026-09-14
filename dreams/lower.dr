@@ -25,6 +25,7 @@ import dreams.ast;
 import dreams.builtins;
 import dreams.diag;
 import dreams.emit;
+import dreams.fuse;
 import dreams.ir;
 import dreams.modules;
 import std.vm;
@@ -44,7 +45,11 @@ let lowering r p source =
        // Compile-time expressions waiting to be evaluated: `[node, function]`.
        // The node is a placeholder that whatever the function comes to will
        // overwrite, once the program has been built and can be run.
-       :pending_comp => [] };
+       :pending_comp => [],
+       // Slots that are read but never written, and the expression each one
+       // stands for. Only ever non-empty while a fused loop's body is being
+       // emitted -- see "deforestation" below.
+       :subst => core.map_new () };
 
 let res l    = core.map_get l :r ();
 let prog l   = core.map_get l :prog ir.program;
@@ -62,6 +67,9 @@ let set_ctx i l = core.map_put l :ctx i;
 
 let func_bodies l = core.map_get l :func_bodies (core.map_new ());
 let set_func_body fi n l = core.map_put l :func_bodies (core.map_put (func_bodies l) fi n);
+
+let subst l = core.map_get l :subst (core.map_new ());
+let set_subst m l = core.map_put l :subst m;
 
 let pending_comp l = core.map_get l :pending_comp [];
 let add_comp node fi l = core.map_put l :pending_comp (list.append (pending_comp l) [[node, fi]]);
@@ -140,6 +148,27 @@ let emit_apply callee args l = {
         }
         else { inherited };
     [sequenced, i]
+};
+
+/// An ordinary call: a saturated call of a wrapper is the call it stands for.
+/// See "wrappers" in `scope` -- the rewrite removes a frame that bound nothing
+/// but the arguments the inner call was going to get.
+let lower_apply callee args span l = {
+    let found = callee_resolution callee l;
+    match unwrap found args 8 l {
+        // ..and a wrapper around a `get` or a `set` is that operation.
+        [[:op, kind], actual] => lower_expr (op_expr kind actual span) l,
+        [target, actual] => {
+            let f = emit_target target l;
+            let done = lower_all actual (list.head f);
+            emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
+        },
+        _ => {
+            let f = lower_callee callee found l;
+            let done = lower_all args (list.head f);
+            emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
+        },
+    }
 };
 
 let builtin_ref name l =
@@ -298,6 +327,20 @@ let lower_resolved name found span l = {
 
 let emit_name span l = emit_resolution (lookup span l) l;
 
+/// A local, or -- when nothing ever writes that slot -- the expression it
+/// stands for, lowered here. The slot is taken out of the substitution while
+/// its own expression is lowered, so a table that somehow named itself would
+/// stop rather than spin; nothing builds one, and a compiler must terminate on
+/// a program that will not run.
+let emit_local slot l =
+    match core.map_get (subst l) slot () {
+        () => emit (ir.node :local slot ir.no_node ir.no_node) l,
+        e  => {
+            let got = lower_expr e (set_subst (core.map_remove (subst l) slot) l);
+            [set_subst (subst l) (list.head got), list.nth 1 got]
+        },
+    };
+
 /// A recorded resolution, or -- when there is none -- whatever `emit_resolution`
 /// makes of that, which is the same unit placeholder it always was.
 let emit_resolution_or found span l = emit_resolution found l;
@@ -306,7 +349,7 @@ let emit_resolution_or found span l = emit_resolution found l;
 /// because a wrapper's call site emits a resolution it did not read off a name.
 let emit_resolution found l =
     match found {
-        [:local, slot, _]   => emit (ir.node :local slot ir.no_node ir.no_node) l,
+        [:local, slot, _]   => emit_local slot l,
         [:capture, idx, _]  => emit (ir.node :capture idx ir.no_node ir.no_node) l,
         [:global, _, _, g]  => emit (ir.node :global g ir.no_node ir.no_node) l,
         [:builtin, name]    => builtin_ref name l,
@@ -340,29 +383,25 @@ let rec lower_expr e l =
         [:atom, n, _]  => const_atom n l,
         [:unit, _]     => emit_leaf :unit l,
 
-        [:name, n, span] => lower_name n span l,
+        // A name `scope` staged stands for the stage that was bound to it and
+        // read here once. The `let` that bound it is gone from the block
+        // below, so this is the only place the body is written -- which is the
+        // whole of what staging does when the pipeline turns out not to fuse.
+        [:name, n, span] =>
+            match scope.staging (res l) (ctx l) (source l) span {
+                [:body, body] => lower_expr body l,
+                _ => lower_name n span l,
+            },
         [:field, _, _, span] => lower_field e span l,
 
-        [:apply, callee, args, span] => {
-            let found = callee_resolution callee l;
-            // A saturated call of a wrapper is the call it stands for. See
-            // "wrappers" in `scope`: the rewrite removes a frame that bound
-            // nothing but the arguments the inner call was going to get.
-            match unwrap found args 8 l {
-                // ..and a wrapper around a `get` or a `set` is that operation.
-                [[:op, kind], actual] => lower_expr (op_expr kind actual span) l,
-                [target, actual] => {
-                    let f = emit_target target l;
-                    let done = lower_all actual (list.head f);
-                    emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
-                },
-                _ => {
-                    let f = lower_callee callee found l;
-                    let done = lower_all args (list.head f);
-                    emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
-                },
-            }
-        },
+        // A pipeline `scope` decided to fuse is a loop and a call of it, and
+        // neither the producer nor the consumer is called at all. Asked first,
+        // because everything below is about a call that still happens.
+        [:apply, callee, args, span] =>
+            match scope.fusion (res l) (ctx l) (source l) span {
+                () => lower_apply callee args span l,
+                p  => lower_fused p l,
+            },
 
         // `x |> f a` is folded into the single call `f a x` rather than a call
         // of a call. That is what lets a variadic host function take everything
@@ -583,6 +622,12 @@ let rec lower_block stmts span l = {
     // from, which is what a warning about a discarded value points at.
     let done = list.fold (fn acc st ->
         match st {
+            // A `let` whose body was written where it is read binds nothing and
+            // lowers to nothing. It contributes no node, so it is not a
+            // statement whose value could be discarded either.
+            [:let, _, _, _, _, sp] if scope.staging (res l) (ctx l) (source l) sp == :elided =>
+                acc,
+
             [:let, n, ps, body, _, sp] => {
                 let value =
                     if list.is_empty ps { lower_expr body (list.head acc) }
@@ -653,6 +698,172 @@ let bind_value slot value l = {
         [set_flag value ir.f_strict (set_flag i ir.f_strict inherited), i]
     }
     else { [inherited, i] }
+};
+
+// --- deforestation ----------------------------------------------------------------
+//
+// `scope` decided that a pipeline of `std.list` combinators is one loop, gave
+// that loop a function and a global, and resolved the fold's function inside
+// it. What is left is to write the loop out.
+//
+// Every fused loop has the same shape, whichever source it came from:
+//
+//     let rec loop cursor carried acc =
+//         if <done> { acc } else { loop <next> carried <step> };
+//
+// `range` counts the cursor up and carries its limit; `replicate` counts it
+// down and carries the element. Three parameters and no captures, because the
+// JIT compiles a function of its arguments and a capture is a frame it would
+// have to keep -- and a global callee is the only self call it recognises at
+// all (`check_self_call` in dream/src/jit.cpp).
+
+let local_node slot l = emit (ir.node :local slot ir.no_node ir.no_node) l;
+
+/// The call that enters the loop: the producer's arguments, in the order they
+/// were written, and then the seed. They are lowered here, in the frame the
+/// pipeline was written in, which is where they were always going to be
+/// evaluated -- and so with whatever substitution was already in force, which
+/// is how a pipeline written inside another one's stage still works.
+let lower_fused p l = {
+    let outer = subst l;
+    let built = set_subst outer (fused_body p (set_subst (subst_of p) l));
+    let inits = lower_all (list.nth 1 (fuse.plan_source p)) built;
+    let seeded =
+        match fuse.plan_seed p {
+            [:expr, e] => lower_expr e (list.head inits),
+            [:int, v]  => const_int v (list.head inits),
+            _          => emit_leaf :unit (list.head inits),
+        };
+    let callee = emit (ir.node :global (fuse.plan_gi p) ir.no_node ir.no_node)
+                      (list.head seeded);
+    emit_apply (list.nth 1 callee)
+               (list.append (list.nth 1 inits) [list.nth 1 seeded])
+               (list.head callee)
+};
+
+let subst_of p =
+    list.fold (fn m e -> core.map_put m (list.nth 0 e) (list.nth 1 e))
+              (core.map_new ()) (fuse.plan_subst p);
+
+/// The loop itself, emitted into the same arena as everything else -- a
+/// function is a body node and a descriptor, not an arena of its own.
+let fused_body p l = {
+    let stag = list.nth 0 (fuse.plan_source p);
+    let replicating = stag == :replicate;
+
+    // Done: `range` stops at its limit, `replicate` when there is nothing left
+    // to repeat. Both are the condition the combinator itself tests, said
+    // about a counter instead of about a list.
+    let cur0 = local_node fuse.cursor_slot l;
+    let done =
+        if replicating {
+            let zero = const_int 0 (list.head cur0);
+            binary :le (list.nth 1 cur0) (list.nth 1 zero) (list.head zero)
+        }
+        else {
+            let limit = local_node fuse.carried_slot (list.head cur0);
+            binary :ge (list.nth 1 cur0) (list.nth 1 limit) (list.head limit)
+        };
+
+    let answer = local_node fuse.acc_slot (list.head done);
+
+    // The turn that takes this element, and -- when a `filter` says it might
+    // not be taken -- the turn that leaves the accumulator alone.
+    let taken = self_turn p replicating (fn l0 -> fused_step p l0) (list.head answer);
+    let advanced =
+        match fuse.plan_guards p {
+            [] => taken,
+            gs => {
+                let cond = lower_guards gs (list.head taken);
+                let skipped = self_turn p replicating (fn l0 -> local_node fuse.acc_slot l0)
+                                        (list.head cond);
+                let made = emit (ir.node :if (list.nth 1 cond) (list.nth 1 taken)
+                                         (list.nth 1 skipped))
+                                (list.head skipped);
+                [set_flag (list.nth 1 cond) ir.f_strict
+                    (inherit (list.nth 1 made)
+                             [list.nth 1 cond, list.nth 1 taken, list.nth 1 skipped]
+                             (list.head made)),
+                 list.nth 1 made]
+            },
+        };
+    let otherwise =
+        if fuse.plan_strict p { forced_acc (list.nth 1 advanced) (list.head advanced) }
+        else { advanced };
+
+    let made = emit (ir.node :if (list.nth 1 done) (list.nth 1 answer) (list.nth 1 otherwise))
+                    (list.head otherwise);
+    let i = list.nth 1 made;
+    let settled =
+        set_flag (list.nth 1 done) ir.f_strict
+            (inherit i [list.nth 1 done, list.nth 1 answer, list.nth 1 otherwise]
+                     (list.head made));
+    set_func_body (fuse.plan_fi p) i (mark_tail i settled)
+};
+
+/// One turn of the loop: the cursor moved on, whatever the source carries
+/// passed through untouched, and whatever accumulator the caller asks for.
+///
+/// Emitted fresh every time it is wanted, rather than built once and pointed
+/// at twice. The arena is a tree -- a node reached from two parents would be
+/// walked twice by everything that reads it, and would take a flag meant for
+/// one of them in both places.
+let self_turn p replicating acc_at l = {
+    let cur = local_node fuse.cursor_slot l;
+    let one = const_int 1 (list.head cur);
+    let advanced = binary (if replicating { :sub } else { :add })
+                          (list.nth 1 cur) (list.nth 1 one) (list.head one);
+    let carried = local_node fuse.carried_slot (list.head advanced);
+    let acc = acc_at (list.head carried);
+    let callee = emit (ir.node :global (fuse.plan_gi p) ir.no_node ir.no_node)
+                      (list.head acc);
+    emit_apply (list.nth 1 callee)
+               [list.nth 1 advanced, list.nth 1 carried, list.nth 1 acc]
+               (list.head callee)
+};
+
+/// The `filter`s, as one condition. `and` is short-circuiting, which is what
+/// keeps the order right: an element the first filter rejects never reaches
+/// the second, exactly as it never reached the second `filter`'s call.
+let lower_guards gs l =
+    list.fold (fn acc g -> {
+        let got = lower_expr g (list.head acc);
+        match list.nth 1 acc {
+            () => [list.head got, list.nth 1 got],
+            prev => binary :and prev (list.nth 1 got) (list.head got),
+        }
+    }) [l, ()] gs;
+
+/// What the accumulator becomes: the fold's own function, whose parameters
+/// `scope` bound to these very slots, or the operator `sum` and `product`
+/// stand for.
+let fused_step p l =
+    match fuse.plan_step p {
+        [:ast, body] => lower_expr body l,
+        [:op, op] => {
+            let a = local_node fuse.acc_slot l;
+            let x = emit_local (fuse.plan_elem p) (list.head a);
+            binary (if op == :mul { :mul } else { :add })
+                   (list.nth 1 a) (list.nth 1 x) (list.head x)
+        },
+        _ => emit_leaf :unit l,
+    };
+
+/// `fold_strict`, which forces each step before taking the next.
+///
+/// It forces the accumulator at the *top* of the following iteration rather
+/// than at the bottom of this one, which comes to the same thing -- the chain
+/// of suspensions never gets past one link either way -- and is the only way
+/// to say it that the JIT can still take. A `let` would need a slot the frame
+/// holds, and a compiled frame's slots are registers; a statement is just a
+/// statement, and one marked strict is run where it stands.
+let forced_acc call l = {
+    let acc = local_node fuse.acc_slot l;
+    let forced = emit (ir.node :force (list.nth 1 acc) ir.no_node ir.no_node) (list.head acc);
+    let marked = set_flag (list.nth 1 forced) ir.f_strict (list.head forced);
+    let placed = kids [list.nth 1 forced, call] marked;
+    let made = emit (ir.node :block (list.nth 1 placed) 2 ir.no_node) (list.head placed);
+    [inherit (list.nth 1 made) [list.nth 1 forced, call] (list.head made), list.nth 1 made]
 };
 
 // --- patterns ---------------------------------------------------------------------

@@ -19,6 +19,18 @@ namespace {
 
 inline const Image& img_of(Process& p) { return *p.code; }
 
+/// A nested `force_whnf` loop is in progress on this process's machine stack.
+/// See `Process::force_nest` and `kMaxForceNestForCompiled`: the depth is what
+/// `enter_function` reads before offering the compiled tier, because each link
+/// of a lazy chain a *compiled* body forces is a C++ frame.
+struct ForceNest {
+    Process& p;
+    explicit ForceNest(Process& proc) : p(proc) { ++p.force_nest; }
+    ~ForceNest() { --p.force_nest; }
+    ForceNest(const ForceNest&) = delete;
+    ForceNest& operator=(const ForceNest&) = delete;
+};
+
 inline void eval_node(Process& p, uint32_t node, Value frame) {
     p.mode = Mode::Eval;
     p.node = node;
@@ -272,10 +284,31 @@ inline uint32_t native_strict_mask(Value callee) {
     return static_cast<NativeObj*>(as_obj(callee))->strict_mask;
 }
 
+/// The depth of nested `force_whnf` loops past which `enter_function` stops
+/// offering the compiled tier. See `Process::force_nest`: interpreted code
+/// nests forces only as deep as natives on the same C++ chain actually sit one
+/// inside another (a `strict!` over nested natives, tens at most), while a
+/// *compiled* chain of lazy links spends one C++ frame per link and would blow
+/// the machine stack long before `DREAM_MAX_DEPTH`. Small enough to keep the
+/// interpreter in charge of anything pathological, large enough that every
+/// healthy program nests well under it.
+constexpr uint32_t kMaxForceNestForCompiled = 256;
+
 /// Enter a function body, taking the compiled tier when one is available.
 void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value frame) {
     Jit* jit = p.runtime().jit();
-    if (jit) {
+    // When a nested force is already deep on the process's machine stack, the
+    // compiled tier is not offered at all. A compiled body forces a slot by
+    // *calling*, so a chain of lazy links under a force is a C++ frame per link
+    // -- one compiled body, one `dream_rt_force`, one `force_whnf` -- and a
+    // long enough chain overflows the machine stack before `DREAM_MAX_DEPTH` is
+    // anywhere in sight. The interpreter makes those frames on the heap and can
+    // reach its limit, so it takes the chain over. Interpreted code never nests
+    // this deep (each of its forces returns before the next), which is what
+    // lets a small bound here be free for every healthy program. See
+    // `Process::force_nest`, `dream/tests/programs/force_chain.dr`, and "Fixed:
+    // compiled code forcing a long thunk chain crashed" in CLAUDE.md.
+    if (jit && p.force_nest <= kMaxForceNestForCompiled) {
         // One inlined, lock-free read of the tier table (see `Jit::tier`), so
         // a process whose functions never grow hot -- most of a compile --
         // pays a load and a branch for the JIT being present.
@@ -321,6 +354,18 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
                 // re-enter the compiled tier at every level and do it again
                 // per level. One store here is what keeps the fallback linear.
                 jit->deoptimize(func_index);
+                eval_node(p, f.body, frame);
+                return;
+            }
+            if (status == JitBailed) {
+                // An entry guard did not hold: a slot the compiled body carries
+                // as an unboxed double was handed something that is not a float
+                // in hand. Nothing has been spent and nothing written, so the
+                // interpreter runs this one call -- and the tier stays, because
+                // unlike running out of machine stack this is a property of the
+                // call rather than of the function. The guard costs a load and
+                // two branches, so a function that bails every time is no
+                // slower than one that was never compiled.
                 eval_node(p, f.body, frame);
                 return;
             }
@@ -2368,6 +2413,7 @@ void run_process(Process& p, int64_t budget) {
 }
 
 bool force_whnf(Process& p, Value v, Value* out) {
+    ForceNest nest(p);
     v = resolve(v);
     if (is_whnf(v)) {
         *out = v;
@@ -2546,24 +2592,36 @@ bool force_deep(Process& p, Value v, Value* out) {
             // marked afterwards: a cell is deeply forced only once everything
             // after it is, so the marking runs backwards, from the end.
             p.stack.push_back(head);
+            // The cell being walked waits on the value stack so that a
+            // collection can find it and rewrite the reference -- which means
+            // no C++ pointer to it may outlive a force. The object moves, and
+            // a pointer taken before the force still names the block it moved
+            // out of. So the cell is re-read from the stack at every single
+            // use rather than once per turn round the loop, and this is the
+            // only way to touch it.
+            //
+            // Storing through a stale one does not fault where it happens,
+            // which is what made this expensive to find. It writes into
+            // whatever that block has since been recycled into, and since
+            // `ConsObj::head` and `ThunkObj::node` share an offset, the shape
+            // the damage usually takes is a thunk whose node is the low half
+            // of a pointer. The machine jumps to it some thousands of
+            // reductions later and dies a long way from here.
+            auto cell = [&] { return static_cast<ConsObj*>(as_obj(p.stack.back())); };
             for (;;) {
-                // The cells are walked in place: the one on top of the stack
-                // held its head before we started, and forcing can collect at
-                // any step, so its address is re-read after each force.
-                auto* cell = static_cast<ConsObj*>(as_obj(p.stack.back()));
                 Value tmp;
-                if (!force_deep(p, cell->head, &tmp)) {
+                if (!force_deep(p, cell()->head, &tmp)) {
                     return unwind(out);
                 }
-                value_slot_store(&cell->head, tmp);
-                p.heap().remember_if_old(cell, tmp);
+                value_slot_store(&cell()->head, tmp);
+                p.heap().remember_if_old(cell(), tmp);
 
                 Value tail;
-                if (!force_whnf(p, cell->tail, &tail)) {
+                if (!force_whnf(p, cell()->tail, &tail)) {
                     return unwind(out);
                 }
-                value_slot_store(&cell->tail, tail);
-                p.heap().remember_if_old(cell, tail);
+                value_slot_store(&cell()->tail, tail);
+                p.heap().remember_if_old(cell(), tail);
 
                 const bool more = is_ptr(tail) && as_obj(tail)->type == ObjType::Cons
                                   && !(as_obj(tail)->aux & AUX_DEEP_FORCED);
@@ -2594,14 +2652,18 @@ bool force_deep(Process& p, Value v, Value* out) {
         }
         case ObjType::Array: {
             p.stack.push_back(head);
-            uint32_t len = static_cast<ArrayObj*>(as_obj(head))->len;
+            // Re-read on both sides of the force, for the reason the list
+            // above is: the array is on the value stack precisely so that a
+            // collection may move it, and a pointer that spans the force is a
+            // pointer to where it used to be. The length is safe to keep --
+            // it is a number, and an array's does not change.
+            auto arr = [&] { return static_cast<ArrayObj*>(as_obj(p.stack.back())); };
+            const uint32_t len = arr()->len;
             for (uint32_t i = 0; i < len; ++i) {
-                auto* a = static_cast<ArrayObj*>(as_obj(p.stack.back()));
-                Value item = a->items()[i];
                 Value tmp;
-                if (!force_deep(p, item, &tmp)) return unwind(out);
-                value_slot_store(&a->items()[i], tmp);
-                p.heap().remember_if_old(a, tmp);
+                if (!force_deep(p, arr()->items()[i], &tmp)) return unwind(out);
+                value_slot_store(&arr()->items()[i], tmp);
+                p.heap().remember_if_old(arr(), tmp);
             }
             as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
             *out = p.stack.back();

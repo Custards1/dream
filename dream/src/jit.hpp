@@ -25,10 +25,11 @@ class Process;
 /// `status` reports what happened: 0 the return value is a result, 1 it is an
 /// error to raise, 2 the reduction budget ran out mid-loop and the frame holds
 /// the loop-carried state, so the caller should resume the body from the top,
-/// and 3 compiled self recursion ran out of machine stack and the call has to
-/// be interpreted instead. The third case is not a failure -- a compiled body
-/// is arithmetic and has written nothing down -- and the second is what keeps
-/// compiled loops preemptible.
+/// 3 compiled self recursion ran out of machine stack and the call has to be
+/// interpreted instead, and 4 an entry guard did not hold, so this one call has
+/// to be interpreted. Neither 3 nor 4 is a failure -- a compiled body is
+/// arithmetic and has written nothing down at either point -- and 2 is what
+/// keeps compiled loops preemptible.
 using CompiledFn = Value (*)(Process* p, Value frame, int* status);
 
 /// The `status` values above, named. The emitter's copies are in jit.cpp,
@@ -38,6 +39,7 @@ enum JitStatus {
     JitRaised = 1,
     JitYielded = 2,
     JitTooDeep = 3,
+    JitBailed = 4,
 };
 
 class Jit {

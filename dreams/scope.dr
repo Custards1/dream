@@ -32,6 +32,7 @@ import std.str;
 import dreams.ast;
 import dreams.builtins;
 import dreams.diag;
+import dreams.fuse;
 import dreams.modules;
 
 // --- what a name in front of a dot can be ------------------------------------
@@ -692,7 +693,8 @@ let declare_module l mi s0 = {
 
 let frame func impure display =
     %{ :func => func, :scopes => [[]], :next_slot => 0, :max_slots => 0,
-       :cap_names => [], :caps => [], :impure => impure, :display => display };
+       :cap_names => [], :caps => [], :impure => impure, :display => display,
+       :staged => core.map_new () };
 
 let frame_func f    = core.map_get f :func 0;
 let scopes f        = core.map_get f :scopes [];
@@ -702,6 +704,14 @@ let cap_names f     = core.map_get f :cap_names [];
 let caps f          = core.map_get f :caps [];
 let frame_impure f  = core.map_get f :impure false;
 let frame_display f = core.map_get f :display "";
+
+/// The stages this frame has bound a name to and will write where they are
+/// read. It hangs off the frame rather than off the resolver so that it stops
+/// at a function boundary without anyone having to remember to clear it: a
+/// lambda inside the block gets a new frame, and a stage moved into one would
+/// need the enclosing frame's names as captures -- which is the one thing a
+/// fused loop, being a global, has none of.
+let frame_staged f = core.map_get f :staged (core.map_new ());
 
 /// A capture says where the enclosing frame keeps the value: in one of its own
 /// slots, or in one of *its* captures. Threading it down like this is what lets
@@ -755,6 +765,76 @@ let bodies r   = core.map_get r :bodies [];
 /// Global index -> `[target, plan, arity]` for every wrapper. See "wrappers".
 let wrappers r = core.map_get r :wrappers (core.map_new ());
 let defs r     = core.map_get r :defs [];
+
+// --- what deforestation left behind ------------------------------------------
+//
+// Three tables, all empty unless this resolution is the one a compile runs.
+// `roles` says which global is which `std.list` member, so a call site can be
+// recognised by the index it resolved to rather than by how it was spelled.
+// `fusions` is the plan for each pipeline, found by where the call was
+// written. `fused` is the globals the pass invented, which go on the end of
+// the program's global table -- after every module's, because they belong to
+// no module.
+
+let roles r    = core.map_get r :roles (core.map_new ());
+/// The *spellings* any of those globals go by, which is what makes asking
+/// cheap. `fuse_shape` is asked about every application in the program, and
+/// resolving a callee to find out it is not `fold` would put a scan of the
+/// frame stack on the compiler's hottest path. A name nothing was ever bound
+/// to under cannot be a pipeline, and that is one lookup.
+let role_names r = core.map_get r :role_names (core.map_new ());
+let fusions r  = core.map_get r :fusions (core.map_new ());
+let fused r    = core.map_get r :fused [];
+let fuses r    = core.map_get r :fuse false;
+
+/// The plan for the pipeline written at this span, or `()`.
+///
+/// The span is checked and not only its start, because the key is a byte
+/// offset and two applications can begin at the same byte -- `x |> f a` is
+/// lowered as an application that starts where `x` does, and it is not this
+/// one.
+let fusion r ctx source span =
+    match core.map_get (fusions r) (ref_key ctx source (ast.span_start span)) () {
+        () => (),
+        p => if fuse.plan_span p == span { p } else { () },
+    };
+
+/// What the current frame has staged, and how to change it. Both answer
+/// through the innermost frame, so a block installs its own and puts the
+/// enclosing one back when it ends.
+let staged_now r =
+    if list.is_empty (frames r) { core.map_new () } else { frame_staged (list.head (frames r)) };
+
+let set_staged m r = update_frame (fn f -> core.map_put f :staged m) r;
+
+/// The stage a name stands for here, or `()`. A name is only ever staged in
+/// the frame it was written in, so this is one lookup and no walk.
+let staged_use r n = core.map_get (staged_now r) n ();
+
+/// The same, asked by a `let` about itself: is *this* statement the one whose
+/// body was moved? Two `let`s in a block may share a name, and only the one
+/// whose span matches is the one that was staged.
+let staged_here r n span =
+    match staged_use r n {
+        () => (),
+        st => if fuse.staged_span st == span { st } else { () },
+    };
+
+// What lowering has to be told, because it must make the same decision and
+// must not remake it: a `let` that no longer binds anything, and a name that
+// stands for the body of one. A pass that disagreed with this one would either
+// lower a stage twice or build a loop over a name nothing bound.
+
+let staged_table r = core.map_get r :staged (core.map_new ());
+
+let record_staged ctx source span what r =
+    core.map_put r :staged
+        (core.map_put (staged_table r) (ref_key ctx source (ast.span_start span)) what);
+
+/// `[:body, expr]` where a name stands for a stage written elsewhere,
+/// `:elided` at the `let` that used to bind it, or `()`.
+let staging r ctx source span =
+    core.map_get (staged_table r) (ref_key ctx source (ast.span_start span)) ();
 
 let set_frames fs r = core.map_put r :frames fs;
 
@@ -1194,7 +1274,16 @@ let rest_bindings rest = match rest { [n, name_span] => [[n, name_span]], _ => [
 
 let rec check_expr c e r =
     match e {
-        [:name, n, span] => check_name c n span r,
+        // A name the block staged is not a binding to look up -- there is
+        // none, because the `let` was skipped. It *is* the stage, walked here
+        // in the frame it was written in, where every name in it still means
+        // what it meant.
+        [:name, n, span] =>
+            match staged_use r n {
+                () => check_name c n span r,
+                st => record_staged (ctx_mi c) (ctx_source c) span [:body, fuse.staged_body st]
+                          (check_expr c (fuse.staged_body st) r),
+            },
 
         [:field, obj, field, span] =>
             match as_namespace c r obj {
@@ -1229,8 +1318,15 @@ let rec check_expr c e r =
                 },
             },
 
+        // A pipeline of `std.list` combinators is one loop, and the list
+        // between them is never built -- see "deforestation" below. Asked
+        // first, because a fused call walks its pieces into different frames
+        // than an ordinary one does.
         [:apply, callee, args, _] =>
-            list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) args,
+            match fuse_shape c r callee args {
+                () => list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) args,
+                shape => check_fused c e shape r,
+            },
         [:pipe, l, rhs, _] => check_expr c rhs (check_expr c l r),
         [:unary, _, x, _] => check_expr c x r,
         [:binary, _, l, rhs, _] => check_expr c rhs (check_expr c l r),
@@ -1242,9 +1338,16 @@ let rec check_expr c e r =
         // it and cannot see it: a block's non-final statements are only worth
         // forcing inside an impure function, and inside a pure one they are
         // dead code worth saying so about.
-        [:block, stmts, span] =>
-            pop_scope (check_block c stmts
-                          (push_scope (record (ctx_mi c) (ctx_source c) span [:block, impure_ok r] r))),
+        [:block, stmts, span] => {
+            // A block may name a stage of a pipeline and read it once, which is
+            // the direct form with a name on it -- see "a stage that was given
+            // a name" in `fuse`. The names it stages are in scope for the whole
+            // block and no longer, so the enclosing frame's are put back after.
+            let saved = staged_now r;
+            let entered = stage_block c stmts
+                              (record (ctx_mi c) (ctx_source c) span [:block, impure_ok r] r);
+            set_staged saved (pop_scope (check_block c stmts (push_scope entered)))
+        },
 
         // `$( .. )` is a value: building it is always allowed, and running it is
         // what needs an impure context. So the thunk's own frame permits
@@ -1341,6 +1444,14 @@ let rec check_block c stmts r =
         [] => r,
         [st, ..rest] =>
             match st {
+                // A `let` whose body is written where it is read binds nothing
+                // and is not walked here. The one place that reads it walks it,
+                // in this same frame -- so walking it here as well would give
+                // its lambdas a second set of slots and a second function
+                // record, and only one of the two would ever be lowered.
+                [:let, n, _, _, _, span] if staged_here r n span != () =>
+                    check_block c rest r,
+
                 [:let, n, ps, body, is_rec, span] => {
                     // `let rec` puts the name in scope for its own body, so a
                     // closure can refer to itself. The slot is allocated either
@@ -1577,7 +1688,25 @@ let declare! l =
 /// the empty `state` -- so one function serves both, and a session cannot take
 /// a different path from a build of the same text.
 let resolve_from! l declared r0 from s_pre = {
-    let base = core.map_put (core.map_put r0 :envs (envs declared)) :frames [];
+    let base0 = core.map_put (core.map_put r0 :envs (envs declared)) :frames [];
+    // Deforestation needs three things settled before a body is walked: which
+    // global is which `std.list` member, where the globals it invents start,
+    // and an empty list to put them in. A resolution that is not a compile --
+    // a session's, a language server's -- does not fuse and carries none of it.
+    let base =
+        if not (fuses r0) { base0 }
+        else {
+            let base_roles = list_roles l (envs declared);
+            core.map_put
+                (core.map_put
+                    (core.map_put
+                        (core.map_put base0 :roles
+                            (alias_roles (envs declared) (pending declared) base_roles))
+                        :role_names
+                            (role_spellings (envs declared) (pending declared) base_roles))
+                    :next_global (next_global declared))
+                :fused []
+        };
     let new_pending = list.drop from (pending declared);
     // The global behind a destructuring is how one was compiled, not something
     // anyone defined, so it stays out of an outline.
@@ -1632,7 +1761,9 @@ let resolve_from! l declared r0 from s_pre = {
             (list.fold (fn acc kv ->
                  core.map_put acc (list.head kv) (list.nth 1 kv))
                        (wrappers r0) (core.map_pairs aliased)))
-        :global_recs (list.append (r_global_recs r0) filled)
+        // The loops deforestation invented go last, after every module's
+        // globals, which is where their indices were taken from.
+        :global_recs (list.append (list.append (r_global_recs r0) filled) (fused walked))
 };
 
 /// Resolve and purity-check a whole loaded program.
@@ -1645,9 +1776,15 @@ let resolve! l = {
     let declared = declare! l;
     let r0 = core.map_put
                  (core.map_put
-                     (core.map_put (resolver (envs declared)) :imports (s_imports declared))
-                     :module_recs (s_module_recs declared))
-                 :diags (diags declared);
+                     (core.map_put
+                         (core.map_put (resolver (envs declared)) :imports (s_imports declared))
+                         :module_recs (s_module_recs declared))
+                     :diags (diags declared))
+                 // Only a whole-program resolution fuses. A session resolves a
+                 // statement at a time on top of a carried result, and the
+                 // globals a loop would take are the ones the next entry is
+                 // about to declare.
+                 :fuse true;
     resolve_from! l declared r0 0 state
 };
 
@@ -1804,6 +1941,479 @@ let op_wrapper params kind operands =
         plan =>
             if params_all_used plan (list.length params) { [[:op, kind], plan, list.length params] }
             else { () },
+    };
+
+// --- deforestation ------------------------------------------------------------
+//
+// A pipeline of `std.list` combinators becomes one loop, and the list between
+// them is never built. What that is worth, and why it is worth it here rather
+// than in the VM, is written up in `dreams/fuse.dr`; this is the half that
+// decides *whether*, because only a resolved name can.
+//
+// "Only a resolved name" is the whole reason this lives in the resolver. A
+// pass over the syntax would see `list.range` and have to guess: `list` may be
+// a parameter, the module may have declared its own `range`, an import may
+// have renamed something, and a module may have been derived from. What a call
+// site resolves to is a global index, and an index cannot be spelled two ways
+// -- so the question "is this really `std.list`'s `range`?" becomes "is this
+// the index `std.list` gave `range`?", which has one answer.
+//
+// The recognition is narrow on purpose. A sink written as a saturated call,
+// whose last argument is *written there* as a saturated call to a source: no
+// binding in between, because a named list is a shared one and fusing it would
+// build it twice. A fold's function must be a lambda written at the call site,
+// because it is inlined into the loop -- passing it by name would leave a
+// closure call in the loop's body, and a loop that calls a closure is a loop
+// the JIT will not take, which is the entire point of the exercise.
+
+/// Which global a module-level expression plainly names, or `()`.
+///
+/// Only the two shapes an alias is ever written in -- `list.fold_strict` and,
+/// after `import std.list.{fold_strict}`, `fold_strict`. There are no frames at
+/// module level, so there is nothing to shadow it and nothing to thread.
+let static_global es mi e =
+    match e {
+        [:name, n, _] => {
+            let e0 = list.nth mi es;
+            if has_global e0 n { global_index e0 n }
+            else {
+                match only_of e0 n {
+                    [m, field, _] =>
+                        match m { [:dream, t] => global_index (list.nth t es) field, _ => () },
+                    _ => (),
+                }
+            }
+        },
+        [:field, obj, field, _] =>
+            match obj {
+                [:name, a, _] =>
+                    match alias_of (list.nth mi es) a {
+                        [:dream, t] => global_index (list.nth t es) field,
+                        _ => (),
+                    },
+                _ => (),
+            },
+        _ => (),
+    };
+
+/// Global index -> role, for every member of `std.list` this pass knows about.
+///
+/// Built once, before a body is walked, because it is the same answer for the
+/// whole program: a global index is a property of the program, not of where it
+/// is used. A program with no standard library has no roles and no fusion.
+let list_roles l es = {
+    let names = module_names l;
+    let hits = list.filter (fn i -> list.nth i names == "std.list")
+                           (list.range 0 (list.length names));
+    if list.is_empty hits { core.map_new () }
+    else {
+        let e = list.nth (list.head hits) es;
+        list.fold (fn acc n ->
+            match global_index e n {
+                () => acc,
+                gi => core.map_put acc gi (fuse.role_of n),
+            }) (core.map_new ()) fuse.member_names
+    }
+};
+
+/// Every spelling those globals answer to: the member names themselves, and
+/// the name of any `let` that renames one.
+let role_spellings es pend base =
+    list.fold (fn acc p -> {
+        let d = list.nth 2 p;
+        if not (list.is_empty (decl_params d)) { acc }
+        else {
+            match static_global es (list.nth 0 p) (decl_body d) {
+                () => acc,
+                target =>
+                    if core.map_has base target { core.map_put acc (decl_name d) true } else { acc },
+            }
+        }
+    }) (list.fold (fn acc n -> core.map_put acc n true) (core.map_new ()) fuse.member_names)
+      pend;
+
+/// The same, through a `let` that only renames one: `let fold = list.fold_strict;`
+/// is a global whose value *is* that function, and a call of it is the same
+/// call. This is the parameterless sibling of a wrapper, and it exists because
+/// naming the fold you mean once at the top of a file is what people actually
+/// write -- the benchmark this pass was built for does exactly that.
+///
+/// One step only. A rename of a rename is not followed, because the table is
+/// read while it is being built and a chain would depend on the order.
+let alias_roles es pend base =
+    list.fold (fn acc p -> {
+        let mi = list.nth 0 p;
+        let d = list.nth 2 p;
+        if not (list.is_empty (decl_params d)) { acc }
+        else {
+            match global_index (list.nth mi es) (decl_name d) {
+                () => acc,
+                gi =>
+                    match static_global es mi (decl_body d) {
+                        () => acc,
+                        target =>
+                            match core.map_get base target () {
+                                () => acc,
+                                role => core.map_put acc gi role,
+                            },
+                    },
+            }
+        }
+    }) base pend;
+
+/// Which global a callee names, asked without recording anything -- the call
+/// is walked normally afterwards whether or not it fuses.
+let callee_global c r e =
+    match e {
+        [:name, n, _] =>
+            if in_scope r n { () }
+            else {
+                let e0 = ctx_env c r;
+                if has_global e0 n { global_index e0 n }
+                else {
+                    match only_of e0 n {
+                        [m, field, _] =>
+                            match m { [:dream, t] => global_index (env_of c r t) field, _ => () },
+                        _ => (),
+                    }
+                }
+            },
+        [:field, obj, field, _] =>
+            match as_namespace c r obj {
+                () => (),
+                base =>
+                    match list.head base {
+                        [:dream, t] => global_index (env_of c r t) field,
+                        _ => (),
+                    },
+            },
+        _ => (),
+    };
+
+let role_at c r e = match callee_global c r e { () => (), g => core.map_get (roles r) g () };
+
+/// A pipeline this pass can fuse, as `[source tag, source arguments, seed,
+/// step, strict]`, or `()`.
+let fuse_shape c r callee args =
+    if not (spelled_like_a_role r callee) { () }
+    else {
+        match role_at c r callee {
+            [:sink, tag, n, strict] =>
+                if list.length args != n { () } else { with_source c r tag strict args },
+            _ => (),
+        }
+    };
+
+/// The stages a block names and reads once, put where every name inside it can
+/// find them.
+///
+/// The decision is syntax and nothing else -- one use, no rebinding in between
+/// -- so it does not depend on whether the pipeline turns out to fuse. That is
+/// deliberate: a block is staged before it is walked, and whether the `range`
+/// in it is really `std.list`'s is not known until the use site is reached. A
+/// staged `let` that never fuses is still the same program, one binding
+/// shorter, and lowering writes its body where the name was.
+let stage_block c stmts r = {
+    let found = fuse.staged_lets (fn body -> stage_shaped r body) stmts;
+    if list.is_empty found { r }
+    else {
+        let seen = list.fold (fn acc st -> core.map_put acc (fuse.staged_name st) st)
+                             (staged_now r) found;
+        set_staged seen
+            (list.fold (fn acc st ->
+                record_staged (ctx_mi c) (ctx_source c) (fuse.staged_span st) :elided acc)
+             r found)
+    }
+};
+
+/// Is a `let`'s body worth counting uses for? A call whose callee is spelled
+/// like a `std.list` member -- the same cheap question `fuse_shape` asks before
+/// resolving anything, and asked here for the same reason: every block in the
+/// program passes through this, and almost none of them contain a pipeline.
+///
+/// And nothing impure, which is not an optimization guard but the rule that
+/// makes moving one sound at all. A pure `let` is lazy: it is not evaluated
+/// where it is written, so writing it somewhere else changes nothing. An
+/// impure one is a *statement*, forced in the order the block gives, and
+/// moving it moves the effect. `dreams` built a payload that way --
+///
+///     let copied = list.fold_strict (fn ok p -> ok && copy_payload! handle ..) ..;
+///     io.close! handle
+///
+/// -- and staging `copied` put every write after the close, which the runtime
+/// answered with `:io_closed`. Purity is spelling in this language, so the
+/// test is the one `step_ok` already makes.
+let stage_shaped r body =
+    match body {
+        [:apply, callee, _, _] =>
+            spelled_like_a_role r callee
+            && not (list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body)),
+        _ => false,
+    };
+
+/// Is this callee even spelled like something that could fuse? Answered before
+/// anything is resolved, because most applications in a program are not.
+let spelled_like_a_role r e =
+    match e {
+        [:name, n, _]        => core.map_has (role_names r) n,
+        [:field, _, field, _] => core.map_has (role_names r) field,
+        _ => false,
+    };
+
+/// The producer has to be written where the list goes, and nowhere else.
+///
+/// `fold f acc (range 1 n)` fuses; `let xs = range 1 n; fold f acc xs` does
+/// not, and the difference is not tidiness. A bound list may be used twice,
+/// and fusing it would produce it twice -- turning one traversal into two, and
+/// a list that costs memory into a computation that costs time. One syntactic
+/// use is the only case where the list is provably nobody else's. The same
+/// rule applies to every stage in between, which is why the chain is peeled
+/// out of the syntax rather than looked up anywhere.
+let with_source c r tag strict args =
+    match peel c r (list.last args) [] 16 {
+        () => (),
+        peeled => {
+            let src = list.nth 0 peeled;
+            let steps = list.nth 1 peeled;
+            if not (list.all (fn st -> step_ok r st) steps) { () }
+            else {
+                match sink_step tag strict (list.nth 0 src) (list.nth 1 src) args {
+                    () => (),
+                    shape =>
+                        if reaches_frame r (list.nth 3 shape) { () }
+                        else if not (fuse.affordable steps (sink_uses shape)) { () }
+                        else { list.append shape [steps] }
+                }
+            }
+        },
+    };
+
+/// The chain from the consumer inwards, until something that is not a stage:
+/// `[[source tag, its arguments], stages in the order elements meet them]`.
+///
+/// The fuel is not a guess about how long a pipeline gets. It is what makes a
+/// compiler terminate on a program that will not run, which is the same reason
+/// unwrapping a chain of wrappers is capped.
+let rec peel c r e acc fuel =
+    if fuel <= 0 { () }
+    else {
+        match e {
+            [:apply, callee, cargs, _] =>
+                match role_at c r callee {
+                    [:source, stag, n] =>
+                        if list.length cargs != n { () } else { [[stag, cargs], acc] },
+                    [:step, stag, n] =>
+                        if list.length cargs != n { () }
+                        else {
+                            peel c r (list.nth 1 cargs)
+                                 (core.cons [stag, list.nth 0 cargs] acc) (fuel - 1)
+                        },
+                    _ => (),
+                },
+            // A stage the block gave a name to and reads exactly once. The
+            // binding is not a barrier between the producer and the consumer;
+            // it is the same pipeline written over two lines, and `fuse`'s
+            // `staged_lets` is what established that moving it changes nothing.
+            [:name, n, _] =>
+                match staged_use r n {
+                    () => (),
+                    st => peel c r (fuse.staged_body st) acc (fuel - 1),
+                },
+            _ => (),
+        }
+    };
+
+/// A stage is only spliced into the loop when its function was written where
+/// it is used: one plain parameter, no effect, and nothing from the frame
+/// around it. The same three conditions a fold's function is held to, and for
+/// the same three reasons.
+let step_ok r st =
+    match fuse.step_lambda st {
+        [:lambda, ps, body, _] =>
+            list.length ps == 1
+            && ast.param_pattern (list.nth 0 ps) == ()
+            && not (list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body))
+            && not (reaches_frame r [:ast, body, ps]),
+        _ => false,
+    };
+
+/// How many times the consumer reads each element -- which is how many times
+/// the stage in front of it has to be written out.
+let sink_uses shape =
+    match list.nth 3 shape {
+        [:ast, body, ps] => fuse.uses (ast.param_name (list.nth 1 ps)) body,
+        _ => 1,
+    };
+
+/// What the accumulator does with each element: a lambda written at the call
+/// site, or -- for `sum` and `product`, whose function nobody wrote down --
+/// the operator they stand for.
+let sink_step tag strict stag src_args args =
+    match tag {
+        :fold =>
+            match list.nth 0 args {
+                [:lambda, ps, body, _] =>
+                    if list.length ps != 2 { () }
+                    // A parameter written as a pattern binds through a slot of
+                    // its own and a check in front of the body. The loop has
+                    // no room for either, and a fold over pairs is rare enough
+                    // not to be worth making room.
+                    else if list.any (fn p -> ast.param_pattern p != ()) ps { () }
+                    // An effect inside the loop would be an effect the machine
+                    // no longer sequences -- see "what a body mentions" in
+                    // `fuse`.
+                    else if list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body) { () }
+                    else { [stag, src_args, [:expr, list.nth 1 args], [:ast, body, ps], strict] },
+                _ => (),
+            },
+        op => [stag, src_args, [:int, if op == :mul { 1 } else { 0 }], [:op, op], strict],
+    };
+
+/// Does the step reach a name the frame around it holds? The loop is a global,
+/// which has no captures, so a body that does cannot become one.
+let reaches_frame r step =
+    match step {
+        [:ast, body, ps] => {
+            let ours = list.map (fn p -> ast.param_name p) ps;
+            list.any (fn n -> not (list.contains n ours) && in_scope r n) (fuse.mentioned body)
+        },
+        _ => false,
+    };
+
+/// Take the next global for a loop nobody wrote: `[r, index]`.
+///
+/// They come after every module's, because a fused loop belongs to no module
+/// -- it was not written in one. Nothing reads a module's global range to find
+/// out what exists; the range says which module a global came from, and the
+/// honest answer here is none.
+let take_fused_global name fi r = {
+    let gi = core.map_get r :next_global 0;
+    [core.map_put (core.map_put r :next_global (gi + 1))
+                  :fused (list.append (fused r) [[gi, name, :function, fi]]),
+     gi]
+};
+
+let record_fusion ctx source span p r =
+    core.map_put r :fusions
+        (core.map_put (fusions r) (ref_key ctx source (ast.span_start span)) p);
+
+/// The plan's step, without the parameter list that only this pass needed.
+let step_for_plan step = match step { [:ast, body, _] => [:ast, body], s => s };
+
+/// Walk a pipeline that is going to be fused, and record the plan.
+///
+/// Where each piece is walked is the whole of the rewrite's honesty. The
+/// producer's arguments and the seed are resolved in the frame the pipeline
+/// was written in, because that is where they are still evaluated: they become
+/// the loop's first arguments, built exactly once, in the order they were
+/// written. The fold's function is resolved inside the loop's *own* frame,
+/// with its two parameters bound to the slots the loop keeps the accumulator
+/// and the element in -- so its body reads them as locals and there is no
+/// closure anywhere. Nothing else moves.
+///
+/// Both callees are walked as well, though no call to either is emitted. An
+/// editor asking what is under the cursor is asking about the text, and the
+/// text still says `list.fold_strict`.
+let check_fused c e shape r = {
+    let span = ast.span e;
+    let args = list.nth 2 e;
+    let stag = list.nth 0 shape;
+    let src_args = list.nth 1 shape;
+    let seed = list.nth 2 shape;
+    let step = list.nth 3 shape;
+    let strict = list.nth 4 shape;
+    let steps = list.nth 5 shape;
+
+    let r1 = check_chain c (list.last args) (check_expr c (list.nth 1 e) r);
+    let r2 = match seed { [:expr, x] => check_expr c x r1, _ => r1 };
+
+    let started = begin_func (fuse.loop_name stag) fuse.arity false (impure_ok r2)
+                             true false span r2;
+    let fi = list.nth 1 started;
+    // The three parameters exist whether or not anything names them, so the
+    // frame is as wide as the loop's arity before a stage takes a slot.
+    let reserved = reserve_slot (fuse.arity - 1) (list.head started);
+
+    let staged = walk_steps c steps (fuse.element_slot stag) [] [] reserved;
+    let elem = list.nth 1 staged;
+    let inner =
+        match step {
+            [:ast, body, ps] => {
+                let acc_p = list.nth 0 ps;
+                let elem_p = list.nth 1 ps;
+                let scoped = push_scope (list.nth 0 staged);
+                let bound =
+                    bind_at (ctx_mi c) (ctx_source c) (ast.param_name elem_p) elem
+                            (list.nth 1 elem_p)
+                        (bind_at (ctx_mi c) (ctx_source c) (ast.param_name acc_p)
+                                 fuse.acc_slot (list.nth 1 acc_p) scoped);
+                pop_scope (check_expr c body bound)
+            },
+            _ => list.nth 0 staged,
+        };
+    let walked = end_func fi inner;
+    let taken = take_fused_global (fuse.loop_name stag) fi walked;
+    record_fusion (ctx_mi c) (ctx_source c) span
+        (fuse.plan span fi (list.nth 1 taken) [stag, src_args] seed
+                    (step_for_plan step) strict (list.nth 2 staged) (list.nth 3 staged) elem)
+        (list.head taken)
+};
+
+/// Each stage in turn, in the order the elements meet them.
+///
+/// A stage's parameter is bound to the slot its input is read from, and then
+/// put back out of sight: two stages of one pipeline are siblings, not nested
+/// scopes, and leaving the first one's parameter in scope would let a later
+/// body resolve a *global* of the same name to it. The slot stays taken --
+/// leaving a scope does not give slots back -- which is exactly what a slot
+/// that is read but never written needs.
+///
+/// A `filter` hands its input straight on and contributes a condition. A `map`
+/// hands on a slot of its own, which nothing ever writes: see "a stage that
+/// has no slot" in `fuse`.
+let rec walk_steps c steps slot guards subst r =
+    match steps {
+        [] => [r, slot, guards, subst],
+        [st, ..rest] => {
+            let body = fuse.step_body st;
+            let p = list.nth 0 (fuse.step_params st);
+            let scoped = push_scope r;
+            let bound = bind_at (ctx_mi c) (ctx_source c) (ast.param_name p) slot
+                                (list.nth 1 p) scoped;
+            let walked = pop_scope (check_expr c body bound);
+            if list.nth 0 st == :filter {
+                walk_steps c rest slot (list.append guards [body]) subst walked
+            }
+            else {
+                let fresh = bind_one (ctx_mi c) (ctx_source c) "_"
+                                     (ast.span (fuse.step_lambda st)) walked;
+                walk_steps c rest (list.nth 1 fresh) guards
+                           (list.append subst [[list.nth 1 fresh, body]]) (list.head fresh)
+            }
+        },
+    };
+
+/// Resolve the callees along the chain, though no call to any of them is
+/// emitted. An editor asking what is under the cursor is asking about the
+/// text, and the text still says `list.map`.
+let rec check_chain c e r =
+    match e {
+        [:apply, callee, cargs, _] =>
+            match role_at c r callee {
+                [:step, _, _] => check_chain c (list.nth 1 cargs) (check_expr c callee r),
+                // The source: its arguments are evaluated where they were
+                // written, so they are resolved in this frame like any other.
+                _ => list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) cargs,
+            },
+        // Through a staged name as well, and for the reason the chain is
+        // walked at all: the source's arguments are evaluated at the fused
+        // call, so they have to be resolved in this frame. Walking the body
+        // here rather than where the `let` stood is what the staging rule
+        // bought -- nothing it names is bound again in between, so the two
+        // positions resolve alike.
+        [:name, n, _] =>
+            match staged_use r n { () => r, st => check_chain c (fuse.staged_body st) r },
+        _ => r,
     };
 
 /// Just the diagnostics, for a caller that only wants to know whether the

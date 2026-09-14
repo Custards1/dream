@@ -19,15 +19,19 @@ The Dream VM on your PATH (or set `dream.vm.path`), and a built server image.
 
 ```
 just lucid          # writes build/lucid.dream
+just install        # puts it (and the VM) in ~/.mindv2, on your $MINDV2_PATH
 ```
 
-The extension looks for `build/lucid.dream` and `build-dream/bin/lucid.dream`
-in the workspace, then `$LUCID_IMAGE`. Set `dream.server.path` to point
-somewhere else.
+The extension looks for `build/lucid.dream` in the workspace, then `build-drain/bin/lucid.dream`,
+then `$LUCID_IMAGE`, then `$MINDV2_PATH/lucid.dream`. Set `dream.server.path` to
+point somewhere else; `~` and `$VARS` are expanded in it. A workspace that is
+the Dream checkout uses its own freshly built image, which beats an installed
+one.
 
 `lucid` is a compiled `.dream` image rather than a native program, so it is run
 by the VM: the extension starts `dream lucid.dream -L …` and talks LSP to it
-over stdin and stdout.
+over stdin and stdout. Both `dream.vm.path` and `dream.server.path` are
+expanded before use.
 
 ## Settings
 
