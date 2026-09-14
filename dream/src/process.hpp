@@ -176,14 +176,17 @@ public:
 
     /// Nested `force_whnf` loops currently on the process's machine stack.
     ///
-    /// Interpreted code never nests them -- each force is a heap continuation
-    /// and the loop returns between links -- so a deep count is a *compiled*
-    /// signature: a compiled body forces a slot by calling, and `fetch -> force
-    /// -> force_whnf` runs a whole nested machine, which re-enters another
-    /// compiled body, which forces again. One real C++ frame per link, against
-    /// a fixed machine stack, which is the SIGSEGV under "Known and not fixed"
-    /// below. `enter_function` declines the compiled tier past a bound, and the
-    /// interpreter, whose recursion is heap continuations, finishes the chain.
+
+    /// Interpreted code never nests them deeply -- each force is a heap
+    /// continuation and the loop returns between links -- so a deep count is a
+    /// *compiled* signature: a compiled body forces a slot by calling, and
+    /// `load_slot -> force -> dream_rt_force -> force_whnf` runs a whole nested
+    /// machine, which re-enters another compiled body, which forces again. One
+    /// real C++ frame per link of a lazy chain, against a fixed machine stack.
+    /// That was the SIGSEGV under "Fixed: compiled code forcing a long thunk
+    /// chain crashed" in CLAUDE.md; `enter_function` declines the compiled tier
+    /// past `kMaxForceNestForCompiled`, and the interpreter, whose recursion is
+    /// heap continuations and so has a limit it can check, finishes the chain.
     uint32_t force_nest = 0;
 
     /// Values a C++ frame is holding across a call that can collect.

@@ -397,12 +397,13 @@ The verifier now names the object's type and what it was reached *from* when it
 reports a young object surviving a minor, because "a minor collection left a
 young object reachable" without a path is a fact you cannot act on.
 
-### Known and not fixed: compiled code forcing a long thunk chain crashes
+### Fixed: compiled code forcing a long thunk chain crashed
 
-A JIT-compiled function that forces a long chain of suspensions dies with
-**SIGSEGV** where the interpreter raises `:stack_overflow`. Found 2026-09-13,
+A JIT-compiled function that forced a long chain of suspensions died with
+**SIGSEGV** where the interpreter raised `:stack_overflow`. Found 2026-09-13,
 reproduced against the JIT exactly as it was before it learnt self recursion, so
-it is not new -- but nothing here had looked for it before.
+it was never new -- nothing here had looked for it before. Fixed the same day;
+`dream/tests/programs/force_chain.dr` is what holds the line.
 
 ```
 import std.console;
@@ -413,29 +414,47 @@ let main! = { console.print! (loop_f (fn a b -> a + b) 1 10000000 0) };
 `acc` is lazy, so this builds ten million suspended applications rather than
 adding anything -- the trap `list.fold_strict` exists to avoid, and its note in
 [mind/std/list.dr](mind/std/list.dr) explains it. Forcing that chain is supposed
-to raise at `DREAM_MAX_DEPTH`, and with `--no-jit` it does, exactly:
+to raise at `DREAM_MAX_DEPTH`, and with `--no-jit` it always did, exactly:
 
 ```
 dream: uncaught error: <error :stack_overflow recursion too deep: 4194305 pending frames>
 ```
 
-With the JIT it segfaults. The reason is one line of the machine: the
+With the JIT it segfaulted. The reason was one line of the machine: the
 interpreter forces a slot by pushing a **continuation**, so its recursion is
 heap and its limit is a number it can check, while compiled code forces a slot
 by *calling* -- `load_slot` -> `force` -> `dream_rt_force` -> `force_whnf`,
 which runs a whole nested machine loop, which enters the compiled body again for
 the next link. One C++ frame per link of the chain, against an 8 MB thread
-stack. The lambda here is the whole trigger: `fn a b -> a + b` is arithmetic
-over two strict parameters, which is precisely what this tier compiles.
+stack. The lambda was the whole trigger: `fn a b -> a + b` is arithmetic over
+two strict parameters, which is precisely what this tier compiles.
 
 The fix is not the depth argument that bounds compiled *self* recursion, because
-the recursion here goes out through the runtime and back in. What it wants is
-the same move `Jit::deoptimize` makes, on a different trigger: count the nested
-`force_whnf` loops on a process, and have `enter_function` decline the compiled
-tier past some depth. From there the interpreter handles the rest of the chain,
-pushing continuations instead of C++ frames, and the walk finishes on the heap
-where its limit can be enforced. That counter does not exist yet -- `force_pins`
-is about vouching, not depth -- and none of it is written.
+the recursion here goes out through the runtime and back in. It is the same move
+`Jit::deoptimize` makes, on a different trigger: `Process::force_nest` counts
+the nested `force_whnf` loops on the process's machine stack, and
+`enter_function` stops offering the compiled tier past
+`kMaxForceNestForCompiled` (256). From there the interpreter handles the rest of
+the chain, pushing continuations instead of C++ frames, and the walk finishes on
+the heap where its limit can be enforced. Interpreted code never nests forces
+deeply -- each one returns before the next -- so the bound costs every healthy
+program one compare on function entry and nothing else.
+
+The bound is free, which was worth measuring rather than asserting because
+`enter_function` runs on every single call: one `uint32_t` load and a compare,
+folded into the branch that was already testing whether the JIT exists. The six
+benchmark workloads A/B'd against the same build without it on the same machine
+came back 44/51/216/30/82/25 ms before and 43/49/217/29/82/25 after -- inside
+the placement noise floor in "Two things that will lie to you about a change to
+the interpreter" in every row.
+
+What makes the test cheap enough to keep is `force_chain.env`: a small
+`DREAM_MAX_DEPTH` and a 200,000-link chain, which is comfortably past the
+roughly 16,000 links eight megabytes of stack allowed and finishes in a fraction
+of a second. Note that the crash was *not* catchable -- `try!` did not see it --
+which is why the e2e harness running every program under both tiers is the right
+place for it: what it asserts is that the two tiers agree, and a segfault on one
+side is the loudest possible disagreement.
 
 ### Measured, and not kept
 
@@ -788,13 +807,20 @@ interpreter pushes the frame object on the value stack and passes it into
 code unsafe is that its live values live in LLVM allocas (registers), *not in
 that frame*. So a collection underneath a compiled frame loses whatever the
 frame's canonical copy no longer agrees with -- which is why the four runtime
-helpers pin the heap and the tier refuses every function that allocates. The
-route chosen here: make the frame the source of truth at every point where the
-collector can run -- **spill slots into the frame before a collect-capable
-helper, reload from it after** -- and de-pin the helpers. No machine-stack
-walking, which is what keeps this sound with the concurrent collector's helper
-threads: they never see the process's stack, but they never need to, because the
-roots are the frames on the value stack.
+
+helpers pin the heap. (The draft also said the tier "refuses every function that
+allocates". That is not what the tier checks and not why those functions are
+refused; see the second correction below.) The
+route chosen here: make something the collector rewrites the source of truth at
+every point where the collector can run -- **root the live slots before a
+collect-capable helper, read them back after** -- and de-pin the helpers. No
+machine-stack walking, which is what keeps this sound with the concurrent
+collector's helper threads: they never see the process's stack, but they never
+need to, because the roots are the process's own. The draft of this said "spill
+into the frame", and that is wrong for a recursing function -- see the first
+correction under that stage below, which is the single most useful thing in
+this section.
+
 
 **What the goal concretely is.** Let the JIT compile self-recursive loops whose
 values are objects: forward list builders (`list.replicate`, manual `upto`-style
@@ -803,23 +829,110 @@ more -- see the table and "What it did not reach" above; it is already compiled.
 The work is all in `dream/src`; there is no compiler change, so no bootstrap
 moves.
 
-**The draft of it in stages:**
 
-- ~~**Fix the known compiled-force SIGSEGV first.**~~ **Done** -- `force_nest`
-  on the process, `enter_function` declines the compiled tier past
-  `kMaxForceNestForCompiled`. See the section below, which is now a record.
-- **Spill/reload and de-pin.** **Written, measured, and reverted.** It works and
-  it does not pay for itself; the next entry is the whole of what was learnt,
-  and the two things to try before writing it again.
-- **Admit object-allocating self-recursion.** Widen `op_is_supported` and the
-  emitter for the shape `is_self_call` already bounds: `Op::Cons` via a
-  `dream_rt_cons` helper that calls the interpreter's own list-building path
-  (building stays lazy -- a tail thunk stays a thunk), `Op::Bind` as a store
-  into the slot the way the interpreter writes a frame slot, and a second,
-  distinct native class beside the eight inline numeric ones: natives compiled
-  code *calls*, arguments pushed onto the value stack exactly as `resume_native`
-  does, spill/reload around the call. Object values ride the existing `Ty::Any`
-  tagged path; only `Ty::Float` is ever unboxed.
+**The draft of it in stages**, with one caveat about their order. The two
+corrections below say that the de-pinning stage is not a prerequisite for the
+widening stage, and the two together say something about sequence: done in the
+drafted order, de-pinning lands machinery that no workload exercises, because
+the tier as it stands is numeric and the forces it makes are shallow. There is
+nothing to measure it with until the tier is wider, and "what each stage has to
+prove" cannot be satisfied for it in isolation. Widening first gives de-pinning
+a workload to be judged by.
+
+- ~~**Fix the known compiled-force SIGSEGV first.**~~ **Done** (2026-09-13). A
+  `force_nest` counter on the process, incremented at the top of `force_whnf`,
+  and `enter_function` declining the compiled tier past
+  `kMaxForceNestForCompiled`. Same shape and trigger as the `JitTooDeep` deopt.
+  It was right that this had to come first, and for the reason given: every
+  stage after it sends more nested forces out through the runtime. See "Fixed:
+  compiled code forcing a long thunk chain crashed" above, and
+  `dream/tests/programs/force_chain.dr`, which is the tier-agreement test that
+  holds it.
+- **Spill/reload and de-pin.** Before each call to `dream_rt_force/arith/
+  compare/arith_f`, root every live slot somewhere the collector rewrites;
+  after the call returns, read them back, because a mid-call collection moved
+  objects. Then the helpers stop pinning. **Two corrections to this stage, both
+  found by reading the emitter rather than by writing any of it, and both of
+  which would have cost a day each to find the other way:**
+
+  - **The frame cannot be the spill target for a recursing function.** This is
+    the one that matters. In the recursive shape (`Emitter::emit_body`) the
+    frame is *not* per-invocation: `recursive_call` passes the same `frame_`
+    argument down at every depth, because the whole point of that shape is that
+    a self call allocates nothing and the only frame in the picture is the one
+    the interpreter made for the outermost call. So a depth-N invocation
+    spilling its slots into that frame overwrites the depth-0 loop-carried
+    state, and the `emit_yield` that reads it back at depth 0 resumes the
+    iteration with the wrong values. Spilling to the frame is sound only in the
+    loop shape (`emit_loop`), where there is exactly one invocation. What the
+    recursive shape wants is a *stack*, and there is already one the collector
+    rewrites: `p.pins` (see `Pin` in [dream/src/interp.hpp](dream/src/interp.hpp)),
+    which is precisely the mechanism a C++ frame uses to hold a `Value` across a
+    force. Push the live slots, call, read back, pop. That also covers the case
+    the frame never could: an intermediate LLVM temporary -- the left operand of
+    `a + b` while the right is being forced -- which is live in a register and
+    has no slot to be spilled into at all.
+  - **Nothing here is a prerequisite for allocating.** The stage below reads as
+    if de-pinning were what unlocks it. It is not. Allocation never collects: a
+    collection runs only at a safepoint, and there are exactly two
+    (`run_process`'s and `force_whnf`'s, the latter gated on `force_pins == 0`),
+    neither of which an allocation passes through. `dream_rt_float` already
+    allocates from compiled code for this reason and says so. What the pinning
+    actually buys is that a collection cannot happen *underneath* a compiled
+    frame while its values are in registers -- and de-pinning is what a compiled
+    loop needs before it can force a long lazy structure without the nursery
+    growing for the whole walk, which is the `strict!` failure in "Making it
+    faster" a size away. So this stage is about memory under nested forcing, not
+    about permission to allocate, and the stage below does not have to wait for
+    it.
+
+- **Admit object-allocating self-recursion.** The draft read as though this
+  were a widening of `op_is_supported`. It is not, and the gate that actually
+  refuses a list builder is worth knowing before any of it is written.
+
+  Take the shape the stage is for:
+
+  ```
+  let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (core.cons i acc) };
+  ```
+
+  Three separate things are true about it, and only the third is the blocker:
+
+  - There is no `Op::Cons`. A list literal is `Op::MakeList`; a prepend is the
+    `core.cons` **native**. So the list case is not an opcode at all, it is the
+    old draft's third bullet, "natives compiled code calls".
+  - `core.cons` is the easiest native in the table to admit: strict mask `0b0`,
+    and a body that is one `make_cons` (`list_cons` in
+    [dream/src/builtins.cpp](dream/src/builtins.cpp)). It forces nothing, raises
+    nothing and allocates -- which, per the correction above, compiled code is
+    already allowed to do.
+  - **`Analyzer::run` refuses the function, and would still refuse it with
+    `core.cons` admitted.** Every parameter must be forced on every path, and
+    `acc` is not: `strict_of` of the `if` is the condition's `{i, n}` union the
+    *intersection* of the two arms, the `then` arm gives `{acc}`, the `else` arm
+    gives `{i, n}` because a native contributes only what its strict mask
+    claims and cons's claims nothing -- so the intersection is empty and `acc`
+    never joins the set. Measured rather than argued: compiling the loop above
+    beside a numeric one and running it under `--stats` reports `1 functions
+    compiled`, and the one is the numeric loop.
+
+  So the stage is a change to the tier's *soundness argument*, not to a table.
+  The rule "every parameter is forced on every path" is what licenses compiling
+  a self tail call by evaluating its argument expressions eagerly. What a list
+  builder needs is the weaker licence: a parameter may be non-strict provided
+  every self-call argument in that position is *eagerly safe* -- cannot raise,
+  diverge, or perform an effect -- which `core.cons i acc` is, because it builds
+  a cell around two values it does not look at. Both halves have to move
+  together with `load_slot`, which today *forces* every slot it reads: that is
+  exactly what must not happen to a lazy cons's argument, so an unforced read is
+  needed beside it -- and `strict_of` counting a slot read as a force is only
+  true *because* `load_slot` forces. Change one without the other and the
+  strictness claim the whole tier rests on quietly stops being true.
+
+  What bounds the nursery once this lands is the yield: a compiled loop spends
+  its slice and returns to the interpreter, which collects at its safepoint, so
+  a loop that allocates per iteration allocates for one slice and no more.
+
 - **Generalize the callable set only if measurement justifies it.** The claim
   "call any host native exactly as the interpreter enters it, with the compiled
   caller's slots spilled" inherits the interpreter's safety per native, so the
@@ -831,6 +944,7 @@ regression there is a spill paid on the hot path instead of only at true
 boundaries); new rows for list builder, string fold and map fold, judged
 JIT-on against JIT-off (the placement-noise floor applies); equivalence between
 the tiers under `just test-all` (heap-verified run plus fuzzer) for the new
+
 `consbuild`, `strfold` and `mapfold` cases; and the long-thunk-chain repro
 raising `:stack_overflow` byte-identically with and without `--no-jit`.
 
@@ -924,6 +1038,7 @@ nursery no safepoint can reach -- real, but not visible in any measurement here,
 and not worth 40% of `mapfilter` to have early. Do the site-count work first;
 then this becomes cheap enough to be worth having, and stage three has something
 to stand on.
+
 
 ## Large data in an image
 
