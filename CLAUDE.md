@@ -807,7 +807,9 @@ interpreter pushes the frame object on the value stack and passes it into
 code unsafe is that its live values live in LLVM allocas (registers), *not in
 that frame*. So a collection underneath a compiled frame loses whatever the
 frame's canonical copy no longer agrees with -- which is why the four runtime
-helpers pin the heap and the tier refuses every function that allocates. The
+helpers pin the heap. (The draft also said the tier "refuses every function that
+allocates". That is not what the tier checks and not why those functions are
+refused; see the second correction below.) The
 route chosen here: make something the collector rewrites the source of truth at
 every point where the collector can run -- **root the live slots before a
 collect-capable helper, read them back after** -- and de-pin the helpers. No
@@ -825,7 +827,14 @@ more -- see the table and "What it did not reach" above; it is already compiled.
 The work is all in `dream/src`; there is no compiler change, so no bootstrap
 moves.
 
-**The draft of it in stages:**
+**The draft of it in stages**, with one caveat about their order. The two
+corrections below say that the de-pinning stage is not a prerequisite for the
+widening stage, and the two together say something about sequence: done in the
+drafted order, de-pinning lands machinery that no workload exercises, because
+the tier as it stands is numeric and the forces it makes are shallow. There is
+nothing to measure it with until the tier is wider, and "what each stage has to
+prove" cannot be satisfied for it in isolation. Widening first gives de-pinning
+a workload to be judged by.
 
 - ~~**Fix the known compiled-force SIGSEGV first.**~~ **Done** (2026-09-13). A
   `force_nest` counter on the process, incremented at the top of `force_whnf`,
@@ -874,20 +883,52 @@ moves.
     about permission to allocate, and the stage below does not have to wait for
     it.
 
-- **Admit object-allocating self-recursion.** Widen `op_is_supported` and the
-  emitter for the shape `is_self_call` already bounds. What bounds the nursery
-  here is the yield: a compiled loop spends its slice and returns to the
-  interpreter, which collects at its safepoint, so a loop that allocates per
-  iteration allocates for one slice and no more. Note there is no `Op::Cons` --
-  a list literal is `Op::MakeList` and a prepend is the `core.cons` *native* --
-  so this stage is really the third bullet of the old draft, "natives compiled
-  code calls", and the list case falls out of it. Two things the emitter as it
-  stands will fight, both about `load_slot`: it *forces* every slot it reads,
-  which is exactly what must not happen to the argument of a lazy `cons`, so an
-  unforced slot read is needed beside it; and `Analyzer::strict_of` counts
-  reading a slot as forcing it, which is only true because `load_slot` forces
-  -- so the two have to move together or the strictness claim the tier rests on
-  stops being true.
+- **Admit object-allocating self-recursion.** The draft read as though this
+  were a widening of `op_is_supported`. It is not, and the gate that actually
+  refuses a list builder is worth knowing before any of it is written.
+
+  Take the shape the stage is for:
+
+  ```
+  let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (core.cons i acc) };
+  ```
+
+  Three separate things are true about it, and only the third is the blocker:
+
+  - There is no `Op::Cons`. A list literal is `Op::MakeList`; a prepend is the
+    `core.cons` **native**. So the list case is not an opcode at all, it is the
+    old draft's third bullet, "natives compiled code calls".
+  - `core.cons` is the easiest native in the table to admit: strict mask `0b0`,
+    and a body that is one `make_cons` (`list_cons` in
+    [dream/src/builtins.cpp](dream/src/builtins.cpp)). It forces nothing, raises
+    nothing and allocates -- which, per the correction above, compiled code is
+    already allowed to do.
+  - **`Analyzer::run` refuses the function, and would still refuse it with
+    `core.cons` admitted.** Every parameter must be forced on every path, and
+    `acc` is not: `strict_of` of the `if` is the condition's `{i, n}` union the
+    *intersection* of the two arms, the `then` arm gives `{acc}`, the `else` arm
+    gives `{i, n}` because a native contributes only what its strict mask
+    claims and cons's claims nothing -- so the intersection is empty and `acc`
+    never joins the set. Measured rather than argued: compiling the loop above
+    beside a numeric one and running it under `--stats` reports `1 functions
+    compiled`, and the one is the numeric loop.
+
+  So the stage is a change to the tier's *soundness argument*, not to a table.
+  The rule "every parameter is forced on every path" is what licenses compiling
+  a self tail call by evaluating its argument expressions eagerly. What a list
+  builder needs is the weaker licence: a parameter may be non-strict provided
+  every self-call argument in that position is *eagerly safe* -- cannot raise,
+  diverge, or perform an effect -- which `core.cons i acc` is, because it builds
+  a cell around two values it does not look at. Both halves have to move
+  together with `load_slot`, which today *forces* every slot it reads: that is
+  exactly what must not happen to a lazy cons's argument, so an unforced read is
+  needed beside it -- and `strict_of` counting a slot read as a force is only
+  true *because* `load_slot` forces. Change one without the other and the
+  strictness claim the whole tier rests on quietly stops being true.
+
+  What bounds the nursery once this lands is the yield: a compiled loop spends
+  its slice and returns to the interpreter, which collects at its safepoint, so
+  a loop that allocates per iteration allocates for one slice and no more.
 - **Generalize the callable set only if measurement justifies it.** The claim
   "call any host native exactly as the interpreter enters it, with the compiled
   caller's slots spilled" inherits the interpreter's safety per native, so the
