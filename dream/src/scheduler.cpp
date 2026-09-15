@@ -8,6 +8,7 @@
 #include <chrono>
 
 #include "builtins.hpp"
+#include "env.hpp"
 #include "gc_pool.hpp"
 #include "interp.hpp"
 
@@ -301,8 +302,7 @@ bool Scheduler::wait_for_all() {
     // parked on IO is not deadlocked -- the kernel may yet answer -- so the
     // runtime cannot simply declare it stuck; but a program that has stopped
     // for good is exactly the case where nothing is left that could ask.
-    const char* env = std::getenv("DREAM_STUCK_SECONDS");
-    double stuck_after = env ? std::atof(env) : 0.0;
+    const double stuck_after = g_env.stuck_seconds;
 
     std::unique_lock<std::mutex> lk(idle_mutex_);
     if (stuck_after <= 0.0) {

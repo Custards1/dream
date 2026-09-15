@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "builtins.hpp"
+#include "env.hpp"
 #include "interp.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
@@ -40,8 +41,7 @@
 namespace dream {
 namespace {
 
-bool trace_on() { static bool on = ::getenv("DREAM_IO_TRACE") != nullptr; return on; }
-#define IOTRACE(...) do { if (trace_on()) { std::fprintf(stderr, "[io] " __VA_ARGS__); std::fprintf(stderr, "\n"); } } while (0)
+#define IOTRACE(...) do { if (g_env.io_trace) { std::fprintf(stderr, "[io] " __VA_ARGS__); std::fprintf(stderr, "\n"); } } while (0)
 
 
 // ---------------------------------------------------------------------------

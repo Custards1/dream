@@ -317,10 +317,6 @@ public:
     /// True when this heap owns `bytes` starting at `p`.
     bool owns(const void* p, size_t bytes) const;
 
-    /// Set from the DREAM_VERIFY_HEAP environment variable: verify after every
-    /// collection. Slow, and meant for chasing exactly this class of bug.
-    static bool verify_after_gc();
-
 private:
     struct Block {
         Block* next;
@@ -482,7 +478,25 @@ private:
     size_t nursery_bytes_ = 0;
     /// The nursery's high-water mark: past it, a minor collection is due.
     size_t nursery_hi_;
-    /// How large the nursery may grow. See `grow_nursery_if_crowded`.
+    /// How large the nursery may grow, and where the number comes from.
+    /// See `grow_nursery_if_crowded` for the growing.
+    ///
+    /// A nursery is a bet that most objects die young, and its size is how long
+    /// they are given to do it. Too small and a collection promotes objects that
+    /// were about to die anyway -- which is the expensive mistake, because
+    /// promotion is a copy and everything it copies has to be scanned and then
+    /// swept later. Too large and the collection's working set falls out of cache
+    /// and every process pays for memory it is not using.
+    ///
+    /// So the size is not chosen: it is *earned*. Every process starts at 64 KB,
+    /// and only one that keeps promoting a large share of what it allocates grows
+    /// -- doubling each time, up to this. A language that expects hundreds of
+    /// thousands of processes cannot afford a large nursery by default, and a
+    /// compiler churning through a syntax tree cannot afford a small one; letting
+    /// the survival rate decide gives each of them what it needs.
+    ///
+    /// The default cap is 32 MiB, which is where the self-compile stops improving.
+    /// `DREAM_NURSERY_MAX` overrides it, for measuring the next workload.
     size_t nursery_max_;
     /// Old objects the mutator has been made to point at young ones. Drained
     /// (not deduplicated) by scanning each entry at the next minor collection.

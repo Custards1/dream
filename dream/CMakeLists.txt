@@ -139,6 +139,7 @@ endif()
 # The VM library
 # ---------------------------------------------------------------------------
 set(DREAM_SOURCES
+  src/env.cpp
   src/value.cpp
   src/image.cpp
   src/heap.cpp

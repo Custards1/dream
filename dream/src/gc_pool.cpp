@@ -1,7 +1,8 @@
 #include "gc_pool.hpp"
 
 #include <algorithm>
-#include <cstdlib>
+
+#include "env.hpp"
 
 namespace dream {
 
@@ -17,10 +18,7 @@ namespace {
 /// either. `DREAM_GC_THREADS` is how the next workload gets to disagree, and 1
 /// turns the helpers off altogether.
 unsigned configured_capacity() {
-    if (const char* env = std::getenv("DREAM_GC_THREADS")) {
-        long long n = std::atoll(env);
-        if (n > 0) return unsigned(std::min<long long>(n, 64));
-    }
+    if (g_env.gc_threads) return g_env.gc_threads;
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 1;
     return std::min(hw, 8u);

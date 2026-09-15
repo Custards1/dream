@@ -1,5 +1,3 @@
-#include <cstdlib>
-
 #include "interp.hpp"
 
 #include <cinttypes>
@@ -8,12 +6,12 @@
 #include <cstring>
 
 #include "builtins.hpp"
+#include "env.hpp"
 #include "jit.hpp"
 
 namespace dream {
 
 std::atomic<uint64_t> g_thunk_counts[64];
-const bool g_probe_thunk = std::getenv("DREAM_PROBE_THUNK") != nullptr;
 
 namespace {
 
@@ -2025,7 +2023,7 @@ bool unwind(Process& p, size_t floor) {
 /// only on the path that was about to allocate anyway.
 
 void dbg_dump_thunks() {
-    if (!g_probe_thunk) return;
+    if (!g_env.probe_thunk) return;
     for (size_t i = 0; i < 64; ++i) {
         uint64_t c = g_thunk_counts[i].load();
         if (c > 50000)
@@ -2174,7 +2172,7 @@ Value thunk_for(Process& p, uint32_t node, Value frame) {
         }
         default: break;
     }
-    if (g_probe_thunk) g_thunk_counts[size_t(n.op) & 63].fetch_add(1, std::memory_order_relaxed);
+    if (g_env.probe_thunk) g_thunk_counts[size_t(n.op) & 63].fetch_add(1, std::memory_order_relaxed);
     return p.heap().make_thunk(node, frame);
 }
 
@@ -2219,41 +2217,6 @@ void prime_force(Process& p, Value v) {
     push_cont(p, ContKind::Halt, 0, 0, 0, UNIT);
     enter(p, v);
 }
-
-/// The limits that keep one runaway process from taking the runtime with it.
-///
-/// A process is the unit of failure here, so exhausting memory has to kill the
-/// process that did it and nothing else. Without these, `std::bad_alloc`
-/// escapes the allocator and calls `terminate`, which loses every other
-/// process, the scheduler, and any work already done.
-///
-/// Each is generous enough that ordinary programs never approach it -- a tail
-/// call pops its continuation, so a loop runs in constant space, and
-/// `sum_to 100000` needs 100k frames against a limit of four million -- and
-/// each can be moved for a program that genuinely needs more.
-struct Limits {
-    size_t conts;
-    size_t stack;
-    size_t heap_bytes;
-
-    static const Limits& get() {
-        static Limits l = [] {
-            auto from_env = [](const char* name, size_t fallback) {
-                if (const char* env = std::getenv(name)) {
-                    long long n = std::atoll(env);
-                    if (n > 0) return size_t(n);
-                }
-                return fallback;
-            };
-            return Limits{
-                from_env("DREAM_MAX_DEPTH", size_t(4u) << 20),      // ~96 MB of continuations
-                from_env("DREAM_MAX_STACK", size_t(4u) << 20),      // ~32 MB of values
-                from_env("DREAM_MAX_HEAP", size_t(1u) << 30),       // 1 GB per process
-            };
-        }();
-        return l;
-    }
-};
 
 /// The raises behind the checks below, kept here rather than in the loops so
 /// the per-reduction path stays a couple of compares and the error-string
@@ -2349,13 +2312,12 @@ void run_process(Process& p, int64_t budget) {
     p.reductions = budget;
     p.slice = budget;
     p.slice_spent = false;
-    // The limits are loop-invariant over the whole run; read them once so the
-    // per-reduction check stays a couple of compares against registers, not a
-    // thread-safe static init guarded call.
-    const Limits lim = Limits::get();
-    const size_t max_conts = lim.conts;
-    const size_t max_stack = lim.stack;
-    const size_t max_heap = lim.heap_bytes;
+    // The limits are loop-invariant over the whole run -- see `EnvConfig`, which
+    // is what keeps them from being a `getenv` -- so they are copied into
+    // registers here rather than re-read through the global on every check.
+    const size_t max_conts = g_env.max_conts;
+    const size_t max_stack = g_env.max_stack;
+    const size_t max_heap = g_env.max_heap;
     const WellKnownAtoms& wk = well_known(p.runtime());
     // Profiling never turns on mid-run, so this is a register for the whole
     // loop rather than a load per step. That matters most for the Return run
@@ -2451,10 +2413,9 @@ bool force_whnf(Process& p, Value v, Value* out) {
     p.force_vouched = false;
     if (!vouched) ++p.force_pins;
 
-    const Limits lim = Limits::get();
-    const size_t max_conts = lim.conts;
-    const size_t max_stack = lim.stack;
-    const size_t max_heap = lim.heap_bytes;
+    const size_t max_conts = g_env.max_conts;
+    const size_t max_stack = g_env.max_stack;
+    const size_t max_heap = g_env.max_heap;
     const WellKnownAtoms& wk = well_known(p.runtime());
     const bool prof = p.runtime().profiling();
     const size_t floor = p.conts.size();

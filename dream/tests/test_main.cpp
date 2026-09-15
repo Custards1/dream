@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "builtins.hpp"
+#include "env.hpp"
 #include "gc_pool.hpp"
 #include "heap.hpp"
 #include "image.hpp"
@@ -412,10 +413,12 @@ static void test_concurrent_mark_period() {
         std::printf("  skipped (concurrent mark): the pool has no threads to give\n");
         return;
     }
-    // The mode is read once, by the first `start_concurrent_mark` call, so the
-    // knob must be set before this test's own call -- which is also the
-    // binary's first. Forcing it is what makes the size gate below not matter.
-    setenv("DREAM_GC_CONCURRENT", "1", 1);
+    // `DREAM_GC_CONCURRENT=1` is what the race detector uses to put every major
+    // through this path however small the heap is, and it is what this test
+    // needs too -- the graph below is nowhere near the size that would earn the
+    // concurrent path on its own. The knob is read from the environment once,
+    // before `main`, so the test writes the field rather than the variable.
+    g_env.gc_concurrent = 1;
 
     Heap h(64 * 1024);
     VectorRoots roots;

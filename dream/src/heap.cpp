@@ -12,6 +12,7 @@
 #include <thread>
 #include <unordered_set>
 
+#include "env.hpp"
 #include "gc_pool.hpp"
 
 namespace dream {
@@ -78,19 +79,6 @@ struct ClassTable {
 constexpr ClassTable kClassOf{};
 static_assert(kHeapClassCount <= 256, "a class index has to fit in the table's byte");
 
-/// Set from DREAM_GC_TRACE: report every collection on stderr as it happens.
-/// Read once, because the collector asks twice per collection and the answer
-/// cannot change. `--stats` gives the totals; this gives the shape of them,
-/// which is what says whether a pause is one long collection or forty short
-/// ones, and whether the threads that joined in found anything to do.
-static bool gc_trace() {
-    static const bool on = [] {
-        const char* v = std::getenv("DREAM_GC_TRACE");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    return on;
-}
-
 /// A monotonic clock read, in nanoseconds. Two of these per collection is
 /// nothing against the collection itself, and a pause nobody measured is a
 /// pause nobody has diagnosed.
@@ -113,38 +101,9 @@ inline uint32_t class_size(uint32_t bytes) {
 }
 }  // namespace
 
-/// How large a nursery may grow, and where the number comes from.
-///
-/// A nursery is a bet that most objects die young, and its size is how long
-/// they are given to do it. Too small and a collection promotes objects that
-/// were about to die anyway -- which is the expensive mistake, because
-/// promotion is a copy and everything it copies has to be scanned and then
-/// swept later. Too large and the collection's working set falls out of cache
-/// and every process pays for memory it is not using.
-///
-/// So the size is not chosen: it is *earned*. Every process starts at 64 KB,
-/// and only one that keeps promoting a large share of what it allocates grows
-/// -- doubling each time, up to this. A language that expects hundreds of
-/// thousands of processes cannot afford a large nursery by default, and a
-/// compiler churning through a syntax tree cannot afford a small one; letting
-/// the survival rate decide gives each of them what it needs.
-///
-/// The default cap is 32 MiB, which is where the self-compile stops improving.
-/// `DREAM_NURSERY_MAX` overrides it, for measuring the next workload.
-static size_t nursery_max_bytes() {
-    static const size_t value = [] {
-        if (const char* env = std::getenv("DREAM_NURSERY_MAX")) {
-            long long n = std::atoll(env);
-            if (n > 0) return size_t(n);
-        }
-        return size_t(32) << 20;
-    }();
-    return value;
-}
-
 Heap::Heap(size_t initial_bytes)
     : nursery_hi_(initial_bytes),
-      nursery_max_(nursery_max_bytes()),
+      nursery_max_(g_env.nursery_max),
       gc_threshold_(initial_bytes),
       initial_bytes_(initial_bytes) {
     // The nursery starts with one block; old space grows its own as objects
@@ -741,14 +700,7 @@ Heap::~Heap() {
 /// parallel path however small it is, which is how the race detector gets to
 /// see the parallel collector on a program small enough to run under it.
 static size_t parallel_floor(bool minor) {
-    static const size_t base = [] {
-        if (const char* env = std::getenv("DREAM_GC_PAR_MIN")) {
-            long long n = std::atoll(env);
-            if (n >= 0) return size_t(n);
-        }
-        return size_t(1) << 20;
-    }();
-    return minor ? base : base * 4;
+    return minor ? g_env.gc_par_min : g_env.gc_par_min * 4;
 }
 
 Value Heap::await_forward(Obj* o) {
@@ -1296,7 +1248,7 @@ bool Heap::trace_in_parallel(RootSource& roots, bool minor) {
 
     parallel_ = false;
     round_ = nullptr;
-    if (ran && gc_trace()) {
+    if (ran && g_env.gc_trace) {
         std::fprintf(stderr, ";   traced by");
         for (GcCtx& c : round.ctxs) {
             if (c.scanned) std::fprintf(stderr, " %llu", (unsigned long long)c.scanned);
@@ -1403,7 +1355,7 @@ void Heap::major_collect(RootSource& roots) {
     minor_pays_ = true;
 
     major_nanos_ += now_nanos() - started;
-    if (gc_trace())
+    if (g_env.gc_trace)
         std::fprintf(stderr,
                      "; major: %zu live, %zu held, %.2f ms mark, %.2f ms sweep\n",
                      live_after_gc_, block_bytes_, double(marked - started) / 1e6,
@@ -1445,7 +1397,7 @@ void Heap::minor_collect(RootSource& roots) {
     minor_pays_ = promoted_now * 4 <= looked_at * 3;
     grow_nursery_if_crowded(promoted_now, looked_at);
     minor_nanos_ += now_nanos() - started;
-    if (gc_trace())
+    if (g_env.gc_trace)
         std::fprintf(stderr,
                      "; minor: %zu nursery, %llu promoted, %zu remembered, %zu held, %.2f ms\n",
                      looked_at, (unsigned long long)(promoted_bytes_ - promoted_before),
@@ -1480,13 +1432,7 @@ bool Heap::start_concurrent_mark(RootSource& roots) {
     // `parallel_floor`, with a heavier thumb on the scale. `DREAM_GC_CONCURRENT=1`
     // forces every major through this path (the race detector's door in), and
     // `=0` switches it off regardless of size.
-    static const int mode = [] {
-        if (const char* v = std::getenv("DREAM_GC_CONCURRENT")) {
-            if (std::strcmp(v, "1") == 0) return 1;
-            if (std::strcmp(v, "0") == 0) return 0;
-        }
-        return -1;
-    }();
+    const int mode = g_env.gc_concurrent;
     if (mode == 0) return false;
     if (mode < 0 && allocated_ < (size_t(1) << 24)) return false;
     GcPool& pool = GcPool::instance();
@@ -1620,7 +1566,7 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     const uint64_t final_ns = now_nanos() - started;
     major_nanos_ += final_ns;
     concurrent_nanos_ += overlap_ns;
-    if (gc_trace())
+    if (g_env.gc_trace)
         std::fprintf(stderr,
                      "; concurrent major: %zu live, %zu held, "
                      "%.2f ms overlap + %.2f ms stop\n",
@@ -1758,7 +1704,7 @@ bool Heap::sweep_in_parallel() {
 }
 
 void Heap::verify_collect(RootSource& roots, bool expect_no_young) {
-    if (!verify_after_gc()) return;
+    if (!g_env.verify_heap) return;
     std::string problem = verify_internal(roots, expect_no_young);
     if (!problem.empty()) {
         std::fprintf(stderr, "dream: heap corrupted after collection %llu: %s\n",
@@ -1784,20 +1730,6 @@ bool Heap::owns(const void* p, size_t bytes) const {
         if (addr >= start && addr + bytes <= start + b->used) return true;
     }
     return false;
-}
-
-bool Heap::verify_after_gc() {
-    // Read once and answered from a bool thereafter, so that the collector
-    // pays one predictable branch for it. It used to be compiled out unless
-    // the build defined `DREAM_DEBUG` or `DREAM_VERIFY_HEAP` -- which no build
-    // here ever did, so the environment variable did nothing and `just
-    // test-heap` verified nothing. A branch per collection is not a cost worth
-    // a switch that is off by accident.
-    static const bool on = [] {
-        const char* v = std::getenv("DREAM_VERIFY_HEAP");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    return on;
 }
 
 namespace {
