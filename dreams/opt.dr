@@ -1,0 +1,510 @@
+// The optimizer: one rebuild of the finished arena.
+//
+// Lowering emits a node wherever the source says one, and says nothing about
+// whether it has emitted that node before. It has, constantly. `local 3` is one
+// record and a self-compile writes ten thousand of them; `core.head` as a
+// callee is a `builtin` beside an `apply` and there are seven thousand of those;
+// a whole `if x == () { .. }` written twice in two modules is two identical
+// subtrees. Nothing downstream can tell the copies apart, because a node record
+// is the entire description of what it does -- there is no identity in it, only
+// an opcode, its flags and three operands.
+//
+// So the arena is rebuilt once, bottom up, into a fresh one that keeps a table
+// of everything it has already emitted. A node whose record has been seen is
+// not appended again; the edge that wanted it points at the copy that exists.
+// Because the children are rebuilt first, two equal subtrees reach this with
+// equal operands, and the sharing compounds all the way up: on `dreams` itself
+// 67,306 nodes become 19,323 and the image goes from 1.29 MB to 474 KB. Flat,
+// only 47% of the arena is duplicate records; bottom up it is 71%.
+//
+// The same walk answers two other questions for free, which is why they are
+// here rather than in passes of their own:
+//
+//   - **What is dead.** The walk starts from the function bodies, so a node
+//     nothing reaches is never copied. Wrapper lowering leaves these behind by
+//     the hundred -- it emits the call before deciding to rewrite it -- and
+//     before this pass they were written into the image and loaded by the VM.
+//   - **Which runs of children are the same.** A variadic node addresses its
+//     children as an offset and a count into one side pool, so two calls with
+//     the same arguments want the same run, and after the sharing above they
+//     have the same indices to look identical by. Half the pool goes.
+//
+// What makes all of this sound is that a node is a *function of the frame it is
+// evaluated against*, and of nothing else. Sharing one between two functions
+// does not make them share anything at run time: each forces it against its own
+// frame, and `local 3` means "slot 3 of whoever is asking". Memoization belongs
+// to the thunk the machine builds, which is a pair of a node and a frame, so
+// two sites that share a node still get a thunk each.
+//
+// The one exception is `field`, and it is not about correctness -- see
+// `shareable` below.
+//
+// **Why this is a second walk and not part of `ir.push_node`.** Interning as
+// nodes are pushed would be strictly cheaper -- no second walk, no memo, and
+// lowering already pays for the push. It is also wrong, because a node's flags
+// are not final when it is pushed. `ir.set_node_flag` exists precisely so that
+// a flag discovered late -- that a call turned out to be in tail position, that
+// a value turned out to be effectful -- can be set on a node already in the
+// arena, and setting one on a node shared at push time would hand it to every
+// other site sharing it. A flag is the compiler's answer to "when does this
+// run?", so that is not a small error. The same argument puts this after
+// `settle_comps!` rather than merely after lowering: a compile-time expression
+// overwrites its placeholder once the program has been built and run.
+//
+// Nothing here changes what the program computes. Every node emitted is a node
+// lowering already emitted, with its operands renumbered; no node is folded,
+// reordered or deleted except one that nothing could reach. That is a
+// deliberately narrow licence, and it is what lets the pass run unconditionally
+// on every build without a flag to turn it off -- there is no program it can be
+// wrong about. `--no-opt` exists anyway, because when an image misbehaves the
+// first question is whether the pass that rewrote it is why.
+
+import std.core;
+import std.list;
+
+import dreams.ir;
+
+// --- what an operand means ----------------------------------------------------
+//
+// A rebuild has to renumber every edge and copy everything else, so it has to
+// know which is which -- and the three operand fields of a node record are not
+// typed. `a` is another node in `force`, a frame slot in `bind`, a function
+// index in `closure`, a constant index in `int` and a Unicode scalar in `char`.
+// Getting one wrong is silent in the worst way: the image still loads, the
+// section table still adds up, and some program somewhere reads a slot number
+// as a node index and evaluates whatever happens to live there.
+//
+// So the two tables below are written out per opcode rather than inferred, and
+// an opcode named in neither is a leaf whose operands are all copied. The
+// operands are numbered 0, 1, 2 for `a`, `b`, `c`.
+
+/// Which operands are edges to other nodes.
+let node_edges = [
+    /// `a` is the object; `b` is the string constant naming the field.
+    [:field, [0]],
+    /// `a` is the callee; `b` and `c` address the argument run below.
+    [:apply, [0]],
+    [:if, [0, 1, 2]],
+    /// `a` is the slot bound; only the value is a node.
+    [:bind, [1]],
+    /// `a` is the body and `b` the handler; `c` is the slot the error binds to.
+    [:try, [0, 1]],
+    [:force, [0]],
+    [:neg, [0]], [:not, [0]],
+    [:add, [0, 1]], [:sub, [0, 1]], [:mul, [0, 1]],
+    [:div, [0, 1]], [:mod, [0, 1]],
+    [:eq, [0, 1]], [:ne, [0, 1]], [:lt, [0, 1]],
+    [:le, [0, 1]], [:gt, [0, 1]], [:ge, [0, 1]],
+    [:and, [0, 1]], [:or, [0, 1]],
+    /// `c` is the fallback, and absent when there is none.
+    [:get, [0, 1, 2]],
+    [:set, [0, 1, 2]],
+];
+
+/// Which opcodes address a run of children, as `[op, offset operand, count
+/// operand, kids per count]`. The multiplier is for `map`, whose count is a
+/// number of pairs and whose run is two kids each.
+let node_runs = [
+    [:apply, 1, 2, 1],
+    [:block, 0, 1, 1],
+    [:make_list, 0, 1, 1],
+    [:make_array, 0, 1, 1],
+    [:make_map, 0, 1, 2],
+];
+
+// Asked once per node of the program, which is the shape of question that has
+// twice been the most expensive thing in a self-compile when it was answered by
+// walking a list. Both tables are built once, at module level.
+let edge_map = list.fold (fn m e -> core.map_put m (list.nth 0 e) (list.nth 1 e))
+                         (core.map_new ()) node_edges;
+let run_map = list.fold (fn m e -> core.map_put m (list.nth 0 e) [list.nth 1 e, list.nth 2 e, list.nth 3 e])
+                        (core.map_new ()) node_runs;
+
+let edges_of op = core.map_get edge_map op [];
+let run_of op = core.map_get run_map op ();
+
+/// An opcode with no children at all: every operand it has is a number that
+/// means something other than "the node over there". Half the arena is these --
+/// `local`, `builtin`, `global`, `atom`, `int` -- and the walk below treats
+/// them differently, so the question is asked once per node and gets its own
+/// table rather than two misses on the two above.
+let leaf_map = list.fold (fn m e -> core.map_put m (list.nth 0 e) false)
+                         (list.fold (fn m e -> core.map_put m (list.nth 0 e) false)
+                                    (core.map_new ()) node_edges)
+                         node_runs;
+let is_leaf op = core.map_get leaf_map op true;
+
+/// Operand `k` of a node, and a node with operand `k` replaced. A node is
+/// `[op, flags, a, b, c]`, so operand `k` is at position `k + 2`.
+let operand k n = n.[k + 2 else ir.no_node];
+let set_operand k v n = n.[k + 2 => v];
+
+/// Whether two equal copies of this node may become one.
+///
+/// Only `field` may not, and the reason is speed rather than meaning. A member
+/// access carries an inline cache in the VM, and the cache is indexed *by node*:
+/// `member_value` in [dream/src/interp.cpp](dream/src/interp.cpp) remembers
+/// against the site which member of which module it found last time. Sharing a
+/// site would still be correct -- the cache stores the import index alongside
+/// the answer and falls back to the search when it does not match, precisely so
+/// that a node meeting a different module cannot read the wrong member out of
+/// the right one -- but a shared site is one that can meet more than one module,
+/// and a cache that misses is worse than no sharing. There are 842 of them in
+/// `dreams` against 47,000 nodes saved, so this costs nothing worth having.
+let shareable n = ir.node_op n != :field;
+
+// --- the rebuild state ----------------------------------------------------------
+//
+// The arena being built, and the three tables that keep the walk from doing
+// anything twice. All of them are maps rather than lists for the reason
+// `ir.program` gives: appending to a list costs its length and indexing one
+// costs the index, and there are tens of thousands of both here.
+
+let state nodes kids = %{
+    // The arena being read, as arrays: the walk indexes it in no order at all,
+    // and indexing a list of sixty thousand nodes by position would be the
+    // whole cost of the pass.
+    :src => nodes, :src_kids => kids,
+    // The arena being written.
+    :out => core.map_new (), :count => 0,
+    :out_kids => core.map_new (), :kid_count => 0,
+    // Node record to the index it was given. This is what does the sharing.
+    :seen => core.map_new (),
+    // Run of children to the offset it was given.
+    :runs => core.map_new (),
+    // Old node index to new. This is not an optimization but a requirement: the
+    // arena is a DAG rather than a tree -- `lower` shares a subtree whenever it
+    // can and fusion shares more -- so a walk without it would copy a shared
+    // node once per path to it and could not finish a large program.
+    :memo => core.map_new (),
+};
+
+let src s        = core.map_get s :src #[];
+let src_kids s   = core.map_get s :src_kids #[];
+let out s        = core.map_get s :out (core.map_new ());
+let count s      = core.map_get s :count 0;
+let out_kids s   = core.map_get s :out_kids (core.map_new ());
+let kid_count s  = core.map_get s :kid_count 0;
+let seen s       = core.map_get s :seen (core.map_new ());
+let runs s       = core.map_get s :runs (core.map_new ());
+let memo s       = core.map_get s :memo (core.map_new ());
+
+/// Force what has been built so far.
+///
+/// The same move `ir.settle` makes and for the same reason: every table here
+/// grows by one `map_put` per node, and a `map_put` nobody forces is a
+/// suspension holding the map before it. Left alone that is sixty thousand of
+/// them stacked up, every intermediate table live at once, and forcing the last
+/// walks the whole history. Forced as it is built, what stays live is the five
+/// tables and nothing else. `len` of a map is its stored count, so this is five
+/// loads.
+///
+/// Called once per node, from `rebuild`, and not by the table writes
+/// underneath it -- a node passes through `keep` and at most one `keep_run` on
+/// its way back up, so settling at the top of that catches every write with a
+/// chain three long rather than one. Settling at each write instead cost 2.8%
+/// of a self-compile to force what the next call would have forced anyway.
+let settle s =
+    if len (out s) >= 0 && len (out_kids s) >= 0 && len (seen s) >= 0
+       && len (runs s) >= 0 && len (memo s) >= 0 { s } else { s };
+
+let node_at i s = (src s).[i else ir.leaf :nop];
+let kid_at i s = (src_kids s).[i else ir.no_node];
+
+/// Append a node, or answer the index of one already emitted that says the same
+/// thing: `[state, index]`.
+///
+/// The key is the record itself, written out. A list cannot be a map key --
+/// keys are compared by identity, and two equal lists are two objects -- so the
+/// five fields become a string, which can. That is one native call and a short
+/// string per node, against a trie walk per field for the nested-map form.
+let keep n s =
+    if not (shareable n) {
+        let i = count s;
+        [core.map_put (core.map_put s :out (core.map_put (out s) i n)) :count (i + 1), i]
+    } else {
+        let key = to_string n;
+        match core.map_get (seen s) key () {
+            () => {
+                let i = count s;
+                [core.map_put (core.map_put (core.map_put s :out (core.map_put (out s) i n))
+                                            :count (i + 1))
+                              :seen (core.map_put (seen s) key i),
+                 i]
+            },
+            found => [s, found],
+        }
+    };
+
+/// Append a run of children, or answer the offset of an identical run already
+/// placed: `[state, offset]`.
+let keep_run xs s = {
+    let key = to_string xs;
+    match core.map_get (runs s) key () {
+        () => {
+            // One pass, carrying the index rather than zipping a counted list
+            // alongside: `zip` and the `range` feeding it were between them 4%
+            // of a self-compile's allocation, to number a list this already
+            // walks in order.
+            let filled = list.fold (fn acc x ->
+                [core.map_put (list.head acc) (list.nth 1 acc) x, list.nth 1 acc + 1])
+                [out_kids s, kid_count s] xs;
+            let at = kid_count s;
+            [core.map_put (core.map_put (core.map_put s :out_kids (list.head filled))
+                                        :kid_count (list.nth 1 filled))
+                          :runs (core.map_put (runs s) key at),
+             at]
+        },
+        found => [s, found],
+    }
+};
+
+// --- the walk --------------------------------------------------------------------
+
+/// Rebuild the node at `i` into the new arena: `[state, new index]`.
+///
+/// Children first, so that by the time a node is looked up in the sharing table
+/// its operands are already the indices the copy would have, and two subtrees
+/// that mean the same thing are the same record.
+///
+/// A leaf skips the memo, and which nodes get one is worth the paragraph
+/// because the obvious answer -- all of them -- is the slower one. The arena
+/// this reads is very nearly a tree: on `dreams` itself, walking it with no
+/// memo at all visits 77,920 nodes against 66,336 distinct, so the whole table
+/// buys 17% fewer visits and charges a lookup and an insert on a table the size
+/// of the program for every one of them. Half those entries are leaves, and a
+/// leaf is the one node a re-walk cannot make expensive: it has no children, so
+/// visiting it twice is twice one visit rather than twice a subtree, and no
+/// amount of sharing above it can compound. So leaves are simply re-walked --
+/// `keep` answers them from the sharing table anyway, which is the same table
+/// the memo would have been consulted for -- and the memo is kept for nodes
+/// with children, where a shared subtree could otherwise be copied once per
+/// path to it and a deep enough DAG could take exponential time.
+let rec rebuild i s =
+    if not (ir.is_node i) { [s, i] }
+    else {
+        let n = node_at i s;
+        if is_leaf (ir.node_op n) { keep n s }
+        else {
+            match core.map_get (memo s) i () {
+                () => {
+                    let got = rebuild_node n s;
+                    let s1 = list.head got;
+                    let at = list.nth 1 got;
+                    [settle (core.map_put s1 :memo (core.map_put (memo s1) i at)), at]
+                },
+                found => [s, found],
+            }
+        }
+    };
+
+/// The rebuild proper, for a node with children that has not been met before.
+let rec rebuild_node n s = {
+    let op = ir.node_op n;
+    // The edges, left to right. Each answers the state it left behind and the
+    // node with that one operand renumbered.
+    let edged = list.fold (fn acc k -> {
+        let got = rebuild (operand k (list.nth 1 acc)) (list.head acc);
+        [list.head got, set_operand k (list.nth 1 got) (list.nth 1 acc)]
+    }) [s, n] (edges_of op);
+    // Then the run of children, if this opcode has one.
+    let run = match run_of op {
+                  () => edged,
+                  spec => rebuild_run spec (list.nth 1 edged) (list.head edged),
+              };
+    keep (list.nth 1 run) (list.head run)
+};
+
+/// Rebuild one node's run of children and point the node at the new run:
+/// `[state, node]`.
+let rec rebuild_run spec n s = {
+    let off = operand (list.nth 0 spec) n;
+    let many = operand (list.nth 1 spec) n * list.nth 2 spec;
+    let built = list.fold (fn acc k -> {
+        let got = rebuild (kid_at (off + k) (list.head acc)) (list.head acc);
+        [list.head got, core.cons (list.nth 1 got) (list.nth 1 acc)]
+    }) [s, []] (list.range 0 many);
+    let placed = keep_run (list.reverse (list.nth 1 built)) (list.head built);
+    [list.head placed, set_operand (list.nth 0 spec) (list.nth 1 placed) n]
+};
+
+// --- the pass ----------------------------------------------------------------------
+
+/// Turn a table built by index back into the flat list the image writer wants.
+let flatten m n fill = list.map (fn i -> core.map_get m i fill) (list.range 0 n);
+
+/// Carry one function's capture descriptors across to the new pool.
+///
+/// Captures share the kids pool with call arguments and block statements --
+/// `place_captures` in [dreams/lower.dr](dreams/lower.dr) says why -- so a pass
+/// that rebuilds that pool from the nodes alone drops every one of them, and a
+/// `closure` then reads its captures out of whatever indices now live at the
+/// offset it remembers. The VM catches it at load (`capture list extends past
+/// the kids pool`) only when the run happened to fall off the end.
+///
+/// A descriptor is not an edge: it is a slot number, or a capture index with
+/// the high bit set, read against the *defining* frame. So the run is copied
+/// verbatim rather than renumbered, and only its offset changes. It still goes
+/// through `keep_run`, which is sound for the same reason sharing an argument
+/// run is: the pool is a flat array of numbers, and two runs holding the same
+/// numbers are the same run to everyone who reads it.
+let place_captures f s = {
+    let off = core.map_get f :captures_off 0;
+    let many = core.map_get f :n_captures 0;
+    if many == 0 { [s, 0] }
+    else { keep_run (list.map (fn k -> kid_at (off + k) s) (list.range 0 many)) s }
+};
+
+/// Rebuild every reachable node of a finished image.
+///
+/// The entry points are the function bodies and there are no others: a global
+/// names a function, a closure and a thunk name a function, and the image's
+/// entry is a function. So a node no body reaches is a node nothing can ever
+/// evaluate.
+///
+/// Everything the image holds that is not a node or a kid is carried through
+/// untouched, which is what makes this safe to drop into the middle of a build:
+/// the constant pools keep their indices, so every `int`, `str` and `atom` node
+/// still names what it named, and `funcs` changes in exactly two fields.
+let optimize img = {
+    let s0 = state (core.array_of_list (core.map_get img :nodes []))
+                   (core.array_of_list (core.map_get img :kids []));
+    let walked = list.fold (fn acc f -> {
+        let got = rebuild (core.map_get f :body ir.no_node) (list.head acc);
+        let caps = place_captures f (list.head got);
+        [settle (list.head caps),
+         core.cons (core.map_put (core.map_put f :body (list.nth 1 got))
+                                 :captures_off (list.nth 1 caps))
+                   (list.nth 1 acc)]
+    }) [s0, []] (core.map_get img :funcs []);
+    let s = list.head walked;
+    core.map_put (core.map_put (core.map_put img
+                     :nodes (flatten (out s) (count s) (ir.leaf :nop)))
+                     :kids (flatten (out_kids s) (kid_count s) ir.no_node))
+                 :funcs (list.reverse (list.nth 1 walked))
+};
+
+when test {
+    import std.test;
+
+    /// An image with nothing in it but nodes, kids and the bodies that reach
+    /// them. Everything else `optimize` carries through untouched, so a test of
+    /// the walk does not need it.
+    let image nodes kids bodies =
+        %{ :nodes => nodes, :kids => kids,
+           :funcs => list.map (fn b -> %{ :body => b }) bodies };
+
+    let with_caps nodes kids bodies caps =
+        %{ :nodes => nodes, :kids => kids,
+           :funcs => list.map (fn pair ->
+               %{ :body => list.nth 0 pair,
+                  :captures_off => list.nth 0 (list.nth 1 pair),
+                  :n_captures => list.nth 1 (list.nth 1 pair) })
+               (list.zip bodies caps) };
+
+    let nodes_of img = core.map_get img :nodes [];
+    let kids_of img = core.map_get img :kids [];
+    let bodies_of img = list.map (fn f -> core.map_get f :body ir.no_node)
+                                 (core.map_get img :funcs []);
+    let caps_of img = list.map (fn f -> [core.map_get f :captures_off 0,
+                                         core.map_get f :n_captures 0])
+                               (core.map_get img :funcs []);
+
+    /// `local 0` twice over, as two bodies.
+    let two_locals = optimize (image [ir.node :local 0 ir.no_node ir.no_node,
+                                      ir.node :local 0 ir.no_node ir.no_node] [] [0, 1]);
+
+    /// The same one-argument negation written twice.
+    let two_trees = optimize (image [ir.node :local 0 ir.no_node ir.no_node,
+                                     ir.node :local 0 ir.no_node ir.no_node,
+                                     ir.node :neg 0 ir.no_node ir.no_node,
+                                     ir.node :neg 1 ir.no_node ir.no_node] [] [2, 3]);
+
+    let tests = [
+        test.case "two copies of a leaf become one node"
+            $( test.eq! 1 (list.length (nodes_of two_locals)) ),
+        test.case "and both bodies point at it"
+            $( test.eq! [0, 0] (bodies_of two_locals) ),
+
+        // The whole point of rebuilding children first: equal subtrees only
+        // look equal once their operands have been renumbered.
+        test.case "two copies of a subtree become one node"
+            $( test.eq! 2 (list.length (nodes_of two_trees)) ),
+        test.case "and both bodies point at it"
+            $( test.eq! [1, 1] (bodies_of two_trees) ),
+
+        test.case "a node nothing reaches is dropped"
+            $( test.eq! 1 (list.length (nodes_of (optimize
+                   (image [ir.leaf :unit, ir.node :local 5 ir.no_node ir.no_node] [] [0])))) ),
+        test.case "and what is kept is what was reachable"
+            $( test.eq! [:unit] (list.map (fn n -> ir.node_op n) (nodes_of (optimize
+                   (image [ir.node :local 5 ir.no_node ir.no_node, ir.leaf :unit] [] [1])))) ),
+
+        // Two nodes that differ only in a flag are two nodes: a flag is the
+        // compiler's answer to "when does this run?", so sharing across one
+        // would move an effect or drop a force.
+        test.case "nodes that differ only in a flag are not shared"
+            $( test.eq! 2 (list.length (nodes_of (optimize
+                   (image [ir.leaf :unit,
+                           ir.with_flags ir.f_strict (ir.leaf :unit)] [] [0, 1])))) ),
+
+        // `field` owns an inline cache in the VM, indexed by node.
+        test.case "a field is never shared, though what it reads is"
+            $( test.eq! 3 (list.length (nodes_of (optimize
+                   (image [ir.node :global 3 ir.no_node ir.no_node,
+                           ir.node :field 0 7 ir.no_node,
+                           ir.node :field 0 7 ir.no_node] [] [1, 2])))) ),
+
+        // The class of mistake that is silent: an operand that is a slot, a
+        // function index or a Unicode scalar must be copied, never renumbered.
+        test.case "a bind's slot is copied, not renumbered"
+            $( test.eq! [5, 0] { let img = optimize (image
+                   [ir.leaf :unit, ir.node :bind 5 0 ir.no_node] [] [1]);
+                   let b = list.nth 1 (nodes_of img);
+                   [ir.node_a b, ir.node_b b] } ),
+        test.case "a char's scalar is copied, not renumbered"
+            $( test.eq! 955 (ir.node_a (list.head (nodes_of (optimize
+                   (image [ir.node :const_char 955 ir.no_node ir.no_node] [] [0]))))) ),
+        test.case "a closure's function index is copied, not renumbered"
+            $( test.eq! 42 (ir.node_a (list.head (nodes_of (optimize
+                   (image [ir.node :make_closure 42 ir.no_node ir.no_node] [] [0]))))) ),
+
+        // A run of children is addressed by offset and count, so two runs that
+        // hold the same indices are one run.
+        test.case "two identical runs of children become one"
+            $( test.eq! [1, 1] { let img = optimize (image
+                   [ir.leaf :unit, ir.node :block 0 1 ir.no_node, ir.node :block 1 1 ir.no_node]
+                   [0, 0] [1, 2]);
+                   [list.length (kids_of img), list.length (nodes_of img) - 1] } ),
+        test.case "a run's elements are renumbered with everything else"
+            $( test.eq! [0] { let img = optimize (image
+                   [ir.node :local 9 ir.no_node ir.no_node, ir.leaf :unit,
+                    ir.node :block 1 1 ir.no_node] [9, 0] [2]);
+                   kids_of img } ),
+
+        // Captures share the kids pool but are not edges: a descriptor is a
+        // slot, or a capture index with the high bit set, read against the
+        // defining frame. Dropping them is how the VM comes to say "capture
+        // list extends past the kids pool".
+        test.case "a capture run survives the rebuild"
+            $( test.eq! [7, ir.cap_from_capture + 1] { let img = optimize (with_caps
+                   [ir.leaf :unit] [7, ir.cap_from_capture + 1] [0] [[0, 2]]);
+                   kids_of img } ),
+        test.case "and the function still points at it"
+            $( test.eq! [[0, 2]] (caps_of (optimize (with_caps
+                   [ir.leaf :unit] [7, ir.cap_from_capture + 1] [0] [[0, 2]]))) ),
+        test.case "a function with no captures asks for no run"
+            $( test.eq! [[0, 0]] (caps_of (optimize (image [ir.leaf :unit] [] [0]))) ),
+
+        // Nothing is invented and nothing is folded: the pass only ever emits a
+        // node lowering already emitted, with its edges renumbered.
+        test.case "an arena with nothing to share is unchanged"
+            $( test.eq! 3 (list.length (nodes_of (optimize (image
+                   [ir.node :local 0 ir.no_node ir.no_node,
+                    ir.node :local 1 ir.no_node ir.no_node,
+                    ir.node :add 0 1 ir.no_node] [] [2])))) ),
+        test.case "an empty program comes out empty"
+            $( test.eq! [[], []] { let img = optimize (image [] [] []);
+                                   [nodes_of img, kids_of img] } ),
+    ];
+}

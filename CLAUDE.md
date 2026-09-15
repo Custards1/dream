@@ -40,6 +40,13 @@ the first thing to read before touching either.
    and `mapfilter` from 13.1x to **0.75x**. What it is, what makes it sound,
    and the one workload it does not finish are under "Deforestation" in
    *Making it faster*.
+5. ~~**`dreams` stops writing the same node twice.**~~ **Done.** The second
+   optimization that is the compiler's own, and the first that is about the
+   image rather than the clock: the finished arena is rebuilt once, bottom up,
+   sharing every node whose record something has already emitted. `dreams`
+   itself went from 67,306 nodes to **19,323** and from 1.29 MB to **474 KB**.
+   It buys no speed, at either end, and says so with numbers -- "Sharing the
+   arena" in *Making it faster*.
 
 `dreams` builds from `dreams/bootstrap/dreams.dream`, an image of itself that is
 checked in. The seed needs the VM and nothing else:
@@ -907,6 +914,110 @@ with each other, which is the check that matters.
 
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
+
+### Sharing the arena
+
+**What it does.** `lower` emits a node wherever the source says one and never
+asks whether it has emitted that node before. It has, constantly: `local 3` is
+one 16-byte record and a self-compile writes ten thousand of them, `core.head`
+as a callee is a `builtin` beside an `apply` and there are seven thousand of
+those, and a condition written the same way in two modules is two identical
+subtrees. [dreams/opt.dr](dreams/opt.dr) rebuilds the finished arena once,
+bottom up, into a fresh one that keeps a table of every record it has already
+written. On the three programs in this repository:
+
+| | nodes | image | |
+|---|---|---|---|
+| `dreams` | 67,306 -> **19,323** | 1.29 MB -> **474 KB** | -63% |
+| `lucid` | 52,157 -> **15,317** | 1.00 MB -> **373 KB** | -63% |
+| `mind` | 10,715 -> **4,129** | 219 KB -> **107 KB** | -51% |
+
+The sharing compounds because the children are rebuilt first: two subtrees that
+mean the same thing arrive at the table with the same operands and so are the
+same record. Flat, only 47% of the arena is duplicate records; bottom up it is
+71%. The same walk answers two more questions for free, which is why they are
+not passes of their own -- it starts from the function bodies, so a node nothing
+reaches is never copied (wrapper lowering leaves these behind by the hundred),
+and once the nodes are renumbered two runs of children holding the same indices
+are one run, which is half the kids pool.
+
+**What makes it sound** is that a node is a function of the frame it is
+evaluated against and of nothing else. Sharing one between two functions makes
+them share nothing at run time: each forces it against its own frame, and
+`local 3` means "slot 3 of whoever is asking". Memoization belongs to the thunk,
+which is a pair of a node and a frame, so two sites that share a node still get
+a thunk each. Three things follow, and all three are in `opt.dr`'s `when test`
+block so they stay found:
+
+- **A flag is part of the record.** `strict`, `impure` and `tail` are the
+  compiler's answer to "when does this run?", so two nodes differing only in one
+  are two nodes. This is also why the pass cannot live in `ir.push_node`, which
+  would be strictly cheaper -- there is no second walk and no memo. Flags are
+  set *after* emission (`ir.set_node_flag`: tail position and impurity are
+  discovered later), and a node shared at push time would hand a flag it
+  acquired later to everyone sharing it. The pass runs on the *finished* arena
+  for exactly this reason, and after `settle_comps!` besides, because a
+  compile-time expression overwrites its placeholder.
+- **An operand is not always an edge.** `a` is another node in `force`, a frame
+  slot in `bind`, a function index in `closure`, a constant index in `int` and a
+  Unicode scalar in `char`. The two tables at the top of `opt.dr` are written
+  out per opcode rather than inferred, because getting one wrong is silent in
+  the worst way: the image still loads, the section table still adds up, and
+  some program reads a slot number as a node index.
+- **Captures share the kids pool.** `place_captures` puts a function's capture
+  descriptors in the same pool as call arguments, so a pass that rebuilds that
+  pool from the nodes alone drops every one of them. The VM says `capture list
+  extends past the kids pool` -- but only when the run happens to fall off the
+  end, which on the first attempt here it did on the fourth program tried and
+  not on the first three.
+
+**What it costs, and what it does not buy.** The pass is 342 ms of a 2.7 s
+self-compile: **+11% to compile, for -63% of the image**. It makes nothing
+faster. Both halves of that were measured rather than assumed, and both are
+worth knowing before anyone tries to claim the pass back as a speedup:
+
+- **The six benchmark workloads do not move** (40/48/102/29/76/22 ms against
+  40/48/100/29/76/21 before), which is the expected answer: they are tight
+  loops, and a loop's nodes are in cache whatever the rest of the image weighs.
+- **Neither does load time, and neither does the compiler running on itself.**
+  A 474 KB image and a 1.29 MB image of the *same compiler* compiling the same
+  program came back 2649 ms and 2599 ms -- the smaller one nominally slower,
+  which is how a difference inside the placement noise floor looks. The reason
+  is that the VM maps an image and reads it where it lies, so it never pays for
+  bytes it does not touch. A smaller image is a smaller image.
+
+**Measured, and not kept.** Constant folding, which is the obvious thing to add
+to a pass that is already walking every node. There are 299 `if`s with a
+constant condition in `dreams` and the branches they would delete come to 897
+nodes -- 1.3% of the arena against the 71% above -- and taking them means
+deciding what happens to the `if`'s own flags when its child takes its place,
+which is the delicate part of the whole design. The constant pools were also
+checked and are already fully interned: 108 of 108 ints, 280 of 280 atoms, and
+42 unreferenced strings out of 1,871.
+
+**Two things that were tuned, one of which mattered.** The memo -- old node
+index to new -- is what stops a shared subtree being copied once per path to it,
+and it is half as big as it looks like it should be, because **leaves are
+deliberately not memoized**. The arena is very nearly a tree: walking `dreams`
+with no memo at all visits 77,920 nodes against 66,336 distinct, so the whole
+table buys 17% fewer visits and charges a lookup and an insert on a table the
+size of the program for each one. Half those entries were leaves, and a leaf is
+the one node a re-walk cannot make expensive -- it has no children, so visiting
+it twice is twice one visit rather than twice a subtree. Dropping them took the
+pass from 462 ms to 342. The memo is kept for everything else, because a deep
+enough DAG without one is exponential and 1.17x on one program is not a promise.
+What did *not* matter, measured the same way: settling the tables at every write
+rather than once per node, and the `zip`/`range` pair that numbered a list the
+walk already had in order -- together 19 ms of 481.
+
+**When changing it**, the bootstrap is the test, as it is for fusion: a compiler
+that shares nodes compiles *itself* smaller, so the seed moves and has to reach
+a fixpoint again. Note the shape of that -- the old seed does not have the pass,
+so it builds an *unoptimized* image of a compiler that does have it, and the
+stage after that is the first optimized one. Run `just bootstrap` twice and keep
+the second image; `bootstrap-check` then passes because every compiler built
+from this source emits the same thing. `--no-opt` emits the arena as lowered,
+which is what to reach for first when an image misbehaves.
 
 ### A JIT that can allocate -- the plan
 

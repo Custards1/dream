@@ -29,6 +29,9 @@ import dreams.ir;
 import dreams.lexer;
 import dreams.lower;
 import dreams.modules;
+// Aliased, because `opt` is already the options accessor a few lines down and
+// `opt o :output` beside `opt.optimize` reads as one thing doing two jobs.
+import dreams.opt as optimizer;
 import dreams.package;
 import dreams.parser;
 import dreams.path;
@@ -227,7 +230,7 @@ let copy_payload! out path n =
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out shebang payloads = {
+let build! l out shebang payloads optimize = {
     let r = scope.resolve! l;
     let low = lower.link! l r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
@@ -243,7 +246,13 @@ let build! l out shebang payloads = {
         // The sizes ride in the image record rather than being handed to the
         // writer separately, because they are part of what the image *is*: the
         // section table cannot be laid out without them.
-        let img = core.map_put (lower.image low) :payloads sizes;
+        // The optimizer runs here rather than inside `lower` because what it
+        // rewrites is the *finished* arena: a node's flags are only final once
+        // every body has been lowered and every compile-time expression has
+        // been settled into the placeholder that was waiting for it, and two
+        // nodes that differ only in a flag are two nodes.
+        let built = if optimize { optimizer.optimize (lower.image low) } else { lower.image low };
+        let img = core.map_put built :payloads sizes;
         let payload_bytes = list.fold (fn n k -> n + k) 0 sizes;
         // The shebang goes in front of the image rather than into it: the VM
         // skips a leading `#!` line when it loads a file, which is what makes
@@ -309,14 +318,19 @@ let rec write_all! handle text = {
 /// to see that a change to the front end did not quietly change its output.
 let show_stats! l = {
     let r = scope.resolve! l;
-    let img = lower.image (lower.lower_program r);
+    let lowered = lower.image (lower.lower_program r);
+    let img = optimizer.optimize lowered;
     let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
                                         + to_string n);
     count! "modules" (list.length (modules.modules l))
     count! "host" (list.length (modules.natives l))
     count! "globals" (list.length (scope.defs r))
     count! "functions" (list.length (scope.funcs r))
+    // Both counts, because the interesting number about the arena is how much
+    // of it was the same node written again: `nodes` is what the image carries
+    // and `lowered` is what lowering emitted to get there.
     count! "nodes" (list.length (core.map_get img :nodes []))
+    count! "lowered" (list.length (core.map_get lowered :nodes []))
     count! "constants" (list.length (core.map_get img :ints [])
                        + list.length (core.map_get img :floats [])
                        + list.length (core.map_get img :strs [])
@@ -384,12 +398,14 @@ let show_time! o file = {
     let linked = timed! (lower.link! l r);
     let low = value_of linked;
     let built = timed! (lower.image low);
-    let img = value_of built;
+    let lowered = value_of built;
+    let shared = timed! (optimizer.optimize lowered);
+    let img = value_of shared;
     let written = timed! (emit.to_binary img);
     let bytes = value_of written;
 
     let stages = [["parse", load], ["resolve", resolved], ["lower", linked],
-                  ["arena", built], ["emit", written]];
+                  ["arena", built], ["share", shared], ["emit", written]];
     let total = list.fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
     let pad n text = str.repeat (n - str.byte_length text) " " + text;
     let line! label ms walk = {
@@ -403,7 +419,8 @@ let show_time! o file = {
     line! "total" total ()
     console.print! ("image     " + to_string (str.byte_length bytes) + " bytes, "
                     + to_string (list.length (modules.modules l)) + " modules, "
-                    + to_string (list.length (core.map_get img :nodes [])) + " nodes")
+                    + to_string (list.length (core.map_get img :nodes [])) + " nodes"
+                    + " (from " + to_string (list.length (core.map_get lowered :nodes [])) + ")")
     print_diags! (modules.files l) (list.append (modules.diags l) (lower.all_diags r low))
 };
 
@@ -634,6 +651,10 @@ let rec parse_args args o =
         ["-D", d, ..rest] => parse_args rest (append_opt :defines d o),
         ["--define", d, ..rest] => parse_args rest (append_opt :defines d o),
         ["--test", ..rest] => parse_args rest (with_opt :test true o),
+        // Emit the arena exactly as `lower` built it. Nothing should need
+        // this, which is the point: when an image misbehaves it answers
+        // whether the pass that rewrote it is why.
+        ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
         ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
         ["--debug-cfg", ..rest] => parse_args rest (append_opt :defines "debug" o),
         ["-q", ..rest] => parse_args rest (with_opt :quiet true o),
@@ -682,6 +703,7 @@ let usage! () = {
         "  --test                   define `test`, and add a runner for the tests",
         "                           each module exports",
         "  --release                define `release`",
+        "  --no-opt                 emit the arena as lowered, unshared",
         "  --debug-cfg              define `debug`",
         "  -q, --quiet              print only what was asked for",
     ] |> strict!
@@ -717,7 +739,8 @@ let run_command! o file =
         :ast       => with_source! file (fn src -> ast! file src),
         :parse     => with_source! file (fn src -> parse_only! file src),
         :check     => check_program! (load! o file),
-        :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :payloads),
+        :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :payloads)
+                             (opt o :no_opt != true),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),
