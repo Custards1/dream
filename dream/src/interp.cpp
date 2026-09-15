@@ -307,11 +307,8 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
     // this deep (each of its forces returns before the next), which is what
     // lets a small bound here be free for every healthy program. See
 
-    // `Process::force_nest` and "Known and not fixed" in CLAUDE.md.
-
     // `Process::force_nest`, `dream/tests/programs/force_chain.dr`, and "Fixed:
     // compiled code forcing a long thunk chain crashed" in CLAUDE.md.
-
     if (jit && p.force_nest <= kMaxForceNestForCompiled) {
         // One inlined, lock-free read of the tier table (see `Jit::tier`), so
         // a process whose functions never grow hot -- most of a compile --
@@ -1423,9 +1420,27 @@ void finish_binary(Process& p, Op op, Value lhs, Value rhs) {
                 }
                 break;
             case Op::Div:
-            case Op::Mod:
+                // A quotient leaves the fixnum range in exactly one place:
+                // `-2^62 / -1` is `2^62`, one past the largest. `arith` hands
+                // that to the double path and answers a float; this one used
+                // to build the fixnum anyway, which wraps it to the *smallest*
+                // fixnum. It was the only number the two paths disagreed
+                // about, and which one a program got depended on whether both
+                // operands happened to be in hand -- so `12 / n` and a `12 / n`
+                // whose `n` arrived as a thunk gave different answers.
                 if (y != 0) {
-                    ret(p, make_fixnum(op == Op::Div ? x / y : x % y));
+                    r = x / y;
+                    if (fixnum_fits(r)) {
+                        ret(p, make_fixnum(r));
+                        return;
+                    }
+                }
+                break;
+            case Op::Mod:
+                // A remainder is smaller than its divisor, so it is a fixnum
+                // whenever the divisor was one: nothing to check.
+                if (y != 0) {
+                    ret(p, make_fixnum(x % y));
                     return;
                 }
                 break;

@@ -1,14 +1,27 @@
 // The LLVM JIT tier.
 //
 // Scope, and why it is drawn where it is: this compiles the strict numeric
-// spine of a function -- arithmetic, comparisons, branches, and self recursion
-// -- and leaves everything else to the interpreter. The limit is not laziness
-// in general but a soundness requirement. Compiled code evaluates a self call's
-// arguments eagerly, and doing that to an argument the callee would never have
-// forced can raise an error in a program that was going to terminate quietly.
-// So a function is only compiled when a strictness analysis proves every
-// parameter is forced on every path. Anything else stays interpreted, where
-// laziness is explicit and free.
+// spine of a function -- arithmetic, comparisons, branches, `let`, and calls to
+// itself and to other functions it can compile -- and leaves everything else to
+// the interpreter. The limit is not laziness in general but a soundness
+// requirement. Compiled code evaluates a call's arguments eagerly, and doing
+// that to an argument the callee would never have forced can raise an error in
+// a program that was going to terminate quietly. So a function is only compiled
+// when a strictness analysis proves every parameter is forced on every path,
+// and a call is only compiled when the same is true of the callee -- which is
+// what `PeerSet` asks. Anything else stays interpreted, where laziness is
+// explicit and free.
+//
+// What that rule does *not* promise is that an argument is forced at the same
+// point the interpreter would have forced it, only that it is forced. Where two
+// errors are reachable that can decide which one a program gets; the repro and
+// why it is not fixed are under "The tier's eager arguments can change *which*
+// error a program raises" in CLAUDE.md.
+//
+// A `let` has nowhere to live here -- no thunks, and the frame's slots are
+// registers -- so its value is emitted where its name is read, which is where
+// the interpreter would have forced the thunk. `Analyzer::check_bind` is the
+// rule and what it costs.
 //
 // Self recursion comes in two shapes and they are compiled differently. A tail
 // call is a loop back-edge: the parameters are overwritten and control jumps to
@@ -103,6 +116,31 @@ constexpr uint32_t kStackBudget = 1u << 20;
 /// tree walk tens; a function that needs thousands is one the interpreter
 /// should have anyway.
 constexpr uint32_t kFrameOverhead = 128;
+
+/// How many *other* functions one compilation may pull into its module.
+///
+/// A call to another global function is compiled by emitting that function's
+/// body into the same module and calling it, so saying yes to one costs the
+/// compile time of writing it. That time is real and already visible: the
+/// first run of `mapfilter` spends about 19 ms in LLVM, which is most of what
+/// the benchmark reports for it. A small closure buys the shapes that matter
+/// -- a loop that calls a helper, a helper that calls one more -- and a large
+/// one buys a compile nobody asked for.
+constexpr uint32_t kMaxPeers = 8;
+/// How deep the closure may be followed. A guard against a chain of calls,
+/// not a budget: `kMaxPeers` is what bounds the size.
+constexpr int kMaxPeerDepth = 8;
+/// "Not a function index", for the answer to "which function does this call
+/// name?" when it does not name one.
+constexpr uint32_t kNoFunc = ~uint32_t(0);
+
+/// How big a `let` may be for its value to be written out more than once.
+///
+/// A binding read twice has no thunk to remember its answer in, so writing it
+/// where each name is read runs it twice. Counted in nodes, after every `let`
+/// inside it has itself been written out -- which is what stops
+/// `let a = ..; let b = a + a; let c = b + b` from doubling at every step.
+constexpr uint32_t kMaxBindDuplication = 8;
 
 // ---------------------------------------------------------------------------
 // Representation
@@ -221,11 +259,19 @@ uint32_t known_native_strict_mask(Runtime& rt, const Image& img, uint32_t callee
     return nd ? nd->strict_mask : 0;
 }
 
+/// The ops the emitter can write. `Op::ConstAtom` and `Op::Capture` are
+/// deliberately absent: an atom index has to be remapped through the runtime
+/// and a capture lives in the frame, and the emitter refuses both. It used to
+/// refuse them *after* the analysis had said yes, which cost nothing while a
+/// compile was one function -- the emitter gave up and the function was marked
+/// rejected. It is not free now: an emitter that gives up on a peer gives up on
+/// the whole closure, including a root that had nothing wrong with it. So the
+/// two lists say the same thing.
 bool op_is_supported(Op op) {
     switch (op) {
         case Op::ConstInt: case Op::ConstFloat: case Op::ConstBool:
-        case Op::ConstChar: case Op::ConstAtom: case Op::Unit:
-        case Op::Local: case Op::Capture:
+        case Op::ConstChar: case Op::Unit:
+        case Op::Local:
         case Op::If: case Op::Block: case Op::Force:
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
@@ -256,17 +302,48 @@ struct Analysis {
     /// Slots to force on entry, in this order, before the float ones are
     /// unboxed. Empty unless `float_slots` is. See `Analyzer::force_order`.
     std::vector<uint32_t> force_first;
+    /// The other global functions this body calls. Every one of them is a
+    /// member of the compile's `PeerSet` and is emitted beside it.
+    std::vector<uint32_t> calls;
+    /// The body calls itself in tail position, so it is a loop. That is the
+    /// best shape there is for the root of a compile and the one shape a peer
+    /// may not have; `PeerSet::admit` says why.
+    bool tail_self = false;
+    /// For each slot, the node a `let` bound it to, or `NO_NODE`. A bound slot
+    /// is never read: the expression is written where the name is. See
+    /// `Analyzer::check_bind`.
+    std::vector<uint32_t> binds;
 };
+
+class PeerSet;
+/// `peers.admit(gi, depth)`, spelled as a free function because `Analyzer` and
+/// `PeerSet` each have to name the other: deciding whether a call may be
+/// compiled means analysing the callee, and analysing the callee means asking
+/// the same question of everything *it* calls.
+bool peer_admits(PeerSet& peers, uint32_t gi, int depth);
 
 class Analyzer {
 public:
-    Analyzer(Runtime& rt, const Image& img, uint32_t func_index)
-        : img_(img), fi_(func_index), f_(img.func(func_index)), rt_(rt) {}
+    Analyzer(Runtime& rt, const Image& img, uint32_t func_index, PeerSet* peers = nullptr,
+             int peer_depth = 0)
+        : img_(img), fi_(func_index), f_(img.func(func_index)), rt_(rt), peers_(peers),
+          peer_depth_(peer_depth) {}
 
     Analysis run() {
         Analysis a;
         if (f_.slots > 64 || f_.arity == 0) return a;
+        binds_.assign(f_.slots, NO_NODE);
+        reads_.assign(f_.slots, 0);
         if (!check(f_.body, 0)) return a;
+
+        // A slot no parameter owns and no `let` bound holds state that lives in
+        // the frame and nowhere this can reach. Nothing should produce one --
+        // `Op::Bind` is the only thing that writes such a slot, and every bind
+        // in the body has just been accounted for -- so this is checked rather
+        // than argued, because the argument is about the compiler and this file
+        // is not.
+        if (reads_beyond_params_) return a;
+        if (!bindings_substitutable()) return a;
 
         SlotSet strict = strict_of(f_.body, 0);
         SlotSet params = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
@@ -274,17 +351,12 @@ public:
         // self tail call would evaluate something the interpreter never would.
         if ((strict & params) != params) return a;
 
-        // A body that reads a slot no parameter owns has state the frame
-        // holds and the argument list does not, so it cannot be emitted as a
-        // function of its arguments. In practice nothing reaches this: the
-        // only thing that writes such a slot is `Op::Bind`, and a block
-        // containing one is refused above. It is checked rather than argued
-        // because the argument is about the compiler, not about this file.
-        if (recurses_ && reads_beyond_params_) return a;
-
+        a.binds = binds_;
         a.compilable = true;
         a.strict_params = strict;
         a.recurses = recurses_;
+        a.tail_self = tail_self_;
+        a.calls = calls_;
         a.float_slots = float_slots();
         if (a.float_slots) {
             if (!entry_forces(a.float_slots, &a.force_first)) {
@@ -307,7 +379,20 @@ private:
 
         if (op == Op::Apply) return check_apply(n, depth);
         if (!op_is_supported(op)) return false;
-        if (op == Op::Local && n.a >= f_.arity) reads_beyond_params_ = true;
+        // An integer too big for a fixnum is a boxed constant the emitter has
+        // no way to name, so it is refused here rather than there -- same
+        // reason as the two ops missing from the list above.
+        if (op == Op::ConstInt && !fixnum_fits(img_.integer(n.a))) return false;
+        if (op == Op::Local) {
+            if (n.a >= f_.slots) return false;
+            ++reads_[n.a];
+            // A read of a slot that is neither a parameter nor already bound.
+            // "Already" is what makes a binding that names itself, or one that
+            // names a later binding, refuse the function rather than expand for
+            // ever -- `check_bind` records a slot only after its value has been
+            // walked.
+            if (n.a >= f_.arity && binds_[n.a] == NO_NODE) reads_beyond_params_ = true;
+        }
 
         switch (op) {
             case Op::If:
@@ -316,9 +401,10 @@ private:
             case Op::Block:
                 for (uint32_t i = 0; i < n.b; ++i) {
                     uint32_t stmt = img_.kid(n.a + i);
-                    // A `let` inside the body would need a thunk built against
-                    // the frame, but the frame's slots live in registers here.
-                    if (Op(img_.node(stmt).op) == Op::Bind) return false;
+                    if (Op(img_.node(stmt).op) == Op::Bind) {
+                        if (!check_bind(img_.node(stmt), depth + 1)) return false;
+                        continue;
+                    }
                     if (!check(stmt, depth + 1)) return false;
                 }
                 return true;
@@ -333,10 +419,10 @@ private:
         }
     }
 
-    /// This function calling itself with a full argument list -- the only
-    /// Dream-level call the tier compiles. In tail position it becomes a loop
-    /// back-edge; anywhere else a machine call, which is what `recurses_`
-    /// records: the two need different shapes of function around them.
+    /// This function calling itself with a full argument list. In tail position
+    /// it becomes a loop back-edge; anywhere else a machine call, which is what
+    /// `recurses_` records: the two need different shapes of function around
+    /// them. A call to some *other* global function is a peer, below.
     bool is_self_call(const Node& n) const {
         if (Op(n.op) != Op::Apply || n.c != f_.arity) return false;
         const Node& callee = img_.node(n.a);
@@ -345,22 +431,168 @@ private:
         return g.kind == GLOBAL_FUNCTION && g.target == fi_;
     }
 
-    /// A call: this function calling itself, or one of the numeric natives
-    /// compiled code makes rather than calls. Anything else refuses the whole
-    /// function, because the tier has no way to enter an arbitrary callee.
+    /// A call. Three of them are compiled: this function calling itself, one of
+    /// the numeric natives compiled code makes rather than calls, and a
+    /// saturated call to another global function this tier can write. Anything
+    /// else -- a closure, a partial application, a member of a module, a native
+    /// that is not one of the five -- refuses the whole function, because there
+    /// is no way to enter a callee that is not named.
     bool check_apply(const Node& n, int depth) {
         if (is_self_call(n)) {
             for (uint32_t i = 0; i < n.c; ++i) {
                 if (!check(img_.kid(n.b + i), depth + 1)) return false;
             }
-            if (!(n.flags & F_TAIL)) recurses_ = true;
+            if (n.flags & F_TAIL) {
+                tail_self_ = true;
+            } else {
+                recurses_ = true;
+            }
             return true;
         }
-        if (known_native(rt_, img_, n.a, n.c) == KnownNative::None) return false;
+        if (known_native(rt_, img_, n.a, n.c) != KnownNative::None) {
+            for (uint32_t i = 0; i < n.c; ++i) {
+                if (!check(img_.kid(n.b + i), depth + 1)) return false;
+            }
+            return true;
+        }
+        // A saturated call to another global function, when that function is
+        // itself something this tier can write. It is compiled by emitting the
+        // callee into the same module and calling it -- so the whole closure of
+        // callees is decided here, before a line of either is written.
+        const uint32_t gi = peer_target(n);
+        if (gi == kNoFunc || !peers_ || !peer_admits(*peers_, gi, peer_depth_)) return false;
         for (uint32_t i = 0; i < n.c; ++i) {
             if (!check(img_.kid(n.b + i), depth + 1)) return false;
         }
+        calls_.push_back(gi);
         return true;
+    }
+
+    /// The function this call names, when it is a saturated call to a global
+    /// function other than this one. `kNoFunc` otherwise -- which covers a
+    /// partial application, a call through a local or a closure, and a call of
+    /// a module member.
+    ///
+    /// A self call is deliberately excluded: it has its own two shapes, and a
+    /// function is not its own peer.
+    uint32_t peer_target(const Node& n) const {
+        if (Op(n.op) != Op::Apply) return kNoFunc;
+        const Node& callee = img_.node(n.a);
+        if (Op(callee.op) != Op::Global) return kNoFunc;
+        const GlobalRec& g = img_.global(callee.a);
+        if (g.kind != GLOBAL_FUNCTION || g.target == fi_) return kNoFunc;
+        if (g.target >= img_.func_count()) return kNoFunc;
+        if (n.c != img_.func(g.target).arity) return kNoFunc;
+        return g.target;
+    }
+
+    /// Does compiled code evaluate every one of this call's arguments before
+    /// making it? True of a self call and of a peer, false of a native, which
+    /// evaluates only the ones its strict mask claims.
+    ///
+    /// For a peer the licence is the same one the self call rests on: a
+    /// function is only admitted when it forces every parameter on every path,
+    /// so an argument evaluated here is an argument the callee was going to
+    /// force anyway.
+    bool evaluates_all_args(const Node& n) const {
+        return is_self_call(n) || peer_target(n) != kNoFunc;
+    }
+
+    // --- bindings ---------------------------------------------------------
+    //
+    // A `let` in a compiled body has nowhere to put its value. The interpreter
+    // suspends it in a thunk against the frame and forces that thunk the first
+    // time the name is read; a compiled body has no thunks, and its frame slots
+    // are registers the collector cannot see.
+    //
+    // So the value is written where the name is *read* instead. That is exactly
+    // where the interpreter would have forced the thunk, so nothing moves: a
+    // binding nobody reads is never evaluated, which is what an unforced thunk
+    // comes to, and a binding read once is evaluated at the read. What is lost
+    // is the thunk's memory of its own answer -- read twice, the expression runs
+    // twice -- which is why reading twice is only allowed for something small
+    // that calls nothing.
+
+    /// A `let` statement. Answers false to refuse the whole function.
+    bool check_bind(const Node& n, int depth) {
+        // An impure `let` is a statement, not a binding: the block runs it where
+        // it stands because the effect has to happen there, and writing it
+        // somewhere else would move the effect. Its value would have to be a
+        // call this tier refuses anyway -- but the reason to refuse is the
+        // order, which is worth saying where the order is decided.
+        if (n.flags & F_STRICT) return false;
+        // Into a parameter's slot, or past the end of the frame: neither is
+        // something the compiler emits, and neither has a meaning here.
+        if (n.a < f_.arity || n.a >= f_.slots) return false;
+        // One slot, one binding. Bound twice, a read means whichever came
+        // before it, and this has no way to say which that was.
+        if (binds_[n.a] != NO_NODE) return false;
+        if (!check(n.b, depth + 1)) return false;
+        binds_[n.a] = n.b;
+        return true;
+    }
+
+    /// May every `let` in the body be written where its name is read?
+    ///
+    /// Read once or not at all, always. Read more than once, only when the
+    /// value is small and contains no call: "once per read" then costs a couple
+    /// of instructions, where a duplicated call could be a duplicated
+    /// recursion, and nested duplication is how a linear body becomes an
+    /// exponential one.
+    bool bindings_substitutable() {
+        for (uint32_t slot = f_.arity; slot < f_.slots; ++slot) {
+            if (binds_[slot] == NO_NODE || reads_[slot] <= 1) continue;
+            bool calls = false;
+            const uint32_t cost = expand_cost(binds_[slot], 0, &calls);
+            if (calls || cost > kMaxBindDuplication) return false;
+        }
+        return true;
+    }
+
+    /// How many nodes `idx` becomes once every `let` inside it has been written
+    /// out, and whether any of it is a call. Only asked of a body `check` has
+    /// already accepted, so every op it meets is one this tier emits.
+    uint32_t expand_cost(uint32_t idx, int depth, bool* calls) {
+        if (depth > 64) {
+            // Too deep to measure. Say the one thing that refuses it either way.
+            *calls = true;
+            return kMaxBindDuplication + 1;
+        }
+        const Node& n = img_.node(idx);
+        switch (Op(n.op)) {
+            case Op::Local:
+                if (n.a >= f_.arity && binds_[n.a] != NO_NODE) {
+                    return expand_cost(binds_[n.a], depth + 1, calls);
+                }
+                return 1;
+            case Op::Apply:
+                *calls = true;
+                return 1;
+            case Op::If: {
+                uint32_t c = 1 + expand_cost(n.a, depth + 1, calls) +
+                             expand_cost(n.b, depth + 1, calls);
+                if (n.c != NO_NODE) c += expand_cost(n.c, depth + 1, calls);
+                return c;
+            }
+            case Op::Block: {
+                uint32_t c = 1;
+                for (uint32_t i = 0; i < n.b; ++i) {
+                    const uint32_t stmt = img_.kid(n.a + i);
+                    const Node& sn = img_.node(stmt);
+                    c += expand_cost(Op(sn.op) == Op::Bind ? sn.b : stmt, depth + 1, calls);
+                }
+                return c;
+            }
+            case Op::Force: case Op::Neg: case Op::Not:
+                return 1 + expand_cost(n.a, depth + 1, calls);
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+            case Op::And: case Op::Or:
+                return 1 + expand_cost(n.a, depth + 1, calls) +
+                       expand_cost(n.b, depth + 1, calls);
+            default:
+                return 1;
+        }
     }
 
     /// Slots definitely forced when this node is reduced to WHNF.
@@ -369,6 +601,10 @@ private:
         const Node& n = img_.node(node);
         switch (Op(n.op)) {
             case Op::Local:
+                // A bound slot is the expression it was bound to, written here.
+                if (n.a >= f_.arity && binds_[n.a] != NO_NODE) {
+                    return strict_of(binds_[n.a], depth + 1);
+                }
                 return SlotSet(1) << n.a;
             case Op::If:
                 // The condition always runs; a branch only counts when both
@@ -404,11 +640,11 @@ private:
                 // argument nobody looks at, and this set is what licenses
                 // compiling the call in the first place.
                 SlotSet s = 0;
-                const bool self = is_self_call(n);
+                const bool eager = evaluates_all_args(n);
                 const uint32_t mask =
-                    self ? ~uint32_t(0) : known_native_strict_mask(rt_, img_, n.a);
+                    eager ? ~uint32_t(0) : known_native_strict_mask(rt_, img_, n.a);
                 for (uint32_t i = 0; i < n.c; ++i) {
-                    if (!self && !((mask >> i) & 1)) continue;
+                    if (!eager && !((mask >> i) & 1)) continue;
                     s |= strict_of(img_.kid(n.b + i), depth + 1);
                 }
                 return s;
@@ -481,6 +717,9 @@ private:
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
             case Op::Local:
+                if (n.a >= f_.arity && binds_[n.a] != NO_NODE) {
+                    return force_order(binds_[n.a], depth + 1, out);
+                }
                 out.push_back(n.a);
                 return true;
             case Op::Force: case Op::Neg: case Op::Not:
@@ -513,9 +752,9 @@ private:
                 return true;
             }
             case Op::Apply: {
-                const bool self = is_self_call(n);
-                const uint32_t mask =
-                    self ? ~uint32_t(0) : known_native_strict_mask(rt_, img_, n.a);
+                const uint32_t mask = evaluates_all_args(n)
+                                          ? ~uint32_t(0)
+                                          : known_native_strict_mask(rt_, img_, n.a);
                 for (uint32_t i = 0; i < n.c; ++i) {
                     if (!((mask >> i) & 1)) continue;
                     if (!force_order(img_.kid(n.b + i), depth + 1, out)) return false;
@@ -563,7 +802,13 @@ private:
                 if (n.c != NO_NODE) collect_calls(n.c, depth + 1);
                 return;
             case Op::Block:
-                for (uint32_t i = 0; i < n.b; ++i) collect_calls(img_.kid(n.a + i), depth + 1);
+                // Through a `let` to its value: the call inside one is emitted
+                // where the name is read, and the fixpoint has to see it.
+                for (uint32_t i = 0; i < n.b; ++i) {
+                    const uint32_t stmt = img_.kid(n.a + i);
+                    const Node& sn = img_.node(stmt);
+                    collect_calls(Op(sn.op) == Op::Bind ? sn.b : stmt, depth + 1);
+                }
                 return;
             case Op::Force: case Op::Neg: case Op::Not:
                 collect_calls(n.a, depth + 1);
@@ -583,9 +828,17 @@ private:
     uint32_t fi_;
     const FuncRec& f_;
     Runtime& rt_;
+    PeerSet* peers_ = nullptr;
+    int peer_depth_ = 0;
     std::vector<Ty> slot_ty_;
     std::vector<uint32_t> call_sites_;
+    std::vector<uint32_t> calls_;
+    /// Per slot: the node a `let` bound it to, or `NO_NODE`; and how many times
+    /// the body reads it. Both are filled in by `check` as it walks.
+    std::vector<uint32_t> binds_;
+    std::vector<uint32_t> reads_;
     bool recurses_ = false;
+    bool tail_self_ = false;
     bool reads_beyond_params_ = false;
 
 public:
@@ -598,7 +851,11 @@ public:
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
             case Op::ConstFloat: return Ty::Float;
-            case Op::Local: return n.a < slot_ty_.size() ? slot_ty_[n.a] : Ty::Any;
+            case Op::Local:
+                if (n.a >= f_.arity && n.a < binds_.size() && binds_[n.a] != NO_NODE) {
+                    return ty(binds_[n.a], depth + 1);
+                }
+                return n.a < slot_ty_.size() ? slot_ty_[n.a] : Ty::Any;
             case Op::Force: case Op::Neg: return ty(n.a, depth + 1);
             case Op::If: {
                 // An arm that transfers control -- a tail call -- contributes
@@ -635,16 +892,141 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// The functions one compile reaches
+// ---------------------------------------------------------------------------
+
+/// The other global functions a compilation may call, and the analysis of each.
+///
+/// The tier used to compile exactly one Dream-level call: this function calling
+/// itself. Everything else refused the whole function, which is why a fused
+/// `collatz` -- a loop whose body is `acc + collatz_steps x` -- ran interpreted
+/// while `collatz_steps` beside it was compiled. A call to another global
+/// function is now compiled the way a non-tail self call already was: the
+/// callee is emitted as a function of its arguments, into the same module, and
+/// called. There is no frame, no thunk and no trip through the interpreter.
+///
+/// The soundness argument is the one the tier already rests on. Compiled code
+/// evaluates a call's arguments before making it, and doing that to an argument
+/// the callee would never have forced can raise in a program that was going to
+/// finish quietly -- so a function is only compiled when it forces every
+/// parameter on every path. Asking that of the callee is asking exactly what
+/// the tier asks of itself, which is why the test below is `Analyzer::run` and
+/// not a second set of rules.
+///
+/// Mutual recursion makes the question circular: `f` is admissible if `g` is,
+/// and `g` is admissible if `f` is. What is being asked is "nothing anywhere in
+/// this closure is unsupported", which is a greatest fixpoint, so a function
+/// whose own decision is still running is assumed admissible. That assumption
+/// can be wrong -- the decision underneath it may come back no -- and `sound()`
+/// is what catches it, rather than an argument about which cases can happen.
+class PeerSet {
+  public:
+    PeerSet(Runtime& rt, const Image& img) : rt_(rt), img_(img) {}
+
+    bool admit(uint32_t gi, int depth);
+
+    /// Every call every member makes, and every call the root makes, is to a
+    /// member. False means the optimistic answer above was taken somewhere and
+    /// turned out wrong, and the whole compile is given up.
+    bool sound(const Analysis& root) const {
+        for (uint32_t gi : root.calls) {
+            if (!members.count(gi)) return false;
+        }
+        for (const auto& entry : members) {
+            for (uint32_t gi : entry.second.calls) {
+                if (!members.count(gi)) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Admitted functions, by image function index.
+    std::unordered_map<uint32_t, Analysis> members;
+
+  private:
+    enum class State : uint8_t { Deciding, Yes, No };
+    Runtime& rt_;
+    const Image& img_;
+    std::unordered_map<uint32_t, State> state_;
+};
+
+bool PeerSet::admit(uint32_t gi, int depth) {
+    if (depth > kMaxPeerDepth) return false;
+    auto seen = state_.find(gi);
+    if (seen != state_.end()) return seen->second != State::No;
+    if (members.size() >= kMaxPeers) return false;
+    if (gi >= img_.func_count()) return false;
+
+    state_[gi] = State::Deciding;
+    Analysis a = Analyzer(rt_, img_, gi, this, depth + 1).run();
+
+    // A peer is emitted as a function of its arguments and is given no frame of
+    // its own. Reading a slot no parameter owns is already refused for every
+    // function, peer or not, so what is left to refuse here is one thing:
+    //
+    // A peer may not be a loop. A compiled loop stays preemptible by writing its
+    // loop-carried state back to its frame and handing control to the
+    // interpreter, and a peer has no frame to write to -- so a peer that looped
+    // would hold its worker for as long as the loop ran, which for a loop that
+    // does not terminate is for ever. Recursion is allowed, because the machine
+    // stack bounds it: past `kStackBudget` the body answers `JIT_DEEP` and the
+    // interpreter takes the call over. A loop has no such bound, and that is the
+    // whole of the difference. A function refused here is still compiled in its
+    // own right when something enters it directly; it is only refused as
+    // somebody else's callee.
+    const bool ok = a.compilable && !a.tail_self;
+    state_[gi] = ok ? State::Yes : State::No;
+    if (!ok) return false;
+
+    // Emitted with no float specialization. A peer's signature has to be the
+    // same whoever calls it, and a slot carried as a raw double is a decision
+    // about one function's own loop -- keeping it would mean compiling the
+    // callee once per shape of argument its callers happened to have.
+    a.float_slots = 0;
+    a.force_first.clear();
+    members.emplace(gi, std::move(a));
+    return true;
+}
+
+bool peer_admits(PeerSet& peers, uint32_t gi, int depth) { return peers.admit(gi, depth); }
+
+
+// ---------------------------------------------------------------------------
 // Code generation
 // ---------------------------------------------------------------------------
 
+/// The signature of a body emitted as a function of its arguments:
+/// `(proc, depth, frame, a0..an, status)`. A peer's is always all-tagged, which
+/// is what lets one declaration serve every caller of it.
+llvm::FunctionType* body_signature(llvm::LLVMContext& ctx, uint32_t arity, SlotSet float_slots) {
+    auto* i64t = llvm::Type::getInt64Ty(ctx);
+    auto* i32t = llvm::Type::getInt32Ty(ctx);
+    auto* ptrt = llvm::PointerType::getUnqual(ctx);
+    auto* dblt = llvm::Type::getDoubleTy(ctx);
+    std::vector<llvm::Type*> params{ptrt, i32t, i64t};
+    for (uint32_t i = 0; i < arity; ++i) {
+        params.push_back(((float_slots >> i) & 1) ? dblt : i64t);
+    }
+    params.push_back(ptrt);
+    return llvm::FunctionType::get(i64t, params, false);
+}
+
+/// The LLVM function emitted for each peer of one compile, by image function
+/// index. Every one of them is declared before any body is written, because a
+/// call to a peer may be emitted before that peer's own body is -- which is
+/// what mutual recursion needs.
+using PeerFns = std::unordered_map<uint32_t, llvm::Function*>;
+
 class Emitter {
 public:
+    /// `peers` is the compile's declarations, shared by every emitter in it.
+    /// `preset` is non-null when this emitter is writing a peer: the function
+    /// already exists, because somebody may already have called it.
     Emitter(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime& rt, const Image& img, uint32_t fi,
-            const Analysis& a)
+            const Analysis& a, const PeerFns* peers = nullptr, llvm::Function* preset = nullptr)
         : ctx_(ctx), mod_(mod), rt_(rt), img_(img), fi_(fi), f_(img.func(fi)),
           recurses_(a.recurses), float_slots_(a.float_slots), force_first_(a.force_first),
-          b_(ctx) {}
+          binds_(a.binds), peers_(peers), preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
 
@@ -685,6 +1067,15 @@ private:
     JV apply(const Node& n);
     JV native_call(KnownNative which, const Node& n);
     JV self_call(const Node& n);
+    /// A saturated call to another global function, emitted beside this one.
+    JV peer_call(uint32_t gi, const Node& n);
+    /// What a callee is handed as its depth. One more than ours in a shape
+    /// that has one, and one in the loop shape, which has no depth of its own
+    /// because it makes no machine call.
+    llvm::Value* callee_depth() { return depth_ ? b_.CreateAdd(depth_, i32c(1)) : i32c(1); }
+    /// Take the callee's status: anything but `JIT_OK` is this invocation's
+    /// answer too, and the value in hand is already the right one to return.
+    JV take_call_status(llvm::Value* r, const char* what);
     JV tail_call(const Node& n, const std::vector<JV>& args);
     JV recursive_call(const std::vector<JV>& args);
     /// Spend one reduction on a call. Answers what is left, so the tail path
@@ -758,6 +1149,13 @@ private:
     const SlotSet float_slots_;
     /// Slots to force on entry, in the order the body would have forced them.
     const std::vector<uint32_t> force_first_;
+    /// Per slot, the node a `let` bound it to, or `NO_NODE`.
+    const std::vector<uint32_t> binds_;
+    /// The compile's peer declarations, or null when it has none.
+    const PeerFns* peers_ = nullptr;
+    /// Non-null when this emitter is writing a peer, into a function that was
+    /// declared before any body in this module was written.
+    llvm::Function* preset_ = nullptr;
     llvm::IRBuilder<> b_;
 
     llvm::Type* i64_ = nullptr;
@@ -791,6 +1189,9 @@ private:
 
 llvm::Function* Emitter::emit(const std::string& name) {
     declare_helpers();
+    // A peer is always a function of its arguments, recursive or not: it has no
+    // frame, so there is nothing for the loop shape to read its slots out of.
+    if (preset_) return emit_body(name);
     if (!recurses_) return emit_loop(name);
     llvm::Function* body = emit_body(name + ".rec");
     if (!body) return nullptr;
@@ -912,17 +1313,17 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
     // interpreter already made for the outermost call. A parameter the
     // function carries as a float arrives as a `double`; the entry below is
     // where that is checked, once.
-    std::vector<llvm::Type*> params{ptr_, i32_, i64_};
-    for (uint32_t i = 0; i < f_.arity; ++i) params.push_back(slot_is_dbl(i) ? dbl_ : i64_);
-    params.push_back(ptr_);
-    auto* fty = llvm::FunctionType::get(i64_, params, false);
     // Internal, so LLVM is free to inline the first level or two of the
-    // recursion into itself and to pick its own calling convention for it.
-    fn_ = llvm::Function::Create(fty, llvm::Function::InternalLinkage, name, mod_);
+    // recursion into itself and to pick its own calling convention for it. A
+    // peer's declaration was made before any body in this module was written,
+    // so that a call to it could be emitted first.
+    fn_ = preset_ ? preset_
+                  : llvm::Function::Create(body_signature(ctx_, f_.arity, float_slots_),
+                                           llvm::Function::InternalLinkage, name, mod_);
     proc_ = fn_->getArg(0);
     depth_ = fn_->getArg(1);
     frame_ = fn_->getArg(2);
-    status_ = fn_->getArg(uint32_t(params.size()) - 1);
+    status_ = fn_->getArg(fn_->arg_size() - 1);
     proc_->setName("proc");
     depth_->setName("depth");
     frame_->setName("frame");
@@ -941,11 +1342,12 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
     for (uint32_t i = 0; i < f_.arity; ++i) {
         b_.CreateStore(fn_->getArg(3 + i), slots_[i]);
     }
-    // Slots past the parameters belong to `let` bindings, and a body with one
-    // is not compiled at all -- the analysis refuses a block containing a
-    // `Bind`, and refuses outright to use this shape if any slot beyond the
-    // parameters is even read. They are allocated so slot indices line up and
-    // left alone.
+    // Slots past the parameters belong to `let` bindings, and a bound slot is
+    // never read here: its value is written where its name is. So they are
+    // allocated to keep the slot indices lining up, filled with something
+    // legible, and never touched again. A slot that is neither a parameter nor
+    // bound refuses the whole function (`Analyzer::run`), which is what makes
+    // that true.
     for (uint32_t i = f_.arity; i < f_.slots; ++i) b_.CreateStore(i64(UNIT), slots_[i]);
     reduction_slot_ = b_.CreateCall(rt_reduction_slot_, {proc_}, "reductions");
 
@@ -963,8 +1365,11 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
 
     b_.SetInsertPoint(loop_header_);
     JV result = node(f_.body);
+    // A peer is not erased on failure: another peer may already have emitted a
+    // call to it, and a function with uses cannot be removed. Nothing is leaked
+    // by leaving it -- every caller of this drops the whole module.
     if (failed_) {
-        fn_->eraseFromParent();
+        if (!preset_) fn_->eraseFromParent();
         return nullptr;
     }
     if (result.v) {
@@ -975,7 +1380,7 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
     }
 
     if (llvm::verifyFunction(*fn_, &llvm::errs())) {
-        fn_->eraseFromParent();
+        if (!preset_) fn_->eraseFromParent();
         return nullptr;
     }
     return fn_;
@@ -1288,16 +1693,23 @@ Emitter::JV Emitter::node(uint32_t idx) {
             // that never left the loop.
             return flt(llvm::ConstantFP::get(dbl_, img_.real(n.a)));
         case Op::ConstAtom:
-            // Atom indices are remapped through the runtime, so this needs a
-            // call; the analyzer allows it because it is cheap and total.
+            // An atom's index is remapped through the runtime at load, so
+            // naming one here would need a call. Unreachable: `op_is_supported`
+            // does not list it. Kept because a switch that answers every op is
+            // easier to check than one that answers most of them.
             failed_ = true;
             return none();
-        case Op::Local: return load_slot(n.a);
-        case Op::Capture: {
-            // Captures are immutable for the life of the call.
+        case Op::Local:
+            // A `let` has no thunk and no slot here: its value is written where
+            // its name is read, which is here. See `Analyzer::check_bind`.
+            if (n.a < binds_.size() && binds_[n.a] != NO_NODE) return node(binds_[n.a]);
+            return load_slot(n.a);
+        case Op::Capture:
+            // A capture lives in the frame, and a compiled body is a function
+            // of its arguments. Unreachable, for the same reason as the atom
+            // above.
             failed_ = true;
             return none();
-        }
         case Op::Force: return node(n.a);
         case Op::If: return conditional(n);
         case Op::Block: return block(n);
@@ -1313,6 +1725,11 @@ Emitter::JV Emitter::block(const Node& n) {
     for (uint32_t i = 0; i < n.b; ++i) {
         uint32_t stmt = img_.kid(n.a + i);
         bool is_last = (i + 1 == n.b);
+        // A `let` is not a statement here -- its value is written where its
+        // name is read -- so there is nothing to emit where it stands. A block
+        // whose *last* statement is one has the value a block of no statements
+        // has, which is what the interpreter's `advance_block` ends with too.
+        if (Op(img_.node(stmt).op) == Op::Bind) continue;
         if (!is_last && !(img_.node(stmt).flags & F_STRICT)) continue;
         JV v = node(stmt);
         if (failed_) return none();
@@ -1516,22 +1933,6 @@ Emitter::JV Emitter::binary(const Node& n) {
     llvm::Value* a = box(av);
     llvm::Value* bb_ = box(bv);
 
-    const bool inline_arith = (op == Op::Add || op == Op::Sub || op == Op::Mul);
-    if (!is_cmp && !inline_arith) {
-        // Division and remainder go straight to the runtime: the zero checks
-        // and the integer/float split are not worth duplicating here.
-        auto* out = b_.CreateAlloca(i64_);
-        llvm::Value* ok = b_.CreateCall(rt_arith_, {proc_, i32c(int(op)), a, bb_, out});
-        llvm::Value* v = b_.CreateLoad(i64_, out);
-        auto* cont = bb("arith.ok");
-        auto* raise_bb = bb("arith.raise");
-        b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), cont, raise_bb);
-        b_.SetInsertPoint(raise_bb);
-        emit_raise(v);
-        b_.SetInsertPoint(cont);
-        return tag(v);
-    }
-
     auto* fast_bb = bb("bin.fast");
     auto* slow_bb = bb("bin.slow");
     auto* join_bb = bb("bin.end");
@@ -1555,6 +1956,53 @@ Emitter::JV Emitter::binary(const Node& n) {
         fastv = b_.CreateSelect(c, i64(TRUE_V), i64(FALSE_V));
         fast_end = b_.GetInsertBlock();
         b_.CreateBr(join_bb);
+    } else if (op == Op::Div || op == Op::Mod) {
+        // Two fixnums and a divisor that is not zero is one machine
+        // instruction. Everything else -- a zero divisor, a float on either
+        // side, something that is not a number at all -- is `arith`'s, and
+        // goes down the slow path below to be given the error or the float the
+        // interpreter would have given.
+        //
+        // These two used to be the only arithmetic that did not have a fast
+        // path here, on the grounds that the zero check and the integer/float
+        // split were not worth duplicating. Measured, they were: a
+        // ten-million-iteration loop takes 92 ms dividing where the same loop
+        // multiplying takes 48, and that difference is a helper call and
+        // nothing else. `collatz` pays it on every step for `n % 2` and again
+        // on half of them for `n / 2`.
+        llvm::Value* x = b_.CreateAShr(a, 1);
+        llvm::Value* y = b_.CreateAShr(bb_, 1);
+        auto* nonzero = bb("bin.divmod.nz");
+        b_.CreateCondBr(b_.CreateICmpEQ(y, i64(0)), slow_bb, nonzero);
+        b_.SetInsertPoint(nonzero);
+        if (op == Op::Mod) {
+            // A remainder is smaller than its divisor, so it is a fixnum
+            // whenever the divisor was one and there is nothing to check.
+            // `srem` is C's `%`, which is what `arith` computes, so the sign
+            // of the answer follows the dividend in both tiers.
+            fastv = b_.CreateOr(b_.CreateShl(b_.CreateSRem(x, y), 1), i64(1));
+            fast_end = b_.GetInsertBlock();
+            b_.CreateBr(join_bb);
+        } else {
+            // A quotient leaves the fixnum range in exactly one place:
+            // `-2^62 / -1` is `2^62`, one past the largest. Retagging is a
+            // shift left, so the overflow check the multiply path already uses
+            // decides it -- `n` is a fixnum exactly when `n * 2` does not
+            // overflow -- and that one case goes to `arith`, which answers the
+            // float the interpreter answers.
+            llvm::Value* q = b_.CreateSDiv(x, y);
+            auto* shl = llvm::Intrinsic::getOrInsertDeclaration(
+                &mod_, llvm::Intrinsic::smul_with_overflow, {i64_});
+            llvm::Value* pair = b_.CreateCall(shl, {q, i64(2)});
+            llvm::Value* shifted = b_.CreateExtractValue(pair, 0);
+            llvm::Value* ovf = b_.CreateExtractValue(pair, 1);
+            auto* ok_bb = bb("bin.div.ok");
+            b_.CreateCondBr(ovf, slow_bb, ok_bb);
+            b_.SetInsertPoint(ok_bb);
+            fastv = b_.CreateOr(shifted, i64(1));
+            fast_end = b_.GetInsertBlock();
+            b_.CreateBr(join_bb);
+        }
     } else {
         llvm::Intrinsic::ID iid = op == Op::Add   ? llvm::Intrinsic::sadd_with_overflow
                                   : op == Op::Sub ? llvm::Intrinsic::ssub_with_overflow
@@ -1623,7 +2071,80 @@ Emitter::JV Emitter::binary(const Node& n) {
 Emitter::JV Emitter::apply(const Node& n) {
     KnownNative which = known_native(rt_, img_, n.a, n.c);
     if (which != KnownNative::None) return native_call(which, n);
+    // The analyzer admitted this call, so it is one of the two Dream-level
+    // calls this tier makes: this function calling itself, or a peer. A peer's
+    // callee is a `Global` naming some other function; a self call's names this
+    // one, and `peers_` never holds it.
+    const Node& callee = img_.node(n.a);
+    if (Op(callee.op) == Op::Global && peers_) {
+        const GlobalRec& g = img_.global(callee.a);
+        if (g.kind == GLOBAL_FUNCTION && g.target != fi_) return peer_call(g.target, n);
+    }
     return self_call(n);
+}
+
+/// The tail every call in this file shares: anything but `JIT_OK` is this
+/// invocation's answer too.
+///
+/// `JIT_RAISED` carries the error, `JIT_DEEP` carries the placeholder a deopt
+/// returns -- either way the value in hand is the one to give back, and there
+/// is nothing to unwind, because a compiled body has no effects and has written
+/// nothing down but its own registers.
+///
+/// A `JIT_DEEP` from a *peer* is worth one note. It travels up to
+/// `enter_function`, which deoptimizes the function it entered -- the root of
+/// this compile, not the peer that ran out of stack. That is a misdirected
+/// heuristic and not a wrong answer: the root is run by the interpreter, which
+/// enters the peer through `enter_function` in its own right, and *that* entry
+/// deoptimizes the peer. It corrects itself after one call.
+Emitter::JV Emitter::take_call_status(llvm::Value* r, const char* what) {
+    auto* ok_bb = bb((std::string(what) + ".ok").c_str());
+    auto* out_bb = bb((std::string(what) + ".out").c_str());
+    llvm::Value* st = b_.CreateLoad(i32_, status_);
+    b_.CreateCondBr(b_.CreateICmpEQ(st, i32c(JIT_OK)), ok_bb, out_bb);
+
+    b_.SetInsertPoint(out_bb);
+    b_.CreateRet(r);
+
+    b_.SetInsertPoint(ok_bb);
+    return tag(r);
+}
+
+/// A saturated call to another global function.
+///
+/// The callee was emitted into this module by the same code that emitted this
+/// function, so the call is a machine call with the arguments in registers: no
+/// frame, no thunk, and no trip through the interpreter. What licenses
+/// evaluating the arguments here rather than suspending them is the callee's
+/// own admission test -- it forces every parameter on every path -- and
+/// `PeerSet` is where that is written down.
+///
+/// The frame passed along is this function's, and the callee never touches it:
+/// a peer has no tail self call, so it never reaches `emit_yield`, which is the
+/// only thing in a compiled body that writes to a frame. It is passed because
+/// the shape takes one, not because it means anything here.
+Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
+    auto found = peers_->find(gi);
+    if (found == peers_->end()) {
+        failed_ = true;
+        return none();
+    }
+    // Every argument before the call, and left to right, which is the order the
+    // interpreter's own argument list is built in.
+    std::vector<JV> args(n.c);
+    for (uint32_t i = 0; i < n.c; ++i) {
+        args[i] = node(img_.kid(n.b + i));
+        if (failed_ || !args[i].v) return none();
+    }
+    spend_reduction();
+
+    std::vector<llvm::Value*> call{proc_, callee_depth(), frame_};
+    // A peer's parameters are all tagged -- see `PeerSet::admit` -- so a float
+    // in a register is boxed here. That is the fourth of the four crossings
+    // listed under "Representation", and the only one a peer adds.
+    for (JV& a : args) call.push_back(box(a));
+    call.push_back(status_);
+    return take_call_status(b_.CreateCall(found->second, call), "peer");
 }
 
 /// One of the numeric natives, made rather than called.
@@ -1712,6 +2233,9 @@ void Emitter::emit_yield() {
     // put in them.
     const uint32_t n = recurses_ ? f_.arity : f_.slots;
     for (uint32_t i = 0; i < n; ++i) {
+        // A slot a `let` bound holds nothing worth carrying: the interpreter
+        // resumes at the top of the body and runs the `let` again.
+        if (i < binds_.size() && binds_[i] != NO_NODE) continue;
         llvm::Value* v = slot_is_dbl(i) ? box(flt(b_.CreateLoad(dbl_, slots_[i])))
                                         : b_.CreateLoad(i64_, slots_[i]);
         b_.CreateCall(rt_frame_store_, {proc_, frame_, i32c(int(i)), v});
@@ -1759,41 +2283,52 @@ Emitter::JV Emitter::tail_call(const Node& n, const std::vector<JV>& args) {
     return none();  // control transferred
 }
 
-/// A call anywhere else is a machine call, one frame deeper.
-///
-/// Its status is the callee's: `JIT_RAISED` and `JIT_DEEP` both mean this
-/// invocation has nothing left to say, and the value in hand is the callee's
-/// -- an error, or the placeholder a deopt returns -- so it is returned as it
-/// stands. Only `JIT_OK` carries on. That is the same shape every slow-path
-/// call in this file already has, which is why there is no unwinding to do:
-/// a compiled body has no effects to undo and nothing written down but its own
-/// registers.
+/// A self call anywhere but tail position is a machine call, one frame deeper.
+/// Its status is the callee's -- see `take_call_status`.
 Emitter::JV Emitter::recursive_call(const std::vector<JV>& args) {
     spend_reduction();
 
-    std::vector<llvm::Value*> call{proc_, b_.CreateAdd(depth_, i32c(1)), frame_};
+    std::vector<llvm::Value*> call{proc_, callee_depth(), frame_};
     for (uint32_t i = 0; i < args.size(); ++i) {
         call.push_back(slot_is_dbl(i)
                            ? as_double(args[i], "a call carrying a float was given something else")
                            : box(args[i]));
     }
     call.push_back(status_);
-    llvm::Value* r = b_.CreateCall(fn_, call);
+    // Whatever the body computes comes back through the return register as a
+    // tagged `Value`. That is why a non-tail self call is `Ty::Any`: the status
+    // has to travel with it, and a `double` return would leave the error
+    // nowhere to sit.
+    return take_call_status(b_.CreateCall(fn_, call), "call");
+}
 
-    auto* ok_bb = bb("call.ok");
-    auto* out_bb = bb("call.out");
-    llvm::Value* st = b_.CreateLoad(i32_, status_);
-    b_.CreateCondBr(b_.CreateICmpEQ(st, i32c(JIT_OK)), ok_bb, out_bb);
+/// Analyze `func_index` and write it, and everything it calls, into `mod`.
+///
+/// One module holds the whole closure: the root under `name`, and one internal
+/// function per peer. They are all declared before any of them is written,
+/// because a call to a peer may be emitted before that peer's own body is --
+/// which is what makes mutual recursion between two compiled functions work.
+///
+/// Answers the root's function, or null if anything in the closure could not be
+/// written, in which case the caller drops the module whole.
+llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime& rt,
+                             const Image& img, uint32_t func_index, const std::string& name) {
+    PeerSet peers(rt, img);
+    Analysis root = Analyzer(rt, img, func_index, &peers, 0).run();
+    if (!root.compilable || !peers.sound(root)) return nullptr;
 
-    b_.SetInsertPoint(out_bb);
-    b_.CreateRet(r);
-
-    b_.SetInsertPoint(ok_bb);
-    // Whatever the body computed, it comes back through the return register as
-    // a tagged `Value`. That is why a non-tail self call is `Ty::Any`: the
-    // status has to travel with it, and a `double` return would leave the
-    // error nowhere to sit.
-    return tag(r);
+    PeerFns fns;
+    for (const auto& member : peers.members) {
+        fns[member.first] = llvm::Function::Create(
+            body_signature(ctx, img.func(member.first).arity, 0),
+            llvm::Function::InternalLinkage, "dream_peer_" + std::to_string(member.first), &mod);
+    }
+    for (const auto& member : peers.members) {
+        llvm::Function* decl = fns[member.first];
+        Emitter peer(ctx, mod, rt, img, member.first, member.second, &fns, decl);
+        if (!peer.emit(decl->getName().str())) return nullptr;
+    }
+    return Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
 }
 
 }  // namespace
@@ -1919,11 +2454,6 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     if (it != impl_->compiled.end()) return it->second;
 
     const Image& img = impl_->rt.image();
-    Analysis a = Analyzer(impl_->rt, img, func_index).run();
-    if (!a.compilable) {
-        if (error) *error = "not compilable by this tier";
-        return nullptr;
-    }
     if (!impl_->ensure_jit(error)) return nullptr;
 
     auto ctx = std::make_unique<llvm::LLVMContext>();
@@ -1931,9 +2461,8 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     mod->setDataLayout(impl_->lljit->getDataLayout());
 
     std::string name = "dream_fn_" + std::to_string(func_index);
-    Emitter em(*ctx, *mod, impl_->rt, img, func_index, a);
-    if (!em.emit(name)) {
-        if (error) *error = "code generation failed";
+    if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index, name)) {
+        if (error) *error = "not compilable by this tier";
         return nullptr;
     }
 
@@ -1972,16 +2501,12 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
 std::string Jit::dump_ir(uint32_t func_index) {
     std::lock_guard<std::mutex> g(impl_->mutex);
     const Image& img = impl_->rt.image();
-    Analysis a = Analyzer(impl_->rt, img, func_index).run();
-    if (!a.compilable) {
-        return "; fn#" + std::to_string(func_index) +
-               " is not compilable by this tier (it is interpreted)\n";
-    }
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
-    Emitter em(*ctx, *mod, impl_->rt, img, func_index, a);
-    if (!em.emit("dream_fn_" + std::to_string(func_index))) {
-        return "; code generation failed\n";
+    if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index,
+                      "dream_fn_" + std::to_string(func_index))) {
+        return "; fn#" + std::to_string(func_index) +
+               " is not compilable by this tier (it is interpreted)\n";
     }
     std::string out;
     llvm::raw_string_ostream os(out);

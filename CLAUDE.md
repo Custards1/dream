@@ -169,6 +169,11 @@ report from `os.exit!` as well as from the end of `main`, which matters because
 every tool here ends by exiting -- a number only printed on the way out of
 `main` is never printed for the runs worth measuring.
 
+A compiled function that calls another compiled function makes the same kind of
+hole a native does: the callee is a machine call inside the caller's compiled
+body, so its reductions are charged to the caller and it does not appear in the
+profile at all. `collatz_steps` under a fused `collatz` is the example.
+
 `--time` forces each stage where it reads the clock, because a lazy stage that
 has not been forced has not run: bind and force on one line and every stage
 looks free except the last. `--profile` attributes each reduction to the
@@ -362,6 +367,102 @@ What has already been learnt from them, so it is not learnt twice:
   PLT and none of them inline -- and the interpreter's hot path is nothing but
   cross-TU calls. Link-time optimization on top of that was measured and bought
   nothing, so it is not enabled.
+- **A compiled function may call another compiled function.** The tier used to
+  compile exactly one Dream-level call -- this function calling itself -- and
+  refuse any function that made another, which is why a fused `collatz` was
+  interpreted while `collatz_steps` beside it was compiled: the loop body is
+  `acc + collatz_steps x`, and that call refused the loop. The callee is now
+  emitted into the same LLVM module, as a function of its arguments, and called
+  with them in registers: no frame, no thunk, no trip through the interpreter.
+  `collatz` went **205 ms -> 100 ms**, from 0.30x CPython to 0.15x, and from
+  20.8 MB allocated over 317 minor collections to 570 KB over 8: the frame per
+  element *was* the allocation, and a machine call has none. The self-compile does
+  not move at all (2617-2662 ms before, 2609-2659 after, on the same machine in
+  the same minute), which is the expected answer -- `dreams` is not a numeric
+  loop anywhere -- and is worth having measured rather than assumed.
+  What licenses it is the rule the tier already rested on -- a function is only
+  compiled when it forces every parameter on every path -- asked of the callee
+  rather than invented for the occasion, so the test is `Analyzer::run` and not
+  a second set of rules. `PeerSet` in [dream/src/jit.cpp](dream/src/jit.cpp) is
+  where that is written, along with the two things a callee may not be: a
+  function that reads a slot no parameter owns (there is no frame for one), and
+  a *loop* (a compiled loop stays preemptible by writing its state back to its
+  frame, and a callee has none, so a callee that looped would hold its worker
+  for as long as the loop ran). Recursion is fine, because the machine stack
+  bounds it and `JIT_DEEP` hands the call back when it runs out. Mutual
+  recursion works, because every function in the closure is declared before any
+  of them is written. One consequence for `--profile`: a callee's reductions are
+  charged to the function that called it, the way a native's already are.
+- **A `let` is written where its name is read.** A block containing one used to
+  refuse the whole function, because a `let` in a compiled body has nowhere to
+  put its value: there are no thunks, and the frame's slots are registers. So
+  the value is emitted at the *read* instead -- which is exactly where the
+  interpreter would have forced the thunk, so nothing moves. A binding nobody
+  reads is never evaluated, which is what an unforced thunk comes to; one read
+  once runs at the read. What is lost is the thunk's memory of its own answer,
+  so a binding read twice runs twice -- allowed only when its value is small and
+  contains no call, since a duplicated call could be a duplicated recursion and
+  nesting duplications is how a linear body becomes an exponential one.
+  `dream/tests/programs/jit_let.dr` is what holds the laziness: a binding whose
+  value divides by zero and is never named must not raise, and one named below
+  something that raises first must not get there.
+- **Integer `/` and `%` are two instructions, not a call.** They were the only
+  arithmetic with no inline fast path, on the stated grounds that the zero check
+  and the integer/float split were not worth duplicating. Measured, they were: a
+  ten-million-iteration loop took 92 ms dividing where the same loop multiplying
+  took 48, and the difference was one `dream_rt_arith` call per operation. Both
+  are now 46-49 ms. `collatz` pays it on every step for `n % 2` and again on half
+  of them for `n / 2`, and `mapfilter`'s guard is `x % 2 == 1`.
+- **The interpreter disagreed with itself about one quotient.** Found by writing
+  the JIT's division against `arith` and then asking both tiers the awkward
+  questions. `-2^62 / -1` is `2^62`, one past the largest fixnum: `arith` falls
+  through to the double path and answers a float, and `finish_binary` -- the
+  two-fixnums fast path every operator takes first -- built the fixnum anyway,
+  which wraps to the *smallest* one. So `x / y` gave `-4611686018427387904` or
+  `4.611686018427388e+18` depending on whether both operands happened to be in
+  hand at the operator, which is a property of how the argument arrived and not
+  of the program. `Op::Add`, `Op::Sub` and `Op::Mul` beside it all checked
+  `fixnum_fits`; `Op::Div` did not. It does now, and `Op::Mod` is written out
+  separately beside it with the note that a remainder always fits.
+
+### The tier's eager arguments can change *which* error a program raises
+
+Found 2026-09-14, confirmed against the VM as it was before any of that day's
+work, so it is old and it is not a consequence of anything above. It is written
+down because the file header states the rule in a way that reads stronger than
+the rule is.
+
+Compiled code evaluates a self call's arguments before making the call, and what
+licenses that is the admission test: every parameter is forced on every path, so
+an argument evaluated here is one the callee was going to force anyway. That
+keeps the guarantee the header claims -- a program that finishes quietly still
+finishes quietly. It does **not** keep the argument being forced at the same
+*point*, and when more than one error is reachable that decides which one the
+program gets:
+
+```
+let rec ordered i n acc =
+    if i > n { acc } else { ordered (i + 1) n (if i + () > 0 { acc } else { acc }) };
+ordered 1 20000 0
+```
+
+`acc` is forced on every path, so the loop is compiled. Interpreted, the
+accumulator is a chain of twenty thousand suspended `if`s and forcing it
+evaluates the outermost condition first, so the error names `integer 20000`.
+Compiled, each iteration evaluates its own condition, so the error names
+`integer 32` -- the iteration the JIT threshold happened to fall on. Both raise,
+both raise a `:type_error`, and the payloads differ. The same argument says a
+program whose accumulator *diverges* where an earlier one raises can diverge
+under one tier and raise under the other.
+
+Not fixed, and the reason is the benchmark. The rule that would fix it is "the
+argument must be forced before anything else that can raise", and `sum`'s fused
+loop fails it -- its condition `i >= hi` is a comparison, which can raise a type
+error, and it runs before the accumulator is forced. Refusing that would undo
+the whole of the fusion result. This is the same trade every lazy language makes
+under "imprecise exceptions"; what makes it worth writing down here rather than
+shrugging at is that Dream has typed errors and `catch`, so a program *can* look
+at which one it got.
 
 ### Two collector bugs that presented as a segfault a long way from home
 
@@ -606,26 +707,34 @@ So the order of work, most valuable first:
 
 `benchmark/benchmark/run.sh` runs the six workloads of `main.dr` against the
 transliteration of them in `bench.py`, best of `--repeat` runs each, and prints
-the ratio. On this machine, 2026-09-13, best of five against CPython 3.13 (below
+the ratio. On this machine, 2026-09-14, best of five against CPython 3.13 (below
 1.00x is Dream ahead; "was" is the same measurement before any of the work in
-this section, "pre-fusion" is after the JIT work and before deforestation):
+this section, "pre-fusion" is after the JIT work and before deforestation, and
+"pre-calls" is before the tier learnt to call another compiled function):
 
-| workload | dream | python | ratio | pre-fusion | was |
-|---|---|---|---|---|---|
-| `sum` | 47 ms | 316 ms | **0.15x** | 13.0x | 14.3x |
-| `fib` | 40 ms | 207 ms | **0.19x** | 0.19x | 2.62x |
-| `collatz` | 205 ms | 687 ms | **0.30x** | 0.33x | 2.83x |
-| `mapfilter` | 22 ms | 30 ms | **0.75x** | 13.1x | 14.8x |
-| `pi` | 31 ms | 243 ms | **0.13x** | 5.8x | 6.55x |
-| `strbuild` | 73 ms | 1.0 ms | 70x | 82x | 72x |
+| workload | dream | python | ratio | pre-calls | pre-fusion | was |
+|---|---|---|---|---|---|---|
+| `sum` | 48 ms | 311 ms | **0.15x** | 0.15x | 13.0x | 14.3x |
+| `fib` | 40 ms | 211 ms | **0.19x** | 0.19x | 0.19x | 2.62x |
+| `collatz` | 100 ms | 687 ms | **0.15x** | 0.30x | 0.33x | 2.83x |
+| `mapfilter` | 21 ms | 29 ms | **0.72x** | 0.75x | 13.1x | 14.8x |
+| `pi` | 29 ms | 230 ms | **0.13x** | 0.13x | 5.8x | 6.55x |
+| `strbuild` | 76 ms | 1.1 ms | 72x | 70x | 82x | 72x |
 
-Four of the six are now ahead of CPython, and the two that are not are each
-behind for a reason that has nothing to do with lists. `pi` **is** fused -- it
-builds no list at all -- and is still 3.1x, because its loop is floating point:
-44% of what it allocates is boxed floats, so the JIT declines it (compiled code
-may not allocate) and a fused but interpreted loop is what is left. That is the
-"JIT that can allocate" bullet below, not a fusion gap. `strbuild` is a
-different algorithm on each side and always was.
+Five of the six are ahead of CPython, and the sixth is a different algorithm on
+each side. Read the five with the noise floor in mind: everything but `collatz`
+moved by less than the 3% that "Two things that will lie to you" says a
+recompile of `step_eval` is worth on its own.
+
+`mapfilter` is the one row whose number is not about the loop. 500,000 elements
+at 22 ms is 44 ns each, where `sum` runs at 5 -- and the difference is that the
+JIT spends about **10 ms per function it compiles**, which at this size is most
+of the measurement. Timed at ten times the size the per-element cost is 15 ns,
+which is the loop's own: an `x % 2` and a guard. Measured by running the same
+workload twice in one process, where the second run costs 6 ms against the
+first's 25. That 10 ms is not the optimization pipeline -- `O1` and `O2` come
+out the same -- so it is instruction selection and object emission, and nothing
+short of a cheaper code path through LLJIT would move it.
 
 `strbuild` is the one that went the wrong way, and it is worth knowing why: it
 is the workload here whose data is *live* rather than garbage -- a 400,000-cell
@@ -764,7 +873,11 @@ and `zip`.
   than a frame the JIT would have to keep. A fold's function must be a lambda
   written at the call site, because it is inlined; passed by name it would be a
   closure call in the loop body, and a loop that calls a closure is a loop the
-  JIT declines.
+  JIT declines. What the loop body *may* now name, which it could not when this
+  was written, is another global function: `collatz`'s fused loop is
+  `acc + collatz_steps x`, and the tier compiles that call rather than refusing
+  the loop over it. A closure is still out -- it is the name that has to be
+  resolvable, not the call.
 
 **What it did not reach.** This used to say `pi`. `pi` fuses *and* compiles now:
 loops that fuse no longer allocate per element, so the remaining row was a loop
@@ -838,6 +951,15 @@ the tier as it stands is numeric and the forces it makes are shallow. There is
 nothing to measure it with until the tier is wider, and "what each stage has to
 prove" cannot be satisfied for it in isolation. Widening first gives de-pinning
 a workload to be judged by.
+
+*What has been widened since this was drafted*, none of it about allocation: a
+compiled function may call another compiled function (`PeerSet`), a `let` in a
+compiled body is written where its name is read, and integer `/` and `%` are
+inline. All three are in "Making it faster" above. They do not move this plan --
+the values are still numbers -- but they do mean the tier reaches ordinary code
+rather than only a hand-shaped loop, so the workloads the de-pinning stage was
+missing are now easier to write: anything whose helper forces a lazy structure
+is one.
 
 - ~~**Fix the known compiled-force SIGSEGV first.**~~ **Done** (2026-09-13). A
   `force_nest` counter on the process, incremented at the top of `force_whnf`,

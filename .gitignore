@@ -12,6 +12,7 @@ build-tsan/
 build-verify/
 build-heap/
 CMakeFiles/
+editors/vscode/node_modules/
 out/
 target/
 result/
