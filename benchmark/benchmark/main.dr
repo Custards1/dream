@@ -71,6 +71,34 @@ let pi_terms2 n = {
 
 let strbuild n = core.str_len (core.str_concat (list.replicate n "hello "));
 
+// A byte scan: a loop whose body is a call to a host native, which is the shape
+// a lexer is and the one the JIT could not take until it could make the call.
+// `core.str_byte` is a wrapper the compiler rewrites into `std.native`'s, so
+// what the loop body holds is one native call and an addition.
+//
+// The text is a global rather than something the workload builds, because
+// building it is `strbuild` and is not what this measures: `main!` forces it
+// before the clock starts, exactly as the Python side builds its bytes before
+// the call it times.
+let scan_text = core.str_concat (list.replicate (bytescan_n / 6) "hello ");
+
+// The guard on `acc` is not decoration. Without it the accumulator is three
+// million suspended additions and forcing that chain runs the machine out of
+// depth -- the same trap `fold_strict` exists to avoid, and its note in
+// mind/std/list.dr is the explanation. A condition is the one place the
+// language must evaluate something, and a byte is never negative, so this one
+// forces each step and never fires.
+// The order of the two conditions matters, and not only for speed. The bounds
+// test has to come first: the tier compiles a function it can prove forces
+// every parameter on every path, and a guard in front of it would leave a path
+// -- the one that answers `acc` straight away -- where `i` is never looked at.
+let rec scan_bytes s i n acc =
+    if i >= n { acc }
+    else if acc < 0 { acc }
+    else { scan_bytes s (i + 1) n (acc + core.str_byte s i) };
+
+let bytescan n = scan_bytes scan_text 0 n 0;
+
 let mapfilter n = {
     let squares = list.map (fn x -> x * x) (list.range 1 (n + 1));
     let odds = list.filter (fn x -> x % 2 == 1) squares;
@@ -83,6 +111,7 @@ let collatz_n = 100_000;
 let pi_n = 2_000_000;
 let strbuild_n = 400_000;
 let mapfilter_n = 500_000;
+let bytescan_n = 3_000_000;
 
 // --- timing -----------------------------------------------------------------
 
@@ -146,5 +175,11 @@ let main! = {
     if want "mapfilter" {
         bench! "mapfilter" (fn () ->mapfilter mapfilter_n)
         result! "mapfilter" (mapfilter mapfilter_n)
+    }
+    if want "bytescan" {
+        // Built before the clock starts. See `scan_text`.
+        strict! scan_text
+        bench! "bytescan" (fn () -> bytescan bytescan_n)
+        result! "bytescan" (bytescan bytescan_n)
     }
 };

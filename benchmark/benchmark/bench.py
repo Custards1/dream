@@ -75,12 +75,25 @@ def mapfilter(n):
     return total
 
 
+def bytescan(s, n):
+    # The guard mirrors the one the Dream side needs to keep its accumulator
+    # from becoming a chain of suspensions. It never fires; it is here so the
+    # two loops do the same work per element.
+    total = 0
+    for i in range(n):
+        if total < 0:
+            return total
+        total += s[i]
+    return total
+
+
 FIB_N = 32
 SUM_N = 10_000_000
 COLLATZ_N = 100_000
 PI_N = 2_000_000
 STRBUILD_N = 400_000
 MAPFILTER_N = 500_000
+BYTESCAN_N = 3_000_000
 
 
 def bench(name, work):
@@ -124,6 +137,12 @@ def main():
     if want("mapfilter"):
         value = bench("mapfilter", lambda: mapfilter(MAPFILTER_N))
         result("mapfilter", value)
+    if want("bytescan"):
+        # Built before the call that is timed, the way the Dream side forces
+        # its text before the clock starts: what is measured is the scan.
+        text = ("hello " * (BYTESCAN_N // 6)).encode("ascii")
+        value = bench("bytescan", lambda: bytescan(text, BYTESCAN_N))
+        result("bytescan", value)
 
 
 if __name__ == "__main__":

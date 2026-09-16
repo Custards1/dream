@@ -10,6 +10,7 @@
 #include <sstream>
 
 #include "builtins.hpp"
+#include "jit.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
 
@@ -203,6 +204,17 @@ void Runtime::print_stats() const {
         line += buf;
     }
     std::fprintf(stderr, "%s\n", line.c_str());
+
+    // How much of the run the JIT took over. It is printed here rather than
+    // beside the "workers, jit on" line in the CLI for the reason the rest of
+    // this function exists: every tool in this repository ends with `os.exit!`,
+    // which never returns to `main`, so a number only `main` prints is never
+    // printed for the runs worth measuring. Whether a change to the tier
+    // *widened* it is exactly the question a self-compile is asked.
+    if (jit_) {
+        std::fprintf(stderr, "; %llu functions compiled\n",
+                     static_cast<unsigned long long>(jit_->compiled_count()));
+    }
 }
 
 Runtime::~Runtime() {

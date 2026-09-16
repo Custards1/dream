@@ -166,8 +166,9 @@ be justified:
 dreams --time FILE       # what each stage of a compile cost
 dream --profile [N] IMG  # the hottest functions, by reductions
 dream --stats IMG        # reductions, collections, bytes allocated and
-                         # promoted, and milliseconds stopped in collection
-benchmark/benchmark/run.sh   # six workloads, Dream against CPython
+                         # promoted, milliseconds stopped in collection, and
+                         # how many functions the JIT took
+benchmark/benchmark/run.sh   # seven workloads, Dream against CPython
 ```
 
 A VM option goes **before** the image: `dream --stats build/dreams.dream ...`,
@@ -431,6 +432,91 @@ What has already been learnt from them, so it is not learnt twice:
   of the program. `Op::Add`, `Op::Sub` and `Op::Mul` beside it all checked
   `fixnum_fits`; `Op::Div` did not. It does now, and `Op::Mod` is written out
   separately beside it with the note that a remainder always fits.
+- **A compiled function may call a host native.** The tier wrote out five
+  numeric natives -- `to_float`, `to_int`, `sqrt`, `abs`, `floor` -- and refused
+  the whole function for any other, which is every member of `std.native`. That
+  refusal, not the strictness rule, is what kept the tier to loops somebody had
+  shaped for it: a lexer reading a byte, a walk over a list through `tail` and
+  `is_empty`, an ordering written over `compare` are all arithmetic with one
+  call in the middle. Such a call is now made the way the interpreter makes one
+  -- the callee value this process already built, the arguments on the process's
+  own value stack, the native itself -- so there is one implementation of what a
+  native means and both tiers reach it (`run_native` in
+  [dream/src/jit_rt.cpp](dream/src/jit_rt.cpp)). `native_site` in
+  [dream/src/jit.cpp](dream/src/jit.cpp) is the admission rule and it is four
+  questions, of which the first does most of the work:
+  - **Is it pure?** Purity is spelling in this language, so this is one look at
+    the last character of the name. That single rule is what makes the rest
+    simple: nothing has to order an effect against anything, and nothing can
+    park -- every native that answers `NativeOutcome::Block` is impure, and so is
+    everything reachable from the Dream work a pure one runs underneath itself.
+  - **Is it saturated, of fixed arity, and four arguments or fewer?** The call is
+    one helper with a fixed signature; a partial application has no callee to
+    enter and a variadic native has no argument positions for a mask to describe.
+  - **Does it vouch for the collector?** If so it is refused -- see below, which
+    is the one measurement that changed the design.
+  - **May every argument be produced here?** A position the native's strict mask
+    claims is evaluated, which is what the interpreter does a step later anyway.
+    A position it does not claim is *read and not evaluated*: a literal, or a
+    slot handed over as it stands. That is exactly `thunk_for`, so it is not an
+    eager evaluation at all, and anything of another shape refuses the call.
+
+  What it is worth is one new benchmark row, `bytescan` -- three million bytes
+  through `core.str_byte` -- which went **454 ms to 59 ms**, from 3.06x CPython
+  to **0.41x**. The other six do not move. What it *costs* is at the end of this
+  entry, because it is not nothing.
+- **A parameter every self call hands back is carried, not evaluated.** Written
+  with the above, and without it the above reaches almost nothing. The tier
+  admits a function only when every parameter is forced on every path, and
+  `f s (i + 1) n (acc + core.str_byte s i)` fails it for `s`: the base case
+  answers `acc` and never looks at the string. That refused every loop that
+  carries the thing it is walking, which is most of the loops a native call is
+  good for.
+
+  The rule was always stronger than the reason behind it. What the strictness is
+  for is *eager evaluation*: compiled code evaluates a call's arguments before
+  making the call, and doing that to one the callee would never force can raise
+  in a program that was going to finish quietly. A parameter every self call
+  passes straight back -- slot `i` to slot `i` -- is not evaluated by one. It is
+  moved, which is precisely what the interpreter does with it, so it needs no
+  licence. `Analyzer::carried` is the set, `Emitter::load_slot_raw` is the read
+  that does not force, and `dream/tests/programs/jit_natives.dr` holds the line
+  that matters: a loop carrying `1 / 0` it never looks at must not raise.
+
+  Note who still has to be strict in everything. A **peer** is entered by a
+  caller that evaluates its arguments, so nothing here is weakened for one. The
+  **root** of a compile is entered from a heap frame the interpreter filled, so
+  the only eager evaluation in its picture is its own self calls'. The two
+  answers differ and `Analyzer::run` says why in the one place it decides.
+- **A native that vouches for the collector is one compiled code may not call.**
+  The measurement that decided it, and the reason the widening above is not a
+  trade of memory for speed. `VouchesForGc` is how a native says "I walk a lazy
+  structure underneath myself and I am written to survive a collection while I
+  do" -- `str_concat`, `str_of_chars`, `str_of_bytes`, and `strict!`, which is
+  impure and was already refused. A *compiled* caller cannot honour that: its
+  values are in machine registers, so the call pins the heap however the native
+  is written. A loop calling `str_concat` over a 300,000-element lazy list held
+  **163 MB of peak heap against 45 MB interpreted**, and collected twice against
+  334 times, which is the same failure "`strict!` is the native that most needed
+  to vouch" describes from the other side. So `NativeDef::vouches` says which
+  they are and the tier declines them. Declining costs nothing that was not
+  already being paid -- a function containing one was not compiled at all before
+  this -- and false is the safe default: a native wrongly left unmarked costs
+  memory in one compiled loop, where one wrongly marked costs only the compile.
+- **A wider tier is not free for a program that does not use it.** The
+  self-compile got **2.7% slower** -- 2805 ms to 2882 ms, mean of seven
+  interleaved rounds, and the new build was slower in all seven, so this is not
+  the placement noise the section below describes. It compiles 19 functions where
+  it compiled 10, and nine functions at the ~8.5 ms apiece LLVM charges is the
+  whole of the difference: run both with the threshold set high enough that
+  nothing is compiled and they are 2798 ms against 2823 ms, which *is* noise, and
+  with `--no-jit` they are 2800 against 2790. `dreams` does not spend its time in
+  the nine -- its own profile is AST walkers that build lists and maps, which
+  this tier will never take -- so it pays for them and gets nothing back. The
+  image is byte-identical and the reduction count is within 0.2%. `--stats` now
+  reports the number of functions compiled from `print_stats` rather than from
+  the end of `main`, which is what makes that question askable at all for a tool
+  that ends in `os.exit!`.
 
 ### The tier's eager arguments can change *which* error a program raises
 
@@ -712,26 +798,40 @@ So the order of work, most valuable first:
 
 ### Where it stands against CPython, and what the remaining gap is made of
 
-`benchmark/benchmark/run.sh` runs the six workloads of `main.dr` against the
+`benchmark/benchmark/run.sh` runs the seven workloads of `main.dr` against the
 transliteration of them in `bench.py`, best of `--repeat` runs each, and prints
-the ratio. On this machine, 2026-09-14, best of five against CPython 3.13 (below
+the ratio. On this machine, 2026-09-15, best of five against CPython 3.13 (below
 1.00x is Dream ahead; "was" is the same measurement before any of the work in
-this section, "pre-fusion" is after the JIT work and before deforestation, and
-"pre-calls" is before the tier learnt to call another compiled function):
+this section, "pre-fusion" is after the JIT work and before deforestation,
+"pre-calls" is before the tier learnt to call another compiled function, and
+"pre-natives" is before it learnt to call a host native):
 
-| workload | dream | python | ratio | pre-calls | pre-fusion | was |
-|---|---|---|---|---|---|---|
-| `sum` | 48 ms | 311 ms | **0.15x** | 0.15x | 13.0x | 14.3x |
-| `fib` | 40 ms | 211 ms | **0.19x** | 0.19x | 0.19x | 2.62x |
-| `collatz` | 100 ms | 687 ms | **0.15x** | 0.30x | 0.33x | 2.83x |
-| `mapfilter` | 21 ms | 29 ms | **0.72x** | 0.75x | 13.1x | 14.8x |
-| `pi` | 29 ms | 230 ms | **0.13x** | 0.13x | 5.8x | 6.55x |
-| `strbuild` | 76 ms | 1.1 ms | 72x | 70x | 82x | 72x |
+| workload | dream | python | ratio | pre-natives | pre-calls | pre-fusion | was |
+|---|---|---|---|---|---|---|---|
+| `sum` | 42 ms | 310 ms | **0.14x** | 0.15x | 0.15x | 13.0x | 14.3x |
+| `fib` | 40 ms | 214 ms | **0.19x** | 0.19x | 0.19x | 0.19x | 2.62x |
+| `collatz` | 100 ms | 715 ms | **0.14x** | 0.15x | 0.30x | 0.33x | 2.83x |
+| `mapfilter` | 22 ms | 29 ms | **0.77x** | 0.79x | 0.75x | 13.1x | 14.8x |
+| `pi` | 28 ms | 230 ms | **0.12x** | 0.13x | 0.13x | 5.8x | 6.55x |
+| `bytescan` | 59 ms | 144 ms | **0.41x** | 3.06x | -- | -- | -- |
+| `strbuild` | 68 ms | 0.9 ms | 75x | 76x | 70x | 82x | 72x |
 
-Five of the six are ahead of CPython, and the sixth is a different algorithm on
-each side. Read the five with the noise floor in mind: everything but `collatz`
-moved by less than the 3% that "Two things that will lie to you" says a
-recompile of `step_eval` is worth on its own.
+Six of the seven are ahead of CPython, and the seventh is a different algorithm
+on each side. Read the six with the noise floor in mind: everything but
+`bytescan` moved by less than the 3% that "Two things that will lie to you" says
+a recompile of `step_eval` is worth on its own, and the `pre-natives` column is
+an adjacent run of the same images under a VM built from the commit before.
+
+`bytescan` is the newest row and the one the native-call work is judged by:
+three million bytes read through `core.str_byte`, which is a wrapper the
+compiler rewrites into `std.native`'s, so the loop body is one native call and
+an addition. Before, a single such call refused the function and the whole scan
+ran interpreted. Two things about how it is written are worth copying, because
+both were found by getting them wrong: its accumulator is guarded (`if acc < 0`)
+because otherwise it is three million suspended additions and forcing them runs
+the machine out of depth -- the `fold_strict` trap -- and that guard sits
+*after* the bounds test, because in front of it there is a path where `i` is
+never looked at and the tier cannot admit the function at all.
 
 `mapfilter` is the one row whose number is not about the loop. 500,000 elements
 at 22 ms is 44 ns each, where `sum` runs at 5 -- and the difference is that the
@@ -1166,11 +1266,28 @@ is one.
   its slice and returns to the interpreter, which collects at its safepoint, so
   a loop that allocates per iteration allocates for one slice and no more.
 
-- **Generalize the callable set only if measurement justifies it.** The claim
+- ~~**Generalize the callable set only if measurement justifies it.**~~ **Done**
+  (2026-09-15), and done *first* rather than last, because the staged version
+  above turned out not to be its prerequisite. What this stage guessed at was
   "call any host native exactly as the interpreter enters it, with the compiled
-  caller's slots spilled" inherits the interpreter's safety per native, so the
-  vetting can shrink from an allowlist to a property. Declined until the staged
-  version is on the floor and its numbers are in.
+  caller's slots spilled"; what it needed was the first half of that and none of
+  the second. No spill: the arguments go on the process's value stack, which the
+  collector already walks, and the heap is pinned for the call exactly as
+  `dream_rt_force` pins it. The vetting did shrink from an allowlist to a
+  property, and the property is purity plus a saturated fixed arity plus not
+  vouching for the collector -- see "A compiled function may call a host native"
+  in *Making it faster* for the rule, the numbers, and the one measurement
+  (`str_concat` under a compiled frame) that added the third clause.
+
+  Two things it changes about the stage above, which is still open. Its second
+  bullet -- "`core.cons` is the easiest native in the table to admit" -- is now
+  true in the sense that `cons` *is* admitted, being pure, binary and
+  non-vouching. Its third is untouched and remains the whole blocker: `upto`
+  above is still refused, because `acc` is neither forced on any path nor
+  *carried* (the widening that landed beside this one covers a parameter handed
+  straight back, and `core.cons i acc` computes a new one). So the list builder
+  still wants exactly what this bullet said it wanted -- the weaker licence for
+  an eagerly safe self-call argument -- and now wants only that.
 
 **What each stage has to prove.** A repeated `pi` row that does not move (a
 regression there is a spill paid on the hot path instead of only at true

@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
         *) benches+=("$1"); shift ;;
     esac
 done
-[ ${#benches[@]} -eq 0 ] && benches=(fib sum collatz pi strbuild mapfilter)
+[ ${#benches[@]} -eq 0 ] && benches=(fib sum collatz pi strbuild mapfilter bytescan)
 
 for f in "$dream" "$dreams"; do
     if [ ! -e "$f" ]; then
