@@ -71,6 +71,24 @@ struct NativeDef {
     /// Attached to the function value, and readable by `fn` from its own
     /// object. Lets one implementation back many members.
     uint64_t user = 0;
+    /// This native declares `VouchesForGc`: it runs unbounded Dream work
+    /// underneath itself and is written so that a collection may happen while
+    /// it does.
+    ///
+    /// The flag exists for the JIT, which is the one caller that cannot honour
+    /// it. Compiled code keeps its values in machine registers the collector
+    /// cannot rewrite, so a call made from it pins the heap whatever the native
+    /// says -- and a pinned walk of a long lazy list allocates for the length of
+    /// the walk with nothing able to reclaim any of it. Measured on a loop
+    /// calling `str_concat` over a 300,000-element lazy list: 163 MB of peak
+    /// heap against 45 MB interpreted, and two collections against 334. So the
+    /// tier declines such a native and the function containing one stays
+    /// interpreted, which is exactly where the vouch works.
+    ///
+    /// False is the safe default: a native wrongly left unmarked costs memory
+    /// in one compiled loop, where a native wrongly marked costs nothing but
+    /// the compile. See `native_site` in dream/src/jit.cpp.
+    bool vouches = false;
 };
 
 /// A module the host provides, such as `std.console`.

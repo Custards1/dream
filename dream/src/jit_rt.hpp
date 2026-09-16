@@ -73,4 +73,29 @@ dream::Value* dream_rt_frame_slots(dream::Value frame);
 /// frame, and the next minor collection has to know the edge exists.
 void dream_rt_frame_store(dream::Process* p, dream::Value frame, uint32_t index, dream::Value v);
 
+/// Call a host native the way the interpreter calls one.
+///
+/// The two shapes a native comes in are the two entry points: a *builtin* is an
+/// immediate carrying an index into a static table, and a *member* is one
+/// function of one host module -- `std.native`'s `str_byte`, `std.math`'s
+/// `sqrt` -- named by where it sits rather than by a pointer, so that the
+/// callee value this process already built for it is what gets called.
+///
+/// Arguments arrive in registers and are moved onto the process's value stack,
+/// which is where a native expects to find them and where the collector can see
+/// them. Four is the whole of it: a native taking more is not admitted, so the
+/// signature is fixed and nothing has to be spilled through memory at the call
+/// site. Unused positions are `UNIT` and are never read, because `argc` says
+/// how many there are.
+///
+/// Returns 1 with the value in `*out`, or 0 with the error there instead.
+/// Whichever it is, the value is in weak head normal form: a native that hands
+/// back something it found without forcing it (`NativeOutcome::Enter`) is
+/// forced here, which is exactly where the machine forces one too.
+int dream_rt_native(dream::Process* p, uint32_t module_index, uint32_t member_index, uint32_t argc,
+                    dream::Value a0, dream::Value a1, dream::Value a2, dream::Value a3,
+                    dream::Value* out);
+int dream_rt_builtin(dream::Process* p, uint32_t builtin_id, uint32_t argc, dream::Value a0,
+                     dream::Value a1, dream::Value a2, dream::Value a3, dream::Value* out);
+
 }  // extern "C"

@@ -1,16 +1,25 @@
 // The LLVM JIT tier.
 //
 // Scope, and why it is drawn where it is: this compiles the strict numeric
-// spine of a function -- arithmetic, comparisons, branches, `let`, and calls to
-// itself and to other functions it can compile -- and leaves everything else to
-// the interpreter. The limit is not laziness in general but a soundness
-// requirement. Compiled code evaluates a call's arguments eagerly, and doing
-// that to an argument the callee would never have forced can raise an error in
-// a program that was going to terminate quietly. So a function is only compiled
-// when a strictness analysis proves every parameter is forced on every path,
-// and a call is only compiled when the same is true of the callee -- which is
-// what `PeerSet` asks. Anything else stays interpreted, where laziness is
-// explicit and free.
+// spine of a function -- arithmetic, comparisons, branches, `let`, calls to
+// itself and to other functions it can compile, and calls to the host natives
+// of `std.native` -- and leaves everything else to the interpreter. The limit is
+// not laziness in general but a soundness requirement. Compiled code evaluates a
+// call's arguments eagerly, and doing that to an argument the callee would never
+// have forced can raise an error in a program that was going to terminate
+// quietly. So a function is only compiled when a strictness analysis proves
+// every parameter is forced on every path, and a call is only compiled when the
+// same is true of the callee -- which is what `PeerSet` asks. Anything else
+// stays interpreted, where laziness is explicit and free.
+//
+// Two things sit deliberately *outside* that rule, and both are there because
+// they are not evaluations at all. A parameter every self call hands straight
+// back to itself is moved rather than computed, so it needs no strictness --
+// `Analyzer::carried`, and it is what lets a loop carry the string, array or map
+// it is walking. And an argument in a position a native's strict mask does not
+// claim is read rather than evaluated -- `Analyzer::eagerly_safe` and
+// `Emitter::lazy_operand`. Both do exactly what `thunk_for` does with the same
+// expression, which is what makes them free of the question above.
 //
 // What that rule does *not* promise is that an argument is forced at the same
 // point the interpreter would have forced it, only that it is forced. Where two
@@ -49,6 +58,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -64,6 +74,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "builtins.hpp"
 #include "image.hpp"
 #include "jit_rt.hpp"
 #include "process.hpp"
@@ -133,6 +144,15 @@ constexpr int kMaxPeerDepth = 8;
 /// "Not a function index", for the answer to "which function does this call
 /// name?" when it does not name one.
 constexpr uint32_t kNoFunc = ~uint32_t(0);
+
+/// How many arguments a native compiled code calls may take.
+///
+/// The call is one helper with a fixed signature and the arguments in
+/// registers, so the widest native decides the signature. Four covers every one
+/// the VM provides -- `ffi.bind!` and `ffi.load!` are the only four, and the
+/// pure ones stop at three -- and a host module that registers a wider one is
+/// simply not called from compiled code.
+constexpr uint32_t kMaxNativeArgs = 4;
 
 /// How big a `let` may be for its value to be written out more than once.
 ///
@@ -247,16 +267,125 @@ KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node, ui
     return KnownNative::None;
 }
 
-/// The bit of the strict mask a recognised native has. All of them force their
-/// one argument, but the mask is what says so, and reading it is what keeps
-/// this honest if one is ever admitted that does not.
-uint32_t known_native_strict_mask(Runtime& rt, const Image& img, uint32_t callee_node) {
+// ---------------------------------------------------------------------------
+// Natives compiled code calls
+//
+// The five above are natives compiled code *makes*: each is a few instructions,
+// so writing them out beats calling them. Everything else a program reaches
+// through `std.native` -- `str_byte`, `map_get`, `array_get`, `compare`, `len`
+// -- is a call, and until this existed a single one of them refused the whole
+// function. That refusal was most of what kept the tier to hand-shaped numeric
+// loops: a lexer that reads a byte, a resolver that looks a name up in a map and
+// a comparison written over `core.compare` are all arithmetic with one call in
+// the middle of them.
+//
+// A call is made the way the interpreter makes one -- same callee value, same
+// arguments on the same stack, same native -- so the two tiers cannot disagree
+// about what a native means. What decides whether a call may be *compiled* is
+// below, and it is three questions:
+//
+//   * **Is it pure?** Purity is spelling in this language, so this is one look
+//     at the last character of the name. An impure native is refused, and that
+//     one rule is what makes the rest of this simple: nothing here has to order
+//     an effect against anything, and nothing here can park -- every native that
+//     answers `NativeOutcome::Block` is impure, and so is everything reachable
+//     from the Dream work a pure one runs underneath itself.
+//   * **Is it saturated, and narrow enough?** A partial application has no
+//     callee to enter, and a variadic native has no fixed argument positions for
+//     a strict mask to describe. `kMaxNativeArgs` is the rest.
+//   * **May every argument be evaluated here?** A native forces the arguments
+//     its mask claims and leaves the others suspended, and compiled code has no
+//     thunk to suspend one in -- so a position the mask does not claim is only
+//     allowed when evaluating it is not an observable event. See `eagerly_safe`.
+//
+// What is deliberately *not* asked is whether the native allocates, or forces,
+// or runs Dream code underneath itself. Allocation never collects, so compiled
+// code has always been allowed to allocate -- `dream_rt_float` does -- and
+// forcing is what `dream_rt_force` already does on every slot read. Both are the
+// runtime's to get right, and `run_native` in jit_rt.cpp is where it does.
+// ---------------------------------------------------------------------------
+
+/// A native a compiled body may call, and everything needed to call it.
+///
+/// `builtin` says which of the two shapes it is: a builtin is an immediate
+/// carrying an index into a static table, and a member is one function of one
+/// host module, named by where it sits. Both are constants at compile time --
+/// the module registry is fixed before a program runs -- so the call site is a
+/// helper call with two literals in it and nothing to look up.
+struct NativeSite {
+    bool ok = false;
+    bool builtin = false;
+    /// Index into `rt.modules()`, when this is a member.
+    uint32_t module = 0;
+    /// Index within that module's members, or the builtin's table index.
+    uint32_t member = 0;
+    uint32_t strict_mask = 0;
+};
+
+/// Purity, the way the language spells it: a name ending in `!` is impure.
+bool native_is_pure(const char* name) {
+    const size_t n = std::strlen(name);
+    return n > 0 && name[n - 1] != '!';
+}
+
+/// Which native this call names, when it names one this tier may call.
+///
+/// The callee has to be a `Builtin` node or `Field(Global module, name)` -- a
+/// member of a module named at the top level, which is what every `std` call
+/// looks like. `module_for_import` is the same lookup the interpreter does, so a
+/// member of the same name from anywhere else resolves to a different
+/// `ModuleDef`, or to none, and is not recognised.
+NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node, uint32_t argc) {
+    NativeSite site;
     const Node& c = img.node(callee_node);
-    const GlobalRec& g = img.global(img.node(c.a).a);
-    const ModuleDef* def = rt.module_for_import(g.target);
-    if (!def) return 0;
-    const NativeDef* nd = def->find(img.str(c.b));
-    return nd ? nd->strict_mask : 0;
+    const char* name = nullptr;
+    uint32_t arity = 0;
+    bool vouches = false;
+
+    if (Op(c.op) == Op::Builtin) {
+        if (c.a >= builtin_count()) return site;
+        const BuiltinDef& bd = builtin_def(c.a);
+        site.builtin = true;
+        site.member = c.a;
+        site.strict_mask = bd.strict_mask;
+        name = bd.name;
+        arity = bd.arity;
+        vouches = bd.vouches;
+    } else if (Op(c.op) == Op::Field) {
+        const Node& m = img.node(c.a);
+        if (Op(m.op) != Op::Global) return site;
+        const GlobalRec& g = img.global(m.a);
+        if (g.kind != GLOBAL_MODULE) return site;
+        const ModuleDef* def = rt.module_for_import(g.target);
+        if (!def) return site;
+        const NativeDef* nd = def->find(img.str(c.b));
+        if (!nd) return site;
+        // Two indices rather than either pointer: a module is found again at run
+        // time by where it sits, which is fixed once a program is running and so
+        // needs nothing to stay valid. `modules()` is filled while the runtime
+        // is being built and never afterwards.
+        site.module = uint32_t(def - rt.modules().data());
+        site.member = uint32_t(nd - def->members.data());
+        site.strict_mask = nd->strict_mask;
+        name = nd->name;
+        arity = nd->arity;
+        vouches = nd->vouches;
+    } else {
+        return site;
+    }
+
+    if (!native_is_pure(name)) return site;
+    if (arity == NATIVE_VARIADIC || arity != argc || arity > kMaxNativeArgs) return site;
+    // A native that vouches for the collector is one this tier must not call:
+    // it walks a lazy structure underneath itself and is written so a
+    // collection may happen while it does, and a call from compiled code pins
+    // the heap instead. `NativeDef::vouches` has the measurement. Declining
+    // costs nothing that was not already being paid -- such a function was not
+    // compiled at all before this -- and it keeps the widening from being a
+    // trade of memory for speed.
+    if (vouches) return site;
+    site.ok = true;
+    return site;
 }
 
 /// The ops the emitter can write. `Op::ConstAtom` and `Op::Capture` are
@@ -309,6 +438,10 @@ struct Analysis {
     /// best shape there is for the root of a compile and the one shape a peer
     /// may not have; `PeerSet::admit` says why.
     bool tail_self = false;
+    /// Parameters every self call hands straight back to itself, one bit per
+    /// slot. Such an argument is moved rather than evaluated, which is what
+    /// lets it be neither forced nor proved strict. See `Analyzer::carried`.
+    SlotSet carried = 0;
     /// For each slot, the node a `let` bound it to, or `NO_NODE`. A bound slot
     /// is never read: the expression is written where the name is. See
     /// `Analyzer::check_bind`.
@@ -345,13 +478,42 @@ public:
         if (reads_beyond_params_) return a;
         if (!bindings_substitutable()) return a;
 
+        // Before `strict_of`, which needs to know which arguments are moved
+        // rather than evaluated in order not to claim them forced.
+        collect_calls(f_.body, 0);
+        carried_ = carried();
+
         SlotSet strict = strict_of(f_.body, 0);
         SlotSet params = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
-        // Every parameter must be forced on every path, or compiling the
-        // self tail call would evaluate something the interpreter never would.
-        if ((strict & params) != params) return a;
+
+        // What a parameter has to be, and why the two answers differ.
+        //
+        // The rule the tier rests on is about *eager evaluation*: compiled code
+        // evaluates a call's arguments before making the call, and doing that to
+        // an argument the callee would never have forced can raise in a program
+        // that was going to finish quietly. So wherever an argument is
+        // evaluated, the parameter it lands in must be one the callee forces
+        // anyway.
+        //
+        // A **peer** is entered by a caller that does exactly that, so every one
+        // of its parameters must be forced on every path. That is what
+        // `peer_call` cites and it cannot be weakened from here.
+        //
+        // The **root** is entered from a heap frame the interpreter filled, so
+        // nothing about its parameters is evaluated on the way in -- the only
+        // eager evaluation in the picture is its own self calls'. A parameter
+        // every self call hands straight back to itself is not evaluated by one:
+        // slot `i` to slot `i` moves a word and forces nothing, which is
+        // precisely what the interpreter does with it (`thunk_for` of a `Local`
+        // is the slot, unforced). So such a parameter needs no licence, and that
+        // is what lets a loop carry a string, an array or a map it reads on one
+        // path and not on the other -- `f s (i + 1) n (acc + core.str_byte s i)`
+        // is the shape, and before this it was refused for `s`.
+        const SlotSet licensed = peer_depth_ > 0 ? strict : (strict | carried_);
+        if ((licensed & params) != params) return a;
 
         a.binds = binds_;
+        a.carried = carried_;
         a.compilable = true;
         a.strict_params = strict;
         a.recurses = recurses_;
@@ -431,12 +593,12 @@ private:
         return g.kind == GLOBAL_FUNCTION && g.target == fi_;
     }
 
-    /// A call. Three of them are compiled: this function calling itself, one of
-    /// the numeric natives compiled code makes rather than calls, and a
-    /// saturated call to another global function this tier can write. Anything
-    /// else -- a closure, a partial application, a member of a module, a native
-    /// that is not one of the five -- refuses the whole function, because there
-    /// is no way to enter a callee that is not named.
+    /// A call. Four of them are compiled: this function calling itself, one of
+    /// the numeric natives compiled code makes rather than calls, a host native
+    /// it calls, and a saturated call to another global function this tier can
+    /// write. Anything else -- a closure, a partial application, a call through
+    /// a local -- refuses the whole function, because there is no way to enter a
+    /// callee that is not named.
     bool check_apply(const Node& n, int depth) {
         if (is_self_call(n)) {
             for (uint32_t i = 0; i < n.c; ++i) {
@@ -452,6 +614,20 @@ private:
         if (known_native(rt_, img_, n.a, n.c) != KnownNative::None) {
             for (uint32_t i = 0; i < n.c; ++i) {
                 if (!check(img_.kid(n.b + i), depth + 1)) return false;
+            }
+            return true;
+        }
+        // A host native. Its arguments are evaluated here, which for the ones
+        // its strict mask claims is exactly what the interpreter does a step
+        // later -- and for the ones it does not, is only allowed where
+        // evaluating cannot be observed.
+        const NativeSite site = native_site(rt_, img_, n.a, n.c);
+        if (site.ok) {
+            for (uint32_t i = 0; i < n.c; ++i) {
+                const uint32_t arg = img_.kid(n.b + i);
+                if (!check(arg, depth + 1)) return false;
+                const bool strict = i < 32 && ((site.strict_mask >> i) & 1);
+                if (!strict && !eagerly_safe(arg, 0)) return false;
             }
             return true;
         }
@@ -486,6 +662,48 @@ private:
         return g.target;
     }
 
+    /// May compiled code evaluate this expression where the interpreter would
+    /// have suspended it?
+    ///
+    /// Asked of the arguments a native's strict mask does *not* claim. Such an
+    /// argument reaches the native as a thunk, and a compiled body has no thunk
+    /// to make -- so either the value can be produced here without that being an
+    /// event, or the call is not compiled at all.
+    ///
+    /// Two things qualify, and neither is an evaluation at all. A literal, which
+    /// is a word. And a *slot*, which is read without being forced -- see
+    /// `Emitter::lazy_operand`, which is what emits one, and note that this is
+    /// exactly what the interpreter passes in the same position: `thunk_for` of
+    /// a `Local` is the slot's value, suspended or not, handed over as it
+    /// stands.
+    ///
+    /// A `let`'s name stands for its value, which is written where the name is
+    /// read, so the question is asked of the value instead.
+    ///
+    /// Everything else is refused, arithmetic included: `x + 1` can raise, and
+    /// raising from an argument nobody was going to look at is exactly the
+    /// change this must not make.
+    bool eagerly_safe(uint32_t idx, int depth) const {
+        if (depth > 64) return false;
+        const Node& n = img_.node(idx);
+        switch (Op(n.op)) {
+            case Op::ConstInt:
+                return fixnum_fits(img_.integer(n.a));
+            case Op::ConstFloat: case Op::ConstBool: case Op::ConstChar: case Op::Unit:
+                return true;
+            case Op::Local:
+                if (n.a >= f_.arity) {
+                    return n.a < binds_.size() && binds_[n.a] != NO_NODE &&
+                           eagerly_safe(binds_[n.a], depth + 1);
+                }
+                return true;
+            case Op::Force:
+                return eagerly_safe(n.a, depth + 1);
+            default:
+                return false;
+        }
+    }
+
     /// Does compiled code evaluate every one of this call's arguments before
     /// making it? True of a self call and of a peer, false of a native, which
     /// evaluates only the ones its strict mask claims.
@@ -496,6 +714,18 @@ private:
     /// force anyway.
     bool evaluates_all_args(const Node& n) const {
         return is_self_call(n) || peer_target(n) != kNoFunc;
+    }
+
+    /// Which of this call's arguments the native it names forces. Zero when it
+    /// names no native, which is the answer that claims nothing.
+    ///
+    /// The natives compiled code *makes* rather than calls are recognised here
+    /// too, and answer the same mask: they are ordinary members of an ordinary
+    /// module, and which arguments they force is a fact about them rather than
+    /// about how this tier chooses to emit them.
+    uint32_t native_mask(const Node& n) const {
+        const NativeSite site = native_site(rt_, img_, n.a, n.c);
+        return site.ok ? site.strict_mask : 0;
     }
 
     // --- bindings ---------------------------------------------------------
@@ -595,6 +825,30 @@ private:
         }
     }
 
+    /// Parameters every self call hands straight back to itself.
+    ///
+    /// `loop s (i + 1) n acc` in a function whose first parameter is `s`: the
+    /// argument is slot 0 and the position is slot 0, so the call moves nothing
+    /// and evaluates nothing. Every site has to agree -- one that computes a new
+    /// value there is an evaluation like any other, and the parameter is back to
+    /// needing the strictness the rest of the tier asks for.
+    ///
+    /// Asked of the self call sites only, which is what `collect_calls`
+    /// gathers: a peer's arguments are evaluated at the call, so nothing is
+    /// carried across one.
+    SlotSet carried() const {
+        if (call_sites_.empty()) return 0;
+        SlotSet bits = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
+        for (uint32_t site : call_sites_) {
+            const Node& n = img_.node(site);
+            for (uint32_t i = 0; i < f_.arity; ++i) {
+                const Node& arg = img_.node(img_.kid(n.b + i));
+                if (Op(arg.op) != Op::Local || arg.a != i) bits &= ~(SlotSet(1) << i);
+            }
+        }
+        return bits;
+    }
+
     /// Slots definitely forced when this node is reduced to WHNF.
     SlotSet strict_of(uint32_t node, int depth) {
         if (depth > 256) return 0;
@@ -641,10 +895,15 @@ private:
                 // compiling the call in the first place.
                 SlotSet s = 0;
                 const bool eager = evaluates_all_args(n);
-                const uint32_t mask =
-                    eager ? ~uint32_t(0) : known_native_strict_mask(rt_, img_, n.a);
+                const uint32_t mask = eager ? ~uint32_t(0) : native_mask(n);
+                const bool self = is_self_call(n);
                 for (uint32_t i = 0; i < n.c; ++i) {
                     if (!eager && !((mask >> i) & 1)) continue;
+                    // A carried argument is moved, not evaluated, so it forces
+                    // nothing. Counting it would be this set proving a parameter
+                    // strict on the strength of a read that only happens because
+                    // the set said the parameter was strict.
+                    if (self && i < 64 && ((carried_ >> i) & 1)) continue;
                     s |= strict_of(img_.kid(n.b + i), depth + 1);
                 }
                 return s;
@@ -667,7 +926,7 @@ private:
     SlotSet float_slots() {
         slot_ty_.assign(f_.slots, Ty::Unknown);
         for (uint32_t i = f_.arity; i < f_.slots; ++i) slot_ty_[i] = Ty::Any;
-        collect_calls(f_.body, 0);
+        // The sites were gathered in `run`, which needs them before this does.
 
         const int rounds = int(2 * f_.arity) + 2;
         for (int round = 0; round < rounds; ++round) {
@@ -752,11 +1011,13 @@ private:
                 return true;
             }
             case Op::Apply: {
-                const uint32_t mask = evaluates_all_args(n)
-                                          ? ~uint32_t(0)
-                                          : known_native_strict_mask(rt_, img_, n.a);
+                const uint32_t mask = evaluates_all_args(n) ? ~uint32_t(0) : native_mask(n);
+                const bool self = is_self_call(n);
                 for (uint32_t i = 0; i < n.c; ++i) {
                     if (!((mask >> i) & 1)) continue;
+                    // Moved, not evaluated -- so nothing is forced here and the
+                    // order carries on past it. See `carried`.
+                    if (self && i < 64 && ((carried_ >> i) & 1)) continue;
                     if (!force_order(img_.kid(n.b + i), depth + 1, out)) return false;
                 }
                 // A tail call transfers control and a machine call comes back
@@ -837,6 +1098,9 @@ private:
     /// the body reads it. Both are filled in by `check` as it walks.
     std::vector<uint32_t> binds_;
     std::vector<uint32_t> reads_;
+    /// Parameters every self call moves rather than evaluates. Computed in
+    /// `run` before `strict_of`, which has to know.
+    SlotSet carried_ = 0;
     bool recurses_ = false;
     bool tail_self_ = false;
     bool reads_beyond_params_ = false;
@@ -1025,8 +1289,8 @@ public:
     Emitter(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime& rt, const Image& img, uint32_t fi,
             const Analysis& a, const PeerFns* peers = nullptr, llvm::Function* preset = nullptr)
         : ctx_(ctx), mod_(mod), rt_(rt), img_(img), fi_(fi), f_(img.func(fi)),
-          recurses_(a.recurses), float_slots_(a.float_slots), force_first_(a.force_first),
-          binds_(a.binds), peers_(peers), preset_(preset), b_(ctx) {}
+          recurses_(a.recurses), float_slots_(a.float_slots), carried_(a.carried),
+          force_first_(a.force_first), binds_(a.binds), peers_(peers), preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
 
@@ -1066,6 +1330,8 @@ private:
     JV block(const Node& n);
     JV apply(const Node& n);
     JV native_call(KnownNative which, const Node& n);
+    /// A call to a host native, made the way the interpreter makes one.
+    JV host_call(const NativeSite& site, const Node& n);
     JV self_call(const Node& n);
     /// A saturated call to another global function, emitted beside this one.
     JV peer_call(uint32_t gi, const Node& n);
@@ -1085,6 +1351,15 @@ private:
     /// `JIT_YIELD`, so the interpreter resumes the body from the top.
     void emit_yield();
     JV load_slot(uint32_t slot);
+    /// A slot as it stands, unforced. What an argument the callee may never
+    /// look at is made of, and the one read in this file that is not a demand.
+    JV load_slot_raw(uint32_t slot);
+    /// An argument in a position nobody is obliged to force: a literal, or a
+    /// slot read without forcing it. `Analyzer::eagerly_safe` is what has
+    /// already said this expression is one of those.
+    JV lazy_operand(uint32_t idx);
+    /// Is this parameter one every self call moves rather than evaluates?
+    bool slot_is_carried(uint32_t i) const { return i < 64 && ((carried_ >> i) & 1); }
     llvm::Value* force(llvm::Value* v);
 
     // --- the two representations, and the crossings between them -----------
@@ -1147,6 +1422,8 @@ private:
     const bool recurses_;
     /// One bit per slot carried as a raw double.
     const SlotSet float_slots_;
+    /// One bit per parameter every self call moves rather than evaluates.
+    const SlotSet carried_;
     /// Slots to force on entry, in the order the body would have forced them.
     const std::vector<uint32_t> force_first_;
     /// Per slot, the node a `let` bound it to, or `NO_NODE`.
@@ -1184,7 +1461,7 @@ private:
     // Declarations of the runtime helpers.
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
-        rt_frame_slots_, rt_frame_store_;
+        rt_frame_slots_, rt_frame_store_, rt_native_, rt_builtin_;
 };
 
 llvm::Function* Emitter::emit(const std::string& name) {
@@ -1239,6 +1516,17 @@ void Emitter::declare_helpers() {
     rt_frame_store_ = mod_.getOrInsertFunction(
         "dream_rt_frame_store",
         llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i64_, i32_, i64_}, false));
+    // `(proc, module, member, argc, a0..a3, out)` and the same without the
+    // module, which a builtin does not have. Four argument words whatever the
+    // native's arity: the unused ones are never read, and a fixed signature
+    // keeps the call site free of anything to lay out in memory.
+    rt_native_ = mod_.getOrInsertFunction(
+        "dream_rt_native",
+        llvm::FunctionType::get(
+            i32_, {ptr_, i32_, i32_, i32_, i64_, i64_, i64_, i64_, ptr_}, false));
+    rt_builtin_ = mod_.getOrInsertFunction(
+        "dream_rt_builtin",
+        llvm::FunctionType::get(i32_, {ptr_, i32_, i32_, i64_, i64_, i64_, i64_, ptr_}, false));
 }
 
 llvm::Function* Emitter::emit_loop(const std::string& name) {
@@ -1497,6 +1785,35 @@ Emitter::JV Emitter::load_slot(uint32_t slot) {
     // free; the thunk itself was already updated by the runtime.
     b_.CreateStore(forced, slots_[slot]);
     return tag(forced);
+}
+
+Emitter::JV Emitter::load_slot_raw(uint32_t slot) {
+    // No force, and nothing written back. A slot the loop carries as a double
+    // is already a number and there is nothing to force about it; every other
+    // slot is handed on exactly as it arrived, which may be a suspension the
+    // program never demands.
+    if (slot_is_dbl(slot)) return flt(b_.CreateLoad(dbl_, slots_[slot]));
+    return tag(b_.CreateLoad(i64_, slots_[slot]));
+}
+
+Emitter::JV Emitter::lazy_operand(uint32_t idx) {
+    const Node& n = img_.node(idx);
+    switch (Op(n.op)) {
+        case Op::Local:
+            // A `let`'s name stands for its value; a parameter stands for its
+            // slot, read and not forced.
+            if (n.a < binds_.size() && binds_[n.a] != NO_NODE) return lazy_operand(binds_[n.a]);
+            return load_slot_raw(n.a);
+        case Op::Force:
+            // The compiler asked for this to be evaluated where it stands. It is
+            // handed over unevaluated instead, which is what the interpreter
+            // does too -- it suspends the `Force` in a thunk -- and whoever
+            // demands the value gets the same answer either way.
+            return lazy_operand(n.a);
+        default:
+            // A literal. `eagerly_safe` admits nothing else.
+            return node(idx);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2071,6 +2388,10 @@ Emitter::JV Emitter::binary(const Node& n) {
 Emitter::JV Emitter::apply(const Node& n) {
     KnownNative which = known_native(rt_, img_, n.a, n.c);
     if (which != KnownNative::None) return native_call(which, n);
+    // Asked in the same order the analyzer asked it, which is what keeps the
+    // two from disagreeing about which of the two native paths a call takes.
+    const NativeSite site = native_site(rt_, img_, n.a, n.c);
+    if (site.ok) return host_call(site, n);
     // The analyzer admitted this call, so it is one of the two Dream-level
     // calls this tier makes: this function calling itself, or a peer. A peer's
     // callee is a `Global` naming some other function; a self call's names this
@@ -2199,11 +2520,74 @@ Emitter::JV Emitter::native_call(KnownNative which, const Node& n) {
     return tag(v);
 }
 
+/// A call to a host native.
+///
+/// One helper call with the arguments in registers. The helper does what the
+/// interpreter's `resume_native` does -- put them on the process's value stack,
+/// call the native, take its answer -- so there is one implementation of what a
+/// native call means and both tiers reach it.
+///
+/// A reduction is spent, because the interpreter spends one evaluating the
+/// `Apply` node this stands for. That keeps `--stats` honest, and it is also
+/// what keeps a compiled loop whose body is mostly native calls preemptible:
+/// the budget falls at the same rate either tier runs it.
+///
+/// Every argument is evaluated before the call and left to right, which is the
+/// order the interpreter builds its own argument list in. A float in a register
+/// is boxed here: a native speaks tagged values and knows nothing about the
+/// representation a compiled body chose.
+Emitter::JV Emitter::host_call(const NativeSite& site, const Node& n) {
+    std::vector<JV> args(n.c);
+    for (uint32_t i = 0; i < n.c; ++i) {
+        const uint32_t arg = img_.kid(n.b + i);
+        // A position the native's mask does not claim is one it may never look
+        // at, so what goes there is read rather than evaluated. The analyzer has
+        // already refused any shape that cannot be (`eagerly_safe`).
+        const bool strict = i < 32 && ((site.strict_mask >> i) & 1);
+        args[i] = strict ? node(arg) : lazy_operand(arg);
+        if (failed_ || !args[i].v) return none();
+    }
+    spend_reduction();
+
+    std::vector<llvm::Value*> call{proc_};
+    if (!site.builtin) call.push_back(i32c(int(site.module)));
+    call.push_back(i32c(int(site.member)));
+    call.push_back(i32c(int(n.c)));
+    for (uint32_t i = 0; i < kMaxNativeArgs; ++i) {
+        call.push_back(i < n.c ? box(args[i]) : i64(UNIT));
+    }
+    auto* out = b_.CreateAlloca(i64_);
+    call.push_back(out);
+
+    llvm::Value* ok = b_.CreateCall(site.builtin ? rt_builtin_ : rt_native_, call);
+    llvm::Value* v = b_.CreateLoad(i64_, out);
+    auto* cont = bb("host.ok");
+    auto* raise_bb = bb("host.raise");
+    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), cont, raise_bb);
+
+    b_.SetInsertPoint(raise_bb);
+    emit_raise(v);
+
+    b_.SetInsertPoint(cont);
+    // In weak head normal form, which is the invariant every value in a
+    // compiled body has: the helper forces a result the native handed back
+    // unforced, at the point the machine would have forced it.
+    return tag(v);
+}
+
 Emitter::JV Emitter::self_call(const Node& n) {
     // Evaluate every argument before touching any slot: an argument may read a
     // parameter this call is about to overwrite.
     std::vector<JV> args(n.c);
     for (uint32_t i = 0; i < n.c; ++i) {
+        // A carried parameter is moved, not evaluated: slot `i` to slot `i`,
+        // whatever is in it. That is what the interpreter does with it, and it
+        // is why such a parameter needs no strictness -- see `Analyzer::carried`
+        // and the note in `Analyzer::run` about who has to force what.
+        if (i < f_.arity && slot_is_carried(i)) {
+            args[i] = load_slot_raw(i);
+            continue;
+        }
         args[i] = node(img_.kid(n.b + i));
         if (failed_ || !args[i].v) return none();
     }
@@ -2387,6 +2771,8 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_reduction_slot", reinterpret_cast<void*>(&dream_rt_reduction_slot));
     add("dream_rt_frame_slots", reinterpret_cast<void*>(&dream_rt_frame_slots));
     add("dream_rt_frame_store", reinterpret_cast<void*>(&dream_rt_frame_store));
+    add("dream_rt_native", reinterpret_cast<void*>(&dream_rt_native));
+    add("dream_rt_builtin", reinterpret_cast<void*>(&dream_rt_builtin));
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms)))) {
         if (error) *error = llvm::toString(std::move(err));
         lljit.reset();

@@ -547,11 +547,9 @@ int main(int argc, char** argv) {
     if (stats) {
         // What the runtime cannot know: how this particular invocation was set
         // up.
-        std::fprintf(stderr, "; %u workers, jit %s", workers, jit_owner ? "on" : "off");
-        if (jit_owner) {
-            std::fprintf(stderr, ", %" PRIu64 " functions compiled", jit_owner->compiled_count());
-        }
-        std::fputc('\n', stderr);
+        // How many functions the JIT took is `print_stats`'s, so that a program
+        // ending in `os.exit!` still reports it.
+        std::fprintf(stderr, "; %u workers, jit %s\n", workers, jit_owner ? "on" : "off");
     }
     return status;
 }

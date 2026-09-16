@@ -22,6 +22,9 @@ struct BuiltinDef {
     /// on the caller's stack, which is exactly what spawning must not do.
     uint32_t strict_mask;
     NativeFn fn;
+    /// This builtin declares `VouchesForGc`. Same meaning and same consequence
+    /// as `NativeDef::vouches`, which is where it is written down.
+    bool vouches = false;
 };
 
 const BuiltinDef& builtin_def(uint32_t id);

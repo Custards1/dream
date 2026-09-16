@@ -829,8 +829,9 @@ const BuiltinDef BUILTINS[] = {
     {"len", 1, 0b1, bi_len},
     // Mask 0: the argument must arrive unforced, or the deep force below
     // would be handed something already reduced to weak head normal form by
-    // the caller and could not report a raise from inside it.
-    {"strict!", 1, 0b0, bi_strict},
+    // the caller and could not report a raise from inside it. The last field
+    // is the vouch: `strict!` is the native that most needed one.
+    {"strict!", 1, 0b0, bi_strict, true},
     // The container and the key are forced to WHNF for them, by the machine's
     // own continuation (never by a force of their own, which would run a
     // nested machine loop on the C++ stack); the piece they hand back stays
@@ -2193,12 +2194,16 @@ ModuleDef make_core_module() {
             {"tail", 1, 0b1, list_tail},
             {"cons", 2, 0b0, list_cons},
             {"is_empty", 1, 0b1, list_is_empty},
-            // strings
+            // strings. The three that walk a lazy list declare the vouch --
+            // the field after `user` -- because each of them forces one
+            // underneath itself and is written to survive a collection while it
+            // does. `NativeDef::vouches` says what that costs a caller that
+            // cannot allow one.
             {"str_len", 1, 0b1, core_str_len},
             {"str_chars", 1, 0b1, core_str_chars},
-            {"str_of_chars", 1, 0b1, core_str_of_chars},
-            {"str_of_bytes", 1, 0b1, core_str_of_bytes},
-            {"str_concat", 1, 0b1, core_str_concat},
+            {"str_of_chars", 1, 0b1, core_str_of_chars, 0, true},
+            {"str_of_bytes", 1, 0b1, core_str_of_bytes, 0, true},
+            {"str_concat", 1, 0b1, core_str_concat, 0, true},
             // An error is a kind and a payload; these are the way in and out.
             // `error_new`'s payload is left lazy, so the mask forces only the
             // kind.
