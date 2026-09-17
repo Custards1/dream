@@ -114,6 +114,10 @@ struct Pin {
     Pin(Process& proc, Value v) : p(proc), at(proc.pins.size()) { p.pins.push_back(v); }
     ~Pin() { p.pins.resize(at); }
     Value get() const { return p.pins[at]; }
+    /// Move the pin on to another value. A walk down a list holds one cell at a
+    /// time and forces between them, so the slot is reused rather than a fresh
+    /// pin pushed per step.
+    void set(Value v) const { p.pins[at] = v; }
     Pin(const Pin&) = delete;
     Pin& operator=(const Pin&) = delete;
 };
@@ -139,6 +143,36 @@ Value make_native(Process& p, NativeFn fn, Value name, uint32_t arity,
 /// the interpreter's slow paths rather than reimplementing them.
 bool jit_arith(Process& p, Op op, Value a, Value b, Value* out);
 bool jit_compare(Process& p, Op op, Value a, Value b, Value* out);
+
+/// Build a closure for image function `func_index`, capturing from `frame`.
+/// Creating one allocates but cannot fail at the language level and has no
+/// effects, which is what lets both tiers do it where they stand rather than
+/// suspending it. False with the error in `*out` for a malformed capture
+/// descriptor, which is an image nothing should have produced.
+bool jit_build_closure(Process& p, uint32_t func_index, Value frame, Value* out);
+
+/// The `StrObj` for image string constant `index`, from this process's cache.
+/// The same object `Op::ConstStr` hands the interpreter, which is what keeps a
+/// literal one allocation per process rather than one per evaluation.
+Value jit_literal_string(Process& p, uint32_t index);
+
+/// `c.[k]` and `c.[k => v]`, answered with a value rather than through the
+/// machine.
+///
+/// `container_get` and `container_set` finish the way an opcode finishes: they
+/// `enter` a value, or `ret` one, or push a continuation to walk a list. A
+/// compiled body has no continuation to return into, so these do the same work
+/// and hand the answer back -- forcing what the machine would have entered, and
+/// forcing a list's tails in place where the machine would have walked them with
+/// `GetWalk`.
+///
+/// Answers 1 with the value in `*out`, 0 with the error there, or -- for `get`
+/// alone -- 2 for "nothing at that key", which the caller answers with its
+/// `else` expression, evaluated where the machine would have evaluated it.
+/// `has_else` is what decides between 2 and the error, because which error it is
+/// depends on the container and belongs here rather than at the call site.
+int jit_container_get(Process& p, Value container, Value key, bool has_else, Value* out);
+int jit_container_set(Process& p, Value container, Value key, Value value, Value* out);
 Value raise_error(Process& p, uint32_t kind_atom, const std::string& message);
 
 }  // namespace dream

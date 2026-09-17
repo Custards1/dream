@@ -259,4 +259,62 @@ int dream_rt_builtin(Process* p, uint32_t builtin_id, uint32_t argc, Value a0, V
     return run_native(*p, make_builtin(builtin_id), bd.fn, argc, args, out);
 }
 
+// ---------------------------------------------------------------------------
+// Suspending, and building
+//
+// None of these pins the heap and none of them needs to: allocating cannot
+// collect, and nothing here forces. The two that can -- `dream_rt_get` and
+// `dream_rt_set` -- pin for the same reason every helper in this file that runs
+// the machine pins.
+// ---------------------------------------------------------------------------
+
+Value dream_rt_snapshot(Process* p, Value frame, uint32_t nslots) {
+    // The closure, not the slots: a snapshot is this invocation's values in a
+    // frame of this function's closure, and the closure is the one thing about
+    // the frame the compiled body was handed that is still true of it.
+    auto* fo = static_cast<FrameObj*>(as_obj(frame));
+    return p->heap().make_frame(fo->closure, nslots);
+}
+
+Value dream_rt_suspend(Process* p, uint32_t node, Value frame) {
+    return thunk_for(*p, node, frame);
+}
+
+Value dream_rt_capture(Value frame, uint32_t index) {
+    auto* fo = static_cast<FrameObj*>(as_obj(frame));
+    return static_cast<ClosureObj*>(as_obj(fo->closure))->caps()[index];
+}
+
+int dream_rt_closure(Process* p, uint32_t func_index, Value frame, Value* out) {
+    return jit_build_closure(*p, func_index, frame, out) ? 1 : 0;
+}
+
+Value dream_rt_string(Process* p, uint32_t index) { return jit_literal_string(*p, index); }
+
+Value dream_rt_cons(Process* p, Value head, Value tail) {
+    return p->heap().make_cons(head, tail);
+}
+
+Value dream_rt_array(Process* p, uint32_t len) { return p->heap().make_array(len); }
+
+Value* dream_rt_array_items(Value array) {
+    return static_cast<ArrayObj*>(as_obj(array))->items();
+}
+
+Value dream_rt_map_new(Process* p) { return p->heap().make_map(0); }
+
+Value dream_rt_map_insert(Process* p, Value map, Value key, Value value) {
+    return map_insert(*p, map, key, value);
+}
+
+int dream_rt_get(Process* p, Value container, Value key, int32_t has_else, Value* out) {
+    PinsTheHeap pinned(*p);
+    return jit_container_get(*p, container, key, has_else != 0, out);
+}
+
+int dream_rt_set(Process* p, Value container, Value key, Value value, Value* out) {
+    PinsTheHeap pinned(*p);
+    return jit_container_set(*p, container, key, value, out);
+}
+
 }  // extern "C"

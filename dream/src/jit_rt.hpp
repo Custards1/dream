@@ -98,4 +98,71 @@ int dream_rt_native(dream::Process* p, uint32_t module_index, uint32_t member_in
 int dream_rt_builtin(dream::Process* p, uint32_t builtin_id, uint32_t argc, dream::Value a0,
                      dream::Value a1, dream::Value a2, dream::Value a3, dream::Value* out);
 
+// ---------------------------------------------------------------------------
+// Suspending, from code that has no frame
+//
+// A compiled body keeps its slots in machine registers, which is what compiling
+// it is for -- and it is also the reason it could not, until these existed, say
+// "not yet". A thunk is a node and a *frame*, and the frame the interpreter made
+// for this call holds whatever it held when the call began: in the loop shape
+// the loop has since overwritten its registers, and in the recursive shape the
+// frame belongs to the outermost invocation and not to this one.
+//
+// So compiled code makes a frame of its own when it needs one -- a snapshot of
+// the slots as they stand -- and suspends against that. Which is exactly what
+// the interpreter does, because a snapshot filled with this invocation's values
+// *is* this invocation's frame; it is only built later and built once per site
+// rather than once per call.
+// ---------------------------------------------------------------------------
+
+/// A frame with this function's closure and `nslots` empty slots, for the caller
+/// to fill. Unfilled slots read as "not bound yet", which is what a slot no
+/// `let` reached means.
+dream::Value dream_rt_snapshot(dream::Process* p, dream::Value frame, uint32_t nslots);
+
+/// `thunk_for`: the value of `node` against `frame` without evaluating it. A
+/// node already in normal form answers itself, so a constant or a slot costs no
+/// allocation here any more than it does in the interpreter.
+dream::Value dream_rt_suspend(dream::Process* p, uint32_t node, dream::Value frame);
+
+/// A capture of the closure this frame belongs to, unforced.
+dream::Value dream_rt_capture(dream::Value frame, uint32_t index);
+
+/// A closure for image function `func_index`, capturing from `frame`. Returns 1
+/// with the closure in `*out`, or 0 with the error there -- which happens only
+/// for a capture descriptor the image should never have contained.
+int dream_rt_closure(dream::Process* p, uint32_t func_index, dream::Value frame,
+                     dream::Value* out);
+
+// ---------------------------------------------------------------------------
+// Building
+//
+// Allocation never collects -- a collection runs only at a safepoint, and an
+// allocation passes through none -- so a compiled body may build. What it may
+// not do is *forget*: every object below is filled by the caller immediately
+// after it is made, with nothing in between that could move it.
+// ---------------------------------------------------------------------------
+
+/// The string constant at `index`, from this process's cache.
+dream::Value dream_rt_string(dream::Process* p, uint32_t index);
+
+dream::Value dream_rt_cons(dream::Process* p, dream::Value head, dream::Value tail);
+/// An array of `len` slots, all "not bound yet" until the caller writes them.
+dream::Value dream_rt_array(dream::Process* p, uint32_t len);
+/// The elements of an array, for the caller to fill. No write barrier: an array
+/// big enough to be born old is remembered whole at birth (`alloc_bare`), and a
+/// young one needs none.
+dream::Value* dream_rt_array_items(dream::Value array);
+dream::Value dream_rt_map_new(dream::Process* p);
+dream::Value dream_rt_map_insert(dream::Process* p, dream::Value map, dream::Value key,
+                                 dream::Value value);
+
+/// `c.[k]`, `c.[k else d]` and `c.[k => v]`. See `jit_container_get` in
+/// interp.hpp for what the three answers mean; 2 is "use the `else`", which the
+/// caller emits where the machine would have evaluated it.
+int dream_rt_get(dream::Process* p, dream::Value container, dream::Value key, int32_t has_else,
+                 dream::Value* out);
+int dream_rt_set(dream::Process* p, dream::Value container, dream::Value key, dream::Value value,
+                 dream::Value* out);
+
 }  // extern "C"

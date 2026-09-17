@@ -2735,6 +2735,187 @@ bool jit_compare(Process& p, Op op, Value a, Value b, Value* out) {
     return compare(p, op, a, b, out);
 }
 
+Value jit_literal_string(Process& p, uint32_t index) { return literal_string(p, index); }
+
+bool jit_build_closure(Process& p, uint32_t func_index, Value frame, Value* out) {
+    return build_closure(p, func_index, frame, out);
+}
+
+// ---------------------------------------------------------------------------
+// Containers, for a caller with no continuation
+//
+// The two below are `container_get` and `container_set` said as functions. Every
+// decision in them is the same one, taken in the same order and with the same
+// error, because a disagreement between the tiers about what `.[ ]` means would
+// be a disagreement about a thing programs do constantly. What differs is only
+// how the answer leaves: the machine `enter`s the element it found and lets the
+// next reduction force it, and these force it here.
+//
+// Both are called with the heap pinned -- `PinsTheHeap` in the caller -- so a
+// value may wait in a C++ local across a force. The list walks still put their
+// working set where the collector can see it, because the cost is a push and a
+// pop and the alternative is a rule that has to be remembered.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The element `container_get` would have entered, forced. 1 with the value, 0
+/// with the error.
+int jit_deliver(Process& p, Value v, Value* out) {
+    Value w;
+    if (!force_whnf(p, v, &w)) {
+        *out = p.result;
+        return 0;
+    }
+    *out = w;
+    return 1;
+}
+
+}  // namespace
+
+int jit_container_get(Process& p, Value container, Value key, bool has_else, Value* out) {
+    container = resolve(container);
+    key = resolve(key);
+    // Nothing at the key. With an `else` the caller answers it; without one the
+    // error is this container's to name.
+    auto missing = [&](uint32_t kind, const std::string& why) {
+        if (has_else) return 2;
+        *out = raise_error(p, kind, why);
+        return 0;
+    };
+
+    if (is_obj(container, ObjType::Map)) {
+        Value found;
+        if (map_lookup(p, container, key, &found)) return jit_deliver(p, found, out);
+        return missing(well_known(p.runtime()).no_such_key,
+                       "the map has no key " + describe(p, key));
+    }
+    if (!is_sequence(container)) {
+        *out = type_error(p, "`.[ ]` reads a map, an array or a list, not " +
+                                 describe(p, container));
+        return 0;
+    }
+    if (!is_fixnum(key)) {
+        *out = type_error(p, "a position is an integer, not " + describe(p, key));
+        return 0;
+    }
+    const int64_t k = fixnum_value(key);
+    if (is_obj(container, ObjType::Array)) {
+        auto* a = static_cast<ArrayObj*>(as_obj(container));
+        if (k >= 0 && k < int64_t(a->len)) return jit_deliver(p, a->items()[k], out);
+        return missing(out_of_bounds_atom(p), "index " + std::to_string(k) +
+                                                  " is outside an array of " +
+                                                  std::to_string(a->len));
+    }
+    if (k < 0 || k > int64_t(0xFFFFFFFFu)) {
+        return missing(out_of_bounds_atom(p),
+                       "index " + std::to_string(k) + " is not a position in a list");
+    }
+    // The walk. Where `list_get` pushes a `GetWalk` continuation for a tail that
+    // is not in normal form, this forces it and carries on round the loop -- so
+    // the depth is one nested force, not one per cell.
+    Pin cur(p, container);
+    uint32_t remaining = uint32_t(k);
+    for (;;) {
+        Value c = resolve(cur.get());
+        if (!is_obj(c, ObjType::Cons)) {
+            return missing(out_of_bounds_atom(p),
+                           "index " + std::to_string(k) + " is past the end of a list of " +
+                               std::to_string(uint32_t(k) - remaining));
+        }
+        if (remaining == 0) return jit_deliver(p, static_cast<ConsObj*>(as_obj(c))->head, out);
+        --remaining;
+        Value tail;
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(c))->tail, &tail)) {
+            *out = p.result;
+            return 0;
+        }
+        cur.set(tail);
+    }
+}
+
+int jit_container_set(Process& p, Value container, Value key, Value value, Value* out) {
+    container = resolve(container);
+    key = resolve(key);
+    if (is_obj(container, ObjType::Map)) {
+        *out = map_insert(p, container, key, value);
+        return 1;
+    }
+    if (!is_sequence(container)) {
+        *out = type_error(p, "`.[ => ]` changes a map, an array or a list, not " +
+                                 describe(p, container));
+        return 0;
+    }
+    if (!is_fixnum(key)) {
+        *out = type_error(p, "a position is an integer, not " + describe(p, key));
+        return 0;
+    }
+    const int64_t k = fixnum_value(key);
+    if (is_obj(container, ObjType::Array)) {
+        const uint32_t n = static_cast<ArrayObj*>(as_obj(container))->len;
+        if (k < 0 || k >= int64_t(n)) {
+            *out = raise_error(p, out_of_bounds_atom(p),
+                               "index " + std::to_string(k) + " is outside an array of " +
+                                   std::to_string(n));
+            return 0;
+        }
+        // A copy, for the reason `container_set` gives: the array given is a
+        // value and someone else may hold it.
+        Value arr = p.heap().make_array(n);
+        auto* src = static_cast<ArrayObj*>(as_obj(container));
+        auto* dst = static_cast<ArrayObj*>(as_obj(arr));
+        for (uint32_t i = 0; i < n; ++i) {
+            Value item = uint32_t(k) == i ? value : src->items()[i];
+            dst->items()[i] = item;
+            p.heap().remember_if_old(dst, item);
+        }
+        *out = arr;
+        return 1;
+    }
+    if (k < 0 || k > int64_t(0xFFFFFFFFu)) {
+        *out = raise_error(p, out_of_bounds_atom(p),
+                           "index " + std::to_string(k) + " is not a position in a list");
+        return 0;
+    }
+    // The cells walked past wait on the value stack, exactly as `list_set`
+    // leaves them: the new spine is built back out of them once the position is
+    // reached, and everything behind it is shared.
+    const size_t base = p.stack.size();
+    Pin cur(p, container);
+    Pin val(p, value);
+    uint32_t remaining = uint32_t(k);
+    for (;;) {
+        Value c = resolve(cur.get());
+        if (!is_obj(c, ObjType::Cons)) {
+            const uint32_t walked = uint32_t(k) - remaining;
+            p.stack.resize(base);
+            *out = raise_error(p, out_of_bounds_atom(p),
+                               "index " + std::to_string(k) + " is past the end of a list of " +
+                                   std::to_string(walked));
+            return 0;
+        }
+        if (remaining == 0) {
+            Value built = p.heap().make_cons(val.get(), static_cast<ConsObj*>(as_obj(c))->tail);
+            while (p.stack.size() > base) {
+                Value head = static_cast<ConsObj*>(as_obj(p.stack.back()))->head;
+                built = p.heap().make_cons(head, built);
+                p.stack.pop_back();
+            }
+            *out = built;
+            return 1;
+        }
+        p.stack.push_back(c);
+        --remaining;
+        Value tail;
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(c))->tail, &tail)) {
+            p.stack.resize(base);
+            *out = p.result;
+            return 0;
+        }
+        cur.set(tail);
+    }
+}
+
 std::string describe(Process& p, Value v) {
     v = resolve(v);
     if (is_fixnum(v)) return "integer " + std::to_string(fixnum_value(v));

@@ -5,6 +5,8 @@ compile_commands.json
 *.dream
 *.cache
 *.vscode
+opencode.json
+.claude/
 build/
 build-dream/
 build-nojit/
@@ -16,6 +18,6 @@ editors/vscode/node_modules/
 out/
 target/
 result/
-result
+result/
 lib/
 bin/

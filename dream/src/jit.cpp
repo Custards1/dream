@@ -58,6 +58,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -388,23 +390,31 @@ NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node, uint
     return site;
 }
 
-/// The ops the emitter can write. `Op::ConstAtom` and `Op::Capture` are
-/// deliberately absent: an atom index has to be remapped through the runtime
-/// and a capture lives in the frame, and the emitter refuses both. It used to
-/// refuse them *after* the analysis had said yes, which cost nothing while a
-/// compile was one function -- the emitter gave up and the function was marked
-/// rejected. It is not free now: an emitter that gives up on a peer gives up on
-/// the whole closure, including a root that had nothing wrong with it. So the
-/// two lists say the same thing.
+/// The ops the emitter can write.
+///
+/// The list and the emitter's own switch have to say the same thing, and the
+/// reason is `PeerSet`: an emitter that gives up on a peer gives up on the whole
+/// closure, including a root that had nothing wrong with it. While a compile was
+/// one function, refusing in the emitter cost nothing.
+///
+/// What is still absent is everything that names something the tier has no way
+/// to enter: `Op::Global` and `Op::Field` as *values* rather than as the callee
+/// of a call, `Op::Try`, and `Op::Bind` outside a block. Note that this list is
+/// asked only of a node compiled code *emits* -- a node it suspends is run by
+/// the interpreter, where every op is supported, so a `Try` inside a list
+/// element or an unclaimed argument refuses nothing.
 bool op_is_supported(Op op) {
     switch (op) {
         case Op::ConstInt: case Op::ConstFloat: case Op::ConstBool:
-        case Op::ConstChar: case Op::Unit:
-        case Op::Local:
+        case Op::ConstChar: case Op::ConstStr: case Op::ConstAtom: case Op::Unit:
+        case Op::Local: case Op::Capture:
         case Op::If: case Op::Block: case Op::Force:
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or: case Op::Neg: case Op::Not:
+        case Op::MakeList: case Op::MakeArray: case Op::MakeMap:
+        case Op::MakeClosure: case Op::MakeThunk:
+        case Op::Get: case Op::Set:
             return true;
         default:
             return false;
@@ -414,6 +424,12 @@ bool op_is_supported(Op op) {
 // ---------------------------------------------------------------------------
 // Analysis
 // ---------------------------------------------------------------------------
+
+/// An image function, by index, named -- for the refusal reasons.
+std::string func_name(const Image& img, uint32_t fi) {
+    const FuncRec& f = img.func(fi);
+    return f.name != NO_NODE ? img.str(f.name).str() : "fn#" + std::to_string(fi);
+}
 
 using SlotSet = uint64_t;  // one bit per slot; functions with >64 slots are skipped
 
@@ -442,18 +458,31 @@ struct Analysis {
     /// slot. Such an argument is moved rather than evaluated, which is what
     /// lets it be neither forced nor proved strict. See `Analyzer::carried`.
     SlotSet carried = 0;
+    /// Parameters a self call *suspends* rather than evaluates, one bit per
+    /// slot. The interpreter suspends every argument; this tier evaluates the
+    /// ones the callee is proved to force and suspends the rest, which is what
+    /// lets a function be compiled without proving anything about the others.
+    /// See the fixpoint in `Analyzer::run`.
+    SlotSet lazy = 0;
     /// For each slot, the node a `let` bound it to, or `NO_NODE`. A bound slot
     /// is never read: the expression is written where the name is. See
     /// `Analyzer::check_bind`.
     std::vector<uint32_t> binds;
+    /// Why the function was refused, when it was. The first refusal found,
+    /// which is good enough to aim a widening at -- chasing reasons is what
+    /// `DREAM_JIT_TRACE` and `--dump-jit` are for. Empty when `compilable`.
+    /// See `Analyzer::refuse`.
+    std::string refuse;
 };
 
 class PeerSet;
 /// `peers.admit(gi, depth)`, spelled as a free function because `Analyzer` and
 /// `PeerSet` each have to name the other: deciding whether a call may be
 /// compiled means analysing the callee, and analysing the callee means asking
-/// the same question of everything *it* calls.
-bool peer_admits(PeerSet& peers, uint32_t gi, int depth);
+/// the same question of everything *it* calls. `refuse`, if non-null, receives
+/// why the callee was refused, which `PeerSet` is complete enough to say by the
+/// time it is implemented.
+bool peer_admits(PeerSet& peers, uint32_t gi, int depth, std::string* refuse = nullptr);
 
 class Analyzer {
 public:
@@ -464,27 +493,34 @@ public:
 
     Analysis run() {
         Analysis a;
-        if (f_.slots > 64 || f_.arity == 0) return a;
+        auto finish = [&] { a.refuse = refuse_; return a; };
+        // A reason is only recorded when someone asks, so refusal has no reason of its own to be lazy about.
+        if (f_.slots > 64) {
+            refuse("more than 64 slots");
+            return finish();
+        }
+        if (f_.arity == 0) {
+            refuse("arity 0");
+            return finish();
+        }
         binds_.assign(f_.slots, NO_NODE);
+        bound_yet_.assign(f_.slots, false);
         reads_.assign(f_.slots, 0);
-        if (!check(f_.body, 0)) return a;
 
-        // A slot no parameter owns and no `let` bound holds state that lives in
-        // the frame and nowhere this can reach. Nothing should produce one --
-        // `Op::Bind` is the only thing that writes such a slot, and every bind
-        // in the body has just been accounted for -- so this is checked rather
-        // than argued, because the argument is about the compiler and this file
-        // is not.
-        if (reads_beyond_params_) return a;
-        if (!bindings_substitutable()) return a;
-
-        // Before `strict_of`, which needs to know which arguments are moved
-        // rather than evaluated in order not to claim them forced.
+        // Every `let` first, before anything is decided. The three answers
+        // below -- what the body forces, what it carries, what it suspends --
+        // each read a binding through its slot, and none of them can wait for
+        // the validating walk, because that walk needs *them* to know which
+        // subtrees it has to validate at all.
+        collect_binds(f_.body, 0);
+        if (rebound_) {
+            refuse("a slot is bound twice");
+            return finish();
+        }
         collect_calls(f_.body, 0);
         carried_ = carried();
 
-        SlotSet strict = strict_of(f_.body, 0);
-        SlotSet params = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
+        const SlotSet params = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
 
         // What a parameter has to be, and why the two answers differ.
         //
@@ -495,25 +531,95 @@ public:
         // evaluated, the parameter it lands in must be one the callee forces
         // anyway.
         //
-        // A **peer** is entered by a caller that does exactly that, so every one
-        // of its parameters must be forced on every path. That is what
-        // `peer_call` cites and it cannot be weakened from here.
+        // There are now three ways for a parameter to satisfy that, and only the
+        // first is a proof about the body:
         //
-        // The **root** is entered from a heap frame the interpreter filled, so
-        // nothing about its parameters is evaluated on the way in -- the only
-        // eager evaluation in the picture is its own self calls'. A parameter
-        // every self call hands straight back to itself is not evaluated by one:
-        // slot `i` to slot `i` moves a word and forces nothing, which is
-        // precisely what the interpreter does with it (`thunk_for` of a `Local`
-        // is the slot, unforced). So such a parameter needs no licence, and that
-        // is what lets a loop carry a string, an array or a map it reads on one
-        // path and not on the other -- `f s (i + 1) n (acc + core.str_byte s i)`
-        // is the shape, and before this it was refused for `s`.
-        const SlotSet licensed = peer_depth_ > 0 ? strict : (strict | carried_);
-        if ((licensed & params) != params) return a;
+        //   * **forced on every path** (`strict_of`), so evaluating the argument
+        //     at the call raises exactly what the callee would have raised;
+        //   * **carried** -- handed straight back, slot `i` to slot `i`, by every
+        //     self call, which moves a word and evaluates nothing;
+        //   * **suspended**, which is what the interpreter does with every
+        //     argument there is and is therefore always available.
+        //
+        // The third is what turns the rule from a gate into a choice: a function
+        // is no longer refused for a parameter it does not force, it merely gets
+        // a thunk there. Eagerness survives exactly where it pays -- a numeric
+        // loop forces everything it carries, so nothing about `sum`'s fused loop
+        // changes -- and everywhere else the tier does what the interpreter does.
+        //
+        // The three sets are circular, because whether an argument's own
+        // subexpression forces a slot depends on whether that argument is
+        // evaluated at all. So `strict` is computed against a growing set of
+        // suspended positions until it stops shrinking. It terminates because
+        // `lazy_` only ever grows and is bounded by the parameters.
+        //
+        // A **peer** takes none of this. It is entered by a caller that
+        // evaluates its arguments, and that caller has no way to know which of
+        // the callee's positions were meant to be suspended -- so a peer still
+        // has to force every parameter on every path. `peer_call` is what cites
+        // that, and it cannot be weakened from here.
+        SlotSet strict = 0;
+        for (int round = 0; round <= int(f_.arity) + 1; ++round) {
+            strict = strict_of(f_.body, 0);
+            if (peer_depth_ > 0) break;
+            const SlotSet next = params & ~(strict | carried_);
+            if (next == lazy_) break;
+            lazy_ = next;
+        }
+
+        const SlotSet licensed = peer_depth_ > 0 ? strict : (strict | carried_ | lazy_);
+        if ((licensed & params) != params) {
+            std::string missing;
+            for (uint32_t i = 0; i < f_.arity; ++i) {
+                if (!((licensed >> i) & 1)) {
+                    char buf[32];
+                    std::snprintf(buf, sizeof buf, "#%u ", i);
+                    missing += buf;
+                }
+            }
+            refuse((peer_depth_ > 0 ? "a peer must force every parameter; "
+                                    : "a parameter is neither forced, carried nor suspended: ") +
+                   missing);
+            return finish();
+        }
+
+        // The validating walk, which needs `lazy_`: an argument in a suspended
+        // position is not emitted, so nothing about it has to be emittable.
+        if (!check(f_.body, 0)) {
+            if (refuse_.empty()) refuse_ = "this tier's analysis refused the body "
+                                          "but recorded no specific reason";
+            return finish();
+        }
+
+        // A slot no parameter owns and no `let` bound holds state that lives in
+        // the frame and nowhere this can reach. Nothing should produce one --
+        // `Op::Bind` is the only thing that writes such a slot, and every bind
+        // in the body has just been accounted for -- so this is checked rather
+        // than argued, because the argument is about the compiler and this file
+        // is not.
+        if (reads_beyond_params_) {
+            refuse("reads a slot no parameter owns, or reads one before its `let`");
+            return finish();
+        }
+        if (!bindings_substitutable()) return finish();
+
+        // A body emitted as a function of its arguments is handed a frame that
+        // is not its own: the outermost invocation's in the recursive shape,
+        // because a self call passes the same one down, and the *caller's* in a
+        // peer. Its closure is the only thing about it still true of this
+        // invocation, and only because a function reached by name has no
+        // captures. So a function that has captures of its own -- one that reads
+        // a capture, builds a closure over one, or suspends an expression that
+        // might do either -- is compiled in the loop shape or not at all, since
+        // there the frame really is this invocation's.
+        if (f_.n_captures > 0 && (recurses_ || peer_depth_ > 0)) {
+            refuse("a function with captures is only compiled as a loop");
+            return finish();
+        }
 
         a.binds = binds_;
         a.carried = carried_;
+        a.lazy = lazy_;
         a.compilable = true;
         a.strict_params = strict;
         a.recurses = recurses_;
@@ -529,31 +635,48 @@ public:
                 a.force_first.clear();
             }
         }
+        a.refuse = refuse_;
         return a;
     }
 
 private:
     /// Is this node, and everything under it, something we can emit?
     bool check(uint32_t node, int depth) {
-        if (depth > 256) return false;
+        if (depth > 256) {
+            refuse("body deeper than 256 nodes");
+            return false;
+        }
         const Node& n = img_.node(node);
         Op op = Op(n.op);
 
         if (op == Op::Apply) return check_apply(n, depth);
-        if (!op_is_supported(op)) return false;
+        if (!op_is_supported(op)) {
+            refuse(std::string("unsupported op `") + op_name(op) + "`");
+            return false;
+        }
         // An integer too big for a fixnum is a boxed constant the emitter has
         // no way to name, so it is refused here rather than there -- same
         // reason as the two ops missing from the list above.
-        if (op == Op::ConstInt && !fixnum_fits(img_.integer(n.a))) return false;
+        if (op == Op::ConstInt && !fixnum_fits(img_.integer(n.a))) {
+            refuse("an integer constant does not fit a fixnum");
+            return false;
+        }
         if (op == Op::Local) {
-            if (n.a >= f_.slots) return false;
+            if (n.a >= f_.slots) {
+                refuse("a local names a slot past the end of the frame");
+                return false;
+            }
             ++reads_[n.a];
-            // A read of a slot that is neither a parameter nor already bound.
-            // "Already" is what makes a binding that names itself, or one that
-            // names a later binding, refuse the function rather than expand for
-            // ever -- `check_bind` records a slot only after its value has been
-            // walked.
-            if (n.a >= f_.arity && binds_[n.a] == NO_NODE) reads_beyond_params_ = true;
+            // A read of a slot that is neither a parameter nor bound *yet*.
+            // "Yet" is what makes a binding that names itself, or one that names
+            // a later binding, refuse the function rather than expand for ever:
+            // `collect_binds` knows every slot a `let` writes, so the ordering
+            // has to be said here, where the body is walked in the order it runs.
+            if (n.a >= f_.arity && !bound_yet_[n.a]) reads_beyond_params_ = true;
+        }
+        if (op == Op::Capture && n.a >= f_.n_captures) {
+            refuse("a capture names a slot past the end of the closure");
+            return false;
         }
 
         switch (op) {
@@ -576,6 +699,33 @@ private:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or:
                 return check(n.a, depth + 1) && check(n.b, depth + 1);
+            // A list's and an array's elements are suspended, exactly as the
+            // interpreter suspends them, so nothing about them has to be
+            // emittable. A map's *keys* are not: it has to hash them, so the
+            // machine forces each one where it stands and so does this.
+            case Op::MakeList: case Op::MakeArray:
+                return true;
+            case Op::MakeMap:
+                for (uint32_t i = 0; i < n.b; ++i) {
+                    if (!check(img_.kid(n.a + i * 2), depth + 1)) return false;
+                }
+                return true;
+            // The container and the key are forced; a `get`'s fallback is
+            // evaluated where the machine would have evaluated it, and a `set`'s
+            // value is stored unforced.
+            case Op::Get:
+                return check(n.a, depth + 1) && check(n.b, depth + 1) &&
+                       (n.c == NO_NODE || check(n.c, depth + 1));
+            case Op::Set:
+                return check(n.a, depth + 1) && check(n.b, depth + 1);
+            // The function a closure is built over is entered by the
+            // interpreter, so it is not this tier's to have an opinion about.
+            case Op::MakeClosure: case Op::MakeThunk:
+                if (n.a >= img_.func_count()) {
+                    refuse("a closure names a function that is not in the image");
+                    return false;
+                }
+                return true;
             default:
                 return true;
         }
@@ -602,6 +752,9 @@ private:
     bool check_apply(const Node& n, int depth) {
         if (is_self_call(n)) {
             for (uint32_t i = 0; i < n.c; ++i) {
+                // A carried argument is moved and a lazy one is suspended;
+                // neither is emitted, so neither has to be emittable.
+                if (i < 64 && (((carried_ | lazy_) >> i) & 1)) continue;
                 if (!check(img_.kid(n.b + i), depth + 1)) return false;
             }
             if (n.flags & F_TAIL) {
@@ -617,17 +770,17 @@ private:
             }
             return true;
         }
-        // A host native. Its arguments are evaluated here, which for the ones
-        // its strict mask claims is exactly what the interpreter does a step
-        // later -- and for the ones it does not, is only allowed where
-        // evaluating cannot be observed.
+        // A host native. An argument its strict mask claims is evaluated here,
+        // which is exactly what the interpreter does a step later; one the mask
+        // does not claim is suspended, which is exactly what the interpreter
+        // does with that. So only the first kind has to be emittable -- and that
+        // is the whole of why `core.cons`, whose mask claims nothing, no longer
+        // refuses everything it appears in.
         const NativeSite site = native_site(rt_, img_, n.a, n.c);
         if (site.ok) {
             for (uint32_t i = 0; i < n.c; ++i) {
-                const uint32_t arg = img_.kid(n.b + i);
-                if (!check(arg, depth + 1)) return false;
-                const bool strict = i < 32 && ((site.strict_mask >> i) & 1);
-                if (!strict && !eagerly_safe(arg, 0)) return false;
+                if (!(i < 32 && ((site.strict_mask >> i) & 1))) continue;
+                if (!check(img_.kid(n.b + i), depth + 1)) return false;
             }
             return true;
         }
@@ -636,7 +789,21 @@ private:
         // callee into the same module and calling it -- so the whole closure of
         // callees is decided here, before a line of either is written.
         const uint32_t gi = peer_target(n);
-        if (gi == kNoFunc || !peers_ || !peer_admits(*peers_, gi, peer_depth_)) return false;
+        if (gi == kNoFunc) {
+            refuse("a call whose callee is not a name (a closure, a partial "
+                   "application, or a call through a local)");
+            return false;
+        }
+        if (!peers_) {
+            refuse("a call to a peer from an analysis with no peer set");
+            return false;
+        }
+        std::string peer_refuse;
+        if (!peer_admits(*peers_, gi, peer_depth_, &peer_refuse)) {
+            refuse("peer `" + func_name(img_, gi) + "` refused: " +
+                   (peer_refuse.empty() ? "not compilable as a peer" : peer_refuse));
+            return false;
+        }
         for (uint32_t i = 0; i < n.c; ++i) {
             if (!check(img_.kid(n.b + i), depth + 1)) return false;
         }
@@ -753,10 +920,20 @@ private:
         if (n.flags & F_STRICT) return false;
         // Into a parameter's slot, or past the end of the frame: neither is
         // something the compiler emits, and neither has a meaning here.
-        if (n.a < f_.arity || n.a >= f_.slots) return false;
+        if (n.a < f_.arity) {
+            refuse("a `let` binds into a parameter's slot");
+            return false;
+        }
+        if (n.a >= f_.slots) {
+            refuse("a `let` binds past the end of the frame");
+            return false;
+        }
         // One slot, one binding. Bound twice, a read means whichever came
         // before it, and this has no way to say which that was.
-        if (binds_[n.a] != NO_NODE) return false;
+        if (binds_[n.a] != NO_NODE) {
+            refuse("a slot is bound twice");
+            return false;
+        }
         if (!check(n.b, depth + 1)) return false;
         binds_[n.a] = n.b;
         return true;
@@ -774,7 +951,14 @@ private:
             if (binds_[slot] == NO_NODE || reads_[slot] <= 1) continue;
             bool calls = false;
             const uint32_t cost = expand_cost(binds_[slot], 0, &calls);
-            if (calls || cost > kMaxBindDuplication) return false;
+            if (calls || cost > kMaxBindDuplication) {
+                char buf[32];
+                std::snprintf(buf, sizeof buf, "slot #%u ", slot);
+                refuse("a `let` bound in " + std::string(buf) + "is read more than once and " +
+                       (calls ? "its value contains a call"
+                              : "its value is bigger than kMaxBindDuplication"));
+                return false;
+            }
         }
         return true;
     }
@@ -1104,6 +1288,16 @@ private:
     bool recurses_ = false;
     bool tail_self_ = false;
     bool reads_beyond_params_ = false;
+    /// The first reason `refuse` has been given, kept so `run` can hand it to
+    /// the analysis and from there to whoever reports a refusal.
+    std::string refuse_;
+
+    /// Record why this function cannot be compiled. Only the first reason is
+    /// kept -- a report is a pointer at a widening, not an inventory, and the
+    /// first refusal is the one a walk order would have to change.
+    void refuse(const std::string& why) {
+        if (refuse_.empty()) refuse_ = why;
+    }
 
 public:
     /// The type of one node, given what is known about the slots. Public
@@ -1189,6 +1383,10 @@ class PeerSet {
 
     bool admit(uint32_t gi, int depth);
 
+    /// The first reason the last `admit` failed for, threaded back to the call
+    /// site that asked so it can name the peer rather than just the failure.
+    const std::string& refuse() const { return refuse_; }
+
     /// Every call every member makes, and every call the root makes, is to a
     /// member. False means the optimistic answer above was taken somewhere and
     /// turned out wrong, and the whole compile is given up.
@@ -1212,14 +1410,27 @@ class PeerSet {
     Runtime& rt_;
     const Image& img_;
     std::unordered_map<uint32_t, State> state_;
+    std::string refuse_;
 };
 
 bool PeerSet::admit(uint32_t gi, int depth) {
-    if (depth > kMaxPeerDepth) return false;
+    if (depth > kMaxPeerDepth) {
+        refuse_ = "the peer chain is deeper than kMaxPeerDepth";
+        return false;
+    }
     auto seen = state_.find(gi);
-    if (seen != state_.end()) return seen->second != State::No;
-    if (members.size() >= kMaxPeers) return false;
-    if (gi >= img_.func_count()) return false;
+    if (seen != state_.end()) {
+        if (seen->second == State::No) refuse_ = "the peer was refused when it was analysed";
+        return seen->second != State::No;
+    }
+    if (members.size() >= kMaxPeers) {
+        refuse_ = "the peer closure already holds kMaxPeers members";
+        return false;
+    }
+    if (gi >= img_.func_count()) {
+        refuse_ = "the callee is not an image function";
+        return false;
+    }
 
     state_[gi] = State::Deciding;
     Analysis a = Analyzer(rt_, img_, gi, this, depth + 1).run();
@@ -1238,6 +1449,11 @@ bool PeerSet::admit(uint32_t gi, int depth) {
     // whole of the difference. A function refused here is still compiled in its
     // own right when something enters it directly; it is only refused as
     // somebody else's callee.
+    if (!a.compilable) {
+        refuse_ = a.refuse.empty() ? "not compilable by this tier" : a.refuse;
+    } else if (a.tail_self) {
+        refuse_ = "is a loop (a peer may not be a loop)";
+    }
     const bool ok = a.compilable && !a.tail_self;
     state_[gi] = ok ? State::Yes : State::No;
     if (!ok) return false;
@@ -1252,7 +1468,11 @@ bool PeerSet::admit(uint32_t gi, int depth) {
     return true;
 }
 
-bool peer_admits(PeerSet& peers, uint32_t gi, int depth) { return peers.admit(gi, depth); }
+bool peer_admits(PeerSet& peers, uint32_t gi, int depth, std::string* refuse) {
+    const bool ok = peers.admit(gi, depth);
+    if (!ok && refuse) *refuse = peers.refuse();
+    return ok;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1513,12 @@ public:
           force_first_(a.force_first), binds_(a.binds), peers_(peers), preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
+
+    /// Why `emit` gave up, when it did. `failed_` records the first `fail`,
+    /// so a root that refused in the analyzer and then a peer that refused in
+    /// the emitter reports the peer -- but that is honest: the last body is
+    /// the reason the whole closure is refused.
+    const std::string& refusal() const { return failure_; }
 
 private:
     /// A value in hand, in one of the two representations of "Representation"
@@ -1457,6 +1683,16 @@ private:
     std::vector<llvm::Value*> slots_;   // allocas, one per frame slot
     llvm::Value* reduction_slot_ = nullptr;
     bool failed_ = false;
+    /// Why `failed_` was set, the first time. `failed_` guards the whole
+    /// downstream walk, so the reason has to be captured where the flag is
+    /// raised rather than reconstructed later.
+    std::string failure_;
+
+    /// Give up on writing this function, naming the place that did it.
+    void fail(const std::string& why) {
+        failed_ = true;
+        if (failure_.empty()) failure_ = why;
+    }
 
     // Declarations of the runtime helpers.
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
@@ -1669,6 +1905,7 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
 
     if (llvm::verifyFunction(*fn_, &llvm::errs())) {
         if (!preset_) fn_->eraseFromParent();
+        fail("the body did not verify");
         return nullptr;
     }
     return fn_;
@@ -1995,7 +2232,7 @@ Emitter::JV Emitter::node(uint32_t idx) {
         case Op::ConstInt: {
             int64_t v = img_.integer(n.a);
             if (!fixnum_fits(v)) {
-                failed_ = true;
+                fail("an integer constant does not fit a fixnum");
                 return none();
             }
             return tag(i64(make_fixnum(v)));
@@ -2014,7 +2251,7 @@ Emitter::JV Emitter::node(uint32_t idx) {
             // naming one here would need a call. Unreachable: `op_is_supported`
             // does not list it. Kept because a switch that answers every op is
             // easier to check than one that answers most of them.
-            failed_ = true;
+            fail("an atom constant reached the emitter");
             return none();
         case Op::Local:
             // A `let` has no thunk and no slot here: its value is written where
@@ -2025,7 +2262,7 @@ Emitter::JV Emitter::node(uint32_t idx) {
             // A capture lives in the frame, and a compiled body is a function
             // of its arguments. Unreachable, for the same reason as the atom
             // above.
-            failed_ = true;
+            fail("a capture reached the emitter");
             return none();
         case Op::Force: return node(n.a);
         case Op::If: return conditional(n);
@@ -2447,7 +2684,7 @@ Emitter::JV Emitter::take_call_status(llvm::Value* r, const char* what) {
 Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
     auto found = peers_->find(gi);
     if (found == peers_->end()) {
-        failed_ = true;
+        fail("a peer this function was supposed to call was not emitted");
         return none();
     }
     // Every argument before the call, and left to right, which is the order the
@@ -2694,13 +2931,20 @@ Emitter::JV Emitter::recursive_call(const std::vector<JV>& args) {
 /// which is what makes mutual recursion between two compiled functions work.
 ///
 /// Answers the root's function, or null if anything in the closure could not be
-/// written, in which case the caller drops the module whole.
+/// written, in which case the caller drops the module whole. `refuse` receives
+/// the first reason the closure could not be written, for the report.
 llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime& rt,
-                             const Image& img, uint32_t func_index, const std::string& name) {
+                             const Image& img, uint32_t func_index, const std::string& name,
+                             std::string* refuse = nullptr) {
+    auto fail = [&](const std::string& why) {
+        if (refuse) *refuse = why;
+        return nullptr;
+    };
     PeerSet peers(rt, img);
     Analysis root = Analyzer(rt, img, func_index, &peers, 0).run();
-    if (!root.compilable || !peers.sound(root)) return nullptr;
-
+    if (!root.compilable)
+        return fail(root.refuse.empty() ? "not compilable by this tier" : root.refuse);    if (!peers.sound(root))
+        return fail("a call names a global outside the peer closure (`PeerSet::sound`)");
     PeerFns fns;
     for (const auto& member : peers.members) {
         fns[member.first] = llvm::Function::Create(
@@ -2710,9 +2954,13 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
     for (const auto& member : peers.members) {
         llvm::Function* decl = fns[member.first];
         Emitter peer(ctx, mod, rt, img, member.first, member.second, &fns, decl);
-        if (!peer.emit(decl->getName().str())) return nullptr;
+        if (!peer.emit(decl->getName().str()))
+            return fail("the emitter could not write a body for peer `" +
+                        func_name(img, member.first) + "`");
     }
-    return Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
+    Emitter e(ctx, mod, rt, img, func_index, root, &fns);
+    if (!(fns[func_index] = e.emit(name))) return fail(e.refusal());
+    return fns[func_index];
 }
 
 }  // namespace
@@ -2847,8 +3095,18 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     mod->setDataLayout(impl_->lljit->getDataLayout());
 
     std::string name = "dream_fn_" + std::to_string(func_index);
-    if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index, name)) {
-        if (error) *error = "not compilable by this tier";
+    std::string refuse;
+    if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index, name, &refuse)) {
+        // One line per refused function, once (this is the entry that crossed
+        // the threshold). `DREAM_JIT_TRACE` turns that line on, which is how
+        // "what does the tier refuse and why" is asked of a real run.
+        static const bool trace = std::getenv("DREAM_JIT_TRACE") != nullptr;
+        if (trace) {
+            std::fprintf(stderr, "; jit refused fn#%u %s: %s\n", func_index,
+                         func_name(img, func_index).c_str(),
+                         (refuse.empty() ? "not compilable by this tier" : refuse).c_str());
+        }
+        if (error) *error = refuse.empty() ? "not compilable by this tier" : refuse;
         return nullptr;
     }
 
@@ -2889,10 +3147,12 @@ std::string Jit::dump_ir(uint32_t func_index) {
     const Image& img = impl_->rt.image();
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
+    std::string refuse;
     if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index,
-                      "dream_fn_" + std::to_string(func_index))) {
+                      "dream_fn_" + std::to_string(func_index), &refuse)) {
         return "; fn#" + std::to_string(func_index) +
-               " is not compilable by this tier (it is interpreted)\n";
+               " is not compilable by this tier: " +
+               (refuse.empty() ? std::string("not compilable by this tier") : refuse) + "\n";
     }
     std::string out;
     llvm::raw_string_ostream os(out);
