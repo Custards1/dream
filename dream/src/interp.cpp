@@ -1301,6 +1301,11 @@ void container_get(Process& p, uint32_t at, Value container, Value key, Value fr
         return;
     }
     if (!is_sequence(container)) {
+        if (std::getenv("DREAM_JIT_TRACE")) {
+            const Node& g = img_of(p).node(at);
+            std::fprintf(stderr, "INTERP container_get nonseq at=%u op=%d a=%u b=%u c=%u\n", at,
+                         int(g.op), g.a, g.b, g.c);
+        }
         do_raise(p, type_error(p, "`.[ ]` reads a map, an array or a list, not " +
                                       describe(p, container)));
         return;
@@ -1343,6 +1348,11 @@ void container_set(Process& p, uint32_t at, Value container, Value key, Value fr
         return;
     }
     if (!is_sequence(container)) {
+        if (std::getenv("DREAM_JIT_TRACE")) {
+            const Node& g = img_of(p).node(at);
+            std::fprintf(stderr, "INTERP container_set nonseq at=%u op=%d a=%u b=%u c=%u\n", at,
+                         int(g.op), g.a, g.b, g.c);
+        }
         do_raise(p, type_error(p, "`.[ => ]` changes a map, an array or a list, not " +
                                       describe(p, container)));
         return;
@@ -1952,6 +1962,9 @@ void step_return(Process& p, size_t floor) {
                 eval_node(p, idx.b, c.v1);
                 return;
             }
+            if (!is_whnf(container)) {
+                if (!force_whnf(p, container, &container)) return;
+            }
             if (Op(idx.op) == Op::Get) container_get(p, c.b, container, key, c.v1);
             else container_set(p, c.b, container, key, c.v1);
             return;
@@ -1960,6 +1973,9 @@ void step_return(Process& p, size_t floor) {
         case ContKind::IndexApply: {
             Value container = p.stack.back();
             p.stack.pop_back();
+            if (!is_whnf(container)) {
+                if (!force_whnf(p, container, &container)) return;
+            }
             if (Op(img_of(p).node(c.b).op) == Op::Get) {
                 container_get(p, c.b, container, p.result, c.v1);
             } else {
@@ -2791,6 +2807,9 @@ int jit_container_get(Process& p, Value container, Value key, bool has_else, Val
                        "the map has no key " + describe(p, key));
     }
     if (!is_sequence(container)) {
+        if (std::getenv("DREAM_JIT_TRACE"))
+            std::fprintf(stderr, "JITRT container_get nonseq container=%llx key=%llx\n",
+                         (unsigned long long)container, (unsigned long long)key);
         *out = type_error(p, "`.[ ]` reads a map, an array or a list, not " +
                                  describe(p, container));
         return 0;

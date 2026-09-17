@@ -17,9 +17,9 @@
 // back to itself is moved rather than computed, so it needs no strictness --
 // `Analyzer::carried`, and it is what lets a loop carry the string, array or map
 // it is walking. And an argument in a position a native's strict mask does not
-// claim is read rather than evaluated -- `Analyzer::eagerly_safe` and
-// `Emitter::lazy_operand`. Both do exactly what `thunk_for` does with the same
-// expression, which is what makes them free of the question above.
+// claim is suspended rather than evaluated, against a snapshot of the current
+// slots -- `Emitter::suspend`. Both do exactly what `thunk_for` does with the
+// same expression, which is what makes them free of the question above.
 //
 // What that rule does *not* promise is that an argument is forced at the same
 // point the interpreter would have forced it, only that it is forced. Where two
@@ -295,10 +295,12 @@ KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node, ui
 //   * **Is it saturated, and narrow enough?** A partial application has no
 //     callee to enter, and a variadic native has no fixed argument positions for
 //     a strict mask to describe. `kMaxNativeArgs` is the rest.
-//   * **May every argument be evaluated here?** A native forces the arguments
-//     its mask claims and leaves the others suspended, and compiled code has no
-//     thunk to suspend one in -- so a position the mask does not claim is only
-//     allowed when evaluating it is not an observable event. See `eagerly_safe`.
+//   * **May every argument be produced here?** A position the native's strict
+//     mask claims is evaluated, which is what the interpreter does a step later
+//     anyway. A position it does not claim is *suspended* -- `Emitter::suspend`
+//     -- so it is not an eager evaluation at all, and so is never an event.
+//     See jit_rt.hpp and the note under "A compiled function may call a host
+//     native" in CLAUDE.md for why the tier admits the function regardless.
 //
 // What is deliberately *not* asked is whether the native allocates, or forces,
 // or runs Dream code underneath itself. Allocation never collects, so compiled
@@ -404,6 +406,26 @@ NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node, uint
 /// the interpreter, where every op is supported, so a `Try` inside a list
 /// element or an unclaimed argument refuses nothing.
 bool op_is_supported(Op op) {
+    static const bool no_get = std::getenv("DREAM_JIT_NO_GET") != nullptr;
+    static const bool no_set = std::getenv("DREAM_JIT_NO_SET") != nullptr;
+    static const bool no_list = std::getenv("DREAM_JIT_NO_LIST") != nullptr;
+    static const bool no_array = std::getenv("DREAM_JIT_NO_ARRAY") != nullptr;
+    static const bool no_map = std::getenv("DREAM_JIT_NO_MAP") != nullptr;
+    static const bool no_closure = std::getenv("DREAM_JIT_NO_CLOSURE") != nullptr;
+    static const bool no_cap = std::getenv("DREAM_JIT_NO_CAP") != nullptr;
+    static const bool no_thunk = std::getenv("DREAM_JIT_NO_THUNK") != nullptr;
+    static const bool no_str = std::getenv("DREAM_JIT_NO_STR") != nullptr;
+    static const bool no_atom = std::getenv("DREAM_JIT_NO_ATOM") != nullptr;
+    if (no_get && op == Op::Get) return false;
+    if (no_set && op == Op::Set) return false;
+    if (no_list && (op == Op::MakeList || op == Op::MakeArray)) return false;
+    if (no_array && op == Op::MakeArray) return false;
+    if (no_map && op == Op::MakeMap) return false;
+    if (no_closure && op == Op::MakeClosure) return false;
+    if (no_cap && op == Op::Capture) return false;
+    if (no_thunk && op == Op::MakeThunk) return false;
+    if (no_str && op == Op::ConstStr) return false;
+    if (no_atom && op == Op::ConstAtom) return false;
     switch (op) {
         case Op::ConstInt: case Op::ConstFloat: case Op::ConstBool:
         case Op::ConstChar: case Op::ConstStr: case Op::ConstAtom: case Op::Unit:
@@ -711,11 +733,11 @@ private:
                 }
                 return true;
             // The container and the key are forced; a `get`'s fallback is
-            // evaluated where the machine would have evaluated it, and a `set`'s
-            // value is stored unforced.
+            // suspended where a missing key would reach it, and a `set`'s value
+            // is stored unforced -- so neither has to be emittable, any more
+            // than a list element does.
             case Op::Get:
-                return check(n.a, depth + 1) && check(n.b, depth + 1) &&
-                       (n.c == NO_NODE || check(n.c, depth + 1));
+                return check(n.a, depth + 1) && check(n.b, depth + 1);
             case Op::Set:
                 return check(n.a, depth + 1) && check(n.b, depth + 1);
             // The function a closure is built over is entered by the
@@ -829,48 +851,6 @@ private:
         return g.target;
     }
 
-    /// May compiled code evaluate this expression where the interpreter would
-    /// have suspended it?
-    ///
-    /// Asked of the arguments a native's strict mask does *not* claim. Such an
-    /// argument reaches the native as a thunk, and a compiled body has no thunk
-    /// to make -- so either the value can be produced here without that being an
-    /// event, or the call is not compiled at all.
-    ///
-    /// Two things qualify, and neither is an evaluation at all. A literal, which
-    /// is a word. And a *slot*, which is read without being forced -- see
-    /// `Emitter::lazy_operand`, which is what emits one, and note that this is
-    /// exactly what the interpreter passes in the same position: `thunk_for` of
-    /// a `Local` is the slot's value, suspended or not, handed over as it
-    /// stands.
-    ///
-    /// A `let`'s name stands for its value, which is written where the name is
-    /// read, so the question is asked of the value instead.
-    ///
-    /// Everything else is refused, arithmetic included: `x + 1` can raise, and
-    /// raising from an argument nobody was going to look at is exactly the
-    /// change this must not make.
-    bool eagerly_safe(uint32_t idx, int depth) const {
-        if (depth > 64) return false;
-        const Node& n = img_.node(idx);
-        switch (Op(n.op)) {
-            case Op::ConstInt:
-                return fixnum_fits(img_.integer(n.a));
-            case Op::ConstFloat: case Op::ConstBool: case Op::ConstChar: case Op::Unit:
-                return true;
-            case Op::Local:
-                if (n.a >= f_.arity) {
-                    return n.a < binds_.size() && binds_[n.a] != NO_NODE &&
-                           eagerly_safe(binds_[n.a], depth + 1);
-                }
-                return true;
-            case Op::Force:
-                return eagerly_safe(n.a, depth + 1);
-            default:
-                return false;
-        }
-    }
-
     /// Does compiled code evaluate every one of this call's arguments before
     /// making it? True of a self call and of a peer, false of a native, which
     /// evaluates only the ones its strict mask claims.
@@ -929,13 +909,19 @@ private:
             return false;
         }
         // One slot, one binding. Bound twice, a read means whichever came
-        // before it, and this has no way to say which that was.
-        if (binds_[n.a] != NO_NODE) {
+        // before it, and this has no way to say which that was. `collect_binds`
+        // already refused the function on `rebound_`; this is the same check in
+        // the walk that has to say "yet", because `bound_yet_` is what licenses
+        // a read that comes after the binding.
+        if (bound_yet_[n.a]) {
             refuse("a slot is bound twice");
             return false;
         }
         if (!check(n.b, depth + 1)) return false;
         binds_[n.a] = n.b;
+        // The binding is passed: a read of this slot from here on is a read of
+        // the value bound now, so `check`'s `Local` case stops flagging it.
+        bound_yet_[n.a] = true;
         return true;
     }
 
@@ -1269,6 +1255,79 @@ private:
         }
     }
 
+    /// Every `let` in the body, before anything is decided.
+    ///
+    /// The three answers below -- what the body forces, what it carries, what it
+    /// suspends -- each read a binding through its slot, and none of them can
+    /// wait for the validating walk, because that walk needs *them* to know
+    /// which subtrees it has to validate at all. So `binds_` is filled here,
+    /// over the whole body including the subtrees `check` will skip because
+    /// they are suspended: those can read a `let` of their own when a snapshot
+    /// gives them a frame, and the binding has to be there for them.
+    ///
+    /// A slot a second `let` writes has no single meaning for either the
+    /// fixpoint or the substituting emitter, so that is refused here, up front,
+    /// where `run` can see it before a line of the analysis has run.
+    void collect_binds(uint32_t idx, int depth) {
+        if (depth > 256) return;
+        const Node& n = img_.node(idx);
+        switch (Op(n.op)) {
+            case Op::Bind:
+                if (n.a >= f_.arity && n.a < f_.slots) {
+                    if (binds_[n.a] != NO_NODE) {
+                        rebound_ = true;
+                    } else {
+                        binds_[n.a] = n.b;
+                    }
+                }
+                collect_binds(n.b, depth + 1);
+                return;
+            case Op::If:
+                collect_binds(n.a, depth + 1);
+                collect_binds(n.b, depth + 1);
+                if (n.c != NO_NODE) collect_binds(n.c, depth + 1);
+                return;
+            case Op::Block:
+                for (uint32_t i = 0; i < n.b; ++i) {
+                    collect_binds(img_.kid(n.a + i), depth + 1);
+                }
+                return;
+            case Op::Force: case Op::Neg: case Op::Not:
+                collect_binds(n.a, depth + 1);
+                return;
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+            case Op::And: case Op::Or:
+            case Op::Get:
+                collect_binds(n.a, depth + 1);
+                collect_binds(n.b, depth + 1);
+                if (Op(n.op) == Op::Get && n.c != NO_NODE) collect_binds(n.c, depth + 1);
+                return;
+            case Op::Set:
+                collect_binds(n.a, depth + 1);
+                collect_binds(n.b, depth + 1);
+                collect_binds(n.c, depth + 1);
+                return;
+            case Op::MakeList: case Op::MakeArray:
+                for (uint32_t i = 0; i < n.b; ++i) {
+                    collect_binds(img_.kid(n.a + i), depth + 1);
+                }
+                return;
+            case Op::MakeMap:
+                for (uint32_t i = 0; i < 2 * n.b; ++i) {
+                    collect_binds(img_.kid(n.a + i), depth + 1);
+                }
+                return;
+            case Op::Apply:
+                for (uint32_t i = 0; i < n.c; ++i) {
+                    collect_binds(img_.kid(n.b + i), depth + 1);
+                }
+                return;
+            default:
+                return;
+        }
+    }
+
     const Image& img_;
     uint32_t fi_;
     const FuncRec& f_;
@@ -1282,9 +1341,23 @@ private:
     /// the body reads it. Both are filled in by `check` as it walks.
     std::vector<uint32_t> binds_;
     std::vector<uint32_t> reads_;
+    /// Per slot: whether the validating walk has passed the `let` that binds it.
+    /// A read of a slot not yet bound here is a binding that names itself or a
+    /// later one, which refuses the function rather than expand for ever. See
+    /// the `Local` case of `check`.
+    std::vector<bool> bound_yet_;
+    /// A slot a second `let` wrote. Set by `collect_binds`, which is the walk
+    /// that has the whole body before anything else runs; `run` refuses on it
+    /// immediately, before the fixpoint reads through the bindings.
+    bool rebound_ = false;
     /// Parameters every self call moves rather than evaluates. Computed in
     /// `run` before `strict_of`, which has to know.
     SlotSet carried_ = 0;
+    /// Parameters every self call suspends rather than evaluates, one bit per
+    /// slot. The fixpoint in `run` grows it round by round; an argument in a
+    /// suspended position is thunked at the call, which is exactly what the
+    /// interpreter does with every argument. See the third bullet of `run`.
+    SlotSet lazy_ = 0;
     bool recurses_ = false;
     bool tail_self_ = false;
     bool reads_beyond_params_ = false;
@@ -1510,7 +1583,8 @@ public:
             const Analysis& a, const PeerFns* peers = nullptr, llvm::Function* preset = nullptr)
         : ctx_(ctx), mod_(mod), rt_(rt), img_(img), fi_(fi), f_(img.func(fi)),
           recurses_(a.recurses), float_slots_(a.float_slots), carried_(a.carried),
-          force_first_(a.force_first), binds_(a.binds), peers_(peers), preset_(preset), b_(ctx) {}
+          lazy_(a.lazy), force_first_(a.force_first), binds_(a.binds), peers_(peers),
+          preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
 
@@ -1580,13 +1654,41 @@ private:
     /// A slot as it stands, unforced. What an argument the callee may never
     /// look at is made of, and the one read in this file that is not a demand.
     JV load_slot_raw(uint32_t slot);
-    /// An argument in a position nobody is obliged to force: a literal, or a
-    /// slot read without forcing it. `Analyzer::eagerly_safe` is what has
-    /// already said this expression is one of those.
-    JV lazy_operand(uint32_t idx);
     /// Is this parameter one every self call moves rather than evaluates?
     bool slot_is_carried(uint32_t i) const { return i < 64 && ((carried_ >> i) & 1); }
     llvm::Value* force(llvm::Value* v);
+    /// `v` as a value the enclosing operation demands in normal form: a thunk
+    /// is forced, a float register is already one. This is what the interpreter
+    /// does when `operand_value` declines and it evaluates the operand instead,
+    /// and it is needed wherever a suspension may reach a demanding site --
+    /// `node` hands back a thunk for `MakeThunk` and for a `get`'s fallback.
+    JV demand(JV v);
+
+    // --- suspending: a frame of the current values, then thunks against it ---
+
+    /// The value of `idx`, not evaluated: a thunk of the node against a
+    /// snapshot of the slots it reads (already in hand for a node that is
+    /// constant or one read, exactly as `thunk_for` answers the interpreter).
+    JV suspend(uint32_t idx);
+    /// A snapshot frame holding the current value of every slot `idx`'s whole
+    /// subtree reads -- the slots a thunk of it will need when forced. The
+    /// caller's own frame when none are read, which is indistinguishable.
+    llvm::Value* snapshot_for(uint32_t idx);
+    /// `slots`: one bit per slot to fill with the current value into a fresh
+    /// frame carrying this function's closure.
+    llvm::Value* make_snapshot(uint64_t slots);
+    /// OR the frame slots `idx`'s subtree reads into `slots`, following a bound
+    /// slot's value so the fills a thunk needs are there too.
+    void collect_reachable_slots(uint32_t idx, uint64_t& slots, int depth);
+
+    // --- the article ops: building and indexing, as the interpreter does ---
+
+    JV make_list(const Node& n);
+    JV make_array(const Node& n);
+    JV make_map(const Node& n);
+    JV make_closure(const Node& n);
+    JV container_get(const Node& n);
+    JV container_set(const Node& n);
 
     // --- the two representations, and the crossings between them -----------
 
@@ -1650,6 +1752,10 @@ private:
     const SlotSet float_slots_;
     /// One bit per parameter every self call moves rather than evaluates.
     const SlotSet carried_;
+    /// One bit per parameter a self call may suspend rather than evaluate:
+    /// the analyzer could not prove it is forced on every path, so eager
+    /// evaluation of it would be a point where the tier might raise early.
+    const SlotSet lazy_;
     /// Slots to force on entry, in the order the body would have forced them.
     const std::vector<uint32_t> force_first_;
     /// Per slot, the node a `let` bound it to, or `NO_NODE`.
@@ -1698,6 +1804,11 @@ private:
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
         rt_frame_slots_, rt_frame_store_, rt_native_, rt_builtin_;
+    /// Suspending and building, from a body with no frame of its own. See
+    /// jit_rt.hpp; the snapshot is filled by the caller (compiled code) before
+    /// anything is suspended against it.
+    llvm::FunctionCallee rt_snapshot_, rt_suspend_, rt_capture_, rt_closure_, rt_string_,
+        rt_cons_, rt_array_, rt_array_items_, rt_map_new_, rt_map_insert_, rt_get_, rt_set_;
 };
 
 llvm::Function* Emitter::emit(const std::string& name) {
@@ -1763,6 +1874,31 @@ void Emitter::declare_helpers() {
     rt_builtin_ = mod_.getOrInsertFunction(
         "dream_rt_builtin",
         llvm::FunctionType::get(i32_, {ptr_, i32_, i32_, i64_, i64_, i64_, i64_, ptr_}, false));
+    rt_snapshot_ = mod_.getOrInsertFunction(
+        "dream_rt_snapshot", llvm::FunctionType::get(i64_, {ptr_, i64_, i32_}, false));
+    rt_suspend_ = mod_.getOrInsertFunction(
+        "dream_rt_suspend", llvm::FunctionType::get(i64_, {ptr_, i32_, i64_}, false));
+    rt_capture_ = mod_.getOrInsertFunction(
+        "dream_rt_capture", llvm::FunctionType::get(i64_, {i64_, i32_}, false));
+    rt_closure_ = mod_.getOrInsertFunction(
+        "dream_rt_closure", llvm::FunctionType::get(i32_, {ptr_, i32_, i64_, ptr_}, false));
+    rt_string_ = mod_.getOrInsertFunction(
+        "dream_rt_string", llvm::FunctionType::get(i64_, {ptr_, i32_}, false));
+    rt_cons_ = mod_.getOrInsertFunction(
+        "dream_rt_cons", llvm::FunctionType::get(i64_, {ptr_, i64_, i64_}, false));
+    rt_array_ = mod_.getOrInsertFunction(
+        "dream_rt_array", llvm::FunctionType::get(i64_, {ptr_, i32_}, false));
+    rt_array_items_ = mod_.getOrInsertFunction(
+        "dream_rt_array_items", llvm::FunctionType::get(ptr_, {i64_}, false));
+    rt_map_new_ = mod_.getOrInsertFunction(
+        "dream_rt_map_new", llvm::FunctionType::get(i64_, {ptr_}, false));
+    rt_map_insert_ = mod_.getOrInsertFunction(
+        "dream_rt_map_insert",
+        llvm::FunctionType::get(i64_, {ptr_, i64_, i64_, i64_}, false));
+    rt_get_ = mod_.getOrInsertFunction(
+        "dream_rt_get", llvm::FunctionType::get(i32_, {ptr_, i64_, i64_, i32_, ptr_}, false));
+    rt_set_ = mod_.getOrInsertFunction(
+        "dream_rt_set", llvm::FunctionType::get(i32_, {ptr_, i64_, i64_, i64_, ptr_}, false));
 }
 
 llvm::Function* Emitter::emit_loop(const std::string& name) {
@@ -2010,6 +2146,14 @@ llvm::Value* Emitter::force(llvm::Value* v) {
     return phi;
 }
 
+Emitter::JV Emitter::demand(JV v) {
+    // A value already in a register as a double is a number and in normal form;
+    // a tagged one may still be a suspension, so it goes through `force`, whose
+    // own fast path is a compare for anything that is not a heap pointer.
+    if (!v.v || v.dbl) return v;
+    return tag(force(v.v));
+}
+
 Emitter::JV Emitter::load_slot(uint32_t slot) {
     if (slot_is_dbl(slot)) {
         // Already a double: the entry guard saw a float box and nothing since
@@ -2031,26 +2175,6 @@ Emitter::JV Emitter::load_slot_raw(uint32_t slot) {
     // program never demands.
     if (slot_is_dbl(slot)) return flt(b_.CreateLoad(dbl_, slots_[slot]));
     return tag(b_.CreateLoad(i64_, slots_[slot]));
-}
-
-Emitter::JV Emitter::lazy_operand(uint32_t idx) {
-    const Node& n = img_.node(idx);
-    switch (Op(n.op)) {
-        case Op::Local:
-            // A `let`'s name stands for its value; a parameter stands for its
-            // slot, read and not forced.
-            if (n.a < binds_.size() && binds_[n.a] != NO_NODE) return lazy_operand(binds_[n.a]);
-            return load_slot_raw(n.a);
-        case Op::Force:
-            // The compiler asked for this to be evaluated where it stands. It is
-            // handed over unevaluated instead, which is what the interpreter
-            // does too -- it suspends the `Force` in a thunk -- and whoever
-            // demands the value gets the same answer either way.
-            return lazy_operand(n.a);
-        default:
-            // A literal. `eagerly_safe` admits nothing else.
-            return node(idx);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2227,6 +2351,11 @@ Emitter::JV Emitter::float_order(Op op, JV a, JV bv) {
 
 Emitter::JV Emitter::node(uint32_t idx) {
     if (failed_) return none();
+    if (idx >= img_.node_count()) {
+        std::fprintf(stderr, "JIT BAD NODE idx=%u count=%u\n", idx, img_.node_count());
+        fail("bad node index");
+        return none();
+    }
     const Node& n = img_.node(idx);
     switch (Op(n.op)) {
         case Op::ConstInt: {
@@ -2246,29 +2375,44 @@ Emitter::JV Emitter::node(uint32_t idx) {
             // literal per iteration, four million of them, to hold two numbers
             // that never left the loop.
             return flt(llvm::ConstantFP::get(dbl_, img_.real(n.a)));
+        case Op::ConstStr:
+            // The process's one copy of the constant, exactly what the
+            // interpreter hands back for the same index. The same object for
+            // the life of the process, which is why ConstStr suspends less
+            // often than it looks as though it should.
+            return tag(b_.CreateCall(rt_string_, {proc_, i32c(int(n.a))}));
         case Op::ConstAtom:
-            // An atom's index is remapped through the runtime at load, so
-            // naming one here would need a call. Unreachable: `op_is_supported`
-            // does not list it. Kept because a switch that answers every op is
-            // easier to check than one that answers most of them.
-            fail("an atom constant reached the emitter");
-            return none();
+            // The atom's id is remapped once, at load, and an atom is an
+            // immediate -- a constant `make_atom` of a runtime-chosen id. No
+            // helper and nothing to suspend: it is a literal here the way
+            // `ConstInt` is.
+            return tag(i64(make_atom(rt_.image_atom(n.a))));
         case Op::Local:
             // A `let` has no thunk and no slot here: its value is written where
             // its name is read, which is here. See `Analyzer::check_bind`.
             if (n.a < binds_.size() && binds_[n.a] != NO_NODE) return node(binds_[n.a]);
             return load_slot(n.a);
         case Op::Capture:
-            // A capture lives in the frame, and a compiled body is a function
-            // of its arguments. Unreachable, for the same reason as the atom
-            // above.
-            fail("a capture reached the emitter");
-            return none();
-        case Op::Force: return node(n.a);
+            // A capture lives in this function's closure, and both shapes keep
+            // the closure the interpreter made for the call -- the outer frame
+            // in the recursive shape owns it, and captures do not change with
+            // recursion depth. So the current closure is wherever `frame_`
+            // points. The machine `enter`s a capture it reads, which forces it,
+            // and a capture may well hold a suspension -- so this is a read and
+            // then a demand, not a bare read.
+            return tag(force(b_.CreateCall(rt_capture_, {frame_, i32c(int(n.a))})));
+        case Op::Force: return demand(node(n.a));
         case Op::If: return conditional(n);
         case Op::Block: return block(n);
         case Op::And: case Op::Or: return logic(n);
         case Op::Neg: case Op::Not: return unary(n);
+        case Op::MakeList: return make_list(n);
+        case Op::MakeArray: return make_array(n);
+        case Op::MakeMap: return make_map(n);
+        case Op::Get: return container_get(n);
+        case Op::Set: return container_set(n);
+        case Op::MakeClosure: return make_closure(n);
+        case Op::MakeThunk: return suspend(n.a);
         case Op::Apply: return apply(n);
         default: return binary(n);
     }
@@ -2293,8 +2437,325 @@ Emitter::JV Emitter::block(const Node& n) {
     return last;
 }
 
+// ---------------------------------------------------------------------------
+// Suspending, and the article ops
+//
+// A compiled body keeps its slots in registers, so when it says "not yet" it
+// has to make a frame of its own to say it against -- a snapshot of the slots
+// as they stand, filled with the current register values, which is exactly
+// what the interpreter's frame already is but built once per site instead of
+// once per call. Everything below builds that frame and suspends against it;
+// see jit_rt.hpp for what the helpers do and why allocation cannot collect.
+// ---------------------------------------------------------------------------
+
+void Emitter::collect_reachable_slots(uint32_t idx, uint64_t& slots, int depth) {
+    if (depth > 256 || failed_) return;
+    const Node& n = img_.node(idx);
+    switch (Op(n.op)) {
+        case Op::Local:
+            // The slot, and anything a `let` bound to it reads: a thunk of
+            // that value runs against the same snapshot, so its slots have to
+            // be there too. A self-referential bind cannot appear (the
+            // analyzer refuses a read before its bind), so following the chain
+            // terminates of its own accord; the depth cap is belt and braces.
+            if (n.a < f_.slots) slots |= uint64_t(1) << n.a;
+            if (n.a >= f_.arity && n.a < binds_.size() && binds_[n.a] != NO_NODE)
+                collect_reachable_slots(binds_[n.a], slots, depth + 1);
+            return;
+        case Op::Force: case Op::Neg: case Op::Not: case Op::MakeThunk:
+            collect_reachable_slots(n.a, slots, depth + 1);
+            return;
+        case Op::If:
+            collect_reachable_slots(n.a, slots, depth + 1);
+            collect_reachable_slots(n.b, slots, depth + 1);
+            if (n.c != NO_NODE) collect_reachable_slots(n.c, slots, depth + 1);
+            return;
+        case Op::Block:
+            for (uint32_t i = 0; i < n.b; ++i)
+                collect_reachable_slots(img_.kid(n.a + i), slots, depth + 1);
+            return;
+        case Op::And: case Op::Or:
+            collect_reachable_slots(n.a, slots, depth + 1);
+            collect_reachable_slots(n.b, slots, depth + 1);
+            return;
+        case Op::Get:
+            collect_reachable_slots(n.a, slots, depth + 1);
+            collect_reachable_slots(n.b, slots, depth + 1);
+            if (n.c != NO_NODE) collect_reachable_slots(n.c, slots, depth + 1);
+            return;
+        case Op::Set:
+            // A set's value is stored unforced and runs against the frame when
+            // demanded, so its reads have to be covered whether or not the
+            // container side read anything.
+            collect_reachable_slots(n.a, slots, depth + 1);
+            collect_reachable_slots(n.b, slots, depth + 1);
+            collect_reachable_slots(n.c, slots, depth + 1);
+            return;
+        case Op::MakeClosure: {
+            // What a new closure captures of *this* frame: each slot capture
+            // descriptor reads that slot when the closure is built against the
+            // snapshot, and a captured `let`'s value reads the same snapshot.
+            if (n.a < img_.func_count()) {
+                const FuncRec& f = img_.func(n.a);
+                for (uint32_t i = 0; i < f.n_captures; ++i) {
+                    uint32_t desc = img_.kid(f.captures_off + i);
+                    if (desc & CAP_FROM_CAPTURE) continue;  // the snapshot's closure carries it
+                    if (desc < f_.slots) slots |= uint64_t(1) << desc;
+                    if (desc >= f_.arity && desc < binds_.size() && binds_[desc] != NO_NODE)
+                        collect_reachable_slots(binds_[desc], slots, depth + 1);
+                }
+            }
+            return;
+        }
+        case Op::MakeList: case Op::MakeArray:
+            for (uint32_t i = 0; i < n.b; ++i)
+                collect_reachable_slots(img_.kid(n.a + i), slots, depth + 1);
+            return;
+        case Op::MakeMap:
+            for (uint32_t i = 0; i < n.b * 2; ++i)
+                collect_reachable_slots(img_.kid(n.a + i), slots, depth + 1);
+            return;
+        case Op::Apply:
+            // The callee is at `n.a` and the arguments are the kids from
+            // `n.b`; a callee is usually a name (a `Global`, which reads no
+            // slot) but a dynamic call's callee may be any expression, so it
+            // is walked too.
+            collect_reachable_slots(n.a, slots, depth + 1);
+            for (uint32_t i = 0; i < n.c; ++i)
+                collect_reachable_slots(img_.kid(n.b + i), slots, depth + 1);
+            return;
+        case Op::Bind:
+            // `let slot = value` as a statement: the value is what a read of
+            // the slot follows, and `binds_` already holds it.
+            collect_reachable_slots(n.b, slots, depth + 1);
+            return;
+        case Op::Try:
+            // A `try!`'s body and its handler both run against this frame --
+            // the handler is entered with the error written into `n.c` and the
+            // same frame. A `Try` inside a suspended subtree is run by the
+            // interpreter, which supports it; the emitter never emits one.
+            collect_reachable_slots(n.a, slots, depth + 1);
+            collect_reachable_slots(n.b, slots, depth + 1);
+            return;
+        case Op::Field:
+            // `mod.member`: the base is a module name in practice (no slot),
+            // but `Field` may in principle index any expression.
+            collect_reachable_slots(n.a, slots, depth + 1);
+            return;
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+            collect_reachable_slots(n.a, slots, depth + 1);
+            collect_reachable_slots(n.b, slots, depth + 1);
+            return;
+        case Op::Global: case Op::Builtin:
+        case Op::ConstInt: case Op::ConstFloat: case Op::ConstStr:
+        case Op::ConstChar: case Op::ConstBool: case Op::ConstAtom:
+        case Op::Unit: case Op::Capture: case Op::Nop: case Op::Count:
+            // A name, a literal or a capture: no frame slot is read.
+            return;
+        default:
+            // Nothing else names a frame slot. Kept so that adding an op makes
+            // the omission visible here rather than a stale value at run time.
+            return;
+    }
+}
+
+llvm::Value* Emitter::make_snapshot(uint64_t slots) {
+    if (slots == 0) return frame_;
+    // The fresh frame carries this function's closure (it is built from the
+    // caller's frame), and is a brand-new allocation, so the fills below need
+    // no write barrier: a young frame cannot already be pointed at by an old
+    // object. See `dream_rt_snapshot` and the note in jit_rt.hpp.
+    llvm::Value* snap = b_.CreateCall(rt_snapshot_, {proc_, frame_, i32c(int(f_.slots))}, "snap");
+    llvm::Value* base = b_.CreateCall(rt_frame_slots_, {snap}, "snap.base");
+    for (uint32_t s = 0; s < f_.slots; ++s) {
+        if (!((slots >> s) & 1)) continue;
+        llvm::Value* v;
+        if (s < f_.arity) {
+            // The register this slot is carried in, boxed if it is unboxed:
+            // the interpreter's frame speaks tagged values. Read, not forced,
+            // exactly as `load_slot_raw` hands an argument on.
+            v = box(load_slot_raw(s));
+        } else if (s < binds_.size() && binds_[s] != NO_NODE) {
+            // A `let`: the slot holds a suspension of the bound value, which
+            // is what the interpreter's own `Bind` would have put there.
+            v = b_.CreateCall(rt_suspend_, {proc_, i32c(int(binds_[s])), snap});
+        } else {
+            continue;  // nothing bound it; nothing legitimate reads it
+        }
+        b_.CreateStore(v, b_.CreateGEP(i64_, base, {i64(s)}));
+    }
+    return snap;
+}
+
+Emitter::JV Emitter::suspend(uint32_t idx) {
+    uint64_t slots = 0;
+    collect_reachable_slots(idx, slots, 0);
+    llvm::Value* snap = make_snapshot(slots);
+    return tag(b_.CreateCall(rt_suspend_, {proc_, i32c(int(idx)), snap}));
+}
+
+Emitter::JV Emitter::make_list(const Node& n) {
+    // The interpreter builds a list literal from the last element to the
+    // first, each element suspended against the frame; the elements are not
+    // evaluated by the building, so the direction is unobservable, but it is
+    // kept for the sake of matching the reference.
+    uint64_t slots = 0;
+    for (uint32_t i = 0; i < n.b; ++i)
+        collect_reachable_slots(img_.kid(n.a + i), slots, 0);
+    llvm::Value* snap = make_snapshot(slots);
+    llvm::Value* list = i64(NIL);
+    for (uint32_t i = n.b; i > 0; --i) {
+        llvm::Value* head = b_.CreateCall(rt_suspend_, {proc_, i32c(int(img_.kid(n.a + i - 1))), snap});
+        list = b_.CreateCall(rt_cons_, {proc_, head, list});
+    }
+    return tag(list);
+}
+
+Emitter::JV Emitter::make_array(const Node& n) {
+    uint64_t slots = 0;
+    for (uint32_t i = 0; i < n.b; ++i)
+        collect_reachable_slots(img_.kid(n.a + i), slots, 0);
+    llvm::Value* snap = make_snapshot(slots);
+    llvm::Value* arr = b_.CreateCall(rt_array_, {proc_, i32c(int(n.b))});
+    llvm::Value* items = b_.CreateCall(rt_array_items_, {arr});
+    for (uint32_t i = 0; i < n.b; ++i) {
+        llvm::Value* v = b_.CreateCall(rt_suspend_, {proc_, i32c(int(img_.kid(n.a + i))), snap});
+        b_.CreateStore(v, b_.CreateGEP(i64_, items, {i64(i)}));
+    }
+    return tag(arr);
+}
+
+Emitter::JV Emitter::make_map(const Node& n) {
+    // Keys are evaluated where the machine evaluates them (it has to hash
+    // one), values are stored as suspensions, exactly as a map literal's
+    // values are stored.
+    llvm::Value* m = b_.CreateCall(rt_map_new_, {proc_});
+    uint64_t slots = 0;
+    for (uint32_t i = 0; i < n.b * 2; ++i)
+        collect_reachable_slots(img_.kid(n.a + i), slots, 0);
+    llvm::Value* snap = make_snapshot(slots);
+    for (uint32_t i = 0; i < n.b; ++i) {
+        JV key = demand(node(img_.kid(n.a + i * 2)));
+        if (failed_ || !key.v) return none();
+        llvm::Value* val =
+            b_.CreateCall(rt_suspend_, {proc_, i32c(int(img_.kid(n.a + i * 2 + 1))), snap});
+        m = b_.CreateCall(rt_map_insert_, {proc_, m, box(key), val});
+    }
+    return tag(m);
+}
+
+Emitter::JV Emitter::make_closure(const Node& n) {
+    // The captures come from the current invocation's values, which only a
+    // snapshot holds: the recursive shape's frame belongs to the outermost
+    // invocation. A `CAP_FROM_CAPTURE` descriptor names this function's own
+    // closure, which the snapshot carries from `frame_` unchanged.
+    if (n.a >= img_.func_count()) {
+        fail("a closure names a function that is not in the image");
+        return none();
+    }
+    uint64_t slots = 0;
+    const FuncRec& f = img_.func(n.a);
+    for (uint32_t i = 0; i < f.n_captures; ++i) {
+        uint32_t desc = img_.kid(f.captures_off + i);
+        if (!(desc & CAP_FROM_CAPTURE) && desc < f_.slots) slots |= uint64_t(1) << desc;
+    }
+    llvm::Value* snap = make_snapshot(slots);
+    auto* out = b_.CreateAlloca(i64_);
+    llvm::Value* ok = b_.CreateCall(rt_closure_, {proc_, i32c(int(n.a)), snap, out});
+    llvm::Value* v = b_.CreateLoad(i64_, out);
+    auto* cont = bb("closure.ok");
+    auto* raise_bb = bb("closure.raise");
+    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), cont, raise_bb);
+    b_.SetInsertPoint(raise_bb);
+    emit_raise(v);
+    b_.SetInsertPoint(cont);
+    return tag(v);
+}
+
+Emitter::JV Emitter::container_get(const Node& n) {
+    // The container then the key, each evaluated where the machine evaluates
+    // it; the fallback is the one part that runs only on a miss, and runs
+    // there exactly as the machine runs it. Three answers: 1 is the value,
+    // 2 is "use the `else`", 0 is an error raised in `*out`.
+    JV c = demand(node(n.a));
+    if (failed_ || !c.v) return none();
+    JV k = demand(node(n.b));
+    if (failed_ || !k.v) return none();
+    auto* out = b_.CreateAlloca(i64_);
+    llvm::Value* ok = b_.CreateCall(
+        rt_get_, {proc_, box(c), box(k), i32c(n.c != NO_NODE ? 1 : 0), out});
+    llvm::Value* v = b_.CreateLoad(i64_, out);
+
+    auto* found_bb = bb("get.found");
+    auto* missing_bb = bb("get.missing");
+    auto* join_bb = bb("get.end");
+    b_.CreateCondBr(b_.CreateICmpEQ(ok, i32c(1)), found_bb, missing_bb);
+
+    // A found value is what the machine would have entered, so it is in hand
+    // and tagged. The fallback path below may produce a float in a register;
+    // with nothing to say the container holds one, the two paths meet as
+    // tagged values and a float is boxed in its own arm.
+    b_.SetInsertPoint(found_bb);
+    llvm::Value* found = v;
+    auto* found_end = b_.GetInsertBlock();
+    b_.CreateBr(join_bb);
+
+    b_.SetInsertPoint(missing_bb);
+    llvm::Value* missv = nullptr;
+    llvm::BasicBlock* miss_end = nullptr;
+    if (n.c != NO_NODE) {
+        auto* else_bb = bb("get.else");
+        auto* raise_bb = bb("get.raise");
+        b_.CreateCondBr(b_.CreateICmpEQ(ok, i32c(2)), else_bb, raise_bb);
+        b_.SetInsertPoint(raise_bb);
+        emit_raise(v);
+        b_.SetInsertPoint(else_bb);
+        JV ev = suspend(n.c);
+        if (failed_ || !ev.v) return none();
+        missv = box(ev);
+        miss_end = b_.GetInsertBlock();
+        b_.CreateBr(join_bb);
+    } else {
+        // Without a fallback the runtime never answers 2, so this is the
+        // error path and nothing else.
+        emit_raise(v);
+    }
+    b_.SetInsertPoint(join_bb);
+    // One incoming per predecessor edge, which is `found` plus the `else` arm
+    // when it fell through. The fallback may instead have raised or tail
+    // called, in which case only `found` reaches the join and the phi has the
+    // single incoming its single predecessor calls for.
+    auto* phi = b_.CreatePHI(i64_, miss_end ? 2 : 1);
+    phi->addIncoming(found, found_end);
+    if (miss_end) phi->addIncoming(missv, miss_end);
+    return tag(phi);
+}
+
+Emitter::JV Emitter::container_set(const Node& n) {
+    // `c.[k => v]`: the container and the key are evaluated, the value is
+    // stored unforced, as a map literal's values are. One answer: 1 with the
+    // updated container, 0 with an error raised.
+    JV c = demand(node(n.a));
+    if (failed_ || !c.v) return none();
+    JV k = demand(node(n.b));
+    if (failed_ || !k.v) return none();
+    JV val = suspend(n.c);
+    if (failed_ || !val.v) return none();
+    auto* out = b_.CreateAlloca(i64_);
+    llvm::Value* ok = b_.CreateCall(rt_set_, {proc_, box(c), box(k), box(val), out});
+    llvm::Value* v = b_.CreateLoad(i64_, out);
+    auto* cont = bb("set.ok");
+    auto* raise_bb = bb("set.raise");
+    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), cont, raise_bb);
+    b_.SetInsertPoint(raise_bb);
+    emit_raise(v);
+    b_.SetInsertPoint(cont);
+    return tag(v);
+}
+
 Emitter::JV Emitter::conditional(const Node& n) {
-    JV cond = node(n.a);
+    JV cond = demand(node(n.a));
     if (failed_ || !cond.v) return none();
     // A condition that is a float is not a bool, and the tagged path below
     // says so with the message the interpreter would use.
@@ -2362,7 +2823,7 @@ Emitter::JV Emitter::conditional(const Node& n) {
 }
 
 Emitter::JV Emitter::logic(const Node& n) {
-    JV lhs = node(n.a);
+    JV lhs = demand(node(n.a));
     if (failed_ || !lhs.v) return none();
     llvm::Value* l = box(lhs);
     const bool is_and = (Op(n.op) == Op::And);
@@ -2389,7 +2850,7 @@ Emitter::JV Emitter::logic(const Node& n) {
     b_.CreateBr(join_bb);
 
     b_.SetInsertPoint(rhs_bb);
-    JV rhs = node(n.b);
+    JV rhs = demand(node(n.b));
     if (failed_) return none();
     // The short-circuit answer is a bool, so the two paths only meet as tagged
     // values; a float right-hand side is boxed here rather than at the join.
@@ -2405,7 +2866,7 @@ Emitter::JV Emitter::logic(const Node& n) {
 }
 
 Emitter::JV Emitter::unary(const Node& n) {
-    JV x = node(n.a);
+    JV x = demand(node(n.a));
     if (failed_ || !x.v) return none();
 
     if (Op(n.op) == Op::Not) {
@@ -2465,9 +2926,13 @@ Emitter::JV Emitter::unary(const Node& n) {
 
 Emitter::JV Emitter::binary(const Node& n) {
     Op op = Op(n.op);
-    JV av = node(n.a);
+    if (std::getenv("DREAM_JIT_TRACE") &&
+        (n.a >= img_.node_count() || n.b >= img_.node_count()))
+        std::fprintf(stderr, "binary bad op=%d a=%u b=%u c=%u count=%u\n", int(op), n.a, n.b, n.c,
+                     img_.node_count());
+    JV av = demand(node(n.a));
     if (failed_ || !av.v) return none();
-    JV bv = node(n.b);
+    JV bv = demand(node(n.b));
     if (failed_ || !bv.v) return none();
 
     const bool is_order = (op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge);
@@ -2778,10 +3243,11 @@ Emitter::JV Emitter::host_call(const NativeSite& site, const Node& n) {
     for (uint32_t i = 0; i < n.c; ++i) {
         const uint32_t arg = img_.kid(n.b + i);
         // A position the native's mask does not claim is one it may never look
-        // at, so what goes there is read rather than evaluated. The analyzer has
-        // already refused any shape that cannot be (`eagerly_safe`).
+        // at, so what goes there is suspended, not evaluated -- exactly what
+        // the interpreter does with every argument it does not force, and what
+        // a position of any shape is allowed to be.
         const bool strict = i < 32 && ((site.strict_mask >> i) & 1);
-        args[i] = strict ? node(arg) : lazy_operand(arg);
+        args[i] = strict ? node(arg) : suspend(arg);
         if (failed_ || !args[i].v) return none();
     }
     spend_reduction();
@@ -2817,6 +3283,15 @@ Emitter::JV Emitter::self_call(const Node& n) {
     // parameter this call is about to overwrite.
     std::vector<JV> args(n.c);
     for (uint32_t i = 0; i < n.c; ++i) {
+        // A parameter the analyzer could not prove forced on every path is
+        // suspended, not evaluated: evaluating it here could raise or diverge
+        // where the interpreter's unforced argument never would. See
+        // `Analyzer::lazy` and what it licenses.
+        if (i < 64 && ((lazy_ >> i) & 1)) {
+            args[i] = suspend(img_.kid(n.b + i));
+            if (failed_ || !args[i].v) return none();
+            continue;
+        }
         // A carried parameter is moved, not evaluated: slot `i` to slot `i`,
         // whatever is in it. That is what the interpreter does with it, and it
         // is why such a parameter needs no strictness -- see `Analyzer::carried`
@@ -2943,7 +3418,8 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
     PeerSet peers(rt, img);
     Analysis root = Analyzer(rt, img, func_index, &peers, 0).run();
     if (!root.compilable)
-        return fail(root.refuse.empty() ? "not compilable by this tier" : root.refuse);    if (!peers.sound(root))
+        return fail(root.refuse.empty() ? "not compilable by this tier" : root.refuse);
+    if (!peers.sound(root))
         return fail("a call names a global outside the peer closure (`PeerSet::sound`)");
     PeerFns fns;
     for (const auto& member : peers.members) {
@@ -3021,6 +3497,18 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_frame_store", reinterpret_cast<void*>(&dream_rt_frame_store));
     add("dream_rt_native", reinterpret_cast<void*>(&dream_rt_native));
     add("dream_rt_builtin", reinterpret_cast<void*>(&dream_rt_builtin));
+    add("dream_rt_snapshot", reinterpret_cast<void*>(&dream_rt_snapshot));
+    add("dream_rt_suspend", reinterpret_cast<void*>(&dream_rt_suspend));
+    add("dream_rt_capture", reinterpret_cast<void*>(&dream_rt_capture));
+    add("dream_rt_closure", reinterpret_cast<void*>(&dream_rt_closure));
+    add("dream_rt_string", reinterpret_cast<void*>(&dream_rt_string));
+    add("dream_rt_cons", reinterpret_cast<void*>(&dream_rt_cons));
+    add("dream_rt_array", reinterpret_cast<void*>(&dream_rt_array));
+    add("dream_rt_array_items", reinterpret_cast<void*>(&dream_rt_array_items));
+    add("dream_rt_map_new", reinterpret_cast<void*>(&dream_rt_map_new));
+    add("dream_rt_map_insert", reinterpret_cast<void*>(&dream_rt_map_insert));
+    add("dream_rt_get", reinterpret_cast<void*>(&dream_rt_get));
+    add("dream_rt_set", reinterpret_cast<void*>(&dream_rt_set));
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms)))) {
         if (error) *error = llvm::toString(std::move(err));
         lljit.reset();
@@ -3139,6 +3627,23 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     auto fn = sym->toPtr<CompiledFn>();
     impl_->compiled[func_index] = fn;
     ++impl_->compiled_count;
+    if (std::getenv("DREAM_JIT_TRACE")) {
+        std::fprintf(stderr, "; jit compiled fn#%u %s\n", func_index,
+                     func_name(img, func_index).c_str());
+    }
+    if (const char* want = std::getenv("DREAM_JIT_FN")) {
+        if ((uint32_t)std::atoi(want) == func_index) {
+            std::string ir;
+            llvm::raw_string_ostream os(ir);
+            // Re-emit for a clean dump; the optimized module is already moved.
+            auto c2 = std::make_unique<llvm::LLVMContext>();
+            auto m2 = std::make_unique<llvm::Module>("dump", *c2);
+            std::string ref;
+            emit_closure(*c2, *m2, impl_->rt, img, func_index, name, &ref);
+            m2->print(os, nullptr);
+            std::fprintf(stderr, "%s\n", os.str().c_str());
+        }
+    }
     return fn;
 }
 

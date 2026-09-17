@@ -24,6 +24,18 @@ extern "C" {
 int dream_rt_force(Process* p, Value v, Value* out) {
     PinsTheHeap pinned(*p);
     Value result;
+    if (getenv("DREAM_JIT_FORCE_FN") && is_obj(v, ObjType::Thunk)) {
+        auto* th = static_cast<ThunkObj*>(as_obj(v));
+        uint32_t cf = 0;
+        Value fr = resolve(th->frame);
+        if (is_obj(fr, ObjType::Frame)) {
+            auto* fo = static_cast<FrameObj*>(as_obj(fr));
+            Value cl = resolve(fo->closure);
+            if (is_obj(cl, ObjType::Closure))
+                cf = static_cast<ClosureObj*>(as_obj(cl))->func;
+        }
+        std::fprintf(stderr, "FORCE thunk node=%u thunk_frame_func=%u\n", th->node, cf);
+    }
     if (!force_whnf(*p, v, &result)) {
         *out = p->result;
         return 0;
