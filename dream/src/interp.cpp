@@ -314,6 +314,15 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
         // a process whose functions never grow hot -- most of a compile --
         // pays a load and a branch for the JIT being present.
         CompiledFn fn = jit->tier(func_index);
+        // Entry arguments may perform effects when forced, including parking.
+        // Machine code has no continuation for that force. Leave such entries
+        // to the interpreter; a later loop entry with values can use the tier.
+        if (fn) {
+            auto* fr = static_cast<FrameObj*>(as_obj(frame));
+            for (uint32_t i = 0; i < f.arity; ++i) {
+                if (!is_whnf(resolve(fr->slots()[i]))) { fn = nullptr; break; }
+            }
+        }
         if (fn) {
             int status = 0;
             // Compiled code spends the same budget the interpreter does, so

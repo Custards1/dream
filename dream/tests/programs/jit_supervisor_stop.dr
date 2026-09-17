@@ -1,0 +1,21 @@
+// Warm the shared list/map helpers before stopping two live children.
+// The VM must finish, not merely print success while leaving a child parked.
+import std.console;
+import std.proc;
+import std.supervisor;
+
+let worker! () = proc.serve! 0 (fn n m ->
+    if proc.is_shutdown m { [:stop, n] } else { [:go, n] });
+
+let rec run! n = if n == 0 { () } else {
+    let sup = supervisor.start! :one_for_one
+        [supervisor.child "x" worker!, supervisor.child "y" worker!];
+    let ended = supervisor.stop! sup;
+    if ended == [:ok, [:ok, :stopped]] { run! (n - 1) }
+    else { raise! ended }
+};
+
+let main! = {
+    run! 40
+    console.print! "stopped"
+};
