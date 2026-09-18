@@ -1,0 +1,43 @@
+import std.list
+import std.str
+import std.array
+import std.error;
+derive std.seq;
+
+let get_fold_from kind = match kind {
+    :list => list.fold,
+    :array => array.fold,
+    :string => str.fold,
+    _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
+}
+
+let get_map_from kind = match kind {
+    :list => list.map,
+    :array => array.map,
+    :string => str.map,
+    _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
+}
+
+
+let fold f init xa = (get_fold_from (type_of xa)) f init xa;
+
+let map f init xa = (get_map_from (type_of xa)) f init xa;
+
+let name x = "dynamic"
+
+
+when test {
+    import std.test;
+
+    let arr = #[1,2,3,4,5,6]
+    let accum x acc = x+acc
+    let arr_sum = fold accum 0
+    
+    let li = [1,2,3,4,5,6]
+    let accum x acc = x+acc
+    let li_sum = fold li 0;
+    let tests = [
+        test.case "dymanic compiles" 1 1
+    ];
+
+}
