@@ -210,6 +210,26 @@ target_compile_options(dream PRIVATE
   $<$<CONFIG:RelWithDebInfo>:-O3>
   $<$<CONFIG:Release>:-O3>)
 
+# Train and rebuild in the same build directory. Instrument only the VM;
+# ordinary builds have no profiling counters or profile-file dependency.
+set(DREAM_PGO "OFF" CACHE STRING "GCC profile-guided optimization: OFF, GENERATE, USE")
+set_property(CACHE DREAM_PGO PROPERTY STRINGS OFF GENERATE USE)
+set(DREAM_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "GCC runtime profile directory")
+if(NOT DREAM_PGO STREQUAL "OFF")
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "DREAM_PGO requires GCC")
+  endif()
+  if(DREAM_PGO STREQUAL "GENERATE")
+    target_compile_options(dream PRIVATE "-fprofile-generate=${DREAM_PGO_DIR}" -fprofile-update=atomic)
+    target_link_options(dream PRIVATE "-fprofile-generate=${DREAM_PGO_DIR}")
+    target_compile_definitions(dream PRIVATE DREAM_PROFILE_GENERATE=1)
+  elseif(DREAM_PGO STREQUAL "USE")
+    target_compile_options(dream PRIVATE "-fprofile-use=${DREAM_PGO_DIR}" -Werror=missing-profile)
+  else()
+    message(FATAL_ERROR "DREAM_PGO must be OFF, GENERATE or USE")
+  endif()
+endif()
+
 
 if(DREAM_HAVE_LLVM)
   target_compile_definitions(dream PRIVATE DREAM_HAVE_LLVM=1

@@ -317,7 +317,23 @@ bool Image::parse(std::string& error) {
         }
         // Unknown sections are skipped, as the format requires.
     }
-    return validate(error);
+    if (!validate(error)) return false;
+    // Decode trivial record readers once, without changing the image format.
+    accessors_.assign(n_funcs_, Accessor{});
+    for (uint32_t i = 0; i < n_funcs_; ++i) {
+        const auto& f = funcs_[i];
+        const auto& body = node(f.body);
+        if (Op(body.op) != Op::Get) continue;
+        const auto& container = node(body.a);
+        const auto& key = node(body.b);
+        if (Op(container.op) != Op::Local || container.a >= f.arity) continue;
+        if (Op(key.op) == Op::ConstInt) {
+            accessors_[i] = Accessor{container.a, NO_NODE, integer(key.a)};
+        } else if (Op(key.op) == Op::Local && key.a < f.arity) {
+            accessors_[i] = Accessor{container.a, key.a, 0};
+        }
+    }
+    return true;
 }
 
 int Image::module_of_global(uint32_t global_index) const {

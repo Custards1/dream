@@ -406,6 +406,30 @@ static void test_parallel_major_collects_across_threads() {
     CHECK_EQ(h.verify(roots), std::string());
 }
 
+static void test_declined_concurrent_mark() {
+    std::printf("declined concurrent marking rolls back root marks\n");
+    if (GcPool::instance().capacity() < 2) return;
+    setenv("DREAM_GC_CONCURRENT", "1", 1);
+    Heap h(64 * 1024);
+    VectorRoots roots;
+    roots.values.push_back(h.make_cons(h.make_float(42.0), NIL));
+    roots.values.push_back(h.make_float(7.0));
+    h.minor_collect(roots);
+    // Duplicate roots must not change rollback behavior.
+    roots.values.push_back(roots.values[0]);
+    std::atomic<unsigned> idle{0};
+    GcPool::instance().set_idle_hint(&idle);
+    CHECK(!h.start_concurrent_mark(roots));
+    for (Value v : roots.values) CHECK(!(as_obj(v)->gc & GC_MARK));
+    h.major_collect(roots);
+    GcPool::instance().set_idle_hint(nullptr);
+    CHECK_EQ(h.verify(roots), std::string());
+    auto* cell = static_cast<ConsObj*>(as_obj(roots.values[0]));
+    CHECK(is_obj(cell->head, ObjType::Float));
+    CHECK_EQ(static_cast<FloatObj*>(as_obj(cell->head))->value, 42.0);
+    CHECK_EQ(roots.values[0], roots.values[2]);
+}
+
 static void test_concurrent_mark_period() {
     std::printf("a concurrent mark overlaps the mutator\n");
     if (GcPool::instance().capacity() < 2) {
@@ -1018,6 +1042,7 @@ int main() {
     test_write_barrier_keeps_old_to_young();
     test_parallel_collection_preserves_sharing();
     test_parallel_major_collects_across_threads();
+    test_declined_concurrent_mark();
     test_concurrent_mark_period();
     test_heap_verifier_accepts_a_healthy_heap();
     test_heap_verifier_catches_corruption();

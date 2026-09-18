@@ -1636,6 +1636,36 @@ void step_eval(Process& p) {
                 auto* cl = static_cast<ClosureObj*>(as_obj(fn));
                 const FuncRec& f = img.func(cl->func);
                 if (f.arity == n.c && n.c > 0) {
+                    // A trivial accessor needs no environment of its own.
+                    // Read only an already-built container; suspended inputs,
+                    // out-of-range indexes and fallbacks use the normal call.
+                    const auto& accessor = img.accessor(cl->func);
+                    if (accessor.container_slot != NO_NODE &&
+                        !p.runtime().profiling() && p.reductions > 1) {
+                        Value container, key = UNIT;
+                        bool have_key = false;
+                        if (operand_value(p, img, kids[accessor.container_slot], frame, &container)) {
+                            if (accessor.key_slot == NO_NODE) {
+                                if (fixnum_fits(accessor.key)) {
+                                    key = make_fixnum(accessor.key);
+                                    have_key = true;
+                                }
+                            } else {
+                                have_key = operand_value(p, img, kids[accessor.key_slot], frame, &key);
+                            }
+                            if (have_key && is_fixnum(key) && is_obj(container, ObjType::Array)) {
+                                auto* array = static_cast<ArrayObj*>(as_obj(container));
+                                const int64_t index = fixnum_value(key);
+                                if (index >= 0 && uint64_t(index) < array->len &&
+                                    array->items()[index] != NIL_SLOT) {
+                                    --p.reductions;
+                                    ++p.total_reductions;
+                                    enter(p, array->items()[index]);
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     Value fr = p.heap().make_frame_filling(fn, f.slots, f.arity);
                     auto* fo = static_cast<FrameObj*>(as_obj(fr));
                     // Safe to hold `fo` across these: allocation never

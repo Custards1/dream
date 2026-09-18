@@ -472,6 +472,15 @@ NativeResult os_now(Process& p, Value, Value*, uint32_t) {
         make_integer(p, int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now).count())));
 }
 
+#ifdef DREAM_PROFILE_GENERATE
+extern "C" void __gcov_dump();
+#endif
+
+// Its training-only flush changes this cold function's control-flow graph;
+// exclude it from GCC's profile rather than applying mismatched counters.
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((no_profile_instrument_function))
+#endif
 NativeResult os_exit(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_fixnum(v)) return fail(p, "type_error", "exit! needs an exit code");
@@ -482,6 +491,11 @@ NativeResult os_exit(Process& p, Value, Value* args, uint32_t) {
     // all until this line existed.
     p.runtime().print_profile();
     p.runtime().print_stats();
+#ifdef DREAM_PROFILE_GENERATE
+    // _Exit bypasses GCC's normal profile writer. Compiler training runs
+    // finish through this native, so flush explicitly in instrumented builds.
+    __gcov_dump();
+#endif
     std::fflush(nullptr);
     std::_Exit(int(fixnum_value(v)));
 }

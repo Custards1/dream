@@ -22,6 +22,7 @@
 import std.core;
 import std.list;
 import std.str;
+import std.dynamic.{fold,map}
 
 // --- opcodes -------------------------------------------------------------------
 //
@@ -84,6 +85,7 @@ let ops = [
     [:set, 40, "set"],
 ];
 
+let nth = list.nth; //get_nth_from (type_of ops);
 // The table above is the readable form; these are the three ways it is
 // actually asked about. A linear scan of it was the single largest thing in a
 // self-compile -- 20 million reductions, a quarter of the whole -- because
@@ -96,11 +98,11 @@ let ops = [
 // (That cost was invisible until `--profile` learnt to attribute the
 // reductions a nested force makes, which is most of them. It named
 // `check_expr` before that, and `check_expr` was not the problem.)
-let op_codes = list.fold (fn m o -> core.map_put m (list.nth 0 o) (list.nth 1 o))
+let op_codes = fold (fn m o -> core.map_put m (nth 0 o) (nth 1 o))
                          (core.map_new ()) ops;
-let op_names = list.fold (fn m o -> core.map_put m (list.nth 0 o) (list.nth 2 o))
+let op_names = fold (fn m o -> core.map_put m (nth 0 o) (nth 2 o))
                          (core.map_new ()) ops;
-let op_of_codes = list.fold (fn m o -> core.map_put m (list.nth 1 o) (list.nth 0 o))
+let op_of_codes = fold (fn m o -> core.map_put m (nth 1 o) (nth 0 o))
                             (core.map_new ()) ops;
 
 /// The VM's number for an opcode, or `()` if it is not one.
@@ -167,11 +169,11 @@ let is_node n = n != no_node;
 /// than threaded through every constructor unused.
 let node op a b c = [op, 0, a, b, c];
 
-let node_op n    = list.nth 0 n;
-let node_flags n = list.nth 1 n;
-let node_a n     = list.nth 2 n;
-let node_b n     = list.nth 3 n;
-let node_c n     = list.nth 4 n;
+let node_op n    = nth 0 n;
+let node_flags n = nth 1 n;
+let node_a n     = nth 2 n;
+let node_b n     = nth 3 n;
+let node_c n     = nth 4 n;
 
 let leaf op = node op no_node no_node no_node;
 
@@ -186,9 +188,9 @@ let node_is_impure n = has_flag (node_flags n) f_impure;
 
 let pool_new = [[], 0, core.map_new ()];
 
-let pool_values p = list.nth 0 p;
-let pool_count p  = list.nth 1 p;
-let pool_index p  = list.nth 2 p;
+let pool_values p = nth 0 p;
+let pool_count p  = nth 1 p;
+let pool_index p  = nth 2 p;
 
 /// Intern a value: `[pool, index]`. The index is stable once given.
 let intern v p =
@@ -272,22 +274,22 @@ let push_node n p = {
 let push_kids xs p = {
     let at = kid_count p;
     let filled = list.fold (fn acc pair ->
-        core.map_put acc (at + list.nth 1 pair) (list.nth 0 pair))
+        core.map_put acc (at + nth 1 pair) (nth 0 pair))
         (kids p) (list.zip xs (list.range 0 (list.length xs)));
     [settle (core.map_put (core.map_put p :kids filled) :kid_count (at + list.length xs)), at]
 };
 
-let intern_int v p   = { let got = intern v (ints p);   [core.map_put p :ints (list.head got), list.nth 1 got] };
-let intern_float v p = { let got = intern v (floats p); [core.map_put p :floats (list.head got), list.nth 1 got] };
-let intern_str v p   = { let got = intern v (strs p);   [core.map_put p :strs (list.head got), list.nth 1 got] };
+let intern_int v p   = { let got = intern v (ints p);   [core.map_put p :ints (list.head got), nth 1 got] };
+let intern_float v p = { let got = intern v (floats p); [core.map_put p :floats (list.head got), nth 1 got] };
+let intern_str v p   = { let got = intern v (strs p);   [core.map_put p :strs (list.head got), nth 1 got] };
 
 /// An atom is stored as the string-table index of its name, because the runtime
 /// interns atoms by name when it loads an image. Interning the name first is
 /// what makes that index exist.
 let intern_atom v p = {
     let named = intern_str v p;
-    let got = intern (list.nth 1 named) (atoms (list.head named));
-    [core.map_put (list.head named) :atoms (list.head got), list.nth 1 got]
+    let got = intern (nth 1 named) (atoms (list.head named));
+    [core.map_put (list.head named) :atoms (list.head got), nth 1 got]
 };
 
 /// Set a flag on a node already in the arena. Nodes are appended and never
@@ -342,7 +344,7 @@ let quoted s =
 let show_node img i n = {
     let const_at pool at = {
         let xs = core.map_get img pool [];
-        if at == no_node || at >= list.length xs { "?" } else { to_string (list.nth at xs) }
+        if at == no_node || at >= list.length xs { "?" } else { to_string (nth at xs) }
     };
     let operands =
         match node_op n {
@@ -353,7 +355,7 @@ let show_node img i n = {
                 let ats = core.map_get img :atoms [];
                 let at = node_a n;
                 if at >= list.length ats { ":?" }
-                else { ":" + const_at :strs (list.nth at ats) }
+                else { ":" + const_at :strs (nth at ats) }
             },
             :const_char  => "'" + str.of_chars [core.char_of_code (node_a n)] + "'",
             :const_bool  => if node_a n == 1 { "true" } else { "false" },
@@ -394,7 +396,7 @@ let show_node img i n = {
 /// in a failure than a nest of indices.
 let dump img =
     str.join_str "\n"
-        (list.map (fn i -> show_node img i (list.nth i (core.map_get img :nodes [])))
+        (list.map (fn i -> show_node img i (nth i (core.map_get img :nodes [])))
                   (list.range 0 (list.length (core.map_get img :nodes []))));
 
 // --- tests -------------------------------------------------------------------
@@ -404,7 +406,7 @@ when test {
 
     let built = {
         let a = push_node (leaf :unit) program;
-        let b = push_node (node :force (list.nth 1 a) no_node no_node) (list.head a);
+        let b = push_node (node :force (nth 1 a) no_node no_node) (list.head a);
         list.head b
     };
 
@@ -414,9 +416,9 @@ when test {
                         [opcode :apply, op_name :apply, op_of_code 13] ),
         test.case "every opcode has a distinct number"
             $( test.eq! (list.length ops)
-                        (list.length (list.unique (list.map (fn o -> list.nth 1 o) ops))) ),
+                        (list.length (list.unique (list.map (fn o -> nth 1 o) ops))) ),
         test.case "opcode numbers are the VM's, in order from zero"
-            $( test.eq! (list.range 0 (list.length ops)) (list.map (fn o -> list.nth 1 o) ops) ),
+            $( test.eq! (list.range 0 (list.length ops)) (list.map (fn o -> nth 1 o) ops) ),
         test.case "an unknown opcode is not invented"
             $( test.eq! [(), ()] [opcode :nonsense, op_of_code 999] ),
 
@@ -431,7 +433,7 @@ when test {
             $( test.eq! [0, 1]
                         { let a = push_node (leaf :unit) program;
                           let b = push_node (leaf :unit) (list.head a);
-                          [list.nth 1 a, list.nth 1 b] } ),
+                          [nth 1 a, nth 1 b] } ),
         test.case "a node can be read back by its index"
             $( test.eq! [:unit, :force]
                         [node_op (node_at 0 built), node_op (node_at 1 built)] ),
@@ -444,7 +446,7 @@ when test {
             $( test.eq! [0, 3]
                         { let a = push_kids [1, 2, 3] program;
                           let b = push_kids [4] (list.head a);
-                          [list.nth 1 a, list.nth 1 b] } ),
+                          [nth 1 a, nth 1 b] } ),
         test.case "children come back in the order they went in"
             $( test.eq! [1, 2, 3, 4]
                         { let a = push_kids [1, 2, 3] program;
@@ -455,7 +457,7 @@ when test {
                         { let a = intern_str "x" program;
                           let b = intern_str "x" (list.head a);
                           let c = intern_str "y" (list.head b);
-                          [list.nth 1 a, list.nth 1 b, list.nth 1 c] } ),
+                          [nth 1 a, nth 1 b, nth 1 c] } ),
         test.case "the pool comes out in index order"
             $( test.eq! ["x", "y"]
                         { let a = intern_str "x" program;
@@ -470,18 +472,18 @@ when test {
             $( test.eq! [0, 0]
                         { let a = intern_atom "ok" program;
                           let b = intern_atom "ok" (list.head a);
-                          [list.nth 1 a, list.nth 1 b] } ),
+                          [nth 1 a, nth 1 b] } ),
         test.case "the pools are separate"
             $( test.eq! [0, 0]
                         { let a = intern_int 1 program;
                           let b = intern_float 1.0 (list.head a);
-                          [list.nth 1 a, list.nth 1 b] } ),
+                          [nth 1 a, nth 1 b] } ),
 
         test.case "a node keeps its index however many are added after it"
             $( test.eq! :unit
                         { let a = push_node (leaf :unit) program;
                           let b = push_node (leaf :force) (list.head a);
-                          node_op (node_at (list.nth 1 a) (list.head b)) } ),
+                          node_op (node_at (nth 1 a) (list.head b)) } ),
         test.case "the arena comes out in the order it was built"
             $( test.eq! [:unit, :force]
                         (list.map (fn n -> node_op n) (core.map_get (finish built) :nodes [])) ),
@@ -490,7 +492,7 @@ when test {
         test.case "a dump shows a constant's value, not its index"
             $( test.true! (str.contains_str "\"hi\""
                    { let interned = intern_str "hi" program;
-                     let n = push_node (node :const_str (list.nth 1 interned) no_node no_node)
+                     let n = push_node (node :const_str (nth 1 interned) no_node no_node)
                                        (list.head interned);
                      dump (finish (list.head n)) }) ),
     ];

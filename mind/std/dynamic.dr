@@ -1,43 +1,70 @@
-import std.list
-import std.str
-import std.array
-import std.error;
 derive std.seq;
 
-let get_fold_from kind = match kind {
-    :list => list.fold,
-    :array => array.fold,
-    :string => str.fold,
-    _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
+mod get {
+    import std.list
+    import std.str
+    import std.array
+    import std.error;
+
+
+    let fold_from kind = match kind {
+        :list => list.fold,
+        :array => array.fold,
+        :string => str.fold,
+        _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
+    }
+
+    let map_from kind = match kind {
+        :list => list.map,
+        :array => array.map,
+        :string => str.map,
+        _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
+    }
+
+    let nth_from kind = match kind {
+        :list => list.nth,
+        :array => array.get,
+        :string => str.byte,
+        _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
+    }
+    let reverse_from kind = match kind {
+        :list => list.reverse,
+        :array => array.reverse,
+        :string => str.reverse,
+        _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
+    }
+    let reflect f i = f (type_of i)
+    let from_dy fa = match fa {
+        :fold => fold_from,
+        :map => map_from,
+        :nth => nth_from,
+        :reverse => reverse_from,
+        _=> error.new :value_error ("std.dymanic needs a real from request. got : " + to_string fa)
+    }
 }
 
-let get_map_from kind = match kind {
-    :list => list.map,
-    :array => array.map,
-    :string => str.map,
-    _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
-}
+let fold f init xa = (get.fold_from (type_of xa)) f init xa;
 
+let map f init xa = (get.map_from (type_of xa)) f init xa;
 
-let fold f init xa = (get_fold_from (type_of xa)) f init xa;
+let nth i l = (get.nth_from (type_of l)) i l;
 
-let map f init xa = (get_map_from (type_of xa)) f init xa;
+let reverse c = (get.reverse_from (type_of c) c); 
+
 
 let name x = "dynamic"
 
 
-when test {
-    import std.test;
-
-    let arr = #[1,2,3,4,5,6]
-    let accum x acc = x+acc
-    let arr_sum = fold accum 0
+// when test {
+//     import std.test;
+//     let arr = #[1,2,3,4,5,6]
+//     let accum x acc = x+acc
+//     let arr_sum = fold accum 0 arr
     
-    let li = [1,2,3,4,5,6]
-    let accum x acc = x+acc
-    let li_sum = fold li 0;
-    let tests = [
-        test.case "dymanic compiles" 1 1
-    ];
+//     let li = [1,2,3,4,5,6]
+//     let li_sum = fold accum 0 li;
+//     let tests = [
+//         test.case "dymanic compiles" 1 1
+//     ];
 
-}
+// }

@@ -163,6 +163,12 @@ struct StringRef {
 
 class Image {
 public:
+    struct Accessor {
+        uint32_t container_slot = NO_NODE;
+        uint32_t key_slot = NO_NODE;
+        int64_t key = 0;
+    };
+    const Accessor& accessor(uint32_t function) const { return accessors_[function]; }
     Image() = default;
     ~Image();
     Image(const Image&) = delete;
@@ -227,6 +233,7 @@ public:
     int find_global(const char* name) const;
 
 private:
+    std::vector<Accessor> accessors_;
     bool parse(std::string& error);
     bool validate(std::string& error);
 

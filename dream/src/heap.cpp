@@ -1528,10 +1528,14 @@ bool Heap::start_concurrent_mark(RootSource& roots) {
     // Seed the grey set: every old root is claimed and handed to the shared
     // stack, so the first helper to wake finds something to draw from. Nothing
     // races here -- the helpers have not been told the round exists yet.
+    std::vector<Obj*> claimed_roots;
     for (Value v : mark_roots_) {
         if (!is_ptr(v)) continue;
         Obj* o = as_obj(v);
-        if (claim_mark(o) && !is_atom_object(o->type)) round.stack.push_back(o);
+        if (claim_mark(o)) {
+            claimed_roots.push_back(o);
+            if (!is_atom_object(o->type)) round.stack.push_back(o);
+        }
     }
     round.shared.store(round.stack.size(), std::memory_order_relaxed);
 
@@ -1555,6 +1559,10 @@ bool Heap::start_concurrent_mark(RootSource& roots) {
         // The pool declined between our check and the launch -- another heap
         // took it, or the scheduler's idle hint moved. Back the sealed round
         // out so the caller can do the usual thing, and leave no trace.
+        // No helper ran, but seeding already marked the roots. The fallback
+        // tracer must claim and scan them again or it will reclaim their
+        // children. Include atom roots and undo only marks we acquired here.
+        for (Obj* o : claimed_roots) o->gc &= ~GC_MARK;
         marking_ = false;
         round_ = nullptr;
         mark_round_.reset();
@@ -1808,6 +1816,16 @@ struct VerifyWalk {
     std::string error;
     std::vector<Value> work;
     std::vector<Value> parents;
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+
+    bool owns(const void* p, size_t bytes) const {
+        const auto addr = reinterpret_cast<uintptr_t>(p);
+        auto it = std::upper_bound(ranges.begin(), ranges.end(), addr,
+            [](uintptr_t key, const auto& range) { return key < range.first; });
+        if (it == ranges.begin()) return false;
+        --it;
+        return addr >= it->first && addr <= it->second && bytes <= it->second - addr;
+    }
 
 
     bool problem(const std::string& what) {
@@ -1830,6 +1848,12 @@ struct VerifyWalk {
 
     bool check_object(Value v, Value parent) {
         Obj* o = as_obj(v);
+        if (reinterpret_cast<uintptr_t>(o) % 8 != 0) {
+            return problem("object at " + addr(o) + " is not 8-byte aligned");
+        }
+        if (!owns(o, sizeof(Obj))) {
+            return problem("pointer " + addr(o) + " does not land in this heap");
+        }
         if (no_young && (o->gc & GC_YOUNG)) {
             std::string via = "root";
             if (is_ptr(parent)) {
@@ -1841,23 +1865,11 @@ struct VerifyWalk {
                            addr(o) + " type " + std::to_string(static_cast<int>(o->type)) +
                            " (reached from " + via + ")");
         }
-        if (reinterpret_cast<uintptr_t>(o) % 8 != 0) {
-            return problem("object at " + addr(o) + " is not 8-byte aligned");
-        }
-        if (!heap.owns(o, sizeof(Obj))) {
-            std::string via = "root";
-            if (is_ptr(parent)) {
-                Obj* p = as_obj(parent);
-                via = addr(p) + " type " + std::to_string(static_cast<int>(p->type));
-            }
-            return problem("pointer " + addr(o) + " does not land in this heap (reached from " +
-                           via + ")");
-        }
         if (o->bytes < sizeof(Obj) || o->bytes > (1u << 30)) {
             return problem("object at " + addr(o) + " claims an implausible size " +
                            std::to_string(o->bytes));
         }
-        if (!heap.owns(o, o->bytes)) {
+        if (!owns(o, o->bytes)) {
             return problem("object at " + addr(o) + " of " + std::to_string(o->bytes) +
                            " bytes runs past the end of its block");
         }
@@ -2021,7 +2033,17 @@ std::string Heap::verify_internal(RootSource& roots, bool no_young) {
     roots.visit_roots(*this);
     recording_ = nullptr;
 
-    VerifyWalk walk{*this, no_young, {}, {}, {}};
+    VerifyWalk walk{*this, no_young, {}, {}, {}, {}};
+    // Ownership checks used to walk every block for every object, making a
+    // verified self-compile quadratic in heap size. Index the used ranges
+    // once per verification, without changing the allocator's hot path.
+    auto add_range = [&](Block* b) {
+        const auto start = reinterpret_cast<uintptr_t>(b->data);
+        walk.ranges.emplace_back(start, start + b->used);
+    };
+    for (Block* b = blocks_; b; b = b->next) add_range(b);
+    for (Block* b : nursery_) add_range(b);
+    std::sort(walk.ranges.begin(), walk.ranges.end());
     for (Value v : collected) walk.push(v, 0);
     walk.run();
     return walk.error;
