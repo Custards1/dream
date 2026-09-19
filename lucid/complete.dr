@@ -1,0 +1,470 @@
+// Completion: what could be written where the cursor is.
+//
+// Every other question in this server is asked of a program. Completion is the
+// one that is asked of something that is *not* one yet, and that difference
+// decides the whole design. At the moment a completion is wanted the buffer
+// usually says
+//
+//     console.
+//
+// which does not parse, and a file that does not parse has no module, no
+// environment, no globals and no resolutions -- there is nothing left to
+// complete *from*. So the text is repaired before it is analysed: a name
+// nothing would write is inserted at the cursor, which turns the fragment above
+// into an ordinary member access. Everything before the cursor keeps the byte
+// offsets it had, and everything this module asks about is before the cursor,
+// so the repair costs nothing but the insert.
+//
+// What is offered then comes from the compiler's own tables, and the module
+// this cursor is in decides which ones. After a dot the question is what a
+// module exports, which is `scope.exports` -- the same list the compiler quotes
+// back when a member is misspelled. Otherwise it is everything a bare name
+// could reach, in the order resolution would reach it: a local, then a global
+// of this module, then something an import brought in, then a builtin. That
+// order is the resolver's, and it is reproduced in `sortText` so that the
+// editor offers names in the order the language would find them.
+import std.core;
+import std.list;
+import std.str;
+
+import dreams.ast;
+import dreams.builtins;
+import dreams.modules;
+import dreams.parser;
+import dreams.scope;
+
+import analysis;
+import pos;
+
+// --- reading the cursor's surroundings -------------------------------------------
+//
+// Lexical, and it has to be: the tree cannot say what is being typed, because
+// what is being typed is usually not in one.
+
+let dot = 46;
+let slash = 47;
+let newline = 10;
+
+/// The dotted chain written immediately before `at`, head first, or `[]`.
+///
+/// `std.list.|` answers `["std", "list"]`. The walk stops the moment what is in
+/// front of a dot is not a name, which is what keeps `..rest` and `c.[k]` out
+/// of this: neither has a name to the left of the dot that a module could be.
+let rec chain_before src at acc =
+    if at <= 0 || core.str_byte src (at - 1) != dot { acc }
+    else {
+        let start = analysis.name_start src (at - 1);
+        // Nothing but the dot -- a second dot, a bracket, a space.
+        if start >= at - 1 { acc }
+        else { chain_before src start (core.cons (str.slice start (at - 1 - start) src) acc) }
+    };
+
+/// What the cursor is asking for: `[:member, segments]` when it sits after a
+/// dotted chain, `[:name]` otherwise.
+///
+/// The prefix already typed is deliberately not part of this. A client filters
+/// the list against what the user has typed -- that is what it computes a word
+/// range for -- and a server that filters as well only disagrees with it the
+/// moment the two count a character differently.
+let context src offset = {
+    let word = analysis.name_start src offset;
+    if word > 0 && core.str_byte src (word - 1) == dot {
+        match chain_before src word [] {
+            [] => [:name],
+            segs => [:member, segs],
+        }
+    }
+    else { [:name] }
+};
+
+/// Is the cursor inside a line comment?
+///
+/// A `//` earlier on the same line with no newline in between. This is a
+/// guess and not a lexer: a `//` inside a string literal on the same line
+/// fools it, and the cost of being fooled is a completion list nobody asked
+/// for, where the cost of not asking at all is one offered inside every line
+/// of prose in the file.
+let in_comment src offset = {
+    let rec back i =
+        if i <= 1 { false }
+        else if core.str_byte src (i - 1) == newline { false }
+        else if core.str_byte src (i - 1) == slash && core.str_byte src (i - 2) == slash { true }
+        else { back (i - 1) };
+    back offset
+};
+
+/// The name inserted at the cursor so that the buffer parses. Nothing would
+/// write it, so nothing it resolves to can be mistaken for something real, and
+/// the diagnostics the repaired buffer produces are thrown away with it.
+let hole = "lucid__completion__hole";
+
+let repaired src offset =
+    str.slice 0 offset src + hole + str.slice offset (str.byte_length src - offset) src;
+
+// --- what one entry looks like ---------------------------------------------------
+
+/// LSP `CompletionItemKind`, the handful of them this language has uses for.
+let kind_function = 3;
+let kind_variable = 6;
+let kind_module = 9;
+let kind_keyword = 14;
+
+/// The groups, in the order resolution would reach them. `sortText` is compared
+/// as a string, so the digit in front is what does the ordering and the label
+/// behind it breaks ties alphabetically.
+let rank_local = "0";
+let rank_global = "1";
+let rank_import = "2";
+let rank_builtin = "3";
+let rank_keyword = "4";
+
+let item label kind detail doc rank =
+    %{ "label" => label,
+       "kind" => kind,
+       "detail" => detail,
+       "documentation" => %{ "kind" => "markdown", "value" => doc },
+       "sortText" => rank + label };
+
+// --- after a dot ------------------------------------------------------------------
+
+/// The chain as the expression it would have been, so that the compiler can be
+/// asked what it names rather than this module working it out again.
+/// `scope.as_namespace` is the function that decides whether `list` in
+/// `list.map` is a module, an import, a package or a local, and it is the one
+/// that answers here too -- spans are not needed, because nothing it does with
+/// this tree is reported.
+let chain_expr segs =
+    list.fold (fn e s -> ast.field_e e s ast.no_span)
+              (ast.name_e (list.head segs) ast.no_span)
+              (list.tail segs);
+
+/// What a dotted chain names -- a module, a host module or a package -- or `()`.
+let namespace_of a segs =
+    match analysis.module_of a {
+        () => (),
+        mi => {
+            let l = analysis.loader a;
+            let c = scope.ctx l mi (modules.module_source (modules.module_at l mi));
+            match scope.as_namespace c (analysis.resolved a) (chain_expr segs) {
+                () => (),
+                found => list.head found,
+            }
+        },
+    };
+
+/// The modules directly inside a package, without the ones further down:
+/// `std.list` but not `std.list.something`. The same set `scope.group_contents`
+/// names in a diagnostic, as a list rather than as a sentence.
+let group_names l prefix = {
+    let at = str.byte_length prefix + 1;
+    list.sort (list.unique (list.filter (fn rest -> not (str.contains_str "." rest))
+        (list.map (fn n -> str.slice at (str.byte_length n - at) n)
+                  (list.filter (fn n -> str.starts_with (prefix + ".") n)
+                               (scope.module_names l)))))
+};
+
+/// A module bound as a global is a module. Anything else is a function when it
+/// was declared with parameters and a value when it was not -- the resolver
+/// does not separate those two, so the parameters are the only evidence there
+/// is, and where there are none the honest answer is the vaguer one.
+let entry_kind a mi e n =
+    match scope.global_kind e n {
+        :module => kind_module,
+        _ => match analysis.params_of a mi n {
+                 () => kind_variable,
+                 [] => kind_variable,
+                 _  => kind_function,
+             },
+    };
+
+/// One member of a Dream module, shown with the parameters it was declared with.
+let member_item a target e n =
+    item n (entry_kind a target e n)
+         (analysis.shown_signature a target n)
+         ("A member of module `" + modules.module_name (modules.module_at (analysis.loader a) target)
+          + "`." + if builtins.is_impure_name n { " Impure." } else { "" })
+         rank_local;
+
+let member_items a segs =
+    match namespace_of a segs {
+        [:dream, target] => {
+            let e = list.nth target (scope.r_envs (analysis.resolved a));
+            list.map (fn n -> member_item a target e n) (scope.exports e)
+        },
+        [:group, prefix] =>
+            list.map (fn n -> item n kind_module ("module " + prefix + "." + n)
+                                   ("A module in package `" + prefix + "`.") rank_local)
+                     (group_names (analysis.loader a) prefix),
+        // A host module owns its member table and the lookup happens at run
+        // time, so the compiler has never seen a list of the names and neither
+        // has this. Nothing is better than a guess.
+        _ => [],
+    };
+
+// --- a bare name -------------------------------------------------------------------
+
+let local_items a src offset =
+    list.map (fn b -> {
+        let n = analysis.binder_name b;
+        let ps = analysis.binder_params b;
+        item n (if list.is_empty ps { kind_variable } else { kind_function })
+             (analysis.signature src n ps)
+             (if list.is_empty ps { "A local." } else { "A local function." })
+             rank_local
+    }) (analysis.locals_at a offset);
+
+/// This module's own globals. The ones whose names begin with `<` are the
+/// hidden globals a top-level destructuring leaves behind -- nobody wrote them
+/// and nobody can name them, which is what `scope.exports` filters out too.
+let global_items a mi e =
+    list.map (fn n -> item n (entry_kind a mi e n)
+                           (analysis.shown_signature a mi n)
+                           "A global of this module." rank_global)
+             (list.filter (fn n -> not (str.starts_with "<" n))
+                          (list.map (fn d -> list.nth 2 d)
+                                    (scope.module_defs (analysis.resolved a) mi)));
+
+/// Everything an import put in this module's namespace: the modules it named,
+/// and the members an `import a.{x}` brought in one at a time.
+let import_items a e = {
+    let aliases =
+        list.map (fn kv -> {
+            let n = list.head kv;
+            match list.nth 1 kv {
+                [:dream, target] =>
+                    item n kind_module
+                         ("module " + modules.module_name
+                                          (modules.module_at (analysis.loader a) target))
+                         "An imported module." rank_import,
+                [:native, p, _] => item n kind_module ("host module " + p)
+                                        "An imported host module." rank_import,
+                [:group, prefix] => item n kind_module ("package " + prefix)
+                                         "An imported package." rank_import,
+                _ => item n kind_module "" "An import." rank_import,
+            }
+        }) (core.map_pairs (scope.aliases e));
+    // `import a.{x as y}` binds `y` to `a`'s `x`. What is offered is the name
+    // it was bound to, described by where it came from, because that is the
+    // pair the reader has to keep straight.
+    //
+    // `scope.dr` records each of these as `[module, member, path]`, and the
+    // path is already the dotted string -- `declare_import` has run it through
+    // `relative_path` by the time it gets here, so it is not a list of segments
+    // and must not be joined again.
+    let singles =
+        list.map (fn kv -> {
+            let bound = list.head kv;
+            let sel = list.nth 1 kv;
+            let member = list.nth 1 sel;
+            let from = list.nth 2 sel;
+            item bound kind_variable member
+                 ("`" + member + "` of `" + from + "`, brought in by an import.")
+                 rank_import
+        }) (core.map_pairs (scope.only e));
+    list.append aliases singles
+};
+
+/// The builtins, less the ones `match` compiles to.
+///
+/// `match_head` and the rest are real names and resolution does reach them, so
+/// this is not a claim that they cannot be written. They are named the way they
+/// are so that they *are not* written -- see the note beside them in
+/// `dreams/builtins.dr` -- and a list that offers them to somebody typing `mat`
+/// is the accident that naming was meant to prevent.
+let builtin_items =
+    list.map (fn n -> item n kind_function n
+                           "A builtin: the language provides it, no module does."
+                           rank_builtin)
+             (list.filter (fn n -> not (str.starts_with "match_" n)) builtins.names);
+
+let keyword_items =
+    list.map (fn n -> item n kind_keyword "" "A keyword." rank_keyword) parser.keywords;
+
+let name_items a offset =
+    match analysis.module_of a {
+        // The buffer does not parse even repaired. Keywords are the only thing
+        // that can be offered without knowing anything about the program, and
+        // they are exactly what somebody halfway through writing a `match` or a
+        // `let` is reaching for.
+        () => keyword_items,
+        mi => {
+            // The repaired text, which is what every span in this analysis is
+            // an offset into. It differs from the buffer only at and after the
+            // cursor, and every binder shown here was written before it.
+            let src = analysis.module_text a mi;
+            let e = list.nth mi (scope.r_envs (analysis.resolved a));
+            list.concat [local_items a src offset,
+                         global_items a mi e,
+                         import_items a e,
+                         builtin_items,
+                         keyword_items]
+        },
+    };
+
+// --- the request ---------------------------------------------------------------------
+
+/// The analysis a completion is answered out of: the buffer as it stands when
+/// that is a program, and the buffer with a name inserted at the cursor when it
+/// is not.
+///
+/// The repair is tried *second*, and the order is the whole of what this
+/// function is for. Where the text already parses, analysing it as written is
+/// exact and inserting anything into it can only make it worse -- `helper.map`
+/// with the cursor after the dot is a program, and the chain in front of the
+/// cursor is the same chain either way. Where it does not parse there is
+/// nothing to lose by trying.
+///
+/// Neither attempt is guaranteed, and the two fail in different places, which
+/// is the other half of the reason for trying both. A bare name is a statement
+/// but it is not a *declaration*, so a cursor on a blank line between two
+/// top-level `let`s is a position where the repair is what breaks the file and
+/// the buffer as written is what answers it.
+let analysed! path roots docs src offset = {
+    let plain = analysis.analyse! path roots docs;
+    match analysis.module_of plain {
+        () => analysis.analyse! path roots (core.map_put docs path (repaired src offset)),
+        _ => plain,
+    }
+};
+
+/// Everything that could be written at this position, as an LSP
+/// `CompletionItem[]`.
+///
+/// This takes the documents rather than a finished analysis because the program
+/// it analyses may not be the one on screen -- see `analysed!`. The chain in
+/// front of the cursor is always read out of the real text, which both
+/// candidates agree with up to that point.
+let completions! path roots docs line character = {
+    let src = core.map_get docs path "";
+    let offset = pos.offset_of src line character;
+    if in_comment src offset { [] }
+    else {
+        let a = analysed! path roots docs src offset;
+        match context src offset {
+            [:member, segs] => member_items a segs,
+            _ => name_items a offset,
+        }
+    }
+};
+
+// --- tests -----------------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let src = "import std.console;\n\nlet main! = {\n    console.print! 1\n};\n";
+
+    /// An analysis of one buffer, as `analysis`'s own tests do it.
+    ///
+    /// Nothing here is on a package path, so an import of `std.list` is not
+    /// found as a file and is treated as host-provided. That is the same branch
+    /// of `declare_import` a real selective import takes, and it is the one
+    /// that fills the `only` table -- so these reach it without needing a
+    /// standard library on disk.
+    let of! text = analysis.analyse! "/buf.dr" [] (core.map_put (core.map_new ()) "/buf.dr" text);
+
+    /// The entries an import contributes, by label.
+    let import_labels! text = {
+        let a = of! text;
+        match analysis.module_of a {
+            () => [],
+            mi => list.sort (list.map (fn i -> core.map_get i "label" ())
+                                      (import_items a (list.nth mi (scope.r_envs
+                                                                        (analysis.resolved a))))),
+        }
+    };
+
+    /// What one label's entry says it is.
+    let import_doc! text label = {
+        let a = of! text;
+        match analysis.module_of a {
+            () => "",
+            mi => {
+                let hit = list.filter (fn i -> core.map_get i "label" () == label)
+                                      (import_items a (list.nth mi (scope.r_envs
+                                                                        (analysis.resolved a))));
+                match hit {
+                    [] => "",
+                    [i, .._] => core.map_get (core.map_get i "documentation" ()) "value" (),
+                }
+            },
+        }
+    };
+
+    let tests = [
+        test.case "a cursor after a dot asks about the chain in front of it"
+            $( test.eq! [:member, ["console"]] (context "    console." 12) ),
+        test.case "a partly typed member still asks about the chain"
+            $( test.eq! [:member, ["console"]] (context "    console.pri" 15) ),
+        test.case "a dotted chain is collected head first"
+            $( test.eq! [:member, ["std", "list"]] (context "std.list." 9) ),
+        test.case "a bare name asks about names"
+            $( test.eq! [:name] (context "    conso" 9) ),
+        test.case "the start of a line asks about names"
+            $( test.eq! [:name] (context "" 0) ),
+        test.case "`c.[k]` is a read, not a member"
+            $( test.eq! [:name] (context "xs.[k" 5) ),
+        test.case "a rest pattern is not a member"
+            $( test.eq! [:name] (context "[a, ..re" 8) ),
+
+        test.case "the repair puts a name where the cursor is"
+            $( test.eq! ("console." + hole) (repaired "console." 8) ),
+        test.case "the repair keeps what comes after the cursor"
+            $( test.eq! ("a" + hole + "b") (repaired "ab" 1) ),
+        test.case "the repaired buffer is what parses"
+            $( test.true! (str.contains_str hole (repaired src 40)) ),
+
+        test.case "a cursor inside a line comment is not completing"
+            $( test.true! (in_comment "// a note here" 8) ),
+        test.case "a cursor on a line below a comment is"
+            $( test.false! (in_comment "// a note\nx" 11) ),
+        test.case "a cursor before the comment on its own line is"
+            $( test.false! (in_comment "x // a note" 1) ),
+
+        test.case "an item carries its label, kind and sort key"
+            $( test.eq! ["map", kind_function, "1map"]
+                        (match item "map" kind_function "map f xs" "" rank_global {
+                             i => [core.map_get i "label" (), core.map_get i "kind" (),
+                                   core.map_get i "sortText" ()]
+                         }) ),
+        test.case "the groups sort in the order resolution reaches them"
+            $( test.eq! [rank_local, rank_global, rank_import, rank_builtin, rank_keyword]
+                        (list.sort [rank_keyword, rank_import, rank_builtin, rank_local,
+                                    rank_global]) ),
+
+        test.case "a chain becomes the expression the compiler would have seen"
+            $( test.eq! "(field (name std) list)" (ast.show (chain_expr ["std", "list"])) ),
+        test.case "a chain of one is just the name"
+            $( test.eq! "(name console)" (ast.show (chain_expr ["console"])) ),
+
+        test.case "every keyword is offered as one"
+            $( test.eq! (list.length parser.keywords) (list.length keyword_items) ),
+        test.case "every builtin is offered as a function"
+            $( test.true! (list.all (fn i -> core.map_get i "kind" () == kind_function)
+                                    builtin_items) ),
+        test.case "the builtins `match` compiles to are not offered"
+            $( test.false! (list.any (fn i -> str.starts_with "match_"
+                                                  (core.map_get i "label" ()))
+                                     builtin_items) ),
+
+        // --- what an import contributes ---------------------------------------
+        //
+        // `scope.dr` keeps a plain module import and a selective one in two
+        // different tables, with two different shapes, and the second of them
+        // holds a path that has *already* been joined into a dotted string.
+        // Joining it again is a match error rather than a wrong answer, and it
+        // is only reachable through a selective import -- which is why these
+        // are here.
+
+        test.case "a plain import offers the name it binds"
+            $( test.eq! ["list"] (import_labels! "import std.list;") ),
+        test.case "a selective import offers each name it brings in"
+            $( test.eq! ["fold", "map"] (import_labels! "import std.list.{map, fold};") ),
+        test.case "a renamed import offers the name it was bound to"
+            $( test.eq! ["map", "reduce"]
+                        (import_labels! "import std.list.{map, fold as reduce};") ),
+        test.case "a renamed import says which member it really is"
+            $( test.true! (str.contains_str "`fold` of `std.list`"
+                   (import_doc! "import std.list.{map, fold as reduce};" "reduce")) ),
+    ];
+}

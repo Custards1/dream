@@ -1,15 +1,21 @@
 // The questions an editor asks, answered out of the compiler's own tables.
 //
-// Nothing here re-implements anything. `dreams` already resolves every name to
-// what it means and records where each one was written, because that is what
-// lowering reads; a language server wants the same table, asked a different
-// way. So this module is a translation layer and not an analysis: from a
-// position in a buffer to a byte offset, from a byte offset to a resolution,
-// from a resolution back to a range.
+// Almost nothing here re-implements anything. `dreams` already resolves every
+// name to what it means and records where each one was written, because that is
+// what lowering reads; a language server wants the same table, asked a
+// different way. So most of this module is a translation layer and not an
+// analysis: from a position in a buffer to a byte offset, from a byte offset to
+// a resolution, from a resolution back to a range.
 //
-// The one thing it adds is the overlay. A build compiles what is on disk; an
-// editor asks about what is in its buffers, which is a different program, and
-// often one that has never been saved.
+// It adds two things. The first is the overlay: a build compiles what is on
+// disk, and an editor asks about what is in its buffers, which is a different
+// program and often one that has never been saved.
+//
+// The second is the exception to the paragraph above, and the section that does
+// it -- "what is in scope here" -- says at length why it has to exist and what
+// it costs. In short: the resolver knows what is in scope while it walks and
+// forgets it when it returns, so the one question it cannot be asked is the one
+// a cursor sitting on empty space needs answered.
 import std.core;
 import std.list;
 import std.str;
@@ -148,6 +154,12 @@ let name_end src offset = {
 
 let name_at src at = str.slice at (name_end src at - at) src;
 
+/// The text a span covers, which is the honest way to show a piece of a
+/// program back to the person who wrote it: a parameter that is a pattern comes
+/// out exactly as it was typed rather than as this compiler would re-print it.
+let span_text src span =
+    str.slice (ast.span_start span) (ast.span_end span - ast.span_start span) src;
+
 /// The head of the dotted chain a name is part of.
 ///
 /// A member access is recorded at the start of the whole expression:
@@ -188,6 +200,344 @@ let at_position a line character =
                 found => [list.head span, list.nth 1 span, found],
             }
         },
+    };
+
+// --- what is in scope here -----------------------------------------------------
+//
+// This is the one question in this file that the compiler cannot be asked. The
+// resolver knows what is in scope at every point of its walk -- that is what a
+// frame stack *is* -- but it pushes and pops as it goes, and when `resolve!`
+// returns there is nothing left saying what was visible at a given byte. `refs`
+// answers "what does the name here mean", which is a different question and no
+// help to a cursor sitting where no name has been written yet.
+//
+// So the binders are read back off the tree, and that means the scoping rules
+// are written twice: once in `scope.dr`, where they decide what a program
+// means, and once here, where they decide what to offer. The duplication is
+// real and it is the reason this section is as literal as it is -- every case
+// below is a transcription of the corresponding case of `check_expr`,
+// `check_block` or `check_arm`, in the same order, so that the two can be read
+// side by side when one of them changes. Where `scope.dr` exports the rule
+// itself it is called rather than copied: `scope.pattern_bindings` is what says
+// which names a pattern binds, here as there.
+//
+// A binder is `[name, span, params]`. The parameters are carried because the
+// walk has them in hand and both callers want them -- completion to describe an
+// entry, hover to show a local function's arguments -- and going back for them
+// afterwards would mean finding the declaration a second time. The span is
+// where the name was written, which is what identifies one binding among
+// several of the same name; nothing reads it yet, and it is kept because a
+// walk that found a binder and then threw away where it was would have to be
+// run again by the first thing that wants to rename or highlight one.
+
+let binder name span params = [name, span, params];
+let binder_name b   = list.nth 0 b;
+let binder_span b   = list.nth 1 b;
+let binder_params b = list.nth 2 b;
+
+/// Spans are closed at both ends here, because the position being asked about
+/// is a cursor rather than a character: a cursor at the very end of a block is
+/// still inside it.
+let covers span offset = ast.span_start span <= offset && offset <= ast.span_end span;
+
+let larger a b = if a > b { a } else { b };
+
+/// Where a node actually ends, which is not always where its span says.
+///
+/// Almost every node's span contains the parts this walk descends into. That
+/// was measured rather than assumed, across every construct below, and there is
+/// exactly one exception: a `match`'s span covers `match subject {` and stops
+/// there. `match xs { [h] => h, _ => 0 }` written at byte 11 has span
+/// `[11, 23]` while its second arm runs to 38 -- so the arms lie outside the
+/// node that owns them, and a cursor in one looks as though it is in no `match`
+/// at all. It cost eight failing tests to find, which is the reason it is
+/// written down here at this length.
+///
+/// Only the *end* is ever short, and only ever because of what comes last, so
+/// this follows the last part of each construct rather than walking the whole
+/// subtree: the cost is the depth of the tree and not its size. The constructs
+/// listed are the ones whose own end is their last part's end, and which a
+/// short part therefore shortens too -- a block, a list or a `c.[k]` all end at
+/// a closing bracket and cannot be short whatever is inside them.
+let rec reach e = {
+    let ends = ast.span_end (ast.span e);
+    let deeper =
+        match e {
+            [:match, _, arms, _] =>
+                if list.is_empty arms { ends }
+                else {
+                    let a = list.last arms;
+                    larger (ast.span_end (list.nth 3 a)) (reach (ast.arm_body a))
+                },
+            [:lambda, _, body, _]      => reach body,
+            [:thunk, x, _]             => reach x,
+            [:comp, _, x, _]           => reach x,
+            [:unary, _, x, _]          => reach x,
+            [:binary, _, _, r, _]      => reach r,
+            [:pipe, _, r, _]           => reach r,
+            [:try, _, _, h, _]         => reach h,
+            [:if, _, t, el, _]         => match el { () => reach t, x => reach x },
+            [:apply, callee, args, _]  =>
+                if list.is_empty args { reach callee } else { reach (list.last args) },
+            [:let, _, _, body, _, _]   => reach body,
+            [:let_p, _, body, _]       => reach body,
+            [:virtual, _, _, body, _]  => match body { () => ends, b => reach b },
+            _ => ends,
+        };
+    larger ends deeper
+};
+
+/// A node's span, corrected at the end by `reach`.
+let extent e = [ast.span_start (ast.span e), reach e];
+
+/// Does this node contain the cursor? Always asked of the extent and never of
+/// the span, for the reason `reach` gives.
+let holds e offset = covers (extent e) offset;
+
+/// An arm reaches as far as its body does, for the same reason and in the same
+/// way -- an arm whose body is a `match` has an arm span that stops short of it.
+let arm_holds a offset =
+    covers [ast.span_start (list.nth 3 a), larger (ast.span_end (list.nth 3 a))
+                                                  (reach (ast.arm_body a))]
+           offset;
+
+/// The names a parameter list binds. A parameter is a name, `()` -- a slot that
+/// binds nothing -- or a pattern, and only the last of those binds more than
+/// one thing.
+let param_binders ps =
+    list.concat (list.map (fn p ->
+        match ast.param_pattern p {
+            () => match ast.param_name p {
+                      () => [],
+                      n => [binder n (list.nth 1 p) []],
+                  },
+            pattern => list.map (fn nb -> binder (list.head nb) (list.nth 1 nb) [])
+                                (scope.pattern_bindings pattern),
+        }) ps);
+
+let pattern_binders pattern =
+    list.map (fn nb -> binder (list.head nb) (list.nth 1 nb) []) (scope.pattern_bindings pattern);
+
+/// Every local visible at `offset`, outermost first, threaded down through the
+/// constructs that contain it. `acc` is what the enclosing constructs have
+/// already put in scope, which is why this reads as a descent rather than as a
+/// collection: only the child that contains the cursor can add anything, and a
+/// child that does not contain it hands `acc` straight back.
+let rec expr_binders e offset acc =
+    if not (holds e offset) { acc }
+    else {
+        match e {
+            [:lambda, ps, body, _] =>
+                expr_binders body offset (list.append acc (param_binders ps)),
+            [:block, stmts, _] => block_binders stmts offset acc,
+
+            // The binder is in scope in the handler and nowhere else, and it is
+            // bound at the `try`'s own span -- which is where `check_expr`
+            // binds it, so hovering it finds it here.
+            //
+            // The body is asked about *first*, and it has to be: these two
+            // spans are not disjoint. Both begin at the `try` keyword, so the
+            // handler's span contains the body's entirely, and asking the
+            // handler first puts the catch binder in scope inside the very
+            // block it guards.
+            [:try, body, name, handler, span] =>
+                if holds body offset { expr_binders body offset acc }
+                else if holds handler offset {
+                    expr_binders handler offset (list.append acc [binder name span []])
+                }
+                else { acc },
+
+            [:match, subject, arms, _] =>
+                if holds subject offset { expr_binders subject offset acc }
+                else { arm_binders arms offset acc },
+
+            // A compile-time expression is walked with an empty frame stack:
+            // it runs before the program does, so there is no local for it to
+            // see. Dropping `acc` here is that rule, and it is the only place
+            // in this walk where anything is dropped.
+            [:comp, _, body, _] => expr_binders body offset [],
+
+            [:field, obj, _, _] => expr_binders obj offset acc,
+            [:apply, callee, args, _] =>
+                list.fold (fn a x -> expr_binders x offset a) (expr_binders callee offset acc) args,
+            [:pipe, l, r, _] => expr_binders r offset (expr_binders l offset acc),
+            [:unary, _, x, _] => expr_binders x offset acc,
+            [:binary, _, l, r, _] => expr_binders r offset (expr_binders l offset acc),
+            [:if, cond, t, el, _] => {
+                let seen = expr_binders t offset (expr_binders cond offset acc);
+                match el { () => seen, x => expr_binders x offset seen }
+            },
+            [:thunk, x, _] => expr_binders x offset acc,
+            [:list, xs, _]  => list.fold (fn a x -> expr_binders x offset a) acc xs,
+            [:array, xs, _] => list.fold (fn a x -> expr_binders x offset a) acc xs,
+            [:map, pairs, _] =>
+                list.fold (fn a kv -> expr_binders (list.nth 1 kv) offset
+                                          (expr_binders (list.nth 0 kv) offset a))
+                          acc pairs,
+            [:get, c, k, fallback, _] => {
+                let seen = expr_binders k offset (expr_binders c offset acc);
+                match fallback { () => seen, f => expr_binders f offset seen }
+            },
+            [:set, c, k, v, _] =>
+                expr_binders v offset (expr_binders k offset (expr_binders c offset acc)),
+            [:destructure, _, body, _] => expr_binders body offset acc,
+            _ => acc,
+        }
+    };
+
+/// A block's statements, where the scope grows as the block is walked: a `let`
+/// binds a name the statements *after* it can see, and not its own body unless
+/// it is `rec`.
+let rec block_binders stmts offset acc =
+    match stmts {
+        [] => acc,
+        [st, ..rest] =>
+            // Written below the cursor. Nothing from here down is in scope at
+            // it, which is the half of this that a cursor sitting in the gap
+            // *between* two statements gets wrong if the test is only whether
+            // some statement contains it: none does, and every `let` in the
+            // block -- including the ones underneath -- would be offered.
+            if ast.span_start (ast.span st) > offset { acc }
+            else if holds st offset { stmt_binders st offset acc }
+            else { block_binders rest offset (list.append acc (bound_after st)) },
+    };
+
+/// What the cursor can see from inside one statement.
+let stmt_binders st offset acc =
+    match st {
+        [:let, n, ps, body, is_rec, span] =>
+            if holds body offset {
+                expr_binders body offset
+                    (list.append (list.append acc (if is_rec { [binder n span ps] } else { [] }))
+                                 (param_binders ps))
+            }
+            else { acc },
+        // A destructuring `let` does not put its own names in scope in its
+        // value -- `let [a, b] = f a` is the outer `a`.
+        [:let_p, _, body, _] => expr_binders body offset acc,
+        _ => expr_binders st offset acc,
+    };
+
+/// What one statement leaves in scope for the statements below it.
+let bound_after st =
+    match st {
+        [:let, n, ps, _, _, span] => [binder n span ps],
+        [:let_p, pattern, _, _] => pattern_binders pattern,
+        _ => [],
+    };
+
+/// The arm containing the cursor, with its pattern's names in scope -- for the
+/// guard as well as the body, because a guard exists to ask about what the
+/// pattern bound.
+let rec arm_binders arms offset acc =
+    match arms {
+        [] => acc,
+        [a, ..rest] =>
+            if arm_holds a offset {
+                let bound = list.append acc (pattern_binders (ast.arm_pattern a));
+                match ast.arm_guard a {
+                    () => expr_binders (ast.arm_body a) offset bound,
+                    g => if holds g offset { expr_binders g offset bound }
+                         else { expr_binders (ast.arm_body a) offset bound },
+                }
+            }
+            else { arm_binders rest offset acc },
+    };
+
+/// A module's declarations. Only a body can contain the cursor, and only a
+/// parameter list puts anything in scope for one -- what a top-level `let`
+/// binds is a global, which is a different question with a different answer.
+let rec item_binders items offset acc =
+    match items {
+        [] => acc,
+        [it, ..rest] =>
+            if holds it offset { in_item it offset acc }
+            else { item_binders rest offset acc },
+    };
+
+let in_item it offset acc =
+    match it {
+        [:let, _, ps, body, _, _] =>
+            if holds body offset {
+                expr_binders body offset (list.append acc (param_binders ps))
+            }
+            else { acc },
+        [:let_p, _, body, _] => expr_binders body offset acc,
+        [:virtual, _, ps, body, _] =>
+            match body {
+                () => acc,
+                b => if holds b offset {
+                         expr_binders b offset (list.append acc (param_binders ps))
+                     }
+                     else { acc },
+            },
+        [:mod, _, inner, _]  => item_binders inner offset acc,
+        [:when, _, inner, _] => item_binders inner offset acc,
+        _ => acc,
+    };
+
+/// Every local in scope at a byte offset, innermost first and shadowed names
+/// dropped. The walk builds them outermost first, so reversing puts the
+/// innermost binding of a name in front of the one it shadows, and keeping the
+/// first of each name is then exactly the shadowing rule.
+let locals_at a offset =
+    match module_of a {
+        () => [],
+        mi => {
+            let items = modules.module_items (modules.module_at (loader a) mi);
+            let found = list.reverse (item_binders items offset []);
+            let names = list.unique (list.map (fn b -> binder_name b) found);
+            list.map (fn n -> list.head (list.filter (fn b -> binder_name b == n) found)) names
+        },
+    };
+
+// --- how a name was written -------------------------------------------------------
+//
+// Hover and completion both want to show a function the way it was declared --
+// `map f xs` rather than `map` -- because the question a reader has about a
+// name they do not recognise is almost always "what do I pass it?". The
+// resolver keeps arity and not parameter names, so this reads the declaration.
+
+/// The declaration of `name` among a module's items, or `()`.
+///
+/// `when` blocks are searched because what one declares is a global like any
+/// other in a program compiled with them in, and `mod` blocks are not, because
+/// what is inside one belongs to a module of its own.
+let rec find_decl items name =
+    match items {
+        [] => (),
+        [it, ..rest] =>
+            match it {
+                [:let, n, _, _, _, _]  => if n == name { it } else { find_decl rest name },
+                [:virtual, n, _, _, _] => if n == name { it } else { find_decl rest name },
+                [:when, _, inner, _] =>
+                    match find_decl inner name { () => find_decl rest name, d => d },
+                _ => find_decl rest name,
+            },
+    };
+
+/// A global's parameters as they were written, or `()` when its declaration is
+/// not among this module's items -- a body inherited through `derive` is
+/// written somewhere else, and a host module's members are not written at all.
+let params_of a mi name =
+    match find_decl (modules.module_items (modules.module_at (loader a) mi)) name {
+        () => (),
+        // `:let` and `:virtual` both keep their parameters third.
+        d => list.nth 2 d,
+    };
+
+/// `name` followed by the parameters of `ps`, sliced out of `src` so that a
+/// pattern parameter reads as it was typed.
+let signature src name ps =
+    if list.is_empty ps { name }
+    else { name + " " + str.join_str " " (list.map (fn p -> span_text src (list.nth 1 p)) ps) };
+
+/// How to show a global or a member: its signature when the declaration can be
+/// found, and its bare name when it cannot.
+let shown_signature a mi name =
+    match params_of a mi name {
+        () => name,
+        ps => signature (module_text a mi) name ps,
     };
 
 // --- go to definition -------------------------------------------------------------
@@ -231,16 +581,39 @@ let definition_at a line character =
 
 // --- hover ------------------------------------------------------------------------
 
-let describe a found =
+/// How a local was bound, shown with its parameters when it has any.
+///
+/// Found by *name* among what is in scope at the cursor, rather than by the
+/// span the resolver recorded. Both would do for a local, but a capture is
+/// recorded with no span at all -- `resolve_in_frames` has threaded it in from
+/// an enclosing frame and the binder is somewhere else entirely -- and the name
+/// is the one thing that is right in both cases. `locals_at` has already
+/// applied the shadowing rule, so the first entry under a name is the binding
+/// this occurrence means.
+let describe_local a offset name =
+    match list.filter (fn b -> binder_name b == name) (locals_at a offset) {
+        [] => "a local",
+        [b, .._] =>
+            match module_of a {
+                () => "a local",
+                mi => "`" + signature (module_text a mi) (binder_name b) (binder_params b)
+                      + "` -- a local"
+                      + if list.is_empty (binder_params b) { "" } else { " function" },
+            },
+    };
+
+let describe a offset name found =
     match found {
-        [:local, slot, _] => "local, slot " + to_string slot,
-        [:capture, idx, _] => "captured from an enclosing function (capture " + to_string idx + ")",
+        [:local, _, _] => describe_local a offset name,
+        [:capture, idx, _] =>
+            describe_local a offset name
+            + " (captured from an enclosing function, capture " + to_string idx + ")",
         [:global, mi, name, _] =>
-            "`" + name + "` -- a global of module `"
+            "`" + shown_signature a mi name + "` -- a global of module `"
             + modules.module_name (modules.module_at (loader a) mi) + "`",
         [:builtin, name] => "`" + name + "` -- a builtin",
         [:member, [:dream, target], field, _] =>
-            "`" + field + "` of module `"
+            "`" + shown_signature a target field + "` of module `"
             + modules.module_name (modules.module_at (loader a) target) + "`",
         [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
         [:closure, _] => "a function",
@@ -258,8 +631,10 @@ let hover_at a line character =
                 () => (),
                 mi => {
                     let src = module_text a mi;
-                    %{ "contents" => %{ "kind" => "markdown",
-                                        "value" => describe a found },
+                    %{ "contents" =>
+                           %{ "kind" => "markdown",
+                              "value" => describe a (pos.offset_of src line character)
+                                                  (name_at src from) found },
                        "range" => pos.range src from until }
                 },
             },
@@ -294,6 +669,26 @@ let symbols a =
 when test {
     import std.test;
 
+    /// An analysis of one buffer and nothing else. Nothing below imports
+    /// anything, so nothing has to be found on a package path.
+    let of! text = analyse! "/buf.dr" [] (core.map_put (core.map_new ()) "/buf.dr" text);
+
+    /// The names in scope where the `|` is, innermost first.
+    ///
+    /// Writing the position into the source is what keeps these readable. The
+    /// alternative is a byte offset counted by hand in every one of them, which
+    /// is a thing to get wrong quietly: a test asking about the wrong position
+    /// still passes or fails, it just stops being about anything.
+    let scope_at! text = {
+        let at = str.find "|" text;
+        let src = str.slice 0 at text + str.slice (at + 1) (str.byte_length text - at - 1) text;
+        list.map (fn b -> binder_name b) (locals_at (of! src) at)
+    };
+
+    /// Sorted, for the cases where what is in scope matters and the order it
+    /// comes back in does not.
+    let in_scope_at! text = list.sort (scope_at! text);
+
     let tests = [
         test.case "a file URI becomes a path"
             $( test.eq! "/a/b.dr" (uri_to_path "file:///a/b.dr") ),
@@ -319,5 +714,67 @@ when test {
             $( test.eq! 0 (chain_start "a.b.c" 4) ),
         test.case "a name that is not a field is its own head"
             $( test.eq! 4 (chain_start "let value = 1;" 4) ),
+
+        // --- the scope walk ---------------------------------------------------
+        //
+        // These are the tests for the one thing in this file that is a second
+        // implementation, so they are written against the rules in `scope.dr`
+        // rather than against what this walk happens to do.
+
+        test.case "a parameter is in scope in the body it belongs to"
+            $( test.eq! ["a", "b"] (in_scope_at! "let f a b = { | };") ),
+        test.case "a parameter is not in scope outside its function"
+            $( test.eq! [] (in_scope_at! "let f a b = a; let g = |;") ),
+
+        test.case "a `let` in a block is in scope below it"
+            $( test.eq! ["x", "y"] (in_scope_at! "let f x = { let y = 1; | };") ),
+        test.case "a `let` is not in scope in its own value"
+            $( test.eq! ["x"] (in_scope_at! "let f x = { let y = |x; 1 };") ),
+        // A cursor in the gap between two statements is in neither of them.
+        // What is above it is in scope; `z`, written below, is not.
+        test.case "a `let` above the cursor is in scope and one below is not"
+            $( test.eq! ["x", "y"] (in_scope_at! "let f x = { let y = 1; | let z = 2; z };") ),
+
+        test.case "a lambda's parameter is in scope in its body"
+            $( test.eq! ["p", "x"] (in_scope_at! "let f x = { let g = fn p -> |p; 1 };") ),
+        test.case "a lambda still sees what encloses it"
+            $( test.true! (list.contains "x" (scope_at! "let f x = { let g = fn p -> |p; 1 };")) ),
+
+        test.case "a match arm's pattern binds in its body"
+            $( test.eq! ["head", "rest", "xs"]
+                        (in_scope_at! "let f xs = match xs { [head, ..rest] => |head, _ => 0 };") ),
+        // This one is also the test for `reach`: the cursor is in the second
+        // arm, which lies outside the `match`'s own span, and outside the
+        // declaration's too, since a declaration ends where its body does.
+        test.case "a match arm's names do not reach the arm beside it"
+            $( test.eq! ["xs"]
+                        (in_scope_at! "let f xs = match xs { [head, ..rest] => 1, _ => |0 };") ),
+        test.case "a match arm's names reach its guard"
+            $( test.true! (list.contains "head"
+                   (scope_at! "let f xs = match xs { [head, ..rest] if |true => 1, _ => 0 };")) ),
+        test.case "a match inside the last arm of a match is still reached"
+            $( test.eq! ["a", "b", "xs"]
+                   (in_scope_at!
+                      "let f xs = match xs { [a] => match xs { [b] => |b, _ => 0 }, _ => 0 };") ),
+
+        test.case "a catch binder is in scope in the handler"
+            $( test.true! (list.contains "e"
+                   (scope_at! "let f! x = { try! { x } catch e { | } };")) ),
+        test.case "a catch binder is not in scope in the body it guards"
+            $( test.false! (list.contains "e"
+                   (scope_at! "let f! x = { try! { | } catch e { 0 } };")) ),
+
+        // `comp` runs before the program does, so it is walked with an empty
+        // frame stack -- there is no local for it to see. This is the one case
+        // in the walk that drops what encloses it, and the easiest to lose.
+        test.case "a compile-time expression sees no local"
+            $( test.eq! [] (in_scope_at! "let f x = { let y = comp (|); 1 };") ),
+
+        // Innermost first, which is what makes the first entry under a name the
+        // binding an occurrence there would mean.
+        test.case "an inner binding shadows an outer one of the same name"
+            $( test.eq! ["n"] (scope_at! "let f n = { let n = 1; | };") ),
+        test.case "the innermost binding comes first"
+            $( test.eq! ["y", "x"] (scope_at! "let f x = { let y = 1; | };") ),
     ];
 }

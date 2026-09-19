@@ -11,10 +11,19 @@
 // available as a value rather than as text.
 //
 // What it answers, it answers out of those tables: diagnostics from the front
-// end, go-to-definition and hover from the resolution table, and the outline
-// from the list of what each module declares. None of it is a second
-// implementation of anything, which is the point -- an editor that disagrees
-// with the compiler is worse than an editor that says nothing.
+// end, go-to-definition and hover from the resolution table, the outline from
+// the list of what each module declares, and completion from what a module
+// exports. Almost none of it is a second implementation of anything, which is
+// the point -- an editor that disagrees with the compiler is worse than an
+// editor that says nothing.
+//
+// There is one exception and it is worth naming here rather than leaving to be
+// found. Completion has to offer the *locals* in scope, and that is the one
+// thing the compiler does not record: the resolver knows it while it walks and
+// forgets it when it returns, so `analysis.dr` reads the binders back off the
+// syntax tree. Those scoping rules are therefore written twice. The section
+// that does it says so at length, and says which parts of `scope.dr` each of
+// its cases was transcribed from.
 import std.cli;
 import std.console;
 import std.core;
@@ -27,6 +36,7 @@ import std.str;
 import dreams.path;
 
 import analysis;
+import complete;
 import rpc;
 
 let version = "0.1.0";
@@ -85,11 +95,19 @@ let refresh! out s path =
 
 /// What this server can do. Full document sync, because a language whose
 /// compiler is this fast has no reason to reassemble incremental edits.
+///
+/// `.` is the one trigger character. A client asks for completions on its own
+/// as a word is typed; a trigger character is how it is told to ask again at a
+/// point where no word has been started, which after a dot is the whole
+/// question -- and a dot is also the one place this server has a precise answer
+/// rather than a list of everything in sight.
 let capabilities =
     %{ "capabilities" => %{ "textDocumentSync" => 1,
                             "hoverProvider" => true,
                             "definitionProvider" => true,
-                            "documentSymbolProvider" => true },
+                            "documentSymbolProvider" => true,
+                            "completionProvider" =>
+                                %{ "triggerCharacters" => ["."] } },
        "serverInfo" => %{ "name" => "lucid", "version" => version } };
 
 /// The workspace root, as a package search path. An editor opens a directory,
@@ -172,6 +190,16 @@ let handle! out s m = {
             answer! out (rpc.id m) (analysis.hover_at a (line_of p) (character_of p))
             [:go, s]
         },
+        // Completion does not reuse `analysis.analyse!` the way its neighbours
+        // do, because it does not analyse the document that is on screen: a
+        // buffer is rarely a program at the moment somebody asks what can go
+        // next, so `complete` repairs it first. See the head of that file.
+        "textDocument/completion" => {
+            answer! out (rpc.id m)
+                (complete.completions! path (roots s) (docs s) (line_of p) (character_of p))
+            [:go, s]
+        },
+
         "textDocument/documentSymbol" => {
             let a = analysis.analyse! path (roots s) (docs s);
             answer! out (rpc.id m) (analysis.symbols a)

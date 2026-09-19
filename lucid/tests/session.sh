@@ -31,6 +31,7 @@ src = "."
 TOML
 cat > "$tmp/ws/helper.dr" <<'DREAM'
 let double n = n * 2;
+let triple n = n * 3;
 DREAM
 cat > "$tmp/ws/app.dr" <<'DREAM'
 import std.console;
@@ -50,12 +51,20 @@ msg() { printf 'Content-Length: %d\r\n\r\n%s' "$(printf '%s' "$1" | wc -c)" "$1"
 # so a server reading the file rather than the buffer sees nothing wrong.
 broken='import std.console;\nimport helper;\n\nlet main! = {\n    console.print! (to_string (helper.missing 21))\n};\n'
 
+# The buffer at the moment a completion is wanted: a dot with nothing after it.
+# This does not parse, which is the whole point -- the server has to repair it
+# before it can say anything at all.
+mid_edit='import std.console;\nimport helper;\n\nlet main! = {\n    console.print! (to_string (helper.))\n};\n'
+
 {
   msg '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":"file://'"$tmp"'/ws"}}'
   msg '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"'"$uri"'","text":"import std.console;\nimport helper;\n\nlet main! = {\n    console.print! (to_string (helper.double 21))\n};\n"}}}'
   msg '{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":38}}}'
   msg '{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":38}}}'
   msg '{"jsonrpc":"2.0","id":4,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"'"$uri"'"}}}'
+  msg '{"jsonrpc":"2.0","id":6,"method":"textDocument/completion","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":4}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$mid_edit"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":38}}}'
   msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$broken"'"}]}}'
   msg '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}'
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
@@ -80,6 +89,23 @@ has "the outline is missing"                     '"name":"main!"'
 # ever mentions it.
 has "an unsaved edit is not what gets compiled"  'has no member .missing'
 has "shutdown is not answered"                   '"id":5'
+
+# Completion, asked twice. Request 6 sits on a bare name in a buffer that
+# parses, and must reach what a bare name reaches.
+has "a bare name offers no global of this module" '"label":"main!"'
+has "a bare name offers no keyword"               '"label":"match"'
+
+# Request 7 is the one that matters. Its buffer is `helper.` with nothing after
+# the dot, which does not parse -- so there is no module, no environment and no
+# global table to answer out of until the text is repaired. `triple` is only
+# reachable through `helper`, and it is not written anywhere in the buffer, so
+# finding it here is proof that the repaired text was analysed and that the
+# chain in front of the cursor was resolved to the module it names.
+has "a mid-edit buffer is never answered"         '"id":7'
+has "a bare dot does not reach the module"        '"label":"triple"'
+# And a member is offered with the parameters it was declared with, which is
+# most of what a completion list is for.
+has "a member comes without its parameters"       '"detail":"double n"'
 
 if [ "$fail" -eq 0 ]; then
     echo "the language server answers a whole conversation"
