@@ -1141,18 +1141,18 @@ Resolved directly, without an import, unless shadowed by a binding:
 | `len` | list \| array \| map \| string → integer |
 | `strict!` | value → the same value, evaluated all the way down |
 
-### `std.marcos` — syntax conveniences
+### `std.macros` — syntax conveniences
 
-Import `std.marcos` and call its macros with `expand`. The module name is
-spelled `marcos`. All transformers are pure; any effects in the code they
+Import `std.macros` and call its macros with `expand`. The module name is
+spelled `macros`. All transformers are pure; any effects in the code they
 produce are checked in the caller. Generated code needs no additional imports.
 
 ```dream
-import std.marcos;
+import std.macros;
 
-let bounded n = expand marcos.clamp n 0 100;
-let port config = expand marcos.coalesce config.[:port else ()] 8080;
-let doubled result = expand marcos.with_ok value result [:ok, value * 2];
+let bounded n = expand macros.clamp n 0 100;
+let port config = expand macros.coalesce config.[:port else ()] 8080;
+let doubled result = expand macros.with_ok value result [:ok, value * 2];
 ```
 
 | Macro arguments | Result |

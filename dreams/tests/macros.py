@@ -147,12 +147,12 @@ let main! = expand loop 1;
         ('expand m.with_some 1 () 2', 'binding name'),
         ('expand m.with_ok [x] [:ok, 1] x', 'binding name'),
     ):
-        failure('import std.marcos as m; let main! = ' + expression + ';', message)
+        failure('import std.macros as m; let main! = ' + expression + ';', message)
     for expression in ('expand m.assert true "fine"', 'expand m.attempt 1'):
-        failure('import std.marcos as m; let pure () = ' + expression + ';', 'impure')
-    failure('import std.marcos as m; let main! = expand m.if_some x () x x;',
+        failure('import std.macros as m; let pure () = ' + expression + ';', 'impure')
+    failure('import std.macros as m; let main! = expand m.if_some x () x x;',
             'cannot find `x`')
-    success('import std.console; import std.marcos.{pipe as through, with_some}; '
+    success('import std.console; import std.macros.{pipe as through, with_some}; '
             'let double n = n * 2; '
             'let main! = console.print! (expand through (expand with_some x 3 (x + 1)) [double]);',
             '8\n')

@@ -24,7 +24,7 @@ examples/run.sh --bless     # re-record output after a deliberate change
 | [`08_generic.dr`](08_generic.dr) | `virtual` and `derive`: generic code with no run-time cost |
 | [`09_compile_time.dr`](09_compile_time.dr) | `comp`, `comp!`, and `when` |
 | [`10_macros_records.dr`](10_macros_records.dr) | syntax macros and generated record constructors/getters/setters |
-| [`11_standard_macros.dr`](11_standard_macros.dr) | `std.marcos`: branches, bindings, pipelines, updates and effects |
+| [`11_standard_macros.dr`](11_standard_macros.dr) | `std.macros`: branches, bindings, pipelines, updates and effects |
 
 ## The packages
 
