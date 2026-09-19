@@ -95,6 +95,19 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 | `parse_int` | `string → integer\|unit` | Parses a base-10 integer from a string. Returns `unit` on failure. The entire string must be a valid integer (trailing non-numeric characters cause failure). |
 | `parse_float` | `string → float\|unit` | Parses a floating-point number from a string. Returns `unit` on failure. |
 
+### Atoms
+
+There is no `to_atom`, and that is the design rather than a gap. An atom is an
+index into a table the runtime never shrinks — every atom value in every
+process is one of those indexes, so none can be reused — and a program that
+interned text it did not write would grow that table until it died, with no
+collector able to reach it. So the only direction offered is the one that
+cannot leak.
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `to_existing_atom` | `string\|bigstr → atom\|unit` | The atom of this name if there already is one, `unit` if there is not. Never creates one. A name is an atom when the program writes it as one anywhere — an image's atoms are interned when it loads — so this is how text from outside is matched against names the program does know. Accepts a bigstr, since it reads the bytes and builds nothing. Raises `:type_error` on anything that is not a string. The answer only moves one way: the table never forgets, so an atom stays one. |
+
 ### Arrays
 
 Arrays are fixed-length, eagerly allocated sequences. Indexing is O(1). All update operations return a new array (values are immutable).

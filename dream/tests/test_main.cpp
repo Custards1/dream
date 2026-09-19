@@ -943,6 +943,19 @@ static void test_atom_interning() {
     const WellKnownAtoms& wk = well_known(rt);
     CHECK(wk.divide_by_zero != wk.type_error);
     CHECK_EQ(rt.atom_name(wk.divide_by_zero), std::string("divide_by_zero"));
+
+    // `find_atom` answers the same id as `intern_atom` for a name that is
+    // already an atom -- and, the point of it, does not create one for a name
+    // that is not. The count is what says so: asking about a name the table
+    // has never seen must leave the table exactly the size it was.
+    uint32_t found = 0;
+    CHECK(rt.find_atom("hello", &found));
+    CHECK_EQ(found, a);
+    const uint32_t before = rt.atom_count();
+    CHECK(!rt.find_atom("nothing has ever interned this", &found));
+    CHECK_EQ(rt.atom_count(), before);
+    // And the id it does not find is not written over the caller's.
+    CHECK_EQ(found, a);
 }
 
 static void test_builtin_table_matches_compiler() {

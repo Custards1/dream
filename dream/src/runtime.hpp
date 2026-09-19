@@ -153,6 +153,18 @@ public:
     const std::string& atom_name(uint32_t index) const;
     uint32_t atom_count() const;
 
+    /// The id of an atom that already exists, and `false` when the name has
+    /// never been one here.
+    ///
+    /// The whole of the difference from `intern_atom` is that this does not
+    /// create. An atom id is an index into a table that only ever grows --
+    /// nothing reuses an id, because every atom value in every process is one
+    /// -- so a program that turns text it did not write into atoms has a leak
+    /// no collector can reach. This is how such a program asks its question
+    /// without taking that risk, and it is why there is no `to_atom` beside
+    /// it.
+    bool find_atom(std::string_view name, uint32_t* out) const;
+
     /// The runtime id of image atom `i`.
     ///
     /// Every `:ok` a program evaluates lands here, so what this must not do is

@@ -1986,6 +1986,34 @@ NativeResult core_parse_int(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_integer(p, int64_t(v)));
 }
 
+/// `core.to_existing_atom` -- the atom of this name, if there already is one.
+///
+/// There is no `to_atom` beside this, and that is the design rather than an
+/// omission. An atom is an index into a table that only grows, so a program
+/// that interned whatever text arrived on a socket would leak until it died.
+/// This asks instead of asserting, and answers `()` where the name has never
+/// been written as an atom anywhere in the program -- which, since the image's
+/// atoms are interned at load, means the program does not mention it.
+///
+/// The answer is monotone and that is what makes it usable: the table never
+/// forgets, so a name that is an atom stays one, and a `()` can only become an
+/// atom if something else creates it -- loading another image, or a value
+/// copied in from another VM. Nothing here can turn an atom back into a `()`.
+///
+/// A big string is accepted for the reason `len` and `str.byte` accept one:
+/// this reads the bytes and builds nothing. The cost is hashing the bytes it
+/// was given, so asking it about a megabyte is a megabyte of hashing to be
+/// told `()`.
+NativeResult core_to_existing_atom(Process& p, Value, Value* args, uint32_t) {
+    Bytes b;
+    if (!string_bytes(args[0], &b)) return type_fail(p, "to_existing_atom needs a string");
+    uint32_t id = 0;
+    if (!p.runtime().find_atom(std::string_view(b.data, b.len), &id)) {
+        return NativeResult::ok(UNIT);
+    }
+    return NativeResult::ok(make_atom(id));
+}
+
 NativeResult core_parse_float(Process& p, Value, Value* args, uint32_t) {
     StrObj* s = as_string(args[0]);
     if (!s) return type_fail(p, "parse_float needs a string");
@@ -2268,6 +2296,8 @@ ModuleDef make_core_module() {
             {"to_int", 1, 0b1, core_to_int},
             {"parse_int", 1, 0b1, core_parse_int},
             {"parse_float", 1, 0b1, core_parse_float},
+            // atoms
+            {"to_existing_atom", 1, 0b1, core_to_existing_atom},
             // arrays
             {"array_new", 2, 0b01, core_array_new},
             {"array_get", 2, 0b11, core_array_get},

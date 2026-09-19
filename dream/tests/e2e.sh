@@ -180,13 +180,19 @@ let main! = {
     console.print! ("child " + to_string (join! (spawn! $( len b ))))
     // Concatenating one is refused, and the message says what to do instead.
     console.print! ("refused " + to_string (type_of (try! { a + "x" } catch e { e })))
+    // Naming an atom is a read and builds nothing, so a view is a string for
+    // it the way it is for `len` and `==`. `:quick` exists because this line
+    // writes it; `:the` is written nowhere, so the same call over the other
+    // slice has nothing to find.
+    console.print! ("atom " + to_string (core.to_existing_atom (core.str_slice a 4 5) == :quick))
+    console.print! ("noatom " + to_string (core.to_existing_atom (core.str_slice a 0 3)))
     io.write! (io.stdout! ()) b
 };
 EOF
 
 {
   printf 'count 2\ntype :bigstr\nlens 19 11\nbyte 113\nslice true\nwhole true\n'
-  printf 'order true\nagain true\nchild 11\nrefused :error\n'
+  printf 'order true\nagain true\nchild 11\nrefused :error\natom true\nnoatom ()\n'
   cat "$payload_dir/b.bin"
 } > "$payload_dir/expected"
 
