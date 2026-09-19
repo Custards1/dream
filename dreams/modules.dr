@@ -164,6 +164,11 @@ let parsed l       = core.map_get l :parsed (core.map_new ());
 let with_parsed p l = core.map_put l :parsed p;
 let put_parsed file v l = with_parsed (core.map_put (parsed l) file v) l;
 
+/// `[owner, kind, name, fields, span]` for each `group`, `struct` or `mapping`
+/// declaration, where `owner` is the module it was written in. `note_records`
+/// is the only thing that adds to this and says why it exists.
+let records l      = core.map_get l :records [];
+
 /// What each `expand` in the program named: `[module, source, offset, what]`,
 /// one entry per call site, where `what` is the resolution of the macro's own
 /// name wrapped as `[:macro, ..]`.
@@ -369,6 +374,32 @@ let rec expand_items cfg items =
             other => [other],
         }) items);
 
+/// Every record declaration `expand_items` is about to rewrite, in the same
+/// order and under the same `when` conditions -- an item the configuration
+/// switches off becomes no module, so it is no record either.
+let rec record_items cfg items =
+    list.concat (list.map (fn item ->
+        match item {
+            [:when, cond, inner, _] =>
+                if config.eval cfg cond { record_items cfg inner } else { [] },
+            [:record, kind, name, fields, span] => [[kind, name, fields, span]],
+            _ => [],
+        }) items);
+
+/// Remember what `owner`'s records were written as, before the rewrite.
+///
+/// A `group`, a `struct` or a `mapping` becomes a module of generated
+/// functions, and those carry spans in a reserved part of the offset space
+/// because several of them stand where one declaration was written. So by the
+/// time any later pass walks this program the fields are gone, the kind is
+/// gone, and the place it was written is gone with them -- an editor asking
+/// "what is `Point.x` and where is it" has nothing at all to answer from, and
+/// answered `x ` and the end of the file. This is that, kept, and nothing in
+/// the compiler reads it: `owner + "." + name` is the module the rewrite made.
+let note_records owner items l =
+    put :records (records l + list.map (fn r -> core.cons owner r)
+                                       (record_items (config_of l) items)) l;
+
 // --- loading -----------------------------------------------------------------
 
 /// The dotted paths a module depends on, with the span to blame: its imports
@@ -515,7 +546,7 @@ let rec hoist_mod! l parent source m =
                             [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                         },
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                    }) [l, []] kept;
+                    }) [note_records full items l, []] kept;
                 let inner_items = list.nth 1 nested;
 
                 // A submodule may import, so follow those before it is recorded.
@@ -573,6 +604,7 @@ let load_items! l source parsed display name file = {
         [:ok, items] => {
             // Resolve `when` before anything else looks at the module.
             let kept = expand_items (config_of l) items;
+            let noted = note_records name items l;
 
             // A `mod name { .. }` is a module written inside another. Register
             // it as `parent.name` and leave the parent importing it, so from
@@ -586,7 +618,7 @@ let load_items! l source parsed display name file = {
                         [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                     },
                     other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                }) [enter name l, []] kept;
+                }) [enter name noted, []] kept;
             let items_out = list.nth 1 hoisted;
 
             // Follow this module's own imports before recording it, so the
@@ -774,6 +806,10 @@ let failed l = diag.error_count (diags l) > 0;
 /// dependencies before what uses them.
 let names l = list.map (fn m -> module_name m) (modules l);
 
+
+
+
+
 // --- tests -------------------------------------------------------------------
 
 when test {
@@ -803,6 +839,30 @@ when test {
             $( test.eq! 1 (list.length (expand_items on (items_of "when test { let a = 1; }"))) ),
         test.case "a when that does not hold contributes nothing"
             $( test.eq! [] (expand_items config.empty (items_of "when test { let a = 1; }")) ),
+
+        // What `expand_items` is about to destroy, kept for a tool. Nothing in
+        // the compiler reads it -- see `note_records`.
+        test.case "a record declaration is remembered as it was written"
+            $( test.eq! [[:list, "Point", ["x", "y"]]]
+                        (list.map (fn r -> [list.nth 0 r, list.nth 1 r,
+                                            list.map (fn f -> list.head f) (list.nth 2 r)])
+                                  (record_items on (items_of "group Point { x, y }"))) ),
+        test.case "the three keywords keep their backing kinds apart"
+            $( test.eq! [:list, :array, :map]
+                        (list.map (fn r -> list.head r)
+                                  (record_items on (items_of
+                                      "group A { x }\nstruct B { x }\nmapping C { x }"))) ),
+        test.case "a record inside a `when` that is on is remembered"
+            $( test.eq! 1 (list.length (record_items on
+                              (items_of "when test { group Hidden { x } }"))) ),
+        test.case "a record inside a `when` that is off becomes no module and no record"
+            $( test.eq! [] (record_items config.empty
+                              (items_of "when test { group Hidden { x } }")) ),
+        test.case "a record's fields keep the spans they were written at"
+            $( test.eq! [[14, 15], [17, 18]]
+                        (list.map (fn f -> list.nth 1 f)
+                                  (list.nth 2 (list.head (record_items on
+                                      (items_of "group Point { x, y }"))))) ),
         test.case "a nested when is resolved too"
             $( test.eq! 1 (list.length (expand_items on
                    (items_of "when test { when test { let a = 1; } }"))) ),

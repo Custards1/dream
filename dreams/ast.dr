@@ -162,6 +162,20 @@ let param_pattern p = match p { [_, _, pattern] => pattern, _ => () };
 let let_d name params body is_rec span = [:let, name, params, body, is_rec, span];
 let macro_d name params body span = [:macro, name, params, body, span];
 /// The backing kind is `:list`, `:array` or `:map`.
+/// One field of a record: the parameter its constructor takes, and what an
+/// accessor answers when the field is not there.
+///
+/// `()` is a field with no default, which is what every field was before they
+/// could have one -- and it is exactly what `get_e` wants for "no fallback",
+/// so a field's default is spliced straight into the read. A default of `()`
+/// *written by the author* is `[:unit, span]` and not this, so the two do not
+/// collide.
+let record_field param default = [param, default];
+let field_param f   = list.nth 0 f;
+let field_default f = list.nth 1 f;
+let field_name f    = param_name (list.nth 0 f);
+let field_span f    = list.nth 1 (list.nth 0 f);
+
 let record_d kind name fields span = [:record, kind, name, fields, span];
 
 /// `let [a, b] = pair` -- a `let` that binds what a pattern names. A node of
@@ -305,7 +319,12 @@ let rec show e =
         [:macro, n, ps, b, _] => "(macro " + n + " " + show_params ps + " " + show b + ")",
         [:record, kind, n, fields, _] =>
             "(" + (match kind { :list => "group", :array => "struct", :map => "mapping" })
-                + " " + n + " " + show_params fields + ")",
+                + " " + n + " "
+                + str.join_str " " (list.map (fn f ->
+                      match field_default f {
+                          () => field_name f,
+                          d => "(" + field_name f + " = " + show d + ")",
+                      }) fields) + ")",
         [:list, xs, _]      => "(list " + show_all xs + ")",
         [:array, xs, _]     => "(array " + show_all xs + ")",
         [:map, pairs, _]    => "(map " + show_pairs pairs + ")",

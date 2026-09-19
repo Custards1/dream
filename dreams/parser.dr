@@ -988,9 +988,9 @@ let rec parse_item c ts = {
                 [:ok, _, _] => err "a macro needs a name" sp,
                 other => other,
             },
-            "group" => parse_record :list sp (list.tail ts),
-            "struct" => parse_record :array sp (list.tail ts),
-            "mapping" => parse_record :map sp (list.tail ts),
+            "group" => parse_record c :list sp (list.tail ts),
+            "struct" => parse_record c :array sp (list.tail ts),
+            "mapping" => parse_record c :map sp (list.tail ts),
             _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `macro`, `group`, `struct` or `mapping` at the top level, found "
                       + describe ts) sp,
         },
@@ -998,40 +998,79 @@ let rec parse_item c ts = {
     }
 };
 
-let rec parse_record kind sp ts =
+let rec parse_record c kind sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a record name" (peek_span ts)
     } else {
         let name = peek_value ts;
         match expect (list.tail ts) :lbrace "`{` before record fields" {
             [:error, m, s] => err m s,
-            [:ok, _, rest] => record_fields kind name sp [] rest,
+            [:ok, _, rest] => record_fields c kind name sp [] rest,
         }
     };
 
-let rec record_fields kind name sp fields ts =
+/// Does this expression name anything?
+///
+/// A field's default is compiled *inside* the module the record becomes, and a
+/// module does not see the one it was written in -- `mod M { let f () = outer;
+/// }` cannot find `outer` either. So a default that named a global would be a
+/// "cannot find" reported against a span nobody wrote, which is the worst kind
+/// of diagnostic there is. Refusing it here says so where it was written.
+///
+/// A lambda is caught by this too, because its body names its own parameter.
+/// That is stricter than it has to be and it is the honest boundary: what can
+/// be written is what needs nothing from any scope.
+let rec names_something e =
+    match e {
+        [:name, _, _] => true,
+        [:field, _, _, _] => true,
+        _ => type_of e == :list && list.any (fn x -> names_something x) e,
+    };
+
+let rec record_fields c kind name sp fields ts =
     match peek_kind ts {
         :rbrace => ok (ast.record_d kind name (list.reverse fields)
                                    (ast.span_to sp (peek_span ts))) (list.tail ts),
         :ident => {
             let field = peek_value ts;
-            let names = list.map (fn p -> ast.param_name p) fields;
+            let names = list.map (fn f -> ast.field_name f) fields;
             let helpers = ["make"] + names + list.map (fn n -> "set_" + n) names;
             if is_keyword field || str.ends_with "!" field {
                 err "a record field must be a plain name" (peek_span ts)
             } else if list.contains field helpers || list.contains ("set_" + field) helpers {
                 err ("record field `" + field + "` conflicts with a generated helper") (peek_span ts)
             } else {
-                let more = core.cons (ast.param field (peek_span ts)) fields;
+                let param = ast.param field (peek_span ts);
                 let rest = list.tail ts;
+                // `x = e` gives the field a default: what reading it answers
+                // when the collection has nothing at that key or position.
                 match peek_kind rest {
-                    :comma => record_fields kind name sp more (list.tail rest),
-                    :rbrace => record_fields kind name sp more rest,
-                    _ => err "expected `,` or `}` after a record field" (peek_span rest),
+                    :eq => match parse_expr (grouped c) (list.tail rest) {
+                        [:error, m, s] => err m s,
+                        [:ok, e, after] =>
+                            if names_something e {
+                                err ("a record field's default may not name anything: it is "
+                                     + "compiled inside the module `" + name + "` becomes, which "
+                                     + "cannot see the one it is written in") (ast.span e)
+                            } else {
+                                after_field c kind name sp
+                                            (core.cons (ast.record_field param e) fields) after
+                            },
+                    },
+                    _ => after_field c kind name sp
+                                     (core.cons (ast.record_field param ()) fields) rest,
                 }
             }
         },
         _ => err "expected a record field or `}`" (peek_span ts),
+    };
+
+/// What may follow one field: another, or the end of the list.
+let after_field c kind name sp fields ts =
+    match peek_kind ts {
+        :comma => record_fields c kind name sp fields (list.tail ts),
+        :rbrace => record_fields c kind name sp fields ts,
+        _ => err "expected `,` or `}` after a record field" (peek_span ts),
     };
 
 /// A dotted path: `std.list`. Answers `[segments, rest]`.

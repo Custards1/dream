@@ -43,22 +43,32 @@ let rec literal value span = match type_of value {
 };
 
 /// Records are namespaces of ordinary functions over ordinary collections.
+///
+/// A field's default -- `mapping Config { retries = 3 }` -- is the fallback of
+/// the read its accessor compiles to, and nothing else: `c.[k else d]` is one
+/// opcode and already means "this, or that when it is not there". So a default
+/// costs nothing where it is not used, is lazy where it is, and works the same
+/// for a `group` and a `struct`, whose reads are by position. It does *not*
+/// make the constructor's parameter optional: arity is fixed in this language,
+/// so `make` still takes every field.
 let record kind name fields span = {
-    let values = list.map (fn p -> ast.name_e (ast.param_name p) (list.nth 1 p)) fields;
+    let named f = ast.name_e (ast.field_name f) (ast.field_span f);
     let body = match kind {
-        :list => ast.list_e values span,
-        :array => ast.array_e values span,
-        :map => ast.map_e (list.map (fn p ->
-            [ast.atom_e (ast.param_name p) (list.nth 1 p),
-             ast.name_e (ast.param_name p) (list.nth 1 p)]) fields) span,
+        :list => ast.list_e (list.map (fn f -> named f) fields) span,
+        :array => ast.array_e (list.map (fn f -> named f) fields) span,
+        :map => ast.map_e (list.map (fn f ->
+            [ast.atom_e (ast.field_name f) (ast.field_span f), named f]) fields) span,
     };
     let constructor = ast.let_d "make"
-        (if list.is_empty fields { [ast.param () span] } else { fields }) body false span;
+        (if list.is_empty fields { [ast.param () span] }
+         else { list.map (fn f -> ast.field_param f) fields }) body false span;
     let helpers = list.concat (list.map (fn i -> {
-        let field = ast.param_name (list.nth i fields);
+        let f = list.nth i fields;
+        let field = ast.field_name f;
         let obj = ast.name_e "record" span;
         let key = match kind { :map => ast.atom_e field span, _ => ast.int_e i span };
-        [ast.let_d field [ast.param "record" span] (ast.get_e obj key () span) false span,
+        [ast.let_d field [ast.param "record" span]
+                   (ast.get_e obj key (ast.field_default f) span) false span,
          ast.let_d ("set_" + field) [ast.param "record" span, ast.param "value" span]
                    (ast.set_e obj key (ast.name_e "value" span) span) false span]
     }) (list.range 0 (list.length fields)));
