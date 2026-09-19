@@ -65,10 +65,46 @@ let module_index l path = {
 };
 
 /// Compile `path` as the root of a program, reading `open_docs` -- a map of
-/// path to text -- instead of the disk wherever it has an entry.
-let analyse! path roots open_docs = {
-    let l = modules.load_overlaid! path roots (config.defaults! ()) false open_docs;
+/// path to text -- instead of the disk wherever it has an entry, and reusing
+/// `parsed` for every file whose text has not changed since it produced it.
+///
+/// The cache is most of what makes a server answering a running editor
+/// affordable, and it is the loader's own -- see `load_overlaid_cached!`, which
+/// exists for this. Measured on `dreams/lower.dr`, which pulls in the whole
+/// compiler: loading it cold parses 23 modules and costs 793 ms, and loading it
+/// again with one buffer edited costs 127 ms, because only the buffer is parsed
+/// again. What a caller has to do is carry the map back -- `parses` below --
+/// since a cache that is not handed forward is not a cache.
+let analyse_cached! path roots open_docs parsed = {
+    let l = modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed;
     analysis l (scope.resolve! (l)) (module_index l path)
+};
+
+let analyse! path roots open_docs = analyse_cached! path roots open_docs (core.map_new ());
+
+/// The parse results this analysis produced, to hand to the next one.
+let parses a = modules.parsed (loader a);
+
+/// The same program, **declared but not checked**.
+///
+/// `scope.resolve!` is two passes. `declare!` settles what each module binds --
+/// its globals, what its imports brought in, and which name in front of a dot
+/// is which module -- and the pass after it walks every body in the program to
+/// resolve every name written in one. On `dreams/lower.dr` the first is 110 ms
+/// and the pair is 483, so three quarters of the cost is the walk.
+///
+/// Completion needs none of that walk: what a module exports and what an import
+/// bound are both settled by the first pass. So this stops after it.
+///
+/// **What is missing is `refs`**, which is the table saying what the name at a
+/// given offset means -- it is the walk's output and the walk has not run. Hover
+/// and go-to-definition are precisely that question, so neither may be asked of
+/// one of these; they use `analyse_cached!`. `defs` is empty too, so a caller
+/// wanting the globals of a module reads `scope.exports` of its environment,
+/// which is phase one's own answer to the same question.
+let declared! path roots open_docs parsed = {
+    let l = modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed;
+    analysis l (scope.resolver (scope.envs (scope.declare! l))) (module_index l path)
 };
 
 /// The text of a module as the compiler saw it, which is the buffer when there

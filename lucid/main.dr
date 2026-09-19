@@ -30,6 +30,7 @@ import std.core;
 import std.io;
 import std.json;
 import std.list;
+import std.map;
 import std.os;
 import std.str;
 
@@ -43,17 +44,42 @@ let version = "0.1.0";
 
 // --- what the server is holding ------------------------------------------------
 
-/// The open documents, and where to look for packages. Everything else is
-/// recomputed per request: an analysis is cheap enough, and one that is kept is
-/// one that can be stale.
-let state docs roots = %{ :docs => docs, :roots => roots };
+/// The open documents, where to look for packages, and what has been parsed.
+///
+/// Everything *derived* is recomputed per request -- an analysis that is kept
+/// is one that can be stale -- but the parses are not derived from anything
+/// this server decides: a file's text either changed or it did not, and the
+/// loader checks which for itself. So the parse map is carried, and it is the
+/// difference between a request costing 793 ms and 127. See `analyse_cached!`.
+let state docs roots = %{ :docs => docs, :roots => roots, :parsed => core.map_new () };
 
 let docs s  = core.map_get s :docs (core.map_new ());
 let roots s = core.map_get s :roots [];
+let parses s = core.map_get s :parsed (core.map_new ());
 
 let with_doc path text s = core.map_put s :docs (core.map_put (docs s) path text);
 let without_doc path s = core.map_put s :docs (core.map_remove (docs s) path);
 let with_roots rs s = core.map_put s :roots rs;
+/// Add to what has been parsed. **Merged, never replaced**, and that is not a
+/// detail: a buffer that does not parse names no imports, so the loader for it
+/// never reaches the other modules and its parse map comes back holding only
+/// the buffer. Assigning that map over the old one throws away every other
+/// module, and the next request parses the whole program again -- which is the
+/// state an editor is in for most of the time somebody is typing. Measured on
+/// `dreams/lower.dr`: a completion against a buffer with a half-written member
+/// access cost 815 ms that way and 244 ms merged.
+///
+/// A stale entry cannot do any harm. The loader keeps the text it parsed beside
+/// the result and compares it to the text it is given, so an entry for a file
+/// that has since changed is re-parsed rather than believed.
+let with_parses ps s = core.map_put s :parsed (map.merge (parses s) ps);
+
+/// The two halves of every request that analyses. They are a pair on purpose:
+/// an analysis made without `analysed!` does not reuse the parses, and one
+/// whose state is not put back through `carrying` throws away the parses it
+/// just did.
+let analysed! s path = analysis.analyse_cached! path (roots s) (docs s) (parses s);
+let carrying a s = with_parses (analysis.parses a) s;
 
 // --- reading the parts of a request ---------------------------------------------
 
@@ -84,11 +110,23 @@ let publish! out a path = {
     if list.contains path mentioned { () } else { send! path [] }
 };
 
-/// Compile the document and say what is wrong with it.
+/// Compile the document, say what is wrong with it, and hand back the state to
+/// go on with -- this one plus the parses the compile did.
+///
+/// A caller must bind the result as a statement and answer with the name, never
+/// drop the call straight into the `[:go, ..]` it answers with. A value in a
+/// list is a thunk, and a thunk nobody forces is a compile nobody ran: written
+/// as `[:go, refresh! ..]`, opening a document published no diagnostics at all,
+/// and published them late if some later request happened to read the state.
+/// `publish!` below is a bare statement for the same reason.
 let refresh! out s path =
     match path {
-        "" => (),
-        p => publish! out (analysis.analyse! p (roots s) (docs s)) p,
+        "" => s,
+        p => {
+            let a = analysed! s p;
+            publish! out a p
+            carrying a s
+        },
     };
 
 // --- the requests -----------------------------------------------------------------
@@ -151,8 +189,7 @@ let handle! out s m = {
 
         "textDocument/didOpen" => {
             let text = core.map_get (text_document p) "text" "";
-            let s2 = with_doc path text s;
-            refresh! out s2 path
+            let s2 = refresh! out (with_doc path text s) path;
             [:go, s2]
         },
         "textDocument/didChange" => {
@@ -162,13 +199,12 @@ let handle! out s m = {
                            [] => core.map_get (docs s) path "",
                            [c, .._] => core.map_get c "text" "",
                        };
-            let s2 = with_doc path text s;
-            refresh! out s2 path
+            let s2 = refresh! out (with_doc path text s) path;
             [:go, s2]
         },
         "textDocument/didSave" => {
-            refresh! out s path
-            [:go, s]
+            let s2 = refresh! out s path;
+            [:go, s2]
         },
         "textDocument/didClose" => {
             let s2 = without_doc path s;
@@ -180,30 +216,34 @@ let handle! out s m = {
             [:go, s2]
         },
 
+        // These three want `refs`, which only the pass that walks every body
+        // fills, so they analyse the whole program. What they do not have to do
+        // is parse it again -- see `analyse_cached!`.
         "textDocument/definition" => {
-            let a = analysis.analyse! path (roots s) (docs s);
+            let a = analysed! s path;
             answer! out (rpc.id m) (analysis.definition_at a (line_of p) (character_of p))
-            [:go, s]
+            [:go, carrying a s]
         },
         "textDocument/hover" => {
-            let a = analysis.analyse! path (roots s) (docs s);
+            let a = analysed! s path;
             answer! out (rpc.id m) (analysis.hover_at a (line_of p) (character_of p))
-            [:go, s]
+            [:go, carrying a s]
         },
         // Completion does not reuse `analysis.analyse!` the way its neighbours
         // do, because it does not analyse the document that is on screen: a
         // buffer is rarely a program at the moment somebody asks what can go
         // next, so `complete` repairs it first. See the head of that file.
         "textDocument/completion" => {
-            answer! out (rpc.id m)
-                (complete.completions! path (roots s) (docs s) (line_of p) (character_of p))
-            [:go, s]
+            let got = complete.completions! path (roots s) (docs s) (parses s)
+                                            (line_of p) (character_of p);
+            answer! out (rpc.id m) (list.head got)
+            [:go, with_parses (list.nth 1 got) s]
         },
 
         "textDocument/documentSymbol" => {
-            let a = analysis.analyse! path (roots s) (docs s);
+            let a = analysed! s path;
             answer! out (rpc.id m) (analysis.symbols a)
-            [:go, s]
+            [:go, carrying a s]
         },
 
         // A request must be answered even when it is not understood, or the

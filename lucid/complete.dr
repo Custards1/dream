@@ -25,6 +25,7 @@
 // editor offers names in the order the language would find them.
 import std.core;
 import std.list;
+import std.map;
 import std.str;
 
 import dreams.ast;
@@ -213,16 +214,23 @@ let local_items a src offset =
              rank_local
     }) (analysis.locals_at a offset);
 
-/// This module's own globals. The ones whose names begin with `<` are the
-/// hidden globals a top-level destructuring leaves behind -- nobody wrote them
-/// and nobody can name them, which is what `scope.exports` filters out too.
+/// This module's own globals.
+///
+/// Read from the environment rather than from `scope.module_defs`, and the
+/// difference is the whole reason completion is affordable: `defs` is filled by
+/// the pass that walks every body in the program, and `exports` is phase one's
+/// own answer to the same question. It also drops the hidden globals a
+/// top-level destructuring leaves behind -- nobody wrote them and nobody can
+/// name them -- which `defs` has to filter for separately.
+///
+/// A module imported for its value takes a global of this module too, so the
+/// ones whose kind is `:module` are left out here and offered by `import_items`
+/// instead, which knows where they came from.
 let global_items a mi e =
     list.map (fn n -> item n (entry_kind a mi e n)
                            (analysis.shown_signature a mi n)
                            "A global of this module." rank_global)
-             (list.filter (fn n -> not (str.starts_with "<" n))
-                          (list.map (fn d -> list.nth 2 d)
-                                    (scope.module_defs (analysis.resolved a) mi)));
+             (list.filter (fn n -> scope.global_kind e n != :module) (scope.exports e));
 
 /// Everything an import put in this module's namespace: the modules it named,
 /// and the members an `import a.{x}` brought in one at a time.
@@ -303,47 +311,62 @@ let name_items a offset =
 
 // --- the request ---------------------------------------------------------------------
 
-/// The analysis a completion is answered out of: the buffer as it stands when
-/// that is a program, and the buffer with a name inserted at the cursor when it
-/// is not.
+/// The analysis a completion is answered out of: the buffer as it stands, and
+/// the buffer with a name inserted at the cursor when that does not parse.
 ///
-/// The repair is tried *second*, and the order is the whole of what this
-/// function is for. Where the text already parses, analysing it as written is
-/// exact and inserting anything into it can only make it worse -- `helper.map`
-/// with the cursor after the dot is a program, and the chain in front of the
-/// cursor is the same chain either way. Where it does not parse there is
-/// nothing to lose by trying.
+/// Both are needed, because the two fail in different places. The repair is
+/// what rescues `console.`, which does not parse at all. But a bare name is a
+/// statement and not a *declaration*, so on a blank line between two top-level
+/// `let`s the repair is what breaks a file that was fine, and there the buffer
+/// as written is the one that answers.
 ///
-/// Neither attempt is guaranteed, and the two fail in different places, which
-/// is the other half of the reason for trying both. A bare name is a statement
-/// but it is not a *declaration*, so a cursor on a blank line between two
-/// top-level `let`s is a position where the repair is what breaks the file and
-/// the buffer as written is what answers it.
-let analysed! path roots docs src offset = {
-    let plain = analysis.analyse! path roots docs;
-    match analysis.module_of plain {
-        () => analysis.analyse! path roots (core.map_put docs path (repaired src offset)),
-        _ => plain,
+/// The buffer as written is tried **first**, and the order was measured rather
+/// than reasoned about. Where the buffer parses it is three times the cheaper:
+/// the editor sent that exact text a moment ago and the diagnostics run parsed
+/// it, so the buffer is a cache hit and only the declaration is paid -- 92 ms
+/// against 275 on `dreams/lower.dr`. Where it does not parse the two orders are
+/// within 6% of each other, because either way something has to be parsed that
+/// nothing has parsed before. So one order is much better half the time and
+/// level the rest, which settles it, and it is the order that analyses what the
+/// user actually wrote whenever that is possible.
+///
+/// Answers `[analysis, parses]`. A second attempt is given the first's parse
+/// results merged over the ones it was handed, and the answer carries the same
+/// merge: an attempt whose buffer did not parse reached no imports, so its own
+/// map holds only the buffer and would wipe the rest if it were passed on as
+/// it stands. `with_parses` in the server says what that costs.
+let analysed! path roots docs parsed src offset = {
+    let first = analysis.declared! path roots docs parsed;
+    let after_first = map.merge parsed (analysis.parses first);
+    match analysis.module_of first {
+        () => {
+            let patched = analysis.declared! path roots
+                              (core.map_put docs path (repaired src offset)) after_first;
+            [patched, map.merge after_first (analysis.parses patched)]
+        },
+        _ => [first, after_first],
     }
 };
 
-/// Everything that could be written at this position, as an LSP
-/// `CompletionItem[]`.
+/// Everything that could be written at this position, and the parse results to
+/// carry forward: `[items, parses]`.
 ///
 /// This takes the documents rather than a finished analysis because the program
-/// it analyses may not be the one on screen -- see `analysed!`. The chain in
-/// front of the cursor is always read out of the real text, which both
-/// candidates agree with up to that point.
-let completions! path roots docs line character = {
+/// it analyses is not the one on screen -- see `analysed!`. The chain in front
+/// of the cursor is always read out of the real text, which every candidate
+/// agrees with up to that point.
+let completions! path roots docs parsed line character = {
     let src = core.map_get docs path "";
     let offset = pos.offset_of src line character;
-    if in_comment src offset { [] }
+    if in_comment src offset { [[], parsed] }
     else {
-        let a = analysed! path roots docs src offset;
-        match context src offset {
-            [:member, segs] => member_items a segs,
-            _ => name_items a offset,
-        }
+        let got = analysed! path roots docs parsed src offset;
+        let a = list.head got;
+        [match context src offset {
+             [:member, segs] => member_items a segs,
+             _ => name_items a offset,
+         },
+         list.nth 1 got]
     }
 };
 
