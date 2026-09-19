@@ -27,6 +27,7 @@ examples/run.sh --bless     # re-record output after a deliberate change
 | [`11_standard_macros.dr`](11_standard_macros.dr) | `std.macros`: branches, bindings, pipelines, updates and effects |
 | [`12_behaviors.dr`](12_behaviors.dr) | behavior contracts, record implementations, defaults and generic callers |
 | [`13_codecs.dr`](13_codecs.dr) | `std.codec`: one walk over a value, two formats, framing, and records on a wire |
+| [`14_servers.dr`](14_servers.dr) | `std.server`: a process that holds state, its handlers driven without one, and supervision |
 
 ## The packages
 

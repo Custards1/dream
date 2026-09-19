@@ -1,0 +1,67 @@
+// A server behavior: state in a process, and the same handlers without one.
+//
+// `std.server` declares what a server must answer -- `init!`, `handle_call!`,
+// `handle_cast!` -- and writes everything else once: the mailbox loop, the
+// request/reply protocol, stopping, and being a supervisor's child. A server
+// fills in the answers and inherits the rest.
+import std.agent;
+import std.console;
+import std.list;
+import std.map;
+import std.supervisor;
+
+mod store {
+    derive std.server;
+    import std.map;
+
+    let server_name u = "store";
+
+    let init! seed = seed;
+
+    let handle_call! request from state = match request {
+        [:get, k]    => reply (map.get :missing state k) state,
+        [:put, k, v] => reply :ok (map.put state k v),
+        :keys        => reply (map.sorted_keys state) state,
+        _            => reply [:error, :unknown] state,
+    };
+
+    // The same write, with nobody waiting for it to finish.
+    let handle_cast! message state = match message {
+        [:put, k, v] => noreply (map.put state k v),
+        _            => noreply state,
+    };
+}
+
+let main! = {
+    let s = store.start! %{};
+
+    // A call waits for its answer; a cast does not. Both arrive in the order
+    // this process sent them, which is why the `:keys` below sees "b".
+    store.call! s [:put, "a", 1]
+    store.cast! s [:put, "b", 2]
+    console.print! (to_string (store.call! s [:get, "a"]));
+    console.print! (to_string (store.call! s :keys));
+    console.print! (to_string (store.call! s [:get, "nope"]));
+    console.print! (to_string (store.call! s :nonsense));
+
+    // `stop!` asks, waits, and answers the final state.
+    console.print! (to_string (map.sorted_keys (store.stop! s)));
+
+    // The seam: the same handlers, no process and no mailbox anywhere. This is
+    // what a socket loop drives -- read a request, answer it, write the reply.
+    let step = store.answer! [:put, "x", 9] %{};
+    console.print! (to_string (list.nth 0 step) + " " + to_string (map.sorted_keys (list.nth 1 step)));
+
+    // A server is a supervisor's child without any further work, because the
+    // inherited loop honours the shutdown the supervisor sends.
+    let sup = supervisor.start! :one_for_one [store.child! "store" %{}, agent.child! "count" 0];
+    // Sorted, because a supervisor answers in whatever order its map walks.
+    console.print! (to_string (list.sort (supervisor.which! sup)));
+    supervisor.stop! sup
+
+    // An agent is the smallest server there is: one value, held.
+    let a = agent.start! 0;
+    agent.update! a (fn n -> n + 1)
+    agent.update! a (fn n -> n * 10)
+    console.print! (to_string (agent.stop! a))
+};

@@ -5,6 +5,7 @@
 // Importing them is also a check in itself: a module that no longer compiles
 // fails the build rather than being quietly skipped.
 
+import std.agent;
 import std.array;
 import std.cli;
 import std.codec;
@@ -18,6 +19,7 @@ import std.proc;
 import std.record;
 import std.result;
 import std.seq;
+import std.server;
 import std.str;
 import std.streams;
 import std.supervisor;
@@ -28,8 +30,9 @@ import std.wire;
 let version = "0.1.0";
 
 /// The modules this build provides.
-let modules = ["std.array", "std.cli", "std.codec", "std.core", "std.error", "std.json", "std.list",
-               "std.map", "std.macros", "std.proc", "std.record", "std.result", "std.seq", "std.str", "std.streams",
+let modules = ["std.agent", "std.array", "std.cli", "std.codec", "std.core", "std.error", "std.json", "std.list",
+               "std.map", "std.macros", "std.proc", "std.record", "std.result", "std.seq", "std.server",
+               "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml", "std.wire"];
 
 // --- the tests std.record cannot hold ----------------------------------------
