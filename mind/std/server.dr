@@ -1,0 +1,328 @@
+// A server: the shape of a process that holds state and answers questions.
+//
+// Erlang calls this a `gen_server` and the name is apt -- what is generic is
+// everything except the answers. Reading a mailbox, telling a request from a
+// notification, sending a reply to the process that asked, keeping the state
+// from one message to the next, stopping when a supervisor says to: that is the
+// same program every time, and writing it again per server is how a program
+// acquires five subtly different versions of it.
+//
+// So it is written once, here, and a server fills in the holes:
+//
+//     mod counter {
+//         derive std.server;
+//         let init! start = start;
+//         let handle_call! request from state = match request {
+//             :value    => reply state state,
+//             [:add, n] => reply (state + n) (state + n),
+//             _         => reply [:error, :unknown] state,
+//         };
+//     }
+//
+//     let p = counter.start! 0;
+//     counter.call! p [:add, 5]      // 5
+//     counter.stop! p                // 5
+//
+// `counter.start!`, `counter.call!`, `counter.cast!`, `counter.stop!` and
+// `counter.child` are all inherited, and because `derive` specializes this
+// module's syntax tree against `counter`'s handlers, `counter.call!` is
+// ordinary code with those handlers inlined -- there is no dispatch table and
+// nothing to register.
+//
+// **What is a hole and what is not.** The callbacks are the holes. The
+// *transport* is not, and that is the distinction worth keeping in view: a
+// mailbox is one way to drive these handlers and it is not the only one.
+// `answer!` runs one request against a state with no process and no mailbox
+// anywhere, which is what a socket loop needs -- read a frame, answer it,
+// write a frame. The behavior is the contract; a process is an implementation
+// of it.
+//
+// Four things about this runtime decide the rest, and each one is visible
+// below rather than hidden:
+//
+// **There is no selective receive.** `recv!` hands over the next message
+// whatever it is, so a caller waiting for a reply is handed everything else
+// that was sent to it first. `call!` therefore keeps what it did not want and
+// puts it back -- see `await_reply!`, which says exactly what that costs.
+//
+// **There is no kill and no monitor.** A server is stopped by *asking*
+// (`proc.shutdown`), so the loop below always honours that message, whatever
+// the handlers say -- a server that could decline it could not be supervised.
+// And `std.supervisor` learns a child died by joining it in a separate
+// process, which is why nothing here has to.
+//
+// **A thunk runs once.** `start!` builds its thunk inside itself, so calling it
+// twice starts two servers; `child` hands the supervisor a function of unit for
+// the same reason, because a restart has to run the work again.
+//
+// **A server is a fold over its mailbox**, and a fold with a lazy accumulator
+// that never ends is the trap `list.fold_strict` exists to avoid. So the loop
+// forces the state at every step. That is cheap rather than careless: `strict!`
+// is linear in *data* and not in paths, because a forced object says so
+// (`AUX_DEEP_FORCED`), so re-forcing a state that only grew at one edge costs
+// the edge.
+import std.core;
+import std.debug;
+import std.list;
+import std.proc;
+import std.supervisor;
+
+// --- the holes a server fills ---------------------------------------------------
+//
+// Every one but `init!` has a default, so the smallest server is an `init!` and
+// one handler. The `!` is part of each name because a handler is where a server
+// does its work, and work here is effects; a handler that performs none is
+// still spelled with it, because the contract is the name.
+
+/// The state to begin with, from whatever `start!` was given.
+virtual let init! args;
+
+/// A request that wants an answer. `from` is who asked.
+///
+/// Answer with `reply value state`, `noreply state` -- when the reply will be
+/// sent later, by handing `from` to `reply_to!` -- or `stop_with_reply reason
+/// value state`.
+///
+/// The default answers every request the same way, which is what a server that
+/// only takes casts should do: refuse clearly rather than hang.
+virtual let handle_call! request from state = reply [:error, :unhandled] state;
+
+/// A message that wants no answer. `noreply state` or `stop reason state`.
+virtual let handle_cast! message state = noreply state;
+
+/// Anything else that arrived: a raw `send!`, a reply to something this server
+/// asked for, a notification from a supervisor. The default ignores it, which
+/// is the only safe default -- a server that stopped on an unrecognised message
+/// could be stopped by anyone who sent it one.
+virtual let handle_info! message state = noreply state;
+
+/// Run as the server stops, for whatever has to be let go of. Its answer is
+/// ignored; the process's value is the final state.
+virtual let terminate! reason state = ();
+
+/// What this server is called, where a person will read it.
+virtual let server_name u = "server";
+
+// --- what a handler answers -------------------------------------------------------
+//
+// Named rather than written out, so that a handler says what it means and the
+// shapes below stay this module's business.
+
+let reply value state = [:reply, value, state];
+
+let noreply state = [:noreply, state];
+
+/// Stop, with no reply outstanding. From `handle_cast!` or `handle_info!`.
+let stop reason state = [:stop, reason, state];
+
+/// Stop, answering the call that asked for it first.
+let stop_with_reply reason value state = [:stop, reason, value, state];
+
+// --- the protocol ------------------------------------------------------------------
+//
+// Three shapes on the wire between a caller and a server. They are tagged with
+// names nothing else uses, because `recv!` hands over every message a process
+// was sent and a server has to tell its own protocol from a program's.
+//
+// A call carries the caller's pid twice over: once as where to send the reply,
+// and once *inside* the reply, as the token that says this reply is the one
+// that was waited for. One pid is enough of a token because a caller blocks
+// until its reply comes back, so it never has two calls outstanding -- and
+// there are no timeouts here, so it can never abandon one and be handed a stale
+// answer later. Adding a timeout would break that argument and would need a
+// real reference.
+
+priv let call_of from request = [:server_call, from, request];
+priv let cast_of message     = [:server_cast, message];
+priv let reply_of to value   = [:server_reply, to, value];
+
+/// The tag of a message, or `()` for a message that has none.
+///
+/// A message is any value at all -- an atom, a number, a string -- so this
+/// cannot simply read element zero: `core.head` of an atom raises, and a server
+/// brought down by a stray `send!` is a server that cannot be trusted with a
+/// mailbox.
+priv let tag_of m =
+    if type_of m == :list && not (core.is_empty m) { core.head m } else { () };
+
+// --- driving the handlers from a mailbox -------------------------------------------
+
+/// Send the answer to a call that was left open by `noreply`.
+///
+/// `from` is what `handle_call!` was given. Holding on to one and replying
+/// later is how a server answers something it must wait for without making
+/// every other client wait too.
+let reply_to! from value = send! from (reply_of from value);
+
+/// What one message does to the server: `[:continue, state]` or `[:done, value]`.
+priv let step! state m =
+    if m == proc.shutdown {
+        terminate! :shutdown state
+        [:done, state]
+    }
+    else {
+        match tag_of m {
+            :server_call => after_call! (list.nth 1 m)
+                                        (handle_call! (list.nth 2 m) (list.nth 1 m) state),
+            :server_cast => after! (handle_cast! (list.nth 1 m) state),
+            _            => after! (handle_info! m state),
+        }
+    };
+
+priv let after_call! from answer = match answer {
+    [:reply, value, next] => {
+        reply_to! from value
+        [:continue, next]
+    },
+    [:noreply, next] => [:continue, next],
+    [:stop, reason, value, next] => {
+        reply_to! from value
+        terminate! reason next
+        [:done, next]
+    },
+    // A handler that answers something else has a bug, and stopping with it
+    // says so where looping on it for ever would not. `proc.serve!` takes the
+    // same view, and for the same reason.
+    other => [:done, other],
+};
+
+priv let after! answer = match answer {
+    [:noreply, next] => [:continue, next],
+    [:stop, reason, next] => {
+        terminate! reason next
+        [:done, next]
+    },
+    other => [:done, other],
+};
+
+/// Read the mailbox until something stops the server, and answer the state it
+/// stopped with.
+///
+/// The `strict!` is not tidiness -- see the head of this file. Without it a
+/// server whose handler answers `state + 1` holds a chain of suspended
+/// additions as long as its uptime, and forcing that chain is what runs a
+/// program out of depth.
+let rec loop! state = {
+    let m = recv! ();
+    match step! state m {
+        [:continue, next] => loop! (strict! next),
+        [:done, value] => value,
+    }
+};
+
+/// The whole of a server, in the process that calls it: initialize, then loop.
+/// This is what `start!` spawns and what a supervisor starts.
+let run! args = loop! (strict! (init! args));
+
+/// Start one, and answer its process.
+let start! args = spawn! $( run! args );
+
+/// This server as a `std.supervisor` child, ready to be restarted.
+///
+/// A function of unit rather than a thunk, because a thunk remembers its answer
+/// and a restart has to run it again -- which is the supervisor's rule and is
+/// why it asks for one.
+///
+/// **Why this is spelled with a `!` when it performs no effect.** There is no
+/// impure lambda: `fn u -> run! args` is a pure function naming an impure one,
+/// which the purity checker refuses, and `fn u -> $( run! args )` would answer
+/// a thunk where the supervisor is going to `spawn!` one already -- the server
+/// would never run. So the closure over `args` has to be a partial application
+/// of a named impure function, and merely *naming* one is what a pure function
+/// may not do. `std.supervisor` takes the other side of this same trade and
+/// says so where `child_with` is declared: it spells its parameter without the
+/// `!` so that describing a child stays pure for everyone who already holds a
+/// starter. Nothing here performs an effect until the supervisor starts it.
+priv let started! args u = run! args;
+
+let child! name args = supervisor.child name (started! args);
+
+/// The same, with when it should be restarted: `:permanent`, `:transient` or
+/// `:temporary`.
+let child_with! name args restart = supervisor.child_with name (started! args) restart;
+
+// --- talking to one ------------------------------------------------------------------
+
+/// Ask, and wait for the answer.
+let call! pid request = {
+    let me = self! ();
+    send! pid (call_of me request)
+    await_reply! me []
+};
+
+/// Wait for the reply to this call, keeping anything else that turns up.
+///
+/// With no selective receive there is no way to look past a message without
+/// taking it, and no way to put one back where it was. So the ones that are not
+/// the reply are held and re-sent afterwards. What that preserves is their
+/// order relative to *each other*; what it cannot preserve is their order
+/// relative to whatever arrived while this was waiting, which ends up in front
+/// of them. That is the honest cost of a synchronous call here, and it is still
+/// better than the alternative of treating the next message as the answer --
+/// which loses them outright, and answers the caller with the wrong value.
+///
+/// It is also what makes a server calling another server safe: the messages
+/// meant for the caller's own loop are waiting for it when the call returns.
+/// Two servers calling *each other* still deadlock, as they do in Erlang --
+/// each is waiting on a reply the other will not send until its own arrives.
+priv let rec await_reply! me kept = {
+    let m = recv! ();
+    if tag_of m == :server_reply && list.nth 1 m == me {
+        requeue! (list.reverse kept)
+        list.nth 2 m
+    }
+    else { await_reply! me (core.cons m kept) }
+};
+
+priv let requeue! ms = {
+    let me = self! ();
+    strict! (list.map (fn m -> send! me m) ms)
+    ()
+};
+
+/// Tell, and carry on. Nothing comes back, including a failure: a cast to a
+/// server that is not there is a message into a void, which is what makes it
+/// the right shape for a notification and the wrong one for a question.
+let cast! pid message = send! pid (cast_of message);
+
+/// Ask it to stop, and wait until it has. The answer is its final state.
+///
+/// This is `proc.shutdown`, the same message `std.supervisor` sends, so a
+/// server stops the same way whoever is asking.
+let stop! pid = {
+    send! pid proc.shutdown
+    join! pid
+};
+
+/// A call, and how long it took in nanoseconds: `[value, ns]`.
+///
+/// The reply is forced before the clock is read a second time, which is the
+/// whole difficulty with timing anything in a lazy language -- an unforced
+/// reply is a measurement of how long it took to be handed a thunk. See
+/// `std.debug`, which is where time lives and why.
+let timed_call! pid request = {
+    let before = debug.now! ();
+    let value = strict! (call! pid request);
+    [value, debug.elapsed (debug.since before (debug.now! ()))]
+};
+
+// --- driving the handlers without a process ---------------------------------------
+
+/// One request, answered against a state: `[value, state]`.
+///
+/// No mailbox, no process, no `spawn!` -- the handlers alone. This is the seam
+/// the rest of the plan hangs on: a mailbox is one driver and a socket is
+/// another, and a socket loop that decodes a frame, calls this, and encodes the
+/// answer is running the same server the same way. It is also how a server's
+/// handlers are tested, which is worth as much: a test that does not spawn
+/// anything cannot hang, and a test that hangs tells you nothing.
+///
+/// `from` is `:nobody`, because there is nobody to reply to later. A handler
+/// that answers `noreply` is therefore answered `()`; one that means to be
+/// driven this way should reply directly.
+let answer! request state = match handle_call! request :nobody state {
+    [:reply, value, next] => [value, next],
+    [:noreply, next] => [(), next],
+    [:stop, _, value, next] => [value, next],
+    other => [other, state],
+};

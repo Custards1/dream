@@ -62,6 +62,24 @@ const cases = [
   ['let rec go n = n;', 'go', 'entity.name.function.dream'],
   ['mapping Point { x, y }', 'mapping', 'keyword.declaration.dream'],
   ['mapping Point { x, y }', 'Point', 'entity.name.function.dream'],
+  ['group Pool { values, count }', 'group', 'keyword.declaration.dream'],
+  ['group Pool { values, count }', 'Pool', 'entity.name.function.dream'],
+  ['struct Token { kind, value }', 'struct', 'keyword.declaration.dream'],
+  ['struct Token { kind, value }', 'Token', 'entity.name.function.dream'],
+  // A behavior: the base declares the hole and the deriving module fills it.
+  // `derive` reads as a declaration keyword in both of the places it is
+  // written -- as a statement of its own, and as a record's base clause, where
+  // it sits between the name and the body and must not swallow either.
+  ['virtual let name self;', 'virtual', 'keyword.declaration.dream'],
+  ['virtual let name self;', 'name', 'entity.name.function.dream'],
+  ['derive std.seq;', 'derive', 'keyword.declaration.dream'],
+  ['group Span derive dreams.source_range { a, b }', 'derive', 'keyword.declaration.dream'],
+  ['group Span derive dreams.source_range { a, b }', 'Span', 'entity.name.function.dream'],
+  // A macro is declared like a function and called with `expand`, and both
+  // words are the compiler's rather than the program's.
+  ['macro twice e = e;', 'macro', 'keyword.declaration.dream'],
+  ['macro twice e = e;', 'twice', 'entity.name.function.dream'],
+  ['let double c = expand twice c;', 'expand', 'keyword.declaration.dream'],
 ];
 
 registry.loadGrammar('source.dream').then((grammar) => {

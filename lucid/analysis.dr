@@ -612,6 +612,52 @@ let params_of a mi name =
         [_, d] => list.nth 2 d,
     };
 
+/// Is this global one its module keeps to itself?
+///
+/// `priv` does not survive as a declaration: the loader unwraps it, files the
+/// inner `let` with every other one and remembers only the span
+/// (`modules.loaded`), so by the time anything resolves there is no item left
+/// to read. The environment is where the answer ends up, and asking it is the
+/// only way to tell `priv let f x = ..` from `let f x = ..`.
+let is_private_global a mi name =
+    scope.is_private (list.nth mi (scope.r_envs (resolved a))) name;
+
+/// Is the name still open where it was resolved -- declared `virtual` and not
+/// answered by an ordinary `let`?
+///
+/// A behavior's requirement and its implementation are two different items
+/// with the same name, and `signature_decl` already prefers the module's own
+/// over an inherited one, so this reads "virtual" exactly where the name has
+/// no implementation: in the base, and in a module that derived it without
+/// answering.
+let is_virtual_global a mi name =
+    match signature_decl a mi name { [_, [:virtual, _, _, _, _]] => true, _ => false };
+
+/// What the line declaring a global says about it, beyond its name: `priv`,
+/// `virtual`, or nothing at all. Empty rather than a word like "global",
+/// because this is what an outline shows beside an entry and most entries have
+/// nothing to add.
+let declaration_words a mi name =
+    str.trim ((if is_private_global a mi name { "priv " } else { "" })
+              + if is_virtual_global a mi name { "virtual" } else { "" });
+
+/// The same two facts, as hover says them in a sentence.
+let global_phrase a mi name =
+    (if is_private_global a mi name { "a private " } else { "a " })
+    + if is_virtual_global a mi name { "virtual" } else { "global" };
+
+/// Where a body was written, when that is not the module the name resolved
+/// against. `derive` is the only thing that pulls those apart, and which file
+/// an inherited method came from is exactly what the reader cannot see.
+let inherited_note a mi name =
+    match signature_decl a mi name {
+        [owner, _] =>
+            if owner == mi { "" }
+            else { ", inherited from `"
+                   + modules.module_name (modules.module_at (loader a) owner) + "`" },
+        _ => "",
+    };
+
 // --- records ----------------------------------------------------------------------
 //
 // `group Point { x, y }` is a module of generated functions by the time
@@ -760,14 +806,28 @@ let shown_signature a mi name =
 
 // --- go to definition -------------------------------------------------------------
 
-/// An LSP `Location` for a span in a module.
-let location a mi span = {
-    let l = loader a;
-    let m = modules.module_at l mi;
-    let src = diag.source_text (list.nth (modules.module_source m) (modules.files l));
-    %{ "uri" => path_to_uri (modules.module_path m),
-       "range" => pos.range src (ast.span_start span) (ast.span_end span) }
+/// An LSP `Location` for a span in a *file*, named by the index the loader
+/// gave it.
+///
+/// The unit is the file and not the module, which repairs two things rather
+/// than tidying one. A module written as `mod B { .. }` is recorded with its
+/// dotted name where a path goes, so `modules.module_path` made a URI out of
+/// `buf.B`. And a body inherited through `derive` is at an offset into the
+/// file the *base* was written in, while the module owning it is the one that
+/// derived it -- so the offset was resolved against the wrong text and landed
+/// wherever it happened to fall, which in a file long enough is a position
+/// that still exists and is silently wrong. `scope.definition` has carried
+/// the source each body came from all along; nothing was reading it.
+let location_in a source span = {
+    let f = list.nth source (modules.files (loader a));
+    %{ "uri" => path_to_uri (diag.source_path f),
+       "range" => pos.range (diag.source_text f) (ast.span_start span) (ast.span_end span) }
 };
+
+/// The same, for a span known only by which module it belongs to -- which is
+/// every span the deriving above cannot have moved.
+let location a mi span =
+    location_in a (modules.module_source (modules.module_at (loader a) mi)) span;
 
 /// Where the thing under the cursor was written, or `()`.
 ///
@@ -781,7 +841,7 @@ let rec located a found =
         [:global, mi, name, _] =>
             match scope.definition (resolved a) mi name {
                 () => (),
-                d => location a mi (list.nth 2 d),
+                d => location_in a (list.nth 1 d) (list.nth 2 d),
             },
         // A record's members are generated, so the declaration the resolver
         // found is at an offset into no file. The place to go is where the
@@ -792,7 +852,7 @@ let rec located a found =
             match record_of a target {
                 () => match scope.definition (resolved a) target field {
                           () => (),
-                          d => location a target (list.nth 2 d),
+                          d => location_in a (list.nth 1 d) (list.nth 2 d),
                       },
                 r => match modules.find (loader a) (record_owner r) {
                          () => (),
@@ -845,13 +905,15 @@ let describe a offset name found =
             describe_local a offset name
             + " (captured from an enclosing function, capture " + to_string idx + ")",
         [:global, mi, name, _] =>
-            "`" + shown_signature a mi name + "` -- a global of module `"
-            + modules.module_name (modules.module_at (loader a) mi) + "`",
+            "`" + shown_signature a mi name + "` -- " + global_phrase a mi name
+            + " of module `" + modules.module_name (modules.module_at (loader a) mi) + "`"
+            + inherited_note a mi name,
         [:builtin, name] => "`" + builtins.signature name + "` -- a builtin",
         [:member, [:dream, target], field, _] =>
             match record_of a target {
                 () => "`" + shown_signature a target field + "` of module `"
-                      + modules.module_name (modules.module_at (loader a) target) + "`",
+                      + modules.module_name (modules.module_at (loader a) target) + "`"
+                      + inherited_note a target field,
                 r => "`" + shown_signature a target field + "` -- " + record_role r field,
             },
         [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
@@ -903,6 +965,10 @@ let symbol_field = 8;
 /// outline without a word of explanation.
 let symbol_method = 6;
 
+/// LSP shows `detail` beside the name, and an empty one is an empty column
+/// rather than nothing, so it is added only when there is something to say.
+let detailed words sym = if words == "" { sym } else { sym.["detail" => words] };
+
 /// A record's fields and members, as outline children in the order they were
 /// written. `at` is the caller's span-to-range, which needs the file's text.
 let child_symbols at r =
@@ -932,12 +998,24 @@ let symbols a =
         mi => {
             let src = module_text a mi;
             let at span = pos.range src (ast.span_start span) (ast.span_end span);
+            // Three sources, not two, once a module can derive: a body
+            // inherited through `derive` is a global of *this* module and is
+            // written in another file, so its span is an offset into the
+            // base's text and against this one it is a range over whatever
+            // happens to lie there. An outline says what the file in front of
+            // the reader declares, so an inherited name belongs to the base's
+            // outline and is dropped from this one -- `defs` carries the
+            // source each body came from, which is what makes the two
+            // separable at all.
+            let own = modules.module_source (modules.module_at (loader a) mi);
             let globals = list.map (fn d -> {
                 let span = list.nth 3 d;
+                let name = list.nth 2 d;
                 [ast.span_start span,
-                 %{ "name" => list.nth 2 d, "kind" => symbol_variable,
-                    "range" => at span, "selectionRange" => at span }]
-            }) (scope.module_defs (resolved a) mi);
+                 detailed (declaration_words a mi name)
+                     %{ "name" => name, "kind" => symbol_variable,
+                        "range" => at span, "selectionRange" => at span }]
+            }) (list.filter (fn d -> list.nth 1 d == own) (scope.module_defs (resolved a) mi));
             let mine = modules.module_name (modules.module_at (loader a) mi);
             let records = list.map (fn r -> {
                 let span = record_span r;
@@ -1017,6 +1095,11 @@ when test {
                  },
         };
     let symbol_names! text = list.map (fn s -> core.map_get s "name" "") (symbols (of! text));
+    /// The same, each name with whatever `detail` it was given -- `""` for an
+    /// entry that has none, since the key is left off rather than set empty.
+    let symbol_details! text =
+        list.map (fn s -> [core.map_get s "name" "", core.map_get s "detail" ""])
+                 (symbols (of! text));
     let child_names! text name =
         list.concat (list.map (fn s -> list.map (fn c -> core.map_get c "name" "")
                                                 (core.map_get s "children" []))
@@ -1156,6 +1239,33 @@ when test {
                                   [[".", :list, "a", [], [0, 0]],
                                    [".", :array, "a", [], [0, 0]],
                                    [".", :map, "a", [], [0, 0]]]) ),
+
+        // --- `priv` and `virtual` ---------------------------------------------
+        //
+        // Neither survives as a declaration anything downstream can read. The
+        // loader unwraps a `priv` and keeps only the span, so the environment
+        // is the last thing that remembers; a `virtual` becomes an ordinary
+        // `let` in whichever module answers it, so the item written in the
+        // file is the only thing that still says it was a requirement. Both
+        // are facts a reader can see and the resolver's answer cannot say, so
+        // hover and the outline are where they have to be put back.
+        test.case "hover says a global is private"
+            $( test.eq! "`hidden x` -- a private global of module `buf`"
+                        (hover_value! "priv let hidden x = x;\nlet main! = hidden 1;\n" 1 12) ),
+        test.case "hover says a global is not"
+            $( test.eq! "`shown x` -- a global of module `buf`"
+                        (hover_value! "let shown x = x;\nlet main! = shown 1;\n" 1 12) ),
+        test.case "hover says a name is still a virtual"
+            $( test.eq! "`name self` -- a virtual of module `buf`"
+                        (hover_value! "virtual let name self;\nlet label self = name self;\n"
+                                      1 18) ),
+        test.case "the outline marks a private declaration and leaves the rest alone"
+            $( test.eq! [["hidden", "priv"], ["shown", ""], ["main!", ""]]
+                        (symbol_details!
+                             "priv let hidden x = x;\nlet shown y = hidden y;\nlet main! = shown 1;\n") ),
+        test.case "the outline marks a virtual"
+            $( test.eq! [["name", "virtual"], ["label", ""]]
+                        (symbol_details! "virtual let name self;\nlet label self = name self;\n") ),
 
         test.case "a match arm's pattern binds in its body"
             $( test.eq! ["head", "rest", "xs"]

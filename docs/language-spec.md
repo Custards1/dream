@@ -1334,6 +1334,7 @@ and `repeat` on top of it.
 | strings | `str_len` `str_chars` `str_of_chars` `str_of_bytes` `str_concat` `str_slice` `str_find` `str_byte` |
 | chars | `char_code` `char_of_code` |
 | numbers | `to_float` `to_int` `parse_int` `parse_float` `float_bytes` `float_of_bytes` |
+| atoms | `to_existing_atom` |
 | arrays | `array_new` `array_get` `array_set` `array_of_list` `array_to_list` |
 | maps | `map_new` `map_get` `map_has` `map_put` `map_remove` `map_pairs` |
 | ordering | `compare` |

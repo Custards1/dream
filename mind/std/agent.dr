@@ -1,0 +1,257 @@
+// An agent: a process whose whole job is to hold one value.
+//
+// The smallest useful thing a server can be, and the one people reach for most
+// -- shared state that several processes read and change, without any of them
+// owning it. Elixir calls it an `Agent` and it is a `gen_server` underneath;
+// here it is a `std.server` underneath, and the derivation is the entire
+// implementation: three handlers, and every client function below is one line
+// over the inherited `call!` and `cast!`.
+//
+//     let counter = agent.start! 0;
+//     agent.update! counter (fn n -> n + 1)
+//     agent.get! counter (fn n -> n)         // 1
+//     agent.stop! counter                    // 1
+//
+// **The function runs in the agent, not in the caller.** That is the point of
+// an agent rather than a lock: the read-modify-write happens in one process, so
+// two callers incrementing at once cannot both read the same value first. It is
+// also why every handler here forces its answer -- a lazy reply would be a
+// thunk sent to the caller and evaluated *there*, which is exactly the race the
+// agent exists to prevent, arrived at by accident.
+//
+// **An agent is not a lock, either.** A function handed to `update!` runs while
+// the agent handles nothing else, so an expensive one holds every other client
+// up, and one that never returns stops the agent for good. Keep them small; a
+// long computation belongs in the caller, with only its result sent here.
+derive std.server;
+
+import std.list;
+
+let server_name u = "agent";
+
+// --- the holes std.server declares ---------------------------------------------
+
+/// The value to hold. Forced, because everything else here forces: an agent
+/// started with a suspended computation would run it in whichever client
+/// happened to look first.
+let init! value = strict! value;
+
+let handle_call! request from state = match request {
+    :value        => reply state state,
+    [:get, f]     => reply (strict! (f state)) state,
+    [:update, f]  => reply :ok (strict! (f state)),
+    // One trip for a read that depends on a write. `f` answers `[value, next]`,
+    // and doing it as a `get!` and then an `update!` would let another client
+    // in between -- which is the whole difference between this and those two.
+    [:get_and_update, f] => {
+        let pair = strict! (f state);
+        reply (list.nth 0 pair) (list.nth 1 pair)
+    },
+    _ => reply [:error, :unknown_request] state,
+};
+
+let handle_cast! message state = match message {
+    [:update, f] => noreply (strict! (f state)),
+    _            => noreply state,
+};
+
+// --- talking to one --------------------------------------------------------------
+//
+// Each of these is the inherited `call!` or `cast!` with a request built for
+// it. They exist so that a caller writes what it means rather than the shape
+// the mailbox carries.
+
+/// The value itself.
+let value! pid = call! pid :value;
+
+/// `f` of the value, computed in the agent and answered here.
+let get! pid f = call! pid [:get, f];
+
+/// Replace the value with `f` of it, and wait until that has happened.
+let update! pid f = call! pid [:update, f];
+
+/// The same, without waiting.
+///
+/// Faster and weaker, and the weakness is worth stating: this returns before
+/// the update has happened, so a `value!` immediately afterwards from the
+/// *same* process still sees the new one -- messages from one sender arrive in
+/// order -- and one from any other process may not.
+let send_update! pid f = cast! pid [:update, f];
+
+/// `f` answers `[value, next]`: the value to give back and the value to keep.
+let get_and_update! pid f = call! pid [:get_and_update, f];
+
+// --- tests ---------------------------------------------------------------------
+
+when test {
+    import std.test;
+    import std.supervisor;
+
+    // A second server, to check what `std.server` claims about one server
+    // calling another. It holds the pid of an agent and asks it for its value
+    // from inside a handler, which is the shape that would deadlock or lose a
+    // message if `await_reply!` were not careful.
+    mod relay {
+        derive std.server;
+
+        let init! peer = peer;
+
+        /// The `strict!` is the test. `reply (call! state :value) state` leaves
+        /// the call unforced in the list, so the relay would hand its *caller*
+        /// a suspended call and the caller would make it -- which is the
+        /// nesting this is meant to exercise, not performed where it looks.
+        let handle_call! request from state = {
+            let v = strict! (call! state :value);
+            reply v state
+        };
+    }
+
+    let tests = [
+        test.case "an agent holds what it was started with"
+            $( {
+                let a = start! 41;
+                let v = value! a;
+                stop! a
+                test.eq! 41 v
+            } ),
+        test.case "update! changes it"
+            $( {
+                let a = start! 0;
+                update! a (fn n -> n + 1)
+                update! a (fn n -> n + 1)
+                let v = value! a;
+                stop! a
+                test.eq! 2 v
+            } ),
+        test.case "get! computes in the agent"
+            $( {
+                let a = start! [1, 2, 3];
+                let n = get! a (fn xs -> list.length xs);
+                stop! a
+                test.eq! 3 n
+            } ),
+        test.case "get_and_update! answers the old and keeps the new"
+            $( {
+                let a = start! 10;
+                let old = get_and_update! a (fn n -> [n, n * 2]);
+                let now = value! a;
+                stop! a
+                test.eq! [10, 20] [old, now]
+            } ),
+        test.case "send_update! arrives, in order, from one sender"
+            $( {
+                let a = start! 0;
+                send_update! a (fn n -> n + 1)
+                send_update! a (fn n -> n * 10)
+                let v = value! a;
+                stop! a
+                test.eq! 10 v
+            } ),
+        test.case "stop! answers the final value"
+            $( {
+                let a = start! 0;
+                update! a (fn n -> n + 5)
+                test.eq! 5 (stop! a)
+            } ),
+        test.case "an unknown request is refused rather than ignored"
+            $( {
+                let a = start! 0;
+                let r = call! a :nonsense;
+                stop! a
+                test.eq! [:error, :unknown_request] r
+            } ),
+        test.case "a cast it does not understand leaves it alone"
+            $( {
+                let a = start! 7;
+                cast! a :nonsense
+                let v = value! a;
+                stop! a
+                test.eq! 7 v
+            } ),
+        test.case "a raw send! reaches handle_info!, which ignores it"
+            $( {
+                let a = start! 7;
+                send! a :hello
+                let v = value! a;
+                stop! a
+                test.eq! 7 v
+            } ),
+
+        // Two clients, to show the reply goes to whoever asked rather than to
+        // whoever happens to be reading next.
+        test.case "two callers each get their own answer"
+            $( {
+                let a = start! 100;
+                let helper = spawn! $( {
+                    let who = recv! ();
+                    send! who (get! a (fn n -> n + 1))
+                } );
+                send! helper (self! ())
+                let mine = value! a;
+                let theirs = recv! ();
+                stop! a
+                test.eq! [100, 101] [mine, theirs]
+            } ),
+
+        // The seam: the same handlers, with no process anywhere.
+        test.case "answer! runs a request with no mailbox"
+            $( test.eq! [:ok, 5] (answer! [:update, fn n -> n + 5] 0) ),
+        test.case "answer! reads too"
+            $( test.eq! [3, 3] (answer! :value 3) ),
+
+        test.case "timed_call! answers the value and a duration"
+            $( {
+                let a = start! 1;
+                let got = timed_call! a :value;
+                stop! a
+                test.eq! [1, true] [list.nth 0 got, list.nth 1 got >= 0]
+            } ),
+
+        // And the reason a server is worth deriving: it is a supervisor's child
+        // without any further work, because it honours `proc.shutdown`.
+        test.case "an agent is a supervisor child"
+            $( {
+                let sup = supervisor.start! :one_for_one [child! "held" 0];
+                let names = supervisor.which! sup;
+                supervisor.stop! sup
+                test.eq! ["held"] names
+            } ),
+
+        // What a call does with a message that is not its reply. The noise is
+        // put in this process's own mailbox first, so `await_reply!` is certain
+        // to meet it before the agent answers -- no timing involved.
+        test.case "a call keeps a message that is not its reply"
+            $( {
+                let a = start! 5;
+                send! (self! ()) :noise
+                let v = value! a;
+                let kept = recv! ();
+                stop! a
+                test.eq! [5, :noise] [v, kept]
+            } ),
+        test.case "and keeps several, in order"
+            $( {
+                let a = start! 5;
+                send! (self! ()) :first
+                send! (self! ()) :second
+                let v = value! a;
+                let one = recv! ();
+                let two = recv! ();
+                stop! a
+                test.eq! [5, :first, :second] [v, one, two]
+            } ),
+
+        // One server calling another, from inside a handler.
+        test.case "a server can call another server"
+            $( {
+                let a = start! 99;
+                let r = relay.start! a;
+                let got = relay.call! r :anything;
+                relay.stop! r
+                stop! a
+                test.eq! 99 got
+            } ),
+
+        test.case "server_name" $( test.eq! "agent" (server_name ()) ),
+    ];
+}

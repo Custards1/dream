@@ -22,6 +22,8 @@
 // `null` and "absent" are therefore the same value, which matches how the rest
 // of the library answers a missing thing.
 
+derive std.codec;
+
 import std.core;
 import std.list;
 import std.str;
@@ -241,77 +243,130 @@ let parse_or default text = {
 
 // --- writing ----------------------------------------------------------------
 //
-// The inverse of the table at the top of this file, with one asymmetry worth
-// knowing: `()` renders as `null`, so a round trip through JSON cannot tell a
-// missing member from one that was explicitly null. JSON cannot either.
+// The walk over a value -- what a list does, what a map does, how a nested one
+// nests -- is not JSON's and is not written here: it is `std.codec`'s, and this
+// module derives it. What is left below is the part that really is JSON, which
+// is the spelling of each kind and nothing else.
+//
+// Two asymmetries are worth knowing, and both are JSON's rather than this
+// library's. `()` renders as `null`, so a round trip cannot tell a missing
+// member from one that was explicitly null -- JSON cannot either. And JSON has
+// one number, one sequence and no atoms, so `:ok` comes back `"ok"` and an
+// array comes back a list. `std.wire` is the format for when that matters; the
+// tests at the foot of this file say exactly which values survive this one.
 
-let escape_char c =
-    if c == '"' { "\\\"" }
-    else if c == '\\' { "\\\\" }
-    else if c == '\n' { "\\n" }
-    else if c == '\t' { "\\t" }
-    else if c == '\r' { "\\r" }
-    else if core.char_code c == 8 { "\\b" }
-    else if core.char_code c == 12 { "\\f" }
-    else if core.char_code c < 32 {
+let escape_char c = match c {
+    '"'  => "\\\"",
+    '\\' => "\\\\",
+    '\n' => "\\n",
+    '\t' => "\\t",
+    '\r' => "\\r",
+    _ => match core.char_code c {
+        8  => "\\b",
+        12 => "\\f",
         // The only characters JSON insists on escaping, and the only ones that
         // need the `\u` form: everything else is legal as itself, including
         // any non-ASCII, which stays as UTF-8 rather than becoming escapes.
-        let code = core.char_code c;
-        let digits = "0123456789abcdef";
-        let hi = str.slice ((code / 16) % 16) 1 digits;
-        let lo = str.slice (code % 16) 1 digits;
-        "\\u00" + hi + lo
-    }
-    else { str.of_chars [c] };
+        code =>
+            if code >= 32 { str.of_chars [c] }
+            else {
+                let digits = "0123456789abcdef";
+                "\\u00" + str.slice ((code / 16) % 16) 1 digits + str.slice (code % 16) 1 digits
+            },
+    },
+};
 
 let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
 
-/// A number as JSON. Dream renders a whole float as `2` where JSON readers
-/// generally expect `2.0` back, but both parse to the same value, and forcing
-/// a `.0` on would misrepresent an integer.
-let rec write v = {
-    let t = type_of v;
-    if t == :unit { "null" }
-    else if t == :bool { if v { "true" } else { "false" } }
-    else if t == :integer { to_string v }
-    else if t == :float { to_string v }
-    else if t == :string { quote v }
-    else if t == :atom { quote (str.slice 1 (str.byte_length (to_string v)) (to_string v)) }
-    else if t == :list { "[" + str.join_str "," (list.map write v) + "]" }
-    else if t == :array { "[" + str.join_str "," (list.map write (core.array_to_list v)) + "]" }
-    else if t == :map {
-        let pair p = quote (to_string (list.head p)) + ":" + write (list.nth 1 p);
-        "{" + str.join_str "," (list.map pair (core.map_pairs v)) + "}"
-    }
-    else { quote (to_string v) }
+// --- the holes std.codec declares --------------------------------------------
+
+let write_unit u = "null";
+
+let write_bool b = if b { "true" } else { "false" };
+
+/// Dream renders a whole float as `2` where JSON readers generally expect `2.0`
+/// back, but both parse to the same value, and forcing a `.0` on would
+/// misrepresent an integer. So both numbers are simply `to_string`.
+let write_int n = to_string n;
+
+let write_float x = to_string x;
+
+let write_string s = quote s;
+
+/// JSON has no atoms, so an atom is its name -- without the colon `to_string`
+/// writes in front of one. It comes back a string, which is the loss this
+/// format takes and `std.wire` does not.
+let write_atom a = quote (atom_name a);
+
+priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a);
+
+/// The text of a key.
+///
+/// A JSON object's keys are strings and a Dream map's are any flat value, so
+/// something has to be chosen for each. The rule is the one the value side
+/// already uses -- an atom is its name, a string is itself, anything else is
+/// its digits -- because a key and a value that are the same atom had better
+/// not come out spelled two different ways. They used to: `:a` was `"a"` as a
+/// value and `":a"` as a key, which no reader on the far side could be expected
+/// to guess at.
+priv let key_text k = match type_of k {
+    :atom   => atom_name k,
+    :string => k,
+    _       => to_string k,
 };
 
+let write_list parts = "[" + str.join_str "," parts + "]";
+
+/// An object. `std.codec` hands the pairs over raw, so the key is stringified
+/// here -- JSON has no other kind of key, and a number or an atom used as one
+/// comes back as its text.
+let write_map pairs = {
+    let entry p = quote (key_text (list.nth 0 p)) + ":" + encode (list.nth 1 p);
+    "{" + str.join_str "," (list.map entry pairs) + "}"
+};
+
+let format_name u = "json";
+
+/// The other hole: reading is `parse`, which already answers the result shape
+/// `std.codec` asks for.
+let decode text = parse text;
+
+// --- the names this module had before it derived anything ---------------------
+
+/// A value as JSON. `encode` is the same function under the name every codec
+/// answers to; this is the one JSON callers already write.
+let write v = encode v;
+
 /// The same, spread over lines with two-space indentation.
-let rec write_indented depth v = {
-    let pad n = str.repeat n "  ";
-    let t = type_of v;
-    let inner = depth + 1;
-    if t == :list || t == :array {
-        let items = if t == :array { core.array_to_list v } else { v };
-        if list.is_empty items { "[]" }
-        else {
-            let one x = pad inner + write_indented inner x;
-            "[\n" + str.join_str ",\n" (list.map one items) + "\n" + pad depth + "]"
-        }
+///
+/// Indentation is not a spelling of a value -- it is a spelling of the *walk*,
+/// which is why this is written out here rather than filled into a hole. It
+/// orders a map's members the way `codec.map_entries` does, so that compact and
+/// indented output agree about what comes first.
+let rec write_indented depth v = match type_of v {
+    :list  => indented_items depth v,
+    :array => indented_items depth (core.array_to_list v),
+    :map   => indented_members depth v,
+    _      => write v,
+};
+
+priv let indent depth = str.repeat depth "  ";
+
+priv let indented_items depth items =
+    if list.is_empty items { "[]" }
+    else {
+        let one x = indent (depth + 1) + write_indented (depth + 1) x;
+        "[\n" + str.join_str ",\n" (list.map one items) + "\n" + indent depth + "]"
+    };
+
+priv let indented_members depth v = {
+    let entries = map_entries v;
+    if list.is_empty entries { "{}" }
+    else {
+        let one p = indent (depth + 1) + quote (key_text (list.nth 0 p)) + ": "
+                    + write_indented (depth + 1) (list.nth 1 p);
+        "{\n" + str.join_str ",\n" (list.map one entries) + "\n" + indent depth + "}"
     }
-    else if t == :map {
-        let pairs = core.map_pairs v;
-        if list.is_empty pairs { "{}" }
-        else {
-            let one p = {
-                let key = quote (to_string (list.head p));
-                pad inner + key + ": " + write_indented inner (list.nth 1 p)
-            };
-            "{\n" + str.join_str ",\n" (list.map one pairs) + "\n" + pad depth + "}"
-        }
-    }
-    else { write v }
 };
 
 let pretty v = write_indented 0 v;
@@ -392,5 +447,36 @@ when test {
             $( test.eq! 1 (core.map_get (parsed (write %{ "a" => 1 })) "a" 0) ),
         test.case "pretty round trips"
             $( test.eq! [1, 2] (parsed (pretty [1, 2])) ),
+
+        // what deriving std.codec added. A map's members now come out in a
+        // settled order rather than the trie's, so the same value is always the
+        // same text -- which is what makes an encoding comparable and cacheable.
+        test.case "an object's members are ordered"
+            $( test.eq! "{\"a\":1,\"b\":2,\"c\":3}" (write %{ :c => 3, :a => 1, :b => 2 }) ),
+        test.case "and indented output agrees about the order"
+            $( test.eq! (write %{ :c => 3, :a => 1 }) (write (parsed (pretty %{ :c => 3, :a => 1 }))) ),
+        test.case "encode is write under the name every codec answers to"
+            $( test.eq! (write [1, "a"]) (encode [1, "a"]) ),
+        test.case "decode is parse under that name"
+            $( test.eq! [:ok, 1] (decode "1") ),
+        test.case "decode_or"   $( test.eq! :fallback (decode_or :fallback "{") ),
+        test.case "format_name" $( test.eq! "json" (format_name ()) ),
+
+        // framing, which std.codec writes once for every format. A length in
+        // front of the text is what lets a stream be split back into messages
+        // without parsing to find where one ended.
+        test.case "a framed message comes back"
+            $( test.eq! [:ok, %{ "a" => 1 }] (list.nth 0 (next_frame (frame %{ "a" => 1 }))) ),
+        test.case "two framed messages come back in order"
+            $( test.eq! [[:ok, 1], [:ok, "two"]] (list.nth 0 (frames (frame_all [1, "two"]))) ),
+        test.case "half a message is not an answer"
+            $( test.eq! () (next_frame (core.str_slice (frame "hello") 0 6)) ),
+
+        // and what this format loses, stated rather than left to be discovered
+        test.case "a list round trips"     $( test.true! (round_trips [1, 2]) ),
+        test.case "a string round trips"   $( test.true! (round_trips "hi") ),
+        test.case "an atom does not"       $( test.false! (round_trips :ok) ),
+        test.case "an array comes back a list"
+            $( test.eq! [1, 2] (parsed (write (core.array_of_list [1, 2]))) ),
     ];
 }

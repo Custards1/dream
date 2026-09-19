@@ -332,6 +332,16 @@ const std::string& Runtime::atom_name(uint32_t index) const {
     return atom_names_[index];
 }
 
+bool Runtime::find_atom(std::string_view name, uint32_t* out) const {
+    std::lock_guard<std::mutex> g(atoms_mutex_);
+    // Transparent lookup again: asking whether a name is an atom must not be
+    // the one thing that builds a `std::string` out of it.
+    auto it = atom_ids_.find(name);
+    if (it == atom_ids_.end()) return false;
+    *out = it->second;
+    return true;
+}
+
 uint32_t Runtime::atom_count() const {
     std::lock_guard<std::mutex> g(atoms_mutex_);
     return uint32_t(atom_names_.size());

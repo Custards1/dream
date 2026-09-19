@@ -294,10 +294,22 @@ let local_items a src offset =
 /// A module imported for its value takes a global of this module too, so the
 /// ones whose kind is `:module` are left out here and offered by `import_items`
 /// instead, which knows where they came from.
+///
+/// `priv` and `virtual` are said here for the same reason `Impure.` is: they
+/// are facts about the declaration that the name and its parameters do not
+/// carry, and both change what writing the name means -- a private one cannot
+/// be named from anywhere else, and a virtual one is a requirement nothing has
+/// answered yet.
 let global_items a mi e =
     list.map (fn n -> item n (entry_kind a mi e n)
                            (analysis.shown_signature a mi n)
-                           "A global of this module." rank_global)
+                           ("A global of this module."
+                            + match analysis.declaration_words a mi n {
+                                  "" => "",
+                                  words => " Declared `" + words + "`.",
+                              }
+                            + if builtins.is_impure_name n { " Impure." } else { "" })
+                           rank_global)
              (list.filter (fn n -> scope.global_kind e n != :module) (scope.visible_names e));
 
 /// Everything an import put in this module's namespace: the modules it named,

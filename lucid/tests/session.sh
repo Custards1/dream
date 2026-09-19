@@ -63,6 +63,22 @@ mid_edit='import std.console;\nimport helper;\n\nlet main! = {\n    console.prin
 macros='import std.console;\nimport std.vm;\n\nmacro twice e = [:binary, :add, e, e, [0, 0]];\n\nlet double n = expand twice n;\n\nlet main! = {\n    console.print! (double 21)\n};\n'
 host_dot='import std.console;\nimport std.vm;\n\nmacro twice e = [:binary, :add, e, e, [0, 0]];\n\nlet double n = expand twice n;\n\nlet main! = {\n    console.print! (vm.)\n};\n'
 
+# A behavior, and below it a buffer that derives it.
+#
+# `derive` is the one thing that pulls a module and a file apart: the base's
+# bodies are checked as though they had been written into the deriving module,
+# so `label` is a global of `ws.app` and is written in `behavior.dr`. Every
+# span it carries is an offset into *that* text, which against this buffer is a
+# position that still exists and means nothing.
+cat > "$tmp/ws/behavior.dr" <<'DREAM'
+virtual let name self;
+let label self = "<" + name self + ">";
+DREAM
+
+# Line 6 reaches the inherited `label` at column 20.
+# The quotes are escaped because this is a JSON string before it is Dream.
+derived='import std.console;\nderive behavior;\n\nlet name self = \"app\";\n\nlet main! = {\n    console.print! (label 0)\n};\n'
+
 # A record, which is a module of generated functions by the time anything
 # resolves it. Line 2 is the declaration, with `x` at column 14 and `y` at 17;
 # line 4 reaches an accessor at column 26.
@@ -88,6 +104,10 @@ records='import std.console;\n\ngroup Point { x, y }\n\nlet main! = {\n    conso
   msg '{"jsonrpc":"2.0","id":12,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"'"$uri"'"}}}'
   msg '{"jsonrpc":"2.0","id":13,"method":"textDocument/hover","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":26}}}'
   msg '{"jsonrpc":"2.0","id":14,"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":26}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$derived"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":15,"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":6,"character":21}}}'
+  msg '{"jsonrpc":"2.0","id":16,"method":"textDocument/hover","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":6,"character":21}}}'
+  msg '{"jsonrpc":"2.0","id":17,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"'"$uri"'"}}}'
   msg '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}'
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
 } > "$tmp/in"
@@ -172,6 +192,16 @@ has_in "a record's member is not shown with its parameters" 13 'x record'
 # `x` is written at line 2, column 14 -- inside the declaration, not at the
 # end of the file, which is where a generated span used to land.
 has_in "going to a record's field does not reach it"     14 '"start":{"character":14,"line":2}'
+
+# Requests 15 to 17 are `derive`, and all three used to answer about the wrong
+# file. A `Location` is now built from the source the body came from rather
+# than from the module that owns it, and the outline shows what this file
+# declares rather than everything the module ended up with.
+has_in "an inherited method does not lead to the file it was written in" 15 'behavior\.dr'
+has_in "an inherited method does not land on its declaration"            15 '"start":{"character":0,"line":1}'
+has_in "hover does not say a method was inherited"                       16 'inherited from .ws\.behavior.'
+has_in "the outline lost what the file does declare"                     17 '"name":"name"'
+lacks_in "the outline lists a name written in another file"              17 '"name":"label"'
 
 if [ "$fail" -eq 0 ]; then
     echo "the language server answers a whole conversation"

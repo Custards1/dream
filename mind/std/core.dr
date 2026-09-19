@@ -122,6 +122,27 @@ let parse_float s = native.parse_float s;
 let float_bytes f = native.float_bytes f;
 let float_of_bytes bytes = native.float_of_bytes bytes;
 
+// --- atoms ----------------------------------------------------------------------
+//
+// One direction only, and deliberately. An atom is an index into a table the
+// runtime never shrinks -- every atom value in every process is one of those
+// indexes, so none can be reused -- and a program that turned arriving text
+// into atoms would grow that table until it died. There is no `to_atom` to
+// write that program with.
+//
+// What is left is the safe half of it, which is also the useful half: a name
+// the program already mentions somewhere is an atom, and this finds it.
+// `:ok` written anywhere in the source is enough, because an image's atoms are
+// interned when it loads.
+
+/// The atom of this name if there already is one, and `()` if there is not.
+///
+/// The `()` is what makes it safe to ask about text from outside the program:
+/// `match core.to_existing_atom field { () => .., :name => .. }` decides on a
+/// name the program does know and cannot be made to remember one it does not.
+/// The answer only ever goes one way -- a name that is an atom stays one.
+let to_existing_atom s = native.to_existing_atom s;
+
 // --- errors ---------------------------------------------------------------------
 
 /// An error with a kind and a payload; the payload stays lazy.
