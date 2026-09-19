@@ -20,14 +20,16 @@ import std.list;
 
 // --- spans ------------------------------------------------------------------
 
-let span_of a b = [a, b];
-let span_start s = list.nth 0 s;
-let span_end s = list.nth 1 s;
+group Span derive dreams.source_range { span_start, span_end }
+
+let span_of = Span.make;
+let span_start s = Span.span_start s;
+let span_end s = Span.span_end s;
 
 /// The span covering both, for a node built out of two others.
 let span_to a b = [span_start a, span_end b];
 
-let no_span = [0, 0];
+let no_span = Span.make 0 0;
 
 // --- expressions ------------------------------------------------------------
 //
@@ -172,9 +174,11 @@ let macro_d name params body span = [:macro, name, params, body, span];
 /// so a field's default is spliced straight into the read. A default of `()`
 /// *written by the author* is `[:unit, span]` and not this, so the two do not
 /// collide.
-let record_field param default = [param, default];
-let field_param f   = list.nth 0 f;
-let field_default f = list.nth 1 f;
+group RecordField { param, default }
+
+let record_field = RecordField.make;
+let field_param f = RecordField.param f;
+let field_default f = RecordField.default f;
 let field_name f    = param_name (list.nth 0 f);
 let field_span f    = list.nth 1 (list.nth 0 f);
 
@@ -194,11 +198,13 @@ let field_span f    = list.nth 1 (list.nth 0 f);
 /// Having parameters is also what tells a member from a field: `x = 0` is a
 /// field with a default and `f self = 0` is a member, and nothing else has to
 /// be written to say which was meant.
-let record_member name params body span = [name, params, body, span];
-let member_name m   = list.nth 0 m;
-let member_params m = list.nth 1 m;
-let member_body m   = list.nth 2 m;
-let member_span m   = list.nth 3 m;
+group RecordMember { name, params, body, span }
+
+let record_member = RecordMember.make;
+let member_name m = RecordMember.name m;
+let member_params m = RecordMember.params m;
+let member_body m = RecordMember.body m;
+let member_span m = RecordMember.span m;
 
 let record_d kind name fields members span = [:record, kind, name, fields, members, [], span];
 
@@ -254,6 +260,11 @@ when test {
     let tests = [
         test.case "a span keeps its byte endpoints"
             $( test.eq! [2, 7] (span_of 2 7) ),
+        test.case "span behavior uses half-open byte bounds"
+            $( test.eq! [5, false, true, true, false]
+                        [Span.byte_length [2, 7], Span.contains 1 [2, 7],
+                         Span.contains 2 [2, 7], Span.contains 6 [2, 7],
+                         Span.contains 7 [2, 7]] ),
         test.case "span_to covers its two inputs"
             $( test.eq! [2, 13] (span_to [2, 7] [8, 13]) ),
         test.case "every expression keeps its kind and span"

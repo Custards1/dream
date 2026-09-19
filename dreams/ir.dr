@@ -85,25 +85,25 @@ let ops = [
     [:set, 40, "set"],
 ];
 
-let nth = list.nth; //get_nth_from (type_of ops);
+priv let nth = list.nth;
+
 // The table above is the readable form; these are the three ways it is
 // actually asked about. A linear scan of it was the single largest thing in a
 // self-compile -- 20 million reductions, a quarter of the whole -- because
 // `opcode` is asked once per node the lowerer emits and `op_of_code` once per
 // node an image is read back from, and each answer walked an average of twenty
 // three-element lists to find one atom. A list searched more often than it is
-// built wants to be a map, and these are built once: a module's `let` is a
-// global, and a global is created on first use and then kept.
+// built wants to be a map. These maps are evaluated with `comp` when the
+// compiler is built, so a compilation only reads them.
 //
 // (That cost was invisible until `--profile` learnt to attribute the
 // reductions a nested force makes, which is most of them. It named
 // `check_expr` before that, and `check_expr` was not the problem.)
-let op_codes = fold (fn m o -> core.map_put m (nth 0 o) (nth 1 o))
-                         (core.map_new ()) ops;
-let op_names = fold (fn m o -> core.map_put m (nth 0 o) (nth 2 o))
-                         (core.map_new ()) ops;
-let op_of_codes = fold (fn m o -> core.map_put m (nth 1 o) (nth 0 o))
-                            (core.map_new ()) ops;
+// The tables depend only on the bytecode vocabulary, so build them into the
+// compiler image. Destructuring makes each column's meaning explicit.
+priv let op_codes = comp fold (fn m [op, code, _] -> m.[op => code]) %{} ops;
+priv let op_names = comp fold (fn m [op, _, name] -> m.[op => name]) %{} ops;
+priv let op_of_codes = comp fold (fn m [op, code, _] -> m.[code => op]) %{} ops;
 
 /// The VM's number for an opcode, or `()` if it is not one.
 let opcode op = core.map_get op_codes op ();
@@ -187,22 +187,29 @@ let node_is_impure n = has_flag (node_flags n) f_impure;
 // One pool per type, each deduplicated: the same string written twice in a
 // program is one entry. A pool is `[reversed values, count, index by value]`.
 
-group Pool { values, count, index }
+group Pool {
+    values = []
+    count = 0
+    index = %{}
 
-let pool_new = Pool.make [] 0 %{};
+    // Interning belongs to the pool: indexes are stable and values stay lazy.
+    intern value self = match (index self).[value else ()] {
+        () => {
+            let next = count self;
+            [make (core.cons value (values self)) (next + 1)
+                  ((index self).[value => next]), next]
+        },
+        found => [self, found],
+    }
+}
+
+let pool_new = Pool.new ();
 let pool_values = Pool.values;
 let pool_count = Pool.count;
 let pool_index = Pool.index;
 
 /// Intern a value: `[pool, index]`. The index is stable once given.
-let intern v p =
-    match core.map_get (pool_index p) v () {
-        () => {
-            let i = pool_count p;
-            [Pool.make (core.cons v (pool_values p)) (i + 1) ((pool_index p).[v => i]), i]
-        },
-        found => [p, found],
-    };
+let intern v p = Pool.intern v p;
 
 let pool_list p = list.reverse (pool_values p);
 

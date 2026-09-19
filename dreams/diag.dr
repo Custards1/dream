@@ -22,9 +22,11 @@ import dreams.ast;
 // --- a source file ----------------------------------------------------------
 
 /// The name to print and the text to point into.
-let source path text = [path, text];
-let source_path s = list.nth 0 s;
-let source_text s = list.nth 1 s;
+group Source { path, text }
+
+let source = Source.make;
+let source_path s = Source.path s;
+let source_text s = Source.text s;
 
 /// Generated occurrences keep unique offsets for resolution and a range map
 /// back to their macro call for diagnostics. Ordinary sources remain pairs.
@@ -39,18 +41,24 @@ let with_origin start end sp s =
 
 // --- a diagnostic -----------------------------------------------------------
 
-mapping Diagnostic { severity, span, message, note, source }
+mapping Diagnostic {
+    severity = :error
+    span = [0, 0]
+    message = ""
+    note = ()
+    source = 0
+}
 
 let error span message = Diagnostic.make :error span message () 0;
 let warning span message = Diagnostic.make :warning span message () 0;
 
-// Readers accept partial diagnostics too, so their defaults remain explicit.
+// Record defaults preserve reads of partial diagnostics.
 
-let severity d = core.map_get d :severity :error;
-let span d     = core.map_get d :span ast.no_span;
-let message d  = core.map_get d :message "";
-let note d     = core.map_get d :note ();
-let source_of d = core.map_get d :source 0;
+let severity d = Diagnostic.severity d;
+let span d = Diagnostic.span d;
+let message d = Diagnostic.message d;
+let note d = Diagnostic.note d;
+let source_of d = Diagnostic.source d;
 
 let with_note n d = Diagnostic.set_note d n;
 

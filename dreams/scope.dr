@@ -28,6 +28,7 @@
 import std.core;
 import std.list;
 import std.str;
+import std.macros;
 
 import dreams.ast;
 import dreams.builtins;
@@ -55,29 +56,36 @@ let ref_target r = list.nth 1 r;
 
 // --- a module's environment ---------------------------------------------------
 
-let env name source =
-    %{ :name => name, :source => source, :globals => core.map_new (),
-       :aliases => core.map_new (), :only => core.map_new (), :derives => () };
+mapping Environment {
+    name = ""
+    source = 0
+    globals = %{}
+    aliases = %{}
+    only = %{}
+    derives = ()
+}
 
-let env_name e   = core.map_get e :name "";
-let env_source e = core.map_get e :source 0;
-let globals e    = core.map_get e :globals (core.map_new ());
-let aliases e    = core.map_get e :aliases (core.map_new ());
-let only e       = core.map_get e :only (core.map_new ());
-let derives e    = core.map_get e :derives ();
+let env name source = Environment.make name source %{} %{} %{} ();
+
+let env_name e = Environment.name e;
+let env_source e = Environment.source e;
+let globals e = Environment.globals e;
+let aliases e = Environment.aliases e;
+let only e = Environment.only e;
+let derives e = Environment.derives e;
 
 /// A global is bound to `[kind, index]`. The index is the VM's: globals are
 /// numbered across the whole program, and a module's are contiguous, which is
 /// what lets an image record a module as a range rather than a list. The kind
 /// is for everything else -- diagnostics, and later a language server.
-let with_global n kind idx e = core.map_put e :globals (core.map_put (globals e) n [kind, idx]);
+let with_global n kind idx e = e.[:globals => (globals e).[n => [kind, idx]]];
 
 /// The index a global was given, or `()`.
-let global_index e n = match core.map_get (globals e) n () { () => (), g => list.nth 1 g };
+let global_index e n = expand macros.with_some g ((globals e).[n else ()]) (list.nth 1 g);
 
-let global_kind e n = match core.map_get (globals e) n () { () => (), g => list.nth 0 g };
-let with_alias n r e     = core.map_put e :aliases (core.map_put (aliases e) n r);
-let with_only n v e      = core.map_put e :only (core.map_put (only e) n v);
+let global_kind e n = expand macros.with_some g ((globals e).[n else ()]) (list.nth 0 g);
+let with_alias n r e     = e.[:aliases => (aliases e).[n => r]];
+let with_only n v e      = e.[:only => (only e).[n => v]];
 let without_only n e     = core.map_put e :only (core.map_remove (only e) n);
 
 let has_global e n = core.map_has (globals e) n;
@@ -758,19 +766,28 @@ let declare_module l mi s0 = {
 // A frame also allocates the slots its locals live in, and remembers the widest
 // the frame ever got, which is what the VM needs to size an activation record.
 
-let frame func impure display =
-    %{ :func => func, :scopes => [[]], :next_slot => 0, :max_slots => 0,
-       :cap_names => [], :caps => [], :impure => impure, :display => display,
-       :staged => core.map_new () };
+mapping Frame {
+    func = 0
+    scopes = []
+    next_slot = 0
+    max_slots = 0
+    cap_names = []
+    caps = []
+    impure = false
+    display = ""
+    staged = %{}
+}
 
-let frame_func f    = core.map_get f :func 0;
-let scopes f        = core.map_get f :scopes [];
-let next_slot f     = core.map_get f :next_slot 0;
-let max_slots f     = core.map_get f :max_slots 0;
-let cap_names f     = core.map_get f :cap_names [];
-let caps f          = core.map_get f :caps [];
-let frame_impure f  = core.map_get f :impure false;
-let frame_display f = core.map_get f :display "";
+let frame func impure display = Frame.make func [[]] 0 0 [] [] impure display %{};
+
+let frame_func f = Frame.func f;
+let scopes f = Frame.scopes f;
+let next_slot f = Frame.next_slot f;
+let max_slots f = Frame.max_slots f;
+let cap_names f = Frame.cap_names f;
+let caps f = Frame.caps f;
+let frame_impure f = Frame.impure f;
+let frame_display f = Frame.display f;
 
 /// The stages this frame has bound a name to and will write where they are
 /// read. It hangs off the frame rather than off the resolver so that it stops
@@ -778,7 +795,7 @@ let frame_display f = core.map_get f :display "";
 /// lambda inside the block gets a new frame, and a stage moved into one would
 /// need the enclosing frame's names as captures -- which is the one thing a
 /// fused loop, being a global, has none of.
-let frame_staged f = core.map_get f :staged (core.map_new ());
+let frame_staged f = Frame.staged f;
 
 /// A capture says where the enclosing frame keeps the value: in one of its own
 /// slots, or in one of *its* captures. Threading it down like this is what lets
@@ -1159,11 +1176,17 @@ let display_of r =
 /// it resolves against, and the file it was written in. For a body inherited
 /// through `derive` those last two differ, and that difference is the whole of
 /// what `derive` means.
-let ctx l mi source = %{ :l => l, :mi => mi, :source => source };
+mapping Context {
+    l = ()
+    mi = 0
+    source = 0
+}
 
-let ctx_l c      = core.map_get c :l ();
-let ctx_mi c     = core.map_get c :mi 0;
-let ctx_source c = core.map_get c :source 0;
+let ctx l mi source = Context.make l mi source;
+
+let ctx_l c = Context.l c;
+let ctx_mi c = Context.mi c;
+let ctx_source c = Context.source c;
 
 let ctx_env c r = list.nth (ctx_mi c) (r_envs r);
 let env_of c r i = list.nth i (r_envs r);

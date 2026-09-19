@@ -34,18 +34,25 @@ let module_extensions = ["dr"];
 
 // --- a package --------------------------------------------------------------
 
-mapping Package { name, version, root, src, deps, manifest }
+mapping Package {
+    name = ""
+    version = "0.0.0"
+    root = "."
+    src = "."
+    deps = []
+    manifest = ""
+}
 
 let make = Package.make;
 
-let name p    = core.map_get p :name "";
-let version p = core.map_get p :version "0.0.0";
+let name p = Package.name p;
+let version p = Package.version p;
 /// The directory holding the manifest.
-let root p    = core.map_get p :root ".";
+let root p = Package.root p;
 /// Where this package's modules live -- `src` in the manifest.
-let src p     = core.map_get p :src ".";
-let deps p    = core.map_get p :deps [];
-let manifest p = core.map_get p :manifest "";
+let src p = Package.src p;
+let deps p = Package.deps p;
+let manifest p = Package.manifest p;
 
 /// A dependency: a name, and where to find it relative to the depending
 /// package's root. The path is `()` for a dependency given some other way,
@@ -207,13 +214,9 @@ let at s i = list.nth i (packages s);
 
 /// The package called `n`, or `()`.
 let find s n =
-    match core.map_get (by_name s) n () {
-        () => (),
-        i  => at s i,
-    };
+    expand macros.with_some i ((by_name s).[n else ()]) (at s i);
 
-let current_index s = core.map_get s :current ()
-;
+let current_index s = s.[:current else ()];
 /// The package the root file belongs to, or `()`.
 let current s = expand macros.with_some i (current_index s) (at s i);
 

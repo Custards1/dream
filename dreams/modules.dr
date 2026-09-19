@@ -110,7 +110,12 @@ let with_core name items deps =
 
 /// `source` is an index into the loader's file list, so a diagnostic raised
 /// about this module can quote the line it came from.
-mapping Module { name, path, source, items }
+mapping Module {
+    name = ""
+    path = ""
+    source = 0
+    items = []
+}
 
 // Visibility is module metadata; later passes still walk ordinary declarations.
 let loaded name path source items =
@@ -123,10 +128,10 @@ let private_declaration m span =
                    && ast.span_end span <= ast.span_end sp)
              (core.map_get m :private_spans []);
 
-let module_name m   = core.map_get m :name "";
-let module_path m   = core.map_get m :path "";
-let module_source m = core.map_get m :source 0;
-let module_items m  = core.map_get m :items [];
+let module_name m = Module.name m;
+let module_path m = Module.path m;
+let module_source m = Module.source m;
+let module_items m = Module.items m;
 
 // --- the loader --------------------------------------------------------------
 

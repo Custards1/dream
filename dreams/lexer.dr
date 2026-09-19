@@ -46,20 +46,21 @@ import std.str;
 /// walking to it, so `col` cost five cells every time it was asked for. Reading
 /// a token was a fifth of everything the compiler did. An array indexes in
 /// constant time, and a token is exactly the fixed-shape record arrays are for.
-struct Token { kind, value, span_start, span_end, starts_line, col }
+struct Token derive dreams.source_range { kind, value, span_start, span_end, starts_line, col }
 
 let make = Token.make;
 let kind = Token.kind;
 let value = Token.value;
 let span_start = Token.span_start;
 let span_end = Token.span_end;
+let span t = Token.span t;
 let starts_line = Token.starts_line;
 let col = Token.col;
 
 let is_error t = kind t == :error;
 
 /// The source text a token was cut from.
-let text_of s t = str.slice (span_start t) (span_end t - span_start t) s;
+let text_of s t = str.slice (span_start t) (Token.byte_length t) s;
 
 // --- byte classes -----------------------------------------------------------
 //
@@ -75,14 +76,14 @@ let cr      = 13;
 let space   = 32;
 let eof     = 0 - 1;
 
-let is_digit b = b >= 48 && b <= 57;
-let is_lower b = b >= 97 && b <= 122;
-let is_upper b = b >= 65 && b <= 90;
-let is_alpha b = is_lower b || is_upper b || b == 95;
-let is_alnum b = is_alpha b || is_digit b;
+priv let is_digit b = b >= 48 && b <= 57;
+priv let is_lower b = b >= 97 && b <= 122;
+priv let is_upper b = b >= 65 && b <= 90;
+priv let is_alpha b = is_lower b || is_upper b || b == 95;
+priv let is_alnum b = is_alpha b || is_digit b;
 
 /// The value of one digit in `radix`, or `-1` if it is not one.
-let digit_value b radix = {
+priv let digit_value b radix = {
     let v = match b {
         _ if is_digit b => b - 48,
         _ if is_lower b => b - 97 + 10,
@@ -93,7 +94,7 @@ let digit_value b radix = {
 };
 
 /// Does `s` carry the bytes of `word` at `i`?
-let rec starts_at s i word j =
+priv let rec starts_at s i word j =
     if j >= str.byte_length word { true }
     else if core.str_byte s (i + j) != core.str_byte word j { false }
     else { starts_at s i word (j + 1) };
@@ -562,6 +563,11 @@ when test {
     let one src = list.head (lex_ok src);
 
     let tests = [
+        test.case "token range behavior preserves lazy payloads"
+            $( test.eq! [[2, 7], 5, true, false]
+                        { let t = make :ident (1 / 0) 2 7 true 3;
+                          [span t, Token.byte_length t, Token.contains 2 t,
+                           Token.contains 7 t] } ),
         // --- operators ---
         //
         // The dispatch and the table are two statements of the same thing, and

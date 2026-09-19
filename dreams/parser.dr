@@ -42,18 +42,27 @@ let span_of r = list.nth 2 r;
 
 // --- the layout context -----------------------------------------------------
 
-let ctx nl no_brace indent = [nl, no_brace, indent];
-let ctx_nl c = list.nth 0 c;
-let ctx_no_brace c = list.nth 1 c;
-let ctx_indent c = list.nth 2 c;
+group Context {
+    nl
+    no_brace
+    indent
+    grouped self = make false false (indent self)
+    forbid_brace self = set_no_brace self true
+    allow_brace self = set_no_brace self false
+}
+
+let ctx = Context.make;
+let ctx_nl c = Context.nl c;
+let ctx_no_brace c = Context.no_brace c;
+let ctx_indent c = Context.indent c;
 
 /// Inside a bracket group: newlines stop mattering, and a `{` is an argument
 /// again. `( .. )`, `[ .. ]`, `$( .. )`, `#[ .. ]` and `%{ .. }` all do this.
 /// Braces are deliberately not in that list -- a block is newline-sensitive.
-let grouped c = ctx false false (ctx_indent c);
+let grouped c = Context.grouped c;
 
-let no_brace c = ctx (ctx_nl c) true (ctx_indent c);
-let allow_brace c = ctx (ctx_nl c) false (ctx_indent c);
+let no_brace c = Context.forbid_brace c;
+let allow_brace c = Context.allow_brace c;
 
 let top = ctx true false 0;
 
@@ -65,7 +74,7 @@ let peek_kind ts = if at_end ts { :eof } else { lexer.kind (list.head ts) };
 let peek_value ts = if at_end ts { () } else { lexer.value (list.head ts) };
 let peek_span ts =
     if at_end ts { ast.no_span }
-    else { ast.span_of (lexer.span_start (list.head ts)) (lexer.span_end (list.head ts)) };
+    else { lexer.span (list.head ts) };
 
 let at ts k = peek_kind ts == k;
 
@@ -101,11 +110,11 @@ let non_starters = ["let", "priv", "rec", "else", "import", "as", "catch", "virt
 /// linear scan answers "is this identifier a keyword" in a dozen reductions
 /// per candidate, and the parser asks it of every identifier in the program --
 /// it was a tenth of everything the compiler did. A map answers it in one
-/// hash, and the set is built once because a top-level binding is forced once.
-let set_of names = list.fold (fn m n -> core.map_put m n true) (core.map_new ()) names;
+/// hash; `comp` builds both sets into the compiler image.
+priv let set_of names = list.fold (fn m n -> m.[n => true]) %{} names;
 
-let keyword_set = set_of keywords;
-let non_starter_set = set_of non_starters;
+priv let keyword_set = comp set_of keywords;
+priv let non_starter_set = comp set_of non_starters;
 
 let is_kw ts word = at ts :ident && peek_value ts == word;
 // Record introducers are contextual: existing code can still bind `group`.

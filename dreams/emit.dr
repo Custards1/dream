@@ -112,14 +112,19 @@ let f64 v = core.float_bytes v;
 /// A section, with its length worked out once. A section body is a string, so
 /// its length is a field read rather than a walk -- and it is asked for three
 /// times over, in the table, in the layout, and in the padding.
-mapping Section { kind, body, count, len }
+mapping Section {
+    kind = 0
+    body = ""
+    count = 0
+    len = 0
+}
 
 let section kind body count = Section.make kind body count (str.byte_length body);
 
-let sec_kind s  = core.map_get s :kind 0;
-let sec_body s  = core.map_get s :body "";
-let sec_count s = core.map_get s :count 0;
-let sec_len s   = core.map_get s :len 0;
+let sec_kind s = Section.kind s;
+let sec_body s = Section.body s;
+let sec_count s = Section.count s;
+let sec_len s = Section.len s;
 
 /// A four-character tag, read as a little-endian word the way the loader reads
 /// it. Written out as the characters so that a hex dump of an image says what
