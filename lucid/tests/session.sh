@@ -63,6 +63,11 @@ mid_edit='import std.console;\nimport helper;\n\nlet main! = {\n    console.prin
 macros='import std.console;\nimport std.vm;\n\nmacro twice e = [:binary, :add, e, e, [0, 0]];\n\nlet double n = expand twice n;\n\nlet main! = {\n    console.print! (double 21)\n};\n'
 host_dot='import std.console;\nimport std.vm;\n\nmacro twice e = [:binary, :add, e, e, [0, 0]];\n\nlet double n = expand twice n;\n\nlet main! = {\n    console.print! (vm.)\n};\n'
 
+# A record, which is a module of generated functions by the time anything
+# resolves it. Line 2 is the declaration, with `x` at column 14 and `y` at 17;
+# line 4 reaches an accessor at column 26.
+records='import std.console;\n\ngroup Point { x, y }\n\nlet main! = {\n    console.print! (Point.x (Point.make 1 2))\n};\n'
+
 {
   msg '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":"file://'"$tmp"'/ws"}}'
   msg '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"'"$uri"'","text":"import std.console;\nimport helper;\n\nlet main! = {\n    console.print! (to_string (helper.double 21))\n};\n"}}}'
@@ -79,6 +84,10 @@ host_dot='import std.console;\nimport std.vm;\n\nmacro twice e = [:binary, :add,
   msg '{"jsonrpc":"2.0","id":10,"method":"textDocument/completion","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":27}}}'
   msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$host_dot"'"}]}}'
   msg '{"jsonrpc":"2.0","id":11,"method":"textDocument/completion","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":8,"character":23}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$records"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":12,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"'"$uri"'"}}}'
+  msg '{"jsonrpc":"2.0","id":13,"method":"textDocument/hover","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":26}}}'
+  msg '{"jsonrpc":"2.0","id":14,"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":26}}}'
   msg '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}'
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
 } > "$tmp/in"
@@ -149,6 +158,20 @@ lacks_in "a name after expand offers what cannot go there"   10 '"label":"double
 # running on. Nothing was offered here at all before it was asked.
 has_in "a host module offers no members"                 11 '"label":"stats!"'
 has_in "a host member comes without its arity"           11 '"detail":"stats! (1 argument)"'
+
+# Requests 12 to 14 are the record. `group Point { x, y }` is a module of
+# generated functions by the time the resolver sees it, and those carry spans
+# into no file -- so the outline had nothing called `Point` in it, `Point.x`
+# hovered as `x ` with the parameter sliced out of thin air, and going to its
+# definition landed at the end of the file. All three are answered out of
+# `modules.records`, which is what the rewrite knew.
+has_in "a record is missing from the outline"            12 '"name":"Point"'
+has_in "a record's fields are not under it"              12 '"name":"x"'
+has_in "a record's member does not say what it reads"    13 'reads .x. of the group .Point.'
+has_in "a record's member is not shown with its parameters" 13 'x record'
+# `x` is written at line 2, column 14 -- inside the declaration, not at the
+# end of the file, which is where a generated span used to land.
+has_in "going to a record's field does not reach it"     14 '"start":{"character":14,"line":2}'
 
 if [ "$fail" -eq 0 ]; then
     echo "the language server answers a whole conversation"

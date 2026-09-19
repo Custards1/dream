@@ -604,6 +604,81 @@ let params_of a mi name =
         d => list.nth 2 d,
     };
 
+// --- records ----------------------------------------------------------------------
+//
+// `group Point { x, y }` is a module of generated functions by the time
+// anything resolves it -- a constructor, an accessor and a setter per field --
+// and those carry spans in a reserved part of the offset space, because
+// several of them stand where one declaration was written. So the compiler's
+// answer about `Point.x` is true and useless to a reader: a global called `x`
+// in a module called `ws.app.Point`, written nowhere in this file.
+//
+// `modules.records` is what the rewrite knew, kept. Everything below turns it
+// back into the declaration the author is looking at.
+
+/// The record a module was generated from: `[owner, kind, name, fields, span]`,
+/// or `()` for an ordinary module.
+let record_of a mi = {
+    let l = loader a;
+    let full = modules.module_name (modules.module_at l mi);
+    list.first_or () (list.filter (fn r -> list.head r + "." + list.nth 2 r == full)
+                                  (modules.records l))
+};
+
+let record_owner r  = list.head r;
+let record_name r   = list.nth 2 r;
+let record_fields r = list.nth 3 r;
+let record_span r   = list.nth 4 r;
+
+/// The keyword it was written with. `syntax.record` keeps the *representation*
+/// -- which collection the fields go into -- because that is what it builds
+/// from; a reader wants the word they typed.
+let record_keyword r =
+    match list.nth 1 r {
+        :list  => "group",
+        :array => "struct",
+        :map   => "mapping",
+        other  => to_string other,
+    };
+
+/// The field a generated member is about, or `()` for `make`.
+///
+/// Asked by exact name first and only then with `set_` taken off, because a
+/// record may have a field genuinely called `set_thing` -- what it may not have
+/// is that *and* a field called `thing`, which is the clash the compiler
+/// already refuses as "conflicts with a generated helper".
+let record_field r n =
+    match list.filter (fn f -> ast.field_name f == n) (record_fields r) {
+        [f, .._] => f,
+        [] => if not (str.starts_with "set_" n) { () }
+              else {
+                  let stem = str.slice 4 (str.byte_length n - 4) n;
+                  list.first_or ()
+                      (list.filter (fn f -> ast.field_name f == stem) (record_fields r))
+              },
+    };
+
+/// Where to send a reader who asked about one of a record's members: the field
+/// it is about, or the declaration itself for the constructor.
+let record_site r n = match record_field r n { () => record_span r, f => ast.field_span f };
+
+/// What a generated member does, in the words of the declaration it came from.
+let record_role r n =
+    match record_field r n {
+        () => "builds the " + record_keyword r + " `" + record_name r + "`",
+        f => (if str.starts_with "set_" n && ast.field_name f != n {
+                  "replaces `" + ast.field_name f + "` in the "
+              } else {
+                  "reads `" + ast.field_name f + "` of the "
+              }) + record_keyword r + " `" + record_name r + "`"
+             // A field with a default never fails to read, and what it answers
+             // instead is the most useful thing to say about it.
+             + match ast.field_default f {
+                   () => "",
+                   d => ", or `" + ast.show d + "` when it is not there",
+               },
+    };
+
 /// Was this global declared with `macro`?
 ///
 /// Read off the source tree, because expansion rewrites a `macro` into an
@@ -616,11 +691,26 @@ let is_macro a mi name =
         _ => false,
     };
 
-/// `name` followed by the parameters of `ps`, sliced out of `src` so that a
-/// pattern parameter reads as it was typed.
+/// One parameter as it should be shown: its name, or -- for one that is a
+/// pattern, which has no name -- the text it was written as.
+///
+/// Preferring the name matters for more than tidiness. A declaration the
+/// compiler *generated* carries a span in a reserved part of the offset space
+/// rather than one into this file, and slicing that gives an empty string. A
+/// record's members are all generated, so `Point.make` read `make  ` and
+/// `Point.x` read `x ` before this. Their parameter *names* were right all
+/// along. A generated parameter with no name is the `()` an empty record's
+/// constructor takes, and there is nothing to slice for it either.
+let param_text src p =
+    match ast.param_name p {
+        () => match span_text src (list.nth 1 p) { "" => "()", written => written },
+        n => n,
+    };
+
+/// `name` followed by the parameters of `ps`.
 let signature src name ps =
     if list.is_empty ps { name }
-    else { name + " " + str.join_str " " (list.map (fn p -> span_text src (list.nth 1 p)) ps) };
+    else { name + " " + str.join_str " " (list.map (fn p -> param_text src p) ps) };
 
 /// How to show a global or a member: its signature when the declaration can be
 /// found, and its bare name when it cannot.
@@ -655,10 +745,21 @@ let rec located a found =
                 () => (),
                 d => location a mi (list.nth 2 d),
             },
+        // A record's members are generated, so the declaration the resolver
+        // found is at an offset into no file. The place to go is where the
+        // field was written, which is in the module the record was written
+        // *in* -- a record's own module has a dotted name where a path goes
+        // and `location` would make a URI out of it.
         [:member, [:dream, target], field, _] =>
-            match scope.definition (resolved a) target field {
-                () => (),
-                d => location a target (list.nth 2 d),
+            match record_of a target {
+                () => match scope.definition (resolved a) target field {
+                          () => (),
+                          d => location a target (list.nth 2 d),
+                      },
+                r => match modules.find (loader a) (record_owner r) {
+                         () => (),
+                         owner => location a owner (record_site r field),
+                     },
             },
         // The name an `expand` named. A macro is an ordinary global by the
         // time the program is resolved -- expansion rewrites the declaration
@@ -710,8 +811,11 @@ let describe a offset name found =
             + modules.module_name (modules.module_at (loader a) mi) + "`",
         [:builtin, name] => "`" + builtins.signature name + "` -- a builtin",
         [:member, [:dream, target], field, _] =>
-            "`" + shown_signature a target field + "` of module `"
-            + modules.module_name (modules.module_at (loader a) target) + "`",
+            match record_of a target {
+                () => "`" + shown_signature a target field + "` of module `"
+                      + modules.module_name (modules.module_at (loader a) target) + "`",
+                r => "`" + shown_signature a target field + "` -- " + record_role r field,
+            },
         [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
         // An `expand` site. The declaration is an ordinary global by now, so
         // the signature and the module come from the same place they would for
@@ -751,23 +855,52 @@ let hover_at a line character =
 
 /// LSP `SymbolKind`. A Dream global is a function or a value and the resolver
 /// does not separate them here, so everything is reported as a variable rather
-/// than guessed at wrongly.
+/// than guessed at wrongly. A record is a `Struct` whatever keyword declared
+/// it, and its fields are `Field`s underneath it.
 let symbol_variable = 13;
+let symbol_struct = 23;
+let symbol_field = 8;
 
 /// What this file declares, for the outline and for the symbol search.
+///
+/// Two sources, because a record is not among a module's globals: `group Point
+/// { x, y }` became a module of its own, so the resolver's table of what this
+/// file declares has nothing called `Point` in it and the outline of a file
+/// full of records was empty. They are merged and sorted by where they were
+/// written, since an outline out of source order reads as a different file.
 let symbols a =
     match module_of a {
         () => [],
         mi => {
             let src = module_text a mi;
-            list.map (fn d -> {
+            let at span = pos.range src (ast.span_start span) (ast.span_end span);
+            let globals = list.map (fn d -> {
                 let span = list.nth 3 d;
-                let r = pos.range src (ast.span_start span) (ast.span_end span);
-                %{ "name" => list.nth 2 d,
-                   "kind" => symbol_variable,
-                   "range" => r,
-                   "selectionRange" => r }
-            }) (scope.module_defs (resolved a) mi)
+                [ast.span_start span,
+                 %{ "name" => list.nth 2 d, "kind" => symbol_variable,
+                    "range" => at span, "selectionRange" => at span }]
+            }) (scope.module_defs (resolved a) mi);
+            let mine = modules.module_name (modules.module_at (loader a) mi);
+            let records = list.map (fn r -> {
+                let span = record_span r;
+                [ast.span_start span,
+                 %{ "name" => record_name r,
+                    "detail" => record_keyword r,
+                    "kind" => symbol_struct,
+                    "range" => at span,
+                    "selectionRange" => at span,
+                    // A field is written inside the declaration, so its range
+                    // is inside the record's -- which is what LSP requires of
+                    // a child, and the reason nothing here is invented.
+                    "children" =>
+                        list.map (fn f -> %{ "name" => ast.field_name f, "kind" => symbol_field,
+                                             "range" => at (ast.field_span f),
+                                             "selectionRange" => at (ast.field_span f) })
+                                 (record_fields r) }]
+            }) (list.filter (fn r -> record_owner r == mine) (modules.records (loader a)));
+            list.map (fn s -> list.nth 1 s)
+                     (list.sort_by (fn x y -> list.head x < list.head y)
+                                   (list.append globals records))
         },
     };
 
@@ -800,6 +933,31 @@ when test {
     /// the argument. One line, because the lexer is indentation-sensitive and
     /// a test that wrapped it would be testing that instead.
     let macro_buffer = "macro twice e = [:binary, :add, e, e, [0, 0]];\nlet double counter = expand twice |counter;\n";
+
+    /// A buffer with a record in it, and the three things an editor asks about
+    /// one. Line 0 is the declaration -- `x` at column 14, `y` at 17 -- and on
+    /// line 1 the three kinds of generated member are at columns 18, 28 and 41.
+    let record_src = "group Point { x, y }\nlet main! = Point.x (Point.set_y (Point.make 1 2) 3);\n";
+
+    let hover_value! text line ch =
+        match hover_at (of! text) line ch {
+            () => "",
+            h => core.map_get (core.map_get h "contents" ()) "value" "",
+        };
+    /// `[line, character]` of where go-to-definition lands, or `()`.
+    let definition_start! text line ch =
+        match definition_at (of! text) line ch {
+            () => (),
+            d => match core.map_get (core.map_get d "range" ()) "start" () {
+                     at => [core.map_get at "line" (), core.map_get at "character" ()],
+                 },
+        };
+    let symbol_names! text = list.map (fn s -> core.map_get s "name" "") (symbols (of! text));
+    let child_names! text name =
+        list.concat (list.map (fn s -> list.map (fn c -> core.map_get c "name" "")
+                                                (core.map_get s "children" []))
+                              (list.filter (fn s -> core.map_get s "name" "" == name)
+                                           (symbols (of! text))));
 
     /// The same two questions asked of the buffer's own module.
     let is_macro! text name =
@@ -873,6 +1031,45 @@ when test {
             $( test.false! (is_macro! "macro twice e = e;\nlet f x = x;\n" "f") ),
         test.case "a macro is shown with the parameters it was declared with"
             $( test.eq! "twice e" (shown_signature_of! "macro twice e = e;\n" "twice") ),
+
+        // --- records ----------------------------------------------------------
+        //
+        // A `group` is a module of generated functions by the time anything
+        // resolves it, so every one of these was answered out of
+        // `modules.records` rather than out of the program.
+        test.case "a record's accessor says which field it reads"
+            $( test.eq! "`x record` -- reads `x` of the group `Point`"
+                        (hover_value! record_src 1 18) ),
+        test.case "a record's setter says which field it replaces"
+            $( test.eq! "`set_y record value` -- replaces `y` in the group `Point`"
+                        (hover_value! record_src 1 28) ),
+        test.case "a record's constructor is shown with its fields"
+            $( test.eq! "`make x y` -- builds the group `Point`"
+                        (hover_value! record_src 1 41) ),
+        test.case "a generated parameter is named, not sliced out of the file"
+            $( test.eq! "make x y" (param_text "" (ast.param "make" [0, 0])
+                                    + " " + str.join_str " "
+                                        (list.map (fn n -> param_text "" (ast.param n [99, 99]))
+                                                  ["x", "y"])) ),
+        test.case "going to a record's accessor goes to the field"
+            $( test.eq! [0, 14] (definition_start! record_src 1 18) ),
+        test.case "going to a record's setter goes to the field it replaces"
+            $( test.eq! [0, 17] (definition_start! record_src 1 28) ),
+        test.case "going to a record's constructor goes to the declaration"
+            $( test.eq! [0, 0] (definition_start! record_src 1 41) ),
+        test.case "a record is in the outline, in the order it was written"
+            $( test.eq! ["Point", "main!"] (symbol_names! record_src) ),
+        test.case "a record's fields are in the outline underneath it"
+            $( test.eq! ["x", "y"] (child_names! record_src "Point") ),
+        test.case "a record with no fields still shows its constructor"
+            $( test.eq! "`make ()` -- builds the struct `Empty`"
+                        (hover_value! "struct Empty {}\nlet main! = Empty.make ();\n" 1 18) ),
+        test.case "the keyword a record was written with survives the rewrite"
+            $( test.eq! ["group", "struct", "mapping"]
+                        (list.map (fn r -> record_keyword r)
+                                  [[".", :list, "a", [], [0, 0]],
+                                   [".", :array, "a", [], [0, 0]],
+                                   [".", :map, "a", [], [0, 0]]]) ),
 
         test.case "a match arm's pattern binds in its body"
             $( test.eq! ["head", "rest", "xs"]

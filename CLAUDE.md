@@ -1764,6 +1764,49 @@ front of the cursor is found lexically (`word_before`), for the reason the
 section above gives: at the moment a completion is wanted, `expand tw` does not
 parse.
 
+### A record is a declaration before it is a module
+
+`group Point { x, y }`, `struct`, and `mapping` are rewritten by the *loader*
+into a module of generated functions — a constructor, an accessor and a setter
+per field ([syntax.record](dreams/syntax.dr)). That happens before anything
+resolves, which is what makes records cost the rest of the compiler nothing;
+and it is why a language server had nothing true to say about one.
+
+Three things are gone by the time the resolver runs, and each was a visible
+defect:
+
+- **The declaration is not among the module's globals.** `Point` became a
+  module of its own and the parent got an import of that name, so
+  `scope.module_defs` has no `Point` in it and the outline of a file full of
+  records was empty.
+- **The members carry spans into no file.** Several of them stand where one
+  declaration was written, so `syntax.record` freshens them into a reserved
+  part of the offset space. Go-to-definition on `Point.x` clamped to the end of
+  the file, and the signature — which lucid built by *slicing the source* at
+  each parameter's span — came out `make  ` and `x `.
+- **The kind and the fields are gone.** `:list`/`:array`/`:map` is what the
+  rewrite builds from; `group`/`struct`/`mapping` is what the reader typed.
+
+`modules.records` is what the rewrite knew, kept: `[owner, kind, name, fields,
+span]` per declaration, collected by `record_items` alongside `expand_items` and
+under the same `when` conditions, so a record a configuration switches off is no
+module and no record either. **Nothing in the compiler reads it** — it is there
+for `lucid`, the same way `modules.expansions` is, and for the same reason: the
+pass that rewrites something is the only one that ever sees what was written.
+
+What it buys, all in [lucid/analysis.dr](lucid/analysis.dr)'s "records" section:
+the outline lists each record with its fields underneath it, in source order;
+hover says `` `x record` -- reads `x` of the group `Point` `` and
+`` `set_y record value` -- replaces `y` in the struct `Vector` ``; and
+go-to-definition on a member lands on **the field**, in the module the record
+was written in — not on the record's own module, whose "path" is a dotted name
+that `location` would have made a URI out of.
+
+One fix that is not about records and should be kept in mind for any generated
+code: `signature` now shows a parameter by its **name**, and only slices the
+source for one that is a pattern, which has no name. Slicing was never right for
+a declaration the compiler made up, and a record's members are all of them.
+
 ### A host module's members come from the host
 
 `import std.vm` compiles to a lookup that happens while the program runs, so
@@ -1808,8 +1851,12 @@ test.
   lists, with a span last — and returns syntax, which is checked and then
   substituted. It runs on the same embedded VM `comp!` does, before name
   resolution; [dreams/expand.dr](dreams/expand.dr) and "Expanding a macro is a
-  compile" say what that costs. `group`/`struct`/`mapping` declare records the
-  same pass rewrites.
+  compile" say what that costs.
+- `group P { x, y }`, `struct P { x, y }` and `mapping P { x, y }` declare a
+  record: a module of generated functions — `P.make`, `P.x`, `P.set_x` — over a
+  list, an array and a map respectively. The *loader* rewrites them
+  (`syntax.record`), so nothing downstream knows a record from a `mod`; "A
+  record is a declaration before it is a module" is what that costs a tool.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

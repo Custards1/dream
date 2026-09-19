@@ -133,6 +133,10 @@ let kind_function = 3;
 let kind_variable = 6;
 let kind_module = 9;
 let kind_keyword = 14;
+/// A `group`, a `struct` or a `mapping`. It is a module like any other by the
+/// time the compiler is done with it, and this is the one place that difference
+/// is worth showing rather than hiding.
+let kind_struct = 22;
 
 /// The groups, in the order resolution would reach them. `sortText` is compared
 /// as a string, so the digit in front is what does the ordering and the label
@@ -229,11 +233,19 @@ let host_item path member = {
 };
 
 /// One member of a Dream module, shown with the parameters it was declared with.
+///
+/// A record's members are generated, so what they are is better said by the
+/// declaration they came from than by the module they ended up in: nobody
+/// wrote `ws.app.Point`, they wrote `group Point { x, y }`.
 let member_item a target e n =
     item n (entry_kind a target e n)
          (analysis.shown_signature a target n)
-         ("A member of module `" + modules.module_name (modules.module_at (analysis.loader a) target)
-          + "`." + if builtins.is_impure_name n { " Impure." } else { "" })
+         (match analysis.record_of a target {
+              () => "A member of module `"
+                    + modules.module_name (modules.module_at (analysis.loader a) target) + "`.",
+              r => "Generated: " + analysis.record_role r n + ".",
+          }
+          + if builtins.is_impure_name n { " Impure." } else { "" })
          rank_local;
 
 let member_items a segs =
@@ -296,10 +308,25 @@ let import_items a e = {
             let n = list.head kv;
             match list.nth 1 kv {
                 [:dream, target] =>
-                    item n kind_module
-                         ("module " + modules.module_name
-                                          (modules.module_at (analysis.loader a) target))
-                         "An imported module." rank_import,
+                    match analysis.record_of a target {
+                        () => item n kind_module
+                                   ("module " + modules.module_name
+                                                    (modules.module_at (analysis.loader a) target))
+                                   "An imported module." rank_import,
+                        // A record is reached the same way an import is -- the
+                        // rewrite leaves the module it made behind an import
+                        // of that name -- but calling it one says the wrong
+                        // thing about a declaration written right here.
+                        r => item n kind_struct
+                                  (analysis.record_keyword r + " " + n)
+                                  ("The " + analysis.record_keyword r + " `" + n + "`"
+                                   + match analysis.record_fields r {
+                                         [] => ", with no fields",
+                                         fs => ", with " + str.join_str ", "
+                                                   (list.map (fn f -> "`" + ast.field_name f + "`")
+                                                             fs),
+                                     } + ".") rank_import,
+                    },
                 [:native, p, _] => item n kind_module ("host module " + p)
                                         "An imported host module." rank_import,
                 [:group, prefix] => item n kind_module ("package " + prefix)
@@ -506,6 +533,11 @@ when test {
         }
     };
 
+    /// What is offered after a dot, as `[label, detail]` pairs.
+    let member_details! text segs =
+        list.map (fn i -> [core.map_get i "label" (), core.map_get i "detail" ()])
+                 (member_items (of! text) segs);
+
     let tests = [
         test.case "a cursor after a dot asks about the chain in front of it"
             $( test.eq! [:member, ["console"]] (context "    console." 12) ),
@@ -591,6 +623,24 @@ when test {
         test.case "a renamed import offers the name it was bound to"
             $( test.eq! ["map", "reduce"]
                         (import_labels! "import std.list.{map, fold as reduce};") ),
+        // A record's members are generated, so their parameters are not in the
+        // file and their module is one nobody wrote. Both were visible:
+        // `Point.make` was offered as `make  `, and `Point` itself as an
+        // import of a module called `buf.Point`.
+        test.case "a record's members are offered with their parameters"
+            $( test.eq! [["make", "make x y"], ["set_x", "set_x record value"],
+                         ["set_y", "set_y record value"], ["x", "x record"], ["y", "y record"]]
+                        (member_details! "group Point { x, y }\n" ["Point"]) ),
+        test.case "a record is offered as the declaration it was written as"
+            $( test.eq! "The group `Point`, with `x`, `y`."
+                        (import_doc! "group Point { x, y }\n" "Point") ),
+        test.case "a mapping says which keyword declared it"
+            $( test.eq! "The mapping `Named`, with `first`."
+                        (import_doc! "mapping Named { first }\n" "Named") ),
+        test.case "a record with no fields says so rather than trailing off"
+            $( test.eq! "The struct `Empty`, with no fields."
+                        (import_doc! "struct Empty {}\n" "Empty") ),
+
         test.case "a renamed import says which member it really is"
             $( test.true! (str.contains_str "`fold` of `std.list`"
                    (import_doc! "import std.list.{map, fold as reduce};" "reduce")) ),
