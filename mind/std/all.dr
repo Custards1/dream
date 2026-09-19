@@ -12,6 +12,7 @@ import std.error;
 import std.json;
 import std.list;
 import std.map;
+import std.macros;
 import std.proc;
 import std.result;
 import std.seq;
@@ -25,5 +26,5 @@ let version = "0.1.0";
 
 /// The modules this build provides.
 let modules = ["std.array", "std.cli", "std.core", "std.error", "std.json", "std.list",
-               "std.map", "std.proc", "std.result", "std.seq", "std.str", "std.streams",
+               "std.map", "std.macros", "std.proc", "std.result", "std.seq", "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml"];

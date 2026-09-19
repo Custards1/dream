@@ -1,0 +1,12 @@
+unless ran
+fallback
+42
+[:ok, 42]
+14
+warm
+false
+100
+%{:count => 3}
+[:error, <error :error :failed>]
+42
+43

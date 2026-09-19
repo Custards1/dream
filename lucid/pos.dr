@@ -17,7 +17,6 @@
 import std.core;
 import std.list;
 import std.str;
-
 /// How many bytes the character starting with this byte occupies, and how many
 /// UTF-16 units it becomes. Read from the UTF-8 lead byte alone, which is the
 /// point of UTF-8: `[bytes, units]`.

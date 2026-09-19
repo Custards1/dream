@@ -19,6 +19,8 @@ runtime, and — in progress — its self-hosted compiler.
 `docs/bytecode-format.md` is the container as it actually is; `docs/gc.md` and
 `docs/dynamic-linking.md` are a design plus a log of how far it has got, and are
 the first thing to read before touching either.
+# Code Requirements when writing in the dream language
+Use match instead of massive if/else/else if chains. If you see an ugly if else chain in dream convert it to the match pattern. There are a lot of ugly offenders, so just update as you go.
 
 ## Where this is going
 

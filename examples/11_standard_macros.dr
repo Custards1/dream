@@ -1,0 +1,27 @@
+import std.console;
+import std.list;
+import std.macros;
+
+let main! = {
+    // Branches and optional bindings keep the caller's expressions lazy.
+    expand macros.unless false { console.print! "unless ran" }
+    console.print! (expand macros.coalesce () "fallback")
+    console.print! (expand macros.with_some value 6 (value * 7))
+    console.print! (expand macros.with_ok value [:ok, 20] [:ok, value + 22])
+
+    // A literal list of pipeline stages expands to ordinary |> expressions.
+    console.print! (expand macros.pipe [1, 2, 3, 4]
+        [list.map (fn x -> x * 2), list.filter (fn x -> x > 4), list.sum])
+    console.print! (expand macros.cond [[false, "cold"], [true, "warm"]] "unknown")
+    console.print! (expand macros.and_all [true, false, 1 / 0 == 0])
+
+    // Bounds and updates share their inputs instead of inserting them twice.
+    console.print! (expand macros.clamp 120 0 100)
+    console.print! (expand macros.update %{ :count => 2 } :count (fn n -> n + 1))
+
+    // Errors are caught even when deferred inside a collection.
+    console.print! (expand macros.attempt [1, raise! :failed])
+    expand macros.assert (expand macros.between 3 1 5) "out of bounds"
+    let value = expand macros.tap 42 console.print!;
+    console.print! (value + 1)
+};

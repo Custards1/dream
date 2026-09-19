@@ -117,6 +117,8 @@ let evaluate! s mi call sp = {
                 } catch e { [:error, to_string e] };
                 match result {
                     [:error, why] => [fail s1 mi sp ("macro evaluation failed: " + why), ()],
+                    [:ok, [:error, message]] if type_of message == :string =>
+                        [fail s1 mi sp message, ()],
                     [:ok, value] => if syntax.expression value {
                         let fresh = syntax.fresh value (next s1);
                         let si = modules.module_source m;
@@ -139,6 +141,11 @@ let rec walk! s mi tree depth = match tree {
         if depth >= 64 { [fail s mi sp "macro expansion exceeded 64 nested calls", ast.unit_e sp] }
         else {
             let result = evaluate! s mi call sp;
+            // Both the syntax and the updated loader contain lazy fields whose
+            // frames retain this expansion's resolver and lowered program.
+            // Finish them before the next call, so a module with many expands
+            // does not keep every temporary compilation alive at once.
+            strict! result
             match list.nth 1 result {
                 () => [list.head result, ast.unit_e sp],
                 expanded => walk! (list.head result) mi expanded (depth + 1),
