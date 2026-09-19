@@ -96,11 +96,11 @@ different identifiers, and the `!` is what marks the binding impure ([§6](#6-pu
 Keywords, which may not be used as ordinary names:
 
 ```
-let  rec  if  else  import  as  catch  true  false
+let  priv  rec  if  else  import  as  catch  true  false
 not  try!  fn  virtual  derive  comp  comp!  when  mod
 ```
 
-Of these, `let  rec  else  import  as  catch  virtual  derive  when  mod` can
+Of these, `let  priv  rec  else  import  as  catch  virtual  derive  when  mod` can
 never begin an expression, so encountering one ends an application's argument
 list.
 
@@ -1795,3 +1795,18 @@ deliberately narrow — it records *which* globals are wrappers at scope time, s
 lowering can rewrite a saturated call *because* it knows the frame it stands
 for adds nothing. When a measurement shows a function hot for no apparent
 reason, the first question is whether a lazy list is being walked twice.
+
+### Private declarations
+
+Module declarations are public by default. Prefix a declaration with `priv`
+to keep its bindings private to that module:
+
+```dream
+priv let helper x = x + 1;
+let increment x = helper x;
+```
+
+`priv let rec` and `priv let [a, b] = pair` are also supported. Other modules
+cannot access private bindings through qualified names or selective imports.
+Block-local bindings already have lexical scope; `priv` applies to module
+declarations only.

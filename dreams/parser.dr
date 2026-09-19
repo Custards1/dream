@@ -88,13 +88,13 @@ let token_continues c t =
 
 /// Keywords are ordinary identifiers that the parser recognises; the lexer has
 /// no idea they are special.
-let keywords = ["let", "rec", "if", "else", "import", "as", "catch", "true", "false",
+let keywords = ["let", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
                 "match", "macro", "expand", "group", "struct", "mapping"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
-let non_starters = ["let", "rec", "else", "import", "as", "catch", "virtual", "derive",
+let non_starters = ["let", "priv", "rec", "else", "import", "as", "catch", "virtual", "derive",
                     "when", "mod", "macro"];
 
 /// The lists above are the readable form; these are how they are asked. A
@@ -991,6 +991,14 @@ let rec parse_item c ts = {
             "virtual" => parse_virtual c sp (list.tail ts),
             "when" => parse_when c sp (list.tail ts),
             "let" => parse_let c sp (list.tail ts),
+            "priv" => {
+                let rest = list.tail ts;
+                if not (is_kw rest "let") { err "expected `let` after `priv`" (peek_span rest) }
+                else { match parse_let c sp (list.tail rest) {
+                    [:ok, d, after] => ok (ast.priv_d d (ast.span d)) after,
+                    other => other,
+                } }
+            },
             "macro" => match parse_let c sp (list.tail ts) {
                 [:ok, [:let, n, ps, body, _, span], rest] =>
                     ok (ast.macro_d n ps body span) rest,
@@ -1000,7 +1008,7 @@ let rec parse_item c ts = {
             "group" => parse_record c :list sp (list.tail ts),
             "struct" => parse_record c :array sp (list.tail ts),
             "mapping" => parse_record c :map sp (list.tail ts),
-            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `macro`, `group`, `struct` or `mapping` at the top level, found "
+            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `priv let`, `macro`, `group`, `struct` or `mapping` at the top level, found "
                       + describe ts) sp,
         },
         _ => err ("expected a declaration, found " + describe ts) sp,
@@ -1408,6 +1416,14 @@ when test {
         };
 
     let tests = [
+        test.case "private let retains its visibility"
+            $( test.eq! "(priv (let x (int 1)))" (items "priv let x = 1;") ),
+        test.case "priv requires a let declaration"
+            $( test.eq! "expected `let` after `priv`" (fails_module "priv mod a {}") ),
+        test.case "priv is reserved as a binding name"
+            $( test.true! (str.contains_str "keyword" (fails_module "let priv = 1;")) ),
+        test.case "priv cannot modify a local binding"
+            $( test.true! (str.contains_str "keyword" (fails "{ priv let x = 1; x }")) ),
         test.case "macro declarations retain syntax parameters"
             $( test.eq! "(macro identity x (name x))" (items "macro identity x = x;") ),
         test.case "expand consumes an application before operators"

@@ -298,7 +298,7 @@ let global_items a mi e =
     list.map (fn n -> item n (entry_kind a mi e n)
                            (analysis.shown_signature a mi n)
                            "A global of this module." rank_global)
-             (list.filter (fn n -> scope.global_kind e n != :module) (scope.exports e));
+             (list.filter (fn n -> scope.global_kind e n != :module) (scope.visible_names e));
 
 /// Everything an import put in this module's namespace: the modules it named,
 /// and the members an `import a.{x}` brought in one at a time.
@@ -539,6 +539,16 @@ when test {
                  (member_items (of! text) segs);
 
     let tests = [
+        test.case "member completion omits private bindings"
+            $( test.eq! [["shown", "shown"]]
+                (member_details! "mod m { priv let hidden = 1; let shown = hidden; } let main! = 0;" ["m"]) ),
+        test.case "local completion includes private bindings"
+            $( test.true! ({
+                let a = of! "priv let helper x = x; let main! = helper 1;";
+                let mi = analysis.module_of a;
+                list.any (fn i -> core.map_get i "label" () == "helper")
+                    (global_items a mi (list.nth mi (scope.r_envs (analysis.resolved a))))
+            }) ),
         test.case "a cursor after a dot asks about the chain in front of it"
             $( test.eq! [:member, ["console"]] (context "    console." 12) ),
         test.case "a partly typed member still asks about the chain"

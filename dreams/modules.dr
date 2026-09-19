@@ -112,7 +112,16 @@ let with_core name items deps =
 /// about this module can quote the line it came from.
 mapping Module { name, path, source, items }
 
-let loaded = Module.make;
+// Visibility is module metadata; later passes still walk ordinary declarations.
+let loaded name path source items =
+    core.map_put (Module.make name path source
+        (list.filter (fn item -> ast.kind item != :private) items)) :private_spans
+        (list.map ast.span (list.filter (fn item -> ast.kind item == :private) items));
+
+let private_declaration m span =
+    list.any (fn sp -> ast.span_start sp <= ast.span_start span
+                   && ast.span_end span <= ast.span_end sp)
+             (core.map_get m :private_spans []);
 
 let module_name m   = core.map_get m :name "";
 let module_path m   = core.map_get m :path "";
@@ -370,6 +379,7 @@ let rec expand_items cfg items =
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { expand_items cfg inner } else { [] },
+            [:priv, d, span] => [d, [:private, span]],
             [:record, kind, name, fields, members, span] =>
                 [syntax.record kind name fields members span],
             other => [other],
@@ -653,7 +663,7 @@ let load_items! l source parsed display name file = {
 let exports_tests m =
     list.any (fn item ->
         match item {
-            [:let, "tests", [], _, _, _] => true,
+            [:let, "tests", [], _, _, span] => not (private_declaration m span),
             _ => false,
         }) (module_items m);
 

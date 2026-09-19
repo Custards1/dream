@@ -32,6 +32,7 @@ const registry = new textmate.Registry({
 
 // [line, the text to find in it, the scope that must apply to it]
 const cases = [
+  ['priv let helper x = x;', 'priv', 'keyword.declaration.dream'],
   ['/// A doc comment.', '///', 'comment.block.documentation.dream'],
   ['// An ordinary one.', '//', 'comment.line.double-slash.dream'],
   ['let greeting = "hi";', 'greeting', 'entity.name.function.dream'],

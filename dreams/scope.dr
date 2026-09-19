@@ -84,12 +84,16 @@ let has_global e n = core.map_has (globals e) n;
 let alias_of e n   = core.map_get (aliases e) n ();
 let only_of e n    = core.map_get (only e) n ();
 
-/// What a module exports, sorted -- for the message that says a member is not
-/// one of them. Naming what is actually there is most of a diagnostic's value,
-/// and the global behind a destructuring is not there to be named.
-let exports e =
+/// Names visible inside the module, sorted. The global behind a destructuring
+/// is an implementation detail, so completion must not offer it.
+let visible_names e =
     list.sort (list.filter (fn n -> not (is_hidden_name n))
                            (list.map (fn kv -> list.head kv) (core.map_pairs (globals e))));
+
+let is_private e n = core.map_has (core.map_get e :private (core.map_new ())) n;
+
+/// Public names used by member completion and missing-member diagnostics.
+let exports e = list.filter (fn n -> not (is_private e n)) (visible_names e);
 
 // --- diagnostics ---------------------------------------------------------------
 
@@ -257,7 +261,15 @@ let rec declare_import_names mi r p names span s =
     list.fold (fn acc sel -> {
         let e = env_at acc mi;
         let bound = default_alias [list.nth 0 sel] (list.nth 1 sel);
-        if has_global e bound || only_of e bound != () {
+        let inaccessible = match r {
+            [:dream, target] => target != mi && target < list.length (envs acc)
+                && is_private (env_at acc target) (list.nth 0 sel),
+            _ => false,
+        };
+        if inaccessible {
+            complain span ("member `" + p + "." + list.nth 0 sel + "` is private") (env_source e) acc
+        }
+        else if has_global e bound || only_of e bound != () {
             complain span ("`" + bound + "` is already bound in this module") (env_source e) acc
         }
         else { set_env mi (with_only bound [r, list.nth 0 sel, p] e) acc }
@@ -578,7 +590,11 @@ let module_span l mi = {
 let declare_one_let l mi od s = {
     let owner = list.head od;
     let d = list.nth 1 od;
-    let e = env_at s mi;
+    let original = env_at s mi;
+    let e = if modules.private_declaration (modules.module_at l owner) (decl_span d) {
+        core.map_put original :private
+            (core.map_put (core.map_get original :private (core.map_new ())) (decl_name d) true)
+    } else { original };
     if has_global e (decl_name d) {
         complain (decl_span d) ("`" + decl_name d + "` is already bound in this module")
                  (modules.module_source (modules.module_at l owner)) s
@@ -1121,7 +1137,10 @@ let check_member c r_ref shown field span r = {
         match r_ref {
             [:dream, target] => {
                 let e = env_of c r target;
-                if has_global e field {
+                if is_private e field && target != ctx_mi c {
+                    report c span ("member `" + shown + "." + field + "` is private") r
+                }
+                else if has_global e field {
                     // The global index, so lowering has nothing left to look
                     // up: a cross-module call is one index by the time the
                     // image is written, which is the whole point of compiling
@@ -2490,6 +2509,33 @@ when test {
     let note_of ds = if list.is_empty ds { "" } else { to_string (diag.note (list.head ds)) };
 
     let tests = [
+        test.case "private bindings are usable inside their module"
+            $( test.eq! [] (messages (checked! "priv let x = 1; let main! = x;")) ),
+        test.case "private recursive functions resolve"
+            $( test.eq! [] (messages (checked! "priv let rec f n = if n == 0 { 0 } else { f (n - 1) }; let main! = f 2;")) ),
+        test.case "qualified private access is rejected"
+            $( test.eq! "member `a.x` is private"
+                (first (checked_two! "priv let x = 1;" "import a; let main! = a.x;")) ),
+        test.case "an unused private selective import is rejected"
+            $( test.eq! "member `a.x` is private"
+                (first (checked_two! "priv let x = 1;" "import a.{x as y}; let main! = 0;")) ),
+        test.case "private destructuring keeps every binding private"
+            $( test.eq! "member `a.y` is private"
+                (first (checked_two! "priv let [x, y] = [1, 2];" "import a; let main! = a.y;")) ),
+        test.case "private names are absent from export diagnostics"
+            $( test.true! (str.contains_str "it exports: visible"
+                (note_of (checked_two! "priv let hidden = 1; let visible = hidden;"
+                                      "import a; let main! = a.nope;"))) ),
+        test.case "public functions can use private helpers"
+            $( test.eq! [] (messages (checked_two! "priv let x = 1; let value = x;"
+                                                   "import a; let main! = a.value;")) ),
+        test.case "nested modules enforce private visibility"
+            $( test.eq! "member `a.x` is private"
+                (first (checked! "mod a { priv let x = 1; } let main! = a.x;")) ),
+        test.case "conditional private bindings remain private"
+            $( test.eq! "member `a.x` is private"
+                (first (checked_two! "when true { priv let x = 1; }"
+                                     "import a; let main! = a.x;")) ),
         // --- resolution ---
         test.case "a name nothing binds is reported"
             $( test.eq! "cannot find `nope` in this scope" (first (checked! "let main! = nope;")) ),
