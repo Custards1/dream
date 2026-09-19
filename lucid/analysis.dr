@@ -616,8 +616,9 @@ let params_of a mi name =
 // `modules.records` is what the rewrite knew, kept. Everything below turns it
 // back into the declaration the author is looking at.
 
-/// The record a module was generated from: `[owner, kind, name, fields, span]`,
-/// or `()` for an ordinary module.
+/// The record a module was generated from:
+/// `[owner, kind, name, fields, members, span]`, or `()` for an ordinary
+/// module.
 let record_of a mi = {
     let l = loader a;
     let full = modules.module_name (modules.module_at l mi);
@@ -625,10 +626,19 @@ let record_of a mi = {
                                   (modules.records l))
 };
 
-let record_owner r  = list.head r;
-let record_name r   = list.nth 2 r;
-let record_fields r = list.nth 3 r;
-let record_span r   = list.nth 4 r;
+let record_owner r   = list.head r;
+let record_name r    = list.nth 2 r;
+let record_fields r  = list.nth 3 r;
+let record_members r = list.nth 4 r;
+let record_span r    = list.nth 5 r;
+
+/// The member of this name, or `()`. A member is written rather than
+/// generated, so everything below answers about it from what the author typed
+/// -- which is also why it is asked about before the generated names are: a
+/// member could be called `set_thing` where no field `thing` exists, and the
+/// `set_` stem search would otherwise get there first and find nothing.
+let record_member r n =
+    list.first_or () (list.filter (fn m -> ast.member_name m == n) (record_members r));
 
 /// The keyword it was written with. `syntax.record` keeps the *representation*
 /// -- which collection the fields go into -- because that is what it builds
@@ -658,25 +668,45 @@ let record_field r n =
               },
     };
 
-/// Where to send a reader who asked about one of a record's members: the field
-/// it is about, or the declaration itself for the constructor.
-let record_site r n = match record_field r n { () => record_span r, f => ast.field_span f };
+/// Where to send a reader who asked about one of a record's names: the member
+/// as it was written, the field a generated helper is about, or the
+/// declaration itself for a constructor.
+let record_site r n =
+    match record_member r n {
+        () => match record_field r n { () => record_span r, f => ast.field_span f },
+        m => ast.member_span m,
+    };
 
-/// What a generated member does, in the words of the declaration it came from.
+/// What one of a record's names does, in the words of the declaration it came
+/// from. A member is a function somebody wrote, so there is nothing to explain
+/// about what it does -- only where it lives, which is what a reader who
+/// reached it through `Point.` does not otherwise know.
 let record_role r n =
-    match record_field r n {
-        () => "builds the " + record_keyword r + " `" + record_name r + "`",
-        f => (if str.starts_with "set_" n && ast.field_name f != n {
-                  "replaces `" + ast.field_name f + "` in the "
-              } else {
-                  "reads `" + ast.field_name f + "` of the "
-              }) + record_keyword r + " `" + record_name r + "`"
-             // A field with a default never fails to read, and what it answers
-             // instead is the most useful thing to say about it.
-             + match ast.field_default f {
-                   () => "",
-                   d => ", or `" + ast.show d + "` when it is not there",
-               },
+    match record_member r n {
+        () => match record_field r n {
+            () => "builds the " + record_keyword r + " `" + record_name r + "`"
+                  // The two constructors differ only in what they ask for, so
+                  // which fields `new` is filling in is the whole of what
+                  // there is to say about the difference.
+                  + match [n, list.filter (fn f -> ast.field_default f != ()) (record_fields r)] {
+                        ["new", [_, .._] as defaulted] =>
+                            ", defaulting " + str.join_str ", "
+                                (list.map (fn f -> "`" + ast.field_name f + "`") defaulted),
+                        _ => "",
+                    },
+            f => (if str.starts_with "set_" n && ast.field_name f != n {
+                      "replaces `" + ast.field_name f + "` in the "
+                  } else {
+                      "reads `" + ast.field_name f + "` of the "
+                  }) + record_keyword r + " `" + record_name r + "`"
+                 // A field with a default never fails to read, and what it
+                 // answers instead is the most useful thing to say about it.
+                 + match ast.field_default f {
+                       () => "",
+                       d => ", or `" + ast.show d + "` when it is not there",
+                   },
+        },
+        _ => "a member of the " + record_keyword r + " `" + record_name r + "`",
     };
 
 /// Was this global declared with `macro`?
@@ -860,6 +890,26 @@ let hover_at a line character =
 let symbol_variable = 13;
 let symbol_struct = 23;
 let symbol_field = 8;
+/// A member is a function the author wrote, which is exactly what `Method`
+/// means here -- and showing it as one is what tells it from a field in the
+/// outline without a word of explanation.
+let symbol_method = 6;
+
+/// A record's fields and members, as outline children in the order they were
+/// written. `at` is the caller's span-to-range, which needs the file's text.
+let child_symbols at r =
+    list.map (fn c -> list.nth 1 c)
+        (list.sort_by (fn x y -> list.head x < list.head y)
+            (list.map (fn f -> [ast.span_start (ast.field_span f),
+                                %{ "name" => ast.field_name f, "kind" => symbol_field,
+                                   "range" => at (ast.field_span f),
+                                   "selectionRange" => at (ast.field_span f) }])
+                      (record_fields r)
+             + list.map (fn m -> [ast.span_start (ast.member_span m),
+                                  %{ "name" => ast.member_name m, "kind" => symbol_method,
+                                     "range" => at (ast.member_span m),
+                                     "selectionRange" => at (ast.member_span m) }])
+                        (record_members r)));
 
 /// What this file declares, for the outline and for the symbol search.
 ///
@@ -892,11 +942,13 @@ let symbols a =
                     // A field is written inside the declaration, so its range
                     // is inside the record's -- which is what LSP requires of
                     // a child, and the reason nothing here is invented.
-                    "children" =>
-                        list.map (fn f -> %{ "name" => ast.field_name f, "kind" => symbol_field,
-                                             "range" => at (ast.field_span f),
-                                             "selectionRange" => at (ast.field_span f) })
-                                 (record_fields r) }]
+                    //
+                    // Fields and members are sorted back together because they
+                    // were written interleaved: a record is read top to bottom
+                    // like anything else, and an outline that listed every
+                    // field and then every member would be describing a
+                    // declaration nobody wrote.
+                    "children" => child_symbols at r }]
             }) (list.filter (fn r -> record_owner r == mine) (modules.records (loader a)));
             list.map (fn s -> list.nth 1 s)
                      (list.sort_by (fn x y -> list.head x < list.head y)
@@ -938,6 +990,10 @@ when test {
     /// one. Line 0 is the declaration -- `x` at column 14, `y` at 17 -- and on
     /// line 1 the three kinds of generated member are at columns 18, 28 and 41.
     let record_src = "group Point { x, y }\nlet main! = Point.x (Point.set_y (Point.make 1 2) 3);\n";
+
+    /// The same, with a member written in it. One line again, and the member
+    /// is last so that the fields keep the columns `record_src` uses.
+    let member_src = "group Point { x, y, len self = x self + y self }\nlet main! = Point.len (Point.new 1 2);\n";
 
     let hover_value! text line ch =
         match hover_at (of! text) line ch {
@@ -1061,6 +1117,28 @@ when test {
             $( test.eq! ["Point", "main!"] (symbol_names! record_src) ),
         test.case "a record's fields are in the outline underneath it"
             $( test.eq! ["x", "y"] (child_names! record_src "Point") ),
+
+        // A member is the one part of a record that is *not* generated: its
+        // body and its parameters are in the file, at the offsets they were
+        // written at, because `syntax.record` freshens only what it made up.
+        // So every answer below comes from the source rather than from a
+        // reconstruction, and `self` is shown because the author chose it.
+        test.case "a member is shown with the parameters it was written with"
+            $( test.eq! "`len self` -- a member of the group `Point`"
+                        (hover_value! member_src 1 18) ),
+        test.case "going to a member goes to where it was written"
+            $( test.eq! [0, 20] (definition_start! member_src 1 18) ),
+        test.case "a member is in the outline beside the fields, in source order"
+            $( test.eq! ["x", "y", "len"] (child_names! member_src "Point") ),
+        test.case "going to `new` goes to the declaration, as `make` does"
+            $( test.eq! [0, 0] (definition_start! member_src 1 29) ),
+        test.case "`new` says which fields it is filling in"
+            $( test.eq! "`new host` -- builds the mapping `C`, defaulting `retries`"
+                        (hover_value! "mapping C { host, retries = 3 }\nlet main! = C.new \"h\";\n"
+                                      1 14) ),
+        test.case "`new` with nothing to default reads as the constructor it is"
+            $( test.eq! "`new x y` -- builds the group `Point`"
+                        (hover_value! member_src 1 29) ),
         test.case "a record with no fields still shows its constructor"
             $( test.eq! "`make ()` -- builds the struct `Empty`"
                         (hover_value! "struct Empty {}\nlet main! = Empty.make ();\n" 1 18) ),

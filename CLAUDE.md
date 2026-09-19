@@ -1788,24 +1788,43 @@ defect:
   rewrite builds from; `group`/`struct`/`mapping` is what the reader typed.
 
 `modules.records` is what the rewrite knew, kept: `[owner, kind, name, fields,
-span]` per declaration, collected by `record_items` alongside `expand_items` and
-under the same `when` conditions, so a record a configuration switches off is no
-module and no record either. **Nothing in the compiler reads it** — it is there
-for `lucid`, the same way `modules.expansions` is, and for the same reason: the
-pass that rewrites something is the only one that ever sees what was written.
+members, span]` per declaration, collected by `record_items` alongside
+`expand_items` and under the same `when` conditions, so a record a configuration
+switches off is no module and no record either. **Nothing in the compiler reads
+it** — it is there for `lucid`, the same way `modules.expansions` is, and for the
+same reason: the pass that rewrites something is the only one that ever sees what
+was written.
 
 What it buys, all in [lucid/analysis.dr](lucid/analysis.dr)'s "records" section:
-the outline lists each record with its fields underneath it, in source order;
-hover says `` `x record` -- reads `x` of the group `Point` `` and
-`` `set_y record value` -- replaces `y` in the struct `Vector` ``; and
-go-to-definition on a member lands on **the field**, in the module the record
-was written in — not on the record's own module, whose "path" is a dotted name
-that `location` would have made a URI out of.
+the outline lists each record with its fields and members underneath it, in
+source order; hover says `` `x record` -- reads `x` of the group `Point` ``,
+`` `set_y record value` -- replaces `y` in the struct `Vector` `` and
+`` `new host` -- builds the mapping `C`, defaulting `retries` ``; and
+go-to-definition on a generated name lands on **the field**, in the module the
+record was written in — not on the record's own module, whose "path" is a dotted
+name that `location` would have made a URI out of.
 
 One fix that is not about records and should be kept in mind for any generated
 code: `signature` now shows a parameter by its **name**, and only slices the
 source for one that is a pattern, which has no name. Slicing was never right for
-a declaration the compiler made up, and a record's members are all of them.
+a declaration the compiler made up, and a record's generated helpers are all of
+them.
+
+**A member is the exception, and it is the one that needed no work.** Everything
+above exists because the rewrite throws the author's spans away. It throws away
+only the spans it *made up*: `syntax.record` freshens the generated declarations
+and appends the members after, un-freshened, so a member's body and parameters
+are still at the offsets they were typed at. That is not tidiness — `fresh`
+exists because resolution keys names and binders by span, and the generated
+declarations need new ones because several stand where one declaration was
+written and a default is emitted twice (in the accessor's `else` and in `new`'s
+body). A member is emitted once, so it needs nothing. The consequences are worth
+stating because each is a thing that had to be built for every other generated
+name: a "cannot find" inside a member body is reported **where it is written**,
+go-to-definition lands on the member itself, and `shown_signature` reads the
+real parameters out of the file, so `self` is shown because the author chose it.
+Generated spans live above 2^31 and written ones below, which is what keeps the
+two from colliding.
 
 ### A host module's members come from the host
 
@@ -1853,10 +1872,17 @@ test.
   resolution; [dreams/expand.dr](dreams/expand.dr) and "Expanding a macro is a
   compile" say what that costs.
 - `group P { x, y }`, `struct P { x, y }` and `mapping P { x, y }` declare a
-  record: a module of generated functions — `P.make`, `P.x`, `P.set_x` — over a
-  list, an array and a map respectively. The *loader* rewrites them
+  record: a module of generated functions — `P.make`, `P.new`, `P.x`, `P.set_x`
+  — over a list, an array and a map respectively. The *loader* rewrites them
   (`syntax.record`), so nothing downstream knows a record from a `mod`; "A
   record is a declaration before it is a module" is what that costs a tool.
+  A field may be given a default (`x = 0`), which is the `else` of the read its
+  accessor compiles to; `new` is the constructor that takes only the fields
+  without one. An entry *with parameters* is a **member** — `say_hi self = ..`
+  — an ordinary function compiled inside the generated module, where the
+  accessors are globals. Having parameters is the whole of what tells the two
+  apart, and entries are separated by `,` or by a line break, as a block's
+  statements are by `;`.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

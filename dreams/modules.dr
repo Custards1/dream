@@ -164,9 +164,9 @@ let parsed l       = core.map_get l :parsed (core.map_new ());
 let with_parsed p l = core.map_put l :parsed p;
 let put_parsed file v l = with_parsed (core.map_put (parsed l) file v) l;
 
-/// `[owner, kind, name, fields, span]` for each `group`, `struct` or `mapping`
-/// declaration, where `owner` is the module it was written in. `note_records`
-/// is the only thing that adds to this and says why it exists.
+/// `[owner, kind, name, fields, members, span]` for each `group`, `struct` or
+/// `mapping` declaration, where `owner` is the module it was written in.
+/// `note_records` is the only thing that adds to this and says why it exists.
 let records l      = core.map_get l :records [];
 
 /// What each `expand` in the program named: `[module, source, offset, what]`,
@@ -370,7 +370,8 @@ let rec expand_items cfg items =
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { expand_items cfg inner } else { [] },
-            [:record, kind, name, fields, span] => [syntax.record kind name fields span],
+            [:record, kind, name, fields, members, span] =>
+                [syntax.record kind name fields members span],
             other => [other],
         }) items);
 
@@ -382,7 +383,8 @@ let rec record_items cfg items =
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { record_items cfg inner } else { [] },
-            [:record, kind, name, fields, span] => [[kind, name, fields, span]],
+            [:record, kind, name, fields, members, span] =>
+                [[kind, name, fields, members, span]],
             _ => [],
         }) items);
 
@@ -845,7 +847,7 @@ when test {
         test.case "a record declaration is remembered as it was written"
             $( test.eq! [[:list, "Point", ["x", "y"]]]
                         (list.map (fn r -> [list.nth 0 r, list.nth 1 r,
-                                            list.map (fn f -> list.head f) (list.nth 2 r)])
+                                            list.map (fn f -> ast.field_name f) (list.nth 2 r)])
                                   (record_items on (items_of "group Point { x, y }"))) ),
         test.case "the three keywords keep their backing kinds apart"
             $( test.eq! [:list, :array, :map]
@@ -860,7 +862,7 @@ when test {
                               (items_of "when test { group Hidden { x } }")) ),
         test.case "a record's fields keep the spans they were written at"
             $( test.eq! [[14, 15], [17, 18]]
-                        (list.map (fn f -> list.nth 1 f)
+                        (list.map (fn f -> ast.field_span f)
                                   (list.nth 2 (list.head (record_items on
                                       (items_of "group Point { x, y }"))))) ),
         test.case "a nested when is resolved too"

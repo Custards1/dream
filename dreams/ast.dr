@@ -176,7 +176,29 @@ let field_default f = list.nth 1 f;
 let field_name f    = param_name (list.nth 0 f);
 let field_span f    = list.nth 1 (list.nth 0 f);
 
-let record_d kind name fields span = [:record, kind, name, fields, span];
+/// A member of a record: `say_hi self = "hi " + name self`. It is an ordinary
+/// function placed in the module the record becomes, and it is not a field --
+/// it occupies no slot in the collection, `make` does not take it, and it has
+/// no setter. What makes it worth writing there rather than beside the
+/// declaration is where its body is compiled: *inside* that module, where the
+/// accessors are globals. So `name self` is the generated accessor and nothing
+/// had to be imported for it to be.
+///
+/// The receiver is an ordinary parameter with no special standing -- `self` is
+/// a name the author picked and the language does not know it. That is what
+/// makes a member "not exactly a method": it is a function that happens to be
+/// about the record, and `Person.say_hi p` is the call it looks like.
+///
+/// Having parameters is also what tells a member from a field: `x = 0` is a
+/// field with a default and `f self = 0` is a member, and nothing else has to
+/// be written to say which was meant.
+let record_member name params body span = [name, params, body, span];
+let member_name m   = list.nth 0 m;
+let member_params m = list.nth 1 m;
+let member_body m   = list.nth 2 m;
+let member_span m   = list.nth 3 m;
+
+let record_d kind name fields members span = [:record, kind, name, fields, members, span];
 
 /// `let [a, b] = pair` -- a `let` that binds what a pattern names. A node of
 /// its own rather than a `let` whose name is a pattern, because everything
@@ -317,14 +339,17 @@ let rec show e =
         [:comp, impure, x, _] => "(" + (if impure { "comp!" } else { "comp" }) + " " + show x + ")",
         [:expand, x, _] => "(expand " + show x + ")",
         [:macro, n, ps, b, _] => "(macro " + n + " " + show_params ps + " " + show b + ")",
-        [:record, kind, n, fields, _] =>
+        [:record, kind, n, fields, members, _] =>
             "(" + (match kind { :list => "group", :array => "struct", :map => "mapping" })
                 + " " + n + " "
                 + str.join_str " " (list.map (fn f ->
                       match field_default f {
                           () => field_name f,
                           d => "(" + field_name f + " = " + show d + ")",
-                      }) fields) + ")",
+                      }) fields
+                    + list.map (fn m ->
+                      "(" + member_name m + " " + show_params (member_params m)
+                          + " = " + show (member_body m) + ")") members) + ")",
         [:list, xs, _]      => "(list " + show_all xs + ")",
         [:array, xs, _]     => "(array " + show_all xs + ")",
         [:map, pairs, _]    => "(map " + show_pairs pairs + ")",

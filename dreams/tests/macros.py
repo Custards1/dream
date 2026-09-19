@@ -156,6 +156,39 @@ let main! = {
 };
 ''', '[:map, true]\n[10, 20, 30, 10]\n30\ntrue\n7\n8\n4\n5\n5\n')
 
+    # Defaults, `new` and members, through a real compile and both VM paths.
+    #
+    # `Lazy` is the laziness check: a default is the `else` of the read its
+    # accessor compiles to, so a record built by `new` never evaluates the
+    # default of a field nobody asks for -- `1 / 0` as a default is reached
+    # only by the read that wants it.
+    success('''
+import std.console;
+mapping Person {
+    name
+    greeting = "Hi"
+    say_hi self = greeting self + " " + name self
+    louder self = say_hi self + "!"
+}
+group Point {
+    x
+    y = 0
+    len2 self = x self * x self + y self * y self
+    shifted self d = make (x self + d) (y self + d)
+}
+struct Boxed { w = 1, h = 2, area self = w self * h self }
+mapping Lazy { kept, bad = 1 / 0 }
+let main! = {
+    console.print! [Person.say_hi (Person.new "Ada"), Person.louder (Person.make "Bob" "Yo")]
+    console.print! (Person.new "Ada" == Person.make "Ada" "Hi")
+    console.print! [Point.len2 (Point.make 3 4), Point.len2 (Point.new 3)]
+    console.print! (Point.shifted (Point.new 1) 5)
+    console.print! [Boxed.area (Boxed.new ()), Boxed.area (Boxed.make 3 4)]
+    console.print! (Lazy.kept (Lazy.new 7))
+    console.print! (Person.greeting %{})
+};
+''', '["Hi Ada", "Yo Bob!"]\ntrue\n[25, 9]\n[6, 5]\n[2, 12]\n7\nHi\n')
+
     failure('macro id x = x; let main! = expand id;', 'expects 1 syntax arguments')
     failure('let id x = x; let main! = expand id 1;', 'declared macro')
     failure('macro bad x = [:error, \"expected a literal list\"]; let main! = expand bad 1;',
@@ -176,10 +209,16 @@ let main! = expand loop 1;
                         'mapping Bad { make }', 'mapping Bad { x, x }',
                         'mapping Bad { x, set_x }', 'mapping Bad { set_x, x }'):
         failure(declaration, 'conflicts with a generated helper')
-    failure('group Bad { x y }', 'expected `,` or `}`')
+    # `x y` is the start of a member -- a name with a parameter -- so what is
+    # missing is the `=` and its body, not a separator.
+    failure('group Bad { x y }', 'expected `=` after the parameters of `x`')
     failure('group Bad { x!', 'plain name')
-    failure('mapping Bad { x y }', 'expected `,` or `}`')
+    failure('mapping Bad { x y }', 'expected `=` after the parameters of `x`')
     failure('mapping Bad { x!', 'plain name')
+    for declaration in ('group Bad { new }', 'mapping Bad { x, new self = 1 }',
+                        'struct Bad { x, x self = 1 }'):
+        failure(declaration, 'conflicts with a generated helper')
+    failure('mapping Bad { x, y = x }', 'may not name anything')
     # The library returns actionable syntax errors, with no runtime imports
     # needed by its generated expressions. Effects remain checked at the call.
     for expression, message in (

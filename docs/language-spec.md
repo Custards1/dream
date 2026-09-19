@@ -570,9 +570,61 @@ let n = Position.set_y m 9;  // %{ :x => 3, :y => 9 }; m is unchanged
 For each field `f`, the compiler generates `f record` and
 `set_f record value`. `make` takes the fields in declaration order. Helpers
 are ordinary curried functions, and fields retain normal collection laziness.
-An empty declaration has a `make ()` constructor. Fields are comma-separated,
-with an optional trailing comma. Duplicate fields and names that collide with
-`make` or another generated helper are rejected.
+An empty declaration has a `make ()` constructor. Duplicate fields and names
+that collide with `make`, `new` or another generated helper are rejected.
+
+Entries are separated by `,`, or by a line break where no comma is written —
+the same rule a block uses for `;`. An entry may run over as many lines as it
+is indented past.
+
+**Defaults.** `f = e` gives a field a default: what reading it answers when
+the collection has nothing at that key or position. The default is the `else`
+of the read the accessor compiles to, so it costs nothing where it is not used
+and is lazy where it is. A default may not name anything — it is compiled
+inside the module the declaration becomes, which cannot see the one it is
+written in.
+
+**`new`.** Arity is fixed, so a default does not make `make`'s parameter
+optional. `new` is the constructor that takes only the fields *without*
+defaults, in declaration order, and fills the rest in:
+
+```dream
+mapping Config { host, retries = 3 }
+
+let a = Config.make "h" 9;    // %{ :host => "h", :retries => 9 }
+let b = Config.new "h";       // %{ :host => "h", :retries => 3 }
+let c = Config.retries %{};   // 3 -- the accessor's fallback
+```
+
+`new` writes the default into the collection rather than leaving the slot
+empty, so `Config.new "h" == Config.make "h" 3`. It is generated for every
+record; one with no defaults gets two names for the same constructor.
+
+**Members.** An entry with parameters is a function rather than a field:
+
+```dream
+mapping Person {
+    name
+    greeting = "Hi"
+    say_hi self = greeting self + " " + name self
+    louder self = say_hi self + "!"
+}
+
+let p = Person.new "Ada";
+let s = Person.say_hi p;      // "Hi Ada"
+```
+
+Having parameters is the whole of what tells a member from a field — `x = 0`
+has none and is a field, `f self = 0` has one and is a member. A member
+occupies no slot in the collection, `make` and `new` do not take it, and it
+has no setter. Its body is compiled *inside* the generated module, so it may
+name the accessors, the setters, the constructors and the other members
+without importing anything; it may not name anything from the module the
+declaration was written in, which is the ordinary rule for a nested `mod`.
+
+The receiver is an ordinary parameter with no special standing: `self` above
+is a name the author picked, and the language does not know it. A member may
+be impure (`f! self = ..`); a field may not, because reading one is pure.
 
 These declarations add no runtime type or tag: indexing, equality, `type_of`,
 and list/array/map patterns work exactly as for the underlying collection.

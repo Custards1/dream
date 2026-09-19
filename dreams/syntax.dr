@@ -48,20 +48,52 @@ let rec literal value span = match type_of value {
 /// the read its accessor compiles to, and nothing else: `c.[k else d]` is one
 /// opcode and already means "this, or that when it is not there". So a default
 /// costs nothing where it is not used, is lazy where it is, and works the same
-/// for a `group` and a `struct`, whose reads are by position. It does *not*
-/// make the constructor's parameter optional: arity is fixed in this language,
-/// so `make` still takes every field.
-let record kind name fields span = {
+/// for a `group` and a `struct`, whose reads are by position.
+///
+/// It does *not* make `make`'s parameter optional, because arity is fixed in
+/// this language and a constructor that sometimes took four arguments and
+/// sometimes three would be a different function each time. `new` is that
+/// other function, written out: it takes the fields that have no default, in
+/// the order they were declared, and fills the rest in. So the two constructors
+/// are the two honest readings of a defaulted field -- `make` says "I am giving
+/// you all of it" and `new` says "give me the rest" -- and a record with no
+/// defaults gets two names for the same thing, which is better than a name that
+/// appears and disappears with the declaration.
+///
+/// Note that `new` puts the default *in the collection* rather than leaving the
+/// slot empty for the accessor to fall back on. It has to for a `group` and a
+/// `struct`, whose fields are positions and whose later positions would shift;
+/// doing the same for a `mapping` is what makes `C.new a == C.make a 3` hold,
+/// and equality is the thing a reader will assume.
+///
+/// A member -- `say_hi self = ..` -- is spliced in as the `let` it already is.
+/// Everything generated is freshened first and the members are appended after,
+/// which is not tidiness: `fresh` exists because resolution keys names and
+/// binders by span, and the generated declarations need new spans because
+/// several of them stand where one declaration was written and a default is
+/// emitted twice. A member is written once, at a real place, so freshening it
+/// would throw away the only spans a diagnostic inside it could point at.
+/// Generated spans live above 2^31 and written ones below, so the two cannot
+/// collide.
+let record kind name fields members span = {
     let named f = ast.name_e (ast.field_name f) (ast.field_span f);
-    let body = match kind {
-        :list => ast.list_e (list.map (fn f -> named f) fields) span,
-        :array => ast.array_e (list.map (fn f -> named f) fields) span,
+    let build of_field = match kind {
+        :list => ast.list_e (list.map of_field fields) span,
+        :array => ast.array_e (list.map of_field fields) span,
         :map => ast.map_e (list.map (fn f ->
-            [ast.atom_e (ast.field_name f) (ast.field_span f), named f]) fields) span,
+            [ast.atom_e (ast.field_name f) (ast.field_span f), of_field f]) fields) span,
     };
     let constructor = ast.let_d "make"
         (if list.is_empty fields { [ast.param () span] }
-         else { list.map (fn f -> ast.field_param f) fields }) body false span;
+         else { list.map (fn f -> ast.field_param f) fields })
+        (build (fn f -> named f)) false span;
+    // `new` names only the fields that have no default; the others are their
+    // defaults, spliced where the value goes.
+    let required = list.filter (fn f -> ast.field_default f == ()) fields;
+    let from_default = ast.let_d "new"
+        (if list.is_empty required { [ast.param () span] }
+         else { list.map (fn f -> ast.field_param f) required })
+        (build (fn f -> match ast.field_default f { () => named f, d => d })) false span;
     let helpers = list.concat (list.map (fn i -> {
         let f = list.nth i fields;
         let field = ast.field_name f;
@@ -72,8 +104,12 @@ let record kind name fields span = {
          ast.let_d ("set_" + field) [ast.param "record" span, ast.param "value" span]
                    (ast.set_e obj key (ast.name_e "value" span) span) false span]
     }) (list.range 0 (list.length fields)));
-    ast.mod_d name (list.head (fresh (core.cons constructor helpers)
-                                  (2147483648 + ast.span_start span * 128))) span
+    let generated = list.head (fresh ([constructor, from_default] + helpers)
+                                     (2147483648 + ast.span_start span * 128));
+    let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
+                                              (ast.member_body m) true (ast.member_span m))
+                           members;
+    ast.mod_d name (generated + written) span
 };
 
 // Validate returned data before any compiler pass assumes an AST shape. Spans

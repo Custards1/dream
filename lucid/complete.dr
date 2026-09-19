@@ -628,9 +628,25 @@ when test {
         // `Point.make` was offered as `make  `, and `Point` itself as an
         // import of a module called `buf.Point`.
         test.case "a record's members are offered with their parameters"
-            $( test.eq! [["make", "make x y"], ["set_x", "set_x record value"],
+            $( test.eq! [["make", "make x y"], ["new", "new x y"],
+                         ["set_x", "set_x record value"],
                          ["set_y", "set_y record value"], ["x", "x record"], ["y", "y record"]]
                         (member_details! "group Point { x, y }\n" ["Point"]) ),
+        // `new` takes only what has no default, which is the whole difference
+        // between the two constructors and so is the thing a completion has to
+        // get right.
+        test.case "new is offered without the fields that have defaults"
+            $( test.eq! [["make", "make x y"], ["new", "new x"]]
+                        (list.filter (fn d -> list.head d == "make" || list.head d == "new")
+                            (member_details! "group Point { x, y = 0 }\n" ["Point"])) ),
+        // A member is written rather than generated, so its parameters are in
+        // the file and are the ones the author chose -- `self` has no standing
+        // in the language and the completion must not invent one.
+        test.case "a member is offered with the parameters it was written with"
+            $( test.eq! [["len", "len self"], ["scaled", "scaled self k"]]
+                        (list.filter (fn d -> list.head d == "len" || list.head d == "scaled")
+                            (member_details! "group P { x, len self = x self, scaled self k = k }\n"
+                                             ["P"])) ),
         test.case "a record is offered as the declaration it was written as"
             $( test.eq! "The group `Point`, with `x`, `y`."
                         (import_doc! "group Point { x, y }\n" "Point") ),
