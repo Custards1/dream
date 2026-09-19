@@ -432,6 +432,36 @@ let cycle at name from_source l =
                   "modules are compiled together, so their imports must form a tree"
                   from_source l;
 
+/// Find a hoisted module through an alternate spelling of its parent file.
+let rec nested_module l dotted =
+    match find l dotted {
+        i if i != () => i,
+        _ => {
+            let segs = dotted_segments dotted;
+            if list.length segs <= 1 { () }
+            else {
+                let parent = str.join_str "." (list.take (list.length segs - 1) segs);
+                match nested_module l parent {
+                    () => (),
+                    i => find l (module_name (module_at l i) + "." + list.last segs),
+                }
+            }
+        },
+    };
+
+/// A dotted import can name a block inside a file, or a member of that block.
+/// Load the nearest containing file before asking what it declares.
+let rec load_container! l dotted at from_source = {
+    let segs = dotted_segments dotted;
+    if list.length segs <= 1 { l }
+    else {
+        let parent = str.join_str "." (list.take (list.length segs - 1) segs);
+        if nested_module l parent != () { l }
+        else if resolve_path! l parent != () { load_named! l parent at from_source }
+        else { load_container! l parent at from_source }
+    }
+};
+
 let rec load_named! l dotted at from_source =
     if is_host l dotted { record_native dotted (mark_visited dotted l) }
     else if is_visited l dotted { l }
@@ -443,8 +473,21 @@ let rec load_named! l dotted at from_source =
             // No module by that name -- but a *package* by that name is
             // `import std;`, which brings in everything the package provides.
             () => {
-                let tried = load_package! l dotted at from_source;
-                if list.nth 1 tried { list.head tried }
+                let containing = load_container! l dotted at from_source;
+                let nested = nested_module containing dotted;
+                let segs = dotted_segments dotted;
+                let parent = str.join_str "." (list.take (list.length segs - 1) segs);
+                let owner = nested_module containing parent;
+                let tried = load_package! containing dotted at from_source;
+                if nested != () {
+                    mark_visited dotted (put :by_name
+                        (core.map_put (by_name containing) dotted nested) containing)
+                }
+                else if owner != () {
+                    // Resolution binds the final segment like a selective import.
+                    put :by_name (core.map_put (by_name containing) parent owner) containing
+                }
+                else if list.nth 1 tried { list.head tried }
                 else {
                     complain_note at ("cannot find module `" + dotted + "`")
                                   (unresolved_note! l dotted) from_source (list.head tried)

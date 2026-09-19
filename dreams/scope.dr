@@ -275,7 +275,7 @@ let rec declare_import_names mi r p names span s =
         else { set_env mi (with_only bound [r, list.nth 0 sel, p] e) acc }
     }) s names;
 
-let declare_import l mi imp s = {
+let rec declare_import l mi imp s = {
     let e = env_at s mi;
     let written = list.nth 1 imp;
     let names = list.nth 3 imp;
@@ -285,8 +285,23 @@ let declare_import l mi imp s = {
     // `import path.{ a, b }` binds members rather than the module, so the
     // module's own name is never taken and cannot collide.
     let takes_members = names != () && not (list.is_empty names);
+    let parent = relative_path l mi (dotted (list.take (list.length written - 1) written));
 
-    if not takes_members && alias_of e alias != () {
+    if not takes_members && modules.find l p == ()
+       && list.length written > 1 && modules.find l parent != () {
+        let owner = modules.find l parent;
+        let member = list.last written;
+        if owner < list.length (envs s) && not (has_global (env_at s owner) member) {
+            complain span ("module `" + parent + "` has no member `" + member + "`")
+                     (env_source e) s
+        }
+        else {
+            declare_import l mi
+                (ast.import_d (modules.dotted_segments parent) ()
+                              [[member, list.nth 2 imp]] span) s
+        }
+    }
+    else if not takes_members && alias_of e alias != () {
         complain span ("`" + alias + "` is already imported here") (env_source e) s
     }
     else {
@@ -299,6 +314,9 @@ let declare_import l mi imp s = {
                                  (env_source e) s
                     }
                     else { set_env mi (with_alias alias (group_ref p) e) s }
+                }
+                else if not (list.contains p (modules.natives l)) {
+                    complain span ("cannot find module `" + p + "`") (env_source e) s
                 }
                 else {
                     // Host-provided. The global holding the module value is
