@@ -99,7 +99,7 @@
         },
         {
           "name": "keyword.declaration.dream",
-          "match": "\\b(let|rec|fn|import|as|mod|virtual|derive|comp)\\b"
+          "match": "\\b(let|rec|fn|import|as|mod|virtual|derive|comp|macro|expand|group|struct)\\b"
         },
         {
           "name": "constant.language.boolean.dream",
@@ -118,7 +118,7 @@
     },
     "declaration": {
       "comment": "The name a `let` introduces, so a definition stands out from a use.",
-      "match": "\\b(let)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
+      "match": "\\b(let|macro|group|struct)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
       "captures": {
         "1": {
           "name": "keyword.declaration.dream"

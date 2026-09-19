@@ -16,7 +16,8 @@
 
 namespace dream {
 
-Runtime::Runtime() : wk_(std::make_unique<WellKnownAtoms>()) {
+Runtime::Runtime(bool owns_host_services)
+    : wk_(std::make_unique<WellKnownAtoms>()), owns_host_services_(owns_host_services) {
     // Intern the atoms the runtime itself names, before any image atoms, so
     // their indices are stable no matter what is loaded.
     wk_->error = intern_atom("error");
@@ -220,8 +221,11 @@ void Runtime::print_stats() const {
 Runtime::~Runtime() {
     // Stop the poller before the scheduler it wakes into can go away, and
     // close whatever descriptors the program left open.
-    io_shutdown();
-    os_shutdown();
+    // A `comp!` or macro VM must leave its caller's handles and jobs alive.
+    if (owns_host_services_) {
+        io_shutdown();
+        os_shutdown();
+    }
 }
 
 bool Runtime::load_image_file(const std::string& path, std::string& error) {

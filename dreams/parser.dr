@@ -90,12 +90,12 @@ let token_continues c t =
 /// no idea they are special.
 let keywords = ["let", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
-                "match"];
+                "match", "macro", "expand", "group", "struct"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
 let non_starters = ["let", "rec", "else", "import", "as", "catch", "virtual", "derive",
-                    "when", "mod"];
+                    "when", "mod", "macro"];
 
 /// The lists above are the readable form; these are how they are asked. A
 /// linear scan answers "is this identifier a keyword" in a dozen reductions
@@ -108,7 +108,8 @@ let keyword_set = set_of keywords;
 let non_starter_set = set_of non_starters;
 
 let is_kw ts word = at ts :ident && peek_value ts == word;
-let is_keyword name = core.map_has keyword_set name;
+// Record introducers are contextual: existing code can still bind `group`.
+let is_keyword name = core.map_has keyword_set name && name != "group" && name != "struct";
 let is_non_starter name = core.map_has non_starter_set name;
 
 /// The token after this one, for the single place that needs to look ahead:
@@ -365,20 +366,24 @@ let rec parse_primary c ts = {
 };
 
 /// The keywords that begin an expression, and then plain names.
-let rec parse_ident c word sp rest = {
-    if word == "true"  { ok (ast.bool_e true sp) rest }
-    else if word == "false" { ok (ast.bool_e false sp) rest }
-    else if word == "if"    { parse_if c sp rest }
-    else if word == "fn"    { parse_lambda c sp rest }
-    else if word == "try!"  { parse_try c sp rest }
-    else if word == "match" { parse_match c sp rest }
-    else if word == "comp"  { parse_comp c false sp rest }
-    else if word == "comp!" { parse_comp c true sp rest }
-    else if is_non_starter word {
-        err ("expected an expression, found the keyword `" + word + "`") sp
-    }
-    else { ok (ast.name_e word sp) rest }
-};
+let rec parse_ident c word sp rest =
+    match word {
+        "true" => ok (ast.bool_e true sp) rest,
+        "false" => ok (ast.bool_e false sp) rest,
+        "if" => parse_if c sp rest,
+        "fn" => parse_lambda c sp rest,
+        "try!" => parse_try c sp rest,
+        "match" => parse_match c sp rest,
+        "comp" => parse_comp c false sp rest,
+        "comp!" => parse_comp c true sp rest,
+        "expand" => match parse_apply c rest {
+            [:error, m, s] => err m s,
+            [:ok, e, after] => ok (ast.expand_e e (ast.span_to sp (ast.span e))) after,
+        },
+        _ => if is_non_starter word {
+            err ("expected an expression, found the keyword `" + word + "`") sp
+        } else { ok (ast.name_e word sp) rest },
+    };
 
 /// `()` is unit; `( e )` is grouping. Inside the brackets newlines stop
 /// ending statements.
@@ -963,21 +968,65 @@ let parse_expression src =
 
 let rec parse_item c ts = {
     let sp = peek_span ts;
-    // A lexical error token is the last token of a bad input; a top-level item
-    // position is where every unresolved one comes to rest, so it reports
-    // itself here rather than being swallowed by a `describe`-and-stop.
-    if peek_kind ts == :error { err (peek_value ts) sp }
-    else if is_kw ts "import"  { parse_import c sp (list.tail ts) }
-    else if is_kw ts "mod"     { parse_mod c sp (list.tail ts) }
-    else if is_kw ts "derive"  { parse_derive c sp (list.tail ts) }
-    else if is_kw ts "virtual" { parse_virtual c sp (list.tail ts) }
-    else if is_kw ts "when"    { parse_when c sp (list.tail ts) }
-    else if is_kw ts "let"     { parse_let c sp (list.tail ts) }
-    else {
-        err ("expected `import`, `derive`, `virtual`, `mod`, `when` or `let` at the top level, found "
-             + describe ts) sp
+    match peek_kind ts {
+        :error => err (peek_value ts) sp,
+        :ident => match peek_value ts {
+            "import" => parse_import c sp (list.tail ts),
+            "mod" => parse_mod c sp (list.tail ts),
+            "derive" => parse_derive c sp (list.tail ts),
+            "virtual" => parse_virtual c sp (list.tail ts),
+            "when" => parse_when c sp (list.tail ts),
+            "let" => parse_let c sp (list.tail ts),
+            "macro" => match parse_let c sp (list.tail ts) {
+                [:ok, [:let, n, ps, body, _, span], rest] =>
+                    ok (ast.macro_d n ps body span) rest,
+                [:ok, _, _] => err "a macro needs a name" sp,
+                other => other,
+            },
+            "group" => parse_record false sp (list.tail ts),
+            "struct" => parse_record true sp (list.tail ts),
+            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `macro`, `group` or `struct` at the top level, found "
+                      + describe ts) sp,
+        },
+        _ => err ("expected a declaration, found " + describe ts) sp,
     }
 };
+
+let rec parse_record array sp ts =
+    if not (at ts :ident) || is_keyword (peek_value ts) {
+        err "expected a record name" (peek_span ts)
+    } else {
+        let name = peek_value ts;
+        match expect (list.tail ts) :lbrace "`{` before record fields" {
+            [:error, m, s] => err m s,
+            [:ok, _, rest] => record_fields array name sp [] rest,
+        }
+    };
+
+let rec record_fields array name sp fields ts =
+    match peek_kind ts {
+        :rbrace => ok (ast.record_d array name (list.reverse fields)
+                                   (ast.span_to sp (peek_span ts))) (list.tail ts),
+        :ident => {
+            let field = peek_value ts;
+            let names = list.map (fn p -> ast.param_name p) fields;
+            let helpers = ["make"] + names + list.map (fn n -> "set_" + n) names;
+            if is_keyword field || str.ends_with "!" field {
+                err "a record field must be a plain name" (peek_span ts)
+            } else if list.contains field helpers || list.contains ("set_" + field) helpers {
+                err ("record field `" + field + "` conflicts with a generated helper") (peek_span ts)
+            } else {
+                let more = core.cons (ast.param field (peek_span ts)) fields;
+                let rest = list.tail ts;
+                match peek_kind rest {
+                    :comma => record_fields array name sp more (list.tail rest),
+                    :rbrace => record_fields array name sp more rest,
+                    _ => err "expected `,` or `}` after a record field" (peek_span rest),
+                }
+            }
+        },
+        _ => err "expected a record field or `}`" (peek_span ts),
+    };
 
 /// A dotted path: `std.list`. Answers `[segments, rest]`.
 let rec dotted_path acc ts =
@@ -1241,6 +1290,19 @@ when test {
         };
 
     let tests = [
+        test.case "macro declarations retain syntax parameters"
+            $( test.eq! "(macro identity x (name x))" (items "macro identity x = x;") ),
+        test.case "expand consumes an application before operators"
+            $( test.eq! "(binary add (expand (apply (name twice) (name x))) (int 1))"
+                        (shape "expand twice x + 1") ),
+        test.case "records retain their backing kind and field order"
+            $( test.eq! "(group Point x y) (struct Pair a b)"
+                        (items "group Point { x, y } struct Pair { a, b, }") ),
+        test.case "record helpers cannot collide"
+            $( test.eq! "record field `set_x` conflicts with a generated helper"
+                        (fails_module "group Point { x, set_x }") ),
+        test.case "record keywords remain usable as local names"
+            $( test.eq! "(let group (int 1))" (items "let group = 1;") ),
         // --- literals ---
         test.case "integer"   $( test.eq! "(int 42)" (shape "42") ),
         test.case "float"     $( test.eq! "(float 1.5)" (shape "1.5") ),

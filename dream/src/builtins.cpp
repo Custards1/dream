@@ -1413,7 +1413,7 @@ NativeResult vm_eval_image(Process& p, Value, Value* args, uint32_t) {
     auto* s = static_cast<StrObj*>(as_obj(v));
     std::string bytes(s->data(), s->len);
 
-    Runtime rt;
+    Runtime rt(/*owns_host_services=*/false);
     std::string message;
     if (!rt.load_image_bytes(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
                              message)) {

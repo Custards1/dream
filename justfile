@@ -251,6 +251,7 @@ test-dreams-corpus: build
 # finally matters, and it is the evidence that the self-hosted compiler works.
 test-dreams-compile: build
     dream={{dream}} seed={{seed}} dreams/tests/compile.sh
+    python3 dreams/tests/macros.py --dream {{dream}} --compiler {{image}}
 
 # The VS Code extension's grammar, tokenized and checked against the scopes it
 # promises. Needs `npm install` in editors/vscode first.

@@ -23,6 +23,7 @@ examples/run.sh --bless     # re-record output after a deliberate change
 | [`07_modules.dr`](07_modules.dr) | `mod`, and all four forms of `import` |
 | [`08_generic.dr`](08_generic.dr) | `virtual` and `derive`: generic code with no run-time cost |
 | [`09_compile_time.dr`](09_compile_time.dr) | `comp`, `comp!`, and `when` |
+| [`10_macros_records.dr`](10_macros_records.dr) | syntax macros and generated record constructors/getters/setters |
 
 ## The packages
 

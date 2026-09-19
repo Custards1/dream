@@ -23,6 +23,7 @@ import std.str;
 import dreams.ast;
 import dreams.config;
 import dreams.diag;
+import dreams.expand as expansion;
 import dreams.modules;
 import dreams.scope;
 
@@ -76,7 +77,7 @@ let module_index l path = {
 /// again. What a caller has to do is carry the map back -- `parses` below --
 /// since a cache that is not handed forward is not a cache.
 let analyse_cached! path roots open_docs parsed = {
-    let l = modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed;
+    let l = expansion.expand! (modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed);
     analysis l (scope.resolve! (l)) (module_index l path)
 };
 
@@ -103,7 +104,7 @@ let parses a = modules.parsed (loader a);
 /// wanting the globals of a module reads `scope.exports` of its environment,
 /// which is phase one's own answer to the same question.
 let declared! path roots open_docs parsed = {
-    let l = modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed;
+    let l = expansion.expand! (modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed);
     analysis l (scope.resolver (scope.envs (scope.declare! l))) (module_index l path)
 };
 
@@ -131,7 +132,8 @@ let lsp_diagnostic a d = {
     let si = diag.source_of d;
     let files = modules.files l;
     let src = if si < list.length files { diag.source_text (list.nth si files) } else { "" };
-    let sp = diag.span d;
+    let sp = if si < list.length files { diag.origin_span (list.nth si files) (diag.span d) }
+             else { diag.span d };
     %{ "range" => pos.range src (ast.span_start sp) (ast.span_end sp),
        "severity" => if diag.is_error d { severity_error } else { severity_warning },
        "source" => "dreams",

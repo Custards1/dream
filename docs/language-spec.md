@@ -548,6 +548,35 @@ statement), and the two differ in one way:
 Writing `rec` at top level is still worth doing where it documents intent; the
 standard library does.
 
+### `group` and `struct`
+
+Records declare a namespace of generated functions. `group` uses a list;
+`struct` uses an array (a fixed-size positional tuple).
+
+```dream
+group Point { x, y }
+struct Vector { x, y }
+
+let p = Point.make 3 4;       // [3, 4]
+let x = Point.x p;            // 3
+let q = Point.set_y p 9;      // [3, 9]; p is still [3, 4]
+let v = Vector.make 3 4;      // #[3, 4]
+```
+
+For each field `f`, the compiler generates `f record` and
+`set_f record value`. `make` takes the fields in declaration order. Helpers
+are ordinary curried functions, and fields retain normal collection laziness.
+An empty declaration has a `make ()` constructor. Fields are comma-separated,
+with an optional trailing comma. Duplicate fields and names that collide with
+`make` or another generated helper are rejected.
+
+These declarations add no runtime type or tag: indexing, equality, `type_of`,
+and list/array patterns work exactly as for the underlying collection.
+Records can appear wherever module declarations can, including `mod` and
+`when` blocks, and their helper namespaces can be imported. `group` and
+`struct` are contextual declaration keywords; existing local bindings with
+those names continue to work.
+
 ### `import`
 
 ```dream
@@ -879,6 +908,51 @@ error: `core` is not a Dream module, so `core.cons` is not available at compile 
 That is what `comp!` is for — it hands the expression to a real VM. So the rule
 is: `comp` for arithmetic and pure Dream code, `comp!` for anything that needs
 the runtime.
+
+### Syntax macros
+
+`macro` defines a Dream function over unevaluated syntax. `expand` invokes it
+at compile time and replaces the call with its returned expression tree,
+before runtime names and effects are checked.
+
+```dream
+macro twice e = [:binary, :add, e, e, [0, 0]];
+macro discard e = [:int, 42, [0, 0]];
+
+let double n = expand twice n;
+let answer = expand discard nonexistent_name;  // 42; the argument is discarded
+```
+
+Arguments are AST values, using the tagged-list forms in
+[`dreams/ast.dr`](../dreams/ast.dr). For example, `x + 1` arrives as
+`[:binary, :add, [:name, "x", span], [:int, 1, span], span]`.
+Each node ends in a `[start, end]` span. A transformer can use normal Dream
+functions, imports, recursion, and `match` to inspect and construct trees.
+The compiler validates the returned tree and assigns fresh occurrence spans;
+diagnostics in generated expressions point back to the expansion call.
+
+`expand` takes a macro name (including a qualified or selectively imported
+name) and exactly its declared number of syntax arguments. It has the same
+precedence as `comp`: `expand twice x + 1` expands `twice x`, then adds one.
+Use parentheses to pass an entire operator expression. A parameterless macro
+is invoked as `expand name`.
+
+Expansion is outside-in. Arguments are not expanded before the transformer
+receives them; returned syntax is expanded recursively, with a maximum nesting
+of 64 macro calls. A transformer may call another transformer as an ordinary
+function on syntax values. Helpers used during macro evaluation cannot demand
+an expression whose own `expand` has not yet been processed.
+
+This initial interface manipulates raw, **unhygienic** syntax: names in the
+result resolve at the call site, and introduced bindings can capture names.
+There is no implicit quoting, interpolation, or automatic renaming. Imports
+needed by generated code must already be declared in the caller. A macro's
+function is also available as an ordinary function on AST data; only `expand`
+passes unevaluated arguments and inserts returned syntax into the program.
+
+Macro execution uses the embedded VM, as `comp!` does. Ordinary purity rules
+apply to transformer bodies; effects need the usual `!` spelling or `comp!`.
+Unrelated `comp!` expressions are not evaluated while running a transformer.
 
 ---
 

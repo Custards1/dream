@@ -25,6 +25,7 @@ import dreams.ast;
 import dreams.config;
 import dreams.diag;
 import dreams.emit;
+import dreams.expand as expansion;
 import dreams.ir;
 import dreams.lexer;
 import dreams.lower;
@@ -730,8 +731,8 @@ let configured! o =
 /// Load the whole program the file is the root of. The include directories are
 /// search paths as well as package roots, which is what `-I` means.
 let load! o file =
-    modules.load! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
-                  (opt o :test == true);
+    expansion.expand! (modules.load! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
+                  (opt o :test == true));
 
 let run_command! o file =
     match opt o :command {

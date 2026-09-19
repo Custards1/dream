@@ -1,0 +1,127 @@
+// Utilities shared by declaration sugar and macro expansion. Generated syntax
+// needs distinct occurrence offsets: resolution keys names and binders by span.
+import std.core;
+import std.list;
+import dreams.ast;
+
+let is_span x = match x {
+    [a, b] => type_of a == :integer && type_of b == :integer,
+    _ => false,
+};
+
+/// Fresh offsets in a reserved part of the 32-bit source-offset space.
+/// Returns [tree, next_offset]. A copied argument must be freshened too: a
+/// macro may insert it twice, under two different lexical scopes.
+let rec fresh tree next =
+    if type_of tree != :list || list.is_empty tree { [tree, next] }
+    else {
+        let has_span = is_span (list.last tree);
+        let parts = if has_span { list.take (list.length tree - 1) tree } else { tree };
+        let walked = list.fold (fn acc part -> {
+            let done = fresh part (list.nth 1 acc);
+            [core.cons (list.head done) (list.head acc), list.nth 1 done]
+        }) [[], next] parts;
+        let items = list.reverse (list.head walked);
+        let end = list.nth 1 walked;
+        if has_span { [items + [[end, end + 1]], end + 2] }
+        else { [items, end] }
+    };
+
+/// A value represented as an expression that constructs it, without evaluation.
+let rec literal value span = match type_of value {
+    :integer => ast.int_e value span,
+    :float => ast.float_e value span,
+    :bool => ast.bool_e value span,
+    :char => ast.char_e value span,
+    :string => ast.str_e value span,
+    :atom => ast.atom_e (ast.atom_name value) span,
+    :unit => ast.unit_e span,
+    :list => ast.list_e (list.map (fn v -> literal v span) value) span,
+    :array => ast.array_e (list.map (fn v -> literal v span) (core.array_to_list value)) span,
+    :map => ast.map_e (list.map (fn kv -> list.map (fn v -> literal v span) kv)
+                              (core.map_pairs value)) span,
+    _ => ast.unit_e span,
+};
+
+/// Records are namespaces of ordinary functions over ordinary collections.
+let record array name fields span = {
+    let values = list.map (fn p -> ast.name_e (ast.param_name p) (list.nth 1 p)) fields;
+    let body = if array { ast.array_e values span } else { ast.list_e values span };
+    let constructor = ast.let_d "make"
+        (if list.is_empty fields { [ast.param () span] } else { fields }) body false span;
+    let helpers = list.concat (list.map (fn i -> {
+        let field = ast.param_name (list.nth i fields);
+        let obj = ast.name_e "record" span;
+        let key = ast.int_e i span;
+        [ast.let_d field [ast.param "record" span] (ast.get_e obj key () span) false span,
+         ast.let_d ("set_" + field) [ast.param "record" span, ast.param "value" span]
+                   (ast.set_e obj key (ast.name_e "value" span) span) false span]
+    }) (list.range 0 (list.length fields)));
+    ast.mod_d name (list.head (fresh (core.cons constructor helpers)
+                                  (2147483648 + ast.span_start span * 128))) span
+};
+
+// Validate returned data before any compiler pass assumes an AST shape. Spans
+// are replaced, but requiring their usual shape catches accidental values.
+let sequence check xs = type_of xs == :list && list.all check xs;
+let pair check_a check_b p = match p { [a, b] => check_a a && check_b b, _ => false };
+let string x = type_of x == :string;
+let optional check x = x == () || check x;
+let rec parameter p = match p {
+    [n, sp] => (n == () || string n) && is_span sp,
+    [(), sp, pat] => is_span sp && pattern pat,
+    _ => false,
+};
+let rec pattern p = match p {
+    [:wildcard, sp] => is_span sp,
+    [:bind, n, sp] => string n && is_span sp,
+    [:literal, e, sp] => expression e && is_span sp,
+    [:list_p, xs, rest, sp] => sequence pattern xs && rest_pattern rest && is_span sp,
+    [:array_p, xs, rest, sp] => sequence pattern xs && rest_pattern rest && is_span sp,
+    [:map_p, xs, sp] => sequence (pair expression pattern) xs && is_span sp,
+    [:as_p, p, n, ns, sp] => pattern p && string n && is_span ns && is_span sp,
+    _ => false,
+};
+let rest_pattern p = match p {
+    () => true, [()] => true, [n, sp] => string n && is_span sp, _ => false,
+};
+let rec statement e = match e {
+    [:let, n, ps, b, rec_, sp] => string n && sequence parameter ps && expression b
+                              && type_of rec_ == :bool && is_span sp,
+    [:let_p, p, b, sp] => pattern p && expression b && is_span sp,
+    _ => expression e,
+};
+let rec expression e = match e {
+    [:int, v, sp] => type_of v == :integer && is_span sp,
+    [:float, v, sp] => type_of v == :float && is_span sp,
+    [:char, v, sp] => type_of v == :char && is_span sp,
+    [:bool, v, sp] => type_of v == :bool && is_span sp,
+    [:str, v, sp] => string v && is_span sp,
+    [:atom, v, sp] => string v && is_span sp,
+    [:unit, sp] => is_span sp,
+    [:name, n, sp] => string n && is_span sp,
+    [:field, obj, n, sp] => expression obj && string n && is_span sp,
+    [:apply, f, args, sp] => expression f && sequence expression args && is_span sp,
+    [:pipe, l, r, sp] => expression l && expression r && is_span sp,
+    [:unary, op, x, sp] => list.contains op [:neg, :not] && expression x && is_span sp,
+    [:binary, op, l, r, sp] => list.contains op [:add, :sub, :mul, :div, :mod,
+        :eq, :ne, :lt, :le, :gt, :ge, :and, :or] && expression l && expression r && is_span sp,
+    [:if, c, t, f, sp] => expression c && expression t && optional expression f && is_span sp,
+    [:block, xs, sp] => sequence statement xs && is_span sp,
+    [:thunk, x, sp] => expression x && is_span sp,
+    [:try, b, n, h, sp] => expression b && string n && expression h && is_span sp,
+    [:lambda, ps, b, sp] => sequence parameter ps && expression b && is_span sp,
+    [:comp, impure, x, sp] => type_of impure == :bool && expression x && is_span sp,
+    [:expand, x, sp] => expression x && is_span sp,
+    [:list, xs, sp] => sequence expression xs && is_span sp,
+    [:array, xs, sp] => sequence expression xs && is_span sp,
+    [:map, xs, sp] => sequence (pair expression expression) xs && is_span sp,
+    [:match, x, arms, sp] => expression x && sequence arm arms && is_span sp,
+    [:get, x, k, f, sp] => expression x && expression k && optional expression f && is_span sp,
+    [:set, x, k, v, sp] => expression x && expression k && expression v && is_span sp,
+    _ => false,
+};
+let arm a = match a {
+    [p, g, b, sp] => pattern p && optional expression g && expression b && is_span sp,
+    _ => false,
+};

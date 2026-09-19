@@ -106,7 +106,8 @@ struct ModuleDef {
 
 class Runtime {
 public:
-    Runtime();
+    // An embedded evaluation borrows the enclosing runtime's host services.
+    explicit Runtime(bool owns_host_services = true);
     ~Runtime();
     Runtime(const Runtime&) = delete;
     Runtime& operator=(const Runtime&) = delete;
@@ -281,6 +282,7 @@ private:
     std::vector<std::atomic<uint64_t>> alloc_;
     class Jit* jit_ = nullptr;
     std::unique_ptr<struct WellKnownAtoms> wk_;
+    bool owns_host_services_;
 };
 
 /// Well-known atoms, interned at startup so the runtime can name them cheaply.

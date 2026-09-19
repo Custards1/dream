@@ -29,6 +29,7 @@ import std.os;
 import std.str;
 
 import dreams.ast;
+import dreams.syntax;
 import dreams.config;
 import dreams.diag;
 import dreams.package;
@@ -77,6 +78,7 @@ let rec mentions_name target e =
 let item_mentions_core item =
     match item {
         [:let, _, _, body, _, _] => mentions_name "core" body,
+        [:macro, _, _, body, _] => mentions_name "core" body,
         // A map pattern's keys are expressions too.
         [:let_p, pattern, body, _] => mentions_name "core" body || mentions_name "core" pattern,
         [:virtual, _, _, body, _] => match body { () => false, b => mentions_name "core" b },
@@ -350,6 +352,7 @@ let rec expand_items cfg items =
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { expand_items cfg inner } else { [] },
+            [:record, array, name, fields, span] => [syntax.record array name fields span],
             other => [other],
         }) items);
 

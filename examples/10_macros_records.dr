@@ -1,0 +1,31 @@
+// Records are ordinary collections with generated helpers.
+import std.console;
+
+group Point { x, y }
+struct Vector { x, y }
+group Empty {}
+
+// A macro receives syntax, not values. Here the input tree is inserted twice.
+// The last element of every syntax node is its source span; the compiler gives
+// generated nodes fresh spans and reports errors at the expansion site.
+macro twice expression = [:binary, :add, expression, expression, [0, 0]];
+macro ignore expression = [:int, 42, [0, 0]];
+
+// Syntax can be inspected with ordinary Dream pattern matching.
+macro swap expression = match expression {
+    [:list, [a, b], span] => [:list, [b, a], span],
+    other => other,
+};
+
+let double n = expand twice n;
+
+let main! = {
+    let point = Point.make 3 4;
+    console.print! [point, Point.x point, Point.set_y point 9, point]
+    let vector = Vector.make 5 6;
+    console.print! [vector, Vector.y vector, Vector.set_x vector 7, vector]
+    console.print! (Empty.make ())
+    console.print! (double 10)
+    console.print! (expand ignore name_that_does_not_exist)
+    console.print! (expand swap [1, 2])
+};

@@ -73,6 +73,7 @@ let lambda_e params body span      = [:lambda, params, body, span];
 
 /// `comp e` is evaluated by the compiler; `comp! e` by running it on a VM.
 let comp_e impure e span = [:comp, impure, e, span];
+let expand_e e span = [:expand, e, span];
 
 let list_e items span   = [:list, items, span];
 let array_e items span  = [:array, items, span];
@@ -159,6 +160,8 @@ let param_pattern p = match p { [_, _, pattern] => pattern, _ => () };
 /// `let name params = body`. `rec` is recorded even though a top-level `let`
 /// is always visible to itself, because it documents intent where it is used.
 let let_d name params body is_rec span = [:let, name, params, body, is_rec, span];
+let macro_d name params body span = [:macro, name, params, body, span];
+let record_d array name fields span = [:record, array, name, fields, span];
 
 /// `let [a, b] = pair` -- a `let` that binds what a pattern names. A node of
 /// its own rather than a `let` whose name is a pattern, because everything
@@ -297,6 +300,10 @@ let rec show e =
         [:try, b, binder, h, _] => "(try " + show b + " " + binder + " " + show h + ")",
         [:lambda, ps, b, _] => "(fn " + show_params ps + " " + show b + ")",
         [:comp, impure, x, _] => "(" + (if impure { "comp!" } else { "comp" }) + " " + show x + ")",
+        [:expand, x, _] => "(expand " + show x + ")",
+        [:macro, n, ps, b, _] => "(macro " + n + " " + show_params ps + " " + show b + ")",
+        [:record, array, n, fields, _] =>
+            "(" + (if array { "struct" } else { "group" }) + " " + n + " " + show_params fields + ")",
         [:list, xs, _]      => "(list " + show_all xs + ")",
         [:array, xs, _]     => "(array " + show_all xs + ")",
         [:map, pairs, _]    => "(map " + show_pairs pairs + ")",

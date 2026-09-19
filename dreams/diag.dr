@@ -26,6 +26,17 @@ let source path text = [path, text];
 let source_path s = list.nth 0 s;
 let source_text s = list.nth 1 s;
 
+/// Generated occurrences keep unique offsets for resolution and a range map
+/// back to their macro call for diagnostics. Ordinary sources remain pairs.
+let origins s = match s { [_, _, ranges] => ranges, _ => [] };
+let origin_span s sp = {
+    let found = list.filter (fn r -> ast.span_start sp >= list.nth 0 r
+                                 && ast.span_start sp < list.nth 1 r) (origins s);
+    match found { [] => sp, [r, .._] => list.nth 2 r }
+};
+let with_origin start end sp s =
+    [source_path s, source_text s, core.cons [start, end, origin_span s sp] (origins s)];
+
 // --- a diagnostic -----------------------------------------------------------
 
 let error span message =
@@ -104,7 +115,7 @@ let label s = match s { :warning => "warning", _ => "error" };
 let render sources d = {
     let src = if source_of d < list.length sources { list.nth (source_of d) sources }
               else { source "<unknown>" "" };
-    let head = position (source_path src) (source_text src) (ast.span_start (span d))
+    let head = position (source_path src) (source_text src) (ast.span_start (origin_span src (span d)))
                + ": " + label (severity d) + ": " + message d;
     match note d {
         () => [head],

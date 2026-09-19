@@ -48,6 +48,7 @@ import std.str;
 
 import dreams.diag;
 import dreams.emit;
+import dreams.expand as expansion;
 import dreams.ir;
 import dreams.lower;
 import dreams.modules;
@@ -150,6 +151,8 @@ let carried_ok slice =
             _ => false,
         }) slice;
 
+let ast_record item = match item { [:record, _, _, _, _] => true, _ => false };
+
 /// Which way to compile an entry, decided before anything is loaded:
 /// `:reboot` -- nothing carried, or the prefix the engine stands for no longer
 /// starts the new program. The engine's `base_text` is the whole of what the
@@ -161,12 +164,14 @@ let carried_ok slice =
 let route text base_text engine base =
     match parser.parse_module text {
         [:error, _, _] => :fresh,
-        [:ok, items] =>
-            if engine == () { :reboot }
-            else if not (str.starts_with (engine_base_text engine) text) { :reboot }
-            else if brings_core engine items base { :reboot }
-            else if carried_ok (list.head (entry_partition items base)) { [:proceed, items] }
-            else { :fresh },
+        [:ok, items] => match true {
+            _ if expansion.has_expansion items || list.any ast_record items => :fresh,
+            _ if engine == () => :reboot,
+            _ if not (str.starts_with (engine_base_text engine) text) => :reboot,
+            _ if brings_core engine items base => :reboot,
+            _ if carried_ok (list.head (entry_partition items base)) => [:proceed, items],
+            _ => :fresh,
+        },
     };
 
 /// Does this entry name `core` in a session that has not loaded it? `core` needs
@@ -312,7 +317,7 @@ let finalize! l mi en low2 r2 funcs2 globals2 source image = {
 /// declared from scratch -- nothing is relied on from an earlier parse -- and
 /// everything up to the transient `main!` becomes the carried engine.
 let boot! roots cfg source image text base_text engine base = {
-    let l = modules.load! source roots cfg false;
+    let l = expansion.expand! (modules.load! source roots cfg false);
     let mi = list.length (modules.modules l) - 1;
     let state_deps =
         list.fold (fn acc i -> scope.declare_module l i acc)
@@ -370,7 +375,7 @@ let proceed! source image items engine base_text base = {
 /// not `let`s. Whatever mission there was, the whole of it is compiled the
 /// ordinary way, and the session re-boots on the next entry.
 let fresh_build! roots cfg source image text engine base = {
-    let l = modules.load! source roots cfg false;
+    let l = expansion.expand! (modules.load! source roots cfg false);
     let r = scope.resolve! l;
     let low = lower.link! l r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);

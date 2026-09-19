@@ -126,7 +126,7 @@ let first_word text =
 
 let declarative text =
     list.contains (first_word text)
-                  ["let", "import", "mod", "when", "virtual", "derive", "//", "///"];
+                  ["let", "import", "mod", "when", "virtual", "derive", "macro", "group", "struct", "//", "///"];
 
 /// Parse an entry the way it will be compiled: `[:ok]`, or `[:error, message]`.
 let parsed text =

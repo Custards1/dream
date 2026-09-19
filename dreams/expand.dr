@@ -1,0 +1,173 @@
+// Syntax macros run on the same VM as `comp!`, before runtime name resolution.
+// This layer sits above scope/lower to keep the compiler's imports acyclic.
+import std.core;
+import std.list;
+import std.str;
+import std.vm;
+import dreams.ast;
+import dreams.diag;
+import dreams.emit;
+import dreams.ir;
+import dreams.lower;
+import dreams.modules;
+import dreams.scope;
+import dreams.syntax;
+
+let rec has_expansion tree = match tree {
+    [:expand, _, _] => true,
+    [:macro, _, _, _, _] => true,
+    _ => type_of tree == :list && list.any (fn x -> has_expansion x) tree,
+};
+let needed l = list.any (fn m -> has_expansion (modules.module_items m)) (modules.modules l);
+let macro_let item = match item {
+    [:macro, n, ps, b, sp] => ast.let_d n ps b false sp,
+    _ => item,
+};
+
+/// Unexpanded runtime expressions are deliberately unavailable to a transformer.
+/// A demanded placeholder raises instead of silently manufacturing a value.
+let rec stage tree = match tree {
+    [:expand, _, sp] => ast.binary_e :div (ast.int_e 1 sp) (ast.int_e 0 sp) sp,
+    [:macro, _, _, _, _] => stage (macro_let tree),
+    _ => if type_of tree == :list { list.map (fn x -> stage x) tree } else { tree },
+};
+let replace_module l mi m = modules.put :modules ((modules.modules l).[mi => m]) l;
+let with_items m items = core.map_put m :items items;
+let loader s = core.map_get s :loader ();
+let next s = core.map_get s :next 3221225472;
+let put_loader l s = core.map_put s :loader l;
+let fail s mi sp message =
+    put_loader (modules.complain sp message (modules.module_source (modules.module_at (loader s) mi))
+                                (loader s)) s;
+
+/// Only a declaration marked `macro` may be the target of `expand`. Use the
+/// normal resolver so aliases and selective imports mean exactly what they do
+/// for ordinary functions.
+let macro_definition l reference = {
+    let target = match reference {
+        [:global, mi, name, _] => [mi, name],
+        [:member, [:dream, mi], name, _] => [mi, name],
+        _ => (),
+    };
+    match target {
+        () => (),
+        [mi, name] => list.first_or () (list.filter (fn item -> match item {
+            [:macro, n, _, _, _] => n == name,
+            _ => false,
+        }) (modules.module_items (modules.module_at l mi))),
+    }
+};
+
+/// `comp` inside a macro dependency is evaluated only if that dependency is
+/// demanded by the macro VM. Unrelated runtime `comp!` effects must not run for
+/// every expansion. Its isolated function already has the right environment.
+let staged_image low = {
+    let ready = list.fold (fn acc one -> {
+        let made = lower.emit (ir.node :make_closure (list.nth 1 one) ir.no_node ir.no_node) acc;
+        lower.set_prog (ir.set_node (list.head one)
+            (ir.node :apply (list.nth 1 made) 0 0)
+            (lower.prog (list.head made))) (list.head made)
+    }) low (lower.pending_comp low);
+    ir.finish (lower.prog ready)
+};
+
+let evaluate! s mi call sp = {
+    let l = loader s;
+    let parts = match call {
+        [:apply, callee, args, _] => [callee, args],
+        _ => [call, []],
+    };
+    let callee = list.head parts;
+    let args = list.nth 1 parts;
+    let literals = list.map (fn a -> syntax.literal a sp) args;
+    let body = if list.is_empty args { callee } else { ast.apply_e callee literals sp };
+    let made = syntax.fresh (ast.let_d "<macro expansion>!" [] body false sp) (next s);
+    let wrapper = list.head made;
+    let s1 = core.map_put s :next (list.nth 1 made);
+    let staged = modules.put :modules (list.map (fn m ->
+        with_items m (stage (modules.module_items m))) (modules.modules l)) l;
+    let m = modules.module_at staged mi;
+    let program = replace_module staged mi (with_items m (modules.module_items m + [wrapper]));
+    let resolved = scope.resolve! program;
+    let target_expr = match scope.decl_body wrapper {
+        [:apply, f, _, _] => f,
+        x => x,
+    };
+    let reference = scope.resolution resolved mi (modules.module_source m) (ast.span target_expr);
+    match macro_definition l reference {
+        () => [fail s1 mi sp "`expand` needs the name of a declared macro", ()],
+        definition => {
+            let arity = list.length (list.nth 2 definition);
+            if arity != list.length args {
+                [fail s1 mi sp ("macro expects " + to_string arity + " syntax arguments, received "
+                               + to_string (list.length args)), ()]
+            } else if diag.error_count (scope.r_diags resolved) > 0 {
+                [fail s1 mi sp ("cannot compile macro: "
+                    + str.join_str "; " (list.map (fn d -> diag.message d)
+                        (list.filter (fn d -> diag.is_error d) (scope.r_diags resolved)))), ()]
+            } else {
+                let low = lower.lower_program resolved;
+                let entries = list.filter (fn b -> list.nth 0 b == mi
+                    && scope.decl_name (list.nth 2 b) == "<macro expansion>!") (scope.bodies resolved);
+                let entry = list.nth 3 (list.head entries);
+                let result = try! {
+                    let value = vm.eval_image! (emit.to_binary (core.map_put (staged_image low) :entry entry));
+                    strict! value
+                    [:ok, value]
+                } catch e { [:error, to_string e] };
+                match result {
+                    [:error, why] => [fail s1 mi sp ("macro evaluation failed: " + why), ()],
+                    [:ok, value] => if syntax.expression value {
+                        let fresh = syntax.fresh value (next s1);
+                        let si = modules.module_source m;
+                        let files = modules.files (loader s1);
+                        let source = diag.with_origin (next s1) (list.nth 1 fresh) sp (list.nth si files);
+                        let s2 = put_loader (modules.put :files (files.[si => source]) (loader s1)) s1;
+                        [core.map_put s2 :next (list.nth 1 fresh), list.head fresh]
+                    } else { [fail s1 mi sp "a macro must return a valid expression syntax tree", ()] },
+                }
+            }
+        },
+    }
+};
+
+/// Outside-in: arguments are passed untouched. Only the returned syntax is
+/// visited again, so a macro can discard names that do not exist, effects, or
+/// even another macro call. A bound catches recursive expansion.
+let rec walk! s mi tree depth = match tree {
+    [:expand, call, sp] =>
+        if depth >= 64 { [fail s mi sp "macro expansion exceeded 64 nested calls", ast.unit_e sp] }
+        else {
+            let result = evaluate! s mi call sp;
+            match list.nth 1 result {
+                () => [list.head result, ast.unit_e sp],
+                expanded => walk! (list.head result) mi expanded (depth + 1),
+            }
+        },
+    _ => if type_of tree != :list { [s, tree] }
+         else {
+             let done = list.fold (fn acc part -> {
+                 let got = walk! (list.head acc) mi part depth;
+                 [list.head got, core.cons (list.nth 1 got) (list.nth 1 acc)]
+             }) [s, []] tree;
+             [list.head done, list.reverse (list.nth 1 done)]
+         },
+};
+
+let expand! l =
+    if not (needed l) || modules.failed l { l }
+    else {
+        let done = list.fold (fn s mi -> {
+            let items = modules.module_items (modules.module_at (loader s) mi);
+            list.fold (fn acc i -> {
+                let result = walk! acc mi (list.nth i items) 0;
+                let current = modules.module_at (loader (list.head result)) mi;
+                put_loader (replace_module (loader (list.head result)) mi
+                    (with_items current ((modules.module_items current).[i => list.nth 1 result])))
+                    (list.head result)
+            }) s (list.range 0 (list.length items))
+        }) %{ :loader => l, :next => 3221225472 } (list.range 0 (list.length (modules.modules l)));
+        let expanded = loader done;
+        modules.put :modules (list.map (fn m -> with_items m
+            (list.map macro_let (modules.module_items m))) (modules.modules expanded)) expanded
+    };
