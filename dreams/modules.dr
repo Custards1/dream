@@ -164,6 +164,18 @@ let parsed l       = core.map_get l :parsed (core.map_new ());
 let with_parsed p l = core.map_put l :parsed p;
 let put_parsed file v l = with_parsed (core.map_put (parsed l) file v) l;
 
+/// What each `expand` in the program named: `[module, source, offset, what]`,
+/// one entry per call site, where `what` is the resolution of the macro's own
+/// name wrapped as `[:macro, ..]`.
+///
+/// Expansion happens before resolution and *replaces* the call, so by the time
+/// the resolver walks this program the name the author wrote is not in it and
+/// nothing would ever record what it meant. An editor asks exactly that
+/// question -- hover and go-to-definition are "what is this name" -- so the
+/// pass that did resolve it says so here, and `scope.resolve!` seeds its
+/// occurrence table with these. See `note_macro` in dreams/expand.dr.
+let expansions l   = core.map_get l :expansions [];
+
 let put k v l = core.map_put l k v;
 
 /// The index of a module, by any name it answers to, or `()`.

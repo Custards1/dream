@@ -27,6 +27,7 @@ import std.core;
 import std.list;
 import std.map;
 import std.str;
+import std.vm;
 
 import dreams.ast;
 import dreams.builtins;
@@ -60,8 +61,28 @@ let rec chain_before src at acc =
         else { chain_before src start (core.cons (str.slice start (at - 1 - start) src) acc) }
     };
 
+let is_space b = b == 32 || b == 9 || b == 10 || b == 13;
+
+/// The word written before `at`, with the spaces between skipped. Lexical,
+/// like everything else in this section, and for the same reason: what comes
+/// before the cursor is text and not a tree.
+let word_before src at = {
+    let rec skip i = if i > 0 && is_space (core.str_byte src (i - 1)) { skip (i - 1) } else { i };
+    let ends = skip at;
+    let starts = analysis.name_start src ends;
+    str.slice starts (ends - starts) src
+};
+
 /// What the cursor is asking for: `[:member, segments]` when it sits after a
-/// dotted chain, `[:name]` otherwise.
+/// dotted chain, `[:name]` otherwise -- and the `:macro` forms of both when
+/// what it sits after is `expand`.
+///
+/// Only a macro may be named there. Everything else a bare name could reach --
+/// a local, an ordinary global, a builtin, a keyword -- is a thing that cannot
+/// be written in that position at all, so offering them is offering mistakes.
+/// The keyword is found by looking back through the spaces rather than by
+/// asking the tree, because at the moment of a completion there is usually no
+/// tree: `expand tw` does not parse.
 ///
 /// The prefix already typed is deliberately not part of this. A client filters
 /// the list against what the user has typed -- that is what it computes a word
@@ -72,9 +93,12 @@ let context src offset = {
     if word > 0 && core.str_byte src (word - 1) == dot {
         match chain_before src word [] {
             [] => [:name],
-            segs => [:member, segs],
+            segs => if word_before src (analysis.chain_start src word) == "expand" {
+                        [:macro_member, segs]
+                    } else { [:member, segs] },
         }
     }
+    else if word_before src word == "expand" { [:macro_name] }
     else { [:name] }
 };
 
@@ -178,6 +202,32 @@ let entry_kind a mi e n =
              },
     };
 
+/// One member of a host module, from the runtime's own table.
+///
+/// A host module's members are the one thing about a program the compiler is
+/// not the authority on: `import std.vm` compiles to a lookup that happens
+/// while the program runs, so `dreams` knows the module by name and by nothing
+/// else, and this used to offer nothing after the dot. But `lucid` runs *on*
+/// the VM that owns the table, so it asks `vm.host_members` rather than
+/// guessing or keeping a copy that would drift.
+///
+/// The arity is all there is to show. A native has no parameter names -- it is
+/// a C++ function -- so the detail says how many arguments it takes and stops
+/// there, which is the honest version of the signature a Dream member gets.
+let host_item path member = {
+    let n = list.head member;
+    let arity = list.nth 1 member;
+    item n kind_function
+         (n + match arity {
+                  -1 => " (variadic)",
+                  1 => " (1 argument)",
+                  _ => " (" + to_string arity + " arguments)",
+              })
+         ("A member of the host module `" + path + "`."
+          + if builtins.is_impure_name n { " Impure." } else { "" })
+         rank_local
+};
+
 /// One member of a Dream module, shown with the parameters it was declared with.
 let member_item a target e n =
     item n (entry_kind a target e n)
@@ -196,9 +246,15 @@ let member_items a segs =
             list.map (fn n -> item n kind_module ("module " + prefix + "." + n)
                                    ("A module in package `" + prefix + "`.") rank_local)
                      (group_names (analysis.loader a) prefix),
-        // A host module owns its member table and the lookup happens at run
-        // time, so the compiler has never seen a list of the names and neither
-        // has this. Nothing is better than a guess.
+        // The host owns this table, so the runtime is asked for it. A module
+        // the *embedder* registered is named to the compiler with
+        // `--host-module` but is not in this VM, and `host_members` answers
+        // `()` for it: nothing offered, which is what was offered before.
+        [:native, path, _] =>
+            match vm.host_members path {
+                () => [],
+                members => list.map (fn member -> host_item path member) members,
+            },
         _ => [],
     };
 
@@ -280,13 +336,47 @@ let import_items a e = {
 /// `dreams/builtins.dr` -- and a list that offers them to somebody typing `mat`
 /// is the accident that naming was meant to prevent.
 let builtin_items =
-    list.map (fn n -> item n kind_function n
+    list.map (fn n -> item n kind_function (builtins.signature n)
                            "A builtin: the language provides it, no module does."
                            rank_builtin)
              (list.filter (fn n -> not (str.starts_with "match_" n)) builtins.names);
 
 let keyword_items =
     list.map (fn n -> item n kind_keyword "" "A keyword." rank_keyword) parser.keywords;
+
+/// What may follow `expand`: a macro of this module, or a name that could lead
+/// to one. An import is offered whole rather than filtered, because whether
+/// `m.something` is a macro is a question about `m` and the cursor has not got
+/// there yet.
+let macro_name_items a =
+    match analysis.module_of a {
+        () => [],
+        mi => {
+            let e = list.nth mi (scope.r_envs (analysis.resolved a));
+            list.append
+                (list.map (fn n -> item n kind_function (analysis.shown_signature a mi n)
+                                        "A macro of this module." rank_global)
+                          (list.filter (fn n -> analysis.is_macro a mi n) (scope.exports e)))
+                (import_items a e)
+        },
+    };
+
+/// The macros of the module a chain names, for `expand a.b.|`.
+let macro_member_items a segs =
+    match namespace_of a segs {
+        [:dream, target] => {
+            let e = list.nth target (scope.r_envs (analysis.resolved a));
+            list.map (fn n -> item n kind_function (analysis.shown_signature a target n)
+                                   ("A macro of module `"
+                                    + modules.module_name (modules.module_at (analysis.loader a) target)
+                                    + "`.") rank_local)
+                     (list.filter (fn n -> analysis.is_macro a target n) (scope.exports e))
+        },
+        // A package is a step on the way to a module that has one.
+        [:group, _] => member_items a segs,
+        // A host module's members are natives, and none of them is a macro.
+        _ => [],
+    };
 
 let name_items a offset =
     match analysis.module_of a {
@@ -364,6 +454,8 @@ let completions! path roots docs parsed line character = {
         let a = list.head got;
         [match context src offset {
              [:member, segs] => member_items a segs,
+             [:macro_member, segs] => macro_member_items a segs,
+             [:macro_name] => macro_name_items a,
              _ => name_items a offset,
          },
          list.nth 1 got]
@@ -429,6 +521,19 @@ when test {
             $( test.eq! [:name] (context "xs.[k" 5) ),
         test.case "a rest pattern is not a member"
             $( test.eq! [:name] (context "[a, ..re" 8) ),
+
+        // Only a macro may be named after `expand`, so the cursor there is
+        // asking a narrower question than a bare name asks anywhere else.
+        test.case "a name after `expand` asks about macros"
+            $( test.eq! [:macro_name] (context "let f x = expand tw" 19) ),
+        test.case "a member after `expand` asks about a module's macros"
+            $( test.eq! [:macro_member, ["m"]] (context "let f x = expand m." 19) ),
+        test.case "a word that merely starts with expand does not narrow it"
+            $( test.eq! [:name] (context "x expanded tw" 13) ),
+        test.case "a macro's argument is ordinary code and asks for everything"
+            $( test.eq! [:name] (context "let f x = expand twice x" 24) ),
+        test.case "the word before the cursor is read across the spaces"
+            $( test.eq! "expand" (word_before "expand   tw" 9) ),
 
         test.case "the repair puts a name where the cursor is"
             $( test.eq! ("console." + hole) (repaired "console." 8) ),

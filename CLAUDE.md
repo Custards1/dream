@@ -1160,6 +1160,80 @@ with each other, which is the check that matters.
 Always put a timeout on a VM run. A Dream program that diverges does not stop on
 its own, and the VM will happily sit there.
 
+### Expanding a macro is a compile, and there used to be one per call
+
+**What it does.** `expand twice n` is answered by *running* the macro, and the
+only thing that knows how to run Dream is the VM — so expansion stages the
+whole program, compiles it, appends the call as a temporary entry, emits an
+image and hands it to `vm.eval_image!`, exactly as `comp!` does. That is a
+compile of the program per call, and the compiler had been doing precisely
+that: a 10-declaration file cost 1.13 s against 0.30 s for the same file with
+the macros written out, and `mind/std/all.dr --test` — whose `std.macros` test
+block is forty `expand`s in one declaration — cost **38.2 s**.
+
+Two changes, each removing one of the two O(program) costs:
+
+| | std tests | 10 declarations, one call each |
+|---|---|---|
+| before | 38.2 s | 1.13 s |
+| one snapshot per *declaration*, wrapper linked incrementally | 7.3 s | 1.12 s |
+| + one image per *round* rather than per call | 2.05 s | 1.16 s |
+| + one snapshot for the whole program | **2.15 s** | **0.53 s** |
+
+The two rows move different workloads, which is the thing to understand before
+changing either: **the snapshot is per declaration and the image is per call**,
+so a declaration with forty calls in it was paying forty images and one
+snapshot, and forty declarations with one call each were paying forty of both.
+The same file with no macros at all compiles in 0.27 s, so what is left of the
+overhead on the second workload is 26 ms a call where it was 86.
+
+- **One image per round, not per call** (`evaluate!` in
+  [dreams/expand.dr](dreams/expand.dr)). Every call of one declaration is
+  compiled against the same snapshot, so the wrapper's body is a *list* of them
+  and the arena is serialized once. `emit.to_binary` was 36% of the compile at
+  that point and is the part whose cost is the whole program rather than the
+  call. A *round* is the nesting of calls and not their number: a macro's
+  answer is punched for `expand`s again and those go in the next image, so
+  `expand with_ok x .. (expand with_ok y ..)` is two rounds and forty calls
+  written side by side are one.
+- **One snapshot for the whole program** (`prepare!`, and the retry in
+  `expand!`). This is the one that needed an argument rather than a
+  rearrangement. The snapshot goes stale the moment a declaration is expanded,
+  and a macro *can* demand a declaration that has been — a macro that calls a
+  helper whose own body was written with `expand`. What makes reuse safe is
+  that going stale is never silent: an unexpanded call is staged as `1 / 0` and
+  a macro is pure, so it cannot catch what that raises. So a declaration that
+  fails *at all* is expanded a second time against a fresh snapshot, starting
+  again from the state before the first attempt so that a failure which is real
+  is still reported exactly once. A program whose macros all succeed builds one
+  snapshot; one whose macro genuinely fails builds two and fails the same way,
+  which is a compile that was not going to finish.
+  `dreams/tests/macros.py` holds that line, and the test was checked against a
+  build with the retry removed — without it, it fails with
+  `macro evaluation failed: the compile-time expression raised`.
+
+**Failure is the slow path, deliberately.** A batch has one entry and one
+result, so a raise anywhere in it is one failure for the whole image and says
+nothing about which call raised. The alternative — generate a `try` around each
+call — means naming `strict!` and `to_string` in the wrapper, and a module is
+free to declare a global of either, which would win (a builtin loses to a
+global; see [dreams/builtins.dr](dreams/builtins.dr)). So a batch that fails is
+thrown away and its calls are run one at a time, where the wrapper *is* the
+call and every diagnostic is the one it gave before batching existed.
+
+**What did not change**, and is worth checking after any change here: the image
+a macro-using program compiles to. `mind/std/all.dr --test` and the benchmark
+above both come out byte-identical to what the pre-change compiler emitted,
+except for the `SPAN` entries of generated functions — expansion hands out
+offsets from a reserved part of the 32-bit space and the order it hands them
+out in moved. Eight bytes of an image of 216,736.
+
+**Where the rest of it went.** After all of the above, the two costs that
+remain are the ones that are genuinely per call: `ir.finish` plus
+`emit.to_binary` of the arena, and `vm.eval_image!` loading it. Both are the
+whole program's size, and removing either means an image format that can be
+patched rather than rebuilt. Nothing has measured whether that is worth it.
+
 ### Sharing the arena
 
 **What it does.** `lower` emits a node wherever the source says one and never
@@ -1654,6 +1728,65 @@ One cost worth knowing: a completion is a whole-program analysis, as hover and
 go-to-definition already are. On `dreams/lower.dr`, which pulls in the whole
 compiler, that is roughly a second per request.
 
+### Two trees, and which question goes to which
+
+`lucid` holds the program twice: as the editor wrote it, and after macro
+expansion. Which one answers is not a matter of convenience — it is exact, and
+getting it wrong is silent.
+
+- **What a name means** is asked of the **expanded** program. That program is
+  what runs, and there is nothing else for a name to mean.
+- **What is written** is asked of the **source**: which locals a cursor can
+  see, what parameters a declaration was given, whether it was a `macro`.
+
+The reason is that expansion *replaces* an `expand` with generated syntax
+carrying offsets from a reserved part of the 32-bit space. Every byte the user
+is looking at inside `expand twice counter` is then inside no node at all, so a
+walk of the expanded tree finds nothing there — and `let double counter =
+expand twice counter` offers no `counter`, which is precisely the local the
+person typing it wants. `analysis.source` is the second loader, and
+`source_items` is what the binder walk, `find_decl` and `params_of` read.
+
+An `expand`'s own name is the other half of the same problem, and it is the
+compiler that fixes it rather than the server. That name is a name occurrence
+like any other, but the only pass that ever resolves it is the one that
+replaces it, so the resolver walks a program the name is not in and nothing
+would ever record what it meant. So expansion writes each one down
+(`modules.expansions`) and `scope.resolve!` seeds its occurrence table with
+them — which makes hover and go-to-definition on a macro the *ordinary*
+lookups, not a second mechanism. Nothing downstream reads those entries:
+lowering asks about nodes, and the nodes at those offsets are gone.
+
+Only a macro may be written after `expand`, so that is all completion offers
+there — not a local, not an ordinary global, not a builtin, not a keyword, all
+of which are things that cannot be written in that position. The keyword in
+front of the cursor is found lexically (`word_before`), for the reason the
+section above gives: at the moment a completion is wanted, `expand tw` does not
+parse.
+
+### A host module's members come from the host
+
+`import std.vm` compiles to a lookup that happens while the program runs, so
+`dreams` knows such a module by name and by nothing else — which is why
+completion after a dot on one used to offer nothing at all. But `lucid` runs
+*on* the VM that owns the table, so it asks: `vm.host_members "std.vm"` answers
+`[name, arity]` for each member, in declaration order, and `()` for a module
+that is not registered. A variadic member's arity is `-1`.
+
+Two things that follow. A module an embedder registered and named to the
+compiler with `--host-module` is not in *this* VM, and `host_members` answers
+`()` for it — nothing offered, which is what was offered before. And the
+compiler still does not check host member names at compile time: it could now,
+but a program may be compiled for a VM other than the one compiling it, and
+that is the bargain `is_host` makes on purpose.
+
+The *builtins* had the same shape of problem for a smaller reason: what each
+one takes and answers was written as a comment beside its name, and a comment
+is no use to a server, so completion on `len` could show nothing but `len`.
+`builtins.signatures` is that comment moved into the program, as a map rather
+than a second list so that adding a name and forgetting its line is a failing
+test.
+
 ## The language, briefly
 
 - A `!` suffix marks an impure name. Purity is checked: a pure function cannot
@@ -1670,6 +1803,13 @@ compiler, that is roughly a second per request.
 - Evaluation is lazy; `strict!` forces.
 - `when test { .. }` holds a module's tests, collected by compiling with
   `--test`. Tests are `test.case "name" $( test.eq! expected actual )`.
+- `macro name params = ..` declares a syntax transformer and `expand name args`
+  calls one. A macro receives its arguments as **syntax** — ordinary Dream
+  lists, with a span last — and returns syntax, which is checked and then
+  substituted. It runs on the same embedded VM `comp!` does, before name
+  resolution; [dreams/expand.dr](dreams/expand.dr) and "Expanding a macro is a
+  compile" say what that costs. `group`/`struct`/`mapping` declare records the
+  same pass rewrites.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

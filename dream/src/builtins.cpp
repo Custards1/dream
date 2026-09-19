@@ -1211,8 +1211,9 @@ NativeResult vm_stats(Process& p, Value, Value*, uint32_t) {
     }));
 }
 
-/// Defined further down, next to the error helpers it needs.
+/// Defined further down, next to the error helpers they need.
 NativeResult vm_eval_image(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_host_members(Process& p, Value self, Value* args, uint32_t n);
 }  // namespace
 
 ModuleDef make_vm_module() {
@@ -1223,6 +1224,7 @@ ModuleDef make_vm_module() {
                          {"collections!", 1, 0b1, vm_collections},
                          {"heap_bytes!", 1, 0b1, vm_heap_bytes},
                          {"modules!", 1, 0b1, vm_modules},
+                         {"host_members", 1, 0b1, vm_host_members},
                          {"has_ffi", 1, 0b1, vm_has_ffi},
                          {"async_io", 1, 0b1, vm_async_io},
                          {"processes_info!", 1, 0b1, vm_process_list},
@@ -1314,6 +1316,40 @@ NativeResult bigstr_refused(Process& p, const char* what) {
 
 NativeResult type_fail(Process& p, const char* what) {
     return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error, what));
+}
+
+/// What a host module provides: `[name, arity]` for each member, in the order
+/// the module declares them, or `()` when no module of that name is registered.
+/// A variadic member's arity is `-1`, since it has no fixed one.
+///
+/// The compiler cannot answer this, and that is not an oversight. A host
+/// module's member table belongs to the runtime -- `import std.vm` compiles to
+/// a lookup that happens while the program runs -- so `dreams` knows such a
+/// module by name and by nothing else. `lucid` is the compiler answering an
+/// editor, and after a dot on one of these it had nothing to offer at all. It
+/// runs *on* the VM that owns the table, so it does not have to guess: it asks.
+///
+/// Read only by a tool. Nothing in the language needs it, and a program that
+/// wanted to reach a member by a computed name still cannot -- this says what
+/// the names are, not how to call one.
+NativeResult vm_host_members(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::Str)) return type_fail(p, "host_members needs a module name");
+    auto* s = static_cast<StrObj*>(as_obj(v));
+    const ModuleDef* module = p.runtime().find_module(std::string(s->data(), s->len));
+    if (module == nullptr) return NativeResult::ok(UNIT);
+
+    // Built back to front so the list comes out in declaration order, which is
+    // the order the module was written in and the one a reader expects.
+    Value list = NIL;
+    for (size_t i = module->members.size(); i-- > 0;) {
+        const NativeDef& member = module->members[i];
+        Value arity = make_integer(
+            p, member.arity == NATIVE_VARIADIC ? int64_t(-1) : int64_t(member.arity));
+        Value name = p.heap().make_string(member.name, uint32_t(std::strlen(member.name)));
+        list = p.heap().make_cons(p.heap().make_cons(name, p.heap().make_cons(arity, NIL)), list);
+    }
+    return NativeResult::ok(list);
 }
 
 /// Bring a value across from another runtime's heap.

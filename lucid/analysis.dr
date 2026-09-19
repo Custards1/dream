@@ -21,6 +21,7 @@ import std.list;
 import std.str;
 
 import dreams.ast;
+import dreams.builtins;
 import dreams.config;
 import dreams.diag;
 import dreams.expand as expansion;
@@ -48,12 +49,31 @@ let path_to_uri path = if str.starts_with "/" path { "file://" + path } else { "
 // --- one analysis --------------------------------------------------------------
 
 /// Everything one question needs: the loaded program, what its names resolved
-/// to, and which module the file in question turned out to be.
-let analysis l r mi = %{ :loader => l, :resolved => r, :module => mi };
+/// to, which module the file in question turned out to be -- and the same
+/// program *before* macro expansion, which is the one the editor is showing.
+///
+/// Two trees, and the split between them is exact. A question about what a
+/// name **means** is asked of the expanded program, because that program is
+/// what runs and there is nothing else for a name to mean. A question about
+/// what is **written** -- which locals a cursor can see, what parameters a
+/// declaration was given, whether it was a `macro` -- is asked of the source,
+/// because expansion replaces an `expand` with generated syntax carrying
+/// generated offsets, and the text the cursor is in is then inside no node at
+/// all. Reading the parameters of `let double n = expand twice n` off the
+/// expanded tree loses `n`, which is the local the person typing most wants.
+let analysis l r mi src = %{ :loader => l, :resolved => r, :module => mi, :source => src };
 
 let loader a   = core.map_get a :loader ();
 let resolved a = core.map_get a :resolved ();
 let module_of a = core.map_get a :module ();
+
+/// The program as written. Falls back to the expanded one, which is the same
+/// program wherever nothing was expanded.
+let source a = core.map_get a :source (loader a);
+
+/// What a module's file says, as declarations -- `macro` still a `macro`, and
+/// every `expand` still a call rather than the code it turned into.
+let source_items a mi = modules.module_items (modules.module_at (source a) mi);
 
 /// The index of the module loaded from this path, or `()`.
 ///
@@ -77,8 +97,9 @@ let module_index l path = {
 /// again. What a caller has to do is carry the map back -- `parses` below --
 /// since a cache that is not handed forward is not a cache.
 let analyse_cached! path roots open_docs parsed = {
-    let l = expansion.expand! (modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed);
-    analysis l (scope.resolve! (l)) (module_index l path)
+    let src = modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed;
+    let l = expansion.expand! src;
+    analysis l (scope.resolve! (l)) (module_index l path) src
 };
 
 let analyse! path roots open_docs = analyse_cached! path roots open_docs (core.map_new ());
@@ -104,8 +125,9 @@ let parses a = modules.parsed (loader a);
 /// wanting the globals of a module reads `scope.exports` of its environment,
 /// which is phase one's own answer to the same question.
 let declared! path roots open_docs parsed = {
-    let l = expansion.expand! (modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed);
-    analysis l (scope.resolver (scope.envs (scope.declare! l))) (module_index l path)
+    let src = modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed;
+    let l = expansion.expand! src;
+    analysis l (scope.resolver (scope.envs (scope.declare! l))) (module_index l path) src
 };
 
 /// The text of a module as the compiler saw it, which is the buffer when there
@@ -318,6 +340,8 @@ let rec reach e = {
             [:apply, callee, args, _]  =>
                 if list.is_empty args { reach callee } else { reach (list.last args) },
             [:let, _, _, body, _, _]   => reach body,
+            [:macro, _, _, body, _]    => reach body,
+            [:expand, call, _]         => reach call,
             [:let_p, _, body, _]       => reach body,
             [:virtual, _, _, body, _]  => match body { () => ends, b => reach b },
             _ => ends,
@@ -419,6 +443,14 @@ let rec expr_binders e offset acc =
             [:set, c, k, v, _] =>
                 expr_binders v offset (expr_binders k offset (expr_binders c offset acc)),
             [:destructure, _, body, _] => expr_binders body offset acc,
+
+            // What a macro is *handed* is source the author wrote, and a
+            // cursor in it can see everything the enclosing code can: nothing
+            // about being an argument narrows the scope. What the macro does
+            // with it is another matter and not one this can know -- a copy
+            // may end up under a binding of the macro's own -- so this is the
+            // scope at the call, which is the only one that is written down.
+            [:expand, call, _] => expr_binders call offset acc,
             _ => acc,
         }
     };
@@ -500,6 +532,14 @@ let in_item it offset acc =
                 expr_binders body offset (list.append acc (param_binders ps))
             }
             else { acc },
+        // A macro is a `let` that runs earlier. Its parameters are in scope in
+        // its body exactly as one's are, and this walk reads the file before
+        // expansion has rewritten it, so the case has to be here.
+        [:macro, _, ps, body, _] =>
+            if holds body offset {
+                expr_binders body offset (list.append acc (param_binders ps))
+            }
+            else { acc },
         [:let_p, _, body, _] => expr_binders body offset acc,
         [:virtual, _, ps, body, _] =>
             match body {
@@ -522,8 +562,7 @@ let locals_at a offset =
     match module_of a {
         () => [],
         mi => {
-            let items = modules.module_items (modules.module_at (loader a) mi);
-            let found = list.reverse (item_binders items offset []);
+            let found = list.reverse (item_binders (source_items a mi) offset []);
             let names = list.unique (list.map (fn b -> binder_name b) found);
             list.map (fn n -> list.head (list.filter (fn b -> binder_name b == n) found)) names
         },
@@ -547,6 +586,7 @@ let rec find_decl items name =
         [it, ..rest] =>
             match it {
                 [:let, n, _, _, _, _]  => if n == name { it } else { find_decl rest name },
+                [:macro, n, _, _, _]   => if n == name { it } else { find_decl rest name },
                 [:virtual, n, _, _, _] => if n == name { it } else { find_decl rest name },
                 [:when, _, inner, _] =>
                     match find_decl inner name { () => find_decl rest name, d => d },
@@ -558,10 +598,22 @@ let rec find_decl items name =
 /// not among this module's items -- a body inherited through `derive` is
 /// written somewhere else, and a host module's members are not written at all.
 let params_of a mi name =
-    match find_decl (modules.module_items (modules.module_at (loader a) mi)) name {
+    match find_decl (source_items a mi) name {
         () => (),
-        // `:let` and `:virtual` both keep their parameters third.
+        // `:let`, `:macro` and `:virtual` all keep their parameters third.
         d => list.nth 2 d,
+    };
+
+/// Was this global declared with `macro`?
+///
+/// Read off the source tree, because expansion rewrites a `macro` into an
+/// ordinary `let` and nothing in the resolved program remembers which it was.
+/// What this is for is completion: only a macro may follow `expand`, so
+/// offering anything else there is offering a mistake.
+let is_macro a mi name =
+    match find_decl (source_items a mi) name {
+        [:macro, _, _, _, _] => true,
+        _ => false,
     };
 
 /// `name` followed by the parameters of `ps`, sliced out of `src` so that a
@@ -595,26 +647,33 @@ let location a mi span = {
 /// the same table the outline is built from. A local carries its binder's span
 /// with it, so it needs no lookup at all -- which is the payoff of the resolver
 /// recording where a name was bound rather than only that it was.
+let rec located a found =
+    match found {
+        [:local, _, span] => match module_of a { () => (), mi => location a mi span },
+        [:global, mi, name, _] =>
+            match scope.definition (resolved a) mi name {
+                () => (),
+                d => location a mi (list.nth 2 d),
+            },
+        [:member, [:dream, target], field, _] =>
+            match scope.definition (resolved a) target field {
+                () => (),
+                d => location a target (list.nth 2 d),
+            },
+        // The name an `expand` named. A macro is an ordinary global by the
+        // time the program is resolved -- expansion rewrites the declaration
+        // -- so the way to it is the way to any other global, and the wrapper
+        // is only there to say what this occurrence was.
+        [:macro, inner] => located a inner,
+        // A builtin and a host module's member are not written in Dream, so
+        // there is nowhere to go.
+        _ => (),
+    };
+
 let definition_at a line character =
     match at_position a line character {
         () => (),
-        [_, _, found] =>
-            match found {
-                [:local, _, span] => match module_of a { () => (), mi => location a mi span },
-                [:global, mi, name, _] =>
-                    match scope.definition (resolved a) mi name {
-                        () => (),
-                        d => location a mi (list.nth 2 d),
-                    },
-                [:member, [:dream, target], field, _] =>
-                    match scope.definition (resolved a) target field {
-                        () => (),
-                        d => location a target (list.nth 2 d),
-                    },
-                // A builtin and a host module's member are not written in
-                // Dream, so there is nowhere to go.
-                _ => (),
-            },
+        [_, _, found] => located a found,
     };
 
 // --- hover ------------------------------------------------------------------------
@@ -649,11 +708,21 @@ let describe a offset name found =
         [:global, mi, name, _] =>
             "`" + shown_signature a mi name + "` -- a global of module `"
             + modules.module_name (modules.module_at (loader a) mi) + "`",
-        [:builtin, name] => "`" + name + "` -- a builtin",
+        [:builtin, name] => "`" + builtins.signature name + "` -- a builtin",
         [:member, [:dream, target], field, _] =>
             "`" + shown_signature a target field + "` of module `"
             + modules.module_name (modules.module_at (loader a) target) + "`",
         [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
+        // An `expand` site. The declaration is an ordinary global by now, so
+        // the signature and the module come from the same place they would for
+        // one; what is worth saying extra is that this runs at compile time.
+        [:macro, [:global, mi, n, _]] =>
+            "`" + shown_signature a mi n + "` -- a macro of module `"
+            + modules.module_name (modules.module_at (loader a) mi) + "`",
+        [:macro, [:member, [:dream, target], field, _]] =>
+            "`" + shown_signature a target field + "` -- a macro of module `"
+            + modules.module_name (modules.module_at (loader a) target) + "`",
+        [:macro, inner] => describe a offset name inner,
         [:closure, _] => "a function",
         [:thunk, _] => "a thunk",
         [:match, _] => "the subject of a match",
@@ -727,6 +796,17 @@ when test {
     /// comes back in does not.
     let in_scope_at! text = list.sort (scope_at! text);
 
+    /// A buffer whose declaration is written with `expand`, with the cursor in
+    /// the argument. One line, because the lexer is indentation-sensitive and
+    /// a test that wrapped it would be testing that instead.
+    let macro_buffer = "macro twice e = [:binary, :add, e, e, [0, 0]];\nlet double counter = expand twice |counter;\n";
+
+    /// The same two questions asked of the buffer's own module.
+    let is_macro! text name =
+        match of! text { a => match module_of a { () => false, mi => is_macro a mi name } };
+    let shown_signature_of! text name =
+        match of! text { a => match module_of a { () => "", mi => shown_signature a mi name } };
+
     let tests = [
         test.case "a file URI becomes a path"
             $( test.eq! "/a/b.dr" (uri_to_path "file:///a/b.dr") ),
@@ -777,6 +857,22 @@ when test {
             $( test.eq! ["p", "x"] (in_scope_at! "let f x = { let g = fn p -> |p; 1 };") ),
         test.case "a lambda still sees what encloses it"
             $( test.true! (list.contains "x" (scope_at! "let f x = { let g = fn p -> |p; 1 };")) ),
+
+        // Expansion replaces an `expand` with generated syntax carrying
+        // generated offsets, so a walk of the expanded tree finds the cursor
+        // inside no node at all and offers nothing. These are the whole reason
+        // the walk reads the program as written -- see `analysis` above.
+        test.case "a macro's argument can see the enclosing parameters"
+            $( test.eq! ["counter"] (in_scope_at! macro_buffer) ),
+        test.case "a macro's own parameter is in scope in its body"
+            $( test.true! (list.contains "e"
+                        (scope_at! "macro twice e = [:list, [|e], [0, 0]];\n")) ),
+        test.case "a macro is known to have been declared with `macro`"
+            $( test.true! (is_macro! "macro twice e = e;\nlet f x = x;\n" "twice") ),
+        test.case "an ordinary global is not"
+            $( test.false! (is_macro! "macro twice e = e;\nlet f x = x;\n" "f") ),
+        test.case "a macro is shown with the parameters it was declared with"
+            $( test.eq! "twice e" (shown_signature_of! "macro twice e = e;\n" "twice") ),
 
         test.case "a match arm's pattern binds in its body"
             $( test.eq! ["head", "rest", "xs"]

@@ -56,6 +56,13 @@ broken='import std.console;\nimport helper;\n\nlet main! = {\n    console.print!
 # before it can say anything at all.
 mid_edit='import std.console;\nimport helper;\n\nlet main! = {\n    console.print! (to_string (helper.))\n};\n'
 
+# A buffer with a macro in it, and one with a dot on a host module. Both are
+# questions the compiler alone cannot answer. Expansion *replaces* the call, so
+# the name `twice` is in no tree the resolver ever walks; and a host module's
+# members belong to the runtime, which is the VM this server is running on.
+macros='import std.console;\nimport std.vm;\n\nmacro twice e = [:binary, :add, e, e, [0, 0]];\n\nlet double n = expand twice n;\n\nlet main! = {\n    console.print! (double 21)\n};\n'
+host_dot='import std.console;\nimport std.vm;\n\nmacro twice e = [:binary, :add, e, e, [0, 0]];\n\nlet double n = expand twice n;\n\nlet main! = {\n    console.print! (vm.)\n};\n'
+
 {
   msg '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":"file://'"$tmp"'/ws"}}'
   msg '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"'"$uri"'","text":"import std.console;\nimport helper;\n\nlet main! = {\n    console.print! (to_string (helper.double 21))\n};\n"}}}'
@@ -66,6 +73,12 @@ mid_edit='import std.console;\nimport helper;\n\nlet main! = {\n    console.prin
   msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$mid_edit"'"}]}}'
   msg '{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":38}}}'
   msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$broken"'"}]}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$macros"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":8,"method":"textDocument/hover","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":22}}}'
+  msg '{"jsonrpc":"2.0","id":9,"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":22}}}'
+  msg '{"jsonrpc":"2.0","id":10,"method":"textDocument/completion","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":27}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$host_dot"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":11,"method":"textDocument/completion","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":8,"character":23}}}'
   msg '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}'
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
 } > "$tmp/in"
@@ -78,6 +91,18 @@ status=$?
 
 has() {
     if grep -q "$2" "$tmp/out"; then :; else say_fail "$1"; fi
+}
+
+# One response, by the id it answers. The stream is a run of `Content-Length:`
+# headers each followed by its body, so splitting on the header is splitting on
+# the message -- which is what lets a test say "not in *this* list" without
+# every other list in the conversation answering for it.
+response() { awk -v RS='Content-Length:' -v id="\"id\":$1" 'index($0, id) { print }' "$tmp/out"; }
+has_in() {
+    if response "$2" | grep -q "$3"; then :; else say_fail "$1"; fi
+}
+lacks_in() {
+    if response "$2" | grep -q "$3"; then say_fail "$1"; else :; fi
 }
 
 has "it does not announce what it can do"        '"definitionProvider":true'
@@ -106,6 +131,24 @@ has "a bare dot does not reach the module"        '"label":"triple"'
 # And a member is offered with the parameters it was declared with, which is
 # most of what a completion list is for.
 has "a member comes without its parameters"       '"detail":"double n"'
+
+# Requests 8 to 11 are about the two things the resolved program does not say.
+#
+# `twice` at its call site is a name expansion consumed: it was resolved, and
+# then the call it belonged to was replaced by what the macro returned. What
+# holds these is that the pass which did resolve it writes the occurrence down
+# (`modules.expansions`) and the resolver seeds its table with them, so hover
+# and go-to-definition are the ordinary lookups and not a second mechanism.
+has_in "a macro's name at its call site says nothing"     8  'a macro of module'
+has_in "a macro's name does not lead to its declaration" 9  '"line":3'
+# Only a macro may be written after `expand`, so nothing else is offered --
+# `double` is a global of this very module and must not be in that list.
+has_in   "a name after expand offers a macro"                10 '"label":"twice"'
+lacks_in "a name after expand offers what cannot go there"   10 '"label":"double"'
+# A host module's members belong to the runtime, which is the VM this is
+# running on. Nothing was offered here at all before it was asked.
+has_in "a host module offers no members"                 11 '"label":"stats!"'
+has_in "a host member comes without its arity"           11 '"detail":"stats! (1 argument)"'
 
 if [ "$fail" -eq 0 ]; then
     echo "the language server answers a whole conversation"

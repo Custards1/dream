@@ -1785,7 +1785,18 @@ let resolve! l = {
                  // globals a loop would take are the ones the next entry is
                  // about to declare.
                  :fuse true;
-    resolve_from! l declared r0 0 state
+    // What expansion already resolved, before the walk begins. An `expand`'s
+    // own name is a name occurrence like any other, but the only pass that
+    // ever sees it is the one that replaces it -- so this program does not
+    // contain it and the walk below cannot record it. Seeding is how those
+    // occurrences reach `at`, which is the question hover and go-to-definition
+    // are. Nothing downstream reads them: lowering asks about nodes, and the
+    // nodes at these offsets are gone. See `modules.expansions`.
+    let seeded = list.fold (fn r e ->
+        core.map_put r :refs (core.map_put (refs r)
+            (ref_key (list.nth 0 e) (list.nth 1 e) (list.nth 2 e)) (list.nth 3 e)))
+        r0 (modules.expansions l);
+    resolve_from! l declared seeded 0 state
 };
 
 // --- wrappers ---------------------------------------------------------------------

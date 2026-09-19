@@ -97,6 +97,20 @@ let main! = {
 };
 ''', '14\n18\n')
 
+    # A macro may call a helper whose own body was written with `expand`, and
+    # that is what the snapshot the macro VM runs against has to be fresh
+    # enough for. One snapshot serves the whole program, so by the time `use`
+    # runs, the snapshot's `helper` is the `1 / 0` an unexpanded call is staged
+    # as -- and the retry against a fresh one is the whole reason this answers
+    # 6 instead of reporting that the macro failed.
+    success("""
+import std.console;
+macro twice e = [:binary, :add, e, e, [0, 0]];
+let helper n = expand twice n;
+macro use e = [:int, helper 3, [0, 0]];
+let main! = console.print! (expand use 1);
+""", '6\n')
+
     # Unrelated comp! expressions run once in the final program's comp pass.
     success('''
 import std.console;
