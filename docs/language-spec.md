@@ -683,6 +683,45 @@ constant, not a hole. Because Dream compiles whole programs, `derive`
 specializes the base module's *syntax tree* against the deriving module's
 implementations, so there is no run-time dispatch.
 
+These modules are Dream's **behaviors**: explicit contracts and reusable
+implementations over dynamically typed values. Each implementation must be
+public and declare exactly as many parameters as its virtual declaration,
+including when overriding a default. A function alias must spell out those
+parameters (`let area self = other.area self`). Parameter names may differ;
+parameter and return types are not checked. The `!` suffix is part of the
+contract's name, and ordinary purity checking applies to method bodies.
+
+Records implement a behavior with `derive` between the name and body:
+
+```dream
+mod shape {
+    virtual let area self;
+    virtual let name self = "shape";
+    let describe self = name self + " of area " + to_string (area self);
+}
+
+struct Rectangle derive shape {
+    width
+    height
+    area self = width self * height self
+    name self = "rectangle"
+}
+
+Rectangle.describe (Rectangle.make 3 4)   // "rectangle of area 12"
+```
+
+The same syntax works for `group` and `mapping`. Generated helpers can satisfy
+requirements too: `mapping Measured derive shape { area }` implements `area`
+through its field accessor and inherits the default `name`. Derived paths
+resolve just as they do inside an ordinary module, including sibling modules
+and modules in other files. Missing methods, wrong arities, and private
+implementations are compile errors even if no caller uses them.
+
+A module or record derives one base module. Calls name the implementing
+namespace (`Rectangle.area value`); values keep their ordinary collection
+representation. For generic callers, pass operations as ordinary function
+arguments. This mechanism does not add automatic dispatch on a value's type.
+
 ### `when` — conditional compilation
 
 ```dream

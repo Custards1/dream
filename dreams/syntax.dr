@@ -75,7 +75,9 @@ let rec literal value span = match type_of value {
 /// would throw away the only spans a diagnostic inside it could point at.
 /// Generated spans live above 2^31 and written ones below, so the two cannot
 /// collide.
-let record kind name fields members span = {
+let record kind name fields members span = record_derived kind name fields members [] span;
+
+let record_derived kind name fields members bases span = {
     let named f = ast.name_e (ast.field_name f) (ast.field_span f);
     let build of_field = match kind {
         :list => ast.list_e (list.map of_field fields) span,
@@ -109,7 +111,7 @@ let record kind name fields members span = {
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
                                               (ast.member_body m) true (ast.member_span m))
                            members;
-    ast.mod_d name (generated + written) span
+    ast.mod_d name (bases + generated + written) span
 };
 
 // Validate returned data before any compiler pass assumes an AST shape. Spans

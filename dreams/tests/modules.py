@@ -62,3 +62,44 @@ mod dot {
     check('import bot; import sample.bot.dot;', 'dot.name')
     check('import bot.dot; import bot.dot.name;', 'name')
     print('module imports passed (interpreter and JIT)')
+
+    # Behaviors use the same specialization for modules and collection records.
+    behavior = """
+mod Named {
+    virtual let name self;
+    virtual let label self = "hello " + name self;
+    let twice self = label self + " / " + label self;
+}
+"""
+    for kind in ('group', 'struct', 'mapping'):
+        check(behavior + f'{kind} Person derive Named {{ name }}',
+              'Person.twice (Person.make "Ada")', 'hello Ada / hello Ada\n')
+        check(behavior + f'{kind} Person derive Named {{ name, label self = name self }}',
+              'Person.twice (Person.new "Ada")', 'Ada / Ada\n')
+        check(behavior + f'{kind} Person derive Named {{ age }}',
+              '()', error='does not implement `name`')
+        check(behavior + f'{kind} Person derive Named {{ name, label a b = "bad" }}',
+              '()', error='implementation of `label` requires 1 parameter, found 2')
+    check(behavior + 'mod Person { derive Named; let name self = "Ada"; }',
+          'Person.label ()', 'hello Ada\n')
+    check(behavior + 'mod Person { derive Named; let name = "Ada"; }',
+          '()', error='implementation of `name` requires 1 parameter, found 0')
+    check(behavior + 'mod Person { derive Named; priv let name self = "Ada"; }',
+          '()', error='implementation of `name` must be public')
+    check(behavior + 'mod Person { derive Named; let name! self = "Ada"; }',
+          '()', error='does not implement `name`')
+    check(behavior + 'mod Person { derive Named; let name self = raise! self; }',
+          '()', error='impure')
+    check('mod B { virtual let f a = a; } mod C { derive B; virtual let f a b; }',
+          '()', error='requires 2 parameters, found 1')
+    check('mod B { virtual let f a; } struct C derive B { f self = 1 } '
+          'mod D { derive C; let f a b = 2; }',
+          '()', error='requires 1 parameter, found 2')
+    check('mod B { virtual let f! x; let run! x = f! x; } '
+          'struct C derive B { f! x = 42 }', 'C.run! ()', '42\n')
+    check('mod B { virtual let f x; let safe x = f x; } '
+          'struct C derive B { f x = 7 }', 'C.safe (1 / 0)', '7\n')
+    (temp / 'behavior.dr').write_text('virtual let name self; let hello self = name self;')
+    check('struct Person derive behavior { name }', 'Person.hello (Person.make "Ada")', 'Ada\n')
+    check('when false { struct C derive nonexistent { x } }', '42', '42\n')
+    print('behavior contracts and records passed (interpreter and JIT)')

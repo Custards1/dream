@@ -537,6 +537,25 @@ let rec collect_virtuals items acc =
             },
     };
 
+/// A behavior's contract is its explicit parameter list and public name.
+/// Values remain dynamically typed; aliases must spell out their parameters
+/// so checking a contract never requires evaluating an implementation.
+let check_virtual_impl l v od s = {
+    let owner = list.head od;
+    let d = list.nth 1 od;
+    let expected = list.length (virtual_params v);
+    let actual = list.length (decl_params d);
+    let source = modules.module_source (modules.module_at l owner);
+    if actual != expected {
+        complain (decl_span d)
+            ("implementation of `" + virtual_name v + "` requires " + to_string expected
+             + (if expected == 1 { " parameter, found " } else { " parameters, found " })
+             + to_string actual) source s
+    } else if modules.private_declaration (modules.module_at l owner) (decl_span d) {
+        complain (decl_span d) ("implementation of `" + virtual_name v + "` must be public") source s
+    } else { s }
+};
+
 /// A virtual nobody implemented. Three outcomes, and which one depends on who
 /// left the hole open.
 let unimplemented l mi owner v lets s =
@@ -698,9 +717,23 @@ let declare_module l mi s0 = {
         else { unimplemented l mi (list.head ov) v (list.head acc) (list.nth 1 acc) }
     }) collected virtuals;
 
+    // Check every inherited declaration, including a contract redeclared by
+    // an intermediate module. Deduplicating defaults must not hide a contract.
+    let contracts = list.fold (fn acc oi -> match list.nth 1 oi {
+        [:virtual, _, _, _, _] => {
+            let v = list.nth 1 oi;
+            match list.first_or () (list.filter
+                (fn od -> decl_name (list.nth 1 od) == virtual_name v) (list.head filled)) {
+                () => acc,
+                od => check_virtual_impl l v od acc,
+            }
+        },
+        _ => acc,
+    }) (list.nth 1 filled) effective;
+
     // Declare the globals, and queue every body for phase two.
     let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
-                             (list.nth 1 filled) (list.head filled);
+                             contracts (list.head filled);
 
     let checked = report_clashes mi (module_span l mi) declared;
     // A module that declares a virtual is abstract: it has a hole in it, and

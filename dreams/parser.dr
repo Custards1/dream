@@ -1020,11 +1020,29 @@ let rec parse_record c kind sp ts =
         err "expected a record name" (peek_span ts)
     } else {
         let name = peek_value ts;
-        match expect (list.tail ts) :lbrace "`{` before the record body" {
+        match record_base c (list.tail ts) {
             [:error, m, s] => err m s,
-            [:ok, _, rest] => record_body (ctx true false (ctx_indent c)) kind name sp [] [] rest,
+            [:ok, bases, after_base] =>
+                match expect after_base :lbrace "`{` before the record body" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest] =>
+                        match record_body (ctx true false (ctx_indent c)) kind name sp [] [] rest {
+                            [:ok, [:record, k, n, fs, ms, _, span], after] =>
+                                ok [:record, k, n, fs, ms, bases, span] after,
+                            other => other,
+                        },
+                },
         }
     };
+
+/// A record specializes a behavior just as an ordinary module does.
+let record_base c ts =
+    if is_kw ts "derive" {
+        match parse_derive c (peek_span ts) (list.tail ts) {
+            [:ok, d, rest] => ok [d] rest,
+            other => other,
+        }
+    } else { ok [] ts };
 
 /// A record body is a list of entries, and it is newline-sensitive for the
 /// same reason a block is: an entry may be a function definition, and nobody
@@ -1432,6 +1450,9 @@ when test {
         test.case "records retain their backing kind and field order"
             $( test.eq! "(group Point x y) (struct Pair a b) (mapping Named z a)"
                         (items "group Point { x, y } struct Pair { a, b, } mapping Named { z, a, }") ),
+        test.case "a record retains its behavior declaration"
+            $( test.eq! "(struct Person (derive example.Named) name)"
+                        (items "struct Person derive example.Named { name }") ),
         test.case "record helpers cannot collide"
             $( test.eq! "record field `set_x` conflicts with a generated helper"
                         (fails_module "group Point { x, set_x }") ),

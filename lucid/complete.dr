@@ -498,11 +498,9 @@ when test {
 
     /// An analysis of one buffer, as `analysis`'s own tests do it.
     ///
-    /// Nothing here is on a package path, so an import of `std.list` is not
-    /// found as a file and is treated as host-provided. That is the same branch
-    /// of `declare_import` a real selective import takes, and it is the one
-    /// that fills the `only` table -- so these reach it without needing a
-    /// standard library on disk.
+    /// Nothing here is on a package path. Native imports use `std.math`;
+    /// Dream imports use inline modules. Both resolve without relying on an
+    /// installed standard library (`std.list` requires source files).
     let of! text = analysis.analyse! "/buf.dr" [] (core.map_put (core.map_new ()) "/buf.dr" text);
 
     /// The entries an import contributes, by label.
@@ -627,12 +625,21 @@ when test {
         // are here.
 
         test.case "a plain import offers the name it binds"
-            $( test.eq! ["list"] (import_labels! "import std.list;") ),
+            $( test.eq! ["math"] (import_labels! "import std.math;") ),
         test.case "a selective import offers each name it brings in"
-            $( test.eq! ["fold", "map"] (import_labels! "import std.list.{map, fold};") ),
+            $( test.eq! ["abs", "sqrt"] (import_labels! "import std.math.{sqrt, abs};") ),
         test.case "a renamed import offers the name it was bound to"
-            $( test.eq! ["map", "reduce"]
-                        (import_labels! "import std.list.{map, fold as reduce};") ),
+            $( test.eq! ["absolute", "sqrt"]
+                        (import_labels! "import std.math.{sqrt, abs as absolute};") ),
+        test.case "a Dream module offers its alias and renamed selective imports"
+            $( test.eq! ["helpers", "increment"]
+                        (import_labels!
+                            "mod helpers { let add_one x = x + 1; } import helpers.{add_one as increment};") ),
+        test.case "a renamed Dream import identifies the original member"
+            $( test.true! (str.contains_str "`add_one` of `buf.helpers`"
+                        (import_doc!
+                            "mod helpers { let add_one x = x + 1; } import helpers.{add_one as increment};"
+                            "increment")) ),
         // A record's members are generated, so their parameters are not in the
         // file and their module is one nobody wrote. Both were visible:
         // `Point.make` was offered as `make  `, and `Point` itself as an
@@ -642,6 +649,12 @@ when test {
                          ["set_x", "set_x record value"],
                          ["set_y", "set_y record value"], ["x", "x record"], ["y", "y record"]]
                         (member_details! "group Point { x, y }\n" ["Point"]) ),
+        test.case "a record offers specialized behavior methods"
+            $( test.eq! [["label", "label self"], ["name", "name record"]]
+                        (list.filter (fn d -> list.head d == "label" || list.head d == "name")
+                            (member_details!
+                                "mod B { virtual let name self; let label self = name self; }\nstruct P derive B { name }\n"
+                                ["P"])) ),
         // `new` takes only what has no default, which is the whole difference
         // between the two constructors and so is the thing a completion has to
         // get right.
@@ -668,7 +681,7 @@ when test {
                         (import_doc! "struct Empty {}\n" "Empty") ),
 
         test.case "a renamed import says which member it really is"
-            $( test.true! (str.contains_str "`fold` of `std.list`"
-                   (import_doc! "import std.list.{map, fold as reduce};" "reduce")) ),
+            $( test.true! (str.contains_str "`abs` of `std.math`"
+                   (import_doc! "import std.math.{sqrt, abs as absolute};" "absolute")) ),
     ];
 }

@@ -200,7 +200,7 @@ let member_params m = list.nth 1 m;
 let member_body m   = list.nth 2 m;
 let member_span m   = list.nth 3 m;
 
-let record_d kind name fields members span = [:record, kind, name, fields, members, span];
+let record_d kind name fields members span = [:record, kind, name, fields, members, [], span];
 
 /// `let [a, b] = pair` -- a `let` that binds what a pattern names. A node of
 /// its own rather than a `let` whose name is a pattern, because everything
@@ -341,9 +341,9 @@ let rec show e =
         [:comp, impure, x, _] => "(" + (if impure { "comp!" } else { "comp" }) + " " + show x + ")",
         [:expand, x, _] => "(expand " + show x + ")",
         [:macro, n, ps, b, _] => "(macro " + n + " " + show_params ps + " " + show b + ")",
-        [:record, kind, n, fields, members, _] =>
+        [:record, kind, n, fields, members, bases, _] =>
             "(" + (match kind { :list => "group", :array => "struct", :map => "mapping" })
-                + " " + n + " "
+                + " " + n + " " + (if list.is_empty bases { "" } else { show_all bases + " " })
                 + str.join_str " " (list.map (fn f ->
                       match field_default f {
                           () => field_name f,

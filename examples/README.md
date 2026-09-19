@@ -25,6 +25,7 @@ examples/run.sh --bless     # re-record output after a deliberate change
 | [`09_compile_time.dr`](09_compile_time.dr) | `comp`, `comp!`, and `when` |
 | [`10_macros_records.dr`](10_macros_records.dr) | syntax macros and generated record constructors/getters/setters |
 | [`11_standard_macros.dr`](11_standard_macros.dr) | `std.macros`: branches, bindings, pipelines, updates and effects |
+| [`12_behaviors.dr`](12_behaviors.dr) | behavior contracts, record implementations, defaults and generic callers |
 
 ## The packages
 

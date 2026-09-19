@@ -594,14 +594,22 @@ let rec find_decl items name =
             },
     };
 
-/// A global's parameters as they were written, or `()` when its declaration is
-/// not among this module's items -- a body inherited through `derive` is
-/// written somewhere else, and a host module's members are not written at all.
-let params_of a mi name =
+/// Preserve the source owner when a signature comes from a behavior, so
+/// pattern parameters are read from the file where they were written.
+let signature_decl a mi name =
     match find_decl (source_items a mi) name {
+        () => list.first_or () (list.filter (fn oi ->
+                  find_decl [list.nth 1 oi] name != ())
+                  (list.reverse (list.head (scope.effective_items (source a) mi [])))),
+        d => [mi, d],
+    };
+
+/// A global's parameters, including those of inherited behavior methods.
+let params_of a mi name =
+    match signature_decl a mi name {
         () => (),
         // `:let`, `:macro` and `:virtual` all keep their parameters third.
-        d => list.nth 2 d,
+        [_, d] => list.nth 2 d,
     };
 
 // --- records ----------------------------------------------------------------------
@@ -745,9 +753,9 @@ let signature src name ps =
 /// How to show a global or a member: its signature when the declaration can be
 /// found, and its bare name when it cannot.
 let shown_signature a mi name =
-    match params_of a mi name {
+    match signature_decl a mi name {
         () => name,
-        ps => signature (module_text a mi) name ps,
+        [owner, d] => signature (module_text a owner) name (list.nth 2 d),
     };
 
 // --- go to definition -------------------------------------------------------------

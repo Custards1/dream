@@ -380,8 +380,8 @@ let rec expand_items cfg items =
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { expand_items cfg inner } else { [] },
             [:priv, d, span] => [d, [:private, span]],
-            [:record, kind, name, fields, members, span] =>
-                [syntax.record kind name fields members span],
+            [:record, kind, name, fields, members, bases, span] =>
+                [syntax.record_derived kind name fields members bases span],
             other => [other],
         }) items);
 
@@ -393,7 +393,7 @@ let rec record_items cfg items =
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { record_items cfg inner } else { [] },
-            [:record, kind, name, fields, members, span] =>
+            [:record, kind, name, fields, members, bases, span] =>
                 [[kind, name, fields, members, span]],
             _ => [],
         }) items);
