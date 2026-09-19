@@ -26,6 +26,7 @@ examples/run.sh --bless     # re-record output after a deliberate change
 | [`10_macros_records.dr`](10_macros_records.dr) | syntax macros and generated record constructors/getters/setters |
 | [`11_standard_macros.dr`](11_standard_macros.dr) | `std.macros`: branches, bindings, pipelines, updates and effects |
 | [`12_behaviors.dr`](12_behaviors.dr) | behavior contracts, record implementations, defaults and generic callers |
+| [`13_codecs.dr`](13_codecs.dr) | `std.codec`: one walk over a value, two formats, framing, and records on a wire |
 
 ## The packages
 

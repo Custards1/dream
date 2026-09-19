@@ -1,0 +1,46 @@
+// Serializing: one walk, two formats, and a record that comes back itself.
+//
+// `std.codec` is a behavior. It declares how a format spells each kind of
+// value and writes the walk over a value -- and the framing that turns a
+// stream of bytes back into messages -- once, for every format that fills
+// those holes. `std.wire` and `std.json` are two that do.
+import std.console;
+import std.json;
+import std.list;
+import std.record;
+import std.wire;
+
+// A record says the one thing the language cannot tell it about itself: what
+// its fields are called. Everything else below is inherited.
+struct User derive std.record {
+    name
+    age
+    fields u = [:name, :age]
+    backing u = :array
+    record_name u = "User"
+}
+
+let ada = User.make "ada" 36;
+
+let main! = {
+    // The same value, in both formats. JSON is text; the wire format is bytes,
+    // so what is shown is how many of them.
+    console.print! (json.write (User.to_map ada));
+    console.print! (to_string (core.str_len (wire.encode (User.to_map ada))) + " bytes");
+
+    // The wire format keeps the kinds apart, so what comes back is `==` to
+    // what went in -- including the atom, which JSON has to spell as a string.
+    console.print! (to_string (wire.decode_or () (wire.encode [1, :ok, 2.5])));
+    console.print! (to_string (json.decode_or () (json.write [1, :ok, 2.5])));
+
+    // A record goes out named and comes back a record, through either.
+    console.print! (User.describe (User.of_map (json.decode_or %{} (json.write (User.to_map ada)))));
+
+    // Framing is what makes a stream of bytes a sequence of messages. Two
+    // messages and a third that has only half arrived: the whole ones are
+    // answered, and the remainder is kept for the next read.
+    let stream = wire.frame_all [:hello, ada] + core.str_slice (wire.frame :bye) 0 3;
+    let read = wire.frames stream;
+    console.print! (to_string (list.nth 0 read));
+    console.print! (to_string (core.str_len (list.nth 1 read)) + " bytes left over")
+};

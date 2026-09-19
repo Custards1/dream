@@ -7,6 +7,7 @@
 
 import std.array;
 import std.cli;
+import std.codec;
 import std.core;
 import std.error;
 import std.json;
@@ -14,6 +15,7 @@ import std.list;
 import std.map;
 import std.macros;
 import std.proc;
+import std.record;
 import std.result;
 import std.seq;
 import std.str;
@@ -21,10 +23,113 @@ import std.streams;
 import std.supervisor;
 import std.test;
 import std.toml;
+import std.wire;
 /// The library's own version, so a program can report what it was built with.
 let version = "0.1.0";
 
 /// The modules this build provides.
-let modules = ["std.array", "std.cli", "std.core", "std.error", "std.json", "std.list",
-               "std.map", "std.macros", "std.proc", "std.result", "std.seq", "std.str", "std.streams",
-               "std.supervisor", "std.test", "std.toml"];
+let modules = ["std.array", "std.cli", "std.codec", "std.core", "std.error", "std.json", "std.list",
+               "std.map", "std.macros", "std.proc", "std.record", "std.result", "std.seq", "std.str", "std.streams",
+               "std.supervisor", "std.test", "std.toml", "std.wire"];
+
+// --- the tests std.record cannot hold ----------------------------------------
+//
+// A record cannot derive the module it is declared in, so `std.record`'s own
+// contract has to be exercised from outside it -- and this is the module that
+// is outside all of them. What is checked here is the join rather than any one
+// piece: a record declared against `std.record`, sent through `std.wire` and
+// through `std.json`, and asked to be itself again on the other side.
+
+when test {
+    // A `group` says only what nothing can tell it: its field names. The
+    // backing defaults to `:list`, which is what a group is.
+    group Point derive std.record {
+        x
+        y
+        fields u = [:x, :y]
+        record_name u = "Point"
+    }
+
+    struct User derive std.record {
+        name
+        age
+        fields u = [:name, :age]
+        backing u = :array
+        record_name u = "User"
+    }
+
+    // A record whose fields have defaults has to read them through its own
+    // accessors, because a default is the `else` of the read and there is no
+    // key in the map to find. `to_fields` is a hole for exactly this, and the
+    // override names only generated helpers -- which is all a member body has.
+    mapping Config derive std.record {
+        host
+        port = 80
+        fields u = [:host, :port]
+        backing u = :map
+        record_name u = "Config"
+        to_fields self = [host self, port self]
+    }
+
+    let ada = User.make "ada" 36;
+
+    let tests = [
+        // what a record already did, before any of this
+        test.case "a record crosses std.wire as itself"
+            $( test.eq! ada (wire.decode_or () (wire.encode ada)) ),
+        test.case "and is still a record on the far side"
+            $( test.eq! "ada" (User.name (wire.decode_or () (wire.encode ada))) ),
+
+        // the named form
+        test.case "to_map names the fields"
+            $( test.eq! %{ :name => "ada", :age => 36 } (User.to_map ada) ),
+        test.case "of_map is its inverse"      $( test.eq! ada (User.of_map (User.to_map ada)) ),
+        test.case "and keeps the backing"      $( test.eq! :array (type_of (User.of_map (User.to_map ada))) ),
+        test.case "a group keeps its backing"  $( test.eq! :list (type_of (Point.of_map (Point.to_map (Point.make 1 2)))) ),
+        test.case "a mapping keeps its backing"
+            $( test.eq! :map (type_of (Config.of_map (Config.to_map (Config.new "h")))) ),
+        test.case "a missing field is ()"      $( test.eq! () (User.name (User.of_map %{ :age => 1 })) ),
+
+        // through a format that has no atoms, which is the case that needs of_map
+        test.case "a record survives JSON"
+            $( test.eq! ada (User.of_map (json.decode_or %{} (json.write (User.to_map ada)))) ),
+        test.case "JSON writes the field names"
+            $( test.eq! "{\"age\":36,\"name\":\"ada\"}" (json.write (User.to_map ada)) ),
+        test.case "a string key reads as its field"
+            $( test.eq! 36 (User.value_of %{ "age" => 36 } :age) ),
+        test.case "an atom key still does"
+            $( test.eq! 36 (User.value_of %{ :age => 36 } :age) ),
+
+        // and through the exact one, framed, which is the shape a server reads
+        test.case "a framed record comes back"
+            $( test.eq! ada (User.of_map (result.or_else %{}
+                   (list.nth 0 (wire.next_frame (wire.frame (User.to_map ada)))))) ),
+
+        // defaults
+        test.case "a default is read through the accessor"
+            $( test.eq! %{ :host => "h", :port => 80 } (Config.to_map (Config.new "h")) ),
+        test.case "and survives the trip"
+            $( test.eq! 80 (Config.port (Config.of_map (Config.to_map (Config.new "h")))) ),
+
+        // shape
+        test.case "arity"                   $( test.eq! 2 (User.arity ()) ),
+        test.case "the right shape fits"    $( test.true! (User.fits ada) ),
+        test.case "a named map fits"        $( test.true! (User.fits (User.to_map ada)) ),
+        test.case "a JSON object fits"      $( test.true! (User.fits %{ "name" => "a", "age" => 1 }) ),
+        test.case "the wrong length does not" $( test.false! (User.fits (core.array_of_list [1])) ),
+        test.case "a missing member does not" $( test.false! (User.fits %{ "name" => "a" }) ),
+        test.case "a number is not a record"  $( test.false! (User.fits 1) ),
+
+        // changing one
+        test.case "with_field"       $( test.eq! 37 (User.age (User.with_field ada :age 37)) ),
+        test.case "and leaves the rest" $( test.eq! "ada" (User.name (User.with_field ada :age 37)) ),
+        test.case "with_fields patches only what it names"
+            $( test.eq! (User.make "grace" 36) (User.with_fields ada %{ :name => "grace" }) ),
+        test.case "and takes a patch that came through JSON"
+            $( test.eq! (User.make "grace" 36) (User.with_fields ada %{ "name" => "grace" }) ),
+
+        // for a person
+        test.case "describe"    $( test.eq! "User(name: ada, age: 36)" (User.describe ada) ),
+        test.case "record_name" $( test.eq! "Point" (Point.record_name ()) ),
+    ];
+}

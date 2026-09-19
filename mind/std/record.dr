@@ -1,0 +1,193 @@
+// Records on a wire: the named form of a declared value, and the way back.
+//
+// A record already crosses a wire without any help, because it is not a new
+// kind of value: `struct User { name, age }` is an array of two, and
+// `std.wire` sends an array of two and hands back an array of two, which *is*
+// a `User`. Nothing here is needed for that, and the tests at the foot of this
+// file say so.
+//
+// What is needed is the other three things, and they are what this module is:
+//
+// - **A name for each field.** A record sent positionally is `["ada", 36]`,
+//   which is exact and unreadable, and which nothing but the same declaration
+//   can interpret. `to_map` makes it `%{ :name => "ada", :age => 36 }`, which
+//   any format can carry and any reader can make sense of -- including one
+//   written in another language, since through `std.json` it is an object with
+//   the field names as its keys.
+// - **A way back that survives a lossy format.** JSON has no atoms and one
+//   sequence, so a `User` that goes out through it comes back as a map with
+//   *string* keys, and no longer is one. `of_map` takes either spelling and
+//   rebuilds the record's own backing, so a round trip through JSON ends where
+//   it started.
+// - **A shape to check.** A message arrives from somewhere else, so "is this a
+//   `User`?" is a real question and `fits` is the answer -- the only one
+//   available, since a record adds no tag and `type_of` cannot tell a `User`
+//   from any other array of two.
+//
+// A record derives this:
+//
+//     struct User derive std.record {
+//         name
+//         age
+//         fields u = [:name, :age]
+//         backing u = :array
+//         record_name u = "User"
+//     }
+//
+// and gets `User.to_map`, `User.of_map`, `User.fits`, `User.describe` and the
+// rest. Only `fields` has no default.
+//
+// **Why the holes are answerable with literals, and why that is the whole
+// design.** A record's members are compiled inside the module the declaration
+// generates, so a member body may name `core`, the builtins and the record's
+// own helpers -- and may *not* name anything the surrounding file imported.
+// That is the ordinary rule for a nested `mod` and it is not negotiable here.
+// So a contract a record can actually fill is one whose answers are constants:
+// a list of atoms, an atom, a string. Every hole below is one of those, and
+// everything that needs `std.list` or `std.map` to compute is on this side of
+// the line, written once, where the imports are.
+//
+// **What a record cannot do is derive two things.** A record derives one base
+// module, so a `User` that derives this cannot also derive `std.seq` or a
+// behavior of its own. Where that collides, the way out is the one the language
+// already offers: the operations are ordinary functions, so pass them.
+import std.core;
+import std.list;
+import std.map;
+import std.str;
+
+// --- the holes ----------------------------------------------------------------
+
+/// The field names, in the order the backing holds them.
+///
+/// The one hole with no default, because it is the one thing the language does
+/// not tell a module about itself: a generated module knows how to read field
+/// `name`, and does not know that `name` is what it is called. The parameter is
+/// ignored -- a virtual needs one, and the answer is a constant.
+virtual let fields u;
+
+/// Which collection this record is built on: `:list` for a `group`, `:array`
+/// for a `struct`, `:map` for a `mapping`.
+///
+/// Only building needs this. Reading does not, because a value in hand can be
+/// asked (`to_fields` uses `type_of`), and asking beats being told; but
+/// `of_fields` is handed the field values and nothing else, so something has to
+/// say what to put them in. The default is `:list`, so a `group` says nothing.
+virtual let backing u = :list;
+
+/// What to call this record where a person will read it.
+virtual let record_name u = "record";
+
+/// The field values, in `fields` order.
+///
+/// The default reads whichever backing the value actually has, which is why it
+/// is right for all three and why it cannot disagree with the value it is given
+/// -- a wrong `backing` breaks construction and leaves reading alone.
+virtual let to_fields self = match type_of self {
+    :array => core.array_to_list self,
+    :map   => list.map (fn k -> self.[k else ()]) (fields ()),
+    _      => self,
+};
+
+/// One of these, from its field values in `fields` order.
+///
+/// The default builds `backing`, which covers every record the language can
+/// declare. A record overrides it only to do something the declaration cannot
+/// express -- validating, defaulting, or renaming a field that moved.
+virtual let of_fields values = match backing () {
+    :array => core.array_of_list values,
+    :map   => map.from_pairs (list.zip (fields ()) values),
+    _      => values,
+};
+
+// --- the named form -------------------------------------------------------------
+
+/// The record as a map from field name to value.
+///
+/// The form to send. It is self-describing, so a reader needs the field *names*
+/// rather than the declaration, and it survives a format with no atoms -- which
+/// `of_map` is written to read back.
+let to_map self = map.from_pairs (list.zip (fields ()) (to_fields self));
+
+/// The record's field name `k` spelled as text, which is what a format with no
+/// atoms will have made of it.
+priv let text_of k = str.slice 1 (str.byte_length (to_string k)) (to_string k);
+
+/// The value `m` holds for field `k`, under either spelling, or `()`.
+///
+/// Either spelling is the whole point. A map that has been through `std.wire`
+/// has the atom keys it left with; one that has been through JSON has their
+/// names as strings, because JSON has no atoms to give back. A record that
+/// could only read the first would be a record that cannot talk to anything but
+/// Dream, and a record that could only read the second would have thrown away
+/// the exactness `std.wire` exists to keep.
+let value_of m k = m.[k else m.[text_of k else ()]];
+
+/// One of these, from such a map. A field the map does not mention is `()`,
+/// which is what every other reader in this library answers for a missing
+/// thing, and what a record's own accessor answers for a field with no default.
+let of_map m = of_fields (list.map (fn k -> value_of m k) (fields ()));
+
+// --- asking about a value ---------------------------------------------------------
+
+/// How many fields this record has.
+let arity u = list.length (fields ());
+
+/// Could this value be one of these?
+///
+/// The only answer there is. A record adds no tag and no type -- `type_of` on a
+/// `User` says `:array`, the same as for any other array -- so "is this a
+/// `User`" can only ever mean "is this the right shape", and a message that
+/// fits is not thereby one that was meant. Check the shape and then check the
+/// values; this is the first half only.
+let fits v = match type_of v {
+    :list  => list.length v == arity (),
+    :array => len v == arity (),
+    :map   => list.all (fn k -> core.map_has v k || core.map_has v (text_of k)) (fields ()),
+    _      => false,
+};
+
+/// `User(name: ada, age: 36)`, for a person rather than a wire.
+///
+/// In the order the fields were declared, which is `fields` and not the order a
+/// map walks: `to_map` exists to be sent and a map has no order worth reading,
+/// but a person reading a record expects to see it as it was written.
+let describe self = {
+    let one p = text_of (list.nth 0 p) + ": " + to_string (list.nth 1 p);
+    record_name () + "("
+        + str.join_str ", " (list.map one (list.zip (fields ()) (to_fields self))) + ")"
+};
+
+// --- changing one ------------------------------------------------------------------
+
+/// The record with field `k` set to `v`.
+///
+/// A generated `set_name` is per field and is the one to reach for where the
+/// field is known when the code is written. This is for where it is not: a
+/// patch that arrived as data names its field at run time.
+let with_field self k v = {
+    let swap p = if list.nth 0 p == k { v } else { list.nth 1 p };
+    of_fields (list.map swap (list.zip (fields ()) (to_fields self)))
+};
+
+/// The record with every field `changes` mentions replaced. Fields it does not
+/// mention are left alone, which is what makes this a patch rather than a
+/// second constructor -- and either spelling of a key is accepted, so a patch
+/// that arrived as JSON applies without being translated first.
+let with_fields self changes = {
+    let pick p = {
+        let k = list.nth 0 p;
+        if core.map_has changes k || core.map_has changes (text_of k) { value_of changes k }
+        else { list.nth 1 p }
+    };
+    of_fields (list.map pick (list.zip (fields ()) (to_fields self)))
+};
+
+// The tests for all of this are in `std.all`, which is the nearest place they
+// can be rather than where they belong. They need concrete records to test,
+// and a record declared in this file would have to `derive std.record` -- the
+// module it is already inside. The compiler does not diagnose that; it dies on
+// it, with `.[ ] reads a map, an array or a list, not unit` and no position.
+// `std.all` is the one module whose business is the library seen as a whole,
+// so the records live there, and testing them against `std.wire` and
+// `std.json` in the same block is worth as much as testing them here.

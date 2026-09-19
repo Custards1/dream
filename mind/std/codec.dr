@@ -1,0 +1,233 @@
+// Codecs: everything a format gets for free once it can spell a value.
+//
+// This module is generic in the way `std.seq` is. It declares the holes a
+// *format* fills -- how this format writes an integer, a string, a list -- and
+// writes everything else in terms of them, so a new format is the spelling and
+// nothing else:
+//
+//     derive std.codec;
+//     let write_int n = ..;
+//     ..
+//     let decode text = ..;
+//
+// `std.wire` and `std.json` are the two that do. Because Dream compiles whole
+// programs, `derive` specializes this module's syntax tree against the deriving
+// module's holes, so `wire.encode` is ordinary code with the binary spellings
+// inlined into it -- there is no dispatch at run time and the generality costs
+// nothing.
+//
+// **What the holes are.** Not one `encode` hole, which would leave a format
+// writing the same walk over lists, arrays and maps that every other format
+// writes. The walk is the part that is the same everywhere, so the walk is
+// here; what differs is what each kind of value looks like on the wire, and
+// that is one hole per kind. A format receives its children *already encoded*
+// (`write_list parts`) for the same reason: assembling them is the format's
+// business and reaching them is not.
+//
+// **Why decoding is one hole and not eleven.** Encoding walks a value, which is
+// a structure the runtime already knows; decoding walks *text*, which has no
+// structure until the format says what it is. There is no shared traversal to
+// factor out, so `decode` is a hole and what this module adds on top of it is
+// the things that do not depend on the format: a default, a round trip, and
+// framing.
+//
+// **Failure is a value.** `decode` answers a `std.result` -- `[:ok, value]` or
+// `[:error, reason]` -- because a parser that raised could not be pure, and
+// decoding is not an effect. So every combinator in `std.result` applies to a
+// decode, and this module does not invent a second set.
+//
+// **What a round trip does and does not preserve.** A codec here is told the
+// runtime's own kinds, so a format *may* keep every one of them apart -- and
+// `std.wire` does. A format that cannot say the difference loses it: JSON has
+// one number and no atoms, so `:ok` comes back as `"ok"` and an array comes
+// back as a list. That is the format's limit rather than this module's, and
+// `round_trips` is here so a format can state in its own tests exactly which
+// values survive it.
+import std.core;
+import std.list;
+import std.result;
+import std.str;
+
+// --- the holes: how this format spells each kind of value --------------------
+//
+// One per kind `type_of` answers, so that a format is never handed a value it
+// was not asked about. The ones with defaults are the ones a format is allowed
+// not to care about.
+
+/// Nothing: the absent value, `()`.
+virtual let write_unit u;
+
+virtual let write_bool b;
+
+virtual let write_int n;
+
+virtual let write_float x;
+
+/// A string's text. Whatever quoting or escaping the format needs is here.
+virtual let write_string s;
+
+/// An atom. A format with no atoms of its own writes the name; `std.json`
+/// does exactly that, and the colon is not part of the name.
+virtual let write_atom a;
+
+/// A list, its elements already encoded. Joining them is what is left.
+virtual let write_list parts;
+
+/// A map, as `[key, value]` pairs in a settled order -- see `map_entries`.
+/// Both halves arrive *raw* rather than encoded, because a format's keys are
+/// not always its values: JSON's must become strings and a binary format's
+/// need not. Call `encode` on whichever half wants it.
+virtual let write_map pairs;
+
+/// One character. The default spells it as a string of one, which is what a
+/// text format wants and what every format can read back as *something*.
+virtual let write_char c = write_string (str.of_chars [c]);
+
+/// An array, its elements already encoded. The default spells it as a list,
+/// which is the right answer for any format that has one sequence and not two;
+/// a format that keeps them apart overrides this and gets an exact round trip.
+virtual let write_array parts = write_list parts;
+
+/// A value that cannot cross a wire at all -- a function, a module, a process,
+/// an error, a view into the image's payload.
+///
+/// The default is its `to_string`, which is lenient and lossy and deliberately
+/// both: a format that would rather refuse can override it, and the hole being
+/// *named* is what stops the walk from quietly pretending such a value is a
+/// string. On a bigstr the default raises, and that is the honest outcome
+/// rather than a gap -- a bigstr is a view into the mapped image precisely so
+/// that nothing copies it, and encoding one is a copy.
+virtual let write_opaque v = write_string (to_string v);
+
+/// What this format is called, for a diagnostic that has to name one.
+virtual let format_name u = "codec";
+
+/// The text, as `[:ok, value]` or `[:error, reason]`.
+///
+/// The one hole with no default: a format that cannot read what it writes is
+/// half a codec, and everything below this line is built on both halves.
+virtual let decode text;
+
+// --- the walk ----------------------------------------------------------------
+
+/// A map's pairs in a settled order.
+///
+/// `core.map_pairs` answers in whatever order the trie happens to walk, which
+/// depends on the hashes and not on the program -- so the same map could encode
+/// two ways in one run, and two programs that agree about a value would
+/// disagree about its bytes. A map's keys are flat values and `core.compare`
+/// totally orders those, so one sort buys an encoding that is a function of the
+/// value alone: comparable, hashable, cacheable, and testable.
+let map_entries m = list.sort_on (fn p -> list.nth 0 p) (core.map_pairs m);
+
+/// The value, in this format.
+///
+/// The whole of the traversal, and the reason this module exists. Every format
+/// shares it, so a value nests the same way in all of them and a format that
+/// spells seven kinds gets the eighth -- a map of lists of maps -- for nothing.
+let rec encode v = match type_of v {
+    :unit    => write_unit v,
+    :bool    => write_bool v,
+    :integer => write_int v,
+    :float   => write_float v,
+    :char    => write_char v,
+    :string  => write_string v,
+    :atom    => write_atom v,
+    :list    => write_list (list.map encode v),
+    :array   => write_array (list.map encode (core.array_to_list v)),
+    :map     => write_map (map_entries v),
+    _        => write_opaque v,
+};
+
+/// Every value, each encoded on its own. Not the encoding of the list -- that
+/// is `encode xs`.
+let encode_all vs = list.map encode vs;
+
+// --- decoding, once a format can ---------------------------------------------
+
+/// The value, or `default` when the text does not decode. The form for when a
+/// fallback is more use than a diagnosis.
+let decode_or default text = result.or_else default (decode text);
+
+/// Does this value survive the trip? What a format's own tests are written
+/// with, and the honest way to state its limits: a format says which values
+/// round trip by listing the ones for which this is true.
+let round_trips v = decode (encode v) == result.ok v;
+
+/// Every value in the text, where the text is a sequence of whole messages --
+/// see framing below.
+let decode_stream buf = list.head (frames buf);
+
+// --- framing: the same problem for every format -------------------------------
+//
+// A stream is not a sequence of messages. It is a sequence of bytes, and a read
+// answers whatever has arrived rather than whatever was sent -- so a reader is
+// handed half a message as often as it is handed two, and neither is an error.
+// A message therefore has to say how long it is, and a reader has to be able to
+// answer "not yet" about a buffer that does not hold a whole one.
+//
+// None of that depends on the format, so it is written once, here, on top of
+// the two holes every codec fills. That is what makes a transport generic over
+// a format without a line of dispatch: a server loop calls `next_frame` and
+// `frame`, and which codec it got them from is settled at compile time.
+//
+// The prefix is four bytes, little-endian, and counts the encoding's bytes
+// rather than its characters -- a length in characters would have to decode the
+// message to find the message. Four bytes caps a message at 4 GiB, which is the
+// same ceiling an image has and for the same reason.
+
+/// The bytes a length prefix takes.
+let frame_header = 4;
+
+/// `v` as one whole message: its length, then its encoding.
+let frame v = {
+    let body = encode v;
+    core.str_concat [core.str_le (core.str_len body) frame_header, body]
+};
+
+/// Every value, each as its own message, back to back. A batch is bytes that
+/// can be split again, not a bigger message.
+let frame_all vs = core.str_concat (list.map frame vs);
+
+/// The length a prefix spells. Little-endian, and read a byte at a time
+/// because that is what a string is indexed by.
+priv let prefix_of buf =
+    core.str_byte buf 0
+    + core.str_byte buf 1 * 256
+    + core.str_byte buf 2 * 65536
+    + core.str_byte buf 3 * 16777216;
+
+/// The first whole message in `buf` and what follows it: `[result, rest]`,
+/// where `result` is whatever `decode` made of that message's bytes.
+///
+/// `()` means the buffer does not hold a whole message *yet* -- read more and
+/// ask again. That is the one answer a reader must not treat as a failure, and
+/// it is spelled differently from a failure for exactly that reason: a message
+/// that arrived and did not decode is `[[:error, reason], rest]`, which the
+/// caller can report and carry on from, because the frame said where the next
+/// message starts whether or not this one made sense.
+let next_frame buf = {
+    let have = core.str_len buf;
+    if have < frame_header { () }
+    else {
+        let size = prefix_of buf;
+        let total = frame_header + size;
+        if have < total { () }
+        else {
+            [decode (core.str_slice buf frame_header size),
+             core.str_slice buf total (have - total)]
+        }
+    }
+};
+
+priv let rec frames_from acc buf = match next_frame buf {
+    ()        => [list.reverse acc, buf],
+    [r, rest] => frames_from (core.cons r acc) rest,
+};
+
+/// Every whole message in `buf`, and the bytes left over: `[results, rest]`.
+///
+/// The leftover is the point. A reader keeps it, appends what arrives next, and
+/// asks again -- which is the whole of a stream reader, and is why this answers
+/// the tail rather than discarding it or calling it an error.
+let frames buf = frames_from [] buf;
