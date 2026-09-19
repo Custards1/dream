@@ -8,6 +8,7 @@ compile_commands.json
 build/
 build-dream/
 build-nojit/
+build-pgo/
 build-tsan/
 build-verify/
 build-heap/

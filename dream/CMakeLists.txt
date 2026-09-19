@@ -210,6 +210,35 @@ target_compile_options(dream PRIVATE
   $<$<CONFIG:RelWithDebInfo>:-O3>
   $<$<CONFIG:Release>:-O3>)
 
+# The inliner's default ceilings are wrong for this interpreter, and knowing
+# why is worth more than the numbers.
+#
+# `step_eval` is one switch over every opcode, so it is enormous -- far past
+# `large-function-insns`, after which GCC will not grow a function further.
+# Everything it calls is therefore outlined, however small: pushing a
+# continuation is a compare and two stores, and it was **6% of a self-compile**
+# as an out-of-line call. It is not that the helpers are expensive; it is that
+# the one function they serve is too big to be allowed to absorb them, so the
+# hot path pays a call per operand read, per continuation push, per operand
+# decode. Raising the ceilings is worth about 5% on a self-compile, measured
+# against the same source built without them, interleaved, seven rounds.
+#
+# The one helper that still needed `always_inline` even with these is
+# `ContStack::push_back` -- see the note on it in process.hpp.
+#
+# The `SHELL:` prefix is load-bearing: without it CMake sees five options that
+# all begin `--param`, deduplicates them down to one, and passes the other four
+# values as bare words -- which the driver reports as unused linker inputs, one
+# warning per file per param. Twelve files, four params, forty-eight warnings,
+# and the flags not applied.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  foreach(param large-function-growth=400 large-function-insns=10000
+                 inline-unit-growth=120 max-inline-insns-auto=120
+                 max-inline-insns-single=800)
+    target_compile_options(dream PRIVATE "SHELL:--param ${param}")
+  endforeach()
+endif()
+
 # Train and rebuild in the same build directory. Instrument only the VM;
 # ordinary builds have no profiling counters or profile-file dependency.
 set(DREAM_PGO "OFF" CACHE STRING "GCC profile-guided optimization: OFF, GENERATE, USE")

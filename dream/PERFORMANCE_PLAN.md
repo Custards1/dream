@@ -1,5 +1,143 @@
 # Self-compilation below 1.25 seconds
 
+## Where this actually stands (2026-09-18, second pass)
+
+The target is not met and is not close. The best configuration measured here is
+**2.32 s** against 1.25 s, a factor of 1.86, and the two changes made since the
+round below are worth about 2% of that between them. What that round itself
+bought, separated by building the same source twice, is less than it reads as:
+
+| | `--no-jit -j 1` |
+| --- | ---: |
+| this source, no PGO | 3.055 s |
+| this source, GCC PGO=USE | 2.572 s |
+
+and against the commit before it, both built without PGO, in the same
+configuration (`--no-jit -j 4`, the one the older VM survives):
+
+| | median | min |
+| --- | ---: | ---: |
+| before | 2.732 s | 2.646 s |
+| after | 2.715 s | 2.673 s |
+
+So the VM changes below are worth **0.6%**, inside the ±3% placement-noise
+floor this repository documents for any edit to `step_eval`. The 16% that is
+real is `-fprofile-use`, a build flag. The section titled "Implementation
+results" should not be read as a record of interpreter improvements.
+
+**What the round did buy is a correctness fix, and it is worth more than the
+timing work.** The VM at the previous commit does not merely fail occasionally
+at `-j 1` -- it segfaults every time, 3 runs of 3, on a stage-2 self-compile.
+The concurrent-mark launch fix is real and necessary.
+
+**The build tree was left configured `DREAM_PGO=USE`.** `just vm` does not pass
+`-DDREAM_PGO`, so the cached setting survived it, and `-Werror=missing-profile`
+plus GCC's coverage-mismatch error meant that *any* edit to a VM source failed
+to build in `build-dream` -- demonstrated with a one-line change to
+`interp.cpp`. Reconfigured to `OFF`, which is the default and what the training
+instructions below already said to do. Note also that those instructions build
+with `-S dream` where `just vm` uses `-S .`; the two are not interchangeable
+build directories.
+
+PGO is now `just vm-pgo`, which builds into `build-pgo` and never into
+`build-dream`, retrains from scratch every time, and is the only recipe that
+reads that directory. `just bench-self-compile <vm>` judges it. The manual
+instructions below are kept because they document what the recipe does and what
+the knobs are, not because anyone should have to run them.
+
+### Scheduler workers: a free 9%, taken
+
+Not in the plan below and not a consequence of any of it. The default worker
+count was one per core, and a self-compile is a single green process, so on a
+24-core machine 23 workers polled every 500us and walked every worker's queue
+twice per poll. The default was the worst setting on the curve (2.67 s at
+`-j 1`, 2.46 s at `-j 4`, 2.70 s at `-j 24`). The default is now cores capped
+at 8 and `steal` short-circuits on a counter: **3.097 s -> 2.805 s**
+interpreted, **3.215 s -> 2.949 s** by default, non-PGO, `just test` and
+`just test-races` clean. See "An idle worker is not free" in the root
+`CLAUDE.md` for the measurement and for the one edit next to it that is
+unsound.
+
+### Where the two changes leave it, measured together
+
+Both built from this source, five warm runs each, medians:
+
+| configuration | ordinary | trained (`just vm-pgo`) |
+| --- | ---: | ---: |
+| default flags | 3.001 s | **2.620 s** |
+| `--no-jit` | 2.847 s | **2.523 s** |
+| `--no-jit -j 1` | 3.068 s | 2.696 s |
+
+The best number available is **2.523 s**, against 2.572 s before any of this --
+so the two rounds together are worth about 2%, and nearly all of what looks
+like progress in the table is the scheduler fix paying for the PGO that was
+already there. They are not additive: the profile absorbs some of what the
+worker cap removes.
+
+Note that `-j 1` is no longer the fastest configuration and has not been since
+the idle-worker walks were fixed, so the gate in §2 now measures the slowest of
+the three. It should be restated against the default, which is what anybody
+running the compiler actually gets.
+
+The worker curve on the trained build is flat from 2 to 8 (2.459, 2.488, 2.491,
+2.534 at 2, 4, 6, 8) and climbs after (2.576 at 12, 2.682 at 24). The cap is 8
+rather than 4 deliberately: 4 would buy another 2% on this single-process
+workload and halve the parallelism available to a program that actually uses
+processes, which is the wrong trade for a default.
+
+### Third pass: 2.32 s, and where the rest of it is
+
+Interleaved seven rounds, `--no-jit` with default workers, each build from the
+same source:
+
+| | median | min |
+| --- | ---: | ---: |
+| before this pass | 2.874 s | 2.811 s |
+| + inliner ceilings, `ContStack`, inline `builtin_def` | 2.760 s | 2.687 s |
+| + `just vm-pgo` | **2.322 s** | **2.263 s** |
+
+Against the VM as committed before any of this session's work, that is
+**3.097 s -> 2.322 s, 25%**. The 2 s target is not met and is 16% away.
+
+The order of the wins is the opposite of where the effort went, which is the
+most useful thing in this section: PGO 12%, the GCC inliner ceilings 4%, the
+scheduler's idle workers 9%, and **every source-level change to the interpreter
+together under 1%**. Three separate hot symbols were attacked on the strength
+of a `perf` profile and all three came back inside the noise floor. See "`step_eval`
+is too big for the inliner" and the two entries after it in the root
+`CLAUDE.md` for why, and for what to read a profile *for* in this interpreter.
+
+What the profile says now, at default workers, is that the collector is
+**35% of all CPU samples** across three parallel lambdas -- but only 284 ms of
+pause on a 2.3 s run, so most of that is helper threads burning cycles beside a
+mutator they are not blocking. Reducing it means allocating less, not
+collecting differently: three GC policy levers have now been measured here and
+none of them moved this workload.
+
+So the remaining 16% is where it has been all along: 75.4M reductions and
+1.7 GB allocated, 39% of it frames. Two routes, both projects rather than
+edits:
+
+- **Frames that do not escape.** The §4 item below, unchanged.
+- **Threaded dispatch.** `step_eval` is 16.6% and much of it is one indirect
+  branch per Eval step that mispredicts by construction. Replicating the
+  dispatch per opcode is the standard 10-25% for a bytecode interpreter -- but
+  this one is a preemptible state machine whose loop does a safepoint and a
+  limit check between every step, and those checks are what threading would
+  have to move. Not attempted.
+
+### Why 1.25 s is not reachable from here
+
+In the gate configuration `--stats` reports **691 ms of the 2572 ms is GC
+pause**. A collector that cost nothing would leave 1.88 s, still 50% over
+target, and that was measured before the two changes above brought the best
+configuration to 2.52 s -- which does not change the conclusion, only the
+arithmetic. The remaining cost is 75.4M reductions and 1.7 GB allocated, of which
+frames are 39% and thunks 20%. That is the frame-reuse and escape-analysis work
+in §4 below, which is unimplemented and which the plan itself never argued was
+safe under lazy evaluation. No combination of PGO, worker tuning and GC work
+reaches the target; the closing sentence of §5 remains the honest summary.
+
 ## Status and scope
 
 The target is not met. The GC fix, indexed heap verification, decoded array
@@ -79,6 +217,11 @@ cmake -S dream -B /tmp/dream-trained-build -DDREAM_PGO=USE
 cmake --build /tmp/dream-trained-build -j 4
 python3 dream/tests/self_compile_bench.py --vm /tmp/dream-trained-build/bin/dream --no-jit --workers 1
 ```
+
+Train in a **fresh** build directory, never in `build-dream`. `just vm` does not
+pass `-DDREAM_PGO`, so a cached `USE` survives it, and the next edit to any VM
+source then fails the build with `-Werror=coverage-mismatch` rather than
+rebuilding. This has already happened once.
 
 PGO defaults to OFF and requires GCC when enabled. Training uses atomic
 counters; `os.exit!` explicitly flushes them because `_Exit` skips GCC's normal

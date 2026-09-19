@@ -62,7 +62,7 @@ inline void push_cont(Process& p, ContKind k, uint32_t a, uint32_t b, uint32_t c
 inline void push_retry(Process& p, ContKind k, uint32_t a, uint32_t b, uint32_t c, Value v1) {
     Cont retry{k, 0, 0, a, b, c, v1};
     if (p.force_blocked) {
-        p.conts.insert(p.conts.begin() + std::ptrdiff_t(p.force_resume_at), retry);
+        p.conts.insert_at(p.force_resume_at, retry);
         p.force_blocked = false;
     } else {
         p.conts.push_back(retry);

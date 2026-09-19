@@ -74,12 +74,32 @@ just vm           # the VM only
 just dreams       # build/dreams.dream, the compiler
 just mind         # build/mind, the build tool
 just lucid        # build/lucid.dream, the language server
+just vm-pgo       # build-pgo/bin/dream, the VM trained on a self-compile
 ```
 
 The binaries that matter:
 
 - `build-dream/bin/dream` — the VM
 - `build/dreams.dream` — the compiler, an image the VM runs
+
+`just vm-pgo` is the VM again with GCC's branch weights fitted to a
+self-compile: it instruments a build, runs the unit tests and two stages of the
+bootstrap through it, and rebuilds against the counters. Worth **11-13%** — a
+self-compile goes 2.85 s to 2.52 s interpreted, 3.00 s to 2.62 s by default —
+and `just bench-self-compile build-pgo/bin/dream` is how to check that on
+another machine.
+
+It builds into `build-pgo`, and the separate directory is the point rather than
+tidiness. `-fprofile-use` refuses a profile that no longer describes the
+source, so a tree carrying one stops building the moment you edit `dream/src`,
+and `just vm` does not pass `-DDREAM_PGO` — a cached `USE` survives it. That
+combination cost a day once. Nothing but `vm-pgo` reads `build-pgo`, `just vm`
+is always editable, and retraining is always from scratch.
+
+One thing to expect: a trained build warns where an ordinary one does not,
+because the profile shows GCC which paths are reachable. `core_str_le`'s
+zero-width case was the first. Treat those as real — the build is meant to be
+warning-free in both modes.
 
 `build/` is a leftover CMake tree and is not the VM build directory —
 `build-dream/` is. What `build/` holds now is what the Dream-side recipes write
@@ -104,7 +124,7 @@ are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
 | `test-dreams-corpus` | Every `.dr` file in the repository parses |
 | `test-dreams-compile` | Programs `dreams` compiled, run, output compared |
 | `test-bootstrap` | The seed still reproduces itself byte for byte |
-| `test-lucid` | The language server's units: positions, framing, URIs |
+| `test-lucid` | The language server's units: positions, framing, URIs, completion context |
 | `test-lucid-session` | One whole LSP conversation, against a running server |
 
 The `dreams/tests/*.sh` scripts run directly with no environment set; there is
@@ -517,6 +537,112 @@ What has already been learnt from them, so it is not learnt twice:
   reports the number of functions compiled from `print_stats` rather than from
   the end of `main`, which is what makes that question askable at all for a tool
   that ends in `os.exit!`.
+- **An idle worker is not free, and the default was one per core.** A
+  self-compile is one green process, so on a 24-core machine twenty-three
+  workers had nothing to do -- and "nothing to do" was a 500us poll that walked
+  every *other* worker's queue looking for something to steal, and then walked
+  every worker's queue again to ask whether the system had deadlocked. One
+  mutex acquisition apiece, both walks, every worker, five hundred microseconds
+  apart: O(workers^2) lock operations per poll, contending with the one worker
+  that was running the program. Measured across worker counts, the self-compile
+  went 2.67 s at `-j 1`, 2.46 s at `-j 4`, and 2.70 s at `-j 24` -- the default
+  was the worst setting available. It is now cores capped at 8, which is the
+  same compromise `GcPool` already made and for the same reason, and `steal`
+  answers "is anything queued anywhere?" from a counter instead of from the
+  locks. Together, 3.10 s -> 2.81 s interpreted and 3.22 s -> 2.95 s by default.
+  `-j` still means what it said, so a program that really does have
+  twenty-four runnable processes still gets twenty-four workers.
+
+  **The deadlock walk beside it cannot be replaced by that counter**, which is
+  the part worth carrying away, because it is the obvious next edit and it is
+  wrong. `take_local` moves a process out of a queue and into `runnable_` as
+  two separate relaxed writes, and what makes the pair safe is that it holds
+  the queue lock across both -- a walker blocks on that lock and never observes
+  the instant when the process is counted in neither. A lock-free read observes
+  exactly that instant and declares a deadlock in a program that is running
+  fine. The comment in `take_local` had said so all along. It cost one test to
+  find out: `console.dr` under `just test-races`, which failed within a few
+  dozen reductions while the rest of the suite passed. If it is ever worth
+  removing that walk, the move is a single counter of "queued or running"
+  incremented by `enqueue` and decremented after `run_slice` -- one atomic, so
+  there is no instant between two of them to observe.
+
+- **`step_eval` is too big for the inliner, and everything it calls pays.** The
+  largest single finding of the 2026-09-18 round, and it is about the build
+  rather than the code. `step_eval` is one switch over every opcode, which puts
+  it far past `large-function-insns` -- past which GCC will not grow a function
+  at all. So every helper it calls is outlined *however small*: pushing a
+  continuation is a compare and two stores, and `perf` showed it as **6.2% of a
+  self-compile** in a symbol of its own. The helpers are not expensive; the one
+  function they serve is too big to be allowed to absorb them, so the hot path
+  pays a call per operand read and per continuation push. Raising the five
+  `--param` ceilings in [dream/CMakeLists.txt](dream/CMakeLists.txt) is worth
+  about 4% on its own. The lesson generalizes: in a switch-per-opcode
+  interpreter, read the profile for *outlined helpers* before reading it for
+  expensive ones, and check `nm`/`perf` rather than assuming `inline` did
+  anything.
+- **A `std::vector` cannot be appended to without a call.** `ContStack` in
+  [dream/src/process.hpp](dream/src/process.hpp) replaced
+  `std::vector<Cont> conts` because there is no way to ask a vector for "bump
+  the size, I have already checked the capacity" -- so the push stayed a call
+  even with the ceilings raised, and needed `always_inline` on top. Note what
+  the measurement said about it though: on its own the change is **inside the
+  noise floor**, because the work was always the stores rather than the call,
+  and inlining relocates work rather than removing it. `step_eval` went 13.7%
+  -> 16.4% as `push_back` went 6.2% -> 0. It is kept because it is the right
+  shape and because it compounds with the ceilings, not because it was a win by
+  itself.
+- **A profile that names a symbol has not told you what removing it saves.**
+  Said already under "What the profile says and what it costs are different
+  questions", re-learnt the hard way here, and worth the repetition: three of
+  the four changes in this round were individually indistinguishable from noise
+  on a seven-round interleaved A/B, and the round as a whole is 4%. Build the
+  before-binary and interleave the runs; a single before-and-after on this
+  machine cannot resolve anything smaller than about 3%.
+- **Where the self-compile now stands.** 3.10 s -> **2.32 s** interpreted,
+  measured `--no-jit` with default workers against a VM built from the commit
+  before any of this. The order of the wins is the opposite of where the effort
+  went: PGO 12%, the inliner ceilings 4%, the scheduler's idle workers 9%, and
+  every source-level interpreter change together under 1%.
+
+### A spurious deadlock, and why it hid behind a slow walk
+
+Found 2026-09-18 by `just test-races` failing on `console`, reported against a
+process the dump described as `finished mode=halted` after 99 reductions --
+which is not what a deadlocked process looks like, and was the clue.
+
+`deadlocked_` is sticky. The detection happened at *startup* and the dump was
+printed at exit, after the program had run correctly to completion. The window
+is one line of `cli.cpp`:
+
+```
+sched.start();      // workers begin looking for work
+sched.enqueue(root);
+```
+
+Between those two statements the root process is live, nothing is queued or
+running, and every worker is idle -- which is precisely the condition the
+deadlock check tests. Enqueueing first closes it, and there is no other instant
+like it, because every later `enqueue` happens while something is already
+running.
+
+Two things kept it hidden. The check only runs when `idle_workers_ + 1 >=
+workers_.size()`, which with one worker per core on a 24-core machine almost
+never held -- capping the default at 8 made it hold routinely. And the check
+used to walk every worker's queue under its lock, which took long enough that
+the window had usually closed by the time it finished. Both of those are
+accidents, not protections: **the check was always wrong and was being saved by
+being slow.**
+
+The walk is gone, and not because of speed. It could not be made correct: a
+worker re-enqueueing its process pushes it onto a queue and only then
+decrements `runnable_`, so a walk that has already passed that queue goes on to
+read `runnable_` after the decrement and concludes that a healthy program is
+deadlocked. Two counters cannot be read without observing a transition between
+them. `Scheduler::active_` is one counter -- queued *or* running -- incremented
+by `enqueue` and decremented when a slice ends without re-enqueueing, so a
+slice that hands its process straight back increments before it decrements and
+the count never dips. The check is one load.
 
 ### The tier's eager arguments can change *which* error a program raises
 
@@ -651,6 +777,23 @@ place for it: what it asserts is that the two tiers agree, and a segfault on one
 side is the loudest possible disagreement.
 
 ### Measured, and not kept
+
+- **A larger major-GC growth factor.** `gc_threshold_ = live * 3` makes the
+  majors a geometric series whose last term dominates, so widening the ratio
+  should mean less total marking. At 3, 4, 6 and 10 the self-compile does 7, 7,
+  5 and 4 majors -- and the wall clock does not move (2.68 s, 2.75, 2.74, 2.74,
+  with 3 nominally best). Peak heap does not improve either. This is the third
+  GC policy lever measured here and the third that does nothing; see also the
+  nursery note below. Whatever the collector costs this workload, it is not the
+  number of collections.
+- **`-march=native -mtune=native`.** 2.775 s against 2.737 for the same source
+  without it -- nominally *worse*, certainly not better. The interpreter's hot
+  loop is pointer chasing and indirect branches; there is no vector width or
+  new instruction for it to find. Not worth the non-portable binary.
+- **Turning the concurrent mark off** (`DREAM_GC_CONCURRENT=0`): 2.325 s
+  against 2.360. Inside the noise floor, so the concurrent mark is neither
+  earning its 7.8% of CPU samples nor costing anything measurable in wall
+  clock. Left on.
 
 - **The outer loop's run of Return steps, added to the nested loop.**
   `run_process` skips its safepoint over a run of Return steps, which is worth
@@ -1453,6 +1596,61 @@ of its chain — `helper.double` is keyed where `helper` begins — so a cursor 
 the field walks back over the dot. And the compiler counts **bytes** while LSP
 counts **UTF-16 code units**; `lucid/pos.dr` is the only place that conversion
 happens, and it should stay that way.
+
+### Completion is asked of something that is not a program
+
+Every other request is asked of a program. Completion is asked of a buffer
+mid-keystroke, and that difference decides the design — it is the thing to
+understand before touching [lucid/complete.dr](lucid/complete.dr).
+
+At the moment a completion is wanted the buffer usually says `console.`, and
+**that does not parse**. Measured rather than assumed: the loader reports zero
+modules for it, so there is no environment, no global table and no resolution —
+nothing to complete *from*. So the text is tried twice. The buffer as written
+comes first, because where it already parses that answer is exact and inserting
+anything into it can only be wrong. When that yields no module, a name nothing
+would write is inserted at the cursor and the repaired text is analysed instead.
+
+The two fail in *different* places, which is why both are kept. A bare name is a
+statement but it is not a declaration, so a cursor on a blank line between two
+top-level `let`s is exactly where the repair breaks a file that was fine — found
+by asking `dreams/lower.dr` for completions at line 300 and getting nineteen
+keywords. Everything read here is before the cursor, so both candidates agree
+about every offset that matters.
+
+What is offered comes from the compiler's tables and is ranked in the order
+resolution would reach it: a local, a global of this module, an import, a
+builtin, a keyword. After a dot it is `scope.exports` — the same list the
+compiler quotes back when a member is misspelled — and the chain in front of the
+cursor is resolved by handing a synthesized expression to `scope.as_namespace`,
+so "is `list` a module, an import, a package or a local" has one answer and not
+two. A host module offers nothing, because the host owns its member table at run
+time and the compiler has never seen the names.
+
+**The locals are the exception, and the only place this server re-implements
+anything.** The resolver knows what is in scope at every point of its walk —
+that is what a frame stack is — but it pushes and pops as it goes, and when
+`resolve!` returns nothing survives saying what was visible at a given byte.
+So `analysis.dr` reads the binders back off the syntax tree, and the scoping
+rules are therefore written twice. That section is deliberately literal: every
+case is a transcription of the matching case of `check_expr`, `check_block` or
+`check_arm`, in the same order, so the two can be read side by side. Where
+`scope.dr` exports the rule itself it is called rather than copied —
+`scope.pattern_bindings` is what says which names a pattern binds, here as
+there. The one case that is easy to get wrong is `comp`, which is walked with an
+empty frame stack because it runs before the program does, and so drops
+everything the enclosing constructs had put in scope.
+
+Hover reads the same walk. It shows a function with the parameters it was
+declared with — `fold f acc xs` rather than `fold` — and takes them from the
+declaration rather than from the resolver, which keeps arity and not names.
+They are sliced out of the source, so a parameter that is a pattern reads as it
+was typed. Hovering a name at its own *definition* still answers nothing, which
+is not new: `refs` records uses, and a binder is not one.
+
+One cost worth knowing: a completion is a whole-program analysis, as hover and
+go-to-definition already are. On `dreams/lower.dr`, which pulls in the whole
+compiler, that is roughly a second per request.
 
 ## The language, briefly
 

@@ -817,6 +817,10 @@ NativeResult bi_match_key(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(p.heap().make_cons(found, NIL));
 }
 
+}  // namespace
+
+// External linkage, because `builtin_def` is inline in the header now -- see
+// the note there. The entries stay next to the functions they name.
 const BuiltinDef BUILTINS[] = {
     {"spawn!", 1, 0b0, bi_spawn},
     {"join!", 1, 0b1, bi_join},
@@ -843,9 +847,6 @@ const BuiltinDef BUILTINS[] = {
     {"match_key", 2, 0b11, bi_match_key},
 };
 
-}  // namespace
-
-const BuiltinDef& builtin_def(uint32_t id) { return BUILTINS[id]; }
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }
 
 // ---------------------------------------------------------------------------
@@ -1852,7 +1853,12 @@ NativeResult core_str_le(Process& p, Value, Value* args, uint32_t) {
     // Through `uint64_t` so that a negative value is its two's complement and
     // the shift is defined.
     uint64_t bits = static_cast<uint64_t>(fixnum_value(v));
-    char buf[8];
+    // Zeroed because a width of zero leaves the loop below writing nothing,
+    // and GCC says so -- but only once a profile has shown it that the zero
+    // case is reachable, so an ordinary build is quiet and the trained one is
+    // not. Nothing reads the bytes either way, since `make_string` is handed
+    // the same width; this is one store to keep the trained build clean.
+    char buf[8] = {};
     for (int64_t i = 0; i < width; ++i) buf[i] = char(uint8_t(bits >> (8 * i)));
     return NativeResult::ok(p.heap().make_string(buf, uint32_t(width)));
 }

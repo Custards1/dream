@@ -27,7 +27,16 @@ struct BuiltinDef {
     bool vouches = false;
 };
 
-const BuiltinDef& builtin_def(uint32_t id);
+/// The table itself, declared here rather than hidden in `builtins.cpp` so
+/// that looking a builtin up is the array index it is.
+///
+/// It was a call across a translation unit for a body of `return BUILTINS[id]`,
+/// and the interpreter asks the question on the way into every native -- 1.15%
+/// of a self-compile to fetch a pointer the caller could have computed itself.
+/// Nothing writes to it; `builtin_count` still reports its extent, because the
+/// size belongs to the definition.
+extern const BuiltinDef BUILTINS[];
+inline const BuiltinDef& builtin_def(uint32_t id) { return BUILTINS[id]; }
 uint32_t builtin_count();
 
 /// Insert into an open-addressed map, growing it when it gets crowded.

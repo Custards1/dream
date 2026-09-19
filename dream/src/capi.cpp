@@ -5,7 +5,6 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "builtins.hpp"
@@ -152,10 +151,7 @@ dream_result dream_vm_run(dream_vm* vm, const char* entry) {
     if (func == NO_NODE) return DREAM_BAD;
 
     unsigned workers = vm->workers;
-    if (workers == 0) {
-        workers = std::thread::hardware_concurrency();
-        if (workers == 0) workers = 1;
-    }
+    if (workers == 0) workers = Scheduler::default_workers();
     vm->sched = std::make_unique<Scheduler>(vm->rt, workers);
 
     auto root = vm->sched->create_process();
@@ -163,8 +159,14 @@ dream_result dream_vm_run(dream_vm* vm, const char* entry) {
     Value cl = root->heap().make_closure(func, 0);
     prime_apply(*root, cl, 0);
 
-    vm->sched->start();
+    // Queued before the workers exist, not after. A process is counted as
+    // active by `enqueue`, so starting first leaves a window in which the root
+    // is live, nothing is active, and every worker is idle -- which is the
+    // definition the deadlock check tests, and it fires. The flag is sticky,
+    // so the program then runs to completion and reports a deadlock on the way
+    // out. Enqueueing first means there is no such instant.
     vm->sched->enqueue(root);
+    vm->sched->start();
     bool clean = vm->sched->wait_for_all();
     vm->sched->stop();
 

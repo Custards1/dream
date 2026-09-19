@@ -40,6 +40,47 @@ vm-no-jit:
     cmake -S . -B build-nojit -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build build-nojit -j
 
+# The VM again, with GCC fitting its branch weights to a self-compile. Worth
+# about 16%, and it lands in `build-pgo` rather than in {{build_dir}} on purpose.
+#
+# `-fprofile-use` refuses a profile that no longer describes the source, so a
+# tree carrying one stops building the moment you touch `dream/src` -- which is
+# what {{build_dir}} did for a while, because `just vm` does not pass
+# `-DDREAM_PGO` and a cached `USE` therefore survives it. Keeping the two apart
+# is the whole design: `just vm` stays editable, and this is the artifact to
+# measure. Nothing else in this file reads `build-pgo`.
+#
+# Always from scratch. Retraining is the only way to move a profile forward,
+# and a tree half-way between two profiles is the failure being avoided.
+vm-pgo:
+    rm -rf build-pgo
+    cmake -S . -B build-pgo -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDREAM_PGO=GENERATE
+    cmake --build build-pgo -j
+    mkdir -p build-pgo/train
+    # The unit tests first, for breadth: every translation unit needs counters
+    # or `-Werror=missing-profile` fails the rebuild below. They contribute
+    # almost nothing to the weights, which is the point of running them first.
+    build-pgo/bin/dream_tests
+    # Then the workload the profile is for -- the compiler compiling itself,
+    # both stages. `os.exit!` flushes the counters explicitly (see os.cpp);
+    # `_Exit` would skip GCC's own writer and every one of these runs ends there.
+    build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/main.dr
+    build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/main.dr
+    cmp build-pgo/train/stage2.dream build-pgo/train/stage3.dream
+    cmake -S . -B build-pgo -DDREAM_PGO=USE
+    cmake --build build-pgo -j
+    @echo "profile-guided VM: build-pgo/bin/dream"
+
+# What a self-compile costs: five runs, a median, and the bootstrap fixpoint
+# checked on every one of them. `just bench-self-compile build-pgo/bin/dream`
+# is how to judge the recipe above against the ordinary build.
+#
+# The second argument is the acceptance gate from `dream/PERFORMANCE_PLAN.md`,
+# and a non-zero exit means the gate was missed rather than that anything broke
+# -- it is missed by roughly a factor of two today. Pass a number to move it.
+bench-self-compile vm=dream target="1.25":
+    python3 dream/tests/self_compile_bench.py --vm {{vm}} --target {{target}}
+
 # The compiler, built by the compiler: the checked-in seed compiles this source
 # into `build/dreams.dream`, which is what every other recipe here runs.
 dreams: vm

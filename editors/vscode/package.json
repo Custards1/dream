@@ -1,7 +1,7 @@
 {
   "name": "dream-lang",
   "displayName": "Dream",
-  "description": "Dream language support: syntax, diagnostics, go to definition, hover and outline, from the Dream compiler itself.",
+  "description": "Dream language support: syntax, diagnostics, go to definition, hover, outline and completion, from the Dream compiler itself.",
   "version": "0.1.0",
   "publisher": "dream",
   "license": "SEE LICENSE IN ../../LICENSE",

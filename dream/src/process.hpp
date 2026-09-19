@@ -11,6 +11,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -61,6 +63,71 @@ struct Cont {
     uint32_t b;
     uint32_t c;
     Value v1;
+};
+
+/// The continuation stack: the machine's "what to do when this part is done".
+///
+/// This was a `std::vector<Cont>`, and pushing one was **6.5% of a
+/// self-compile** -- more than `step_return`, and second only to the dispatch
+/// switch itself. Not the growth, which amortizes to nothing against a stack
+/// that is pushed and popped rather than grown: the *call*. `step_eval`
+/// pushes a continuation from some thirty places, and at that many sites GCC
+/// stops inlining `emplace_back` and emits an outlined clone, so every
+/// continuation the machine pushed paid a function call and a capacity check
+/// that no caller could hoist. A `Cont` is twenty-four bytes of POD; pushing
+/// one is four stores, and it should cost four stores.
+///
+/// So the fast path is written out and nothing else is: `grow` is the only
+/// thing out of line, and it is reached once per doubling. The type is
+/// deliberately not a general container -- it has exactly the operations the
+/// machine performs, which is why `insert_at` exists instead of iterators.
+class ContStack {
+public:
+    ContStack() = default;
+    ~ContStack() { std::free(data_); }
+    ContStack(const ContStack&) = delete;
+    ContStack& operator=(const ContStack&) = delete;
+
+    /// `always_inline` because the heuristics say no and they are wrong here.
+    /// `step_eval` is one switch over every opcode and pushes a continuation
+    /// from some thirty of its arms, which puts it far past the inliner's
+    /// growth ceiling -- so GCC outlines even this, and a push stayed a call
+    /// costing 6% of a self-compile after it stopped being a `std::vector`.
+    /// The body is a compare and two stores; it is smaller than its own call
+    /// sequence.
+    __attribute__((always_inline)) inline void push_back(const Cont& c) {
+        if (size_ == cap_) grow();
+        data_[size_++] = c;
+    }
+
+    /// Splice one in below the work already on the stack. Rare -- only a retry
+    /// under a suspended nested force -- and O(n) on purpose, because making
+    /// the common push cheaper is what this class is for.
+    void insert_at(size_t i, const Cont& c) {
+        if (size_ == cap_) grow();
+        std::memmove(data_ + i + 1, data_ + i, (size_ - i) * sizeof(Cont));
+        data_[i] = c;
+        ++size_;
+    }
+
+    void pop_back() { --size_; }
+    void clear() { size_ = 0; }
+    Cont& back() { return data_[size_ - 1]; }
+    const Cont& back() const { return data_[size_ - 1]; }
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void reserve(size_t n) { if (n > cap_) regrow(n); }
+
+    Cont* begin() { return data_; }
+    Cont* end() { return data_ + size_; }
+
+private:
+    void grow() { regrow(cap_ ? cap_ * 2 : 64); }
+    void regrow(size_t want);
+
+    Cont* data_ = nullptr;
+    size_t size_ = 0;
+    size_t cap_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -229,7 +296,7 @@ public:
     Value result = UNIT;
 
     std::vector<Value> stack;
-    std::vector<Cont> conts;
+    ContStack conts;
 
     // --- scheduling ---
     std::atomic<ProcStatus> status{ProcStatus::Runnable};

@@ -54,6 +54,19 @@ const char* wait_reason_name(WaitReason r) {
 // Mailbox
 // ---------------------------------------------------------------------------
 
+/// Grow the continuation stack. Out of line because it runs once per doubling
+/// and the push beside it runs tens of millions of times; `Cont` is trivially
+/// copyable, so this is a realloc and nothing more.
+void ContStack::regrow(size_t want) {
+    Cont* next = static_cast<Cont*>(std::realloc(data_, want * sizeof(Cont)));
+    if (!next) {
+        std::fprintf(stderr, "dream: out of memory growing the continuation stack\n");
+        std::abort();
+    }
+    data_ = next;
+    cap_ = want;
+}
+
 void Mailbox::push(std::unique_ptr<Message> m) {
     std::lock_guard<std::mutex> g(mutex_);
     queue_.push_back(std::move(m));

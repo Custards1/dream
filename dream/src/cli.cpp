@@ -6,7 +6,6 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <thread>
 #include <filesystem>
 
 #include "builtins.hpp"
@@ -32,7 +31,7 @@ const char* USAGE =
     "options:\n"
     "  -x, --exec <name>    run <name>.dream from $MINDV2_PATH, not from here\n"
     "  -e, --entry <name>   run this global instead of `main!`\n"
-    "  -j, --workers <n>    scheduler threads (default: one per core)\n"
+    "  -j, --workers <n>    scheduler threads (default: cores, capped at 8)\n"
     "      --dump           disassemble the image and exit\n"
     "      --stats          print reduction and heap statistics\n"
     "      --profile [n]    count reductions per function and print the hottest\n"
@@ -504,18 +503,21 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (workers == 0) {
-        workers = std::thread::hardware_concurrency();
-        if (workers == 0) workers = 1;
-    }
+    if (workers == 0) workers = Scheduler::default_workers();
 
     Scheduler sched(rt, workers);
     auto root = sched.create_process();
     Value cl = root->heap().make_closure(func, 0);
     prime_apply(*root, cl, 0);
 
-    sched.start();
+    // Queued before the workers exist, not after. A process is counted as
+    // active by `enqueue`, so starting first leaves a window in which the root
+    // is live, nothing is active, and every worker is idle -- which is the
+    // definition the deadlock check tests, and it fires. The flag is sticky,
+    // so the program then runs to completion and reports a deadlock on the way
+    // out. Enqueueing first means there is no such instant.
     sched.enqueue(root);
+    sched.start();
     bool clean = sched.wait_for_all();
     sched.stop();
 

@@ -1,5 +1,6 @@
 #include "scheduler.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -24,6 +25,12 @@ Scheduler::Scheduler(Runtime& rt, unsigned worker_count) : rt_(rt) {
 }
 
 Scheduler::~Scheduler() { stop(); }
+
+unsigned Scheduler::default_workers() {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    return std::min(hw, 8u);
+}
 
 void Scheduler::start() {
     if (running_.exchange(true)) return;
@@ -60,7 +67,12 @@ void Scheduler::enqueue(const std::shared_ptr<Process>& p) {
     {
         std::lock_guard<std::mutex> g(workers_[i]->mutex);
         workers_[i]->queue.push_back(p);
+        queued_.fetch_add(1, std::memory_order_relaxed);
     }
+    // Sequentially consistent, and once per slice rather than per reduction,
+    // so the ordering costs nothing worth measuring and buys the deadlock
+    // check a count it can trust. See `active_`.
+    active_.fetch_add(1);
     work_cv_.notify_one();
 }
 
@@ -70,6 +82,7 @@ std::shared_ptr<Process> Scheduler::take_local(unsigned index) {
     if (w.queue.empty()) return nullptr;
     auto p = std::move(w.queue.front());
     w.queue.pop_front();
+    queued_.fetch_sub(1, std::memory_order_relaxed);
     // Counted as runnable while still holding the queue lock. A live process
     // must be findable at every instant -- in a queue, in `runnable_`, or
     // parked -- and counting it after the pop instead would leave a moment
@@ -80,6 +93,15 @@ std::shared_ptr<Process> Scheduler::take_local(unsigned index) {
 }
 
 std::shared_ptr<Process> Scheduler::steal(unsigned thief) {
+    // Nothing is queued anywhere, so there is nobody to steal from and no
+    // reason to take a single lock to find that out. This is the common case
+    // for a program with one process, where every worker but one is idle and
+    // asking. A process enqueued immediately after this load is not missed:
+    // `enqueue` notifies the condition variable and the loop comes back round,
+    // which is exactly what happened before when the walk passed a victim just
+    // before it was given work.
+    if (queued_.load(std::memory_order_relaxed) == 0) return nullptr;
+
     // Take from the back of a victim's queue: the front is the work it is
     // about to run, and leaving that alone keeps its cache warm.
     for (unsigned n = 1; n < workers_.size(); ++n) {
@@ -89,6 +111,7 @@ std::shared_ptr<Process> Scheduler::steal(unsigned thief) {
         if (w.queue.empty()) continue;
         auto p = std::move(w.queue.back());
         w.queue.pop_back();
+        queued_.fetch_sub(1, std::memory_order_relaxed);
         runnable_.fetch_add(1, std::memory_order_relaxed);  // see `take_local`
         return p;
     }
@@ -119,15 +142,15 @@ void Scheduler::worker_loop(unsigned index) {
             // Nothing runnable anywhere, every worker asleep, yet processes
             // remain: they are all parked on a message that will never come.
             if (live_.load() > 0 && idle_workers_.load() + 1 >= workers_.size()) {
-                bool any_queued = false;
-                for (auto& w : workers_) {
-                    std::lock_guard<std::mutex> g(w->mutex);
-                    if (!w->queue.empty()) { any_queued = true; break; }
-                }
+                // One load, and the reason it is one is in `active_`: asking
+                // this as "walk every queue, then read `runnable_`" cannot be
+                // done without observing a process mid-transition between the
+                // two, and answers "deadlocked" when it does.
+                //
                 // A process waiting on a descriptor is not deadlocked: the
                 // poller thread still owes it a wake-up, and nothing inside
                 // the scheduler can produce that.
-                if (!any_queued && runnable_.load() == 0 && io_waiters_.load() == 0) {
+                if (active_.load() == 0 && io_waiters_.load() == 0) {
                     deadlocked_.store(true);
                     done_cv_.notify_all();
                 }
@@ -138,6 +161,9 @@ void Scheduler::worker_loop(unsigned index) {
         // Already counted by whichever of `take_local` or `steal` produced it.
         run_slice(p);
         runnable_.fetch_sub(1, std::memory_order_relaxed);
+        // Leaves the active count only if the slice did not hand the process
+        // back: `run_slice` ends in `enqueue`, which has already incremented.
+        active_.fetch_sub(1);
     }
 }
 
