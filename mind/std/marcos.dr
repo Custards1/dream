@@ -1,0 +1,313 @@
+// Syntax conveniences, invoked with `expand marcos.name ...`.
+//
+// These are pure transformers. Effects in their generated expressions are
+// checked in the caller, just as if that code had been written there. Generated
+// code needs no imports beyond this module. Names chosen by a caller bind only
+// in the documented branch; internal names cannot be written as source names.
+import std.core;
+import std.list;
+
+// --- syntax helpers ---------------------------------------------------------
+
+let span = [0, 0];
+let unit = [:unit, span];
+let name n = [:name, n, span];
+let boolean b = [:bool, b, span];
+let atom n = [:atom, n, span];
+let call f args = [:apply, f, args, span];
+let binary op a b = [:binary, op, a, b, span];
+let branch condition yes no = [:if, condition, yes, no, span];
+let binding n value = [:let, n, [], value, false, span];
+let bind_pattern n = [:bind, n, span];
+let literal_pattern value = [:literal, value, span];
+let arm pattern body = [pattern, (), body, span];
+let choose value arms = [:match, value, arms, span];
+let block statements = [:block, statements, span];
+let invalid message = [:error, "std.marcos: " + message];
+
+// Fresh relative to the supplied syntax, including trees made by another
+// macro. Checking every string also covers binders and pattern names. Reserved
+// punctuation prevents ordinary caller identifiers from colliding at all.
+let rec contains_string target tree = match type_of tree {
+    :string => tree == target,
+    :list => list.any (fn child -> contains_string target child) tree,
+    _ => false,
+};
+let rec fresh_from label trees index = {
+    let candidate = "<std.marcos." + label + "." + to_string index + ">";
+    if contains_string candidate trees { fresh_from label trees (index + 1) }
+    else { candidate }
+};
+let fresh label trees = fresh_from label trees 0;
+
+// --- conditions -------------------------------------------------------------
+
+/// Evaluate body only when condition holds; otherwise return ().
+macro when_true condition body = branch condition body unit;
+
+/// Evaluate body only when condition is false; otherwise return ().
+macro unless condition body = branch condition unit body;
+
+let rec boolean_chain op identity expressions = match expressions {
+    [] => boolean identity,
+    [first, ..rest] => binary op first (boolean_chain op identity rest),
+};
+
+/// Short-circuit a literal list of boolean expressions; [] produces true.
+macro and_all conditions = match conditions {
+    [:list, expressions, _] => boolean_chain :and true expressions,
+    _ => invalid "and_all expects a literal list of conditions",
+};
+
+/// Short-circuit a literal list of boolean expressions; [] produces false.
+macro or_any conditions = match conditions {
+    [:list, expressions, _] => boolean_chain :or false expressions,
+    _ => invalid "or_any expects a literal list of conditions",
+};
+
+let rec conditional_arms pairs fallback = match pairs {
+    [] => fallback,
+    [[:list, [condition, body], _], ..rest] => {
+        let tail = conditional_arms rest fallback;
+        match tail {
+            [:error, _] => tail,
+            _ => branch condition body tail,
+        }
+    },
+    _ => invalid "cond expects [condition, expression] pairs in a literal list",
+};
+
+/// `expand marcos.cond [[test, answer], ...] fallback`: first true branch wins.
+macro cond cases fallback = match cases {
+    [:list, pairs, _] => conditional_arms pairs fallback,
+    _ => invalid "cond expects a literal list of [condition, expression] pairs",
+};
+
+// --- optional values and results -------------------------------------------
+
+/// Use fallback only for (); false, zero and empty collections are present.
+macro coalesce value fallback = {
+    let saved = fresh "present" [value, fallback];
+    choose value [arm (literal_pattern unit) fallback,
+                  arm (bind_pattern saved) (name saved)]
+};
+
+/// Bind a present value in body, or evaluate absent without that binding.
+macro if_some binder value body absent = match binder {
+    [:name, n, _] => choose value [arm (literal_pattern unit) absent,
+                                 arm (bind_pattern n) body],
+    _ => invalid "if_some expects a binding name as its first argument",
+};
+
+/// Bind a present value in body; () propagates without evaluating body.
+macro with_some binder value body = if_some binder value body unit;
+
+/// Bind the payload of [:ok, value] in body; pass a non-ok result through.
+/// Body supplies the next result, as with std.result.and_then.
+macro with_ok binder result body = match binder {
+    [:name, n, _] => {
+        let saved = fresh "result" [binder, result, body];
+        let ok_pattern = [:list_p, [literal_pattern (atom "ok"), bind_pattern n], (), span];
+        choose result [arm ok_pattern body, arm (bind_pattern saved) (name saved)]
+    },
+    _ => invalid "with_ok expects a binding name as its first argument",
+};
+
+// --- composing and updating -------------------------------------------------
+
+/// Thread a value through a literal list of pipeline stages, left to right.
+/// `expand marcos.pipe xs [list.map f, list.filter p, list.sum]`
+/// is `xs |> list.map f |> list.filter p |> list.sum`; [] is the identity.
+macro pipe value steps = match steps {
+    [:list, expressions, _] => list.fold (fn acc step -> [:pipe, acc, step, span]) value expressions,
+    _ => invalid "pipe expects a literal list of pipeline stages",
+};
+
+/// Change one collection entry with a function. Collection and key are shared;
+/// the replacement retains the laziness of ordinary `.[key => value]` updates.
+macro update collection key transform = {
+    let saved = fresh "collection" [collection, key, transform];
+    let at = fresh "key" [collection, key, transform];
+    let current = [:get, name saved, name at, (), span];
+    block [binding saved collection, binding at key,
+           [:set, name saved, name at, call transform [current], span]]
+};
+
+// --- bounds -----------------------------------------------------------------
+
+/// Inclusive bounds. Value is evaluated once; upper is skipped below lower.
+macro between value lower upper = {
+    let saved = fresh "bounded" [value, lower, upper];
+    block [binding saved value,
+           binary :and (binary :le lower (name saved)) (binary :le (name saved) upper)]
+};
+
+/// Clamp to an inclusive range, assuming lower <= upper. Inputs are shared;
+/// upper remains unevaluated when the value is below lower.
+macro clamp value lower upper = {
+    let saved = fresh "clamped" [value, lower, upper];
+    let lo = fresh "lower" [value, lower, upper];
+    let hi = fresh "upper" [value, lower, upper];
+    block [binding saved value, binding lo lower, binding hi upper,
+           branch (binary :lt (name saved) (name lo)) (name lo)
+                  (branch (binary :gt (name saved) (name hi)) (name hi) (name saved))]
+};
+
+// --- effects, checked at the expansion site ---------------------------------
+
+/// Return () on success; raise message on failure. Message is evaluated only
+/// on failure. The expansion belongs in an impure context.
+macro assert condition message = branch condition unit (call (name "raise!") [message]);
+
+/// Deeply evaluate expression inside try!, returning [:ok, value] or
+/// [:error, exception]. Deep forcing is deliberate: a deferred error inside
+/// a list must be caught here, not escape after the result is returned.
+macro attempt expression = {
+    let saved = fresh "attempt" expression;
+    let error = fresh "exception" expression;
+    let body = block [binding saved expression, call (name "strict!") [name saved],
+                      [:list, [atom "ok", name saved], span]];
+    [:try, body, error, [:list, [atom "error", name error], span], span]
+};
+
+/// Call observer with the shared value, force its result to weak head normal
+/// form, then return the value. Works with console.print! and pure observers;
+/// effects remain subject to normal purity checks. Does not deeply force the
+/// observer's result or force parts of value the observer leaves alone.
+macro tap value observer = {
+    let saved = fresh "tapped" [value, observer];
+    let observed = choose (call observer [name saved])
+        [arm (literal_pattern unit) (name saved), arm [:wildcard, span] (name saved)];
+    block [binding saved value, observed]
+};
+
+// --- tests ------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let mark! tag value = { send! (self! ()) tag; value };
+    let observe! value = send! (self! ()) [:observed, value];
+    let add a b = a + b;
+    let double x = x * 2;
+
+    let tests = [
+        test.case "when_true takes its body only when true"
+            $( test.eq! [7, ()] [expand when_true true 7, expand when_true false (1 / 0)] ),
+        test.case "unless skips its body when true"
+            $( test.eq! [(), 7] [expand unless true (1 / 0), expand unless false 7] ),
+        test.case "and_all short circuits"
+            $( test.false! (expand and_all [true, false, 1 / 0 == 0]) ),
+        test.case "or_any short circuits"
+            $( test.true! (expand or_any [false, true, 1 / 0 == 0]) ),
+        test.case "empty boolean chains have their identities"
+            $( test.eq! [true, false] [expand and_all [], expand or_any []] ),
+        test.case "single boolean chains still produce booleans"
+            $( test.eq! [false, true] [expand and_all [false], expand or_any [true]] ),
+        test.case "cond picks the first successful branch"
+            $( test.eq! 2 (expand cond [[false, 1 / 0], [true, 2], [1 / 0 == 0, 3]] (1 / 0)) ),
+        test.case "cond falls back, including for no branches"
+            $( test.eq! [8, 9] [expand cond [[false, 0]] 8, expand cond [] 9] ),
+        test.case "coalesce distinguishes absence from false, zero and empty"
+            $( test.eq! [9, false, 0, [], #[], %{}]
+                [expand coalesce () 9, expand coalesce false (1 / 0),
+                 expand coalesce 0 (1 / 0), expand coalesce [] (1 / 0),
+                 expand coalesce #[] (1 / 0), expand coalesce %{} (1 / 0)] ),
+        test.case "coalesce evaluates a present expression once"
+            $({
+                test.eq! 7 (expand coalesce (mark! :value 7) (mark! :fallback 9))
+                send! (self! ()) :end
+                test.eq! [:value, :end] [recv! (), recv! ()]
+            }),
+        test.case "if_some binds only in the present branch"
+            $({
+                let value = 99;
+                test.eq! [8, 99] [expand if_some value 7 (value + 1) (1 / 0),
+                                 expand if_some value () (1 / 0) value]
+            }),
+        test.case "with_some preserves absence and shares its binding"
+            $( test.eq! [(), 6] [expand with_some x () (1 / 0), expand with_some x 3 (x + x)] ),
+        test.case "with_ok binds a success"
+            $( test.eq! [:ok, 8] (expand with_ok value [:ok, 4] [:ok, value + value]) ),
+        test.case "with_ok propagates an error without evaluating its body"
+            $( test.eq! [:error, :bad] (expand with_ok value [:error, :bad] (1 / 0)) ),
+        test.case "result bindings compose with distinct lexical scopes"
+            $( test.eq! [:ok, 10] (expand with_ok x [:ok, 4]
+                (expand with_ok y [:ok, 6] [:ok, x + y])) ),
+        test.case "pipe preserves argument-last pipeline order"
+            $( test.eq! 14 (expand pipe 3 [add 4, double]) ),
+        test.case "an empty pipe is the original expression"
+            $( test.eq! 9 (expand pipe 9 []) ),
+        test.case "update works on lists, arrays and maps"
+            $( test.eq! [[1, 4], #[1, 4], %{ :x => 6 }]
+                [expand update [1, 2] 1 double, expand update #[1, 2] 1 double,
+                 expand update %{ :x => 3 } :x double] ),
+        test.case "update shares collection and key and leaves the input unchanged"
+            $({
+                let original = [3, 4];
+                let changed = expand update (mark! :collection original) (mark! :key 0) double;
+                test.eq! [[6, 4], [3, 4]] [changed, original]
+                send! (self! ()) :end
+                test.eq! [:collection, :key, :end] [recv! (), recv! (), recv! ()]
+            }),
+        test.case "an update does not force its replacement too early"
+            $( test.eq! 2 ((expand update [1, 2] 0 (fn x -> x / 0)).[1]) ),
+        test.case "between includes both endpoints"
+            $( test.eq! [false, true, true, false]
+                [expand between 0 1 3, expand between 1 1 3,
+                 expand between 3 1 3, expand between 4 1 3] ),
+        test.case "between shares the value and skips the unused upper bound"
+            $({
+                test.true! (expand between (mark! :value 2) 1 3)
+                test.false! (expand between 0 1 (1 / 0))
+                send! (self! ()) :end
+                test.eq! [:value, :end] [recv! (), recv! ()]
+            }),
+        test.case "clamp covers below, within, and above the range"
+            $( test.eq! [1, 2, 3]
+                [expand clamp 0 1 3, expand clamp 2 1 3, expand clamp 4 1 3] ),
+        test.case "clamp shares bounds and skips the unused upper bound"
+            $({
+                test.eq! 1 (expand clamp (mark! :value 0) (mark! :lower 1) (1 / 0))
+                send! (self! ()) :end
+                test.eq! [:value, :lower, :end] [recv! (), recv! (), recv! ()]
+            }),
+        test.case "assert does not evaluate the message on success"
+            $( test.eq! () (expand assert true (1 / 0)) ),
+        test.case "assert raises exactly its supplied message"
+            $( test.eq! :failed (try! { expand assert false :failed } catch e { core.error_payload e }) ),
+        test.case "attempt returns a success result"
+            $( test.eq! [:ok, [1, 2]] (expand attempt [1, 2]) ),
+        test.case "attempt catches errors deferred inside a collection"
+            $({
+                let result = expand attempt [1, raise! :deferred];
+                test.eq! [:error, :deferred] [result.[0], core.error_payload result.[1]]
+            }),
+        test.case "attempt evaluates and shares an effectful expression once"
+            $({
+                test.eq! [:ok, 5] (expand attempt (mark! :value 5))
+                send! (self! ()) :end
+                test.eq! [:value, :end] [recv! (), recv! ()]
+            }),
+        test.case "tap observes once and returns the original value"
+            $({
+                test.eq! 5 (expand tap (mark! :value 5) observe!)
+                send! (self! ()) :end
+                test.eq! [:value, [:observed, 5], :end] [recv! (), recv! (), recv! ()]
+            }),
+        test.case "tap evaluates even a pure observer"
+            $( test.raises! $( strict! (expand tap 5 (fn _ -> 1 / 0)) ) ),
+        test.case "tap only forces the observer result to weak head normal form"
+            $( test.eq! 5 (expand tap 5 (fn _ -> [1, 1 / 0])) ),
+        test.case "nested generated temporaries do not capture caller bindings"
+            $({
+                let saved = 100;
+                let lower = 1;
+                let value = 4;
+                test.eq! 103 (saved + (expand clamp (expand coalesce value 0) lower 3))
+            }),
+        test.case "fresh names avoid names in syntax supplied by another macro"
+            $( test.eq! "<std.marcos.present.1>"
+                (fresh "present" [[:name, "<std.marcos.present.0>", span]]) ),
+    ];
+}

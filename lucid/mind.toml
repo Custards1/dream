@@ -7,3 +7,4 @@ src = "."
 package-paths = ["..", "../mind"]
 
 [dependencies]
+dreams = { path = "../dreams"}

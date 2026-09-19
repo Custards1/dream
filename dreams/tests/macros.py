@@ -118,6 +118,8 @@ let main! = {
 
     failure('macro id x = x; let main! = expand id;', 'expects 1 syntax arguments')
     failure('let id x = x; let main! = expand id 1;', 'declared macro')
+    failure('macro bad x = [:error, \"expected a literal list\"]; let main! = expand bad 1;',
+            'expected a literal list')
     failure('macro bad x = 42; let main! = expand bad 1;', 'valid expression syntax tree')
     failure('macro bad x = [:binary, :bogus, x, x, [0, 0]]; let main! = expand bad 1;',
             'valid expression syntax tree')
@@ -134,6 +136,27 @@ let main! = expand loop 1;
         failure(declaration, 'conflicts with a generated helper')
     failure('group Bad { x y }', 'expected `,` or `}`')
     failure('group Bad { x!', 'plain name')
+    # The library returns actionable syntax errors, with no runtime imports
+    # needed by its generated expressions. Effects remain checked at the call.
+    for expression, message in (
+        ('expand m.pipe 1 2', 'pipe expects a literal list'),
+        ('expand m.and_all true', 'and_all expects a literal list'),
+        ('expand m.or_any false', 'or_any expects a literal list'),
+        ('expand m.cond [[true]] 0', 'cond expects [condition, expression] pairs'),
+        ('expand m.if_some 1 () 2 3', 'binding name'),
+        ('expand m.with_some 1 () 2', 'binding name'),
+        ('expand m.with_ok [x] [:ok, 1] x', 'binding name'),
+    ):
+        failure('import std.marcos as m; let main! = ' + expression + ';', message)
+    for expression in ('expand m.assert true "fine"', 'expand m.attempt 1'):
+        failure('import std.marcos as m; let pure () = ' + expression + ';', 'impure')
+    failure('import std.marcos as m; let main! = expand m.if_some x () x x;',
+            'cannot find `x`')
+    success('import std.console; import std.marcos.{pipe as through, with_some}; '
+            'let double n = n * 2; '
+            'let main! = console.print! (expand through (expand with_some x 3 (x + 1)) [double]);',
+            '8\n')
+
     # Embedded macro VMs must preserve the REPL's already-open input handle.
     session = subprocess.run(
         [vm, compiler, '--repl', '-L', str(root / 'mind'), '-L', str(root)],

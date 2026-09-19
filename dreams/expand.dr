@@ -117,6 +117,8 @@ let evaluate! s mi call sp = {
                 } catch e { [:error, to_string e] };
                 match result {
                     [:error, why] => [fail s1 mi sp ("macro evaluation failed: " + why), ()],
+                    [:ok, [:error, message]] if type_of message == :string =>
+                        [fail s1 mi sp message, ()],
                     [:ok, value] => if syntax.expression value {
                         let fresh = syntax.fresh value (next s1);
                         let si = modules.module_source m;

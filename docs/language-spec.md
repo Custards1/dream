@@ -950,6 +950,10 @@ needed by generated code must already be declared in the caller. A macro's
 function is also available as an ordinary function on AST data; only `expand`
 passes unevaluated arguments and inserts returned syntax into the program.
 
+A transformer can return `[:error, "message"]` to reject its arguments with a
+compile-time diagnostic at the expansion site. This lets libraries report an
+invalid syntax shape without raising an exception.
+
 Macro execution uses the embedded VM, as `comp!` does. Ordinary purity rules
 apply to transformer bodies; effects need the usual `!` spelling or `comp!`.
 Unrelated `comp!` expressions are not evaluated while running a transformer.
@@ -1136,6 +1140,68 @@ Resolved directly, without an import, unless shadowed by a binding:
 | `to_string` | value → string |
 | `len` | list \| array \| map \| string → integer |
 | `strict!` | value → the same value, evaluated all the way down |
+
+### `std.marcos` — syntax conveniences
+
+Import `std.marcos` and call its macros with `expand`. The module name is
+spelled `marcos`. All transformers are pure; any effects in the code they
+produce are checked in the caller. Generated code needs no additional imports.
+
+```dream
+import std.marcos;
+
+let bounded n = expand marcos.clamp n 0 100;
+let port config = expand marcos.coalesce config.[:port else ()] 8080;
+let doubled result = expand marcos.with_ok value result [:ok, value * 2];
+```
+
+| Macro arguments | Result |
+|---|---|
+| `when_true condition body` | `body` when true, otherwise `()` |
+| `unless condition body` | `body` when false, otherwise `()` |
+| `and_all [conditions...]` | Short-circuit conjunction; empty list gives `true` |
+| `or_any [conditions...]` | Short-circuit disjunction; empty list gives `false` |
+| `cond [[condition, body], ...] fallback` | First true branch, otherwise the fallback |
+| `coalesce value fallback` | Fallback only for `()`; false, zero and empty collections stay intact |
+| `if_some name value body absent` | Bind a present value in `body`; evaluate `absent` for `()` |
+| `with_some name value body` | As `if_some`, with `()` for the absent branch |
+| `with_ok name result body` | Bind an `[:ok, value]` payload in `body`; pass non-ok results through |
+| `pipe value [stages...]` | Ordinary `\|>` stages, left to right; an empty list returns the value |
+| `update collection key transform` | Apply the function to one entry and return an updated collection |
+| `between value lower upper` | Inclusive range check |
+| `clamp value lower upper` | Clamp to inclusive bounds, assuming `lower <= upper` |
+| `assert condition message` | Return `()` or raise the message; requires an impure context |
+| `attempt expression` | Deeply evaluate inside `try!`, returning `[:ok, value]` or `[:error, exception]`; requires an impure context |
+| `tap value observer` | Call the observer, force its result to weak head normal form, and return the shared value |
+
+Lists supplied to `and_all`, `or_any`, `cond`, and `pipe` must be literal
+syntax lists, so the transformer can generate the branches or stages at
+compile time. Their contents remain ordinary runtime expressions. Invalid
+list shapes and non-name binding arguments produce compile-time diagnostics.
+
+`with_ok` composes result-returning expressions; its body must supply any
+`[:ok, ...]` wrapper it wants. It does not perform an early return from the
+surrounding function. Bindings in `if_some`, `with_some`, and `with_ok` are
+visible only in the present/success branch, and shadow caller names there.
+
+Repeated inputs are shared: for example, `clamp` does not run an effectful
+value or bound twice, and `update` shares its collection and key. Unused
+branches remain lazy. `update` retains the laziness of the replacement in
+`.[key => value]`; a missing entry raises when the original entry is demanded.
+The macros introduce temporary names that cannot be written as ordinary
+source identifiers and avoid names already present in their argument trees.
+This avoids accidental capture by these helpers without adding general macro
+hygiene to the language. Generated builtin names follow normal caller lookup.
+
+`attempt` deliberately uses `strict!`: it catches errors in deferred list,
+array, and map contents before returning. Consequently it is unsuitable for
+infinite structures. It preserves the exception object, including its kind
+and payload. `tap` forces only enough of the observer result to ensure the
+call ran; it does not deeply force that result or parts of the original value
+the observer ignores. Effectful observers still require an impure context.
+
+See [`11_standard_macros.dr`](../examples/11_standard_macros.dr) for a runnable
+example.
 
 ### `std.core` — what the language cannot express in itself
 
