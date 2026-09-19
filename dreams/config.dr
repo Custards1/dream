@@ -26,7 +26,9 @@ import std.str;
 // `when nonsense { .. }` is false -- but a flag has no value to compare, and
 // `when test == "x"` should be false rather than an error.
 
-let make flags values = %{ :flags => flags, :values => values };
+mapping Configuration { flags, values }
+
+let make = Configuration.make;
 
 let flags c = core.map_get c :flags (core.map_new ());
 let values c = core.map_get c :values (core.map_new ());

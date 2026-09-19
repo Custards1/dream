@@ -18,6 +18,7 @@
 import std.core;
 import std.io;
 import std.list;
+import std.macros;
 import std.os;
 import std.str;
 import std.toml;
@@ -33,9 +34,9 @@ let module_extensions = ["dr"];
 
 // --- a package --------------------------------------------------------------
 
-let make name version root src deps manifest =
-    %{ :name => name, :version => version, :root => root,
-       :src => src, :deps => deps, :manifest => manifest };
+mapping Package { name, version, root, src, deps, manifest }
+
+let make = Package.make;
 
 let name p    = core.map_get p :name "";
 let version p = core.map_get p :version "0.0.0";
@@ -49,9 +50,11 @@ let manifest p = core.map_get p :manifest "";
 /// A dependency: a name, and where to find it relative to the depending
 /// package's root. The path is `()` for a dependency given some other way,
 /// which is not supported yet and is reported rather than ignored.
-let dep name path = [name, path];
-let dep_name d = list.nth 0 d;
-let dep_path d = list.nth 1 d;
+group Dependency { name, path }
+
+let dep = Dependency.make;
+let dep_name = Dependency.name;
+let dep_path = Dependency.path;
 
 // --- finding a module inside a package --------------------------------------
 
@@ -178,8 +181,7 @@ let load_manifest! file =
                                         };
                                     [:ok, make n (toml.get "0.0.0" doc "package" "version")
                                               root_dir src_dir
-                                              (list.map (fn e -> dep (list.nth 0 e)
-                                                                     (dep_location (list.nth 1 e)))
+                                              (list.map (fn [name, location] -> dep name (dep_location location))
                                                         (toml.entries doc "dependencies"))
                                               file]
                                 },
@@ -213,8 +215,7 @@ let find s n =
 let current_index s = core.map_get s :current ()
 ;
 /// The package the root file belongs to, or `()`.
-let current s =
-    match current_index s { () => (), i => at s i };
+let current s = expand macros.with_some i (current_index s) (at s i);
 
 let names s = list.sort (list.map (fn p -> name p) (packages s));
 

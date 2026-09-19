@@ -39,11 +39,12 @@ let with_origin start end sp s =
 
 // --- a diagnostic -----------------------------------------------------------
 
-let error span message =
-    %{ :severity => :error, :span => span, :message => message, :note => (), :source => 0 };
+mapping Diagnostic { severity, span, message, note, source }
 
-let warning span message =
-    %{ :severity => :warning, :span => span, :message => message, :note => (), :source => 0 };
+let error span message = Diagnostic.make :error span message () 0;
+let warning span message = Diagnostic.make :warning span message () 0;
+
+// Readers accept partial diagnostics too, so their defaults remain explicit.
 
 let severity d = core.map_get d :severity :error;
 let span d     = core.map_get d :span ast.no_span;
@@ -51,11 +52,11 @@ let message d  = core.map_get d :message "";
 let note d     = core.map_get d :note ();
 let source_of d = core.map_get d :source 0;
 
-let with_note n d = core.map_put d :note n;
+let with_note n d = Diagnostic.set_note d n;
 
 /// Which file the span points into. Set as the diagnostic leaves the pass that
 /// made it, so that a pass working on one file at a time need not thread it.
-let in_source i d = core.map_put d :source i;
+let in_source i d = Diagnostic.set_source d i;
 
 let is_error d = severity d == :error;
 
@@ -104,8 +105,8 @@ let offset_of text line col = {
 
 /// `path:line:col`, the prefix every message carries.
 let position path text offset = {
-    let at = line_col text offset;
-    path + ":" + to_string (list.head at) + ":" + to_string (list.nth 1 at)
+    let [line, col] = line_col text offset;
+    path + ":" + to_string line + ":" + to_string col
 };
 
 let label s = match s { :warning => "warning", _ => "error" };

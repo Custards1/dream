@@ -17,12 +17,11 @@ let rec fresh tree next =
     else {
         let has_span = is_span (list.last tree);
         let parts = if has_span { list.take (list.length tree - 1) tree } else { tree };
-        let walked = list.fold (fn acc part -> {
-            let done = fresh part (list.nth 1 acc);
-            [core.cons (list.head done) (list.head acc), list.nth 1 done]
+        let [reversed, end] = list.fold (fn [acc, offset] part -> {
+            let [child, after_child] = fresh part offset;
+            [core.cons child acc, after_child]
         }) [[], next] parts;
-        let items = list.reverse (list.head walked);
-        let end = list.nth 1 walked;
+        let items = list.reverse reversed;
         if has_span { [items + [[end, end + 1]], end + 2] }
         else { [items, end] }
     };
@@ -44,15 +43,21 @@ let rec literal value span = match type_of value {
 };
 
 /// Records are namespaces of ordinary functions over ordinary collections.
-let record array name fields span = {
+let record kind name fields span = {
     let values = list.map (fn p -> ast.name_e (ast.param_name p) (list.nth 1 p)) fields;
-    let body = if array { ast.array_e values span } else { ast.list_e values span };
+    let body = match kind {
+        :list => ast.list_e values span,
+        :array => ast.array_e values span,
+        :map => ast.map_e (list.map (fn p ->
+            [ast.atom_e (ast.param_name p) (list.nth 1 p),
+             ast.name_e (ast.param_name p) (list.nth 1 p)]) fields) span,
+    };
     let constructor = ast.let_d "make"
         (if list.is_empty fields { [ast.param () span] } else { fields }) body false span;
     let helpers = list.concat (list.map (fn i -> {
         let field = ast.param_name (list.nth i fields);
         let obj = ast.name_e "record" span;
-        let key = ast.int_e i span;
+        let key = match kind { :map => ast.atom_e field span, _ => ast.int_e i span };
         [ast.let_d field [ast.param "record" span] (ast.get_e obj key () span) false span,
          ast.let_d ("set_" + field) [ast.param "record" span, ast.param "value" span]
                    (ast.set_e obj key (ast.name_e "value" span) span) false span]

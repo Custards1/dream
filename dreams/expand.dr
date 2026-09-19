@@ -62,28 +62,25 @@ let macro_definition l reference = {
 /// demanded by the macro VM. Unrelated runtime `comp!` effects must not run for
 /// every expansion. Its isolated function already has the right environment.
 let staged_image low = {
-    let ready = list.fold (fn acc one -> {
-        let made = lower.emit (ir.node :make_closure (list.nth 1 one) ir.no_node ir.no_node) acc;
-        lower.set_prog (ir.set_node (list.head one)
-            (ir.node :apply (list.nth 1 made) 0 0)
-            (lower.prog (list.head made))) (list.head made)
+    let ready = list.fold (fn acc [placeholder, function] -> {
+        let [lowered, closure] = lower.emit (ir.node :make_closure function ir.no_node ir.no_node) acc;
+        lower.set_prog (ir.set_node placeholder (ir.node :apply closure 0 0)
+                                   (lower.prog lowered)) lowered
     }) low (lower.pending_comp low);
     ir.finish (lower.prog ready)
 };
 
 let evaluate! s mi call sp = {
     let l = loader s;
-    let parts = match call {
+    let [callee, args] = match call {
         [:apply, callee, args, _] => [callee, args],
         _ => [call, []],
     };
-    let callee = list.head parts;
-    let args = list.nth 1 parts;
     let literals = list.map (fn a -> syntax.literal a sp) args;
     let body = if list.is_empty args { callee } else { ast.apply_e callee literals sp };
-    let made = syntax.fresh (ast.let_d "<macro expansion>!" [] body false sp) (next s);
-    let wrapper = list.head made;
-    let s1 = core.map_put s :next (list.nth 1 made);
+    let [wrapper, after_wrapper] = syntax.fresh
+        (ast.let_d "<macro expansion>!" [] body false sp) (next s);
+    let s1 = core.map_put s :next after_wrapper;
     let staged = modules.put :modules (list.map (fn m ->
         with_items m (stage (modules.module_items m))) (modules.modules l)) l;
     let m = modules.module_at staged mi;
@@ -120,12 +117,12 @@ let evaluate! s mi call sp = {
                     [:ok, [:error, message]] if type_of message == :string =>
                         [fail s1 mi sp message, ()],
                     [:ok, value] => if syntax.expression value {
-                        let fresh = syntax.fresh value (next s1);
+                        let [expression, after_expression] = syntax.fresh value (next s1);
                         let si = modules.module_source m;
                         let files = modules.files (loader s1);
-                        let source = diag.with_origin (next s1) (list.nth 1 fresh) sp (list.nth si files);
+                        let source = diag.with_origin (next s1) after_expression sp (list.nth si files);
                         let s2 = put_loader (modules.put :files (files.[si => source]) (loader s1)) s1;
-                        [core.map_put s2 :next (list.nth 1 fresh), list.head fresh]
+                        [core.map_put s2 :next after_expression, expression]
                     } else { [fail s1 mi sp "a macro must return a valid expression syntax tree", ()] },
                 }
             }
@@ -146,9 +143,9 @@ let rec walk! s mi tree depth = match tree {
             // Finish them before the next call, so a module with many expands
             // does not keep every temporary compilation alive at once.
             strict! result
-            match list.nth 1 result {
-                () => [list.head result, ast.unit_e sp],
-                expanded => walk! (list.head result) mi expanded (depth + 1),
+            match result {
+                [state, ()] => [state, ast.unit_e sp],
+                [state, expanded] => walk! state mi expanded (depth + 1),
             }
         },
     _ => if type_of tree != :list { [s, tree] }

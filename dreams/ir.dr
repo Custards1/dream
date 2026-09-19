@@ -167,17 +167,18 @@ let is_node n = n != no_node;
 /// `[op, flags, a, b, c]`. The VM's record also carries a 16-bit `aux` field
 /// that nothing generates yet; it is written as zero and left out here rather
 /// than threaded through every constructor unused.
-let node op a b c = [op, 0, a, b, c];
+group Node { op, flags, a, b, c }
 
-let node_op n    = nth 0 n;
-let node_flags n = nth 1 n;
-let node_a n     = nth 2 n;
-let node_b n     = nth 3 n;
-let node_c n     = nth 4 n;
+let node op a b c = Node.make op 0 a b c;
+let node_op = Node.op;
+let node_flags = Node.flags;
+let node_a = Node.a;
+let node_b = Node.b;
+let node_c = Node.c;
 
 let leaf op = node op no_node no_node no_node;
 
-let with_flags flags n = [node_op n, flags, node_a n, node_b n, node_c n];
+let with_flags flags n = Node.set_flags n flags;
 
 let node_is_impure n = has_flag (node_flags n) f_impure;
 
@@ -186,18 +187,19 @@ let node_is_impure n = has_flag (node_flags n) f_impure;
 // One pool per type, each deduplicated: the same string written twice in a
 // program is one entry. A pool is `[reversed values, count, index by value]`.
 
-let pool_new = [[], 0, core.map_new ()];
+group Pool { values, count, index }
 
-let pool_values p = nth 0 p;
-let pool_count p  = nth 1 p;
-let pool_index p  = nth 2 p;
+let pool_new = Pool.make [] 0 %{};
+let pool_values = Pool.values;
+let pool_count = Pool.count;
+let pool_index = Pool.index;
 
 /// Intern a value: `[pool, index]`. The index is stable once given.
 let intern v p =
     match core.map_get (pool_index p) v () {
         () => {
             let i = pool_count p;
-            [[core.cons v (pool_values p), i + 1, core.map_put (pool_index p) v i], i]
+            [Pool.make (core.cons v (pool_values p)) (i + 1) ((pool_index p).[v => i]), i]
         },
         found => [p, found],
     };

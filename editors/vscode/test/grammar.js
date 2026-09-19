@@ -59,6 +59,8 @@ const cases = [
   ['let x = comp f;', 'comp', 'keyword.declaration.dream'],
   ['let a = 5 % 2;', '%', 'keyword.operator.arithmetic.dream'],
   ['let rec go n = n;', 'go', 'entity.name.function.dream'],
+  ['mapping Point { x, y }', 'mapping', 'keyword.declaration.dream'],
+  ['mapping Point { x, y }', 'Point', 'entity.name.function.dream'],
 ];
 
 registry.loadGrammar('source.dream').then((grammar) => {

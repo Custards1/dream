@@ -90,7 +90,7 @@ let token_continues c t =
 /// no idea they are special.
 let keywords = ["let", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
-                "match", "macro", "expand", "group", "struct"];
+                "match", "macro", "expand", "group", "struct", "mapping"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
@@ -109,7 +109,12 @@ let non_starter_set = set_of non_starters;
 
 let is_kw ts word = at ts :ident && peek_value ts == word;
 // Record introducers are contextual: existing code can still bind `group`.
-let is_keyword name = core.map_has keyword_set name && name != "group" && name != "struct";
+let is_keyword name = match name {
+    "group" => false,
+    "struct" => false,
+    "mapping" => false,
+    _ => core.map_has keyword_set name,
+};
 let is_non_starter name = core.map_has non_starter_set name;
 
 /// The token after this one, for the single place that needs to look ahead:
@@ -983,29 +988,30 @@ let rec parse_item c ts = {
                 [:ok, _, _] => err "a macro needs a name" sp,
                 other => other,
             },
-            "group" => parse_record false sp (list.tail ts),
-            "struct" => parse_record true sp (list.tail ts),
-            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `macro`, `group` or `struct` at the top level, found "
+            "group" => parse_record :list sp (list.tail ts),
+            "struct" => parse_record :array sp (list.tail ts),
+            "mapping" => parse_record :map sp (list.tail ts),
+            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `macro`, `group`, `struct` or `mapping` at the top level, found "
                       + describe ts) sp,
         },
         _ => err ("expected a declaration, found " + describe ts) sp,
     }
 };
 
-let rec parse_record array sp ts =
+let rec parse_record kind sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a record name" (peek_span ts)
     } else {
         let name = peek_value ts;
         match expect (list.tail ts) :lbrace "`{` before record fields" {
             [:error, m, s] => err m s,
-            [:ok, _, rest] => record_fields array name sp [] rest,
+            [:ok, _, rest] => record_fields kind name sp [] rest,
         }
     };
 
-let rec record_fields array name sp fields ts =
+let rec record_fields kind name sp fields ts =
     match peek_kind ts {
-        :rbrace => ok (ast.record_d array name (list.reverse fields)
+        :rbrace => ok (ast.record_d kind name (list.reverse fields)
                                    (ast.span_to sp (peek_span ts))) (list.tail ts),
         :ident => {
             let field = peek_value ts;
@@ -1019,8 +1025,8 @@ let rec record_fields array name sp fields ts =
                 let more = core.cons (ast.param field (peek_span ts)) fields;
                 let rest = list.tail ts;
                 match peek_kind rest {
-                    :comma => record_fields array name sp more (list.tail rest),
-                    :rbrace => record_fields array name sp more rest,
+                    :comma => record_fields kind name sp more (list.tail rest),
+                    :rbrace => record_fields kind name sp more rest,
                     _ => err "expected `,` or `}` after a record field" (peek_span rest),
                 }
             }
@@ -1296,13 +1302,14 @@ when test {
             $( test.eq! "(binary add (expand (apply (name twice) (name x))) (int 1))"
                         (shape "expand twice x + 1") ),
         test.case "records retain their backing kind and field order"
-            $( test.eq! "(group Point x y) (struct Pair a b)"
-                        (items "group Point { x, y } struct Pair { a, b, }") ),
+            $( test.eq! "(group Point x y) (struct Pair a b) (mapping Named z a)"
+                        (items "group Point { x, y } struct Pair { a, b, } mapping Named { z, a, }") ),
         test.case "record helpers cannot collide"
             $( test.eq! "record field `set_x` conflicts with a generated helper"
                         (fails_module "group Point { x, set_x }") ),
         test.case "record keywords remain usable as local names"
-            $( test.eq! "(let group (int 1))" (items "let group = 1;") ),
+            $( test.eq! "(let group (int 1)) (let struct (int 2)) (let mapping (int 3))"
+                        (items "let group = 1; let struct = 2; let mapping = 3;") ),
         // --- literals ---
         test.case "integer"   $( test.eq! "(int 42)" (shape "42") ),
         test.case "float"     $( test.eq! "(float 1.5)" (shape "1.5") ),

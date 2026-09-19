@@ -548,19 +548,23 @@ statement), and the two differ in one way:
 Writing `rec` at top level is still worth doing where it documents intent; the
 standard library does.
 
-### `group` and `struct`
+### `group`, `struct` and `mapping`
 
 Records declare a namespace of generated functions. `group` uses a list;
-`struct` uses an array (a fixed-size positional tuple).
+`struct` uses an array (a fixed-size positional tuple); `mapping` uses a map
+whose keys are atoms named after the fields.
 
 ```dream
 group Point { x, y }
 struct Vector { x, y }
+mapping Position { x, y }
 
 let p = Point.make 3 4;       // [3, 4]
 let x = Point.x p;            // 3
 let q = Point.set_y p 9;      // [3, 9]; p is still [3, 4]
 let v = Vector.make 3 4;      // #[3, 4]
+let m = Position.make 3 4;    // %{ :x => 3, :y => 4 }
+let n = Position.set_y m 9;  // %{ :x => 3, :y => 9 }; m is unchanged
 ```
 
 For each field `f`, the compiler generates `f record` and
@@ -571,11 +575,13 @@ with an optional trailing comma. Duplicate fields and names that collide with
 `make` or another generated helper are rejected.
 
 These declarations add no runtime type or tag: indexing, equality, `type_of`,
-and list/array patterns work exactly as for the underlying collection.
+and list/array/map patterns work exactly as for the underlying collection.
+Mapping getters read the corresponding atom key; setters insert or replace
+that key, preserving any other entries in the map.
 Records can appear wherever module declarations can, including `mod` and
-`when` blocks, and their helper namespaces can be imported. `group` and
-`struct` are contextual declaration keywords; existing local bindings with
-those names continue to work.
+`when` blocks, and their helper namespaces can be imported. `group`,
+`struct` and `mapping` are contextual declaration keywords; existing local
+bindings with those names continue to work.
 
 ### `import`
 

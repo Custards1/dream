@@ -110,8 +110,9 @@ let with_core name items deps =
 
 /// `source` is an index into the loader's file list, so a diagnostic raised
 /// about this module can quote the line it came from.
-let loaded name file source items =
-    %{ :name => name, :path => file, :source => source, :items => items };
+mapping Module { name, path, source, items }
+
+let loaded = Module.make;
 
 let module_name m   = core.map_get m :name "";
 let module_path m   = core.map_get m :path "";
@@ -352,7 +353,7 @@ let rec expand_items cfg items =
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { expand_items cfg inner } else { [] },
-            [:record, array, name, fields, span] => [syntax.record array name fields span],
+            [:record, kind, name, fields, span] => [syntax.record kind name fields span],
             other => [other],
         }) items);
 

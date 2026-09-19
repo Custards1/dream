@@ -83,11 +83,17 @@ let warn span message note l =
                      [diag.in_source (source l) (diag.with_note note (diag.warning span message))]);
 
 /// Emit a node: `[lowering, index]`.
-let emit n l = { let got = ir.push_node n (prog l); [set_prog (list.head got) l, list.nth 1 got] };
+let emit n l = {
+    let [program, index] = ir.push_node n (prog l);
+    [set_prog program l, index]
+};
 
 let emit_leaf op l = emit (ir.leaf op) l;
 
-let kids xs l = { let got = ir.push_kids xs (prog l); [set_prog (list.head got) l, list.nth 1 got] };
+let kids xs l = {
+    let [program, offset] = ir.push_kids xs (prog l);
+    [set_prog program l, offset]
+};
 
 let set_flag i f l = set_prog (ir.set_node_flag i f (prog l)) l;
 
@@ -108,23 +114,23 @@ let slot_at span l =
 // --- constants ----------------------------------------------------------------
 
 let const_int v l = {
-    let got = ir.intern_int v (prog l);
-    emit (ir.node :const_int (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_int v (prog l);
+    emit (ir.node :const_int index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_float v l = {
-    let got = ir.intern_float v (prog l);
-    emit (ir.node :const_float (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_float v (prog l);
+    emit (ir.node :const_float index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_str v l = {
-    let got = ir.intern_str v (prog l);
-    emit (ir.node :const_str (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_str v (prog l);
+    emit (ir.node :const_str index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_atom v l = {
-    let got = ir.intern_atom v (prog l);
-    emit (ir.node :const_atom (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_atom v (prog l);
+    emit (ir.node :const_atom index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_char c l = emit (ir.node :const_char (core.char_code c) ir.no_node ir.no_node) l;
