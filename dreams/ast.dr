@@ -20,14 +20,16 @@ import std.list;
 
 // --- spans ------------------------------------------------------------------
 
-let span_of a b = [a, b];
-let span_start s = list.nth 0 s;
-let span_end s = list.nth 1 s;
+group Span derive dreams.source_range { span_start, span_end }
+
+let span_of = Span.make;
+let span_start s = Span.span_start s;
+let span_end s = Span.span_end s;
 
 /// The span covering both, for a node built out of two others.
 let span_to a b = [span_start a, span_end b];
 
-let no_span = [0, 0];
+let no_span = Span.make 0 0;
 
 // --- expressions ------------------------------------------------------------
 //
@@ -159,9 +161,52 @@ let param_pattern p = match p { [_, _, pattern] => pattern, _ => () };
 
 /// `let name params = body`. `rec` is recorded even though a top-level `let`
 /// is always visible to itself, because it documents intent where it is used.
+let priv_d declaration span = [:priv, declaration, span];
+
 let let_d name params body is_rec span = [:let, name, params, body, is_rec, span];
 let macro_d name params body span = [:macro, name, params, body, span];
-let record_d array name fields span = [:record, array, name, fields, span];
+/// The backing kind is `:list`, `:array` or `:map`.
+/// One field of a record: the parameter its constructor takes, and what an
+/// accessor answers when the field is not there.
+///
+/// `()` is a field with no default, which is what every field was before they
+/// could have one -- and it is exactly what `get_e` wants for "no fallback",
+/// so a field's default is spliced straight into the read. A default of `()`
+/// *written by the author* is `[:unit, span]` and not this, so the two do not
+/// collide.
+group RecordField { param, default }
+
+let record_field = RecordField.make;
+let field_param f = RecordField.param f;
+let field_default f = RecordField.default f;
+let field_name f    = param_name (list.nth 0 f);
+let field_span f    = list.nth 1 (list.nth 0 f);
+
+/// A member of a record: `say_hi self = "hi " + name self`. It is an ordinary
+/// function placed in the module the record becomes, and it is not a field --
+/// it occupies no slot in the collection, `make` does not take it, and it has
+/// no setter. What makes it worth writing there rather than beside the
+/// declaration is where its body is compiled: *inside* that module, where the
+/// accessors are globals. So `name self` is the generated accessor and nothing
+/// had to be imported for it to be.
+///
+/// The receiver is an ordinary parameter with no special standing -- `self` is
+/// a name the author picked and the language does not know it. That is what
+/// makes a member "not exactly a method": it is a function that happens to be
+/// about the record, and `Person.say_hi p` is the call it looks like.
+///
+/// Having parameters is also what tells a member from a field: `x = 0` is a
+/// field with a default and `f self = 0` is a member, and nothing else has to
+/// be written to say which was meant.
+group RecordMember { name, params, body, span }
+
+let record_member = RecordMember.make;
+let member_name m = RecordMember.name m;
+let member_params m = RecordMember.params m;
+let member_body m = RecordMember.body m;
+let member_span m = RecordMember.span m;
+
+let record_d kind name fields members span = [:record, kind, name, fields, members, [], span];
 
 /// `let [a, b] = pair` -- a `let` that binds what a pattern names. A node of
 /// its own rather than a `let` whose name is a pattern, because everything
@@ -215,6 +260,11 @@ when test {
     let tests = [
         test.case "a span keeps its byte endpoints"
             $( test.eq! [2, 7] (span_of 2 7) ),
+        test.case "span behavior uses half-open byte bounds"
+            $( test.eq! [5, false, true, true, false]
+                        [Span.byte_length [2, 7], Span.contains 1 [2, 7],
+                         Span.contains 2 [2, 7], Span.contains 6 [2, 7],
+                         Span.contains 7 [2, 7]] ),
         test.case "span_to covers its two inputs"
             $( test.eq! [2, 13] (span_to [2, 7] [8, 13]) ),
         test.case "every expression keeps its kind and span"
@@ -302,8 +352,17 @@ let rec show e =
         [:comp, impure, x, _] => "(" + (if impure { "comp!" } else { "comp" }) + " " + show x + ")",
         [:expand, x, _] => "(expand " + show x + ")",
         [:macro, n, ps, b, _] => "(macro " + n + " " + show_params ps + " " + show b + ")",
-        [:record, array, n, fields, _] =>
-            "(" + (if array { "struct" } else { "group" }) + " " + n + " " + show_params fields + ")",
+        [:record, kind, n, fields, members, bases, _] =>
+            "(" + (match kind { :list => "group", :array => "struct", :map => "mapping" })
+                + " " + n + " " + (if list.is_empty bases { "" } else { show_all bases + " " })
+                + str.join_str " " (list.map (fn f ->
+                      match field_default f {
+                          () => field_name f,
+                          d => "(" + field_name f + " = " + show d + ")",
+                      }) fields
+                    + list.map (fn m ->
+                      "(" + member_name m + " " + show_params (member_params m)
+                          + " = " + show (member_body m) + ")") members) + ")",
         [:list, xs, _]      => "(list " + show_all xs + ")",
         [:array, xs, _]     => "(array " + show_all xs + ")",
         [:map, pairs, _]    => "(map " + show_pairs pairs + ")",
@@ -314,6 +373,7 @@ let rec show e =
         [:let, n, ps, b, is_rec, _] =>
             "(let " + (if is_rec { "rec " } else { "" }) + n
             + (if list.is_empty ps { "" } else { " " + show_params ps }) + " " + show b + ")",
+        [:priv, d, _] => "(priv " + show d + ")",
         [:let_p, pattern, b, _] => "(let " + show_pattern pattern + " " + show b + ")",
         [:import, segments, alias, names, _] =>
             "(import " + str.join_str "." segments

@@ -42,18 +42,27 @@ let span_of r = list.nth 2 r;
 
 // --- the layout context -----------------------------------------------------
 
-let ctx nl no_brace indent = [nl, no_brace, indent];
-let ctx_nl c = list.nth 0 c;
-let ctx_no_brace c = list.nth 1 c;
-let ctx_indent c = list.nth 2 c;
+group Context {
+    nl
+    no_brace
+    indent
+    grouped self = make false false (indent self)
+    forbid_brace self = set_no_brace self true
+    allow_brace self = set_no_brace self false
+}
+
+let ctx = Context.make;
+let ctx_nl c = Context.nl c;
+let ctx_no_brace c = Context.no_brace c;
+let ctx_indent c = Context.indent c;
 
 /// Inside a bracket group: newlines stop mattering, and a `{` is an argument
 /// again. `( .. )`, `[ .. ]`, `$( .. )`, `#[ .. ]` and `%{ .. }` all do this.
 /// Braces are deliberately not in that list -- a block is newline-sensitive.
-let grouped c = ctx false false (ctx_indent c);
+let grouped c = Context.grouped c;
 
-let no_brace c = ctx (ctx_nl c) true (ctx_indent c);
-let allow_brace c = ctx (ctx_nl c) false (ctx_indent c);
+let no_brace c = Context.forbid_brace c;
+let allow_brace c = Context.allow_brace c;
 
 let top = ctx true false 0;
 
@@ -65,7 +74,7 @@ let peek_kind ts = if at_end ts { :eof } else { lexer.kind (list.head ts) };
 let peek_value ts = if at_end ts { () } else { lexer.value (list.head ts) };
 let peek_span ts =
     if at_end ts { ast.no_span }
-    else { ast.span_of (lexer.span_start (list.head ts)) (lexer.span_end (list.head ts)) };
+    else { lexer.span (list.head ts) };
 
 let at ts k = peek_kind ts == k;
 
@@ -88,28 +97,33 @@ let token_continues c t =
 
 /// Keywords are ordinary identifiers that the parser recognises; the lexer has
 /// no idea they are special.
-let keywords = ["let", "rec", "if", "else", "import", "as", "catch", "true", "false",
+let keywords = ["let", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
-                "match", "macro", "expand", "group", "struct"];
+                "match", "macro", "expand", "group", "struct", "mapping"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
-let non_starters = ["let", "rec", "else", "import", "as", "catch", "virtual", "derive",
+let non_starters = ["let", "priv", "rec", "else", "import", "as", "catch", "virtual", "derive",
                     "when", "mod", "macro"];
 
 /// The lists above are the readable form; these are how they are asked. A
 /// linear scan answers "is this identifier a keyword" in a dozen reductions
 /// per candidate, and the parser asks it of every identifier in the program --
 /// it was a tenth of everything the compiler did. A map answers it in one
-/// hash, and the set is built once because a top-level binding is forced once.
-let set_of names = list.fold (fn m n -> core.map_put m n true) (core.map_new ()) names;
+/// hash; `comp` builds both sets into the compiler image.
+priv let set_of names = list.fold (fn m n -> m.[n => true]) %{} names;
 
-let keyword_set = set_of keywords;
-let non_starter_set = set_of non_starters;
+priv let keyword_set = comp set_of keywords;
+priv let non_starter_set = comp set_of non_starters;
 
 let is_kw ts word = at ts :ident && peek_value ts == word;
 // Record introducers are contextual: existing code can still bind `group`.
-let is_keyword name = core.map_has keyword_set name && name != "group" && name != "struct";
+let is_keyword name = match name {
+    "group" => false,
+    "struct" => false,
+    "mapping" => false,
+    _ => core.map_has keyword_set name,
+};
 let is_non_starter name = core.map_has non_starter_set name;
 
 /// The token after this one, for the single place that needs to look ahead:
@@ -634,7 +648,7 @@ let rec parse_let c sp ts = {
     }
     else {
         let name = peek_value after_rec;
-        match let_params [] (list.tail after_rec) {
+        match let_params c [] (list.tail after_rec) {
             [:error, m, s] => err m s,
             [:ok, params, rest] =>
                 match expect rest :eq "`=` in a `let`" {
@@ -689,23 +703,32 @@ let rec parse_let_pattern c sp ts =
 /// takes its argument apart. An `as` around one is written inside the
 /// parenthesised list, `f ([a, b] as pair)`, where the brackets say where it
 /// ends; in a row of juxtaposed parameters nothing would.
-let rec let_params acc ts =
-    if at ts :ident && not (is_keyword (peek_value ts)) {
-        let_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
+///
+/// The context is consulted for the same reason every other optional
+/// continuation consults it: an identifier on the next line may be the next
+/// declaration rather than one more parameter of this one. A `let` never
+/// noticed, because what follows its parameters is `=` and a `let` with a
+/// missing one is an error either way -- but a record body is a list whose
+/// entries may be bare names, so `name` and `age` on two lines have to be two
+/// fields and not one field of one parameter.
+let rec let_params c acc ts =
+    if at_end ts || not (token_continues c (list.head ts)) { ok (list.reverse acc) ts }
+    else if at ts :ident && not (is_keyword (peek_value ts)) {
+        let_params c (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
     }
     else if at ts :lparen && peek2_kind ts == :rparen {
-        let_params (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
+        let_params c (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
     }
     else if at ts :lparen {
         match paren_params acc (list.tail ts) {
             [:error, m, s] => err m s,
-            [:ok, acc2, rest] => let_params acc2 rest,
+            [:ok, acc2, rest] => let_params c acc2 rest,
         }
     }
     else if starts_param_pattern ts {
         match param_pattern ts {
             [:error, m, s] => err m s,
-            [:ok, p, rest] => let_params (core.cons p acc) rest,
+            [:ok, p, rest] => let_params c (core.cons p acc) rest,
         }
     }
     else { ok (list.reverse acc) ts };
@@ -977,55 +1000,185 @@ let rec parse_item c ts = {
             "virtual" => parse_virtual c sp (list.tail ts),
             "when" => parse_when c sp (list.tail ts),
             "let" => parse_let c sp (list.tail ts),
+            "priv" => {
+                let rest = list.tail ts;
+                if not (is_kw rest "let") { err "expected `let` after `priv`" (peek_span rest) }
+                else { match parse_let c sp (list.tail rest) {
+                    [:ok, d, after] => ok (ast.priv_d d (ast.span d)) after,
+                    other => other,
+                } }
+            },
             "macro" => match parse_let c sp (list.tail ts) {
                 [:ok, [:let, n, ps, body, _, span], rest] =>
                     ok (ast.macro_d n ps body span) rest,
                 [:ok, _, _] => err "a macro needs a name" sp,
                 other => other,
             },
-            "group" => parse_record false sp (list.tail ts),
-            "struct" => parse_record true sp (list.tail ts),
-            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `macro`, `group` or `struct` at the top level, found "
+            "group" => parse_record c :list sp (list.tail ts),
+            "struct" => parse_record c :array sp (list.tail ts),
+            "mapping" => parse_record c :map sp (list.tail ts),
+            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `priv let`, `macro`, `group`, `struct` or `mapping` at the top level, found "
                       + describe ts) sp,
         },
         _ => err ("expected a declaration, found " + describe ts) sp,
     }
 };
 
-let rec parse_record array sp ts =
+let rec parse_record c kind sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a record name" (peek_span ts)
     } else {
         let name = peek_value ts;
-        match expect (list.tail ts) :lbrace "`{` before record fields" {
+        match record_base c (list.tail ts) {
             [:error, m, s] => err m s,
-            [:ok, _, rest] => record_fields array name sp [] rest,
+            [:ok, bases, after_base] =>
+                match expect after_base :lbrace "`{` before the record body" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest] =>
+                        match record_body (ctx true false (ctx_indent c)) kind name sp [] [] rest {
+                            [:ok, [:record, k, n, fs, ms, _, span], after] =>
+                                ok [:record, k, n, fs, ms, bases, span] after,
+                            other => other,
+                        },
+                },
         }
     };
 
-let rec record_fields array name sp fields ts =
-    match peek_kind ts {
-        :rbrace => ok (ast.record_d array name (list.reverse fields)
-                                   (ast.span_to sp (peek_span ts))) (list.tail ts),
-        :ident => {
-            let field = peek_value ts;
-            let names = list.map (fn p -> ast.param_name p) fields;
-            let helpers = ["make"] + names + list.map (fn n -> "set_" + n) names;
-            if is_keyword field || str.ends_with "!" field {
-                err "a record field must be a plain name" (peek_span ts)
-            } else if list.contains field helpers || list.contains ("set_" + field) helpers {
-                err ("record field `" + field + "` conflicts with a generated helper") (peek_span ts)
-            } else {
-                let more = core.cons (ast.param field (peek_span ts)) fields;
-                let rest = list.tail ts;
-                match peek_kind rest {
-                    :comma => record_fields array name sp more (list.tail rest),
-                    :rbrace => record_fields array name sp more rest,
-                    _ => err "expected `,` or `}` after a record field" (peek_span rest),
-                }
-            }
+/// A record specializes a behavior just as an ordinary module does.
+let record_base c ts =
+    if is_kw ts "derive" {
+        match parse_derive c (peek_span ts) (list.tail ts) {
+            [:ok, d, rest] => ok [d] rest,
+            other => other,
+        }
+    } else { ok [] ts };
+
+/// A record body is a list of entries, and it is newline-sensitive for the
+/// same reason a block is: an entry may be a function definition, and nobody
+/// writing one wants to end it with a comma. So `,` separates entries where it
+/// is written and a line break separates them where it is not -- exactly what
+/// `;` and a line break do between the statements of a block, and the code
+/// below is `block_stmts` with `,` in place of `;`.
+///
+/// Each entry is parsed at its own column, so a default or a member's body may
+/// run over as many lines as it is indented past.
+let rec record_body c kind name sp fields members ts =
+    if at ts :comma { record_body c kind name sp fields members (list.tail ts) }
+    else if at ts :rbrace {
+        ok (ast.record_d kind name (list.reverse fields) (list.reverse members)
+                         (ast.span_to sp (peek_span ts))) (list.tail ts)
+    }
+    else if at_end ts { err ("unterminated `" + record_keyword kind + "`: expected `}`") sp }
+    else {
+        match record_entry (at_statement c ts) name fields members ts {
+            [:error, m, s] => err m s,
+            [:ok, [:field, f], rest] =>
+                record_body c kind name sp (core.cons f fields) members rest,
+            [:ok, [:member, m], rest] =>
+                record_body c kind name sp fields (core.cons m members) rest,
+        }
+    };
+
+/// The keyword a backing kind was written with, for a diagnostic that quotes
+/// what the reader typed rather than what the compiler made of it.
+let record_keyword kind = match kind { :list => "group", :array => "struct", :map => "mapping" };
+
+/// One entry: a field, a field with a default, or a member.
+///
+/// What tells them apart is whether anything was written between the name and
+/// the `=`. `x = 0` is a field whose accessor falls back to `0`; `f self = 0`
+/// is a function of one parameter, and a field could not be, because a field
+/// is a place in a collection and places do not take arguments. So the
+/// parameters are parsed first and the answer follows from whether there were
+/// any -- no lookahead for `=`, and no keyword to introduce either form.
+let rec record_entry c name fields members ts =
+    if not (at ts :ident) {
+        err ("expected a field, a member or `}` in `" + name + "`, found " + describe ts) (peek_span ts)
+    } else if is_keyword (peek_value ts) {
+        err ("`" + to_string (peek_value ts) + "` is a keyword and cannot name a field or a member")
+            (peek_span ts)
+    } else {
+        let entry = peek_value ts;
+        let at_name = peek_span ts;
+        match let_params c [] (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, params, rest] =>
+                if list.is_empty params { record_field_entry c name fields members entry at_name rest }
+                else { record_member_entry c name fields members entry at_name params rest }
+        }
+    };
+
+/// A field, which may be given a default: what reading it answers when the
+/// collection has nothing at that key or position.
+let record_field_entry c name fields members entry at_name ts =
+    if str.ends_with "!" entry {
+        err "a record field must be a plain name: `!` marks a name impure, and reading a field is pure"
+            at_name
+    } else if taken name fields members entry || taken name fields members ("set_" + entry) {
+        err ("record field `" + entry + "` conflicts with a generated helper") at_name
+    } else { match peek_kind ts {
+        :eq => match parse_expr c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, e, after] =>
+                if names_something e {
+                    err ("a record field's default may not name anything: it is "
+                         + "compiled inside the module `" + name + "` becomes, which "
+                         + "cannot see the one it is written in") (ast.span e)
+                } else {
+                    ok [:field, ast.record_field (ast.param entry at_name) e] after
+                },
         },
-        _ => err "expected a record field or `}`" (peek_span ts),
+        _ => ok [:field, ast.record_field (ast.param entry at_name) ()] ts,
+    } };
+
+/// A member: an ordinary function, compiled inside the module the record
+/// becomes. Its body may name anything that module holds -- the accessors, the
+/// setters, `make`, `new`, another member -- which is the whole point of
+/// writing it there, and is why `names_something` does not apply to it.
+let record_member_entry c name fields members entry at_name params ts =
+    if taken name fields members entry {
+        err ("record member `" + entry + "` conflicts with a generated helper") at_name
+    } else { match expect ts :eq ("`=` after the parameters of `" + entry + "`") {
+        [:error, m, s] => err m s,
+        [:ok, _, rest] => match parse_expr c rest {
+            [:error, m, s] => err m s,
+            [:ok, body, after] =>
+                ok [:member, ast.record_member entry params body
+                                               (ast.span_to at_name (ast.span body))] after,
+        },
+    } };
+
+/// Is this name already spoken for by something the record generates? The two
+/// constructors, every field's accessor and setter, and every member so far.
+/// Checking against what came *before* is what blames the later of two names
+/// and leaves the first where it was written.
+let taken name fields members n =
+    n == "make" || n == "new"
+    || list.any (fn f -> ast.field_name f == n || "set_" + ast.field_name f == n) fields
+    || list.any (fn m -> ast.member_name m == n) members;
+
+/// Does this expression name anything?
+///
+/// A field's default is compiled *inside* the module the record becomes, and a
+/// module does not see the one it was written in -- `mod M { let f () = outer;
+/// }` cannot find `outer` either. So a default that named a global would be a
+/// "cannot find" reported against a span nobody wrote, which is the worst kind
+/// of diagnostic there is: the rewrite hands the generated module fresh spans,
+/// because a default appears twice in it -- in the accessor's `else` and in
+/// `new`'s body -- and two occurrences cannot share one span.
+///
+/// A member is under no such restriction, and for both halves of that reason:
+/// it appears once, so it keeps the spans it was written at, and naming the
+/// module's own globals is what it is for.
+///
+/// A lambda is caught by this too, because its body names its own parameter.
+/// That is stricter than it has to be and it is the honest boundary: what can
+/// be written is what needs nothing from any scope.
+let rec names_something e =
+    match e {
+        [:name, _, _] => true,
+        [:field, _, _, _] => true,
+        _ => type_of e == :list && list.any (fn x -> names_something x) e,
     };
 
 /// A dotted path: `std.list`. Answers `[segments, rest]`.
@@ -1124,7 +1277,7 @@ let rec parse_virtual c sp ts =
                     err ("expected a name after `virtual let`, found " + describe after) (peek_span after)
                 } else {
                     let name = peek_value after;
-                    match let_params [] (list.tail after) {
+                    match let_params c [] (list.tail after) {
                         [:error, m, s] => err m s,
                         [:ok, params, rest] =>
                             if list.is_empty params {
@@ -1290,19 +1443,64 @@ when test {
         };
 
     let tests = [
+        test.case "private let retains its visibility"
+            $( test.eq! "(priv (let x (int 1)))" (items "priv let x = 1;") ),
+        test.case "priv requires a let declaration"
+            $( test.eq! "expected `let` after `priv`" (fails_module "priv mod a {}") ),
+        test.case "priv is reserved as a binding name"
+            $( test.true! (str.contains_str "keyword" (fails_module "let priv = 1;")) ),
+        test.case "priv cannot modify a local binding"
+            $( test.true! (str.contains_str "keyword" (fails "{ priv let x = 1; x }")) ),
         test.case "macro declarations retain syntax parameters"
             $( test.eq! "(macro identity x (name x))" (items "macro identity x = x;") ),
         test.case "expand consumes an application before operators"
             $( test.eq! "(binary add (expand (apply (name twice) (name x))) (int 1))"
                         (shape "expand twice x + 1") ),
         test.case "records retain their backing kind and field order"
-            $( test.eq! "(group Point x y) (struct Pair a b)"
-                        (items "group Point { x, y } struct Pair { a, b, }") ),
+            $( test.eq! "(group Point x y) (struct Pair a b) (mapping Named z a)"
+                        (items "group Point { x, y } struct Pair { a, b, } mapping Named { z, a, }") ),
+        test.case "a record retains its behavior declaration"
+            $( test.eq! "(struct Person (derive example.Named) name)"
+                        (items "struct Person derive example.Named { name }") ),
         test.case "record helpers cannot collide"
             $( test.eq! "record field `set_x` conflicts with a generated helper"
                         (fails_module "group Point { x, set_x }") ),
+        test.case "a field may be given a default"
+            $( test.eq! "(mapping C (retries = (int 3)) host)"
+                        (items "mapping C { retries = 3, host }") ),
+        // Parameters are the whole of what tells a member from a field, so the
+        // two spellings are checked side by side: `x = 0` has none and is a
+        // field, `f self = 0` has one and is a function.
+        test.case "parameters are what make an entry a member"
+            $( test.eq! "(group P (x = (int 0)) (f self = (int 0)))"
+                        (items "group P { x = 0, f self = 0 }") ),
+        test.case "a member may take more than the record"
+            $( test.eq! "(group P x (shifted self d = (apply (name make) (name d))))"
+                        (items "group P { x, shifted self d = make d }") ),
+        // A record body separates its entries the way a block separates its
+        // statements: with the punctuation where it is written, and with a
+        // line break where it is not. Without this, `name` and `age` on two
+        // lines are one field taking one parameter.
+        test.case "a line break separates entries as a comma does"
+            $( test.eq! "(mapping P name age)" (items "mapping P {\n    name\n    age\n}") ),
+        test.case "a member ends at the line break after it"
+            $( test.eq! "(mapping P name (hi self = (apply (name name) (name self))))"
+                        (items "mapping P {\n    name\n    hi self = name self\n}") ),
+        test.case "an entry may run over a line it is indented past"
+            $( test.eq! "(mapping P (n = (binary add (int 1) (int 2))))"
+                        (items "mapping P {\n    n =\n        1 + 2\n}") ),
+        test.case "a member cannot take a name the record generates"
+            $( test.eq! "record member `new` conflicts with a generated helper"
+                        (fails_module "group Point { x, new self = 1 }") ),
+        test.case "a member may be impure where a field may not"
+            $( test.eq! "(group P x (bang! self = (name self)))"
+                        (items "group P { x, bang! self = self }") ),
+        test.case "a field may not be impure"
+            $( test.eq! "a record field must be a plain name: `!` marks a name impure, and reading a field is pure"
+                        (fails_module "group Point { x! }") ),
         test.case "record keywords remain usable as local names"
-            $( test.eq! "(let group (int 1))" (items "let group = 1;") ),
+            $( test.eq! "(let group (int 1)) (let struct (int 2)) (let mapping (int 3))"
+                        (items "let group = 1; let struct = 2; let mapping = 3;") ),
         // --- literals ---
         test.case "integer"   $( test.eq! "(int 42)" (shape "42") ),
         test.case "float"     $( test.eq! "(float 1.5)" (shape "1.5") ),

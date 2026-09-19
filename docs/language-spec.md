@@ -96,11 +96,11 @@ different identifiers, and the `!` is what marks the binding impure ([§6](#6-pu
 Keywords, which may not be used as ordinary names:
 
 ```
-let  rec  if  else  import  as  catch  true  false
+let  priv  rec  if  else  import  as  catch  true  false
 not  try!  fn  virtual  derive  comp  comp!  when  mod
 ```
 
-Of these, `let  rec  else  import  as  catch  virtual  derive  when  mod` can
+Of these, `let  priv  rec  else  import  as  catch  virtual  derive  when  mod` can
 never begin an expression, so encountering one ends an application's argument
 list.
 
@@ -548,34 +548,92 @@ statement), and the two differ in one way:
 Writing `rec` at top level is still worth doing where it documents intent; the
 standard library does.
 
-### `group` and `struct`
+### `group`, `struct` and `mapping`
 
 Records declare a namespace of generated functions. `group` uses a list;
-`struct` uses an array (a fixed-size positional tuple).
+`struct` uses an array (a fixed-size positional tuple); `mapping` uses a map
+whose keys are atoms named after the fields.
 
 ```dream
 group Point { x, y }
 struct Vector { x, y }
+mapping Position { x, y }
 
 let p = Point.make 3 4;       // [3, 4]
 let x = Point.x p;            // 3
 let q = Point.set_y p 9;      // [3, 9]; p is still [3, 4]
 let v = Vector.make 3 4;      // #[3, 4]
+let m = Position.make 3 4;    // %{ :x => 3, :y => 4 }
+let n = Position.set_y m 9;  // %{ :x => 3, :y => 9 }; m is unchanged
 ```
 
 For each field `f`, the compiler generates `f record` and
 `set_f record value`. `make` takes the fields in declaration order. Helpers
 are ordinary curried functions, and fields retain normal collection laziness.
-An empty declaration has a `make ()` constructor. Fields are comma-separated,
-with an optional trailing comma. Duplicate fields and names that collide with
-`make` or another generated helper are rejected.
+An empty declaration has a `make ()` constructor. Duplicate fields and names
+that collide with `make`, `new` or another generated helper are rejected.
+
+Entries are separated by `,`, or by a line break where no comma is written —
+the same rule a block uses for `;`. An entry may run over as many lines as it
+is indented past.
+
+**Defaults.** `f = e` gives a field a default: what reading it answers when
+the collection has nothing at that key or position. The default is the `else`
+of the read the accessor compiles to, so it costs nothing where it is not used
+and is lazy where it is. A default may not name anything — it is compiled
+inside the module the declaration becomes, which cannot see the one it is
+written in.
+
+**`new`.** Arity is fixed, so a default does not make `make`'s parameter
+optional. `new` is the constructor that takes only the fields *without*
+defaults, in declaration order, and fills the rest in:
+
+```dream
+mapping Config { host, retries = 3 }
+
+let a = Config.make "h" 9;    // %{ :host => "h", :retries => 9 }
+let b = Config.new "h";       // %{ :host => "h", :retries => 3 }
+let c = Config.retries %{};   // 3 -- the accessor's fallback
+```
+
+`new` writes the default into the collection rather than leaving the slot
+empty, so `Config.new "h" == Config.make "h" 3`. It is generated for every
+record; one with no defaults gets two names for the same constructor.
+
+**Members.** An entry with parameters is a function rather than a field:
+
+```dream
+mapping Person {
+    name
+    greeting = "Hi"
+    say_hi self = greeting self + " " + name self
+    louder self = say_hi self + "!"
+}
+
+let p = Person.new "Ada";
+let s = Person.say_hi p;      // "Hi Ada"
+```
+
+Having parameters is the whole of what tells a member from a field — `x = 0`
+has none and is a field, `f self = 0` has one and is a member. A member
+occupies no slot in the collection, `make` and `new` do not take it, and it
+has no setter. Its body is compiled *inside* the generated module, so it may
+name the accessors, the setters, the constructors and the other members
+without importing anything; it may not name anything from the module the
+declaration was written in, which is the ordinary rule for a nested `mod`.
+
+The receiver is an ordinary parameter with no special standing: `self` above
+is a name the author picked, and the language does not know it. A member may
+be impure (`f! self = ..`); a field may not, because reading one is pure.
 
 These declarations add no runtime type or tag: indexing, equality, `type_of`,
-and list/array patterns work exactly as for the underlying collection.
+and list/array/map patterns work exactly as for the underlying collection.
+Mapping getters read the corresponding atom key; setters insert or replace
+that key, preserving any other entries in the map.
 Records can appear wherever module declarations can, including `mod` and
-`when` blocks, and their helper namespaces can be imported. `group` and
-`struct` are contextual declaration keywords; existing local bindings with
-those names continue to work.
+`when` blocks, and their helper namespaces can be imported. `group`,
+`struct` and `mapping` are contextual declaration keywords; existing local
+bindings with those names continue to work.
 
 ### `import`
 
@@ -624,6 +682,45 @@ A virtual needs at least one parameter — a parameterless virtual would be a
 constant, not a hole. Because Dream compiles whole programs, `derive`
 specializes the base module's *syntax tree* against the deriving module's
 implementations, so there is no run-time dispatch.
+
+These modules are Dream's **behaviors**: explicit contracts and reusable
+implementations over dynamically typed values. Each implementation must be
+public and declare exactly as many parameters as its virtual declaration,
+including when overriding a default. A function alias must spell out those
+parameters (`let area self = other.area self`). Parameter names may differ;
+parameter and return types are not checked. The `!` suffix is part of the
+contract's name, and ordinary purity checking applies to method bodies.
+
+Records implement a behavior with `derive` between the name and body:
+
+```dream
+mod shape {
+    virtual let area self;
+    virtual let name self = "shape";
+    let describe self = name self + " of area " + to_string (area self);
+}
+
+struct Rectangle derive shape {
+    width
+    height
+    area self = width self * height self
+    name self = "rectangle"
+}
+
+Rectangle.describe (Rectangle.make 3 4)   // "rectangle of area 12"
+```
+
+The same syntax works for `group` and `mapping`. Generated helpers can satisfy
+requirements too: `mapping Measured derive shape { area }` implements `area`
+through its field accessor and inherits the default `name`. Derived paths
+resolve just as they do inside an ordinary module, including sibling modules
+and modules in other files. Missing methods, wrong arities, and private
+implementations are compile errors even if no caller uses them.
+
+A module or record derives one base module. Calls name the implementing
+namespace (`Rectangle.area value`); values keep their ordinary collection
+representation. For generic callers, pass operations as ordinary function
+arguments. This mechanism does not add automatic dispatch on a value's type.
 
 ### `when` — conditional compilation
 
@@ -1737,3 +1834,18 @@ deliberately narrow — it records *which* globals are wrappers at scope time, s
 lowering can rewrite a saturated call *because* it knows the frame it stands
 for adds nothing. When a measurement shows a function hot for no apparent
 reason, the first question is whether a lazy list is being walked twice.
+
+### Private declarations
+
+Module declarations are public by default. Prefix a declaration with `priv`
+to keep its bindings private to that module:
+
+```dream
+priv let helper x = x + 1;
+let increment x = helper x;
+```
+
+`priv let rec` and `priv let [a, b] = pair` are also supported. Other modules
+cannot access private bindings through qualified names or selective imports.
+Block-local bindings already have lexical scope; `priv` applies to module
+declarations only.

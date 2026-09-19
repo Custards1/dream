@@ -10,6 +10,7 @@
 // kept in the runtime's order so that emission can use the position directly
 // when it arrives, rather than needing a second table that could disagree.
 
+import std.core;
 import std.list;
 import std.str;
 
@@ -39,6 +40,39 @@ let names = [
 
 let is_builtin name = list.contains name names;
 
+/// What each one takes and answers, as one line.
+///
+/// This is the comment beside the name above, moved into the program, and it
+/// is here rather than there because a comment is no use to a language server:
+/// completion on a builtin could show nothing but the name it was already
+/// showing. A map rather than a second list, so that adding a name and
+/// forgetting its line is a failing test (`every builtin has a signature`
+/// below) and not a quiet off-by-one in a list nobody reads.
+///
+/// There is no type system to check these against. They say what the runtime
+/// does, in the notation the rest of this codebase uses in its comments.
+let signatures = %{
+    "spawn!"    => "thunk -> process",
+    "join!"     => "process -> value",
+    "send!"     => "process -> value -> unit",
+    "recv!"     => "unit -> value",
+    "self!"     => "unit -> process",
+    "raise!"    => "value -> never",
+    "type_of"   => "value -> atom",
+    "to_string" => "value -> string",
+    "len"       => "list|array|map|string -> integer",
+    "strict!"   => "value -> the same value, forced all the way down",
+
+    "match_is_cons" => "value -> bool, true for a non-empty list",
+    "match_head"    => "list -> its head, unforced",
+    "match_tail"    => "list -> its tail, unforced",
+    "match_at"      => "array -> index -> element, unforced",
+    "match_key"     => "map -> key -> [value] if present, [] if not",
+};
+
+/// A builtin's signature, or its bare name for one that has none.
+let signature name = core.map_get signatures name name;
+
 /// The runtime's index for a builtin, or `()`. Emission will want this; nothing
 /// does yet.
 let id name = {
@@ -67,5 +101,12 @@ when test {
         test.case "the match builtins cannot be reached by an ordinary name"
             $( test.false! (list.any (fn n -> not (str.starts_with "match_" n)
                                                && str.starts_with "match" n) names) ),
+        test.case "every builtin has a signature"
+            $( test.eq! [] (list.filter (fn n -> not (core.map_has signatures n)) names) ),
+        test.case "nothing has a signature that is not a builtin"
+            $( test.eq! [] (list.filter (fn kv -> not (is_builtin (list.head kv)))
+                                        (core.map_pairs signatures)) ),
+        test.case "a signature is what the name takes and answers"
+            $( test.eq! ["value -> atom", "nope"] [signature "type_of", signature "nope"] ),
     ];
 }

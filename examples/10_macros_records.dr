@@ -3,7 +3,24 @@ import std.console;
 
 group Point { x, y }
 struct Vector { x, y }
+mapping Position { x, y }
 group Empty {}
+
+// A field may be given a default: what reading it answers when the collection
+// has nothing at that key or position. `make` still takes every field, because
+// arity is fixed; `new` is the constructor that takes only the ones without a
+// default and fills the rest in.
+//
+// An entry with parameters is a member rather than a field -- an ordinary
+// function, compiled inside the module the declaration becomes, so its body
+// names the accessors without importing anything. Entries are separated by a
+// line break where no comma is written.
+mapping Person {
+    name
+    greeting = "Hi"
+    say_hi self = greeting self + " " + name self
+    louder self = say_hi self + "!"
+}
 
 // A macro receives syntax, not values. Here the input tree is inserted twice.
 // The last element of every syntax node is its source span; the compiler gives
@@ -25,7 +42,13 @@ let main! = {
     let vector = Vector.make 5 6;
     console.print! [vector, Vector.y vector, Vector.set_x vector 7, vector]
     console.print! (Empty.make ())
+    let position = Position.make 3 4;
+    console.print! [type_of position, Position.x position,
+                    (Position.set_y position 9).[:y], Position.y position]
     console.print! (double 10)
     console.print! (expand ignore name_that_does_not_exist)
     console.print! (expand swap [1, 2])
+    let ada = Person.new "Ada";
+    console.print! [Person.say_hi ada, Person.louder (Person.make "Bob" "Hello")]
+    console.print! [Person.new "Ada" == Person.make "Ada" "Hi", Person.greeting %{}]
 };

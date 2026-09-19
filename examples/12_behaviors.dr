@@ -1,0 +1,29 @@
+// A behavior is a module with required methods and optional defaults.
+import std.console;
+
+mod shape {
+    virtual let area self;
+    virtual let name self = "shape";
+    let describe self = name self + " of area " + to_string (area self);
+}
+
+struct Rectangle derive shape {
+    width
+    height
+    area self = width self * height self
+    name self = "rectangle"
+}
+
+// A field accessor can implement a required method. The default name stays.
+mapping Measured derive shape {
+    area
+}
+
+// Functions remain first-class: generic callers can accept an operation.
+let describe_with describe value = describe value;
+
+let main! = {
+    console.print! (Rectangle.describe (Rectangle.make 3 4))
+    console.print! (Measured.describe (Measured.make 9))
+    console.print! (describe_with Rectangle.describe (Rectangle.new 5 6))
+};

@@ -78,6 +78,7 @@ let find needle s = core.str_find s needle 0;
 
 let contains_str needle s = core.str_find s needle 0 >= 0;
 
+
 let starts_with prefix s = core.str_slice s 0 (core.str_len prefix) == prefix;
 
 let ends_with suffix s =

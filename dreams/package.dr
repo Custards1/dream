@@ -18,6 +18,7 @@
 import std.core;
 import std.io;
 import std.list;
+import std.macros;
 import std.os;
 import std.str;
 import std.toml;
@@ -33,25 +34,34 @@ let module_extensions = ["dr"];
 
 // --- a package --------------------------------------------------------------
 
-let make name version root src deps manifest =
-    %{ :name => name, :version => version, :root => root,
-       :src => src, :deps => deps, :manifest => manifest };
+mapping Package {
+    name = ""
+    version = "0.0.0"
+    root = "."
+    src = "."
+    deps = []
+    manifest = ""
+}
 
-let name p    = core.map_get p :name "";
-let version p = core.map_get p :version "0.0.0";
+let make = Package.make;
+
+let name p = Package.name p;
+let version p = Package.version p;
 /// The directory holding the manifest.
-let root p    = core.map_get p :root ".";
+let root p = Package.root p;
 /// Where this package's modules live -- `src` in the manifest.
-let src p     = core.map_get p :src ".";
-let deps p    = core.map_get p :deps [];
-let manifest p = core.map_get p :manifest "";
+let src p = Package.src p;
+let deps p = Package.deps p;
+let manifest p = Package.manifest p;
 
 /// A dependency: a name, and where to find it relative to the depending
 /// package's root. The path is `()` for a dependency given some other way,
 /// which is not supported yet and is reported rather than ignored.
-let dep name path = [name, path];
-let dep_name d = list.nth 0 d;
-let dep_path d = list.nth 1 d;
+group Dependency { name, path }
+
+let dep = Dependency.make;
+let dep_name = Dependency.name;
+let dep_path = Dependency.path;
 
 // --- finding a module inside a package --------------------------------------
 
@@ -178,8 +188,7 @@ let load_manifest! file =
                                         };
                                     [:ok, make n (toml.get "0.0.0" doc "package" "version")
                                               root_dir src_dir
-                                              (list.map (fn e -> dep (list.nth 0 e)
-                                                                     (dep_location (list.nth 1 e)))
+                                              (list.map (fn [name, location] -> dep name (dep_location location))
                                                         (toml.entries doc "dependencies"))
                                               file]
                                 },
@@ -205,16 +214,11 @@ let at s i = list.nth i (packages s);
 
 /// The package called `n`, or `()`.
 let find s n =
-    match core.map_get (by_name s) n () {
-        () => (),
-        i  => at s i,
-    };
+    expand macros.with_some i ((by_name s).[n else ()]) (at s i);
 
-let current_index s = core.map_get s :current ()
-;
+let current_index s = s.[:current else ()];
 /// The package the root file belongs to, or `()`.
-let current s =
-    match current_index s { () => (), i => at s i };
+let current s = expand macros.with_some i (current_index s) (at s i);
 
 let names s = list.sort (list.map (fn p -> name p) (packages s));
 

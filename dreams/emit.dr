@@ -112,13 +112,19 @@ let f64 v = core.float_bytes v;
 /// A section, with its length worked out once. A section body is a string, so
 /// its length is a field read rather than a walk -- and it is asked for three
 /// times over, in the table, in the layout, and in the padding.
-let section kind body count =
-    %{ :kind => kind, :body => body, :count => count, :len => str.byte_length body };
+mapping Section {
+    kind = 0
+    body = ""
+    count = 0
+    len = 0
+}
 
-let sec_kind s  = core.map_get s :kind 0;
-let sec_body s  = core.map_get s :body "";
-let sec_count s = core.map_get s :count 0;
-let sec_len s   = core.map_get s :len 0;
+let section kind body count = Section.make kind body count (str.byte_length body);
+
+let sec_kind s = Section.kind s;
+let sec_body s = Section.body s;
+let sec_count s = Section.count s;
+let sec_len s = Section.len s;
 
 /// A four-character tag, read as a little-endian word the way the loader reads
 /// it. Written out as the characters so that a hex dump of an image says what
@@ -147,14 +153,14 @@ let t_payl = tag 80 65 89 76;   // PAYL
 /// far on each one.
 let concat_map f xs = str.concat_all (list.map f xs);
 
-let node_bytes n =
+let node_bytes [op, flags, a, b, c] =
     str.concat_all [
-        u8 (match ir.opcode (ir.node_op n) { () => 0, c => c }),
-        u8 (ir.node_flags n),
+        u8 (match ir.opcode op { () => 0, code => code }),
+        u8 flags,
         u16 0,
-        index (ir.node_a n),
-        index (ir.node_b n),
-        index (ir.node_c n),
+        index a,
+        index b,
+        index c,
     ];
 
 let func_bytes f =

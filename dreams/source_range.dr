@@ -1,0 +1,9 @@
+// Shared operations on half-open byte ranges. Tokens store their bounds in
+// arrays; AST spans store them in pairs. Derivation specializes these methods
+// against each representation's generated field accessors.
+virtual let span_start self;
+virtual let span_end self;
+
+let span self = [span_start self, span_end self];
+let byte_length self = span_end self - span_start self;
+let contains offset self = span_start self <= offset && offset < span_end self;

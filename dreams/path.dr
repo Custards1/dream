@@ -21,6 +21,7 @@
 import std.core;
 import std.io;
 import std.list;
+import std.macros;
 import std.os;
 import std.str;
 
@@ -48,9 +49,11 @@ let dirname p = {
         else if str.slice i 1 p == separator { last_slash (i + 1) i }
         else { last_slash (i + 1) best };
     let at = last_slash 0 (0 - 1);
-    if at < 0 { "." }
-    else if at == 0 { separator }
-    else { str.slice 0 at p }
+    match at {
+        _ if at < 0 => ".",
+        0 => separator,
+        _ => str.slice 0 at p,
+    }
 };
 
 let basename p = {
@@ -61,12 +64,15 @@ let basename p = {
 /// `a/b` -- but an empty or `.` side is dropped rather than kept, because these
 /// paths are read by people in diagnostics and `././main.dr` helps nobody. An
 /// absolute right-hand side wins outright: it is already anchored.
-let join a b =
-    if str.is_empty b || b == "." { a }
-    else if str.is_empty a || a == "." { b }
-    else if is_absolute b { b }
-    else if str.ends_with separator a { a + b }
-    else { a + separator + b };
+let join a b = match [a, b] {
+    [_, ""] => a,
+    [_, "."] => a,
+    ["", _] => b,
+    [".", _] => b,
+    _ if is_absolute b => b,
+    _ if str.ends_with separator a => a + b,
+    _ => a + separator + b,
+};
 
 let rec join_all base parts =
     match parts {
@@ -144,10 +150,8 @@ let normalize p = {
 /// be worse than not answering.
 let expand_home! p =
     if p == "~" || str.starts_with "~/" p {
-        match os.env! "HOME" {
-            () => p,
-            home => home + str.slice 1 (str.byte_length p - 1) p,
-        }
+        expand macros.if_some home (os.env! "HOME")
+            (home + str.slice 1 (str.byte_length p - 1) p) p
     }
     else { p };
 

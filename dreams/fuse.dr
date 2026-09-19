@@ -109,26 +109,36 @@ let role_strict r = list.nth 3 r;
 /// `source` is `[tag, argument expressions]`; `step` is `[:ast, expr]` for a
 /// fold whose function was written at the call site, or `[:op, tag]` for `sum`
 /// and `product`.
-let plan span fi gi source seed step strict guards subst elem =
-    %{ :span => span, :fi => fi, :gi => gi, :source => source,
-       :seed => seed, :step => step, :strict => strict,
-       :guards => guards, :subst => subst, :elem => elem };
+mapping Plan {
+    span = [0, 0]
+    fi = 0
+    gi = 0
+    source = []
+    seed = ()
+    step = []
+    strict = false
+    guards = []
+    subst = []
+    elem = 0
+}
 
-let plan_span p   = core.map_get p :span [0, 0];
-let plan_fi p     = core.map_get p :fi 0;
-let plan_gi p     = core.map_get p :gi 0;
-let plan_source p = core.map_get p :source [];
-let plan_seed p   = core.map_get p :seed ();
-let plan_step p   = core.map_get p :step [];
-let plan_strict p = core.map_get p :strict false;
+let plan span fi gi source seed step strict guards subst elem = Plan.make span fi gi source seed step strict guards subst elem;
+
+let plan_span p = Plan.span p;
+let plan_fi p = Plan.fi p;
+let plan_gi p = Plan.gi p;
+let plan_source p = Plan.source p;
+let plan_seed p = Plan.seed p;
+let plan_step p = Plan.step p;
+let plan_strict p = Plan.strict p;
 /// The conditions the `filter`s became, in the order the elements meet them.
-let plan_guards p = core.map_get p :guards [];
+let plan_guards p = Plan.guards p;
 /// `[slot, expression]` for each stage whose output has no slot of its own.
 /// See "a stage that has no slot" below.
-let plan_subst p  = core.map_get p :subst [];
+let plan_subst p = Plan.subst p;
 /// The slot the element the sink sees is read from -- the source's own, when
 /// no `map` came between them.
-let plan_elem p   = core.map_get p :elem cursor_slot;
+let plan_elem p = Plan.elem p;
 
 /// Where the loop keeps things. Every fused loop has the same three
 /// parameters, whichever source it came from: a cursor the source advances, a

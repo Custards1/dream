@@ -151,7 +151,7 @@ let carried_ok slice =
             _ => false,
         }) slice;
 
-let ast_record item = match item { [:record, _, _, _, _] => true, _ => false };
+let ast_record item = match item { [:record, _, _, _, _, _, _] => true, _ => false };
 
 /// Which way to compile an entry, decided before anything is loaded:
 /// `:reboot` -- nothing carried, or the prefix the engine stands for no longer

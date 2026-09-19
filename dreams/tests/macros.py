@@ -55,6 +55,7 @@ macro reverse [kind, xs, sp] = [kind, list.reverse xs, sp];
 macro identity e = e;
 group Point { x, y }
 struct Vector { x, y }
+mapping Named { second, first }
 ''')
     success('''
 import std.console;
@@ -96,6 +97,20 @@ let main! = {
 };
 ''', '14\n18\n')
 
+    # A macro may call a helper whose own body was written with `expand`, and
+    # that is what the snapshot the macro VM runs against has to be fresh
+    # enough for. One snapshot serves the whole program, so by the time `use`
+    # runs, the snapshot's `helper` is the `1 / 0` an unexpanded call is staged
+    # as -- and the retry against a fresh one is the whole reason this answers
+    # 6 instead of reporting that the macro failed.
+    success("""
+import std.console;
+macro twice e = [:binary, :add, e, e, [0, 0]];
+let helper n = expand twice n;
+macro use e = [:int, helper 3, [0, 0]];
+let main! = console.print! (expand use 1);
+""", '6\n')
+
     # Unrelated comp! expressions run once in the final program's comp pass.
     success('''
 import std.console;
@@ -116,6 +131,64 @@ let main! = {
 };
 ''', '[[], #[]]\n7\n')
 
+    # Map records use field-name atoms, preserve constructor order and remain
+    # ordinary persistent maps. Both constructors and updates keep values lazy.
+    success('''
+import std.console;
+import helpers;
+import helpers.Named as Pair;
+mod nested { mapping Empty {} }
+when true { mapping Lazy { first, second, } }
+when false { mapping Hidden { unused } }
+let mapping n = n + 1;
+let main! = {
+    let pair = Pair.make 20 10;
+    let changed = Pair.set_first pair;
+    console.print! [type_of pair, pair == %{ :first => 10, :second => 20 }]
+    console.print! [Pair.first pair, Pair.second pair, Pair.first (changed 30), Pair.first pair]
+    console.print! (match pair { %{ :first => x, :second => y } => x + y })
+    console.print! (nested.Empty.make () == %{})
+    console.print! (Lazy.first (Lazy.make 7 (1 / 0)))
+    console.print! (Lazy.first (Lazy.set_second (Lazy.make 8 9) (1 / 0)))
+    console.print! (Pair.second (Pair.set_first %{ :second => 4, :extra => 5 } 3))
+    console.print! ((Pair.set_first %{ :extra => 5 } 3).[:extra])
+    console.print! (mapping 4)
+};
+''', '[:map, true]\n[10, 20, 30, 10]\n30\ntrue\n7\n8\n4\n5\n5\n')
+
+    # Defaults, `new` and members, through a real compile and both VM paths.
+    #
+    # `Lazy` is the laziness check: a default is the `else` of the read its
+    # accessor compiles to, so a record built by `new` never evaluates the
+    # default of a field nobody asks for -- `1 / 0` as a default is reached
+    # only by the read that wants it.
+    success('''
+import std.console;
+mapping Person {
+    name
+    greeting = "Hi"
+    say_hi self = greeting self + " " + name self
+    louder self = say_hi self + "!"
+}
+group Point {
+    x
+    y = 0
+    len2 self = x self * x self + y self * y self
+    shifted self d = make (x self + d) (y self + d)
+}
+struct Boxed { w = 1, h = 2, area self = w self * h self }
+mapping Lazy { kept, bad = 1 / 0 }
+let main! = {
+    console.print! [Person.say_hi (Person.new "Ada"), Person.louder (Person.make "Bob" "Yo")]
+    console.print! (Person.new "Ada" == Person.make "Ada" "Hi")
+    console.print! [Point.len2 (Point.make 3 4), Point.len2 (Point.new 3)]
+    console.print! (Point.shifted (Point.new 1) 5)
+    console.print! [Boxed.area (Boxed.new ()), Boxed.area (Boxed.make 3 4)]
+    console.print! (Lazy.kept (Lazy.new 7))
+    console.print! (Person.greeting %{})
+};
+''', '["Hi Ada", "Yo Bob!"]\ntrue\n[25, 9]\n[6, 5]\n[2, 12]\n7\nHi\n')
+
     failure('macro id x = x; let main! = expand id;', 'expects 1 syntax arguments')
     failure('let id x = x; let main! = expand id 1;', 'declared macro')
     failure('macro bad x = [:error, \"expected a literal list\"]; let main! = expand bad 1;',
@@ -132,10 +205,20 @@ let main! = {
 let main! = expand loop 1;
 ''', 'exceeded 64 nested calls')
     for declaration in ('group Bad { make }', 'group Bad { x, x }',
-                        'struct Bad { x, set_x }', 'struct Bad { set_x, x }'):
+                        'struct Bad { x, set_x }', 'struct Bad { set_x, x }',
+                        'mapping Bad { make }', 'mapping Bad { x, x }',
+                        'mapping Bad { x, set_x }', 'mapping Bad { set_x, x }'):
         failure(declaration, 'conflicts with a generated helper')
-    failure('group Bad { x y }', 'expected `,` or `}`')
+    # `x y` is the start of a member -- a name with a parameter -- so what is
+    # missing is the `=` and its body, not a separator.
+    failure('group Bad { x y }', 'expected `=` after the parameters of `x`')
     failure('group Bad { x!', 'plain name')
+    failure('mapping Bad { x y }', 'expected `=` after the parameters of `x`')
+    failure('mapping Bad { x!', 'plain name')
+    for declaration in ('group Bad { new }', 'mapping Bad { x, new self = 1 }',
+                        'struct Bad { x, x self = 1 }'):
+        failure(declaration, 'conflicts with a generated helper')
+    failure('mapping Bad { x, y = x }', 'may not name anything')
     # The library returns actionable syntax errors, with no runtime imports
     # needed by its generated expressions. Effects remain checked at the call.
     for expression, message in (
@@ -162,10 +245,12 @@ let main! = expand loop 1;
         [vm, compiler, '--repl', '-L', str(root / 'mind'), '-L', str(root)],
         input='macro twice e = [:binary, :add, e, e, [0, 0]];\n'
               'expand twice 21\ngroup Point { x, y }\n'
-              'Point.set_x (Point.make 1 2) 9\n:quit\n',
+              'Point.set_x (Point.make 1 2) 9\nmapping Named { x }\n'
+              'Named.x (Named.set_x (Named.make 1) 73)\n:quit\n',
         env={**os.environ, 'DREAM': vm}, capture_output=True, text=True, timeout=30)
     assert session.returncode == 0, session.stderr
     assert '42' in session.stdout and '[9, 2]' in session.stdout, session.stdout
+    assert '73' in session.stdout, session.stdout
     assert 'error:' not in session.stderr, session.stderr
     count += 1
     print(f'{count} macro/record cases passed (interpreter and JIT)')

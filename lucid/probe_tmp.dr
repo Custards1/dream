@@ -1,0 +1,39 @@
+import std.core;
+import std.list;
+import std.str;
+import std.console;
+import analysis;
+import pos;
+
+let of! text = analysis.analyse! "/buf.dr" [] (core.map_put (core.map_new ()) "/buf.dr" text);
+
+/// Ask at the `|`, which is removed first.
+let at! text = {
+    let i = str.find "|" text;
+    let src = str.slice 0 i text + str.slice (i + 1) (str.byte_length text - i - 1) text;
+    let a = of! src;
+    let lc = pos.to_line src i;
+    let h = match analysis.hover_at a (list.nth 0 lc) (list.nth 1 lc) {
+        () => "<none>", x => core.map_get (core.map_get x "contents" ()) "value" "",
+    };
+    let d = match analysis.definition_at a (list.nth 0 lc) (list.nth 1 lc) {
+        () => "<none>", x => to_string (core.map_get (core.map_get x "range" ()) "start" ()),
+    };
+    [h, d]
+};
+
+let show! label text = {
+    let r = at! text;
+    console.print! (label + "\n    hover: " + list.nth 0 r + "\n    def:   " + list.nth 1 r);
+};
+
+let main! = {
+    show! "use of a virtual inside the base's own body"
+        "mod B { virtual let name self; let label self = |name self; }\nmod C { derive B; let name self = \"c\"; }\nlet main! = C.label 1;\n";
+    show! "the base named by `derive`"
+        "mod B { virtual let name self; let label self = name self; }\nmod C { derive |B; let name self = \"c\"; }\nlet main! = C.label 1;\n";
+    show! "the module named by `import`"
+        "mod B { let q = 1; }\nmod C { import |B; let name = B.q; }\nlet main! = C.name;\n";
+    show! "a private global used in its own module"
+        "priv let hidden x = x;\nlet main! = |hidden 1;\n";
+};

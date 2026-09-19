@@ -26,18 +26,23 @@ import std.str;
 // `when nonsense { .. }` is false -- but a flag has no value to compare, and
 // `when test == "x"` should be false rather than an error.
 
-let make flags values = %{ :flags => flags, :values => values };
+mapping Configuration {
+    flags = %{}
+    values = %{}
+}
 
-let flags c = core.map_get c :flags (core.map_new ());
-let values c = core.map_get c :values (core.map_new ());
+let make = Configuration.make;
+
+let flags c = Configuration.flags c;
+let values c = Configuration.values c;
 
 /// A configuration with nothing defined. `defaults!` is what a compilation
 /// actually starts from; this is what a test starts from.
-let empty = make (core.map_new ()) (core.map_new ());
+let empty = Configuration.new ();
 
-let define name c = make (core.map_put (flags c) name true) (values c);
+let define name c = make ((flags c).[name => true]) (values c);
 
-let set key value c = make (flags c) (core.map_put (values c) key value);
+let set key value c = make (flags c) ((values c).[key => value]);
 
 /// Accepts `name` or `name=value`, which is what `-D` takes. A `=` with
 /// nothing after it defines the setting as the empty string rather than being
@@ -103,8 +108,8 @@ let rec eval c cond =
 /// Every flag and setting, one per line, sorted -- what `--print-cfg` shows.
 /// Settings are quoted so that a value with a space in it still reads as one.
 let describe c = {
-    let named = list.map (fn kv -> list.head kv) (core.map_pairs (flags c));
-    let valued = list.map (fn kv -> list.head kv + " = \"" + list.nth 1 kv + "\"")
+    let named = list.map (fn [name, _] -> name) (core.map_pairs (flags c));
+    let valued = list.map (fn [name, value] -> name + " = \"" + value + "\"")
                           (core.map_pairs (values c));
     list.sort (list.append named valued)
 };

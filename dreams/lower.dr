@@ -20,6 +20,7 @@
 import std.core;
 import std.list;
 import std.str;
+import std.macros;
 
 import dreams.ast;
 import dreams.builtins;
@@ -83,11 +84,17 @@ let warn span message note l =
                      [diag.in_source (source l) (diag.with_note note (diag.warning span message))]);
 
 /// Emit a node: `[lowering, index]`.
-let emit n l = { let got = ir.push_node n (prog l); [set_prog (list.head got) l, list.nth 1 got] };
+let emit n l = {
+    let [program, index] = ir.push_node n (prog l);
+    [set_prog program l, index]
+};
 
 let emit_leaf op l = emit (ir.leaf op) l;
 
-let kids xs l = { let got = ir.push_kids xs (prog l); [set_prog (list.head got) l, list.nth 1 got] };
+let kids xs l = {
+    let [program, offset] = ir.push_kids xs (prog l);
+    [set_prog program l, offset]
+};
 
 let set_flag i f l = set_prog (ir.set_node_flag i f (prog l)) l;
 
@@ -103,28 +110,29 @@ let lookup span l = scope.resolution (res l) (ctx l) (source l) span;
 
 /// The slot a binder at this span was given.
 let slot_at span l =
-    match scope.binding (res l) (ctx l) (source l) span { () => (), b => list.nth 1 b };
+    expand macros.with_some binding (scope.binding (res l) (ctx l) (source l) span)
+        (list.nth 1 binding);
 
 // --- constants ----------------------------------------------------------------
 
 let const_int v l = {
-    let got = ir.intern_int v (prog l);
-    emit (ir.node :const_int (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_int v (prog l);
+    emit (ir.node :const_int index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_float v l = {
-    let got = ir.intern_float v (prog l);
-    emit (ir.node :const_float (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_float v (prog l);
+    emit (ir.node :const_float index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_str v l = {
-    let got = ir.intern_str v (prog l);
-    emit (ir.node :const_str (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_str v (prog l);
+    emit (ir.node :const_str index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_atom v l = {
-    let got = ir.intern_atom v (prog l);
-    emit (ir.node :const_atom (list.nth 1 got) ir.no_node ir.no_node) (set_prog (list.head got) l)
+    let [program, index] = ir.intern_atom v (prog l);
+    emit (ir.node :const_atom index ir.no_node ir.no_node) (set_prog program l)
 };
 
 let const_char c l = emit (ir.node :const_char (core.char_code c) ir.no_node ir.no_node) l;
@@ -456,7 +464,7 @@ let rec lower_expr e l =
         [:try, body, _, handler, span] => {
             let b = lower_expr body l;
             let h = lower_expr handler (list.head b);
-            let held = match slot_at span (list.head h) { () => 0, s => s };
+            let held = expand macros.coalesce (slot_at span (list.head h)) 0;
             let made = emit (ir.node :try (list.nth 1 b) (list.nth 1 h) held) (list.head h);
             [inherit (list.nth 1 made) [list.nth 1 b, list.nth 1 h] (list.head made),
              list.nth 1 made]
@@ -634,7 +642,7 @@ let rec lower_block stmts span l = {
                     // A local `let f x = ..` is a function like any other: it
                     // was numbered by `scope` and its body is lowered here.
                     else { lower_function sp :make_closure ps body (list.head acc) };
-                let held = match slot_at sp (list.head value) { () => 0, s => s };
+                let held = expand macros.coalesce (slot_at sp (list.head value)) 0;
                 let bound = bind_value held (list.nth 1 value) (list.head value);
                 [list.head bound, list.append (list.nth 1 acc) [[list.nth 1 bound, st]]]
             },
@@ -642,7 +650,7 @@ let rec lower_block stmts span l = {
             // are bound out of it -- see "destructuring".
             [:let_p, pattern, body, sp] => {
                 let value = lower_expr body (list.head acc);
-                let held = match slot_at sp (list.head value) { () => 0, s => s };
+                let held = expand macros.coalesce (slot_at sp (list.head value)) 0;
                 let bound = bind_value held (list.nth 1 value) (list.head value);
                 let reader = emit (ir.node :local held ir.no_node ir.no_node) (list.head bound);
                 let parts = destructure pattern (list.nth 1 reader) (list.head reader);
@@ -1021,12 +1029,12 @@ let check_value pattern value l = {
 /// binds a name to its part of the first.
 let destructure pattern value l = {
     let checked = check_value pattern value l;
-    let slot = match slot_at (scope.checked_span pattern) (list.head checked) { () => 0, s => s };
+    let slot = expand macros.coalesce (slot_at (scope.checked_span pattern) (list.head checked)) 0;
     let held = emit (ir.node :bind slot (list.nth 1 checked) ir.no_node) (list.head checked);
     let reader = emit (ir.node :local slot ir.no_node ir.no_node) (list.head held);
     let parts = extract pattern (list.nth 1 reader) (fn _ -> true) [] (list.head reader);
     list.fold (fn acc part -> {
-        let s = match slot_at (list.nth 0 part) (list.head acc) { () => 0, found => found };
+        let s = expand macros.coalesce (slot_at (list.nth 0 part) (list.head acc)) 0;
         let made = emit (ir.node :bind s (list.nth 1 part) ir.no_node) (list.head acc);
         [list.head made, list.append (list.nth 1 acc) [list.nth 1 made]]
     }) [list.nth 0 parts, [list.nth 1 held]] (list.nth 1 parts)
@@ -1104,7 +1112,7 @@ let rest_wanted want rest = match rest { [_, name_span] => want name_span, _ => 
 /// remembers what it came to.
 let lower_destructure pattern body span l = {
     let value = lower_expr body l;
-    let held = match slot_at span (list.head value) { () => 0, s => s };
+    let held = expand macros.coalesce (slot_at span (list.head value)) 0;
     let bind = emit (ir.node :bind held (list.nth 1 value) ir.no_node) (list.head value);
     let i = list.nth 1 bind;
     let sequenced = set_flag i ir.f_strict (inherit i [list.nth 1 value] (list.head bind));
@@ -1137,7 +1145,7 @@ let lower_destructured hidden pattern name_span l =
 
 let rec lower_match scrutinee arms span l = {
     let value = lower_expr scrutinee l;
-    let held = match slot_at span (list.head value) { () => 0, s => s };
+    let held = expand macros.coalesce (slot_at span (list.head value)) 0;
     let bind = emit (ir.node :bind held (list.nth 1 value) ir.no_node) (list.head value);
     let i = list.nth 1 bind;
     // Every pattern but `_` and a bare name looks at the subject, and the arms
@@ -1172,7 +1180,7 @@ let rec lower_arms arms held span l =
             // by where it was written.
             let bound = list.fold (fn acc b -> {
                 let l0 = list.head acc;
-                let s = match slot_at (list.nth 0 b) l0 { () => 0, sl => sl };
+                let s = expand macros.coalesce (slot_at (list.nth 0 b) l0) 0;
                 let made = emit (ir.node :bind s (list.nth 1 b) ir.no_node) l0;
                 [inherit (list.nth 1 made) [list.nth 1 b] (list.head made),
                  list.append (list.nth 1 acc) [list.nth 1 made]]

@@ -46,19 +46,21 @@ import std.str;
 /// walking to it, so `col` cost five cells every time it was asked for. Reading
 /// a token was a fifth of everything the compiler did. An array indexes in
 /// constant time, and a token is exactly the fixed-shape record arrays are for.
-let make kind value start end starts_line col = #[kind, value, start, end, starts_line, col];
+struct Token derive dreams.source_range { kind, value, span_start, span_end, starts_line, col }
 
-let kind t        = core.array_get t 0;
-let value t       = core.array_get t 1;
-let span_start t  = core.array_get t 2;
-let span_end t    = core.array_get t 3;
-let starts_line t = core.array_get t 4;
-let col t         = core.array_get t 5;
+let make = Token.make;
+let kind = Token.kind;
+let value = Token.value;
+let span_start = Token.span_start;
+let span_end = Token.span_end;
+let span t = Token.span t;
+let starts_line = Token.starts_line;
+let col = Token.col;
 
 let is_error t = kind t == :error;
 
 /// The source text a token was cut from.
-let text_of s t = str.slice (span_start t) (span_end t - span_start t) s;
+let text_of s t = str.slice (span_start t) (Token.byte_length t) s;
 
 // --- byte classes -----------------------------------------------------------
 //
@@ -74,23 +76,25 @@ let cr      = 13;
 let space   = 32;
 let eof     = 0 - 1;
 
-let is_digit b = b >= 48 && b <= 57;
-let is_lower b = b >= 97 && b <= 122;
-let is_upper b = b >= 65 && b <= 90;
-let is_alpha b = is_lower b || is_upper b || b == 95;
-let is_alnum b = is_alpha b || is_digit b;
+priv let is_digit b = b >= 48 && b <= 57;
+priv let is_lower b = b >= 97 && b <= 122;
+priv let is_upper b = b >= 65 && b <= 90;
+priv let is_alpha b = is_lower b || is_upper b || b == 95;
+priv let is_alnum b = is_alpha b || is_digit b;
 
 /// The value of one digit in `radix`, or `-1` if it is not one.
-let digit_value b radix = {
-    let v = if is_digit b { b - 48 }
-            else if is_lower b { b - 97 + 10 }
-            else if is_upper b { b - 65 + 10 }
-            else { 0 - 1 };
+priv let digit_value b radix = {
+    let v = match b {
+        _ if is_digit b => b - 48,
+        _ if is_lower b => b - 97 + 10,
+        _ if is_upper b => b - 65 + 10,
+        _ => 0 - 1,
+    };
     if v >= 0 && v < radix { v } else { 0 - 1 }
 };
 
 /// Does `s` carry the bytes of `word` at `i`?
-let rec starts_at s i word j =
+priv let rec starts_at s i word j =
     if j >= str.byte_length word { true }
     else if core.str_byte s (i + j) != core.str_byte word j { false }
     else { starts_at s i word (j + 1) };
@@ -98,7 +102,7 @@ let rec starts_at s i word j =
 /// How many bytes the character starting at `i` occupies.
 let char_bytes s i = {
     let b = core.str_byte s i;
-    if b < 128 { 1 } else if b < 224 { 2 } else if b < 240 { 3 } else { 4 }
+    match b { _ if b < 128 => 1, _ if b < 224 => 2, _ if b < 240 => 3, _ => 4 }
 };
 
 /// Characters, not bytes, between two offsets. A UTF-8 continuation byte is
@@ -136,25 +140,26 @@ let rec drop_block s i col opened =
 /// thing trivia carries to the parser.
 let inline_space = " \t\r\u{c}";
 
-let rec skip_trivia s i col nl = {
-    let b = core.str_byte s i;
-    if b == newline { skip_trivia s (i + 1) 1 true }
-    else if b == space || b == tab || b == cr || b == ff {
+let rec skip_trivia s i col nl = match core.str_byte s i {
+    10 => skip_trivia s (i + 1) 1 true,
+    b if b == space || b == tab || b == cr || b == ff => {
         // The whole run at once. Indentation is most of what this function
         // ever skips, and a byte at a time it was a reduction each.
         let j = core.str_span s i inline_space;
         skip_trivia s j (col + (j - i)) nl
-    }
-    else if b == 47 && core.str_byte s (i + 1) == 47 {
-        let j = drop_line s (i + 2);
-        skip_trivia s j (col + char_len s i j 0) nl
-    }
-    else if b == 47 && core.str_byte s (i + 1) == 42 {
-        let r = drop_block s (i + 2) (col + 2) i;
-        if list.head r == :error { r }
-        else { skip_trivia s (list.nth 0 r) (list.nth 1 r) nl }
-    }
-    else { [i, col, nl] }
+    },
+    47 => match core.str_byte s (i + 1) {
+        47 => {
+            let j = drop_line s (i + 2);
+            skip_trivia s j (col + char_len s i j 0) nl
+        },
+        42 => match drop_block s (i + 2) (col + 2) i {
+            [:error, message, offset] => [:error, message, offset],
+            [next, next_col] => skip_trivia s next next_col nl,
+        },
+        _ => [i, col, nl],
+    },
+    _ => [i, col, nl],
 };
 
 // --- escapes ----------------------------------------------------------------
@@ -558,6 +563,11 @@ when test {
     let one src = list.head (lex_ok src);
 
     let tests = [
+        test.case "token range behavior preserves lazy payloads"
+            $( test.eq! [[2, 7], 5, true, false]
+                        { let t = make :ident (1 / 0) 2 7 true 3;
+                          [span t, Token.byte_length t, Token.contains 2 t,
+                           Token.contains 7 t] } ),
         // --- operators ---
         //
         // The dispatch and the table are two statements of the same thing, and

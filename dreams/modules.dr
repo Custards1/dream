@@ -110,13 +110,28 @@ let with_core name items deps =
 
 /// `source` is an index into the loader's file list, so a diagnostic raised
 /// about this module can quote the line it came from.
-let loaded name file source items =
-    %{ :name => name, :path => file, :source => source, :items => items };
+mapping Module {
+    name = ""
+    path = ""
+    source = 0
+    items = []
+}
 
-let module_name m   = core.map_get m :name "";
-let module_path m   = core.map_get m :path "";
-let module_source m = core.map_get m :source 0;
-let module_items m  = core.map_get m :items [];
+// Visibility is module metadata; later passes still walk ordinary declarations.
+let loaded name path source items =
+    core.map_put (Module.make name path source
+        (list.filter (fn item -> ast.kind item != :private) items)) :private_spans
+        (list.map ast.span (list.filter (fn item -> ast.kind item == :private) items));
+
+let private_declaration m span =
+    list.any (fn sp -> ast.span_start sp <= ast.span_start span
+                   && ast.span_end span <= ast.span_end sp)
+             (core.map_get m :private_spans []);
+
+let module_name m = Module.name m;
+let module_path m = Module.path m;
+let module_source m = Module.source m;
+let module_items m = Module.items m;
 
 // --- the loader --------------------------------------------------------------
 
@@ -162,6 +177,23 @@ let with_overlay o l = core.map_put l :overlay o;
 let parsed l       = core.map_get l :parsed (core.map_new ());
 let with_parsed p l = core.map_put l :parsed p;
 let put_parsed file v l = with_parsed (core.map_put (parsed l) file v) l;
+
+/// `[owner, kind, name, fields, members, span]` for each `group`, `struct` or
+/// `mapping` declaration, where `owner` is the module it was written in.
+/// `note_records` is the only thing that adds to this and says why it exists.
+let records l      = core.map_get l :records [];
+
+/// What each `expand` in the program named: `[module, source, offset, what]`,
+/// one entry per call site, where `what` is the resolution of the macro's own
+/// name wrapped as `[:macro, ..]`.
+///
+/// Expansion happens before resolution and *replaces* the call, so by the time
+/// the resolver walks this program the name the author wrote is not in it and
+/// nothing would ever record what it meant. An editor asks exactly that
+/// question -- hover and go-to-definition are "what is this name" -- so the
+/// pass that did resolve it says so here, and `scope.resolve!` seeds its
+/// occurrence table with these. See `note_macro` in dreams/expand.dr.
+let expansions l   = core.map_get l :expansions [];
 
 let put k v l = core.map_put l k v;
 
@@ -352,9 +384,38 @@ let rec expand_items cfg items =
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { expand_items cfg inner } else { [] },
-            [:record, array, name, fields, span] => [syntax.record array name fields span],
+            [:priv, d, span] => [d, [:private, span]],
+            [:record, kind, name, fields, members, bases, span] =>
+                [syntax.record_derived kind name fields members bases span],
             other => [other],
         }) items);
+
+/// Every record declaration `expand_items` is about to rewrite, in the same
+/// order and under the same `when` conditions -- an item the configuration
+/// switches off becomes no module, so it is no record either.
+let rec record_items cfg items =
+    list.concat (list.map (fn item ->
+        match item {
+            [:when, cond, inner, _] =>
+                if config.eval cfg cond { record_items cfg inner } else { [] },
+            [:record, kind, name, fields, members, bases, span] =>
+                [[kind, name, fields, members, span]],
+            _ => [],
+        }) items);
+
+/// Remember what `owner`'s records were written as, before the rewrite.
+///
+/// A `group`, a `struct` or a `mapping` becomes a module of generated
+/// functions, and those carry spans in a reserved part of the offset space
+/// because several of them stand where one declaration was written. So by the
+/// time any later pass walks this program the fields are gone, the kind is
+/// gone, and the place it was written is gone with them -- an editor asking
+/// "what is `Point.x` and where is it" has nothing at all to answer from, and
+/// answered `x ` and the end of the file. This is that, kept, and nothing in
+/// the compiler reads it: `owner + "." + name` is the module the rewrite made.
+let note_records owner items l =
+    put :records (records l + list.map (fn r -> core.cons owner r)
+                                       (record_items (config_of l) items)) l;
 
 // --- loading -----------------------------------------------------------------
 
@@ -376,6 +437,36 @@ let cycle at name from_source l =
                   "modules are compiled together, so their imports must form a tree"
                   from_source l;
 
+/// Find a hoisted module through an alternate spelling of its parent file.
+let rec nested_module l dotted =
+    match find l dotted {
+        i if i != () => i,
+        _ => {
+            let segs = dotted_segments dotted;
+            if list.length segs <= 1 { () }
+            else {
+                let parent = str.join_str "." (list.take (list.length segs - 1) segs);
+                match nested_module l parent {
+                    () => (),
+                    i => find l (module_name (module_at l i) + "." + list.last segs),
+                }
+            }
+        },
+    };
+
+/// A dotted import can name a block inside a file, or a member of that block.
+/// Load the nearest containing file before asking what it declares.
+let rec load_container! l dotted at from_source = {
+    let segs = dotted_segments dotted;
+    if list.length segs <= 1 { l }
+    else {
+        let parent = str.join_str "." (list.take (list.length segs - 1) segs);
+        if nested_module l parent != () { l }
+        else if resolve_path! l parent != () { load_named! l parent at from_source }
+        else { load_container! l parent at from_source }
+    }
+};
+
 let rec load_named! l dotted at from_source =
     if is_host l dotted { record_native dotted (mark_visited dotted l) }
     else if is_visited l dotted { l }
@@ -387,8 +478,21 @@ let rec load_named! l dotted at from_source =
             // No module by that name -- but a *package* by that name is
             // `import std;`, which brings in everything the package provides.
             () => {
-                let tried = load_package! l dotted at from_source;
-                if list.nth 1 tried { list.head tried }
+                let containing = load_container! l dotted at from_source;
+                let nested = nested_module containing dotted;
+                let segs = dotted_segments dotted;
+                let parent = str.join_str "." (list.take (list.length segs - 1) segs);
+                let owner = nested_module containing parent;
+                let tried = load_package! containing dotted at from_source;
+                if nested != () {
+                    mark_visited dotted (put :by_name
+                        (core.map_put (by_name containing) dotted nested) containing)
+                }
+                else if owner != () {
+                    // Resolution binds the final segment like a selective import.
+                    put :by_name (core.map_put (by_name containing) parent owner) containing
+                }
+                else if list.nth 1 tried { list.head tried }
                 else {
                     complain_note at ("cannot find module `" + dotted + "`")
                                   (unresolved_note! l dotted) from_source (list.head tried)
@@ -502,7 +606,7 @@ let rec hoist_mod! l parent source m =
                             [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                         },
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                    }) [l, []] kept;
+                    }) [note_records full items l, []] kept;
                 let inner_items = list.nth 1 nested;
 
                 // A submodule may import, so follow those before it is recorded.
@@ -560,6 +664,7 @@ let load_items! l source parsed display name file = {
         [:ok, items] => {
             // Resolve `when` before anything else looks at the module.
             let kept = expand_items (config_of l) items;
+            let noted = note_records name items l;
 
             // A `mod name { .. }` is a module written inside another. Register
             // it as `parent.name` and leave the parent importing it, so from
@@ -573,7 +678,7 @@ let load_items! l source parsed display name file = {
                         [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                     },
                     other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                }) [enter name l, []] kept;
+                }) [enter name noted, []] kept;
             let items_out = list.nth 1 hoisted;
 
             // Follow this module's own imports before recording it, so the
@@ -606,7 +711,7 @@ let load_items! l source parsed display name file = {
 let exports_tests m =
     list.any (fn item ->
         match item {
-            [:let, "tests", [], _, _, _] => true,
+            [:let, "tests", [], _, _, span] => not (private_declaration m span),
             _ => false,
         }) (module_items m);
 
@@ -761,6 +866,10 @@ let failed l = diag.error_count (diags l) > 0;
 /// dependencies before what uses them.
 let names l = list.map (fn m -> module_name m) (modules l);
 
+
+
+
+
 // --- tests -------------------------------------------------------------------
 
 when test {
@@ -790,6 +899,30 @@ when test {
             $( test.eq! 1 (list.length (expand_items on (items_of "when test { let a = 1; }"))) ),
         test.case "a when that does not hold contributes nothing"
             $( test.eq! [] (expand_items config.empty (items_of "when test { let a = 1; }")) ),
+
+        // What `expand_items` is about to destroy, kept for a tool. Nothing in
+        // the compiler reads it -- see `note_records`.
+        test.case "a record declaration is remembered as it was written"
+            $( test.eq! [[:list, "Point", ["x", "y"]]]
+                        (list.map (fn r -> [list.nth 0 r, list.nth 1 r,
+                                            list.map (fn f -> ast.field_name f) (list.nth 2 r)])
+                                  (record_items on (items_of "group Point { x, y }"))) ),
+        test.case "the three keywords keep their backing kinds apart"
+            $( test.eq! [:list, :array, :map]
+                        (list.map (fn r -> list.head r)
+                                  (record_items on (items_of
+                                      "group A { x }\nstruct B { x }\nmapping C { x }"))) ),
+        test.case "a record inside a `when` that is on is remembered"
+            $( test.eq! 1 (list.length (record_items on
+                              (items_of "when test { group Hidden { x } }"))) ),
+        test.case "a record inside a `when` that is off becomes no module and no record"
+            $( test.eq! [] (record_items config.empty
+                              (items_of "when test { group Hidden { x } }")) ),
+        test.case "a record's fields keep the spans they were written at"
+            $( test.eq! [[14, 15], [17, 18]]
+                        (list.map (fn f -> ast.field_span f)
+                                  (list.nth 2 (list.head (record_items on
+                                      (items_of "group Point { x, y }"))))) ),
         test.case "a nested when is resolved too"
             $( test.eq! 1 (list.length (expand_items on
                    (items_of "when test { when test { let a = 1; } }"))) ),
