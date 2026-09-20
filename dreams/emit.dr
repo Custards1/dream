@@ -336,3 +336,26 @@ let emit img = {
 /// every piece was built as bytes rather than as characters, which is the
 /// difference between binary and UTF-8.
 let to_binary img = emit img;
+
+/// Where the header keeps `entry`. Fixed by the format -- see the header
+/// table in [docs/bytecode-format.md](../docs/bytecode-format.md) -- which is
+/// what makes the next function possible at all.
+let entry_offset = 24;
+
+/// The same image, entered at a different function.
+///
+/// Every compile-time expression in a program is *that program* with one
+/// other entry point: `settle_comp!` used to build the whole image again for
+/// each one, and on a self-compile that was 30% of every reduction the
+/// compiler made and a fifth of everything it allocated -- 121M reductions
+/// and 1.2 GB, to write the same twenty-four thousand node records twenty
+/// times over. Since the one field that differs sits at a fixed offset, the
+/// answer is the bytes either side of it and a fresh four.
+///
+/// This is the same lesson `expand` learnt about macros, which is that a
+/// compile-time evaluation should cost its *expression*, not its program.
+let with_entry bytes fi = str.concat_all [
+    str.slice 0 entry_offset bytes,
+    index fi,
+    str.slice (entry_offset + 4) (str.byte_length bytes) bytes,
+];

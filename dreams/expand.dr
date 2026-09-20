@@ -13,12 +13,21 @@ import dreams.modules;
 import dreams.scope;
 import dreams.syntax;
 
-let rec has_expansion tree = match tree {
-    [:expand, _, _] => true,
-    [:macro, _, _, _, _] => true,
-    _ => type_of tree == :list && list.any (fn x -> has_expansion x) tree,
+let rec has_expansion tree = match type_of tree {
+    :list => match tree {
+        [:expand, _, _] => true,
+        [:macro, _, _, _, _] => true,
+        _ => has_expansion_in tree,
+    },
+    _ => false,
 };
-let needed l = list.any (fn m -> has_expansion (modules.module_items m)) (modules.modules l);
+// Syntax contains many scalar fields (names, tags and offsets). Reject those
+// before list matching, and walk children without a predicate closure at each
+// level of the tree.
+let rec has_expansion_in trees = match trees {
+    [] => false,
+    [tree, ..rest] => has_expansion tree || has_expansion_in rest,
+};
 let macro_let item = match item {
     [:macro, n, ps, b, sp] => ast.let_d n ps b false sp,
     _ => item,
@@ -105,39 +114,27 @@ let staged_lowering low = {
 /// all succeed builds exactly one of these; one whose macro genuinely fails
 /// builds a second and fails the same way, which is a compile that was not
 /// going to finish.
-let prepare! l = {
+let prepare! l = prepare_work! l (work_of l);
+
+/// Only declarations containing an expansion need placeholders. Reuse the
+/// work list from discovery instead of copying every syntax node in every
+/// imported module just to change the handful containing `expand`.
+let prepare_work! l work = {
+    let replaced = apply_items l (list.map (fn [mi, i, tree] ->
+        [mi, i, stage tree]) work);
     let staged = modules.put :modules (list.map (fn m ->
-        with_items m (stage (modules.module_items m))) (modules.modules l)) l;
+        with_items m (list.map macro_let (modules.module_items m)))
+        (modules.modules replaced)) replaced;
     let declared = scope.declare! staged;
-    // Incremental globals must not overlap globals invented by fusion.
-    let initial = core.map_put (core.map_put (core.map_put
-        (scope.resolver (scope.envs declared)) :imports (scope.s_imports declared))
-        :module_recs (scope.s_module_recs declared)) :diags (scope.diags declared);
-    let resolved = scope.resolve_from! staged declared initial 0 scope.state;
-    let low = staged_lowering (core.map_remove (lower.lower_program resolved) :image);
-    %{ :loader => staged, :declared => declared, :resolved => resolved, :low => low }
+    %{ :loader => staged, :declared => declared }
 };
 
 /// Lower and link only the temporary wrapper. The base arena and function
 /// indices stay fixed, and each call discards its wrapper instead of growing
 /// the cache. Compile-time dependencies remain lazy in the embedded VM.
-let invocation_image base resolved = {
-    let previous = base.[:resolved];
-    let low = base.[:low];
-    let added = lower.lower_from resolved low
-        (list.drop (list.length (scope.bodies previous)) (scope.bodies resolved));
-    let [with_funcs, funcs] = lower.link_funcs_from resolved (lower.func_bodies added)
-        added (scope.func_count previous);
-    let [with_globals, globals] = lower.link_globals_from resolved with_funcs
-        (list.length (scope.r_global_recs previous));
-    let [linked, imports] = lower.link_imports resolved with_globals;
-    let original = lower.prog low;
-    let program = (lower.prog linked)
-        .[:funcs => original.[:funcs] + funcs]
-        .[:globals => original.[:globals] + globals]
-        .[:imports => imports];
-    ir.finish (lower.prog (staged_lowering (lower.set_prog program linked)))
-};
+let invocation_image resolved =
+    ir.finish (lower.prog (staged_lowering
+        (core.map_remove (lower.lower_program resolved) :image)));
 
 /// One `expand` call as the expression the macro VM will evaluate: the macro's
 /// own name applied to its arguments, each argument quoted into the expression
@@ -171,99 +168,82 @@ let one_by_one! base s mi calls =
         [list.head got, values + list.nth 1 got]
     }) [s, []] calls;
 
-/// Evaluate every `expand` of one round on the macro VM: `[state, values]`,
-/// one value per call in the order the calls were given, and `()` where the
-/// call could not be run and a diagnostic was raised instead.
+/// One module's calls for a round. A single module is the unit because a call
+/// resolves against the imports of the module it was *written* in, so two
+/// modules cannot share a wrapper -- but they can share an image, which is
+/// where the cost actually is.
+let evaluate! base s mi calls = {
+    let got = evaluate_round! base s [[mi, calls]];
+    [list.head got, list.head (list.nth 1 got)]
+};
+
+/// Evaluate every `expand` of one round of the whole program on the macro VM:
+/// `[state, values per job]`, one value per call in the order given, and `()`
+/// where the call could not be run and a diagnostic was raised instead.
 ///
-/// **One image, not one per call.** Every call of a round is compiled against
-/// the same snapshot, so the wrapper's body is a list of them all and the
-/// image is emitted once. Emitting is the one part of an expansion whose cost
-/// is the whole program rather than the call -- the arena is serialized from
-/// scratch each time -- and a declaration holding forty calls, which a
-/// `when test` block is, was paying for forty copies of the program to expand
-/// forty one-line trees.
+/// **One image for the round, not one per declaration.** Building an image is
+/// `ir.finish` plus `emit.to_binary`, and both are the size of the *program*
+/// rather than of the call: on a self-compile, serializing the arena for each
+/// declaration that used a macro was 30% of every reduction the compiler made
+/// and most of a stage that was 75% of the compile -- eighteen copies of a
+/// twenty-four-thousand-node program to expand eighteen one-line trees.
+///
+/// So every module's wrapper for this round goes into one image, and each is
+/// entered by patching the four header bytes that say where to start
+/// (`emit.with_entry`). That is sound for the same reason the shared snapshot
+/// is: the wrappers are independent of one another, and a wrapper that turns
+/// out to need something this image does not have raises rather than
+/// answering wrongly -- see `prepare!` -- which puts it on the slow path
+/// below.
 ///
 /// **Failure is the slow path, deliberately.** A batch has one entry and one
 /// result, so a raise anywhere in it is one failure for the whole image and
 /// says nothing about which call raised. Rather than generate a `try` around
 /// each call -- which means naming `strict!` and `to_string` in the wrapper,
 /// and a module is free to declare a global of either name, which would win --
-/// a batch that fails at all is thrown away and its calls are run one at a
-/// time, where the wrapper *is* the call and every diagnostic is the one this
-/// gave before batching existed. A failing expansion fails the compile, so the
-/// round is run twice only for a build that was not going to finish.
-let evaluate! base s mi calls = {
+/// a module whose batch fails at all is thrown away and its calls are run one
+/// at a time, where the wrapper *is* the call and every diagnostic is the one
+/// this gave before batching existed. A failing expansion fails the compile,
+/// so the round is run twice only for a build that was not going to finish.
+let evaluate_round! base s jobs = {
     let l = loader s;
     let staged = base.[:loader];
-    let m = modules.module_at staged mi;
-    let sp = list.nth 1 (list.head calls);
-    let quoted = list.map (fn [call, at] -> call_body call at) calls;
-    let alone = list.length calls == 1;
-    let body = if alone { list.head (list.head quoted) }
-               else { ast.list_e (list.map (fn q -> list.head q) quoted) sp };
-    let [wrapper, after_wrapper] = syntax.fresh
-        (ast.let_d "<macro expansion>!" [] body false sp) (next s);
-    let s1 = core.map_put s :next after_wrapper;
-    let declared = scope.declare_items! staged mi [wrapper] base.[:declared];
-    let previous = (base.[:resolved]).[:imports => scope.s_imports declared];
-    let resolved = scope.resolve_from! staged declared previous
-        (list.length (scope.pending base.[:declared])) base.[:declared];
 
-    // The wrapper's body once it has been freshened, one expression per call:
-    // the body itself when there is one call and the elements of the list when
-    // there are several. Their spans are what the resolver keyed its answers
-    // by, which is why they are read back from the wrapper rather than kept.
-    let targets = if alone { [scope.decl_body wrapper] }
-                  else { match scope.decl_body wrapper {
-                             [:list, elements, _] => elements,
-                             other => [other],
-                         } };
+    // A wrapper per module, each freshened from the running offset counter so
+    // that no two generated declarations of one round can collide.
+    let prepared = list.fold (fn [acc, n] [mi, calls] -> {
+        let sp = list.nth 1 (list.head calls);
+        let quoted = list.map (fn [call, at] -> call_body call at) calls;
+        let alone = list.length calls == 1;
+        let body = if alone { list.head (list.head quoted) }
+                   else { ast.list_e (list.map (fn q -> list.head q) quoted) sp };
+        let [wrapper, after] = syntax.fresh
+            (ast.let_d "<macro expansion>!" [] body false sp) n;
+        [core.cons [mi, calls, quoted, alone, sp, wrapper] acc, after]
+    }) [[], next s] jobs;
+    let plans = list.reverse (list.head prepared);
+    let s1 = core.map_put s :next (list.nth 1 prepared);
 
-    // What each call's name resolved to, and the macro it named. Asked once
-    // per call rather than once per question about it: the arity check, the
-    // diagnostic and the note an editor reads are all the same lookup.
-    let sites = list.range 0 (list.length calls);
-    let references = list.map (fn i ->
-        scope.resolution resolved mi (modules.module_source m)
-                         (ast.span (called_name (list.nth i targets)))) sites;
-    let definitions = list.map (fn i -> macro_definition l (list.nth i references)) sites;
+    // Declared together and resolved once, so that the incremental link below
+    // sees every wrapper as this round's new bodies.
+    let declared = list.fold (fn acc plan ->
+        scope.declare_items! staged (list.head plan) [list.nth 5 plan] acc)
+        base.[:declared] plans;
+    // Only the bodies this round's wrappers can reach are resolved and lowered;
+    // everything else is stubbed. `:whole` is how a path that has already been
+    // failed by that asks for the program instead -- see `unreached_body`.
+    let resolved = scope.resolve_reachable! staged declared
+        (if base.[:whole else false] { 0 }
+         else { list.length (scope.pending base.[:declared]) });
 
-    /// What is wrong with call `i`, or `()`.
-    let objection i =
-        match list.nth i definitions {
-            () => "`expand` needs the name of a declared macro",
-            definition => {
-                let arity = list.length (list.nth 2 definition);
-                let given = list.nth 1 (list.nth i quoted);
-                if arity == given { () }
-                else { "macro expects " + to_string arity + " syntax arguments, received "
-                       + to_string given }
-            },
-        };
-    let objections = list.map (fn i -> objection i) sites;
-
-    /// The state with every call that named a macro written down, for an
-    /// editor. Only the paths that answer here do this: the one that falls
-    /// back to running the calls singly lets each of those record its own.
-    let noted = list.fold (fn st i -> match list.nth i definitions {
-        () => st,
-        _ => note_macro st mi
-                 (ast.span_start (ast.span (called_name (list.head (list.nth i calls)))))
-                 (list.nth i references),
-    }) s1 sites;
-    let complaint =
-        match list.filter (fn o -> o != ()) objections {
-            [] => if diag.error_count (scope.r_diags resolved) == 0 { () }
-                  else { "cannot compile macro: "
-                         + str.join_str "; " (list.map (fn d -> diag.message d)
-                             (list.filter (fn d -> diag.is_error d) (scope.r_diags resolved))) },
-            [why, .._] => why,
-        };
+    // Lazily, because a round in which every module is refused before it runs
+    // -- a bad arity, a name that is not a macro -- must not pay for one.
+    let bytes = emit.to_binary (invocation_image resolved);
 
     /// A returned value, checked and given offsets of its own, with the range
     /// it occupies recorded against the site it came from -- so a diagnostic
     /// in generated code is reported where the `expand` is written.
-    let install! st value at = match value {
+    let install! mi m st value at = match value {
         [:error, message] if type_of message == :string => [fail st mi at message, ()],
         _ => if syntax.expression value {
                  let [expression, after_expression] = syntax.fresh value (next st);
@@ -277,33 +257,101 @@ let evaluate! base s mi calls = {
              },
     };
 
-    match complaint {
-        why if alone && why != () => [fail noted mi sp why, [()]],
-        why if why != () => one_by_one! base s1 mi calls,
-        _ => {
-            let entries = list.filter (fn b -> list.nth 0 b == mi
-                && scope.decl_name (list.nth 2 b) == "<macro expansion>!") (scope.bodies resolved);
-            let entry = list.nth 3 (list.head entries);
-            let outcome = try! {
-                let value = vm.eval_image!
-                    (emit.to_binary ((invocation_image base resolved).[:entry => entry]));
-                strict! value
-                [:ok, value]
-            } catch e { [:error, to_string e] };
-            match outcome {
-                [:error, why] if alone =>
-                    [fail noted mi sp ("macro evaluation failed: " + why), [()]],
-                [:error, _] => one_by_one! base s1 mi calls,
-                [:ok, value] => {
-                    let done = list.fold (fn [st, acc] pair -> {
-                        let got = install! st (list.head pair) (list.nth 1 (list.nth 1 pair));
-                        [list.head got, core.cons (list.nth 1 got) acc]
-                    }) [noted, []] (list.zip (if alone { [value] } else { value }) calls);
-                    [list.head done, list.reverse (list.nth 1 done)]
+    /// One module's share: what its calls named, whether that is allowed, and
+    /// the answers, by entering the shared image at this module's wrapper.
+    let run! st plan = {
+        let [mi, calls, quoted, alone, sp, wrapper] = plan;
+        let m = modules.module_at staged mi;
+
+        // The wrapper's body once it has been freshened, one expression per
+        // call: the body itself when there is one call and the elements of
+        // the list when there are several. Their spans are what the resolver
+        // keyed its answers by, which is why they are read back from the
+        // wrapper rather than kept.
+        let targets = if alone { [scope.decl_body wrapper] }
+                      else { match scope.decl_body wrapper {
+                                 [:list, elements, _] => elements,
+                                 other => [other],
+                             } };
+
+        // What each call's name resolved to, and the macro it named. Asked
+        // once per call rather than once per question about it: the arity
+        // check, the diagnostic and the note an editor reads are all the same
+        // lookup.
+        let sites = list.range 0 (list.length calls);
+        let references = list.map (fn i ->
+            scope.resolution resolved mi (modules.module_source m)
+                             (ast.span (called_name (list.nth i targets)))) sites;
+        let definitions = list.map (fn i -> macro_definition l (list.nth i references)) sites;
+
+        /// What is wrong with call `i`, or `()`.
+        let objection i =
+            match list.nth i definitions {
+                () => "`expand` needs the name of a declared macro",
+                definition => {
+                    let arity = list.length (list.nth 2 definition);
+                    let given = list.nth 1 (list.nth i quoted);
+                    if arity == given { () }
+                    else { "macro expects " + to_string arity + " syntax arguments, received "
+                           + to_string given }
                 },
-            }
-        },
-    }
+            };
+        let objections = list.map (fn i -> objection i) sites;
+
+        /// The state with every call that named a macro written down, for an
+        /// editor. Only the paths that answer here do this: the one that falls
+        /// back to running the calls singly lets each of those record its own.
+        let noted = list.fold (fn acc i -> match list.nth i definitions {
+            () => acc,
+            _ => note_macro acc mi
+                     (ast.span_start (ast.span (called_name (list.head (list.nth i calls)))))
+                     (list.nth i references),
+        }) st sites;
+        let complaint =
+            match list.filter (fn o -> o != ()) objections {
+                [] => if diag.error_count (scope.r_diags resolved) == 0 { () }
+                      else { "cannot compile macro: "
+                             + str.join_str "; " (list.map (fn d -> diag.message d)
+                                 (list.filter (fn d -> diag.is_error d) (scope.r_diags resolved))) },
+                [why, .._] => why,
+            };
+
+        match complaint {
+            why if alone && why != () => [fail noted mi sp why, [()]],
+            why if why != () => one_by_one! (base.[:whole => true]) st mi calls,
+            _ => {
+                let entries = list.filter (fn b -> list.nth 0 b == mi
+                    && scope.decl_name (list.nth 2 b) == "<macro expansion>!")
+                    (scope.bodies resolved);
+                let entry = list.nth 3 (list.head entries);
+                let outcome = try! {
+                    let value = vm.eval_image! (emit.with_entry bytes entry);
+                    strict! value
+                    [:ok, value]
+                } catch e { [:error, to_string e] };
+                match outcome {
+                    [:error, why] if alone =>
+                        [fail noted mi sp ("macro evaluation failed: " + why), [()]],
+                    [:error, _] => one_by_one! (base.[:whole => true]) st mi calls,
+                    [:ok, value] => {
+                        let done = list.fold (fn [acc, answers] pair -> {
+                            let got = install! mi m acc (list.head pair)
+                                               (list.nth 1 (list.nth 1 pair));
+                            [list.head got, core.cons (list.nth 1 got) answers]
+                        }) [noted, []] (list.zip (if alone { [value] } else { value }) calls);
+                        [list.head done, list.reverse (list.nth 1 done)]
+                    },
+                }
+            },
+        }
+    };
+
+    let done = list.fold (fn [st, acc] plan -> {
+        let got = run! st plan;
+        strict! got
+        [list.head got, core.cons (list.nth 1 got) acc]
+    }) [s1, []] plans;
+    [list.head done, list.reverse (list.nth 1 done)]
 };
 
 /// A tree with every `expand` of this round replaced by a numbered hole, and
@@ -340,6 +388,10 @@ let rec fill tree values = match tree {
 /// declaration with forty calls written side by side takes one. A bound
 /// catches recursive expansion, since a macro whose answer calls it again
 /// never runs out of rounds on its own.
+///
+/// This is the one-declaration form, which is what the fallback below uses
+/// when a whole-program round could not answer. `rounds_all!` is the ordinary
+/// path and expands every declaration together.
 let rec rounds! base s mi tree depth = {
     let punched = punch tree [[], 0];
     let calls = list.reverse (list.head (list.nth 1 punched));
@@ -365,6 +417,70 @@ let rec rounds! base s mi tree depth = {
     }
 };
 
+/// Every declaration of the program, expanded together, a round at a time.
+///
+/// A round used to be one declaration's nesting depth, and an image was built
+/// for each. But the declarations of a program do not depend on one another's
+/// expansion -- each is staged against the same snapshot, in which every
+/// unexpanded `expand` is the same `1 / 0` -- so their rounds can be the same
+/// rounds, and then a round is one image for the whole program rather than
+/// one per declaration. A program's round count is the deepest nesting any
+/// one declaration has, which is almost always one.
+///
+/// `items` is `[module, index, tree]` for every declaration that had an
+/// `expand` in it. What comes back is the same list with the trees expanded.
+let rec rounds_all! base s items depth = {
+    let punched = list.map (fn it -> {
+        let got = punch (list.nth 2 it) [[], 0];
+        [list.nth 0 it, list.nth 1 it, list.head got,
+         list.reverse (list.head (list.nth 1 got))]
+    }) items;
+    let active = list.filter (fn j -> not (list.is_empty (list.nth 3 j))) punched;
+    if list.is_empty active { [s, items] }
+    else if depth >= 64 {
+        let failed = list.fold (fn st j ->
+            list.fold (fn acc call -> fail acc (list.head j) (list.nth 1 call)
+                          "macro expansion exceeded 64 nested calls") st (list.nth 3 j))
+            s active;
+        [failed, list.map (fn j -> [list.nth 0 j, list.nth 1 j,
+            fill (list.nth 2 j) (list.map (fn call -> ast.unit_e (list.nth 1 call))
+                                          (list.nth 3 j))]) punched]
+    } else {
+        // One job per module, its declarations' calls in the order they were
+        // punched, so the answers come back in an order the walk below can
+        // hand out again without keying anything.
+        let mods = list.fold (fn acc j ->
+            if list.contains (list.head j) acc { acc } else { acc + [list.head j] }) [] active;
+        let jobs = list.map (fn mi -> [mi, list.concat (list.map (fn j -> list.nth 3 j)
+            (list.filter (fn j -> list.head j == mi) active))]) mods;
+        let result = evaluate_round! base s jobs;
+        // Both the syntax and the updated loader contain lazy fields whose
+        // frames retain this round's resolver and lowered program. Finish them
+        // before the next round, so a program with many expands does not keep
+        // every temporary compilation alive at once.
+        strict! result
+        let [state, per_module] = result;
+        let pool = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
+                             %{} (list.zip mods per_module);
+        let filled = list.fold (fn [acc, remaining] j -> {
+            let calls = list.nth 3 j;
+            if list.is_empty calls {
+                [core.cons [list.nth 0 j, list.nth 1 j, list.nth 2 j] acc, remaining]
+            } else {
+                let mi = list.head j;
+                let mine = remaining.[mi else []];
+                let answers = list.map (fn pair -> match list.head pair {
+                    () => ast.unit_e (list.nth 1 (list.nth 1 pair)),
+                    answer => answer,
+                }) (list.zip (list.take (list.length calls) mine) calls);
+                [core.cons [mi, list.nth 1 j, fill (list.nth 2 j) answers] acc,
+                 remaining.[mi => list.drop (list.length calls) mine]]
+            }
+        }) [[], pool] punched;
+        rounds_all! base state (list.reverse (list.head filled)) (depth + 1)
+    }
+};
+
 let base_of s  = core.map_get s :base ();
 let put_base b s = core.map_put s :base b;
 
@@ -380,34 +496,83 @@ let expand_item! base s mi i item = {
 
 let complaints s = list.length (modules.diags (loader s));
 
-let expand! l =
-    if not (needed l) || modules.failed l { l }
-    else {
-        let done = list.fold (fn s mi -> {
-            let items = modules.module_items (modules.module_at (loader s) mi);
-            list.fold_strict (fn acc i -> {
-                let item = list.nth i items;
-                if not (has_expansion (macro_let item)) { acc }
+/// Every declaration that has an `expand` in it, as `[module, index, tree]`.
+let work_of l = list.concat (list.map (fn mi -> {
+    let items = modules.module_items (modules.module_at l mi);
+    list.fold (fn acc i ->
+        if has_expansion (macro_let (list.nth i items)) { acc + [[mi, i, list.nth i items]] }
+        else { acc }) [] (list.range 0 (list.length items))
+}) (list.range 0 (list.length (modules.modules l))));
+
+/// Put every expanded declaration back where it came from.
+let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
+    let current = modules.module_at acc mi;
+    replace_module acc mi (with_items current ((modules.module_items current).[i => tree]))
+}) l items;
+
+/// The original algorithm: one declaration at a time, each against a snapshot
+/// rebuilt whenever the last one raised.
+///
+/// This is what runs when the whole-program round could not answer for
+/// everything. It is slower by the size of the program times the number of
+/// declarations, and it is the path that gives a real failure the diagnostic
+/// it had before any batching existed -- so a build that is going to fail
+/// fails the same way, having spent the time only because it was failing.
+let sequential! l =
+    list.fold (fn s mi -> {
+        let items = modules.module_items (modules.module_at (loader s) mi);
+        list.fold_strict (fn acc i -> {
+            let item = list.nth i items;
+            if not (has_expansion (macro_let item)) { acc }
+            else {
+                // The path a failed batch falls to resolves whole programs:
+                // it is here because something the reachable-only snapshot
+                // stubbed was demanded, and only a program with no stubs in it
+                // can tell that apart from a macro that genuinely raised.
+                let base = match base_of acc {
+                    () => (prepare! (loader acc)).[:whole => true],
+                    b => b,
+                };
+                let before = complaints acc;
+                let first = expand_item! base acc mi i item;
+                strict! first
+                // A declaration that raised may have been asking for one the
+                // snapshot has not caught up with. That is the only thing a
+                // stale snapshot can do -- see `prepare!` -- so a fresh one
+                // and a second attempt settles which it was, started again
+                // from before the first so that a failure that is real is
+                // still reported exactly once.
+                if complaints first == before { put_base base first }
                 else {
-                    let base = match base_of acc { () => prepare! (loader acc), b => b };
-                    let before = complaints acc;
-                    let first = expand_item! base acc mi i item;
-                    strict! first
-                    // A declaration that raised may have been asking for one
-                    // the snapshot has not caught up with. That is the only
-                    // thing a stale snapshot can do -- see `prepare!` -- so a
-                    // fresh one and a second attempt settles which it was,
-                    // started again from before the first so that a failure
-                    // that is real is still reported exactly once.
-                    if complaints first == before { put_base base first }
-                    else {
-                        let fresh = prepare! (loader acc);
-                        put_base fresh (expand_item! fresh acc mi i item)
-                    }
+                    let fresh = (prepare! (loader acc)).[:whole => true];
+                    put_base fresh (expand_item! fresh acc mi i item)
                 }
-            }) s (list.range 0 (list.length items))
-        }) %{ :loader => l, :next => 3221225472 } (list.range 0 (list.length (modules.modules l)));
-        let expanded = loader done;
+            }
+        }) s (list.range 0 (list.length items))
+    }) %{ :loader => l, :next => 3221225472 } (list.range 0 (list.length (modules.modules l)));
+
+let expand! l = if modules.failed l { l } else { expand_work! l (work_of l) };
+
+/// `work` is every declaration with an `expand` in it, which is also the
+/// answer to whether there is anything to do: finding it is a walk of the
+/// whole program's syntax, and asking first whether the walk is worth making
+/// was the same walk again.
+let expand_work! l work =
+    if list.is_empty work { l }
+    else {
+        let batched = rounds_all! (prepare_work! l work)
+                                  %{ :loader => l, :next => 3221225472 } work 0;
+        strict! batched
+        let state = list.head batched;
+        // Nothing complained, so one snapshot answered for the whole program
+        // and the batch is the answer. Otherwise a declaration wanted
+        // something the shared snapshot did not have, or genuinely failed,
+        // and only the original order can tell those apart -- so the whole
+        // program is expanded again the old way, from the original loader, and
+        // the batch is discarded rather than merged.
+        let expanded = if complaints state == list.length (modules.diags l) {
+            apply_items (loader state) (list.nth 1 batched)
+        } else { loader (sequential! l) };
         modules.put :modules (list.map (fn m -> with_items m
             (list.map macro_let (modules.module_items m))) (modules.modules expanded)) expanded
     };

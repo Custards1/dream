@@ -1469,18 +1469,20 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
 
 /// Settle them in an order where nothing is evaluated before what it reads.
 ///
-/// `built` is the program the next evaluation runs against, and the whole of
-/// the cost here is how often it has to be made again: `ir.finish` is the
-/// size of the *program*, so rebuilding once per compile-time expression is
-/// the program's size times however many there are. A self-compile has about
-/// twenty, and paying that was worth five times the whole compile.
+/// `built` is the serialized image the next evaluation runs against, and the
+/// whole of the cost here is how often it has to be made again. Building one
+/// is `ir.finish` plus `emit.to_binary`, and both are the size of the
+/// *program* rather than of the expression -- so one per compile-time
+/// expression is the program's size times however many there are. On a
+/// self-compile that was 30% of every reduction the compiler made.
 ///
 /// It almost never has to be rebuilt. Settling one overwrites its
 /// placeholder, and the only thing that can read that placeholder is an
 /// expression which depends on it -- so the image stays good until a
 /// dependency of something still waiting has been settled. A program whose
 /// compile-time expressions are independent of each other, which is nearly
-/// all of them, builds exactly one image, as it did before any of this.
+/// all of them, builds exactly one, and the rest are that one with four
+/// bytes of header changed.
 let rec settle_comp_order! rows done built l =
     if list.is_empty rows { l }
     else {
@@ -1492,9 +1494,11 @@ let rec settle_comp_order! rows done built l =
             let one = row.[0];
             // Each evaluation sees the constants its dependencies installed,
             // rather than the original image full of unit placeholders.
-            let image = match built { () => ir.finish (prog l), ready_made => ready_made };
-            let settled = settle_comp! (fn fi img -> core.map_put img :entry fi)
-                                       (fn _ -> image) one l;
+            let image = match built {
+                () => emit.to_binary (ir.finish (prog l)),
+                ready_made => ready_made,
+            };
+            let settled = settle_comp! (fn fi -> emit.with_entry image fi) one l;
             if list.length (l_diags settled) > list.length (l_diags l) { settled }
             else {
                 let rest = list.filter (fn r -> r.[0].[0] != one.[0]) rows;
@@ -1585,10 +1589,14 @@ let rec const_seq op items l = {
 /// available to a compiler that is itself running on one: the value a `comp`
 /// produces is produced by exactly the machinery that would have produced it at
 /// run time, so the two cannot disagree.
-let settle_comp! entry_of img_of one l = {
+/// `bytes_of` is handed the function index to enter at and answers the image
+/// to run. It is a function rather than the image itself so that a caller
+/// which has already serialized the program can hand the same bytes back
+/// with only the entry changed -- see `emit.with_entry`.
+let settle_comp! bytes_of one l = {
     let node = list.nth 0 one;
     let fi = list.nth 1 one;
-    let value = try! { vm.eval_image! (emit.to_binary (entry_of fi (img_of l))) }
+    let value = try! { vm.eval_image! (bytes_of fi) }
                 catch e { [:comp_error, e] };
     match value {
         [:comp_error, why] =>

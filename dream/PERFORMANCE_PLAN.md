@@ -1,5 +1,10 @@
 # Self-compilation below 1.25 seconds
 
+Current compiler work: [macro expansion performance TODO](../dreams/TODO.md).
+It records the 2026-09-20 baseline and the plan to remove whole-program macro
+snapshots, including an incremental compile-time VM option. The measurements
+below are historical and predate that baseline.
+
 ## Where this actually stands (2026-09-18, second pass)
 
 The target is not met and is not close. The best configuration measured here is

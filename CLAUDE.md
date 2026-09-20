@@ -603,7 +603,14 @@ What has already been learnt from them, so it is not learnt twice:
   machine cannot resolve anything smaller than about 3%.
 - **Where the self-compile now stands.** 3.10 s -> **2.32 s** interpreted,
   measured `--no-jit` with default workers against a VM built from the commit
-  before any of this. The order of the wins is the opposite of where the effort
+  before any of this. **Do not trust this row as an absolute.** Re-measured
+  2026-09-19 on the same machine and a `just vm` build, a self-compile is
+  7 s -- and the two numbers were never measuring the same program, since
+  `dreams` and `std` have both grown a great deal since. What the row is good
+  for is its ratio; what it is not good for is deciding that today's compile
+  has regressed. Measure the commit before, in a worktree, with the same
+  binary -- `git worktree add /tmp/base HEAD` -- which is how the two
+  image-per-call bugs below were found rather than argued about. The order of the wins is the opposite of where the effort
   went: PGO 12%, the inliner ceilings 4%, the scheduler's idle workers 9%, and
   every source-level interpreter change together under 1%.
 
@@ -1187,6 +1194,15 @@ snapshot, and forty declarations with one call each were paying forty of both.
 The same file with no macros at all compiles in 0.27 s, so what is left of the
 overhead on the second workload is 26 ms a call where it was 86.
 
+**And that last sentence is how the remaining factor of two hid for a year.**
+26 ms a call is what a *ten-declaration* file says, and the cost being
+measured is the size of the **program**, not of the file -- so the only
+workload in this table that could have shown it is one whose program is big,
+and neither of them is. On `dreams` compiling itself, which is a megabyte,
+the same overhead is **390 ms a declaration**, and macro expansion was 7 s of
+a 13 s compile. Beware a benchmark that holds constant the thing the cost is
+proportional to. The row below is the fix.
+
 - **One image per round, not per call** (`evaluate!` in
   [dreams/expand.dr](dreams/expand.dr)). Every call of one declaration is
   compiled against the same snapshot, so the wrapper's body is a *list* of them
@@ -1228,11 +1244,138 @@ except for the `SPAN` entries of generated functions — expansion hands out
 offsets from a reserved part of the 32-bit space and the order it hands them
 out in moved. Eight bytes of an image of 216,736.
 
-**Where the rest of it went.** After all of the above, the two costs that
-remain are the ones that are genuinely per call: `ir.finish` plus
-`emit.to_binary` of the arena, and `vm.eval_image!` loading it. Both are the
-whole program's size, and removing either means an image format that can be
-patched rather than rebuilt. Nothing has measured whether that is worth it.
+### A compile-time expression is the program with a different entry
+
+The same mistake as the macro one above, in the other pass that runs the
+compiler at compile time, and found the same way. `settle_comps!` evaluated
+each `comp` by handing `vm.eval_image!` a freshly serialized image of the
+whole program -- and every one of those images differs from every other in
+exactly one field, the entry point, which the format keeps at a fixed offset
+in the header. So the program is serialized once and each expression gets
+those four bytes changed (`emit.with_entry`). A self-compile has about twenty
+`comp`s and was paying twenty copies of itself for them.
+
+Beside it, `settle_comp_order!` now settles the expressions in dependency
+order, so a `comp` may read what another `comp` produced; the image is rebuilt
+only when something still waiting depends on the one just settled, which for a
+program whose compile-time expressions are independent -- nearly all of them --
+means never.
+
+### One image per round of the whole program
+
+**What it does.** The section above got the image down to one per
+*declaration* and stopped, and left a note saying the rest would need "an
+image format that can be patched rather than rebuilt". It does not. What it
+needed was for the round to belong to the program instead of to the
+declaration.
+
+The declarations of a program do not depend on one another's expansion: each
+is staged against the same snapshot, in which every unexpanded `expand` is
+the same `1 / 0`. So their rounds are the same rounds, and a round is one
+image for the whole program. `rounds_all!` punches every declaration at once,
+groups the calls by module -- a call resolves against the imports of the
+module it was *written* in, so the modules cannot share a wrapper -- declares
+every module's wrapper together, resolves once, and emits **one** image.
+Each module then enters that image at its own wrapper by patching the four
+header bytes that say where to start (`emit.with_entry`), which is the patch
+the old note thought the format could not take. A program's round count is
+the deepest nesting any one declaration has, which is almost always one.
+
+| | dreams self-compile | 40 declarations | 10 declarations |
+|---|---|---|---|
+| one image per declaration | 13.34 s | 0.88 s | 0.48 s |
+| one image per round | **7.06 s** | **0.43 s** | **0.37 s** |
+
+Reductions for the self-compile went 402M -> 206M and `node_bytes` -- writing
+node records into an image -- from **30.1% of everything the compiler did** to
+7.4%. The gap widens with the number of declarations, which is the shape to
+expect: the old cost was declarations times program, the new one is program.
+
+**What licenses it** is the argument `prepare!` already rests on, asked of a
+batch rather than of one declaration. A wrapper that needs something this
+image does not have raises, because an unexpanded declaration is `1 / 0` and a
+macro is pure and cannot catch it -- so it cannot answer *wrongly*, only fail.
+A failure means one snapshot could not serve the whole program, and only the
+original order can say whether that is staleness or a real error, so the batch
+is thrown away and the program is expanded again the old way, declaration by
+declaration from the original loader (`sequential!`). A build that was going
+to fail fails identically, having spent the extra time only because it was
+failing. `dreams/tests/macros.py` is what holds that, and the bootstrap's byte
+equality is what holds the batch agreeing with the sequential path.
+
+**Where the rest of it went.** Of the 4.0 s `--time` now charges to `parse` on
+a self-compile, about half is parsing and half is the one snapshot -- a full
+resolve and lower of the program, which is what "expanding a macro is a
+compile" costs and is paid once. `vm.eval_image!` per module is what is left
+of the per-call cost, and it is small enough not to show.
+
+### A macro reaches a handful of declarations, not the program
+
+**What it does.** The two sections above got the *image* down to one per round.
+What they left was the snapshot: `prepare!` resolved and lowered the whole
+program so that a transformer could call anything, and it did that whether the
+macro called two helpers or two hundred. On a self-compile that was the whole
+compiler -- 2,264 functions -- resolved and lowered a second time so that
+eighteen one-line trees could be rewritten.
+
+A transformer does not reach the program. It reaches its own definition and
+whatever that names, which is a handful of declarations. `scope.resolve_reachable!`
+walks out from this round's wrappers, resolving a body at a time and following
+the references that body turned out to have, and resolves nothing else.
+
+| | self-compile | `std --test` | one call, 1600 unrelated declarations |
+|---|---|---|---|
+| whole-program snapshot | 6768 ms | 3522 ms | tax 2048 ms |
+| reachable only | **5238 ms** | **2903 ms** | tax **1059 ms** |
+
+`--time` says where it went: `parse`, which is where expansion lives, is
+3859 ms -> **2070 ms** on a self-compile, and the stages after it do not move.
+The third column is the macro *tax* in isolation -- the same program with the
+`expand` written out, subtracted -- and it halves. It is still linear in the
+program, because what is left is the part that is not a body: `declare!`, and a
+function record and a stub node for every declaration in the image.
+
+**What "reaches" means is the resolver's answer, not a syntactic one.**
+`check_body` already records what every name occurrence resolved to, so an
+alias, a renamed selective import, a global that merely *names* a function
+without calling it, a capture and a chain two modules deep are all edges, and a
+builtin, a host member, a parameter and a local are all correctly not. Nothing
+here re-implements name lookup, which is the mistake that would make this
+subtly wrong in the cases nobody writes a test for.
+
+**What makes it sound** is that a declaration the walk does not reach still gets
+a body, and the body raises. It needs one at all because a global of kind
+`function` names a function index and the VM rejects an image whose global names
+none (`global names an out-of-range function`) -- so "do not resolve this" has
+to be spelled as "resolve something trivial", and the only real question is
+what. It is `1 / 0`: the same placeholder an unexpanded `expand` is staged as,
+for the same reason. A macro is pure, so it cannot catch it. So an incomplete
+reachability answer cannot be silently wrong -- it raises, the batch is thrown
+away, and the round is run again with every declaration a root, which is the
+whole program (`:whole` in [dreams/expand.dr](dreams/expand.dr), and every
+fallback path sets it: `one_by_one!` and `sequential!` both).
+
+**That was measured rather than argued.** A compiler built with the dependency
+edge deleted -- a walk that finds *nothing*, so every declaration but the
+wrapper is stubbed -- still passes all 47 macro and record cases and still
+compiles itself, because every batch fails and every failure falls through. It
+is slower and it is not wrong. What it produces differs from the batch path in
+18 bytes of 374,456, which are the generated `SPAN` entries the section above
+already says the two paths disagree about.
+
+**What to expect of the images.** Byte-identical, everywhere: the bootstrap
+reaches a fixpoint in one stage, and `mind/std/all.dr --test` comes out the same
+file it came out before. That is the test worth running after any change here,
+because expansion deciding differently is exactly the failure this pass could
+have.
+
+**One behaviour did change**, and it is an improvement rather than a
+compatibility note: an error in a body no macro reaches no longer refuses the
+expansion. It used to be reported twice -- once as `cannot compile macro: ...`
+at the `expand`, and again as itself by the real compile -- because `run!`
+refuses a round whose resolution has any error in it at all, and the resolution
+was the whole program. Now the round only sees the bodies it resolved, so the
+error is reported once, where it is.
 
 ### Sharing the arena
 

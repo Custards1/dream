@@ -1769,6 +1769,89 @@ let declare! l =
     list.fold (fn acc mi -> declare_module l mi acc) state
               (list.range 0 (list.length (modules.modules l)));
 
+/// A queued declaration the reachability walk below did not reach, with its
+/// body replaced by the same `1 / 0` an unexpanded `expand` is staged as.
+///
+/// It needs a body at all, rather than simply being left out, because a global
+/// of kind `function` names a function index and the VM rejects an image whose
+/// global names none -- `global names an out-of-range function`. So "do not
+/// resolve this one" has to be spelled as "resolve something trivial", and the
+/// only question is what.
+///
+/// Spelling it as a raise is what makes an incomplete answer loud instead of
+/// wrong. If the walk decides a transformer cannot reach a body and the
+/// transformer reaches it anyway, it gets `:divide_by_zero` rather than some
+/// other declaration's function -- and a macro is pure, so it cannot catch
+/// that, which is the same argument `expand.prepare!` already rests on for a
+/// snapshot that has fallen behind. The caller answers a failure by running
+/// the round again with every declaration a root, which is the whole program.
+let unreached_body p = {
+    let d = list.nth 2 p;
+    let sp = decl_span d;
+    p.[2 => d.[3 => ast.binary_e :div (ast.int_e 1 sp) (ast.int_e 0 sp) sp]]
+};
+
+/// Resolve the bodies reachable from the declarations queued at `from` onward,
+/// and stub the rest.
+///
+/// Macro expansion needs the whole program's *names* -- a transformer may call
+/// anything the module it is written in can see -- but it does not need the
+/// whole program's *bodies*. A macro reaches its own definition and a handful
+/// of helpers; resolving and lowering the other two thousand declarations of a
+/// program the size of this compiler is the largest fixed cost an expansion
+/// pays, and it is paid whether the macro is one line or a hundred.
+///
+/// What a body can reach is asked of the ordinary resolver rather than of the
+/// syntax: `check_body` already records what every name occurrence resolved
+/// to, so an alias, a selective import, a captured closure and a function
+/// named but never called all mean here exactly what they mean everywhere
+/// else. A reference whose target is one of these queued declarations is an
+/// edge; anything else -- a builtin, a host member, a parameter, a local -- is
+/// not a body and cannot be one.
+///
+/// `from` 0 makes every declaration a root, which is the whole program and is
+/// how the fallback path asks for one.
+let resolve_reachable! l declared from = {
+    let es = envs declared;
+    let queued = list.zip (list.range 0 (list.length (pending declared))) (pending declared);
+    let body_global p = global_index (list.nth (list.head p) es)
+                                     (decl_name (list.nth 2 p));
+    // Global index to queue entry, so that a resolved reference is a body in
+    // one lookup rather than a scan of the queue per occurrence.
+    let indexed = list.fold (fn acc [i, p] ->
+        match body_global p { () => acc, gi => acc.[gi => [i, p]] }) %{} queued;
+    let initial = (resolver es).[:imports => s_imports declared]
+        .[:module_recs => s_module_recs declared].[:diags => diags declared];
+    let rec walk todo seen r all_refs = match todo {
+        [] => [r.[:refs => all_refs], seen],
+        [[i, p], ..rest] =>
+            if core.map_has seen i { walk rest seen r all_refs }
+            else {
+                // This body's occurrences on their own. Merging them into the
+                // running table afterwards keeps reading them proportional to
+                // the body rather than to everything resolved so far, which a
+                // shared table walked once per body would not be.
+                let checked = check_body l p (r.[:refs => %{}]);
+                let occurrences = core.map_pairs (refs checked);
+                let deps = list.fold (fn acc [_, reference] ->
+                    match indexed.[target_global reference else ()] {
+                        () => acc,
+                        found => core.cons found acc,
+                    }) [] occurrences;
+                let merged = list.fold (fn acc [key, value] -> acc.[key => value])
+                                       all_refs occurrences;
+                walk (deps + rest) (seen.[i => true]) checked merged
+            },
+    };
+    let [walked, seen] = walk (list.drop from queued) %{} initial %{};
+    let unreached = list.map (fn [_, p] -> unreached_body p)
+        (list.filter (fn [i, _] -> not (core.map_has seen i)) queued);
+    // The ordinary tail of a resolution, with the stubs as its queue: the
+    // globals, the wrappers and the module records are built exactly as a
+    // whole-program resolve builds them, over bodies that now all exist.
+    resolve_from! l (declared.[:pending => unreached]) walked 0 state
+};
+
 /// Resolve the newly-declared part of a program on top of a carried resolution.
 ///
 /// `declared` is the scope state after the new declarations; `r0` the resolver

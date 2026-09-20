@@ -111,6 +111,50 @@ macro use e = [:int, helper 3, [0, 0]];
 let main! = console.print! (expand use 1);
 """, '6\n')
 
+    # A transformer reaches only some of the program, and what "reaches" means
+    # is the resolver's answer rather than a syntactic one -- so these two
+    # modules exist to be reached the awkward ways: through a renamed selective
+    # import, through a global that merely *names* a function without calling
+    # it, and two modules deep from the call.
+    (temp / 'deep.dr').write_text('''
+let bottom n = n * 2;
+''')
+    (temp / 'mid.dr').write_text('''
+import deep;
+let through n = deep.bottom n + 1;
+let apply_to f n = f n;
+''')
+    success('''
+import std.console;
+import std.list;
+import mid;
+import mid.{through as via};
+
+let scale = 3;
+let by_value = mid.through;
+
+macro computed e = {
+    let a = mid.apply_to by_value 4;
+    let b = via 1;
+    let c = list.fold (fn acc x -> acc + x * scale) 0 [1, 2];
+    [:int, a + b + c, [0, 0]]
+};
+
+let main! = console.print! (expand computed ignored);
+''', '21\n')
+
+    # Selective staging must still turn nested macro declarations into callable
+    # functions, while keeping ordinary helper declarations available unchanged.
+    success('''
+import std.console;
+mod nested {
+    let helper n = n + 4;
+    macro number e = [:int, helper 3, [0, 0]];
+}
+macro forward e = nested.number e;
+let main! = console.print! (expand forward ignored);
+''', '7\n')
+
     # Unrelated comp! expressions run once in the final program's comp pass.
     success('''
 import std.console;
