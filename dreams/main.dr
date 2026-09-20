@@ -393,7 +393,11 @@ let own_of t = {
 /// Time the whole pipeline, stage by stage, and write nothing.
 let show_time! o file = {
     let read = timed! (read! o file);
-    let load = timed! (expansion.expand! (value_of read));
+    // Ask expansion to charge its own phases while it runs. `--time` is the
+    // only caller that does, and `modules.metering` says why: charging a phase
+    // forces it, and one of expansion's phases is deliberately never forced on
+    // a round that refuses every module before running one.
+    let load = timed! (expansion.expand! (modules.with_metering (value_of read)));
     let l = value_of load;
     let resolved = timed! (scope.resolve! l);
     let r = value_of resolved;
@@ -424,7 +428,64 @@ let show_time! o file = {
                     + to_string (modules.module_count l) + " modules, "
                     + to_string (list.length (core.map_get img :nodes [])) + " nodes"
                     + " (from " + to_string (list.length (core.map_get lowered :nodes [])) + ")")
+    show_macros! l
     print_diags! (modules.files l) (list.append (modules.diags l) (lower.all_diags r low))
+};
+
+/// What macro expansion spent, broken into the things a round does.
+///
+/// The `expand` row above is the whole of it and was enough to justify the
+/// three changes that took expansion from seven seconds of a self-compile to
+/// under half of one. It is not enough to justify the next one, which is a
+/// proposal to stop building an image per round at all (dreams/TODO.md): that
+/// is a redesign of `lower`, `emit` and `run` together, and whether it is
+/// worth doing depends on what those three are against `snapshot` and
+/// `resolve`, which it does not touch.
+///
+/// `discover` and `snapshot` are paid once for the program. The rest are paid
+/// once per round, and a round is the *nesting* of macro calls rather than
+/// their number -- forty calls written side by side are one round, and one
+/// macro whose answer calls another is two.
+let show_macros! l = match modules.macro_meter l {
+    () => (),
+    meter => {
+        let phases = core.map_get meter :phases %{};
+        let tallies = core.map_get meter :counts %{};
+        let count k = core.map_get tallies k 0;
+        let rows = [[:discover, "discover"], [:snapshot, "snapshot"], [:declare, "declare"],
+                    [:resolve, "resolve"], [:image, "lower"], [:emit, "emit"],
+                    [:vm, "run"], [:install, "install"]];
+        let at k = core.map_get phases k [0, 0, 0, 0];
+        let ms r = list.nth 0 r / 1000000;
+        let total = list.fold (fn n [k, _] -> n + ms (at k)) 0 rows;
+        let pad n text = str.repeat (n - str.byte_length text) " " + text;
+        let millions n = to_string (n / 1000000) + "." + to_string (n % 1000000 / 100000);
+        let plural n one = to_string n + " " + one + (if n == 1 { "" } else { "s" });
+        let row! [k, label] = {
+            let r = at k;
+            let pct = if total <= 0 { 0 } else { ms r * 100 / total };
+            console.print! ("  " + label + str.repeat (9 - str.byte_length label) " "
+                            + pad 6 (to_string (ms r)) + " ms  " + pad 3 (to_string pct) + "%"
+                            + pad 9 (millions (list.nth 1 r)) + " M red"
+                            + pad 7 (to_string (list.nth 2 r / 1048576)) + " MB")
+        };
+        console.print! ("macro     " + str.join_str ", "
+            [plural (count :rounds) "round", plural (count :wrappers) "wrapper",
+             plural (count :calls) "call",
+             plural (count :images) "image" + " of "
+                 + to_string (count :image_bytes / 1024) + " KB",
+             plural (count :vm_starts) "VM start"]
+            + (match [count :one_by_one, count :sequential, count :refused] {
+                   [0, 0, 0] => "",
+                   [o, q, f] => "  (" + str.join_str ", "
+                       (list.filter (fn t -> t != "")
+                           [if o == 0 { "" } else { plural o "fallback to one call at a time" },
+                            if q == 0 { "" } else { "expanded again in order" },
+                            if f == 0 { "" } else { plural f "module refused" }]) + ")",
+               }))
+        list.map (fn r -> row! r) rows |> strict!
+        console.print! ("  " + pad 21 (to_string total) + " ms of the expand row above")
+    },
 };
 
 // --- questions an editor asks ----------------------------------------------------

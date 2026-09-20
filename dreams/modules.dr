@@ -234,6 +234,24 @@ let records l      = core.map_get l :records [];
 /// occurrence table with these. See `note_macro` in dreams/expand.dr.
 let expansions l   = core.map_get l :expansions [];
 
+/// Should macro expansion measure itself, and what did it measure?
+///
+/// Off unless a tool asks, and the reason is not the handful of clock reads.
+/// A phase charges itself around a `strict!`, because in a lazy language a
+/// phase that has not been forced has not run -- and that changes *when* the
+/// work happens as well as who is charged for it. Expansion relies on that in
+/// one place: a round whose modules are all refused before any of them runs
+/// never forces the image, and so never builds one. Charging the image would
+/// take that away. So `--time` turns this on and an ordinary build does not.
+///
+/// `macro_meter` is what came back: `[:phases, :counts]`, written by
+/// `expand.publish_meter` and read by `main.show_time!`. Nothing in the
+/// compiler reads it, the way nothing reads `records` -- it is here because
+/// the pass that spends the time is the only one that can say where.
+let metering l     = core.map_get l :metering false;
+let with_metering l = put :metering true l;
+let macro_meter l  = core.map_get l :macro_meter ();
+
 let put k v l = core.map_put l k v;
 
 /// The index of a module, by any name it answers to, or `()`.

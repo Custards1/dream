@@ -45,6 +45,117 @@ let with_items m items = core.map_put m :items items;
 let loader s = core.map_get s :loader ();
 let next s = core.map_get s :next 3221225472;
 let put_loader l s = core.map_put s :loader l;
+
+// --- what a round of expansion costs -------------------------------------------
+//
+// Expansion is the one stage of this compiler that *is* the compiler: a macro
+// is answered by staging the program, resolving what the transformer reaches,
+// lowering it, serializing an image and handing that to a VM. `--time` says
+// what the stage came to, which was enough to justify the three changes that
+// took it from seven seconds of a self-compile to under half of one. It cannot
+// say which of those five things is left, and the next change proposed for it
+// -- a compile-time VM that is loaded once and called, rather than an image
+// built and loaded per round (dreams/TODO.md) -- is a redesign of exactly two
+// of them. So each phase charges itself, and the question has an answer before
+// anything is rewritten to improve it.
+//
+// Every reading is taken twice, for the reason `main.dr`'s `timed!` gives at
+// length: forcing a phase walks everything the phases before it built, and the
+// second `strict!` finds all of that already forced, so it measures the walk
+// alone. The difference is what this phase did that nothing before it had.
+//
+// None of it runs unless `modules.metering` is on, and that is not about the
+// clock reads -- it is that forcing a phase is a decision about *when* it
+// happens. A round that refuses every one of its modules never forces the
+// image and so never builds one, which is deliberate; a meter that charged the
+// image would have to build it first.
+
+let no_meter = %{ :phases => %{}, :counts => %{} };
+let metering s = modules.metering (loader s);
+let meter_of s = core.map_get s :meter no_meter;
+let put_meter m s = core.map_put s :meter m;
+
+/// The clock, the reduction count and the bytes allocated, as one reading, so
+/// that three questions about a phase cannot be answered from three moments.
+///
+/// Bound one at a time rather than written as a list of three calls, because a
+/// list literal's elements are thunks and a reading taken when somebody gets
+/// round to looking at it is not a reading. An impure `let` is a statement, so
+/// these three happen here, in this order.
+let reading! u = {
+    let ns = vm.now_ns! ();
+    let reductions = vm.reductions! ();
+    let allocated = vm.allocated! ();
+    [ns, reductions, allocated]
+};
+/// `a - b`, elementwise and never below zero -- used twice, first to turn two
+/// readings into an interval and then to take the walk back off the work.
+let minus a b = list.map (fn [x, y] -> if x > y { x - y } else { 0 }) (list.zip a b);
+
+/// Force `value` and answer `[value, [ns, reductions, bytes]]`.
+///
+/// The value arrives unevaluated -- an argument is a thunk -- which is the
+/// whole of the trick and the reason there is no lambda here.
+let charge! on value =
+    if not on { [value, [0, 0, 0]] }
+    else {
+        let before = reading! ();
+        strict! value
+        let forced = reading! ();
+        strict! value
+        let walked = reading! ();
+        [value, minus (minus forced before) (minus walked forced)]
+    };
+
+let add_reading meter name r = {
+    let phases = core.map_get meter :phases %{};
+    let cur = core.map_get phases name [0, 0, 0, 0];
+    core.map_put meter :phases (core.map_put phases name
+        [list.nth 0 cur + list.nth 0 r, list.nth 1 cur + list.nth 1 r,
+         list.nth 2 cur + list.nth 2 r, list.nth 3 cur + 1])
+};
+
+/// Charge a reading already taken to `s`, for the phases whose value *is* the
+/// next state and so cannot be handed back beside one.
+let charged s name r = if metering s { put_meter (add_reading (meter_of s) name r) s } else { s };
+
+/// Force `value`, charge what that cost to `name`, and answer `[state, value]`.
+let phase! s name value = {
+    let r = charge! (metering s) value;
+    [charged s name (list.nth 1 r), list.head r]
+};
+
+/// Count something a phase cannot time: images built, wrappers run, calls
+/// answered, times a fallback was taken.
+let counted s name n = if not (metering s) { s } else {
+    let meter = meter_of s;
+    let tallies = core.map_get meter :counts %{};
+    put_meter (core.map_put meter :counts
+        (core.map_put tallies name (core.map_get tallies name 0 + n))) s
+};
+/// Several at once. The counts arrive as thunks and a meter that is off never
+/// forces one, so a round pays nothing for being countable.
+let counts s pairs = list.fold (fn acc [name, n] -> counted acc name n) s pairs;
+let tally s name = core.map_get (core.map_get (meter_of s) :counts %{}) name 0;
+let vm_starts s = tally s :vm_starts;
+
+/// Two meters added together, which the fallback paths need: a batch that
+/// failed spent its phases before the path that answered spent its own, and a
+/// reader wants the compile rather than the half of it that worked.
+let merge_meter a b = {
+    let join key combine = list.fold (fn m [k, v] -> core.map_put m k (combine (core.map_get m k ()) v))
+                                     (core.map_get a key %{}) (core.map_pairs (core.map_get b key %{}));
+    %{ :phases => join :phases (fn old v -> match old {
+           () => v,
+           _ => list.map (fn [x, y] -> x + y) (list.zip old v),
+       }),
+       :counts => join :counts (fn old v -> match old { () => v, n => n + v }) }
+};
+
+/// The meter, on the loader, for a tool to read. `modules.macro_meter` is the
+/// other end and says why it is kept there.
+let publish_meter s l =
+    if not (metering s) { l } else { modules.put :macro_meter (meter_of s) l };
 let fail s mi sp message =
     put_loader (modules.complain sp message (modules.module_source (modules.module_at (loader s) mi))
                                 (loader s)) s;
@@ -221,23 +332,31 @@ let evaluate_round! base s jobs = {
         [core.cons [mi, calls, quoted, alone, sp, wrapper] acc, after]
     }) [[], next s] jobs;
     let plans = list.reverse (list.head prepared);
-    let s1 = core.map_put s :next (list.nth 1 prepared);
+    let s1 = counts (core.map_put s :next (list.nth 1 prepared))
+        [[:rounds, 1], [:wrappers, list.length plans],
+         [:calls, list.fold (fn n plan -> n + list.length (list.nth 1 plan)) 0 plans]];
 
     // Declared together and resolved once, so that the incremental link below
     // sees every wrapper as this round's new bodies.
-    let declared = list.fold (fn acc plan ->
+    let declaring = phase! s1 :declare (list.fold (fn acc plan ->
         scope.declare_items! staged (list.head plan) [list.nth 5 plan] acc)
-        base.[:declared] plans;
+        base.[:declared] plans);
+    let s2 = list.head declaring;
+    let declared = list.nth 1 declaring;
     // Only the bodies this round's wrappers can reach are resolved and lowered;
     // everything else is stubbed. `:whole` is how a path that has already been
     // failed by that asks for the program instead -- see `unreached_body`.
-    let resolved = scope.resolve_reachable! staged declared
+    let resolving = phase! s2 :resolve (scope.resolve_reachable! staged declared
         (if base.[:whole else false] { 0 }
-         else { scope.pending_count base.[:declared] });
+         else { scope.pending_count base.[:declared] }));
+    let s3 = list.head resolving;
+    let resolved = list.nth 1 resolving;
 
     // Lazily, because a round in which every module is refused before it runs
-    // -- a bad arity, a name that is not a macro -- must not pay for one.
-    let bytes = emit.to_binary (invocation_image resolved);
+    // -- a bad arity, a name that is not a macro -- must not pay for one. That
+    // is also why the meter is off by default: charging these two forces them.
+    let arena = invocation_image resolved;
+    let bytes = emit.to_binary arena;
 
     /// A returned value, checked and given offsets of its own, with the range
     /// it occupies recorded against the site it came from -- so a diagnostic
@@ -316,29 +435,44 @@ let evaluate_round! base s jobs = {
             };
 
         match complaint {
-            why if alone && why != () => [fail noted mi sp why, [()]],
-            why if why != () => one_by_one! (base.[:whole => true]) st mi calls,
+            why if alone && why != () => [fail (counted noted :refused 1) mi sp why, [()]],
+            why if why != () => one_by_one! (base.[:whole => true])
+                                    (counted st :one_by_one 1) mi calls,
             _ => {
                 let entries = list.filter (fn b -> list.nth 0 b == mi
                     && scope.decl_name (list.nth 2 b) == "<macro expansion>!")
                     (scope.bodies resolved);
                 let entry = list.nth 3 (list.head entries);
+                // The round's arena and its bytes are shared by every module in
+                // it, so only the first one to get here pays for them: a meter
+                // takes two readings and the second finds the work already
+                // done, which is exactly what makes the ones after it free.
+                // With the meter off these are still the thunks they were, and
+                // `emit.with_entry` below forces them inside the `try!`.
+                let building = phase! noted :image arena;
+                let ready = phase! (list.head building) :emit bytes;
+                let started = reading! ();
                 let outcome = try! {
                     let value = vm.eval_image! (emit.with_entry bytes entry);
                     strict! value
                     [:ok, value]
                 } catch e { [:error, to_string e] };
+                let ran = counted (charged (list.head ready) :vm (minus (reading! ()) started))
+                                  :vm_starts 1;
                 match outcome {
                     [:error, why] if alone =>
-                        [fail noted mi sp ("macro evaluation failed: " + why), [()]],
-                    [:error, _] => one_by_one! (base.[:whole => true]) st mi calls,
+                        [fail ran mi sp ("macro evaluation failed: " + why), [()]],
+                    [:error, _] => one_by_one! (base.[:whole => true])
+                                       (counted ran :one_by_one 1) mi calls,
                     [:ok, value] => {
-                        let done = list.fold (fn [acc, answers] pair -> {
+                        let installing = charge! (metering ran) (list.fold (fn [acc, answers] pair -> {
                             let got = install! mi m acc (list.head pair)
                                                (list.nth 1 (list.nth 1 pair));
                             [list.head got, core.cons (list.nth 1 got) answers]
-                        }) [noted, []] (list.zip (if alone { [value] } else { value }) calls);
-                        [list.head done, list.reverse (list.nth 1 done)]
+                        }) [ran, []] (list.zip (if alone { [value] } else { value }) calls));
+                        let done = list.head installing;
+                        [charged (list.head done) :install (list.nth 1 installing),
+                         list.reverse (list.nth 1 done)]
                     },
                 }
             },
@@ -349,8 +483,15 @@ let evaluate_round! base s jobs = {
         let got = run! st plan;
         strict! got
         [list.head got, core.cons (list.nth 1 got) acc]
-    }) [s1, []] plans;
-    [list.head done, list.reverse (list.nth 1 done)]
+    }) [s3, []] plans;
+    // One image serves the whole round, so it is counted here rather than in
+    // `run!`, which would count it once per module that read it -- and only
+    // when something actually entered it, because a round that refuses every
+    // module never forces one. That is what `vm_starts` moving says.
+    let ended = list.head done;
+    [if vm_starts ended == vm_starts s3 { ended }
+     else { counts ended [[:images, 1], [:image_bytes, str.byte_length bytes]] },
+     list.reverse (list.nth 1 done)]
 };
 
 /// A tree with every `expand` of this round replaced by a numbered hole, and
@@ -581,12 +722,18 @@ let sequential! l =
                 // it is here because something the reachable-only snapshot
                 // stubbed was demanded, and only a program with no stubs in it
                 // can tell that apart from a macro that genuinely raised.
-                let base = match base_of acc {
+                let preparing = charge! (metering acc) (match base_of acc {
                     () => (prepare! (loader acc)).[:whole => true],
                     b => b,
-                };
+                });
+                let base = list.head preparing;
                 let before = complaints acc;
-                let first = expand_item! base acc mi i item;
+                // Charged onto the state this declaration produced rather than
+                // handed back beside it, because a snapshot this fold already
+                // has costs nothing to reuse and the reading says so: the
+                // second `strict!` finds it forced.
+                let first = charged (expand_item! base acc mi i item)
+                                    :snapshot (list.nth 1 preparing);
                 strict! first
                 // A declaration that raised may have been asking for one the
                 // snapshot has not caught up with. That is the only thing a
@@ -596,8 +743,11 @@ let sequential! l =
                 // still reported exactly once.
                 if complaints first == before { put_base base first }
                 else {
-                    let fresh = (prepare! (loader acc)).[:whole => true];
-                    put_base fresh (expand_item! fresh acc mi i item)
+                    let again = charge! (metering acc)
+                        ((prepare! (loader acc)).[:whole => true]);
+                    let fresh = list.head again;
+                    put_base fresh (charged (expand_item! fresh acc mi i item)
+                                            :snapshot (list.nth 1 again))
                 }
             }
         }) s (list.range 0 (list.length items))
@@ -609,11 +759,17 @@ let expand! l = if modules.failed l { l } else { expand_work! l (work_of l) };
 /// answer to whether there is anything to do: finding it is a walk of the
 /// whole program's syntax, and asking first whether the walk is worth making
 /// was the same walk again.
-let expand_work! l work =
-    if list.is_empty work { l }
+let expand_work! l work = {
+    let start = %{ :loader => l, :next => 3221225472 };
+    // Finding the work is the one phase every compile pays, macros or not, so
+    // it is charged even though it is not part of a round.
+    let discovery = phase! start :discover work;
+    let s0 = list.head discovery;
+    let found = list.nth 1 discovery;
+    if list.is_empty found { l }
     else {
-        let batched = rounds_all! (prepare_work! l work)
-                                  %{ :loader => l, :next => 3221225472 } work 0;
+        let snapshot = phase! s0 :snapshot (prepare_work! l found);
+        let batched = rounds_all! (list.nth 1 snapshot) (list.head snapshot) found 0;
         strict! batched
         let state = list.head batched;
         // Nothing complained, so one snapshot answered for the whole program
@@ -622,9 +778,20 @@ let expand_work! l work =
         // and only the original order can tell those apart -- so the whole
         // program is expanded again the old way, from the original loader, and
         // the batch is discarded rather than merged.
-        let expanded = if complaints state == list.length (modules.diags l) {
-            apply_items (loader state) (list.nth 1 batched)
-        } else { loader (sequential! l) };
-        modules.map_modules (fn m -> with_items m
-            (list.map macro_let (modules.module_items m))) expanded
-    };
+        // The fallback is a second expansion of the whole program, so its meter
+        // is added to the batch's rather than replacing it: what the compile
+        // spent is what both attempts spent, and `sequential` is what says a
+        // reader is looking at two of them. Both come out of one call, because
+        // `sequential!` is impure and asking it twice would expand twice.
+        let outcome = if complaints state == list.length (modules.diags l) {
+                [state, apply_items (loader state) (list.nth 1 batched)]
+            } else {
+                let seq = sequential! l;
+                [counted (put_meter (merge_meter (meter_of state) (meter_of seq)) state)
+                         :sequential 1,
+                 loader seq]
+            };
+        publish_meter (list.head outcome) (modules.map_modules (fn m -> with_items m
+            (list.map macro_let (modules.module_items m))) (list.nth 1 outcome))
+    }
+};

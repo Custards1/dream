@@ -185,7 +185,9 @@ Three tools, all of which had to exist before any of the speedups below could
 be justified:
 
 ```
-dreams --time FILE       # what each stage of a compile cost
+dreams --time FILE       # what each stage of a compile cost, and -- for a
+                         # program with macros -- what each phase of expanding
+                         # them cost
 dream --profile [N] IMG  # the hottest functions, by reductions
 dream --stats IMG        # reductions, collections, bytes allocated and
                          # promoted, milliseconds stopped in collection, and
@@ -1376,6 +1378,79 @@ at the `expand`, and again as itself by the real compile -- because `run!`
 refuses a round whose resolution has any error in it at all, and the resolution
 was the whole program. Now the round only sees the bodies it resolved, so the
 error is reported once, where it is.
+
+### What a macro call actually costs, phase by phase
+
+The three sections above each removed a whole-program cost from expansion, and
+each was justified by one number: what `--time` charged to the `expand` stage.
+One number cannot say which of the things a round does is the one still worth
+removing -- and the change proposed next for this, a compile-time VM kept
+loaded for the session and called rather than an image built and loaded per
+round ([dreams/TODO.md](dreams/TODO.md)), is a redesign of two of them. So the
+phases charge themselves now, and `dreams --time` prints the breakdown under
+the stage table for any program with a macro in it.
+
+What a round does, in order: **discover** the declarations with an `expand` in
+them, **snapshot** the program (stage it, and `scope.declare!` it), **declare**
+this round's wrappers, **resolve** what the transformers reach and stub the
+rest, **lower** that to an arena, **emit** it as an image, **run** it on a VM,
+and **install** what came back. `discover` and `snapshot` are paid once for the
+program; the rest once per round, and a round is the *nesting* of macro calls
+rather than their number.
+
+| | tax | discover | snapshot | declare | resolve | lower | emit | run | install |
+|---|---|---|---|---|---|---|---|---|---|
+| `dreams` compiling itself | 379 ms of 4786 | 52 | 49 | 26 | 93 | 100 | 51 | 5 | 3 |
+| `std --test` | 392 ms of 2519 | 4 | 30 | 17 | 117 | 144 | 60 | 10 | 10 |
+| 1,600 declarations, one call | 306 ms of 2353 | 0 | 124 | 0 | 76 | 79 | 27 | 0 | 0 |
+| 3,200 declarations, one call | 587 ms of 4309 | 0 | 227 | 0 | 147 | 169 | 44 | 0 | 0 |
+
+The last two are `dreams/tests/scale.py`'s program, which is a one-line
+transformer called once in a program of N unrelated declarations -- the macro
+tax in isolation, and the shape a large project has.
+
+**It agrees with the measurement it replaces.** The tax used to be read as the
+same program with the `expand` written out, subtracted. Three interleaved pairs
+of the 1,600-declaration program: 309, 497 and 382 ms by subtraction, against
+316, 429 and 295 ms by the meter. The same number to within what a two-second
+compile on this machine can resolve -- and only the meter says where it went.
+
+**Running the macro is not the cost, and neither is serializing the image.**
+`run` -- a fresh `Runtime`, `Scheduler` and heap per call, which is the whole
+of what `vm.eval_image!` does -- is 5 ms of a self-compile's 379 and 0 ms on
+either generated program. `emit` is 7-15%. Together they are **8% of the tax on
+a large program**, and they are precisely what a compile-time VM loaded once
+and called would remove. Everything else would stay where it is, because a
+session still has to be told what the transformer reaches, and being told is
+`snapshot`, `resolve` and `lower`.
+
+**The cost is per declaration, and it is the declarations nothing reaches.**
+Those three are 83-92% of the tax and every one of them is linear in the size
+of the program: double the declarations and the tax goes 306 ms to 587 with
+each phase doubling under it. On the generated program a transformer reaches
+exactly one declaration, so essentially all of that is what the *other* 3,199
+cost -- a name declared, a stub body of `1 / 0` resolved, and that stub lowered
+into a function record and its nodes, three thousand times over, so that one
+one-line macro can be run. The stub exists because a global of kind `function`
+must name a function the image has (see the section above); nothing says it
+must name a *different* one for every declaration, and that is the next thing
+to try.
+
+**How to read it yourself.** `dreams --time FILE` on anything with a macro. The
+meter is off unless a tool asks (`modules.metering`), and the reason is not the
+clock reads: a phase is charged around a `strict!`, and in a lazy language
+forcing a phase is a decision about *when* it happens. Expansion depends on
+that in one place -- a round that refuses every module before running one never
+forces the image, and so never builds one -- which a meter that charged the
+image would take away. Each reading is taken twice and the second subtracted,
+for the reason `main.dr`'s `timed!` gives: forcing a phase walks everything the
+phases before it built, and the walk is not this phase's work.
+
+Off, it costs nothing measurable: the same compiler with the meter in it and
+the commit before it, alternating on `mind/std/all.dr --test`, came back
+2534/2597/2593 ms against 2519/2568/2589 -- the metered build nominally faster
+in all three, which is how a difference inside the noise floor looks. Every
+image in this repository is byte-identical either way.
 
 ### The compiler was quadratic in the size of the program
 

@@ -28,16 +28,27 @@ bootstrap reaches a fixpoint in one stage.
 **What is still linear in the program**, and it is no longer the bodies:
 `scope.declare!` walks every declaration, and every declaration the transformer
 does not reach still costs a stub body, a function record and its nodes in the
-image that is serialized and handed to the macro VM. That is what the remaining
-~1 s of tax on the 1600-declaration benchmark is, and it is what the two
-redesigns below would remove.
+image that is serialized and handed to the macro VM. That was written as a
+guess and it is now measured, phase by phase -- see the first item below. It
+was right about which costs are left and wrong about their sizes, in a way that
+reorders this whole file: the stub is nearly all of it and the image is 8%.
 
-- [x] **Measure the macro tax directly.** Done to the extent the decision
-  needed: `--time` separates `parse`, and the tax is measured as the same
-  program with the `expand` written out, subtracted, at three program sizes.
-  The finer breakdown this item asked for -- reductions, allocation, images
-  serialized, VM starts, per phase -- was not built, because the first two
-  numbers already said which change to make. Build it before the next one.
+- [x] **Measure the macro tax directly.** Done twice. First to the extent the
+  last decision needed: `--time` separates `expand` from `parse`, and the tax
+  was read as the same program with the `expand` written out, subtracted, at
+  three program sizes. Then properly, because this item said to build the finer
+  breakdown before the next change and the next change is a redesign: expansion
+  charges its own phases now -- discover, snapshot, declare, resolve, lower,
+  emit, run, install, each with milliseconds, reductions and bytes, plus rounds,
+  wrappers, calls, images, image bytes and VM starts -- and `dreams --time`
+  prints it. See "What a macro call actually costs, phase by phase" in
+  `CLAUDE.md` for the numbers and for why the meter is off by default.
+
+  **It changed the order of everything below**, which is what it was for. On a
+  1,600-declaration program with one macro call the tax is 306 ms, of which
+  `emit` is 27 and `run` is 0. Building and loading an image is **8%** of what
+  a macro costs a large program; declaring, resolving and lowering the
+  declarations no transformer reaches is 83-92%.
 
 - [x] **Compile only reachable transformer dependencies.**
   `scope.resolve_reachable!` walks out from the round's wrappers using the
@@ -65,6 +76,16 @@ redesigns below would remove.
   which would introduce a second implementation of Dream evaluation semantics.
   Define GC ownership, exception cleanup, and state isolation explicitly; reuse
   executable code without accidentally sharing per-call mutable execution state.
+
+  **Measured before building: its ceiling is 8%**, and that is the whole of why
+  it is no longer first. What it removes is `emit` and `run`, and on a
+  1,600-declaration program with one macro call those are 27 ms and 0 ms of a
+  306 ms tax; on a self-compile, 51 ms and 5 ms of 379. A fresh `Runtime`,
+  `Scheduler` and heap per call -- the thing this item is mostly written about
+  -- does not show up at all at these image sizes. Everything else a round
+  spends is telling the session what the transformer reaches, which a session
+  needs told exactly as much as an image does. Worth doing after the stub cost
+  below, and not before it.
 
 - [ ] **Cache compiled transformers across builds.** After dependency tracking
   works, key cached artifacts by transformer source, transitive dependencies,
@@ -186,16 +207,47 @@ The modules axis is done: peak heap across it is flat, and the wall a large
 project hits is now entirely the **declarations** axis -- 646 MB at 3,200
 declarations, 2.5x per doubling, which is the lazy pipeline holding source,
 tokens, syntax, the staged copy, the resolver's tables and the arena live at
-once. That is not a quadratic anybody can delete, which is what makes 2 and 3
+once. That is not a quadratic anybody can delete, which is what makes 3 and 4
 below the answer rather than another round of this.
 
-1. **The incremental compile-time VM**, which is the last whole-program cost
-   macro expansion has: what remains is building and serializing an image at
-   all, and no further trimming of *what goes into* one removes it.
-2. **`.libdream` for transformers**, which is that VM's input and the smallest
-   honest version of separate compilation.
-3. **`.libdream` for everything**, if 1 and 2 have not already moved the wall
+**This list was reordered on 2026-09-20 by the phase meter**, which is the
+whole point of having built it. It used to put the incremental compile-time VM
+first, on the reasoning that building and serializing an image is the last
+whole-program cost expansion has. That is true and it is 8% of the cost. What
+the other 92% is, is a name declared, a stub resolved and a stub lowered for
+every declaration in the program that no transformer reaches -- so the thing
+to remove is the stub, not the image.
+
+1. **One stub, not one per declaration.** A declaration the reachability walk
+   does not reach gets a body of `1 / 0`, because a global of kind `function`
+   must name a function the image has. Nothing says every such global must name
+   a *different* one. If they all named one shared stub, `resolve` and `lower`
+   would do their per-declaration work once instead of N times and the image
+   would lose N function records and their nodes -- which is most of the
+   `resolve` + `lower` + `emit` that the table in `CLAUDE.md` charges to a
+   program of 3,200 declarations expanding one one-line macro (147 + 169 + 44
+   ms of 587). It changes how globals are numbered against functions, which is
+   the part to look at first: see `resolve_from!` and `unreached_body` in
+   `dreams/scope.dr`, and `docs/bytecode-format.md` on what a `GLOB` may say.
+   Measure it with `dreams/tests/scale.py` and `--time` at two sizes; the image
+   must stay byte-identical for every program in this repository, because
+   nothing reachable changes.
+2. **`scope.declare!`, which is `snapshot`** -- 124 ms of that same 306, and
+   the largest single phase on a large program. It walks every declaration
+   because expansion needs the whole program's *names*, which is a weaker thing
+   than its bodies and might be cheaper to build; nobody has looked at whether
+   it can be shared with the resolve that follows the expansion, which does the
+   same walk again.
+3. **`.libdream` for transformers**, which is separate compilation's smallest
+   honest version and is what removes 1 and 2 rather than shrinking them: a
+   dependency's declarations are not in this program at all, so there is
+   nothing to declare and nothing to stub.
+4. **`.libdream` for everything**, if the above has not already moved the wall
    past where anyone is standing.
+5. **The incremental compile-time VM**, last, because its ceiling is measured
+   and it is 8%. It is still the right shape for 3 -- a transformer library
+   loaded once for a session and called with syntax values is the same thing
+   from the VM's side -- so it is worth doing *with* that and not before it.
 
 If a fourth round of list-to-map is ever tempting, measure first and measure
 the right thing: allocation by kind at two sizes says *whether* something is
@@ -203,5 +255,9 @@ growing, and only peak live heap says whether it is the wall. The three tables
 above were 18% of allocation and 34% of the peak; `modules.modules` alone was
 6% of the first and none of the second.
 
-Do not spend another round shaving the whole-program snapshot; that seam is
-worked out.
+Do not spend another round on *which bodies* the snapshot resolves. That seam
+is worked out: the walk reaches what a transformer reaches and stubs the rest,
+and deleting the dependency edge entirely still compiles. What items 1 and 2
+are about is the opposite question -- what a declaration costs when it is
+stubbed, and what declaring its name costs -- and the meter says those are
+where the time is.
