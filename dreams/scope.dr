@@ -134,34 +134,61 @@ let next_global s = core.map_get s :next_global 0;
 /// globals contiguous.
 let take_global s = [core.map_put s :next_global (next_global s + 1), next_global s];
 
-let s_imports s     = core.map_get s :imports [];
-let s_global_recs s = core.map_get s :global_recs [];
+// Three of this state's fields grow one entry at a time and end up as long as
+// the program: the imports, the global records and the queue of bodies to walk.
+// Each is held **reversed**, and the accessor below is what puts it in order.
+//
+// The reason is that `list.append xs [x]` is one reduction and a copy of `xs`.
+// A profile counts the reduction and says nothing about the copy, so an
+// accumulator built this way is invisible there and quadratic in *bytes*: on a
+// program of 3,200 declarations, `record_global` and `add_pending` were 282 MB
+// and 281 MB apiece where 1,600 cost 80 MB each -- 3.5x for twice the program,
+// which is the shape of an n^2 with a fixed cost in it. A `core.cons` is one
+// cell whatever the list behind it, and one `list.reverse` at the end is one
+// pass. Nothing that reads these is in a loop over the program; where something
+// only wanted the length, it asks for the count instead and never builds the
+// ordered list at all.
+let s_imports_rev s     = core.map_get s :imports [];
+let s_global_recs_rev s = core.map_get s :global_recs [];
+let pending_rev s       = core.map_get s :pending [];
+
+let s_imports s     = list.reverse (s_imports_rev s);
+let s_global_recs s = list.reverse (s_global_recs_rev s);
 let s_module_recs s = core.map_get s :module_recs [];
+
+/// How many there are, without putting them in order to find out.
+let s_global_recs_count s = list.length (s_global_recs_rev s);
+let pending_count s       = list.length (pending_rev s);
 
 /// Reserve the import record for a host module: `[state, index]`. The index is
 /// what the module's global points at, because a host module is reached through
 /// the runtime rather than through a function of this program.
 let take_import path alias s =
-    [core.map_put s :imports (list.append (s_imports s) [[path, alias]]),
-     list.length (s_imports s)];
+    [core.map_put s :imports (core.cons [path, alias] (s_imports_rev s)),
+     list.length (s_imports_rev s)];
 
 /// `[index, name, kind, target]`. A function's target is its function index,
 /// which is not known until its body has been walked, so it is filled in at the
 /// end; a module's is its import index, which is known now.
 let record_global gi name kind target s =
-    core.map_put s :global_recs (list.append (s_global_recs s) [[gi, name, kind, target]]);
-let pending s = core.map_get s :pending [];
+    core.map_put s :global_recs (core.cons [gi, name, kind, target] (s_global_recs_rev s));
+let pending s = list.reverse (pending_rev s);
 let diags s   = core.map_get s :diags [];
 
 let env_at s mi = list.nth mi (envs s);
 
-let set_env mi e s =
-    core.map_put s :envs
-        (list.map (fn i -> if i == mi { e } else { list.nth i (envs s) })
-                  (list.range 0 (list.length (envs s))));
+/// Replace module `mi`'s environment.
+///
+/// `.[mi => e]` rather than a rebuild: setting a list by position is the `set`
+/// opcode, one machine walk, where the `list.map` with a `list.nth` per element
+/// this used to be was O(modules^2) *reductions* -- and it is called several
+/// times per module, so declaring a program was cubic in its module count. A
+/// program of 400 modules is where that starts to show; this repository has
+/// fifty, which is why it never did.
+let set_env mi e s = core.map_put s :envs ((envs s).[mi => e]);
 
 let add_env e s     = core.map_put s :envs (list.append (envs s) [e]);
-let add_pending p s = core.map_put s :pending (list.append (pending s) [p]);
+let add_pending p s = core.map_put s :pending (core.cons p (pending_rev s));
 
 let complain span message source s =
     core.map_put s :diags (err span message source (diags s));
@@ -448,9 +475,34 @@ let declare_core l mi items s = {
     else { s }
 };
 
-/// Replace element `at` of `xs`.
-let replace_at at x xs =
-    list.map (fn i -> if i == at { x } else { list.nth i xs }) (list.range 0 (list.length xs));
+/// The `let`s of a module as they are being gathered: the entries by position,
+/// where each name sits, and how many there are.
+///
+/// This is not the list it looks like it should be, and the reason is the one
+/// these notes keep rediscovering: a list searched more often than it is built
+/// wants to be a map. `collect_let` asks "have I already got this name?" once
+/// per declaration, and asking a list makes gathering a module quadratic in the
+/// module's size -- with a `list.map` building an intermediate of everything
+/// collected so far, and a `list.append` copying it, per declaration. On a
+/// module of sixteen hundred declarations that single scan was a sixth of every
+/// reduction the compiler made, and a program using a macro paid it twice,
+/// because expansion declares the staged program as well as the real one.
+///
+/// The positions are what make it a map and still ordered: a name keeps the
+/// slot it was first given, so a later declaration from a module this one
+/// derives replaces an earlier one *where it stood*, and `gathered` reads them
+/// back in declaration order.
+mapping Gather {
+    entries = %{}
+    slots = %{}
+    count = 0
+}
+
+let gather_new = Gather.make %{} %{} 0;
+
+/// The collection as the rest of declaration reads it: one entry per position,
+/// in declaration order.
+let gathered g = list.map (fn i -> (Gather.entries g).[i]) (list.range 0 (Gather.count g));
 
 /// The `let`s a module ends up with, base first, a later one of the same name
 /// replacing an earlier one from a *different* module. Redefining a name from a
@@ -476,18 +528,34 @@ let rec collect_lets l items acc s =
         },
     };
 
+/// Every `let` of a module, gathered and handed back as a list: `[lets, s]`.
+/// The two callers want the list; the map is an implementation detail of
+/// getting there without a scan per declaration.
+let collected_lets l items s = {
+    let got = collect_lets l items gather_new s;
+    [gathered (list.head got), list.nth 1 got]
+};
+
 /// One `let` into the collection: `[acc, s]`.
 let collect_let l owner d acc s = {
     let n = decl_name d;
-    let at = list.index_of true (list.map (fn od -> decl_name (list.nth 1 od) == n) acc);
-    if at < 0 { [list.append acc [[owner, d, true, ()]], s] }
-    else if list.head (list.nth at acc) != owner { [replace_at at [owner, d, true, ()] acc, s] }
-    // A hidden global repeats only where the names beside it repeat, and those
-    // are reported in the terms the source was written in.
-    else if is_hidden_name n { [acc, s] }
-    else {
-        [acc, complain (decl_span d) ("`" + n + "` is already bound in this module")
-                       (modules.module_source (modules.module_at l owner)) s]
+    let entry = [owner, d, true, ()];
+    let slot = Gather.count acc;
+    match (Gather.slots acc).[n else ()] {
+        () => [Gather.make ((Gather.entries acc).[slot => entry])
+                           ((Gather.slots acc).[n => slot])
+                           (slot + 1), s],
+        at =>
+            if list.head ((Gather.entries acc).[at]) != owner {
+                [Gather.set_entries acc ((Gather.entries acc).[at => entry]), s]
+            }
+            // A hidden global repeats only where the names beside it repeat, and
+            // those are reported in the terms the source was written in.
+            else if is_hidden_name n { [acc, s] }
+            else {
+                [acc, complain (decl_span d) ("`" + n + "` is already bound in this module")
+                               (modules.module_source (modules.module_at l owner)) s]
+            },
     }
 };
 
@@ -683,7 +751,7 @@ let declare_items! l mi items s0 = {
             _ => acc,
         }) s2 items;
     let with_core = declare_core l mi pairs imported;
-    let collected = collect_lets l pairs [] with_core;
+    let collected = collected_lets l pairs with_core;
     let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
                              (list.nth 1 collected) (list.head collected);
     report_clashes mi (module_span l mi) declared
@@ -715,7 +783,7 @@ let declare_module l mi s0 = {
     let effective = list.head (effective_items l mi []);
     let with_core = declare_core l mi effective derived;
 
-    let collected = collect_lets l effective [] with_core;
+    let collected = collected_lets l effective with_core;
     let virtuals = collect_virtuals effective [];
 
     // Every virtual that nothing implemented, in declaration order.
@@ -845,7 +913,11 @@ let func_at r i = core.map_get (func_map r) i (core.map_new ());
 /// Every function, in index order. Built on demand: what the walk needs is
 /// access by index, and what everything downstream wants is the sequence.
 let funcs r = list.map (fn i -> func_at r i) (list.range 0 (func_count r));
-let bodies r   = core.map_get r :bodies [];
+/// The bodies queued for the walk, in the order they were queued. Reversed in
+/// the state for the reason the three fields above are -- see the note there.
+let bodies_rev r = core.map_get r :bodies [];
+let bodies r     = list.reverse (bodies_rev r);
+let bodies_count r = list.length (bodies_rev r);
 /// Global index -> `[target, plan, arity]` for every wrapper. See "wrappers".
 let wrappers r = core.map_get r :wrappers (core.map_new ());
 let defs r     = core.map_get r :defs [];
@@ -868,7 +940,13 @@ let roles r    = core.map_get r :roles (core.map_new ());
 /// to under cannot be a pipeline, and that is one lookup.
 let role_names r = core.map_get r :role_names (core.map_new ());
 let fusions r  = core.map_get r :fusions (core.map_new ());
-let fused r    = core.map_get r :fused [];
+/// The globals deforestation invented, in the order it invented them. Held
+/// reversed and reversed once here, like the three fields at the top of this
+/// file and for the same reason: a program whose every declaration folds over a
+/// range invents a loop per declaration, and appending each one to the end cost
+/// 124 MB of a 3,200-declaration compile against 31 MB of one half its size.
+let fused_rev r = core.map_get r :fused [];
+let fused r     = list.reverse (fused_rev r);
 let fuses r    = core.map_get r :fuse false;
 
 /// The plan for the pipeline written at this span, or `()`.
@@ -1757,7 +1835,7 @@ let check_body l p r = {
     let fi = list.nth 1 started;
     let bound = bind_params c (decl_params d) (list.head started);
     let done = end_func fi (check_expr c (decl_body d) bound);
-    core.map_put done :bodies (list.append (bodies done) [[mi, source, d, fi]])
+    core.map_put done :bodies (core.cons [mi, source, d, fi] (bodies_rev done))
 };
 
 // --- the entry point ---------------------------------------------------------
@@ -1813,7 +1891,8 @@ let unreached_body p = {
 /// how the fallback path asks for one.
 let resolve_reachable! l declared from = {
     let es = envs declared;
-    let queued = list.zip (list.range 0 (list.length (pending declared))) (pending declared);
+    let all = pending declared;
+    let queued = list.zip (list.range 0 (list.length all)) all;
     let body_global p = global_index (list.nth (list.head p) es)
                                      (decl_name (list.nth 2 p));
     // Global index to queue entry, so that a resolved reference is a body in
@@ -1924,7 +2003,7 @@ let resolve_from! l declared r0 from s_pre = {
     // Only the globals this declaration added get records, and they go on the
     // end of the ones already in the carried resolution.
     let fresh =
-        list.drop (list.length (s_global_recs s_pre)) (s_global_recs declared);
+        list.drop (s_global_recs_count s_pre) (s_global_recs declared);
     let filled = list.map (fn g ->
          match list.nth 2 g {
              :function => [list.nth 0 g, list.nth 1 g, :function,
@@ -2476,7 +2555,7 @@ let reaches_frame r step =
 let take_fused_global name fi r = {
     let gi = core.map_get r :next_global 0;
     [core.map_put (core.map_put r :next_global (gi + 1))
-                  :fused (list.append (fused r) [[gi, name, :function, fi]]),
+                  :fused (core.cons [gi, name, :function, fi] (fused_rev r)),
      gi]
 };
 
@@ -2665,7 +2744,40 @@ when test {
     let first ds = if list.is_empty ds { "" } else { diag.message (list.head ds) };
     let note_of ds = if list.is_empty ds { "" } else { to_string (diag.note (list.head ds)) };
 
+    /// A `let` declaration with nothing in it but its name, for the gather
+    /// tests below: what they are about is which slot a name lands in.
+    let named n = ast.let_d n [] (ast.unit_e ast.no_span) false ast.no_span;
+
+    /// The names a gather ends up holding, in the order it hands them back,
+    /// each with the module that owns it: `[[owner, name], ..]`.
+    let gather_of owned =
+        list.map (fn e -> [list.head e, decl_name (list.nth 1 e)])
+            (gathered (list.fold (fn g [owner, n] ->
+                 list.head (collect_let () owner (named n) g state)) gather_new owned));
+
     let tests = [
+        test.case "gathered lets come back in the order they were collected"
+            $( test.eq! [[0, "a"], [0, "b"], [0, "c"]]
+                        (gather_of [[0, "a"], [0, "b"], [0, "c"]]) ),
+        // The point of the map behind the gather: it must not turn a
+        // replacement into an append. A module that derives another overrides
+        // a name *where the base declared it*, so everything after it keeps
+        // the position it had -- which is what an image's global numbering and
+        // every diagnostic that cites declaration order rest on.
+        test.case "a name redeclared by another module keeps its original slot"
+            $( test.eq! [[1, "a"], [0, "b"], [0, "c"]]
+                        (gather_of [[0, "a"], [0, "b"], [0, "c"], [1, "a"]]) ),
+        test.case "a third owner replaces the second in the same slot"
+            $( test.eq! [[2, "a"], [0, "b"]]
+                        (gather_of [[0, "a"], [0, "b"], [1, "a"], [2, "a"]]) ),
+        // A hidden global -- the one a destructuring compiles to -- repeats
+        // wherever the names beside it repeat, so the same module declaring it
+        // twice is silently the first one rather than a diagnostic. A name the
+        // author wrote is the other case and is a complaint, which needs a
+        // loader to name the file and so is tested through `checked!` above.
+        test.case "a hidden name the same module declares twice is collected once"
+            $( test.eq! [[0, "<let x>"], [0, "b"]]
+                        (gather_of [[0, "<let x>"], [0, "b"], [0, "<let x>"]]) ),
         test.case "private bindings are usable inside their module"
             $( test.eq! [] (messages (checked! "priv let x = 1; let main! = x;")) ),
         test.case "private recursive functions resolve"

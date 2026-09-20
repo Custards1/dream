@@ -1279,6 +1279,13 @@ let place_captures caps l = {
     kids encoded l
 };
 
+/// The four `link_*` folds below build their record lists with `core.cons` and
+/// reverse once at the end rather than appending. `list.append xs [x]` is one
+/// reduction and a copy of `xs`, so a profile counts none of it and the list
+/// costs O(n^2) bytes to build -- these three fold lambdas were, between them,
+/// 39% of everything a 3,200-declaration program allocated, and 3.5x what the
+/// same program at half the size allocated. See the note over `s_imports_rev`
+/// in [scope.dr](scope.dr), which is the same mistake in the other direction.
 /// The function records, as an image stores them. The two halves of a function
 /// meet here: `scope` knows its name, arity, frame size and captures, and
 /// lowering knows which node its body turned out to be.
@@ -1292,7 +1299,7 @@ let link_funcs r bodies l = link_funcs_from r bodies l 0;
 let link_funcs_from r bodies l from = {
     let zip = list.zip (list.drop from (scope.funcs r))
                        (list.range from (list.length (scope.funcs r)));
-    list.fold (fn acc pair -> {
+    let built = list.fold (fn acc pair -> {
         let f = list.nth 0 pair;
         let fi = list.nth 1 pair;
         let l0 = list.head acc;
@@ -1307,15 +1314,17 @@ let link_funcs_from r bodies l from = {
                          ir.fn_global_value
                      } else { 0 });
         [list.head placed,
-         list.append (list.nth 1 acc)
-             [%{ :name => list.nth 1 named, :body => core.map_get bodies fi ir.no_node,
+         core.cons
+             %{ :name => list.nth 1 named, :body => core.map_get bodies fi ir.no_node,
                  :arity => scope.func_arity f, :flags => flags,
                  :slots => scope.func_slots f,
                  :n_captures => list.length (scope.func_captures f),
                  :captures_off => list.nth 1 placed,
                  :span_start => ast.span_start (core.map_get f :span ast.no_span),
-                 :span_end => ast.span_end (core.map_get f :span ast.no_span) }]]
-    }) [l, []] zip
+                 :span_end => ast.span_end (core.map_get f :span ast.no_span) }
+             (list.nth 1 acc)]
+    }) [l, []] zip;
+    [list.head built, list.reverse (list.nth 1 built)]
 };
 
 let link_globals r l = link_globals_from r l 0;
@@ -1324,42 +1333,49 @@ let link_globals r l = link_globals_from r l 0;
 /// image `globals` list -- the sibling of `link_funcs_from`, same reason.
 let link_globals_from r l from = {
     let fresh = list.drop from (scope.r_global_recs r);
-    list.fold (fn acc g -> {
+    let built = list.fold (fn acc g -> {
         let named = strk (list.nth 1 g) (list.head acc);
         let is_module = list.nth 2 g == :module;
         [list.head named,
-         list.append (list.nth 1 acc)
-             [%{ :name => list.nth 1 named,
-                 :kind => if is_module { ir.global_module } else { ir.global_function },
-                 :target => match list.nth 3 g { () => ir.no_node, t => t },
-                 :flags => ir.g_exported
-                           + (if builtins.is_impure_name (list.nth 1 g) { ir.g_impure }
-                              else { 0 }) }]]
-    }) [l, []] fresh
+         core.cons
+             %{ :name => list.nth 1 named,
+                :kind => if is_module { ir.global_module } else { ir.global_function },
+                :target => match list.nth 3 g { () => ir.no_node, t => t },
+                :flags => ir.g_exported
+                          + (if builtins.is_impure_name (list.nth 1 g) { ir.g_impure }
+                             else { 0 }) }
+             (list.nth 1 acc)]
+    }) [l, []] fresh;
+    [list.head built, list.reverse (list.nth 1 built)]
 };
 
-let link_imports r l =
-    list.fold (fn acc i -> {
+let link_imports r l = {
+    let built = list.fold (fn acc i -> {
         let path = strk (list.nth 0 i) (list.head acc);
         let alias = strk (list.nth 1 i) (list.head path);
         [list.head alias,
-         list.append (list.nth 1 acc)
-             [%{ :path => list.nth 1 path, :alias => list.nth 1 alias }]]
+         core.cons %{ :path => list.nth 1 path, :alias => list.nth 1 alias }
+                   (list.nth 1 acc)]
     }) [l, []] (scope.r_imports r);
+    [list.head built, list.reverse (list.nth 1 built)]
+};
 
-let link_modules ld r l =
-    list.fold (fn acc m -> {
+let link_modules ld r l = {
+    let built = list.fold (fn acc m -> {
         let mi = list.nth 0 m;
         let mod_at = modules.module_at ld mi;
         let named = strk (modules.module_name mod_at) (list.head acc);
         let src = strk (modules.module_path mod_at) (list.head named);
         [list.head src,
-         list.append (list.nth 1 acc)
-             [%{ :name => list.nth 1 named, :source => list.nth 1 src,
-                 :globals_start => list.nth 1 m, :globals_count => list.nth 2 m,
-                 :flags => if list.nth 3 m { ir.m_abstract } else { 0 },
-                 :derives => match list.nth 4 m { () => ir.no_node, d => d } }]]
+         core.cons
+             %{ :name => list.nth 1 named, :source => list.nth 1 src,
+                :globals_start => list.nth 1 m, :globals_count => list.nth 2 m,
+                :flags => if list.nth 3 m { ir.m_abstract } else { 0 },
+                :derives => match list.nth 4 m { () => ir.no_node, d => d } }
+             (list.nth 1 acc)]
     }) [l, []] (scope.r_module_recs r);
+    [list.head built, list.reverse (list.nth 1 built)]
+};
 
 /// The function `main!` compiles to, or nothing. The entry point is a global of
 /// the root module, which is the last one loaded -- everything else was loaded

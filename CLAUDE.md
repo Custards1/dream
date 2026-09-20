@@ -1377,6 +1377,106 @@ refuses a round whose resolution has any error in it at all, and the resolution
 was the whole program. Now the round only sees the bodies it resolved, so the
 error is reported once, where it is.
 
+### The compiler was quadratic in the size of the program
+
+**How it was found**, because the method is the transferable part. Everything in
+*Making it faster* above was found by asking "what is expensive?" of one
+program. That question cannot distinguish a large linear cost from a small
+quadratic one, and a quadratic is the only kind that decides whether a big
+project compiles at all. The question that can is **"what grows faster than the
+input?"** -- run the same profile at two sizes and divide:
+
+```
+dream --stats --profile 12 build/dreams.dream -L mind -L proj -o /tmp/o.dream proj/main.dr
+```
+
+on a generated program of N and of 2N declarations. Anything near 2.0x is
+linear and can be ignored however large it is; anything near 4.0x is the bug,
+however small it is today. Four of them turned up in one sitting, and three had
+been there for the whole life of the compiler.
+
+| declarations | before | | after | |
+|---|---|---|---|---|
+| 400 | 1048 ms | 84 MB | **971 ms** | **53 MB** |
+| 1,600 | 4671 ms | 600 MB | **2685 ms** | **247 MB** |
+| 3,200 | 13144 ms | 1927 MB | **4775 ms** | **647 MB** |
+| 6,400 | 40158 ms | 6680 MB | **9848 ms** | **1660 MB** |
+
+(Peak live heap, `--stats`. Every image is byte-identical before and after, at
+every size.) Time was 2.8x-3.1x per doubling and is now 1.8x-2.1x: **linear**.
+Memory is 2.5x-2.6x per doubling, so it is better by 4x and still not linear --
+what is left is under "What is still superlinear" below.
+
+The self-compile moves from 5.1 s to 4.8 s and that is the whole of what this
+is worth on *this* repository, which is the point worth taking away: `dreams`
+has fifty modules of a hundred-odd declarations each, and n^2 on a hundred is
+nothing. **A quadratic that this codebase cannot feel is still the reason a
+large project would not build.** Generate the big program; do not wait for
+someone to write one.
+
+**1. A list searched more often than it is built wants to be a map** -- for the
+fourth time in these notes, and the previous three are above. `collect_let`
+gathers a module's `let`s and asks, per declaration, "have I got this name
+already?" It asked a list, with a `list.map` that built an intermediate of
+everything collected so far and a `list.append` that copied it. Gathering one
+module was O(M^2) in the module's size. It is a `mapping Gather` now -- entries
+by position, a slot per name, and the positions are what keep it ordered while
+the map answers the question. A name redeclared by a module that derives this
+one still replaces the earlier one *where it stood*, which is what the image's
+global numbering rests on, and there are four cases in `scope.dr`'s `when test`
+holding exactly that.
+
+**2. `list.append xs [x]` is one reduction and a copy of `xs`.** This is the
+big one, and it is the reason the first question is the wrong one. Appending is
+an opcode -- `xs + ys`, a single machine walk, which is why "a linear walk the
+machine can do is worth ten of the same walk in Dream" above recommends it --
+so a `--profile` charges one reduction for copying a list of any length. An
+accumulator built this way is therefore **invisible in a reduction profile and
+quadratic in bytes**. `record_global`, `add_pending` and `check_body`'s queue of
+bodies were 282 MB, 281 MB and 295 MB of a 3,200-declaration compile against
+80 MB, 80 MB and 87 MB at half the size; the three `link_*` folds in
+[dreams/lower.dr](dreams/lower.dr) were another 39% of everything allocated.
+All are `core.cons` onto a reversed list now, with one `list.reverse` in the
+accessor. Where a caller only wanted the length, it asks for a count and the
+ordered list is never built (`scope.pending_count`, `bodies_count`,
+`s_global_recs_count`).
+
+**3. Deforestation's invented globals were the same mistake**, and the workload
+that exposed it is the one to keep in mind: a program whose every declaration
+folds over a range invents a fused loop per declaration, so `take_fused_global`
+appended to a list as long as the program, once per declaration.
+
+**4. Declaring a program was cubic in its module count.** The other axis, and
+the one nothing here had ever varied: every measurement above changes the number
+of *declarations*. `set_env` replaced one module's environment by rebuilding the
+whole list with a `list.nth` per element -- O(modules^2) reductions -- and it is
+called several times per module. It is `(envs s).[mi => e]` now, which is the
+`set` opcode and one machine walk. On 3,200 declarations spread over 400 modules
+that is 6744 ms -> **4880 ms**, and the macro tax alone 1505 ms -> **718 ms**.
+
+**Generating the program is now one command**, because the advice above is
+useless without it:
+
+```
+dreams/tests/scale.py --sizes 800 1600 3200               # declarations
+dreams/tests/scale.py --sizes 3200 --modules 400          # modules
+```
+
+It prints the ratio between consecutive sizes for time and for peak heap, which
+is the number to read. It is not in `just test`: it takes minutes.
+
+**What is still superlinear**, measured and left. Peak heap is ~2.1x per
+doubling on both axes and time ~1.9x, so both are close to linear but neither is
+quite there; the default 1 GB per-process cap (`DREAM_MAX_HEAP`) is reached
+around 4,000-5,000 declarations. Two known candidates. `envs` is still a list
+indexed by module, so `env_at s mi` is a `list.nth` -- O(modules) per name
+resolution, which `set_env` no longer is but this still is. And the compiler is
+lazy end to end, so every stage's intermediate is retained by the stage that
+reads it: source, tokens, syntax, effective items, the staged copy, the
+resolver's tables and the arena are all live at once. That second one is not a
+bug and cannot be tuned away -- it is the argument for compiling a package at a
+time, which is what [dreams/TODO.md](dreams/TODO.md) calls for.
+
 ### Sharing the arena
 
 **What it does.** `lower` emits a node wherever the source says one and never

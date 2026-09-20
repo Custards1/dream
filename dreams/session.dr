@@ -215,10 +215,10 @@ let pre s_pre resolver low root_globals_from funcs globals imports modules boote
 /// `base_text` arrive from the caller: the engine records them for the next
 /// entry.
 let rec compile_slice! l mi state1 pre base_next base_text source = {
-    let from = list.length (scope.pending (pre_s_pre pre));
+    let from = scope.pending_count (pre_s_pre pre);
     let r1 = scope.resolve_from! l state1 (pre_resolver pre) from (pre_s_pre pre);
     let n_low = lower.lower_from r1 (pre_low pre)
-        (list.drop (list.length (scope.bodies (pre_resolver pre))) (scope.bodies r1));
+        (list.drop (scope.bodies_count (pre_resolver pre)) (scope.bodies r1));
     let lf = lower.link_funcs_from r1 (lower.func_bodies n_low) n_low
                  (scope.func_count (pre_resolver pre));
     let lg = lower.link_globals_from r1 (list.head lf) (list.length (pre_globals pre));
@@ -266,9 +266,9 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
 let rec main_step! l mi main_item en source image = {
     let state2 = scope.declare_items! l mi [main_item] (engine_state en);
     let r2 = scope.resolve_from! l state2 (engine_resolver en)
-                (list.length (scope.pending (engine_state en))) (engine_state en);
+                (scope.pending_count (engine_state en)) (engine_state en);
     let n_main = lower.lower_from r2 (engine_low en)
-        (list.drop (list.length (scope.bodies (engine_resolver en))) (scope.bodies r2));
+        (list.drop (scope.bodies_count (engine_resolver en)) (scope.bodies r2));
     let lm = lower.link_funcs_from r2 (lower.func_bodies n_main) n_main
                  (scope.func_count (engine_resolver en));
     let lg = lower.link_globals_from r2 (list.head lm) (list.length (engine_globals en));

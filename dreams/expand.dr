@@ -234,7 +234,7 @@ let evaluate_round! base s jobs = {
     // failed by that asks for the program instead -- see `unreached_body`.
     let resolved = scope.resolve_reachable! staged declared
         (if base.[:whole else false] { 0 }
-         else { list.length (scope.pending base.[:declared]) });
+         else { scope.pending_count base.[:declared] });
 
     // Lazily, because a round in which every module is refused before it runs
     // -- a bad arity, a name that is not a macro -- must not pay for one.

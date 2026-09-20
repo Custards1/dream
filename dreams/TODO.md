@@ -2,11 +2,17 @@
 
 ## Macro expansion: stop compiling the program twice
 
-Priority: was high. **The first two items below are done** -- see "A macro
-reaches a handful of declarations, not the program" in `CLAUDE.md`, which is the
-record of what landed, what it cost and what it did not buy. What is left here
-is the part that is still linear in the program, and the two redesigns that
-would remove the rest of it.
+Priority: was high. **The first two items below are done**, and a separate
+round has taken the compiler from quadratic to linear in the number of
+declarations -- see "The compiler was quadratic in the size of the program" in
+`CLAUDE.md`. On a generated 6,400-declaration program that is 40.2 s and 6.7 GB
+down to **9.8 s and 1.7 GB**, with byte-identical output. Macro cost is no
+longer the thing that stops a large project; peak heap is.
+
+The macro work itself is recorded under "A macro reaches a handful of
+declarations, not the program" in `CLAUDE.md` -- what landed, what it cost and
+what it did not buy. What is left in this section is the part still linear in
+the program, and the two redesigns that would remove the rest of it.
 
 Where it stands, 2026-09-20, `build-dream/bin/dream`, default workers and JIT,
 non-PGO, alternating runs of the same source:
@@ -85,7 +91,84 @@ redesigns below would remove.
   equivalent written-out source; report cold and warm medians over at least five
   alternating runs, with an absolute millisecond budget set from the phase profile.
 
-Reachable dependencies are done and bought roughly a quarter of a self-compile.
-The next real step is the incremental compile-time VM: what is left of the cost
-is building and serializing an image at all, and no further trimming of *what
-goes in it* can remove that. Do not spend another round shaving the snapshot.
+## Compiling a package at a time
+
+Priority: high, and it is the one Blake named -- packages compiled to `.dream`
+or a new `.libdream`, linked rather than recompiled. Everything above makes the
+whole-program compile *cheaper*; this is what makes it *unnecessary*.
+
+**What forces it, measured.** Peak live heap is 2.5x per doubling of the
+program and the default per-process cap is 1 GB, so a compile stops somewhere
+around 4,000-5,000 declarations and `DREAM_MAX_HEAP` is the only lever. Part of
+that is fixable (see "What is still superlinear" in `CLAUDE.md`) and part is
+not: the compiler is lazy end to end, so the source, the tokens, the syntax,
+the effective items, the staged copy for macros, the resolver's tables and the
+arena are all live at once, by construction. Holding one package at a time is
+the only thing that changes the shape of that.
+
+- [x] **Generate the benchmark this is missing.** Done:
+  `dreams/tests/scale.py`, which varies declarations *or* modules and prints the
+  ratio between consecutive sizes. It immediately found a cubic -- `set_env`
+  rebuilt the whole module-environment list with a `list.nth` per element, and a
+  400-module program went 6744 ms to 4880 ms when it became the `set` opcode.
+  It left one, and this is the thing to fix before reaching for a linker: `envs`
+  is still a *list* indexed by module, so `env_at s mi` is a `list.nth` and
+  every name resolution is O(modules). Both axes now grow ~1.9x in time and
+  ~2.1x in heap per doubling. Making `envs` indexable is a much smaller change
+  than separate compilation and may buy the same order of magnitude.
+
+- [ ] **Decide what a `.libdream` contains.** An image today is closed: every
+  index in it is a whole-program index, validated on load
+  ([docs/bytecode-format.md](../docs/bytecode-format.md)). A node's operands are
+  `NODE` indices, a `closure` names a `FUNC` index, a constant is a `KINT`/
+  `KSTR`/`KATM` index, a global names a `FUNC` index, a module record is a
+  *range* of `GLOB`. So a package image is the same container with every one of
+  those made relocatable, plus two tables the format has no place for yet: what
+  this package **exports** (name -> global) and what it **imports unresolved**
+  (name -> the site that needs patching). Linking is then a renumbering pass,
+  which is a pass this compiler already has in another guise -- `opt.dr` rebuilds
+  the whole arena into a fresh one with every index rewritten, and its two
+  per-opcode tables are exactly the statement of which operand is an edge and
+  which is not. Reuse those tables; do not write a second copy of that knowledge
+  (getting one wrong is silent and the image still loads).
+
+- [ ] **Decide what separate compilation costs the optimizations.** Each of
+  these is currently whole-program and each needs an answer, not a shrug:
+  deforestation asks "is this the global index `std.list` gave `range`?", which
+  is cross-package; wrapper lowering rewrites a saturated call of a wrapper into
+  what it stands for, which is cross-package inlining; `opt.dr`'s arena sharing
+  dedupes across modules and would dedupe less per package; purity is checked
+  across imports. The cheap answer for all four is "the linker re-runs it over
+  the linked arena", which keeps them exactly as sound as they are now and
+  makes a link cost more than a concatenation. Measure that before inventing
+  anything cleverer.
+
+- [ ] **Do macros first, as the smallest version of the whole problem.** A
+  package's transformers are the one thing a dependent package must be able to
+  *run*, not merely name -- which is what makes them the natural first
+  `.libdream`, and the reason is the stated goal: a project should not compile
+  its dependencies' bodies to expand its own macros. It is strictly smaller than
+  general separate compilation (a transformer is a closed program already, and
+  nothing links *into* it), it forces the export-table and relocation questions
+  on something small, and it removes the last whole-program cost expansion has.
+  Pair it with the incremental compile-time VM below: a transformer library
+  loaded once for the session and called with syntax values is the same thing
+  from the VM's side.
+
+
+## What to do next, in order
+
+1. **Make `envs` indexable**, the last known superlinear thing in the compiler
+   and the cheapest. `dreams/tests/scale.py --sizes 3200 --modules 400` is the
+   measurement; a linker is not worth designing while an afternoon's change is
+   still on the table.
+2. **The incremental compile-time VM**, which is the last whole-program cost
+   macro expansion has: what remains is building and serializing an image at
+   all, and no further trimming of *what goes into* one removes it.
+3. **`.libdream` for transformers**, which is that VM's input and the smallest
+   honest version of separate compilation.
+4. **`.libdream` for everything**, if 1-3 have not already moved the wall past
+   where anyone is standing.
+
+Do not spend another round shaving the whole-program snapshot; that seam is
+worked out.
