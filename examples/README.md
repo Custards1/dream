@@ -28,6 +28,7 @@ examples/run.sh --bless     # re-record output after a deliberate change
 | [`12_behaviors.dr`](12_behaviors.dr) | behavior contracts, record implementations, defaults and generic callers |
 | [`13_codecs.dr`](13_codecs.dr) | `std.codec`: one walk over a value, two formats, framing, and records on a wire |
 | [`14_servers.dr`](14_servers.dr) | `std.server`: a process that holds state, its handlers driven without one, and supervision |
+| [`15_remote.dr`](15_remote.dr) | `std.remote`: the same server over a socket, client and server in one program |
 
 ## The packages
 

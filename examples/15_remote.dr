@@ -1,0 +1,71 @@
+// The same server, over a socket: a client and a server in one program.
+//
+// `std.server` holds the state and answers the questions; `std.remote` is a
+// listener, a process per connection, and `std.wire` framing in between. The
+// server below is not written for the network in any way -- it is the same
+// module shape as `14_servers.dr`, reached by `remote.call!` instead of by
+// `store.call!`, and it cannot tell the difference.
+import std.console;
+import std.list;
+import std.map;
+import std.remote;
+
+mod store {
+    derive std.server;
+    import std.map;
+
+    let init! seed = seed;
+
+    let handle_call! request from state = match request {
+        [:get, k]    => reply (map.get :missing state k) state,
+        [:put, k, v] => reply :ok (map.put state k v),
+        :keys        => reply (map.sorted_keys state) state,
+        _            => reply [:error, :unknown] state,
+    };
+
+    let handle_cast! message state = match message {
+        [:put, k, v] => noreply (map.put state k v),
+        _            => noreply state,
+    };
+}
+
+let main! = {
+    // The server side: start it, then serve it. `0` asks for any free port, so
+    // this example does not fight anything else on the machine for one.
+    let s = store.start! %{};
+    let listener = remote.serve! 0 s;
+    let port = remote.port_of! listener;
+
+    // The client side. Nothing below has the server's pid; it has a socket.
+    let c = remote.connect! "127.0.0.1" port;
+    console.print! (to_string (remote.call! c [:put, "a", 1]));
+    console.print! (to_string (remote.call! c [:get, "a"]));
+    console.print! (to_string (remote.call! c [:get, "nope"]));
+
+    // A cast expects nothing back, and still arrives before the call after it.
+    remote.cast! c [:put, "b", 2];
+    console.print! (to_string (remote.call! c :keys));
+
+    // The kinds survive, because the codec underneath is `std.wire` and not
+    // JSON: an atom arrives an atom, a whole float stays a float, a char stays
+    // a char. Shown as `type_of` rather than as the values, because
+    // `to_string` renders `2.0` as `2` and would prove nothing.
+    remote.call! c [:put, "kinds", [:ok, 2.0, 'x']]
+    console.print! (to_string (list.map (fn v -> type_of v) (remote.call! c [:get, "kinds"])));
+
+    // A request the server refuses is a perfectly good reply whose value says
+    // no. `try_call!` shows the transport succeeding around it.
+    console.print! (to_string (remote.try_call! c :nonsense));
+
+    // A second client, reaching the same state.
+    let other = remote.connect! "127.0.0.1" port;
+    console.print! (to_string (remote.call! other :keys));
+
+    // Everything started here has to be stopped here: a listener parked in
+    // `accept!` and a server parked on `recv!` both outlive `main!` otherwise,
+    // and the runtime reports that as a deadlock rather than as an answer.
+    remote.close! other
+    remote.close! c
+    remote.stop_serving! listener
+    console.print! (to_string (map.sorted_keys (store.stop! s)))
+};

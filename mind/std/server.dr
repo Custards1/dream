@@ -300,6 +300,11 @@ let stop! pid = {
 /// whole difficulty with timing anything in a lazy language -- an unforced
 /// reply is a measurement of how long it took to be handed a thunk. See
 /// `std.debug`, which is where time lives and why.
+///
+/// A reading is a whole `vm.stats!` snapshot rather than a bare clock, so this
+/// is a diagnostic rather than something to put inside a loop that matters.
+/// What it costs is two snapshots per call, and what it buys is that the same
+/// `std.debug` vocabulary describes a call as describes everything else.
 let timed_call! pid request = {
     let before = debug.now! ();
     let value = strict! (call! pid request);

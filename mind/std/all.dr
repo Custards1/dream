@@ -17,6 +17,7 @@ import std.map;
 import std.macros;
 import std.proc;
 import std.record;
+import std.remote;
 import std.result;
 import std.seq;
 import std.server;
@@ -31,7 +32,8 @@ let version = "0.1.0";
 
 /// The modules this build provides.
 let modules = ["std.agent", "std.array", "std.cli", "std.codec", "std.core", "std.error", "std.json", "std.list",
-               "std.map", "std.macros", "std.proc", "std.record", "std.result", "std.seq", "std.server",
+               "std.map", "std.macros", "std.proc", "std.record", "std.remote", "std.result", "std.seq",
+               "std.server",
                "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml", "std.wire"];
 

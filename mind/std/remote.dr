@@ -1,0 +1,376 @@
+// The same server, over a socket.
+//
+// `std.server` says a mailbox is one way to drive a set of handlers and not the
+// only one. This is the other one: a listener, a process per connection, and
+// `std.codec`'s framing turning a stream of bytes back into the messages that
+// were sent. Between them they are a client and a server, and neither knows
+// anything the other end has to be told.
+//
+//     // one side
+//     let counter = counter.start! 0;
+//     let l = remote.serve! 0 counter;          // 0 means "any free port"
+//     let port = remote.port_of! l;
+//
+//     // the other
+//     let c = remote.connect! "127.0.0.1" port;
+//     remote.call! c [:add, 5]                  // 5
+//     remote.close! c
+//
+// **Nothing here is a second implementation of a server.** A connection
+// process decodes a request and hands it to `std.server`'s own `call!` -- the
+// same function a local caller uses, reaching the same mailbox, with the same
+// state behind it. That is why this module derives nothing and declares no
+// holes: the behavior is already written, and this is one more way of arriving
+// at it. Two clients on two sockets and a third in the same VM are all just
+// callers, and the server cannot tell them apart.
+//
+// **The format is `std.wire`, and that is a decision rather than a default.**
+// An RPC between two Dream programs wants the kinds to survive -- an atom to
+// arrive an atom, an array not to become a list -- and `std.wire` is the codec
+// that keeps them. A JSON service is a different thing with a different
+// audience and would want `std.json`'s framing in the four places this names
+// `wire`; that is a parameter this module deliberately does not have, because
+// a codec chosen per call is a codec two ends can disagree about.
+//
+// **What goes over it.** A request is `[:call, request]` or `[:cast, message]`;
+// a reply is `[:ok, value]` or `[:error, reason]`, and only a call gets one.
+// One call at a time per connection, so a reply needs no id: the answer to the
+// question just asked is the next message to arrive. A client that wants two
+// calls at once opens two connections, which costs a socket and saves a
+// protocol.
+//
+// **Where the honest limits are**, since a network makes some of them louder:
+//
+//   - A reason crosses as *text*. An error is not a value `std.wire` can carry
+//     -- rebuilding one would mean interning whatever atom arrived -- so what
+//     the far side gets is `error.describe`, which a person can read and a
+//     `match` cannot. Structure the failures a caller must branch on into the
+//     reply value itself.
+//   - A server that dies leaves its connections waiting, exactly as a local
+//     `call!` waits, because there are no monitors. Supervise it -- and note
+//     that a restarted server is a *new* pid, which the listener started
+//     against the old one does not know about. Serving a supervised server
+//     wants a registry between them, and that does not exist yet.
+//   - **A remotable server needs a data protocol, not a function protocol.**
+//     This is the one that bites, because it is not about this module at all.
+//     Everything that crosses is encoded, and a function is not a value
+//     `std.wire` can carry -- it arrives as its `to_string`, per `std.codec`'s
+//     `write_opaque`, which is a string that the far side will then try to
+//     call. So `std.agent` is almost entirely unreachable from here: its whole
+//     interface is `get! pid f` and `update! pid f`, and `f` cannot make the
+//     trip. A server meant to be reached over a socket says `[:put, k, v]`
+//     where a local one might have said "run this on the state". The same is
+//     true of a reply.
+import std.core;
+import std.error;
+import std.io;
+import std.list;
+import std.net;
+import std.result;
+import std.server;
+import std.streams;
+import std.wire;
+
+// --- reading one message off a stream ----------------------------------------
+//
+// `std.codec` offers two ways to unframe, and this takes the one for a reader
+// that owns its stream: read the four-byte header, ask how long the body is,
+// read exactly that. Nothing is ever held that belongs to the next message, so
+// there is no buffer to carry between calls and no byte copied twice. The other
+// way -- `next_frame` over a growing buffer -- is right when something else is
+// reading the same bytes, and costs a copy of the unconsumed tail each time.
+
+/// Up to `n` bytes, stopping early only at end of stream.
+///
+/// A read answers what has arrived rather than what was asked for, so this is a
+/// loop; the pieces are collected and joined once, because building the answer
+/// with `+` would copy everything read so far at every step.
+priv let rec exactly! sock n acc =
+    if n <= 0 { core.str_concat (list.reverse acc) }
+    else {
+        let chunk = io.read! sock n;
+        if core.str_len chunk == 0 { core.str_concat (list.reverse acc) }
+        else { exactly! sock (n - core.str_len chunk) (core.cons chunk acc) }
+    };
+
+/// The next message: a `std.result` of the value, or `()` at end of stream.
+///
+/// End of stream is `()` rather than an error for the reason `next_frame` has
+/// the same answer: a connection that closed cleanly between messages is how a
+/// conversation ends, and calling that a failure would make every ordinary
+/// goodbye look like one.
+priv let next! sock = {
+    let header = exactly! sock wire.frame_header [];
+    if core.str_len header < wire.frame_header { () }
+    else {
+        let size = wire.frame_size header;
+        if size < 0 { () }
+        else {
+            let body = exactly! sock size [];
+            if core.str_len body < size { () } else { wire.decode body }
+        }
+    }
+};
+
+priv let send! sock value = streams.write_all! sock (wire.frame value);
+
+// --- serving ------------------------------------------------------------------
+
+/// A listening socket. `0` asks the system for a free port; `port_of!` says
+/// which one it gave.
+let listen! port = net.listen! port;
+
+let port_of! listener = net.port! listener;
+
+/// Stop listening. The accept loop ends with it.
+let stop_serving! listener = io.close! listener;
+
+/// Answer one request, as bytes ready to write.
+///
+/// The encoding happens *inside* the `try!`, and that is the whole shape of this
+/// function. A handler can raise, and so can encoding its answer, and a
+/// connection that died of either while the client waited for a reply would
+/// hang the client rather than tell it. `strict!` is what puts the work inside:
+/// `wire.frame` of a lazy value is a lazy string, and a `try!` around a value
+/// nobody forced catches nothing.
+priv let reply_bytes! pid request = try! {
+    let value = server.call! pid request;
+    strict! (wire.frame [:ok, value])
+} catch e { wire.frame [:error, error.describe e] };
+
+/// One connection, until it ends.
+priv let rec serve_connection! sock pid = match next! sock {
+    () => io.close! sock,
+    [:error, why] => {
+        send! sock [:error, "cannot read that message: " + to_string why]
+        io.close! sock
+    },
+    [:ok, [:call, request]] => {
+        streams.write_all! sock (reply_bytes! pid request)
+        serve_connection! sock pid
+    },
+    [:ok, [:cast, message]] => {
+        server.cast! pid message
+        serve_connection! sock pid
+    },
+    // Something that framed and decoded but is not a request. The connection
+    // survives it: the frame said where the message ended, so the stream is
+    // still in step, and saying so is more use than hanging up.
+    [:ok, other] => {
+        send! sock [:error, "not a request: " + to_string other]
+        serve_connection! sock pid
+    },
+};
+
+/// Accept until the listener is closed.
+///
+/// The `try!` is how the loop ends. There is no way to interrupt a process
+/// parked in `accept!`, so stopping means closing the listener underneath it,
+/// which is what `stop_serving!` does -- and that surfaces here as a raise
+/// rather than as a return, because from `accept!`'s side a closed handle is an
+/// error like any other. Binding the accept inside the `try!` is what forces it
+/// there; in the lazy position of a list it would raise at whoever looked.
+priv let rec accept_loop! listener pid =
+    match try! {
+        let sock = net.accept! listener;
+        [:ok, sock]
+    } catch e { [:error, e] } {
+        [:ok, sock] => {
+            spawn! $( serve_connection! sock pid )
+            accept_loop! listener pid
+        },
+        [:error, _] => :closed,
+    };
+
+/// Serve `pid` on an existing listener, in a process of its own.
+let serve_on! listener pid = spawn! $( accept_loop! listener pid );
+
+/// Listen on `port` and serve `pid` there. Answers the listener, which is what
+/// `port_of!` and `stop_serving!` take.
+let serve! port pid = {
+    let listener = net.listen! port;
+    serve_on! listener pid
+    listener
+};
+
+// --- calling ---------------------------------------------------------------------
+
+let connect! host port = net.connect! host port;
+
+let close! conn = io.close! conn;
+
+/// Ask, and wait for the answer: `[:ok, value]` or `[:error, reason]`.
+///
+/// Every way this can go wrong is a value, because most of them are not the
+/// program's fault: the connection ended, the reply did not decode, the handler
+/// raised. `call!` is the same thing for a caller that would rather not check.
+let try_call! conn request = {
+    streams.write_all! conn (wire.frame [:call, request])
+    match next! conn {
+        () => result.error "the connection ended before a reply arrived",
+        [:error, why] => result.error ("cannot read the reply: " + to_string why),
+        [:ok, [:ok, value]] => result.ok value,
+        [:ok, [:error, why]] => result.error why,
+        [:ok, other] => result.error ("not a reply: " + to_string other),
+    }
+};
+
+/// The answer, raising `:remote_error` if there is not one.
+///
+/// This is what makes a remote call read like a local one -- `remote.call! c
+/// [:add, 5]` beside `counter.call! p [:add, 5]` -- and the difference that
+/// remains is the honest one: a local call cannot fail to arrive.
+let call! conn request = match try_call! conn request {
+    [:ok, value] => value,
+    [:error, why] => error.raise_as! :remote_error why,
+};
+
+/// Tell, and carry on. Nothing comes back, including a failure to arrive.
+let cast! conn message = streams.write_all! conn (wire.frame [:cast, message]);
+
+// --- tests -----------------------------------------------------------------------
+
+when test {
+    import std.map;
+    import std.test;
+
+    // A server with a *data* protocol, which is what makes it reachable from a
+    // socket at all -- see the note at the head of this file.
+    mod store {
+        derive std.server;
+        import std.map;
+
+        let init! seed = seed;
+
+        let handle_call! request from state = match request {
+            [:get, k]    => reply (map.get :missing state k) state,
+            [:put, k, v] => reply :ok (map.put state k v),
+            :keys        => reply (map.sorted_keys state) state,
+            _            => reply [:error, :unknown] state,
+        };
+
+        let handle_cast! message state = match message {
+            [:put, k, v] => noreply (map.put state k v),
+            _            => noreply state,
+        };
+    }
+
+    /// Start a store, serve it on a port the system picks, run `body!` against
+    /// that port, and take all of it down again.
+    ///
+    /// The teardown is the reason this exists rather than being written out per
+    /// case. A listener left open is a process parked in `accept!` and a server
+    /// left running is one parked on `recv!`, and a test program that ends with
+    /// either is reported as deadlocked rather than as passing -- so every case
+    /// here has to undo exactly what it did, and doing that in one place is the
+    /// difference between a suite that fails and a suite that hangs.
+    ///
+    /// The `strict!` matters for the same reason: an answer still holding an
+    /// unforced read of a socket would be forced by the assertion, after this
+    /// has closed it.
+    priv let with_store! body! = {
+        let s = store.start! %{};
+        let l = serve! 0 s;
+        let answer = strict! (body! (port_of! l));
+        stop_serving! l
+        store.stop! s
+        answer
+    };
+
+    priv let here! port = connect! "127.0.0.1" port;
+
+    let tests = [
+        test.case "a call goes out and an answer comes back"
+            $( test.eq! :ok (with_store! (fn port -> {
+                   let c = here! port;
+                   let r = call! c [:put, "a", 1];
+                   close! c
+                   r
+               })) ),
+        test.case "the state is still there for the next call"
+            $( test.eq! 1 (with_store! (fn port -> {
+                   let c = here! port;
+                   call! c [:put, "a", 1]
+                   let r = call! c [:get, "a"];
+                   close! c
+                   r
+               })) ),
+        test.case "a cast arrives, and in order"
+            $( test.eq! ["a", "b"] (with_store! (fn port -> {
+                   let c = here! port;
+                   call! c [:put, "a", 1]
+                   cast! c [:put, "b", 2]
+                   let r = call! c :keys;
+                   close! c
+                   r
+               })) ),
+        test.case "two connections reach the same server"
+            $( test.eq! [:ok, 1] (with_store! (fn port -> {
+                   let one = here! port;
+                   let two = here! port;
+                   let put = call! one [:put, "shared", 1];
+                   let got = call! two [:get, "shared"];
+                   close! one
+                   close! two
+                   [put, got]
+               })) ),
+        test.case "a connection made after the first one closed still works"
+            $( test.eq! 1 (with_store! (fn port -> {
+                   let one = here! port;
+                   call! one [:put, "a", 1]
+                   close! one
+                   let two = here! port;
+                   let r = call! two [:get, "a"];
+                   close! two
+                   r
+               })) ),
+
+        // A server's own error value is not a transport failure, and the two
+        // must not be spelled the same: this arrives as a perfectly good reply
+        // whose value happens to say no.
+        test.case "a request the server refuses is still a reply"
+            $( test.eq! [:ok, [:error, :unknown]] (with_store! (fn port -> {
+                   let c = here! port;
+                   let r = try_call! c :nonsense;
+                   close! c
+                   r
+               })) ),
+        test.case "and reaches call! as the value it is"
+            $( test.eq! [:error, :unknown] (with_store! (fn port -> {
+                   let c = here! port;
+                   let r = call! c :nonsense;
+                   close! c
+                   r
+               })) ),
+
+        // Every kind survives the trip, because the codec under this is the one
+        // that keeps them apart. This is the difference from a JSON service.
+        test.case "an atom comes back an atom"
+            $( test.eq! :atom (with_store! (fn port -> {
+                   let c = here! port;
+                   call! c [:put, "k", :ok]
+                   let r = type_of (call! c [:get, "k"]);
+                   close! c
+                   r
+               })) ),
+        test.case "a nested structure survives"
+            $( test.eq! %{ :xs => [1, 2.5, "three"] } (with_store! (fn port -> {
+                   let c = here! port;
+                   call! c [:put, "k", %{ :xs => [1, 2.5, "three"] }]
+                   let r = call! c [:get, "k"];
+                   close! c
+                   r
+               })) ),
+
+        test.case "a port is reported, and it is a real one"
+            $( test.true! (with_store! (fn port -> port > 0)) ),
+
+        // The transport's own failure, as a value rather than a raise.
+        test.case "calling a connection that is closed is an error, not an answer"
+            $( test.true! (with_store! (fn port -> {
+                   let c = here! port;
+                   close! c
+                   result.is_error (try! { try_call! c :keys } catch e { result.error e })
+               })) ),
+    ];
+}

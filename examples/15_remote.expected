@@ -1,0 +1,8 @@
+:ok
+1
+:missing
+["a", "b"]
+[:atom, :float, :char]
+[:ok, [:error, :unknown]]
+["a", "b", "kinds"]
+["a", "b", "kinds"]

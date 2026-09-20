@@ -189,13 +189,27 @@ let frame v = {
 /// can be split again, not a bigger message.
 let frame_all vs = core.str_concat (list.map frame vs);
 
-/// The length a prefix spells. Little-endian, and read a byte at a time
-/// because that is what a string is indexed by.
-priv let prefix_of buf =
-    core.str_byte buf 0
-    + core.str_byte buf 1 * 256
-    + core.str_byte buf 2 * 65536
-    + core.str_byte buf 3 * 16777216;
+/// The length of the message whose prefix is at the front of `buf`, or `-1`
+/// when `buf` does not yet hold a whole prefix.
+///
+/// `next_frame` below is for a reader that has a *buffer*; this is for one that
+/// has a *stream* and would rather read exactly what it needs -- read
+/// `frame_header` bytes, ask this, read that many more, and never hold a byte
+/// that belongs to the next message. Which of the two is right depends on
+/// whether anything else is reading the same stream: the buffer is general and
+/// copies what it has not consumed, and this copies nothing and assumes the
+/// reader owns the stream.
+///
+/// Little-endian, and read a byte at a time because that is what a string is
+/// indexed by.
+let frame_size buf =
+    if core.str_len buf < frame_header { 0 - 1 }
+    else {
+        core.str_byte buf 0
+        + core.str_byte buf 1 * 256
+        + core.str_byte buf 2 * 65536
+        + core.str_byte buf 3 * 16777216
+    };
 
 /// The first whole message in `buf` and what follows it: `[result, rest]`,
 /// where `result` is whatever `decode` made of that message's bytes.
@@ -210,7 +224,7 @@ let next_frame buf = {
     let have = core.str_len buf;
     if have < frame_header { () }
     else {
-        let size = prefix_of buf;
+        let size = frame_size buf;
         let total = frame_header + size;
         if have < total { () }
         else {
