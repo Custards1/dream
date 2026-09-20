@@ -337,7 +337,7 @@ let operators = [
     ["{", :lbrace], ["}", :rbrace],
     ["<", :lt], [">", :gt], ["=", :eq],
     ["+", :plus], ["-", :minus], ["*", :star], ["/", :slash], ["%", :percent],
-    [".", :dot], [",", :comma], [";", :semi], [":", :colon],
+    [".", :dot], [",", :comma], [";", :semi], [":", :colon], ["|", :bar],
 ];
 
 /// The operator at `i`, as `[kind, width]`, or `()`.
@@ -381,7 +381,7 @@ let operator_at s i = {
     else if a == 37 { if b == 123 { [:percent_brace, 2] } else { [:percent, 1] } }
     else if a == 124 { if b == 62 { [:pipe_into, 2] }
                        else if b == 124 { [:or_or, 2] }
-                       else { () } }
+                       else { [:bar, 1] } }
     else if a == 38 { if b == 38 { [:and_and, 2] } else { () } }
     else if a == 33 { if b == 61 { [:bang_eq, 2] } else { () } }
     else if a == 36 { if b == 40 { [:dollar_paren, 2] } else { () } }
@@ -589,11 +589,15 @@ when test {
             $( test.eq! [:dot, :eq, :minus, :lt, :gt, :percent]
                         (list.map (fn t -> list.head (operator_at t 0))
                                   [".", "=", "-", "<", ">", "%"]) ),
-        // `|`, `&` and `!` are not tokens on their own -- only doubled, or
-        // paired -- and neither is `$` or `#`.
+        // `&` and `!` are not tokens on their own -- only doubled, or paired --
+        // and neither is `$` or `#`. A lone `|` is the exception: it separates
+        // the branches of a union type, so it has to be a token of its own.
         test.case "half of a two-byte operator is not a token"
-            $( test.eq! [(), (), (), (), ()]
-                        (list.map (fn t -> operator_at t 0) ["|", "&", "!", "$", "#"]) ),
+            $( test.eq! [(), (), (), ()]
+                        (list.map (fn t -> operator_at t 0) ["&", "!", "$", "#"]) ),
+        test.case "a lone pipe is the union bar"
+            $( test.eq! [:bar, :or_or, :pipe_into]
+                        (list.map (fn t -> list.head (operator_at t 0)) ["|", "||", "|>"]) ),
 
         // --- numbers ---
         test.case "decimal"        $( test.eq! [42] (values "42") ),

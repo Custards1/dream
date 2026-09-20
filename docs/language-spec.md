@@ -97,7 +97,7 @@ Keywords, which may not be used as ordinary names:
 
 ```
 let  priv  rec  if  else  import  as  catch  true  false
-not  try!  fn  virtual  derive  comp  comp!  when  mod
+not  try!  fn  virtual  derive  comp  comp!  when  mod  type
 ```
 
 Of these, `let  priv  rec  else  import  as  catch  virtual  derive  when  mod` can
@@ -169,6 +169,121 @@ let main! = {
 the VM's `bi_type_of` ([`dream/src/builtins.cpp`](../dream/src/builtins.cpp));
 the compiler lowers `type_of` to that builtin, and this table is checked
 against it by tests rather than kept in step by hand.
+
+### Optional type descriptions
+
+A type is an ordinary Dream value that describes a set of values. Naming one
+changes nothing about how a value is represented and makes no check happen:
+checking is a function call a program chooses to make, where it wants it.
+
+```dream
+import std.types;
+
+type Min      = :integer -> :integer -> :integer;
+type Ints     = [:integer];
+type Outcome v = [:ok, v] | [:error, :string];
+type Port     = :integer where fn n -> n >= 1 && n <= 65535;
+
+let count  = types.check Port input;                 // checked when demanded
+let primes = comp types.check Ints [2, 3, 5];        // checked while compiling
+let schema = comp Ints;                              // bake a description as data
+```
+
+`types.accepts T value` tests membership. `types.check T value` answers the
+original value or raises `:type_error` carrying `T`. A failed check inside
+`comp` is a compile error. There is no inference, no coercion, and no check
+on assignment or application; a function opts in by checking what it takes or
+what it answers, and a partially applied `types.check T` is an ordinary
+reusable checking function.
+
+`type Name params = description` is shorthand for
+`let Name params = [:named, "Name", description]`, so a type follows `let`'s
+rules for imports, privacy (`priv type`), currying and local binding, and a
+local type may capture runtime values.
+
+#### The type grammar
+
+The right-hand side of a `type`, and a record field's annotation, are read in
+a grammar of their own. It is the only place a bracket means a type: in an
+ordinary expression `[:integer]` is still the list holding one atom, and a
+description is built there by calling `std.types` instead.
+
+| written | means |
+|---|---|
+| `:integer`, `:string`, `:pure_fn`, … | a primitive: the atoms `type_of` answers with |
+| `:any`, `:never` | everything, without forcing it; and nothing |
+| `:ok`, `"fast"`, `3`, `'c'` | a literal: that value and no other |
+| `Name`, `mod.Name`, `Name arg` | a named type, and the application of a parameterised one |
+| `a -> b` | a function. Right-associative, so `a -> b -> c` is a function of `a` answering `b -> c` |
+| `a \| b \| c` | a union: any one of them |
+| `[t]` | a list of `t`, of any length |
+| `[a, b, …]` | a list of exactly that many, in that order — which is what makes `[:ok, value]` read as itself |
+| `#[t]`, `#[a, b]` | the same two readings, for an array |
+| `%{k => v}` | a map, when the key names a kind: `%{:string => :integer}` |
+| `%{:host => t, …}` | a record, when the keys are literals. The named keys must be there; others are allowed |
+| `t where predicate` | a refinement: `t`, and the predicate answers `true` |
+| `( t )` | grouping |
+
+`where` takes an ordinary expression, which is how a description reaches
+anything the grammar cannot say. It is contextual, so a program is still free
+to bind the name `where` elsewhere.
+
+**One spelling serves two meanings, and the value decides which.** `:error`
+names every error box, and it is also the tag of `[:error, reason]`; `:list`
+names every list, and it is one of the three answers `record.backing` gives.
+An atom is compared against an atom and asked its kind otherwise, so
+`[:ok, v] | [:error, reason]` means what it looks like and `error.Error` still
+matches a real error. The cost is over-acceptance in cases that do not arise:
+`:integer` also accepts the atom `:integer`, and `:list` read as a tag also
+accepts an actual list. `types.literal :list` is the exact form for a program
+that cares.
+
+#### Building a description at run time
+
+The `std.types` constructors build the same data the grammar does, for a
+program that decides at run time what to check against: `list_of T`,
+`array_of T`, `tuple [T, …]`, `array [T, …]`, `map_of K V`,
+`record %{key => T}`, `one_of [T, …]`, `all_of [T, …]`, `optional T`,
+`literal value`, `fn_of A B`, `refine T predicate`, `enum [values]`,
+`range lo hi` and `sized lo hi T`. Each accepts its argument written either
+way, so `types.enum [:flag, :value]` means the same in a `type` as in an
+expression.
+
+An arrow can only be *tested* for being a function — seeing what it does with
+an argument means applying it, which a membership test may not do.
+`types.enforce (A -> B) f` is the other half: it wraps `f` so that each
+application checks one arrow, argument in and answer out.
+
+Checks force only what membership needs. A homogeneous list type walks the
+spine; `list_of :any` leaves the elements alone; a union stops at its first
+match; an unused check never runs. Predicates obey ordinary purity rules. A
+description holding a closure can be used while checking inside `comp` but
+cannot itself be baked into an image, since a `comp` result must be data.
+
+#### Records
+
+```dream
+group Point { x : :integer, y : :integer = 0 }
+struct Vector { x : :float, y : :float }
+mapping Config { host : :string, retries : :integer = 3 }
+
+let point  = comp types.check Point.type (Point.new 5);
+let config = types.check Config.type incoming;
+```
+
+A field's optional `: description` contributes to `Name.type`. Separate the
+annotation colon from what follows with whitespace (`x : :integer`), because
+`:integer` is itself an atom token. Descriptions are read in the record's
+generated module and have the same scope as its members; they do not capture
+names from the surrounding module. Fields with no annotation accept anything.
+
+`group` checks lists, `struct` arrays, and `mapping` maps. A missing field is
+accepted when its accessor default satisfies the field's type; extra map keys
+are allowed, extra positional elements are not. Constructors, accessors and
+setters are unchanged — `types.check Name.type value` is how a boundary gets
+checked. These are structural, so a matching raw collection is accepted too,
+and `Name.type` is an ordinary named description that composes with
+everything above.
 
 ### Scalars
 

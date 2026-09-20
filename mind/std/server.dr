@@ -331,3 +331,24 @@ let answer! request state = match handle_call! request :nobody state {
     [:stop, _, value, next] => [value, next],
     other => [other, state],
 };
+
+// --- optional types ---------------------------------------------------------
+
+type Handle = :process;
+type Call request = [:server_call, :process, request];
+type Cast message = [:server_cast, message];
+type Action value state = [:reply, value, state]
+                        | [:noreply, state]
+                        | [:stop, :any, state]
+                        | [:stop, :any, value, state];
+
+import std.types;
+
+/// Validate a handler's action explicitly, before handing it to the server.
+let check_action value state action = types.check (Action value state) action;
+
+/// Checks on the caller's side: an invalid request is rejected before sending,
+/// and an invalid reply is rejected after it has been received.
+let call_as! request_type reply_type pid request =
+    types.check reply_type (call! pid (types.check request_type request));
+let cast_as! message_type pid message = cast! pid (types.check message_type message);

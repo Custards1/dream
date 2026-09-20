@@ -132,3 +132,9 @@ when test {
             $( test.eq! ":stopped" (describe (new :stopped "")) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+type Error = :error;
+type Kind = :atom;
+type OfKind expected = :error where fn e -> kind e == expected;

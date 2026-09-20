@@ -964,7 +964,7 @@ static void test_builtin_table_matches_compiler() {
     const char* expected[] = {"spawn!",  "join!",   "send!",     "recv!", "self!",
                               "raise!",  "type_of", "to_string", "len",   "strict!",
                               "match_is_cons", "match_head", "match_tail",
-                              "match_at", "match_key"};
+                              "match_at", "match_key", "type_assert"};
     const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
     CHECK_EQ(builtin_count(), n);
     // Bounded by both, so a table that has grown past this list reports the
@@ -974,6 +974,7 @@ static void test_builtin_table_matches_compiler() {
     }
     // `spawn!` must not force its argument, or spawning would run the work here.
     CHECK_EQ(builtin_def(0).strict_mask, 0u);
+    CHECK_EQ(builtin_def(15).strict_mask, 1u);
 }
 
 static void test_maps() {

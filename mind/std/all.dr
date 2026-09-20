@@ -28,6 +28,7 @@ import std.supervisor;
 import std.test;
 import std.toml;
 import std.wire;
+import std.types;
 /// The library's own version, so a program can report what it was built with.
 let version = "0.1.0";
 
@@ -35,7 +36,7 @@ let version = "0.1.0";
 let modules = ["std.agent", "std.array", "std.cli", "std.codec", "std.core", "std.error", "std.json", "std.list",
                "std.map", "std.macros", "std.proc", "std.record", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.str", "std.streams",
-               "std.supervisor", "std.test", "std.toml", "std.wire"];
+               "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];
 
 // --- the tests std.record cannot hold ----------------------------------------
 //
@@ -78,7 +79,7 @@ when test {
 
     let ada = User.make "ada" 36;
 
-    let tests = [
+    let record_tests = [
         // what a record already did, before any of this
         test.case "a record crosses std.wire as itself"
             $( test.eq! ada (wire.decode_or () (wire.encode ada)) ),
@@ -137,4 +138,108 @@ when test {
         test.case "describe"    $( test.eq! "User(name: ada, age: 36)" (User.describe ada) ),
         test.case "record_name" $( test.eq! "Point" (Point.record_name ()) ),
     ];
+    // These schemas are built by Dream code while compiling this test runner.
+    // If any compiled fixture violates one, there is no test image to run.
+    let options_for_types = [
+        cli.value "m" "mode" "MODE" "mode" |> cli.choices ["fast", "safe"] |> cli.default_to "safe",
+        cli.list_of "I" "include" "PATH" "paths",
+        cli.count "v" "verbose" "verbosity",
+        cli.flag "q" "quiet" "quiet",
+    ];
+    let option_schema = comp cli.values_type options_for_types;
+    let compiled_options = comp cli.parse_as option_schema options_for_types ["--mode", "fast", "-vv"];
+    type Port = types.all_of [:integer, types.range 1 65535];
+    type UserData = types.record_with %{ "name" => types.sized 1 40 :string }
+                                      %{ "port" => Port };
+    let compiled_user = comp json.decode_as UserData "{\"name\":\"Ada\",\"port\":443}";
+    let compiled_packet = comp wire.frame_as (list.Of :integer) [2, 3, 5];
+
+    let mismatch_kind result = match result {
+        [:error, e] => error.kind e,
+        _ => (),
+    };
+
+    let typing_tests = [
+        test.case "core scalar types compose" $( test.eq! [true, false, true]
+            [types.accepts core.Integer 2, types.accepts core.Integer 2.0,
+             types.accepts core.Number 2.0] ),
+        test.case "collection type constructors check their members" $( test.eq! [true, false, true, false]
+            [types.accepts (list.Of :integer) [1, 2], types.accepts (list.Of :integer) [1, "x"],
+             types.accepts (array.Of :string) #["a"], types.accepts (map.Of :atom :integer) %{ :x => "bad" }] ),
+        test.case "nonempty and byte types describe actual bounds" $( test.eq! [false, true, false]
+            [types.accepts (list.NonEmpty :integer) [], types.accepts str.Byte 255,
+             types.accepts str.Byte 256] ),
+        test.case "generic sequence types specialize against their fold" $( test.eq! [true, false]
+            [types.accepts (array.elements_type :integer) #[1, 2],
+             types.accepts (str.elements_type :integer) "abc"] ),
+        test.case "a checked array retains its backing" $( test.eq! #[1, 2] (array.check :integer #[1, 2]) ),
+        test.case "map checks reject bad values" $( test.raises! $( map.check :atom :integer %{ :x => "bad" } ) ),
+        test.case "recursive JSON type checks decoded data" $( test.eq! [true, false]
+            [types.accepts json.Value %{ "xs" => [1, true, ()] }, types.accepts json.Value %{ :atom => 1 }] ),
+        test.case "wire type preserves more kinds than JSON" $( test.true!
+            (types.accepts wire.Value %{ :key => #[1, 'x', :yes] }) ),
+        test.case "TOML document type covers sections" $( test.true!
+            (types.accepts toml.Document (result.unwrap! (toml.parse "[app]\nport=80"))) ),
+        test.case "result types distinguish payloads and errors" $( test.eq! [true, false, true]
+            [types.accepts (result.Of :integer :string) [:ok, 3],
+             types.accepts (result.Of :integer :string) [:ok, "bad"],
+             types.accepts (result.Of :integer :string) [:error, "why"]] ),
+        test.case "result validation preserves an existing error" $( test.eq! [:error, "original"]
+            (result.validate_ok :integer [:error, "original"]) ),
+        test.case "typed errors remain inspectable values" $( test.true!
+            (types.accepts (error.OfKind :type_error) (core.error_new :type_error :integer)) ),
+        test.case "compile time option schemas are reusable runtime data" $( test.eq! "fast"
+            (cli.get "" (result.unwrap! compiled_options) "mode") ),
+        test.case "derived option schemas keep optional fields optional" $( test.true!
+            (result.is_ok (cli.parse_as option_schema options_for_types [])) ),
+        test.case "derived option schemas validate defaults" $( test.eq! :type_error
+            (mismatch_kind (cli.parse_typed [cli.flag "q" "quiet" "quiet" |> cli.default_to "wrong"] [])) ),
+        test.case "option choices survive compilation into a schema" $( test.false!
+            (types.accepts option_schema %{ "mode" => "unknown" }) ),
+        test.case "compiled codec checks keep the decoded value" $( test.eq! 443
+            (result.unwrap! compiled_user).["port"] ),
+        test.case "runtime decode uses the same schema as comp" $( test.eq! :type_error
+            (mismatch_kind (json.decode_as UserData "{\"name\":\"\",\"port\":443}")) ),
+        test.case "codec syntax errors are preserved" $( test.eq! (json.decode "{")
+            (json.decode_as UserData "{") ),
+        test.case "typed wire framing can be compiled" $( test.eq! (wire.frame [2, 3, 5]) compiled_packet ),
+        test.case "TOML can validate caller schemas without raising" $( test.eq! :type_error
+            (mismatch_kind (toml.parse_as (types.record %{ "app" => types.record %{ "port" => Port } })
+                                         "[app]\nport=70000")) ),
+        test.case "compiled numeric ranges reject wrong kinds" $( test.eq! [true, false, false]
+            [types.accepts Port 443, types.accepts Port 0, types.accepts Port "443"] ),
+        test.case "sized schemas check the container too" $( test.eq! [true, false, false]
+            [types.accepts (types.sized 1 3 :string) "abc", types.accepts (types.sized 1 3 :string) "",
+             types.accepts (types.sized 1 3 :string) 3] ),
+        test.case "lazy checks work on infinite lists" $( test.eq! [1, 2, 3]
+            (list.take 3 (types.check_each :integer (list.from 1))) ),
+        test.case "lazy checks leave later failures alone" $( test.eq! [1, 2]
+            (list.take 2 (types.check_each :integer [1, 2, "bad"])) ),
+        test.case "lazy checks reject a demanded bad element" $( test.raises!
+            $( list.nth 2 (types.check_each :integer [1, 2, "bad"]) ) ),
+        test.case "function contracts preserve unused arguments" $( test.eq! 7
+            ((types.function :integer :integer (fn ignored -> 7)) (1 / 0)) ),
+        test.case "function contracts check the result" $( test.raises!
+            $( (types.function :integer :integer (fn n -> "wrong")) 1 ) ),
+        test.case "server action types describe replies and transitions" $( test.eq! [true, false]
+            [types.accepts (server.Action :string :integer) (server.reply "ok" 3),
+             types.accepts (server.Action :string :integer) (server.reply "ok" "bad state")] ),
+        test.case "protocol descriptions compose with application messages" $( test.eq! [true, false]
+            [types.accepts (remote.Request :integer) [:call, 3],
+             types.accepts (remote.Response :integer) [:error, 3]] ),
+        test.case "supervisor types reject misspelled policies" $( test.eq! [true, false, false]
+            [types.accepts supervisor.Strategy :one_for_one,
+             types.accepts supervisor.Restart :forever,
+             types.accepts supervisor.Limits (supervisor.limits 3 0)] ),
+        test.case "typed agent update rejects without changing state or killing the agent" $( {
+            let pid = agent.start! 10;
+            let rejected = agent.update_as! :integer pid (fn n -> "bad");
+            test.eq! :type_error (mismatch_kind rejected)
+            test.eq! 10 (agent.value_as! :integer pid)
+            test.eq! [:ok, ()] (agent.update_as! :integer pid (fn n -> n + 1))
+            test.eq! 11 (agent.value! pid)
+            agent.stop! pid
+        } ),
+    ];
+    let tests = record_tests + typing_tests;
 }

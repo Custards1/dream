@@ -106,12 +106,28 @@ let record_derived kind name fields members bases span = {
          ast.let_d ("set_" + field) [ast.param "record" span, ast.param "value" span]
                    (ast.set_e obj key (ast.name_e "value" span) span) false span]
     }) (list.range 0 (list.length fields)));
+    // Every record supplies a structural description, without changing its
+    // constructors or forcing its fields. Unannotated fields accept anything.
+    // Defaults are carried lazily, so membership agrees with accessor reads.
+    let type_fields = list.map (fn i -> {
+        let f = list.nth i fields;
+        let key = if kind == :map { ast.atom_e (ast.field_name f) span }
+                  else { ast.int_e i span };
+        let description = match ast.field_type f { () => ast.atom_e "any" span, t => t };
+        let defaults = match ast.field_default f { () => [], d => [d] };
+        ast.list_e [key, description, ast.list_e defaults span] span
+    }) (list.range 0 (list.length fields));
+    let description = ast.let_d "type" []
+        (ast.list_e [ast.atom_e "named" span, ast.str_e name span,
+            ast.list_e [ast.atom_e "shape" span, literal kind span,
+                        ast.list_e type_fields span] span] span) false span;
     let generated = list.head (fresh ([constructor, from_default] + helpers)
                                      (2147483648 + ast.span_start span * 128));
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
                                               (ast.member_body m) true (ast.member_span m))
                            members;
-    ast.mod_d name (bases + generated + written) span
+    // Each field type occurs once, so retain its written spans for diagnostics.
+    ast.mod_d name (bases + generated + [description] + written) span
 };
 
 // Validate returned data before any compiler pass assumes an AST shape. Spans

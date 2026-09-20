@@ -98,3 +98,11 @@ let join sep xs = {
 };
 
 let describe xs = name xs + " of " + to_string (length xs)
+
+// --- optional types ---------------------------------------------------------
+
+// A derived container's actual traversal defines membership. The descriptor
+// contains a closure, so it can check inside comp but is not itself bakeable.
+import std.types;
+let elements_type element = types.refine :any
+    (fn values -> fold (fn valid value -> valid && types.accepts element value) true values);

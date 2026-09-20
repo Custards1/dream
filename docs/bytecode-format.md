@@ -290,3 +290,7 @@ A binding of the same name shadows the builtin.
   from `bi_type_of` in `dream/src/builtins.cpp`.
 - **Validation.** A loader should bounds-check every index against its
   section's `count` before use, since a `.dream` file may be untrusted.
+
+Optional type descriptions use ordinary value nodes and need no new opcode.
+The builtin table appends `type_assert` at ID 15 (arity 3, strict mask `0b001`);
+existing builtin IDs are unchanged. Images that use it require an updated VM.

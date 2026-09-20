@@ -40,6 +40,13 @@ let handle_call! request from state = match request {
     :value        => reply state state,
     [:get, f]     => reply (strict! (f state)) state,
     [:update, f]  => reply :ok (strict! (f state)),
+    // A rejected typed update replies with the error and keeps the old state.
+    // Validation and replacement happen in one mailbox turn, so there is no
+    // read/validate/write race and the client is never left awaiting a reply.
+    [:update_as, description, f] => match types.validate description (f state) {
+        [:ok, next] => reply [:ok, ()] (strict! next),
+        failure => reply failure state,
+    },
     // One trip for a read that depends on a write. `f` answers `[value, next]`,
     // and doing it as a `get!` and then an `update!` would let another client
     // in between -- which is the whole difference between this and those two.
@@ -255,3 +262,12 @@ when test {
         test.case "server_name" $( test.eq! "agent" (server_name ()) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+// Checking a state is an explicit boundary; ordinary updates stay generic.
+let value_as! description pid = types.check description (value! pid);
+
+/// Atomic validation: [:ok, ()] on replacement, [:error, error] on mismatch.
+let update_as! description pid f = call! pid [:update_as, description, f];

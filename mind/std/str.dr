@@ -238,3 +238,10 @@ when test {
         test.case "trim of blank"    $( test.eq! "" (trim "   ") ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+type Text = :string;
+type Characters = [:char];
+// Byte offsets are distinct from character positions in this library.
+type Byte = :integer where fn n -> n >= 0 && n <= 255;

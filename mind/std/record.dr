@@ -191,3 +191,11 @@ let with_fields self changes = {
 // `std.all` is the one module whose business is the library seen as a whole,
 // so the records live there, and testing them against `std.wire` and
 // `std.json` in the same block is worth as much as testing them here.
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+// Field metadata and named record data can be checked before conversion.
+type Fields = [:atom];
+type Backing = types.enum [:list, :array, :map];
+let of_map_as description value = types.check description (of_map value);

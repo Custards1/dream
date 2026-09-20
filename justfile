@@ -252,6 +252,7 @@ test-dreams-corpus: build
 test-dreams-compile: build
     dream={{dream}} seed={{seed}} dreams/tests/compile.sh
     python3 dreams/tests/macros.py --dream {{dream}} --compiler {{image}}
+    python3 dreams/tests/optional_types.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/modules.py --dream {{dream}} --compiler {{image}}
 
 # The VS Code extension's grammar, tokenized and checked against the scopes it

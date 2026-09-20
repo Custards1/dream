@@ -659,7 +659,8 @@ when test {
         test.case "a record's members are offered with their parameters"
             $( test.eq! [["make", "make x y"], ["new", "new x y"],
                          ["set_x", "set_x record value"],
-                         ["set_y", "set_y record value"], ["x", "x record"], ["y", "y record"]]
+                         ["set_y", "set_y record value"], ["type", "type"],
+                         ["x", "x record"], ["y", "y record"]]
                         (member_details! "group Point { x, y }\n" ["Point"]) ),
         test.case "a record offers specialized behavior methods"
             $( test.eq! [["label", "label self"], ["name", "name record"]]

@@ -179,6 +179,8 @@ group RecordField { param, default }
 let record_field = RecordField.make;
 let field_param f = RecordField.param f;
 let field_default f = RecordField.default f;
+// Older syntax and macros keep their two-element fields.
+let field_type f = f.[2 else ()];
 let field_name f    = param_name (list.nth 0 f);
 let field_span f    = list.nth 1 (list.nth 0 f);
 
@@ -356,9 +358,14 @@ let rec show e =
             "(" + (match kind { :list => "group", :array => "struct", :map => "mapping" })
                 + " " + n + " " + (if list.is_empty bases { "" } else { show_all bases + " " })
                 + str.join_str " " (list.map (fn f ->
-                      match field_default f {
-                          () => field_name f,
-                          d => "(" + field_name f + " = " + show d + ")",
+                      {
+                          let label = field_name f + match field_type f {
+                              () => "", t => " : " + show t,
+                          };
+                          match field_default f {
+                              () => label,
+                              d => "(" + label + " = " + show d + ")",
+                          }
                       }) fields
                     + list.map (fn m ->
                       "(" + member_name m + " " + show_params (member_params m)

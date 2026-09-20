@@ -480,3 +480,10 @@ when test {
             $( test.eq! [1, 2] (parsed (write (core.array_of_list [1, 2]))) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+// These describe decoded JSON, whose object keys are always strings.
+type Value = :unit | :bool | :integer | :float | :string
+           | [Value] | %{ :string => Value };
+let parse_as description text = decode_as description text;

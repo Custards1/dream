@@ -622,3 +622,53 @@ when test {
             $( test.true! (str.contains_str "build" (commands_help cmds)) ),
     ];
 }
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Arguments = [:string];
+type Option = %{ :short => :string, :long => :string,
+                 :kind => types.enum [:flag, :value, :list, :toggle, :count, :section],
+                 :meta => :string, :help => :string };
+type Parsed = %{ :values => %{ :string => :any }, :rest => Arguments };
+type Command = %{ :name => :string, :help => :string, :opts => [Option] };
+// The caller describes the values table after options and defaults are read.
+let parse_as description options args = match parse options args {
+    [:ok, parsed] => match types.validate description (values parsed) {
+        [:ok, _] => [:ok, parsed],
+        failure => failure,
+    },
+    failure => failure,
+};
+
+/// Infer the parser's output contract from the option declarations themselves.
+/// Calling this under `comp` freezes option kinds, choices and required/default
+/// presence into a reusable data schema, without running the parser.
+let option_type option = {
+    let element = if core.map_has option :choices {
+        types.enum option.[:choices]
+    } else { :string };
+    match kind option {
+        :flag => :bool,
+        :toggle => :bool,
+        :count => types.all_of [:integer, types.range 0 4611686018427387903],
+        :list => types.list_of element,
+        _ => element,
+    }
+};
+
+let values_type options = {
+    let [required_fields, optional_fields] = list.fold (fn [required_fields, optional_fields] o -> {
+        if not (is_option o) { [required_fields, optional_fields] }
+        else {
+            let schema = option_type o;
+            if core.map_get o :required false == true || core.map_has o :default {
+                [core.map_put required_fields (long o) schema, optional_fields]
+            } else { [required_fields, core.map_put optional_fields (long o) schema] }
+        }
+    }) [%{}, %{}] options;
+    types.record_with required_fields optional_fields
+};
+
+/// Validate against the option-derived schema, including programmer-provided
+/// defaults. `parse_as` accepts a precomputed schema to reuse across parses.
+let parse_typed options args = parse_as (values_type options) options args;

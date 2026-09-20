@@ -1883,6 +1883,18 @@ test.
   accessors are globals. Having parameters is the whole of what tells the two
   apart, and entries are separated by `,` or by a line break, as a block's
   statements are by `;`.
+- `type Name params = description` names an **optional type**: a description
+  that is an ordinary value, checked only where a program asks. Its
+  right-hand side, and a record field's `: annotation`, are read in a grammar
+  of their own -- `:integer -> :integer -> :integer`, `[:integer]`,
+  `[:ok, value] | [:error, :string]`, `%{:string => :integer}`,
+  `#[:float]`, `:integer where fn n -> n >= 0` -- which builds exactly the
+  data `std.types` builds by hand. Everywhere else a bracket is still a list.
+  `types.accepts` tests, `types.check` raises, `types.enforce` wraps a
+  function against an arrow. Nothing is inferred or coerced, and a `type` is
+  a `let`, so imports, `priv`, currying and local capture need no new rules.
+  "Optional type descriptions" in [docs/language-spec.md](docs/language-spec.md)
+  is the grammar and the one ambiguity it has to resolve.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

@@ -36,6 +36,7 @@ let names = [
     "match_tail",     // list -> its tail, unforced
     "match_at",       // array -> index -> element, unforced
     "match_key",      // map -> key -> [value] if present, [] if not
+    "type_assert",    // bool -> description -> value -> value, or :type_error
 ];
 
 let is_builtin name = list.contains name names;
@@ -49,7 +50,7 @@ let is_builtin name = list.contains name names;
 /// forgetting its line is a failing test (`every builtin has a signature`
 /// below) and not a quiet off-by-one in a list nobody reads.
 ///
-/// There is no type system to check these against. They say what the runtime
+/// These are documentation, not enforced contracts. They say what the runtime
 /// does, in the notation the rest of this codebase uses in its comments.
 let signatures = %{
     "spawn!"    => "thunk -> process",
@@ -68,6 +69,7 @@ let signatures = %{
     "match_tail"    => "list -> its tail, unforced",
     "match_at"      => "array -> index -> element, unforced",
     "match_key"     => "map -> key -> [value] if present, [] if not",
+    "type_assert"   => "bool -> description -> value -> value, or :type_error",
 };
 
 /// A builtin's signature, or its bare name for one that has none.

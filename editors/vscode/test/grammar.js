@@ -32,6 +32,14 @@ const registry = new textmate.Registry({
 
 // [line, the text to find in it, the scope that must apply to it]
 const cases = [
+  ['type Int = :integer;', 'type', 'keyword.declaration.dream'],
+  ['type Int = :integer;', 'Int', 'entity.name.function.dream'],
+  ['type N = :integer | :float;', '|', 'keyword.operator.union.dream'],
+  ['type Min = :integer -> :integer;', '->', 'keyword.operator.arrow.dream'],
+  ['type B = :integer where fn n -> n > 0;', 'where', 'keyword.other.where.dream'],
+  // The two operators that begin with a bar still win over it.
+  ['let both = a || b;', '||', 'keyword.operator.logical.dream'],
+  ['let fed = x |> f;', '|>', 'keyword.operator.pipe.dream'],
   ['priv let helper x = x;', 'priv', 'keyword.declaration.dream'],
   ['/// A doc comment.', '///', 'comment.block.documentation.dream'],
   ['// An ordinary one.', '//', 'comment.line.double-slash.dream'],

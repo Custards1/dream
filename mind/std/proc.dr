@@ -210,3 +210,9 @@ when test {
             } ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+type Process = :process;
+type Call body = [:call, Process, body];
+type Outcome value = [:ok, value] | [:error, :any];

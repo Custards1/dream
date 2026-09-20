@@ -99,12 +99,12 @@ let token_continues c t =
 /// no idea they are special.
 let keywords = ["let", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
-                "match", "macro", "expand", "group", "struct", "mapping"];
+                "match", "macro", "expand", "group", "struct", "mapping", "type"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
 let non_starters = ["let", "priv", "rec", "else", "import", "as", "catch", "virtual", "derive",
-                    "when", "mod", "macro"];
+                    "when", "mod", "macro", "type"];
 
 /// The lists above are the readable form; these are how they are asked. A
 /// linear scan answers "is this identifier a keyword" in a dozen reductions
@@ -624,6 +624,7 @@ let rec block_stmts c acc ts sp =
 /// A statement is a `let` declaration or an expression.
 let rec parse_statement c ts =
     if is_kw ts "let" { parse_let c (peek_span ts) (list.tail ts) }
+    else if is_kw ts "type" { parse_type c (peek_span ts) (list.tail ts) }
     else { parse_expr c ts };
 
 /// `let name params = body`, with `rec` optional. A block-local `let` that
@@ -664,6 +665,397 @@ let rec parse_let c sp ts = {
         }
     }
 };
+
+// --- type expressions -------------------------------------------------------
+//
+// A type is written in a grammar of its own, and the reason is the one thing
+// that decides the whole design: a description is *data*, and the data it is
+// made of is lists, maps and atoms -- exactly what a list, map and atom
+// literal already mean. So `[:integer]` cannot be both "the list holding the
+// atom `:integer`" and "a list of integers" in the same grammar, and the two
+// are told apart by where they are written rather than by how they look.
+// Inside a `type` declaration and after a record field's `:`, the forms below
+// build a description; everywhere else a bracket is still a list.
+//
+// What the parser emits is the same tagged data `std.types` constructs at run
+// time, so nothing downstream knows a written type from a built one and the
+// two cannot disagree about what a description means.
+//
+//     :integer -> :integer -> :integer     [:fn, :integer, [:fn, ..]]
+//     :integer | :float                    [:union, [:integer, :float]]
+//     [:integer]                           [:list_of, :integer]
+//     [:ok, value]                         [:tuple, [:ok, value]]
+//     #[:float]                            [:array_of, :float]
+//     %{:string => :integer}               [:map_of, :string, :integer]
+//     %{:host => :string}                  [:record, %{:host => :string}]
+//     :integer where fn n -> n > 0         [:refine, :integer, <fn>]
+//
+// Atoms pass straight through, and the parser deliberately keeps no list of
+// which ones name a primitive: `std.types` answers that, so the spelling of
+// `:integer` is decided in exactly one place. An atom that is not a primitive
+// is a literal, which is what makes `[:ok, value]` and `:one_for_one |
+// :one_for_all` mean what they look like.
+
+/// A description of a kind the parser builds: `[tag, ..parts]`, as a list
+/// expression, which is what `std.types` would have returned.
+priv let tagged tag parts span = ast.list_e (core.cons (ast.atom_e tag span) parts) span;
+
+/// The whole of a type. `where` is last so that it refines everything in
+/// front of it, and its predicate is an *ordinary* expression -- a type
+/// grammar has no way to say `fn n -> n >= 0 && n <= 255`, and should not.
+let rec parse_type_expr c ts =
+    match parse_type_arrow c ts {
+        [:error, m, s] => err m s,
+        [:ok, base, rest] =>
+            if not (is_kw rest "where") { ok base rest }
+            else {
+                match parse_expr c (list.tail rest) {
+                    [:error, m, s] => err m s,
+                    [:ok, predicate, rest2] =>
+                        ok (tagged "refine" [base, predicate]
+                                   (ast.span_to (ast.span base) (ast.span predicate))) rest2,
+                }
+            },
+    };
+
+/// `a -> b`, right-associative, so `a -> b -> c` is a function of one
+/// argument answering a function of one argument -- which is what a curried
+/// language means by it, and what `:integer -> :integer -> :integer` says
+/// about a two-argument `min`.
+let rec parse_type_arrow c ts =
+    match parse_type_union c ts {
+        [:error, m, s] => err m s,
+        [:ok, l, rest] =>
+            if not (at rest :arrow) { ok l rest }
+            else {
+                match parse_type_arrow c (list.tail rest) {
+                    [:error, m, s] => err m s,
+                    [:ok, r, rest2] =>
+                        ok (tagged "fn" [l, r] (ast.span_to (ast.span l) (ast.span r))) rest2,
+                }
+            },
+    };
+
+/// `a | b | c`, flattened into one union rather than nested pairs: a union of
+/// unions accepts the same values, and one list is what a reader of the data
+/// and `accepts` both expect to find.
+let rec parse_type_union c ts =
+    match parse_type_apply c ts {
+        [:error, m, s] => err m s,
+        [:ok, first, rest] =>
+            if not (at rest :bar) { ok first rest }
+            else { type_union_tail c [first] rest },
+    };
+
+let rec type_union_tail c acc ts =
+    if not (at ts :bar) {
+        let parts = list.reverse acc;
+        let span = ast.span_to (ast.span (list.head parts)) (ast.span (list.head acc));
+        ok (tagged "union" [ast.list_e parts span] span) ts
+    }
+    else {
+        match parse_type_apply c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, part, rest] => type_union_tail c (core.cons part acc) rest,
+        }
+    };
+
+/// Application, as everywhere else in the language: `List :integer` calls the
+/// type function `List`. Its arguments are types, which is what makes a
+/// parameterised type read like the thing it describes.
+let rec parse_type_apply c ts =
+    match parse_type_postfix c ts {
+        [:error, m, s] => err m s,
+        [:ok, head, rest] =>
+            match gather_type_args c [] rest {
+                [:error, m, s] => err m s,
+                [:ok, args, rest2] =>
+                    if list.is_empty args { ok head rest2 }
+                    else {
+                        ok (ast.apply_e head (list.reverse args)
+                            (ast.span_to (ast.span head) (ast.span (list.head args)))) rest2
+                    },
+            },
+    };
+
+let rec gather_type_args c acc ts =
+    if not (type_starts_arg c ts) { ok acc ts }
+    else {
+        match parse_type_postfix c ts {
+            [:error, m, s] => err m s,
+            [:ok, a, rest] => gather_type_args c (core.cons a acc) rest,
+        }
+    };
+
+/// What can begin another argument. `where` has to end the list even though
+/// it is an ordinary identifier: it is contextual, so that a program is still
+/// free to bind the name everywhere a type is not being written.
+let type_starts_arg c ts = {
+    let t = peek ts;
+    if t == () { false }
+    else if not (token_continues c t) { false }
+    else {
+        match kind_of t {
+            :ident => not (is_non_starter (lexer.value t)) && lexer.value t != "where",
+            :int => true, :float => true, :str => true, :char => true, :atom => true,
+            :lparen => true, :lbracket => true,
+            :hash_bracket => true, :percent_brace => true,
+            _ => false,
+        }
+    }
+};
+
+let rec parse_type_postfix c ts =
+    match parse_type_primary c ts {
+        [:error, m, s] => err m s,
+        [:ok, e, rest] => type_field_tail c e rest,
+    };
+
+/// `types.list_of` and the like: a dotted name reaches a type in another
+/// module, and means there exactly what it means in an expression.
+let rec type_field_tail c e ts =
+    if not (at ts :dot) { ok e ts }
+    else {
+        let after = list.tail ts;
+        if at_end after { ok e ts }
+        else if not (kind_of (list.head after) == :ident) { ok e ts }
+        else {
+            let nametok = list.head after;
+            type_field_tail c (ast.field_e e (lexer.value nametok)
+                                              (ast.span_to (ast.span e) (lexer.span nametok)))
+                              (list.tail after)
+        }
+    };
+
+/// The atoms that name a kind of value rather than a value. `std.types` holds
+/// the same list, and it is the authority -- membership is its question, and
+/// answering it here as well would be two places to add a type to.
+///
+/// What the parser needs it for is one narrower question, asked in exactly one
+/// place: whether the key of a `%{ .. }` is a *type* (`%{:string => :integer}`,
+/// a map keyed by strings) or a *literal* (`%{:host => :string}`, a record with
+/// a field called `:host`). Both are written with the same bracket because
+/// both are maps, and what tells them apart is whether the key names a kind.
+priv let primitive_atoms = [
+    "any", "never",
+    "integer", "float", "char", "bool", "unit", "string", "atom",
+    "list", "array", "map", "module", "error", "process",
+    "pure_fn", "impure_fn", "bigstr",
+];
+
+priv let primitive_atom_set = comp set_of primitive_atoms;
+
+/// A single token that stands for a value, which is what a record's key is.
+/// A primitive atom is not one: `:string` names every string, and a map whose
+/// keys are strings is what `%{:string => :integer}` should mean.
+let type_key_is_literal ts =
+    match peek_kind ts {
+        :atom => not (core.map_has primitive_atom_set (peek_value ts)),
+        :str => true, :int => true, :char => true,
+        _ => false,
+    };
+
+let rec parse_type_primary c ts = {
+    let sp = peek_span ts;
+    if at_end ts { err "expected a type" sp }
+    else {
+        match peek_kind ts {
+            // A literal stands for itself: `:ok` accepts the atom `:ok`, and
+            // `1` the integer 1. `std.types` compares with `==`, so nothing
+            // here has to know which literals there are.
+            :atom => ok (ast.atom_e (peek_value ts) sp) (list.tail ts),
+            :int => ok (ast.int_e (peek_value ts) sp) (list.tail ts),
+            :float => ok (ast.float_e (peek_value ts) sp) (list.tail ts),
+            :str => ok (ast.str_e (peek_value ts) sp) (list.tail ts),
+            :char => ok (ast.char_e (peek_value ts) sp) (list.tail ts),
+            :lbracket => parse_type_list c sp (list.tail ts),
+            :hash_bracket => parse_type_array c sp (list.tail ts),
+            :percent_brace => parse_type_map c sp (list.tail ts),
+            :lparen => parse_type_paren c sp (list.tail ts),
+            :ident =>
+                if peek_value ts == "true" || peek_value ts == "false" {
+                    ok (ast.bool_e (peek_value ts == "true") sp) (list.tail ts)
+                }
+                else if is_keyword (peek_value ts) {
+                    err ("`" + to_string (peek_value ts) + "` is a keyword and cannot be a type") sp
+                }
+                else { ok (ast.name_e (peek_value ts) sp) (list.tail ts) },
+            _ => err ("expected a type, found " + describe ts) sp,
+        }
+    }
+};
+
+/// `( t )` groups, and `()` is the unit value -- which as a type accepts
+/// exactly unit, the same as `:unit`.
+let rec parse_type_paren c sp ts =
+    if at ts :rparen { ok (ast.unit_e (ast.span_to sp (peek_span ts))) (list.tail ts) }
+    else {
+        match parse_type_expr (grouped c) ts {
+            [:error, m, s] => err m s,
+            [:ok, t, rest] =>
+                match expect rest :rparen "`)`" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] => ok t rest2,
+                },
+        }
+    };
+
+/// `[t]` is a list of `t`, of any length; `[a, b]` is a list of exactly two
+/// elements, the first an `a` and the second a `b`. The two readings are the
+/// same question asked of a different number of elements, and between them
+/// they cover what a list is used for: a homogeneous sequence, and a tagged
+/// tuple -- `[:ok, value]` says what it looks like it says.
+///
+/// What cannot be written is a one-element tuple, since `[t]` has been spent
+/// on the commoner meaning. `types.tuple [t]` is that, spelled out.
+let rec parse_type_list c sp ts =
+    match type_comma_list c [] ts :rbracket "]" {
+        [:error, m, s] => err m s,
+        [:ok, [items, close], rest] => {
+            let span = ast.span_to sp close;
+            match items {
+                [only] => ok (tagged "list_of" [only] span) rest,
+                _ => ok (tagged "tuple" [ast.list_e items span] span) rest,
+            }
+        },
+    };
+
+/// `#[t]` and `#[a, b]`, which are to an array what the brackets above are to
+/// a list.
+let rec parse_type_array c sp ts =
+    match type_comma_list c [] ts :rbracket "]" {
+        [:error, m, s] => err m s,
+        [:ok, [items, close], rest] => {
+            let span = ast.span_to sp close;
+            match items {
+                [only] => ok (tagged "array_of" [only] span) rest,
+                _ => ok (tagged "array" [ast.list_e items span] span) rest,
+            }
+        },
+    };
+
+let rec type_comma_list c acc ts closer what =
+    if at ts closer { ok [list.reverse acc, peek_span ts] (list.tail ts) }
+    else {
+        match parse_type_expr (grouped c) ts {
+            [:error, m, s] => err m s,
+            [:ok, t, rest] => {
+                let acc2 = core.cons t acc;
+                if at rest :comma { type_comma_list c acc2 (list.tail rest) closer what }
+                else if at rest closer { ok [list.reverse acc2, peek_span rest] (list.tail rest) }
+                else { err ("expected `,` or `" + what + "`, found " + describe rest) (peek_span rest) }
+            },
+        }
+    };
+
+/// `%{ k => v }` is a map, and which map depends on what the key is.
+///
+///     %{:string => :integer}     every key a string, every value an integer
+///     %{:host => :string}        a record: the key `:host` must be there
+///
+/// The question is settled by the first key alone, because a map that mixed
+/// the two would have no reading anybody could predict; a later key of the
+/// wrong sort is an error rather than a second rule.
+let rec parse_type_map c sp ts =
+    if at ts :rbrace {
+        ok (tagged "record" [ast.map_e [] (ast.span_to sp (peek_span ts))]
+                   (ast.span_to sp (peek_span ts)))
+           (list.tail ts)
+    }
+    else if type_key_is_literal ts { parse_type_record c sp [] ts }
+    else { parse_type_map_of c sp ts };
+
+let rec parse_type_map_of c sp ts =
+    match type_map_pair (grouped c) ts {
+        [:error, m, s] => err m s,
+        [:ok, [k, v], rest] =>
+            if at rest :comma && not (at (list.tail rest) :rbrace) {
+                err "a map type describes all of its keys with one `=>`; a map with more than one key is a record, whose keys are literals"
+                    (peek_span rest)
+            }
+            else {
+                let after = if at rest :comma { list.tail rest } else { rest };
+                match expect after :rbrace "`}`" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        ok (tagged "map_of" [k, v] (ast.span_to sp (peek_span after))) rest2,
+                }
+            },
+    };
+
+let rec parse_type_record c sp acc ts =
+    if at ts :rbrace {
+        let span = ast.span_to sp (peek_span ts);
+        ok (tagged "record" [ast.map_e (list.reverse acc) span] span) (list.tail ts)
+    }
+    else if not (type_key_is_literal ts) {
+        err ("a record type's keys are literals, and this one is not: " + describe ts) (peek_span ts)
+    }
+    else {
+        match type_map_pair (grouped c) ts {
+            [:error, m, s] => err m s,
+            [:ok, pair, rest] => {
+                let acc2 = core.cons pair acc;
+                if at rest :comma { parse_type_record c sp acc2 (list.tail rest) }
+                else if at rest :rbrace {
+                    let span = ast.span_to sp (peek_span rest);
+                    ok (tagged "record" [ast.map_e (list.reverse acc2) span] span) (list.tail rest)
+                }
+                else { err ("expected `,` or `}`, found " + describe rest) (peek_span rest) }
+            },
+        }
+    };
+
+let rec type_map_pair c ts =
+    match parse_type_expr c ts {
+        [:error, m, s] => err m s,
+        [:ok, k, rest] =>
+            match expect rest :fat_arrow "`=>`" {
+                [:error, m, s] => err m s,
+                [:ok, _, rest2] =>
+                    match parse_type_expr c rest2 {
+                        [:error, m, s] => err m s,
+                        [:ok, v, rest3] => ok [k, v] rest3,
+                    },
+            },
+    };
+
+/// `type Name params = description`, which is a `let` whose body is written
+/// in the type grammar above and whose value is the description it builds,
+/// under its own name. Rewriting it here rather than giving types a
+/// declaration of their own is what makes imports, privacy, currying, local
+/// capture and `comp` obey exactly the rules a `let` already obeys -- a type
+/// is a value, and the only thing `type` adds is how its right-hand side is
+/// read and that the result remembers what it is called.
+///
+/// The name is recorded so that a failed check can say which type was
+/// expected rather than quoting the data it expanded to.
+let parse_type c sp ts =
+    if not (at ts :ident) || is_keyword (peek_value ts) {
+        err "expected a name after `type`" (peek_span ts)
+    } else if str.ends_with "!" (peek_value ts) {
+        err "a type name must be pure" (peek_span ts)
+    } else {
+        let name = peek_value ts;
+        match let_params c [] (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, params, rest] =>
+                match expect rest :eq "`=` in a `type`" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        match parse_type_expr c rest2 {
+                            [:error, m, s] => err m s,
+                            [:ok, description, rest3] => {
+                                let span = ast.span_to sp (ast.span description);
+                                ok (ast.let_d name params
+                                    (ast.list_e [ast.atom_e "named" sp, ast.str_e name sp,
+                                                 description] span)
+                                    false span) rest3
+                            },
+                        },
+                },
+        }
+    };
 
 /// What can begin the pattern of a destructuring `let`: a list, an array or a
 /// map, or a parenthesised pattern.
@@ -1000,10 +1392,14 @@ let rec parse_item c ts = {
             "virtual" => parse_virtual c sp (list.tail ts),
             "when" => parse_when c sp (list.tail ts),
             "let" => parse_let c sp (list.tail ts),
+            "type" => parse_type c sp (list.tail ts),
             "priv" => {
                 let rest = list.tail ts;
-                if not (is_kw rest "let") { err "expected `let` after `priv`" (peek_span rest) }
-                else { match parse_let c sp (list.tail rest) {
+                if not (is_kw rest "let") && not (is_kw rest "type") {
+                    err "expected `let` or `type` after `priv`" (peek_span rest)
+                }
+                else { match (if is_kw rest "type" { parse_type c sp (list.tail rest) }
+                              else { parse_let c sp (list.tail rest) }) {
                     [:ok, d, after] => ok (ast.priv_d d (ast.span d)) after,
                     other => other,
                 } }
@@ -1017,7 +1413,7 @@ let rec parse_item c ts = {
             "group" => parse_record c :list sp (list.tail ts),
             "struct" => parse_record c :array sp (list.tail ts),
             "mapping" => parse_record c :map sp (list.tail ts),
-            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `priv let`, `macro`, `group`, `struct` or `mapping` at the top level, found "
+            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `priv let`, `macro`, `group`, `struct`, `mapping` or `type` at the top level, found "
                       + describe ts) sp,
         },
         _ => err ("expected a declaration, found " + describe ts) sp,
@@ -1111,6 +1507,18 @@ let rec record_entry c name fields members ts =
 /// A field, which may be given a default: what reading it answers when the
 /// collection has nothing at that key or position.
 let record_field_entry c name fields members entry at_name ts =
+    if at ts :colon {
+        match parse_type_expr c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, description, rest] =>
+                match record_field_default c name fields members entry at_name rest {
+                    [:ok, [:field, f], after] => ok [:field, f + [description]] after,
+                    other => other,
+                },
+        }
+    } else { record_field_default c name fields members entry at_name ts };
+
+let record_field_default c name fields members entry at_name ts =
     if str.ends_with "!" entry {
         err "a record field must be a plain name: `!` marks a name impure, and reading a field is pure"
             at_name
@@ -1153,7 +1561,7 @@ let record_member_entry c name fields members entry at_name params ts =
 /// Checking against what came *before* is what blames the later of two names
 /// and leaves the first where it was written.
 let taken name fields members n =
-    n == "make" || n == "new"
+    n == "make" || n == "new" || n == "type"
     || list.any (fn f -> ast.field_name f == n || "set_" + ast.field_name f == n) fields
     || list.any (fn m -> ast.member_name m == n) members;
 
@@ -1445,10 +1853,70 @@ when test {
     let tests = [
         test.case "private let retains its visibility"
             $( test.eq! "(priv (let x (int 1)))" (items "priv let x = 1;") ),
-        test.case "priv requires a let declaration"
-            $( test.eq! "expected `let` after `priv`" (fails_module "priv mod a {}") ),
+        test.case "priv requires a let or type declaration"
+            $( test.eq! "expected `let` or `type` after `priv`" (fails_module "priv mod a {}") ),
         test.case "priv is reserved as a binding name"
             $( test.true! (str.contains_str "keyword" (fails_module "let priv = 1;")) ),
+
+        // --- types ---
+        //
+        // A `type` is a `let` whose right-hand side is read in a grammar of
+        // its own, and what that grammar builds is the same tagged data
+        // `std.types` constructs. So these tests are about one thing: that
+        // what is written turns into the description it claims to mean.
+        test.case "a type is a named description"
+            $( test.eq! "(let H (list (atom named) (str \"H\") (atom string)))"
+                        (items "type H = :string;") ),
+        test.case "an arrow is right-associative, which is what currying means"
+            $( test.eq! "(let M (list (atom named) (str \"M\") (list (atom fn) (atom integer) (list (atom fn) (atom integer) (atom integer)))))"
+                        (items "type M = :integer -> :integer -> :integer;") ),
+        test.case "one element in brackets is a list of that"
+            $( test.eq! "(let I (list (atom named) (str \"I\") (list (atom list_of) (atom integer))))"
+                        (items "type I = [:integer];") ),
+        // The reading that makes `[:ok, value]` say what it looks like.
+        test.case "more than one element in brackets is a tuple"
+            $( test.eq! "(let P a b (list (atom named) (str \"P\") (list (atom tuple) (list (name a) (name b)))))"
+                        (items "type P a b = [a, b];") ),
+        test.case "an array reads the same two ways"
+            $( test.eq! "(let A (list (atom named) (str \"A\") (list (atom array_of) (atom float))))"
+                        (items "type A = #[:float];") ),
+        test.case "a union is flattened rather than nested"
+            $( test.eq! "(let N (list (atom named) (str \"N\") (list (atom union) (list (atom integer) (atom float) (atom string)))))"
+                        (items "type N = :integer | :float | :string;") ),
+        test.case "a union binds tighter than an arrow"
+            $( test.eq! "(let F (list (atom named) (str \"F\") (list (atom fn) (list (atom union) (list (atom integer) (atom float))) (atom string))))"
+                        (items "type F = :integer | :float -> :string;") ),
+        // Which map it is depends on whether the key names a kind or a value.
+        test.case "a map keyed by a kind is a map type"
+            $( test.eq! "(let M (list (atom named) (str \"M\") (list (atom map_of) (atom string) (atom integer))))"
+                        (items "type M = %{ :string => :integer };") ),
+        test.case "a map keyed by a literal is a record type"
+            $( test.eq! "(let R (list (atom named) (str \"R\") (list (atom record) (map [(atom host) (atom string)]))))"
+                        (items "type R = %{ :host => :string };") ),
+        test.case "a map type takes only the one key"
+            $( test.true! (str.contains_str "one `=>`"
+                           (fails_module "type M = %{ :string => :integer, :atom => :integer };")) ),
+        test.case "a record type's later keys must be literals too"
+            $( test.true! (str.contains_str "keys are literals"
+                           (fails_module "type R = %{ :host => :string, :string => :integer };")) ),
+        // `where` reaches an ordinary expression, and is contextual: a
+        // program may still bind the name everywhere a type is not written.
+        test.case "where refines with an ordinary predicate"
+            $( test.eq! "(let B (list (atom named) (str \"B\") (list (atom refine) (atom integer) (fn n (binary gt (name n) (int 0))))))"
+                        (items "type B = :integer where fn n -> n > 0;") ),
+        test.case "where is not a reserved word"
+            $( test.eq! "(let where (int 1))" (items "let where = 1;") ),
+        test.case "a private type retains its visibility"
+            $( test.eq! "(priv (let H (list (atom named) (str \"H\") (atom string))))"
+                        (items "priv type H = :string;") ),
+        test.case "a type name must be a name"
+            $( test.eq! "expected a name after `type`" (fails_module "type = :integer;") ),
+        test.case "a type name must be pure"
+            $( test.eq! "a type name must be pure" (fails_module "type Bad! = :integer;") ),
+        test.case "a keyword is not a type"
+            $( test.true! (str.contains_str "cannot be a type" (fails_module "type T = fn;")) ),
+        test.case "a record field carries its description"
+            $( test.eq! "(group Point x : (atom integer))" (items "group Point { x : :integer }") ),
         test.case "priv cannot modify a local binding"
             $( test.true! (str.contains_str "keyword" (fails "{ priv let x = 1; x }")) ),
         test.case "macro declarations retain syntax parameters"

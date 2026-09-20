@@ -123,3 +123,17 @@ when test {
         test.case "unwrap! answers the value" $( test.eq! 5 (unwrap! (ok 5)) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Of value reason = [:ok, value] | [:error, reason];
+let check value reason outcome = types.check (Of value reason) outcome;
+// Validate a success while preserving an existing error unchanged.
+let validate_ok description outcome = match outcome {
+    [:ok, value] => types.validate description value,
+    other => other,
+};
+
+let ok_as description value = ok (types.check description value);
+let error_as description reason = error (types.check description reason);

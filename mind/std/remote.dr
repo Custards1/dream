@@ -502,3 +502,10 @@ when test {
                } ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Request body = [:call, body] | [:cast, body];
+type Response value = [:ok, value] | [:error, :string];
+let call_as! description connection request = types.check description (call! connection request);

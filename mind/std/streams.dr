@@ -10,3 +10,10 @@ let rec write_all! handle text = {
     }
 };
 
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Text = :string;
+// Preserve the existing write loop; callers opt into validation at entry.
+let write_as! description handle text = write_all! handle (types.check description text);

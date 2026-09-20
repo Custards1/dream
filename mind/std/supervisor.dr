@@ -507,3 +507,21 @@ when test {
             $( test.eq! [1000, 900] (recent 500 1000 [900, 100]) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Strategy = :one_for_one | :one_for_all | :rest_for_one;
+type Restart = :permanent | :transient | :temporary;
+type Child = %{ :name => :string, :start => :pure_fn | :impure_fn,
+                :restart => Restart };
+let checked_child name start restart = types.check Child (child_with name start restart);
+
+type Limits = %{ :limit => :integer where fn n -> n >= 0,
+                 :window => :integer where fn n -> n >= 1 };
+let start_checked! strategy children lim = {
+    let checked_strategy = strict! (types.check Strategy strategy);
+    let checked_children = strict! (types.check (types.list_of Child) children);
+    let checked_limits = strict! (types.check Limits lim);
+    start_with! checked_strategy checked_children checked_limits
+};

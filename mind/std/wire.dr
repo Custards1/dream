@@ -408,3 +408,9 @@ when test {
         test.case "format_name" $( test.eq! "wire" (format_name ()) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+// Only values the wire can encode, including recursively nested keys.
+type Value = :unit | :bool | :integer | :float | :string | :atom | :char
+           | [Value] | #[Value] | %{ Value => Value };

@@ -68,3 +68,6 @@ let name x = "dynamic"
 //     ];
 
 // }
+// --- optional types ---------------------------------------------------------
+
+type Collection = :list | :array | :string;

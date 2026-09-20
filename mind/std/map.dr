@@ -130,3 +130,10 @@ when test {
         test.case "members"                 $( test.eq! [1, 2] (list.sort (members (set_of [2, 1]))) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Of key value = %{ key => value };
+type Entry key value = [key, value];
+let check key value entries = types.check (Of key value) entries;

@@ -245,3 +245,14 @@ priv let rec frames_from acc buf = match next_frame buf {
 /// asks again -- which is the whole of a stream reader, and is why this answers
 /// the tail rather than discarding it or calling it an error.
 let frames buf = frames_from [] buf;
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Decoded value = result.Of value :any;
+// Syntax errors stay in the codec's error channel; a schema mismatch is a
+// :type_error value in that same channel. No exception is needed by a parser.
+let decode_as description text = result.validate_ok description (decode text);
+let encode_as description value = encode (types.check description value);
+
+let frame_as description value = frame (types.check description value);

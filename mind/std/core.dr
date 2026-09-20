@@ -161,3 +161,14 @@ let compare a b = native.compare a b;
 let data_count u = native.data_count u;
 /// Payload datum `i`, as a view into the image rather than a copy.
 let data_at i = native.data_at i;
+
+// --- optional types ---------------------------------------------------------
+
+type Integer = :integer;
+type Number = :integer | :float;
+type Boolean = :bool;
+type Character = :char;
+type Text = :string;
+type Atom = :atom;
+type Unit = :unit;
+type Function = :pure_fn | :impure_fn;

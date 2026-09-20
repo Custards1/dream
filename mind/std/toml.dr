@@ -369,3 +369,11 @@ when test {
                            "path" ()) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+import std.result;
+type Value = :string | :integer | :float | :bool
+           | [Value] | %{ :string => Value };
+type Document = %{ :string => %{ :string => Value } };
+let parse_as description text = result.validate_ok description (parse text);

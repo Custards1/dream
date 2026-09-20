@@ -462,3 +462,9 @@ when test {
                })) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+import std.types;
+type Entries = %{ :any => :process };
+let all_as! reg = types.check Entries (all! reg);

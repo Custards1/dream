@@ -99,7 +99,7 @@
         },
         {
           "name": "keyword.declaration.dream",
-          "match": "\\b(let|priv|rec|fn|import|as|mod|virtual|derive|comp|macro|expand|group|struct|mapping)\\b"
+          "match": "\\b(let|priv|rec|fn|import|as|mod|virtual|derive|comp|macro|expand|group|struct|mapping|type)\\b"
         },
         {
           "name": "constant.language.boolean.dream",
@@ -108,6 +108,11 @@
         {
           "name": "keyword.operator.logical.dream",
           "match": "\\bnot\\b"
+        },
+        {
+          "comment": "Refines a type. Contextual, so this is a reader's guess.",
+          "name": "keyword.other.where.dream",
+          "match": "\\bwhere\\b"
         }
       ]
     },
@@ -118,7 +123,7 @@
     },
     "declaration": {
       "comment": "The name a `let` introduces, so a definition stands out from a use.",
-      "match": "\\b(let|macro|group|struct|mapping)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
+      "match": "\\b(let|macro|group|struct|mapping|type)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
       "captures": {
         "1": {
           "name": "keyword.declaration.dream"
@@ -153,6 +158,11 @@
         {
           "name": "keyword.operator.logical.dream",
           "match": "&&|\\|\\|"
+        },
+        {
+          "comment": "A lone `|` is the union of a type. Tried after `|>` and `||`.",
+          "name": "keyword.operator.union.dream",
+          "match": "\\|"
         },
         {
           "name": "keyword.operator.arithmetic.dream",

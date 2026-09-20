@@ -736,7 +736,8 @@ let record_site r n =
 /// about what it does -- only where it lives, which is what a reader who
 /// reached it through `Point.` does not otherwise know.
 let record_role r n =
-    match record_member r n {
+    if n == "type" { "the optional structural type of the " + record_keyword r + " `" + record_name r + "`" }
+    else { match record_member r n {
         () => match record_field r n {
             () => "builds the " + record_keyword r + " `" + record_name r + "`"
                   // The two constructors differ only in what they ask for, so
@@ -761,7 +762,7 @@ let record_role r n =
                    },
         },
         _ => "a member of the " + record_keyword r + " `" + record_name r + "`",
-    };
+    } };
 
 /// Was this global declared with `macro`?
 ///

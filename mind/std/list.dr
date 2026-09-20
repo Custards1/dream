@@ -385,3 +385,9 @@ when test {
         test.case "zip stops at the shorter"    $( test.eq! [[1, 0]] (zip [1] (from 0)) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+// Of checks a finite list in full. Use types.check_each for lazy streams.
+type Of element = [element];
+type NonEmpty element = [element] where fn xs -> not (core.is_empty xs);

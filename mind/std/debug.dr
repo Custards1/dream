@@ -209,3 +209,9 @@ when test {
             $( test.eq! [1, 2] (trace! "x" [1, 2]) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+type Measurement = %{ :elapsed => :integer, :allocated => :integer,
+                      :reductions => :integer, :collections => :integer,
+                      :peak => :integer, :live => :integer };

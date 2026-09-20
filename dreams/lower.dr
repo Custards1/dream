@@ -28,6 +28,7 @@ import dreams.diag;
 import dreams.emit;
 import dreams.fuse;
 import dreams.ir;
+import dreams.opt;
 import dreams.modules;
 import std.vm;
 import dreams.scope;
@@ -1430,15 +1431,91 @@ let lower_program r = {
 /// Done after linking, because an expression may call anything in the program
 /// and so needs the whole of it to be runnable first. Each one is run against
 /// an image of the program with that expression as the entry point -- the
-/// program is built once and only the entry differs.
+/// dependencies are replaced with constants before their users run.
+/// Follow execution-tree references, including called functions and closures,
+/// until another comp placeholder is reached. Stop there: its own dependencies
+/// are settled before it is evaluated. The visited set also bounds recursion.
+let rec comp_dependencies todo seen found pending p funcs globals = match todo {
+    [] => found,
+    [index, ..rest] =>
+        if not (ir.is_node index) || core.map_has seen index {
+            comp_dependencies rest seen found pending p funcs globals
+        } else if core.map_has pending index {
+            comp_dependencies rest (seen.[index => true]) (core.cons index found) pending p funcs globals
+        } else {
+            let n = ir.node_at index p;
+            let op = ir.node_op n;
+            let direct = list.map (fn k -> opt.operand k n) (opt.edges_of op);
+            let run = match opt.run_of op {
+                () => [],
+                [offset, count, width] => list.map (fn i -> ir.kid_at i p)
+                    (list.range (opt.operand offset n)
+                        (opt.operand offset n + opt.operand count n * width)),
+            };
+            let function_body fi = if ir.is_node fi { [funcs.[fi].[:body]] } else { [] };
+            let called = match op {
+                :global => {
+                    let g = globals.[ir.node_a n];
+                    if g.[:kind] == ir.global_function { function_body g.[:target] } else { [] }
+                },
+                :make_closure => function_body (ir.node_a n),
+                :make_thunk => function_body (ir.node_a n),
+                _ => [],
+            };
+            comp_dependencies (direct + run + called + rest) (seen.[index => true]) found
+                              pending p funcs globals
+        },
+};
+
+/// Settle them in an order where nothing is evaluated before what it reads.
+///
+/// `built` is the program the next evaluation runs against, and the whole of
+/// the cost here is how often it has to be made again: `ir.finish` is the
+/// size of the *program*, so rebuilding once per compile-time expression is
+/// the program's size times however many there are. A self-compile has about
+/// twenty, and paying that was worth five times the whole compile.
+///
+/// It almost never has to be rebuilt. Settling one overwrites its
+/// placeholder, and the only thing that can read that placeholder is an
+/// expression which depends on it -- so the image stays good until a
+/// dependency of something still waiting has been settled. A program whose
+/// compile-time expressions are independent of each other, which is nearly
+/// all of them, builds exactly one image, as it did before any of this.
+let rec settle_comp_order! rows done built l =
+    if list.is_empty rows { l }
+    else {
+        let ready = list.filter (fn row -> list.all (fn node -> core.map_has done node) row.[1]) rows;
+        if list.is_empty ready {
+            complain ast.no_span "cyclic dependency between compile-time expressions" l
+        } else {
+            let row = list.head ready;
+            let one = row.[0];
+            // Each evaluation sees the constants its dependencies installed,
+            // rather than the original image full of unit placeholders.
+            let image = match built { () => ir.finish (prog l), ready_made => ready_made };
+            let settled = settle_comp! (fn fi img -> core.map_put img :entry fi)
+                                       (fn _ -> image) one l;
+            if list.length (l_diags settled) > list.length (l_diags l) { settled }
+            else {
+                let rest = list.filter (fn r -> r.[0].[0] != one.[0]) rows;
+                let wanted = list.any (fn r -> list.contains one.[0] r.[1]) rest;
+                settle_comp_order! rest (done.[one.[0] => true])
+                                   (if wanted { () } else { image }) settled
+            }
+        }
+    };
+
 let settle_comps! l = {
     let pend = pending_comp l;
     if list.is_empty pend { l }
     else {
-        let built = ir.finish (prog l);
-        list.fold (fn acc one ->
-            settle_comp! (fn fi img -> core.map_put img :entry fi) (fn _ -> built) one acc)
-            l pend
+        let p = prog l;
+        let funcs = core.array_of_list (ir.funcs p);
+        let globals = core.array_of_list (ir.globals p);
+        let pending = list.fold (fn m one -> m.[one.[0] => true]) %{} pend;
+        let rows = list.map (fn one -> [one,
+            comp_dependencies [funcs.[one.[1]].[:body]] %{} [] pending p funcs globals]) pend;
+        settle_comp_order! rows %{} () l
     }
 };
 

@@ -640,6 +640,15 @@ NativeResult core_error_payload(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(static_cast<ErrorObj*>(as_obj(v))->payload);
 }
 
+// Only the decision is strict. The predicate decides how much of the value
+// must be inspected; the runtime must not force anything else (even on failure).
+// This is a partial pure operation, like indexing or arithmetic on wrong types.
+NativeResult bi_type_assert(Process& p, Value, Value* args, uint32_t) {
+    if (resolve(args[0]) == TRUE_V) return NativeResult::ok(args[2]);
+    return NativeResult::raise(p.heap().make_error(
+        make_atom(well_known(p.runtime()).type_error), args[1]));
+}
+
 NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
     // The names are interned at startup and looked up by `dream_type`, not
     // built here: this is the cheapest builtin that forces its argument, so
@@ -845,6 +854,7 @@ const BuiltinDef BUILTINS[] = {
     {"match_tail", 1, 0b1, bi_match_tail},
     {"match_at", 2, 0b11, bi_match_at},
     {"match_key", 2, 0b11, bi_match_key},
+    {"type_assert", 3, 0b001, bi_type_assert},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }
