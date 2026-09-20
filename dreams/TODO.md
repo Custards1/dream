@@ -22,17 +22,36 @@ non-PGO, alternating runs of the same source:
 | whole-program snapshot | 6768-7005 ms | 3859-3894 ms | 3522-3875 ms | 2048 ms |
 | reachable only | **5238-5265 ms** | **2070-2072 ms** | **2775-2903 ms** | **1059 ms** |
 
-Every image is byte-identical to what the previous compiler emitted, and the
-bootstrap reaches a fixpoint in one stage.
+And the tax itself, at the sizes that can see it, before and after the `core`
+walk was taken out of `scope.declare!`:
 
-**What is still linear in the program** is now one phase. It was two: every
-declaration the transformer does not reach cost a stub body, a function record
-and its nodes, *and* `scope.declare!` walks every declaration for its name. The
-first of those is gone -- every unreached global names one shared stub, so that
-work is paid once rather than N times (see "The stub every unreached
-declaration shares" in `CLAUDE.md`). What is left is `scope.declare!`, which
-did not move and is therefore no longer one cost among four but **85-86% of
-what a macro costs a large program**.
+| | snapshot | whole macro tax | whole compile |
+|---|---|---|---|
+| 3,200 declarations, one call | 229 -> **51 ms** | 267 -> **99 ms** | 3934 -> **3705 ms** |
+| 6,400 declarations, one call | 431 -> **93 ms** | 518 -> **184 ms** | 8132 -> **7315 ms** |
+
+Every image is byte-identical to what the previous compiler emitted -- with the
+one standing exception `mind/std/all.dr --test` is, for reasons that are not
+about any of this work and are written up in `CLAUDE.md` -- and the bootstrap
+reaches a fixpoint in one stage.
+
+**What is still linear in the program** is one phase, and it is now smaller
+than the two rounds before it left it. It was two: every declaration the
+transformer does not reach cost a stub body, a function record and its nodes,
+*and* `scope.declare!` walks every declaration for its name. The first of those
+is gone -- every unreached global names one shared stub (see "The stub every
+unreached declaration shares" in `CLAUDE.md`). The second turned out not to be
+a walk for *names* at all: four fifths of it was `declare_core` asking "does
+this module mention `core`?" by walking every node of every declaration, an
+answer the loader had already worked out and thrown away. It is carried on the
+module record now -- "Declaring a program was mostly a search for the word
+`core`" in `CLAUDE.md` -- which took `snapshot` from 229 ms to **51** at 3,200
+declarations and the whole macro tax from 267 ms to **99**, with every image
+byte-identical.
+
+What is left of `snapshot` is what its name says: a name declared, numbered and
+recorded, about 16 microseconds each, linear in the declarations. At 3,200 it
+is 51 ms of a 99 ms tax on a 3.7 s compile.
 
 - [x] **Measure the macro tax directly.** Done twice. First to the extent the
   last decision needed: `--time` separates `expand` from `parse`, and the tax
@@ -232,15 +251,27 @@ to remove is the stub, not the image.
    numbers and for the one design point worth keeping: the stub is
    parameterless and pure whatever the declarations pointing at it were, so
    naming one *raises* rather than handing back a closure.
-2. **`scope.declare!`, which is `snapshot`** -- and item 1 has made it the
-   whole question rather than the largest of four. It did not move (228 ->
-   231 ms at 3,200 declarations) and is now **85-86% of the macro tax** where
-   it was 41-42%. It walks every declaration because expansion needs the whole
-   program's *names*, which is a weaker thing than its bodies and might be
-   cheaper to build; nobody has looked at whether it can be shared with the
-   resolve that follows the expansion, which does the same walk again. Nothing
-   else in the tax is above 15% any more, so this is the next 200 ms or there
-   is no next 200 ms short of item 3.
+2. ~~**`scope.declare!`, which is `snapshot`.**~~ **Done** (2026-09-20), and
+   not where this item said to look. It guessed that declaring names might be
+   shared with the resolve that follows, and that is not what the time was:
+   four fifths of `declare!` was `declare_core` walking every node of every
+   declaration for the word `core`, an answer the loader had already computed
+   and discarded. Carried on the module record, `snapshot` went 229 ms ->
+   **51** at 3,200 declarations and 431 -> **93** at 6,400, the macro tax 267
+   -> **99** and 518 -> **184**, and whole compiles are 4-9% faster with the
+   new build winning all nine interleaved rounds. The self-compile does not
+   move, for a reason worth reading: `list.any` stops at the first mention, and
+   every module of this compiler names `core` in its first few lines. See
+   "Declaring a program was mostly a search for the word `core`" in `CLAUDE.md`.
+
+   What is left of `snapshot` really is names -- one declared, numbered and
+   recorded, ~16 microseconds each -- and the macro tax is 2.7% of a
+   3,200-declaration compile where it was 6.8%. Nothing in it is above 51 ms.
+   **The transferable part is the method**: the phase meter said `snapshot` was
+   86% of the tax and stopped there, and only a `--profile` at two program
+   sizes said *what inside it*, by naming a function (`mentions_name`) that was
+   10% of the whole compile and had never appeared in a profile of this
+   repository -- because on this repository it costs nothing.
 3. **`.libdream` for transformers**, which is separate compilation's smallest
    honest version and is what removes 1 and 2 rather than shrinking them: a
    dependency's declarations are not in this program at all, so there is
@@ -251,6 +282,14 @@ to remove is the stub, not the image.
    and it is 8%. It is still the right shape for 3 -- a transformer library
    loaded once for a session and called with syntax values is the same thing
    from the VM's side -- so it is worth doing *with* that and not before it.
+
+**And one warning about the next profile.** `mentions_name` was invisible for
+the whole life of this compiler because `dreams` is the one codebase where the
+search it makes is free. Profile the *generated* program as well as this one --
+`dreams/tests/scale.py` writes it -- and compare the two profiles rather than
+reading either alone. A cost that is large on a program of unrelated
+declarations and zero here is exactly the cost a large project would hit and
+nobody here would ever feel.
 
 If a fourth round of list-to-map is ever tempting, measure first and measure
 the right thing: allocation by kind at two sizes says *whether* something is

@@ -442,17 +442,23 @@ let show_time! o file = {
 /// worth doing depends on what those three are against `snapshot` and
 /// `resolve`, which it does not touch.
 ///
-/// `discover` and `snapshot` are paid once for the program. The rest are paid
-/// once per round, and a round is the *nesting* of macro calls rather than
-/// their number -- forty calls written side by side are one round, and one
+/// `discover`, `stage` and `snapshot` are paid once for the program. The rest
+/// are paid once per round, and a round is the *nesting* of macro calls rather
+/// than their number -- forty calls written side by side are one round, and one
 /// macro whose answer calls another is two.
+///
+/// `stage` and `snapshot` were one row until the pair turned out to be most of
+/// what a macro costs a large program, at which point "which of the two?" was
+/// the only question left and the meter could not answer it. Staging rewrites
+/// every module's items; `snapshot` is `scope.declare!`.
 let show_macros! l = match modules.macro_meter l {
     () => (),
     meter => {
         let phases = core.map_get meter :phases %{};
         let tallies = core.map_get meter :counts %{};
         let count k = core.map_get tallies k 0;
-        let rows = [[:discover, "discover"], [:snapshot, "snapshot"], [:declare, "declare"],
+        let rows = [[:discover, "discover"], [:stage, "stage"],
+                    [:snapshot, "snapshot"], [:declare, "declare"],
                     [:resolve, "resolve"], [:image, "lower"], [:emit, "emit"],
                     [:vm, "run"], [:install, "install"]];
         let at k = core.map_get phases k [0, 0, 0, 0];

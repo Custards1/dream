@@ -447,6 +447,37 @@ let rec effective_items l mi seen =
         [list.append (list.head bases) (list.map (fn i -> [mi, i]) items), list.nth 1 bases]
     };
 
+/// Does anything in this effective item list mention `core`?
+///
+/// The question is per *module* rather than per item, and that is what makes it
+/// cheap. `effective_items` hands over every item of every module this one
+/// derives from, so asking each owner once is the same answer as asking each
+/// item -- and the owner already knows, because the loader had to decide
+/// whether to open `std.core` before it could record the module
+/// (`modules.module_mentions_core`).
+///
+/// It had been the item walk, and the item walk is a walk of every *node* of
+/// every declaration in the program looking for one name. `declare!` is
+/// otherwise about names alone -- it does not read a body -- so this was the
+/// whole of what made declaring a program expensive: four fifths of it on a
+/// 3,200-declaration program, and a compile with a macro in it made the walk
+/// three times over, once in the loader and once for each of the two
+/// declarations a macro costs.
+///
+/// Owners arrive in runs -- all of one module's items, then all of the next --
+/// so carrying the last one asks each module once. `()` starts it, because no
+/// module index is one.
+let rec mentions_core_owned l items last =
+    match items {
+        [] => false,
+        [oi, ..rest] => {
+            let owner = list.head oi;
+            if owner == last { mentions_core_owned l rest last }
+            else if modules.module_mentions_core (modules.module_at l owner) { true }
+            else { mentions_core_owned l rest owner }
+        },
+    };
+
 /// `std.core` is available without an import: it is the one module every program
 /// reaches for, and writing the same line at the top of every file is ceremony
 /// rather than information.
@@ -462,7 +493,7 @@ let rec effective_items l mi seen =
 /// that module, as an import's would be. Where there was no standard library to
 /// find it in, the loader settled for the host's module of the same name, and
 /// `core` is that instead.
-let declare_core l mi items s = {
+let declare_core l mi items mentions s = {
     let e = env_at s mi;
     let binds = core.map_has (aliases e) "core"
                 || list.any (fn oi ->
@@ -474,7 +505,7 @@ let declare_core l mi items s = {
                            _ => false,
                        }) items;
     if binds { s }
-    else if list.any (fn oi -> modules.item_mentions_core (list.nth 1 oi)) items {
+    else if mentions {
         match modules.find l "std.core" {
             () => {
                 let got = take_global s;
@@ -765,7 +796,11 @@ let declare_items! l mi items s0 = {
             [:import, _, _, _, _] => declare_import l mi item acc,
             _ => acc,
         }) s2 items;
-    let with_core = declare_core l mi pairs imported;
+    // A session declares a slice of one module, so the question is asked of the
+    // items in hand. `declare_module` below asks it of the modules instead,
+    // which it can because it has all of every one of them.
+    let with_core = declare_core l mi pairs
+        (list.any (fn oi -> modules.item_mentions_core (list.nth 1 oi)) pairs) imported;
     let collected = collected_lets l pairs with_core;
     let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
                              (list.nth 1 collected) (list.head collected);
@@ -796,7 +831,7 @@ let declare_module l mi s0 = {
         }) imported items;
 
     let effective = list.head (effective_items l mi []);
-    let with_core = declare_core l mi effective derived;
+    let with_core = declare_core l mi effective (mentions_core_owned l effective ()) derived;
 
     let collected = collected_lets l effective with_core;
     let virtuals = collect_virtuals effective [];

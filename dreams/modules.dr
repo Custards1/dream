@@ -91,7 +91,11 @@ let item_mentions_core item =
 /// module inherits as well as what it says; an answer that differs costs a
 /// module loaded for nothing, or `core` meaning the host's module, and neither
 /// changes what a program does.
-let needs_core name items =
+///
+/// `mentions` arrives rather than being computed here, because it is the one
+/// expensive part of the question and two passes want the answer. See
+/// `module_mentions_core`.
+let needs_core name items mentions =
     name != "std.core"
     && not (list.any (fn item ->
                 match item {
@@ -100,11 +104,11 @@ let needs_core name items =
                         (match alias { () => list.last segs, a => a }) == "core",
                     _ => false,
                 }) items)
-    && list.any (fn item -> item_mentions_core item) items;
+    && mentions;
 
 /// A module's dependencies, `std.core` first when it needs one it did not write.
-let with_core name items deps =
-    if needs_core name items { core.cons ["std.core", ast.no_span] deps } else { deps };
+let with_core name items mentions deps =
+    if needs_core name items mentions { core.cons ["std.core", ast.no_span] deps } else { deps };
 
 // --- a loaded module ---------------------------------------------------------
 
@@ -118,10 +122,42 @@ mapping Module {
 }
 
 // Visibility is module metadata; later passes still walk ordinary declarations.
-let loaded name path source items =
-    core.map_put (Module.make name path source
-        (list.filter (fn item -> ast.kind item != :private) items)) :private_spans
-        (list.map ast.span (list.filter (fn item -> ast.kind item == :private) items));
+//
+// `mentions` is the one thing recorded here that is not metadata but an
+// *answer*: whether anything in this module names `core`. It is carried rather
+// than asked for twice because asking is a walk of every node of every
+// declaration, and two passes need it -- the loader, to decide whether to open
+// `std.core` at all, and `scope.declare_core`, to decide whether to bind the
+// name. It arrives unforced, so a module whose question is settled another way
+// (`std.core` itself, a module that binds `core`) never pays the walk.
+let loaded name path source items mentions =
+    core.map_put
+        (core.map_put (Module.make name path source
+            (list.filter (fn item -> ast.kind item != :private) items)) :private_spans
+            (list.map ast.span (list.filter (fn item -> ast.kind item == :private) items)))
+        :mentions_core mentions;
+
+/// Whether this module names `core`, from the record rather than from a walk.
+///
+/// A module whose items have been rewritten since it was loaded has no stored
+/// answer and is asked the old way -- see `with_new_items`, which is what
+/// expansion rewrites one through.
+let module_mentions_core m =
+    core.map_get m :mentions_core
+        (list.any (fn item -> item_mentions_core item) (Module.items m));
+
+/// The module a rewritten item list makes, with what it mentions forgotten.
+///
+/// Expansion is the one pass that can put a name into a module its source
+/// never had -- a transformer may hand back `core.head` -- so the stored
+/// answer cannot be carried across one. Replacing an item list that only
+/// *loses* names (staging an `expand` as `1 / 0`) could keep it, and the
+/// difference would be a `core` alias bound in a module that no longer uses
+/// it; recomputing for the handful of modules a macro is written in is
+/// cheaper than having to know which of the two a caller is doing.
+let with_new_items m items =
+    core.map_put (core.map_put m :items items) :mentions_core
+        (list.any (fn item -> item_mentions_core item) items);
 
 let private_declaration m span =
     list.any (fn sp -> ast.span_start sp <= ast.span_start span
@@ -685,6 +721,9 @@ let rec hoist_mod! l parent source m =
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
                     }) [note_records full items l, []] kept;
                 let inner_items = list.nth 1 nested;
+                // One walk for the two readers below: the dependency list, and
+                // the record. Neither forces it unless it gets that far.
+                let mentions = list.any (fn item -> item_mentions_core item) inner_items;
 
                 // A submodule may import, so follow those before it is recorded.
                 let followed = list.fold (fn acc d -> {
@@ -694,13 +733,14 @@ let rec hoist_mod! l parent source m =
                     // registered.
                     if find acc dep != () || local_module acc full dep != () { acc }
                     else { load_named! acc dep (list.nth 1 d) source }
-                }) (enter full (list.head nested)) (with_core full inner_items (dependencies inner_items));
+                }) (enter full (list.head nested))
+                   (with_core full inner_items mentions (dependencies inner_items));
 
                 let recorded = leave followed;
                 let index = module_count recorded;
                 [mark_visited full
                     (put :by_name (core.map_put (by_name recorded) full index)
-                        (add_module (loaded full full source inner_items) recorded)),
+                        (add_module (loaded full full source inner_items mentions) recorded)),
                  stand_in]
             }
         },
@@ -755,6 +795,9 @@ let load_items! l source parsed display name file = {
                     other => [list.head acc, list.append (list.nth 1 acc) [other]],
                 }) [enter name noted, []] kept;
             let items_out = list.nth 1 hoisted;
+            // As in `hoist_mod!`: asked once, read by the dependency list and
+            // by the record, forced by whichever of them gets there first.
+            let mentions = list.any (fn item -> item_mentions_core item) items_out;
 
             // Follow this module's own imports before recording it, so the
             // module list comes out with dependencies first.
@@ -765,14 +808,15 @@ let load_items! l source parsed display name file = {
                 // to search the file system for.
                 if local_module acc name dep != () { acc }
                 else { load_named! acc dep (list.nth 1 d) source }
-            }) (list.head hoisted) (with_core name items_out (dependencies items_out));
+            }) (list.head hoisted)
+               (with_core name items_out mentions (dependencies items_out));
 
             let recorded = leave followed;
             let index = module_count recorded;
             mark_visited name
                 (put :by_path (core.map_put (by_path recorded) (path.absolute! file) index)
                     (put :by_name (core.map_put (by_name recorded) name index)
-                        (add_module (loaded name file source items_out) recorded)))
+                        (add_module (loaded name file source items_out mentions) recorded)))
         },
     }
 };
@@ -1071,11 +1115,13 @@ when test {
                           [is_loading l "a", is_loading (leave l) "b", is_loading (bare on) "a"] } ),
 
         // --- the generated test runner ---
+        // `false` is the `core` answer, which none of these three items needs
+        // and which a loader would have worked out before recording them.
         test.case "a module exports tests by defining `tests`"
             $( test.eq! [true, false, false]
-                        [exports_tests (loaded "m" "m" 0 (items_of "let tests = [];")),
-                         exports_tests (loaded "m" "m" 0 (items_of "let tests x = [];")),
-                         exports_tests (loaded "m" "m" 0 (items_of "let other = [];"))] ),
+                        [exports_tests (loaded "m" "m" 0 (items_of "let tests = [];") false),
+                         exports_tests (loaded "m" "m" 0 (items_of "let tests x = [];") false),
+                         exports_tests (loaded "m" "m" 0 (items_of "let other = [];") false)] ),
         test.case "a runner is generated even when nothing exports tests"
             $( test.eq! ["t", "dreams.test_main"]
                         (names (add_test_runner! (from_text! on "let a = 1;"))) ),

@@ -227,16 +227,28 @@ let staged_lowering low = {
 /// going to finish.
 let prepare! l = prepare_work! l (work_of l);
 
+/// The program as a transformer sees it: every `expand` replaced by `1 / 0`
+/// and every `macro` read as the `let` it is.
+///
 /// Only declarations containing an expansion need placeholders. Reuse the
 /// work list from discovery instead of copying every syntax node in every
 /// imported module just to change the handful containing `expand`.
-let prepare_work! l work = {
+///
+/// It is separate from `prepare_work!` so that the two halves of a snapshot
+/// can be charged separately. They answer different questions and the meter
+/// said so the moment it could: staging is where the program is first walked
+/// -- and so where a lazy parse is finally paid -- and declaring is the walk
+/// for names that `scope.resolve!` makes again afterwards.
+let stage_program l work = {
     let replaced = apply_items l (list.map (fn [mi, i, tree] ->
         [mi, i, stage tree]) work);
-    let staged = modules.map_modules (fn m ->
-        with_items m (list.map macro_let (modules.module_items m))) replaced;
-    let declared = scope.declare! staged;
-    %{ :loader => staged, :declared => declared }
+    modules.map_modules (fn m ->
+        with_items m (list.map macro_let (modules.module_items m))) replaced
+};
+
+let prepare_work! l work = {
+    let staged = stage_program l work;
+    %{ :loader => staged, :declared => scope.declare! staged }
 };
 
 /// Lower and link only the temporary wrapper. The base arena and function
@@ -625,13 +637,17 @@ let base_of s  = core.map_get s :base ();
 let put_base b s = core.map_put s :base b;
 
 /// Declaration `i` of module `mi`, expanded and put back where it was.
+///
+/// `with_new_items` for the reason `apply_items` gives: what a transformer
+/// hands back may name `core` where the source did not.
 let expand_item! base s mi i item = {
     let result = rounds! base s mi item 0;
     strict! result
     let [state, expanded] = result;
     let current = modules.module_at (loader state) mi;
     put_loader (replace_module (loader state) mi
-        (with_items current ((modules.module_items current).[i => expanded]))) state
+        (modules.with_new_items current
+            ((modules.module_items current).[i => expanded]))) state
 };
 
 let complaints s = list.length (modules.diags (loader s));
@@ -690,9 +706,17 @@ let work_of l = list.concat (list.map (fn mi -> {
 }) (list.range 0 (modules.module_count l)));
 
 /// Put every expanded declaration back where it came from.
+///
+/// `with_new_items` rather than `with_items`: a transformer may hand back a
+/// tree naming something the module's source never did, and `core` is the one
+/// name a module gets bound without asking for it. So the module forgets what
+/// it was known to mention and is asked again -- which is a handful of modules
+/// rather than the program, and is the reason the rest of them can keep the
+/// loader's answer across the copy expansion stages against.
 let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
     let current = modules.module_at acc mi;
-    replace_module acc mi (with_items current ((modules.module_items current).[i => tree]))
+    replace_module acc mi
+        (modules.with_new_items current ((modules.module_items current).[i => tree]))
 }) l items;
 
 /// The original algorithm: one declaration at a time, each against a snapshot
@@ -768,7 +792,17 @@ let expand_work! l work = {
     let found = list.nth 1 discovery;
     if list.is_empty found { l }
     else {
-        let snapshot = phase! s0 :snapshot (prepare_work! l found);
+        // Two charges, not one. Staging walks every item of every module, which
+        // is where a lazily parsed program is finally parsed; declaring walks
+        // every declaration for its name, which is the walk `scope.resolve!`
+        // makes again once expansion is done. Charging them together said only
+        // that the pair was most of a macro's cost, which is not a thing
+        // anyone can act on.
+        let staging = phase! s0 :stage (stage_program l found);
+        let staged = list.nth 1 staging;
+        let declaring = phase! (list.head staging) :snapshot (scope.declare! staged);
+        let snapshot = [list.head declaring,
+                        %{ :loader => staged, :declared => list.nth 1 declaring }];
         let batched = rounds_all! (list.nth 1 snapshot) (list.head snapshot) found 0;
         strict! batched
         let state = list.head batched;

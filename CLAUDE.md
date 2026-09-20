@@ -1391,12 +1391,19 @@ phases charge themselves now, and `dreams --time` prints the breakdown under
 the stage table for any program with a macro in it.
 
 What a round does, in order: **discover** the declarations with an `expand` in
-them, **snapshot** the program (stage it, and `scope.declare!` it), **declare**
-this round's wrappers, **resolve** what the transformers reach and stub the
-rest, **lower** that to an arena, **emit** it as an image, **run** it on a VM,
-and **install** what came back. `discover` and `snapshot` are paid once for the
-program; the rest once per round, and a round is the *nesting* of macro calls
-rather than their number.
+them, **stage** the program (every `expand` replaced by `1 / 0`, every `macro`
+read as the `let` it is), **snapshot** it (`scope.declare!`), **declare** this
+round's wrappers, **resolve** what the transformers reach and stub the rest,
+**lower** that to an arena, **emit** it as an image, **run** it on a VM, and
+**install** what came back. `discover`, `stage` and `snapshot` are paid once
+for the program; the rest once per round, and a round is the *nesting* of macro
+calls rather than their number.
+
+`stage` and `snapshot` were charged together as `snapshot` when the table below
+was taken, and were split once that pair was 85% of the tax and "which of the
+two?" was the only question left. The answer is that staging is 2-4 ms of it
+and declaring is all the rest -- see "Declaring a program was mostly a search
+for the word `core`" above for what happened next.
 
 | | tax | discover | snapshot | declare | resolve | lower | emit | run | install |
 |---|---|---|---|---|---|---|---|---|---|
@@ -1519,6 +1526,120 @@ its *names*. It did not move at all (228 -> 231 ms at 3,200 declarations, 123
 the tax** where it was 41-42%. Note what that means about the ordering: the
 phase meter said to take the stub first and it was right, but the same meter
 now says the next 200 ms are in one phase that nothing here has looked at.
+
+### Declaring a program was mostly a search for the word `core`
+
+**The finding, and it is the whole section in one line:** `scope.declare!` is
+about *names* -- it binds them, numbers them and queues the bodies for later --
+and it does not read a body anywhere. Except in one place. `declare_core` asked
+"does this module mention `core`?", and asked it by walking every node of every
+declaration the module has (`modules.mentions_name`, a structural search for
+`[:name, "core", _]`). On a 3,200-declaration program that one question was
+**four fifths of what declaring the program cost**, and nothing else in
+`declare!` came close.
+
+It is asked because `std.core` is available without an import, which is a
+deliberate and good thing (see `declare_core`); what was wrong is that the
+answer was recomputed from scratch every time anyone wanted it, and a compile
+wants it two or three times over:
+
+- the **loader**, to decide whether to open `std.core` at all
+  (`modules.needs_core`),
+- `scope.resolve!`, through `declare_module`,
+- and, in a program with a macro in it, the *snapshot* -- because expansion
+  declares the staged program before it resolves what a transformer reaches,
+  which is a second whole `declare!`.
+
+So the answer is worked out once, when the module is loaded, and carried on the
+module record (`:mentions_core`, set by `modules.loaded`). `declare_core` is
+handed it rather than deriving it, and `scope.mentions_core_owned` supplies it
+for *effective* items -- which is exact rather than approximate, because
+`effective_items` hands over every item of every module a module derives from,
+so asking each owner once is the same question as asking each item. It is
+still lazy, so a module whose question is settled another way -- `std.core`
+itself, a module that binds `core` -- never pays the walk at all.
+
+| | snapshot | macro tax | `resolve` | whole compile |
+|---|---|---|---|---|
+| 3,200 declarations, one call | 229 -> **51 ms** | 267 -> **99** | 903 -> **757** | 3934 -> **3705** |
+| 6,400 declarations, one call | 431 -> **93 ms** | 518 -> **184** | 1785 -> **1441** | 8132 -> **7315** |
+
+Whole compiles, alternating against the same VM running the commit before's
+compiler: at 3,200 declarations 4231/4152/4260 ms against **3852/3816/3818**,
+at 6,400 8598/8770/8833 against **7901/7919/8047**, and the same program with
+the `expand` written out 3924/3795/3861 against **3715/3642/3772** -- the new
+build faster in all nine, which is what puts a 4-9% result outside the
+placement noise floor. Reductions fell 13.7% (114.5M -> 98.8M at 3,200, 226.5M
+-> 195.2M at 6,400) and allocation 5%.
+
+**The self-compile does not move at all** -- 4442/4469/4370/4479 ms against
+4500/4380/4395/4616 -- and the reason is the useful half of this entry. The
+walk is `list.any`, so it stops at the first declaration that mentions `core`,
+and every module of this compiler uses `core` in its first few lines. `dreams`
+was paying about 12 microseconds a declaration for it and the generated program
+69, for the same walk: **the cost of a search is how far it has to look, and a
+codebase that uses the thing it is searching for is the one place the search is
+free.** That is also why no profile had ever named it -- `mentions_name` was
+10.2% of a compile of the generated program and invisible on the one everybody
+runs.
+
+**What makes it sound.** The stored answer is a property of the module's items,
+so the only risk is an item list that changes after the module is recorded, and
+there is exactly one pass that does that: expansion. `expand.with_items`, which
+stages an `expand` as `1 / 0` and reads a `macro` as the `let` it is, can only
+*lose* a mention or keep it, so it carries the answer over. `apply_items` and
+`expand_item!`, which put a transformer's *answer* back into the module, go
+through `modules.with_new_items` instead and forget it -- a macro may hand back
+a tree naming `core` where the source never did, and `core` is the one name a
+module gets bound without asking. That is a handful of modules re-walked rather
+than the program.
+
+`declare_items!` -- session mode -- still asks the item walk, because it
+declares a *slice* of one module and the module's stored answer is about all of
+it. One statement is not a walk worth saving.
+
+Every image in the repository is byte-identical, `mind/std/all.dr --test`
+excepted for a reason that is not this change -- the section below -- and the
+bootstrap reaches a fixpoint in one stage.
+
+**What it leaves.** `snapshot` is 51 ms of a 3,200-declaration compile's 99 ms
+tax and 93 of 184 at 6,400: still the largest phase, still linear, and now
+actually what its name says -- a name declared, numbered and recorded, about 16
+microseconds each. The macro tax as a whole is 2.7% of that compile where it
+was 6.8%.
+
+### `mind/std/all.dr --test` is not byte-stable across compiler changes
+
+Worth knowing before the next person spends an hour on it, because several
+sections above tell you to check byte equality after a compiler change and this
+is the one image that can move without anything being wrong.
+
+`mind/std/all.dr` contains `let compiled_options = comp cli.parse_as
+option_schema options_for_types [..]`, and the value of that is a *map* --
+`%{ :values => .., :rest => .. }`, from `cli.parsed`. A compile-time expression
+is evaluated by running it on a VM and quoting the answer back into the image,
+and a map is quoted in the order its entries come out, which is by runtime atom
+identity. **Runtime atom ids are per process, and the process is the compiler.**
+`:values` is an atom the compiler itself has (number 96 of its own 345);
+`:rest` is not, so in the VM that runs the `comp` it is interned fresh, past
+the compiler's own atoms -- and it moves when the compiler does.
+
+So the two entries can swap, and the image differs by **6 bytes of 374,456**,
+all of them inside that one `comp`. Measured, so that it is not guessed at
+again:
+
+- it is stable across runs, across `-j`, across `DREAM_GC_THREADS`,
+  `DREAM_GC_CONCURRENT` and `DREAM_MAX_HEAP` -- this is not a race;
+- it is decided by the compiler image. A one-line `let x = :zzz;` added to
+  `dreams/config.dr` and nothing else flips it, and so does a one-line
+  `let x = "zzz";`, and so did the change in the section above -- **and all
+  three produce the same image as each other**, which is the check to apply.
+
+So when byte equality is the test, `dreams`, `lucid`, `mind` and a generated
+program are the ones that answer it, and a 6-byte difference in the `std --test`
+image at offset 289,565 is this and not a behaviour change. Confirm it the way
+it was confirmed here: diff against a build with an unrelated one-line addition
+rather than against the seed.
 
 ### The compiler was quadratic in the size of the program
 
