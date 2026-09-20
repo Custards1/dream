@@ -164,7 +164,7 @@ let ast_record item = match item { [:record, _, _, _, _, _, _] => true, _ => fal
 let route text base_text engine base =
     match parser.parse_module text {
         [:error, _, _] => :fresh,
-        [:ok, items] => match true {
+        [:ok, items, _] => match true {
             _ if expansion.has_expansion items || list.any ast_record items => :fresh,
             _ if engine == () => :reboot,
             _ if not (str.starts_with (engine_base_text engine) text) => :reboot,

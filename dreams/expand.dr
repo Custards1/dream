@@ -495,20 +495,58 @@ let expand_item! base s mi i item = {
 
 let complaints s = list.length (modules.diags (loader s));
 
+/// Is offset `at` inside this declaration, and is any of `sites`?
+let holds item at = {
+    let sp = ast.span item;
+    ast.span_start sp <= at && at < ast.span_end sp
+};
+let rec in_item sites item = match sites {
+    [] => false,
+    [at, ..rest] => holds item at || in_item rest item,
+};
+
 /// Every declaration that has an `expand` in it, as `[module, index, tree]`.
 ///
 /// This runs on every compile, macros or not -- it is how the question "is
-/// there anything to expand?" is answered -- so it walks the items rather than
-/// indexing them: a `list.nth i items` inside a fold over `0..length` is a
-/// walk per declaration, which is a module's declarations squared. The index
-/// is carried alongside the accumulator instead, and the accumulator is
-/// consed and reversed for the reason the head of `scope.dr`'s state gives.
-let work_of l = list.concat (list.map (fn mi ->
-    list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
-        if has_expansion (macro_let item) { [i + 1, core.cons [mi, i, item] acc] }
-        else { [i + 1, acc] })
-        [0, []] (modules.module_items (modules.module_at l mi)))))
-    (list.range 0 (modules.module_count l)));
+/// there anything to expand?" is answered -- and it used to answer it by
+/// walking every node of every declaration in the program. On a self-compile
+/// that was **11% of every reduction the compiler made**, to find eighteen
+/// declarations out of two thousand.
+///
+/// The parser already knows. `modules.expand_sites` is where the word
+/// `expand` is written in this module's file, so the declarations that can
+/// hold one are the ones whose span an offset falls inside, and only those
+/// are walked. A file with no offsets at all -- which is nearly every file --
+/// is not looked at.
+///
+/// **The offsets have to account for the declarations, or they decide
+/// nothing.** An `expand` inside a `when` the configuration switched off is
+/// written in the file and belongs to no declaration that survives here, and
+/// that is a real case: `std.macros` tests its own macros. So the check is
+/// two-way -- every offset must land inside one of the declarations picked --
+/// and a file where it does not falls back to the walk it would have had.
+/// Getting this wrong in the other direction would leave an `[:expand, ..]`
+/// node in a program nothing expands, so it is written to be checkable
+/// rather than to be clever.
+///
+/// Where it does walk, it walks the items rather than indexing them: a
+/// `list.nth i items` inside a fold over `0..length` is a walk per
+/// declaration, which is a module's declarations squared.
+let work_of l = list.concat (list.map (fn mi -> {
+    let m = modules.module_at l mi;
+    let sites = modules.expand_sites l (modules.module_source m);
+    if list.is_empty sites { [] }
+    else {
+        let numbered = list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
+            [i + 1, core.cons [i, item] acc]) [0, []] (modules.module_items m)));
+        let picked = list.filter (fn [_, item] -> in_item sites item) numbered;
+        let accounted = list.all (fn at ->
+            list.any (fn [_, item] -> holds item at) picked) sites;
+        list.map (fn [i, item] -> [mi, i, item])
+            (list.filter (fn [_, item] -> has_expansion (macro_let item))
+                         (if accounted { picked } else { numbered }))
+    }
+}) (list.range 0 (modules.module_count l)));
 
 /// Put every expanded declaration back where it came from.
 let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
@@ -526,7 +564,15 @@ let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
 /// fails the same way, having spent the time only because it was failing.
 let sequential! l =
     list.fold (fn s mi -> {
-        let items = modules.module_items (modules.module_at (loader s) mi);
+        let m = modules.module_at (loader s) mi;
+        // The same filter `work_of` uses, at its coarsest: a file with no
+        // `expand` written in it has nothing here. This is the fallback path
+        // and it re-walks by declaration rather than picking, because what
+        // sent it here is a snapshot that could not answer and the order is
+        // the whole of what it has to offer.
+        let items = if list.is_empty (modules.expand_sites (loader s) (modules.module_source m)) {
+                        []
+                    } else { modules.module_items m };
         list.fold_strict (fn acc i -> {
             let item = list.nth i items;
             if not (has_expansion (macro_let item)) { acc }

@@ -144,7 +144,7 @@ let loader packages cfg search_paths host_modules =
        // a dense index rather than by name: the index *is* the order.
        :modules => %{}, :module_count => 0,
        :by_name => core.map_new (), :by_path => core.map_new (),
-       :files => %{}, :file_count => 0,
+       :files => %{}, :file_count => 0, :expanding => %{},
        :natives => [], :namespaces => [],
        :diags => [], :visited => core.map_new (), :in_progress => [],
        // Files whose contents come from memory rather than from disk. An
@@ -187,6 +187,21 @@ let file_at l i    = (file_map l).[i else ()];
 let add_file f l =
     put :file_count (file_count l + 1) (put :files ((file_map l).[file_count l => f]) l);
 let set_file i f l = put :files ((file_map l).[i => f]) l;
+
+/// Where the word `expand` is written in each file, by source index: the
+/// parser's answer (`parser.expand_sites`), kept where the pass that needs it
+/// can ask. A module shares the source index of the file it was written in,
+/// submodules and records included, so this answers for a module as well.
+///
+/// It exists so that macro expansion can find the declarations it is about
+/// without walking the ones it is not. The walk it replaces was 11% of a
+/// self-compile and every program paid it, macros or not, because "has this
+/// declaration got an `expand` in it?" was asked by reading the whole
+/// program's syntax. See `parser.expand_sites` for why the answer is sound.
+let expanding l = core.map_get l :expanding %{};
+let expand_sites l source = (expanding l).[source else []];
+let note_expanding source sites l =
+    if list.is_empty sites { l } else { put :expanding ((expanding l).[source => sites]) l };
 let natives l      = core.map_get l :natives [];
 let namespaces l   = core.map_get l :namespaces [];
 let diags l        = core.map_get l :diags [];
@@ -696,17 +711,17 @@ let rec load_text! l text display name file = {
 };
 
 /// The part of loading that a same-text hit skips: registering an already
-/// parsed module. `parsed` is `parser.parse_module`'s answer -- `[:ok, items]`
-/// or `[:error, message, span]`. `source` is the file's index in the loader's
-/// list, counted before this file is added -- a file shares a source with the
-/// submodules written inside it, which means the pre-append count.
+/// parsed module. `parsed` is `parser.parse_module`'s answer -- `[:ok, items,
+/// sites]` or `[:error, message, span]`. `source` is the file's index in the
+/// loader's table, counted before this file is added -- a file shares a source
+/// with the submodules written inside it, which means the pre-add count.
 let load_items! l source parsed display name file = {
     match parsed {
         [:error, message, span] => complain span message source l,
-        [:ok, items] => {
+        [:ok, items, sites] => {
             // Resolve `when` before anything else looks at the module.
             let kept = expand_items (config_of l) items;
-            let noted = note_records name items l;
+            let noted = note_records name items (note_expanding source sites l);
 
             // A `mod name { .. }` is a module written inside another. Register
             // it as `parent.name` and leave the parent importing it, so from
@@ -924,7 +939,7 @@ when test {
 
     let on = config.define "test" config.empty;
 
-    let items_of src = match parser.parse_module src { [:ok, items] => items, _ => [] };
+    let items_of src = match parser.parse_module src { [:ok, items, _] => items, _ => [] };
 
     let tests = [
         // --- names ---

@@ -94,7 +94,7 @@ let tokenize! file src = {
 /// Parse, and print the syntax tree one item per line.
 let ast! file src =
     match parser.parse_module src {
-        [:ok, items] => {
+        [:ok, items, _] => {
             list.map (fn i -> console.print! (ast.show i)) items |> strict!
             0
         },
@@ -109,7 +109,7 @@ let ast! file src =
 /// wants, and why it is worth keeping separate from `--check`.
 let parse_only! file src =
     match parser.parse_module src {
-        [:ok, _] => 0,
+        [:ok, _, _] => 0,
         [:error, message, span] => {
             report! file src message (ast.span_start span)
             1

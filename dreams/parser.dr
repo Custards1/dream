@@ -1805,17 +1805,64 @@ let rec item_list c acc ts braced =
         }
     };
 
-/// Parse a whole module from source text: `[:ok, items]`, or
-/// `[:error, message, span]`.
+/// Where the word `expand` is written in a token stream, as byte offsets in
+/// the order they occur.
+///
+/// This is answered here because this is the only place the tokens exist, and
+/// it is answered at all because macro expansion had no other way to ask.
+/// `[:expand, ..]` is built at exactly one site in this file, out of exactly
+/// this word, so a declaration no offset falls inside cannot hold one --
+/// which is what lets expansion pick the handful of declarations it is about
+/// instead of walking every node of every declaration in the program to find
+/// them. That walk was **11% of a self-compile** and every program paid it,
+/// macros or not.
+///
+/// The `.` is what makes it worth scanning tokens rather than searching the
+/// text: `import dreams.expand` is a member spelling and not this word at
+/// all, and without the lookbehind it flagged every file that imports the
+/// expander -- which, in this compiler, is most of the large ones.
+///
+/// It is a *superset* and has to stay one. `expand` written where the grammar
+/// makes no expansion of it -- as a parameter name, say -- names a
+/// declaration that is then walked for nothing, and a walk is all that costs.
+/// The other direction would lose an expansion silently, which is why the
+/// caller checks that the offsets and the declaration spans agree before
+/// trusting them.
+let rec expand_sites prev ts acc = match ts {
+    [] => acc,
+    [t, ..rest] => {
+        let kind = lexer.kind t;
+        expand_sites kind rest
+            (if prev != :dot && kind == :ident && lexer.value t == "expand" {
+                 core.cons (lexer.span_start t) acc
+             } else { acc })
+    },
+};
+
+/// Parse a whole module from source text: `[:ok, items, sites]`, or
+/// `[:error, message, span]`. `sites` is `expand_sites` above, and it is lazy
+/// -- a caller that does not read it does not pay for the scan.
+///
+/// The text is searched before the tokens are, and that is not belt and
+/// braces: `core.str_find` is one machine pass over the file where the scan
+/// is a Dream loop over every token in it, and a file that does not contain
+/// the six bytes cannot contain the word. Nearly every file is such a file --
+/// in a program with no macros at all, every one of them is -- so this is
+/// what keeps the whole question down to a memchr per file for the programs
+/// that are not about macros.
 ///
 /// As with `parse_expression`, a lexical error is already a token in the
 /// stream, and a top-level item position is where it ends up.
-let parse_module src =
-    match item_list top [] (lexer.tokens src) false {
+let parse_module src = {
+    let ts = lexer.tokens src;
+    match item_list top [] ts false {
         [:error, m, s] => err m s,
-        [:ok, items, _] => [:ok, items],
+        [:ok, items, _] =>
+            [:ok, items,
+             if str.contains_str "expand" src { expand_sites :none ts [] } else { [] }],
         _ => err "the lexer answered something unexpected" ast.no_span,
-    };
+    }
+};
 
 // --- tests -------------------------------------------------------------------
 
@@ -1832,14 +1879,14 @@ when test {
     /// A whole module's items, one line each.
     let items src =
         match parse_module src {
-            [:ok, its] => str.join_str " " (list.map (fn i -> ast.show i) its),
+            [:ok, its, _] => str.join_str " " (list.map (fn i -> ast.show i) its),
             [:error, m, _] => "error: " + m,
         };
 
     /// The message of a module that must not parse.
     let fails_module src =
         match parse_module src {
-            [:ok, _] => "parsed when it should not have",
+            [:ok, _, _] => "parsed when it should not have",
             [:error, m, _] => m,
         };
 

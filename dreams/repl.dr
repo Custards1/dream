@@ -133,7 +133,7 @@ let declarative text =
 let parsed text =
     if declarative text {
         match parser.parse_module text {
-            [:ok, _] => [:ok],
+            [:ok, _, _] => [:ok],
             [:error, m, _] => [:error, m],
         }
     } else {
