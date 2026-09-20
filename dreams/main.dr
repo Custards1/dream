@@ -392,7 +392,8 @@ let own_of t = {
 
 /// Time the whole pipeline, stage by stage, and write nothing.
 let show_time! o file = {
-    let load = timed! (load! o file);
+    let read = timed! (read! o file);
+    let load = timed! (expansion.expand! (value_of read));
     let l = value_of load;
     let resolved = timed! (scope.resolve! l);
     let r = value_of resolved;
@@ -405,8 +406,9 @@ let show_time! o file = {
     let written = timed! (emit.to_binary img);
     let bytes = value_of written;
 
-    let stages = [["parse", load], ["resolve", resolved], ["lower", linked],
-                  ["arena", built], ["share", shared], ["emit", written]];
+    let stages = [["parse", read], ["expand", load], ["resolve", resolved],
+                  ["lower", linked], ["arena", built], ["share", shared],
+                  ["emit", written]];
     let total = list.fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
     let pad n text = str.repeat (n - str.byte_length text) " " + text;
     let line! label ms walk = {
@@ -728,11 +730,19 @@ let configured! o =
         (if opt o :test { config.define "test" (config.defaults! ()) }
          else { config.defaults! () });
 
-/// Load the whole program the file is the root of. The include directories are
-/// search paths as well as package roots, which is what `-I` means.
-let load! o file =
-    expansion.expand! (modules.load! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
-                  (opt o :test == true));
+/// Load the whole program the file is the root of, before macros. The include
+/// directories are search paths as well as package roots, which is what `-I`
+/// means.
+///
+/// Separate from `load!` so that `--time` can charge reading a program and
+/// expanding it to different lines. They used to be one stage called `parse`,
+/// and the question "what do the macros cost?" then had no answer short of
+/// writing the program twice.
+let read! o file =
+    modules.load! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
+                  (opt o :test == true);
+
+let load! o file = expansion.expand! (read! o file);
 
 let run_command! o file =
     match opt o :command {
