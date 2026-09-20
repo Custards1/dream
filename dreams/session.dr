@@ -318,7 +318,7 @@ let finalize! l mi en low2 r2 funcs2 globals2 source image = {
 /// everything up to the transient `main!` becomes the carried engine.
 let boot! roots cfg source image text base_text engine base = {
     let l = expansion.expand! (modules.load! source roots cfg false);
-    let mi = list.length (modules.modules l) - 1;
+    let mi = modules.module_count l - 1;
     let state_deps =
         list.fold (fn acc i -> scope.declare_module l i acc)
                   scope.state (list.range 0 mi);
@@ -352,7 +352,7 @@ let boot! roots cfg source image text base_text engine base = {
 /// re-read in place and only the new `let`s are compiled.
 let proceed! source image items engine base_text base = {
     let l = modules.reload_root! (engine_loader engine) source false;
-    let mi = list.length (modules.modules l) - 1;
+    let mi = modules.module_count l - 1;
     let part = entry_partition items base;
     let slice = list.head part;
     let main_item = list.nth 1 part;

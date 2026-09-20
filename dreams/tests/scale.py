@@ -15,6 +15,20 @@ CLAUDE.md.
 Read the ratio column, not the milliseconds. Near 2.0 for a doubling is linear
 and fine however large the absolute number; near 4.0 is a bug however small.
 Nothing here is part of `just test`: it takes minutes and needs no fixture.
+
+Read both columns. Time says whether something is quadratic; peak heap says
+whether it is the wall a large project actually hits. They are different
+questions and the modules axis has answered them differently twice -- the
+three loader lists taken out in 2026-09-20 were 18% of allocation and 34% of
+the peak, and `modules.modules`, the one a previous round had named, was 6% of
+the first and none of the second.
+
+The modules axis has to be run *far* out before it says anything. `envs` was a
+list indexed by module for the whole life of the compiler, and at 400 modules
+-- as far as anyone had taken this -- the list and the map that replaced it are
+indistinguishable. At 3,200 the list is 1967 MB against 594, and does not
+compile under the default heap cap at all. Take the last doubling you can
+afford, not the first one that runs.
 """
 
 import argparse, os, shutil, subprocess, sys, tempfile, time

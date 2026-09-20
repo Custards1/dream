@@ -40,7 +40,7 @@ let rec stage tree = match tree {
     [:macro, _, _, _, _] => stage (macro_let tree),
     _ => if type_of tree == :list { list.map (fn x -> stage x) tree } else { tree },
 };
-let replace_module l mi m = modules.put :modules ((modules.modules l).[mi => m]) l;
+let replace_module l mi m = modules.set_module mi m l;
 let with_items m items = core.map_put m :items items;
 let loader s = core.map_get s :loader ();
 let next s = core.map_get s :next 3221225472;
@@ -122,9 +122,8 @@ let prepare! l = prepare_work! l (work_of l);
 let prepare_work! l work = {
     let replaced = apply_items l (list.map (fn [mi, i, tree] ->
         [mi, i, stage tree]) work);
-    let staged = modules.put :modules (list.map (fn m ->
-        with_items m (list.map macro_let (modules.module_items m)))
-        (modules.modules replaced)) replaced;
+    let staged = modules.map_modules (fn m ->
+        with_items m (list.map macro_let (modules.module_items m))) replaced;
     let declared = scope.declare! staged;
     %{ :loader => staged, :declared => declared }
 };
@@ -248,9 +247,9 @@ let evaluate_round! base s jobs = {
         _ => if syntax.expression value {
                  let [expression, after_expression] = syntax.fresh value (next st);
                  let si = modules.module_source m;
-                 let files = modules.files (loader st);
-                 let source = diag.with_origin (next st) after_expression at (list.nth si files);
-                 let s2 = put_loader (modules.put :files (files.[si => source]) (loader st)) st;
+                 let source = diag.with_origin (next st) after_expression at
+                                               (modules.file_at (loader st) si);
+                 let s2 = put_loader (modules.set_file si source (loader st)) st;
                  [core.map_put s2 :next after_expression, expression]
              } else {
                  [fail st mi at "a macro must return a valid expression syntax tree", ()]
@@ -497,12 +496,19 @@ let expand_item! base s mi i item = {
 let complaints s = list.length (modules.diags (loader s));
 
 /// Every declaration that has an `expand` in it, as `[module, index, tree]`.
-let work_of l = list.concat (list.map (fn mi -> {
-    let items = modules.module_items (modules.module_at l mi);
-    list.fold (fn acc i ->
-        if has_expansion (macro_let (list.nth i items)) { acc + [[mi, i, list.nth i items]] }
-        else { acc }) [] (list.range 0 (list.length items))
-}) (list.range 0 (list.length (modules.modules l))));
+///
+/// This runs on every compile, macros or not -- it is how the question "is
+/// there anything to expand?" is answered -- so it walks the items rather than
+/// indexing them: a `list.nth i items` inside a fold over `0..length` is a
+/// walk per declaration, which is a module's declarations squared. The index
+/// is carried alongside the accumulator instead, and the accumulator is
+/// consed and reversed for the reason the head of `scope.dr`'s state gives.
+let work_of l = list.concat (list.map (fn mi ->
+    list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
+        if has_expansion (macro_let item) { [i + 1, core.cons [mi, i, item] acc] }
+        else { [i + 1, acc] })
+        [0, []] (modules.module_items (modules.module_at l mi)))))
+    (list.range 0 (modules.module_count l)));
 
 /// Put every expanded declaration back where it came from.
 let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
@@ -549,7 +555,7 @@ let sequential! l =
                 }
             }
         }) s (list.range 0 (list.length items))
-    }) %{ :loader => l, :next => 3221225472 } (list.range 0 (list.length (modules.modules l)));
+    }) %{ :loader => l, :next => 3221225472 } (list.range 0 (modules.module_count l));
 
 let expand! l = if modules.failed l { l } else { expand_work! l (work_of l) };
 
@@ -573,6 +579,6 @@ let expand_work! l work =
         let expanded = if complaints state == list.length (modules.diags l) {
             apply_items (loader state) (list.nth 1 batched)
         } else { loader (sequential! l) };
-        modules.put :modules (list.map (fn m -> with_items m
-            (list.map macro_let (modules.module_items m))) (modules.modules expanded)) expanded
+        modules.map_modules (fn m -> with_items m
+            (list.map macro_let (modules.module_items m))) expanded
     };

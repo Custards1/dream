@@ -93,7 +93,7 @@ redesigns below would remove.
 
 ## Compiling a package at a time
 
-Priority: high, and it is the one Blake named -- packages compiled to `.dream`
+Priority: medium, and it is the one the user named -- packages compiled to `.dream`
 or a new `.libdream`, linked rather than recompiled. Everything above makes the
 whole-program compile *cheaper*; this is what makes it *unnecessary*.
 
@@ -111,11 +111,35 @@ the only thing that changes the shape of that.
   ratio between consecutive sizes. It immediately found a cubic -- `set_env`
   rebuilt the whole module-environment list with a `list.nth` per element, and a
   400-module program went 6744 ms to 4880 ms when it became the `set` opcode.
-  It left one, and this is the thing to fix before reaching for a linker: `envs`
-  is still a *list* indexed by module, so `env_at s mi` is a `list.nth` and
-  every name resolution is O(modules). Both axes now grow ~1.9x in time and
-  ~2.1x in heap per doubling. Making `envs` indexable is a much smaller change
-  than separate compilation and may buy the same order of magnitude.
+
+- [x] **Make `envs` indexable.** Done, and it did not buy what this list
+  predicted -- read "A table indexed by module wants to be a map, not a list" in
+  `CLAUDE.md` before the next one, because the reason is the useful part. The
+  O(modules) *read* per name resolution, which is what this item was written
+  about, is nearly free: it is the `get` opcode, one pointer chase per element.
+  What cost was the O(modules) *write*: `set_env` was `list_set`, which
+  allocates a cell per element in front of the one it replaces, once per
+  declaration. `envs` is a map keyed by module index now.
+
+  Peak live heap at 3,200 declarations over 3,200 modules: **1967 MB -> 594
+  MB**, and under the default 1 GB cap that program went from not compiling at
+  all to compiling. Time 8371 ms -> 7322 ms there and unmoved below 1,600 modules; the
+  self-compile does not move; every image byte-identical and the bootstrap a
+  fixpoint in one stage.
+
+- [x] **Make `modules.modules` indexable.** Done, as a map keyed by module
+  index plus a count, with `modules l` derived for the three callers that
+  really do want the order. On its own it was worth **5.7% of a 3,200-module
+  compile's allocation and nothing else** -- not the peak heap, not the clock
+  -- against a prediction that it was most of the 24% the list share had grown
+  to. The other 18% was `modules.files` and `scope.module_recs`, the same shape
+  in two more places, and taking all three took peak heap on the modules axis
+  from 623 MB to **409 MB** and made it flat: 364/385/393/409 across 400 to
+  3,200 modules, where it had been 372/390/387/623. Read "The three lists the
+  loader still grew one entry at a time" in `CLAUDE.md` -- the transferable
+  part is that the *named* candidate was the smallest of the three, and the
+  two that mattered were found by measuring again rather than by acting on the
+  earlier note.
 
 - [ ] **Decide what a `.libdream` contains.** An image today is closed: every
   index in it is a whole-program index, validated on load
@@ -158,17 +182,26 @@ the only thing that changes the shape of that.
 
 ## What to do next, in order
 
-1. **Make `envs` indexable**, the last known superlinear thing in the compiler
-   and the cheapest. `dreams/tests/scale.py --sizes 3200 --modules 400` is the
-   measurement; a linker is not worth designing while an afternoon's change is
-   still on the table.
-2. **The incremental compile-time VM**, which is the last whole-program cost
+The modules axis is done: peak heap across it is flat, and the wall a large
+project hits is now entirely the **declarations** axis -- 646 MB at 3,200
+declarations, 2.5x per doubling, which is the lazy pipeline holding source,
+tokens, syntax, the staged copy, the resolver's tables and the arena live at
+once. That is not a quadratic anybody can delete, which is what makes 2 and 3
+below the answer rather than another round of this.
+
+1. **The incremental compile-time VM**, which is the last whole-program cost
    macro expansion has: what remains is building and serializing an image at
    all, and no further trimming of *what goes into* one removes it.
-3. **`.libdream` for transformers**, which is that VM's input and the smallest
+2. **`.libdream` for transformers**, which is that VM's input and the smallest
    honest version of separate compilation.
-4. **`.libdream` for everything**, if 1-3 have not already moved the wall past
-   where anyone is standing.
+3. **`.libdream` for everything**, if 1 and 2 have not already moved the wall
+   past where anyone is standing.
+
+If a fourth round of list-to-map is ever tempting, measure first and measure
+the right thing: allocation by kind at two sizes says *whether* something is
+growing, and only peak live heap says whether it is the wall. The three tables
+above were 18% of allocation and 34% of the peak; `modules.modules` alone was
+6% of the first and none of the second.
 
 Do not spend another round shaving the whole-program snapshot; that seam is
 worked out.

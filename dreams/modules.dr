@@ -139,10 +139,13 @@ let loader packages cfg search_paths host_modules =
     %{ :packages => packages, :config => cfg, :search_paths => search_paths,
        :host_modules => host_modules,
        // Dependencies first, so a later pass never meets a module before what
-       // it uses. That ordering is the reason a module is appended only once
-       // everything it imports has been.
-       :modules => [], :by_name => core.map_new (), :by_path => core.map_new (),
-       :files => [], :natives => [], :namespaces => [],
+       // it uses. That ordering is the reason a module is recorded only once
+       // everything it imports has been -- and it is why the table is keyed by
+       // a dense index rather than by name: the index *is* the order.
+       :modules => %{}, :module_count => 0,
+       :by_name => core.map_new (), :by_path => core.map_new (),
+       :files => %{}, :file_count => 0,
+       :natives => [], :namespaces => [],
        :diags => [], :visited => core.map_new (), :in_progress => [],
        // Files whose contents come from memory rather than from disk. An
        // editor holds a buffer that has not been saved -- often has never been
@@ -159,10 +162,31 @@ let packages l     = core.map_get l :packages package.empty;
 let config_of l    = core.map_get l :config config.empty;
 let search_paths l = core.map_get l :search_paths [];
 let host_modules l = core.map_get l :host_modules [];
-let modules l      = core.map_get l :modules [];
+/// Every module that was loaded, in order. Derived, because the table it
+/// comes from is keyed by index -- so ask `module_count` when the count is all
+/// that is wanted, which is what nearly every caller wanted.
+let modules l      = list.map (fn i -> module_at l i) (list.range 0 (module_count l));
+let module_map l   = core.map_get l :modules %{};
+let module_count l = core.map_get l :module_count 0;
 let by_name l      = core.map_get l :by_name (core.map_new ());
 let by_path l      = core.map_get l :by_path (core.map_new ());
-let files l        = core.map_get l :files [];
+/// Every source file, in order. Derived from the table below, and wanted in
+/// this shape by exactly one caller: `diag.render_all`, which is handed the
+/// whole program's files once, at the end of a compile that has something to
+/// say. Every other reader knows the index it wants -- a diagnostic carries
+/// one -- and asks `file_at`.
+let files l        = list.map (fn i -> file_at l i) (list.range 0 (file_count l));
+let file_map l     = core.map_get l :files %{};
+let file_count l   = core.map_get l :file_count 0;
+let file_at l i    = (file_map l).[i else ()];
+
+/// Record a file's text and say where it went. Keyed by index like the module
+/// table above and for the same two reasons: appending copied the list, once
+/// per file, and `expand.install!` rewrote one entry with the `set` opcode,
+/// which copies every cell in front of it, once per macro call.
+let add_file f l =
+    put :file_count (file_count l + 1) (put :files ((file_map l).[file_count l => f]) l);
+let set_file i f l = put :files ((file_map l).[i => f]) l;
 let natives l      = core.map_get l :natives [];
 let namespaces l   = core.map_get l :namespaces [];
 let diags l        = core.map_get l :diags [];
@@ -200,7 +224,27 @@ let put k v l = core.map_put l k v;
 /// The index of a module, by any name it answers to, or `()`.
 let find l name = core.map_get (by_name l) name ();
 
-let module_at l i = list.nth i (modules l);
+let module_at l i = (module_map l).[i else ()];
+
+/// Record a module at the end, which is the index everything else will know it
+/// by. The two writers are `load_items!` and `hoist_mod!`, and both used to say
+/// `list.append (modules l) [m]` -- which copies the list, so loading a program
+/// was O(modules^2) bytes. See "A table indexed by module wants to be a map" in
+/// CLAUDE.md: this is the same finding as `scope.envs`, on the loader's copy of
+/// the same table.
+let add_module m l =
+    put :module_count (module_count l + 1) (put :modules ((module_map l).[module_count l => m]) l);
+
+/// Replace module `mi`. Expansion rewrites a declaration in place and puts the
+/// module back; nothing here changes the count.
+let set_module mi m l = put :modules ((module_map l).[mi => m]) l;
+
+/// Rewrite every module. Expansion does this twice -- once to stage a snapshot
+/// and once to turn `macro` declarations into ordinary `let`s -- and both used
+/// to rebuild the whole list.
+let map_modules f l =
+    put :modules (list.fold (fn acc i -> acc.[i => f (module_at l i)])
+                            (module_map l) (list.range 0 (module_count l))) l;
 
 /// Is this path provided by the runtime rather than by Dream source?
 let is_host l p = is_native p || list.contains p (host_modules l);
@@ -620,12 +664,10 @@ let rec hoist_mod! l parent source m =
                 }) (enter full (list.head nested)) (with_core full inner_items (dependencies inner_items));
 
                 let recorded = leave followed;
-                let index = list.length (modules recorded);
+                let index = module_count recorded;
                 [mark_visited full
                     (put :by_name (core.map_put (by_name recorded) full index)
-                        (put :modules (list.append (modules recorded)
-                                                   [loaded full full source inner_items])
-                             recorded)),
+                        (add_module (loaded full full source inner_items) recorded)),
                  stand_in]
             }
         },
@@ -633,8 +675,8 @@ let rec hoist_mod! l parent source m =
     };
 
 let rec load_text! l text display name file = {
-    let source = list.length (files l);
-    let read = put :files (list.append (files l) [diag.source display text]) l;
+    let source = file_count l;
+    let read = add_file (diag.source display text) l;
     // A same-text parse already in hand is reused rather than done again: an
     // editor sends the whole buffer with every change, and every request after
     // the change is about that same buffer.
@@ -693,13 +735,11 @@ let load_items! l source parsed display name file = {
             }) (list.head hoisted) (with_core name items_out (dependencies items_out));
 
             let recorded = leave followed;
-            let index = list.length (modules recorded);
+            let index = module_count recorded;
             mark_visited name
                 (put :by_path (core.map_put (by_path recorded) (path.absolute! file) index)
                     (put :by_name (core.map_put (by_name recorded) name index)
-                        (put :modules (list.append (modules recorded)
-                                                   [loaded name file source items_out])
-                             recorded)))
+                        (add_module (loaded name file source items_out) recorded)))
         },
     }
 };
@@ -723,7 +763,7 @@ let add_test_runner! l = {
     let suites = list.filter (fn s -> s != ())
         (list.map (fn i ->
             if exports_tests (module_at l i) { [module_name (module_at l i), i] } else { () })
-         (list.range 0 (list.length (modules l))));
+         (list.range 0 (module_count l)));
     let src =
         if list.is_empty suites {
             // Still a valid program: it reports that there was nothing to run,
@@ -782,13 +822,13 @@ let reload_root! l file test_mode = {
     match find l name {
         () => load_root! l file test_mode,
         root_index => {
-            let mods = modules l;
-            let deps = list.take (list.length mods - 1) mods;
+            let last = module_count l - 1;
             let unmounted =
-                put :modules deps
-                    (put :by_name (core.map_remove (by_name l) name)
-                        (put :by_path (core.map_remove (by_path l) (path.absolute! file))
-                            (put :visited (core.map_remove (visited l) name) l)));
+                put :module_count last
+                    (put :modules (core.map_remove (module_map l) last)
+                        (put :by_name (core.map_remove (by_name l) name)
+                            (put :by_path (core.map_remove (by_path l) (path.absolute! file))
+                                (put :visited (core.map_remove (visited l) name) l))));
             load_file! unmounted file name ast.no_span 0
         }
     }

@@ -251,7 +251,7 @@ let member_item a target e n =
 let member_items a segs =
     match namespace_of a segs {
         [:dream, target] => {
-            let e = list.nth target (scope.r_envs (analysis.resolved a));
+            let e = scope.r_env_at (analysis.resolved a) target;
             list.map (fn n -> member_item a target e n) (scope.exports e)
         },
         [:group, prefix] =>
@@ -391,7 +391,7 @@ let macro_name_items a =
     match analysis.module_of a {
         () => [],
         mi => {
-            let e = list.nth mi (scope.r_envs (analysis.resolved a));
+            let e = scope.r_env_at (analysis.resolved a) mi;
             list.append
                 (list.map (fn n -> item n kind_function (analysis.shown_signature a mi n)
                                         "A macro of this module." rank_global)
@@ -404,7 +404,7 @@ let macro_name_items a =
 let macro_member_items a segs =
     match namespace_of a segs {
         [:dream, target] => {
-            let e = list.nth target (scope.r_envs (analysis.resolved a));
+            let e = scope.r_env_at (analysis.resolved a) target;
             list.map (fn n -> item n kind_function (analysis.shown_signature a target n)
                                    ("A macro of module `"
                                     + modules.module_name (modules.module_at (analysis.loader a) target)
@@ -429,7 +429,7 @@ let name_items a offset =
             // an offset into. It differs from the buffer only at and after the
             // cursor, and every binder shown here was written before it.
             let src = analysis.module_text a mi;
-            let e = list.nth mi (scope.r_envs (analysis.resolved a));
+            let e = scope.r_env_at (analysis.resolved a) mi;
             list.concat [local_items a src offset,
                          global_items a mi e,
                          import_items a e,
@@ -521,8 +521,7 @@ when test {
         match analysis.module_of a {
             () => [],
             mi => list.sort (list.map (fn i -> core.map_get i "label" ())
-                                      (import_items a (list.nth mi (scope.r_envs
-                                                                        (analysis.resolved a))))),
+                                      (import_items a (scope.r_env_at (analysis.resolved a) mi))),
         }
     };
 
@@ -533,8 +532,7 @@ when test {
             () => "",
             mi => {
                 let hit = list.filter (fn i -> core.map_get i "label" () == label)
-                                      (import_items a (list.nth mi (scope.r_envs
-                                                                        (analysis.resolved a))));
+                                      (import_items a (scope.r_env_at (analysis.resolved a) mi));
                 match hit {
                     [] => "",
                     [i, .._] => core.map_get (core.map_get i "documentation" ()) "value" (),
@@ -557,7 +555,7 @@ when test {
                 let a = of! "priv let helper x = x; let main! = helper 1;";
                 let mi = analysis.module_of a;
                 list.any (fn i -> core.map_get i "label" () == "helper")
-                    (global_items a mi (list.nth mi (scope.r_envs (analysis.resolved a))))
+                    (global_items a mi (scope.r_env_at (analysis.resolved a) mi))
             }) ),
         test.case "a cursor after a dot asks about the chain in front of it"
             $( test.eq! [:member, ["console"]] (context "    console." 12) ),

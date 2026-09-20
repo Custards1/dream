@@ -81,7 +81,7 @@ let source_items a mi = modules.module_items (modules.module_at (source a) mi);
 /// the editor gave, and the loader records the path it was asked for.
 let module_index l path = {
     let hits = list.filter (fn i -> modules.module_path (modules.module_at l i) == path)
-                           (list.range 0 (list.length (modules.modules l)));
+                           (list.range 0 (modules.module_count l));
     if list.is_empty hits { () } else { list.head hits }
 };
 
@@ -134,7 +134,7 @@ let declared! path roots open_docs parsed = {
 /// is one. Every offset below is into this, so it has to be the same string.
 let module_text a mi = {
     let l = loader a;
-    diag.source_text (list.nth (modules.module_source (modules.module_at l mi)) (modules.files l))
+    diag.source_text (modules.file_at l (modules.module_source (modules.module_at l mi)))
 };
 
 // --- diagnostics ----------------------------------------------------------------
@@ -152,10 +152,9 @@ let severity_warning = 2;
 let lsp_diagnostic a d = {
     let l = loader a;
     let si = diag.source_of d;
-    let files = modules.files l;
-    let src = if si < list.length files { diag.source_text (list.nth si files) } else { "" };
-    let sp = if si < list.length files { diag.origin_span (list.nth si files) (diag.span d) }
-             else { diag.span d };
+    let f = modules.file_at l si;
+    let src = if f == () { "" } else { diag.source_text f };
+    let sp = if f == () { diag.span d } else { diag.origin_span f (diag.span d) };
     %{ "range" => pos.range src (ast.span_start sp) (ast.span_end sp),
        "severity" => if diag.is_error d { severity_error } else { severity_warning },
        "source" => "dreams",
@@ -168,9 +167,10 @@ let lsp_diagnostic a d = {
 /// Which file a diagnostic is about, as a path.
 let diagnostic_path a d = {
     let l = loader a;
-    let si = diag.source_of d;
-    let files = modules.files l;
-    if si < list.length files { diag.source_path (list.nth si files) } else { "" }
+    match modules.file_at l (diag.source_of d) {
+        () => "",
+        f  => diag.source_path f,
+    }
 };
 
 /// Everything the front end had to say, in one list.
@@ -620,7 +620,7 @@ let params_of a mi name =
 /// to read. The environment is where the answer ends up, and asking it is the
 /// only way to tell `priv let f x = ..` from `let f x = ..`.
 let is_private_global a mi name =
-    scope.is_private (list.nth mi (scope.r_envs (resolved a))) name;
+    scope.is_private (scope.r_env_at (resolved a) mi) name;
 
 /// Is the name still open where it was resolved -- declared `virtual` and not
 /// answered by an ordinary `let`?
@@ -820,7 +820,7 @@ let shown_signature a mi name =
 /// that still exists and is silently wrong. `scope.definition` has carried
 /// the source each body came from all along; nothing was reading it.
 let location_in a source span = {
-    let f = list.nth source (modules.files (loader a));
+    let f = modules.file_at (loader a) source;
     %{ "uri" => path_to_uri (diag.source_path f),
        "range" => pos.range (diag.source_text f) (ast.span_start span) (ast.span_end span) }
 };

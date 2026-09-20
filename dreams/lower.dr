@@ -1128,7 +1128,7 @@ let lower_destructure pattern body span l = {
 /// hidden global is found by name in the module this body was resolved against,
 /// which under `derive` is the deriving module -- whose hidden global it is.
 let lower_destructured hidden pattern name_span l =
-    match scope.global_index (list.nth (ctx l) (scope.r_envs (res l))) hidden {
+    match scope.global_index (scope.r_env_at (res l) (ctx l)) hidden {
         () => emit_leaf :unit l,
         g => {
             let value = emit (ir.node :global g ir.no_node ir.no_node) l;
@@ -1383,7 +1383,7 @@ let link_modules ld r l = {
 /// its entry point every entry on top of a carried resolution, so the newest
 /// body is the one appended last, and a fresh compile has exactly one anyway.
 let find_entry ld r = {
-    let last = list.length (modules.modules ld) - 1;
+    let last = modules.module_count ld - 1;
     let hits = list.filter (fn b -> list.nth 0 b == last
                                     && scope.decl_name (list.nth 2 b) == "main!")
                            (scope.bodies r);
@@ -1546,10 +1546,10 @@ let link! ld r = {
     let low = settle_comps! (lower_program r);
     let ms = link_modules ld r low;
     let named = strk (modules.module_name (modules.module_at ld
-                          (list.length (modules.modules ld) - 1)))
+                          (modules.module_count ld - 1)))
                      (list.head ms);
     let sourced = strk (modules.module_path (modules.module_at ld
-                            (list.length (modules.modules ld) - 1)))
+                            (modules.module_count ld - 1)))
                        (list.head named);
     let p = core.map_put
                 (core.map_put

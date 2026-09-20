@@ -113,8 +113,8 @@ let err_note span message note source ds =
 
 // --- the pass state ------------------------------------------------------------
 
-/// `envs` is indexed by module, in the loader's order. `pending` is every body
-/// still to be checked, as `[ctx, source, decl]`, where `ctx` is the module
+/// `envs` is keyed by module index, in the loader's order. `pending` is every
+/// body still to be checked, as `[ctx, source, decl]`, where `ctx` is the module
 /// whose names it resolves against and `source` the file it was written in. For
 /// a derived body those differ, and that difference is the whole of what
 /// `derive` means.
@@ -123,10 +123,10 @@ let err_note span message note source ds =
 /// host modules are imported, and which range of globals belongs to which
 /// module. They are built here because this is the pass that hands out the
 /// indices they are keyed by.
-let state = %{ :envs => [], :pending => [], :diags => [], :next_global => 0,
+let state = %{ :envs => %{}, :pending => [], :diags => [], :next_global => 0,
                :imports => [], :global_recs => [], :module_recs => [] };
 
-let envs s    = core.map_get s :envs [];
+let envs s    = core.map_get s :envs %{};
 let next_global s = core.map_get s :next_global 0;
 
 /// Take the next global index: `[state, index]`. Handing them out here, while
@@ -134,9 +134,10 @@ let next_global s = core.map_get s :next_global 0;
 /// globals contiguous.
 let take_global s = [core.map_put s :next_global (next_global s + 1), next_global s];
 
-// Three of this state's fields grow one entry at a time and end up as long as
-// the program: the imports, the global records and the queue of bodies to walk.
-// Each is held **reversed**, and the accessor below is what puts it in order.
+// Four of this state's fields grow one entry at a time and end up as long as
+// the program: the imports, the global records, the queue of bodies to walk
+// and one record per module. Each is held **reversed**, and the accessor below
+// is what puts it in order.
 //
 // The reason is that `list.append xs [x]` is one reduction and a copy of `xs`.
 // A profile counts the reduction and says nothing about the copy, so an
@@ -151,10 +152,11 @@ let take_global s = [core.map_put s :next_global (next_global s + 1), next_globa
 let s_imports_rev s     = core.map_get s :imports [];
 let s_global_recs_rev s = core.map_get s :global_recs [];
 let pending_rev s       = core.map_get s :pending [];
+let s_module_recs_rev s = core.map_get s :module_recs [];
 
 let s_imports s     = list.reverse (s_imports_rev s);
 let s_global_recs s = list.reverse (s_global_recs_rev s);
-let s_module_recs s = core.map_get s :module_recs [];
+let s_module_recs s = list.reverse (s_module_recs_rev s);
 
 /// How many there are, without putting them in order to find out.
 let s_global_recs_count s = list.length (s_global_recs_rev s);
@@ -175,19 +177,32 @@ let record_global gi name kind target s =
 let pending s = list.reverse (pending_rev s);
 let diags s   = core.map_get s :diags [];
 
-let env_at s mi = list.nth mi (envs s);
+/// Module `mi`'s environment, and whether it has one yet. Modules are declared
+/// in the loader's order, so an import can name one that is still ahead of the
+/// walk -- which is what `has_env` is asked, and it used to be spelled
+/// `mi < list.length (envs s)` because a list had no other way to say it.
+let env_at s mi  = (envs s).[mi else ()];
+let has_env s mi = core.map_has (envs s) mi;
 
 /// Replace module `mi`'s environment.
 ///
-/// `.[mi => e]` rather than a rebuild: setting a list by position is the `set`
-/// opcode, one machine walk, where the `list.map` with a `list.nth` per element
-/// this used to be was O(modules^2) *reductions* -- and it is called several
-/// times per module, so declaring a program was cubic in its module count. A
-/// program of 400 modules is where that starts to show; this repository has
-/// fifty, which is why it never did.
+/// This was a list, twice over, and each time for the reason the next
+/// paragraph gives. First it was rebuilt here with a `list.map` and a
+/// `list.nth` per element, which is O(modules^2) *reductions* per call and
+/// made declaring a program cubic in its module count. Then it was the `set`
+/// opcode on a list -- one reduction, so the profile went quiet, but `list_set`
+/// allocates a fresh cell for every element in front of the one it replaces,
+/// so a call still cost O(modules) *bytes* and there is one per declaration.
+/// That is the same invisible quadratic `record_global` and `add_pending` had,
+/// in the other axis.
+///
+/// It is a map keyed by module index now, so both halves are O(log32 modules):
+/// a put rebuilds the path to one leaf and shares the rest, and `env_at` is a
+/// lookup rather than a walk of the modules in front of the one asked for.
+/// Nothing wanted the order -- every reader indexes -- so the keys stay dense
+/// 0..n-1 and `has_env` is what the `mi < list.length` guards were.
 let set_env mi e s = core.map_put s :envs ((envs s).[mi => e]);
 
-let add_env e s     = core.map_put s :envs (list.append (envs s) [e]);
 let add_pending p s = core.map_put s :pending (core.cons p (pending_rev s));
 
 let complain span message source s =
@@ -297,7 +312,7 @@ let rec declare_import_names mi r p names span s =
         let e = env_at acc mi;
         let bound = default_alias [list.nth 0 sel] (list.nth 1 sel);
         let inaccessible = match r {
-            [:dream, target] => target != mi && target < list.length (envs acc)
+            [:dream, target] => target != mi && has_env acc target
                 && is_private (env_at acc target) (list.nth 0 sel),
             _ => false,
         };
@@ -326,7 +341,7 @@ let rec declare_import l mi imp s = {
        && list.length written > 1 && modules.find l parent != () {
         let owner = modules.find l parent;
         let member = list.last written;
-        if owner < list.length (envs s) && not (has_global (env_at s owner) member) {
+        if has_env s owner && not (has_global (env_at s owner) member) {
             complain span ("module `" + parent + "` has no member `" + member + "`")
                      (env_source e) s
         }
@@ -739,9 +754,9 @@ let declare_one_let l mi od s = {
 /// was parsed from moves.
 let declare_items! l mi items s0 = {
     let s1 =
-        if list.length (envs s0) > mi { s0 }
-        else { add_env (env (modules.module_name (modules.module_at l mi))
-                            (modules.module_source (modules.module_at l mi))) s0 };
+        if has_env s0 mi { s0 }
+        else { set_env mi (env (modules.module_name (modules.module_at l mi))
+                               (modules.module_source (modules.module_at l mi))) s0 };
     let s2 = set_env mi (core.map_put (env_at s1 mi) :source
                                        (modules.module_source (modules.module_at l mi))) s1;
     let pairs = list.map (fn i -> [mi, i]) items;
@@ -764,7 +779,7 @@ let declare_module l mi s0 = {
     // rather than as a list.
     let globals_from = next_global s0;
     let m = modules.module_at l mi;
-    let s1 = add_env (env (modules.module_name m) (modules.module_source m)) s0;
+    let s1 = set_env mi (env (modules.module_name m) (modules.module_source m)) s0;
     let items = modules.module_items m;
 
     // Aliases first: imports, then derives, which also bring the base module's
@@ -815,9 +830,9 @@ let declare_module l mi s0 = {
     // A module that declares a virtual is abstract: it has a hole in it, and
     // running it directly would reach one.
     core.map_put checked :module_recs
-        (list.append (s_module_recs checked)
-                     [[mi, globals_from, next_global checked - globals_from,
-                       not (list.is_empty virtuals), derives (env_at checked mi)]])
+        (core.cons [mi, globals_from, next_global checked - globals_from,
+                    not (list.is_empty virtuals), derives (env_at checked mi)]
+                   (s_module_recs_rev checked))
 };
 
 // --- frames ---------------------------------------------------------------------
@@ -891,7 +906,13 @@ let resolver es = %{ :envs => es, :frames => [], :diags => [], :refs => core.map
                      :funcs => core.map_new (), :func_count => 0,
                      :bodies => [], :defs => [] };
 
-let r_envs r   = core.map_get r :envs [];
+let r_envs r   = core.map_get r :envs %{};
+
+/// Module `mi`'s environment, out of a finished resolution. The same lookup
+/// `env_at` is, for the readers that hold a resolver rather than the scope
+/// state -- `lower` and `lucid` both do, and both used to reach in with a
+/// `list.nth` of their own.
+let r_env_at r mi = (r_envs r).[mi else ()];
 let r_imports r     = core.map_get r :imports [];
 let r_global_recs r = core.map_get r :global_recs [];
 let r_module_recs r = core.map_get r :module_recs [];
@@ -1266,8 +1287,8 @@ let ctx_l c = Context.l c;
 let ctx_mi c = Context.mi c;
 let ctx_source c = Context.source c;
 
-let ctx_env c r = list.nth (ctx_mi c) (r_envs r);
-let env_of c r i = list.nth i (r_envs r);
+let ctx_env c r = (r_envs r).[ctx_mi c else ()];
+let env_of c r i = (r_envs r).[i else ()];
 
 let report c span message r = complain_at span message (ctx_source c) r;
 let report_note c span message note r = complain_note_at span message note (ctx_source c) r;
@@ -1845,7 +1866,7 @@ let check_body l p r = {
 /// root on top of the carried result for a warm start.
 let declare! l =
     list.fold (fn acc mi -> declare_module l mi acc) state
-              (list.range 0 (list.length (modules.modules l)));
+              (list.range 0 (modules.module_count l));
 
 /// A queued declaration the reachability walk below did not reach, with its
 /// body replaced by the same `1 / 0` an unexpanded `expand` is staged as.
@@ -1893,7 +1914,7 @@ let resolve_reachable! l declared from = {
     let es = envs declared;
     let all = pending declared;
     let queued = list.zip (list.range 0 (list.length all)) all;
-    let body_global p = global_index (list.nth (list.head p) es)
+    let body_global p = global_index (es.[list.head p else ()])
                                      (decl_name (list.nth 2 p));
     // Global index to queue entry, so that a resolved reference is a body in
     // one lookup rather than a scan of the queue per occurrence.
@@ -1977,7 +1998,7 @@ let resolve_from! l declared r0 from s_pre = {
     // function existed, which is now. Joining here rather than threading a
     // half-filled record through the walk keeps the walk about names.
     let by_global = list.fold (fn acc b -> {
-        let e = list.nth (list.nth 0 b) (envs declared);
+        let e = env_at declared (list.nth 0 b);
         match global_index e (decl_name (list.nth 2 b)) {
             () => acc,
             gi => core.map_put acc gi (list.nth 3 b),
@@ -1988,7 +2009,7 @@ let resolve_from! l declared r0 from s_pre = {
         let mi = list.nth 0 b;
         let source = list.nth 1 b;
         let d = list.nth 2 b;
-        match global_index (list.nth mi (envs declared)) (decl_name d) {
+        match global_index (env_at declared mi) (decl_name d) {
             () => acc,
             gi =>
                 match wrapper_of walked mi source d {
@@ -2240,12 +2261,12 @@ let op_wrapper params kind operands =
 let static_global es mi e =
     match e {
         [:name, n, _] => {
-            let e0 = list.nth mi es;
+            let e0 = es.[mi else ()];
             if has_global e0 n { global_index e0 n }
             else {
                 match only_of e0 n {
                     [m, field, _] =>
-                        match m { [:dream, t] => global_index (list.nth t es) field, _ => () },
+                        match m { [:dream, t] => global_index (es.[t else ()]) field, _ => () },
                     _ => (),
                 }
             }
@@ -2253,8 +2274,8 @@ let static_global es mi e =
         [:field, obj, field, _] =>
             match obj {
                 [:name, a, _] =>
-                    match alias_of (list.nth mi es) a {
-                        [:dream, t] => global_index (list.nth t es) field,
+                    match alias_of (es.[mi else ()]) a {
+                        [:dream, t] => global_index (es.[t else ()]) field,
                         _ => (),
                     },
                 _ => (),
@@ -2273,7 +2294,7 @@ let list_roles l es = {
                            (list.range 0 (list.length names));
     if list.is_empty hits { core.map_new () }
     else {
-        let e = list.nth (list.head hits) es;
+        let e = es.[list.head hits else ()];
         list.fold (fn acc n ->
             match global_index e n {
                 () => acc,
@@ -2312,7 +2333,7 @@ let alias_roles es pend base =
         let d = list.nth 2 p;
         if not (list.is_empty (decl_params d)) { acc }
         else {
-            match global_index (list.nth mi es) (decl_name d) {
+            match global_index (es.[mi else ()]) (decl_name d) {
                 () => acc,
                 gi =>
                     match static_global es mi (decl_body d) {

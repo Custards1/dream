@@ -1466,16 +1466,152 @@ It prints the ratio between consecutive sizes for time and for peak heap, which
 is the number to read. It is not in `just test`: it takes minutes.
 
 **What is still superlinear**, measured and left. Peak heap is ~2.1x per
-doubling on both axes and time ~1.9x, so both are close to linear but neither is
-quite there; the default 1 GB per-process cap (`DREAM_MAX_HEAP`) is reached
-around 4,000-5,000 declarations. Two known candidates. `envs` is still a list
-indexed by module, so `env_at s mi` is a `list.nth` -- O(modules) per name
-resolution, which `set_env` no longer is but this still is. And the compiler is
-lazy end to end, so every stage's intermediate is retained by the stage that
-reads it: source, tokens, syntax, effective items, the staged copy, the
-resolver's tables and the arena are all live at once. That second one is not a
-bug and cannot be tuned away -- it is the argument for compiling a package at a
-time, which is what [dreams/TODO.md](dreams/TODO.md) calls for.
+doubling of the *declarations* and time ~1.9x, so both are close to linear but
+neither is quite there, and the compiler is lazy end to end, so every stage's
+intermediate is retained by the stage that reads it: source, tokens, syntax,
+effective items, the staged copy, the resolver's tables and the arena are all
+live at once. That one is not a bug and cannot be tuned away -- it is the
+argument for compiling a package at a time, which is what
+[dreams/TODO.md](dreams/TODO.md) calls for. The *modules* axis is the next
+section, and it was the one nobody had varied far enough.
+
+### A table indexed by module wants to be a map, not a list
+
+**The same finding as all four above**, on the axis they did not vary: this
+section's benchmark changes the number of declarations, and `scale.py
+--modules` changes how many modules they are spread over. Varied to 3,200
+modules, peak heap was 3.4x per doubling -- which is what the declarations axis
+looked like before any of the work above.
+
+`envs` is the resolver's table of what each module binds, keyed by module
+index, and it was a list. Two things followed, and the second is the one that
+mattered:
+
+- **Reading it was O(modules).** `env_at s mi`, `ctx_env` and `env_of` were
+  each a `list.nth`, and one of those runs per name resolved. This is the half
+  everyone notices and it is the half that is nearly free: `xs.[n else ()]` is
+  the `get` opcode, a machine walk of one pointer chase per element, so 3,200
+  declarations over 800 modules is about 2.5M chases and no measurable time.
+- **Writing it allocated O(modules).** `set_env` was `(envs s).[mi => e]`, the
+  `set` opcode -- one reduction, so a `--profile` said nothing -- and
+  `list_set` builds a fresh cell for every element in front of the one it
+  replaces. There is one `set_env` per declaration, so a compile allocated
+  O(declarations x modules) cons cells for nothing. That is exactly the shape
+  "`list.append xs [x]` is one reduction and a copy of `xs`" describes, and it
+  had been hiding behind the same silence.
+
+It is a map keyed by module index now. A put rebuilds the path to one leaf and
+shares the rest, a read is a lookup, and nothing wanted the order -- every
+reader was already indexing it, which is the whole argument. `has_env` replaced
+the `mi < list.length (envs s)` guards, which were asking "has this module been
+declared yet?" in the only spelling a list had.
+
+Peak live heap, 3,200 declarations spread over N modules, `--max-heap` 8 GB so
+that both finish:
+
+| modules | before | after | |
+|---|---|---|---|
+| 200 | 354 MB | 359 MB | the map costs a little more when it cannot pay off |
+| 400 | 384 MB | 360 MB | |
+| 800 | 439 MB | 373 MB | |
+| 1,600 | 575 MB | 360 MB | |
+| 3,200 | **1967 MB** | **594 MB** | -70% |
+
+**What that is worth is not the megabytes, it is the wall.** Under the *default*
+1 GB `DREAM_MAX_HEAP`, the 3,200-module program did not compile at all -- it
+died with `process heap grew past 1073741824 bytes`. It compiles now. The old
+compiler's wall was between 2,400 and 3,200 modules; nothing here moved the
+declarations axis, whose wall is still the 4,000-5,000 this section names.
+
+Time is the small half and says so: 8371 ms -> 7322 ms at 3,200 modules, 6114
+-> 5665 at 1,600, and nothing outside the noise floor below that. The
+self-compile does not move at all -- 4890/4948/4867 ms against 4678/4882/4698,
+9 majors either way with the same live series under `DREAM_GC_TRACE=1` -- which
+is the expected answer for a repository of fifty modules, and is once again a
+quadratic this codebase is too small to feel. Every image is byte-identical --
+`dreams`, `lucid`, `mind` and the generated programs at every size -- and the
+bootstrap reaches a fixpoint in one stage.
+
+**What was next on this axis, measured.** `--stats` reports allocation by kind,
+and the list share climbed where nothing else did: 9%, 10%, 15%, **24%** at 400,
+800, 1,600 and 3,200 modules -- 212 MB, 250 MB, 406 MB, 972 MB, which is 2.4x
+per doubling at the end. The named candidate was `modules.modules`, the same
+table in the loader rather than in the resolver. It was one of three, and the
+next section is what happened when all three were taken.
+
+### The three lists the loader still grew one entry at a time
+
+**What it does.** `modules.modules` was the obvious one and the section above
+names it, so it was taken first, on its own, and measured on its own: **5.7%
+of a 3,200-module compile's allocation, three points of the list share, and
+nothing at all of the peak heap or the wall clock.** That is the whole of what
+the predicted fix was worth, and the prediction had been that it was most of
+the 24%.
+
+The other 18% was two more tables of exactly the same shape, both found by
+asking where the bytes actually went rather than by reading the earlier note
+again:
+
+- **`modules.files`**, the source text of every file, appended to per file --
+  so loading a program copied the list once per module. It is also the table
+  `expand.install!` rewrites one entry of, with the `set` opcode, once per
+  macro call, which is the same `list_set` per expansion the `envs` note
+  describes. Keyed by index now, with `file_at` for the readers that hold a
+  diagnostic's source index (all of them but one) and a derived ordered list
+  for `diag.render_all`, which is handed the whole program once at the end of
+  a compile that has something to say.
+- **`scope.module_recs`**, one record per module, appended to in
+  `declare_module`. It is the fourth field of that state to become a reversed
+  accumulator, beside the imports, the global records and the queue of bodies
+  -- the note at the head of `scope.dr` already explained why, for three.
+
+Two smaller things went with them. `expand.work_of` runs on **every** compile,
+macros or not -- it is how "is there anything to expand?" is answered -- and it
+walked each module's declarations with a `list.nth i items` inside a fold over
+`0..length`, which is a walk per declaration. It carries the index alongside
+the accumulator now. And `expand.replace_module`, the `list_set` the section
+above names, is a map put.
+
+Peak live heap and total allocation, 3,200 declarations spread over N modules,
+`--max-heap` 8 GB:
+
+| modules | allocated | | peak live | | list share | |
+|---|---|---|---|---|---|---|
+| 400 | 2.36 GB | 2.35 GB | 372 MB | 364 MB | 9% | 8% |
+| 800 | 2.50 GB | 2.46 GB | 390 MB | 385 MB | 10% | 9% |
+| 1,600 | 2.90 GB | **2.73 GB** | 387 MB | 393 MB | 14% | 10% |
+| 3,200 | 4.05 GB | **3.34 GB** | 623 MB | **409 MB** | 24% | 13% |
+
+**Peak heap on the modules axis is now flat** -- 364, 385, 393, 409 MB across
+an eightfold spread of modules, against 372, 390, 387, **623**. The bytes
+promoted at 3,200 fell with it, 1.12 GB to 758 MB, and that is the mechanism:
+an appended spine survives the minor collection that catches it, so a table
+grown one entry at a time is not merely churn, it is churn the nursery hands
+to the old generation. Time is the small half again and says so: at 3,200
+modules 7172 ms -> 6816 ms with a macro and 6256 -> 5648 without, and nothing
+outside the noise floor below 1,600.
+
+The **declarations** axis is unmoved in memory (646 MB against 655 at 3,200)
+and a little faster (4831 ms against 5359 with a macro, 4096 against 4437
+without). That is the expected answer and it is the one worth remembering: the
+declarations axis's peak heap is the lazy pipeline holding every stage's
+intermediate at once, which is the argument for compiling a package at a time
+and is not a quadratic anybody can delete. The **self-compile does not move**
+-- 4969/4922/4916 ms against 4912/4924/4861, alternating on the same machine
+-- because fifty modules is not a number any of this can be felt at. Every
+image is byte-identical, `mind` included, and the bootstrap reaches a fixpoint
+in one stage.
+
+**One trap, which cost the only debugging in this round.** The loader's record
+still said `:files => []` after `add_file` had been rewritten to put into a
+map, and `[] .[0 => f]` is a list set of an empty list -- but the field is
+built lazily, so nothing raised until something *read* the table. Ordinary
+compiles never do: a program with no diagnostics never looks at its own source
+text. Only macro expansion reads it, in `install!`, so the whole test suite's
+non-macro half passed and every macro program died with
+`index 0 is past the end of a list of 0` and no span. **When a field changes
+shape, the initializer is the thing to check first, and a lazy field will not
+tell you that you missed it where you missed it.**
 
 ### Sharing the arena
 

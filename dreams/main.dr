@@ -290,7 +290,7 @@ let build! l out shebang payloads optimize = {
                 } else {
                     console.error! ("compiled -> " + out + " ("
                                 + to_string (str.byte_length bytes + payload_bytes)
-                                + " bytes, " + to_string (list.length (modules.modules l))
+                                + " bytes, " + to_string (modules.module_count l)
                                 + " modules, " + to_string (list.length (core.map_get img :nodes []))
                                 + " nodes, " + to_string (list.length (core.map_get img :funcs []))
                                 + " functions"
@@ -323,7 +323,7 @@ let show_stats! l = {
     let img = optimizer.optimize lowered;
     let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
                                         + to_string n);
-    count! "modules" (list.length (modules.modules l))
+    count! "modules" (modules.module_count l)
     count! "host" (list.length (modules.natives l))
     count! "globals" (list.length (scope.defs r))
     count! "functions" (list.length (scope.funcs r))
@@ -419,7 +419,7 @@ let show_time! o file = {
                              (walk_of (list.nth 1 st))) stages |> strict!
     line! "total" total ()
     console.print! ("image     " + to_string (str.byte_length bytes) + " bytes, "
-                    + to_string (list.length (modules.modules l)) + " modules, "
+                    + to_string (modules.module_count l) + " modules, "
                     + to_string (list.length (core.map_get img :nodes [])) + " nodes"
                     + " (from " + to_string (list.length (core.map_get lowered :nodes [])) + ")")
     print_diags! (modules.files l) (list.append (modules.diags l) (lower.all_diags r low))
@@ -436,7 +436,7 @@ let module_of! l file = {
     let want = path.absolute! file;
     let hits = list.filter (fn i -> path.absolute! (modules.module_path (modules.module_at l i))
                                     == want)
-                           (list.range 0 (list.length (modules.modules l)));
+                           (list.range 0 (modules.module_count l));
     if list.is_empty hits { () } else { list.head hits }
 };
 
@@ -450,7 +450,7 @@ let show_symbols! l file = {
         },
         mi => {
             let m = modules.module_at l mi;
-            let src = diag.source_text (list.nth (modules.module_source m) (modules.files l));
+            let src = diag.source_text (modules.file_at l (modules.module_source m));
             list.map (fn d -> {
                 let at = diag.line_col src (ast.span_start (list.nth 3 d));
                 console.print! (to_string (list.head at) + ":" + to_string (list.nth 1 at)
@@ -498,7 +498,7 @@ let show_at! l file line col = {
         mi => {
             let m = modules.module_at l mi;
             let source = modules.module_source m;
-            let src = diag.source_text (list.nth source (modules.files l));
+            let src = diag.source_text (modules.file_at l source);
             let at = name_start src (diag.offset_of src line col);
             let pos = diag.line_col src at;
             let here = to_string (list.head pos) + ":" + to_string (list.nth 1 pos) + "  ";
