@@ -29,6 +29,7 @@ examples/run.sh --bless     # re-record output after a deliberate change
 | [`13_codecs.dr`](13_codecs.dr) | `std.codec`: one walk over a value, two formats, framing, and records on a wire |
 | [`14_servers.dr`](14_servers.dr) | `std.server`: a process that holds state, its handlers driven without one, and supervision |
 | [`15_remote.dr`](15_remote.dr) | `std.remote`: the same server over a socket, client and server in one program |
+| [`16_registry.dr`](16_registry.dr) | `std.registry`: a name for a server, so that a supervisor and a listener compose |
 
 ## The packages
 

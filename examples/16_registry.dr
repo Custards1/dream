@@ -1,0 +1,101 @@
+// A name for a server, so that supervision and a socket compose.
+//
+// `14_servers.dr` has a supervisor restarting a server. `15_remote.dr` has a
+// listener serving one. Putting the two together does not work if what you
+// hold is a pid, and the reason is worth watching rather than being told: a
+// restarted server is a *new* process, so everything that wrote the old pid
+// down is holding an address with nobody at it -- and because there are no
+// monitors here, nobody is told. A client just waits.
+//
+// `std.registry` is the indirection between them. A name means whichever
+// process is answering to it now; the server registers itself as it starts, so
+// a restart registers again; and both the local caller and the listener resolve
+// the name at the moment they use it rather than remembering an answer.
+import std.console;
+import std.registry;
+import std.remote;
+import std.supervisor;
+
+mod store {
+    derive std.server;
+    import std.map;
+
+    let init! seed = seed;
+
+    let handle_call! request from state = match request {
+        [:get, k]    => reply (map.get :missing state k) state,
+        [:put, k, v] => reply :ok (map.put state k v),
+        :keys        => reply (map.sorted_keys state) state,
+        _            => reply [:error, :unknown] state,
+    };
+
+    // A way to end this server on purpose, so the example can show what a
+    // supervisor does about it.
+    let handle_cast! message state = match message {
+        :go_away => stop :asked state,
+        _        => noreply state,
+    };
+}
+
+/// Ask for `name` until the answer is something other than `was`.
+///
+/// A supervisor is asynchronous. The child ending, the watcher reporting it,
+/// the supervisor starting a replacement and that replacement registering
+/// itself are four moments in four processes, and nothing here orders them --
+/// so this asks until the answer has moved on, giving the pending work a turn
+/// each time round. It answers whatever it has when it runs out of patience,
+/// so a genuine disagreement shows up as wrong output rather than as a program
+/// that never ends.
+let rec settle! reg name was tries = {
+    let p = registry.whereis! reg name;
+    if p != was || tries <= 0 { p } else { settle! reg name was (tries - 1) }
+};
+
+let main! = {
+    let reg = registry.start! ();
+
+    // The child registers itself, so the supervisor starts it exactly as it
+    // would start any other -- `registry.child!` takes the child a server
+    // already knows how to describe and keeps its name and restart policy.
+    let sup = supervisor.start! :one_for_one
+                  [registry.child! reg (store.child! "store" %{})];
+    let first = settle! reg "store" () 500;
+    console.print! (to_string (registry.names! reg));
+
+    // Locally, the name is the address. Nothing below ever sees a pid.
+    console.print! (to_string (registry.call! reg "store" [:put, "a", 1]));
+    console.print! (to_string (registry.call! reg "store" [:get, "a"]));
+
+    // And over a socket: the listener is given a lookup rather than a pid, and
+    // asks it once per request.
+    let l = remote.serve_via! 0 (registry.finder! reg "store");
+    let c = remote.connect! "127.0.0.1" (remote.port_of! l);
+    console.print! (to_string (remote.call! c [:get, "a"]));
+
+    // Now take the server down. The supervisor starts another, and that one
+    // puts itself in the registry over the entry the dead one left.
+    registry.cast! reg "store" :go_away
+    let second = settle! reg "store" first 500;
+    console.print! (to_string (second != first));
+
+    // The same connection, never reconnected, answered by a server that has
+    // never seen it. `:missing` rather than `1` is the honest answer: what
+    // survives a restart is the name, not the state.
+    console.print! (to_string (remote.call! c [:get, "a"]));
+    console.print! (to_string (remote.call! c [:put, "b", 2]));
+    console.print! (to_string (registry.call! reg "store" :keys));
+
+    // A name nothing holds is `()`, and a call to one raises rather than
+    // hanging -- which is the other half of not having monitors: the failure
+    // you can see is better than the wait you cannot.
+    console.print! (to_string (registry.whereis! reg "nobody"));
+
+    // Everything started here is stopped here, and in this order: the
+    // supervisor before the registry, because a child restarted after the
+    // registry has gone would have nowhere to register itself.
+    remote.close! c
+    remote.stop_serving! l
+    supervisor.stop! sup
+    registry.stop! reg
+    console.print! "stopped"
+};

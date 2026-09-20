@@ -47,10 +47,22 @@
 //     `match` cannot. Structure the failures a caller must branch on into the
 //     reply value itself.
 //   - A server that dies leaves its connections waiting, exactly as a local
-//     `call!` waits, because there are no monitors. Supervise it -- and note
-//     that a restarted server is a *new* pid, which the listener started
-//     against the old one does not know about. Serving a supervised server
-//     wants a registry between them, and that does not exist yet.
+//     `call!` waits, because there are no monitors. Supervise it -- and when
+//     you do, serve it by *name* rather than by pid, because a restarted
+//     server is a new pid and a listener started against the old one would go
+//     on offering that one for ever. `serve_via!` takes a lookup instead of a
+//     pid and asks it once per request; `std.registry` is what answers one:
+//
+//         let sup = supervisor.start! :one_for_one
+//                       [registry.child! reg (store.child! "store" %{})];
+//         remote.serve_via! 0 (registry.finder! reg "store")
+//
+//     What that does not remove is the window. Between the instant a server
+//     dies and the instant its replacement has registered, the name still
+//     means the pid that died, and a request arriving in there is a call to a
+//     finished process -- an error if the runtime has reaped it, a wait if it
+//     has not. The registry removes the *permanent* version of that, not the
+//     momentary one, and only monitors would remove the rest.
 //   - **A remotable server needs a data protocol, not a function protocol.**
 //     This is the one that bites, because it is not about this module at all.
 //     Everything that crosses is encoded, and a function is not a value
@@ -133,32 +145,58 @@ let stop_serving! listener = io.close! listener;
 /// hang the client rather than tell it. `strict!` is what puts the work inside:
 /// `wire.frame` of a lazy value is a lazy string, and a `try!` around a value
 /// nobody forced catches nothing.
-priv let reply_bytes! pid request = try! {
-    let value = server.call! pid request;
-    strict! (wire.frame [:ok, value])
+///
+/// `find!` is asked here, once per request, and not once per connection. That
+/// is the difference between a listener that survives a restart of what it
+/// serves and one that does not: a connection outlives a single incarnation of
+/// a supervised server, so a pid read when the socket was accepted is a pid
+/// that may since have stopped reading its mailbox. What it costs is a lookup
+/// per request, which for `std.registry` is one local call.
+///
+/// Nobody there is a reply rather than a silence, for the reason the `try!`
+/// above exists: the client is waiting on this socket, and the only thing
+/// worse than telling it no is telling it nothing.
+priv let reply_bytes! find! request = try! {
+    match find! () {
+        () => strict! (wire.frame [:error, "nothing is serving this listener now"]),
+        pid => {
+            let value = server.call! pid request;
+            strict! (wire.frame [:ok, value])
+        },
+    }
 } catch e { wire.frame [:error, error.describe e] };
 
+/// A cast, to whoever is there.
+///
+/// Nothing comes back from a cast, including the news that there was nobody --
+/// which is what a cast means everywhere else here, and is why this is not the
+/// error the same situation is for a call.
+priv let cast_to! find! message = match find! () {
+    () => (),
+    pid => server.cast! pid message,
+};
+
 /// One connection, until it ends.
-priv let rec serve_connection! sock pid = match next! sock {
+priv let rec serve_connection! sock find! = match next! sock {
     () => io.close! sock,
     [:error, why] => {
         send! sock [:error, "cannot read that message: " + to_string why]
         io.close! sock
     },
     [:ok, [:call, request]] => {
-        streams.write_all! sock (reply_bytes! pid request)
-        serve_connection! sock pid
+        streams.write_all! sock (reply_bytes! find! request)
+        serve_connection! sock find!
     },
     [:ok, [:cast, message]] => {
-        server.cast! pid message
-        serve_connection! sock pid
+        cast_to! find! message
+        serve_connection! sock find!
     },
     // Something that framed and decoded but is not a request. The connection
     // survives it: the frame said where the message ended, so the stream is
     // still in step, and saying so is more use than hanging up.
     [:ok, other] => {
         send! sock [:error, "not a request: " + to_string other]
-        serve_connection! sock pid
+        serve_connection! sock find!
     },
 };
 
@@ -170,28 +208,51 @@ priv let rec serve_connection! sock pid = match next! sock {
 /// rather than as a return, because from `accept!`'s side a closed handle is an
 /// error like any other. Binding the accept inside the `try!` is what forces it
 /// there; in the lazy position of a list it would raise at whoever looked.
-priv let rec accept_loop! listener pid =
+priv let rec accept_loop! listener find! =
     match try! {
         let sock = net.accept! listener;
         [:ok, sock]
     } catch e { [:error, e] } {
         [:ok, sock] => {
-            spawn! $( serve_connection! sock pid )
-            accept_loop! listener pid
+            spawn! $( serve_connection! sock find! )
+            accept_loop! listener find!
         },
         [:error, _] => :closed,
     };
 
+/// Serve whatever `find!` answers, on an existing listener, in a process of
+/// its own. `find!` is a function of unit and is asked once per request.
+let serve_on_via! listener find! = spawn! $( accept_loop! listener find! );
+
+/// Listen on `port` and serve whatever `find!` answers there.
+///
+/// This is the form for a server that is supervised, and `std.registry` is
+/// what usually answers: `serve_via! 0 (registry.finder! reg "store")` goes on
+/// serving "store" across every restart of it, because the name is resolved
+/// when a request arrives rather than when the listener started.
+let serve_via! port find! = {
+    let listener = net.listen! port;
+    serve_on_via! listener find!
+    listener
+};
+
+/// The lookup a listener started against one pid asks: that pid, always.
+///
+/// Spelled without a `!` because it performs no effect -- it is the constant
+/// function, and the `!` on everything around it is about what a *lookup* may
+/// do, not about what this one does.
+priv let fixed pid u = pid;
+
 /// Serve `pid` on an existing listener, in a process of its own.
-let serve_on! listener pid = spawn! $( accept_loop! listener pid );
+let serve_on! listener pid = serve_on_via! listener (fixed pid);
 
 /// Listen on `port` and serve `pid` there. Answers the listener, which is what
 /// `port_of!` and `stop_serving!` take.
-let serve! port pid = {
-    let listener = net.listen! port;
-    serve_on! listener pid
-    listener
-};
+///
+/// A pid is the right thing to serve when the server is not going to be
+/// replaced. When it is -- when something supervises it -- `serve_via!` is the
+/// one that keeps working, and the note at the head of this file says why.
+let serve! port pid = serve_via! port (fixed pid);
 
 // --- calling ---------------------------------------------------------------------
 
@@ -232,6 +293,8 @@ let cast! conn message = streams.write_all! conn (wire.frame [:cast, message]);
 
 when test {
     import std.map;
+    import std.registry;
+    import std.supervisor;
     import std.test;
 
     // A server with a *data* protocol, which is what makes it reachable from a
@@ -251,6 +314,9 @@ when test {
 
         let handle_cast! message state = match message {
             [:put, k, v] => noreply (map.put state k v),
+            // A way to end this server on purpose, so that a supervisor can be
+            // watched putting another one in its place.
+            :go_away     => stop :asked state,
             _            => noreply state,
         };
     }
@@ -278,6 +344,19 @@ when test {
     };
 
     priv let here! port = connect! "127.0.0.1" port;
+
+    /// Ask the registry for `name` until the answer is something other than
+    /// `was`, or give up and answer whatever it is.
+    ///
+    /// A supervisor is asynchronous and a child registers itself once it is
+    /// running, so "the name is bound" and "the name is bound to the new one"
+    /// are both moments nothing here can order. Answering rather than waiting
+    /// is what makes a genuine disagreement fail the case instead of hanging
+    /// it.
+    priv let rec settle! reg name was tries = {
+        let p = registry.whereis! reg name;
+        if p != was || tries <= 0 { p } else { settle! reg name was (tries - 1) }
+    };
 
     let tests = [
         test.case "a call goes out and an answer comes back"
@@ -372,5 +451,54 @@ when test {
                    close! c
                    result.is_error (try! { try_call! c :keys } catch e { result.error e })
                })) ),
+
+        // --- a server that is replaced underneath the listener ------------------
+        //
+        // The composition the note at the head of this file used to say did not
+        // work. The listener holds a lookup rather than a pid, so a request
+        // that arrives after a restart is answered by the server running now --
+        // on the same socket, by a client that was told nothing and has nothing
+        // to reconnect to.
+        test.case "a restarted server is still reachable, on the same connection"
+            $( {
+                   let reg = registry.start! ();
+                   let sup = supervisor.start! :one_for_one
+                                 [registry.child! reg (store.child! "store" %{})];
+                   let l = serve_via! 0 (registry.finder! reg "store");
+                   let first_pid = settle! reg "store" () 200;
+                   let c = here! (port_of! l);
+                   let first = call! c [:put, "a", 1];
+
+                   // It ends; the supervisor starts another; that one registers
+                   // itself over the entry the dead one left behind.
+                   store.cast! first_pid :go_away
+                   settle! reg "store" first_pid 200
+
+                   // The same connection, and a server that has never seen it.
+                   // `:missing` rather than `1` is the honest answer: what
+                   // survives a restart is the name, not the state.
+                   let second = call! c [:put, "b", 2];
+                   let got = strict! [first, second, call! c [:get, "a"]];
+
+                   close! c
+                   stop_serving! l
+                   supervisor.stop! sup
+                   registry.stop! reg
+                   test.eq! [:ok, :ok, :missing] got
+               } ),
+
+        // And what a client is told when the name has nothing behind it. This
+        // is the failure that used to be a hang.
+        test.case "a listener serving a name nobody holds answers, rather than waiting"
+            $( {
+                   let reg = registry.start! ();
+                   let l = serve_via! 0 (registry.finder! reg "nobody");
+                   let c = here! (port_of! l);
+                   let r = strict! (try_call! c :keys);
+                   close! c
+                   stop_serving! l
+                   registry.stop! reg
+                   test.true! (result.is_error r)
+               } ),
     ];
 }

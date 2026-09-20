@@ -1,0 +1,464 @@
+// A registry: a name that means whichever process is answering to it now.
+//
+// A pid is an address, and an address is only good while something is living
+// at it. A supervised server is *meant* to die -- that is the whole arrangement
+// -- and what the supervisor puts back is a different process with a different
+// pid. So everything that wrote the old one down is holding a forwarding
+// address to an empty house, and the case where that hurts most is
+// `std.remote`: `remote.serve! 0 pid` starts a listener against one pid, and
+// after the first restart every client of that listener is waiting for a reply
+// from a process that is not reading its mailbox.
+//
+// This is the indirection between the two. The name is registered by the
+// server itself as it starts -- so a restart registers again -- and whatever
+// wants the server asks for the name *at the moment it wants it* rather than
+// remembering the answer:
+//
+//     let reg = registry.start! ();
+//     let sup = supervisor.start! :one_for_one
+//                   [registry.child! reg (store.child! "store" %{})];
+//
+//     registry.call! reg "store" [:put, "a", 1]           // here
+//     remote.serve_via! 0 (registry.finder! reg "store")  // and over a socket
+//
+// **It is an agent, and that is the whole of it.** One value that several
+// processes read and change, with the read-modify-write happening in one place
+// rather than in each of them, is exactly what `std.agent` is -- so there is no
+// mailbox loop here and no second server. What is written below is the
+// vocabulary: a name goes in and a pid comes out, over handlers that are
+// `std.agent`'s.
+//
+// **What this is not.** Each of these is something Erlang's registry does and
+// this one does not, and none of them are oversights -- they are what the
+// runtime's shape leaves:
+//
+//   - **It does not notice a death.** There are no monitors (see the head of
+//     `std.supervisor`), so nothing tells the registry that a process it names
+//     has gone. An entry outlives its process, and `whereis!` will hand back a
+//     pid whose process is finished. What stops that being a lie for ever is
+//     that the replacement registers over it, so the window is the length of a
+//     restart -- but a caller who arrives inside that window gets the dead pid
+//     and waits on it, exactly as a local `call!` to a dead server does.
+//     A program that must not wait there watches the supervisor
+//     (`supervisor.notify!`) and calls `unregister!` when a child goes down.
+//   - **It is not the runtime's.** `send!` takes a pid and has never heard of a
+//     name; only the functions here understand one. There is no `send! "store"`.
+//   - **It is one VM's.** A name is a key in one process's map. It does not
+//     cross a socket, which is the right way round: what crosses is a request,
+//     and which process answers it is the far side's business entirely.
+//
+// **What it costs.** A call by name is two round trips where a call by pid is
+// one, because the registry is a process and asking it is itself a `call!`.
+// That is the price of the indirection, and it is why `whereis!` is public:
+// something that makes many calls in a row, and can live with a restart
+// happening between two of them, is free to look the name up once and use the
+// pid it got.
+import std.agent;
+import std.error;
+import std.map;
+import std.server;
+import std.supervisor;
+
+// --- the table ------------------------------------------------------------
+
+/// An empty registry, in a process of its own.
+let start! u = agent.start! map.empty;
+
+/// Stop it, and answer the table it stopped with.
+///
+/// Nothing registered here is stopped by this. A registry holds names, not the
+/// processes they name; a supervisor owns those, and it should be stopped
+/// first -- a child restarted after this has gone cannot register itself and
+/// dies of trying.
+let stop! reg = agent.stop! reg;
+
+/// Bind `name` to `pid`, over whatever was there. Answers what it replaced,
+/// or `()`.
+///
+/// Replacing rather than refusing is what makes a restart work at all: the
+/// name is still bound to the process that just died, and the one that
+/// replaced it has to win. `claim!` is the other answer, for a name that is
+/// supposed to be free.
+let register! reg name pid = {
+    // Forced here, in the caller, because it is about to be put in a closure
+    // and sent. A message is deep-copied and an unforced thunk inside one is
+    // evaluated by whoever *receives* it -- so without this line,
+    // `register! reg "store" (self! ())` registers the registry's own pid.
+    // `std.supervisor` documents the same trap where it takes `self! ()` into
+    // a statement of its own.
+    let p = strict! pid;
+    agent.get_and_update! reg (fn m -> [map.get () m name, map.put m name p])
+};
+
+/// Bind `name` only if nothing holds it: `[:ok, pid]`, or `[:taken, other]`.
+///
+/// The check and the write happen in the registry, in one message, which is
+/// the difference between this and a `whereis!` followed by a `register!` --
+/// two processes claiming the same name would both find it free.
+let claim! reg name pid = {
+    let p = strict! pid;
+    agent.get_and_update! reg (fn m -> match map.get () m name {
+        ()    => [[:ok, p], map.put m name p],
+        other => [[:taken, other], m],
+    })
+};
+
+/// Forget `name`. Answers the pid it held, or `()`.
+let unregister! reg name =
+    agent.get_and_update! reg (fn m -> [map.get () m name, map.remove m name]);
+
+/// Forget every name `pid` holds, for a process registered under several.
+let forget! reg pid = {
+    let p = strict! pid;
+    agent.update! reg (fn m -> map.filter (fn _ v -> v != p) m)
+};
+
+// --- asking it things -------------------------------------------------------
+
+/// The process registered as `name`, or `()`.
+let whereis! reg name = agent.get! reg (fn m -> map.get () m name);
+
+let has! reg name = agent.get! reg (fn m -> map.has m name);
+
+/// Every name, in order.
+let names! reg = agent.get! reg (fn m -> map.sorted_keys m);
+
+/// The whole table, as a map of name to pid.
+let all! reg = agent.value! reg;
+
+/// `whereis!` as a function of unit, for something that will ask again later.
+///
+/// This is what `remote.serve_via!` takes, and it is a partial application of
+/// a named impure function rather than the lambda it looks like it should be:
+/// `fn u -> whereis! reg name` is a *pure* function naming an impure one,
+/// which the purity checker refuses. `std.server` takes the same route for the
+/// same reason, and says so where `child!` is declared.
+let finder! reg name u = whereis! reg name;
+
+// --- talking to a name -------------------------------------------------------
+//
+// The point of the module: a call that resolves the name at the moment it is
+// made, so two calls with a restart between them reach the server that was
+// running for each.
+
+/// A `std.server` call to whoever holds `name` now.
+///
+/// Raises `:not_registered` when nobody does, and that is deliberately not a
+/// value: a call that was never made has no reply, and `[:error, ..]` would
+/// give it the shape of one the server chose to send. A caller that would
+/// rather branch asks `whereis!` first.
+let call! reg name request = match whereis! reg name {
+    () => error.raise_as! :not_registered ("nothing is registered as " + to_string name),
+    pid => server.call! pid request,
+};
+
+/// A `std.server` cast to whoever holds `name` now, and nothing back --
+/// including when the answer is that nobody does. A cast into a name that is
+/// not registered is the same void as a cast to a server that has stopped,
+/// which is what makes it the shape for a notification and not for a question.
+let cast! reg name message = match whereis! reg name {
+    () => (),
+    pid => server.cast! pid message,
+};
+
+// --- a child that registers itself -------------------------------------------
+
+/// The start function a registered child runs: put this process in the
+/// registry, then do whatever the child was going to do.
+///
+/// `self! ()` is taken here because here is the child -- this function is what
+/// the supervisor spawns, so `self!` answers the process the name should mean.
+/// `start` is spelled without a `!` for the reason `std.supervisor` gives where
+/// `child_with` is declared: describing a child performs no effect, and the
+/// effect happens where the child is started, which is this function.
+///
+/// The registration is a `call!` and so it has finished before `start ()`
+/// begins. That ordering is the whole value of doing it here: the name is
+/// bound before the server has read its first message, so there is no instant
+/// at which the process is running and the name does not reach it.
+priv let registered! reg name start u = {
+    let me = self! ();
+    register! reg name me
+    start ()
+};
+
+/// The same child, registering itself under its own name as it starts.
+///
+/// This is the half a supervisor cannot do. A supervisor knows the name and
+/// learns the pid, but a child is started by *spawning* its start function, so
+/// a supervisor that registered its children would be writing the entry from
+/// outside and one message late -- and a client that got there first would be
+/// handed the pid of the process that had just died. Registering from inside
+/// the child has no such window.
+///
+/// It takes a child rather than a start function so that it composes with
+/// whatever built one -- `store.child! "store" %{}`, `agent.child! "n" 0`, or a
+/// plain `supervisor.child` -- and keeps the name and the restart policy that
+/// child was given.
+let child! reg c =
+    supervisor.child_with (supervisor.child_name c)
+                          (registered! reg (supervisor.child_name c)
+                                           (supervisor.child_start c))
+                          (supervisor.child_restart c);
+
+// --- tests ---------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    /// A server that can be told to end, so that a test can watch a supervisor
+    /// put a new one in its place. It stops rather than raises because the two
+    /// are the same to a `:permanent` child and one of them is quieter.
+    mod counter {
+        derive std.server;
+
+        let init! n = n;
+
+        let handle_call! request from state = match request {
+            :value    => reply state state,
+            [:add, n] => reply (state + n) (state + n),
+            _         => reply [:error, :unknown] state,
+        };
+
+        let handle_cast! message state = match message {
+            :go_away  => stop :asked state,
+            [:add, n] => noreply (state + n),
+            _         => noreply state,
+        };
+    }
+
+    /// What a thunk raised, as a value. The same helper `std.error`'s own tests
+    /// use, and for the same reason: `try!` catches what is raised *inside* it,
+    /// and a process is the one place a raise is certain to have happened
+    /// rather than to have been suspended.
+    priv let caught! body = try! { join! (spawn! body); () } catch e { e };
+
+    /// Ask for `name` until the answer is something other than `was`, or give
+    /// up and answer whatever it is.
+    ///
+    /// A supervisor is asynchronous and a child registers itself once it is
+    /// running, so "the name is bound" and "the name is bound to the new one"
+    /// are both moments nothing here can order. Each round trip gives the
+    /// pending work its turn, so this converges immediately in practice -- and
+    /// answering rather than waiting means a genuine disagreement fails the
+    /// case instead of hanging it.
+    priv let rec settle! reg name was tries = {
+        let p = whereis! reg name;
+        if p != was || tries <= 0 { p } else { settle! reg name was (tries - 1) }
+    };
+
+    /// A registry, a body run against it, and the registry stopped again.
+    ///
+    /// Every case has to undo what it did: a registry left running is a process
+    /// parked on `recv!`, and a test program that ends with one of those is
+    /// reported as deadlocked rather than as passing.
+    priv let with_registry! body! = {
+        let reg = start! ();
+        let answer = strict! (body! reg);
+        stop! reg
+        answer
+    };
+
+    let tests = [
+        test.case "a name answers the process registered under it"
+            $( test.true! (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "c" p
+                   let found = whereis! reg "c";
+                   counter.stop! p
+                   found == p
+               })) ),
+        test.case "a name nothing holds is ()"
+            $( test.eq! () (with_registry! (fn reg -> whereis! reg "nobody")) ),
+        test.case "has! says so without naming the process"
+            $( test.eq! [true, false] (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "c" p
+                   let answer = [has! reg "c", has! reg "other"];
+                   counter.stop! p
+                   answer
+               })) ),
+
+        // The registration is of the process that asks, which is the shape the
+        // whole module is for -- and the one a thunk sent to another process
+        // gets wrong. See `register!`.
+        test.case "a process registers itself, not the registry"
+            $( test.true! (with_registry! (fn reg -> {
+                   let me = self! ();
+                   register! reg "me" (self! ())
+                   whereis! reg "me" == me && whereis! reg "me" != reg
+               })) ),
+
+        test.case "register! replaces, and answers what it replaced"
+            $( test.true! (with_registry! (fn reg -> {
+                   let one = counter.start! 0;
+                   let two = counter.start! 0;
+                   register! reg "c" one
+                   let old = register! reg "c" two;
+                   let now = whereis! reg "c";
+                   counter.stop! one
+                   counter.stop! two
+                   old == one && now == two
+               })) ),
+        test.case "and answers () when it replaced nothing"
+            $( test.eq! () (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   let old = register! reg "c" p;
+                   counter.stop! p
+                   old
+               })) ),
+
+        test.case "claim! takes a free name"
+            $( test.true! (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   let got = claim! reg "c" p;
+                   counter.stop! p
+                   got == [:ok, p]
+               })) ),
+        test.case "claim! refuses a taken one, and names the holder"
+            $( test.true! (with_registry! (fn reg -> {
+                   let one = counter.start! 0;
+                   let two = counter.start! 0;
+                   claim! reg "c" one
+                   let got = claim! reg "c" two;
+                   let now = whereis! reg "c";
+                   counter.stop! one
+                   counter.stop! two
+                   got == [:taken, one] && now == one
+               })) ),
+
+        test.case "unregister! forgets the name and answers the pid"
+            $( test.true! (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "c" p
+                   let gone = unregister! reg "c";
+                   let after = whereis! reg "c";
+                   counter.stop! p
+                   gone == p && after == ()
+               })) ),
+        test.case "forget! drops every name one process holds"
+            $( test.eq! ["other"] (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   let q = counter.start! 0;
+                   register! reg "a" p
+                   register! reg "b" p
+                   register! reg "other" q
+                   forget! reg p
+                   let left = names! reg;
+                   counter.stop! p
+                   counter.stop! q
+                   left
+               })) ),
+
+        test.case "names! lists them in order"
+            $( test.eq! ["a", "b"] (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "b" p
+                   register! reg "a" p
+                   let ns = names! reg;
+                   counter.stop! p
+                   ns
+               })) ),
+        test.case "all! is the table itself"
+            $( test.true! (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "c" p
+                   let table = all! reg;
+                   counter.stop! p
+                   table == %{ "c" => p }
+               })) ),
+
+        // --- calling by name ---------------------------------------------------
+
+        test.case "a call by name reaches the server"
+            $( test.eq! 5 (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "c" p
+                   let got = call! reg "c" [:add, 5];
+                   counter.stop! p
+                   got
+               })) ),
+        test.case "a cast by name arrives"
+            $( test.eq! 3 (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "c" p
+                   cast! reg "c" [:add, 3]
+                   let got = call! reg "c" :value;
+                   counter.stop! p
+                   got
+               })) ),
+        test.case "a call to a name nobody holds raises rather than answering"
+            $( test.eq! :not_registered (with_registry! (fn reg ->
+                   error.kind (caught! $( call! reg "nobody" :value )) )) ),
+        test.case "a cast to one is a message into a void"
+            $( test.eq! () (with_registry! (fn reg -> cast! reg "nobody" :anything)) ),
+
+        // --- the whole point ------------------------------------------------------
+        //
+        // A supervised child, restarted, is a new process -- and the name is
+        // what carries across. Without the registry there is nothing here that
+        // could have been written at all: the pid the caller started with is
+        // the pid of a process that has finished.
+
+        test.case "a supervised child registers itself"
+            $( test.true! (with_registry! (fn reg -> {
+                   let sup = supervisor.start! :one_for_one
+                                 [child! reg (counter.child! "c" 0)];
+                   let p = settle! reg "c" () 200;
+                   supervisor.stop! sup
+                   p != ()
+               })) ),
+        test.case "and a restarted one registers again, under the same name"
+            $( test.true! (with_registry! (fn reg -> {
+                   let sup = supervisor.start! :one_for_one
+                                 [child! reg (counter.child! "c" 0)];
+                   let before = settle! reg "c" () 200;
+                   // It ends; the supervisor starts another; that one puts
+                   // itself here over the entry the dead one left.
+                   counter.cast! before :go_away
+                   let after = settle! reg "c" before 200;
+                   supervisor.stop! sup
+                   before != () && after != () && after != before
+               })) ),
+        test.case "and the name still answers afterwards"
+            $( test.eq! 7 (with_registry! (fn reg -> {
+                   let sup = supervisor.start! :one_for_one
+                                 [child! reg (counter.child! "c" 0)];
+                   let before = settle! reg "c" () 200;
+                   counter.cast! before :go_away
+                   settle! reg "c" before 200
+                   let got = call! reg "c" [:add, 7];
+                   supervisor.stop! sup
+                   got
+               })) ),
+        test.case "a registered child keeps the name it was given"
+            $( test.eq! ["c"] (with_registry! (fn reg -> {
+                   let sup = supervisor.start! :one_for_one
+                                 [child! reg (counter.child! "c" 0)];
+                   settle! reg "c" () 200
+                   let names = supervisor.which! sup;
+                   supervisor.stop! sup
+                   names
+               })) ),
+        test.case "and the restart policy it was given"
+            $( test.eq! :transient
+                        (supervisor.child_restart
+                            (child! () (supervisor.child_with "c" () :transient))) ),
+
+        // The finder is a function of unit, so it answers again rather than
+        // remembering -- which is the property `remote.serve_via!` needs.
+        test.case "a finder answers whoever holds the name now"
+            $( test.true! (with_registry! (fn reg -> {
+                   let one = counter.start! 0;
+                   let two = counter.start! 0;
+                   let find! = finder! reg "c";
+                   register! reg "c" one
+                   let first = find! ();
+                   register! reg "c" two
+                   let second = find! ();
+                   counter.stop! one
+                   counter.stop! two
+                   first == one && second == two
+               })) ),
+    ];
+}
