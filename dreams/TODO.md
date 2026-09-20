@@ -25,13 +25,14 @@ non-PGO, alternating runs of the same source:
 Every image is byte-identical to what the previous compiler emitted, and the
 bootstrap reaches a fixpoint in one stage.
 
-**What is still linear in the program**, and it is no longer the bodies:
-`scope.declare!` walks every declaration, and every declaration the transformer
-does not reach still costs a stub body, a function record and its nodes in the
-image that is serialized and handed to the macro VM. That was written as a
-guess and it is now measured, phase by phase -- see the first item below. It
-was right about which costs are left and wrong about their sizes, in a way that
-reorders this whole file: the stub is nearly all of it and the image is 8%.
+**What is still linear in the program** is now one phase. It was two: every
+declaration the transformer does not reach cost a stub body, a function record
+and its nodes, *and* `scope.declare!` walks every declaration for its name. The
+first of those is gone -- every unreached global names one shared stub, so that
+work is paid once rather than N times (see "The stub every unreached
+declaration shares" in `CLAUDE.md`). What is left is `scope.declare!`, which
+did not move and is therefore no longer one cost among four but **85-86% of
+what a macro costs a large program**.
 
 - [x] **Measure the macro tax directly.** Done twice. First to the extent the
   last decision needed: `--time` separates `expand` from `parse`, and the tax
@@ -218,26 +219,28 @@ the other 92% is, is a name declared, a stub resolved and a stub lowered for
 every declaration in the program that no transformer reaches -- so the thing
 to remove is the stub, not the image.
 
-1. **One stub, not one per declaration.** A declaration the reachability walk
-   does not reach gets a body of `1 / 0`, because a global of kind `function`
-   must name a function the image has. Nothing says every such global must name
-   a *different* one. If they all named one shared stub, `resolve` and `lower`
-   would do their per-declaration work once instead of N times and the image
-   would lose N function records and their nodes -- which is most of the
-   `resolve` + `lower` + `emit` that the table in `CLAUDE.md` charges to a
-   program of 3,200 declarations expanding one one-line macro (147 + 169 + 44
-   ms of 587). It changes how globals are numbered against functions, which is
-   the part to look at first: see `resolve_from!` and `unreached_body` in
-   `dreams/scope.dr`, and `docs/bytecode-format.md` on what a `GLOB` may say.
-   Measure it with `dreams/tests/scale.py` and `--time` at two sizes; the image
-   must stay byte-identical for every program in this repository, because
-   nothing reachable changes.
-2. **`scope.declare!`, which is `snapshot`** -- 124 ms of that same 306, and
-   the largest single phase on a large program. It walks every declaration
-   because expansion needs the whole program's *names*, which is a weaker thing
-   than its bodies and might be cheaper to build; nobody has looked at whether
-   it can be shared with the resolve that follows the expansion, which does the
-   same walk again.
+1. ~~**One stub, not one per declaration.**~~ **Done** (2026-09-20), and it was
+   worth what the meter said it would be. Every unreached global names one
+   shared stub, so `check_body`, the function record and the nodes are paid
+   once instead of N times. On a 3,200-declaration program expanding one
+   one-line macro, `resolve` + `lower` + `emit` went 312 ms to **39** -- 87% of
+   what it was aimed at -- and the whole macro tax 546 ms to **275**; the
+   self-compile's expand row 415 ms to **242**. Whole compiles are 5-9% faster,
+   the new build winning all six interleaved rounds. Every image in the
+   repository is byte-identical and the bootstrap is a fixpoint in one stage.
+   See "The stub every unreached declaration shares" in `CLAUDE.md` for the
+   numbers and for the one design point worth keeping: the stub is
+   parameterless and pure whatever the declarations pointing at it were, so
+   naming one *raises* rather than handing back a closure.
+2. **`scope.declare!`, which is `snapshot`** -- and item 1 has made it the
+   whole question rather than the largest of four. It did not move (228 ->
+   231 ms at 3,200 declarations) and is now **85-86% of the macro tax** where
+   it was 41-42%. It walks every declaration because expansion needs the whole
+   program's *names*, which is a weaker thing than its bodies and might be
+   cheaper to build; nobody has looked at whether it can be shared with the
+   resolve that follows the expansion, which does the same walk again. Nothing
+   else in the tax is above 15% any more, so this is the next 200 ms or there
+   is no next 200 ms short of item 3.
 3. **`.libdream` for transformers**, which is separate compilation's smallest
    honest version and is what removes 1 and 2 rather than shrinking them: a
    dependency's declarations are not in this program at all, so there is
@@ -260,4 +263,7 @@ is worked out: the walk reaches what a transformer reaches and stubs the rest,
 and deleting the dependency edge entirely still compiles. What items 1 and 2
 are about is the opposite question -- what a declaration costs when it is
 stubbed, and what declaring its name costs -- and the meter says those are
-where the time is.
+where the time is. Item 1 has since answered the first half: a stubbed
+declaration now costs a `GLOB` entry pointing at a function somebody else
+already built, which is as close to nothing as the format allows. Only the
+name is left.

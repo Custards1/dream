@@ -1868,10 +1868,10 @@ let declare! l =
     list.fold (fn acc mi -> declare_module l mi acc) state
               (list.range 0 (modules.module_count l));
 
-/// A queued declaration the reachability walk below did not reach, with its
-/// body replaced by the same `1 / 0` an unexpanded `expand` is staged as.
+/// The one body every declaration the reachability walk did not reach shares:
+/// the same `1 / 0` an unexpanded `expand` is staged as, declared once.
 ///
-/// It needs a body at all, rather than simply being left out, because a global
+/// They need a body at all, rather than simply being left out, because a global
 /// of kind `function` names a function index and the VM rejects an image whose
 /// global names none -- `global names an out-of-range function`. So "do not
 /// resolve this one" has to be spelled as "resolve something trivial", and the
@@ -1884,10 +1884,34 @@ let declare! l =
 /// that, which is the same argument `expand.prepare!` already rests on for a
 /// snapshot that has fallen behind. The caller answers a failure by running
 /// the round again with every declaration a root, which is the whole program.
-let unreached_body p = {
-    let d = list.nth 2 p;
-    let sp = decl_span d;
-    p.[2 => d.[3 => ast.binary_e :div (ast.int_e 1 sp) (ast.int_e 0 sp) sp]]
+///
+/// **One of these, not one per declaration**, which is what made the stub
+/// cheap enough to stop being the cost of a macro. Nothing says two globals
+/// may not name the same function: a `GLOB` is a name, a kind and a `FUNC`
+/// index, and the VM checks only that the index is in range. So the stub is
+/// declared once and every unreached global points at it, which takes the
+/// per-declaration work out of three phases at once -- `check_body` does not
+/// run, no function record is built, and no nodes are lowered or serialized
+/// for it. See "The stub every unreached declaration shares" in CLAUDE.md for
+/// what that was worth.
+///
+/// It is **parameterless and pure** on purpose, whatever the declarations
+/// pointing at it were. A pure 0-arity function is a `GLOBAL_VALUE`, so
+/// *naming* one evaluates it -- where a stub of the declaration's own arity
+/// would hand back a closure, and a call of it with too few arguments would
+/// hand back another one. A walk that misses an edge therefore raises at the
+/// first mention rather than partially applying something, which is the louder
+/// of the two and the whole reason the body is a raise.
+///
+/// `mi` and `source` come from one of the declarations it stands in for, so a
+/// span in the image points somewhere real. Nothing reads it: the image this
+/// goes in is handed to the macro VM and thrown away.
+let shared_stub p = {
+    let sp = decl_span (list.nth 2 p);
+    [list.nth 0 p, list.nth 1 p,
+     ast.let_d "<unreached>" []
+               (ast.binary_e :div (ast.int_e 1 sp) (ast.int_e 0 sp) sp) false sp,
+     ()]
 };
 
 /// Resolve the bodies reachable from the declarations queued at `from` onward,
@@ -1944,12 +1968,33 @@ let resolve_reachable! l declared from = {
             },
     };
     let [walked, seen] = walk (list.drop from queued) %{} initial %{};
-    let unreached = list.map (fn [_, p] -> unreached_body p)
-        (list.filter (fn [i, _] -> not (core.map_has seen i)) queued);
-    // The ordinary tail of a resolution, with the stubs as its queue: the
-    // globals, the wrappers and the module records are built exactly as a
-    // whole-program resolve builds them, over bodies that now all exist.
-    resolve_from! l (declared.[:pending => unreached]) walked 0 state
+    let missing = list.filter (fn [i, _] -> not (core.map_has seen i)) queued;
+    // Which globals the stub is answering for. `resolve_from!` fills a
+    // function global's target from the body that was queued for it and leaves
+    // `no_function` where there was none -- which is also what an unfilled
+    // virtual gets, so the rewrite below has to know one from the other rather
+    // than replacing every hole it finds.
+    let stubbed = list.fold (fn acc [_, p] ->
+        match body_global p { () => acc, gi => acc.[gi => true] }) %{} missing;
+    // Either way this is the ordinary tail of a resolution: the globals, the
+    // wrappers and the module records are built exactly as a whole-program
+    // resolve builds them. The only difference is what is queued -- one stub,
+    // or nothing at all when the walk reached everything.
+    match missing {
+        [] => resolve_from! l (declared.[:pending => []]) walked 0 state,
+        [[_, first], ..] => {
+            let resolved = resolve_from! l
+                (declared.[:pending => [shared_stub first]]) walked 0 state;
+            // The stub is the only body queued, so it is the first of the
+            // accumulator the queue is built in reverse in.
+            let fi = list.nth 3 (list.head (bodies_rev resolved));
+            core.map_put resolved :global_recs
+                (list.map (fn g -> match g {
+                    [gi, n, :function, ()] if core.map_has stubbed gi => [gi, n, :function, fi],
+                    _ => g,
+                }) (r_global_recs resolved))
+        },
+    }
 };
 
 /// Resolve the newly-declared part of a program on top of a carried resolution.

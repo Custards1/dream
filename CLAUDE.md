@@ -1452,6 +1452,74 @@ the commit before it, alternating on `mind/std/all.dr --test`, came back
 in all three, which is how a difference inside the noise floor looks. Every
 image in this repository is byte-identical either way.
 
+### The stub every unreached declaration shares
+
+**What it does.** The section above resolves only what a transformer reaches
+and stubs the rest, and the section before that says why a stub has to exist at
+all: a global of kind `function` names a function index, and the VM rejects an
+image whose global names none. So every declaration the walk did not reach got
+a body of `1 / 0` -- *its own*, resolved into its own function record and
+lowered into its own nodes, three thousand times over so that one one-line
+macro could run.
+
+Nothing says two globals may not name the same function. A `GLOB` is a name, a
+kind and a `FUNC` index, and the VM checks only that the index is in range. So
+the stub is declared once and every unreached global points at it
+(`shared_stub` and the rewrite at the end of `resolve_reachable!` in
+[dreams/scope.dr](dreams/scope.dr)), which takes the per-declaration work out of
+three phases at once: `check_body` does not run, no function record is built,
+and no nodes are lowered or serialized.
+
+`dreams --time`, the meter the section above exists to provide:
+
+| | expand | resolve | lower | emit | the macro's image |
+|---|---|---|---|---|---|
+| `dreams` compiling itself | 415 -> **242 ms** | 93 -> **25** | 97 -> **24** | 56 -> **29** | 223 KB -> **80 KB** |
+| 1,600 declarations, one call | 302 -> **139 ms** | 81 -> **11** | 72 -> **4** | 22 -> **3** | 181 KB -> **48 KB** |
+| 3,200 declarations, one call | 546 -> **270 ms** | 137 -> **22** | 130 -> **9** | 45 -> **8** | 351 KB -> **93 KB** |
+
+Those three phases together are 312 ms of a 3,200-declaration program's macro
+tax and are now 39 -- **87% of what the change was aimed at**, which is about
+what the meter predicted when it was used to reorder
+[dreams/TODO.md](dreams/TODO.md). Whole compiles, alternating against the same
+VM running the commit before's compiler: the self-compile 4.86/4.86/4.96 s
+against **4.62/4.75/4.58**, the 3,200-declaration program 4.37/4.50/4.67
+against **4.08/4.23/4.14** -- the new build faster in all six, which is what
+puts a 5-9% result outside the placement noise floor that "Two things that will
+lie to you" describes.
+
+**The stub is parameterless and pure, whatever the declarations pointing at it
+were**, and that is the part to think about before changing it. A pure 0-arity
+function is a `GLOBAL_VALUE`, so *naming* one evaluates it. A stub of the
+declaration's own arity would hand back a closure instead, and a call of it
+with too few arguments would hand back another one -- so a walk that missed an
+edge would partially apply something and carry on, where this raises at the
+first mention. That is the whole reason the body is a raise, and sharing it
+must not quietly weaken it.
+
+**What makes it sound** is unchanged from the section above, because the
+soundness never rested on the stubs being distinct. An unreached declaration
+still raises when named, a macro is pure and cannot catch what it raises, so an
+incomplete reachability answer is still loud rather than wrong; the batch is
+thrown away and the round runs again with every declaration a root. What the
+sharing changes is only how many function records say so.
+
+**What did not change: the image.** Every image in this repository is
+byte-identical -- `dreams`, `lucid`, `mind`, and `mind/std/all.dr --test`,
+which is the macro-heavy one -- and so is the 3,200-declaration program's
+(877,144 bytes, 26,109 nodes either way). That is the test this change is held
+to, and the reason is that nothing *reachable* changes: the stub is only ever
+in the image handed to the macro VM and thrown away. The bootstrap reaches a
+fixpoint in one stage.
+
+**What it leaves**, which is the next thing to do and is now most of what a
+macro costs: `snapshot` -- `scope.declare!`, which walks every declaration for
+its *names*. It did not move at all (228 -> 231 ms at 3,200 declarations, 123
+-> 120 at 1,600), and with the three phases around it gone it is **85-86% of
+the tax** where it was 41-42%. Note what that means about the ordering: the
+phase meter said to take the stub first and it was right, but the same meter
+now says the next 200 ms are in one phase that nothing here has looked at.
+
 ### The compiler was quadratic in the size of the program
 
 **How it was found**, because the method is the transferable part. Everything in
