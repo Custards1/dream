@@ -1171,15 +1171,29 @@ let rec parse_match c sp ts =
                 [:ok, _, rest2] =>
                     match match_arms (grouped c) [] rest2 {
                         [:error, m, s] => err m s,
-                        [:ok, arms, rest3] =>
+                        // As `comma_list` does, and for the same reason: the
+                        // closing brace is consumed by the time the arms come
+                        // back, and a `match` that does not reach the end of
+                        // its own last arm is a declaration whose span stops
+                        // at its first one -- which is what a `let f = match
+                        // ..` is. See `match_arms`.
+                        [:ok, [arms, close], rest3] =>
                             if list.is_empty arms { err "a `match` needs at least one arm" sp }
-                            else { ok (ast.match_e scrutinee arms (ast.span_to sp (peek_span rest2))) rest3 },
+                            else { ok (ast.match_e scrutinee arms (ast.span_to sp close)) rest3 },
                     },
             },
     };
 
+/// The arms and the span of the `}` that ended them.
+///
+/// The brace is handed back for the reason `comma_list` gives: it is consumed
+/// here, and the `match` node's span has to reach the end of it. It used to
+/// end at the *first* token after the `{` instead, which made every `let f =
+/// match ..` a declaration whose span covered its header and nothing else --
+/// invisible to anything that asks which declaration an offset is in, which
+/// is macro discovery, the outline, hover and go-to-definition.
 let rec match_arms c acc ts =
-    if at ts :rbrace { ok (list.reverse acc) (list.tail ts) }
+    if at ts :rbrace { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else if at_end ts { err "unterminated `match`: expected `}`" (peek_span ts) }
     else {
         match parse_pattern c ts {
@@ -1190,7 +1204,7 @@ let rec match_arms c acc ts =
                     [:ok, a, rest2] => {
                         let acc2 = core.cons a acc;
                         if at rest2 :comma { match_arms c acc2 (list.tail rest2) }
-                        else if at rest2 :rbrace { ok (list.reverse acc2) (list.tail rest2) }
+                        else if at rest2 :rbrace { ok [list.reverse acc2, peek_span rest2] (list.tail rest2) }
                         else { err ("expected `,` or `}` after a match arm, found " + describe rest2)
                                    (peek_span rest2) }
                     },
@@ -1890,6 +1904,22 @@ when test {
             [:error, m, _] => m,
         };
 
+    /// The span of the one declaration in `src`.
+    ///
+    /// Spans are otherwise absent from these tests on purpose -- `shape` and
+    /// `items` drop them, because what a node *is* is a different question
+    /// from where it was written. This asks the second question, for the one
+    /// construct that got it wrong: a `match` ended at its first arm, so every
+    /// `let f = match ..` was a declaration whose span covered its header and
+    /// nothing else. Anything that asks which declaration an offset is in --
+    /// macro discovery, the outline, hover, completion's locals -- was told
+    /// that most of this compiler is in no declaration at all.
+    let decl_span src =
+        match parse_module src {
+            [:ok, [it], _] => ast.span it,
+            _ => "did not parse to one declaration",
+        };
+
     /// The message of a source that must not parse.
     let fails src =
         match parse_expression src {
@@ -1898,6 +1928,11 @@ when test {
         };
 
     let tests = [
+        test.case "a declaration reaches the end of the match that is its body"
+            $( test.eq! [0, 36] (decl_span "let f x = match x { 0 => 1, _ => 2 };") ),
+        test.case "and the end of a match nested in its last arm"
+            $( test.eq! [0, 53] (decl_span "let f x = match x { 0 => match x { _ => 1 }, _ => 2 };") ),
+
         test.case "private let retains its visibility"
             $( test.eq! "(priv (let x (int 1)))" (items "priv let x = 1;") ),
         test.case "priv requires a let or type declaration"

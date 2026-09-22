@@ -11,6 +11,7 @@ CLAUDE.md.
 
     dreams/tests/scale.py --sizes 800 1600 3200
     dreams/tests/scale.py --sizes 400 1600 --modules 50   # many modules, few decls each
+    dreams/tests/scale.py --sizes 400 1600 --call-in-module  # the expand in a big module
 
 Read the ratio column, not the milliseconds. Near 2.0 for a doubling is linear
 and fine however large the absolute number; near 4.0 is a bug however small.
@@ -23,6 +24,17 @@ three loader lists taken out in 2026-09-20 were 18% of allocation and 34% of
 the peak, and `modules.modules`, the one a previous round had named, was 6% of
 the first and none of the second.
 
+The discovery axis is the newest and the only one on which *this* repository
+is the expensive workload and a generated program is free -- the inverse of the
+warning above, and the reason it went unmeasured. Discovery is per item of a
+module that has a call written in it, so what it costs is the size of that
+module: 2, 3 and 5 ms at 400, 800 and 1,600 declarations, linear and cheap.
+What made `dreams` pay 49 ms for eighteen one-line calls was not that axis but
+the fallback behind it -- a module whose offsets cannot be matched to its
+declarations is walked node by node -- and a generated program never trips it,
+because nothing generated here is written as a `match`. See "Discovery was a
+walk of two whole modules" in CLAUDE.md.
+
 The modules axis has to be run *far* out before it says anything. `envs` was a
 list indexed by module for the whole life of the compiler, and at 400 modules
 -- as far as anyone had taken this -- the list and the map that replaced it are
@@ -33,27 +45,50 @@ afford, not the first one that runs.
 
 import argparse, os, shutil, subprocess, sys, tempfile, time
 
-def write_program(root, decls, modules, with_macro):
-    """`modules` files sharing `decls` declarations between them, one `expand`."""
+def write_program(root, decls, modules, with_macro, call_in_module=False):
+    """`modules` files sharing `decls` declarations between them, one `expand`.
+
+    `call_in_module` writes that one call into the *largest* generated module
+    instead of into `main.dr`, which is the third axis this file can vary and
+    the one nobody had. Discovery -- "is there anything to expand?" -- is per
+    item of a module that has a call written in it and free for every module
+    that has none, so the size of the module the call lives in is the input it
+    is linear in, and neither of the other two axes moves it. `dreams` writes
+    its own macro calls in `lower.dr`, its largest module, which is why its
+    discovery cost 49 ms where a generated program's was 0.
+    """
     per = max(1, decls // modules)
     for m in range(modules):
         with open(os.path.join(root, f"m{m}.dr"), "w") as f:
-            f.write("import std.list;\n\n")
+            f.write("import std.list;\n")
+            if m == 0 and call_in_module:
+                f.write("import mac;\n\nlet add a b = a + b;\n")
+            f.write("\n")
             for i in range(per):
                 k = m * per + i
                 f.write(f"let f{k} n = list.fold (fn a x -> a + x * {k+1}) "
                         f"n (list.range 0 (n + {k}));\n")
+            # Last, so that every declaration in front of it is one the
+            # discovery walk has to step over to reach the call.
+            if m == 0 and call_in_module:
+                f.write("let v0 = expand mac.twice 0;\n" if with_macro
+                        else "let v0 = add 0 0;\n")
     with open(os.path.join(root, "mac.dr"), "w") as f:
         f.write('import std.list;\n\n'
                 'macro twice e = [:apply, [:name, "add", [0, 0]], [e, e], [0, 0]];\n')
     with open(os.path.join(root, "main.dr"), "w") as f:
-        f.write("import std.console;\nimport mac;\n")
+        f.write("import std.console;\n")
+        if not call_in_module:
+            f.write("import mac;\n")
         for m in range(modules):
             f.write(f"import m{m};\n")
         f.write("\nlet add a b = a + b;\n")
         # The macro call is the point of the `mac` import: a one-line transformer
         # in a program of any size, which is what the macro tax is measured as.
-        f.write("let v0 = expand mac.twice 0;\n" if with_macro else "let v0 = add 0 0;\n")
+        if call_in_module:
+            f.write("let v0 = m0.v0;\n")
+        else:
+            f.write("let v0 = expand mac.twice 0;\n" if with_macro else "let v0 = add 0 0;\n")
         f.write("let main! = { console.print! v0 };\n")
 
 def run(vm, compiler, root, out, env):
@@ -76,6 +111,9 @@ def main():
     ap.add_argument("--sizes", type=int, nargs="+", default=[400, 1600, 3200])
     ap.add_argument("--modules", type=int, default=1,
                     help="spread the declarations over this many modules")
+    ap.add_argument("--call-in-module", action="store_true",
+                    help="write the one `expand` into the largest generated module "
+                         "rather than into main.dr -- the discovery axis")
     ap.add_argument("--max-heap", default=str(8 * 1024**3),
                     help="DREAM_MAX_HEAP; the default 1 GB stops a big program")
     ap.add_argument("--keep", action="store_true", help="leave the generated trees")
@@ -92,7 +130,7 @@ def main():
             for label, with_macro in (("macro", True), ("none", False)):
                 root = os.path.join(temp, f"{label}{n}")
                 os.makedirs(root, exist_ok=True)
-                write_program(root, n, args.modules, with_macro)
+                write_program(root, n, args.modules, with_macro, args.call_in_module)
                 secs, live, rc, output = run(args.vm, args.compiler, root,
                                              os.path.join(temp, f"{label}{n}.dream"), env)
                 if rc != 0 or "compiled ->" not in output:

@@ -1719,8 +1719,95 @@ everything else in these notes: the lexer records where the word `expand`
 appears, so a module with no sites costs nothing at all, and what is left is
 per item of a module that *has* one. `dreams` writes its macro calls in
 `lower.dr` and `scope.dr`, its two largest modules, so it pays for all of both
-to find eighteen one-line calls. [dreams/TODO.md](dreams/TODO.md) has the rest
-of it.
+to find eighteen one-line calls. The section below is what that turned out to
+be.
+
+### Discovery was a walk of two whole modules, because a `match` lied about where it ended
+
+**The finding, and it is not about expansion at all.** The section above ends
+by naming `discover` as the largest phase of a self-compile's macro tax -- 49 ms
+of 152 -- and by saying the shape of it: the lexer records where the word
+`expand` appears, so a module with no offsets costs nothing, and a module that
+has one costs a walk of every declaration whose span an offset falls inside.
+That is cheap when the offsets can be matched to declarations. When they cannot,
+`work_of` falls back to walking every node of every declaration in the module,
+and on a self-compile it was falling back for the two largest modules in the
+compiler.
+
+It was falling back because of a parser bug three years older than any of this.
+`parse_match` ended a `match`'s span at `peek_span rest2` -- the first token
+*after* the `{`, not the `}` that `match_arms` had consumed. So
+
+```
+let rec lower_expr e l =
+    match e {
+```
+
+is a declaration whose span is those two lines and stops: `[16170, 16218]` for
+a body running to 23,244. A declaration's span is `let` to the end of its body
+(`ast.span_to sp (ast.span body)`), so every `let f = match ..` in this
+codebase covered its header and nothing else. Two of `lower.dr`'s nine `expand`
+offsets were inside such a declaration, the two-way check that guards the
+picking therefore failed, and all 124 of its declarations were walked. The fix
+is two lines: `match_arms` hands its closing brace back, exactly as
+`comma_list` beside it already did and for the reason its comment already gave.
+
+The second half was the same question asked of the wrong thing. An offset is a
+position in a *file*, and a file is several modules -- a `mod name { .. }` and
+every `group`/`struct`/`mapping` are hoisted into modules of their own that keep
+the source they were written in. So a record submodule is handed its parent's
+offsets, accounts for none of them, and walks all of its own declarations to
+find expansions it does not have. Six of a self-compile's eleven modules with
+offsets were record submodules doing exactly that. The accounting is pooled per
+source now, which is the question the offsets actually pose.
+
+| | discover | macro tax |
+|---|---|---|
+| before | 49 ms, 2.5 M reductions | 152 ms |
+| the `match` span | 17 ms, 0.8 M | 119 ms |
+| + accounting per file | **14 ms, 0.6 M** | **116 ms** |
+
+`lucid`, which imports this compiler, moves the same way: 51 ms -> **14**, and
+its macro tax 167 -> **133**. `mind/std/all.dr --test` does not move at all
+(3-4 ms either way), and the reason is worth keeping: in `--test` mode
+`std.macros`'s `when test` blocks survive, so its 55 offsets land in
+declarations and it never fell back. The whole self-compile does not move
+either -- 4387/4503/4481 ms against 4482/4082/4489, interleaved -- because
+36 ms is 0.8% of it and the floor on this machine is 3%.
+
+**What is left, and why it is left.** One module still falls back:
+`std.macros` compiled *without* `--test`, whose 55 offsets are all inside
+`when test` blocks the configuration dropped, so they are in the file and in no
+surviving declaration. Measured by forcing the accounting true and rebuilding:
+3 ms of the 14, 0.2 M reductions. Telling "dropped by `when`" from "the span
+logic is broken" would need the loader to carry the spans it dropped, and 3 ms
+does not buy that.
+
+**What the images did.** Every one of them changed, in one field. `mind`,
+`lucid` and `mind/std/all.dr --test` come out the same size with the same node
+and function counts, differing in 63, 496 and 142 bytes -- and every one of
+those bytes is offset 24 of a `FUNC` record, which is `span_end`. 39 of `mind`'s
+505 functions, 284 of `lucid`'s 2,630 and 97 of the std build's 2,010 had a span
+that stopped at their first arm. Check it that way rather than arguing about
+it: decode the differing offsets against the section table and the record
+stride. The bootstrap reaches a fixpoint in one stage, and the seed had to move
+with it because a compiler that spans a `match` correctly compiles *itself*
+with different spans.
+
+**And the reason no profile had named it.** `--profile` counts reductions and
+this was 2.5 M of 58 M, spread across `has_expansion` -- under 5%, in a function
+that is *supposed* to walk syntax. What said it was wrong was not a profile but
+printing what the pass decided: eleven modules with offsets, of which eight
+could not account for their own. A pass with a fallback should be asked how
+often it takes it, and `work_of` had been taking it for a year.
+
+**One thing this deletes elsewhere.** `lucid/analysis.dr` had a `reach` walk --
+follow the last part of a lambda, an `if`, an application, a `let`, a `match`'s
+arms, and take the largest end -- built because "a cursor in a match arm looks
+as though it is in no `match` at all", at a cost its comment records as eight
+failing tests. That was this bug seen from the editor's end. The walk is gone
+and `holds` asks the span, with the tests that found it kept exactly where they
+were: they now hold the parser instead.
 
 ### `mind/std/all.dr --test` is not byte-stable across compiler changes
 

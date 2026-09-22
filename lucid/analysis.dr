@@ -300,68 +300,24 @@ let binder_params b = list.nth 2 b;
 /// still inside it.
 let covers span offset = ast.span_start span <= offset && offset <= ast.span_end span;
 
-let larger a b = if a > b { a } else { b };
-
-/// Where a node actually ends, which is not always where its span says.
+/// Does this node contain the cursor?
 ///
-/// Almost every node's span contains the parts this walk descends into. That
-/// was measured rather than assumed, across every construct below, and there is
-/// exactly one exception: a `match`'s span covers `match subject {` and stops
-/// there. `match xs { [h] => h, _ => 0 }` written at byte 11 has span
-/// `[11, 23]` while its second arm runs to 38 -- so the arms lie outside the
-/// node that owns them, and a cursor in one looks as though it is in no `match`
-/// at all. It cost eight failing tests to find, which is the reason it is
-/// written down here at this length.
-///
-/// Only the *end* is ever short, and only ever because of what comes last, so
-/// this follows the last part of each construct rather than walking the whole
-/// subtree: the cost is the depth of the tree and not its size. The constructs
-/// listed are the ones whose own end is their last part's end, and which a
-/// short part therefore shortens too -- a block, a list or a `c.[k]` all end at
-/// a closing bracket and cannot be short whatever is inside them.
-let rec reach e = {
-    let ends = ast.span_end (ast.span e);
-    let deeper =
-        match e {
-            [:match, _, arms, _] =>
-                if list.is_empty arms { ends }
-                else {
-                    let a = list.last arms;
-                    larger (ast.span_end (list.nth 3 a)) (reach (ast.arm_body a))
-                },
-            [:lambda, _, body, _]      => reach body,
-            [:thunk, x, _]             => reach x,
-            [:comp, _, x, _]           => reach x,
-            [:unary, _, x, _]          => reach x,
-            [:binary, _, _, r, _]      => reach r,
-            [:pipe, _, r, _]           => reach r,
-            [:try, _, _, h, _]         => reach h,
-            [:if, _, t, el, _]         => match el { () => reach t, x => reach x },
-            [:apply, callee, args, _]  =>
-                if list.is_empty args { reach callee } else { reach (list.last args) },
-            [:let, _, _, body, _, _]   => reach body,
-            [:macro, _, _, body, _]    => reach body,
-            [:expand, call, _]         => reach call,
-            [:let_p, _, body, _]       => reach body,
-            [:virtual, _, _, body, _]  => match body { () => ends, b => reach b },
-            _ => ends,
-        };
-    larger ends deeper
-};
+/// This used to be `covers (extent e) offset`, where `extent` was a walk down
+/// the last part of every construct that could end where its last part does --
+/// a lambda at its body, an `if` at its `else`, an application at its final
+/// argument. All of it existed for one node: a `match`'s span covered
+/// `match subject {` and stopped there, so its arms lay outside the node that
+/// owned them and a cursor in one looked as though it were in no `match` at
+/// all. That was a parser bug rather than a fact about spans, and it is fixed
+/// -- `match_arms` hands its closing brace back the way `comma_list` always
+/// did -- so a span is now what it claims to be and the walk is gone. The
+/// tests below that found the original (a cursor in the second arm of a
+/// two-arm `match`) are what hold the fix.
+let holds e offset = covers (ast.span e) offset;
 
-/// A node's span, corrected at the end by `reach`.
-let extent e = [ast.span_start (ast.span e), reach e];
-
-/// Does this node contain the cursor? Always asked of the extent and never of
-/// the span, for the reason `reach` gives.
-let holds e offset = covers (extent e) offset;
-
-/// An arm reaches as far as its body does, for the same reason and in the same
-/// way -- an arm whose body is a `match` has an arm span that stops short of it.
-let arm_holds a offset =
-    covers [ast.span_start (list.nth 3 a), larger (ast.span_end (list.nth 3 a))
-                                                  (reach (ast.arm_body a))]
-           offset;
+/// The same question of a match arm, whose span is its pattern to the end of
+/// its body.
+let arm_holds a offset = covers (list.nth 3 a) offset;
 
 /// The names a parameter list binds. A parameter is a name, `()` -- a slot that
 /// binds nothing -- or a pattern, and only the last of those binds more than
@@ -1271,9 +1227,10 @@ when test {
         test.case "a match arm's pattern binds in its body"
             $( test.eq! ["head", "rest", "xs"]
                         (in_scope_at! "let f xs = match xs { [head, ..rest] => |head, _ => 0 };") ),
-        // This one is also the test for `reach`: the cursor is in the second
-        // arm, which lies outside the `match`'s own span, and outside the
-        // declaration's too, since a declaration ends where its body does.
+        // This one is also what holds the parser's match span: the cursor is
+        // in the second arm, which used to lie outside the `match`'s own span
+        // -- and outside the declaration's too, since a declaration ends where
+        // its body does.
         test.case "a match arm's names do not reach the arm beside it"
             $( test.eq! ["xs"]
                         (in_scope_at! "let f xs = match xs { [head, ..rest] => 1, _ => |0 };") ),

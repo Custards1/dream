@@ -697,6 +697,23 @@ let rec in_item sites item = match sites {
     [at, ..rest] => holds item at || in_item rest item,
 };
 
+/// One module's share of the question `work_of` asks: its source, its offsets,
+/// its declarations numbered, and the ones an offset falls inside. Separate
+/// from `work_of` because the decision those feed is the *file's* and not this
+/// module's -- see there.
+let picks_of l mi = {
+    let m = modules.module_at l mi;
+    let source = modules.module_source m;
+    let sites = modules.expand_sites l source;
+    if list.is_empty sites { [mi, source, [], [], []] }
+    else {
+        let numbered = list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
+            [i + 1, core.cons [i, item] acc]) [0, []] (modules.module_items m)));
+        [mi, source, sites, numbered,
+         list.filter (fn [_, item] -> in_item sites item) numbered]
+    }
+};
+
 /// Every declaration that has an `expand` in it, as `[module, index, tree]`.
 ///
 /// This runs on every compile, macros or not -- it is how the question "is
@@ -721,24 +738,35 @@ let rec in_item sites item = match sites {
 /// node in a program nothing expands, so it is written to be checkable
 /// rather than to be clever.
 ///
+/// **The check is the file's and not one module's**, which is the whole of
+/// why it is written in two passes. An offset is a position in a *file*, and a
+/// file is several modules: a `mod name { .. }` and every `group`/`struct`/
+/// `mapping` are hoisted into modules of their own that keep the source they
+/// were written in (`modules.module_source`). So a submodule is handed its
+/// parent's offsets, accounts for none of them, and -- asked on its own --
+/// falls back to walking every one of its declarations to find the expansions
+/// it does not have. Six of a self-compile's eleven modules with offsets were
+/// record submodules doing exactly that. Pooling what the file's modules
+/// picked answers the question the offsets actually pose.
+///
 /// Where it does walk, it walks the items rather than indexing them: a
 /// `list.nth i items` inside a fold over `0..length` is a walk per
 /// declaration, which is a module's declarations squared.
-let work_of l = list.concat (list.map (fn mi -> {
-    let m = modules.module_at l mi;
-    let sites = modules.expand_sites l (modules.module_source m);
-    if list.is_empty sites { [] }
-    else {
-        let numbered = list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
-            [i + 1, core.cons [i, item] acc]) [0, []] (modules.module_items m)));
-        let picked = list.filter (fn [_, item] -> in_item sites item) numbered;
-        let accounted = list.all (fn at ->
-            list.any (fn [_, item] -> holds item at) picked) sites;
-        list.map (fn [i, item] -> [mi, i, item])
-            (list.filter (fn [_, item] -> has_expansion (macro_let item))
-                         (if accounted { picked } else { numbered }))
-    }
-}) (list.range 0 (modules.module_count l)));
+let work_of l = {
+    let picks = list.map (fn mi -> picks_of l mi) (list.range 0 (modules.module_count l));
+    let seen = list.fold (fn acc [_, source, _, _, picked] ->
+        if list.is_empty picked { acc }
+        else { acc.[source => picked + acc.[source else []]] }) %{} picks;
+    list.concat (list.map (fn [mi, source, sites, numbered, picked] ->
+        if list.is_empty sites { [] }
+        else {
+            let accounted = list.all (fn at ->
+                list.any (fn [_, item] -> holds item at) (seen.[source else []])) sites;
+            list.map (fn [i, item] -> [mi, i, item])
+                (list.filter (fn [_, item] -> has_expansion (macro_let item))
+                             (if accounted { picked } else { numbered }))
+        }) picks)
+};
 
 /// Put every expanded declaration back where it came from.
 ///

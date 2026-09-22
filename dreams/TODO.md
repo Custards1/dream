@@ -351,29 +351,46 @@ what a change will reach, and nothing but building the change says that.
    round, holding a library that is a function of the dependency rather than of
    the program.
 
-6. **`discover`, which nothing has ever looked at.** Now the largest phase of
-   a self-compile's macro tax: **48 ms of 147**, where `snapshot` -- the phase
-   the two rounds above were about -- is 25.
+6. ~~**`discover`, which nothing has ever looked at.**~~ **Done**
+   (2026-09-21), and the guess in this item was wrong in an instructive way.
+   It proposed "stop numbering and walking items whose span does not contain a
+   site" -- which is what `picked` already did -- and then said to measure
+   first, because `accounted` falls back to the whole module when the sites
+   cannot be matched to items and *how often that happens is not known*. That
+   was the question. It happened for **eight of a self-compile's eleven modules
+   with sites**, including the two largest in the compiler, and for two
+   unrelated reasons:
 
-   It is `expand.work_of`, and its shape is the opposite of everything else in
-   this file, which is why it should be read before it is touched. It is
-   **0 ms on a 3,200-declaration generated program and 51 on `dreams`**, and
-   that is not noise: the lexer records where the word `expand` appears
-   (`modules.expand_sites`), so a module with no sites costs nothing at all and
-   35 of that program's 36 modules are free. What is left is per *item of a
-   module that does have one* -- every declaration numbered into an `[i, item]`
-   pair, tested against the sites, and then walked node by node by
-   `has_expansion`. `dreams` uses `macros.coalesce` and `macros.with_some` in
-   `lower.dr` and `scope.dr`, which are its two largest modules, so it pays for
-   all of both to find eighteen one-line calls.
+   - a `match`'s span ended at its first arm rather than at its `}`
+     (`parse_match` read `peek_span rest2` where `comma_list` beside it hands
+     the closing token back), so every `let f = match ..` was a declaration
+     whose span covered its header -- and that is most of this compiler;
+   - sites are keyed by *file* and a file is several modules, so a record
+     submodule inherits its parent's sites, accounts for none, and walks itself
+     to find expansions it does not have.
 
-   So the axis to vary is not the program's size but **the size of the module
-   the macro is written in**, and `scale.py` cannot currently vary it. The
-   cheap fix is probably to stop numbering and walking items whose span does
-   not contain a site at all -- `in_item` already knows -- but measure before
-   believing that, because `accounted` exists to fall back to the whole module
-   when the sites cannot be matched to items, and how often that happens is not
-   known.
+   `discover` 49 ms -> **14**, 2.5 M reductions -> **0.6 M**, the self-compile's
+   macro tax 152 -> **116**, and `lucid` the same (51 -> 14, tax 167 -> 133).
+   `mind/std/all.dr --test` does not move, because in `--test` mode
+   `std.macros`'s sites are inside declarations that survive. Every image in the
+   repository changed in exactly one field -- `span_end` of a `FUNC` record --
+   and the bootstrap reaches a fixpoint in one stage. See "Discovery was a walk
+   of two whole modules" in `CLAUDE.md`, and note what deleted itself with it:
+   `lucid`'s `reach` walk existed solely to work around the same span.
+
+   The axis this item asked for exists now: `scale.py --call-in-module` writes
+   the one `expand` into the largest generated module. It says the axis is real
+   and cheap -- 2, 3, 5 ms at 400, 800, 1,600 declarations, linear, and the
+   *same before and after*, because a generated program never trips the
+   fallback. This is the one cost in this file where `dreams` is the expensive
+   workload and the generated program is free, which is the exact inverse of
+   the warning below.
+
+   What is left is 3 ms: `std.macros` compiled without `--test`, whose sites
+   are all inside `when test` blocks the configuration dropped, so they are in
+   the file and in no surviving declaration. Measured by forcing the accounting
+   true; telling that apart from a real mismatch would need the loader to carry
+   the spans it dropped, and 3 ms does not buy it.
 
 **And one warning about the next profile.** `mentions_name` was invisible for
 the whole life of this compiler because `dreams` is the one codebase where the
@@ -382,6 +399,13 @@ search it makes is free. Profile the *generated* program as well as this one --
 reading either alone. A cost that is large on a program of unrelated
 declarations and zero here is exactly the cost a large project would hit and
 nobody here would ever feel.
+
+**And the same warning read backwards**, which is what item 6 turned out to be.
+`work_of`'s fallback was 35 ms on a self-compile and 0 on every generated
+program, because what trips it is a `match` and nothing `scale.py` writes is
+written as one. Neither program is the check; the pair is. And when a pass has
+a fallback, the number to print is not how long it took but **how often it fell
+back** -- eight modules of eleven, which no profile would ever have said.
 
 If a fourth round of list-to-map is ever tempting, measure first and measure
 the right thing: allocation by kind at two sizes says *whether* something is
