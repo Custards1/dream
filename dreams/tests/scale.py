@@ -12,6 +12,7 @@ CLAUDE.md.
     dreams/tests/scale.py --sizes 800 1600 3200
     dreams/tests/scale.py --sizes 400 1600 --modules 50   # many modules, few decls each
     dreams/tests/scale.py --sizes 400 1600 --call-in-module  # the expand in a big module
+    dreams/tests/scale.py --sizes 400 --macros 64            # a dependency of 64 macros
 
 Read the ratio column, not the milliseconds. Near 2.0 for a doubling is linear
 and fine however large the absolute number; near 4.0 is a bug however small.
@@ -45,7 +46,7 @@ afford, not the first one that runs.
 
 import argparse, os, shutil, subprocess, sys, tempfile, time
 
-def write_program(root, decls, modules, with_macro, call_in_module=False):
+def write_program(root, decls, modules, with_macro, call_in_module=False, macros=1):
     """`modules` files sharing `decls` declarations between them, one `expand`.
 
     `call_in_module` writes that one call into the *largest* generated module
@@ -56,6 +57,14 @@ def write_program(root, decls, modules, with_macro, call_in_module=False):
     is linear in, and neither of the other two axes moves it. `dreams` writes
     its own macro calls in `lower.dr`, its largest module, which is why its
     discovery cost 49 ms where a generated program's was 0.
+
+    `macros` is the fourth axis and it is the one the macro *image* is a
+    function of. The image holds the program's transformers and what they
+    reach, whether or not this program calls them -- which is what makes it a
+    function of the package rather than of the round, and so cacheable -- so a
+    dependency that declares many macros and exports one that anybody uses is
+    where that choice is paid for. `std.macros` declares sixteen and a
+    self-compile calls three.
     """
     per = max(1, decls // modules)
     for m in range(modules):
@@ -76,6 +85,11 @@ def write_program(root, decls, modules, with_macro, call_in_module=False):
     with open(os.path.join(root, "mac.dr"), "w") as f:
         f.write('import std.list;\n\n'
                 'macro twice e = [:apply, [:name, "add", [0, 0]], [e, e], [0, 0]];\n')
+        # Only the first is ever called. The rest are what a package of
+        # transformers costs a program that imports it for one of them.
+        for k in range(macros - 1):
+            f.write(f'macro twice{k} e = [:apply, [:name, "add", [0, 0]], '
+                    f'[e, [:binary, :add, e, [:int, {k}, [0, 0]], [0, 0]]], [0, 0]];\n')
     with open(os.path.join(root, "main.dr"), "w") as f:
         f.write("import std.console;\n")
         if not call_in_module:
@@ -111,6 +125,8 @@ def main():
     ap.add_argument("--sizes", type=int, nargs="+", default=[400, 1600, 3200])
     ap.add_argument("--modules", type=int, default=1,
                     help="spread the declarations over this many modules")
+    ap.add_argument("--macros", type=int, default=1,
+                    help="declare this many transformers in the dependency; one is called")
     ap.add_argument("--call-in-module", action="store_true",
                     help="write the one `expand` into the largest generated module "
                          "rather than into main.dr -- the discovery axis")
@@ -130,7 +146,8 @@ def main():
             for label, with_macro in (("macro", True), ("none", False)):
                 root = os.path.join(temp, f"{label}{n}")
                 os.makedirs(root, exist_ok=True)
-                write_program(root, n, args.modules, with_macro, args.call_in_module)
+                write_program(root, n, args.modules, with_macro, args.call_in_module,
+                              args.macros)
                 secs, live, rc, output = run(args.vm, args.compiler, root,
                                              os.path.join(temp, f"{label}{n}.dream"), env)
                 if rc != 0 or "compiled ->" not in output:

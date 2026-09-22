@@ -458,7 +458,7 @@ let show_macros! l = match modules.macro_meter l {
         let tallies = core.map_get meter :counts %{};
         let count k = core.map_get tallies k 0;
         let rows = [[:discover, "discover"], [:stage, "stage"],
-                    [:snapshot, "snapshot"], [:declare, "declare"],
+                    [:snapshot, "snapshot"], [:sites, "sites"],
                     [:resolve, "resolve"], [:image, "lower"], [:emit, "emit"],
                     [:vm, "run"], [:install, "install"]];
         let at k = core.map_get phases k [0, 0, 0, 0];

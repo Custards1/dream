@@ -236,6 +236,33 @@ let staged_lowering low = {
 /// going to finish.
 let prepare! l = prepare_work! l (work_of l);
 
+/// Where every transformer in the program is written, as `scope.root_key`s.
+///
+/// This is what the macro image is resolved from, and choosing it is the whole
+/// of the difference between an image that belongs to a *round* and one that
+/// belongs to the package the transformers came from. The roots used to be the
+/// round's wrappers, so the image held whichever macros this round happened to
+/// call and had to be built again for the next round; they are the macros
+/// themselves now, so every round of a program shares one image -- and so,
+/// eventually, can every build (`dreams/TODO.md`, ".libdream for
+/// transformers").
+///
+/// Read off the loader as the reader wrote it, before staging: `macro_let`
+/// turns a `macro` into the `let` it is, so by the time anything is declared
+/// there is nothing left saying which declarations were transformers. What
+/// survives the rewrite is the span, which is why a root is named by where it
+/// was written rather than by what it is called -- and a name would not do
+/// anyway, since two modules may each declare `twice`.
+let transformer_roots l =
+    list.fold (fn acc mi -> {
+        let m = modules.module_at l mi;
+        let source = modules.module_source m;
+        list.fold (fn a item -> match item {
+            [:macro, _, _, _, sp] => a.[scope.root_key source (ast.span_start sp) => true],
+            _ => a,
+        }) acc (modules.module_items m)
+    }) %{} (list.range 0 (modules.module_count l));
+
 /// The program as a transformer sees it: every `expand` replaced by `1 / 0`
 /// and every `macro` read as the `let` it is.
 ///
@@ -257,7 +284,8 @@ let stage_program l work = {
 
 let prepare_work! l work = {
     let staged = stage_program l work;
-    %{ :loader => staged, :declared => scope.declare! staged }
+    %{ :loader => staged, :declared => scope.declare! staged,
+       :roots => transformer_roots l }
 };
 
 /// Lower and link only the temporary wrapper. The base arena and function
@@ -303,14 +331,18 @@ let call_args call = match call {
 /// resolves against the imports of the module it was *written* in, so two
 /// modules cannot share a wrapper -- but they can share an image, which is
 /// where the cost actually is.
-let evaluate! base s mi calls = {
-    let got = evaluate_round! base s [[mi, calls]];
-    [list.head got, list.head (list.nth 1 got)]
+///
+/// `session` is the open image, or `()` for "there is not one yet"; it comes
+/// back either way, so a caller with several rounds to make opens one.
+let evaluate! base s session mi calls = {
+    let got = evaluate_round! base s session [[mi, calls]];
+    [list.head got, list.nth 1 got, list.head (list.nth 2 got)]
 };
 
 /// Evaluate every `expand` of one round of the whole program on the macro VM:
-/// `[state, values per job]`, one value per call in the order given, and `()`
-/// where the call could not be run and a diagnostic was raised instead.
+/// `[state, session, values per job]`, one value per call in the order given,
+/// and `()` where the call could not be run and a diagnostic was raised
+/// instead.
 ///
 /// **One image for the round, and it is a library rather than a program.**
 /// Building an image is `ir.finish` plus `emit.to_binary`, and both are the
@@ -339,7 +371,15 @@ let evaluate! base s mi calls = {
 /// may fail because the shared snapshot has gone stale, which is only knowable
 /// by resolving the whole program and asking again (`:whole`), and a failure
 /// that repeats there is the real one and is reported once.
-let evaluate_round! base s jobs = {
+///
+/// **And now one image for the whole expansion**, because nothing in it is
+/// about the round any more. The wrappers are resolved on their own and thrown
+/// away (`scope.resolve_names!`), so what is resolved, lowered and serialized
+/// here is the program's transformers and what they reach -- the same set for
+/// every round, since every round stages the same program. So the session is
+/// passed in and handed back rather than opened and closed here, and the
+/// caller that owns the rounds owns it.
+let evaluate_round! base s session0 jobs = {
     let l = loader s;
     let staged = base.[:loader];
 
@@ -361,25 +401,30 @@ let evaluate_round! base s jobs = {
         [[:rounds, 1], [:wrappers, list.length plans],
          [:calls, list.fold (fn n plan -> n + list.length (list.nth 1 plan)) 0 plans]];
 
-    // Declared together and resolved once, so that the incremental link below
-    // sees every wrapper as this round's new bodies.
-    let declaring = phase! s1 :declare (list.fold (fn acc plan ->
-        scope.declare_items! staged (list.head plan) [list.nth 3 plan] acc)
-        base.[:declared] plans);
-    let s2 = list.head declaring;
-    let declared = list.nth 1 declaring;
-    // Only the bodies this round's wrappers can reach are resolved and lowered;
-    // everything else is stubbed. `:whole` is how a path that has already been
-    // failed by that asks for the program instead -- see `unreached_body`.
-    let resolving = phase! s2 :resolve (scope.resolve_reachable! staged declared
-        (if base.[:whole else false] { 0 }
-         else { scope.pending_count base.[:declared] }));
-    let s3 = list.head resolving;
-    let resolved = list.nth 1 resolving;
+    // What every call's name means, and nothing else. The wrappers used to be
+    // declared as globals and resolved along with the transformers, which put
+    // them in the image and made it this round's rather than the program's;
+    // they are resolved on their own now and the resolution is read for its
+    // `refs` and thrown away.
+    let siting = phase! s1 :sites (scope.resolve_names! staged base.[:declared]
+        (list.map (fn plan -> [list.head plan,
+                               modules.module_source (modules.module_at staged (list.head plan)),
+                               list.nth 3 plan, ()]) plans));
+    let s2 = list.head siting;
+    let sited = list.nth 1 siting;
 
-    // Lazily, because a round in which every module is refused before it runs
-    // -- a bad arity, a name that is not a macro -- must not pay for one. That
-    // is also why the meter is off by default: charging these two forces them.
+    // The transformers, and only what they reach; everything else is stubbed.
+    // `:whole` is how a path that has already been failed by that asks for the
+    // program instead -- see `unreached_body`.
+    //
+    // Lazily, all three of them, because a round in which every module is
+    // refused before it runs -- a bad arity, a name that is not a macro --
+    // must not pay for one, and because a second round must not pay for them
+    // at all: they are the same three values it was handed. That is also why
+    // the meter is off by default, and why these are charged where the session
+    // is opened rather than here -- charging a phase forces it.
+    let resolved = scope.resolve_reachable! staged base.[:declared]
+        (if base.[:whole else false] { () } else { base.[:roots else ()] });
     let arena = invocation_image staged resolved;
     let bytes = emit.to_binary arena;
 
@@ -400,17 +445,19 @@ let evaluate_round! base s jobs = {
              },
     };
 
-    /// The round's image, loaded once, as a session every call of every module
-    /// enters by name.
+    /// The expansion's image, built once, as a session every call of every
+    /// module of every round enters by name.
     ///
     /// Opened here rather than before the fold because a round may refuse
     /// every module it has, and must not build an image in order to say so.
     /// Opening is an effect, so it cannot be a lazy binding that nobody
     /// forces; what defers it instead is that nothing calls this until a call
-    /// is actually about to be made.
+    /// is actually about to be made. A session handed in is a session already
+    /// built, which is what makes a second round cost nothing but its calls.
     let open_round! st session = match session {
         () => {
-            let building = phase! st :image arena;
+            let resolving = phase! st :resolve resolved;
+            let building = phase! (list.head resolving) :image arena;
             let ready = phase! (list.head building) :emit bytes;
             let handle = vm.open_image! bytes;
             [counts (list.head ready) [[:images, 1], [:image_bytes, str.byte_length bytes]],
@@ -442,7 +489,7 @@ let evaluate_round! base s jobs = {
         // session is entered at are all the same lookup.
         let sites = list.range 0 (list.length calls);
         let references = list.map (fn i ->
-            scope.resolution resolved mi (modules.module_source m)
+            scope.resolution sited mi (modules.module_source m)
                              (ast.span (list.nth i targets))) sites;
         let definitions = list.map (fn i -> macro_definition l (list.nth i references)) sites;
 
@@ -451,12 +498,12 @@ let evaluate_round! base s jobs = {
         /// together, so nothing it produced can be trusted.
         let objection i =
             match list.nth i definitions {
-                () => if diag.error_count (scope.r_diags resolved) == 0 {
+                () => if diag.error_count (scope.r_diags sited) == 0 {
                           "`expand` needs the name of a declared macro"
                       } else {
                           "cannot compile macro: "
                           + str.join_str "; " (list.map (fn d -> diag.message d)
-                              (list.filter (fn d -> diag.is_error d) (scope.r_diags resolved)))
+                              (list.filter (fn d -> diag.is_error d) (scope.r_diags sited)))
                       },
                 definition => {
                     let arity = list.length (list.nth 2 definition);
@@ -506,12 +553,20 @@ let evaluate_round! base s jobs = {
                         [:error, why] if base.[:whole else false] =>
                             [fail ran mi at ("macro evaluation failed: " + why),
                              handle, core.cons () answers],
+                        // A session of its own, because the base is a
+                        // different one: the whole program resolves to a
+                        // different image, and this one must not be mistaken
+                        // for the round's.
                         [:error, _] => {
                             let got = evaluate! (base.[:whole => true])
-                                          (counted ran :one_by_one 1) mi [list.nth i calls];
+                                          (counted ran :one_by_one 1) () mi [list.nth i calls];
                             strict! got
-                            [list.head got, handle,
-                             core.cons (list.head (list.nth 1 got)) answers]
+                            let spent = match list.nth 1 got {
+                                () => (),
+                                other => vm.close_image! other,
+                            };
+                            strict! spent
+                            [list.head got, handle, core.cons (list.nth 2 got) answers]
                         },
                         [:ok, value] => {
                             let installing = charge! (metering ran) (install! mi m ran value at);
@@ -530,15 +585,13 @@ let evaluate_round! base s jobs = {
         strict! got
         [list.head got, list.nth 1 got,
          core.cons (list.reverse (list.nth 2 got)) acc]
-    }) [s3, (), []] plans;
+    }) [s2, session0, []] plans;
     strict! done
-    // The session holds an image, a heap and an atom table of its own, and
-    // nothing else will free them: the runtime closes what a compile leaves
-    // open, but only when the compile is over, and a program with many rounds
-    // would hold every round's image until then.
-    let closed = match list.nth 1 done { () => (), handle => vm.close_image! handle };
-    strict! closed
-    [list.head done, list.reverse (list.nth 2 done)]
+    // The session is handed back rather than closed. It holds an image, a heap
+    // and an atom table of its own and nothing else will free them -- the
+    // runtime closes what a compile leaves open, but only when the compile is
+    // over -- so whoever owns the rounds closes it when the last one is done.
+    [list.head done, list.nth 1 done, list.reverse (list.nth 2 done)]
 };
 
 /// A tree with every `expand` of this round replaced by a numbered hole, and
@@ -579,28 +632,29 @@ let rec fill tree values = match tree {
 /// This is the one-declaration form, which is what the fallback below uses
 /// when a whole-program round could not answer. `rounds_all!` is the ordinary
 /// path and expands every declaration together.
-let rec rounds! base s mi tree depth = {
+let rec rounds! base s session mi tree depth = {
     let punched = punch tree [[], 0];
     let calls = list.reverse (list.head (list.nth 1 punched));
     let refused sp = ast.unit_e sp;
-    if list.is_empty calls { [s, tree] }
+    if list.is_empty calls { [s, session, tree] }
     else if depth >= 64 {
         [list.fold (fn st call ->
              fail st mi (list.nth 1 call) "macro expansion exceeded 64 nested calls") s calls,
+         session,
          fill (list.head punched) (list.map (fn call -> refused (list.nth 1 call)) calls)]
     } else {
-        let result = evaluate! base s mi calls;
+        let result = evaluate! base s session mi calls;
         // Both the syntax and the updated loader contain lazy fields whose
         // frames retain this round's resolver and lowered program. Finish them
         // before the next round, so a declaration with many expands does not
         // keep every temporary compilation alive at once.
         strict! result
-        let [state, values] = result;
+        let [state, opened, values] = result;
         let answers = list.map (fn pair -> match list.head pair {
             () => refused (list.nth 1 (list.nth 1 pair)),
             answer => answer,
         }) (list.zip values calls);
-        rounds! base state mi (fill (list.head punched) answers) (depth + 1)
+        rounds! base state opened mi (fill (list.head punched) answers) (depth + 1)
     }
 };
 
@@ -616,20 +670,20 @@ let rec rounds! base s mi tree depth = {
 ///
 /// `items` is `[module, index, tree]` for every declaration that had an
 /// `expand` in it. What comes back is the same list with the trees expanded.
-let rec rounds_all! base s items depth = {
+let rec rounds_all! base s session items depth = {
     let punched = list.map (fn it -> {
         let got = punch (list.nth 2 it) [[], 0];
         [list.nth 0 it, list.nth 1 it, list.head got,
          list.reverse (list.head (list.nth 1 got))]
     }) items;
     let active = list.filter (fn j -> not (list.is_empty (list.nth 3 j))) punched;
-    if list.is_empty active { [s, items] }
+    if list.is_empty active { [s, session, items] }
     else if depth >= 64 {
         let failed = list.fold (fn st j ->
             list.fold (fn acc call -> fail acc (list.head j) (list.nth 1 call)
                           "macro expansion exceeded 64 nested calls") st (list.nth 3 j))
             s active;
-        [failed, list.map (fn j -> [list.nth 0 j, list.nth 1 j,
+        [failed, session, list.map (fn j -> [list.nth 0 j, list.nth 1 j,
             fill (list.nth 2 j) (list.map (fn call -> ast.unit_e (list.nth 1 call))
                                           (list.nth 3 j))]) punched]
     } else {
@@ -640,13 +694,13 @@ let rec rounds_all! base s items depth = {
             if list.contains (list.head j) acc { acc } else { acc + [list.head j] }) [] active;
         let jobs = list.map (fn mi -> [mi, list.concat (list.map (fn j -> list.nth 3 j)
             (list.filter (fn j -> list.head j == mi) active))]) mods;
-        let result = evaluate_round! base s jobs;
+        let result = evaluate_round! base s session jobs;
         // Both the syntax and the updated loader contain lazy fields whose
         // frames retain this round's resolver and lowered program. Finish them
         // before the next round, so a program with many expands does not keep
         // every temporary compilation alive at once.
         strict! result
-        let [state, per_module] = result;
+        let [state, opened, per_module] = result;
         let pool = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
                              %{} (list.zip mods per_module);
         let filled = list.fold (fn [acc, remaining] j -> {
@@ -664,7 +718,7 @@ let rec rounds_all! base s items depth = {
                  remaining.[mi => list.drop (list.length calls) mine]]
             }
         }) [[], pool] punched;
-        rounds_all! base state (list.reverse (list.head filled)) (depth + 1)
+        rounds_all! base state opened (list.reverse (list.head filled)) (depth + 1)
     }
 };
 
@@ -676,9 +730,11 @@ let put_base b s = core.map_put s :base b;
 /// `with_new_items` for the reason `apply_items` gives: what a transformer
 /// hands back may name `core` where the source did not.
 let expand_item! base s mi i item = {
-    let result = rounds! base s mi item 0;
+    let result = rounds! base s () mi item 0;
     strict! result
-    let [state, expanded] = result;
+    let [state, session, expanded] = result;
+    let spent = match session { () => (), handle => vm.close_image! handle };
+    strict! spent
     let current = modules.module_at (loader state) mi;
     put_loader (replace_module (loader state) mi
         (modules.with_new_items current
@@ -865,10 +921,15 @@ let expand_work! l work = {
         let staged = list.nth 1 staging;
         let declaring = phase! (list.head staging) :snapshot (scope.declare! staged);
         let snapshot = [list.head declaring,
-                        %{ :loader => staged, :declared => list.nth 1 declaring }];
-        let batched = rounds_all! (list.nth 1 snapshot) (list.head snapshot) found 0;
+                        %{ :loader => staged, :declared => list.nth 1 declaring,
+                           :roots => transformer_roots l }];
+        let batched = rounds_all! (list.nth 1 snapshot) (list.head snapshot) () found 0;
         strict! batched
         let state = list.head batched;
+        // One image served every round of the whole program; this is where it
+        // stops being needed.
+        let spent = match list.nth 1 batched { () => (), handle => vm.close_image! handle };
+        strict! spent
         // Nothing complained, so one snapshot answered for the whole program
         // and the batch is the answer. Otherwise a declaration wanted
         // something the shared snapshot did not have, or genuinely failed,
@@ -881,7 +942,7 @@ let expand_work! l work = {
         // reader is looking at two of them. Both come out of one call, because
         // `sequential!` is impure and asking it twice would expand twice.
         let outcome = if complaints state == list.length (modules.diags l) {
-                [state, apply_items (loader state) (list.nth 1 batched)]
+                [state, apply_items (loader state) (list.nth 2 batched)]
             } else {
                 let seq = sequential! l;
                 [counted (put_meter (merge_meter (meter_of state) (meter_of seq)) state)

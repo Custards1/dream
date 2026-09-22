@@ -1949,8 +1949,14 @@ let shared_stub p = {
      ()]
 };
 
-/// Resolve the bodies reachable from the declarations queued at `from` onward,
-/// and stub the rest.
+/// Which queued body a declaration is, by where it was written.
+///
+/// A span offset alone does not say which declaration: a file is several
+/// modules and two files have offsets in common, so the source index goes in
+/// front of it -- the same shape `ref_key` uses for the same reason.
+let root_key source start = source * 4294967296 + start;
+
+/// Resolve the bodies reachable from `roots`, and stub the rest.
 ///
 /// Macro expansion needs the whole program's *names* -- a transformer may call
 /// anything the module it is written in can see -- but it does not need the
@@ -1967,9 +1973,14 @@ let shared_stub p = {
 /// edge; anything else -- a builtin, a host member, a parameter, a local -- is
 /// not a body and cannot be one.
 ///
-/// `from` 0 makes every declaration a root, which is the whole program and is
-/// how the fallback path asks for one.
-let resolve_reachable! l declared from = {
+/// `roots` is a map of `root_key`, or `()` for every declaration -- which is
+/// the whole program, and is how the fallback path asks for one. The roots
+/// used to be an *index*: the bodies queued after a point, which were the
+/// wrappers a round of expansion had just declared. That tied what the image
+/// held to which macros this round happened to call, and so to the program
+/// rather than to the package it came from. Naming the roots by where they
+/// were written is what lets expansion say "the transformers" instead.
+let resolve_reachable! l declared roots = {
     let es = envs declared;
     let all = pending declared;
     let queued = list.zip (list.range 0 (list.length all)) all;
@@ -2002,7 +2013,13 @@ let resolve_reachable! l declared from = {
                 walk (deps + rest) (seen.[i => true]) checked merged
             },
     };
-    let [walked, seen] = walk (list.drop from queued) %{} initial %{};
+    let rooted = match roots {
+        () => queued,
+        picked => list.filter (fn [_, p] ->
+            core.map_has picked (root_key (list.nth 1 p)
+                                          (ast.span_start (decl_span (list.nth 2 p))))) queued,
+    };
+    let [walked, seen] = walk rooted %{} initial %{};
     let missing = list.filter (fn [i, _] -> not (core.map_has seen i)) queued;
     // Which globals the stub is answering for. `resolve_from!` fills a
     // function global's target from the body that was queued for it and leaves
@@ -2030,6 +2047,27 @@ let resolve_reachable! l declared from = {
                 }) (r_global_recs resolved))
         },
     }
+};
+
+/// Resolve these bodies for what their names mean, and nothing else.
+///
+/// Expansion asks one question of the resolver that is not about compiling
+/// anything: what does the name after an `expand` refer to? It asks it the
+/// only way that cannot drift from what the compiler would answer -- by
+/// building a declaration whose body *is* those names and resolving it, so
+/// that an alias, a selective import, a shadowed global and a renamed module
+/// all mean here exactly what they mean everywhere else.
+///
+/// That declaration used to be declared as a global and resolved with the
+/// transformers, which put it in the macro image: a few nodes, but enough to
+/// make the image a function of *this round's calls* rather than of the
+/// package the transformers came from. It is resolved on its own now and
+/// thrown away -- the caller wants `refs` and `r_diags` and nothing else, so
+/// there is no global to declare and no body to lower.
+let resolve_names! l declared ps = {
+    let initial = (resolver (envs declared)).[:imports => s_imports declared]
+        .[:module_recs => s_module_recs declared].[:diags => diags declared];
+    list.fold (fn acc p -> check_body l p acc) initial ps
 };
 
 /// Resolve the newly-declared part of a program on top of a carried resolution.
