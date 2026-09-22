@@ -75,6 +75,29 @@ let rec mentions_name target e =
              else { false },
     };
 
+/// Can a file whose source reads like this possibly contain a use of `core`?
+///
+/// A gate in front of the walk above, and the only reason it is worth having is
+/// that it is exact in the direction that costs: every `[:name, "core", _]` was
+/// lexed from an identifier spelled `core`, so text without those four bytes
+/// anywhere in it cannot produce one, and the answer is `false` without reading
+/// a single node. The converse is not exact -- `x.core`, `mod core`, a comment,
+/// a string literal all match the bytes and none is a use -- which is why this
+/// only ever *skips* the walk and never stands in for it. Both callers spell
+/// that as `&&`.
+///
+/// It is worth having because the expensive case and the common case are
+/// opposites. `list.any` stops at the first declaration that mentions `core`,
+/// and every module of this compiler names it in its first few lines, so the
+/// walk is free here and complete -- every node of every declaration -- for a
+/// module that never touches it. That is the module this gate answers in one
+/// machine scan of the file: 9.2% of the compile of a 3,200-declaration program
+/// that uses `std.list` and nothing else, and nothing at all of a self-compile.
+/// See "Declaring a program was mostly a search for the word `core`" in
+/// CLAUDE.md for how the walk came to be asked once, and why asking it once
+/// still was not cheap enough.
+let text_may_mention_core text = str.contains_str "core" text;
+
 let item_mentions_core item =
     match item {
         [:let, _, _, body, _, _] => mentions_name "core" body,
@@ -700,7 +723,7 @@ let rec load_file! l file name at from_source =
 /// The submodule shares the parent's source file, so its diagnostics point at
 /// the right lines. It is deliberately *not* recorded by path: identity there
 /// is the file, and the file already belongs to the parent.
-let rec hoist_mod! l parent source m =
+let rec hoist_mod! l parent source may m =
     match m {
         [:mod, child, items, span] => {
             let full = parent + "." + child;
@@ -715,7 +738,7 @@ let rec hoist_mod! l parent source m =
                 let nested = list.fold (fn acc item ->
                     match item {
                         [:mod, _, _, _] => {
-                            let done = hoist_mod! (list.head acc) full source item;
+                            let done = hoist_mod! (list.head acc) full source may item;
                             [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                         },
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
@@ -723,7 +746,8 @@ let rec hoist_mod! l parent source m =
                 let inner_items = list.nth 1 nested;
                 // One walk for the two readers below: the dependency list, and
                 // the record. Neither forces it unless it gets that far.
-                let mentions = list.any (fn item -> item_mentions_core item) inner_items;
+                let mentions = may
+                    && list.any (fn item -> item_mentions_core item) inner_items;
 
                 // A submodule may import, so follow those before it is recorded.
                 let followed = list.fold (fn acc d -> {
@@ -755,15 +779,15 @@ let rec load_text! l text display name file = {
     // the change is about that same buffer.
     match core.map_get (parsed l) file () {
         [same, result] => {
-            if same == text { load_items! read source result display name file }
+            if same == text { load_items! read source result display name file text }
             else {
                 let parsed = parser.parse_module text;
-                load_items! (put_parsed file [text, parsed] read) source parsed display name file
+                load_items! (put_parsed file [text, parsed] read) source parsed display name file text
             }
         },
         _ => {
             let parsed = parser.parse_module text;
-            load_items! (put_parsed file [text, parsed] read) source parsed display name file
+            load_items! (put_parsed file [text, parsed] read) source parsed display name file text
         },
     }
 };
@@ -773,10 +797,14 @@ let rec load_text! l text display name file = {
 /// sites]` or `[:error, message, span]`. `source` is the file's index in the
 /// loader's table, counted before this file is added -- a file shares a source
 /// with the submodules written inside it, which means the pre-add count.
-let load_items! l source parsed display name file = {
+let load_items! l source parsed display name file text = {
     match parsed {
         [:error, message, span] => complain span message source l,
         [:ok, items, sites] => {
+            // One machine scan of the file, in front of every `core` walk this
+            // module and its submodules would otherwise do. Lazy, so a module
+            // whose question is settled another way never even scans.
+            let may = text_may_mention_core text;
             // Resolve `when` before anything else looks at the module.
             let kept = expand_items (config_of l) items;
             let noted = note_records name items (note_expanding source sites l);
@@ -789,15 +817,19 @@ let load_items! l source parsed display name file = {
             let hoisted = list.fold (fn acc item ->
                 match item {
                     [:mod, _, _, _] => {
-                        let done = hoist_mod! (list.head acc) name source item;
+                        let done = hoist_mod! (list.head acc) name source may item;
                         [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                     },
                     other => [list.head acc, list.append (list.nth 1 acc) [other]],
                 }) [enter name noted, []] kept;
             let items_out = list.nth 1 hoisted;
             // As in `hoist_mod!`: asked once, read by the dependency list and
-            // by the record, forced by whichever of them gets there first.
-            let mentions = list.any (fn item -> item_mentions_core item) items_out;
+            // by the record, forced by whichever of them gets there first --
+            // and only asked at all when the file's own bytes say it could be
+            // true. A submodule is written inside this file, so the same answer
+            // gates its walk too.
+            let mentions = may
+                && list.any (fn item -> item_mentions_core item) items_out;
 
             // Follow this module's own imports before recording it, so the
             // module list comes out with dependencies first.
@@ -1003,6 +1035,24 @@ when test {
 
     let items_of src = match parser.parse_module src { [:ok, items, _] => items, _ => [] };
 
+    // The gate and the walk it stands in front of, as a pair, so that the
+    // direction of the implication is visible in every case below.
+    let gate_and_walk src =
+        [text_may_mention_core src,
+         list.any (fn i -> item_mentions_core i) (expand_items on (items_of src))];
+
+    // The same pair, asked of the declarations a record generates. A record
+    // becomes a `mod`, and `hoist_mod!` walks a submodule's items under the
+    // *parent* file's gate answer, so the generated bodies are covered by the
+    // bytes of the file the record was written in and by nothing else.
+    let gate_and_inner src =
+        [text_may_mention_core src,
+         list.any (fn item ->
+             match item {
+                 [:mod, _, inner, _] => list.any (fn i -> item_mentions_core i) inner,
+                 i => item_mentions_core i,
+             }) (expand_items on (items_of src))];
+
     let tests = [
         // --- names ---
         test.case "a dotted path is its segments"
@@ -1047,6 +1097,29 @@ when test {
             $( test.eq! [] (natives (from_text! config.empty "when test { import std.console; }")) ),
         test.case "an import inside a when that holds is"
             $( test.eq! ["std.console"] (natives (from_text! on "when test { import std.console; }")) ),
+
+        // --- the gate in front of the `core` walk ---
+        //
+        // What has to hold is an implication and not an equality. The gate may
+        // say `true` of a file that turns out not to use `core`, because it
+        // reads bytes and not nodes; it must never say `false` of one that
+        // does, because `false` is what skips the walk. Each case states both
+        // answers, and the ones that would be a bug are those whose second
+        // answer is `true` and whose first is not.
+        test.case "a use of `core` is seen by the gate and by the walk"
+            $( test.eq! [true, true] (gate_and_walk "let f x = core.head x;") ),
+        test.case "a file that never spells `core` is answered without a walk"
+            $( test.eq! [false, false] (gate_and_walk "let f x = x + 1;") ),
+        test.case "a field named `core` is not a use, and the gate may say so wrongly"
+            $( test.eq! [true, false] (gate_and_walk "let f x = x.core;") ),
+        // This is the one that would rot silently. `syntax.record` invents
+        // declarations, and it reads and writes fields with the `get` and `set`
+        // opcodes rather than through `core`; if that ever changed, a file with
+        // a record and no `core` in its bytes would have its walk skipped.
+        test.case "a record's generated declarations do not name `core`"
+            $( test.eq! [false, false] (gate_and_inner "group Point { x, y }") ),
+        test.case "a record whose field is named `core` is spelled in the source"
+            $( test.eq! true (list.head (gate_and_inner "group P { core }")) ),
 
         // --- what a module depends on ---
         test.case "imports and derives are both dependencies"

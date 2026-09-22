@@ -104,6 +104,37 @@ struct ModuleDef {
     const NativeDef* find(const StringRef& member) const;
 };
 
+class Runtime;
+
+/// An image loaded once and kept, so that something can be called in it more
+/// than once.
+///
+/// Compile-time evaluation used to mean one runtime per answer: `eval_image!`
+/// builds a `Runtime`, loads an image, runs its entry point and throws all
+/// three away. That is the right shape for `comp`, where the image *is* the
+/// expression and there is nothing to keep. It is the wrong one for macro
+/// expansion, where the same transformers are asked the same questions with
+/// different arguments, and the only reason the image was rebuilt each time is
+/// that the arguments were quoted into it.
+///
+/// A session is the other half of that: the image stays, and the arguments
+/// arrive as values. What Dream holds is an integer naming a slot in the
+/// runtime that opened it -- deliberately not a heap object, because the
+/// thing named is a whole runtime with a heap and a scheduler of its own, and
+/// making its lifetime depend on a collector is how one ends up freed while a
+/// process inside it is running.
+struct ImageSession {
+    /// The image bytes, owned here. `Image::load_bytes` *borrows* what it is
+    /// given -- an image is read where it lies, which is the whole reason
+    /// loading is O(1) -- so the caller's string going out of scope would
+    /// leave every node record pointing at freed memory.
+    std::string bytes;
+    std::unique_ptr<Runtime> runtime;
+
+    ImageSession();
+    ~ImageSession();
+};
+
 class Runtime {
 public:
     // An embedded evaluation borrows the enclosing runtime's host services.
@@ -196,6 +227,21 @@ public:
     Scheduler* scheduler() { return scheduler_; }
     void set_scheduler(Scheduler* s) { scheduler_ = s; }
 
+    // --- compile-time sessions ---
+    //
+    // See `ImageSession`. These are owned by the runtime that opened them
+    // rather than by any process, and the destructor closes whatever is left:
+    // a compile that raises must not leak a runtime, and there is no path out
+    // of a compile that does not pass through here.
+
+    /// Keep `session` and answer the handle that names it. Handles are never
+    /// reused, so a stale one is an error rather than someone else's session.
+    uint64_t open_session(std::unique_ptr<ImageSession> session);
+    /// The session a handle names, or null when it names none.
+    ImageSession* session(uint64_t handle) const;
+    /// Forget a session and free it. False when the handle named none.
+    bool close_session(uint64_t handle);
+
     // --- the profile ---
     //
     // Where a program's time goes, counted in reductions and attributed to the
@@ -284,6 +330,11 @@ private:
     uint64_t next_pid_ = 1;
 
     std::vector<std::string> program_args_;
+
+    mutable std::mutex sessions_mutex_;
+    std::unordered_map<uint64_t, std::unique_ptr<ImageSession>> sessions_;
+    uint64_t next_session_ = 1;
+
     Scheduler* scheduler_ = nullptr;
     std::vector<std::atomic<const ModuleDef*>> import_defs_;
     std::vector<std::atomic<uint64_t>> field_cache_;

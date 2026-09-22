@@ -218,7 +218,21 @@ void Runtime::print_stats() const {
     }
 }
 
+ImageSession::ImageSession() = default;
+/// Out of line because `runtime` is a `unique_ptr` to a type that is still
+/// incomplete where the struct is declared -- `ImageSession` is named by
+/// `Runtime` and names it back.
+ImageSession::~ImageSession() = default;
+
 Runtime::~Runtime() {
+    // A session owns a whole runtime, so leaving one open leaks an image, a
+    // heap and an atom table. Nothing else closes them: the compiler closes
+    // the sessions it opened, but a compile that raises does not get that
+    // far, and there is no path out of a process that does not come here.
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        sessions_.clear();
+    }
     // Stop the poller before the scheduler it wakes into can go away, and
     // close whatever descriptors the program left open.
     // A `comp!` or macro VM must leave its caller's handles and jobs alive.
@@ -226,6 +240,34 @@ Runtime::~Runtime() {
         io_shutdown();
         os_shutdown();
     }
+}
+
+uint64_t Runtime::open_session(std::unique_ptr<ImageSession> session) {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    uint64_t handle = next_session_++;
+    sessions_.emplace(handle, std::move(session));
+    return handle;
+}
+
+ImageSession* Runtime::session(uint64_t handle) const {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    auto it = sessions_.find(handle);
+    return it == sessions_.end() ? nullptr : it->second.get();
+}
+
+bool Runtime::close_session(uint64_t handle) {
+    std::unique_ptr<ImageSession> held;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        auto it = sessions_.find(handle);
+        if (it == sessions_.end()) return false;
+        // Moved out and freed with the lock dropped: tearing down a runtime
+        // stops a scheduler, and holding a mutex across that is how a
+        // deadlock is written.
+        held = std::move(it->second);
+        sessions_.erase(it);
+    }
+    return true;
 }
 
 bool Runtime::load_image_file(const std::string& path, std::string& error) {

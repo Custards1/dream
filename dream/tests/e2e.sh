@@ -245,6 +245,127 @@ else
   fail=$((fail + 1))
 fi
 
+# --- compile-time sessions --------------------------------------------------
+#
+# `vm.open_image!` loads an image and keeps it; `vm.call_image!` calls a named
+# global in it with ordinary values; `vm.close_image!` frees it. Its own block
+# rather than a program in the loop above because it takes *two* compiles: the
+# point of the feature is one image calling into another.
+#
+# What it is for is macro expansion, which until now answered a transformer by
+# compiling the whole program with the call quoted into it. An image that can
+# be called is an image that can be kept, which is what makes a transformer a
+# library rather than a program written for the occasion.
+#
+# Everything here imports host modules only. These programs are compiled with
+# no package path, so `std.list` and `std.str` -- which are Dream source in
+# `mind/std` -- are not reachable, and the library deliberately imports nothing
+# at all.
+
+session_dir="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$shebang_src" "$payload_dir" "$session_dir"' EXIT
+
+cat > "$session_dir/lib.dr" <<'EOF'
+// A library: no `main!`, nothing imported, nothing to run. What a caller
+// reaches is a global, by the name of its module and its own.
+let twice x = x + x;
+let greet name = "hello " + name;
+let pair a b = [a, b];
+let boom x = x / 0;
+// A pure nullary global is a value, so naming this one hands back `twice`
+// and the arguments apply to what comes back. A transformer reached through
+// an alias is exactly this shape.
+let alias = twice;
+
+mod inner {
+    // Same name as a global of the outer module, so a lookup that ignored
+    // which module it was asked about could answer with the wrong one.
+    let twice x = x + x + 1;
+}
+EOF
+
+cat > "$session_dir/caller.dr" <<'EOF'
+import std.console;
+import std.io;
+import std.vm;
+
+let rec read_all! h acc = {
+    let chunk = io.read! h 65536;
+    if len chunk == 0 { acc } else { read_all! h (acc + chunk) }
+};
+
+let main! = {
+    let bytes = read_all! (io.stdin! ()) "";
+    let s = vm.open_image! bytes;
+    // The same session, asked four times: what an image costs is loading it,
+    // and a session is that cost paid once.
+    console.print! (vm.call_image! s "lib" "twice" [21])
+    console.print! (vm.call_image! s "lib" "greet" ["world"])
+    console.print! (vm.call_image! s "lib" "twice" [1000])
+    // Nested data crosses in both directions, by the same rule that governs
+    // what `eval_image!` brings back.
+    console.print! (vm.call_image! s "lib" "pair" [[:a, 1], %{ :k => "v" }])
+    // A nullary global naming a function, applied to an argument anyway.
+    console.print! (vm.call_image! s "lib" "alias" [7])
+    // A module is part of the name. `inner.twice` is a different function.
+    console.print! (vm.call_image! s "lib.inner" "twice" [21])
+    // A transformer that raises is a failure of the call, not of the caller.
+    console.print! (try! { vm.call_image! s "lib" "boom" [1] } catch e { type_of e })
+    // A name the image does not have says so rather than calling something else.
+    console.print! (try! { vm.call_image! s "lib" "absent" [1] } catch e { type_of e })
+    // Closing answers whether the handle named anything, so closing twice is
+    // not an error -- a compile that failed partway is entitled to close what
+    // it thinks it opened without working out how far it got.
+    console.print! (vm.close_image! s)
+    console.print! (vm.close_image! s)
+    // A handle that is no longer open names nothing, rather than someone else.
+    console.print! (try! { vm.call_image! s "lib" "twice" [1] } catch e { type_of e })
+};
+EOF
+
+cat > "$session_dir/expected" <<'EOF'
+42
+hello world
+2000
+[[:a, 1], %{:k => "v"}]
+14
+43
+:error
+:error
+true
+false
+:error
+EOF
+
+if ! "${compile[@]}" "$session_dir/lib.dr" -o "$session_dir/lib.dream" \
+       >"$session_dir/compile" 2>&1; then
+  echo "FAIL session (could not compile the library)"
+  sed 's/^/    /' "$session_dir/compile"
+  fail=$((fail + 1))
+elif ! "${compile[@]}" "$session_dir/caller.dr" -o "$session_dir/caller.dream" \
+       >"$session_dir/compile" 2>&1; then
+  echo "FAIL session (could not compile the caller)"
+  sed 's/^/    /' "$session_dir/compile"
+  fail=$((fail + 1))
+else
+  # The library is handed over on stdin rather than by a path the program
+  # spells, so the test does not depend on where the temporary directory is.
+  jit_out="$("$dream" "$session_dir/caller.dream" < "$session_dir/lib.dream" 2>&1)"
+  int_out="$("$dream" --no-jit "$session_dir/caller.dream" < "$session_dir/lib.dream" 2>&1)"
+  if [[ "$jit_out" != "$int_out" ]]; then
+    echo "FAIL session (the two tiers disagree)"
+    diff <(printf '%s\n' "$int_out") <(printf '%s\n' "$jit_out") | sed 's/^/    /'
+    fail=$((fail + 1))
+  elif ! diff -q <(printf '%s\n' "$jit_out") "$session_dir/expected" >/dev/null; then
+    echo "FAIL session (output)"
+    diff "$session_dir/expected" <(printf '%s\n' "$jit_out") | sed 's/^/    /'
+    fail=$((fail + 1))
+  else
+    echo "ok   session"
+    pass=$((pass + 1))
+  fi
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

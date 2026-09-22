@@ -1602,11 +1602,125 @@ Every image in the repository is byte-identical, `mind/std/all.dr --test`
 excepted for a reason that is not this change -- the section below -- and the
 bootstrap reaches a fixpoint in one stage.
 
+A gate sits in front of the walk that remains, and it is worth knowing about
+before reading `item_mentions_core`: `modules.text_may_mention_core` asks
+whether the file's *bytes* contain `core` at all, which is one machine scan and
+is exact in the direction that costs -- every `[:name, "core", _]` was lexed
+from an identifier spelled `core`, so text without those four bytes cannot
+produce one. It only ever skips the walk; the converse (`x.core`, a comment, a
+string) is not a use, which is why both callers spell it as `&&`.
+
 **What it leaves.** `snapshot` is 51 ms of a 3,200-declaration compile's 99 ms
 tax and 93 of 184 at 6,400: still the largest phase, still linear, and now
 actually what its name says -- a name declared, numbered and recorded, about 16
 microseconds each. The macro tax as a whole is 2.7% of that compile where it
 was 6.8%.
+
+### The image was the calls, and now it is the transformers
+
+**The finding, which is about what an image is for.** Three rounds of work
+above got the macro image down from one per call to one per round, and each
+time the thing being removed was a *rebuild*. None of them asked why the image
+had to be rebuilt at all, and the answer was in `call_body`: a call was turned
+into an **expression** -- the macro's name applied to its arguments, each
+argument quoted into the code that reconstructs it -- and a wrapper around that
+expression was compiled and run. So the arguments were *in* the image. An image
+carrying the arguments can answer one round of one program and nothing else,
+and that is what made "one image per round" the floor rather than "one image".
+
+The arguments were already values. Quoting them into a program so that running
+the program would rebuild them was a way of getting data across a boundary that
+had no other way across -- `vm.eval_image!` runs an entry point and takes no
+arguments. So the boundary grew one: `vm.open_image!` loads an image and keeps
+it, `vm.call_image!` enters `module.member` in it with arguments that cross as
+data, `vm.close_image!` frees it (see "Compile-time evaluation" in
+[docs/builtins.md](docs/builtins.md)). The image is a **library** now, not a
+program written for the occasion.
+
+A wrapper is still declared and is still what the reachability walk starts from
+and what the resolver answers "which macro is this?" about -- nothing here
+re-implements name lookup, which is the mistake that would make it subtly wrong
+in the cases nobody writes a test for. Its body is just the names.
+
+`dreams --time` on `mind/std/all.dr --test`, which is the macro-heavy build --
+55 calls in two rounds:
+
+| | declare | resolve | lower | emit | run | tax | image |
+|---|---|---|---|---|---|---|---|
+| the call, compiled in | 19 ms | 41 | 59 | 32 | 8 | 202 ms | 122 KB |
+| the call, passed in | **0 ms** | **31** | **35** | **10** | 13 | **133 ms** | **88 KB** |
+
+and on a self-compile, 14 calls in one round, 194 ms -> **147**, with the image
+80 KB -> **63 KB** and the same columns moving: `declare` 24 -> 15, `lower`
+22 -> 13, `emit` 27 -> **4**. Whole compiles of the std build, alternating
+against the same VM running the committed compiler: 2178/2268/2226 ms against
+**2162/2176/2164**, the new build faster in all three -- which is what a 68 ms
+saving on a 2.2 s compile should look like, and is below what this machine can
+resolve on the self-compile, where the tax is 3% of the whole.
+
+**Read the `run` column, because it is the one that went up.** A batch was one
+entry and one result, so a module's calls shared a VM start; a session makes one
+call, so the std build does 55 starts where it did 2, and that is 5 ms. It buys
+back three times its cost in `emit` alone, and it buys something that is not
+milliseconds -- see the next paragraph -- but it is linear in *calls* where
+everything it replaced was linear in the *program*, so a program with thousands
+of macro calls would want them batched again. The place for that is a
+`call_image!` taking a list of calls rather than one: a start is a `Scheduler`,
+a worker thread and a process, and the image is already loaded.
+
+**A failing call is now the call that failed.** This is the part worth having
+even at equal cost. A batch says only that *something* in it raised, so the
+answer was to throw it away and run its calls one at a time, where the wrapper
+*was* the call and the diagnostic was the one it gave before batching existed --
+which meant compiling the program again to find out which line was wrong. A
+session makes one call, so there is nothing to attribute. What survives is the
+retry that was never about attribution: a call may fail because the shared
+snapshot has gone stale, which only the whole program can rule out, so a failure
+is asked once more with every declaration a root (`:whole`) and a failure that
+repeats there is the real one and is reported where it is written.
+`dreams/tests/macros.py`'s 47 cases are what hold that.
+
+**One thing the snapshot image did not have and now needs.** `lower_program`
+links funcs, globals and imports; the module table is built by `link!`, which
+only the real compile calls -- so the macro image had no `MODS` section at all.
+That did not matter when the entry point was patched into the header by index,
+and it is fatal when a member is found by the name of its module and its own:
+the image loads, runs, and has no member of any name. `MODS` is the only
+statement in the container of which globals are whose, and a global's name is
+not unique in one -- two modules may each declare `helper`. See
+`invocation_image` in [dreams/expand.dr](dreams/expand.dr).
+
+**What the images did.** `dreams` changes, because its own source did. `lucid`,
+`mind` and a generated 3,200-declaration program are byte-identical, and the
+bootstrap reaches a fixpoint in one stage. `mind/std/all.dr --test` moves by
+**12 bytes**, and they are not the 6 the section below is about: three
+`<lambda>` function records' `span_start` and `span_end`, all of them above
+2^31, which is the reserved part of the offset space expansion hands generated
+code out of. The wrapper is smaller, so it consumes fewer offsets, so everything
+generated after it shifts by the same 3,380. Check that the same way it was
+checked here -- decode the differing offsets against the section table and the
+`FUNC` stride rather than arguing about them.
+
+**Where this leaves `.libdream`.** The session is the VM half of "a transformer
+library loaded once for the session and called with syntax values", which
+[dreams/TODO.md](dreams/TODO.md) has as the pairing for separate compilation's
+smallest version. The half that is left is the *roots*: this image is still
+lowered from the staged whole program, so it still costs a name declared and a
+global emitted per declaration, and it is still thrown away at the end of the
+round. Making it a function of the dependency package rather than of the
+program is what makes it cacheable, and that is where the remaining tax is --
+not in the calls, which now cost nothing to make.
+
+**And one thing that was found by measuring rather than looked for.**
+`discover` -- "is there anything to expand?" -- is now the *largest* phase of a
+self-compile's macro tax, 48 ms of 147, where `snapshot` is 25. It is **0 ms on
+a 3,200-declaration generated program**, which is the opposite shape to
+everything else in these notes: the lexer records where the word `expand`
+appears, so a module with no sites costs nothing at all, and what is left is
+per item of a module that *has* one. `dreams` writes its macro calls in
+`lower.dr` and `scope.dr`, its two largest modules, so it pays for all of both
+to find eighteen one-line calls. [dreams/TODO.md](dreams/TODO.md) has the rest
+of it.
 
 ### `mind/std/all.dr --test` is not byte-stable across compiler changes
 

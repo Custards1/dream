@@ -1224,6 +1224,9 @@ NativeResult vm_stats(Process& p, Value, Value*, uint32_t) {
 /// Defined further down, next to the error helpers they need.
 NativeResult vm_eval_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_host_members(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_open_image(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_call_image(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_close_image(Process& p, Value self, Value* args, uint32_t n);
 }  // namespace
 
 ModuleDef make_vm_module() {
@@ -1243,6 +1246,10 @@ ModuleDef make_vm_module() {
                          {"io!", 1, 0b1, vm_io},
                          {"dump!", 1, 0b1, vm_dump},
                          {"eval_image!", 1, 0b1, vm_eval_image},
+                         // An image kept open and called into; see `ImageSession`.
+                         {"open_image!", 1, 0b1, vm_open_image},
+                         {"call_image!", 4, 0b1111, vm_call_image, 0, true},
+                         {"close_image!", 1, 0b1, vm_close_image},
                          // measuring
                          {"now_ns!", 1, 0b1, vm_now_ns},
                          {"wall_ms!", 1, 0b1, vm_wall_ms},
@@ -1453,6 +1460,36 @@ NativeResult comp_fail(Process& p, const char* kind, const std::string& message)
     return NativeResult::raise(raise_error(p, p.runtime().intern_atom(kind), message));
 }
 
+/// Run a process that has already been primed, and bring its answer across.
+///
+/// Shared by `eval_image!` and `call_image!` because all that separates them
+/// is what gets primed -- an image's entry point with no arguments, or a
+/// named global with some. Everything after that is the definition of what a
+/// compile-time answer *is*: run it to completion, force it all the way down,
+/// and copy the data into the heap that asked. There should be one of that,
+/// not two that drift.
+NativeResult run_compile_time(Process& p, Runtime& rt, Scheduler& sched,
+                              const std::shared_ptr<Process>& root) {
+    sched.start();
+    sched.enqueue(root);
+    bool clean = sched.wait_for_all();
+    sched.stop();
+
+    if (root->failed || !clean) {
+        return comp_fail(p, "comp_failed", "the compile-time expression failed");
+    }
+    Value deep;
+    if (!force_deep(*root, root->exit_value, &deep)) {
+        return comp_fail(p, "comp_failed", "the compile-time expression raised");
+    }
+    Value imported;
+    if (!import_across(p, rt, deep, &imported, 0)) {
+        return comp_fail(p, "comp_failed",
+                    "a compile-time expression must produce data, not a function or a process");
+    }
+    return NativeResult::ok(imported);
+}
+
 NativeResult vm_eval_image(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_obj(v, ObjType::Str)) return type_fail(p, "eval_image! needs an image as a string");
@@ -1474,24 +1511,157 @@ NativeResult vm_eval_image(Process& p, Value, Value* args, uint32_t) {
     auto root = sched.create_process();
     Value cl = root->heap().make_closure(func, 0);
     prime_apply(*root, cl, 0);
-    sched.start();
-    sched.enqueue(root);
-    bool clean = sched.wait_for_all();
-    sched.stop();
+    return run_compile_time(p, rt, sched, root);
+}
 
-    if (root->failed || !clean) {
-        return comp_fail(p, "comp_failed", "the compile-time expression failed");
+/// Load an image and keep it, answering the handle that names it.
+///
+/// The counterpart of `eval_image!` for the caller that has one image and
+/// many questions. See `ImageSession` in dream/src/runtime.hpp for why the
+/// handle is an integer rather than an object, and `close_image!` below for
+/// what has to happen to it.
+NativeResult vm_open_image(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::Str)) return type_fail(p, "open_image! needs an image as a string");
+    auto* s = static_cast<StrObj*>(as_obj(v));
+
+    auto session = std::make_unique<ImageSession>();
+    // Copied before it is loaded, and kept for as long as the session is:
+    // the image is read where it lies, so these bytes *are* the program.
+    session->bytes.assign(s->data(), s->len);
+    session->runtime = std::make_unique<Runtime>(/*owns_host_services=*/false);
+    std::string message;
+    if (!session->runtime->load_image_bytes(
+            reinterpret_cast<const uint8_t*>(session->bytes.data()), session->bytes.size(),
+            message)) {
+        return comp_fail(p, "bad_image", message);
     }
-    Value deep;
-    if (!force_deep(*root, root->exit_value, &deep)) {
-        return comp_fail(p, "comp_failed", "the compile-time expression raised");
+    return NativeResult::ok(
+        make_integer(p, int64_t(p.runtime().open_session(std::move(session)))));
+}
+
+/// The `FUNC` index of the global `module.name` names, or `NO_NODE`.
+///
+/// Qualified by module because a global's name is not unique in an image: two
+/// modules may each declare `helper`, and a caller that asked by bare name
+/// would get whichever was written first. `MODS` is what makes the question
+/// answerable at all -- a module record owns a contiguous range of `GLBL`,
+/// which is the only statement in the container of which globals are whose.
+uint32_t global_in_module(const Image& img, const std::string& module_name,
+                          const std::string& name) {
+    for (uint32_t mi = 0; mi < img.module_count(); ++mi) {
+        const ModuleRec& m = img.module(mi);
+        StringRef mn = img.str(m.name);
+        if (mn.len != module_name.size() ||
+            std::memcmp(mn.data, module_name.data(), mn.len) != 0) {
+            continue;
+        }
+        for (uint32_t i = m.globals_start; i < m.globals_start + m.globals_count; ++i) {
+            const GlobalRec& g = img.global(i);
+            if (g.kind != GLOBAL_FUNCTION) continue;
+            StringRef gn = img.str(g.name);
+            if (gn.len == name.size() && std::memcmp(gn.data, name.data(), gn.len) == 0) {
+                return g.target;
+            }
+        }
     }
-    Value imported;
-    if (!import_across(p, rt, deep, &imported, 0)) {
-        return comp_fail(p, "comp_failed",
-                    "a compile-time expression must produce data, not a function or a process");
+    return NO_NODE;
+}
+
+/// Call `module.name` in an open session, with `args`, and answer what it
+/// produced.
+///
+/// This is what lets an image be a *library* rather than an expression. The
+/// arguments cross the runtime boundary as data, by the same rule that governs
+/// what comes back -- `import_across` -- which is why a macro can be handed
+/// syntax without the syntax being quoted into a program and compiled first.
+///
+/// Each call gets a scheduler and a process of its own and the session keeps
+/// neither. That is not a cost worth avoiding: what was expensive about
+/// `eval_image!` was building the image, not starting a process in it. It is
+/// also what keeps one call from seeing another's state, which is the only
+/// isolation guarantee a compiler can actually use.
+NativeResult vm_call_image(Process& p, Value, Value* args, uint32_t) {
+    if (!is_fixnum(resolve(args[0]))) return type_fail(p, "call_image! needs a session handle");
+
+    // Forced before anything else is read, and deeply, because `import_across`
+    // copies what it is shown and a lazy structure shows it a thunk. This is
+    // the one place in this native where the outer heap can collect -- forcing
+    // a caller's data is unbounded Dream work, which is what `VouchesForGc`
+    // says and why `strict!` says it -- so nothing may be held across it. The
+    // handle is a fixnum and the two names are re-read below, from `args`,
+    // which the collector rewrites in place.
+    Value argv;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[3], &argv)) return NativeResult::raise(p.result);
     }
-    return NativeResult::ok(imported);
+    if (argv != NIL && !is_obj(argv, ObjType::Cons)) {
+        return type_fail(p, "call_image! needs a list of arguments");
+    }
+
+    Value hv = resolve(args[0]);
+    Value mv = resolve(args[1]);
+    Value nv = resolve(args[2]);
+    if (!is_obj(mv, ObjType::Str) || !is_obj(nv, ObjType::Str)) {
+        return type_fail(p, "call_image! needs a module name and a member name");
+    }
+    int64_t handle = fixnum_value(hv);
+    ImageSession* session = handle < 0 ? nullptr : p.runtime().session(uint64_t(handle));
+    if (session == nullptr) return comp_fail(p, "bad_image", "no such open image");
+    Runtime& rt = *session->runtime;
+
+    std::string module_name(static_cast<StrObj*>(as_obj(mv))->data(),
+                            static_cast<StrObj*>(as_obj(mv))->len);
+    std::string name(static_cast<StrObj*>(as_obj(nv))->data(),
+                     static_cast<StrObj*>(as_obj(nv))->len);
+    uint32_t func = global_in_module(rt.image(), module_name, name);
+    if (func == NO_NODE || func >= rt.image().func_count()) {
+        return comp_fail(p, "bad_image", "the image has no " + module_name + "." + name);
+    }
+
+    Scheduler sched(rt, 1);
+    auto root = sched.create_process();
+
+    // Pushed as each arrives, because the inner process's value stack is what
+    // its collector walks: an argument held only in a C++ local while the next
+    // one is being built is a reference nothing can find. Nothing collects in
+    // the *outer* heap from here on -- the force above was the last of it --
+    // so walking `argv` a cell at a time is safe.
+    uint32_t argc = 0;
+    for (Value cur = argv; is_obj(cur, ObjType::Cons);
+         cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        Value crossed;
+        if (!import_across(*root, p.runtime(), static_cast<ConsObj*>(as_obj(cur))->head, &crossed,
+                           0)) {
+            return comp_fail(p, "comp_failed",
+                             "a compile-time argument must be data, not a function or a process");
+        }
+        root->stack.push_back(crossed);
+        ++argc;
+    }
+
+    // A global of arity 0 is a value, and `do_apply` applies the arguments to
+    // what it comes to -- so a transformer reached through an alias, which is
+    // what a pure nullary global naming another function is, still answers
+    // here. A saturated one enters directly.
+    Value cl = root->heap().make_closure(func, 0);
+    prime_apply(*root, cl, argc);
+    return run_compile_time(p, rt, sched, root);
+}
+
+/// Close a session, freeing its image, heap and atom table.
+///
+/// True when the handle named an open session. It is not an error to close one
+/// twice -- a compiler that fails partway is entitled to close what it thinks
+/// it opened without first working out how far it got -- and a handle is never
+/// reused, so a stale one can never name somebody else's session.
+NativeResult vm_close_image(Process& p, Value, Value* args, uint32_t) {
+    Value hv = resolve(args[0]);
+    if (!is_fixnum(hv)) return type_fail(p, "close_image! needs a session handle");
+    int64_t handle = fixnum_value(hv);
+    bool closed = handle >= 0 && p.runtime().close_session(uint64_t(handle));
+    return NativeResult::ok(make_bool(closed));
 }
 
 /// Decode one UTF-8 scalar starting at `i`, advancing it. Invalid bytes are

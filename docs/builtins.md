@@ -416,6 +416,45 @@ These report figures for the **calling** process.
 
 Process info map fields: `:id` · `:status` (`:runnable`, `:running`, `:waiting`, `:finished`, `:failed`) · `:waiting_on` (`:recv`, `:join`, `:io`, `:none`) · `:fd` · `:reductions` · `:heap_bytes` · `:collections` · `:mailbox` (count) · `:failed`
 
+### Compile-time evaluation
+
+A compiler written in the language it compiles has to *run* Dream to work out
+what a `comp` expression comes to or what a macro expands to, and the only
+thing that knows how to run Dream is the VM. These are how it asks. Each
+answer is produced in a runtime of its own — its own image, heap, atom table
+and scheduler — and crosses back as **data**: a closure, a process or an I/O
+handle cannot be a compile-time answer, and neither can be a compile-time
+argument.
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `eval_image!` | `string → value` | Load an image, run its entry point, and answer what it produced, forced all the way down. The runtime is discarded afterwards. |
+| `open_image!` | `string → integer` | Load an image and **keep** it, answering a handle that names it. |
+| `call_image!` | `integer → string → string → list → value` | Call `module.member` in an open image with the arguments in the list, and answer what it produced. |
+| `close_image!` | `integer → bool` | Free an open image. `false` when the handle named none; closing twice is not an error. |
+
+`eval_image!` is for one image and one question: the image *is* the expression.
+The other three are for one image and many questions — a package's macros,
+compiled once and then called — which is what keeps the arguments out of the
+image. Since the arguments are values rather than quoted code, nothing has to
+be recompiled per call.
+
+Handles are integers rather than objects on purpose: what one names is a whole
+runtime, and tying its lifetime to a collector is how it ends up freed while
+something inside it is running. Handles are never reused, so a stale one names
+nothing rather than someone else's image. Whatever a program leaves open is
+freed when its own runtime goes away.
+
+A member is named by its module *and* its own name, because a global's name is
+not unique in an image — two modules may each declare `helper`. A pure nullary
+global is a value, so naming one whose value is a function applies the
+arguments to what it comes to; that is what makes an alias callable.
+
+| Failure | When |
+|---|---|
+| `:bad_image` | the bytes are not a loadable image, the handle names no open image, or the image has no such member |
+| `:comp_failed` | the call raised or did not finish, or a value crossing either way is not data |
+
 ---
 
 ## `std.ffi`

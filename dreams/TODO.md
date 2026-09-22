@@ -85,27 +85,52 @@ is 51 ms of a 99 ms tax on a 3.7 s compile.
   when a macro discards an argument or never demands a dependency; a syntactic
   dependency alone must not force expansion or evaluation. Distinguish a missing
   staged dependency from a real macro exception instead of treating both as
-  `1 / 0` and recompiling the program to find out. Report the failing call once.
+  `1 / 0` and recompiling the program to find out.
 
-- [ ] **Radical option: a dedicated incremental compile-time VM.** Keep a
-  transformer executable loaded for the compilation session. Add reachable
-  functions incrementally and invoke a function directly with syntax values.
-  Eliminate generated wrapper ASTs, full `.dream` serialization, header patching,
-  and image reloads from the expansion loop. Prototype an in-memory module/call
-  API against the existing VM before considering a separate AST interpreter,
-  which would introduce a second implementation of Dream evaluation semantics.
-  Define GC ownership, exception cleanup, and state isolation explicitly; reuse
-  executable code without accidentally sharing per-call mutable execution state.
+  **"Report the failing call once" is done**, and it came free with the
+  session rather than from anything on this list. A batch had one result, so a
+  raise in it named no call and the program was compiled again to find out
+  which; one call per invocation attributes itself. What is left of the retry
+  is only the part this item is actually about -- telling a stale snapshot from
+  a real exception -- and it is still spelled as "run the round again with the
+  whole program a root". See "The image was the calls, and now it is the
+  transformers" in `CLAUDE.md`.
 
-  **Measured before building: its ceiling is 8%**, and that is the whole of why
-  it is no longer first. What it removes is `emit` and `run`, and on a
-  1,600-declaration program with one macro call those are 27 ms and 0 ms of a
-  306 ms tax; on a self-compile, 51 ms and 5 ms of 379. A fresh `Runtime`,
-  `Scheduler` and heap per call -- the thing this item is mostly written about
-  -- does not show up at all at these image sizes. Everything else a round
-  spends is telling the session what the transformer reaches, which a session
-  needs told exactly as much as an image does. Worth doing after the stub cost
-  below, and not before it.
+- [~] **Radical option: a dedicated incremental compile-time VM.** *Half
+  done.* The item said to "prototype an in-memory module/call API against the
+  existing VM before considering a separate AST interpreter", and that API now
+  exists and is what expansion runs on: `vm.open_image!`, `vm.call_image!`,
+  `vm.close_image!` (see "Compile-time evaluation" in
+  [docs/builtins.md](../docs/builtins.md), and "The image was the calls, and now
+  it is the transformers" in `CLAUDE.md`). Generated wrapper ASTs for the
+  *calls* are gone, header patching is gone from this path, and a call's
+  arguments cross as values rather than as quoted code. GC ownership is
+  explicit and is not the collector's: a handle is an integer naming a slot on
+  the runtime that opened it, handles are never reused, and whatever a compile
+  leaves open is freed with its runtime. Per-call state is not shared -- each
+  call gets a process and a scheduler of its own in the session's runtime.
+
+  **Its ceiling was measured at 8% and it beat that, because the measurement
+  was of the wrong thing.** What the phase meter said this would remove was
+  `emit` and `run`. What it actually removed was the *arguments from the
+  image*, which is `emit` (32 ms -> 10 on the std build) plus the `lower` and
+  `resolve` and `declare` of code that no longer exists: 202 ms -> 133 on
+  `mind/std/all.dr --test`, 194 -> 147 on a self-compile. The lesson is the
+  one this file keeps relearning from the other side -- a phase meter says
+  where the time is, not what a change will reach.
+
+  **What is left of this item** is the "incrementally" half: the image is still
+  built per round from the staged whole program and thrown away at the end of
+  it, so a session is not yet something a *build* keeps. That is item 3 below
+  and not this one -- a session that outlives a round is only worth having if
+  what is in it is a function of the dependency rather than of the program.
+
+  **One thing to know before extending it.** A batch shared a VM start between
+  a module's calls and a session does not, so the std build makes 55 starts
+  where it made 2. That is 5 ms against the 79 the change saves, and it is the
+  honest cost of per-call attribution -- but it is linear in calls, and a
+  program with thousands of them would want `call_image!` to take a list of
+  calls rather than one.
 
 - [ ] **Cache compiled transformers across builds.** After dependency tracking
   works, key cached artifacts by transformer source, transitive dependencies,
@@ -214,11 +239,30 @@ the only thing that changes the shape of that.
   `.libdream`, and the reason is the stated goal: a project should not compile
   its dependencies' bodies to expand its own macros. It is strictly smaller than
   general separate compilation (a transformer is a closed program already, and
-  nothing links *into* it), it forces the export-table and relocation questions
-  on something small, and it removes the last whole-program cost expansion has.
-  Pair it with the incremental compile-time VM below: a transformer library
-  loaded once for the session and called with syntax values is the same thing
-  from the VM's side.
+  nothing links *into* it), and it removes the last whole-program cost
+  expansion has.
+
+  **Correction, 2026-09-21: it does not force the relocation question, and the
+  ordering argument above was wrong about that.** A transformer library is
+  closed and nothing links into it, so there is nothing to relocate: it is an
+  ordinary `.dream` image, and the format needs no new section and no
+  relocatable index. What it needs is an *export* mechanism and a way in, and
+  both of those now exist and are in use -- `GLBL` already carries a name and
+  `MODS` already says which globals belong to which module, which together
+  make `module.member` a lookup, and `vm.call_image!` is the way in. So the
+  relocation work is entirely item 4's, and what is left of *this* item is not
+  a format question at all:
+
+  - build the image from the **transformers** as roots rather than from a
+    round's wrappers, so that what is in it is a function of the package and
+    not of the program calling it. `scope.resolve_reachable!` already walks
+    from a set of queued bodies; it takes an index today and would take a set.
+  - keep it across rounds, and then across builds, keyed the way the caching
+    item below says.
+
+  Both are what is left of the incremental compile-time VM too, which is what
+  "pair it with" meant and is now literally true: the call half of that item is
+  done and this is the other half.
 
 
 ## What to do next, in order
@@ -237,6 +281,15 @@ whole-program cost expansion has. That is true and it is 8% of the cost. What
 the other 92% is, is a name declared, a stub resolved and a stub lowered for
 every declaration in the program that no transformer reaches -- so the thing
 to remove is the stub, not the image.
+
+**And 5 was then done anyway, on 2026-09-21, out of order and for more than
+8%** -- which is the one warning to take from this ordering exercise. The
+meter costs *phases*, so it can only ever price a change as "the phases it
+removes", and it priced the compile-time VM as `emit` plus `run`. What the
+change actually did was take the **arguments** out of the image, which is a
+change to `lower` and `resolve` and `declare` as well, none of which the
+prediction mentioned. A phase meter says where the time is. It does not say
+what a change will reach, and nothing but building the change says that.
 
 1. ~~**One stub, not one per declaration.**~~ **Done** (2026-09-20), and it was
    worth what the meter said it would be. Every unreached global names one
@@ -275,13 +328,52 @@ to remove is the stub, not the image.
 3. **`.libdream` for transformers**, which is separate compilation's smallest
    honest version and is what removes 1 and 2 rather than shrinking them: a
    dependency's declarations are not in this program at all, so there is
-   nothing to declare and nothing to stub.
+   nothing to declare and nothing to stub. **Its VM half landed first** (item 5
+   below) and shrank it: a transformer library needs no relocation and no new
+   section, because it is closed and nothing links into it, so what is left is
+   choosing the roots and keeping the image. See "Do macros first" above.
 4. **`.libdream` for everything**, if the above has not already moved the wall
    past where anyone is standing.
-5. **The incremental compile-time VM**, last, because its ceiling is measured
-   and it is 8%. It is still the right shape for 3 -- a transformer library
-   loaded once for a session and called with syntax values is the same thing
-   from the VM's side -- so it is worth doing *with* that and not before it.
+5. ~~**The incremental compile-time VM**~~ **Half done** (2026-09-21), and
+   done out of order on purpose: the half that is the *call* -- an image loaded
+   and entered by name with arguments that cross as values -- turned out not to
+   depend on anything in 3 or 4, and doing it first is what takes the calls out
+   of the image so that 3 has something to cache. It was worth more than the 8%
+   ceiling the meter predicted for it, and the reason is worth carrying: the
+   meter costed "stop rebuilding the image", and what the change actually did
+   was stop *putting the calls in it*. The macro tax is 202 ms -> 133 on
+   `mind/std/all.dr --test` and 194 -> 147 on a self-compile, with every image
+   in the repository byte-identical bar the 12 generated-span bytes of
+   `std --test`, and the bootstrap a fixpoint in one stage. See "The image was
+   the calls, and now it is the transformers" in `CLAUDE.md`.
+
+   What is left of it is the half that belongs to 3: a session that outlives a
+   round, holding a library that is a function of the dependency rather than of
+   the program.
+
+6. **`discover`, which nothing has ever looked at.** Now the largest phase of
+   a self-compile's macro tax: **48 ms of 147**, where `snapshot` -- the phase
+   the two rounds above were about -- is 25.
+
+   It is `expand.work_of`, and its shape is the opposite of everything else in
+   this file, which is why it should be read before it is touched. It is
+   **0 ms on a 3,200-declaration generated program and 51 on `dreams`**, and
+   that is not noise: the lexer records where the word `expand` appears
+   (`modules.expand_sites`), so a module with no sites costs nothing at all and
+   35 of that program's 36 modules are free. What is left is per *item of a
+   module that does have one* -- every declaration numbered into an `[i, item]`
+   pair, tested against the sites, and then walked node by node by
+   `has_expansion`. `dreams` uses `macros.coalesce` and `macros.with_some` in
+   `lower.dr` and `scope.dr`, which are its two largest modules, so it pays for
+   all of both to find eighteen one-line calls.
+
+   So the axis to vary is not the program's size but **the size of the module
+   the macro is written in**, and `scale.py` cannot currently vary it. The
+   cheap fix is probably to stop numbering and walking items whose span does
+   not contain a site at all -- `in_item` already knows -- but measure before
+   believing that, because `accounted` exists to fall back to the whole module
+   when the sites cannot be matched to items, and how often that happens is not
+   known.
 
 **And one warning about the next profile.** `mentions_name` was invisible for
 the whole life of this compiler because `dreams` is the one codebase where the
