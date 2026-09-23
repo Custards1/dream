@@ -1,0 +1,5 @@
+import std.console;
+
+let main! = {
+    console.print! "Hello from sleep"
+};

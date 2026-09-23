@@ -24,31 +24,7 @@ Use match instead of massive if/else/else if chains. If you see an ugly if else 
 
 ## Where this is going
 
-`dreams` is the compiler. The plan, in order:
-
-1. ~~`dreams` reaches parity with the compiler it replaces~~ — every stage agrees
-   on the corpus.
-2. ~~An old `dreams` build bootstraps the new one~~ — **done**: `dreams` compiles
-   itself to a fixpoint.
-3. ~~`dreams` is the compiler~~ — **done**: `mind`, `lucid`, the examples, the
-   end-to-end programs and `dreams` itself are all compiled by `dreams`; the
-   old Rust compiler, `dreamc`, is gone.
-4. ~~**`dreams` learns to fuse.**~~ **Done.** The first optimization that is
-   genuinely the compiler's own rather than the VM's: a pipeline of `std.list`
-   combinators becomes one loop, and the list between them is never built. It
-   did what it was built to do and it did it the way the plan said -- not by
-   making the list cheaper but by producing no list, so that what remains is a
-   loop the JIT already compiles. `sum` went from 13.0x CPython to **0.15x**
-   and `mapfilter` from 13.1x to **0.75x**. What it is, what makes it sound,
-   and the one workload it does not finish are under "Deforestation" in
-   *Making it faster*.
-5. ~~**`dreams` stops writing the same node twice.**~~ **Done.** The second
-   optimization that is the compiler's own, and the first that is about the
-   image rather than the clock: the finished arena is rebuilt once, bottom up,
-   sharing every node whose record something has already emitted. `dreams`
-   itself went from 67,306 nodes to **19,323** and from 1.29 MB to **474 KB**.
-   It buys no speed, at either end, and says so with numbers -- "Sharing the
-   arena" in *Making it faster*.
+`dreams` is the compiler. 
 
 `dreams` builds from `dreams/bootstrap/dreams.dream`, an image of itself that is
 checked in. The seed needs the VM and nothing else:
