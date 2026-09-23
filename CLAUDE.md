@@ -2422,6 +2422,105 @@ branch count by the entry count, and anything much above a third means this.
 the same shape as the arena's, and `keep` only forces a node when it happens to
 be shareable, because `to_string` is how it makes the sharing key.
 
+*(It was not `opt.dr`, and it was not a table of the compiler's at all -- it was
+the arena. The section below is what the hundred megabytes turned out to be,
+and how it was found, since guessing from the ratio got the place wrong.)*
+
+### The arena was a chain of its own versions, and `push_node` never saw it
+
+**The finding.** `ir.push_node` has always refused an unforced node --
+`settled` is the whole of the section above, applied at the one place a node is
+appended. There are two other writers. `ir.set_node_flag` reads a node back out
+of the arena, puts a flag on it and writes it in again, and `with_flags` is a
+`set` of a list, so what went in was a *suspended* one. Lowering sets a flag on
+most of the nodes it emits -- tail position, strictness, impurity -- so most of
+the arena was stored as a thunk, each holding the frame of whichever lowering
+function asked for the flag, and each of those frames holding the lowering
+state, which holds the arena as it stood at that node.
+
+So the arena was a chain of tens of thousands of its own versions, held
+together by nodes nobody had looked at yet, exactly as the section above
+describes for a map built in a fold -- and past a guard written to prevent it.
+It was **45% of a self-compile's live set**.
+
+| | peak live | largest major | map branches / entries | promoted |
+|---|---|---|---|---|
+| before | 297 MB | 174 MB | 632,614 / 405,846 = **1.56** | 441 MB |
+| `set_node_flag` settled | 202 MB | 95 MB | 227,416 / 328,345 = 0.69 | 396 MB |
+| + `lower.set_func_body` | 235 MB | 142 MB | | 356 MB |
+| + `scope`'s two tables | **204 MB** | 108 MB | 335,360 / 384,170 = **0.87** | **328 MB** |
+
+Read `promoted` down that column rather than `peak live`: a version chain is
+churn the nursery hands to the old generation, so promotion is what falls
+monotonically, where a peak is only ever sampled where a collection happens and
+moves by a third between runs of the *same* binary for the reason "Two things
+that will lie to you" gives. `mind` and `mind/std/all.dr --test` are
+byte-identical to what the previous compiler emitted, and the bootstrap reaches
+a fixpoint in one stage. `lucid` differs in **3 bytes**, all of them `span_start`
+and `span_end` of one `FUNC` record, because `lucid` imports `dreams` and so
+the prose added to `scope.dr` is part of *its* source too -- the check that
+matters is the one this repository has always used: decode the differing
+offsets against the section table and the record stride rather than arguing
+about them.
+
+**And the wall moved by 40%, which is what this is for.** Under the default
+1 GB `DREAM_MAX_HEAP`, on `scale.py`'s declarations axis: before, 8,000
+declarations compiled and 9,600 did not; now **11,200 compiles** and 12,800 does
+not. (The section above records 9,600 compiling, and it did when that was
+written -- `dreams` has grown since, and the wall moves with it. Measure the
+commit before in a worktree, as that section and "Where the self-compile now
+stands" both say, rather than against a number in this file.) Each of the three changes is load-bearing for that -- `set_node_flag`
+alone reaches 9,600 and fails at 11,200, and `set_func_body` is what takes it
+the rest of the way. The self-compile is 1-2% *faster*, mean of three
+interleaved rounds, which is inside the noise floor and is the answer that
+matters: none of this costs anything.
+
+The other two are the same rule at the two other places that break it. A
+function's body index (`lower.set_func_body`) is one integer per function, but
+an unforced one holds a whole arena apiece. `scope.record` and
+`record_bind` are the resolver's real output, and a resolution is a small tree
+(`[:member, [:dream, mi], field, gi]`) rather than a fixed list of fields, so
+`scope.forced` is a walk where `ir.settled` is five `type_of`s -- and forcing
+the spine is a second, separate job (`settle_refs`), because the two chains have
+different causes: values hold versions, an unforced put holds the table before
+it.
+
+**How it was found, because the ratio pointed at the wrong place.** The branch
+count over the entry count says *that* something is a version chain and says
+nothing about which map. Three temporary probes in `dream/src/heap.cpp`, each
+answering the next question, and none of them kept:
+
+1. A histogram of live `MapObj::count` by log2. A healthy trie of N entries has
+   exactly one node at the top bucket; this had 5,549, and a continuous spread
+   of every intermediate size from 1K to 88K -- which is what a map that grew
+   one entry at a time and kept every version looks like.
+2. The type of the object pointing at each big map. All of them were map
+   entries, so the big maps were *values* -- `:nodes` inside the program
+   record, which is `:prog` inside the lowering state.
+3. A walk from the roots keeping a parent for every object, attributing each
+   live byte to the nearest frame above it, reported as function indices. That
+   named `lower_arms`, `ir.set_node_flag` and `lower_expr`, and
+   `dreams/tests/` has no tool for turning a function index into a name, so the
+   image was decoded by hand against `FUNC`, `GLBL` and `MODS`.
+
+The third of those is the one worth rebuilding if this comes up again: "which
+Dream function is holding the heap" is the question, and nothing in the tree
+answers it. The first two only narrow it.
+
+**Measured, and not kept: `opt.dr`'s tables**, which is what the paragraph above
+this section predicted. `keep` stores a node in `:out` unforced when it is not
+shareable, `rebuild` stores an index in `:memo` and `keep_run` one in `:runs`,
+so all three break the rule. Settling them is six lines and it buys **1% of
+promotion on a self-compile and nothing at all on a generated program** -- 459
+and 463 MB against 463 and 459, the two builds swapping places. The reason is
+that `opt`'s one big table is `:out`, and `to_string` forces every node that
+goes into it because that is how the sharing key is made; the memo and the run
+table hold integers, and an integer version chain of 30,000 entries is not
+where a hundred megabytes is. Worth knowing before reaching for it: with the
+arena settled, `opt` costs **no peak heap at all** -- 202 MB with it and 204 MB
+with `--no-opt` -- where before this it cost 61 MB, all of which was the pass
+forcing the suspended nodes it was handed.
+
 ### A JIT that can allocate -- the plan
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the

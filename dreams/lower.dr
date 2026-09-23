@@ -68,7 +68,15 @@ let set_source i l = core.map_put l :source i;
 let set_ctx i l = core.map_put l :ctx i;
 
 let func_bodies l = core.map_get l :func_bodies (core.map_new ());
-let set_func_body fi n l = core.map_put l :func_bodies (core.map_put (func_bodies l) fi n);
+/// The node index is forced before it is stored, for the reason `ir.settled`
+/// gives: an unforced one is a thunk holding the frame that would compute it,
+/// and that frame holds this state -- which holds the arena as it stood when
+/// the function's body was finished. One per function is not many, but it is
+/// one *whole arena* apiece.
+let set_func_body fi n l =
+    if type_of n != :nothing {
+        core.map_put l :func_bodies (core.map_put (func_bodies l) fi n)
+    } else { l };
 
 let subst l = core.map_get l :subst (core.map_new ());
 let set_subst m l = core.map_put l :subst m;

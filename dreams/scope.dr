@@ -1080,11 +1080,59 @@ let frame_count r = list.length (frames r);
 /// of the key, or the last walk would quietly overwrite the others.
 let ref_key ctx source start = (ctx * 65536 + source) * 4294967296 + start;
 
+/// True, having forced `v` and everything inside it on the way to saying so.
+///
+/// The same job `ir.settled` does for a node, for the two tables below, and it
+/// has to be a walk rather than a list of fields because a resolution is a
+/// small tree of its own: `[:member, [:dream, mi], field, gi]`.
+///
+/// What it is for is the finding under "A lazy value stored in a map pins the
+/// map it was made in": a map is persistent, so a put shares the entries and
+/// copies the path to the one it added, and *one* map is cheap where every
+/// version of one is not. A lazy value is what keeps the old versions
+/// reachable -- a thunk carries the frame that would compute it, and in a walk
+/// that threads the resolver through every name that frame holds the resolver
+/// as it stood one occurrence ago, which holds `refs` as it stood then. Store
+/// N lazy resolutions and the table holds N versions of itself.
+///
+/// Forcing the spine is not enough, and that was measured before this was
+/// written: the elements are where the frames hang. `[:global, ctx_mi c, name,
+/// global_index e name]` in normal form is a list of three thunks, and each of
+/// them holds the context and the environment it would have been computed
+/// from.
+///
+/// `type_of` is the cheapest builtin that cannot answer without evaluating and
+/// `:nothing` is not one of its answers, so every arm is true and the callers'
+/// `else` below is unreachable -- the shape `ir.settled` and
+/// `list.fold_strict` both use, and for the reason given there: an argument is
+/// not evaluated, so `record .. (forced what)` would suspend the call and
+/// change nothing.
+let rec forced v =
+    match type_of v {
+        :list => list.is_empty v || (forced (list.head v) && forced (list.tail v)),
+        _ => true,
+    };
+
+/// Force the two tables' spines.
+///
+/// The other half of the same problem, and the same answer `ir.settle` gives:
+/// forcing the values keeps a table from being a chain of its own versions,
+/// and forcing the spine keeps it from being a chain of suspended puts. A
+/// resolution threads `r` through every name in the program, so a `map_put`
+/// nobody forces is a suspension holding the resolver before it -- twenty-five
+/// thousand of them stacked up, with every intermediate table live at once.
+/// `len` of a map is its stored count, so this is two loads.
+let settle_refs r = if len (refs r) >= 0 && len (binds r) >= 0 { r } else { r };
+
 /// Record what a name occurrence means. This is the pass's real output: a
 /// diagnostic says what went wrong, but `refs` says what went *right*, which is
 /// what everything downstream actually needs.
 let record ctx source span what r =
-    core.map_put r :refs (core.map_put (refs r) (ref_key ctx source (ast.span_start span)) what);
+    if forced what {
+        settle_refs
+            (core.map_put r :refs
+                 (core.map_put (refs r) (ref_key ctx source (ast.span_start span)) what))
+    } else { r };
 
 /// What was recorded at this occurrence, or `()`.
 let resolution r ctx source span =
@@ -1098,8 +1146,11 @@ let resolution r ctx source span =
 /// walk patterns in the same order as this pass did. It asks where a binder's
 /// slot is; it does not recount.
 let record_bind ctx source span name slot r =
-    core.map_put r :binds (core.map_put (binds r) (ref_key ctx source (ast.span_start span))
-                                        [name, slot]);
+    if forced name && forced slot {
+        settle_refs
+            (core.map_put r :binds
+                 (core.map_put (binds r) (ref_key ctx source (ast.span_start span)) [name, slot]))
+    } else { r };
 
 let binding r ctx source span =
     core.map_get (binds r) (ref_key ctx source (ast.span_start span)) ();

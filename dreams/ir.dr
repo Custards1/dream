@@ -345,10 +345,23 @@ let intern_atom v p = {
 /// moved, so an index stays valid, and a flag discovered late -- that a call is
 /// in tail position, that a value turned out to be effectful -- can still be
 /// recorded where it belongs.
+///
+/// Settled for the reason `settled` gives, and this is the site that reason was
+/// written for without anyone noticing: `push_node` above has always refused an
+/// unforced node, and this wrote one straight past it. `with_flags` is a `set`
+/// of a list, so what went into the arena was a *suspended* one, holding the
+/// frame of whichever lowering function asked for the flag -- and that frame
+/// holds the lowering state, which holds the arena as it stood at that node.
+/// Lowering sets a flag on most of the nodes it emits (tail position,
+/// strictness, impurity), so the arena was a chain of tens of thousands of its
+/// own versions, held together by nodes nobody had looked at yet. It was 45% of
+/// a self-compile's live set.
 let set_node_flag i f p = {
     let n = node_at i p;
-    settle (core.map_put p :nodes
-                (core.map_put (nodes p) i (with_flags (add_flag (node_flags n) f) n)))
+    let flagged = with_flags (add_flag (node_flags n) f) n;
+    if settled flagged {
+        settle (core.map_put p :nodes (core.map_put (nodes p) i flagged))
+    } else { p }
 };
 
 let node_flags_at i p = node_flags (node_at i p);
@@ -358,7 +371,12 @@ let node_flags_at i p = node_flags (node_at i p);
 /// Only compile-time evaluation needs this: the expression is lowered into a
 /// placeholder, and what it came to is only known once the program has been
 /// built and run. Everything else emits a node once and leaves it alone.
-let set_node i n p = settle (core.map_put p :nodes (core.map_put (nodes p) i n));
+///
+/// Settled like the two writers above, and for the same reason -- there are
+/// only twenty or so of these in a self-compile, so this is consistency rather
+/// than a measurement.
+let set_node i n p =
+    if settled n { settle (core.map_put p :nodes (core.map_put (nodes p) i n)) } else { p };
 
 // --- what the arena becomes -------------------------------------------------------
 
