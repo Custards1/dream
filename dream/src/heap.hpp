@@ -300,6 +300,22 @@ public:
     /// four different threshold policies all failed to move it. See docs/gc.md.
     size_t bytes_alloc_at_peak() const { return peak_allocated_; }
     const std::array<uint64_t, 32>& bytes_by_type() const { return by_type_; }
+    /// The live set of the largest major collection, and what it was made of.
+    ///
+    /// `bytes_by_type` says where a program's *allocation* went, which is the
+    /// question "what is this program making?" -- and for a lazy language the
+    /// answer is always thunks and frames, because making a call is most of
+    /// what any program does. This is the other question: of what survived,
+    /// what is it? A compile that holds 400 MB at its peak is held back by
+    /// whatever those bytes are, and nothing else in this runtime could say.
+    ///
+    /// A *major* because only a major proves anything: a minor leaves old
+    /// space untouched, so its idea of "live" is every object old space has,
+    /// dead ones included. So this is not necessarily the moment `bytes_peak`
+    /// reports -- it is the largest live set anything here can vouch for, and
+    /// the two are printed together for that reason.
+    size_t bytes_live_at_major_peak() const { return peak_major_live_; }
+    const std::array<uint64_t, 64>& live_by_type_at_peak() const { return peak_by_type_; }
 
     /// Deep-copy `v` out of this heap into `dest`. Used for message sends and
     /// for spawning, which are the only two places a value crosses heaps.
@@ -449,7 +465,12 @@ private:
     /// Sweep one block into `head`/`tail`, a chain per size class, counting
     /// what survives. Shared by the serial sweep and the parallel one, which
     /// differ only in whose chains they fill and who rebuilds the block list.
-    void sweep_block(Block* b, Obj** head, Obj** tail, size_t& live);
+    void sweep_block(Block* b, Obj** head, Obj** tail, size_t& live, uint64_t* by_type);
+    void note_live_by_type(size_t live, const uint64_t* by_type);
+    static std::string live_kinds_line(const uint64_t* by_type, size_t live);
+    /// What the last major's sweep found, for its trace line. Built only
+    /// when the trace is on, because formatting it is not free.
+    std::string last_kinds_;
     /// Prepend one thread's swept chains to the heap's free lists.
     void merge_free_lists(Obj** head, Obj** tail);
 
@@ -497,6 +518,14 @@ private:
     /// and knowing the share is what says whether a strictness analysis would
     /// be worth writing. One add per allocation, indexed by the type byte.
     std::array<uint64_t, 32> by_type_{};
+    /// The live set of the largest major collection so far, by object kind.
+    /// Written only by the thread that finishes a sweep, which is the same
+    /// thread that writes every other heap-wide number.
+    /// Bytes in the low half, object counts in the high half: a live set is
+    /// only half described by its bytes, since "map 55%" reads very
+    /// differently as a thousand fat branches and as a million thin ones.
+    std::array<uint64_t, 64> peak_by_type_{};
+    size_t peak_major_live_ = 0;
     size_t peak_block_bytes_ = 0;
     size_t peak_allocated_ = 0;
     size_t gc_threshold_;

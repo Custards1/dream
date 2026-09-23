@@ -195,6 +195,14 @@ dream --stats IMG        # reductions, collections, bytes allocated and
 benchmark/benchmark/run.sh   # seven workloads, Dream against CPython
 ```
 
+`--stats` answers two questions about memory that are easy to confuse. What a
+program *allocated*, by kind, is what it made; what is *live at its largest
+major*, by kind -- with the object count and average size beside each -- is
+what it is still holding, which is the one that decides whether a large program
+fits. They rarely name the same kind, and the gap between them is where a
+representation problem lives: see "A lazy value stored in a map pins the map it
+was made in" below, which is a finding nothing else here could have reached.
+
 A VM option goes **before** the image: `dream --stats build/dreams.dream ...`,
 because everything after the image name belongs to the program. All three
 report from `os.exit!` as well as from the end of `main`, which matters because
@@ -858,6 +866,13 @@ at when something that does less work takes longer.
 Measured 2026-09-12, after the round of work that took the self-compile from
 2.78 s to 2.02 s and its peak RSS from 859 MB to 499 MB. Both numbers now have
 one dominant cause each, and neither is the collector.
+
+*(Both halves of this section were overtaken on 2026-09-22, and by the same
+tool. "Memory is fragmentation" was measured against a live set nobody could
+break down -- 57% of it turned out to be map branches nothing could reach but
+an unforced value, and removing a third of it moved the wall a large program
+hits by 50%. Read "A lazy value stored in a map pins the map it was made in"
+before acting on anything below.)*
 
 **Memory is fragmentation, not policy.** The last full collection of a
 self-compile finds 182 MB live in 386 MB of blocks, and only 422 of 5848 blocks
@@ -1709,7 +1724,10 @@ lowered from the staged whole program, so it still costs a name declared and a
 global emitted per declaration, and it is still thrown away at the end of the
 round. Making it a function of the dependency package rather than of the
 program is what makes it cacheable, and that is where the remaining tax is --
-not in the calls, which now cost nothing to make.
+not in the calls, which now cost nothing to make. *(The roots moved two days
+later, and the image is one per compile rather than one per round -- "One image
+for the whole expansion" below, which also prices what keeping it across builds
+would be worth.)*
 
 **And one thing that was found by measuring rather than looked for.**
 `discover` -- "is there anything to expand?" -- is now the *largest* phase of a
@@ -1808,6 +1826,98 @@ as though it is in no `match` at all", at a cost its comment records as eight
 failing tests. That was this bug seen from the editor's end. The walk is gone
 and `holds` asks the span, with the tests that found it kept exactly where they
 were: they now hold the parser instead.
+
+### One image for the whole expansion, and what it cost to buy that
+
+**What it does.** The section above got the image down to one per *round* and
+ended by naming what was left: the roots. The image was resolved from the
+round's **wrappers**, so what was in it was whichever transformers this round
+happened to call -- a function of the program, and rebuilt for the next round.
+It is resolved from the **transformers** now (`expand.transformer_roots`), so
+every round of a program shares one image and there is one per compile rather
+than one per round.
+
+Two things had to move for that. `scope.resolve_reachable!` took an *index* --
+"the bodies queued after this point", which is how "the wrappers I just
+declared" was spelled -- and takes a set of `root_key`s, a source index and an
+offset, because a root is now named by where it was written. And the wrapper
+itself had to get out of the image: it was declared as a global and resolved
+with the transformers, which is a few nodes but is what made the image this
+round's. `scope.resolve_names!` resolves it on its own and the caller keeps
+`refs` and `r_diags` and throws the rest away, so nothing is declared and
+nothing is lowered for it. It is still the thing the resolver answers "which
+macro is this?" about, which is the one question expansion must not answer for
+itself.
+
+`dreams --time` on `mind/std/all.dr --test`, which is the macro-heavy build --
+55 calls in two rounds -- and on a self-compile, which is 14 calls in one:
+
+| | sites | resolve | lower | emit | tax | image |
+|---|---|---|---|---|---|---|
+| `std --test`, per round | -- | 32 ms | 36 | 11 | 134 ms | 2 of 88 KB |
+| `std --test`, per program | 7 ms | **8** | **30** | **5** | **107 ms** | **1 of 51 KB** |
+| self-compile, per round | -- | 19 ms | 12 | 4 | 110 ms | 1 of 63 KB |
+| self-compile, per program | 19 ms | **7** | 28 | 7 | **118 ms** | 1 of 79 KB |
+
+**Read the second pair, because it is the one that went the wrong way.** A
+program with one round has no second round to amortize anything over, so all it
+sees is the new cost: the image now holds every transformer in the program
+whether or not this compile calls it, and lowering one is not free. The
+self-compile is **8 ms worse** and its image is 16 KB bigger.
+
+**What a root costs, measured on the axis that exists for it.**
+`scale.py --macros N` writes a dependency declaring N transformers of which one
+is called, which is the shape a package of macros has. Against the same VM,
+the compiler before this change and the compiler after:
+
+| transformers declared | 1 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|
+| roots are the calls | 23 ms | 21 | -- | 17 | 22 | 25 |
+| roots are the transformers | 19 ms | 28 | 34 | 67 | 100 | **159** |
+
+Flat against linear, at about **0.5 ms per trivial transformer**. That is not a
+per-root overhead and it was worth checking rather than assuming: a syntax
+transformer's body is a syntax *literal*, which is fifty-odd nodes, and the
+same run lowers the whole program's 16,919 nodes in 238 ms -- 14 microseconds a
+node, against the 12 these come out at. A root costs exactly its own body, and
+what the change did was stop declining to lower it.
+
+**So this is a down-payment, and it is written down as one.** What it buys
+today is the std build's 30 ms, which is real but is only the second round not
+paying for the first. What it is *for* is that an image which is a function of
+the program's transformers is the same image on every build, and so is the
+thing a build could keep -- where an image that is a function of the round can
+only ever be built again. Until it is kept between builds, a one-round program
+pays 8 ms and gets nothing back.
+
+**What keeping it would be worth, so the next person does not have to guess.**
+The phases a cache removes are `resolve` + `lower` + `emit`: **42 ms of a
+4,286 ms self-compile (1%)**, 43 ms of 2,200 on the std build (2%), and 145 ms
+of 1,129 on a 256-transformer program (**13%**). That is the whole case for
+caching, and it says what kind of project it is for -- not this one. The rest of
+a self-compile's 118 ms tax is `discover` 14, `stage` 15, `snapshot` 21 and
+`sites` 19, none of which a cached image touches, because they are the *calling*
+program being staged, declared and asked what its own call sites mean.
+
+**One row is new and one moved into it.** `sites` is `resolve_names!`, the
+wrapper's own resolution, and it is 19 ms on a self-compile against 0 on a
+generated program. Most of that is not the fourteen names: it is forcing the
+environments of the four modules they are written in, which `resolve` used to be
+charged for because the wrappers were resolved with everything else. The pair is
+26 ms where it was 38.
+
+**What did not change.** The images: `dreams`, `lucid`, `mind` and
+`mind/std/all.dr --test` are all four byte-identical to what the previous
+compiler emitted -- including the std build, which the section above had to
+excuse for twelve generated-span bytes and this one does not -- and the
+bootstrap reaches a fixpoint in one stage. And the diagnostics, which is the
+half worth checking deliberately, because resolving every transformer rather
+than the called one moves where a broken macro is first noticed. Three shapes,
+before and after, character for character the same: a macro that is never called
+and names something that does not exist (reported once, by the real compile, at
+the name), one that *is* called and names it (reported twice, as it always was
+-- once against the `expand` and once at the name), and one that raises when it
+runs.
 
 ### `mind/std/all.dr --test` is not byte-stable across compiler changes
 
@@ -1937,7 +2047,14 @@ intermediate is retained by the stage that reads it: source, tokens, syntax,
 effective items, the staged copy, the resolver's tables and the arena are all
 live at once. That one is not a bug and cannot be tuned away -- it is the
 argument for compiling a package at a time, which is what
-[dreams/TODO.md](dreams/TODO.md) calls for. The *modules* axis is the next
+[dreams/TODO.md](dreams/TODO.md) calls for.
+
+*(Those last two sentences were written without being able to see what the live
+set was made of, and they are wrong in an instructive way. A third of that peak
+was not any stage's intermediate -- it was versions of the arena retained by
+values nobody had forced, and it did tune away. "A lazy value stored in a map
+pins the map it was made in" is what happened once the question became
+askable.)* The *modules* axis is the next
 section, and it was the one nobody had varied far enough.
 
 ### A table indexed by module wants to be a map, not a list
@@ -2181,6 +2298,129 @@ stage after that is the first optimized one. Run `just bootstrap` twice and keep
 the second image; `bootstrap-check` then passes because every compiler built
 from this source emits the same thing. `--no-opt` emits the arena as lowered,
 which is what to reach for first when an image misbehaves.
+
+### A lazy value stored in a map pins the map it was made in
+
+**The tool first, because the finding was not reachable without it.** `--stats`
+said how much a program *allocated*, by kind, and how much was *live* at its
+peak -- but never what the live bytes were. For a lazy language the allocation
+answer is always the same (frames and thunks: making a call is most of what any
+program does), and the live answer is the one that decides whether a large
+program compiles at all. So the major sweep, which already walks every live
+object, tallies them:
+
+```
+; 222356000 live at the largest major, by kind: map 57% (745534 at 169 B)
+  list 15% (1412025 at 24 B) frame 11% (219134 at 114 B) map entry 10% (552026 at 40 B) ...
+```
+
+A major, because only a major proves anything -- a minor never looks at old
+space, so its survivors include whatever old space is carrying. The count and
+the average size are there because "map 57%" reads very differently as a
+thousand fat branches and as a million thin ones, and in this case the
+difference *was* the finding. `DREAM_GC_TRACE=1` prints the top three kinds on
+every major's line, which is how the shape over a whole compile gets read.
+
+**What it said.** A self-compile's live set is **57% map branches and 10% map
+entries** -- 1.35 branches per entry, averaging 169 bytes. Everything the notes
+here had assumed about that peak was wrong: not the source, not the tokens,
+not the syntax, not the arena's own size. And `--check`, which parses and
+resolves and stops, holds **map 0%**, so all of it arrives in `lower`.
+
+The number to compare against is what a map that size ought to weigh. Two
+hundred thousand integer keys, built and held:
+
+```
+; 10797072 live at the largest major, by kind: map entry 71% (191101 at 40 B) map 29% (52327 at 60 B)
+```
+
+0.27 branches per entry at 60 bytes. The compiler's trie is **five times as
+many branches, each nearly three times as fat**, for the same number of
+entries -- fourteen times the bytes.
+
+**Why, and it is a general fact about lazy code rather than anything to do with
+compilers.** A map is persistent: a put shares the entries and copies the path
+to the one it added. So *one* map is cheap and *every version of one* is not,
+and what decides which you are holding is whether anything still points at the
+old versions. A lazy value is exactly such a pointer. `m.[i => f x]` stores a
+thunk, a thunk carries the frame that would compute it, and in a fold that
+threads the map that frame holds **the map as it stood one step ago**. Store N
+lazy values and the map holds N versions of itself: N frames, N thunks, and a
+trie path-copied per entry instead of shared.
+
+Measured on its own, the same hundred thousand entries three ways:
+
+| | live | branches | frames |
+|---|---|---|---|
+| values stored unforced | 68.5 MB | 280,368 at 213 B | 77,188 |
+| the spine forced, fields not | 46.2 MB | 200,502 at 169 B | 90,130 |
+| values in normal form at the put | **10.4 MB** | **20,847 at 46 B** | **4** |
+
+Three things in that table are worth keeping. It is **6.6x**, which is not a
+constant factor anybody tunes away. Forcing the *spine* is less than half the
+answer, because the fields are where the frames hang -- and that is the version
+someone would write first. And `list.fold_strict` in place of `list.fold` makes
+it **worse** (97 MB), which is the check that this is not the chain-of-
+suspended-accumulators trap that `fold_strict` exists for: the fold was never
+the problem, the stored value was.
+
+**The fix, in the compiler.** `ir.push_node` stored the node it was handed, and
+`ir.push_kids` the child indices, both unforced -- so the arena was a chain of
+every version of itself, held together by nodes nobody had looked at yet.
+`ir.settled` forces a node's five fields, and the shape is `list.fold_strict`'s
+and for the reason given there: an argument is not evaluated, so
+`push_node (settled n) p` suspends the call to `settled` and changes nothing.
+A condition is the one place the language must evaluate something, `type_of` is
+the cheapest builtin that cannot answer without evaluating, and `:nothing` is
+not one of its answers -- so every clause is true, `&&` reaches the last, and
+the caller's `else` is unreachable and says so.
+
+| | peak live | largest major | live frames | thunks |
+|---|---|---|---|---|
+| self-compile | 409 MB -> **225-297 MB** | 222 -> **95-174 MB** | 219,134 -> **76,028** | 366,700 -> **122,736** |
+| 1,600 declarations | 217 MB -> **172 MB** | | | |
+| 6,400 declarations | 926 MB -> **755 MB** | | | |
+
+The self-compile's range is not sloppiness and is worth understanding before
+reading any peak figure here. Three interleaved runs of the old compiler came
+back 409.9, 409.1 and 408.6 MB and of the new one 297.0, 297.0 and 225.1 -- the
+*old* one is pinned to a tenth of a percent and the new one varies by a third,
+because a peak is only ever sampled where a collection happens and
+`gc_threshold_` is refitted to `live * 3` after every major. Allocate less and
+every crossing in that geometric series moves, so which major lands on the
+high-water mark becomes a coin toss. "Two things that will lie to you about a
+change to the interpreter" says the same thing about the clock. The floor of
+the new range is the honest reading of what is held; the ceiling is where a
+collection happened to look.
+
+**And the wall moved, which is what this is for.** Under the default 1 GB
+`DREAM_MAX_HEAP`, a generated program of **8,000 declarations did not compile
+and now does**, and so does one of 9,600; 12,800 still does not, either way.
+That is a 50% larger program on the axis [dreams/TODO.md](dreams/TODO.md) names
+as the one a large project actually hits.
+
+**What it costs: nothing measurable.** Interleaved on the 1,600-declaration
+program, 1852/1800/1778 ms before against 1870/1756/1862 after -- a wash, and
+well inside the 3% floor that "Two things that will lie to you" describes.
+Allocation falls 3% and promotion 14%, which is the mechanism showing up from
+the other side: a version chain is not merely churn, it is churn the nursery
+hands to the old generation.
+
+**What did not change.** `mind` and `mind/std/all.dr --test` are byte-identical,
+and so is the 6,400-declaration program's image. `dreams` and `lucid` differ,
+for a reason that is not a behaviour change and is worth knowing before anyone
+checks: both *contain* the compiler, so editing `ir.dr` edits their source --
+26 nodes, which is the `if` this adds. The bootstrap reaches a fixpoint in one
+stage and the seed moved with it.
+
+**What is left, and the number to watch.** Still 1.5 branches per entry against
+the 0.35 a settled map has, so roughly a hundred megabytes of a self-compile's
+peak is *still* versions nobody can reach but a value nobody has forced. The
+tool says so in one number now, which is the useful part: divide the map
+branch count by the entry count, and anything much above a third means this.
+[dreams/opt.dr](dreams/opt.dr) is the obvious next place -- its five tables are
+the same shape as the arena's, and `keep` only forces a node when it happens to
+be shareable, because `to_string` is how it makes the sharing key.
 
 ### A JIT that can allocate -- the plan
 

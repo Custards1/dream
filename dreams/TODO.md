@@ -139,6 +139,20 @@ is 51 ms of a 99 ms tax on a 3.7 s compile.
   Start with executable caching; caching expansion results requires a separate
   account of inputs, generated spans, and compile-time effects.
 
+  **Priced, 2026-09-22, and the price is the reason it is still unchecked.**
+  The image is now a function of the program's transformers rather than of a
+  round, which is what would make it cacheable at all -- so what a perfect cache
+  saves is exactly the phases that build it, `resolve` + `lower` + `emit`:
+  **42 ms of a 4,286 ms self-compile (1%)**, 43 ms of 2,200 on `std --test`
+  (2%), and 145 ms of 1,129 on a program whose dependency declares 256
+  transformers (**13%**). A cache is a new way to be wrong -- a stale one
+  expands the wrong program -- and 1-2% does not buy that. The row that would
+  is the third one, and nobody here has that project. Note also what a cache
+  does *not* reach: the rest of a self-compile's 118 ms tax is `discover` 14,
+  `stage` 15, `snapshot` 21 and `sites` 19, which are the *calling* program
+  being staged, declared and asked what its own call sites mean, and which only
+  item 5 removes.
+
 - [ ] **If implicit dependencies remain too costly, design an explicit
   compile-time module boundary.** Explore separately built macro libraries with
   declared dependencies and a syntax-value interface. This may require a language
@@ -163,14 +177,33 @@ Priority: medium, and it is the one the user named -- packages compiled to `.dre
 or a new `.libdream`, linked rather than recompiled. Everything above makes the
 whole-program compile *cheaper*; this is what makes it *unnecessary*.
 
-**What forces it, measured.** Peak live heap is 2.5x per doubling of the
-program and the default per-process cap is 1 GB, so a compile stops somewhere
-around 4,000-5,000 declarations and `DREAM_MAX_HEAP` is the only lever. Part of
-that is fixable (see "What is still superlinear" in `CLAUDE.md`) and part is
-not: the compiler is lazy end to end, so the source, the tokens, the syntax,
-the effective items, the staged copy for macros, the resolver's tables and the
-arena are all live at once, by construction. Holding one package at a time is
-the only thing that changes the shape of that.
+**What forces it, measured.** Peak live heap is ~2.0x per doubling of the
+program and the default per-process cap is 1 GB, so a compile stops at some
+size and `DREAM_MAX_HEAP` is the only lever.
+
+**Where that wall is was re-measured on 2026-09-22 and it moved**, which is the
+first thing to know before doing any of the work below. It used to be said as
+"4,000-5,000 declarations, and the part that is not fixable is that the
+compiler is lazy end to end, so every stage's intermediate is live at once, by
+construction". The second half of that was an assumption, and a tool that could
+break the live set down by object kind said it was wrong: **57% of a
+self-compile's peak was map branches**, and not because the compiler holds many
+maps -- because a lazily-valued entry pins the version of the map it was stored
+in, so the arena was a chain of every version of itself. Forcing what goes into
+it took the self-compile's peak from a very steady 409 MB to 225-297 MB (the
+range is the collector's geometric thresholds, not sloppiness -- see the
+section named below) and a 6,400-declaration program's from 926 MB to 755 MB,
+at no cost in wall clock, and a generated
+program of **8,000 declarations that could not compile under the default cap
+now does** (9,600 too; 12,800 still cannot). See "A lazy value stored in a map
+pins the map it was made in" in `CLAUDE.md`.
+
+So the wall is between 9,600 and 12,800 declarations, not 4,000-5,000, and
+about a hundred megabytes of a self-compile's peak is *still* retained versions
+that nothing can reach -- the number to watch is map branches divided by map
+entries, which is 1.5 here and 0.35 in a map with nothing holding its history.
+Holding one package at a time is still the thing that changes the *shape*;
+it is no longer the only thing that moves the wall.
 
 - [x] **Generate the benchmark this is missing.** Done:
   `dreams/tests/scale.py`, which varies declarations *or* modules and prints the
@@ -250,19 +283,36 @@ the only thing that changes the shape of that.
   both of those now exist and are in use -- `GLBL` already carries a name and
   `MODS` already says which globals belong to which module, which together
   make `module.member` a lookup, and `vm.call_image!` is the way in. So the
-  relocation work is entirely item 4's, and what is left of *this* item is not
+  relocation work is entirely the `.libdream` bullet above's, and what is left
+  of *this* item is not
   a format question at all:
 
-  - build the image from the **transformers** as roots rather than from a
-    round's wrappers, so that what is in it is a function of the package and
-    not of the program calling it. `scope.resolve_reachable!` already walks
-    from a set of queued bodies; it takes an index today and would take a set.
-  - keep it across rounds, and then across builds, keyed the way the caching
-    item below says.
+  - ~~build the image from the **transformers** as roots rather than from a
+    round's wrappers~~ **Done** (2026-09-22). `scope.resolve_reachable!` takes
+    a set of `root_key`s rather than an index, and the wrapper got out of the
+    image altogether (`scope.resolve_names!` resolves it on its own and the
+    caller keeps `refs` and throws the rest away). One image per *compile*
+    rather than per round: `mind/std/all.dr --test` 134 ms -> **107** with its
+    two rounds sharing one 51 KB image where they built two totalling 88 KB.
+  - keep it across rounds ~~and then across builds~~. Across rounds is what the
+    above is. **Across builds is priced and is not worth building yet** -- see
+    the numbers under 3 below.
 
   Both are what is left of the incremental compile-time VM too, which is what
   "pair it with" meant and is now literally true: the call half of that item is
   done and this is the other half.
+
+  **And the roots are a down-payment that has not been repaid.** A program with
+  one round sees only the new cost, because the image holds every transformer
+  in the program whether this compile calls it or not: the self-compile is
+  **8 ms worse**, and on `scale.py --macros N` the tax goes flat-at-20 ms to
+  19/28/34/67/100/**159** ms at 1/16/32/64/128/256 transformers. That is 0.5 ms
+  per trivial transformer and it is the transformer's own body being lowered,
+  not an overhead -- checked against the 12-14 microseconds a node costs to
+  lower anywhere else in the same run. It is worth paying only because an image
+  that is a function of the program's transformers is the same image on every
+  build and so *can* be kept, where one that is a function of the round can
+  only be built again. See "One image for the whole expansion" in `CLAUDE.md`.
 
 
 ## What to do next, in order
@@ -282,7 +332,7 @@ the other 92% is, is a name declared, a stub resolved and a stub lowered for
 every declaration in the program that no transformer reaches -- so the thing
 to remove is the stub, not the image.
 
-**And 5 was then done anyway, on 2026-09-21, out of order and for more than
+**And 6 was then done anyway, on 2026-09-21, out of order and for more than
 8%** -- which is the one warning to take from this ordering exercise. The
 meter costs *phases*, so it can only ever price a change as "the phases it
 removes", and it priced the compile-time VM as `emit` plus `run`. What the
@@ -290,6 +340,16 @@ change actually did was take the **arguments** out of the image, which is a
 change to `lower` and `resolve` and `declare` as well, none of which the
 prediction mentioned. A phase meter says where the time is. It does not say
 what a change will reach, and nothing but building the change says that.
+
+**And item 4 is new, from 2026-09-22, and arrived the same way the `core` walk
+did** -- not from any list, but from building the instrument that could see the
+thing. Every memory number in this file until then was a total: how much was
+live, never what it was. A breakdown of the live set by object kind said 57% of
+a self-compile's peak was map branches, which nobody would have guessed and
+nothing here could have found by reading code. Two lessons, and the second is
+the one to carry: **a total is not a measurement**, and when a number has been
+quoted for a year without anyone being able to decompose it, decomposing it is
+the work.
 
 1. ~~**One stub, not one per declaration.**~~ **Done** (2026-09-20), and it was
    worth what the meter said it would be. Every unreached global names one
@@ -325,16 +385,45 @@ what a change will reach, and nothing but building the change says that.
    sizes said *what inside it*, by naming a function (`mentions_name`) that was
    10% of the whole compile and had never appeared in a profile of this
    repository -- because on this repository it costs nothing.
-3. **`.libdream` for transformers**, which is separate compilation's smallest
-   honest version and is what removes 1 and 2 rather than shrinking them: a
-   dependency's declarations are not in this program at all, so there is
-   nothing to declare and nothing to stub. **Its VM half landed first** (item 5
-   below) and shrank it: a transformer library needs no relocation and no new
-   section, because it is closed and nothing links into it, so what is left is
-   choosing the roots and keeping the image. See "Do macros first" above.
-4. **`.libdream` for everything**, if the above has not already moved the wall
+3. ~~**`.libdream` for transformers**~~ **As far as it is worth taking on its
+   own** (2026-09-22). Separate compilation's smallest honest version needed no
+   relocation and no new section -- a transformer library is closed and nothing
+   links into it -- so it was two things, choosing the roots and keeping the
+   image. The roots are the transformers now, which makes the image a function
+   of the program rather than of a round: one image per compile, and
+   `std --test` 134 ms -> 107. Keeping it *across builds* is the other half and
+   it is priced under "Cache compiled transformers across builds" above: 1% of
+   a self-compile, 2% of the std build, 13% of a macro-heavy dependency. Do it
+   when somebody has the third kind of project; a cache that can be stale is
+   not worth 1%.
+
+   **What the pricing also settled is that this was never going to remove 1 and
+   2.** The argument for it was that "a dependency's declarations are not in
+   this program at all, so there is nothing to declare and nothing to stub" --
+   and that is true of the dependency's *bodies*, which is `resolve` and
+   `lower`, and false of everything else. The calling program still has to be
+   staged and declared, because a call site resolves against the program it is
+   written in. `discover` + `stage` + `snapshot` + `sites` is 69 ms of a
+   self-compile's 118 ms tax and no transformer library touches any of it. Only
+   item 5 does.
+4. **The map versions that are still retained.** New on 2026-09-22 and ahead
+   of `.libdream` for everything, because it is a hundred megabytes for a
+   day's work where that is a month's. `--stats` now breaks the live set down
+   by kind at the largest major, with counts, and the number it puts in front
+   of you is **map branches per map entry**: 0.35 in a map nothing holds the
+   history of, 1.5 in a self-compile. The arena was most of that and is fixed
+   (`ir.settled`); what is left has the same shape and the same cause -- a
+   value stored into a persistent map before anything forces it, pinning the
+   version it was stored in. [dreams/opt.dr](dreams/opt.dr)'s five tables are
+   the named suspect: `keep` forces a node only when it happens to be
+   shareable, because `to_string` is how it makes the sharing key, so every
+   node that is not shareable goes in as a thunk. Measure the ratio before and
+   after, not the megabytes -- the megabytes move with the collector's
+   thresholds and the ratio does not.
+
+5. **`.libdream` for everything**, if the above has not already moved the wall
    past where anyone is standing.
-5. ~~**The incremental compile-time VM**~~ **Half done** (2026-09-21), and
+6. ~~**The incremental compile-time VM**~~ **Half done** (2026-09-21), and
    done out of order on purpose: the half that is the *call* -- an image loaded
    and entered by name with arguments that cross as values -- turned out not to
    depend on anything in 3 or 4, and doing it first is what takes the calls out
@@ -347,11 +436,13 @@ what a change will reach, and nothing but building the change says that.
    `std --test`, and the bootstrap a fixpoint in one stage. See "The image was
    the calls, and now it is the transformers" in `CLAUDE.md`.
 
-   What is left of it is the half that belongs to 3: a session that outlives a
-   round, holding a library that is a function of the dependency rather than of
-   the program.
+   **And the half that belonged to 3 landed the next day**: the session
+   outlives the round now, because what is in it is a function of the program's
+   transformers rather than of the round's calls. So a compile opens one image
+   and one VM, whatever its macros nest to. What is left is keeping that image
+   between *builds*, which is priced above and is not worth building yet.
 
-6. ~~**`discover`, which nothing has ever looked at.**~~ **Done**
+7. ~~**`discover`, which nothing has ever looked at.**~~ **Done**
    (2026-09-21), and the guess in this item was wrong in an instructive way.
    It proposed "stop numbering and walking items whose span does not contain a
    site" -- which is what `picked` already did -- and then said to measure
@@ -400,7 +491,7 @@ reading either alone. A cost that is large on a program of unrelated
 declarations and zero here is exactly the cost a large project would hit and
 nobody here would ever feel.
 
-**And the same warning read backwards**, which is what item 6 turned out to be.
+**And the same warning read backwards**, which is what item 7 turned out to be.
 `work_of`'s fallback was 35 ms on a self-compile and 0 on every generated
 program, because what trips it is a `match` and nothing `scale.py` writes is
 written as one. Neither program is the check; the pair is. And when a pass has

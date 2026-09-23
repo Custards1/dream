@@ -206,6 +206,52 @@ void Runtime::print_stats() const {
     }
     std::fprintf(stderr, "%s\n", line.c_str());
 
+    // And of what *survived*, what is it? The line above is what the program
+    // made; this is what it is still holding, which is the different question
+    // and the one that decides whether a large program compiles at all. A
+    // compile's peak is not garbage it has yet to collect -- `bytes_peak` and
+    // the held figure above already say that -- so the only thing left to ask
+    // is which objects they are.
+    //
+    // The moment is the largest *major* collection, which is the largest live
+    // set anything here can vouch for: a minor never looks at old space, so
+    // its survivors include everything old space happens to be carrying. It
+    // is printed with its own total for exactly that reason -- it is usually
+    // smaller than the peak on the line above, and reading one as the other
+    // would overstate what is known.
+    std::array<uint64_t, 64> live_kinds{};
+    size_t live_peak = 0;
+    for (const auto& p : all_processes()) {
+        const auto& t = p->heap().live_by_type_at_peak();
+        for (size_t i = 0; i < live_kinds.size(); ++i) live_kinds[i] += t[i];
+        live_peak += p->heap().bytes_live_at_major_peak();
+    }
+    if (live_peak) {
+        std::vector<std::pair<uint64_t, size_t>> live_rows;
+        for (size_t i = 0; i < 32; ++i)
+            if (live_kinds[i]) live_rows.push_back({live_kinds[i], i});
+        std::sort(live_rows.begin(), live_rows.end(),
+                  [](auto& a, auto& b) { return a.first > b.first; });
+        char head[96];
+        std::snprintf(head, sizeof head, "; %zu live at the largest major, by kind:",
+                      live_peak);
+        std::string live_line = head;
+        for (size_t i = 0; i < live_rows.size() && i < 8; ++i) {
+            char buf[64];
+            // The average size comes with the share, because a kind's bytes
+            // and its object count answer different questions and the gap
+            // between them is where a representation problem shows up.
+            const uint64_t n = live_kinds[32 + live_rows[i].second];
+            std::snprintf(buf, sizeof buf, " %s %.0f%% (%llu at %llu B)",
+                          obj_type_name(ObjType(live_rows[i].second)),
+                          100.0 * double(live_rows[i].first) / double(live_peak),
+                          static_cast<unsigned long long>(n),
+                          static_cast<unsigned long long>(n ? live_rows[i].first / n : 0));
+            live_line += buf;
+        }
+        std::fprintf(stderr, "%s\n", live_line.c_str());
+    }
+
     // How much of the run the JIT took over. It is printed here rather than
     // beside the "workers, jit on" line in the CLI for the reason the rest of
     // this function exists: every tool in this repository ends with `os.exit!`,

@@ -253,6 +253,33 @@ let floats p = core.map_get p :floats pool_new;
 let strs p   = core.map_get p :strs pool_new;
 let atoms p  = core.map_get p :atoms pool_new;
 
+/// True, having forced every field of `n` on the way to saying so.
+///
+/// A node handed to `push_node` is an *unforced* one: an argument is a thunk,
+/// and a thunk carries the frame that would build it -- which is the lowerer's
+/// frame, and that frame holds the arena as it stood one node ago. So an arena
+/// of unforced nodes is not an arena at all, it is every version of one. The
+/// map is persistent, so each version shares its entries with the last and
+/// copies the path to the one it added, and a live chain of them is a trie
+/// with several branches per entry rather than the third of one a settled map
+/// has. Measured on a self-compile, before this: 745,534 live trie branches
+/// averaging 169 bytes against 552,026 entries, and 219,134 frames nothing
+/// could reach but a node that had not been looked at yet.
+///
+/// Forcing the *spine* is not enough and that was measured too -- the fields
+/// are where the frames hang, so all five are named here.
+///
+/// The shape is `fold_strict`'s and the reason is the one given there: an
+/// argument is not evaluated, so `push_node (settled n) p` would suspend the
+/// call to `settled` and change nothing. A condition is the one place the
+/// language must evaluate something. `type_of` is the cheapest builtin that
+/// cannot answer without evaluating, `:nothing` is not one of its answers, so
+/// every clause is true, `&&` reaches the last of them, and the answer is
+/// always true -- which is why the caller's `else` is unreachable and says so.
+let settled n = type_of (node_op n) != :nothing && type_of (node_flags n) != :nothing
+    && type_of (node_a n) != :nothing && type_of (node_b n) != :nothing
+    && type_of (node_c n) != :nothing;
+
 /// Force the arena's spine.
 ///
 /// Everything in Dream is lazy, and a lazy structure built in a loop is a chain
@@ -261,8 +288,11 @@ let atoms p  = core.map_get p :atoms pool_new;
 /// spine is forced as it is built: each push collapses the step before it, and
 /// what stays live is the arena rather than the history of how it was made.
 ///
-/// Only the spine. The values inside stay lazy, which is where laziness is
-/// actually wanted.
+/// Only the spine -- the *tables*. What goes into them is forced by `settled`
+/// at the push, which is a separate job and was found much later: this keeps
+/// the arena from being a chain of suspended puts, and that keeps it from
+/// being a chain of its own versions, which is a different chain with a
+/// different cause and was worth four hundred megabytes.
 let settle p = if len (nodes p) >= 0 && len (kids p) >= 0 { p } else { p };
 
 /// The node at an index. Every edge in the arena is one of these.
@@ -273,18 +303,28 @@ let kid_at i p = core.map_get (kids p) i no_node;
 /// Append a node: `[program, index]`.
 let push_node n p = {
     let i = node_count p;
-    [settle (core.map_put (core.map_put p :nodes (core.map_put (nodes p) i n))
-                          :node_count (i + 1)),
-     i]
+    if settled n {
+        [settle (core.map_put (core.map_put p :nodes (core.map_put (nodes p) i n))
+                              :node_count (i + 1)),
+         i]
+    } else { [p, i] }
 };
 
 /// Append a run of children: `[program, offset]`. The run is contiguous, which
 /// is what lets a parent address it with one offset and a count.
+///
+/// A child is a node index and is stored forced, for the reason `settled`
+/// gives about nodes: an unforced one is a thunk holding the frame that would
+/// compute it, and that frame holds the arena of the moment it was written.
+/// The fold is strict for the reason `list.fold_strict` gives -- a lazy one
+/// answers a chain of suspended puts, and a run of children is as long as a
+/// call's argument list.
 let push_kids xs p = {
     let at = kid_count p;
-    let filled = list.fold (fn acc pair ->
-        core.map_put acc (at + nth 1 pair) (nth 0 pair))
-        (kids p) (list.zip xs (list.range 0 (list.length xs)));
+    let filled = list.fold_strict (fn acc pair -> {
+        let kid = nth 0 pair;
+        if type_of kid != :nothing { core.map_put acc (at + nth 1 pair) kid } else { acc }
+    }) (kids p) (list.zip xs (list.range 0 (list.length xs)));
     [settle (core.map_put (core.map_put p :kids filled) :kid_count (at + list.length xs)), at]
 };
 

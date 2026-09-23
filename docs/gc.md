@@ -385,6 +385,37 @@ Doubling the cap to 64 MB moves promotion from 369 MB to 363 MB and costs
 23 MB of RSS; 256 MB moves it to 348 MB and costs 221 MB. The survivors are
 long-lived, and 32 MB stays the right cap.
 
+### What the live set is made of
+
+Everything in the section below is about the *holes* -- the gap between what a
+compile holds and what the OS is asked for -- and it was measured against a
+live set nobody could describe. `--stats` reports one now, by object kind, as
+of the largest major collection, with the object count and average size beside
+each share:
+
+```
+; 222356000 live at the largest major, by kind: map 57% (745534 at 169 B)
+  list 15% (1412025 at 24 B) frame 11% (219134 at 114 B) map entry 10% (552026 at 40 B) ...
+```
+
+A *major*, because a minor never looks at old space, so its survivors include
+everything old space happens to be carrying; the figure is therefore usually
+smaller than `bytes_peak` on the line above it, and the two are printed
+separately so that neither is read as the other. `DREAM_GC_TRACE=1` puts the
+top three kinds on every major's own line, which is what shows the shape over a
+whole run.
+
+It was built to ask why a large compile runs out of heap, and it answered
+immediately and not as expected: more than half of a self-compile's live set
+was map *branches*, at five times the count and three times the size a map of
+that many entries should have. The cause is not the collector's and is written
+up in `CLAUDE.md` under "A lazy value stored in a map pins the map it was made
+in" -- a lazily stored value holds the frame that would compute it, and in a
+fold that threads a persistent map that frame holds the map one version ago.
+Worth knowing here for two reasons: the ratio of map branches to map entries
+is a one-number test for it (0.35 healthy, 1.5 in the compiler before the
+fix), and a third of the peak this section calls irreducible was that.
+
 ### What is left: the holes
 
 After the change, peak RSS is 511 MB, of which 412 MB is blocks held from the

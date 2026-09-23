@@ -524,6 +524,10 @@ struct Heap::GcCtx {
     uint64_t promoted = 0;
     uint64_t total = 0;
     size_t live = 0;
+    /// What this thread's share of the sweep found alive, by object kind.
+    /// Summed into the heap's own when the round ends, like every other
+    /// counter here, so that no collector thread writes a heap-wide number.
+    uint64_t by_type[64] = {};
     /// Objects this thread took off a queue and scanned. Counted only in a
     /// parallel round, where the question it answers -- did the work divide?
     /// -- is the only one worth asking about a collector thread.
@@ -1405,9 +1409,9 @@ void Heap::major_collect(RootSource& roots) {
     major_nanos_ += now_nanos() - started;
     if (gc_trace())
         std::fprintf(stderr,
-                     "; major: %zu live, %zu held, %.2f ms mark, %.2f ms sweep\n",
+                     "; major: %zu live, %zu held, %.2f ms mark, %.2f ms sweep%s\n",
                      live_after_gc_, block_bytes_, double(marked - started) / 1e6,
-                     double(now_nanos() - marked) / 1e6);
+                     double(now_nanos() - marked) / 1e6, last_kinds_.c_str());
     verify_collect(roots, false);
 }
 
@@ -1631,9 +1635,9 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     if (gc_trace())
         std::fprintf(stderr,
                      "; concurrent major: %zu live, %zu held, "
-                     "%.2f ms overlap + %.2f ms stop\n",
+                     "%.2f ms overlap + %.2f ms stop%s\n",
                      live_after_gc_, block_bytes_, double(overlap_ns) / 1e6,
-                     double(final_ns) / 1e6);
+                     double(final_ns) / 1e6, last_kinds_.c_str());
     verify_collect(roots, false);
 }
 
@@ -1641,7 +1645,7 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
 // Sweeping
 // ---------------------------------------------------------------------------
 
-void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live) {
+void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live, uint64_t* by_type) {
     if (b->big) {
         // A dedicated block carries exactly one big object. It never joins
         // a size class (its size is past the table), so the choice is
@@ -1651,6 +1655,8 @@ void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live) {
         if (o->gc & GC_MARK) {
             o->gc &= ~GC_MARK;
             live += o->bytes;
+            by_type[size_t(o->type) & 31] += o->bytes;
+            ++by_type[32 + (size_t(o->type) & 31)];
         } else {
             b->dead = true;
         }
@@ -1669,6 +1675,8 @@ void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live) {
             // mark is cleared.
             o->gc &= ~GC_MARK;
             live += sz;
+            by_type[size_t(o->type) & 31] += sz;
+            ++by_type[32 + (size_t(o->type) & 31)];
         } else if (o->gc & GC_FREE) {
             // Alive on a list from an earlier cycle, untouched since. The
             // free bit is what keeps us from pushing it a second time; it
@@ -1683,14 +1691,50 @@ void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live) {
     }
 }
 
+/// The kinds that make up a live set, largest first, as ` map 55% list 16%`.
+///
+/// A trace line that says only how many bytes survived says nothing about
+/// what they are, and "what are they?" is the only question a live set of
+/// hundreds of megabytes actually poses. Three kinds is enough to tell the
+/// shapes apart -- a compile holding its syntax from one holding its tables --
+/// and short enough to leave the timings on the same line readable.
+std::string Heap::live_kinds_line(const uint64_t* by_type, size_t live) {
+    if (!live) return "";
+    std::vector<std::pair<uint64_t, size_t>> rows;
+    for (size_t i = 0; i < 32; ++i)
+        if (by_type[i]) rows.push_back({by_type[i], i});
+    std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::string out;
+    for (size_t i = 0; i < rows.size() && i < 3; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, " %s %.0f%%", obj_type_name(ObjType(rows[i].second)),
+                      100.0 * double(rows[i].first) / double(live));
+        out += buf;
+    }
+    return out;
+}
+
+/// Keep this sweep's tally if it found more live than any before it.
+///
+/// A live set is only worth reporting with the moment it belongs to, and the
+/// largest one is the moment that decides whether a program fits in a heap.
+/// Keeping the largest rather than the last is what makes the number answer
+/// "what is this compile held back by?" instead of "what was left at the end?"
+void Heap::note_live_by_type(size_t live, const uint64_t* by_type) {
+    if (live <= peak_major_live_ && peak_major_live_) return;
+    peak_major_live_ = live;
+    for (size_t i = 0; i < 64; ++i) peak_by_type_[i] = by_type[i];
+}
+
 void Heap::sweep() {
     Obj* head[kHeapClassCount] = {};
     Obj* tail[kHeapClassCount] = {};
     size_t live = 0;
+    uint64_t by_type[64] = {};
     Block* prev = nullptr;
     for (Block* b = blocks_; b;) {
         Block* next = b->next;
-        sweep_block(b, head, tail, live);
+        sweep_block(b, head, tail, live, by_type);
         if (b->dead) {
             if (prev) prev->next = next;
             else blocks_ = next;
@@ -1707,6 +1751,8 @@ void Heap::sweep() {
     carve_block_ = cb;
     live_after_gc_ = live;
     if (live > peak_live_) peak_live_ = live;
+    note_live_by_type(live, by_type);
+    last_kinds_ = gc_trace() ? live_kinds_line(by_type, live) : std::string();
     allocated_ = live;
 }
 
@@ -1730,16 +1776,18 @@ bool Heap::sweep_in_parallel() {
         for (;;) {
             size_t i = round.next_block.fetch_add(1, std::memory_order_relaxed);
             if (i >= round.blocks.size()) break;
-            sweep_block(round.blocks[i], c.free_head, c.free_tail, c.live);
+            sweep_block(round.blocks[i], c.free_head, c.free_tail, c.live, c.by_type);
         }
     });
     round_ = nullptr;
     if (!ran) return false;
 
     size_t live = 0;
+    uint64_t by_type[64] = {};
     for (GcCtx& c : round.ctxs) {
         merge_free_lists(c.free_head, c.free_tail);
         live += c.live;
+        for (size_t i = 0; i < 64; ++i) by_type[i] += c.by_type[i];
     }
 
     Block* head = nullptr;
@@ -1760,6 +1808,8 @@ bool Heap::sweep_in_parallel() {
     carve_block_ = cb;
     live_after_gc_ = live;
     if (live > peak_live_) peak_live_ = live;
+    note_live_by_type(live, by_type);
+    last_kinds_ = gc_trace() ? live_kinds_line(by_type, live) : std::string();
     allocated_ = live;
     ++parallel_collections_;
     return true;
