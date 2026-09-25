@@ -2078,7 +2078,10 @@ let resolve_from! l declared r0 from s_pre = {
         match global_index (env_at declared mi) (decl_name d) {
             () => acc,
             gi =>
-                match wrapper_of walked mi source d {
+                match (match wrapper_of walked mi source d {
+                           () => rename_wrapper walked by_global mi source d,
+                           w => w,
+                       }) {
                     () => acc,
                     found =>
                         if target_global (list.head found) == gi { acc }
@@ -2157,6 +2160,12 @@ let literal_expr e =
         [:bool, _, _]  => true,
         [:atom, _, _]  => true,
         [:unit, _]     => true,
+        // An empty list or map is as much a constant as a number: it names
+        // nothing, so it means the same at the call site as in the wrapper.
+        // They are what an accessor's default is -- `p.[:nodes else (%{})]`
+        // -- and without them every such accessor was a call and a frame.
+        [:list, [], _] => true,
+        [:map, [], _]  => true,
         _ => false,
     };
 
@@ -2269,6 +2278,44 @@ let wrapper_of r mi source d = {
         }
     }
 };
+
+/// A declaration that only renames a function -- `let node_op = Node.op;`,
+/// `let nth = list.nth;` -- as the wrapper it amounts to: `[target, plan,
+/// arity]`, with every parameter passed on in order, or `()`.
+///
+/// Such a global's value is the function it names, so a saturated call of it
+/// is a call of that function with the same arguments, and nothing is
+/// evaluated that was not before: the rename is read once and shared, and the
+/// call it stands for is the call it makes. What the rewrite removes is the
+/// read and the application of a closure where the named function would have
+/// been entered directly -- and, because the target is so often a wrapper
+/// itself (a record's accessor is one `get`), usually the call as well. A
+/// compiler written in this style renames its accessors at the top of every
+/// file, and each of those renames was a call at every use.
+///
+/// Only a function the program declares, with parameters, is followed: its
+/// arity is what says a call is saturated, and a global with no parameters is a
+/// value rather than a function.
+let rename_wrapper r by_global mi source d =
+    if not (list.is_empty (decl_params d)) { () }
+    else {
+        let target = match decl_body d {
+            [:name, _, span]     => resolution r mi source span,
+            [:field, _, _, span] => resolution r mi source span,
+            _ => (),
+        };
+        match target_global target {
+            () => (),
+            g => match by_global.[g else ()] {
+                () => (),
+                fi => {
+                    let arity = func_arity (func_at r fi);
+                    if arity < 1 { () }
+                    else { [target, list.map (fn k -> [:param, k]) (list.range 0 arity), arity] }
+                },
+            },
+        }
+    };
 
 /// A wrapper whose body is one container operation: `[[:op, kind], plan, arity]`.
 /// The plan is the operands in order, and each is held to the rule a call's
