@@ -191,6 +191,7 @@ mapping Checker {
     uses = %{}
     comps = %{}
     refined = %{}
+    heads = %{}
 }
 
 let res k = Checker.r k;
@@ -1350,24 +1351,29 @@ let bind_items k h items rest found kind = {
 
 /// Each arm is checked against what the arms above it have left: an arm is
 /// only reached by a value no earlier unguarded arm took, so after `() => 0`
-/// the next arm's binder is not `()` (see "narrowing" below). A scrutinee that
-/// is a name is narrowed with it, so `_ => x + 1` reads `x` the same way; and
-/// a scrutinee that is `type_of x` narrows `x`, to the kind an arm names in
-/// that arm and to the kinds no arm above named below it. Exhaustiveness is
-/// asked of the scrutinee as written, not as narrowed.
+/// the next arm's binder is not `()` (see "narrowing" below). Within the arm,
+/// what is left is cut down again to the members its pattern could match, so
+/// `:empty => ..` sees `:empty` and `[:circle, r] => ..` the circle. A
+/// scrutinee that is a name is narrowed with it, so `_ => x + 1` reads `x` the
+/// same way; and a scrutinee that is a *probe* of a name -- `type_of x`,
+/// `list.head x`, `x.[0]`, `x.[:kind]` -- narrows `x` by what an arm's literal
+/// says the probe answered, in that arm and, for an unguarded one, the other
+/// way in the arms below it. Exhaustiveness is asked of the scrutinee as
+/// written, not as narrowed.
 let infer_match k h s arms sp expected ds = {
     let [st, ds1] = infer k h s ds;
     let [t, _, _, ds2] = list.fold (fn acc arm -> {
         let [t, left, hs, d] = acc;
         let pattern = ast.arm_pattern arm;
-        let h1 = kind_arm k (if left == st { hs } else { narrow_scrutinee k hs s left }) s pattern true;
-        let h2 = bind_pattern k h1 pattern left;
+        let here_t = within k left pattern;
+        let h1 = probe_arm k (if here_t == st { hs } else { narrow_scrutinee k hs s here_t }) s pattern true;
+        let h2 = bind_pattern k h1 pattern here_t;
         let [h3, d1] = match ast.arm_guard arm {
             () => [h2, d],
             g => [narrowing k h2 g true, check k h2 g :bool "a guard" d],
         };
         let [rest, hs2] = match ast.arm_guard arm {
-            () => [without k left pattern, kind_arm k hs s pattern false],
+            () => [without k left pattern, probe_arm k hs s pattern false],
             _ => [left, hs],
         };
         match expected {
@@ -1383,11 +1389,16 @@ let infer_match k h s arms sp expected ds = {
 
 let narrow_scrutinee k h s t = narrow_name k h s (fn _ -> t);
 
-/// An arm of a `match` on `type_of x` whose pattern is a kind: `x` is of that
-/// kind in the arm, and is not in the arms below an unguarded one.
-let kind_arm k h s p yes = match [type_of_subject k h s, p] {
-    [(), _] => h,
-    [x, [:literal, [:atom, n, _], _]] => narrow_kind k h x n yes,
+/// An arm whose pattern is a literal, of a `match` whose scrutinee probes a
+/// name: the probe answered that literal in the arm, and did not in the arms
+/// below an unguarded one. A scrutinee that is the name itself is left to
+/// `within` and `without`, which already say both.
+let probe_arm k h s p yes = match p {
+    [:literal, e, _] => match probe k h s {
+        () => h,
+        [:value, _] => h,
+        pr => narrow_probe k h pr (literal_type e) yes,
+    },
     _ => h,
 };
 
@@ -1398,14 +1409,30 @@ let kind_arm k h s p yes = match [type_of_subject k h s, p] {
 // the test invisible to the checker, every use behind it would be reported --
 // `r + 1` after `if r == ()` is `:integer | :unit` plus one -- and that is a
 // report on code that works, which rule 2 forbids. So a test narrows, in the
-// two places a program writes one: the arms of a `match` below an arm that
-// took some members, and the branches of an `if` (and the right of `&&`/`||`)
-// behind a test.
+// two places a program writes one: the arms of a `match`, and the branches of
+// an `if` (and the right of `&&`/`||`) behind a test.
 //
-// There are two tests. `x == ()` is the maybe's. `type_of x == :integer` is
-// the one a union of kinds is taken apart with -- `:integer | :string` says
-// nothing about which, and `type_of` is how a program asks -- and so is a
-// `match` on `type_of x` whose arms are kinds.
+// A test is a comparison of a *probe* of a name with a literal, and there are
+// three probes, each the way a program takes one kind of union apart:
+//
+//   - the name itself. `x == ()` is the maybe's test, and `x == :empty` picks
+//     one value out of a union of them -- the variants of a `union` that carry
+//     no fields are exactly such atoms.
+//   - `type_of x`, which is how `:integer | :string` is told apart, since the
+//     union says nothing about which.
+//   - an element read by a literal key: `list.head x`, `x.[0]`, `x.[:kind]`.
+//     That is the tag of a tagged list -- `[:circle, r]`, the variants of a
+//     `union` that do carry fields -- and the discriminating field of a
+//     record.
+//
+// A `match` is the same tests written as arms: an arm's pattern is compared
+// with the scrutinee, and an arm whose scrutinee is a probe has its literal
+// compared with the probe.
+//
+// Only atoms, booleans and `()` are compared, because only those equal nothing
+// but themselves: `3 == 3.0` and `3` matches `3.0`, and a `bigstr` is `==` the
+// string of its bytes, so a number or a string literal says less about a
+// value's type than it appears to.
 //
 // What is tested is a name, and a name is either a local or a global. A local
 // is narrowed by name, the way a `let` would shadow it; a global by its index,
@@ -1417,18 +1444,51 @@ let kind_arm k h s p yes = match [type_of_subject k h s, p] {
 //
 // Narrowing only ever *removes* a member the checker can see a value cannot
 // be, so the worst an incomplete answer does is narrow less, which is where
-// the checker was before. And it never narrows `:any`: an unannotated name
-// told apart by `type_of` stays as unannotated as it was, which is what rule 1
+// the checker was before. A test nothing could pass narrows nothing, so that a
+// branch the signature says is dead does not have its uses reported against
+// something else instead. And it never narrows `:any`: an unannotated name
+// told apart by a test stays as unannotated as it was, which is what rule 1
 // asks.
+
+/// A union's members, with the unions behind its names opened too, so that a
+/// test of `Shape` where `type Shape = Round | Square` can see into both. A
+/// member that is a name and not a union stays a name, which is how it is
+/// shown back; whatever asks about one peels it.
+let flat_members k t = {
+    let rec flat t n =
+        if n <= 0 { [t] }
+        else {
+            match t {
+                [:union, ts] => list.concat (list.map (fn x -> flat x (n - 1)) ts),
+                [:named, _, _, _] => match peel k t 8 {
+                    [:union, ts] => list.concat (list.map (fn x -> flat x (n - 1)) ts),
+                    _ => [t],
+                },
+                _ => [t],
+            }
+        };
+    flat t 6
+};
+
+/// `t` cut down to the members `keep` answers true for, or `t` itself --
+/// still folded if it was a name -- when that is all of them or none.
+let keeping k t keep = {
+    let ms = flat_members k t;
+    let kept = list.filter keep ms;
+    if list.length kept == list.length ms || list.is_empty kept { t } else { union_of kept }
+};
 
 /// What is left of `t` for the arms below one whose pattern is `p`: every
 /// member `p` certainly matches is gone. Unchanged -- the same value, still
 /// folded if it was a named type -- when nothing is.
 let without k t p = {
-    let ms = members (peel k t 8);
-    let kept = list.filter (fn m -> not (covers p m)) ms;
+    let ms = flat_members k t;
+    let kept = list.filter (fn m -> not (covers p (peel k m 8))) ms;
     if list.length kept == list.length ms { t } else { union_of kept }
 };
+
+/// What `t` is in an arm whose pattern is `p`: the members `p` could match.
+let within k t p = keeping k t (fn m -> may_match k p m);
 
 /// Whether pattern `p` matches every value of type `m`, whatever it holds.
 /// `false` is always a safe answer.
@@ -1457,6 +1517,51 @@ let rec covers p m = match p {
     _ => false,
 };
 
+/// Whether pattern `p` could match some value of type `m`. The converse of
+/// `covers`, and as careful the other way: `true` is always a safe answer.
+let rec may_match k p m = match p {
+    [:as_p, inner, _, _, _] => may_match k inner m,
+    [:literal, e, _] => match comparable (literal_type e) {
+        () => true,
+        l => fits k l m,
+    },
+    [:list_p, items, rest, _] => sequence_may k items rest m :list,
+    [:array_p, items, rest, _] => sequence_may k items rest m :array,
+    [:map_p, _, _] => match kinds_of k m {
+        () => true,
+        ks => list.contains :map ks,
+    },
+    _ => true,
+};
+
+let sequence_may k items rest m kind = match kinds_of k m {
+    () => true,
+    ks if not (list.contains kind ks) => false,
+    _ => match [kind, peel k m 8] {
+        [:list, [:tuple, ts]] => fixed_may k items rest ts,
+        [:array, [:array_t, ts]] => fixed_may k items rest ts,
+        [:list, [:list_of, e]] => list.all (fn p -> may_match k p e) items,
+        [:array, [:array_of, e]] => list.all (fn p -> may_match k p e) items,
+        _ => true,
+    },
+};
+
+let fixed_may k items rest ts = {
+    let n = list.length items;
+    (if rest == () { n == list.length ts } else { n <= list.length ts })
+    && list.all (fn pt -> may_match k (list.nth 0 pt) (list.nth 1 pt)) (list.zip items ts)
+};
+
+/// A literal's type when comparing with it says what a value's type is -- an
+/// atom, a boolean, `()` -- and `()` otherwise. See "narrowing" for why a
+/// number or a string does not.
+let comparable l = match l {
+    :unit => l,
+    [:lit, :atom, _] => l,
+    [:lit, :bool, _] => l,
+    _ => (),
+};
+
 /// `h` with what condition `c` says about the names it tests, given that it
 /// came out `yes`. `not`, `&&` and `||` carry a test through where the outcome
 /// of the whole says the outcome of the part -- `a && b` true means both were,
@@ -1470,30 +1575,64 @@ let rec narrowing k h c yes = match c {
     _ => h,
 };
 
-/// `x == y` known to have come out `equal`, when it is one of the two tests.
-let equality k h x y equal = match [x, y] {
-    [_, [:unit, _]] => narrow_unit k h x equal,
-    [[:unit, _], _] => narrow_unit k h y equal,
-    [_, [:atom, n, _]] => match type_of_subject k h x {
-        () => h,
-        subject => narrow_kind k h subject n equal,
-    },
-    [[:atom, n, _], _] => match type_of_subject k h y {
-        () => h,
-        subject => narrow_kind k h subject n equal,
-    },
+/// `x == y` known to have come out `equal`: a probe on one side and a literal
+/// on the other, either way round.
+let equality k h x y equal = match [literal_type x, literal_type y] {
+    [:any, :any] => h,
+    [:any, l] => narrow_probe k h (probe k h x) l equal,
+    [l, :any] => narrow_probe k h (probe k h y) l equal,
     _ => h,
 };
 
-/// `x` when `e` is `type_of x` -- the builtin, not a global of that name,
-/// which the resolver is the one to say -- and `()` otherwise.
-let type_of_subject k h e = match e {
-    [:apply, [:name, "type_of", sp], [x], _] =>
-        match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
-            [:builtin, "type_of"] => x,
-            _ => (),
-        },
+/// What expression `e` asks of a name, if it is a probe (see "narrowing"):
+/// `[:value, x]`, `[:kind, x]` or `[:elem, x, key, raises]`, with `key` the
+/// type of a literal key and `raises` whether a read of an element that is not
+/// there raises rather than answering a fallback. `()` for anything else, and for a probe of something that is
+/// not a name, which there would be nothing to narrow.
+let probe k h e = match e {
+    [:name, _, _] => [:value, e],
+    [:field, _, _, _] => [:value, e],
+    [:apply, f, [x], _] if is_name x => match callee_probe k h f {
+        :type_of => [:kind, x],
+        :head => [:elem, x, lit :integer 0, true],
+        _ => (),
+    },
+    // With a fallback of `()` a read of nothing answers `()`, which is not the
+    // literal either; what it changes is that the test then comes out false
+    // rather than never coming out at all.
+    [:get, c, key, fb, _] if is_name c && (fb == () || literal_type fb == :unit) => match literal_type key {
+        [:lit, kind, v] => [:elem, c, lit kind v, fb == ()],
+        _ => (),
+    },
     _ => (),
+};
+
+let is_name e = match e { [:name, _, _] => true, [:field, _, _, _] => true, _ => false };
+
+/// Which probe a callee is: `type_of` -- the builtin, not a global of that
+/// name, which the resolver is the one to say -- or `std.list`'s `head`.
+let callee_probe k h f = match f {
+    [:name, _, sp] => resolved_probe k h sp,
+    [:field, _, _, sp] => resolved_probe k h sp,
+    _ => (),
+};
+
+let resolved_probe k h sp = match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
+    [:builtin, "type_of"] => :type_of,
+    [:global, _, _, gi] => if (Checker.heads k).[gi else false] { :head } else { () },
+    [:member, _, _, gi] if gi != () => if (Checker.heads k).[gi else false] { :head } else { () },
+    _ => (),
+};
+
+/// `h` with what the probe `pr` having answered `l` -- or, when not `yes`,
+/// something else -- says about the name it probes.
+let narrow_probe k h pr l yes = match [pr, comparable l] {
+    [_, ()] => h,
+    [[:value, x], :unit] => narrow_unit k h x yes,
+    [[:value, x], c] => narrow_value k h x c yes,
+    [[:kind, x], [:lit, :atom, n]] => narrow_kind k h x n yes,
+    [[:elem, x, key, raises], [:lit, _, _]] => narrow_elem k h x key raises l yes,
+    _ => h,
 };
 
 /// A name known to be `()`, or known not to be. Only `()` equals `()` -- not
@@ -1506,25 +1645,81 @@ let narrow_unit k h x is_unit = narrow_name k h x (fn t -> match is_unit {
     _ => without k t (ast.literal_p [:unit, [0, 0]] [0, 0]),
 });
 
+/// A name known to equal the atom or boolean `l`, or known not to. An atom
+/// equals only itself, so the first is exact, as `narrow_unit`'s is. The
+/// second drops the member that is `l`, and turns `:bool` into the other
+/// boolean.
+let narrow_value k h x l yes = narrow_name k h x (fn t -> match yes {
+    true if fits k l t => l,
+    true => t,
+    _ => {
+        let ms = flat_members k t;
+        let kept = list.concat (list.map (fn m -> match [peel k m 8, l] {
+            [p, _] if p == l => [],
+            [:bool, [:lit, :bool, v]] => [lit :bool (not v)],
+            _ => [m],
+        }) ms);
+        if kept == ms || list.is_empty kept { t } else { union_of kept }
+    },
+});
+
 /// A name whose `type_of` is known to be the kind spelled `n`, or known not to
 /// be. A member is kept by the first unless every value it has is of another
 /// kind, and dropped by the second only when every value it has is of this
-/// one; a member whose kind the checker cannot say is kept by both. A test
-/// nothing could pass -- `type_of x == :string` of an `:integer` -- narrows
-/// nothing, for the reason `narrow_unit` gives.
+/// one; a member whose kind the checker cannot say is kept by both.
 let narrow_kind k h x n yes = match primitives.[n else ()] {
     () => h,
     :any => h,
     :never => h,
-    kind => narrow_name k h x (fn t -> {
-        let ms = members (peel k t 8);
-        let kept = list.filter (fn m -> match kinds_of k m {
-            () => true,
-            ks => if yes { list.contains kind ks } else { ks != [kind] },
-        }) ms;
-        if list.length kept == list.length ms || list.is_empty kept { t } else { union_of kept }
-    }),
+    kind => narrow_name k h x (fn t -> keeping k t (fn m -> match kinds_of k m {
+        () => true,
+        ks => if yes { list.contains kind ks } else { ks != [kind] },
+    })),
 };
+
+/// A name one of whose elements -- the one at literal key `key` -- is known to
+/// equal the atom or boolean `l`, or known not to. The first keeps a member
+/// only if that element could be `l`: a tagged list with another tag is gone,
+/// and so is anything with no such element, since reading it raised or
+/// answered the fallback. The second drops a member whose element is
+/// certainly there and certainly `l` -- and, where reading a missing element
+/// raises, a member with no such element, because the test never came out at
+/// all for it: `s.[0] == :circle` false leaves the square, not the `:empty`.
+let narrow_elem k h x key raises l yes = narrow_name k h x (fn t -> keeping k t (fn m ->
+    match element_at k m key {
+        :unknown => true,
+        :none => not (yes || raises),
+        [et, there] => if yes { fits k l et } else { not (there && peel k et 8 == l) },
+    }));
+
+/// What `m.[key]` reads for a value of type `m`: `[t, there]`, where `there`
+/// says every such value has the element; `:none` when none has it; and
+/// `:unknown` when the checker cannot say. A record may hold keys its type
+/// does not name, so a key it does not name is unknown rather than absent.
+let element_at k m key = match [peel k m 8, key] {
+    [[:tuple, ts], [:lit, :integer, i]] => positional ts i,
+    [[:array_t, ts], [:lit, :integer, i]] => positional ts i,
+    [[:list_of, e], _] => [e, false],
+    [[:array_of, e], _] => [e, false],
+    [[:record, ps], _] => match list.filter (fn p -> list.nth 0 p == key) ps {
+        [] => :unknown,
+        [p, .._] => [list.nth 1 p, list.length p == 2],
+    },
+    [[:map_of, _, v], _] => [v, false],
+    [pm, _] => match kinds_of k pm {
+        () => :unknown,
+        ks => if list.all (fn kd -> list.contains kd scalar_kinds) ks { :none } else { :unknown },
+    },
+};
+
+let positional ts i = match i {
+    _ if i < 0 => :unknown,
+    _ if i < list.length ts => [list.nth i ts, true],
+    _ => :none,
+};
+
+/// The kinds a value of which has no elements to read.
+let scalar_kinds = [:integer, :float, :atom, :bool, :char, :unit, :pure_fn, :impure_fn];
 
 /// The kinds `type_of` can answer for a value of type `m`, or `()` when the
 /// checker cannot say -- `:any`, a type variable, a union behind a name.
@@ -2183,7 +2378,7 @@ let sig_table l r =
 let checker l r = {
     let named = named_table l r;
     let [sigs, ds] = sig_table l r;
-    let k0 = Checker.make l r named sigs %{} %{} %{};
+    let k0 = Checker.make l r named sigs %{} %{} %{} %{};
     let evaluated = list.fold (fn acc kv -> {
         let [owner, t, _] = list.nth 1 kv;
         acc.[list.nth 0 kv => eval_type k0 (in_module owner) t]
@@ -2198,8 +2393,18 @@ let checker l r = {
         let [mi, _, desc, _] = list.nth 1 kv;
         if mentions_refine k0 mi desc 8 { acc.[list.nth 0 kv => true] } else { acc }
     }) %{} (map_pairs named);
-    [Checker.set_refined (Checker.set_sigs (Checker.set_uses k0 uses) evaluated) refined, unknown]
+    let k1 = Checker.set_refined (Checker.set_sigs (Checker.set_uses k0 uses) evaluated) refined;
+    [Checker.set_heads k1 (heads_of k0 l), unknown]
 };
+
+/// The globals that are `std.list`'s `head`, which a test reads a tag with
+/// (see "narrowing"). By index, as fusion knows `range`, so that a `head` of
+/// the program's own is not taken for it.
+let heads_of k l = list.fold (fn acc i ->
+    match [modules.module_name (modules.module_at l i), gi_of k i "head"] {
+        ["std.list", gi] if gi != () => acc.[gi => true],
+        _ => acc,
+    }) %{} (list.range 0 (modules.module_count l));
 
 /// One declaration's body, against its signature if it has one.
 let check_decl k b ds = {

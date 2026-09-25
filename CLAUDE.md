@@ -3348,7 +3348,17 @@ not, each found by running the checker over this repository:
   rest of the scrutinee's union (and so does a scrutinee that is a name),
   and `x == ()`/`x != ()` under `if`, `&&`, `||`, `not` or a guard narrows
   `x` in the branch the outcome decides; `type_of x == :kind`, and a `match`
-  on `type_of x` whose arms are kinds, narrow to that kind or away from it.
+  on `type_of x` whose arms are kinds, narrow to that kind or away from it;
+  `x == :atom` picks one value out of a union (a fieldless `union` variant is
+  one), and `list.head x`, `x.[0]` or `x.[:kind]` compared with an atom picks
+  out the tagged lists or records that could carry it, which is how a
+  `union`'s variants with fields are told apart; and inside a `match` arm the
+  scrutinee is cut down to what the arm's pattern could match. Only atoms,
+  booleans and `()` narrow -- `3 == 3.0`, and a `bigstr` is `==` its string,
+  so a number or a string literal says less than it looks. A read with no
+  fallback that raises for a member drops that member from *both* branches:
+  `s.[0] == :circle` false leaves the square, not `:empty`. `list.head` is
+  known by its global index, as fusion knows `range` (`heads_of`).
   `x` may be a global (keyed by its index, so a local of the same spelling
   under the test is not it) but not an impure name, and `:any` is never
   narrowed, so rule 1 still holds of unannotated code -- "narrowing" in

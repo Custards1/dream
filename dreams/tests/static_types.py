@@ -247,6 +247,69 @@ let main! = console.print! [a 1, a 0, b 2, c 3, d 4, e, f, h, i];
     failure(prelude + 'let g : :integer | :unit;\nlet g = 3;\nlet main! = console.print! (g + 1);',
             'but this is `:integer | :unit` and `1`')
 
+    # A union is taken apart by its values and its tags as well as by its
+    # kinds. `x == :atom` picks out one value -- a `union` variant with no
+    # fields is one -- and `list.head x`, `x.[0]` or `x.[:kind]` compared with
+    # an atom picks out the tagged lists or records that could carry it. A
+    # `match` arm sees the scrutinee cut down to what its pattern could match,
+    # and a `match` on a probe narrows the name it probes. Only atoms, booleans
+    # and `()` narrow: `3 == 3.0`, and a `bigstr` is `==` its string.
+    tagged = prelude + '''
+import std.list;
+union Shape { circle(radius : :float), square(side : :float), empty }
+let radius : [:circle, :float] -> :float;
+let radius c = list.nth 1 c;
+let pick : :integer -> Shape;
+let pick n = match n { 0 => Shape.empty, 1 => Shape.circle 1.5, _ => Shape.square 2.0 };
+let status : :integer -> :ok | :error | :pending;
+let status n = match n { 0 => :ok, 1 => :error, _ => :pending };
+let only_ok : :ok -> :integer;
+let only_ok x = 1;
+type Msg = [:add, :integer] | [:say, :string];
+let msg : :integer -> Msg;
+let msg n = if n > 0 { [:add, n] } else { [:say, "hi"] };
+let flag : :bool | :unit;
+let flag = true;
+let yes : true -> :integer;
+let yes x = 7;
+'''
+    success(tagged + '''
+let rec_t : %{:kind => :circle, :r => :float} | %{:kind => :box, :w => :integer};
+let rec_t = %{:kind => :box, :w => 3};
+let a n = { let x = status n; if x == :ok { only_ok x } else { 0 } };
+let b n = { let x = status n; match x { :ok => only_ok x, _ => 0 } };
+let c n = { let s = pick n; if s != :empty && s.[0] == :circle { radius s } else { 0.0 } };
+let d n = { let s = pick n; if s.[0 else ()] == :circle { radius s } else { 0.0 } };
+let e n = { let s = pick n; match s { [:circle, _] => radius s, _ => 0.0 } };
+let f n = { let s = pick n; match s.[0 else ()] { :circle => radius s, _ => 0.0 } };
+let g n = { let x = msg n; if list.head x == :add { list.nth 1 x + 1 } else { 0 } };
+let h n = { let x = msg n; match list.head x { :say => 0, _ => list.nth 1 x + 1 } };
+let i = if rec_t.[:kind] == :box { rec_t.[:w] + 1 } else { 0 };
+let j = if flag != () && flag != false { yes flag } else { 0 };
+let main! = console.print! [a 0, a 1, b 0, c 0, c 1, d 1, d 2, e 1, f 1, g 3, h 3, h 0, i, j];
+''', '[1, 0, 1, 0, 1.5, 1.5, 0, 1.5, 1.5, 4, 4, 0, 4, 7]\n')
+    shape = '`[:circle, :float]`, but this is '
+    failure(tagged + 'let main! = console.print! (radius (pick 1));', shape + '`Shape`')
+    failure(tagged + 'let main! = { let s = pick 1; console.print! (if s == :empty { 0.0 } else { radius s }) };',
+            shape + '`[:circle, :float] | [:square, :float]`')
+    # A read with no fallback raises for `:empty`, so the test never came out
+    # false for it; with one, it answered `()` and did.
+    failure(tagged + 'let main! = { let s = pick 1; console.print! (if s.[0] == :circle { 0.0 } else { radius s }) };',
+            shape + '`[:square, :float]`')
+    failure(tagged + 'let main! = { let s = pick 1; console.print! (if s.[0 else ()] == :circle { 0.0 } else { radius s }) };',
+            shape + '`[:square, :float] | :empty`')
+    failure(tagged + 'let main! = { let s = pick 1; console.print! (match s { [:square, _] => radius s, _ => 0.0 }) };',
+            shape + '`[:square, :float]`')
+    failure(tagged + 'let main! = { let x = status 1; console.print! (if x == :ok { 0 } else { only_ok x }) };',
+            'should be `:ok`, but this is `:error | :pending`')
+    failure(tagged + 'let main! = { let x = status 1; console.print! (match x { :ok if false => 0, _ => only_ok x }) };',
+            'should be `:ok`, but this is `:ok | :error | :pending`')
+    failure(tagged + 'let main! = console.print! (if flag != () { yes flag } else { 0 });',
+            'should be `true`, but this is `:bool`')
+    # `list.head` of a union with an atom in it is itself the mistake.
+    failure(tagged + 'let main! = { let s = pick 1; console.print! (list.head s == :circle) };',
+            'argument 1 of `list.head` should be `[a]`, but this is `Shape`')
+
     # --- what is not ----------------------------------------------------------------
     #
     # Code no signature touches is never an error, however obviously it would

@@ -945,6 +945,17 @@ to the rest, and so does a `match` on `type_of x` whose arms are kinds. `x`
 may be a local, a global or a module's member (`m.x`); an impure name is never
 narrowed, since two reads of it are two answers.
 
+A union's values and tags are tests too. `x == :pending` narrows `x` to that
+atom, and `x != :pending` to the rest -- which is how a `union` variant with no
+fields is told apart. A variant with fields is a tagged list, and its tag is
+read with `list.head x`, `x.[0]` or `x.[0 else ()]`; comparing that with an atom
+narrows `x` to the variants that could carry it, and a record's discriminating
+field, `x.[:kind]`, works the same way. A `match` on such a read narrows arm by
+arm, and inside any `match` arm the scrutinee is only what the pattern could
+match, so in `[:circle, _] => area x` the whole `x` is the circle. Only atoms,
+booleans and `()` narrow: `3 == 3.0` is true, and a `bigstr` equals the string
+of its bytes, so a number or a string says less about a type than it seems to.
+
 ```dream
 let find : :string -> :integer | :unit;
 
@@ -953,6 +964,10 @@ let twice s = { let r = find s; if r != () { r * 2 } else { 0 } };
 
 let pick : :integer -> :integer | :string;
 let size n = { let v = pick n; if type_of v == :string { 0 } else { v + 1 } };
+
+union Shape { circle(radius : :float), square(side : :float), empty }
+let radius : [:circle, :float] -> :float;
+let r s = if s != :empty && s.[0] == :circle { radius s } else { 0.0 };
 ```
 
 ### `import`
