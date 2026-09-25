@@ -2871,6 +2871,65 @@ accepts something the seed's checker rejects needs one build with `--no-types`
 first: build the new compiler with the seed and `--no-types`, let *that*
 compile the source twice, compare, and copy it over the seed.
 
+### What a signature buys the compiled code
+
+The first use of the types for speed, 2026-09-25, and the rule it rests on is
+the one to keep: **the types are gradual, so a signature is a hint and never a
+promise.** An unannotated caller may hand a `:float` parameter an integer, the
+checker cannot object (`:any` fits everywhere), and the program is owed the
+answer the interpreter gives. So nothing is *trusted* on a signature's say-so;
+it chooses a representation, and the representation is guarded.
+
+What flows: `typecheck.float_params` reads which parameters each top-level
+signature declares `:float` (a name for one, a float literal and a union of
+floats count; `:number` and a type variable do not), `main.dr` maps globals to
+functions, and the image carries a `TYPE` section of `[func, mask]` records
+(docs/bytecode-format.md). A program with no float in a signature has no
+section and is byte-identical to before -- which is why the bootstrap seed only
+moved because the compiler's own source did.
+
+What the JIT does with it, all in [dream/src/jit.cpp](dream/src/jit.cpp):
+
+- **A declared float starts the float fixpoint as Float.** That is what reaches
+  `integrate (x + dx) hi dx (acc + x * dx)`, a loop with no float literal in its
+  self call, where inference alone never says `x` is one. Only parameters the
+  body forces on every path are seeded: a merely carried one may arrive as a
+  suspension nobody is allowed to force, and would bail every call.
+- **The first iteration is peeled** when the entry cannot force the float slots
+  in the body's order. That rule used to drop the whole specialization, so it
+  matters for untyped loops too; now the first iteration runs over tagged slots
+  and only its back-edge crosses into doubles, as a guard (`enter_loop`). A
+  carried slot is re-read at the back-edge, because the argument after it is
+  usually what forced it -- a raw read taken earlier is the caller's thunk, and
+  that was a 20x slowdown before it was found.
+- **A declared-float peer gets a typed variant**, taking doubles, beside the
+  generic one; a call site passes doubles straight through, checks a tagged
+  argument for a float box, and falls to the generic variant otherwise.
+- **A peer whose body is a float returns a raw double**, typed or not. The bits
+  ride in the return register and are read only after the status says
+  `JIT_OK`.
+- **A run of bails gives the function up.** A guard that fails hands the call to
+  the interpreter; sixteen in a row (`Jit::note_bail`) deoptimize it, since a
+  peeled loop fed integers would otherwise pay a wasted first iteration per
+  interpreted iteration.
+
+| | untyped | typed | allocated, typed |
+|---|---|---|---|
+| `integrate`, 3M steps, no float literal in the self call | 213 ms | **23-32 ms** | 192 MB -> 230 KB |
+| `term` helper called from a loop, 3M calls | 135 ms (99 now, from the double return) | **39 ms** | 192 MB -> 297 KB |
+| escape-time loop, floats already inferred | 63 ms | 62 ms | -- |
+
+The benchmark's seven rows did not move. `dream/tests/programs/jit_types.dr`
+holds the tier agreement, including integers passed to declared floats through
+an unannotated caller, a first iteration that raises, and both give-ups.
+
+**What a type cannot do here, measured rather than assumed:** admit a function.
+The admission rule is strictness -- every parameter forced on every path -- and
+a type says what a value is, not whether it is evaluated. The escape-time loop
+written `if i >= limit { i } else if zr * zr + zi * zi > 4.0 ..` compiles
+nothing typed or untyped, because `zr` is not forced on the first path; the
+same loop with the two tests swapped is compiled either way.
+
 ## The language server
 
 `lucid` is the compiler answering an editor's questions. It imports `dreams` and
@@ -3123,7 +3182,8 @@ test.
 - `let name : type` is a **signature**, checked at compile time
   ([dreams/typecheck.dr](dreams/typecheck.dr)); `let x : t = e` and
   `let f x : answer = e` are the inline forms. A free lowercase name in one is
-  a type variable. Signatures compile to nothing, code no signature touches is
+  a type variable. A signature changes no node -- the one thing it adds to an
+  image is a hint for the JIT, below -- code no signature touches is
   never rejected, and `--no-types` skips the pass. "Static types" below is the
   design.
 - `union Shape { circle(radius : :float), empty }` declares a **discriminated

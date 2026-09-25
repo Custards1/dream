@@ -193,6 +193,18 @@ constexpr uint32_t kMaxBindDuplication = 8;
 // a double is checked on entry, and a function entered with something else in
 // it answers `JIT_BAIL` and is run by the interpreter, which is what would have
 // happened had it never been compiled.
+//
+// Which parameters are floats has two sources. The fixpoint finds the ones a
+// loop's own self calls make floats -- `acc + 1.0 / k` -- and a **signature**
+// names the rest: a parameter declared `:float` starts the fixpoint as Float
+// rather than as Unknown (the image's `TYPE` section, `Image::float_params`).
+// The second is what reaches `go (x + dx) dx (acc + x * dx)`, where no float
+// literal appears and the fixpoint alone would never say `x` is one. It is a
+// guess and is treated as one, because the types are gradual: a caller with no
+// signature may pass an integer, and the guard that makes the fixpoint's own
+// answers safe makes this one safe too. A declared float that turns out to be
+// an integer costs a bail, and a run of them gives the function up
+// (`Jit::note_bail`); it never costs an answer.
 // ---------------------------------------------------------------------------
 
 enum class Ty : uint8_t {
@@ -431,6 +443,20 @@ struct Analysis {
     /// Slots to force on entry, in this order, before the float ones are
     /// unboxed. Empty unless `float_slots` is. See `Analyzer::force_order`.
     std::vector<uint32_t> force_first;
+    /// The entry cannot force the float slots in the order the body would, so
+    /// the first iteration is emitted a second time over tagged slots and only
+    /// its tail call crosses into doubles. Loop shape only. See "The first
+    /// iteration" above `Emitter::emit_loop`.
+    bool peel = false;
+    /// A peer only: this body returns its answer as a raw double, its bits in
+    /// the return register. Decided by the type of the body, not by a
+    /// signature -- see "Typed peers" above `PeerSet`.
+    bool ret_dbl = false;
+    /// A peer only: the parameters of its *typed* variant, which takes them as
+    /// doubles, and whether that variant returns one. Zero when the signature
+    /// declares no float parameter, and then there is no typed variant.
+    SlotSet typed_slots = 0;
+    bool typed_ret_dbl = false;
     /// The other global functions this body calls. Every one of them is a
     /// member of the compile's `PeerSet` and is emitted beside it.
     std::vector<uint32_t> calls;
@@ -454,6 +480,9 @@ class PeerSet;
 /// compiled means analysing the callee, and analysing the callee means asking
 /// the same question of everything *it* calls.
 bool peer_admits(PeerSet& peers, uint32_t gi, int depth);
+/// The type of a call to peer `gi` whose arguments in `float_args` are known to
+/// be floats. Also a free function, for the same reason.
+Ty peer_call_ty(const PeerSet& peers, uint32_t gi, SlotSet float_args);
 
 class Analyzer {
 public:
@@ -519,14 +548,67 @@ public:
         a.recurses = recurses_;
         a.tail_self = tail_self_;
         a.calls = calls_;
-        a.float_slots = float_slots();
-        if (a.float_slots) {
-            if (!entry_forces(a.float_slots, &a.force_first)) {
-                // The body forces its parameters in an order this cannot pin
-                // down, so unboxing one would mean forcing it out of turn.
-                // Give the specialization up rather than the order.
-                a.float_slots = 0;
-                a.force_first.clear();
+        // A parameter the signature declares `:float` starts the fixpoint as
+        // one instead of as nothing. That is a guess about the value the
+        // caller hands in, and the entry guards it exactly as it guards a slot
+        // the fixpoint found on its own; what it adds is the loop whose self
+        // calls never mention a float literal -- `go (x + dx) dx (acc + x * dx)`
+        // -- where nothing else would ever say that `x` is one.
+        //
+        // Only a parameter the body forces on every path. One it merely
+        // carries may never be looked at, so the value it arrives with may be
+        // a suspension nobody is allowed to force -- and a guard can only hand
+        // such a call back, every time.
+        const SlotSet hinted = img_.float_params(fi_) & params & strict;
+        a.float_slots = float_slots(hinted, 0);
+        if (a.float_slots && !entry_forces(a.float_slots, &a.force_first)) {
+            // The body forces its parameters in an order the entry cannot pin
+            // down, so unboxing one there would mean forcing it out of turn.
+            a.force_first.clear();
+            if (!recurses_) {
+                // A loop runs its first iteration over tagged slots instead,
+                // forcing in the body's own order, and crosses into doubles
+                // at the back-edge. Nothing is forced early and nothing is
+                // given up.
+                a.peel = true;
+            } else {
+                // A recursion has no back-edge to cross at, so it keeps the
+                // float slots the entry *can* reach and gives up only the
+                // others -- which used to be all of them. Giving one up can
+                // demote another (a slot that was a float because this one
+                // was), so the fixpoint runs again with the given-up ones
+                // pinned, until what is left is inside the prefix.
+                std::vector<uint32_t> seq;
+                force_order(f_.body, 0, seq);
+                SlotSet prefix = 0;
+                for (uint32_t slot : seq) {
+                    if (slot < 64) prefix |= SlotSet(1) << slot;
+                }
+                SlotSet pinned = 0;
+                SlotSet fs = a.float_slots;
+                while (fs & ~prefix) {
+                    pinned |= fs & ~prefix;
+                    fs = float_slots(hinted & ~pinned, pinned);
+                }
+                a.float_slots = fs;
+                if (fs && !entry_forces(fs, &a.force_first)) {
+                    a.float_slots = 0;
+                    a.force_first.clear();
+                }
+            }
+        }
+        if (peer_depth_ > 0) {
+            // The two variants a peer may be emitted as, typed by the slots
+            // each one has: every parameter tagged, and the declared floats
+            // (plus whatever the fixpoint finds follows from them) as doubles.
+            // Each returns a double when its body's type is Float -- a fact
+            // about the body, true of the generic variant as much as the typed
+            // one: `1.0 / (k * k + 1.0)` is a float whatever `k` is, or raises.
+            float_slots(0, params);
+            a.ret_dbl = ty(f_.body, 0) == Ty::Float;
+            if (hinted) {
+                a.typed_slots = float_slots(hinted, 0) & params;
+                a.typed_ret_dbl = a.typed_slots && ty(f_.body, 0) == Ty::Float;
             }
         }
         return a;
@@ -922,10 +1004,17 @@ private:
     // (Unknown to Float to Any), so the loop is bounded by that and terminates
     // on the round that changes nothing.
 
-    /// One bit per slot the function can carry as a raw double.
-    SlotSet float_slots() {
+    /// One bit per slot the function can carry as a raw double. `seed` is
+    /// where the fixpoint starts at Float rather than at Unknown -- the
+    /// parameters a signature declared -- and `pinned` is where it starts at
+    /// Any and so stays.
+    SlotSet float_slots(SlotSet seed, SlotSet pinned) {
         slot_ty_.assign(f_.slots, Ty::Unknown);
         for (uint32_t i = f_.arity; i < f_.slots; ++i) slot_ty_[i] = Ty::Any;
+        for (uint32_t i = 0; i < f_.arity && i < 64; ++i) {
+            if ((pinned >> i) & 1) slot_ty_[i] = Ty::Any;
+            else if ((seed >> i) & 1) slot_ty_[i] = Ty::Float;
+        }
         // The sites were gathered in `run`, which needs them before this does.
 
         const int rounds = int(2 * f_.arity) + 2;
@@ -1138,6 +1227,16 @@ public:
                 // through the return register, which is a tagged `Value`
                 // whatever the body computed.
                 if (is_self_call(n)) return (n.flags & F_TAIL) ? Ty::Unknown : Ty::Any;
+                if (peers_) {
+                    const uint32_t gi = peer_target(n);
+                    if (gi != kNoFunc) {
+                        SlotSet floats = 0;
+                        for (uint32_t i = 0; i < n.c && i < 64; ++i) {
+                            if (ty(img_.kid(n.b + i), depth + 1) == Ty::Float) floats |= SlotSet(1) << i;
+                        }
+                        return peer_call_ty(*peers_, gi, floats);
+                    }
+                }
                 switch (known_native(rt_, img_, n.a, n.c)) {
                     case KnownNative::ToFloat:
                     case KnownNative::Sqrt:
@@ -1154,6 +1253,37 @@ public:
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Typed peers
+//
+// A peer used to be all-tagged, for a reason that was right: its signature has
+// to be the same for every caller, and a double parameter is a decision about
+// what callers pass. So a float helper called from a compiled float loop cost
+// a box for every argument going in and one for the answer coming out -- three
+// allocations an iteration for `acc + term (to_float i)`, which is the whole of
+// what that loop allocated.
+//
+// A signature is a decision that does not depend on the caller, which is what
+// the missing piece was. A peer whose signature declares a float parameter is
+// emitted twice: the generic variant, every parameter tagged, as before; and a
+// typed one, the declared floats (and whatever the fixpoint finds follows from
+// them) as doubles. A call site whose arguments are already doubles calls the
+// typed variant with them in registers. One holding a tagged value checks it
+// -- it is evaluated, so a float is a float box -- and calls the typed variant
+// if every such argument is one and the generic variant otherwise, which is
+// where an integer the types allowed an unannotated caller to pass ends up,
+// and it gets exactly what the interpreter would give it.
+//
+// Either variant hands back a raw double when its *body* is a float -- a fact
+// the analysis establishes, not the signature, and so true of untyped peers
+// too: `1.0 / (k * k + 1.0)` is a float whatever `k` is, or it raises. The
+// bits travel in the return register the tagged value used, and are only read
+// once the status says `JIT_OK`, because on any other status that register
+// holds an error or a placeholder. The caller's analysis knows which variant
+// answers what (`peer_call_ty`), so a loop accumulating a peer's answer carries
+// that accumulator as a double as well.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // The functions one compile reaches
@@ -1248,11 +1378,29 @@ bool PeerSet::admit(uint32_t gi, int depth) {
     // callee once per shape of argument its callers happened to have.
     a.float_slots = 0;
     a.force_first.clear();
+    a.peel = false;
     members.emplace(gi, std::move(a));
     return true;
 }
 
 bool peer_admits(PeerSet& peers, uint32_t gi, int depth) { return peers.admit(gi, depth); }
+
+Ty peer_call_ty(const PeerSet& peers, uint32_t gi, SlotSet float_args) {
+    auto found = peers.members.find(gi);
+    // Still being decided -- a mutual recursion -- so nothing is known yet.
+    if (found == peers.members.end()) return Ty::Any;
+    const Analysis& a = found->second;
+    // Arguments the analysis already knows are floats are floats at run time
+    // too, so the call site's check for them passes and the typed variant is
+    // the one that runs. That is what licenses answering for it here.
+    if (a.typed_slots && (a.typed_slots & ~float_args) == 0) {
+        return a.typed_ret_dbl ? Ty::Float : Ty::Any;
+    }
+    // Otherwise either variant may run, so the answer is a float only when
+    // both of them give one.
+    const bool both = a.ret_dbl && (!a.typed_slots || a.typed_ret_dbl);
+    return both ? Ty::Float : Ty::Any;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -1279,7 +1427,17 @@ llvm::FunctionType* body_signature(llvm::LLVMContext& ctx, uint32_t arity, SlotS
 /// index. Every one of them is declared before any body is written, because a
 /// call to a peer may be emitted before that peer's own body is -- which is
 /// what mutual recursion needs.
-using PeerFns = std::unordered_map<uint32_t, llvm::Function*>;
+struct PeerFn {
+    /// Every parameter tagged. What a call gets when it cannot show the typed
+    /// variant floats.
+    llvm::Function* generic = nullptr;
+    /// The declared floats as doubles; null when the signature declares none.
+    llvm::Function* typed = nullptr;
+    SlotSet typed_slots = 0;
+    bool ret_dbl = false;
+    bool typed_ret_dbl = false;
+};
+using PeerFns = std::unordered_map<uint32_t, PeerFn>;
 
 class Emitter {
 public:
@@ -1290,7 +1448,9 @@ public:
             const Analysis& a, const PeerFns* peers = nullptr, llvm::Function* preset = nullptr)
         : ctx_(ctx), mod_(mod), rt_(rt), img_(img), fi_(fi), f_(img.func(fi)),
           recurses_(a.recurses), float_slots_(a.float_slots), carried_(a.carried),
-          force_first_(a.force_first), binds_(a.binds), peers_(peers), preset_(preset), b_(ctx) {}
+          force_first_(a.force_first), binds_(a.binds), peel_first_(a.peel),
+          ret_dbl_(preset && a.ret_dbl), peers_(peers),
+          preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
 
@@ -1309,7 +1469,11 @@ private:
 
     /// Does the function carry this slot as a raw double? Decided by the
     /// fixpoint in the analyzer and guarded on entry.
-    bool slot_is_dbl(uint32_t i) const { return (float_slots_ >> i) & 1; }
+    /// Always false while the first iteration of a peeled loop is being
+    /// written: every slot is tagged there.
+    bool slot_is_dbl(uint32_t i) const { return !peeling_ && ((float_slots_ >> i) & 1); }
+    /// The same question about the loop proper, whichever is being written.
+    bool loop_slot_is_dbl(uint32_t i) const { return (float_slots_ >> i) & 1; }
 
     void declare_helpers();
     /// The body, as a function of `(proc, depth, frame, a0..an, status)`. Only
@@ -1341,8 +1505,17 @@ private:
     llvm::Value* callee_depth() { return depth_ ? b_.CreateAdd(depth_, i32c(1)) : i32c(1); }
     /// Take the callee's status: anything but `JIT_OK` is this invocation's
     /// answer too, and the value in hand is already the right one to return.
-    JV take_call_status(llvm::Value* r, const char* what);
+    JV take_call_status(llvm::Value* r, const char* what, bool dbl = false);
+    /// A call of one variant of a peer, arguments already in hand.
+    JV call_peer_variant(llvm::Function* fn, SlotSet dbl_slots, bool ret_dbl,
+                         const std::vector<JV>& args);
+    /// What a body hands back through the return register.
+    llvm::Value* returned(JV v) {
+        if (!ret_dbl_) return box(v);
+        return b_.CreateBitCast(as_double(v, "a float function answered something else"), i64_);
+    }
     JV tail_call(const Node& n, const std::vector<JV>& args);
+    JV enter_loop(const Node& n, const std::vector<JV>& args);
     JV recursive_call(const std::vector<JV>& args);
     /// Spend one reduction on a call. Answers what is left, so the tail path
     /// can test it; the recursive path ignores it.
@@ -1428,6 +1601,19 @@ private:
     const std::vector<uint32_t> force_first_;
     /// Per slot, the node a `let` bound it to, or `NO_NODE`.
     const std::vector<uint32_t> binds_;
+    /// The loop's first iteration is written separately, over tagged slots.
+    const bool peel_first_;
+    /// A peer that answers a raw double, its bits in the return register.
+    const bool ret_dbl_;
+    /// That first iteration is what is being written right now.
+    bool peeling_ = false;
+    /// The loop's own slots, typed as `float_slots_` says. `slots_` is these
+    /// except while the first iteration is written, when it is a set of tagged
+    /// ones and the back-edge stores into these.
+    std::vector<llvm::Value*> loop_slots_;
+    /// Where a first iteration goes when the value it hands the loop is not
+    /// the float the loop carries.
+    llvm::BasicBlock* peel_bail_ = nullptr;
     /// The compile's peer declarations, or null when it has none.
     const PeerFns* peers_ = nullptr;
     /// Non-null when this emitter is writing a peer, into a function that was
@@ -1529,6 +1715,23 @@ void Emitter::declare_helpers() {
         llvm::FunctionType::get(i32_, {ptr_, i32_, i32_, i64_, i64_, i64_, i64_, ptr_}, false));
 }
 
+// The first iteration.
+//
+// A float slot has to be a double before the loop starts, and the value the
+// interpreter left in the frame is usually a suspension, so the entry forces
+// the slots in the order the body would -- but only as far as that order is
+// the same on every path (`Analyzer::force_order`). Past that prefix, forcing
+// at the entry would be forcing out of turn, and a float slot out there used
+// to cost the whole specialization.
+//
+// So the loop's first iteration is emitted a second time, over tagged slots,
+// and runs exactly as an unspecialized body would: every slot forced on first
+// read, in the body's own order. Only its back-edge (`enter_loop`) crosses
+// into doubles, and it does so with values the iteration has already computed
+// -- a guard, not a force. From there the loop is the specialized one.
+// `integrate x hi dx acc` is the shape that needs it: the condition forces `x`
+// and `hi`, and `acc` is forced by the base case on one side and by the self
+// call on the other, so no prefix reaches it.
 llvm::Function* Emitter::emit_loop(const std::string& name) {
     auto* fty = llvm::FunctionType::get(i64_, {ptr_, i64_, ptr_}, false);
     fn_ = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, name, mod_);
@@ -1551,22 +1754,62 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
         slots_[i] = b_.CreateAlloca(slot_is_dbl(i) ? dbl_ : i64_, nullptr,
                                     "slot" + std::to_string(i));
     }
+    loop_slots_ = slots_;
+    std::vector<llvm::Value*> first_slots;
+    if (peel_first_) {
+        first_slots.resize(f_.slots);
+        for (uint32_t i = 0; i < f_.slots; ++i) {
+            first_slots[i] = b_.CreateAlloca(i64_, nullptr, "first" + std::to_string(i));
+        }
+    }
     llvm::BasicBlock* bail = float_slots_ ? llvm::BasicBlock::Create(ctx_, "bail", fn_) : nullptr;
+    peel_bail_ = bail;
     llvm::Value* slot_base = b_.CreateCall(rt_frame_slots_, {frame_}, "slots");
     std::vector<llvm::Value*> raw(f_.slots);
     for (uint32_t i = 0; i < f_.slots; ++i) {
         raw[i] = b_.CreateLoad(i64_, b_.CreateGEP(i64_, slot_base, {i64(i)}));
     }
-    // Force what the body would have forced, in the order it would have forced
-    // it. Empty unless a slot is carried as a double; see `Analyzer::force_order`.
-    for (uint32_t slot : force_first_) raw[slot] = force(raw[slot]);
-    for (uint32_t i = 0; i < f_.slots; ++i) {
-        b_.CreateStore(slot_is_dbl(i) ? guard_float(raw[i], bail) : raw[i], slots_[i]);
+    if (peel_first_) {
+        // Handed over exactly as they arrived; the first iteration forces
+        // each on first read, as the interpreter would.
+        for (uint32_t i = 0; i < f_.slots; ++i) b_.CreateStore(raw[i], first_slots[i]);
+    } else {
+        // Force what the body would have forced, in the order it would have
+        // forced it. Empty unless a slot is carried as a double; see
+        // `Analyzer::force_order`.
+        for (uint32_t slot : force_first_) raw[slot] = force(raw[slot]);
+        for (uint32_t i = 0; i < f_.slots; ++i) {
+            b_.CreateStore(slot_is_dbl(i) ? guard_float(raw[i], bail) : raw[i], slots_[i]);
+        }
     }
     reduction_slot_ = b_.CreateCall(rt_reduction_slot_, {proc_}, "reductions");
 
     loop_header_ = llvm::BasicBlock::Create(ctx_, "loop", fn_);
-    b_.CreateBr(loop_header_);
+    if (peel_first_) {
+        // The first iteration, over tagged slots. Its base case returns like
+        // any other; its tail call stores into the loop's own slots and
+        // enters the loop (`tail_call`).
+        auto* first = llvm::BasicBlock::Create(ctx_, "first", fn_);
+        b_.CreateBr(first);
+        b_.SetInsertPoint(first);
+        slots_ = first_slots;
+        peeling_ = true;
+        JV r = node(f_.body);
+        peeling_ = false;
+        slots_ = loop_slots_;
+        if (failed_) {
+            fn_->eraseFromParent();
+            return nullptr;
+        }
+        if (r.v) {
+            b_.CreateStore(i32c(JIT_OK), status_);
+            b_.CreateRet(box(r));
+        } else if (!b_.GetInsertBlock()->getTerminator()) {
+            b_.CreateUnreachable();
+        }
+    } else {
+        b_.CreateBr(loop_header_);
+    }
 
     if (bail) {
         b_.SetInsertPoint(bail);
@@ -1662,7 +1905,7 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
     }
     if (result.v) {
         b_.CreateStore(i32c(JIT_OK), status_);
-        b_.CreateRet(box(result));
+        b_.CreateRet(returned(result));
     } else if (!b_.GetInsertBlock()->getTerminator()) {
         b_.CreateUnreachable();
     }
@@ -2418,7 +2661,7 @@ Emitter::JV Emitter::apply(const Node& n) {
 /// heuristic and not a wrong answer: the root is run by the interpreter, which
 /// enters the peer through `enter_function` in its own right, and *that* entry
 /// deoptimizes the peer. It corrects itself after one call.
-Emitter::JV Emitter::take_call_status(llvm::Value* r, const char* what) {
+Emitter::JV Emitter::take_call_status(llvm::Value* r, const char* what, bool dbl) {
     auto* ok_bb = bb((std::string(what) + ".ok").c_str());
     auto* out_bb = bb((std::string(what) + ".out").c_str());
     llvm::Value* st = b_.CreateLoad(i32_, status_);
@@ -2428,6 +2671,10 @@ Emitter::JV Emitter::take_call_status(llvm::Value* r, const char* what) {
     b_.CreateRet(r);
 
     b_.SetInsertPoint(ok_bb);
+    // A callee that answers a double hands back its bits; anything but
+    // `JIT_OK` is an error or a placeholder in the same register, which is why
+    // the status is read before the bits are.
+    if (dbl) return flt(b_.CreateBitCast(r, dbl_));
     return tag(r);
 }
 
@@ -2450,6 +2697,7 @@ Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
         failed_ = true;
         return none();
     }
+    const PeerFn& pf = found->second;
     // Every argument before the call, and left to right, which is the order the
     // interpreter's own argument list is built in.
     std::vector<JV> args(n.c);
@@ -2459,13 +2707,84 @@ Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
     }
     spend_reduction();
 
+    if (!pf.typed) return call_peer_variant(pf.generic, 0, pf.ret_dbl, args);
+
+    // Which of the typed variant's parameters are not doubles already. None is
+    // the case that pays: the caller computed them as floats, and they go
+    // across in registers without a box on either side.
+    llvm::Value* all_floats = nullptr;
+    for (uint32_t i = 0; i < n.c && i < 64; ++i) {
+        if (!((pf.typed_slots >> i) & 1) || args[i].dbl) continue;
+        // A tagged value in hand -- every argument here is evaluated -- so a
+        // float is a float box, and anything else (an integer the types let
+        // an unannotated caller pass) goes to the generic variant, which does
+        // with it what the interpreter would.
+        llvm::Value* v = args[i].v;
+        llvm::Value* ptr = is_heap_ptr(v);
+        auto* here = b_.GetInsertBlock();
+        auto* obj = bb("peer.obj");
+        auto* joined = bb("peer.checked");
+        b_.CreateCondBr(ptr, obj, joined);
+        b_.SetInsertPoint(obj);
+        llvm::Value* type = b_.CreateLoad(i8_, b_.CreateIntToPtr(v, ptr_));
+        llvm::Value* is_float =
+            b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Float)));
+        auto* obj_end = b_.GetInsertBlock();
+        b_.CreateBr(joined);
+        b_.SetInsertPoint(joined);
+        auto* phi = b_.CreatePHI(i1_, 2);
+        phi->addIncoming(b_.getFalse(), here);
+        phi->addIncoming(is_float, obj_end);
+        all_floats = all_floats ? b_.CreateAnd(all_floats, phi) : phi;
+    }
+    if (!all_floats) return call_peer_variant(pf.typed, pf.typed_slots, pf.typed_ret_dbl, args);
+
+    auto* typed_bb = bb("peer.typed");
+    auto* generic_bb = bb("peer.generic");
+    auto* done_bb = bb("peer.done");
+    b_.CreateCondBr(all_floats, typed_bb, generic_bb);
+
+    b_.SetInsertPoint(typed_bb);
+    std::vector<JV> unboxed = args;
+    for (uint32_t i = 0; i < n.c && i < 64; ++i) {
+        if (((pf.typed_slots >> i) & 1) && !args[i].dbl) unboxed[i] = flt(load_float(args[i].v));
+    }
+    JV t = call_peer_variant(pf.typed, pf.typed_slots, pf.typed_ret_dbl, unboxed);
+
+    // The two variants meet here. Both answer a double when both bodies are
+    // floats; otherwise the double side is boxed, which is the one allocation
+    // this path can make and only when the two variants disagree.
+    const bool both_dbl = pf.typed_ret_dbl && pf.ret_dbl;
+    llvm::Value* tv = both_dbl ? t.v : box(t);
+    auto* typed_end = b_.GetInsertBlock();
+    b_.CreateBr(done_bb);
+
+    b_.SetInsertPoint(generic_bb);
+    JV g = call_peer_variant(pf.generic, 0, pf.ret_dbl, args);
+    llvm::Value* gv = both_dbl ? g.v : box(g);
+    auto* generic_end = b_.GetInsertBlock();
+    b_.CreateBr(done_bb);
+
+    b_.SetInsertPoint(done_bb);
+    auto* phi = b_.CreatePHI(both_dbl ? dbl_ : i64_, 2);
+    phi->addIncoming(tv, typed_end);
+    phi->addIncoming(gv, generic_end);
+    return both_dbl ? flt(phi) : tag(phi);
+}
+
+Emitter::JV Emitter::call_peer_variant(llvm::Function* fn, SlotSet dbl_slots, bool ret_dbl,
+                                       const std::vector<JV>& args) {
     std::vector<llvm::Value*> call{proc_, callee_depth(), frame_};
-    // A peer's parameters are all tagged -- see `PeerSet::admit` -- so a float
-    // in a register is boxed here. That is the fourth of the four crossings
-    // listed under "Representation", and the only one a peer adds.
-    for (JV& a : args) call.push_back(box(a));
+    // A tagged parameter is handed a box -- a float in a register is boxed
+    // here, the fourth crossing under "Representation" -- and a double one a
+    // double. Every double one was either a double already or has just been
+    // checked to be a float box and unboxed; nothing converts here.
+    for (uint32_t i = 0; i < args.size(); ++i) {
+        const bool dbl = i < 64 && ((dbl_slots >> i) & 1);
+        call.push_back(dbl ? args[i].v : box(args[i]));
+    }
     call.push_back(status_);
-    return take_call_status(b_.CreateCall(found->second, call), "peer");
+    return take_call_status(b_.CreateCall(fn, call), "peer", ret_dbl);
 }
 
 /// One of the numeric natives, made rather than called.
@@ -2630,6 +2949,7 @@ void Emitter::emit_yield() {
 
 /// A tail call is the loop back-edge: overwrite the parameters and jump.
 Emitter::JV Emitter::tail_call(const Node& n, const std::vector<JV>& args) {
+    if (peeling_) return enter_loop(n, args);
     for (uint32_t i = 0; i < n.c; ++i) {
         // The coercions here should both be no-ops: the analyzer decided a slot
         // was a double by looking at exactly these expressions. They are
@@ -2667,6 +2987,51 @@ Emitter::JV Emitter::tail_call(const Node& n, const std::vector<JV>& args) {
     return none();  // control transferred
 }
 
+/// The back-edge of a peeled first iteration: into the loop proper.
+///
+/// The arguments were evaluated over tagged slots, so a slot the loop carries
+/// as a double is handed whatever the first iteration computed, and that is
+/// only a float if the program's values are. The fixpoint's claim is about the
+/// loop *given* floats on entry -- by induction, every iteration after -- so
+/// this is where the induction starts, and it is a guard: a float box goes in
+/// as its double, anything else hands the call back (`JIT_BAIL`). Nothing has
+/// been written but registers, so the interpreter can run the call as though
+/// it had never been compiled; what the first iteration forced stays forced,
+/// which is the one thing it did and is what the interpreter would have done.
+///
+/// A carried slot is read again here rather than taken from `args`. `self_call`
+/// reads it before evaluating the arguments after it, and those are usually
+/// what force it -- `go cr (zr * zr + cr)` hands `cr` over as the caller's
+/// thunk and then forces it one argument later -- so the value it read is the
+/// suspension and the slot now holds the float. Reading the slot is still a
+/// move and forces nothing.
+Emitter::JV Emitter::enter_loop(const Node& n, const std::vector<JV>& args) {
+    for (uint32_t i = 0; i < n.c; ++i) {
+        JV a = (i < f_.arity && slot_is_carried(i)) ? load_slot_raw(i) : args[i];
+        llvm::Value* v = !loop_slot_is_dbl(i) ? box(a)
+                         : a.dbl              ? a.v
+                                              : guard_float(a.v, peel_bail_);
+        b_.CreateStore(v, loop_slots_[i]);
+    }
+    llvm::Value* next = spend_reduction();
+    auto* yield_bb = bb("yield");
+    auto* cont_bb = bb("iterate");
+    b_.CreateCondBr(b_.CreateICmpSGT(next, i64(0)), cont_bb, yield_bb);
+
+    // The yield writes the loop's slots, which are the ones just stored.
+    b_.SetInsertPoint(yield_bb);
+    std::vector<llvm::Value*> first = slots_;
+    slots_ = loop_slots_;
+    peeling_ = false;
+    emit_yield();
+    peeling_ = true;
+    slots_ = first;
+
+    b_.SetInsertPoint(cont_bb);
+    b_.CreateBr(loop_header_);
+    return none();
+}
+
 /// A self call anywhere but tail position is a machine call, one frame deeper.
 /// Its status is the callee's -- see `take_call_status`.
 Emitter::JV Emitter::recursive_call(const std::vector<JV>& args) {
@@ -2679,11 +3044,11 @@ Emitter::JV Emitter::recursive_call(const std::vector<JV>& args) {
                            : box(args[i]));
     }
     call.push_back(status_);
-    // Whatever the body computes comes back through the return register as a
-    // tagged `Value`. That is why a non-tail self call is `Ty::Any`: the status
-    // has to travel with it, and a `double` return would leave the error
-    // nowhere to sit.
-    return take_call_status(b_.CreateCall(fn_, call), "call");
+    // Whatever the body computes comes back through the return register -- a
+    // tagged `Value`, or a peer's double as its bits. The analysis calls a
+    // non-tail self call `Ty::Any` either way, which is the cautious answer:
+    // the emitter handles whichever representation arrives.
+    return take_call_status(b_.CreateCall(fn_, call), "call", ret_dbl_);
 }
 
 /// Analyze `func_index` and write it, and everything it calls, into `mod`.
@@ -2703,14 +3068,35 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
 
     PeerFns fns;
     for (const auto& member : peers.members) {
-        fns[member.first] = llvm::Function::Create(
-            body_signature(ctx, img.func(member.first).arity, 0),
-            llvm::Function::InternalLinkage, "dream_peer_" + std::to_string(member.first), &mod);
+        const Analysis& a = member.second;
+        const uint32_t arity = img.func(member.first).arity;
+        PeerFn& pf = fns[member.first];
+        pf.generic = llvm::Function::Create(
+            body_signature(ctx, arity, 0), llvm::Function::InternalLinkage,
+            "dream_peer_" + std::to_string(member.first), &mod);
+        pf.ret_dbl = a.ret_dbl;
+        if (a.typed_slots) {
+            pf.typed = llvm::Function::Create(
+                body_signature(ctx, arity, a.typed_slots), llvm::Function::InternalLinkage,
+                "dream_peer_" + std::to_string(member.first) + ".typed", &mod);
+            pf.typed_slots = a.typed_slots;
+            pf.typed_ret_dbl = a.typed_ret_dbl;
+        }
     }
+    // Both variants are written whether or not anything calls them; the
+    // optimizer drops an internal function nobody calls before code is
+    // generated for it, which is where the time goes.
     for (const auto& member : peers.members) {
-        llvm::Function* decl = fns[member.first];
-        Emitter peer(ctx, mod, rt, img, member.first, member.second, &fns, decl);
-        if (!peer.emit(decl->getName().str())) return nullptr;
+        const PeerFn& pf = fns[member.first];
+        Emitter generic(ctx, mod, rt, img, member.first, member.second, &fns, pf.generic);
+        if (!generic.emit(pf.generic->getName().str())) return nullptr;
+        if (pf.typed) {
+            Analysis t = member.second;
+            t.float_slots = pf.typed_slots;
+            t.ret_dbl = pf.typed_ret_dbl;
+            Emitter typed(ctx, mod, rt, img, member.first, t, &fns, pf.typed);
+            if (!typed.emit(pf.typed->getName().str())) return nullptr;
+        }
     }
     return Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
 }
@@ -2787,6 +3173,7 @@ Jit::Jit(Runtime& rt) : impl_(std::make_unique<Impl>(rt)) {
     const size_t funcs = impl_->rt.image().func_count();
     counts_ = std::vector<std::atomic<uint32_t>>(funcs);
     cached_ = std::vector<std::atomic<CompiledFn>>(funcs);
+    bails_ = std::vector<std::atomic<uint8_t>>(funcs);
     threshold_.store(impl_->threshold, std::memory_order_relaxed);
     rt.set_jit(this);
 }

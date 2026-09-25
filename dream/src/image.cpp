@@ -311,6 +311,9 @@ bool Image::parse(std::string& error) {
             payload_off_ = s.offset;
             payload_ = reinterpret_cast<const char*>(base + 8);
             has_payload_ = true;
+        } else if (s.kind == tag("TYPE")) {
+            if (!fits(sizeof(TypeRec))) { error = "TYPE section is short"; return false; }
+            types_ = reinterpret_cast<const TypeRec*>(base); n_types_ = s.count;
         } else if (s.kind == tag("SPAN")) {
             if (!fits(sizeof(SpanRec))) { error = "SPAN section is short"; return false; }
             spans_ = reinterpret_cast<const SpanRec*>(base); n_spans_ = s.count;
@@ -318,6 +321,10 @@ bool Image::parse(std::string& error) {
         // Unknown sections are skipped, as the format requires.
     }
     if (!validate(error)) return false;
+    if (n_types_) {
+        float_params_.assign(n_funcs_, 0);
+        for (uint32_t i = 0; i < n_types_; ++i) float_params_[types_[i].func] = types_[i].float_params;
+    }
     // Decode trivial record readers once, without changing the image format.
     accessors_.assign(n_funcs_, Accessor{});
     for (uint32_t i = 0; i < n_funcs_; ++i) {
@@ -429,6 +436,9 @@ bool Image::validate(std::string& error) {
         }
     }
 
+    for (uint32_t i = 0; i < n_types_; ++i) {
+        if (types_[i].func >= n_funcs_) return fail("type record names an out-of-range function");
+    }
     for (uint32_t i = 0; i < n_funcs_; ++i) {
         const FuncRec& f = funcs_[i];
         if (f.name >= n_strs_) return fail("bad function name index");

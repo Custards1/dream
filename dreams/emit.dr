@@ -145,6 +145,7 @@ let t_span = tag 83 80 65 78;   // SPAN
 let t_mods = tag 77 79 68 83;   // MODS
 let t_ldat = tag 76 68 65 84;   // LDAT
 let t_payl = tag 80 65 89 76;   // PAYL
+let t_type = tag 84 89 80 69;   // TYPE
 
 // --- the records ---------------------------------------------------------------------
 
@@ -256,6 +257,17 @@ let data_sections lens =
          section t_payl (u64 total) 0]
     };
 
+/// `TYPE`, or nothing at all: one 16-byte record per function whose signature
+/// declares a float parameter -- the function, a reserved word, and a 64-bit
+/// mask of which parameters. A program with no such signature writes the bytes
+/// it wrote before the section existed, for the reason `data_sections` gives.
+let type_sections hints =
+    if list.is_empty hints { [] }
+    else {
+        [section t_type (concat_map (fn e -> u32 (list.head e) + u32 0 + u64 (list.nth 1 e)) hints)
+                 (list.length hints)]
+    };
+
 /// Every section, in the order a reader meets them.
 let sections_of img = {
     let strs = core.map_get img :strs [];
@@ -277,7 +289,8 @@ let sections_of img = {
     // The payload goes last, and must: its bytes are written after everything
     // the table describes, and they are the one part of the file whose size a
     // `u32` offset could not reach.
-    list.append base (data_sections (core.map_get img :payloads []))
+    list.concat [base, type_sections (core.map_get img :float_params []),
+                 data_sections (core.map_get img :payloads [])]
 };
 
 /// The image, as bytes.

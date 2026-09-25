@@ -25,9 +25,14 @@
 //      cannot see into (an unannotated call, a thunk, a refinement's
 //      predicate) passes.
 //
-//   3. **The checker never changes the program.** Signatures compile to
-//      nothing, so an image is byte-identical with or without them, and this
-//      pass only produces diagnostics. `--no-types` skips it.
+//   3. **The checker never changes what a program means.** Checking only
+//      produces diagnostics, and no signature changes a single node. The one
+//      thing a signature adds to an image is a *hint* -- which parameters are
+//      declared `:float`, in the `TYPE` section, see "what a signature tells
+//      the machine" at the end -- and the JIT guards every value a hint
+//      describes, so a wrong one costs speed and never an answer. A program
+//      whose signatures declare no float compiles to the image it compiled to
+//      before. `--no-types` skips both.
 //
 // The types are the ones `std.types` describes, read from the same grammar,
 // so a `type` declaration means the same thing to this pass and to
@@ -1527,6 +1532,65 @@ let check_program l r = {
     let found = list.fold (fn ds b -> check_decl k b ds) ds0 (scope.bodies r);
     let once = list.fold (fn acc d -> if list.contains d acc { acc } else { core.cons d acc }) [] found;
     list.sort_by (fn a b -> place a < place b) once
+};
+
+// --- what a signature tells the machine -------------------------------------------------
+//
+// Everything above produces diagnostics and nothing else. This produces the one
+// thing a signature says that code generation can use: which parameters of a
+// function are declared `:float`. It goes into the image (`TYPE`, see
+// docs/bytecode-format.md) for the JIT, which carries such a parameter as a raw
+// double instead of a tagged value -- see "Representation" in
+// dream/src/jit.cpp.
+//
+// It is a *hint* and the VM treats it as one. The types are gradual: a caller
+// with no signature of its own may hand a `:float` parameter an integer, the
+// checker says nothing because `:any` fits everywhere, and the program is
+// entitled to the answer it gets interpreted. So the JIT guards every value a
+// hint describes and hands the call back to the interpreter when the guard
+// fails; a wrong hint costs speed and never an answer. That is why only a
+// description that is certainly a float counts -- `:float`, a float literal, a
+// name for one, a union of those -- and `:number` or a type variable does not.
+
+let rec is_float_type k t = match peel k t 8 {
+    :float => true,
+    [:lit, :float, _] => true,
+    [:union, ts] => list.all (fn x -> is_float_type k x) ts,
+    _ => false,
+};
+
+/// Bit `i` set when parameter `i` of an `arity`-parameter function of type `t`
+/// is declared a float. Parameters past 62 are not described: a mask is a
+/// fixnum, and a function the JIT would take has fewer slots than that.
+let rec float_mask k t i arity bit acc =
+    if i >= arity || i >= 62 { acc }
+    else {
+        match peel k t 8 {
+            [:fn, a, b] =>
+                float_mask k b (i + 1) arity (bit * 2) (if is_float_type k a { acc + bit } else { acc }),
+            _ => acc,
+        }
+    };
+
+/// Every top-level function whose signature declares a float parameter, as a
+/// map from the global it is bound to to its mask. A map because a body
+/// inherited through `derive` is walked once per module that derives it.
+let float_params l r = {
+    let [k, _] = checker l r;
+    list.fold (fn acc b -> {
+        let [mi, _, d, _] = b;
+        let arity = list.length (scope.decl_params d);
+        match gi_of k mi (scope.decl_name d) {
+            () => acc,
+            gi => match (Checker.sigs k).[gi else ()] {
+                () => acc,
+                t => match float_mask k t 0 arity 1 0 {
+                    0 => acc,
+                    mask => acc.[gi => mask],
+                },
+            },
+        }
+    }) %{} (scope.bodies r)
 };
 
 /// Where a diagnostic points, as one number that orders them the way a reader

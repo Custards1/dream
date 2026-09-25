@@ -88,6 +88,27 @@ public:
     /// run. One relaxed store on a path taken at most once per function.
     void deoptimize(uint32_t func_index);
 
+    /// A compiled body answered `JitBailed`: a guard on a value it carries as
+    /// a double did not hold. One bail is a fact about one call, and the call
+    /// is simply run interpreted. A run of them is a fact about the program --
+    /// a function whose signature says `:float` and whose callers pass it
+    /// integers, which the types allow -- and a peeled loop pays a first
+    /// iteration for every one, so after `kMaxBails` in a row the function is
+    /// the interpreter's. Anything but a bail ends the run (`note_ran`).
+    void note_bail(uint32_t func_index) {
+        if (func_index >= bails_.size()) return;
+        const uint8_t n = uint8_t(bails_[func_index].load(std::memory_order_relaxed) + 1);
+        bails_[func_index].store(n, std::memory_order_relaxed);
+        if (n >= kMaxBails) deoptimize(func_index);
+    }
+    /// The compiled body ran: a load, and a store only when a run of bails is
+    /// being ended.
+    void note_ran(uint32_t func_index) {
+        if (func_index < bails_.size() && bails_[func_index].load(std::memory_order_relaxed)) {
+            bails_[func_index].store(0, std::memory_order_relaxed);
+        }
+    }
+
     /// Compile now, regardless of temperature. Returns nullptr on failure.
     CompiledFn compile(uint32_t func_index, std::string* error);
 
@@ -111,6 +132,10 @@ private:
     /// in the constructor, after the image has loaded.
     std::vector<std::atomic<uint32_t>> counts_;
     std::vector<std::atomic<CompiledFn>> cached_;
+    /// Consecutive bails per function; see `note_bail`. Relaxed, like
+    /// `counts_`, and for the same reason: a lost count moves a heuristic.
+    std::vector<std::atomic<uint8_t>> bails_;
+    static constexpr uint8_t kMaxBails = 16;
     /// Mirrors the threshold inside `Impl`, so `tier` can read it without
     /// reaching through the PIMPL.
     std::atomic<uint32_t> threshold_{0};

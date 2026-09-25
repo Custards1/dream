@@ -133,6 +133,17 @@ struct DataRec {
 };
 static_assert(sizeof(DataRec) == 16, "large-data records are 16 bytes on disk");
 
+/// What a function's signature declared, for the JIT: which parameters are
+/// `:float`. A hint and never a promise -- the types are gradual, so a caller
+/// with no signature may pass such a parameter anything, and whoever acts on
+/// this guards the value first. See "Representation" in jit.cpp.
+struct TypeRec {
+    uint32_t func;
+    uint32_t reserved;
+    uint64_t float_params;
+};
+static_assert(sizeof(TypeRec) == 16, "type records are 16 bytes on disk");
+
 /// One module of a whole-program image. Compilation is whole-program, so an
 /// image carries every module it needs and records which globals belong to
 /// which -- for diagnostics, tooling, and reflection.
@@ -214,6 +225,11 @@ public:
     uint32_t data_count() const { return n_large_; }
     const char* data_bytes(uint32_t i) const { return payload_ + large_[i].offset; }
     uint64_t data_length(uint32_t i) const { return large_[i].length; }
+    /// One bit per parameter the function's signature declares `:float`, or
+    /// zero when it declares none or the image has no `TYPE` section.
+    uint64_t float_params(uint32_t func) const {
+        return func < float_params_.size() ? float_params_[func] : 0;
+    }
     /// The module a global belongs to, or -1.
     int module_of_global(uint32_t global_index) const;
     /// Source span for a node, or {0,0} when the image carries no debug info.
@@ -234,6 +250,10 @@ public:
 
 private:
     std::vector<Accessor> accessors_;
+    /// `TYPE`, spread out by function so that asking costs an index. Empty
+    /// when the image has no such section, which is every image built from a
+    /// program without a float in a signature.
+    std::vector<uint64_t> float_params_;
     bool parse(std::string& error);
     bool validate(std::string& error);
 
@@ -262,6 +282,7 @@ private:
     const SpanRec* spans_ = nullptr;         uint32_t n_spans_ = 0;
     const ModuleRec* modules_ = nullptr;     uint32_t n_modules_ = 0;
     const DataRec* large_ = nullptr;         uint32_t n_large_ = 0;
+    const TypeRec* types_ = nullptr;         uint32_t n_types_ = 0;
 
     /// The payload bytes, and where its `u64` length header sits. The offset
     /// is kept because validation has to prove the payload ends inside the

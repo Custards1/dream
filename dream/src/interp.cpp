@@ -339,7 +339,11 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             // And attributed, which nothing did before: a function the JIT
             // compiled was invisible to `--profile` however hot it was.
             if (own && p.runtime().profiling()) p.runtime().note_reductions(func_index, own);
-            if (status == JitOk) { ret(p, r); return; }
+            if (status == JitOk) {
+                jit->note_ran(func_index);
+                ret(p, r);
+                return;
+            }
             if (status == JitRaised) { do_raise(p, r); return; }
             if (status == JitTooDeep) {
                 // Compiled self recursion ran out of machine stack. The body
@@ -359,17 +363,18 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
                 return;
             }
             if (status == JitBailed) {
-                // An entry guard did not hold: a slot the compiled body carries
-                // as an unboxed double was handed something that is not a float
-                // in hand. Nothing has been spent and nothing written, so the
-                // interpreter runs this one call -- and the tier stays, because
-                // unlike running out of machine stack this is a property of the
-                // call rather than of the function. The guard costs a load and
-                // two branches, so a function that bails every time is no
-                // slower than one that was never compiled.
+                // A guard did not hold: a slot the compiled body carries as an
+                // unboxed double was handed something that is not a float in
+                // hand -- on entry, or at the end of a peeled first iteration.
+                // Nothing has been written but registers, so the interpreter
+                // runs this one call, and the tier stays: one bail is a
+                // property of the call. A run of them is a property of the
+                // program, and `note_bail` gives the function up after one.
+                jit->note_bail(func_index);
                 eval_node(p, f.body, frame);
                 return;
             }
+            jit->note_ran(func_index);
             // Yielded: the compiled loop spent its budget and wrote its
             // loop-carried state back to the frame. Fall through to the
             // interpreter, which resumes the body and lets the scheduler

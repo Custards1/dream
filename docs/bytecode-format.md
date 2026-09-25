@@ -65,6 +65,7 @@ Unknown section kinds must be skipped, not treated as an error.
 | `IMPT` | `u32 path, u32 alias`                               | imports; both are `KSTR` indices |
 | `MODS` | 24 bytes (below)                                    | module records: which globals belong to which module |
 | `SPAN` | `u32 start, u32 end`                                 | per-node source spans, parallel to `NODE` |
+| `TYPE` | `u32 func, u32 reserved, u64 float_params`          | what signatures declared, for the JIT (below) |
 | `LDAT` | `u64 offset, u64 length`                            | large-data table, into `PAYL` |
 | `PAYL` | `u64 byte_length` header, then the bytes            | the payload; last in the file |
 
@@ -196,6 +197,26 @@ globals_count`. The range is what lets a reader say which global belongs to
 which module without every `GLBL` record carrying a module id of its own — and
 it is the identity that survives a merge of two images, which is why the record
 is here rather than being reconstructible from the rest.
+
+## Declared types (`TYPE`)
+
+One record per function whose signature declares a `:float` parameter:
+`func` is a `FUNC` index, `reserved` is zero, and bit `i` of `float_params` is
+set when parameter `i` is declared a float. A function with no such parameter
+has no record, and a program with none has no section, so an image built from
+a program without a float in a signature is byte-identical to one built before
+the section existed. Masks cover the first 62 parameters.
+
+It is a **hint**. Dream's types are gradual -- code with no signature may call
+a `:float` function with an integer, and is entitled to the answer the
+interpreter gives -- so nothing may be *trusted* on the strength of this
+section. The JIT uses it to choose a representation (a raw double rather than
+a tagged value) and guards every value it describes, handing the call back to
+the interpreter when the guard fails. A reader that ignores the section runs
+every program correctly; one that ignores it loses only speed.
+
+**Validation.** `count * 16 <= length`, and every `func` is below the number of
+function records.
 
 ## Large data (`LDAT` and `PAYL`)
 
