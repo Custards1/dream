@@ -28,7 +28,20 @@ cat > "$tmp/ws/mind.toml" <<'TOML'
 name = "ws"
 version = "0.1.0"
 src = "."
+[dependencies]
+nav = "../nav"
 TOML
+mkdir -p "$tmp/nav"
+cat > "$tmp/nav/mind.toml" <<'TOML'
+[package]
+name = "nav"
+version = "0.1.0"
+src = "."
+TOML
+cat > "$tmp/nav/types.dr" <<'DREAM'
+type Count = :integer;
+let value = 1;
+DREAM
 cat > "$tmp/ws/helper.dr" <<'DREAM'
 let double n = n * 2;
 let triple n = n * 3;
@@ -83,6 +96,7 @@ derived='import std.console;\nderive behavior;\n\nlet name self = \"app\";\n\nle
 # resolves it. Line 2 is the declaration, with `x` at column 14 and `y` at 17;
 # line 4 reaches an accessor at column 26.
 records='import std.console;\n\ngroup Point { x, y }\n\nlet main! = {\n    console.print! (Point.x (Point.make 1 2))\n};\n'
+navigation='import nav;\nimport nav.types as t;\nlet f : t.Count -> t.Count;\nlet f n = n;\nlet main! = t.value;\nlet other = nav.types.value;\n'
 
 {
   msg '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":"file://'"$tmp"'/ws"}}'
@@ -108,6 +122,11 @@ records='import std.console;\n\ngroup Point { x, y }\n\nlet main! = {\n    conso
   msg '{"jsonrpc":"2.0","id":15,"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":6,"character":21}}}'
   msg '{"jsonrpc":"2.0","id":16,"method":"textDocument/hover","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":6,"character":21}}}'
   msg '{"jsonrpc":"2.0","id":17,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"'"$uri"'"}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$navigation"'"}]}}'
+  for request in '18 0 8' '19 1 13' '20 2 11' '21 4 12' '22 1 8' '23 5 13' '24 5 17' '25 5 23'; do
+    set -- $request
+    msg '{"jsonrpc":"2.0","id":'"$1"',"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":'"$2"',"character":'"$3"'}}}'
+  done
   msg '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}'
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
 } > "$tmp/in"
@@ -202,6 +221,15 @@ has_in "an inherited method does not land on its declaration"            15 '"st
 has_in "hover does not say a method was inherited"                       16 'inherited from .ws\.behavior.'
 has_in "the outline lost what the file does declare"                     17 '"name":"name"'
 lacks_in "the outline lists a name written in another file"              17 '"name":"label"'
+has_in "a package import does not lead to its manifest" 18 'nav/mind.toml'
+has_in "an aliased module import does not lead to its file" 19 'nav/types.dr'
+has_in "a qualified type does not lead to its file" 20 'nav/types.dr'
+has_in "a qualified type does not lead to its declaration" 20 '"start":{"character":0,"line":0}'
+has_in "a module prefix leads to its member instead of its file" 21 '"start":{"character":0,"line":0}'
+has_in "a package prefix does not lead to its manifest" 22 'nav/mind.toml'
+has_in "a package in an expression does not lead to its manifest" 23 'nav/mind.toml'
+has_in "a module in a package expression does not lead to its file" 24 'nav/types.dr'
+has_in "a package member does not lead to its declaration" 25 '"start":{"character":0,"line":1}'
 
 if [ "$fail" -eq 0 ]; then
     echo "the language server answers a whole conversation"

@@ -1897,7 +1897,7 @@ let rec parse_import c sp ts =
                 match import_names [] (list.tail (list.tail rest)) {
                     [:error, m, s] => err m s,
                     [:ok, names, rest2] =>
-                        ok (ast.import_d segments () names (ast.span_to sp (peek_span rest))) rest2,
+                        ok (ast.import_d segments () names (ast.span_to sp (peek_span rest2))) (list.tail rest2),
                 }
             }
             else if is_kw rest "as" {
@@ -1914,8 +1914,9 @@ let rec parse_import c sp ts =
     };
 
 /// `{ map, filter, sum as total }`
+/// Leave the closing brace for the caller to include in the import's span.
 let rec import_names acc ts =
-    if at ts :rbrace { ok (list.reverse acc) (list.tail ts) }
+    if at ts :rbrace { ok (list.reverse acc) ts }
     else if not (at ts :ident) {
         err ("expected a member name, found " + describe ts) (peek_span ts)
     }
@@ -1928,7 +1929,7 @@ let rec import_names acc ts =
         let rest = if renamed { list.tail (list.tail after) } else { after };
         let acc2 = list_cons [name, alias] acc;
         if at rest :comma { import_names acc2 (list.tail rest) }
-        else if at rest :rbrace { ok (list.reverse acc2) (list.tail rest) }
+        else if at rest :rbrace { ok (list.reverse acc2) rest }
         else { err ("expected `,` or `}` in an import list, found " + describe rest) (peek_span rest) }
     };
 
@@ -2529,6 +2530,8 @@ when test {
             $( test.eq! "(import std.list as l)" (items "import std.list as l;") ),
         test.case "import of members"
             $( test.eq! "(import std.list.{map filter})" (items "import std.list.{map, filter};") ),
+        test.case "a selective import's span includes its members and closing brace"
+            $( test.eq! [0, 29] (decl_span "import std.list.{map, filter};") ),
         test.case "a member may be renamed"
             $( test.eq! "(import std.list.{sum as total})" (items "import std.list.{sum as total};") ),
         test.case "a whole package"

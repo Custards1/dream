@@ -26,7 +26,9 @@ import dreams.compile;
 import dreams.config;
 import dreams.diag;
 import dreams.expand as expansion;
+import dreams.lexer;
 import dreams.modules;
+import dreams.package;
 import dreams.scope;
 import dreams.typecheck;
 
@@ -842,11 +844,163 @@ let rec located a found =
         _ => (),
     };
 
-let definition_at a line character =
-    match at_position a line character {
-        () => (),
-        [_, _, found] => located a found,
+/// Names in signatures and namespace prefixes are not executable references.
+/// Find their written expression, stopping at the segment under the cursor.
+let rec navigation_expr tree here end =
+    match tree {
+        [:name, _, sp] if ast.span_start sp == here => tree,
+        [:field, obj, field, sp] if ast.span_end sp == end => tree,
+        xs if type_of xs == :list => {
+            let rec search rest = match rest {
+                [] => (),
+                [x, ..tail] => match navigation_expr x here end {
+                    () => search tail,
+                    e => e,
+                },
+            };
+            search xs
+        },
+        _ => (),
     };
+
+let rec namespace_location a ref = match ref {
+    [:dream, target] => match record_of a target {
+        r if r != () => match modules.find (loader a) (record_owner r) {
+            () => (),
+            owner => location a owner (record_span r),
+        },
+        _ => {
+            let m = modules.module_at (loader a) target;
+            // Inline modules leave an import at their declaration's span.
+            let sites = list.flat_map (fn owner ->
+                if modules.module_source owner != modules.module_source m { [] }
+                else { list.filter (fn it -> match it {
+                    [:import, segs, _, _, _] => str.join_str "." segs == modules.module_name m,
+                    _ => false,
+                }) (modules.module_items owner) }) (modules.modules (source a));
+            location a target (match sites {
+                [it, .._] => ast.span it,
+                [] => [0, 0],
+            })
+        },
+    },
+    [:group, name] => match package.find (modules.packages (loader a)) name {
+        () => (),
+        p => match package.manifest p {
+            "" => match list.filter (fn m ->
+                str.starts_with (package.name p + ".") (modules.module_name m))
+                (modules.modules (loader a)) {
+                [] => (),
+                [m, .._] => location_in a (modules.module_source m) [0, 0],
+            },
+            file => %{ "uri" => path_to_uri file, "range" => pos.range "" 0 0 },
+        },
+    },
+    _ => (),
+};
+
+let navigation_context a here = {
+    let root = module_of a;
+    let source_id = modules.module_source (modules.module_at (loader a) root);
+    list.fold (fn best mi -> {
+        let m = modules.module_at (source a) mi;
+        if modules.module_source m == source_id
+           && list.any (fn it -> holds it here) (modules.module_items m)
+           && str.byte_length (modules.module_name m)
+              > str.byte_length (modules.module_name (modules.module_at (source a) best)) {
+            mi
+        } else { best }
+    }) root (list.range 0 (modules.module_count (source a)))
+};
+
+let rec navigation_target a mi e = {
+    let c = scope.ctx (loader a) mi (modules.module_source (modules.module_at (loader a) mi));
+    match scope.as_namespace c (resolved a) e {
+        [ref, _] => namespace_location a ref,
+        () => match e {
+            [:name, n, _] => {
+                let env = scope.r_env_at (resolved a) mi;
+                match scope.only_of env n {
+                    [ref, member, _] => located a [:member, ref, member, ()],
+                    _ => located a [:global, mi, n, ()],
+                }
+            },
+            [:field, obj, field, _] => match scope.as_namespace c (resolved a) obj {
+                [ref, _] => located a [:member, ref, field, ()],
+                _ => (),
+            },
+            _ => (),
+        },
+    }
+};
+
+let definition_at a line character = match module_of a {
+    () => (),
+    root => {
+        let src = module_text a root;
+        let here = name_start src (pos.offset_of src line character);
+        let end = name_end src here;
+        let mi = navigation_context a here;
+        let items = source_items a mi;
+        let expr = navigation_expr items here end;
+        let shadowed = list.any (fn b -> binder_name b == name_at src (chain_start src here))
+            (locals_at a here);
+        let found = scope.at (resolved a) mi
+            (modules.module_source (modules.module_at (loader a) mi)) here;
+        // Real locals take precedence over identically named module aliases.
+        let direct = match found {
+            [:local, _, _] => located a found,
+            [:capture, _, _] => located a found,
+            _ => match expr {
+                () => (),
+                e => if shadowed { () } else { navigation_target a mi e },
+            },
+        };
+        match direct {
+            d if d != () => d,
+            _ => {
+                let is_token = list.any (fn t -> lexer.span_start t == here && lexer.kind t == :ident)
+                    (lexer.tokens src);
+                let imports = list.filter (fn it -> is_token && holds it here &&
+                    (ast.kind it == :import || ast.kind it == :derive)) items;
+                match imports {
+                    [imp, .._] => {
+                        let head = chain_start src here;
+                        let segs = str.split "." (str.slice head (end - head) src);
+                        let dotted = str.join_str "." segs;
+                        let target = modules.find (loader a)
+                            (scope.relative_path (loader a) mi dotted);
+                        match target {
+                            target if target != () => namespace_location a [:dream, target],
+                            _ => match package.find (modules.packages (loader a)) dotted {
+                                p if p != () => namespace_location a [:group, dotted],
+                                _ => {
+                                    let selected = match imp {
+                                        [:import, _, _, names, _] if names != () =>
+                                            list.first_or () (list.filter (fn sel ->
+                                                list.head sel == dotted || list.nth 1 sel == dotted) names),
+                                        _ => (),
+                                    };
+                                    match selected {
+                                        [original, alias] => navigation_target a mi
+                                            (ast.name_e (match alias { () => original, n => n }) ast.no_span),
+                                        _ => navigation_target a mi
+                                            (list.fold (fn obj n -> ast.field_e obj n ast.no_span)
+                                                (ast.name_e (list.head segs) ast.no_span) (list.tail segs)),
+                                    }
+                                },
+                            },
+                        }
+                    },
+                    _ => match at_position a line character {
+                        () => (),
+                        [_, _, ref] => located a ref,
+                    },
+                }
+            },
+        }
+    },
+};
 
 // --- hover ------------------------------------------------------------------------
 
@@ -1086,6 +1240,42 @@ when test {
         match of! text { a => match module_of a { () => "", mi => shown_signature a mi name } };
 
     let tests = [
+        test.case "a module prefix leads to its declaration, not its member"
+            $( test.eq! [0, 0] (definition_start!
+                "mod Helper { let value = 1; }\nlet x = Helper.value;" 1 10) ),
+        test.case "a dotted member still leads to its own declaration"
+            $( test.eq! [0, 13] (definition_start!
+                "mod Helper { let value = 1; }\nlet x = Helper.value;" 1 17) ),
+        test.case "a type in a signature leads to its declaration"
+            $( test.eq! [0, 0] (definition_start!
+                "type Count = :integer;\nlet f : Count -> Count;\nlet f n = n;" 1 9) ),
+        test.case "a qualified type leads to its declaration"
+            $( test.eq! [0, 13] (definition_start!
+                "mod Helper { type Count = :integer; }\nlet f : Helper.Count -> :integer;\nlet f n = n;" 1 17) ),
+        test.case "a selective type alias leads to its original declaration"
+            $( test.eq! [0, 13] (definition_start!
+                "mod Helper { type Count = :integer; }\nimport Helper.{Count as Number};\nlet f : Number -> :integer;\nlet f n = n;" 2 10) ),
+        test.case "the original name in a renamed selective import is navigable"
+            $( test.eq! [0, 13] (definition_start!
+                "mod Helper { type Count = :integer; }\nimport Helper.{Count as Number};" 1 17) ),
+        test.case "the path of a renamed module import is navigable"
+            $( test.eq! [0, 0] (definition_start!
+                "mod Helper { let value = 1; }\nimport Helper as H;\nlet x = H.value;" 1 9) ),
+        test.case "each nested module prefix leads to its own declaration"
+            $( test.eq! [0, 12] (definition_start!
+                "mod Outer { mod Inner { let value = 1; } }\nlet x = Outer.Inner.value;" 1 16) ),
+        test.case "a union type leads to its declaration"
+            $( test.eq! [0, 0] (definition_start!
+                "union Choice { yes, no }\nlet f : Choice -> Choice;\nlet f x = x;" 1 10) ),
+        test.case "a record type leads to the record declaration"
+            $( test.eq! [0, 0] (definition_start!
+                "group Point { x, y }\nlet f : Point -> :integer;\nlet f p = Point.x p;" 1 10) ),
+        test.case "a type inside an inline module uses that module's scope"
+            $( test.eq! [0, 13] (definition_start!
+                "mod Helper { type Count = :integer;\nlet f : Count -> Count;\nlet f n = n; }" 1 10) ),
+        test.case "a comment containing a type is not a reference"
+            $( test.eq! () (definition_start!
+                "type Count = :integer;\n// Count" 1 5) ),
         test.case "a file URI becomes a path"
             $( test.eq! "/a/b.dr" (uri_to_path "file:///a/b.dr") ),
         test.case "a path becomes a file URI"
