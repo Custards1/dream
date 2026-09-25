@@ -587,6 +587,26 @@ What has already been learnt from them, so it is not learnt twice:
   on a seven-round interleaved A/B, and the round as a whole is 4%. Build the
   before-binary and interleave the runs; a single before-and-after on this
   machine cannot resolve anything smaller than about 3%.
+- **A `match` used to pay for every arm it missed.** The arms are tried in
+  order, and a tagged-list arm that does not fit -- `[:name, n, sp]` against an
+  `:apply` -- is a `type_of`, a cons test, a head read and an equality, about
+  a dozen reductions, before the next arm is asked. The compiler is built out
+  of matches of forty such arms, which is why ordering `infer`'s arms by
+  frequency was once worth 15%. Now a `match` with three or more tags starts
+  with `switch_head` / `switch_atom` (docs/bytecode-format.md), which jumps into
+  the ordinary chain of arm tests at the first arm that could match that tag.
+  A twenty-arm match reaching its last arm went 1645 ms -> 350 ms, and the
+  self-compile 176.0M -> 156.0M reductions (-11.4%), 5733 -> 5394 ms on three
+  interleaved rounds (-5.9%). It is `dispatch` in
+  [dreams/lower.dr](dreams/lower.dr), and two properties make it safe. Every
+  target is a suffix of the chain, so each arm is lowered once and a tag arm
+  that does not match after all falls through as before. And `switch_head` is
+  only emitted where the chain would have forced the cell's head first anyway.
+  `dream/tests/programs/match_switch.dr` holds the orderings: a catch-all
+  between tags, a head that raises, and a first arm that forces nothing. It
+  needs no type: the patterns say which tags they take. The JIT does not
+  compile a switch yet (`op_is_supported`), so a function containing one stays
+  interpreted.
 - **Where the self-compile now stands.** 3.10 s -> **2.32 s** interpreted,
   measured `--no-jit` with default workers against a VM built from the commit
   before any of this. **Do not trust this row as an absolute.** Re-measured
@@ -3146,7 +3166,20 @@ test.
   `core.head`/`map_get`/`map_put`/`array_get`/`array_set` are written as them in
   [mind/std/core.dr](mind/std/core.dr). `std.core` is Dream; what it cannot say
   it re-exports from the host module `std.native`.
-- Evaluation is lazy; `strict!` forces.
+- Evaluation is lazy; `strict!` forces. A parameter written `!acc` or
+  `(strict acc)` is forced when the function is entered, which is the fix for
+  an accumulator that would otherwise become a chain of suspensions and
+  overflow. It is also how to get a loop past the JIT's strictness test. See
+  "Strict parameters" in docs/language-spec.md; the lowering is a strict
+  `local` statement at the top of the body (`lower_body`).
+  `std` uses it wherever an accumulator could grow: `list.fold_strict`, which
+  was a `type_of` test in a condition and is now `!acc`; `list.sum`,
+  `product`, `count`, `minimum` and `maximum`, which were lazy; `array.fold`
+  and `str.fold`, which is to say all of `std.seq`; and every fold in
+  `std.map`. Each forces what `f` answered and never the seed, which is what
+  `fold_strict` always did. On a million-element list, interpreted, peak live
+  heap went 439 MB -> 53 MB and the run 2183 -> 1503 ms. The self-compile did
+  not move, because the compiler already avoided these traps by hand.
 - `when test { .. }` holds a module's tests, collected by compiling with
   `--test`. Tests are `test.case "name" $( test.eq! expected actual )`.
 - `macro name params = ..` declares a syntax transformer and `expand name args`

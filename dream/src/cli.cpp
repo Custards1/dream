@@ -95,6 +95,11 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
             std::snprintf(buf, sizeof buf, "/%u", n.c);
             out += buf;
             break;
+        case Op::SwitchHead:
+        case Op::SwitchAtom:
+            std::snprintf(buf, sizeof buf, "/%u", n.c / 2);
+            out += buf;
+            break;
         case Op::Block:
         case Op::MakeList:
         case Op::MakeArray:
@@ -127,6 +132,8 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
             dump_node(img, n.a, depth + 1, out);
             break;
         case Op::Apply:
+        case Op::SwitchHead:
+        case Op::SwitchAtom:
             dump_node(img, n.a, depth + 1, out);
             dump_kids(img, n.b, n.c, depth + 1, out);
             break;

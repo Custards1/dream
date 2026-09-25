@@ -73,6 +73,10 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
         case Op::MakeMap:
             push_kids(n.a, uint64_t(n.b) * 2);
             break;
+        case Op::SwitchHead: case Op::SwitchAtom:
+            out.push_back(n.a);
+            push_kids(n.b, n.c);
+            break;
         case Op::Bind:
             out.push_back(n.b);
             break;
@@ -143,6 +147,8 @@ const char* op_name(Op op) {
         case Op::MakeMap: return "map";
         case Op::Get: return "get";
         case Op::Set: return "set";
+        case Op::SwitchHead: return "switch_head";
+        case Op::SwitchAtom: return "switch_atom";
         default: return "<bad op>";
     }
 }
@@ -500,6 +506,16 @@ bool Image::validate(std::string& error) {
             case Op::MakeMap:
                 if (!kids_ok(n.a, uint64_t(n.b) * 2)) return fail("bad map entry list");
                 break;
+            case Op::SwitchHead: case Op::SwitchAtom:
+                if (!node_ok(n.a)) return fail("bad switch subject");
+                if (n.c % 2 != 1 || !kids_ok(n.b, n.c)) return fail("bad switch table");
+                // The interpreter reads each key as an atom without asking.
+                for (uint32_t k = 0; k + 1 < n.c; k += 2) {
+                    if (Op(nodes_[kids_[n.b + k]].op) != Op::ConstAtom) {
+                        return fail("switch key is not an atom constant");
+                    }
+                }
+                break;
             case Op::Bind: if (!node_ok(n.b)) return fail("bad bind value"); break;
             case Op::Try:
                 if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad try body or handler");
@@ -601,6 +617,10 @@ bool Image::validate(std::string& error) {
                     break;
                 case Op::MakeMap:
                     for (uint32_t k = 0; k < n.b * 2; ++k) work.push_back(kids_[n.a + k]);
+                    break;
+                case Op::SwitchHead: case Op::SwitchAtom:
+                    work.push_back(n.a);
+                    for (uint32_t k = 0; k < n.c; ++k) work.push_back(kids_[n.b + k]);
                     break;
                 case Op::If:
                     work.push_back(n.a);

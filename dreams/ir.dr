@@ -83,6 +83,13 @@ let ops = [
     /// `a` = container, `b` = key, `c` = the new value, stored unforced. The
     /// answer is the container changed at that key; the one given is untouched.
     [:set, 40, "set"],
+
+    /// `a` = the subject; `b` = kids offset, `c` = kids count. The kids are
+    /// pairs of an atom constant and the node to go to when the key is that
+    /// atom, then the node for every other key. `switch_head` keys on the head
+    /// of a list cell, `switch_atom` on the subject itself. See `dispatch` in
+    /// lower.dr.
+    [:switch_head, 41, "switch_head"], [:switch_atom, 42, "switch_atom"],
 ];
 
 priv let nth = list.nth;
@@ -438,6 +445,10 @@ let show_node img i n = {
             :make_list   => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
             :make_array  => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
             :make_map    => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
+            :switch_head => to_string (node_a n) + " kids@" + to_string (node_b n)
+                            + "x" + to_string (node_c n),
+            :switch_atom => to_string (node_a n) + " kids@" + to_string (node_b n)
+                            + "x" + to_string (node_c n),
             :bind        => "@" + to_string (node_a n) + " = " + to_string (node_b n),
             :make_closure => "fn" + to_string (node_a n),
             :make_thunk  => "fn" + to_string (node_a n),

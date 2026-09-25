@@ -36,6 +36,8 @@ const char* cont_kind_name(ContKind k) {
         case ContKind::IndexApply: return "index_apply";
         case ContKind::GetWalk: return "get_walk";
         case ContKind::SetWalk: return "set_walk";
+        case ContKind::SwitchOn: return "switch_on";
+        case ContKind::SwitchKey: return "switch_key";
     }
     return "?";
 }

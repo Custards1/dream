@@ -136,29 +136,25 @@ let rec fold f acc xs =
 /// worth of anything -- the tens of thousands of nodes a compiler emits -- runs
 /// the machine out of memory long before it runs out of list.
 ///
-/// The force is `type_of` in a *condition*, and both halves of that matter. It
-/// has to be `type_of` because that is the cheapest builtin that cannot answer
-/// without evaluating its argument. It has to be a condition because an
-/// argument is not evaluated: writing `fold_strict f (force (f acc x)) rest`
-/// looks strict and is not -- the call to `force` is itself suspended, and the
-/// chain builds exactly as before. A condition is the one place the language
-/// must evaluate something.
+/// The force is a strict parameter (`!acc`): each step's `f acc x` is forced
+/// when the next step is entered, before the one after it is suspended. It
+/// used to be `if type_of next == :nothing`, a condition being the one place
+/// the language had to evaluate something, which read like a type test and
+/// was a force.
 ///
-/// Which type it turns out to be is not used. `:nothing` is not one of the
-/// answers `type_of` gives, so the fold always continues; what is kept is that
-/// `next` is a value rather than one more link.
+/// The seed is not forced: the first step is taken here, and `step` only ever
+/// sees what `f` answered. So `fold_strict (fn _ x -> x) (1 / 0) [1]` is `1`,
+/// as it always was.
 ///
 /// Only the head is forced. What is inside the accumulator stays lazy, which is
 /// where laziness earns its keep: `strict!` would walk the whole accumulator at
 /// every step and turn a linear fold into a quadratic one.
 let fold_strict : (b -> a -> b) -> b -> [a] -> b;
-let rec fold_strict f acc xs =
-    if core.is_empty xs { acc }
-    else {
-        let next = f acc (core.head xs);
-        if type_of next == :nothing { next }
-        else { fold_strict f next (core.tail xs) }
-    };
+let fold_strict f acc xs =
+    if core.is_empty xs { acc } else { strict_steps f (f acc (core.head xs)) (core.tail xs) };
+
+priv let rec strict_steps f !acc xs =
+    if core.is_empty xs { acc } else { strict_steps f (f acc (core.head xs)) (core.tail xs) };
 
 let fold_right : (a -> b -> b) -> b -> [a] -> b;
 let rec fold_right f acc xs =
@@ -223,9 +219,9 @@ let contains : a -> [a] -> :bool;
 let contains x xs = any (fn y -> y == x) xs;
 
 let count : (a -> :bool) -> [a] -> :integer;
-let count pred xs = fold (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
+let count pred xs = fold_strict (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
 
-let rec index_of_from i x xs =
+let rec index_of_from !i x xs =
     if core.is_empty xs { 0 - 1 }
     else if core.head xs == x { i }
     else { index_of_from (i + 1) x (core.tail xs) };
@@ -234,10 +230,16 @@ let rec index_of_from i x xs =
 let index_of : a -> [a] -> :integer;
 let index_of x xs = index_of_from 0 x xs;
 
-let sum xs = fold (fn a b -> a + b) 0 xs;
-let product xs = fold (fn a b -> a * b) 1 xs;
+// Strict, because a sum is a number and a lazy one is a million suspended
+// additions waiting to overflow the machine. A `sum` over a `range` is fused
+// and runs none of this.
+let sum xs = fold_strict (fn a b -> a + b) 0 xs;
+let product xs = fold_strict (fn a b -> a * b) 1 xs;
 
-let rec min_by_from best less xs =
+// `best` is strict because `next` below is a suspended `if` that names the
+// last one, so a lazy `best` is a chain as long as the list. Both callers
+// compare it on every step anyway, so this forces nothing they did not.
+let rec min_by_from !best less xs =
     if core.is_empty xs { best }
     else {
         let x = core.head xs;

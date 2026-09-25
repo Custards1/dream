@@ -125,6 +125,8 @@ lazy VM cannot work out for itself:
 | 38 | `map` | `KIDS` offset | pair count (`2n` kids: `k0 v0 k1 v1 …`) | |
 | 39 | `get` | container | key | fallback, or `NO_NODE` |
 | 40 | `set` | container | key | value |
+| 41 | `switch_head` | subject | `KIDS` offset | kid count (`2n + 1`: `key0 target0 … default`) |
+| 42 | `switch_atom` | subject | `KIDS` offset | kid count, as above |
 
 A `block` evaluates to its last statement. An empty block evaluates to unit.
 
@@ -137,6 +139,18 @@ answers a new container: a copy of an array, the changed path of a map's trie,
 or the cells of a list in front of the position, with everything behind it
 shared. The container it was given is unchanged. A list is walked a cell at a
 time on the continuation stack, never recursively.
+
+`switch_head` and `switch_atom` are how a `match` skips the arms that cannot
+match. Each key is an `atom` node, followed by the node to evaluate when the
+key is that atom; the last kid is the node for every other key. `switch_atom`
+keys on its subject, when the subject is an atom. `switch_head` keys on the
+head of a list cell, which it forces first; a subject that is not a cell, or
+whose head is not an atom, takes the default. The subject is forced to weak
+head normal form. The compiler emits these only where the tests they skip could
+not have matched and where the chain of arm tests would itself have forced the
+same head first, so a VM that ran every target's arm tests from the top would
+give the same answers. It is only doing more work. Validation: `c` is odd, the
+run is in range, and every key is an `atom` node.
 
 ### Function record (32 bytes)
 

@@ -99,6 +99,8 @@ let node_edges = [
     /// `c` is the fallback, and absent when there is none.
     [:get, [0, 1, 2]],
     [:set, [0, 1, 2]],
+    /// `a` is the subject; the table is a run.
+    [:switch_head, [0]], [:switch_atom, [0]],
 ];
 
 /// Which opcodes address a run of children, as `[op, offset operand, count
@@ -110,6 +112,8 @@ let node_runs = [
     [:make_list, 0, 1, 1],
     [:make_array, 0, 1, 1],
     [:make_map, 0, 1, 2],
+    [:switch_head, 1, 2, 1],
+    [:switch_atom, 1, 2, 1],
 ];
 
 // Asked once per node of the program, which is the shape of question that has

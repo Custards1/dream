@@ -14,10 +14,15 @@ import std.list;
 
 /// Left to right over the elements. Indexing is constant time, so this is a
 /// counted loop rather than a walk.
+///
+/// Strict in each step, as `list.fold_strict` is: `std.seq` builds `sum`,
+/// `count` and the rest on this, and a lazy accumulator over a large array is
+/// a chain of suspensions as long as the array. The seed is handed to `f`
+/// unforced, and only what `f` answers is forced.
 let fold f init xs = {
     let n = len xs;
-    let rec go i acc = if i >= n { acc } else { go (i + 1) (f acc (core.array_get xs i)) };
-    go 0 init
+    let rec go i !acc = if i >= n { acc } else { go (i + 1) (f acc (core.array_get xs i)) };
+    if n == 0 { init } else { go 1 (f init (core.array_get xs 0)) }
 };
 
 let name xs = "array";

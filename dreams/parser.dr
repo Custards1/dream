@@ -542,6 +542,12 @@ let rec lambda_params acc ts =
     else if at ts :ident && not (is_keyword (peek_value ts)) {
         lambda_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
     }
+    else if starts_strict_param ts {
+        match strict_param ts {
+            [:error, m, s] => err m s,
+            [:ok, p, rest] => lambda_params (core.cons p acc) rest,
+        }
+    }
     else if at ts :lparen && peek2_kind ts == :rparen {
         // `()` -- a slot that binds no name.
         lambda_params (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
@@ -1179,6 +1185,12 @@ let rec let_params c acc ts =
     else if at ts :ident && not (is_keyword (peek_value ts)) {
         let_params c (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
     }
+    else if starts_strict_param ts {
+        match strict_param ts {
+            [:error, m, s] => err m s,
+            [:ok, p, rest] => let_params c (core.cons p acc) rest,
+        }
+    }
     else if at ts :lparen && peek2_kind ts == :rparen {
         let_params c (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
     }
@@ -1195,6 +1207,28 @@ let rec let_params c acc ts =
         }
     }
     else { ok (list.reverse acc) ts };
+
+/// A strict parameter: `!acc`, or `(strict acc)` -- see `ast.strict_param`.
+/// The parenthesised spelling is exactly those four tokens, so `(strict)` and
+/// `(strict, x)` are still the parameter lists they always were.
+let starts_strict_param ts =
+    at ts :bang
+    || (at ts :lparen && peek2_kind ts == :ident && peek_value (list.tail ts) == "strict"
+        && peek_kind (list.drop 2 ts) == :ident && peek_kind (list.drop 3 ts) == :rparen);
+
+let strict_param ts =
+    if at ts :bang {
+        let after = list.tail ts;
+        if at after :ident && not (is_keyword (peek_value after)) {
+            ok (ast.strict_param (peek_value after) (peek_span after)) (list.tail after)
+        }
+        else { err ("expected a parameter name after `!`, found " + describe after) (peek_span after) }
+    }
+    else {
+        let name = list.drop 2 ts;
+        if is_keyword (peek_value name) { err ("expected a parameter name after `strict`, found " + describe name) (peek_span name) }
+        else { ok (ast.strict_param (peek_value name) (peek_span name)) (list.drop 4 ts) }
+    };
 
 /// Can this token begin a parameter that is a pattern? Only a bracketed shape:
 /// a name is already a parameter, and a `(` is the parenthesised list.

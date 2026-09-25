@@ -17,7 +17,8 @@ import std.list;
 // --- the hole std.seq declares ----------------------------------------------
 
 /// Left to right over the characters, not the bytes.
-let fold f init s = list.fold f init (core.str_chars s);
+/// Strict in each step, for the reason `array.fold` gives.
+let fold f init s = list.fold_strict f init (core.str_chars s);
 
 let name s = "string";
 

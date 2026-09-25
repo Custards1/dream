@@ -48,6 +48,14 @@ enum class Op : uint8_t {
     // position. Opcodes rather than natives so the element handed back is
     // forced by the machine, not underneath a native call.
     Get = 39, Set = 40,
+    // A `match` jumping straight to the arms that can match, by an atom: the
+    // head of a list cell (`[:tag, ..]`), or the value itself (`:tag`). `a` is
+    // the subject, `b` a kids offset and `c` a kids count: pairs of an atom
+    // constant node and a target, then the default target. Every target is a
+    // suffix of the ordinary chain of arm tests, so the tests still run -- the
+    // switch only skips the arms that cannot match. See `lower_match` in
+    // dreams/lower.dr.
+    SwitchHead = 41, SwitchAtom = 42,
     Count
 };
 

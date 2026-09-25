@@ -556,15 +556,30 @@ let rec lower_function span op ps body l =
         _ => emit_leaf :unit l,
     };
 
-/// A function's body, with its pattern parameters taken apart in front of it.
+/// A function's body, with its strict parameters forced and its pattern
+/// parameters taken apart in front of it.
+///
+/// A strict parameter is a strict statement reading its slot, first and in
+/// parameter order: a block evaluates a strict non-final statement, and
+/// evaluating a `local` forces what is in it. So the function is strict in
+/// that parameter on every path, which is also exactly what the JIT's
+/// admission test asks (`Analyzer::strict_of` counts strict statements).
+///
 /// Such a parameter's argument arrives in its slot like any other -- a function's
 /// parameters are its first slots, in order -- and its names are bound out of
 /// that slot before the body runs. They are bound lazily, as a destructuring
 /// `let` binds them, so naming an argument's parts makes a function no stricter
 /// in it.
 let lower_body ps body l =
-    if not (list.any (fn p -> has_pattern p) ps) { lower_expr body l }
+    if not (list.any (fn p -> has_pattern p || ast.param_strict p) ps) { lower_expr body l }
     else {
+        let forced = list.fold (fn acc pair ->
+            if not (ast.param_strict (list.nth 0 pair)) { acc }
+            else {
+                let read = emit (ir.node :local (list.nth 1 pair) ir.no_node ir.no_node) (list.head acc);
+                [set_flag (list.nth 1 read) ir.f_strict (list.head read),
+                 list.append (list.nth 1 acc) [list.nth 1 read]]
+            }) [l, []] (list.zip ps (list.range 0 (list.length ps)));
         let bound = list.fold (fn acc pair ->
             match ast.param_pattern (list.nth 0 pair) {
                 () => acc,
@@ -573,7 +588,7 @@ let lower_body ps body l =
                     let parts = destructure pattern (list.nth 1 arg) (list.head arg);
                     [list.head parts, list.append (list.nth 1 acc) (list.nth 1 parts)]
                 },
-            }) [l, []] (list.zip ps (list.range 0 (list.length ps)));
+            }) [list.head forced, list.nth 1 forced] (list.zip ps (list.range 0 (list.length ps)));
         let inner = lower_expr body (list.head bound);
         let stmts = list.append (list.nth 1 bound) [list.nth 1 inner];
         let placed = kids stmts (list.head inner);
@@ -1166,9 +1181,122 @@ let rec lower_match scrutinee arms span l = {
     let sequenced = set_flag i ir.f_strict (inherit i [list.nth 1 value] (list.head bind));
 
     let chain = lower_arms arms held span sequenced;
-    let placed = kids [i, list.nth 1 chain] (list.head chain);
+    let dispatched = dispatch arms (list.nth 2 chain) held (list.nth 1 chain) (list.head chain);
+    let placed = kids [i, list.nth 1 dispatched] (list.head dispatched);
     let made = emit (ir.node :block (list.nth 1 placed) 2 ir.no_node) (list.head placed);
-    [inherit (list.nth 1 made) [i, list.nth 1 chain] (list.head made), list.nth 1 made]
+    [inherit (list.nth 1 made) [i, list.nth 1 dispatched] (list.head made), list.nth 1 made]
+};
+
+// --- jumping to the arm -----------------------------------------------------------
+//
+// The arms of a `match` are tried in order, and an arm that misses is not
+// free: `[:name, n, sp]` against a subject it does not fit is a `type_of`, a
+// cons test, a head read and an equality -- about a dozen reductions -- before
+// the next arm is asked. The compiler is built out of matches of forty such
+// arms, and a node that is the fortieth kind paid for thirty-nine misses.
+// Measured on a twenty-arm match over `[:tag, a, b]`, reaching the last arm
+// cost 1645 ms to the first arm's 343.
+//
+// Most of those arms say, in their first element, which subjects they could
+// ever match: `[:name, ..]` only a cell whose head is `:name`, `:empty` only
+// the atom `:empty`. So a `match` with enough of them starts with a switch on
+// that atom, which jumps into the ordinary chain of tests at the first arm
+// that could match. It jumps *into* the chain rather than replacing it: every
+// target is a suffix of the chain `lower_arms` built, so every test that runs
+// is one that would have run, each arm is lowered once, and an arm that does
+// not match after all -- the wrong length, a guard that says no -- falls
+// through to the arms below it exactly as before. What is skipped is only
+// arms that could not have matched.
+//
+// That is sound without any type. A declared union is what makes a `match`
+// look like this, but the patterns alone say which tags they take.
+//
+// The one thing to be careful of is forcing. `switch_head` reads the head of
+// a cell, and reading means forcing. It is only emitted when the chain would
+// have forced that head before anything else: the arms in front of the first
+// tagged-cell arm are all atom literals, which compare the subject and cannot
+// match a cell, so for a cell the first thing the chain does is force its head
+// to compare it with a tag.
+
+/// What an arm's pattern says about the subjects it could match: `[:head, n]`
+/// for a list whose first element is the atom `n`, `[:atom, n]` for the atom
+/// itself, and `:any` for everything else.
+let rec arm_key p = match p {
+    [:as_p, inner, _, _, _] => arm_key inner,
+    [:literal, [:atom, n, _], _] => [:atom, n],
+    [:list_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
+    _ => :any,
+};
+
+/// The position of the first element `pred` accepts, or `()`.
+let rec find_index_from i pred xs = match xs {
+    [] => (),
+    [x, ..rest] => if pred x { i } else { find_index_from (i + 1) pred rest },
+};
+let find_index pred xs = find_index_from 0 pred xs;
+
+/// Fewer tags than this and the chain is already cheap.
+let min_switch = 3;
+
+/// The distinct tags of one kind, in the order the arms first name them.
+let tags_of kind keys = list.fold (fn acc k -> match k {
+    [kd, n] if kd == kind && not (list.contains n acc) => list.append acc [n],
+    _ => acc,
+}) [] keys;
+
+/// The chain suffix of the first arm that could match: the first whose key is
+/// one of `fits`, or `:any`. The last suffix is the `match_error` raise.
+let first_fit fits keys suffixes =
+    match find_index (fn k -> k == :any || list.contains k fits) keys {
+        () => list.nth (list.length keys) suffixes,
+        j => list.nth j suffixes,
+    };
+
+/// A switch node over `tags`, keyed on `kind`, with `default` for everything else.
+let switch_node op kind tags keys suffixes held default l = {
+    let entries = list.fold (fn acc n -> {
+        let key = const_atom n (list.head acc);
+        [list.head key, list.append (list.nth 1 acc) [list.nth 1 key, first_fit [[kind, n]] keys suffixes]]
+    }) [l, []] tags;
+    let subject = emit (ir.node :local held ir.no_node ir.no_node) (list.head entries);
+    let run = list.append (list.nth 1 entries) [default];
+    let placed = kids run (list.head subject);
+    let made = emit (ir.node op (list.nth 1 subject) (list.nth 1 placed) (list.length run)) (list.head placed);
+    [inherit (list.nth 1 made) run (list.head made), list.nth 1 made]
+};
+
+/// The node a `match` starts at: a switch into `chain` when enough arms name a
+/// tag, and `chain` itself otherwise.
+let dispatch arms suffixes held chain l = {
+    let keys = list.map (fn a -> arm_key (ast.arm_pattern a)) arms;
+    let heads = tags_of :head keys;
+    let atoms = tags_of :atom keys;
+    // Everything in front of the first tagged-cell arm is an atom literal.
+    let head_ok = match find_index (fn k -> match k { [:head, _] => true, _ => false }) keys {
+        () => false,
+        j => list.all (fn k -> match k { [:atom, _] => true, _ => false }) (list.take j keys),
+    };
+    let use_heads = head_ok && list.length heads >= min_switch;
+    let use_atoms = list.length atoms >= min_switch || (use_heads && not (list.is_empty atoms));
+    let head_tags = list.map (fn n -> [:head, n]) heads;
+    // Under a `switch_head`, only a cell whose head names no tag, or something
+    // that is not a cell, reaches the atom switch -- and a cell of either kind
+    // can only be matched by an `:any` arm. On its own, a cell may be matched
+    // by any tagged-cell arm, so none of them may be skipped.
+    let atom_default = if use_heads { first_fit [] keys suffixes } else { first_fit head_tags keys suffixes };
+    let by_atom = if not use_atoms { [l, ()] }
+                  else { switch_node :switch_atom :atom atoms keys suffixes held atom_default l };
+    if not use_heads {
+        match list.nth 1 by_atom { () => [l, chain], node => by_atom }
+    } else {
+        // Not a cell, or a cell whose head is no tag: the atom switch when
+        // there is one, and otherwise the first arm that is not a tagged cell.
+        let fallback = match list.nth 1 by_atom {
+            () => first_fit (list.map (fn n -> [:atom, n]) atoms) keys suffixes,
+            node => node,
+        };
+        switch_node :switch_head :head heads keys suffixes held fallback (list.head by_atom)
+    }
 };
 
 let rec lower_arms arms held span l =
@@ -1179,7 +1307,8 @@ let rec lower_arms arms held span l =
         [] => {
             let kind = const_atom "match_error" l;
             let raised = call_builtin "raise!" [list.nth 1 kind] (list.head kind);
-            [set_flag (list.nth 1 raised) ir.f_strict (list.head raised), list.nth 1 raised]
+            [set_flag (list.nth 1 raised) ir.f_strict (list.head raised), list.nth 1 raised,
+             [list.nth 1 raised]]
         },
         [arm, ..rest] => {
             let subject = emit (ir.node :local held ir.no_node ir.no_node) l;
@@ -1238,7 +1367,10 @@ let rec lower_arms arms held span l =
             [set_flag test ir.f_strict
                 (inherit (list.nth 1 made) [test, list.nth 1 block, list.nth 1 otherwise]
                          (list.head made)),
-             list.nth 1 made]
+             list.nth 1 made,
+             // Where each arm's test starts, and the raise after the last:
+             // what a switch in front of the chain jumps to (`dispatch`).
+             core.cons (list.nth 1 made) (list.nth 2 otherwise)]
         },
     };
 
@@ -1255,6 +1387,10 @@ let rec mark_tail i l =
         match ir.node_op n {
             :apply => set_flag i ir.f_tail l,
             :if    => mark_tail (ir.node_c n) (mark_tail (ir.node_b n) l),
+            // Every target, which is every value a switch can finish with;
+            // the keys in between are atoms and are not calls.
+            :switch_head => mark_targets n l,
+            :switch_atom => mark_targets n l,
             // A block's value is its last statement, so that is the only
             // child that can be in tail position.
             :block =>
@@ -1264,6 +1400,12 @@ let rec mark_tail i l =
             _ => l,
         }
     };
+
+let mark_targets n l =
+    list.fold (fn acc k -> if k % 2 == 1 || k == ir.node_c n - 1 {
+                               mark_tail (ir.kid_at (ir.node_b n + k) (prog acc)) acc
+                           } else { acc })
+              l (list.range 0 (ir.node_c n));
 
 // --- the whole program ---------------------------------------------------------
 

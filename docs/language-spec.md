@@ -621,6 +621,36 @@ Sharing is preserved by returning the *binding's* thunk rather than a fresh
 wrapper, and the allocation is skipped entirely when a node is already a value
 (constants, variable references, closures).
 
+### Strict parameters
+
+A parameter written `!name`, or `(strict name)`, is forced when the function is
+entered, before anything in its body runs, in the order the parameters are
+written. Everything else about the call is unchanged. The argument still
+arrives suspended, and it is the callee that forces it.
+
+```dream
+let rec sum_to !acc n = if n == 0 { acc } else { sum_to (acc + n * 2) (n - 1) };
+let total = list.fold (fn !acc x -> acc + x) 0 xs;
+```
+
+It exists for the accumulator. Without it, `acc + n * 2` is suspended on each
+call, the suspension holds the previous one, and a million-step loop builds a
+million-link chain. It overflows the machine when the answer is finally looked
+at, and holds all of it in memory until then. With it, each call's `acc` is a
+value before the next suspension is made of it.
+
+A strict parameter is forced even when the body never uses it, so
+`let ignores !x y = y` raises if `x` does. That is the point of writing one.
+Only a name can be strict. The `!` goes in front and means something different
+from the `!` at the end of an impure name. `(strict)` on its own is still a
+parameter named `strict`. A `fold` whose lambda has a strict parameter is not
+fused (see `dreams/fuse.dr`), because the fused loop inlines the body and would
+drop the force.
+
+For the JIT, a strict parameter is forced on every path by construction, which
+is exactly what admission asks (below). Marking a loop's parameters strict is
+the way to get it compiled.
+
 ### Wrappers
 
 A global whose body is one application of its own parameters -- `let head xs =

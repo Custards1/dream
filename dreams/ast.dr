@@ -156,6 +156,20 @@ let param_name p = list.nth 0 p;
 /// is bound to the argument whole; the body sees what the pattern binds.
 let pattern_param pattern span = [(), span, pattern];
 
+/// A parameter forced when the function is entered: `!acc`, or `(strict acc)`.
+///
+/// Dream is lazy, so an accumulator handed from one call to the next is handed
+/// over suspended, and each call's `acc + x` suspends the last one's -- a
+/// million-step loop builds a million-link chain and overflows the machine
+/// when its answer is finally looked at. The standing workarounds were
+/// `list.fold_strict` and a condition that happens to look at the value. This
+/// says it: the body starts by forcing the argument, so each call's `acc` is
+/// a value by the time the next suspension is made of it. Only a name may be
+/// strict; the marker rides in a fourth element that every reader of a plain
+/// name parameter ignores.
+let strict_param name span = [name, span, (), :strict];
+let param_strict p = match p { [_, _, _, :strict] => true, _ => false };
+
 /// The pattern a parameter takes apart, or `()` for one that is a name.
 let param_pattern p = match p { [_, _, pattern] => pattern, _ => () };
 
@@ -434,7 +448,10 @@ let show_all xs = str.join_str " " (list.map (fn x -> show x) xs)
 let show_params ps =
     str.join_str " " (list.map (fn p ->
         match param_pattern p {
-            () => match param_name p { () => "()", n => n },
+            () => match param_name p {
+                () => "()",
+                n => if param_strict p { "!" + n } else { n },
+            },
             pattern => show_pattern pattern,
         }) ps)
 ;

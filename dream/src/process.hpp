@@ -53,6 +53,8 @@ enum class ContKind : uint8_t {
     GetWalk,     // a = cells still to step over, b = the get node, c = the index, v1 = frame
     SetWalk,     // a = cells still to step over, b = the set node, c = the index,
                  // v1 = frame; the cells stepped over so far are on the value stack
+    SwitchOn,    // a = the switch node, v1 = frame; the result is its subject
+    SwitchKey,   // a = the switch node, v1 = frame; the result is the key (a head)
 };
 
 struct Cont {

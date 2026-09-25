@@ -29,10 +29,10 @@ let empty = core.map_new ();
 /// A map from `[key, value]` pairs. A later pair wins, which is what makes
 /// `from_pairs (list.append defaults overrides)` mean what it looks like.
 let from_pairs ps =
-    list.fold (fn m p -> core.map_put m (list.nth 0 p) (list.nth 1 p)) empty ps;
+    list.fold_strict (fn m p -> core.map_put m (list.nth 0 p) (list.nth 1 p)) empty ps;
 
 /// The pairs of two maps, the second winning where they overlap.
-let merge a b = list.fold (fn m p -> core.map_put m (list.nth 0 p) (list.nth 1 p)) a (core.map_pairs b);
+let merge a b = list.fold_strict (fn m p -> core.map_put m (list.nth 0 p) (list.nth 1 p)) a (core.map_pairs b);
 
 // --- looking ----------------------------------------------------------------
 
@@ -61,18 +61,23 @@ let update default f m k = core.map_put m k (f (core.map_get m k default));
 let put_new m k v = if core.map_has m k { m } else { core.map_put m k v };
 
 let map_values f m =
-    list.fold (fn acc p -> core.map_put acc (list.nth 0 p) (f (list.nth 1 p))) empty (core.map_pairs m);
+    list.fold_strict (fn acc p -> core.map_put acc (list.nth 0 p) (f (list.nth 1 p))) empty (core.map_pairs m);
 
 /// Keep the pairs `keep k v` answers true for.
 let filter keep m =
-    list.fold (fn acc p ->
+    list.fold_strict (fn acc p ->
         if keep (list.nth 0 p) (list.nth 1 p) { core.map_put acc (list.nth 0 p) (list.nth 1 p) }
         else { acc })
         empty (core.map_pairs m);
 
 /// Fold over the pairs. In trie order, so a fold whose answer depends on the
 /// order is a bug waiting for a different set of keys.
-let fold f init m = list.fold (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (core.map_pairs m);
+///
+/// Every fold in this module is `list.fold_strict`. Building a map with a
+/// lazy fold suspends each `map_put` on the one before, so the map arrives as
+/// a chain of every version of itself -- see "A lazy value stored in a map
+/// pins the map it was made in" in CLAUDE.md.
+let fold f init m = list.fold_strict (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (core.map_pairs m);
 
 /// Every key of `m` that `other` does not have.
 let without m other = filter (fn k _ -> not (core.map_has other k)) m;
@@ -84,7 +89,7 @@ let without m other = filter (fn k _ -> not (core.map_has other k)) m;
 // this is a hash -- and because a set written as a list of members reads
 // better at the definition than a map literal does.
 
-let set_of xs = list.fold (fn m x -> core.map_put m x true) empty xs;
+let set_of xs = list.fold_strict (fn m x -> core.map_put m x true) empty xs;
 let member s x = core.map_has s x;
 let add s x = core.map_put s x true;
 let members s = keys s;

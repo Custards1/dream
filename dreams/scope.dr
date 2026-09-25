@@ -2691,6 +2691,8 @@ let step_ok r st =
         [:lambda, ps, body, _] =>
             list.length ps == 1
             && ast.param_pattern (list.nth 0 ps) == ()
+            // The loop inlines the body and has nowhere to put the force.
+            && not (ast.param_strict (list.nth 0 ps))
             && not (list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body))
             && not (reaches_frame r [:ast, body, ps]),
         _ => false,
@@ -2718,6 +2720,10 @@ let sink_step tag strict stag src_args args =
                     // no room for either, and a fold over pairs is rare enough
                     // not to be worth making room.
                     else if list.any (fn p -> ast.param_pattern p != ()) ps { () }
+                    // Nor does it have anywhere to put a strict parameter's
+                    // force: the lambda's body is written into the loop, and
+                    // the force is the body's first statement.
+                    else if list.any (fn p -> ast.param_strict p) ps { () }
                     // An effect inside the loop would be an effect the machine
                     // no longer sequences -- see "what a body mentions" in
                     // `fuse`.

@@ -1492,6 +1492,47 @@ void finish_binary(Process& p, Op op, Value lhs, Value rhs) {
 }
 
 /// `if cond { a } else { b }`, with the condition in hand.
+/// The target a switch names for this key, or its default. The table is short
+/// -- one entry per tag a `match` names -- and each probe is a compare of two
+/// immediates, so a scan is the right shape for it; what it replaces is a
+/// dozen reductions per arm the chain would otherwise have tested and failed.
+uint32_t switch_target(Process& p, const Node& n, Value key) {
+    const Image& img = img_of(p);
+    const uint32_t* kids = img.kids_at(n.b);
+    const uint32_t pairs = n.c / 2;
+    if (is_atom(key)) {
+        for (uint32_t k = 0; k < pairs; ++k) {
+            if (make_atom(p.runtime().image_atom(img.node(kids[2 * k]).a)) == key) return kids[2 * k + 1];
+        }
+    }
+    return kids[n.c - 1];
+}
+
+/// A switch whose subject is in hand. `switch_atom` keys on the subject;
+/// `switch_head` on the head of a list cell, which it forces first -- the
+/// compiler only emits one where the arm chain would have forced that head
+/// before looking at anything else (see `lower_match`), so nothing is forced
+/// that was not going to be, and nothing earlier.
+void take_switch(Process& p, uint32_t node, Value subject, Value frame) {
+    const Node& n = img_of(p).node(node);
+    subject = resolve(subject);
+    if (Op(n.op) == Op::SwitchAtom) {
+        eval_node(p, switch_target(p, n, subject), frame);
+        return;
+    }
+    if (!is_obj(subject, ObjType::Cons)) {
+        eval_node(p, img_of(p).kid(n.b + n.c - 1), frame);
+        return;
+    }
+    Value head = resolve(static_cast<ConsObj*>(as_obj(subject))->head);
+    if (is_whnf(head)) {
+        eval_node(p, switch_target(p, n, head), frame);
+        return;
+    }
+    push_cont(p, ContKind::SwitchKey, node, 0, 0, frame);
+    enter(p, head);
+}
+
 void take_branch(Process& p, Value cond, uint32_t then_node, uint32_t else_node, Value frame) {
     if (!is_bool(cond)) {
         do_raise(p, type_error(p, "`if` needs a bool, got " + describe(p, cond)));
@@ -1712,6 +1753,18 @@ void step_eval(Process& p) {
 
         case Op::Block: advance_block(p, n.a, n.b, 0, frame); return;
 
+        case Op::SwitchHead:
+        case Op::SwitchAtom: {
+            Value subject;
+            if (!operand_value(p, img, n.a, frame, &subject)) {
+                push_cont(p, ContKind::SwitchOn, p.node, 0, 0, frame);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            take_switch(p, p.node, subject, frame);
+            return;
+        }
+
         case Op::Bind: {
             auto* fo = static_cast<FrameObj*>(as_obj(frame));
             Value bound = thunk_for(p, n.b, frame);
@@ -1888,6 +1941,14 @@ void step_return(Process& p, size_t floor) {
 
         case ContKind::IfBranch:
             take_branch(p, p.result, c.a, c.b, c.v1);
+            return;
+
+        case ContKind::SwitchOn:
+            take_switch(p, c.a, p.result, c.v1);
+            return;
+
+        case ContKind::SwitchKey:
+            eval_node(p, switch_target(p, img_of(p).node(c.a), resolve(p.result)), c.v1);
             return;
 
         case ContKind::BinRight: {
