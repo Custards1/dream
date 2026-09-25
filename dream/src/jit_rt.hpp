@@ -74,13 +74,9 @@ int64_t* dream_rt_reduction_slot(dream::Process* p);
 dream::Value dream_rt_yield_frame(dream::Process* p, dream::Value frame, uint32_t n,
                                   const dream::Value* vals);
 
-/// Slots of the frame, for writing loop-carried values back when yielding.
+/// Slots of the frame, for reading the arguments a compiled body was entered with.
 dream::Value* dream_rt_frame_slots(dream::Value frame);
 
-/// Store into a frame slot with the write barrier: the yield spill is the one
-/// place compiled code writes a possibly-young value into a possibly-old
-/// frame, and the next minor collection has to know the edge exists.
-void dream_rt_frame_store(dream::Process* p, dream::Value frame, uint32_t index, dream::Value v);
 
 /// Call a host native the way the interpreter calls one.
 ///
@@ -176,7 +172,9 @@ dream::Value dream_rt_thunk(dream::Process* p, uint32_t node, dream::Value frame
 
 /// Apply a closure -- or any value that can be applied -- to `argc` arguments
 /// as they stand, and force the answer to weak head normal form. 1 with the
-/// answer, 0 with the error. A nested machine loop, pinned like a force.
+/// answer, 0 with the error, and 2 -- having done nothing -- when the callee is
+/// impure and the call has to be the interpreter's. A nested machine loop,
+/// pinned like a force.
 int dream_rt_apply(dream::Process* p, dream::Value callee, uint32_t argc,
                    const dream::Value* args, dream::Value* out);
 

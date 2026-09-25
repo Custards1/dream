@@ -2542,6 +2542,164 @@ arena settled, `opt` costs **no peak heap at all** -- 202 MB with it and 204 MB
 with `--no-opt` -- where before this it cost 61 MB, all of which was the pass
 forcing the suspended nodes it was handed.
 
+### List and map code in the JIT
+
+Done 2026-09-25. Until then the tier compiled numbers: a function was admitted
+only when every parameter was forced on every path and every op was in a short
+numeric table, and that refused essentially every list or map function --
+`cons`, `tail`, the empty test and `.[ ]` were not in the table at all, and any
+argument the callee might not force (a builder's accumulator, the tail of a new
+cell, a value stored under a key) refused the whole function. A self-compile
+made 40 functions hot enough to compile; it compiles 422 now. What changed, in
+[dream/src/jit.cpp](dream/src/jit.cpp) unless it says otherwise:
+
+- **The data ops are compiled.** `ListIsEmpty`, `ListTail`, `Cons`, `Get`,
+  `Set`, `MakeList`, `MakeArray`, `ConstStr` and `Global`, and the three natives
+  `match` lowers a list pattern to (`match_is_cons`, `match_head`,
+  `match_tail`). The reads a list loop makes every iteration -- the empty test,
+  a cell's head and tail, an in-range array element -- are written inline; the
+  rest (a map lookup, a walk, every error) is `dream_rt_get`/`dream_rt_set` in
+  [dream/src/jit_rt.cpp](dream/src/jit_rt.cpp), which are `container_get` and
+  `container_set` with the machine's continuation replaced by a nested force, and
+  say the same words when they raise.
+- **Strictness is a decision per argument, not a condition of admission.** A
+  self-call or peer argument is evaluated where the callee forces that parameter
+  on every path -- the standard strictness fixpoint, assume all and drop what the
+  assumption does not make strict, in `Analyzer::run` under "Which arguments are
+  evaluated" -- and is in a *lazy position* everywhere else.
+- **A lazy position is built or suspended, never evaluated.** Built in place
+  when that cannot be observed: a literal, a slot as it stands, a cell or a list
+  literal (a cell is a value and building one cannot raise), and exactly the
+  shapes `thunk_for` computes. Suspended otherwise, against a frame made on
+  demand from what the slots hold right now -- which is the frame the
+  interpreter would have been running this iteration in, so the thunk means what
+  its thunk would have meant, and needs nothing from this file to run. Before a
+  call's first back-edge the interpreter's own frame for the call *is* that
+  frame, and is adopted rather than copied; that took a self-compile from 3.7M
+  frames made to 0.6M. "Lazy positions" in jit.cpp is the design.
+- **A call the tier cannot make itself, the machine makes.** A closure in a
+  slot, a function the tier did not take, a partial application: `dream_rt_apply`
+  applies it in a nested loop with its arguments lazy and forces the answer. That
+  is what compiles a fold that calls the function it was given. An *impure*
+  callee -- which a pure function can only have been handed through a
+  parameter -- is never run from here: compiled code orders no effects and a
+  call under it that parks is retried from the top, so the whole call is given
+  back (`JIT_BAIL`) before anything has happened.
+- **`e + f ..` recursion is a loop.** `1 + len (tail xs)` used to be a machine
+  call a level and, past a few thousand levels, `JIT_DEEP` -- which gives the
+  function to the interpreter *for good*. It is a loop carrying the pending sum
+  now, and so is `let rest = f ..; .. rest` read as the answer (`filter`
+  skipping an element). The soundness of the first is the part to read before
+  touching it: the interpreter adds innermost first and a partial sum that
+  leaves the fixnum range turns every later addition into a float addition, so
+  the loop keeps the least and greatest prefix sum and proves at the end, in
+  128 bits, that every suffix sum the interpreter would have made fits. Anything
+  else -- a float, a string, a failed proof -- gives the call back (`JIT_BAIL`)
+  to be run from its frame, which answers what the interpreter answers because
+  nothing compiled code did was an effect. "Recursion that is a loop" in jit.cpp.
+- **Hot functions compile on a background thread.** See the finding below; a
+  threshold of 1, or `DREAM_JIT_SYNC`, keeps them synchronous.
+
+What it is worth, 2,000,000-element lists, against the VM before any of it
+(`JIT on`, best of a few runs, KB is what the call allocated):
+
+| | before | after |
+|---|---|---|
+| `sum_list` (empty test, head, tail) | 457 ms, 177 MB | **35 ms, 67 KB** |
+| `sum_match` (the same through `match`) | 173 ms, 345 KB | **47 ms, 104 KB** |
+| `len_rec` (`1 + len (tail xs)`) | 291 ms, 112 MB | **30 ms, 1 KB** |
+| `total` (`x + total rest` through `match`) | 922 ms, 208 MB | **45 ms, 3 KB** |
+| `upto` (`upto (i+1) n (cons i acc)`) | 567 ms, 364 MB | **95 ms, 99 MB** |
+| `rev` | 568 ms, 394 MB | **123 ms, 80 MB** |
+| `evens` (a hand-written `filter`) | 595 ms, 240 MB | **235 ms, 192 MB** |
+| fold calling a lambda | 422 ms, 272 MB | **110 ms, 80 MB** |
+| `list.map` then a sum | 973 ms, 557 MB | **452 ms, 336 MB** |
+| 200,000 map inserts | 380 ms, 367 MB | **127 ms, 194 MB** |
+| 200,000 map reads | 111 ms, 42 MB | **56 ms, 9 KB** |
+
+The consumers now allocate nothing at all, and a builder allocates its cells
+and nothing else: `upto`'s 99 MB is 48 MB of cells and the 44 MB `--stats`
+counts again when a minor collection promotes them, because the list is live.
+What is left in the last four rows is the program's own laziness -- `map`
+suspends `f x` and the rest of the list because the program says to -- and the
+frame the interpreter makes for each call of a closure.
+
+The self-compile: **9.35 s -> 7.37 s** (three interleaved rounds, same machine),
+173M -> 155M reductions, 3.25 -> 3.09 GB allocated, 481 -> 389 MB promoted, and
+a byte-identical image; `benchmark/benchmark/run.sh` moves `collatz` 134 ->
+105 ms and `strbuild` 85 -> 65, and the other five inside the noise.
+
+**Four findings, each of which cost more than the change that exposed it:**
+
+- **Four hundred compiles cost more than they buy, unless nobody waits for
+  them.** The first version made the self-compile 40% *slower*: `DREAM_JIT_TRACE=1`
+  (every compile, and what LLVM charged for it) said 4.7 s of LLVM for 425
+  functions, which was the entire regression -- the compiled code itself was
+  already ahead. Cheaper code generation only halves it (`CodeGenOptLevel::None`
+  2.6 s, `O1` 4.2 s). What removed it is that *when* a compiled body arrives is
+  not observable -- the interpreter runs the function exactly as it did while it
+  was cold -- so the compile moved to a thread of its own (`Jit::compile_worker`)
+  and the program never waits. A self-compile is one green process on a machine
+  with more cores than that. The cost is paid by short programs: a loop that is
+  hot for 30 ms runs interpreted while its compile finishes.
+- **A binding read both evaluated and lazily was computed twice.** A `let` is
+  written where its name is read, which for an evaluated read computes it, and
+  for a lazy read suspended it *again* -- so whoever forced the suspension
+  computed it a second time. `dreams` lowering every function body twice is
+  what it looked like: 24M extra reductions, found by bisecting the compiled
+  functions down to `lower.set_func_body`'s caller with `--profile` showing
+  `emit` and `lower_expr` exactly doubled. A `let` that calls anything is now
+  remembered per iteration and shared with its lazy reads, as the interpreter's
+  one slot thunk is ("A binding computed once" in jit.cpp).
+- **A yield must not write the frame a suspension may read.** A yielding loop
+  used to write its loop state back into the frame it was entered with. Once
+  that frame is adopted as a snapshot, a thunk made in the first iteration reads
+  its slots when forced, and the write-back hands it the *last* iteration's
+  accumulator -- which is the thunk itself: `loop value depends on itself`. A
+  yield returns a new frame now, and `enter_function` resumes in it.
+- **Every alloca belongs in the entry block.** The emitter made its
+  out-parameters where it needed them, and an alloca anywhere but the entry block
+  is a *dynamic* one that grows the machine stack each time it is reached. A
+  numeric loop reaches those blocks almost never. A list loop reaches `force`'s
+  slow path every iteration, and would have grown the stack by a word an
+  iteration for as long as it ran.
+
+**What it does not do yet, and where the rest is:**
+
+- *A call to a closure still makes the interpreter's frame.* The fold row above
+  is 80 MB of the lambda's frames. Taking them away needs a compiled function to
+  be callable with its arguments in registers from *outside* its own module --
+  an entry per function taking values rather than a frame -- which is a registry
+  the tier does not have.
+- *Only `+` accumulates.* `*` has the same shape and a harder proof (suffix
+  products), `-` is not associative, and `f .. + e` evaluates `e` after the
+  recursion returns, so its errors would move. List `+` (`[x] + f rest`) is
+  associative and falls back today because its left side is not a fixnum.
+- *The depth at which a recursion overflows can differ between the tiers.* The
+  loop gives a call back at `DREAM_MAX_DEPTH` pending levels, and the
+  interpreter, which can spend more than one continuation a level, may overflow
+  sooner. A recursion deep enough to overflow one tier and not the other is the
+  one difference this admits; `runaway.dr` holds the case that matters, a
+  recursion that never ends, to raising the same error in both.
+- *An accumulating function is not a peer.* It gives a call back by restarting
+  it from its frame, and a peer has none, so a compiled caller reaches one
+  through `dream_rt_apply`.
+
+`dream/tests/programs/jit_lists.dr` is what holds all of it to the interpreter's
+answers: every function above compiled from its first call (`jit_lists.jit`),
+and the awkward cases each written out -- a float in a sum, a suffix sum that
+overflows though the total does not, an error from the middle of a recursion, a
+lazy element that must never be evaluated, an infinite producer, a missing key
+with and without a default.
+
+**One bug this found that was not the JIT's.** `Scheduler::finish` notified
+`wait_for_all` without the mutex it waits under, so a process finishing between
+the main thread's test of `live_` and its going to sleep lost the wake-up and
+the VM waited for ever on a finished program -- every worker idle, nothing left
+to say so. Once in a few hundred runs on a loaded machine; the full e2e suite
+under a watchdog that took `gdb` backtraces is what caught it, in an `--no-jit`
+run. `Scheduler::notify_done` is the fix.
+
 ### A JIT that can allocate -- the plan
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the
@@ -2642,7 +2800,14 @@ is one.
     about permission to allocate, and the stage below does not have to wait for
     it.
 
-- **Admit object-allocating self-recursion.** The draft read as though this
+- ~~**Admit object-allocating self-recursion.**~~ **Done** (2026-09-25), by
+  the route the last paragraph of this bullet names -- a parameter's argument is
+  evaluated only where the callee forces it, and is in a lazy position otherwise
+  -- and wider than it asked: an argument that is not "eagerly safe" is
+  suspended rather than refused. See "List and map code in the JIT" above. What
+  follows is kept because the reasoning is still the reason.
+
+  The draft read as though this
   were a widening of `op_is_supported`. It is not, and the gate that actually
   refuses a list builder is worth knowing before any of it is written.
 

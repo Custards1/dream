@@ -1,25 +1,27 @@
 // The LLVM JIT tier.
 //
-// Scope, and why it is drawn where it is: this compiles the strict numeric
-// spine of a function -- arithmetic, comparisons, branches, `let`, calls to
-// itself and to other functions it can compile, primitive opcodes and host
-// calls -- and leaves everything else to the interpreter. The limit is
-// not laziness in general but a soundness requirement. Compiled code evaluates a
-// call's arguments eagerly, and doing that to an argument the callee would never
-// have forced can raise an error in a program that was going to terminate
-// quietly. So a function is only compiled when a strictness analysis proves
-// every parameter is forced on every path, and a call is only compiled when the
-// same is true of the callee -- which is what `PeerSet` asks. Anything else
-// stays interpreted, where laziness is explicit and free.
+// Scope, and why it is drawn where it is: this compiles a function's evaluated
+// spine -- arithmetic, comparisons, branches, `let`, calls to itself and to
+// other functions it can compile, primitive opcodes and host calls, reading and
+// building lists, arrays and maps, and calls it hands to the machine -- and
+// leaves what the program does not evaluate to the interpreter. The limit is a
+// soundness requirement. Compiled code evaluates what it can reach eagerly, and
+// doing that to something the program would never have forced can raise an
+// error in a program that was going to terminate quietly.
 //
-// Two things sit deliberately *outside* that rule, and both are there because
-// they are not evaluations at all. A parameter every self call hands straight
-// back to itself is moved rather than computed, so it needs no strictness --
-// `Analyzer::carried`, and it is what lets a loop carry the string, array or map
-// it is walking. And an argument in a position a native's strict mask does not
-// claim is read rather than evaluated -- `Analyzer::eagerly_safe` and
-// `Emitter::lazy_operand`. Both do exactly what `thunk_for` does with the same
-// expression, which is what makes them free of the question above.
+// So nothing is evaluated here that the interpreter would not have evaluated.
+// An argument is evaluated only where the callee forces that parameter on every
+// path -- a strictness fixpoint, per parameter (`Analyzer::run`, "Which
+// arguments are evaluated") -- and every other position is *lazy*: its value is
+// built in place when building it cannot be observed, and suspended against a
+// frame made on demand otherwise, exactly as `thunk_for` would have done (see
+// "Lazy positions"). A parameter every self call hands straight back to itself
+// is moved rather than computed (`Analyzer::carried`).
+//
+// This used to be a condition of *admission* -- a function was compiled only
+// when every parameter was forced on every path -- which refused every list
+// builder, every lazy accumulator and every function that calls what it is
+// given. It is a decision per argument now, and those are compiled.
 //
 // What that rule does *not* promise is that an argument is forced at the same
 // point the interpreter would have forced it, only that it is forced. Where two
@@ -83,6 +85,7 @@
 
 #include "builtins.hpp"
 #include "image.hpp"
+#include "interp.hpp"
 #include "jit_rt.hpp"
 #include "process.hpp"
 #include "runtime.hpp"
@@ -255,7 +258,14 @@ inline Ty arith_ty(Ty a, Ty b) {
 /// used to refuse the whole function: the tier compiles self calls and nothing
 /// else, so a fused `pi` loop, whose body is arithmetic and one `to_float`, was
 /// never compiled at all.
-enum class KnownNative : uint8_t { None, ToFloat, ToInt, Sqrt, Abs, Floor };
+enum class KnownNative : uint8_t {
+    None, ToFloat, ToInt, Sqrt, Abs, Floor,
+    // What `match` lowers a list pattern to: a test for a cell and the two
+    // reads of one. Each is a type check and a load, and a list function makes
+    // all three every iteration -- as helper calls, they were most of what a
+    // compiled `match` over a list cost.
+    MatchIsCons, MatchHead, MatchTail,
+};
 
 /// Which native `Apply`'s callee names, when it names one of the above.
 ///
@@ -273,6 +283,9 @@ KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node,
         const char* name = builtin_def(c.a).name;
         if (std::strcmp(name, "to_float") == 0) return KnownNative::ToFloat;
         if (std::strcmp(name, "to_int") == 0) return KnownNative::ToInt;
+        if (std::strcmp(name, "match_is_cons") == 0) return KnownNative::MatchIsCons;
+        if (std::strcmp(name, "match_head") == 0) return KnownNative::MatchHead;
+        if (std::strcmp(name, "match_tail") == 0) return KnownNative::MatchTail;
     }
     if (Op(c.op) != Op::Field) return KnownNative::None;
     const Node& m = img.node(c.a);
@@ -316,10 +329,10 @@ KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node,
 //   * **Is it saturated, and narrow enough?** A partial application has no
 //     callee to enter, and a variadic native has no fixed argument positions for
 //     a strict mask to describe. `kMaxNativeArgs` is the rest.
-//   * **May every argument be evaluated here?** A native forces the arguments
-//     its mask claims and leaves the others suspended, and compiled code has no
-//     thunk to suspend one in -- so a position the mask does not claim is only
-//     allowed when evaluating it is not an observable event. See `eagerly_safe`.
+//   * **What of the arguments it does not force?** A native forces the ones its
+//     mask claims and is handed the others suspended. Those are lazy positions,
+//     written as the interpreter would write them: built in place where that
+//     cannot be observed, suspended otherwise. See "Lazy positions".
 //
 // What is deliberately *not* asked is whether the native allocates, or forces,
 // or runs Dream code underneath itself. Allocation never collects, so compiled
@@ -587,6 +600,13 @@ struct Analysis {
     /// How each call the body evaluates is made, by node. The emitter reads
     /// this rather than deciding again.
     std::unordered_map<uint32_t, CallKind> kinds;
+    /// Every recursion in the body is one of the two shapes that is a loop in
+    /// disguise, so it is compiled as one, with an accumulator. `steps` are the
+    /// `e + f ..` nodes and `let_steps` the reads of a `let f ..` as the answer.
+    /// See "Recursion that is a loop".
+    bool accumulate = false;
+    std::unordered_set<uint32_t> steps;
+    std::unordered_set<uint32_t> let_steps;
 };
 
 /// How many arguments a call handed to the machine may have. The helper takes
@@ -662,9 +682,11 @@ public:
         SlotSet strict = 0;
         for (int round = 0; round <= int(f_.arity) + 1; ++round) {
             call_sites_.clear();
+            steps_.clear();
+            let_steps_.clear();
             recurses_ = false;
             tail_self_ = false;
-            collect_calls(f_.body, 0);
+            collect_calls(f_.body, 0, true);
             carried_ = carried();
             strict = strict_of(f_.body, 0);
             const SlotSet next = eager_ & strict & params;
@@ -701,6 +723,14 @@ public:
         a.strict_params = strict;
         a.recurses = recurses_;
         a.tail_self = tail_self_;
+        // Only when *every* recursion is a step: one real non-tail call left
+        // makes the body a function of its arguments, and a machine call is
+        // then the only way to make any of them.
+        if (!recurses_ && (!steps_.empty() || !let_steps_.empty())) {
+            a.accumulate = true;
+            a.steps = steps_;
+            a.let_steps = let_steps_;
+        }
         a.calls = calls_;
         // A parameter the signature declares `:float` starts the fixpoint as
         // one instead of as nothing. That is a guess about the value the
@@ -1386,7 +1416,11 @@ private:
     /// position is suspended and made by the interpreter, if by anyone, so it
     /// is not a site, does not make the body recursive, and says nothing about
     /// what the loop carries.
-    void collect_calls(uint32_t idx, int depth) {
+    ///
+    /// `tail` is whether `idx` is in result position -- its value is the
+    /// body's -- which is what recognises the two shapes of recursion that are
+    /// compiled as a loop after all. See "Recursion that is a loop" below.
+    void collect_calls(uint32_t idx, int depth, bool tail = false) {
         if (depth > 256) return;
         const Node& n = img_.node(idx);
         if (Op(n.op) == Op::Apply || is_primitive(Op(n.op))) {
@@ -1396,15 +1430,7 @@ private:
                 if (n.flags & F_TAIL) tail_self_ = true;
                 else recurses_ = true;
             }
-            if (kind == CallKind::Closure) {
-                collect_calls(n.a, depth + 1);
-                return;
-            }
-            // A peer still being decided may evaluate any of them.
-            const uint32_t mask = kind == CallKind::Refused ? 0 : check_mask(n, kind);
-            for (uint32_t i = 0; i < n.c && i < 32; ++i) {
-                if ((mask >> i) & 1) collect_calls(img_.kid(n.b + i), depth + 1);
-            }
+            collect_args(idx, n, kind, depth);
             return;
         }
         switch (Op(n.op)) {
@@ -1412,24 +1438,34 @@ private:
                 // A `let` is written where its name is read -- here, since this
                 // walk only reaches evaluated positions.
                 if (n.a >= f_.arity && n.a < binds_.size() && binds_[n.a] != NO_NODE) {
-                    collect_calls(binds_[n.a], depth + 1);
+                    const uint32_t value = binds_[n.a];
+                    if (tail && kind_at(value) == CallKind::Self &&
+                        !(img_.node(value).flags & F_TAIL)) {
+                        // `let rest = f ..; .. rest` read as the answer: a tail
+                        // call written through a name.
+                        call_sites_.push_back(value);
+                        let_steps_.insert(idx);
+                        collect_args(value, img_.node(value), CallKind::Self, depth);
+                        return;
+                    }
+                    collect_calls(value, depth + 1);
                 }
                 return;
             case Op::SwitchAtom: case Op::SwitchHead:
                 collect_calls(n.a, depth + 1);
                 for (uint32_t i = 1; i < n.c; i += 2)
-                    collect_calls(img_.kid(n.b + i), depth + 1);
-                collect_calls(img_.kid(n.b + n.c - 1), depth + 1);
+                    collect_calls(img_.kid(n.b + i), depth + 1, tail);
+                collect_calls(img_.kid(n.b + n.c - 1), depth + 1, tail);
                 return;
             case Op::If:
                 if (constant_condition(img_, n) >= 0) {
                     uint32_t arm = constant_condition(img_, n) ? n.b : n.c;
-                    if (arm != NO_NODE) collect_calls(arm, depth + 1);
+                    if (arm != NO_NODE) collect_calls(arm, depth + 1, tail);
                     return;
                 }
                 collect_calls(n.a, depth + 1);
-                collect_calls(n.b, depth + 1);
-                if (n.c != NO_NODE) collect_calls(n.c, depth + 1);
+                collect_calls(n.b, depth + 1, tail);
+                if (n.c != NO_NODE) collect_calls(n.c, depth + 1, tail);
                 return;
             case Op::Block:
                 // A strict `let` runs where it stands; any other is reached
@@ -1443,14 +1479,34 @@ private:
                         if (sn.flags & F_STRICT) collect_calls(sn.b, depth + 1);
                         continue;
                     }
-                    if (last || (sn.flags & F_STRICT)) collect_calls(stmt, depth + 1);
+                    if (last || (sn.flags & F_STRICT)) collect_calls(stmt, depth + 1, last && tail);
                 }
                 return;
             case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
             case Op::ListIsEmpty: case Op::ListTail:
                 collect_calls(n.a, depth + 1);
                 return;
-            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::Add:
+                if (tail) {
+                    // `e + f ..` as the answer: the left side first, and when it
+                    // makes no self call of its own, the right side is a step.
+                    const size_t before = call_sites_.size();
+                    collect_calls(n.a, depth + 1);
+                    const Node& r = img_.node(n.b);
+                    if (call_sites_.size() == before && kind_at(n.b) == CallKind::Self &&
+                        !(r.flags & F_TAIL)) {
+                        call_sites_.push_back(n.b);
+                        steps_.insert(idx);
+                        collect_args(n.b, r, CallKind::Self, depth);
+                        return;
+                    }
+                    collect_calls(n.b, depth + 1);
+                    return;
+                }
+                collect_calls(n.a, depth + 1);
+                collect_calls(n.b, depth + 1);
+                return;
+            case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or: case Op::Set:
                 collect_calls(n.a, depth + 1);
@@ -1463,6 +1519,21 @@ private:
                 return;
             default:
                 return;
+        }
+    }
+
+    /// The evaluated parts of a call: its callee when the machine makes it,
+    /// and the arguments compiled code evaluates for it.
+    void collect_args(uint32_t idx, const Node& n, CallKind kind, int depth) {
+        (void)idx;
+        if (kind == CallKind::Closure) {
+            collect_calls(n.a, depth + 1);
+            return;
+        }
+        // A peer still being decided may evaluate any of them.
+        const uint32_t mask = kind == CallKind::Refused ? 0 : check_mask(n, kind);
+        for (uint32_t i = 0; i < n.c && i < 32; ++i) {
+            if ((mask >> i) & 1) collect_calls(img_.kid(n.b + i), depth + 1);
         }
     }
 
@@ -1490,6 +1561,10 @@ private:
     std::vector<uint8_t> bind_inline_;
     /// How each call `check` reached is made. See `check_apply`.
     std::unordered_map<uint32_t, CallKind> kinds_;
+    /// The two shapes of step found by `collect_calls`: an `e + f ..` in
+    /// result position, and a `let` of a self call read as the answer.
+    std::unordered_set<uint32_t> steps_;
+    std::unordered_set<uint32_t> let_steps_;
     bool nested_calls_ = false;
     bool recurses_ = false;
     bool tail_self_ = false;
@@ -1613,12 +1688,12 @@ public:
 /// called. There is no frame, no thunk and no trip through the interpreter.
 ///
 /// The soundness argument is the one the tier already rests on. Compiled code
-/// evaluates a call's arguments before making it, and doing that to an argument
-/// the callee would never have forced can raise in a program that was going to
-/// finish quietly -- so a function is only compiled when it forces every
-/// parameter on every path. Asking that of the callee is asking exactly what
-/// the tier asks of itself, which is why the test below is `Analyzer::run` and
-/// not a second set of rules.
+/// evaluates an argument before making a call only where the callee would have
+/// forced it anyway, because evaluating one it would never have forced can
+/// raise in a program that was going to finish quietly -- so a caller needs the
+/// callee's strictness, per parameter. Asking that of the callee is asking
+/// exactly what the tier asks of itself, which is why the test below is
+/// `Analyzer::run` and not a second set of rules.
 ///
 /// Mutual recursion makes the question circular: `f` is admissible if `g` is,
 /// and `g` is admissible if `f` is. What is being asked is "nothing anywhere in
@@ -1681,7 +1756,10 @@ bool PeerSet::admit(uint32_t gi, int depth) {
     // whole of the difference. A function refused here is still compiled in its
     // own right when something enters it directly; it is only refused as
     // somebody else's callee.
-    const bool ok = a.compilable && !a.tail_self;
+    // Nor a recursion compiled as a loop (`Analysis::accumulate`), for the same
+    // reason and one more: it gives a call back to the interpreter by starting
+    // it again from its frame, and a peer has none.
+    const bool ok = a.compilable && !a.tail_self && !a.accumulate;
     state_[gi] = ok ? State::Yes : State::No;
     if (!ok) return false;
 
@@ -1771,7 +1849,8 @@ public:
           recurses_(a.recurses), float_slots_(a.float_slots), carried_(a.carried),
           force_first_(a.force_first), binds_(a.binds), peel_first_(a.peel),
           ret_dbl_(preset && a.ret_dbl), eager_(a.eager), bind_inline_(a.bind_inline),
-          bind_memo_(a.bind_memo),
+          bind_memo_(a.bind_memo), accumulate_(a.accumulate), steps_(a.steps),
+          let_steps_(a.let_steps),
           kinds_(a.kinds), nested_calls_(a.nested_calls), peers_(peers),
           preset_(preset), b_(ctx) {}
 
@@ -1812,14 +1891,26 @@ private:
     /// Today's shape, for a body whose only self calls are tail calls: one
     /// function, slots read out of the frame, a loop and nothing else.
     llvm::Function* emit_loop(const std::string& name);
-    JV node(uint32_t idx);
+    /// `tail` is whether the value is the body's answer: the one context in
+    /// which a step is a loop. See "Recursion that is a loop".
+    JV node(uint32_t idx, bool tail = false);
     JV binary(const Node& n);
     JV logic(const Node& n);
     JV unary(const Node& n);
     JV type_test(const Node& n);
-    JV conditional(const Node& n);
-    JV switch_node(const Node& n);
-    JV block(const Node& n);
+    JV conditional(const Node& n, bool tail = false);
+    JV switch_node(const Node& n, bool tail = false);
+    JV block(const Node& n, bool tail = false);
+    // --- recursion that is a loop ------------------------------------------
+    JV add_step(const Node& n);
+    JV let_step(const Node& n);
+    /// One more level the interpreter would have had pending. Past the depth
+    /// it allows, the call is handed back (`JIT_DEEP`) to overflow as it would.
+    void bump_pending();
+    /// Hand the answer back, finishing the accumulation when there is one.
+    void emit_return(JV r);
+    /// The arguments of a self call, evaluated or lazy as the analysis said.
+    bool self_args(const Node& n, std::vector<JV>* args);
     JV apply(uint32_t idx, const Node& n);
     JV native_call(KnownNative which, const Node& n);
     /// A call to a host native, made the way the interpreter makes one.
@@ -1979,6 +2070,20 @@ private:
     const SlotSet eager_;
     const std::vector<uint8_t> bind_inline_;
     const std::vector<uint8_t> bind_memo_;
+    /// See `Analysis::accumulate`.
+    const bool accumulate_;
+    const std::unordered_set<uint32_t> steps_;
+    const std::unordered_set<uint32_t> let_steps_;
+    /// The accumulation: the sum of the left sides so far (`acc_`), the least
+    /// and greatest it has been before each addition (`minp_`, `maxp_`), how
+    /// many levels the interpreter would have pending (`pend_`), and whether
+    /// any of them added anything (`adds_`). Null unless `accumulate_`.
+    llvm::Value* acc_ = nullptr;
+    llvm::Value* minp_ = nullptr;
+    llvm::Value* maxp_ = nullptr;
+    llvm::Value* pend_ = nullptr;
+    llvm::Value* adds_ = nullptr;
+    llvm::Type* i128_ = nullptr;
     /// Per slot, the alloca a remembered `let` keeps its value in once it is
     /// computed this iteration -- zero until then -- or null.
     std::vector<llvm::Value*> memo_;
@@ -2042,7 +2147,7 @@ private:
     // Declarations of the runtime helpers.
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
-        rt_frame_slots_, rt_frame_store_, rt_native_, rt_builtin_, rt_switch_head_,
+        rt_frame_slots_, rt_native_, rt_builtin_, rt_switch_head_,
         rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_literal_str_,
         rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_;
     /// The adopt arm of the `snapshot` being written, joined at its end.
@@ -2100,9 +2205,6 @@ void Emitter::declare_helpers() {
         "dream_rt_reduction_slot", llvm::FunctionType::get(ptr_, {ptr_}, false));
     rt_frame_slots_ = mod_.getOrInsertFunction(
         "dream_rt_frame_slots", llvm::FunctionType::get(ptr_, {i64_}, false));
-    rt_frame_store_ = mod_.getOrInsertFunction(
-        "dream_rt_frame_store",
-        llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i64_, i32_, i64_}, false));
     // `(proc, module, member, argc, a0..a3, out)` and the same without the
     // module, which a builtin does not have. Four argument words whatever the
     // native's arity: the unused ones are never read, and a fixed signature
@@ -2186,6 +2288,20 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
     make_iteration_state();
     fresh_ = b_.CreateAlloca(i1_, nullptr, "fresh");
     b_.CreateStore(b_.getTrue(), fresh_);
+    if (accumulate_) {
+        i128_ = llvm::Type::getInt128Ty(ctx_);
+        auto zero = llvm::ConstantInt::get(i128_, 0);
+        acc_ = b_.CreateAlloca(i128_, nullptr, "acc");
+        minp_ = b_.CreateAlloca(i128_, nullptr, "minp");
+        maxp_ = b_.CreateAlloca(i128_, nullptr, "maxp");
+        pend_ = b_.CreateAlloca(i64_, nullptr, "pending");
+        adds_ = b_.CreateAlloca(i1_, nullptr, "adds");
+        b_.CreateStore(zero, acc_);
+        b_.CreateStore(zero, minp_);
+        b_.CreateStore(zero, maxp_);
+        b_.CreateStore(i64(0), pend_);
+        b_.CreateStore(b_.getFalse(), adds_);
+    }
     std::vector<llvm::Value*> first_slots;
     if (peel_first_) {
         first_slots.resize(f_.slots);
@@ -2225,7 +2341,7 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
         b_.SetInsertPoint(first);
         slots_ = first_slots;
         peeling_ = true;
-        JV r = node(f_.body);
+        JV r = node(f_.body, true);
         peeling_ = false;
         slots_ = loop_slots_;
         if (failed_) {
@@ -2233,8 +2349,7 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
             return nullptr;
         }
         if (r.v) {
-            b_.CreateStore(i32c(JIT_OK), status_);
-            b_.CreateRet(box(r));
+            emit_return(r);
         } else if (!b_.GetInsertBlock()->getTerminator()) {
             b_.CreateUnreachable();
         }
@@ -2251,14 +2366,13 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
     // Every back-edge lands here with new slots, so a frame made for the last
     // iteration's suspensions is not this one's, nor are its bindings.
     reset_iteration_state();
-    JV result = node(f_.body);
+    JV result = node(f_.body, true);
     if (failed_) {
         fn_->eraseFromParent();
         return nullptr;
     }
     if (result.v) {
-        b_.CreateStore(i32c(JIT_OK), status_);
-        b_.CreateRet(box(result));
+        emit_return(result);
     } else if (!b_.GetInsertBlock()->getTerminator()) {
         // Every path ended in a tail call; nothing falls through here.
         b_.CreateUnreachable();
@@ -3251,7 +3365,7 @@ Emitter::JV Emitter::float_order(Op op, JV a, JV bv) {
 // The tree
 // ---------------------------------------------------------------------------
 
-Emitter::JV Emitter::node(uint32_t idx) {
+Emitter::JV Emitter::node(uint32_t idx, bool tail) {
     if (failed_) return none();
     const Node& n = img_.node(idx);
     switch (Op(n.op)) {
@@ -3274,10 +3388,11 @@ Emitter::JV Emitter::node(uint32_t idx) {
             return flt(llvm::ConstantFP::get(dbl_, img_.real(n.a)));
         case Op::ConstAtom:
             return tag(i64(make_atom(rt_.image_atom(n.a))));
-        case Op::SwitchAtom: case Op::SwitchHead: return switch_node(n);
+        case Op::SwitchAtom: case Op::SwitchHead: return switch_node(n, tail);
         case Op::Local:
             // A `let` has no thunk and no slot here: its value is written where
             // its name is read, which is here. See `Analyzer::check_bind`.
+            if (tail && accumulate_ && let_steps_.count(idx)) return let_step(n);
             if (n.a < binds_.size() && binds_[n.a] != NO_NODE) {
                 return is_memo(n.a) ? bound_value(n.a) : node(binds_[n.a]);
             }
@@ -3289,8 +3404,8 @@ Emitter::JV Emitter::node(uint32_t idx) {
             return none();
         case Op::Force: return node(n.a);
         case Op::TypeIs: return type_test(n);
-        case Op::If: return conditional(n);
-        case Op::Block: return block(n);
+        case Op::If: return conditional(n, tail);
+        case Op::Block: return block(n, tail);
         case Op::And: case Op::Or: return logic(n);
         case Op::Neg: case Op::Not: return unary(n);
         DREAM_PRIMITIVE_CASES
@@ -3305,7 +3420,10 @@ Emitter::JV Emitter::node(uint32_t idx) {
             // Every part of these is in a lazy position, and so is the whole:
             // building one in place is the one way it is ever written.
             return lazy(idx);
-        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::Add:
+            if (tail && accumulate_ && steps_.count(idx)) return add_step(n);
+            return binary(n);
+        case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             return binary(n);
         default:
@@ -3363,7 +3481,7 @@ Emitter::JV Emitter::type_test(const Node& n) {
     return tag(b_.CreateSelect(test, i64(TRUE_V), i64(FALSE_V)));
 }
 
-Emitter::JV Emitter::block(const Node& n) {
+Emitter::JV Emitter::block(const Node& n, bool tail) {
     JV last = tag(i64(UNIT));
     for (uint32_t i = 0; i < n.b; ++i) {
         uint32_t stmt = img_.kid(n.a + i);
@@ -3381,7 +3499,7 @@ Emitter::JV Emitter::block(const Node& n) {
             continue;
         }
         if (!is_last && !(img_.node(stmt).flags & F_STRICT)) continue;
-        JV v = node(stmt);
+        JV v = node(stmt, is_last && tail);
         if (failed_) return none();
         if (!v.v) return none();  // control transferred
         if (is_last) last = v;
@@ -3389,7 +3507,7 @@ Emitter::JV Emitter::block(const Node& n) {
     return last;
 }
 
-Emitter::JV Emitter::switch_node(const Node& n) {
+Emitter::JV Emitter::switch_node(const Node& n, bool tail) {
     JV subject = node(n.a);
     if (failed_ || !subject.v) return none();
     llvm::Value* key = box(subject);
@@ -3422,7 +3540,7 @@ Emitter::JV Emitter::switch_node(const Node& n) {
                 dispatch->addCase(llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(i64_), key_value), arm);
         }
         b_.SetInsertPoint(arm);
-        JV v = node(img_.kid(n.b + (last ? n.c - 1 : 2 * i + 1)));
+        JV v = node(img_.kid(n.b + (last ? n.c - 1 : 2 * i + 1)), tail);
         if (failed_) return none();
         if (v.v) {
             doubles &= v.dbl;
@@ -3445,9 +3563,9 @@ Emitter::JV Emitter::switch_node(const Node& n) {
     return JV{phi, doubles};
 }
 
-Emitter::JV Emitter::conditional(const Node& n) {
-    if (constant_condition(img_, n) == 1) return node(n.b);
-    if (constant_condition(img_, n) == 0) return n.c == NO_NODE ? tag(i64(UNIT)) : node(n.c);
+Emitter::JV Emitter::conditional(const Node& n, bool tail) {
+    if (constant_condition(img_, n) == 1) return node(n.b, tail);
+    if (constant_condition(img_, n) == 0) return n.c == NO_NODE ? tag(i64(UNIT)) : node(n.c, tail);
     JV cond = node(n.a);
     if (failed_ || !cond.v) return none();
     // A condition that is a float is not a bool, and the tagged path below
@@ -3475,12 +3593,12 @@ Emitter::JV Emitter::conditional(const Node& n) {
     // register -- and a box belongs at the end of the arm that needs one, not
     // at the join where it would be paid on both paths.
     b_.SetInsertPoint(then_bb);
-    JV tv = node(n.b);
+    JV tv = node(n.b, tail);
     if (failed_) return none();
     llvm::BasicBlock* tb = b_.GetInsertBlock();
 
     b_.SetInsertPoint(else_bb);
-    JV ev = n.c == NO_NODE ? tag(i64(UNIT)) : node(n.c);
+    JV ev = n.c == NO_NODE ? tag(i64(UNIT)) : node(n.c, tail);
     if (failed_) return none();
     llvm::BasicBlock* eb = b_.GetInsertBlock();
 
@@ -3822,13 +3940,18 @@ Emitter::JV Emitter::closure_call(const Node& n) {
     if (failed_) return none();
     spend_reduction();
     llvm::Value* out = entry_alloca(i64_, "applied");
-    llvm::Value* ok = b_.CreateCall(rt_apply_, {proc_, f, i32c(int(n.c)), items, out});
+    llvm::Value* st = b_.CreateCall(rt_apply_, {proc_, f, i32c(int(n.c)), items, out});
     llvm::Value* v = b_.CreateLoad(i64_, out);
     auto* cont = bb("apply.ok");
     auto* raise_bb = bb("apply.raise");
-    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), cont, raise_bb);
+    auto* bail_bb = bb("apply.impure");
+    auto* sw = b_.CreateSwitch(st, raise_bb, 2);
+    sw->addCase(llvm::cast<llvm::ConstantInt>(i32c(1)), cont);
+    sw->addCase(llvm::cast<llvm::ConstantInt>(i32c(2)), bail_bb);
     b_.SetInsertPoint(raise_bb);
     emit_raise(v);
+    b_.SetInsertPoint(bail_bb);
+    emit_bail();
     b_.SetInsertPoint(cont);
     return tag(v);
 }
@@ -3868,15 +3991,15 @@ Emitter::JV Emitter::take_call_status(llvm::Value* r, const char* what, bool dbl
 ///
 /// The callee was emitted into this module by the same code that emitted this
 /// function, so the call is a machine call with the arguments in registers: no
-/// frame, no thunk, and no trip through the interpreter. What licenses
-/// evaluating the arguments here rather than suspending them is the callee's
-/// own admission test -- it forces every parameter on every path -- and
-/// `PeerSet` is where that is written down.
+/// frame, no thunk, and no trip through the interpreter. An argument is
+/// evaluated here only where the callee forces that parameter on every path --
+/// its own analysis says which (`Analysis::eager`) -- and is in a lazy position
+/// everywhere else.
 ///
-/// The frame passed along is this function's, and the callee never touches it:
-/// a peer has no tail self call, so it never reaches `emit_yield`, which is the
-/// only thing in a compiled body that writes to a frame. It is passed because
-/// the shape takes one, not because it means anything here.
+/// The frame passed along is this function's, and the callee never writes it:
+/// a peer has no tail self call, so it never yields, and it makes its own
+/// frames for anything it suspends. It is passed because the shape takes one,
+/// not because it means anything here.
 Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
     auto found = peers_->find(gi);
     if (found == peers_->end()) {
@@ -3984,6 +4107,40 @@ Emitter::JV Emitter::native_call(KnownNative which, const Node& n) {
     JV x = node(img_.kid(n.b));
     if (failed_ || !x.v) return none();
 
+    if (which == KnownNative::MatchIsCons || which == KnownNative::MatchHead ||
+        which == KnownNative::MatchTail) {
+        // The natives' own bodies: a cell or not, and the head or the tail of
+        // one forced where the machine forces what a native hands back.
+        llvm::Value* v = box(x);
+        auto* obj = bb("cell.obj");
+        auto* test = bb("cell.test");
+        auto* here = b_.GetInsertBlock();
+        b_.CreateCondBr(is_heap_ptr(v), obj, test);
+        b_.SetInsertPoint(obj);
+        llvm::Value* type = b_.CreateLoad(i8_, b_.CreateIntToPtr(v, ptr_));
+        llvm::Value* cons_here =
+            b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Cons)));
+        auto* obj_end = b_.GetInsertBlock();
+        b_.CreateBr(test);
+        b_.SetInsertPoint(test);
+        auto* is_cons = b_.CreatePHI(i1_, 2);
+        is_cons->addIncoming(b_.getFalse(), here);
+        is_cons->addIncoming(cons_here, obj_end);
+        if (which == KnownNative::MatchIsCons) {
+            return tag(b_.CreateSelect(is_cons, i64(TRUE_V), i64(FALSE_V)));
+        }
+        auto* cell = bb("cell.read");
+        auto* bad = bb("cell.bad");
+        b_.CreateCondBr(is_cons, cell, bad);
+        b_.SetInsertPoint(bad);
+        emit_type_error(which == KnownNative::MatchHead ? "match_head needs a list cell"
+                                                        : "match_tail needs a list cell");
+        b_.SetInsertPoint(cell);
+        const uint64_t at = which == KnownNative::MatchHead ? 8 : 16;
+        llvm::Value* part = b_.CreateLoad(i64_, b_.CreateIntToPtr(b_.CreateAdd(v, i64(at)), ptr_));
+        return tag(force(part));
+    }
+
     switch (which) {
         case KnownNative::ToFloat:
             return flt(as_double(x, "to_float needs a number"));
@@ -4048,8 +4205,8 @@ Emitter::JV Emitter::host_call(const NativeSite& site, const Node& n) {
     for (uint32_t i = 0; i < n.c; ++i) {
         const uint32_t arg = img_.kid(n.b + i);
         // A position the native's mask does not claim is one it may never look
-        // at, so what goes there is read rather than evaluated. The analyzer has
-        // already refused any shape that cannot be (`eagerly_safe`).
+        // at, so what goes there is a lazy position -- built or suspended, and
+        // never evaluated.
         const bool strict = i < 32 && ((site.strict_mask >> i) & 1);
         args[i] = strict ? node(arg) : lazy(arg);
         if (failed_ || !args[i].v) return none();
@@ -4083,9 +4240,17 @@ Emitter::JV Emitter::host_call(const NativeSite& site, const Node& n) {
 }
 
 Emitter::JV Emitter::self_call(const Node& n) {
+    std::vector<JV> args;
+    if (!self_args(n, &args)) return none();
+    if (n.flags & F_TAIL) return tail_call(n, args);
+    return recursive_call(args);
+}
+
+bool Emitter::self_args(const Node& n, std::vector<JV>* out) {
     // Evaluate every argument before touching any slot: an argument may read a
     // parameter this call is about to overwrite.
-    std::vector<JV> args(n.c);
+    std::vector<JV>& args = *out;
+    args.assign(n.c, JV{});
     for (uint32_t i = 0; i < n.c; ++i) {
         // A carried parameter is moved, not evaluated: slot `i` to slot `i`,
         // whatever is in it. That is what the interpreter does with it, and it
@@ -4100,10 +4265,173 @@ Emitter::JV Emitter::self_call(const Node& n) {
         // evaluated" in `Analyzer::run`.
         const bool eager = i < 64 && ((eager_ >> i) & 1);
         args[i] = eager ? node(img_.kid(n.b + i)) : lazy(img_.kid(n.b + i));
-        if (failed_ || !args[i].v) return none();
+        if (failed_ || !args[i].v) return false;
     }
-    if (n.flags & F_TAIL) return tail_call(n, args);
-    return recursive_call(args);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Recursion that is a loop
+//
+// `len xs = if is_empty xs { 0 } else { 1 + len (tail xs) }` is recursion, and
+// until this it was compiled as recursion: a machine call per level, and past
+// `kStackBudget` -- a few thousand levels -- `JIT_DEEP`, which gives the
+// function to the interpreter for good. Over a long list that is every list
+// function written the natural way, and the interpreter then spends a heap
+// continuation per element to hold the pending additions.
+//
+// Two shapes of recursion are loops in disguise, and are compiled as loops:
+//
+//   * `e + f ..` as the answer, where `e` makes no self call. Every level adds
+//     its `e` to what the next level answers, so what is pending is one number:
+//     the sum of the `e`s so far. The loop carries it and adds the base case's
+//     answer at the end.
+//   * `let r = f ..; .. r` with `r` read as the answer, which is a tail call
+//     written through a name -- `filter` skipping an element is the shape.
+//     Nothing is pending but the level itself.
+//
+// What makes the first sound is the part worth reading twice. The interpreter
+// evaluates `e1 + (e2 + (e3 + b))`: every `e` in order on the way down, then
+// the additions innermost first on the way back. The loop evaluates the `e`s in
+// the same order -- so anything they raise, they raise at the same point -- and
+// sums them as it goes. For fixnums the two sums are the same number *only if
+// no partial sum the interpreter makes leaves the fixnum range*, because one
+// that does becomes a float and every addition after it is a float addition.
+// Those partial sums are the suffix sums `T - P(j-1)`, where `T` is the total
+// and `P` the prefix sums the loop has, so the loop keeps the least and the
+// greatest prefix sum and checks both ends at the end, in 128 bits. When any `e`
+// or the base is not a fixnum, or the check fails, the call is given back to
+// the interpreter (`JIT_BAIL`) and run from its frame: nothing compiled code
+// did was an effect, and what it forced stays forced, so running it again
+// answers exactly what the interpreter would have answered the first time.
+//
+// A yield is the one thing a pending level cannot survive -- the interpreter
+// resumes the body in a frame, and a frame has no room for the accumulator --
+// so the loop does not yield while a level is pending. What bounds that is the
+// interpreter's own depth limit: past `DREAM_MAX_DEPTH` pending levels the call
+// is handed back with `JIT_DEEP`, and the interpreter, doing it on the heap,
+// overflows where it always did. Below the limit the loop answers; the
+// interpreter, which may spend more than one continuation a level, can run out
+// sooner, and that difference -- a recursion deep enough to overflow one tier
+// and not the other -- is the one this admits.
+// ---------------------------------------------------------------------------
+
+void Emitter::bump_pending() {
+    llvm::Value* p = b_.CreateAdd(b_.CreateLoad(i64_, pend_), i64(1));
+    b_.CreateStore(p, pend_);
+    auto* deep = bb("pending.deep");
+    auto* ok = bb("pending.ok");
+    b_.CreateCondBr(b_.CreateICmpUGT(p, i64(max_depth_limit())), deep, ok);
+    b_.SetInsertPoint(deep);
+    b_.CreateStore(i32c(JIT_DEEP), status_);
+    b_.CreateRet(i64(UNIT));
+    b_.SetInsertPoint(ok);
+}
+
+Emitter::JV Emitter::add_step(const Node& n) {
+    JV e = node(n.a);
+    if (failed_ || !e.v) return none();
+    llvm::Value* ev = box(e);
+    auto* num = bb("step.fix");
+    auto* bail = bb("step.bail");
+    b_.CreateCondBr(is_fixnum(ev), num, bail);
+    b_.SetInsertPoint(bail);
+    emit_bail();
+    b_.SetInsertPoint(num);
+    llvm::Value* p = b_.CreateLoad(i128_, acc_);
+    llvm::Value* lo = b_.CreateLoad(i128_, minp_);
+    llvm::Value* hi = b_.CreateLoad(i128_, maxp_);
+    b_.CreateStore(b_.CreateSelect(b_.CreateICmpSLT(p, lo), p, lo), minp_);
+    b_.CreateStore(b_.CreateSelect(b_.CreateICmpSGT(p, hi), p, hi), maxp_);
+    b_.CreateStore(b_.CreateAdd(p, b_.CreateSExt(b_.CreateAShr(ev, 1), i128_)), acc_);
+    b_.CreateStore(b_.getTrue(), adds_);
+    bump_pending();
+    const Node& r = img_.node(n.b);
+    std::vector<JV> args;
+    if (!self_args(r, &args)) return none();
+    return tail_call(r, args);
+}
+
+Emitter::JV Emitter::let_step(const Node& n) {
+    const uint32_t slot = n.a;
+    const Node& r = img_.node(binds_[slot]);
+    // Computed already this iteration, or suspended in a frame somebody may
+    // hold: then it is a value to hand back, as any read of it is. Only when
+    // neither is it a tail call -- and then nobody can tell it was a name.
+    if (!is_memo(slot)) {
+        failed_ = true;
+        return none();
+    }
+    mark_slot(slot);
+    auto* known_bb = bb("letstep.known");
+    auto* miss = bb("letstep.miss");
+    auto* from_snap = bb("letstep.snap");
+    auto* loop = bb("letstep.loop");
+    auto* done = bb("letstep.done");
+    llvm::Value* known = b_.CreateLoad(i64_, memo_[slot]);
+    b_.CreateCondBr(b_.CreateICmpNE(known, i64(0)), known_bb, miss);
+    b_.SetInsertPoint(known_bb);
+    b_.CreateBr(done);
+    b_.SetInsertPoint(miss);
+    llvm::Value* snap = b_.CreateLoad(i64_, snap_);
+    b_.CreateCondBr(b_.CreateICmpNE(snap, i64(0)), from_snap, loop);
+    b_.SetInsertPoint(from_snap);
+    llvm::Value* at = b_.CreateIntToPtr(
+        b_.CreateAdd(snap, i64(sizeof(FrameObj) + 8 * uint64_t(slot))), ptr_);
+    llvm::Value* forced = force(b_.CreateLoad(i64_, at));
+    auto* snap_end = b_.GetInsertBlock();
+    b_.CreateBr(done);
+
+    b_.SetInsertPoint(loop);
+    bump_pending();
+    std::vector<JV> args;
+    if (!self_args(r, &args)) return none();
+    tail_call(r, args);
+
+    b_.SetInsertPoint(done);
+    auto* phi = b_.CreatePHI(i64_, 2);
+    phi->addIncoming(known, known_bb);
+    phi->addIncoming(forced, snap_end);
+    return tag(phi);
+}
+
+void Emitter::emit_return(JV r) {
+    if (!accumulate_) {
+        b_.CreateStore(i32c(JIT_OK), status_);
+        b_.CreateRet(box(r));
+        return;
+    }
+    llvm::Value* v = box(r);
+    auto* plain = bb("ret.plain");
+    auto* sum = bb("ret.sum");
+    auto* check = bb("ret.check");
+    auto* fits = bb("ret.fits");
+    auto* bail = bb("ret.bail");
+    b_.CreateCondBr(b_.CreateLoad(i1_, adds_), sum, plain);
+
+    b_.SetInsertPoint(plain);
+    b_.CreateStore(i32c(JIT_OK), status_);
+    b_.CreateRet(v);
+
+    b_.SetInsertPoint(sum);
+    b_.CreateCondBr(is_fixnum(v), check, bail);
+    b_.SetInsertPoint(check);
+    llvm::Value* total =
+        b_.CreateAdd(b_.CreateLoad(i128_, acc_), b_.CreateSExt(b_.CreateAShr(v, 1), i128_));
+    // Every sum the interpreter would have made on the way back up is
+    // `total - P` for a prefix sum `P` the loop passed through. All of them
+    // are fixnums exactly when the two extremes are.
+    llvm::Value* least = b_.CreateSub(total, b_.CreateLoad(i128_, maxp_));
+    llvm::Value* most = b_.CreateSub(total, b_.CreateLoad(i128_, minp_));
+    llvm::Value* ok = b_.CreateAnd(
+        b_.CreateICmpSGE(least, llvm::ConstantInt::getSigned(i128_, -(int64_t(1) << 62))),
+        b_.CreateICmpSLE(most, llvm::ConstantInt::getSigned(i128_, (int64_t(1) << 62) - 1)));
+    b_.CreateCondBr(ok, fits, bail);
+    b_.SetInsertPoint(fits);
+    b_.CreateStore(i32c(JIT_OK), status_);
+    b_.CreateRet(b_.CreateOr(b_.CreateShl(b_.CreateTrunc(total, i64_), 1), i64(1)));
+    b_.SetInsertPoint(bail);
+    emit_bail();
 }
 
 llvm::Value* Emitter::spend_reduction() {
@@ -4169,6 +4497,12 @@ Emitter::JV Emitter::tail_call(const Node& n, const std::vector<JV>& args) {
     auto* yield_bb = bb("yield");
     auto* cont_bb = bb("iterate");
     llvm::Value* carry_on = b_.CreateICmpSGT(next, i64(0));
+    if (accumulate_) {
+        // Levels are pending that exist nowhere but in the accumulator, and a
+        // yield hands the interpreter a frame, which has no room for them. So
+        // the loop carries on until they are paid, which `bump_pending` bounds.
+        carry_on = b_.CreateOr(carry_on, b_.CreateICmpNE(b_.CreateLoad(i64_, pend_), i64(0)));
+    }
     if (recurses_) {
         // A yield leaves the interpreter to resume *this* invocation from the
         // top of the body -- which it can only do for the outermost one. Below
@@ -4218,7 +4552,11 @@ Emitter::JV Emitter::enter_loop(const Node& n, const std::vector<JV>& args) {
     llvm::Value* next = spend_reduction();
     auto* yield_bb = bb("yield");
     auto* cont_bb = bb("iterate");
-    b_.CreateCondBr(b_.CreateICmpSGT(next, i64(0)), cont_bb, yield_bb);
+    llvm::Value* carry_on = b_.CreateICmpSGT(next, i64(0));
+    if (accumulate_) {
+        carry_on = b_.CreateOr(carry_on, b_.CreateICmpNE(b_.CreateLoad(i64_, pend_), i64(0)));
+    }
+    b_.CreateCondBr(carry_on, cont_bb, yield_bb);
 
     // The yield writes the loop's slots, which are the ones just stored.
     b_.SetInsertPoint(yield_bb);
@@ -4388,7 +4726,6 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_type_error", reinterpret_cast<void*>(&dream_rt_type_error));
     add("dream_rt_reduction_slot", reinterpret_cast<void*>(&dream_rt_reduction_slot));
     add("dream_rt_frame_slots", reinterpret_cast<void*>(&dream_rt_frame_slots));
-    add("dream_rt_frame_store", reinterpret_cast<void*>(&dream_rt_frame_store));
     add("dream_rt_native", reinterpret_cast<void*>(&dream_rt_native));
     add("dream_rt_builtin", reinterpret_cast<void*>(&dream_rt_builtin));
     add("dream_rt_get", reinterpret_cast<void*>(&dream_rt_get));

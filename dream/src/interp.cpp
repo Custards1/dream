@@ -2406,6 +2406,8 @@ struct Limits {
     }
 };
 
+size_t max_depth_limit() { return Limits::get().conts; }
+
 /// The raises behind the checks below, kept here rather than in the loops so
 /// the per-reduction path stays a couple of compares and the error-string
 /// construction stays in `.cold` clones.

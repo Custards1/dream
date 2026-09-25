@@ -44,6 +44,9 @@ bool force_whnf(Process& p, Value v, Value* out);
 /// as `do_apply` would have been handed them. Same collector rules as above.
 bool apply_whnf(Process& p, Value callee, const Value* args, uint32_t argc, Value* out);
 
+/// How many continuations a process may have pending: `DREAM_MAX_DEPTH`.
+size_t max_depth_limit();
+
 /// The shared string for image string constant `index`, made once per process.
 Value literal_string_value(Process& p, uint32_t index);
 

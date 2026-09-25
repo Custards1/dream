@@ -152,7 +152,7 @@ void Scheduler::worker_loop(unsigned index) {
                 // the scheduler can produce that.
                 if (active_.load() == 0 && io_waiters_.load() == 0) {
                     deadlocked_.store(true);
-                    done_cv_.notify_all();
+                    notify_done();
                 }
             }
             continue;
@@ -255,6 +255,18 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
 
     live_.fetch_sub(1, std::memory_order_acq_rel);
     for (uint64_t id : waiters) wake(id);
+    notify_done();
+}
+
+void Scheduler::notify_done() {
+    // Through the mutex `wait_for_all` tests its condition under, and after the
+    // state that condition reads has changed. Notifying without it lost the
+    // wake-up whenever it landed between the waiter's test and its going to
+    // sleep: `live_` reached zero, the notify found nobody waiting, and the
+    // main thread slept for ever on a program that had finished -- every
+    // worker idle, nothing left to say so. Rare enough to take a loaded
+    // machine and a few hundred runs to see; `just test` is both.
+    { std::lock_guard<std::mutex> g(idle_mutex_); }
     done_cv_.notify_all();
 }
 

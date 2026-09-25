@@ -176,6 +176,8 @@ private:
     std::mutex idle_mutex_;
     std::condition_variable work_cv_;
     std::condition_variable done_cv_;
+    /// Wake `wait_for_all` after changing what it waits on. See the definition.
+    void notify_done();
 };
 
 }  // namespace dream

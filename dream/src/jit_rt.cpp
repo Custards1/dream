@@ -140,16 +140,6 @@ Value* dream_rt_frame_slots(Value frame) {
     return static_cast<FrameObj*>(as_obj(frame))->slots();
 }
 
-/// Store `v` into slot `index` of a frame, running the write barrier. A
-/// compiled function's own slots live in registers, so the interpreter's
-/// per-store barrier in Op::Bind never sees them; the spill back to the heap
-/// frame at a yield is where an old-to-young edge can appear, and where the
-/// next minor collection has to be told about it.
-void dream_rt_frame_store(Process* p, Value frame, uint32_t index, Value v) {
-    auto* f = static_cast<FrameObj*>(as_obj(frame));
-    p->heap().remember_if_old(f, v);
-    value_slot_store(&f->slots()[index], v);
-}
 
 // ---------------------------------------------------------------------------
 // Calling a host native
@@ -512,7 +502,49 @@ Value dream_rt_thunk(Process* p, uint32_t node, Value frame) {
     return p->heap().make_thunk(node, frame);
 }
 
+namespace {
+
+/// Would applying `v` perform an effect? Purity is spelling: a function record
+/// carries the `!` of its name as `FN_IMPURE`, and a native carries it in its
+/// name. A partial application is its function's.
+bool impure_callee(Process& p, Value v) {
+    v = resolve(v);
+    for (int depth = 0; depth < 64; ++depth) {
+        if (is_obj(v, ObjType::Pap)) {
+            v = resolve(static_cast<PapObj*>(as_obj(v))->fn);
+            continue;
+        }
+        if (is_obj(v, ObjType::Closure)) {
+            const FuncRec& f = p.code->func(static_cast<ClosureObj*>(as_obj(v))->func);
+            return (f.flags & FN_IMPURE) != 0;
+        }
+        if (is_builtin(v)) {
+            const char* name = builtin_def(uint32_t(imm_payload(v))).name;
+            const size_t n = std::strlen(name);
+            return n > 0 && name[n - 1] == '!';
+        }
+        if (is_obj(v, ObjType::Native)) {
+            Value name = static_cast<NativeObj*>(as_obj(v))->name;
+            if (!is_obj(name, ObjType::Str)) return true;
+            auto* s = static_cast<StrObj*>(as_obj(name));
+            return s->len > 0 && s->data()[s->len - 1] == '!';
+        }
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 int dream_rt_apply(Process* p, Value callee, uint32_t argc, const Value* args, Value* out) {
+    // Compiled code orders no effects, and a call it makes is retried from the
+    // top if something under it parks -- so an impure function must never run
+    // from here. A pure caller is handed one only through a parameter, which
+    // the purity check cannot see through, and that is rare enough that the
+    // answer is to give the whole call back (2) before anything happens: the
+    // compiled body has performed no effect, since this is the only way it
+    // could have, and the interpreter runs it from its frame.
+    if (impure_callee(*p, callee)) return 2;
     PinsTheHeap pinned(*p);
     // A nested loop that runs the slice out re-arms it rather than stopping
     // (`Process::slice_spent`), which is right for a native and wrong for a
