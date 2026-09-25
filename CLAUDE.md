@@ -2933,6 +2933,30 @@ types checked ~3.0 s, the sharing child joined and patched ~3.45 s, written
 ~3.65 s. The sharing child (0.8-0.9 s from the join) is the critical path at
 the end; loading is the largest stage before it.
 
+**Under `just vm-pgo` the same compile is 3.05-3.2 s** (five runs, best
+3.06; `DREAM_GC_THREADS=1` once reached 3.00, within the noise). One thing to
+know before running that recipe in a fresh container: a fresh `cmake`
+configure picks whichever `llvm-config` is first on the path, which here is
+LLVM 18, and the JIT needs 20 -- `build-dream` only works because its cache
+carries `-DDREAM_LLVM_CONFIG=/usr/lib/llvm-20/bin/llvm-config`. Pass the same
+flag to both `cmake` steps of `vm-pgo` or it fails in `jit.cpp`.
+
+**What is left, measured, for whoever takes it to 3 s without PGO:**
+
+- *The sharing child* is the end of the critical path: ~0.9 s from the join
+  under contention, 0.75 alone, of which a third is collection. It could
+  overlap lowering instead of following it: the parts are dealt round-robin,
+  so a sharing process that took bodies in body order, as each part sends
+  them, would produce the same deterministic image while the parts are still
+  lowering -- at the price of a message protocol and of agreeing the constant
+  pools with the parent. Estimated 0.3 s.
+- *Dropping the cross-part share* would take ~0.4 s off, and costs 24% more
+  nodes in the image (42.8K against 34.6K). That is a decision about the
+  output, not a finding, so it has not been made.
+- *Parsing* is ~250 reductions a token (lexing ~60 of them), 1.8 s of CPU for
+  the compiler's own source; it bounds loading at ~0.7 s on four cores.
+- *Expansion* is 0.25 s with one core busy, for 14 macro calls.
+
 ### A JIT that can allocate -- the plan
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the
