@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,11 @@ constexpr uint8_t GC_FORWARDED = 16;
 /// making a second copy, because two copies of one object would be two objects
 /// and sharing would not survive the collection.
 constexpr uint8_t GC_BUSY = 32;
+/// An object in the runtime's shared area (`SharedArea`), not in any heap.
+/// Permanent and exclusive: an object carrying it carries nothing else, no
+/// collector ever sets or clears a bit of it, and every trace stops at it --
+/// it is not this heap's to mark, move or free, and nothing under it can be.
+constexpr uint8_t GC_SHARED = 64;
 
 class Heap;
 
@@ -608,5 +614,87 @@ private:
 
 /// The size in bytes of an object, from its header.
 inline size_t object_size(const Obj* o) { return o->bytes; }
+
+/// True for an object in the shared area. The byte is read atomically because
+/// it may be an object of another process's heap whose concurrent mark is
+/// setting a bit of the same byte right now; the answer for this bit cannot
+/// change either way.
+inline bool is_shared_obj(const Obj* o) {
+    return std::atomic_ref<uint8_t>(const_cast<Obj*>(o)->gc).load(std::memory_order_relaxed) &
+           GC_SHARED;
+}
+
+/// Values every process of a runtime can read and none of them owns.
+///
+/// Processes share nothing -- a value crossing between two is copied, which is
+/// what lets each heap collect on its own -- and for a message that is the
+/// right bargain. It is the wrong one for a large table many processes only
+/// read: a compiler handing its resolution to four workers paid for four
+/// copies of it, 0.43 s of a self-compile, before any of them did anything.
+///
+/// So a value can be copied here once instead (`vm.share!`), and from then on
+/// it crosses by pointer. What makes that sound is that nothing here can
+/// change and nothing here points out:
+///
+///   - A value is forced all the way down before it is copied, and the copy
+///     refuses a suspension (a thunk, a frame) rather than bringing one: a
+///     thunk is overwritten when it is forced, and a write by one process into
+///     memory another is reading is exactly what per-process heaps exist to
+///     rule out. Every object here is born with `AUX_DEEP_FORCED`, which is
+///     what keeps `force_deep` from so much as touching its header.
+///   - Every object carries `GC_SHARED` and nothing else in its `gc` byte, and
+///     every collector stops at it (`forward_in`, `mark_object`,
+///     `claim_mark`). A heap's objects may point in; nothing here points out,
+///     because everything reachable from a shared object was copied in with
+///     it. So no heap's collection ever has a reason to look inside.
+///   - Nothing is freed until the runtime is. That is the price, and it is the
+///     right one for what this is for -- a table built once and read for the
+///     rest of a run -- and the wrong one for anything built in a loop.
+class SharedArea {
+public:
+    SharedArea() = default;
+    ~SharedArea();
+    SharedArea(const SharedArea&) = delete;
+    SharedArea& operator=(const SharedArea&) = delete;
+
+    /// Copy an already deeply forced value in, answering the shared copy. A
+    /// value holding a suspension answers false with `*why` saying so, and
+    /// nothing it allocated is used. Objects already shared are not copied
+    /// again, so sharing a table that contains a shared table costs only the
+    /// new part.
+    bool share(Value v, Value* out, std::string* why);
+    /// Bytes handed out so far.
+    size_t bytes() const { return bytes_; }
+    /// True when `p` lies in a block of some live shared area. For the heap
+    /// verifier, which meets pointers it must not dereference until it knows
+    /// whose they are -- including, on purpose, ones that are nobody's.
+    static bool any_contains(const void* p);
+
+    // The constructors the cross-heap copier asks a destination for. See
+    // `copy_value` in heap.cpp, which is written once for both kinds.
+    Value make_float(double v);
+    Value make_string(const char* data, uint32_t len);
+    Value make_bigstr(const char* data, uint64_t len);
+    Value make_pid(uint64_t id);
+    Value make_cons(Value head, Value tail);
+    Value make_array(uint32_t len);
+    Value make_map_branch(uint32_t nslots);
+    Value make_map_leaf(uint64_t hash, Value key, Value value, Value next);
+    Value make_error(Value kind, Value payload);
+    Value make_module(uint32_t import_index, Value name);
+    Value make_closure(uint32_t func, uint32_t ncaps);
+    Value make_pap(Value fn, uint32_t nargs);
+    /// What the copier calls on meeting something that cannot be shared.
+    void refuse(const char* what) { if (refused_.empty()) refused_ = what; }
+
+private:
+    Obj* alloc(ObjType type, size_t extra);
+    std::mutex mutex_;
+    std::vector<uint8_t*> blocks_;
+    uint8_t* cursor_ = nullptr;
+    size_t left_ = 0;
+    size_t bytes_ = 0;
+    std::string refused_;
+};
 
 }  // namespace dream

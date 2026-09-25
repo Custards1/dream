@@ -946,6 +946,39 @@ NativeResult vm_collections(Process& p, Value, Value*, uint32_t) {
     return NativeResult::ok(make_integer(p, int64_t(p.heap().collections())));
 }
 
+/// `vm.share! v` -- `v`, forced all the way down and moved into the runtime's
+/// shared area, where every process can read it and none has to copy it.
+///
+/// The answer is the same value; what changes is what it costs to hand on. A
+/// `spawn!` whose work holds a shared table copies a pointer where it copied
+/// the table, and a `join!` answering one does the same. It also stops being
+/// anyone's to collect, which is why it is for a table built once and read for
+/// the rest of the run -- see `SharedArea` for what that means and why it is
+/// sound. A value with a suspension left in it after forcing (a closure's
+/// captured frame) is refused, loudly, rather than shared by copy.
+///
+/// It vouches for the collector for the reason `strict!` does: the force is
+/// unbounded Dream work. The copy that follows cannot collect, and `out` is
+/// not held across anything that can.
+NativeResult vm_share(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    Value out;
+    std::string why;
+    if (!p.runtime().shared().share(forced, &out, &why)) {
+        return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error, why));
+    }
+    return NativeResult::ok(out);
+}
+
+/// Bytes in the runtime's shared area.
+NativeResult vm_shared_bytes(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::ok(make_integer(p, int64_t(p.runtime().shared().bytes())));
+}
+
 NativeResult vm_heap_bytes(Process& p, Value, Value*, uint32_t) {
     return NativeResult::ok(make_integer(p, int64_t(p.heap().bytes_allocated())));
 }
@@ -1199,6 +1232,8 @@ ModuleDef make_vm_module() {
                          {"reductions!", 1, 0b1, vm_reductions},
                          {"collections!", 1, 0b1, vm_collections},
                          {"heap_bytes!", 1, 0b1, vm_heap_bytes},
+                         {"share!", 1, 0b0, vm_share, 0, true},
+                         {"shared_bytes!", 1, 0b1, vm_shared_bytes},
                          {"modules!", 1, 0b1, vm_modules},
                          {"host_members", 1, 0b1, vm_host_members},
                          {"has_ffi", 1, 0b1, vm_has_ffi},

@@ -2788,6 +2788,64 @@ leaves carry a flag, and a shared one would hand it to every user. Measure
 against a VM built from the commit before, in a worktree; this machine moves by
 10% between minutes.
 
+### Lowering in parts, and a heap every process can read: 5.75 s -> 4.7 s
+
+Done 2026-09-25, the next round after the one above, on the same four-core
+machine (the commit before measured 5.75 s here). Lowering was 2.4 s of the
+critical path and every body's lowering depends on the resolution and on
+nothing else, so it runs in four processes (`lower.link_parallel!`, used by
+`compile.build!` whenever the build is optimized). "Lowering in parts" in
+[dreams/lower.dr](dreams/lower.dr) is the design; what is worth carrying away:
+
+- **The split was worth nothing until copying stopped.** Four processes lower
+  in 0.62 s against 2.5 s for one, but handing each of them the resolution by
+  `spawn!` copied it -- 0.43 s, most of the saving. So the VM grew a
+  **shared area** (`SharedArea` in [dream/src/heap.hpp](dream/src/heap.hpp),
+  `vm.share!` in docs/builtins.md): a value forced all the way down and copied
+  once into memory the runtime owns, marked `GC_SHARED`, which every collector
+  stops at and every cross-heap copy passes by pointer. Sharing the resolution
+  is 40-90 ms; a spawn that holds it is a few. What makes it sound is that
+  nothing in the area can change (a suspension is refused rather than copied
+  in, and every object is born `AUX_DEEP_FORCED`) and nothing in it points
+  out. What it costs is that nothing in it is freed before the runtime is, so
+  only the command line uses it: `modules.load_shared!` for the parses and
+  `link_parallel!` for the resolution and the parts. The REPL builds with
+  `compile.scratch`, which is not optimized and so lowers whole, and `lucid`
+  never builds at all -- both would leak a program's worth per request.
+- **Deal the bodies round-robin.** Contiguous slices of equal source were a
+  third apart in nodes -- a byte of `typecheck.dr` lowers to three times what a
+  byte of `lexer.dr` does -- and the slowest slice is the stage. Dealt one at a
+  time the four parts come out within 12% of each other. The count is fixed at
+  four rather than the number of cores, because which part a body lands in
+  decides how the merged constant pools are numbered, and the image must not
+  depend on the machine.
+- **Share inside a part; do not share across them at the merge.** Each process
+  runs the optimizer over its own part (36K nodes -> 11K), and the merge lays
+  the parts end to end, renaming each part's constants into the program's pools
+  (`opt.renumber_part`) -- 0.35 s. A merge that deduplicated across parts was
+  built first, as the optimizer reading several arenas, and cost 0.8 s: at
+  ~17 us per node, a rebuild whose input is already shared is dearer per node
+  than one whose input is mostly leaves. The cross-part sharing still happens,
+  in the rebuild `compile.build!` already runs in a child while the types are
+  checked, so the image is as small as before (33,247 nodes against 32,898).
+- **A `comp` placeholder is `unit fi`, not `unit`.** Parts are optimized
+  before compile-time expressions are settled, and a bare `unit` would be
+  shared with every other one and then overwritten with them all. Carrying the
+  function index keeps it itself and makes it findable after the merge.
+- **The bootstrap needs two stages to settle.** The parts intern atoms in a
+  different order than the whole-program walk, and a `comp` that builds an
+  atom-keyed map quotes it in the compiling VM's atom order (the same effect as
+  "`mind/std/all.dr --test` is not byte-stable" below). So the stage the old
+  seed builds and the stage after it differ in 434 bytes, and the stage after
+  that is the fixpoint. It is deterministic run to run.
+
+Where the time is now, wall clock from the start of a self-compile: loaded
+1.0 s, resolved 1.95 s, parts joined 3.1 s, merged 3.45 s, lowered (comps
+settled) 3.55 s, types checked 4.25 s, the child's rebuild joined 4.45 s,
+written 4.7 s. Parsing (already spread across processes) and resolving (one
+walk threading one state) are now half of it, and the types pass sits alone on
+the critical path because it needs what the `comp`s came to.
+
 ### A JIT that can allocate -- the plan
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the

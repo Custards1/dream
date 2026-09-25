@@ -795,8 +795,8 @@ let configured! o =
 /// and the question "what do the macros cost?" then had no answer short of
 /// writing the program twice.
 let read! o file =
-    modules.load! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
-                  (opt o :test == true);
+    modules.load_shared! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
+                         (opt o :test == true);
 
 let load! o file = expansion.expand! (read! o file);
 

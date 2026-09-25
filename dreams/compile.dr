@@ -90,7 +90,11 @@ mapping Build {
 let build! : modules.Loader -> Options -> Build;
 let build! l o = {
     let r = scope.resolve! l;
-    let low = lower.link! l r;
+    // A build that will be optimized is lowered in parts, in several processes
+    // at once (`lower.link_parallel!`); one that will not keeps the arena
+    // exactly as `lower` builds it, which the parts cannot, since each is
+    // shared before it is merged.
+    let low = if Options.optimize o { lower.link_parallel! l r } else { lower.link! l r };
     let front = list.append (modules.diags l) (lower.all_diags r low);
     // One checker for the diagnostics, the contracts and both of the JIT's
     // parameter masks. Lazy, so a build without types never makes it.

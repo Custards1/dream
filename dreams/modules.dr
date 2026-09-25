@@ -26,6 +26,7 @@ import std.io;
 import std.list;
 import std.os;
 import std.str;
+import std.vm;
 
 import dreams.ast;
 import dreams.syntax;
@@ -706,6 +707,12 @@ let text_of! l file = match ((overlay l)).[file else ()] {
 let parse_elsewhere! text =
     spawn! $( try! { strict! (parser.parse_module text) } catch e { [:crashed, e] } );
 
+/// The same, answering through the shared area; see `load_shared!`. A parse
+/// the area refuses -- nothing in one should hold a suspension, but if it did
+/// -- comes back `:crashed` and is parsed again in place, like any other.
+let parse_shared! text =
+    spawn! $( try! { vm.share! (parser.parse_module text) } catch e { [:crashed, e] } );
+
 /// Start parsing, elsewhere, every file these imports of the module `name`
 /// will load and nothing has yet.
 /// The modules a file's text imports at the top level, read off the text
@@ -742,7 +749,8 @@ let rec prefetch! l deps = match deps {
         let text = if wanted { text_of! l file } else { () };
         if text == () { prefetch! l rest }
         else {
-            let child = parse_elsewhere! text;
+            let child = if l.[:share_parses else false] { parse_shared! text }
+                        else { parse_elsewhere! text };
             let marked = put :prefetch ((fetched l).[file => [text, child]]) l;
             prefetch! (prefetch! marked (scanned_imports text)) rest
         }
@@ -969,6 +977,18 @@ let default_search_paths! file extra =
 let load! : :string -> [:string] -> :any -> :bool -> Loader;
 let load! file roots cfg test_mode =
     load_root! (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])
+               file test_mode;
+
+/// The same, with every parse fetched ahead handed back through the runtime's
+/// shared area rather than copied (`vm.share!`), which is what a one-shot
+/// compile wants: its syntax trees live as long as it does, and the copy was
+/// most of what a parse elsewhere cost the walk that joins it. Not the
+/// default, because nothing in the shared area is freed before the runtime
+/// is, and a language server loads the program again at every keystroke.
+let load_shared! : :string -> [:string] -> :any -> :bool -> Loader;
+let load_shared! file roots cfg test_mode =
+    load_root! (put :share_parses true
+                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) []))
                file test_mode;
 
 /// The same, reading `ov` -- a map of path to text -- instead of the disk for

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <new>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 
 #include "gc_pool.hpp"
@@ -777,6 +778,7 @@ template <bool Par>
 void Heap::mark_object(GcCtx& c, Value v) {
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
+    if (is_shared_obj(o)) return;
     if constexpr (Par) {
         // The mark is the claim: whoever sets the bit owns the scan, so an
         // object two threads reach at once is still scanned exactly once.
@@ -812,7 +814,7 @@ bool Heap::claim_mark(Obj* o) {
     // same instruction and only turns up during a mark.
     auto gc = std::atomic_ref<uint8_t>(o->gc);
     uint8_t g = gc.load(std::memory_order_acquire);
-    if (g & GC_YOUNG) return false;
+    if (g & (GC_YOUNG | GC_SHARED)) return false;
     if (g & GC_MARK) return false;
     uint8_t prev = gc.fetch_or(GC_MARK, std::memory_order_acq_rel);
     return (prev & GC_MARK) == 0 && !(prev & GC_YOUNG);
@@ -871,6 +873,8 @@ void Heap::forward_in(GcCtx& c, Value* slot) {
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
     uint8_t gc = read_gc<Par>(o);
+    // Not this heap's, and nothing under it is: see `SharedArea`.
+    if (gc & GC_SHARED) return;
     if (gc & (GC_YOUNG | GC_FORWARDED | GC_BUSY)) {
         forward_slow<Par>(c, slot);
         return;
@@ -899,6 +903,7 @@ void Heap::forward_slow(GcCtx& c, Value* slot) {
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
     uint8_t gc = read_gc<Par>(o);
+    if (gc & GC_SHARED) return;
     // A young object is copied to old space and the slot rewritten to the
     // copy. A forwarded one is a young object already copied this cycle; its
     // first payload word holds the copy, so sharing survives promotion.
@@ -1945,6 +1950,10 @@ struct VerifyWalk {
             if (!is_ptr(v)) continue;
             Obj* o = as_obj(v);
             if (!seen.insert(o).second) continue;
+            // A shared object is no heap's, so it is not this one's to vouch
+            // for; the area it lives in is checked by nothing but its own
+            // construction, which is one copy under one lock.
+            if (!owns(o, sizeof(Obj)) && SharedArea::any_contains(o)) continue;
             if (!check_object(v, parent)) return;
 
             switch (o->type) {
@@ -2161,10 +2170,21 @@ private:
 /// Deep-copy with cycle handling. Values crossing a heap boundary are copied
 /// eagerly, which is why forcing must happen before a send: a thunk carries a
 /// frame that points back into the sender's world.
-Value copy_value(Heap& dest, Value v, CopySeen& seen) {
+///
+/// Written once for both destinations: another process's heap, and the
+/// runtime's shared area. The only differences are what a shared object is to
+/// each -- to either, something already where it needs to be, so it crosses by
+/// pointer -- and that the shared area refuses a suspension where a heap takes
+/// one with its frame.
+Value copy_suspension(Heap& dest, Value v, CopySeen& seen);
+
+template <class Dest>
+Value copy_value(Dest& dest, Value v, CopySeen& seen) {
+    constexpr bool to_shared = std::is_same_v<Dest, SharedArea>;
     if (!is_ptr(v)) return v;
     v = resolve(v);
     if (!is_ptr(v)) return v;
+    if (is_shared_obj(as_obj(v))) return v;
 
     if (auto* it = seen.find(v)) return it->second;
 
@@ -2281,6 +2301,25 @@ Value copy_value(Heap& dest, Value v, CopySeen& seen) {
             }
             return pap;
         }
+        case ObjType::Frame:
+        case ObjType::Thunk:
+        case ObjType::Blackhole:
+            if constexpr (to_shared) {
+                dest.refuse(obj_type_name(o->type));
+                return UNIT;
+            } else {
+                return copy_suspension(dest, v, seen);
+            }
+        default:
+            return UNIT;
+    }
+}
+
+/// The half of `copy_value` only a heap can take: a frame or a thunk, which
+/// travel between processes with everything they would need to run.
+Value copy_suspension(Heap& dest, Value v, CopySeen& seen) {
+    Obj* o = as_obj(v);
+    switch (o->type) {
         case ObjType::Frame: {
             auto* src = static_cast<FrameObj*>(o);
             Value fr = dest.make_frame(UNIT, src->nslots);
@@ -2318,6 +2357,194 @@ Value copy_value(Heap& dest, Value v, CopySeen& seen) {
 Value Heap::copy_between(Heap& dest, Value v) {
     CopySeen seen;
     return copy_value(dest, v, seen);
+}
+
+// ---------------------------------------------------------------------------
+// The shared area
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr size_t kSharedBlock = size_t(1) << 20;
+
+/// Every block of every live shared area, as `[start, end)`, for
+/// `SharedArea::any_contains`. Only the verifier reads it, so a lock and a
+/// linear scan are enough.
+std::mutex g_shared_ranges_mutex;
+std::vector<std::pair<uintptr_t, uintptr_t>> g_shared_ranges;
+
+void note_shared_block(const uint8_t* at, size_t bytes) {
+    std::lock_guard<std::mutex> g(g_shared_ranges_mutex);
+    auto start = reinterpret_cast<uintptr_t>(at);
+    g_shared_ranges.emplace_back(start, start + bytes);
+}
+
+void forget_shared_block(const uint8_t* at) {
+    std::lock_guard<std::mutex> g(g_shared_ranges_mutex);
+    auto start = reinterpret_cast<uintptr_t>(at);
+    for (size_t i = 0; i < g_shared_ranges.size(); ++i) {
+        if (g_shared_ranges[i].first == start) {
+            g_shared_ranges[i] = g_shared_ranges.back();
+            g_shared_ranges.pop_back();
+            return;
+        }
+    }
+}
+}  // namespace
+
+bool SharedArea::any_contains(const void* p) {
+    auto at = reinterpret_cast<uintptr_t>(p);
+    std::lock_guard<std::mutex> g(g_shared_ranges_mutex);
+    for (auto& [lo, hi] : g_shared_ranges)
+        if (at >= lo && at + sizeof(Obj) <= hi) return true;
+    return false;
+}
+
+SharedArea::~SharedArea() {
+    for (uint8_t* b : blocks_) {
+        forget_shared_block(b);
+        std::free(b);
+    }
+}
+
+Obj* SharedArea::alloc(ObjType type, size_t extra) {
+    size_t bytes = align_up(sizeof(Obj) + extra);
+    uint8_t* at;
+    if (bytes > kSharedBlock / 4) {
+        // A large object gets a block of its own, so the bump block it would
+        // have ended is not thrown away half used.
+        at = static_cast<uint8_t*>(std::malloc(bytes));
+        if (!at) throw std::bad_alloc();
+        blocks_.push_back(at);
+        note_shared_block(at, bytes);
+    } else {
+        if (bytes > left_) {
+            cursor_ = static_cast<uint8_t*>(std::malloc(kSharedBlock));
+            if (!cursor_) throw std::bad_alloc();
+            blocks_.push_back(cursor_);
+            note_shared_block(cursor_, kSharedBlock);
+            left_ = kSharedBlock;
+        }
+        at = cursor_;
+        cursor_ += bytes;
+        left_ -= bytes;
+    }
+    bytes_ += bytes;
+    std::memset(at, 0, bytes);
+    auto* o = reinterpret_cast<Obj*>(at);
+    o->type = type;
+    o->gc = GC_SHARED;
+    o->aux = AUX_DEEP_FORCED;
+    o->bytes = uint32_t(bytes);
+    return o;
+}
+
+Value SharedArea::make_float(double v) {
+    auto* o = static_cast<FloatObj*>(alloc(ObjType::Float, sizeof(double)));
+    o->value = v;
+    return from_obj(o);
+}
+
+Value SharedArea::make_string(const char* data, uint32_t len) {
+    auto* o = static_cast<StrObj*>(alloc(ObjType::Str, 8 + size_t(len) + 1));
+    o->len = len;
+    o->hash = 0;
+    if (len && data) std::memcpy(o->data(), data, len);
+    o->data()[len] = '\0';
+    return from_obj(o);
+}
+
+Value SharedArea::make_bigstr(const char* data, uint64_t len) {
+    auto* o = static_cast<BigStrObj*>(alloc(ObjType::BigStr, sizeof(BigStrObj) - sizeof(Obj)));
+    o->len = len;
+    // A big string caches its hash the first time a map asks for it. Here
+    // that would be a write every process could race to make, so the answer
+    // is worked out now, while the object is still this thread's alone.
+    o->hash = bytes_hash(Bytes{data, len});
+    o->data = data;
+    return from_obj(o);
+}
+
+Value SharedArea::make_pid(uint64_t id) {
+    auto* o = static_cast<PidObj*>(alloc(ObjType::Pid, sizeof(uint64_t)));
+    o->id = id;
+    return from_obj(o);
+}
+
+Value SharedArea::make_cons(Value head, Value tail) {
+    auto* o = static_cast<ConsObj*>(alloc(ObjType::Cons, 2 * sizeof(Value)));
+    o->head = head;
+    o->tail = tail;
+    return from_obj(o);
+}
+
+Value SharedArea::make_array(uint32_t len) {
+    auto* o = static_cast<ArrayObj*>(alloc(ObjType::Array, 8 + size_t(len) * sizeof(Value)));
+    o->len = len;
+    return from_obj(o);
+}
+
+Value SharedArea::make_map_branch(uint32_t nslots) {
+    auto* o = static_cast<MapObj*>(alloc(ObjType::Map, 8 + size_t(nslots) * sizeof(Value)));
+    o->count = 0;
+    o->bitmap = 0;
+    return from_obj(o);
+}
+
+Value SharedArea::make_map_leaf(uint64_t hash, Value key, Value value, Value next) {
+    auto* o = static_cast<MapLeafObj*>(alloc(ObjType::MapLeaf, 8 + 3 * sizeof(Value)));
+    o->hash = hash;
+    o->key = key;
+    o->value = value;
+    o->next = next;
+    return from_obj(o);
+}
+
+Value SharedArea::make_error(Value kind, Value payload) {
+    auto* o = static_cast<ErrorObj*>(alloc(ObjType::ErrorBox, 2 * sizeof(Value)));
+    o->kind = kind;
+    o->payload = payload;
+    return from_obj(o);
+}
+
+Value SharedArea::make_module(uint32_t import_index, Value name) {
+    auto* o = static_cast<ModuleObj*>(alloc(ObjType::Module, 8 + sizeof(Value)));
+    o->import_index = import_index;
+    o->name = name;
+    return from_obj(o);
+}
+
+Value SharedArea::make_closure(uint32_t func, uint32_t ncaps) {
+    auto* o = static_cast<ClosureObj*>(alloc(ObjType::Closure, 8 + size_t(ncaps) * sizeof(Value)));
+    o->func = func;
+    o->ncaps = ncaps;
+    return from_obj(o);
+}
+
+Value SharedArea::make_pap(Value fn, uint32_t nargs) {
+    auto* o = static_cast<PapObj*>(
+        alloc(ObjType::Pap, sizeof(Value) + 8 + size_t(nargs) * sizeof(Value)));
+    o->fn = fn;
+    o->nargs = nargs;
+    return from_obj(o);
+}
+
+bool SharedArea::share(Value v, Value* out, std::string* why) {
+    // One copy at a time. A share is rare and large, and the bump block is the
+    // area's only state, so a lock around the whole copy is the simple answer
+    // and costs nothing anyone would measure.
+    std::lock_guard<std::mutex> g(mutex_);
+    refused_.clear();
+    CopySeen seen;
+    Value copied = copy_value(*this, v, seen);
+    if (!refused_.empty()) {
+        // What was copied before the refusal stays allocated and unreachable
+        // until the runtime ends. A refusal is a program error, not a path
+        // anything takes in a loop, so it is not worth undoing.
+        if (why) *why = "cannot share a " + refused_ + ": force it first";
+        return false;
+    }
+    *out = copied;
+    return true;
 }
 
 }  // namespace dream

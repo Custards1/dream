@@ -535,6 +535,47 @@ let walk_funcs fs s0 =
                    (list.nth 1 acc)]
     }) [s0, []] fs;
 
+/// One part's nodes with every edge moved by `at` and every run by `kids_at`,
+/// and its constants renamed through `m`: the part as it reads once its arena
+/// is laid after the ones before it. A reversed list is added to, so that the
+/// caller can lay the parts one after another with a cons per node.
+///
+/// This is the merge without the sharing, and it is what a program lowered in
+/// parts is merged with: sharing is a rebuild, and the build shares the arena
+/// once more in a process of its own while the types are checked, so doing it
+/// here too was 0.8 s on the critical path to save work that happens anyway.
+let renumber_part nodes at kids_at m acc =
+    list.fold (fn out n -> {
+        let op = ir.node_op n;
+        let renamed = match op {
+            :field => set_operand 1 ((m.[:strs]).[ir.node_b n]) n,
+            _ => remap_leaf_by m n,
+        };
+        let edged = list.fold (fn e k -> {
+            let v = operand k e;
+            if ir.is_node v { set_operand k (v + at) e } else { e }
+        }) renamed (edges_of op);
+        let moved = match run_of op {
+            () => edged,
+            spec => set_operand (list.head spec) (operand (list.head spec) edged + kids_at) edged,
+        };
+        list_cons moved out
+    }) acc nodes;
+
+/// A part's kids, moved the same way: a kid is a node index.
+let renumber_kids kids at acc =
+    list.fold (fn out k -> list_cons (if ir.is_node k { k + at } else { k }) out) acc kids;
+
+/// A constant leaf with its pool index renamed through `m`, and any other node
+/// as it is: a constant's operand is the only one a part numbers for itself.
+let remap_leaf_by m n = match ir.node_op n {
+    :const_int => set_operand 0 ((m.[:ints]).[ir.node_a n]) n,
+    :const_float => set_operand 0 ((m.[:floats]).[ir.node_a n]) n,
+    :const_str => set_operand 0 ((m.[:strs]).[ir.node_a n]) n,
+    :const_atom => set_operand 0 ((m.[:atoms]).[ir.node_a n]) n,
+    _ => n,
+};
+
 /// The image a finished walk describes.
 let finished img s funcs =
     ((((img.[:nodes => list.reverse (out s)])).[:kids => list.reverse (out_kids s)])).[:funcs => funcs];

@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "heap.hpp"
 #include "image.hpp"
 #include "value.hpp"
 
@@ -303,9 +304,17 @@ public:
 
     const struct WellKnownAtoms& well_known_atoms() const { return *wk_; }
 
+    /// Values every process of this runtime reads and none owns; see
+    /// `SharedArea` and `vm.share!`.
+    SharedArea& shared() { return shared_; }
+
 private:
     void intern_image_atoms();
     void size_caches();
+
+    /// Declared first so that it is destroyed last: every heap may point into
+    /// it, and a process is torn down with the runtime it belongs to.
+    SharedArea shared_;
 
     std::unique_ptr<Image> image_;
     std::string source_text_;

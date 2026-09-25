@@ -541,6 +541,56 @@ static void test_heap_verifier_accepts_a_healthy_heap() {
     CHECK_EQ(h.verify(roots), std::string());
 }
 
+static void test_shared_area() {
+    std::printf("shared area\n");
+
+    SharedArea area;
+    Heap h(4096);
+    // A list of a string and a map, forced -- everything here is a value.
+    Value m = h.make_map_branch(0);
+    Value str = h.make_string("shared", 6);
+    Value list = h.make_cons(str, h.make_cons(m, NIL));
+    Value shared = UNIT;
+    std::string why;
+    CHECK(area.share(list, &shared, &why));
+    CHECK(is_ptr(shared) && is_shared_obj(as_obj(shared)));
+    CHECK(as_obj(shared)->aux & AUX_DEEP_FORCED);
+    CHECK(!h.owns(as_obj(shared), sizeof(Obj)));
+    CHECK(SharedArea::any_contains(as_obj(shared)));
+    CHECK(area.bytes() > 0);
+
+    // Crossing heaps, a shared value is the same pointer, and so is anything
+    // that reaches it -- only the part that is not shared is copied.
+    Heap other(4096);
+    CHECK(Heap::copy_between(other, shared) == shared);
+    Value wrapped = h.make_cons(shared, NIL);
+    Value moved = Heap::copy_between(other, wrapped);
+    CHECK(moved != wrapped);
+    CHECK(static_cast<ConsObj*>(as_obj(moved))->head == shared);
+
+    // Sharing what is already shared copies nothing.
+    size_t before = area.bytes();
+    Value again = UNIT;
+    CHECK(area.share(shared, &again, &why));
+    CHECK(again == shared && area.bytes() == before);
+
+    // A heap that points at it collects without touching it: the verifier
+    // accepts the edge, and a full collection neither marks nor frees it.
+    VectorRoots roots;
+    roots.values = {wrapped};
+    CHECK(h.verify(roots).empty());
+    h.collect(roots);
+    CHECK(as_obj(shared)->gc == GC_SHARED);
+    CHECK(static_cast<ConsObj*>(as_obj(resolve(roots.values[0])))->head == shared);
+    CHECK(h.verify(roots).empty());
+
+    // A suspension is refused, not shared.
+    Value th = h.make_thunk(0, UNIT);
+    Value out = UNIT;
+    CHECK(!area.share(h.make_cons(th, NIL), &out, &why));
+    CHECK(why.find("thunk") != std::string::npos);
+}
+
 static void test_heap_verifier_catches_corruption() {
     std::printf("heap verifier catches corruption\n");
 
@@ -1153,6 +1203,7 @@ int main() {
     test_concurrent_mark_period();
     test_heap_verifier_accepts_a_healthy_heap();
     test_heap_verifier_catches_corruption();
+    test_shared_area();
     test_heap_verifier_follows_every_object_kind();
     test_cross_heap_copy();
     test_image_rejects_bad_input();
