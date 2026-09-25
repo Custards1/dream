@@ -124,15 +124,25 @@ let build! l o = {
     // checker is done. On a self-compile that is the checker's half second
     // taken off the critical path. A build that has already failed shares
     // nothing, and one whose checker fails never waits for the answer.
-    let ahead = if Options.optimize o && diag.error_count front == 0 { share_elsewhere! (lower.prog low) }
-                else { () };
+    let ahead = if not (Options.optimize o) || diag.error_count front > 0 { () }
+                else {
+                    match lower.sharing low {
+                        () => share_elsewhere! (lower.prog low),
+                        started => started,
+                    }
+                };
     let known = if parallel && Options.types o && diag.error_count front == 0 {
                     analyze_parallel! l r (lower.comp_values low)
                 } else { facts };
     let checked = type_diags! (Options.types o) known low front;
     let all = list.append front checked;
     let shared = if ahead == () || diag.error_count all > 0 { () }
-                 else { match join! ahead { [:crashed, _] => (), done => done } };
+                 else {
+                     match join! ahead {
+                         [:crashed, _] => (),
+                         done => if lower.sharing low == () { done } else { lower.patched low done },
+                     }
+                 };
     Build.make l r low known all o shared
 };
 

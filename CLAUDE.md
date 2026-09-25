@@ -2788,7 +2788,7 @@ leaves carry a flag, and a shared one would hand it to every user. Measure
 against a VM built from the commit before, in a worktree; this machine moves by
 10% between minutes.
 
-### Resolving, lowering and checking in parts: 5.75 s -> 4.1 s
+### Resolving, lowering and checking in parts: 5.75 s -> 3.9 s
 
 Done 2026-09-25, the next round after the one above, on the same four-core
 machine (the commit before measured 5.75 s here). Lowering was 2.4 s of the
@@ -2881,15 +2881,24 @@ nothing else, so it runs in four processes (`lower.link_parallel!`, used by
   parts to the whole: the same diagnostics as `--check`, in the same order, and
   a program that prints the same built both ways.
 
+- **Sharing across the parts starts the moment they are joined.** The
+  re-share of the whole arena used to wait for the merge and the `comp`s, then
+  took 0.8 s. Now a child shares the four parts straight into one arena
+  (`opt.optimize_parts`, the rebuild reading several arenas, with leaves
+  memoized because a shared part is a DAG and not a tree) while the parent
+  merges, settles the `comp`s and checks the types; the parent then patches
+  the `comp` values into the child's image (`lower.patched`). The patch lowers
+  each value again, unshared, which is why the image is 1% more nodes than a
+  whole-arena share would give -- 34,428 against 33,860. 0.25 s.
+
 `Options.parallel` is what turns all of this on, and only the command line
 sets it; see the `Options` doc in [dreams/compile.dr](dreams/compile.dr).
 
 Where the time is now, wall clock from the start of a self-compile: loaded
-0.95 s, resolved 1.4 s, parts lowered and joined 2.5 s, merged 2.85 s, `comp`s
-settled 3.05 s, types checked 3.45 s, the child's re-share joined 3.9 s,
-written 4.1 s. Loading (parsing is spread across processes already, 1.8 s of
-CPU) is now the largest serial stage; after lowering, the re-share child
-(0.8 s, started once the `comp`s are settled) is the critical path.
+1.0 s, resolved 1.45 s, parts lowered and joined 2.6 s, merged 3.0 s, `comp`s
+settled 3.15 s, types checked 3.55 s, the sharing child joined and patched
+3.7 s, written 3.9 s. Loading is the largest serial stage (parsing is spread
+across processes already, 1.8 s of CPU), then the lowering parts.
 
 ### A JIT that can allocate -- the plan
 

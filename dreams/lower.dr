@@ -1919,7 +1919,56 @@ let link_parallel! ld r = {
     strict! work
     let running = strict! (list.map (fn w -> part_elsewhere! (list.head w) (list.nth 1 w)) work);
     let parts = strict! (list.map (fn pr -> join! pr) running);
-    link_rest! ld rs (link_parts rs (list.map (fn w -> scope.part_offsets (list.head w)) work) parts)
+    let offsets = list.map (fn w -> scope.part_offsets (list.head w)) work;
+    let head = link_head rs offsets parts;
+    // Sharing across the parts starts now, in a process of its own, and runs
+    // while this one merges, settles and checks: see `patched`.
+    let sharing = share_parts_elsewhere! (vm.share! (parts_for_sharing rs head offsets parts));
+    (link_rest! ld rs (link_parts rs head offsets parts)).[:sharing => sharing]
+};
+
+/// The process sharing this lowering's parts, if it was lowered in parts.
+let sharing l = l.[:sharing else ()];
+
+/// The image the sharing process answered, finished: its `comp` placeholders
+/// replaced by what they came to, and the tables `link_rest!` added after it
+/// started -- the modules, the entry, the names -- taken from this lowering.
+///
+/// The process started from this lowering's constant pools as they stood
+/// before any `comp` was settled, and settling only ever *adds* to a pool, so
+/// every constant its image names means the same in the pools here. Each value
+/// is lowered again into the shared image, which interns nothing new -- this
+/// lowering already did -- and the placeholder is overwritten, as
+/// `settle_comp!` does in the arena it settles.
+let patched l img = {
+    let p = prog l;
+    let nodes = img.[:nodes else []];
+    let kids = img.[:kids else []];
+    let tables = ((((((p.[:nodes => ir.fill_kids %{} 0 nodes]).[:node_count => list.length nodes])
+                    .[:kids => ir.fill_kids %{} 0 kids]).[:kid_count => list.length kids]))
+                    .[:funcs => img.[:funcs else []]]);
+    let placed = list.head (list.fold_strict (fn acc n -> {
+        let [m, i] = acc;
+        [if ir.node_op n == :unit && ir.is_node (ir.node_a n) { m.[ir.node_a n => i] } else { m }, i + 1]
+    }) [%{}, 0] nodes);
+    let values = comp_values l;
+    let filled = list.fold (fn acc one -> {
+        let [_, fi, src, span] = one;
+        match values.[comp_key src span else ()] {
+            () => acc,
+            v => {
+                let built = emit_const v acc;
+                let at = placed.[fi else ir.no_node];
+                if not (ir.is_node at) { list.head built }
+                else {
+                    set_prog (ir.set_node at (ir.node_at (list.nth 1 built) (prog (list.head built)))
+                                         (prog (list.head built)))
+                             (list.head built)
+                }
+            },
+        }
+    }) (set_prog tables l) (pending_comp l);
+    ir.finish (prog filled)
 };
 
 /// Intern every value of a part's pool into the program's: `[program, the
@@ -1941,8 +1990,7 @@ let intern_atom_at strs si p = {
 
 /// Merge the parts into one lowering, linked. The arenas are laid one after
 /// another, renumbered but not shared again -- see `opt.renumber_part`.
-let link_parts r offsets parts = {
-    let invented_from = scope.invented_from r;
+let link_head r offsets parts = {
     // The constant pools, part by part, and each part's table from its own
     // indices to the program's.
     let pooled = list.fold (fn acc part -> {
@@ -1973,6 +2021,51 @@ let link_parts r offsets parts = {
     let is = link_imports r (list.head gs);
     let p = ((((prog (list.head is)).[:funcs => (list.nth 1 fs)]).[:globals => (list.nth 1 gs)]))
                 .[:imports => (list.nth 1 is)];
+    %{ :prog => p, :base => base, :remaps => remaps, :starts => starts }
+};
+
+/// The linked program with every function naming its body as the part it is
+/// in and its node there, `part * opt.part_base + node`, which is how
+/// `opt.optimize_parts` reads them -- and the parts, as it wants them.
+let parts_for_sharing r head offsets parts = {
+    let p = head.[:prog];
+    let starts = head.[:starts];
+    let located = list.fold (fn m k -> {
+        let fo = list.head (offsets.[k]);
+        list.fold (fn m2 fb -> m2.[list.head fb + fo => ((k + 1) * opt.part_base + list.nth 1 fb)])
+                  m ((parts.[k]).[:bodies])
+    }) %{} (list.range 0 (list.length parts));
+    let funcs = list.map (fn pair -> {
+        let [fi, f] = pair;
+        f.[:body => located.[fi else ir.no_node]]
+    }) (list.zip (list.range 0 (list.length (ir.funcs p))) (ir.funcs p));
+    let arenas = array_of_list (list_cons %{ :nodes => #[], :kids => ir.kids p }
+        (list.map (fn k -> %{ :nodes => array_of_list ((parts.[k]).[:nodes]),
+                              :kids => array_of_list ((parts.[k]).[:kids]),
+                              :remap => (head.[:remaps]).[k],
+                              :fo => list.head (offsets.[k]), :go => list.nth 1 (offsets.[k]) })
+                  (list.range 0 (list.length parts))));
+    [(ir.finish_rest p).[:funcs => funcs], arenas, scope.invented_from r]
+};
+
+/// A process sharing the parts into one arena while this one merges them,
+/// settles the `comp`s and checks the types: `[image, arenas, invented_from]`
+/// in, the shared image out, with every `comp` placeholder still in it for
+/// `patched` to fill. Handed what it needs already shared, so starting it is a
+/// pointer; a raise in it answers `:crashed`, and the build shares the merged
+/// arena the ordinary way instead.
+let share_parts_elsewhere! work =
+    spawn! $( try! { vm.share! (opt.optimize_parts (list.nth 0 work) (list.nth 1 work) (list.nth 2 work)) }
+              catch e { [:crashed, e] } );
+
+/// Merge the parts into one lowering, linked. The arenas are laid one after
+/// another, renumbered but not shared again -- see `opt.renumber_part`.
+let link_parts r head offsets parts = {
+    let invented_from = scope.invented_from r;
+    let p = head.[:prog];
+    let base = head.[:base];
+    let remaps = head.[:remaps];
+    let starts = head.[:starts];
     // The captures `link_funcs` placed are the start of the kids pool, and the
     // parts' runs follow them.
     let laid = list.fold (fn acc trio -> {

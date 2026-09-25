@@ -245,6 +245,68 @@ let settle s =
        && len (runs s) >= 0 && len (memo s) >= 0 { s } else { s };
 
 let node_at i s = (src s).[i else ir.leaf :nop];
+
+// --- several arenas at once ---------------------------------------------------------
+//
+// A program lowered in parts arrives as several arenas, each already shared
+// within itself, each numbering its nodes from zero and interning its own
+// constants -- see "lowering in parts" in [dreams/lower.dr](dreams/lower.dr).
+// `optimize_parts` shares them *across* each other in one rebuild, reading
+// them where they lie rather than laid end to end first. Every node a body
+// reaches is in the same arena as the body, because a part is a set of whole
+// bodies, so a function's body names its part as well as its node
+// (`part_base`), the walk switches arenas at each body, and the memo is keyed
+// by both halves. What is not the arena's own is renamed on the way through:
+// a constant (an `int`, `str` or `atom` leaf, and the string a `field` names)
+// indexes the part's pool, and a part resolved in parts also numbered its
+// functions and invented globals for itself (see `renumber_part`).
+//
+// Leaves are memoized here where `rebuild` does not memoize them. A lowered
+// arena is nearly a tree; a shared part is the opposite, a leaf there being
+// one node with a thousand parents, and re-keying it at every one of them was
+// most of what a merge cost.
+
+/// Node `i` of part `k` is `k * part_base + i` wherever a function names it.
+let part_base = 134217728;
+
+let memo_base s = s.[:memo_base else 0];
+let remap s = s.[:remap else ()];
+let memo_leaves s = s.[:memo_leaves else false];
+
+/// Read from part `k` from here on.
+let enter_part k s = {
+    let part = (s.[:parts else #[]]).[k];
+    ((((((s.[:src => part.[:nodes else #[]]]).[:src_kids => part.[:kids else #[]]])
+        .[:remap => part.[:remap else ()]]).[:memo_base => k * part_base])
+        .[:fo => part.[:fo else 0]]).[:go => part.[:go else 0]])
+};
+
+/// A leaf as the whole program numbers it: `remap_leaf_by` for its constant,
+/// and the part's offsets for the function or invented global it names.
+let remap_leaf n s = match remap s {
+    () => n,
+    m => {
+        let fo = s.[:fo else 0];
+        match ir.node_op n {
+            :make_closure => set_operand 0 (ir.node_a n + fo) n,
+            :make_thunk => set_operand 0 (ir.node_a n + fo) n,
+            :unit => if ir.is_node (ir.node_a n) { set_operand 0 (ir.node_a n + fo) n } else { n },
+            :global => if ir.node_a n >= s.[:invented_from else 0] {
+                           set_operand 0 (ir.node_a n + s.[:go else 0]) n
+                       } else { n },
+            _ => remap_leaf_by m n,
+        }
+    },
+};
+
+/// A `field` with the string naming it renamed the same way.
+let remap_field n s = match remap s {
+    () => n,
+    m => match ir.node_op n {
+        :field => set_operand 1 ((m.[:strs]).[ir.node_b n]) n,
+        _ => n,
+    },
+};
 let kid_at i s = (src_kids s).[i else ir.no_node];
 
 // These are runtime representation tests, not signature assumptions. Gradual
@@ -254,7 +316,10 @@ let type_codes = %{ "integer" => 0, "float" => 1, "char" => 2,
     "bool" => 3, "unit" => 4, "string" => 5, "atom" => 6,
     "list" => 7, "array" => 8, "map" => 9 };
 
-let type_test call atom invert flags s = {
+let type_test call written invert flags s = {
+    // The atom as the program numbers it, when this is one part of several:
+    // `type_ids` is keyed by the merged pool.
+    let atom = remap_leaf written s;
     let callee = node_at (ir.node_a call) s;
     let code = (s.[:type_ids else %{}]).[ir.node_a atom else ()];
     if ir.node_op call == :apply && ir.node_c call == 1
@@ -407,14 +472,16 @@ let rec rebuild i s =
     if not (ir.is_node i) { [s, i] }
     else {
         let n = node_at i s;
-        if is_leaf (ir.node_op n) { keep n s }
+        let leaf = is_leaf (ir.node_op n);
+        if leaf && not (memo_leaves s) { keep n s }
         else {
-            match ((memo s)).[i else ()] {
+            let key = i + memo_base s;
+            match ((memo s)).[key else ()] {
                 () => {
-                    let got = rebuild_node n s;
+                    let got = if leaf { keep (remap_leaf n s) s } else { rebuild_node n s };
                     let s1 = list.head got;
                     let at = list.nth 1 got;
-                    [settle (s1.[:memo => (((memo s1)).[i => at])]), at]
+                    [settle (s1.[:memo => (((memo s1)).[key => at])]), at]
                 },
                 found => [s, found],
             }
@@ -423,7 +490,7 @@ let rec rebuild i s =
 
 /// The rebuild proper, for a node with children that has not been met before.
 let rec rebuild_node n s = {
-    let n = specialize n s;
+    let n = specialize (remap_field n s) s;
     let op = ir.node_op n;
     // The edges, left to right. Each answers the state it left behind and the
     // node with that one operand renumbered.
@@ -522,6 +589,28 @@ let fresh img nodes kids = {
     let type_ids = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
                             %{} (list.zip (list.range 0 (list.length ids)) ids);
     (state nodes kids).[:type_ids => type_ids]
+};
+
+/// Share several arenas into one: `parts` is an array of `%{ :nodes, :kids,
+/// :remap, :fo, :go }`, arrays both, and each of `img`'s functions names its
+/// body as `part * part_base + node`. Part 0 holds no nodes: it is the linked
+/// program's own kids pool, where the functions' captures are. See "several
+/// arenas at once".
+let optimize_parts img parts invented_from = {
+    let s0 = ((((fresh img #[] #[]).[:parts => parts]).[:memo_leaves => true]))
+                .[:invented_from => invented_from];
+    let walked = list.fold (fn acc f -> {
+        let body = f.[:body else ir.no_node];
+        let entered = if ir.is_node body { enter_part (body / part_base) (list.head acc) }
+                      else { list.head acc };
+        let local = if ir.is_node body { body % part_base } else { body };
+        let got = rebuild local entered;
+        let caps = place_captures f (enter_part 0 (list.head got));
+        [settle (list.head caps),
+         list_cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
+                   (list.nth 1 acc)]
+    }) [s0, []] (img.[:funcs else []]);
+    finished img (list.head walked) (list.reverse (list.nth 1 walked))
 };
 
 /// Rebuild each function's body and captures, in order: `[state, functions]`,
