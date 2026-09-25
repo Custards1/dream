@@ -2788,7 +2788,7 @@ leaves carry a flag, and a shared one would hand it to every user. Measure
 against a VM built from the commit before, in a worktree; this machine moves by
 10% between minutes.
 
-### Lowering in parts, and a heap every process can read: 5.75 s -> 4.7 s
+### Lowering in parts, and a heap every process can read: 5.75 s -> 4.6 s
 
 Done 2026-09-25, the next round after the one above, on the same four-core
 machine (the commit before measured 5.75 s here). Lowering was 2.4 s of the
@@ -2839,12 +2839,31 @@ nothing else, so it runs in four processes (`lower.link_parallel!`, used by
   seed builds and the stage after it differ in 434 bytes, and the stage after
   that is the fixpoint. It is deterministic run to run.
 
+- **The types pass is per body too.** `typecheck.analyze` builds one checker
+  from the signatures (40 ms) and then checks every body against it (600 ms),
+  and a body's check only ever *adds* to the diagnostics threaded through it.
+  So `typecheck.prepared` and `concluded` split the two, and
+  `compile.analyze_parallel!` shares the checker and deals the bodies to four
+  processes: 0.6 s -> 0.37 s, for identical diagnostics by construction.
+- **Compile-time contracts run against a pruned image**, as a `comp` does
+  (`lower.comp_image`), rather than a serialization of the whole arena.
+- **What did not work: sharing at the merge, twice.** Once as the optimizer
+  reading several arenas, once as a linear pass exploiting that a shared part
+  lists every node after its children (no recursion, no visit memo). Both
+  cost 0.8 s for 42,800 nodes. The price is not the walk but the per-node map
+  work -- keying the node, looking it up, recording where it went -- at ~200
+  reductions a node, and no rearrangement of the walk changes that. Sharing
+  the whole arena therefore stays in the child, where it overlaps the types.
+
+`Options.parallel` is what turns all of this on, and only the command line
+sets it; see the `Options` doc in [dreams/compile.dr](dreams/compile.dr).
+
 Where the time is now, wall clock from the start of a self-compile: loaded
-1.0 s, resolved 1.95 s, parts joined 3.1 s, merged 3.45 s, lowered (comps
-settled) 3.55 s, types checked 4.25 s, the child's rebuild joined 4.45 s,
-written 4.7 s. Parsing (already spread across processes) and resolving (one
-walk threading one state) are now half of it, and the types pass sits alone on
-the critical path because it needs what the `comp`s came to.
+0.9 s, resolved 1.95 s, lowered (parts joined, merged, comps settled) 3.6 s,
+types checked 4.0 s, the child's re-share joined 4.4 s, written 4.6 s. The
+re-share child is the critical path after lowering; before it, parsing
+(already spread across processes, 1.8 s of CPU) and resolving (one walk
+threading one state, 1.0 s) are the two serial stages left.
 
 ### A JIT that can allocate -- the plan
 

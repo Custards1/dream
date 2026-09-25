@@ -34,6 +34,7 @@ import dreams.opt as optimizer;
 import dreams.scope;
 import dreams.typecheck;
 import dreams.contract;
+import std.vm;
 
 // --- what to compile it as ------------------------------------------------------
 
@@ -47,10 +48,18 @@ import dreams.contract;
 /// *sizes* of what `--payload` appends, because they are part of the section
 /// table and so of what the image is -- the bytes themselves never come near
 /// a Dream string.
+///
+/// `parallel` spreads lowering and checking across processes, handing them
+/// the program through the runtime's shared area (`vm.share!`). That is most
+/// of what a large build costs cut by the number of cores, and it is for a
+/// build that runs once: nothing shared is freed before the runtime is, so a
+/// caller that builds again and again in one process -- a session, a server
+/// -- would keep every program it ever built. The command line turns it on.
 mapping Options {
     types = true
     optimize = true
     payloads = []
+    parallel = false
 }
 
 /// The defaults: checked, shared, no payload.
@@ -58,7 +67,7 @@ let options = Options.new ();
 
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
-let scratch = Options.make false false [];
+let scratch = Options.make false false [] false;
 
 // --- a build --------------------------------------------------------------------
 
@@ -89,15 +98,21 @@ mapping Build {
 /// the head of this file.
 let build! : modules.Loader -> Options -> Build;
 let build! l o = {
-    let r = scope.resolve! l;
+    let parallel = Options.parallel o;
+    // In a parallel build the resolution is shared before anything reads it,
+    // so the checker built from it, and every process handed either, reads
+    // the one copy.
+    let r = if parallel { vm.share! (scope.resolve! l) } else { scope.resolve! l };
     // A build that will be optimized is lowered in parts, in several processes
     // at once (`lower.link_parallel!`); one that will not keeps the arena
     // exactly as `lower` builds it, which the parts cannot, since each is
     // shared before it is merged.
-    let low = if Options.optimize o { lower.link_parallel! l r } else { lower.link! l r };
+    let low = if parallel && Options.optimize o { lower.link_parallel! l r } else { lower.link! l r };
     let front = list.append (modules.diags l) (lower.all_diags r low);
     // One checker for the diagnostics, the contracts and both of the JIT's
-    // parameter masks. Lazy, so a build without types never makes it.
+    // parameter masks. Lazy, so a build without types never makes it -- and
+    // in a parallel build, one that is going to be checked is checked below,
+    // once the arena has gone to be shared.
     let facts = typecheck.analyze l r (lower.comp_values low);
     // Sharing the arena needs nothing the checker says, and the checker needs
     // nothing sharing does, so the two run at once: the arena goes to a
@@ -107,11 +122,14 @@ let build! l o = {
     // nothing, and one whose checker fails never waits for the answer.
     let ahead = if Options.optimize o && diag.error_count front == 0 { share_elsewhere! (lower.prog low) }
                 else { () };
-    let checked = type_diags! (Options.types o) facts low front;
+    let known = if parallel && Options.types o && diag.error_count front == 0 {
+                    analyze_parallel! l r (lower.comp_values low)
+                } else { facts };
+    let checked = type_diags! (Options.types o) known low front;
     let all = list.append front checked;
     let shared = if ahead == () || diag.error_count all > 0 { () }
                  else { match join! ahead { [:crashed, _] => (), done => done } };
-    Build.make l r low facts all o shared
+    Build.make l r low known all o shared
 };
 
 /// A process sharing this program's arena. What crosses is the program as
@@ -127,6 +145,29 @@ let share_elsewhere! p = {
     strict! p
     spawn! $( try! { strict! (optimizer.optimize_program p) } catch e { [:crashed, e] } )
 };
+
+/// The type analysis, with the bodies checked in `lower.part_count` processes
+/// at once: the same answer `typecheck.analyze` gives, in about a quarter of
+/// the time. The checker is built here, once, and shared, so each process is
+/// handed a pointer to it; each answers what its bodies said, against their
+/// positions, and `typecheck.concluded` lays them back in order.
+let analyze_parallel! l r comps = {
+    let kd = vm.share! (typecheck.prepared l r comps);
+    let k = list.head kd;
+    let all = scope.bodies r;
+    let numbered = list.zip (list.range 0 (list.length all)) all;
+    let slices = strict! (list.map (fn j -> list.filter (fn nb -> list.head nb % lower.part_count == j) numbered)
+                                   (list.range 0 lower.part_count));
+    let running = strict! (list.map (fn slice -> check_elsewhere! k slice) slices);
+    let said = list.concat (strict! (list.map (fn pr -> join! pr) running));
+    let ordered = list.map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said);
+    strict! (typecheck.concluded k r (list.nth 1 kd) ordered)
+};
+
+/// A process checking some bodies against a shared checker. Its own function
+/// for the reason `share_elsewhere!` is.
+let check_elsewhere! k slice =
+    spawn! $( vm.share! (list.map (fn nb -> [list.head nb, typecheck.check_decl k (list.nth 1 nb) []]) slice) );
 
 /// What a program's signatures and contracts say is wrong with it, given what
 /// the earlier stages said. Nothing, when they already found an error or the

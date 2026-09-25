@@ -2019,9 +2019,27 @@ let check_program l r = Analysis.diags (analyze l r %{});
 struct Analysis { diags, contracts, float_params, integer_params }
 
 let analyze l r comps = {
+    let [k, ds0] = prepared l r comps;
+    concluded k r ds0 (list.map (fn b -> check_decl k b []) (scope.bodies r))
+};
+
+/// The checker `analyze` asks every body about, and what building it said:
+/// `[checker, diagnostics]`. About a twentieth of the pass; the rest is the
+/// bodies, which is why the two are apart -- a build checks the bodies in
+/// several processes at once (`compile.analyze_parallel!`), each handed the one
+/// checker this makes.
+let prepared l r comps = {
     let [k0, ds0] = checker l r;
-    let k = with_comp_globals r (Checker.set_comps k0 comps);
-    let found = list.fold (fn ds b -> check_decl k b ds) ds0 (scope.bodies r);
+    [with_comp_globals r (Checker.set_comps k0 comps), ds0]
+};
+
+/// The analysis, given what each body said on its own -- `check_decl k b []`,
+/// in the order the resolver queued the bodies. Checking threads the
+/// diagnostics through a body only to add to them, never to read them, so
+/// what one body adds is the same whatever came before it, and laying the
+/// bodies' answers end to end is the fold `analyze` used to be.
+let concluded k r ds0 said = {
+    let found = list.fold (fn ds c -> c + ds) ds0 said;
     let contracts = list.filter (fn x -> is_contract x) found;
     let diags = list.filter (fn x -> not (is_contract x)) found;
     let once = list.fold (fn acc d -> if list.contains d acc { acc } else { list_cons d acc }) [] diags;

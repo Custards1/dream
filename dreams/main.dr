@@ -128,7 +128,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
-    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [];
+    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true;
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.

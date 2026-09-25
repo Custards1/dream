@@ -1698,7 +1698,8 @@ let rec comp_reach todo seen fns p funcs globals = match todo {
 };
 
 /// The image compile-time expressions are run against: the program cut down to
-/// what they can reach.
+/// what they can reach. Compile-time contracts are run the same way
+/// (`contract.batch_image`), with their batch as the one root.
 ///
 /// It used to be the whole program, serialized as lowered, and that was most
 /// of what a compile-time expression cost -- on a self-compile, six one-line
