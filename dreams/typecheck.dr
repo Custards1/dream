@@ -198,7 +198,8 @@ let res k = Checker.r k;
 /// Where an expression is being checked: the module whose names it resolves
 /// against, the file it was written in, what its locals are known to be, the
 /// types declared in its blocks, the block signatures still waiting for their
-/// `let`, and whose body this is, for a message.
+/// `let`, whose body this is, for a message, and what a test in scope has
+/// narrowed a global to, by global index (see "narrowing").
 mapping Here {
     mi = 0
     source = 0
@@ -206,9 +207,10 @@ mapping Here {
     ltypes = %{}
     pending = %{}
     owner = ""
+    narrowed = %{}
 }
 
-let here mi source owner = Here.make mi source %{} %{} %{} owner;
+let here mi source owner = Here.make mi source %{} %{} %{} owner %{};
 
 let with_local n t h = Here.set_locals h ((Here.locals h).[n => t]);
 
@@ -692,10 +694,16 @@ let builtin_type n = match n {
 /// What a name means here. The resolver already decided which declaration a
 /// name is; this only asks that declaration's signature.
 let name_type k h n sp = match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
-    [:global, _, _, gi] => (Checker.uses k).[gi else :any],
-    [:member, _, _, gi] => if gi == () { :any } else { (Checker.uses k).[gi else :any] },
+    [:global, _, _, gi] => global_type k h gi,
+    [:member, _, _, gi] => if gi == () { :any } else { global_type k h gi },
     [:builtin, b] => builtin_type b,
     _ => (Here.locals h).[n else :any],
+};
+
+/// A global's signature, unless a test in scope has narrowed it.
+let global_type k h gi = match (Here.narrowed h).[gi else ()] {
+    () => (Checker.uses k).[gi else :any],
+    t => t,
 };
 
 /// The arms are in the order nodes are common in, most first: a `match` tries
@@ -1343,33 +1351,43 @@ let bind_items k h items rest found kind = {
 /// Each arm is checked against what the arms above it have left: an arm is
 /// only reached by a value no earlier unguarded arm took, so after `() => 0`
 /// the next arm's binder is not `()` (see "narrowing" below). A scrutinee that
-/// is a local name is narrowed with it, so `_ => x + 1` reads `x` the same
-/// way. Exhaustiveness is asked of the scrutinee as written, not as narrowed.
+/// is a name is narrowed with it, so `_ => x + 1` reads `x` the same way; and
+/// a scrutinee that is `type_of x` narrows `x`, to the kind an arm names in
+/// that arm and to the kinds no arm above named below it. Exhaustiveness is
+/// asked of the scrutinee as written, not as narrowed.
 let infer_match k h s arms sp expected ds = {
     let [st, ds1] = infer k h s ds;
-    let [t, _, ds2] = list.fold (fn acc arm -> {
-        let [t, left, d] = acc;
+    let [t, _, _, ds2] = list.fold (fn acc arm -> {
+        let [t, left, hs, d] = acc;
         let pattern = ast.arm_pattern arm;
-        let h1 = if left == st { h } else { narrow_scrutinee h s left };
+        let h1 = kind_arm k (if left == st { hs } else { narrow_scrutinee k hs s left }) s pattern true;
         let h2 = bind_pattern k h1 pattern left;
         let [h3, d1] = match ast.arm_guard arm {
             () => [h2, d],
             g => [narrowing k h2 g true, check k h2 g :bool "a guard" d],
         };
-        let rest = match ast.arm_guard arm { () => without k left pattern, _ => left };
+        let [rest, hs2] = match ast.arm_guard arm {
+            () => [without k left pattern, kind_arm k hs s pattern false],
+            _ => [left, hs],
+        };
         match expected {
             () => {
                 let [bt, d2] = infer k h3 (ast.arm_body arm) d1;
-                [join t bt, rest, d2]
+                [join t bt, rest, hs2, d2]
             },
-            [et, why] => [et, rest, check k h3 (ast.arm_body arm) et why d1],
+            [et, why] => [et, rest, hs2, check k h3 (ast.arm_body arm) et why d1],
         }
-    }) [:never, st, ds1] arms;
+    }) [:never, st, h, ds1] arms;
     [t, exhaustive k h st arms sp ds2]
 };
 
-let narrow_scrutinee h s t = match s {
-    [:name, n, _] => with_local n t h,
+let narrow_scrutinee k h s t = narrow_name k h s (fn _ -> t);
+
+/// An arm of a `match` on `type_of x` whose pattern is a kind: `x` is of that
+/// kind in the arm, and is not in the arms below an unguarded one.
+let kind_arm k h s p yes = match [type_of_subject k h s, p] {
+    [(), _] => h,
+    [x, [:literal, [:atom, n, _], _]] => narrow_kind k h x n yes,
     _ => h,
 };
 
@@ -1382,13 +1400,26 @@ let narrow_scrutinee h s t = match s {
 // report on code that works, which rule 2 forbids. So a test narrows, in the
 // two places a program writes one: the arms of a `match` below an arm that
 // took some members, and the branches of an `if` (and the right of `&&`/`||`)
-// behind a comparison of a local with `()`.
+// behind a test.
+//
+// There are two tests. `x == ()` is the maybe's. `type_of x == :integer` is
+// the one a union of kinds is taken apart with -- `:integer | :string` says
+// nothing about which, and `type_of` is how a program asks -- and so is a
+// `match` on `type_of x` whose arms are kinds.
+//
+// What is tested is a name, and a name is either a local or a global. A local
+// is narrowed by name, the way a `let` would shadow it; a global by its index,
+// because that is what the resolver says an occurrence is, and a local of the
+// same spelling in a lambda under the test is still not it. Narrowing a global
+// is sound because a pure global is one value however often it is read; an
+// impure one is an action, and two reads of it are two answers, so it is
+// never narrowed.
 //
 // Narrowing only ever *removes* a member the checker can see a value cannot
 // be, so the worst an incomplete answer does is narrow less, which is where
-// the checker was before. A name the resolver says is a global is not a
-// local, and `name_type` does not read the locals for it, so narrowing one is
-// harmless and does nothing.
+// the checker was before. And it never narrows `:any`: an unannotated name
+// told apart by `type_of` stays as unannotated as it was, which is what rule 1
+// asks.
 
 /// What is left of `t` for the arms below one whose pattern is `p`: every
 /// member `p` certainly matches is gone. Unchanged -- the same value, still
@@ -1426,35 +1457,114 @@ let rec covers p m = match p {
     _ => false,
 };
 
-/// `h` with what condition `c` says about the locals it tests, given that it
-/// came out `yes`. A comparison with `()` is the test; `not`, `&&` and `||`
-/// carry it through where the outcome of the whole says the outcome of the
-/// part -- `a && b` true means both were, `a || b` false means neither was.
+/// `h` with what condition `c` says about the names it tests, given that it
+/// came out `yes`. `not`, `&&` and `||` carry a test through where the outcome
+/// of the whole says the outcome of the part -- `a && b` true means both were,
+/// `a || b` false means neither was.
 let rec narrowing k h c yes = match c {
-    [:binary, :eq, x, y, _] => unit_test k h x y yes,
-    [:binary, :ne, x, y, _] => unit_test k h x y (not yes),
+    [:binary, :eq, x, y, _] => equality k h x y yes,
+    [:binary, :ne, x, y, _] => equality k h x y (not yes),
     [:unary, :not, x, _] => narrowing k h x (not yes),
     [:binary, :and, l, r, _] => if yes { narrowing k (narrowing k h l true) r true } else { h },
     [:binary, :or, l, r, _] => if yes { h } else { narrowing k (narrowing k h l false) r false },
     _ => h,
 };
 
-let unit_test k h x y is_unit = match [x, y] {
-    [[:name, n, _], [:unit, _]] => narrow_unit k h x n is_unit,
-    [[:unit, _], [:name, n, _]] => narrow_unit k h y n is_unit,
+/// `x == y` known to have come out `equal`, when it is one of the two tests.
+let equality k h x y equal = match [x, y] {
+    [_, [:unit, _]] => narrow_unit k h x equal,
+    [[:unit, _], _] => narrow_unit k h y equal,
+    [_, [:atom, n, _]] => match type_of_subject k h x {
+        () => h,
+        subject => narrow_kind k h subject n equal,
+    },
+    [[:atom, n, _], _] => match type_of_subject k h y {
+        () => h,
+        subject => narrow_kind k h subject n equal,
+    },
     _ => h,
+};
+
+/// `x` when `e` is `type_of x` -- the builtin, not a global of that name,
+/// which the resolver is the one to say -- and `()` otherwise.
+let type_of_subject k h e = match e {
+    [:apply, [:name, "type_of", sp], [x], _] =>
+        match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
+            [:builtin, "type_of"] => x,
+            _ => (),
+        },
+    _ => (),
 };
 
 /// A name known to be `()`, or known not to be. Only `()` equals `()` -- not
 /// `[]`, not `false` -- so the first is exact; it is taken only where `()`
 /// could have been there at all, so that a branch the signature says is dead
 /// does not have its uses reported against `:unit` instead.
-let narrow_unit k h x n is_unit = {
+let narrow_unit k h x is_unit = narrow_name k h x (fn t -> match is_unit {
+    true if fits k :unit t => :unit,
+    true => t,
+    _ => without k t (ast.literal_p [:unit, [0, 0]] [0, 0]),
+});
+
+/// A name whose `type_of` is known to be the kind spelled `n`, or known not to
+/// be. A member is kept by the first unless every value it has is of another
+/// kind, and dropped by the second only when every value it has is of this
+/// one; a member whose kind the checker cannot say is kept by both. A test
+/// nothing could pass -- `type_of x == :string` of an `:integer` -- narrows
+/// nothing, for the reason `narrow_unit` gives.
+let narrow_kind k h x n yes = match primitives.[n else ()] {
+    () => h,
+    :any => h,
+    :never => h,
+    kind => narrow_name k h x (fn t -> {
+        let ms = members (peel k t 8);
+        let kept = list.filter (fn m -> match kinds_of k m {
+            () => true,
+            ks => if yes { list.contains kind ks } else { ks != [kind] },
+        }) ms;
+        if list.length kept == list.length ms || list.is_empty kept { t } else { union_of kept }
+    }),
+};
+
+/// The kinds `type_of` can answer for a value of type `m`, or `()` when the
+/// checker cannot say -- `:any`, a type variable, a union behind a name.
+let kinds_of k m = match peel k m 8 {
+    [:lit, kind, _] => [kind],
+    [:fn, _, _] => [:pure_fn, :impure_fn],
+    [:list_of, _] => [:list],
+    [:tuple, _] => [:list],
+    [:array_of, _] => [:array],
+    [:array_t, _] => [:array],
+    [:map_of, _, _] => [:map],
+    [:record, _] => [:map],
+    :number => [:integer, :float],
+    :any => (),
+    p if type_of p == :atom => [p],
+    _ => (),
+};
+
+/// `h` with the name `x` narrowed to what `f` makes of its type. Only a name
+/// is narrowed -- a local by its spelling, a global or a module's member by
+/// its index -- and nothing is when `f` leaves the type as it was, or the
+/// type is `:any`, or the name is impure.
+let narrow_name k h x f = match x {
+    [:name, n, sp] => narrow_at k h n sp x f true,
+    [:field, _, n, sp] => narrow_at k h n sp x f false,
+    _ => h,
+};
+
+let narrow_at k h n sp x f local = if str.ends_with "!" n { h } else {
     let t = list.head (infer k h x []);
-    match is_unit {
-        true if fits k :unit t => with_local n :unit h,
-        true => h,
-        _ => with_local n (without k t (ast.literal_p [:unit, [0, 0]] [0, 0])) h,
+    let nt = if t == :any { t } else { f t };
+    if nt == t { h }
+    else {
+        match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
+            [:global, _, _, gi] => Here.set_narrowed h ((Here.narrowed h).[gi => nt]),
+            [:member, _, _, gi] if gi != () => Here.set_narrowed h ((Here.narrowed h).[gi => nt]),
+            [:member, _, _, _] => h,
+            [:builtin, _] => h,
+            _ => if local { with_local n nt h } else { h },
+        }
     }
 };
 

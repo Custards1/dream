@@ -3345,9 +3345,13 @@ not, each found by running the checker over this repository:
   checked against a solved variable.
 - `()` is "nothing there", and a union with `:unit` in it is how the library
   says "maybe". Two halves. A *test* narrows: an arm below `() =>` sees the
-  rest of the scrutinee's union (and so does a local scrutinee read in it),
+  rest of the scrutinee's union (and so does a scrutinee that is a name),
   and `x == ()`/`x != ()` under `if`, `&&`, `||`, `not` or a guard narrows
-  `x` in the branch the outcome decides -- "narrowing" in
+  `x` in the branch the outcome decides; `type_of x == :kind`, and a `match`
+  on `type_of x` whose arms are kinds, narrow to that kind or away from it.
+  `x` may be a global (keyed by its index, so a local of the same spelling
+  under the test is not it) but not an impure name, and `:any` is never
+  narrowed, so rule 1 still holds of unannotated code -- "narrowing" in
   [dreams/typecheck.dr](dreams/typecheck.dr). It only ever removes members it
   can see a value cannot be, so an incomplete answer narrows less and never
   reports more. Before it, `if r == () { 0 } else { r + 1 }` was a report.

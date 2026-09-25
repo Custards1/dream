@@ -211,6 +211,42 @@ let main! = console.print! [a "a", b "a", c "b", d "a", e "b", f "a", g "a", h "
     failure(maybe + 'let main! = { let r = find "a"; console.print! (if r != () || true { r + 1 } else { 0 }) };',
             'but this is `:integer | :unit` and `1`')
 
+    # `type_of x == :kind` narrows the same way, and so does a `match` on
+    # `type_of x` whose arms are kinds. A global is narrowed as a local is --
+    # through a module's member too -- and a local of the same spelling under
+    # the test is not it. `:any` is never narrowed, so a test of an
+    # unannotated name reports nothing it did not report before.
+    success(prelude + '''
+let pick : :integer -> :integer | :string;
+let pick n = if n > 0 { n } else { "neg" };
+mod m { let g : :integer | :unit; let g = 3; }
+let g : :integer | :unit;
+let g = 3;
+let a n = { let v = pick n; if type_of v == :integer { v + 1 } else { 0 } };
+let b n = { let v = pick n; if type_of v != :string { v * 2 } else { 0 } };
+let c n = { let v = pick n; match type_of v { :string => 0, :integer => v - 1, _ => 5 } };
+let d n = { let v = pick n; match type_of v { :string => 0, _ => v - 1 } };
+let e = if g != () { g + 1 } else { 0 };
+let f = if :integer == type_of g { g + 1 } else { 0 };
+let h = if m.g != () { m.g + 1 } else { 0 };
+let i = if g != () { (fn g -> g + "s") "x" } else { "" };
+let j x = if type_of x == :integer { x + "s" } else { 0 };
+let main! = console.print! [a 1, a 0, b 2, c 3, d 4, e, f, h, i];
+''', '[2, 0, 4, 2, 3, 4, 4, 4, "xs"]\n')
+    pick = prelude + 'let pick : :integer -> :integer | :string;\nlet pick n = if n > 0 { n } else { "neg" };\n'
+    failure(pick + 'let main! = { let v = pick 1; console.print! (if type_of v == :integer { v + "x" } else { 0 }) };',
+            'but this is `:integer` and `"x"`')
+    failure(pick + 'let main! = { let v = pick 1; console.print! (if type_of v == :string { 0 } else { v + "x" }) };',
+            'but this is `:integer` and `"x"`')
+    failure(pick + 'let main! = { let v = pick 1; console.print! (match type_of v { :integer => 1, _ => v + 1 }) };',
+            'but this is `:string` and `1`')
+    failure(pick + 'let main! = { let v = pick 1; console.print! (match type_of v { :integer if false => 1, _ => v + 1 }) };',
+            'but this is `:integer | :string` and `1`')
+    failure(prelude + 'let g : :integer | :unit;\nlet g = 3;\nlet main! = console.print! (if g == () { 0 } else { g + "x" });',
+            'but this is `:integer` and `"x"`')
+    failure(prelude + 'let g : :integer | :unit;\nlet g = 3;\nlet main! = console.print! (g + 1);',
+            'but this is `:integer | :unit` and `1`')
+
     # --- what is not ----------------------------------------------------------------
     #
     # Code no signature touches is never an error, however obviously it would

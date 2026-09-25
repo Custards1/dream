@@ -938,14 +938,21 @@ takes a field apart with a nested pattern, counts as handling its variant,
 since it might. A pattern also narrows: in `[:circle, r] => ..`, `r` is the
 radius's type, not the union of every variant's second field. So does an arm
 *above* it: after an unguarded `() => ..`, a later arm's binder is the rest
-of the union, and after `if x == ()` (or `!=`, under `not`, `&&` and `||`) a
-local `x` is known to be `()` in one branch and not to be in the other.
+of the union, and after `if x == ()` (or `!=`, under `not`, `&&` and `||`)
+`x` is known to be `()` in one branch and not to be in the other.
+`type_of x == :integer` narrows the same way, to the members of that kind or
+to the rest, and so does a `match` on `type_of x` whose arms are kinds. `x`
+may be a local, a global or a module's member (`m.x`); an impure name is never
+narrowed, since two reads of it are two answers.
 
 ```dream
 let find : :string -> :integer | :unit;
 
 let next s = match find s { () => 0, n => n + 1 };      // `n` is `:integer`
 let twice s = { let r = find s; if r != () { r * 2 } else { 0 } };
+
+let pick : :integer -> :integer | :string;
+let size n = { let v = pick n; if type_of v == :string { 0 } else { v + 1 } };
 ```
 
 ### `import`
