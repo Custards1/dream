@@ -198,8 +198,12 @@ let state nodes kids = %{
     // whole cost of the pass.
     :src => nodes, :src_kids => kids,
     // The arena being written.
-    :out => %{}, :count => 0,
-    :out_kids => %{}, :kid_count => 0,
+    // Both are written in order and read only once the walk is over, so they
+    // are lists kept in reverse -- a write is a cons -- rather than tables keyed
+    // by position, whose every write copied a path through a table the size of
+    // the arena.
+    :out => [], :count => 0,
+    :out_kids => [], :kid_count => 0,
     // Node record to the index it was given. This is what does the sharing.
     :seen => %{},
     // Run of children to the offset it was given.
@@ -213,9 +217,9 @@ let state nodes kids = %{
 
 let src s        = s.[:src else #[]];
 let src_kids s   = s.[:src_kids else #[]];
-let out s        = s.[:out else (%{})];
+let out s        = s.[:out else []];
 let count s      = s.[:count else 0];
-let out_kids s   = s.[:out_kids else (%{})];
+let out_kids s   = s.[:out_kids else []];
 let kid_count s  = s.[:kid_count else 0];
 let seen s       = s.[:seen else (%{})];
 let runs s       = s.[:runs else (%{})];
@@ -237,7 +241,7 @@ let memo s       = s.[:memo else (%{})];
 /// chain three long rather than one. Settling at each write instead cost 2.8%
 /// of a self-compile to force what the next call would have forced anyway.
 let settle s =
-    if len (out s) >= 0 && len (out_kids s) >= 0 && len (seen s) >= 0
+    if type_of (out s) != :nothing && type_of (out_kids s) != :nothing && len (seen s) >= 0
        && len (runs s) >= 0 && len (memo s) >= 0 { s } else { s };
 
 let node_at i s = (src s).[i else ir.leaf :nop];
@@ -348,13 +352,13 @@ let specialize n s = match ir.node_op n {
 let keep n s =
     if not (shareable n) {
         let i = count s;
-        [((s.[:out => (((out s)).[i => n])])).[:count => (i + 1)], i]
+        [((s.[:out => list_cons n (out s)])).[:count => (i + 1)], i]
     } else {
         let key = to_string n;
         match ((seen s)).[key else ()] {
             () => {
                 let i = count s;
-                [((((s.[:out => (((out s)).[i => n])])).[:count => (i + 1)])).[:seen => (((seen s)).[key => i])],
+                [((((s.[:out => list_cons n (out s)])).[:count => (i + 1)])).[:seen => (((seen s)).[key => i])],
                  i]
             },
             found => [s, found],
@@ -367,15 +371,11 @@ let keep_run xs s = {
     let key = to_string xs;
     match ((runs s)).[key else ()] {
         () => {
-            // One pass, carrying the index rather than zipping a counted list
-            // alongside: `zip` and the `range` feeding it were between them 4%
-            // of a self-compile's allocation, to number a list this already
-            // walks in order.
-            let filled = list.fold (fn acc x ->
-                [((list.head acc)).[(list.nth 1 acc) => x], list.nth 1 acc + 1])
-                [out_kids s, kid_count s] xs;
+            // The pool is kept in reverse, so the run goes on the front of it
+            // back to front.
+            let filled = list.reverse_from (out_kids s) xs;
             let at = kid_count s;
-            [((((s.[:out_kids => (list.head filled)])).[:kid_count => (list.nth 1 filled)])).[:runs => (((runs s)).[key => at])],
+            [((((s.[:out_kids => filled])).[:kid_count => (at + list.length xs)])).[:runs => (((runs s)).[key => at])],
              at]
         },
         found => [s, found],
@@ -468,9 +468,6 @@ let rec rebuild_kids off k many acc s =
 
 // --- the pass ----------------------------------------------------------------------
 
-/// Turn a table built by index back into the flat list the image writer wants.
-let flatten m n fill = ir.table_list m (n - 1) fill [];
-
 /// Carry one function's capture descriptors across to the new pool.
 ///
 /// Captures share the kids pool with call arguments and block statements --
@@ -513,22 +510,34 @@ let optimize img =
 let optimize_program p = optimize_tables (ir.finish_rest p) (ir.nodes p) (ir.kids p);
 
 let optimize_tables img nodes kids = {
+    let walked = walk_funcs (img.[:funcs else []]) (fresh img nodes kids);
+    finished img (list.head walked) (list.reverse (list.nth 1 walked))
+};
+
+/// A state to walk from: the arena to read, and nothing written yet.
+let fresh img nodes kids = {
     let strings = array_of_list (img.[:strs else []]);
     let ids = list.map (fn at -> type_codes.[strings.[at else ""] else ()])
                       (img.[:atoms else []]);
     let type_ids = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
                             %{} (list.zip (list.range 0 (list.length ids)) ids);
-    let s0 = (state nodes kids).[:type_ids => type_ids];
-    let walked = list.fold (fn acc f -> {
+    (state nodes kids).[:type_ids => type_ids]
+};
+
+/// Rebuild each function's body and captures, in order: `[state, functions]`,
+/// the functions rebuilt and reversed.
+let walk_funcs fs s0 =
+    list.fold (fn acc f -> {
         let got = rebuild (f.[:body else ir.no_node]) (list.head acc);
         let caps = place_captures f (list.head got);
         [settle (list.head caps),
          list_cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
                    (list.nth 1 acc)]
-    }) [s0, []] (img.[:funcs else []]);
-    let s = list.head walked;
-    ((((img.[:nodes => (flatten (out s) (count s) (ir.leaf :nop))])).[:kids => (flatten (out_kids s) (kid_count s) ir.no_node)])).[:funcs => (list.reverse (list.nth 1 walked))]
-};
+    }) [s0, []] fs;
+
+/// The image a finished walk describes.
+let finished img s funcs =
+    ((((img.[:nodes => list.reverse (out s)])).[:kids => list.reverse (out_kids s)])).[:funcs => funcs];
 
 when test {
     import std.test;
