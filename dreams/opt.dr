@@ -259,7 +259,10 @@ let node_at i s = (src s).[i else ir.leaf :nop];
 // by both halves. What is not the arena's own is renamed on the way through:
 // a constant (an `int`, `str` or `atom` leaf, and the string a `field` names)
 // indexes the part's pool, and a part resolved in parts also numbered its
-// functions and invented globals for itself (see `renumber_part`).
+// functions and invented globals for itself -- from where the declarations
+// left off, so `fo` moves every closure, thunk and `comp` placeholder, and `go`
+// every global at or past `invented_from` (see "resolving in parts" in
+// dreams/scope.dr).
 //
 // Leaves are memoized here where `rebuild` does not memoize them. A lowered
 // arena is nearly a tree; a shared part is the opposite, a leaf there being
@@ -298,6 +301,20 @@ let remap_leaf n s = match remap s {
         }
     },
 };
+
+/// A leaf of a part, kept -- or, when it is a `comp` placeholder whose value
+/// has been settled, the part-0 node that value was lowered to, rebuilt in its
+/// place. See "running what was lowered in parts" in dreams/lower.dr.
+let rebuild_leaf n s =
+    match (if ir.node_op n == :unit && ir.is_node (ir.node_a n) { (s.[:filled else (%{})]).[ir.node_a n else ()] }
+           else { () }) {
+        () => keep n s,
+        value => {
+            let back = memo_base s / part_base;
+            let got = rebuild value (enter_part 0 s);
+            [enter_part back (list.head got), list.nth 1 got]
+        },
+    };
 
 /// A `field` with the string naming it renamed the same way.
 let remap_field n s = match remap s {
@@ -430,17 +447,21 @@ let keep n s =
         }
     };
 
-/// Append a run of children, or answer the offset of an identical run already
-/// placed: `[state, offset]`.
-let keep_run xs s = {
-    let key = to_string xs;
+/// Append a run of children, given back to front, or answer the offset of an
+/// identical run already placed: `[state, offset]`.
+///
+/// Back to front because that is how both callers build one and how the pool
+/// is kept: the pool is a list in reverse, so the run goes on the front of it
+/// back to front, which is the order it is already in, and `+` puts it there in
+/// one machine walk. Reversing it to key it and reversing it again to place it
+/// was two Dream loops per run for nothing -- the key only has to be the same
+/// for the same run, and every run is keyed the same way.
+let keep_run rev s = {
+    let key = to_string rev;
     match ((runs s)).[key else ()] {
         () => {
-            // The pool is kept in reverse, so the run goes on the front of it
-            // back to front.
-            let filled = list.reverse_from (out_kids s) xs;
             let at = kid_count s;
-            [((((s.[:out_kids => filled])).[:kid_count => (at + list.length xs)])).[:runs => (((runs s)).[key => at])],
+            [((((s.[:out_kids => rev + out_kids s])).[:kid_count => (at + list.length rev)])).[:runs => (((runs s)).[key => at])],
              at]
         },
         found => [s, found],
@@ -478,7 +499,7 @@ let rec rebuild i s =
             let key = i + memo_base s;
             match ((memo s)).[key else ()] {
                 () => {
-                    let got = if leaf { keep (remap_leaf n s) s } else { rebuild_node n s };
+                    let got = if leaf { rebuild_leaf (remap_leaf n s) s } else { rebuild_node n s };
                     let s1 = list.head got;
                     let at = list.nth 1 got;
                     [settle (s1.[:memo => (((memo s1)).[key => at])]), at]
@@ -490,7 +511,8 @@ let rec rebuild i s =
 
 /// The rebuild proper, for a node with children that has not been met before.
 let rec rebuild_node n s = {
-    let n = specialize (remap_field n s) s;
+    // A part was specialized by its own rebuild; sharing parts only renames.
+    let n = if memo_leaves s { remap_field n s } else { specialize n s };
     let op = ir.node_op n;
     // The edges, left to right. Each answers the state it left behind and the
     // node with that one operand renumbered.
@@ -520,7 +542,7 @@ let rec rebuild_run spec n s = {
     let off = operand (list.nth 0 spec) n;
     let many = operand (list.nth 1 spec) n * list.nth 2 spec;
     let built = rebuild_kids off 0 many [] s;
-    let placed = keep_run (list.reverse (list.nth 1 built)) (list.head built);
+    let placed = keep_run (list.nth 1 built) (list.head built);
     [list.head placed, set_operand (list.nth 0 spec) (list.nth 1 placed) n]
 };
 
@@ -554,7 +576,7 @@ let place_captures f s = {
     let off = f.[:captures_off else 0];
     let many = f.[:n_captures else 0];
     if many == 0 { [s, 0] }
-    else { keep_run (list.map (fn k -> kid_at (off + k) s) (list.range 0 many)) s }
+    else { keep_run (list.map (fn k -> kid_at (off + many - 1 - k) s) (list.range 0 many)) s }
 };
 
 /// Rebuild every reachable node of a finished image.
@@ -591,14 +613,41 @@ let fresh img nodes kids = {
     (state nodes kids).[:type_ids => type_ids]
 };
 
+/// Start sharing one more body into a state that is already sharing others: its
+/// arena is read from here on, and the memo -- which is about that arena's
+/// indices -- starts empty. What has been emitted, and the table saying what
+/// has, carries on, so a node the body shares with one before it is found.
+let enter_body nodes kids type_ids s =
+    ((((s.[:src => nodes]).[:src_kids => kids]).[:memo => %{}])).[:type_ids => type_ids];
+
+/// `type_ids` for a program whose pools are still growing: which atom index is
+/// each of the ten names a runtime type test can be fused against. Ten lookups
+/// in each pool's own index, so it is cheap enough to ask for every body.
+let type_ids_in strs atoms =
+    list.fold (fn m kv -> {
+        let [name, code] = kv;
+        match (ir.pool_index strs).[name else ()] {
+            () => m,
+            si => match (ir.pool_index atoms).[si else ()] {
+                () => m,
+                ai => m.[ai => code],
+            },
+        }
+    }) %{} (map_pairs type_codes);
+
 /// Share several arenas into one: `parts` is an array of `%{ :nodes, :kids,
 /// :remap, :fo, :go }`, arrays both, and each of `img`'s functions names its
 /// body as `part * part_base + node`. Part 0 holds no nodes: it is the linked
 /// program's own kids pool, where the functions' captures are. See "several
 /// arenas at once".
-let optimize_parts img parts invented_from = {
-    let s0 = ((((fresh img #[] #[]).[:parts => parts]).[:memo_leaves => true]))
-                .[:invented_from => invented_from];
+let optimize_parts img parts invented_from = optimize_parts_filled img parts invented_from %{};
+
+/// The same, with each settled `comp` placeholder read as the part-0 node its
+/// value was lowered to: `filled` maps the function a placeholder waits on to
+/// that node.
+let optimize_parts_filled img parts invented_from filled = {
+    let s0 = ((((((fresh img #[] #[]).[:parts => parts]).[:memo_leaves => true]))
+                .[:invented_from => invented_from]).[:filled => filled]);
     let walked = list.fold (fn acc f -> {
         let body = f.[:body else ir.no_node];
         let entered = if ir.is_node body { enter_part (body / part_base) (list.head acc) }
@@ -623,46 +672,6 @@ let walk_funcs fs s0 =
          list_cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
                    (list.nth 1 acc)]
     }) [s0, []] fs;
-
-/// One part's nodes with every edge moved by `at` and every run by `kids_at`,
-/// and its constants renamed through `m`: the part as it reads once its arena
-/// is laid after the ones before it. A reversed list is added to, so that the
-/// caller can lay the parts one after another with a cons per node.
-///
-/// This is the merge without the sharing, and it is what a program lowered in
-/// parts is merged with: sharing is a rebuild, and the build shares the arena
-/// once more in a process of its own while the types are checked, so doing it
-/// here too was 0.8 s on the critical path to save work that happens anyway.
-///
-/// A part resolved in parts also numbered its own functions and invented
-/// globals, from where the declarations left off: `fo` moves the first --
-/// every closure, thunk and compile-time placeholder names one -- and `go`
-/// the second, which are every global at or past `invented_from`.
-let renumber_part nodes at kids_at m fo go invented_from acc =
-    list.fold (fn out n -> {
-        let op = ir.node_op n;
-        let renamed = match op {
-            :field => set_operand 1 ((m.[:strs]).[ir.node_b n]) n,
-            :make_closure => set_operand 0 (ir.node_a n + fo) n,
-            :make_thunk => set_operand 0 (ir.node_a n + fo) n,
-            :unit => if ir.is_node (ir.node_a n) { set_operand 0 (ir.node_a n + fo) n } else { n },
-            :global => if ir.node_a n >= invented_from { set_operand 0 (ir.node_a n + go) n } else { n },
-            _ => remap_leaf_by m n,
-        };
-        let edged = list.fold (fn e k -> {
-            let v = operand k e;
-            if ir.is_node v { set_operand k (v + at) e } else { e }
-        }) renamed (edges_of op);
-        let moved = match run_of op {
-            () => edged,
-            spec => set_operand (list.head spec) (operand (list.head spec) edged + kids_at) edged,
-        };
-        list_cons moved out
-    }) acc nodes;
-
-/// A part's kids, moved the same way: a kid is a node index.
-let renumber_kids kids at acc =
-    list.fold (fn out k -> list_cons (if ir.is_node k { k + at } else { k }) out) acc kids;
 
 /// A constant leaf with its pool index renamed through `m`, and any other node
 /// as it is: a constant's operand is the only one a part numbers for itself.

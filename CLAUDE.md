@@ -2788,7 +2788,7 @@ leaves carry a flag, and a shared one would hand it to every user. Measure
 against a VM built from the commit before, in a worktree; this machine moves by
 10% between minutes.
 
-### Resolving, lowering and checking in parts: 5.75 s -> 3.9 s
+### Resolving, lowering and checking in parts: 5.75 s -> 3.7 s
 
 Done 2026-09-25, the next round after the one above, on the same four-core
 machine (the commit before measured 5.75 s here). Lowering was 2.4 s of the
@@ -2891,14 +2891,47 @@ nothing else, so it runs in four processes (`lower.link_parallel!`, used by
   each value again, unshared, which is why the image is 1% more nodes than a
   whole-arena share would give -- 34,428 against 33,860. 0.25 s.
 
+- **The parent no longer lays the parts out at all.** Its merge (0.4 s)
+  existed only to give it a runnable arena for the `comp`s and contracts, and
+  those need only what they reach. So their images are made from the parts
+  (`lower.parts_image`: reachability walked across parts, every other function
+  the shared stub, a settled `comp` substituted for its placeholder by the
+  rebuild through `:filled`), and the full image is the sharing child's. The
+  parent's critical path after the join is now the link head (pools,
+  function records), the `comp`s and the types.
+- **Each body is shared into its part as soon as it is lowered** -- the first
+  of the two changes the previous round designed and did not build. A body
+  lowers into an arena of its own, where flags can still be set late; once it
+  is finished the optimizer rebuilds it into the part's growing table and the
+  arena is dropped. The per-part optimizer run is gone and no table of a whole
+  part's unshared nodes is built. With it, "is any child impure?" -- asked of
+  every node lowering emits -- is answered by a per-arena flag while no node
+  in the arena is impure (`ir.has_impure`), which is most bodies. A part went
+  0.92 s -> 0.75 s measured alone.
+- **Two ways to check a change like these, and both were used.** The images
+  must be byte-identical to what the previous compiler emits from the same
+  source (`dreams` and `lucid`), since sharing is canonical in function order
+  whatever the parts looked like inside. And one part's lowering can be timed
+  alone in a driver, which the wall clock -- ±0.3 s between identical runs on
+  this machine now -- cannot resolve. A driver that times a lazy value must
+  force it before reading the clock; three measurements this round read 0 ms
+  for that reason before it was noticed.
+- **Measured, and not kept: making the sharing pass leaner.** It is ~280
+  reductions and ~6 KB a node, a third of it collection, and removing a fifth
+  of the reductions (a double reversal per run, re-specializing parts) moved
+  its time by nothing measurable -- the cost is the map inserts and what they
+  promote. A larger nursery did not help either. Only the reversal change was
+  kept, because it is simpler and the output is byte-identical.
+
 `Options.parallel` is what turns all of this on, and only the command line
 sets it; see the `Options` doc in [dreams/compile.dr](dreams/compile.dr).
 
 Where the time is now, wall clock from the start of a self-compile: loaded
-1.0 s, resolved 1.45 s, parts lowered and joined 2.6 s, merged 3.0 s, `comp`s
-settled 3.15 s, types checked 3.55 s, the sharing child joined and patched
-3.7 s, written 3.9 s. Loading is the largest serial stage (parsing is spread
-across processes already, 1.8 s of CPU), then the lowering parts.
+1.0 s (parsing 0.7, spread over processes and bound by 1.8 s of parse CPU;
+expansion 0.24), resolved 1.45 s, parts joined ~2.4 s, `comp`s settled and
+types checked ~3.0 s, the sharing child joined and patched ~3.45 s, written
+~3.65 s. The sharing child (0.8-0.9 s from the join) is the critical path at
+the end; loading is the largest stage before it.
 
 ### A JIT that can allocate -- the plan
 

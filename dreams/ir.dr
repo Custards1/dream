@@ -350,6 +350,13 @@ let settled n = type_of (to_string n) == :string;
 /// different cause and was worth four hundred megabytes.
 let settle p = if len (nodes p) >= 0 && len (kids p) >= 0 { p } else { p };
 
+/// The same program with an empty arena: no nodes, no kids. The constant pools
+/// and everything else are kept. A program lowered in parts starts each body
+/// this way, because what a body lowers is shared into its part as soon as the
+/// body is done (`lower.lower_part`) and the pools are all that carries on.
+let cleared p = ((((p.[:nodes => %{}]).[:node_count => 0]).[:kids => %{}]).[:kid_count => 0])
+                    .[:impure => false];
+
 /// The node at an index. Every edge in the arena is one of these.
 let node_at : :integer -> Program -> [:any];
 let node_at i p = ((nodes p)).[i else (leaf :nop)];
@@ -423,10 +430,19 @@ let intern_atom v p = {
 let set_node_flag i f p = {
     let n = node_at i p;
     let flagged = with_flags (add_flag (node_flags n) f) n;
+    let marked = if f == f_impure { p.[:impure => true] } else { p };
     if settled flagged {
-        settle (p.[:nodes => (((nodes p)).[i => flagged])])
+        settle (marked.[:nodes => (((nodes marked)).[i => flagged])])
     } else { p }
 };
+
+/// Whether any node in the arena has been marked impure. Every mark goes
+/// through `set_node_flag`, so while this is false no node is, and "is any of
+/// these children impure?" -- asked of every node lowering emits with
+/// children -- is answered without looking at them. It is false for most of
+/// a program's bodies, which is what makes it worth keeping: a program lowered
+/// in parts gives every body an arena of its own (`cleared`).
+let has_impure p = p.[:impure else false];
 
 let node_flags_at i p = node_flags (node_at i p);
 
