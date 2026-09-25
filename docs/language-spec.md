@@ -340,6 +340,49 @@ checker or without it, and `dreams --no-types` skips it. There is no runtime
 check on a signed function's arguments — `types.enforce` is that, where it is
 wanted.
 
+#### Compile-time contracts
+
+A refinement is checked as its base type almost everywhere, because its
+predicate is a function and only running it says what it answers. Where the
+compiler already *has* the value, it runs it:
+
+```dream
+type Port = :integer where fn n -> n >= 1 && n <= 65535;
+let connect : Port -> :string;
+
+connect 8080                 // fine
+connect 70000                // error: `70000` is not a `Port` -- its `where` answered false
+let p = 99999; connect p     // error: a local bound to a literal is that literal
+let limit : Port = comp (70 * 1000);   // error: a `comp` is the value it produced
+```
+
+A value is known at compile time when it is a literal (including lists, arrays
+and maps of literals, and a negated number), a local bound to one, or the
+result of `comp` / `comp!`. Where such a value meets a *named* type whose
+description has a `where` anywhere in it, the predicates that decide it are run
+on the VM against the program being built — the same closure `types.check`
+would apply at run time — and a value one of them rejects is reported where it
+was written. The structure decides which predicates are asked: a union is
+accepted by any member, so `()` meets `Port | :unit` without running anything;
+a list asks each element; a tagged variant asks only the variant its tag picks;
+a record asks the fields the value has.
+
+This is what makes a signature a compile-time API. A library that writes
+`type Pattern = :string where fn s -> valid s` and `let compile : Pattern ->
+Regex` rejects `compile "a(b"` in every program that calls it, with nothing
+for the caller to opt into.
+
+- A predicate that answers anything but `true` rejects the value; one that
+  raises is reported as having raised. All of a program's contracts are one
+  run, and each is attributed to its own call.
+- A refinement written inline in a signature, `(:integer where p) -> ..`, is
+  not run: a signature is never compiled. Name the type.
+- A parameterised type is checked for its structure only.
+- A value that is only known at run time is left to run time, as before.
+- Contracts are checked only in a build — `dreams --check` stops before
+  anything runs — and only when the program has no other type errors.
+- They add nothing to the image.
+
 ### Scalars
 
 | Type | |
@@ -1255,6 +1298,12 @@ back.
 `comp f x` folds the whole call and `comp (1 + 2) * 10` is `30`.
 
 Pure runtime primitives are available to `comp`; effects require `comp!`.
+
+A `comp` is typed by the value it produced: `let n : :string = comp (1 + 2)` is
+a compile error, and a global with no signature whose body is a `comp` has that
+value's type at every use. A value that has to satisfy a refinement is checked
+against it at compile time — see "Compile-time contracts" in §3. A `comp` that
+fails to evaluate is reported at the `comp`.
 
 ### Syntax macros
 

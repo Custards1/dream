@@ -2903,6 +2903,59 @@ accepts something the seed's checker rejects needs one build with `--no-types`
 first: build the new compiler with the seed and `--no-types`, let *that*
 compile the source twice, compare, and copy it over the seed.
 
+### Compile-time contracts: a refinement run against a value the compiler has
+
+Added 2026-09-25. A `where` in a named type used to be checked as its base,
+always, because a predicate is a function. Where the value is known while
+compiling -- a literal argument, a local bound to one, a `comp` result -- it is
+now *run*, and a value it rejects is a compile error at the place it was
+written. That is what lets a library turn a signature into a compile-time API.
+Language-level description: "Compile-time contracts" in
+[docs/language-spec.md](docs/language-spec.md). The design, in the order the
+compiler meets it:
+
+- **`lower` keeps what each `comp` came to** (`lower.comp_values`, keyed by
+  source and span start), because the checker runs after `settle_comps!`
+  rather than before it. A `comp` is typed by its value, and a signature-less
+  global whose body is a `comp` is that value's type at every use
+  (`typecheck.with_comp_globals`).
+- **The checker writes a contract, not a verdict.** Where a known value fits a
+  type that could refine it, `contract_of` builds a *formula* over the
+  predicates: `true`/`false` settled from structure, `[:pred, gi, path,
+  datum]`, `[:all, ..]`, `[:any, ..]`. Structure decides which predicates
+  matter -- a union is `any`, a list `all` -- so `()` meets `Port | :unit`
+  without running anything. Compile-time values are spelled as *datums*
+  (atoms, lists, arrays, maps tagged) because an atom the compiler never
+  interned cannot be made into one. Contracts ride in the diagnostics list as
+  lists (a diagnostic is a map) and `analyze` takes them back out; threading a
+  second accumulator through the whole walk was the alternative.
+- **The predicate is reached through the type's value.** `type Port = t where
+  p` is `let Port = [:named, "Port", [:refine, t, p]]`, so `p` is at path
+  `[2, 2]` of global `Port`, and the path is read off the declaration's syntax,
+  which has the value's shape. So nothing is re-resolved or recompiled: the
+  answer is the closure `types.check` would apply at run time.
+- **[dreams/contract.dr](dreams/contract.dr) runs them all at once**: one
+  function appended to a *copy* of the linked arena answers a list, one
+  element per contract, each inside its own `try`, so a raising predicate is
+  its own call's failure. One image and one VM start per program, and none for
+  a program without contracts. The written image never changes -- the test
+  holds that byte for byte.
+- **The cost is gated.** `mentions_refine` marks each named type once when the
+  checker is built, and `refines` asks that before any datum is made, so a
+  program with no refinement pays a lookup per checked literal. With the
+  `comp` typing, the type pass on a self-compile went from 14.87M to 15.18M
+  reductions (0.16% of the compile), and every image in the repository is
+  byte-identical. The checker is now also built once for the diagnostics, the
+  contracts and both JIT parameter masks (`typecheck.analyze`) where it was
+  built three times; that saving is smaller than the new work and not visible
+  on its own.
+
+What it does not reach: a `where` written inline in a signature (never
+compiled), a parameterised type (its value is a function), `--check` (nothing
+runs), and a value only known at run time. `dreams/tests/contracts.py` holds
+the cases. A `comp` that fails to evaluate is now reported at its own span; it
+used to be reported with none.
+
 ### What a signature buys the compiled code
 
 The first use of the types for speed, 2026-09-25, and the rule it rests on is
