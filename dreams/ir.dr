@@ -378,11 +378,18 @@ let push_node n p = {
 /// call's argument list.
 let push_kids xs p = {
     let at = kid_count p;
-    let filled = list.fold_strict (fn acc pair -> {
-        let kid = nth 0 pair;
-        if type_of kid != :nothing { acc.[(at + nth 1 pair) => kid] } else { acc }
-    }) (kids p) (list.zip xs (list.range 0 (list.length xs)));
+    let filled = fill_kids (kids p) at xs;
     [settle (((p.[:kids => filled])).[:kid_count => (at + list.length xs)]), at]
+};
+
+/// Put each child at the next index. The table is a strict parameter for the
+/// reason `list.fold_strict` gives, and the walk is its own loop rather than a
+/// fold over the children zipped with their positions: numbering a list this
+/// already walks in order cost a `range` and a `zip` per call, and a call is
+/// made for every argument list the program has.
+let rec fill_kids !m at xs = match xs {
+    [] => m,
+    [kid, ..rest] => fill_kids (if type_of kid != :nothing { m.[at => kid] } else { m }) (at + 1) rest,
 };
 
 let intern_int v p   = { let got = intern v (ints p);   [p.[:ints => (list.head got)], nth 1 got] };
@@ -440,8 +447,14 @@ let set_node i n p =
 /// Put every pool the right way round. Everything downstream -- the dump, and
 /// eventually the image writer -- reads this rather than the building form.
 let finish : Program -> Image;
-let finish p = (finish_rest p).[:nodes => list.map (fn i -> node_at i p) (list.range 0 (node_count p))]
-                              .[:kids => list.map (fn i -> kid_at i p) (list.range 0 (kid_count p))];
+let finish p = (finish_rest p).[:nodes => table_list (nodes p) (node_count p - 1) (leaf :nop) []]
+                              .[:kids => table_list (kids p) (kid_count p - 1) no_node []];
+
+/// A table keyed `0 .. i` as a list, built from the end so each entry is one
+/// cons and the positions need no list of their own. A hole reads as `fill`,
+/// which is what `node_at` and `kid_at` answer for one.
+let rec table_list m i fill acc =
+    if i < 0 { acc } else { table_list m (i - 1) fill (list_cons (m.[i else fill]) acc) };
 
 /// Everything `finish` makes but the arena itself, for a pass that reads the
 /// arena from its tables and writes a new one.

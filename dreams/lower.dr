@@ -128,8 +128,13 @@ let is_impure_node i l = ir.node_is_impure (ir.node_at i (prog l));
 
 /// Effects are visible through any enclosing node, so the flag travels up.
 let inherit i children l =
-    if list.any (fn k -> ir.is_node k && is_impure_node k l) children { set_flag i ir.f_impure l }
+    if any_impure children (prog l) { set_flag i ir.f_impure l }
     else { l };
+
+let rec any_impure ks p = match ks {
+    [] => false,
+    [k, ..rest] => (ir.is_node k && ir.node_is_impure (ir.node_at k p)) || any_impure rest p,
+};
 
 /// What `scope` recorded for the name at this span.
 let lookup span l = scope.resolution (res l) (ctx l) (source l) span;

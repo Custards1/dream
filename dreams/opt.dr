@@ -427,10 +427,7 @@ let rec rebuild_node n s = {
     let op = ir.node_op n;
     // The edges, left to right. Each answers the state it left behind and the
     // node with that one operand renumbered.
-    let edged = list.fold (fn acc k -> {
-        let got = rebuild (operand k (list.nth 1 acc)) (list.head acc);
-        [list.head got, set_operand k (list.nth 1 got) (list.nth 1 acc)]
-    }) [s, n] (edges_of op);
+    let edged = rebuild_edges (edges_of op) n s;
     // Then the run of children, if this opcode has one.
     let run = match run_of op {
                   () => edged,
@@ -439,23 +436,40 @@ let rec rebuild_node n s = {
     keep (list.nth 1 run) (list.head run)
 };
 
+/// Rebuild each edge operand in turn: `[state, node]`, with the node's
+/// operands renumbered. A loop of its own rather than a fold, which paid for a
+/// closure call and a pair per edge.
+let rec rebuild_edges ks n s = match ks {
+    [] => [s, n],
+    [k, ..rest] => {
+        let got = rebuild (operand k n) s;
+        rebuild_edges rest (set_operand k (list.nth 1 got) n) (list.head got)
+    },
+};
+
 /// Rebuild one node's run of children and point the node at the new run:
 /// `[state, node]`.
 let rec rebuild_run spec n s = {
     let off = operand (list.nth 0 spec) n;
     let many = operand (list.nth 1 spec) n * list.nth 2 spec;
-    let built = list.fold (fn acc k -> {
-        let got = rebuild (kid_at (off + k) (list.head acc)) (list.head acc);
-        [list.head got, list_cons (list.nth 1 got) (list.nth 1 acc)]
-    }) [s, []] (list.range 0 many);
+    let built = rebuild_kids off 0 many [] s;
     let placed = keep_run (list.reverse (list.nth 1 built)) (list.head built);
     [list.head placed, set_operand (list.nth 0 spec) (list.nth 1 placed) n]
 };
 
+/// Rebuild `many` children from `off`, collecting the new indices in reverse:
+/// `[state, reversed]`.
+let rec rebuild_kids off k many acc s =
+    if k >= many { [s, acc] }
+    else {
+        let got = rebuild (kid_at (off + k) s) s;
+        rebuild_kids off (k + 1) many (list_cons (list.nth 1 got) acc) (list.head got)
+    };
+
 // --- the pass ----------------------------------------------------------------------
 
 /// Turn a table built by index back into the flat list the image writer wants.
-let flatten m n fill = list.map (fn i -> m.[i else fill]) (list.range 0 n);
+let flatten m n fill = ir.table_list m (n - 1) fill [];
 
 /// Carry one function's capture descriptors across to the new pool.
 ///
