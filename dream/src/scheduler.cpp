@@ -159,7 +159,7 @@ void Scheduler::worker_loop(unsigned index) {
         }
 
         // Already counted by whichever of `take_local` or `steal` produced it.
-        run_slice(p);
+        run_slice(p, index);
         runnable_.fetch_sub(1, std::memory_order_relaxed);
         // Leaves the active count only if the slice did not hand the process
         // back: `run_slice` ends in `enqueue`, which has already incremented.
@@ -167,7 +167,7 @@ void Scheduler::worker_loop(unsigned index) {
     }
 }
 
-void Scheduler::run_slice(const std::shared_ptr<Process>& p) {
+void Scheduler::run_slice(const std::shared_ptr<Process>& p, unsigned index) {
     p->status.store(ProcStatus::Running, std::memory_order_relaxed);
     p->wait_reason.store(WaitReason::None, std::memory_order_relaxed);
     p->wait_fd.store(-1, std::memory_order_relaxed);
@@ -203,7 +203,29 @@ void Scheduler::run_slice(const std::shared_ptr<Process>& p) {
     // Budget spent mid-computation, or a wake beat the park. Put it back and
     // let something else run; the whole state is in the Process, so there is
     // nothing to save.
-    enqueue(p);
+    requeue(index, p);
+}
+
+// A process whose slice ran out goes back on the queue of the worker that ran
+// it, not round-robin like a new one. `enqueue` spreads processes, which is
+// right for one that has just been made or woken; for one that is merely
+// yielding it meant a program of one process moved to a different worker --
+// and so, usually, a different core -- every 4000 reductions, paying a futex
+// wake of a sleeping thread and a cold cache each time. On a self-compile that
+// was forty thousand migrations. Kept local, the worker picks it straight back
+// up, and nobody is woken unless something else is already waiting behind it,
+// in which case an idle worker is told there is work to steal.
+void Scheduler::requeue(unsigned index, const std::shared_ptr<Process>& p) {
+    p->status.store(ProcStatus::Runnable, std::memory_order_relaxed);
+    bool others;
+    {
+        std::lock_guard<std::mutex> g(workers_[index]->mutex);
+        workers_[index]->queue.push_back(p);
+        queued_.fetch_add(1, std::memory_order_relaxed);
+        others = workers_[index]->queue.size() > 1;
+    }
+    active_.fetch_add(1);  // see `enqueue`
+    if (others) work_cv_.notify_one();
 }
 
 size_t Scheduler::queued() const {

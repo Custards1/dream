@@ -360,7 +360,12 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             }
             if (status == JitOk) {
                 jit->note_ran(func_index);
-                ret(p, r);
+                // A loop may answer a parameter as it stands, unforced -- see
+                // `Emitter::node` -- and it is forced here, by the machine,
+                // where a park suspends the force rather than retrying the
+                // call that produced it.
+                r = resolve(r);
+                if (is_whnf(r)) ret(p, r); else enter(p, r);
                 return;
             }
             if (status == JitRaised) { do_raise(p, r); return; }

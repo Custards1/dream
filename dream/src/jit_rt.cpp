@@ -515,8 +515,15 @@ bool impure_callee(Process& p, Value v) {
             continue;
         }
         if (is_obj(v, ObjType::Closure)) {
+            // A lambda is never impure by spelling -- it has no name to spell
+            // it with -- but one written inside an impure function may perform
+            // effects all the same, and the compiler marks its body for it.
+            // Run from here, such a lambda's effects happen and are then
+            // performed again when a park or a bail retries the call from the
+            // top: a fold whose function spawned a process spawned it forever.
             const FuncRec& f = p.code->func(static_cast<ClosureObj*>(as_obj(v))->func);
-            return (f.flags & FN_IMPURE) != 0;
+            if (f.flags & FN_IMPURE) return true;
+            return f.body != NO_NODE && (p.code->node(f.body).flags & F_IMPURE) != 0;
         }
         if (is_builtin(v)) {
             const char* name = builtin_def(uint32_t(imm_payload(v))).name;

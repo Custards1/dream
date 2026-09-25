@@ -2140,6 +2140,9 @@ private:
     llvm::Argument* depth_ = nullptr;
 
     llvm::BasicBlock* loop_header_ = nullptr;
+    /// Emitting the loop shape, which only a root compile is: its answer goes
+    /// straight back to `enter_function` and nothing compiled reads it.
+    bool root_loop_ = false;
     std::vector<llvm::Value*> slots_;   // allocas, one per frame slot
     llvm::Value* reduction_slot_ = nullptr;
     bool failed_ = false;
@@ -2263,6 +2266,7 @@ void Emitter::declare_helpers() {
 // and `hi`, and `acc` is forced by the base case on one side and by the self
 // call on the other, so no prefix reaches it.
 llvm::Function* Emitter::emit_loop(const std::string& name) {
+    root_loop_ = true;
     auto* fty = llvm::FunctionType::get(i64_, {ptr_, i64_, ptr_}, false);
     fn_ = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, name, mod_);
     proc_ = fn_->getArg(0);
@@ -3396,6 +3400,16 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
             if (n.a < binds_.size() && binds_[n.a] != NO_NODE) {
                 return is_memo(n.a) ? bound_value(n.a) : node(binds_[n.a]);
             }
+            // A parameter that *is* the answer is handed back as it stands,
+            // and the interpreter forces it once the compiled call has
+            // returned (`enter_function`). Forcing it here was not only
+            // unnecessary but unsound: an accumulator is usually a chain of
+            // suspensions this very loop built, and if forcing it reaches a
+            // blocking native -- a `join!` in a fold's function -- the park
+            // retries the whole call from its frame, which builds that chain
+            // afresh and performs every effect in it a second time. A lazy
+            // fold whose function spawned and joined printed each step twice.
+            if (tail && root_loop_ && !accumulate_) return load_slot_raw(n.a);
             return load_slot(n.a);
         case Op::Capture:
             // A capture lives in the frame, and a compiled body is a function
@@ -4881,7 +4895,6 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
 
     const Image& img = impl_->rt.image();
     if (!impl_->ensure_jit(error)) return nullptr;
-
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
     mod->setDataLayout(impl_->lljit->getDataLayout());

@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include "heap.hpp"
 
 #include <algorithm>
@@ -2105,17 +2106,21 @@ std::string Heap::verify_internal(RootSource& roots, bool no_young) {
 
 namespace {
 
+/// What has been copied already, so that sharing survives the copy and a cycle
+/// ends. A hash map: it was a vector searched from the front for every object,
+/// which made a copy quadratic in the size of what crossed -- nothing for a
+/// message, and minutes for a syntax tree.
+using CopySeen = std::unordered_map<Value, Value>;
+
 /// Deep-copy with cycle handling. Values crossing a heap boundary are copied
 /// eagerly, which is why forcing must happen before a send: a thunk carries a
 /// frame that points back into the sender's world.
-Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen) {
+Value copy_value(Heap& dest, Value v, CopySeen& seen) {
     if (!is_ptr(v)) return v;
     v = resolve(v);
     if (!is_ptr(v)) return v;
 
-    for (auto& [from, to] : seen) {
-        if (from == v) return to;
-    }
+    if (auto it = seen.find(v); it != seen.end()) return it->second;
 
     Obj* o = as_obj(v);
     switch (o->type) {
@@ -2134,20 +2139,36 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
         case ObjType::Pid:
             return dest.make_pid(static_cast<PidObj*>(o)->id);
         case ObjType::Cons: {
-            Value cell = dest.make_cons(UNIT, NIL);
-            seen.emplace_back(v, cell);
-            auto* src = static_cast<ConsObj*>(o);
-            Value head = copy_value(dest, src->head, seen);
-            Value tail = copy_value(dest, src->tail, seen);
-            auto* c = static_cast<ConsObj*>(as_obj(cell));
-            c->head = head;
-            c->tail = tail;
-            return cell;
+            // The spine is walked in a loop rather than by recursing on the
+            // tail, so a long list costs no C++ stack: a hundred thousand
+            // cells was a hundred thousand frames on a worker's 8 MB.
+            Value first = dest.make_cons(UNIT, NIL);
+            seen.emplace(v, first);
+            Value cell = first;
+            Value cur = v;
+            for (;;) {
+                auto* src = static_cast<ConsObj*>(as_obj(cur));
+                Value head = copy_value(dest, src->head, seen);
+                static_cast<ConsObj*>(as_obj(cell))->head = head;
+                Value next = resolve(src->tail);
+                if (is_ptr(next) && as_obj(next)->type == ObjType::Cons
+                    && seen.find(next) == seen.end()) {
+                    Value fresh = dest.make_cons(UNIT, NIL);
+                    seen.emplace(next, fresh);
+                    static_cast<ConsObj*>(as_obj(cell))->tail = fresh;
+                    cell = fresh;
+                    cur = next;
+                    continue;
+                }
+                Value tail = copy_value(dest, next, seen);
+                static_cast<ConsObj*>(as_obj(cell))->tail = tail;
+                return first;
+            }
         }
         case ObjType::Array: {
             auto* src = static_cast<ArrayObj*>(o);
             Value arr = dest.make_array(src->len);
-            seen.emplace_back(v, arr);
+            seen.emplace(v, arr);
             for (uint32_t i = 0; i < src->len; ++i) {
                 Value item = copy_value(dest, src->items()[i], seen);
                 static_cast<ArrayObj*>(as_obj(arr))->items()[i] = item;
@@ -2160,7 +2181,7 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
             auto* src = static_cast<MapObj*>(o);
             uint32_t slots = map_bit_count(src->bitmap);
             Value map = dest.make_map_branch(slots);
-            seen.emplace_back(v, map);
+            seen.emplace(v, map);
             auto* out = static_cast<MapObj*>(as_obj(map));
             out->count = src->count;
             out->bitmap = src->bitmap;
@@ -2173,7 +2194,7 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
         case ObjType::MapLeaf: {
             auto* src = static_cast<MapLeafObj*>(o);
             Value leaf = dest.make_map_leaf(src->hash, NIL_SLOT, NIL_SLOT, NIL_SLOT);
-            seen.emplace_back(v, leaf);
+            seen.emplace(v, leaf);
             Value key = copy_value(dest, src->key, seen);
             Value val = copy_value(dest, src->value, seen);
             Value next = copy_value(dest, src->next, seen);
@@ -2197,7 +2218,7 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
         case ObjType::Closure: {
             auto* src = static_cast<ClosureObj*>(o);
             Value cl = dest.make_closure(src->func, src->ncaps);
-            seen.emplace_back(v, cl);
+            seen.emplace(v, cl);
             for (uint32_t i = 0; i < src->ncaps; ++i) {
                 Value cap = copy_value(dest, src->caps()[i], seen);
                 static_cast<ClosureObj*>(as_obj(cl))->caps()[i] = cap;
@@ -2208,7 +2229,7 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
             auto* src = static_cast<PapObj*>(o);
             Value fn = copy_value(dest, src->fn, seen);
             Value pap = dest.make_pap(fn, src->nargs);
-            seen.emplace_back(v, pap);
+            seen.emplace(v, pap);
             for (uint32_t i = 0; i < src->nargs; ++i) {
                 Value arg = copy_value(dest, src->args()[i], seen);
                 static_cast<PapObj*>(as_obj(pap))->args()[i] = arg;
@@ -2218,7 +2239,7 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
         case ObjType::Frame: {
             auto* src = static_cast<FrameObj*>(o);
             Value fr = dest.make_frame(UNIT, src->nslots);
-            seen.emplace_back(v, fr);
+            seen.emplace(v, fr);
             Value closure = copy_value(dest, src->closure, seen);
             static_cast<FrameObj*>(as_obj(fr))->closure = closure;
             for (uint32_t i = 0; i < src->nslots; ++i) {
@@ -2233,7 +2254,7 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
             // everything it needs and evaluates independently in its new home.
             auto* src = static_cast<ThunkObj*>(o);
             Value th = dest.make_thunk(src->node, UNIT);
-            seen.emplace_back(v, th);
+            seen.emplace(v, th);
             Value frame = copy_value(dest, src->frame, seen);
             static_cast<ThunkObj*>(as_obj(th))->frame = frame;
             return th;
@@ -2250,7 +2271,7 @@ Value copy_value(Heap& dest, Value v, std::vector<std::pair<Value, Value>>& seen
 }  // namespace
 
 Value Heap::copy_between(Heap& dest, Value v) {
-    std::vector<std::pair<Value, Value>> seen;
+    CopySeen seen;
     return copy_value(dest, v, seen);
 }
 

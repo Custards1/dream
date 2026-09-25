@@ -1652,6 +1652,73 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
         },
 };
 
+/// Every function a compile-time expression can reach: its own, and whatever
+/// its nodes name -- a function global, a closure, a thunk -- followed the whole
+/// way down. The answer is a set of function indices.
+let rec comp_reach todo seen fns p funcs globals = match todo {
+    [] => fns,
+    [index, ..rest] =>
+        if not (ir.is_node index) || map_has seen index {
+            comp_reach rest seen fns p funcs globals
+        } else {
+            let n = ir.node_at index p;
+            let op = ir.node_op n;
+            let direct = list.map (fn k -> opt.operand k n) (opt.edges_of op);
+            let run = match opt.run_of op {
+                () => [],
+                [offset, count, width] => list.map (fn i -> ir.kid_at i p)
+                    (list.range (opt.operand offset n)
+                        (opt.operand offset n + opt.operand count n * width)),
+            };
+            let fi = match op {
+                :global => {
+                    let g = globals.[ir.node_a n];
+                    if g.[:kind] == ir.global_function { g.[:target] } else { ir.no_node }
+                },
+                :make_closure => ir.node_a n,
+                :make_thunk => ir.node_a n,
+                _ => ir.no_node,
+            };
+            let fresh = ir.is_node fi && not (map_has fns fi);
+            let called = if fresh { [funcs.[fi].[:body]] } else { [] };
+            comp_reach (direct + run + called + rest) (seen.[index => true])
+                       (if fresh { fns.[fi => true] } else { fns }) p funcs globals
+        },
+};
+
+/// The image compile-time expressions are run against: the program cut down to
+/// what they can reach.
+///
+/// It used to be the whole program, serialized as lowered, and that was most
+/// of what a compile-time expression cost -- on a self-compile, six one-line
+/// `comp`s paid for writing out 142,000 nodes, a second of the compile, to run
+/// code that touches a few hundred of them. An expression can only ever run
+/// what its nodes name, so every other function is given one shared body that
+/// raises, and the optimizer, which copies only what a body reaches, drops the
+/// rest of the arena on the way to the image. An incomplete answer here would
+/// be loud rather than wrong: a function it missed raises when called, and the
+/// `comp` is reported as failing to evaluate.
+///
+/// Running the optimized arena rather than the lowered one is the same
+/// program: `opt` is the pass every build runs before its image is written.
+let comp_image fis l = {
+    let p = prog l;
+    let funcs = array_of_list (ir.funcs p);
+    let globals = array_of_list (ir.globals p);
+    let reached = comp_reach (list.map (fn fi -> funcs.[fi].[:body]) fis) %{}
+                             (list.fold (fn m fi -> m.[fi => true]) %{} fis)
+                             p funcs globals;
+    let [l1, one] = const_int 1 l;
+    let [l2, zero] = const_int 0 l1;
+    let [l3, stub] = emit (ir.node :div one zero ir.no_node) l2;
+    let img = ir.finish (prog l3);
+    let cut = list.map (fn pair -> {
+        let [fi, f] = pair;
+        if map_has reached fi { f } else { f.[:body => stub] }
+    }) (list.zip (list.range 0 (list.length (img.[:funcs else []]))) (img.[:funcs else []]));
+    emit.to_binary (opt.optimize (img.[:funcs => cut]))
+};
+
 /// Settle them in an order where nothing is evaluated before what it reads.
 ///
 /// `built` is the serialized image the next evaluation runs against, and the
@@ -1680,7 +1747,7 @@ let rec settle_comp_order! rows done built l =
             // Each evaluation sees the constants its dependencies installed,
             // rather than the original image full of unit placeholders.
             let image = match built {
-                () => emit.to_binary (ir.finish (prog l)),
+                () => comp_image (list.map (fn r -> r.[0].[1]) rows) l,
                 ready_made => ready_made,
             };
             let settled = settle_comp! (fn fi -> emit.with_entry image fi) one l;

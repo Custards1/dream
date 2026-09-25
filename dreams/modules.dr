@@ -666,7 +666,104 @@ let rec hoist_mod! l parent source m =
         _ => [l, m],
     };
 
-let rec load_text! l text display name file = {
+// --- parsing ahead ------------------------------------------------------------
+//
+// Parsing is a fifth of a compile and every file's parse is independent of
+// every other's, but the loader cannot know which files it needs until it has
+// parsed the ones that import them -- it walks the imports depth first, and the
+// order it records modules in is the order that walk finishes them.
+//
+// So the walk stays exactly as it is, and only the parsing moves. When a
+// module has been parsed, each of its imports that names a file not yet seen
+// is read and handed to a process of its own to parse, all of them at once;
+// the walk then descends into the first while the others are being parsed on
+// other workers, and meets each one's answer waiting when it gets there. A
+// module's imports are usually several files, and each of those imports more,
+// so the machine stays busy from the root down. On a self-compile this is most
+// of the parse stage taken off the critical path.
+//
+// Nothing about what is loaded, or in what order, depends on this: a parse
+// fetched ahead is used only when the walk reaches the same file with the same
+// text, and anything else -- a dependency that resolves some other way, a file
+// the walk ends up reaching under another name -- is simply parsed where it
+// always was. A parse that raises is not the child's to report: it answers
+// `:crashed`, and the file is parsed again in place, where the raise happens
+// exactly as it did before there was a child.
+
+let fetched l = l.[:prefetch else (%{})];
+
+/// The text a file would be loaded with: the editor's buffer, then the disk.
+let text_of! l file = match ((overlay l)).[file else ()] {
+    () => path.read_file! file,
+    t => t,
+};
+
+/// A process parsing `text`. Its own function, and not written inline where it
+/// is used, because a suspension carries the frame it was made in and `spawn!`
+/// copies the suspension into the child whole: made inside the walk, that frame
+/// held the loader, and every child received a copy of every module parsed so
+/// far. Here the frame holds the text and nothing else.
+let parse_elsewhere! text =
+    spawn! $( try! { strict! (parser.parse_module text) } catch e { [:crashed, e] } );
+
+/// Start parsing, elsewhere, every file these imports of the module `name`
+/// will load and nothing has yet.
+/// The modules a file's text imports at the top level, read off the text
+/// without parsing it: every line that begins `import `, up to the end of the
+/// dotted name. A guess, and allowed to be one -- a name it misses is parsed
+/// where the walk meets it, and one it invents is a parse nobody joins -- and
+/// cheap enough to make before a file is parsed, which is what lets the
+/// parses of a whole program start at once rather than a level at a time.
+let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+
+let rec import_lines text at acc = {
+    let i = str_find text "\nimport " at;
+    if i < 0 { acc }
+    else {
+        let start = i + 8;
+        let stop = str_span text start name_bytes;
+        let named = str_slice text start (stop - start);
+        let bare = if str.ends_with "." named { str_slice named 0 (len named - 1) } else { named };
+        import_lines text stop (if len bare == 0 { acc } else { list_cons bare acc })
+    }
+};
+
+let scanned_imports text = list.reverse (import_lines ("\n" + text) 0 []);
+
+/// Start parsing, elsewhere, every file these dotted names will load and
+/// nothing has yet -- and, reading each one's imports off its text, every file
+/// those will load too.
+let rec prefetch! l deps = match deps {
+    [] => l,
+    [dep, ..rest] => {
+        let file = if is_host l dep || is_visited l dep { () } else { resolve_path! l dep };
+        let wanted = file != () && not (map_has (fetched l) file)
+                     && not (map_has (by_path l) (path.absolute! file));
+        let text = if wanted { text_of! l file } else { () };
+        if text == () { prefetch! l rest }
+        else {
+            let child = parse_elsewhere! text;
+            let marked = put :prefetch ((fetched l).[file => [text, child]]) l;
+            prefetch! (prefetch! marked (scanned_imports text)) rest
+        }
+    },
+};
+
+/// This file's parse: the one fetched ahead if there is one for the same text,
+/// and one made here otherwise.
+let parse_of! l file text = match ((fetched l)).[file else ()] {
+    [same, child] if same == text => match join! child {
+        [:crashed, _] => parser.parse_module text,
+        answer => answer,
+    },
+    _ => parser.parse_module text,
+};
+
+let rec load_text! l0 text display name file = {
+    // Every file this one leads to is set parsing before this one is parsed.
+    // For the root that is the whole program; for any other file it is almost
+    // always nothing, because the root's scan already reached it.
+    let l = prefetch! l0 (scanned_imports text);
     let source = file_count l;
     let read = add_file (diag.source display text) l;
     // A same-text parse already in hand is reused rather than done again: an
@@ -676,12 +773,12 @@ let rec load_text! l text display name file = {
         [same, result] => {
             if same == text { load_items! read source result display name file text }
             else {
-                let parsed = parser.parse_module text;
+                let parsed = parse_of! l file text;
                 load_items! (put_parsed file [text, parsed] read) source parsed display name file text
             }
         },
         _ => {
-            let parsed = parser.parse_module text;
+            let parsed = parse_of! l file text;
             load_items! (put_parsed file [text, parsed] read) source parsed display name file text
         },
     }

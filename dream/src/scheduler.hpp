@@ -116,7 +116,8 @@ private:
     void worker_loop(unsigned index);
     std::shared_ptr<Process> take_local(unsigned index);
     std::shared_ptr<Process> steal(unsigned thief);
-    void run_slice(const std::shared_ptr<Process>& p);
+    void run_slice(const std::shared_ptr<Process>& p, unsigned index);
+    void requeue(unsigned index, const std::shared_ptr<Process>& p);
     void finish(const std::shared_ptr<Process>& p);
     void note_idle(bool idle);
 
