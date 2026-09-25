@@ -5,8 +5,12 @@
 //   mind run [args]     compile and run it
 //   mind test           compile with `--test` and run the result
 //   mind check          compile without writing an image
+//   mind add <source>   add a dependency to mind.toml
+//   mind remove <name>  take one out again
 //   mind fetch          get dependencies, without building
-//   mind deps           show what the project resolves to
+//   mind update [name]  fetch branch- and url-pinned dependencies again
+//   mind deps           list every package the project resolves to
+//   mind tree           the same, as the tree of who needs what
 //   mind clean          remove `target/`
 //
 // `mind` is written in Dream and compiled by `dreams`, the same as any other
@@ -44,6 +48,13 @@ let opts = [
     cli.flag "" "debug" "define `debug`",
     cli.list_of "f" "flag" "ARG" "pass this to the compiler as written",
 
+    cli.section "adding a dependency",
+    cli.value "" "name" "NAME" "import it as NAME (default: from its manifest or its source)",
+    cli.value "" "tag" "TAG" "pin a git dependency to a tag",
+    cli.value "" "branch" "BRANCH" "pin a git dependency to a branch",
+    cli.value "" "rev" "REV" "pin a git dependency to a commit",
+    cli.flag "" "dev" "a [dev-dependencies] entry: only `mind test` sees it",
+
     cli.section "how to build it",
     cli.value "" "compiler" "PATH" "the compiler to run; a `.dream` is run by the VM",
     cli.flag "v" "verbose" "print the compiler command before running it",
@@ -61,8 +72,12 @@ let command_spec = [
     cli.command "test"  "compile with --test and run the result" [],
     cli.command "check" "compile without writing an image" [],
     cli.command "repl"  "an interactive session, with this project's packages" [],
+    cli.command "add"   "add a dependency: a directory, a git URL, or a tarball" [],
+    cli.command "remove" "remove a dependency by name" [],
     cli.command "fetch" "download dependencies without building" [],
-    cli.command "deps"  "list the packages this project resolves to" [],
+    cli.command "update" "fetch branch- and url-pinned dependencies again" [],
+    cli.command "deps"  "list every package this project resolves to" [],
+    cli.command "tree"  "show the dependency tree" [],
     cli.command "info"  "show what this build would run, without running it" [],
     cli.command "clean" "remove target/" [],
     cli.command "help"  "this message" [],
@@ -72,17 +87,34 @@ let notes = "
 A project is a directory with a `mind.toml`. Commands other than `new` look
 for one here or above, so they work from anywhere inside a project.
 
-Dependencies are local directories or things to fetch, and there is no index:
+Listing a dependency is all it takes to import it. The key is the name you
+import it by, whatever the package calls itself:
 
   [dependencies]
-  util = { path = \"../util\" }
-  json = { git = \"https://github.com/u/dream-json\", tag = \"v1.0\" }
-  pkg  = { url = \"https://example.com/pkg.tar.gz\" }
+  util = \"../util\"                                   # a directory
+  json = \"https://github.com/u/dream-json#v1.0\"      # git, pinned after the #
+  http = { git = \"https://github.com/u/http\", branch = \"main\" }
+  pkg  = \"https://example.com/pkg-1.0.tar.gz\"        # a tarball
 
-A git dependency must be pinned with `tag`, `rev` or `branch`.
+  [dev-dependencies]                                  # only `mind test` sees these
+  bench = \"../bench\"
 
-What is true of the package wherever it is built belongs in the manifest, and
-every one of these has a command-line spelling that wins over it:
+so `import util.strings` and `import json.parse` work with nothing else said.
+A dependency does not need a `mind.toml` of its own -- a directory of `.dr`
+files is a package named by its key -- and what one needs to compile (its
+`[build] includes` and `host-modules`) comes with it. `mind add` writes these
+lines for you:
+
+  mind add ../util
+  mind add https://github.com/u/dream-json --tag v1.0
+  mind add --dev ../bench
+
+A git dependency must be pinned with a tag, a branch or a commit. Fetched
+packages are cached in $MIND_HOME/cache (default ~/.mind/cache) and never
+fetched twice; `mind update` fetches the ones pinned to a branch or a URL again.
+
+`[build]` is only for how *this* package is compiled, and every key has a
+command-line spelling that wins over it:
 
   [build]
   compiler     = \"dreams.dream\"   # an image is run by the VM; a program is run
@@ -140,7 +172,12 @@ let cmd_new! name = {
     if io.exists! name { fail! (name + " already exists") }
     util.mkdir_p! name
     util.write_file! (util.join name "mind.toml")
-        ("[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\nsrc = \".\"\n\n[dependencies]\n")
+        ("[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\n\n"
+         + "# Each dependency's key is the name it is imported by:\n"
+         + "#   util = \"../util\"\n"
+         + "#   json = \"https://github.com/u/dream-json#v1.0\"\n"
+         + "# or run `mind add <directory or URL>`.\n"
+         + "[dependencies]\n")
     util.write_file! (util.join name "main.dr")
         ("import std.console;\n\nlet main! = {\n    console.print! \"Hello from " + name + "\"\n};\n")
     util.write_file! (util.join name ".gitignore") "target/\n*.dream\n"
@@ -148,14 +185,19 @@ let cmd_new! name = {
     console.print! ("  cd " + to_string name + " && mind run")
 };
 
-let report_build! m o label = {
+/// Build, and say so. `quiet` sends the line to stderr rather than stdout,
+/// for the commands whose stdout is the program's: `mind run > out.txt` should
+/// capture what the program printed and nothing of ours.
+let report_build! m o label quiet = {
     match build.compile! m o {
         [:error, why] => {
             console.error! why
             os.exit! 1
         },
         [:ok, _] => {
-            console.print! (to_string label + " " + to_string (manifest.name m) + " v" + to_string (manifest.version m))
+            let line = to_string label + " " + to_string (manifest.name m) + " v"
+                       + to_string (manifest.version m);
+            if quiet { console.error! line } else { console.print! line }
             :ok
         },
     }
@@ -174,21 +216,21 @@ let relay! r =
     };
 
 let cmd_build! m o = {
-    report_build! m o "compiled"
+    report_build! m o "compiled" false
     console.print! ("  " + to_string (build.output_of m o))
 };
 
 let cmd_check! m o = {
-    report_build! m (build.with_option :extra ["--no-emit"] o) "checked"
+    report_build! m (build.with_option :extra ["--no-emit"] o) "checked" false
 };
 
 let cmd_run! m o args = {
-    report_build! m o "running"
+    report_build! m o "running" true
     relay! (build.run_image! m o args)
 };
 
 let cmd_test! m o args = {
-    report_build! m (build.with_option :extra ["--test"] o) "testing"
+    report_build! m (build.with_option :dev true (build.with_option :extra ["--test"] o)) "testing" true
     relay! (build.run_image! m o args)
 };
 
@@ -212,7 +254,7 @@ let cmd_repl! here o =
 let cmd_info! m o = {
     console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
     console.print! ("  root     " + to_string (manifest.root m))
-    console.print! ("  entry    " + to_string (manifest.entry m))
+    console.print! ("  entry    " + to_string (manifest.entry! m))
     console.print! ("  output   " + to_string (build.output_of m o))
     console.print! ("  compiler " + to_string (build.choose_compiler! m (build.option o :compiler ())))
     match build.command_line! m o {
@@ -221,26 +263,194 @@ let cmd_info! m o = {
     }
 };
 
+/// Load the graph, or stop with the reason.
+let graph_of! m dev =
+    match build.graph! m dev {
+        [:error, why] => fail! why,
+        [:ok, g] => g,
+    };
+
+/// One package, the way `deps` and `tree` show it: its key, what it calls
+/// itself when that is something else, and where it came from.
+let describe n = {
+    let key = build.node_key n;
+    let called = match build.node_manifest n {
+        () => " (no manifest)",
+        dm => if manifest.name dm == key { "" } else { " (package `" + manifest.name dm + "`)" },
+    };
+    let version = match build.node_manifest n {
+        () => "",
+        dm => " v" + to_string (manifest.version dm),
+    };
+    key + version + called + "  " + manifest.dep_source (build.node_dep n)
+};
+
 let cmd_deps! m = {
     console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
-    let ds = manifest.dependencies m;
-    if list.is_empty ds { console.print! "  (no dependencies)" }
-    let show! d = {
-        match fetch.resolve! (manifest.root m) d {
-            [:ok, dir] => console.print! ("  " + to_string (manifest.dep_name d) + " -> " + to_string dir),
-            [:error, why] => console.print! ("  " + to_string (manifest.dep_name d) + " -> unresolved: " + to_string why),
-        }
+    let g = graph_of! m true;
+    let ns = build.nodes g;
+    if list.is_empty ns { console.print! "  (no dependencies)" }
+    let dev_keys = list.map manifest.dep_name (manifest.dev_dependencies m);
+    let show! n = {
+        let dev = if list.contains (build.node_key n) dev_keys { "  [dev]" } else { "" };
+        console.print! ("  " + describe n + dev)
+        console.print! ("      -> " + to_string (build.node_abs n))
     };
-    strict! (list.map show! ds)
+    strict! (list.map show! ns)
+    :ok
+};
+
+/// Who needs what. A package reached a second time is shown once and marked,
+/// so a diamond does not print its whole subtree twice and a cycle stops.
+let cmd_tree! m = {
+    console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
+    let g = graph_of! m true;
+    let rec branch! key indent shown =
+        list.fold (fn seen k -> {
+            let n = build.node g k;
+            if list.contains k seen {
+                console.print! (indent + describe n + " (*)")
+                seen
+            } else {
+                console.print! (indent + describe n)
+                branch! k (indent + "  ") (list.cons k seen)
+            }
+        }) shown (build.children g key);
+    strict! (branch! build.root_key "  " [])
     :ok
 };
 
 let cmd_fetch! m = {
-    match build.search_paths! m {
+    let g = graph_of! m true;
+    let fetched = list.filter (fn n -> manifest.dep_kind (build.node_dep n) != :path) (build.nodes g);
+    console.print! ("resolved " + to_string (list.length (build.nodes g)) + " packages, "
+                    + to_string (list.length fetched) + " of them fetched")
+};
+
+/// Throw away the fetched copy of every git or url dependency -- or of the ones
+/// named -- and fetch them again. A tag or a commit comes back the same bytes,
+/// so this is only ever interesting for a branch; it does them all because
+/// "the cache is wrong" is the other reason to run it.
+let cmd_update! m names = {
+    let g = graph_of! m true;
+    let wanted n =
+        manifest.dep_kind (build.node_dep n) != :path
+        && (list.is_empty names || list.contains (build.node_key n) names);
+    let chosen = list.filter wanted (build.nodes g);
+    let unknown = list.filter (fn k -> build.node g k == ()) names;
+    if not (list.is_empty unknown) { fail! ("no dependency is called " + str.join_str ", " unknown) }
+    strict! (list.map (fn n -> match fetch.forget! (build.node_dep n) {
+                          [:error, why] => fail! why,
+                          _ => :ok,
+                      }) chosen)
+    graph_of! m true
+    match chosen {
+        [] => console.print! "nothing to update: every dependency is a directory",
+        _ => strict! (list.map (fn n -> console.print! ("updated " + describe n)) chosen),
+    }
+    :ok
+};
+
+// --- adding and removing -------------------------------------------------------
+
+/// The spec `mind add` writes, from what was typed: the source read the way
+/// the manifest would read it, and then `--tag`, `--branch` or `--rev` in place
+/// of whatever the source's `#` said.
+let add_spec! source c = {
+    let base = manifest.string_spec source;
+    let pins = list.filter (fn p -> cli.get () c p != ()) ["tag", "branch", "rev"];
+    match pins {
+        [] => base,
+        [p] => {
+            let unpinned = list.fold (fn acc k -> map_remove acc k) base ["tag", "branch", "rev"];
+            unpinned.[p => cli.get () c p]
+        },
+        _ => fail! "give one of --tag, --branch or --rev",
+    }
+};
+
+/// What a dependency should be imported as when `--name` does not say: what a
+/// manifest in it calls it, or the last part of where it is, without the
+/// `.git` or the archive extension and without a `dream-` in front, which is
+/// how a repository of a Dream package is usually named and never how it is
+/// imported.
+let strip_suffix suffix s =
+    if str.ends_with suffix s { str.slice 0 (str.byte_length s - str.byte_length suffix) s } else { s };
+
+let strip_prefix prefix s =
+    if str.starts_with prefix s { str.slice (str.byte_length prefix) (str.byte_length s - str.byte_length prefix) s }
+    else { s };
+
+let guessed_name source =
+    strip_prefix "dream-"
+        (strip_suffix ".tgz" (strip_suffix ".tar.gz" (strip_suffix ".git"
+            (util.basename (strip_suffix "/" (list.head (manifest.split_ref source)))))));
+
+let add_name! source dir c =
+    match cli.get () c "name" {
+        () => match manifest.load_dependency! dir {
+            [:ok, dm] => if str.is_empty (manifest.name dm) { guessed_name source } else { manifest.name dm },
+            _ => guessed_name source,
+        },
+        n => n,
+    };
+
+let cmd_add! m c args = {
+    let source = match args {
+        [s] => s,
+        [] => fail! "add needs a directory, a git URL or a tarball URL",
+        _ => fail! "add takes one source; use --name to choose what it is imported as",
+    };
+    let raw = add_spec! source c;
+    // A directory is typed relative to where you are and stored relative to
+    // the manifest, which is where it will be read from.
+    let spec = match raw.["path" else ()] {
+        () => raw,
+        p => raw.["path" => util.relative! (manifest.root m) p],
+    };
+    let section = if cli.flag_set c "dev" { "dev-dependencies" } else { "dependencies" };
+    let probe = [guessed_name source, spec];
+    match fetch.resolve! (manifest.root m) probe {
         [:error, why] => fail! why,
-        [:ok, paths] => {
-            let dirs = list.filter (fn p -> p != "-L") paths;
-            console.print! ("fetched " + to_string (list.length dirs - 1) + " dependencies")
+        [:ok, dir] => {
+            let key = add_name! source dir c;
+            let file = util.join (manifest.root m) "mind.toml";
+            let text = match util.read_file! file { () => "", t => t };
+            util.write_file! file (manifest.with_dependency section key spec text)
+            console.print! ("added " + key + " = " + manifest.dep_source [key, spec]
+                            + " to [" + section + "]")
+            // Reading it back through the whole graph is the check that
+            // matters: a new dependency can bring a conflict with it.
+            match manifest.load! (manifest.root m) {
+                [:ok, m2] => match build.graph! m2 true {
+                    [:error, why] => console.error! ("warning: " + why),
+                    _ => :ok,
+                },
+                [:error, why] => console.error! ("warning: " + why),
+            }
+        },
+    }
+};
+
+let cmd_remove! m names = {
+    if list.is_empty names { fail! "remove needs the name of a dependency" }
+    let file = util.join (manifest.root m) "mind.toml";
+    let text = match util.read_file! file { () => fail! ("cannot read " + file), t => t };
+    let step acc key = match acc {
+        [t, missing] => match manifest.without_dependency "dependencies" key t {
+            [t2, true] => [t2, missing],
+            [_, false] => match manifest.without_dependency "dev-dependencies" key t {
+                [t3, true] => [t3, missing],
+                [_, false] => [t, list.append missing [key]],
+            },
+        },
+    };
+    match list.fold step [text, []] names {
+        [_, [_, .._] as missing] => fail! ("no dependency is called " + str.join_str ", " missing),
+        [after, []] => {
+            util.write_file! file after
+            strict! (list.map (fn k -> console.print! ("removed " + k)) names)
+            :ok
         },
     }
 };
@@ -345,7 +555,11 @@ let run_command! c theirs = {
                   "run"   => cmd_run! (project_in! here) o (list.append (cli.rest c) theirs),
                   "test"  => cmd_test! (project_in! here) o (list.append (cli.rest c) theirs),
                   "deps"  => cmd_deps! (project_in! here),
+                  "tree"  => cmd_tree! (project_in! here),
                   "fetch" => cmd_fetch! (project_in! here),
+                  "update" => cmd_update! (project_in! here) (cli.rest c),
+                  "add"   => cmd_add! (project_in! here) c (cli.rest c),
+                  "remove" => cmd_remove! (project_in! here) (cli.rest c),
                   "clean" => cmd_clean! (project_in! here),
                   "info"  => cmd_info! (project_in! here) o,
                   "repl"  => cmd_repl! here o,

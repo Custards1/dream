@@ -936,7 +936,39 @@ or `_ =>` to handle everything else
 A wildcard or a binder handles everything. An arm with a guard, or one that
 takes a field apart with a nested pattern, counts as handling its variant,
 since it might. A pattern also narrows: in `[:circle, r] => ..`, `r` is the
-radius's type, not the union of every variant's second field.
+radius's type, not the union of every variant's second field. So does an arm
+*above* it: after an unguarded `() => ..`, a later arm's binder is the rest
+of the union, and after `if x == ()` (or `!=`, under `not`, `&&` and `||`)
+`x` is known to be `()` in one branch and not to be in the other.
+`type_of x == :integer` narrows the same way, to the members of that kind or
+to the rest, and so does a `match` on `type_of x` whose arms are kinds. `x`
+may be a local, a global or a module's member (`m.x`); an impure name is never
+narrowed, since two reads of it are two answers.
+
+A union's values and tags are tests too. `x == :pending` narrows `x` to that
+atom, and `x != :pending` to the rest -- which is how a `union` variant with no
+fields is told apart. A variant with fields is a tagged list, and its tag is
+read with `list.head x`, `x.[0]` or `x.[0 else ()]`; comparing that with an atom
+narrows `x` to the variants that could carry it, and a record's discriminating
+field, `x.[:kind]`, works the same way. A `match` on such a read narrows arm by
+arm, and inside any `match` arm the scrutinee is only what the pattern could
+match, so in `[:circle, _] => area x` the whole `x` is the circle. Only atoms,
+booleans and `()` narrow: `3 == 3.0` is true, and a `bigstr` equals the string
+of its bytes, so a number or a string says less about a type than it seems to.
+
+```dream
+let find : :string -> :integer | :unit;
+
+let next s = match find s { () => 0, n => n + 1 };      // `n` is `:integer`
+let twice s = { let r = find s; if r != () { r * 2 } else { 0 } };
+
+let pick : :integer -> :integer | :string;
+let size n = { let v = pick n; if type_of v == :string { 0 } else { v + 1 } };
+
+union Shape { circle(radius : :float), square(side : :float), empty }
+let radius : [:circle, :float] -> :float;
+let r s = if s != :empty && s.[0] == :circle { radius s } else { 0.0 };
+```
 
 ### `import`
 
@@ -1116,10 +1148,20 @@ src = "."
 
 [dependencies]
 other = { path = "../other" }
+json  = "../vendor/dream-json"
 ```
 
-`name` is required; `version` defaults to `0.0.0` and `src` to the manifest's
-own directory. Only path dependencies are supported so far.
+`name` is required; `version` defaults to `0.0.0` and `src` to a `src`
+directory when there is one and the manifest's own directory otherwise. The
+compiler follows path dependencies (`{ path = .. }`, or a bare string); `mind`
+also fetches git and tarball dependencies and hands them over with `-L`.
+
+**A dependency's key is a name it can be imported by.** `json = ..` above makes
+`import json.parse` work whatever the package at that path calls itself: the key
+is recorded as a second name for the same package, and a module's identity is
+still its file, so reaching it through either name is reaching one module. A
+dependency directory with **no manifest** is a package too, named by its key.
+On the command line, `-L NAME=DIR` says the same thing.
 
 A project is itself a package, so its own modules are reachable both as
 `mypkg.util` and, from inside, as plain `util`. Dropping a manifest into a
@@ -1842,7 +1884,7 @@ dreams FILE [-o OUT.dream] [options]
 |------|-|
 | `-o`, `--output PATH` | where to write the image |
 | `-I`, `--include DIR` | add a module search directory |
-| `-L`, `--package-path DIR` | add a package search root |
+| `-L`, `--package-path DIR` | add a package search root; `NAME=DIR` adds the package at `DIR`, importable as `NAME` |
 | `--host-module PATH` | a module the host registers at run time (repeatable) |
 | `-D`, `--define NAME[=VALUE]` | define a `when` flag |
 | `--test` | define `test` and generate a runner (see below) |

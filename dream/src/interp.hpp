@@ -38,6 +38,18 @@ Value global_value(Process& p, uint32_t index);
 /// Whether that loop may *collect* is the caller's to say: see `VouchesForGc`.
 bool force_whnf(Process& p, Value v, Value* out);
 
+/// Apply `callee` to `argc` arguments and force the answer to weak head normal
+/// form, by the same nested loop `force_whnf` runs. What compiled code calls a
+/// closure with: the arguments arrive as they stand, suspended or not, exactly
+/// as `do_apply` would have been handed them. Same collector rules as above.
+bool apply_whnf(Process& p, Value callee, const Value* args, uint32_t argc, Value* out);
+
+/// How many continuations a process may have pending: `DREAM_MAX_DEPTH`.
+size_t max_depth_limit();
+
+/// The shared string for image string constant `index`, made once per process.
+Value literal_string_value(Process& p, uint32_t index);
+
 /// "My locals survive a collection" -- the claim that lets a nested force
 /// collect.
 ///

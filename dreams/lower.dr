@@ -37,6 +37,10 @@ import dreams.scope;
 // The arena being built, the resolutions being read, and which file the code
 // came from, so a diagnostic raised this late still points at a line.
 
+/// The lowering state: the arena being built, and -- once `link!` has run --
+/// the finished image and what each `comp` came to.
+type Lowering = :map;
+
 let lowering r p source =
     %{ :r => r, :prog => p, :source => source, :ctx => 0, :diags => [],
        // Which node is each function's body. Filled in as the functions are
@@ -94,6 +98,7 @@ let add_comp node fi span l =
 /// `typecheck` reads it to give a `comp` the type of what it produced, and to
 /// run a refinement's predicate over it -- see "compile-time contracts" there.
 /// Nothing in the image depends on it.
+let comp_values : Lowering -> :map;
 let comp_values l = l.[:comp_values else (%{})];
 let comp_key source span = source * 4294967296 + ast.span_start span;
 
@@ -123,8 +128,13 @@ let is_impure_node i l = ir.node_is_impure (ir.node_at i (prog l));
 
 /// Effects are visible through any enclosing node, so the flag travels up.
 let inherit i children l =
-    if list.any (fn k -> ir.is_node k && is_impure_node k l) children { set_flag i ir.f_impure l }
+    if ir.has_impure (prog l) && any_impure children (prog l) { set_flag i ir.f_impure l }
     else { l };
+
+let rec any_impure ks p = match ks {
+    [] => false,
+    [k, ..rest] => (ir.is_node k && ir.node_is_impure (ir.node_at k p)) || any_impure rest p,
+};
 
 /// What `scope` recorded for the name at this span.
 let lookup span l = scope.resolution (res l) (ctx l) (source l) span;
@@ -511,7 +521,13 @@ let rec lower_expr e l =
                     let inner = lower_expr body l;
                     let done = set_func_body fi (list.nth 1 inner)
                                              (mark_tail (list.nth 1 inner) (list.head inner));
-                    let made = emit_leaf :unit done;
+                    // The placeholder carries the function it waits on. A
+                    // bare `unit` would be shared with every other `unit` by
+                    // the optimizer, and a program lowered in parts is
+                    // optimized before its expressions are settled -- see
+                    // "lowering in parts" -- so the one written here has to
+                    // stay itself and be findable afterwards.
+                    let made = emit (ir.node :unit fi ir.no_node ir.no_node) done;
                     [add_comp (list.nth 1 made) fi span (list.head made), list.nth 1 made]
                 },
                 _ => emit_leaf :unit l,
@@ -1592,6 +1608,7 @@ let lower_from r low bodies =
                                   (mark_tail (list.nth 1 got) (list.head got)))
     }) (set_res r low) bodies;
 
+let lower_program : scope.Resolution -> Lowering;
 let lower_program r = {
     let walked = lower_from r (lowering r ir.program 0) (scope.bodies r);
 
@@ -1646,6 +1663,76 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
         },
 };
 
+/// Every function a compile-time expression can reach: its own, and whatever
+/// its nodes name -- a function global, a closure, a thunk -- followed the whole
+/// way down. The answer is a set of function indices.
+let rec comp_reach todo seen fns p funcs globals = match todo {
+    [] => fns,
+    [index, ..rest] =>
+        if not (ir.is_node index) || map_has seen index {
+            comp_reach rest seen fns p funcs globals
+        } else {
+            let n = ir.node_at index p;
+            let op = ir.node_op n;
+            let direct = list.map (fn k -> opt.operand k n) (opt.edges_of op);
+            let run = match opt.run_of op {
+                () => [],
+                [offset, count, width] => list.map (fn i -> ir.kid_at i p)
+                    (list.range (opt.operand offset n)
+                        (opt.operand offset n + opt.operand count n * width)),
+            };
+            let fi = match op {
+                :global => {
+                    let g = globals.[ir.node_a n];
+                    if g.[:kind] == ir.global_function { g.[:target] } else { ir.no_node }
+                },
+                :make_closure => ir.node_a n,
+                :make_thunk => ir.node_a n,
+                _ => ir.no_node,
+            };
+            let fresh = ir.is_node fi && not (map_has fns fi);
+            let called = if fresh { [funcs.[fi].[:body]] } else { [] };
+            comp_reach (direct + run + called + rest) (seen.[index => true])
+                       (if fresh { fns.[fi => true] } else { fns }) p funcs globals
+        },
+};
+
+/// The image compile-time expressions are run against: the program cut down to
+/// what they can reach. Compile-time contracts are run the same way
+/// (`contract.batch_image`), with their batch as the one root.
+///
+/// It used to be the whole program, serialized as lowered, and that was most
+/// of what a compile-time expression cost -- on a self-compile, six one-line
+/// `comp`s paid for writing out 142,000 nodes, a second of the compile, to run
+/// code that touches a few hundred of them. An expression can only ever run
+/// what its nodes name, so every other function is given one shared body that
+/// raises, and the optimizer, which copies only what a body reaches, drops the
+/// rest of the arena on the way to the image. An incomplete answer here would
+/// be loud rather than wrong: a function it missed raises when called, and the
+/// `comp` is reported as failing to evaluate.
+///
+/// Running the optimized arena rather than the lowered one is the same
+/// program: `opt` is the pass every build runs before its image is written.
+let comp_image fis l = if in_parts l { parts_image fis l } else { whole_image fis l };
+
+let whole_image fis l = {
+    let p = prog l;
+    let funcs = array_of_list (ir.funcs p);
+    let globals = array_of_list (ir.globals p);
+    let reached = comp_reach (list.map (fn fi -> funcs.[fi].[:body]) fis) %{}
+                             (list.fold (fn m fi -> m.[fi => true]) %{} fis)
+                             p funcs globals;
+    let [l1, one] = const_int 1 l;
+    let [l2, zero] = const_int 0 l1;
+    let [l3, stub] = emit (ir.node :div one zero ir.no_node) l2;
+    let img = ir.finish (prog l3);
+    let cut = list.map (fn pair -> {
+        let [fi, f] = pair;
+        if map_has reached fi { f } else { f.[:body => stub] }
+    }) (list.zip (list.range 0 (list.length (img.[:funcs else []]))) (img.[:funcs else []]));
+    emit.to_binary (opt.optimize (img.[:funcs => cut]))
+};
+
 /// Settle them in an order where nothing is evaluated before what it reads.
 ///
 /// `built` is the serialized image the next evaluation runs against, and the
@@ -1674,7 +1761,7 @@ let rec settle_comp_order! rows done built l =
             // Each evaluation sees the constants its dependencies installed,
             // rather than the original image full of unit placeholders.
             let image = match built {
-                () => emit.to_binary (ir.finish (prog l)),
+                () => comp_image (list.map (fn r -> r.[0].[1]) rows) l,
                 ready_made => ready_made,
             };
             let settled = settle_comp! (fn fi -> emit.with_entry image fi) one l;
@@ -1691,6 +1778,7 @@ let rec settle_comp_order! rows done built l =
 let settle_comps! l = {
     let pend = pending_comp l;
     if list.is_empty pend { l }
+    else if in_parts l { settle_parts_comps! l }
     else {
         let p = prog l;
         let funcs = array_of_list (ir.funcs p);
@@ -1705,8 +1793,13 @@ let settle_comps! l = {
 /// The whole thing, with the module table an image also needs. The loader is
 /// wanted here and nowhere else, which is why it is a separate way in rather
 /// than an argument threaded through every step.
-let link! ld r = {
-    let low = settle_comps! (lower_program r);
+let link! : modules.Loader -> scope.Resolution -> Lowering;
+let link! ld r = link_rest! ld r (lower_program r);
+
+/// Everything after the arena is built and its functions linked: the
+/// compile-time expressions, the module table and the entry point.
+let link_rest! ld r lowered = {
+    let low = settle_comps! lowered;
     let ms = link_modules ld r low;
     let named = strk (modules.module_name (modules.module_at ld
                           (modules.module_count ld - 1)))
@@ -1716,6 +1809,433 @@ let link! ld r = {
                        (list.head named);
     let p = ((((((((prog (list.head sourced))).[:modules => (list.nth 1 ms)])).[:entry => (find_entry ld r)])).[:module_name => (list.nth 1 named)])).[:source_name => (list.nth 1 sourced)];
     ((set_prog p (list.head sourced))).[:image => (ir.finish p)]
+};
+
+// --- lowering in parts -----------------------------------------------------------
+//
+// Lowering a body needs the resolution and nothing else -- not the arena, not
+// any other body -- so a program can be lowered in several processes at once,
+// each into an arena of its own. On a self-compile that is 2.2 s of work that
+// takes 0.6 s on four cores. What had to be true for that is the design:
+//
+//   - **The resolution crosses by pointer.** Each process needs all of it, and
+//     copying it into four of them was 0.43 s -- most of what the split saves.
+//     `vm.share!` puts it in the runtime's shared area once, and a `spawn!`
+//     whose work holds it copies a pointer (`SharedArea` in dream/src/heap.hpp).
+//     The parts come back the same way.
+//   - **The parts are dealt round-robin, and the count is fixed.** Bodies
+//     differ threefold in how many nodes a byte of their source becomes, so
+//     contiguous slices of equal source were a third apart, and the slowest
+//     one is the stage. Dealt one at a time they come out within 12% of each
+//     other. The count is `part_count` and not the number of cores, because
+//     which part a body is in decides how the merged constant pools are
+//     numbered, and an image must not depend on the machine that built it.
+//   - **Each body is shared into its part as soon as it is lowered.** A body
+//     is lowered into an arena of its own, where a flag can still be set on a
+//     node already emitted -- lowering does that constantly -- and once it is
+//     finished, and its flags with it, the optimizer rebuilds it into the
+//     part's table of everything the part has emitted (`opt.enter_body`), and
+//     the arena is dropped. The constant pools carry on from body to body.
+//     A part comes back a third of what it lowered, and no table of a whole
+//     part's unshared nodes is ever built -- which is what the arena used to
+//     be, and was most of what lowering allocated.
+//   - **Sharing across the parts is one process's work, started the moment
+//     they are joined** (`share_parts_elsewhere!`, `opt.optimize_parts`),
+//     reading the parts where they lie: nothing lays them out end to end
+//     first. It is 0.7 s, and this process spends it settling the `comp`s and
+//     checking the types.
+//   - **Nothing here needs the whole arena.** A `comp` or a compile-time
+//     contract runs against an image of what it can reach, and that is made
+//     from the parts too; see "running what was lowered in parts".
+//
+// Compile-time expressions are settled after the parts are shared, so a
+// placeholder must survive two rebuilds as itself -- and a bare `unit` would
+// be shared with every other one. So a placeholder carries its function's
+// index (see the `comp` case of `lower_expr`), which keeps it distinct and
+// lets it be found in the shared image, where `patched` overwrites it.
+//
+// What a part says about itself -- a diagnostic, a pending expression -- is
+// kept against the position of the body that said it, and put back in that
+// order, so a program lowered in parts reports exactly what one lowered whole
+// does, in the same order.
+
+/// How many parts a program is lowered in. See above for why it is fixed.
+let part_count = 4;
+
+/// Lower some of the program's bodies, `[position, body]` each, into an arena
+/// of their own, share it, and answer the part `link_parts` merges.
+let lower_part r numbered = {
+    let walked = list.fold_strict (fn acc nb -> {
+        let [low, shared, bodies, notes] = acc;
+        // A fresh arena for every body: the constant pools are the part's and
+        // carry on, and everything else is this body's and is thrown away once
+        // it has been shared into the part.
+        let cleared = ((((set_prog (ir.cleared (prog low)) low).[:diags => []]).[:pending_comp => []]))
+                        .[:func_bodies => %{}];
+        let done = lower_from r cleared [list.nth 1 nb];
+        let p = prog done;
+        // In the table's own order: a part's numbering is its own business,
+        // and sharing the parts renumbers every node in function order anyway.
+        let roots = map_pairs (func_bodies done);
+        let rebuilt = list.fold (fn st pair -> {
+            let got = opt.rebuild (list.nth 1 pair) (list.head st);
+            [list.head got, (list.nth 1 st).[list.head pair => list.nth 1 got]]
+        }) [opt.enter_body (ir.nodes p) (ir.kids p) (opt.type_ids_in (ir.strs p) (ir.atoms p)) shared,
+            bodies] roots;
+        let said = l_diags done;
+        let waiting = pending_comp done;
+        let noted = if list.is_empty said && list.is_empty waiting { notes }
+                    else { list_cons [list.head nb, said, waiting] notes };
+        let next = opt.settle (list.head rebuilt);
+        let found = list.nth 1 rebuilt;
+        // Forced before they are carried, the `ir.settled` way: a suspended one
+        // would hold the state of the body before it.
+        if type_of noted != :nothing && type_of done != :nothing && len found >= 0 {
+            [done, next, found, noted]
+        } else { [done, next, found, noted] }
+    }) [set_res r (lowering r ir.program 0), opt.state #[] #[], %{}, []] numbered;
+    let [low, shared, bodies, notes] = walked;
+    let p = prog low;
+    %{ :nodes => list.reverse (opt.out shared),
+       :kids => list.reverse (opt.out_kids shared),
+       :bodies => list.sort_on (fn pair -> list.head pair) (map_pairs bodies),
+       :ints => ir.pool_list (ir.ints p), :floats => ir.pool_list (ir.floats p),
+       :strs => ir.pool_list (ir.strs p), :atoms => ir.pool_list (ir.atoms p),
+       :notes => list.reverse notes }
+};
+
+/// A process lowering one part, handed a resolution that is already shared.
+/// Its own function so that the suspension `spawn!` copies holds the
+/// resolution and the slice and nothing else; the part comes back shared, so
+/// joining it is a pointer too.
+let part_elsewhere! r slice = spawn! $( vm.share! (lower_part r slice) );
+
+/// Lower the whole program in parts and link it: what `link!` does, in
+/// `part_count` processes. Each part comes back shared within itself.
+let link_parallel! : modules.Loader -> scope.Resolution -> Lowering;
+let link_parallel! ld r = {
+    let rs = vm.share! r;
+    // A resolution made in parts is lowered in the same parts, each against
+    // the part that walked it -- which is the only one that knows what its
+    // names mean (`scope.parts`) -- with the wrappers of the whole program.
+    // One resolved whole is dealt out here instead.
+    let work = match scope.parts rs {
+        () => {
+            let all = scope.bodies rs;
+            let numbered = list.zip (list.range 0 (list.length all)) all;
+            list.map (fn k -> [rs, list.filter (fn nb -> list.head nb % part_count == k) numbered])
+                     (list.range 0 part_count)
+        },
+        walked => {
+            let wrappers = vm.share! (scope.wrappers rs);
+            list.map (fn pr -> [pr.[:wrappers => wrappers], scope.part_bodies pr]) walked
+        },
+    };
+    // Dealt before any process starts: a slice left lazy would cross into its
+    // child as a suspension holding every body, and be dealt there.
+    strict! work
+    let running = strict! (list.map (fn w -> part_elsewhere! (list.head w) (list.nth 1 w)) work);
+    let parts = strict! (list.map (fn pr -> join! pr) running);
+    let offsets = list.map (fn w -> scope.part_offsets (list.head w)) work;
+    let head = link_head rs offsets parts;
+    // Sharing across the parts starts now, in a process of its own, and runs
+    // while this one settles the `comp`s and checks the types: see `patched`.
+    let sharing = share_parts_elsewhere! (vm.share! (for_sharing rs head));
+    // What each body said, back in the order of the bodies, with a waiting
+    // expression's function moved as the part's functions were.
+    let notes = list.sort_on (fn note -> list.head note) (list.concat (list.map (fn k -> {
+        let fo = list.head (offsets.[k]);
+        list.map (fn note -> {
+            let [position, said, waiting] = note;
+            [position, said, list.map (fn one -> {
+                let [_, fi, src, span] = one;
+                [ir.no_node, fi + fo, src, span]
+            }) waiting]
+        }) ((parts.[k]).[:notes])
+    }) (list.range 0 (list.length parts))));
+    let said = list.concat (list.map (fn note -> list.nth 1 note) notes);
+    let waiting = list.concat (list.map (fn note -> list.nth 2 note) notes);
+    let lowered = ((((((set_prog (head.[:prog]) (head.[:base])).[:diags => said]).[:pending_comp => waiting])
+                       .[:arenas => head.[:arenas]]).[:invented_from => scope.invented_from rs]));
+    let linked = (link_rest! ld rs lowered).[:sharing => sharing];
+    // The image, should anything ask for it without the sharing process's --
+    // the process failed, or the build did. Lazy, and shared here, in this
+    // process: the parts are never laid out any other way.
+    linked.[:image => patched linked (opt.optimize_parts (list.head (for_sharing rs head))
+                                                          (head.[:arenas]) (scope.invented_from rs))]
+};
+
+/// Whether this lowering was made in parts, and so has no arena of its own:
+/// only the parts, and a small table of nodes it emitted itself.
+let in_parts l = l.[:arenas else ()] != ();
+
+/// The process sharing this lowering's parts, if it was lowered in parts.
+let sharing l = l.[:sharing else ()];
+
+/// What the sharing process is handed: the linked program's records, as an
+/// image whose functions name their bodies where the parts hold them, the
+/// parts, and where invented globals start. Everything in it is shared before
+/// it crosses, so starting the process is a pointer.
+let for_sharing r head = [ir.finish_rest (head.[:prog]), head.[:arenas], scope.invented_from r];
+
+/// A process sharing the parts into one arena while this one settles the
+/// `comp`s and checks the types. The shared image comes back with every `comp`
+/// placeholder still in it, for `patched` to fill. A raise in it answers
+/// `:crashed`, and the image is shared in this process instead.
+let share_parts_elsewhere! work =
+    spawn! $( try! { vm.share! (opt.optimize_parts (list.nth 0 work) (list.nth 1 work) (list.nth 2 work)) }
+              catch e { [:crashed, e] } );
+
+/// The image the sharing process answered, finished: its `comp` placeholders
+/// replaced by what they came to, and the tables `link_rest!` added after it
+/// started -- the modules, the entry, the names -- taken from this lowering.
+///
+/// The process started from this lowering's constant pools as they stood
+/// before any `comp` was settled, and settling only ever *adds* to a pool, so
+/// every constant its image names means the same in the pools here. Each value
+/// is lowered again into the shared image, which interns nothing new -- this
+/// lowering already did -- and the placeholder is overwritten, as
+/// `settle_comp!` does in the arena it settles.
+let patched l img = {
+    let p = prog l;
+    let nodes = img.[:nodes else []];
+    let kids = img.[:kids else []];
+    let tables = ((((((p.[:nodes => ir.fill_kids %{} 0 nodes]).[:node_count => list.length nodes])
+                    .[:kids => ir.fill_kids %{} 0 kids]).[:kid_count => list.length kids]))
+                    .[:funcs => img.[:funcs else []]]);
+    let placed = list.head (list.fold_strict (fn acc n -> {
+        let [m, i] = acc;
+        [if ir.node_op n == :unit && ir.is_node (ir.node_a n) { m.[ir.node_a n => i] } else { m }, i + 1]
+    }) [%{}, 0] nodes);
+    let values = comp_values l;
+    let filled = list.fold (fn acc one -> {
+        let [_, fi, src, span] = one;
+        match values.[comp_key src span else ()] {
+            () => acc,
+            v => {
+                let built = emit_const v acc;
+                let at = placed.[fi else ir.no_node];
+                if not (ir.is_node at) { list.head built }
+                else {
+                    set_prog (ir.set_node at (ir.node_at (list.nth 1 built) (prog (list.head built)))
+                                         (prog (list.head built)))
+                             (list.head built)
+                }
+            },
+        }
+    }) (set_prog tables l) (pending_comp l);
+    ir.finish (prog filled)
+};
+
+// --- running what was lowered in parts ----------------------------------------
+//
+// A `comp` and a compile-time contract are run against an image of the
+// program cut down to what they can reach (`comp_image`), and a program
+// lowered in parts has no arena to cut it from -- deliberately: laying the
+// parts out as one was 0.4 s on the critical path, and the only thing that
+// needed it was this. So the image is made from the parts directly: which
+// functions the roots reach is walked across the parts, every other function
+// is the shared stub, and `opt.optimize_parts` -- the rebuild the sharing
+// process makes of the whole program -- makes the image from what is left.
+//
+// What this lowering emits itself -- the stub, a contract's formula, a
+// `comp`'s value -- goes into its own small arena, which is part 0 of the
+// parts (the part the functions' captures are in already). A settled `comp`
+// is not written over its placeholder, since the placeholder is in a part and
+// the parts are not this lowering's to change; `:filled` says which part-0
+// node stands for it, and the rebuild reads that node wherever the
+// placeholder is.
+
+/// The parts, with part 0 as this lowering's own arena now.
+let current_arenas l = {
+    let p = prog l;
+    (l.[:arenas]).[0 => ((((l.[:arenas]).[0]).[:nodes => ir.nodes p]).[:kids => ir.kids p])]
+};
+
+/// What the functions `todo` start from can reach, walked across the parts:
+/// `[functions, placeholders]`, the second the `comp` placeholders met on the
+/// way, by the function each waits on. A node is `part * opt.part_base + i`.
+let rec reach_parts todo seen fns met arenas funcs globals invented_from = match todo {
+    [] => [fns, met],
+    [key, ..rest] =>
+        if not (ir.is_node key) || map_has seen key {
+            reach_parts rest seen fns met arenas funcs globals invented_from
+        } else {
+            let k = key / opt.part_base;
+            let part = arenas.[k];
+            let at = k * opt.part_base;
+            let n = (part.[:nodes]).[key % opt.part_base else (ir.leaf :nop)];
+            let op = ir.node_op n;
+            let fo = part.[:fo else 0];
+            let direct = list.map (fn e -> {
+                let v = opt.operand e n;
+                if ir.is_node v { at + v } else { v }
+            }) (opt.edges_of op);
+            let run = match opt.run_of op {
+                () => [],
+                [off_at, count_at, width] => list.map (fn t -> {
+                    let kid = (part.[:kids]).[opt.operand off_at n + t else ir.no_node];
+                    if ir.is_node kid { at + kid } else { kid }
+                }) (list.range 0 (opt.operand count_at n * width)),
+            };
+            let fi = match op {
+                :global => {
+                    let a = ir.node_a n;
+                    let g = globals.[if k > 0 && a >= invented_from { a + part.[:go else 0] } else { a }];
+                    if g.[:kind] == ir.global_function { g.[:target] } else { ir.no_node }
+                },
+                :make_closure => ir.node_a n + fo,
+                :make_thunk => ir.node_a n + fo,
+                _ => ir.no_node,
+            };
+            let waits = if op == :unit && ir.is_node (ir.node_a n) { met.[ir.node_a n + fo => true] } else { met };
+            let fresh = ir.is_node fi && not (map_has fns fi);
+            let called = if fresh { [(funcs.[fi]).[:body]] } else { [] };
+            reach_parts (direct + run + called + rest) (seen.[key => true])
+                        (if fresh { fns.[fi => true] } else { fns }) waits
+                        arenas funcs globals invented_from
+        },
+};
+
+/// `comp_image` for a lowering made in parts.
+let parts_image fis l = {
+    let [l1, one] = const_int 1 l;
+    let [l2, zero] = const_int 0 l1;
+    let [l3, stub] = emit (ir.node :div one zero ir.no_node) l2;
+    let p = prog l3;
+    let funcs = array_of_list (ir.funcs p);
+    let reached = list.head (reach_parts (list.map (fn fi -> (funcs.[fi]).[:body]) fis) %{}
+                                         (list.fold (fn m fi -> m.[fi => true]) %{} fis) %{}
+                                         (current_arenas l3) funcs (array_of_list (ir.globals p))
+                                         (l.[:invented_from else 0]));
+    let cut = list.map (fn pair -> {
+        let [fi, f] = pair;
+        if map_has reached fi { f } else { f.[:body => stub] }
+    }) (list.zip (list.range 0 (list.length (ir.funcs p))) (ir.funcs p));
+    emit.to_binary (opt.optimize_parts_filled ((ir.finish_rest p).[:funcs => cut]) (current_arenas l3)
+                                              (l.[:invented_from else 0]) (l.[:filled else (%{})]))
+};
+
+/// The `comp` placeholders the function `fi`'s body can reach: the
+/// expressions that have to be settled before it can be run.
+let parts_dependencies fi l = {
+    let p = prog l;
+    let funcs = array_of_list (ir.funcs p);
+    let met = list.nth 1 (reach_parts [(funcs.[fi]).[:body]] %{} (%{fi => true}) %{} (current_arenas l)
+                                      funcs (array_of_list (ir.globals p)) (l.[:invented_from else 0]));
+    list.map (fn kv -> list.head kv) (map_pairs met)
+};
+
+/// `settle_comps!` for a lowering made in parts: the same order, the same
+/// images, but a value is written into this lowering's own arena and recorded
+/// against its function (`:filled`) rather than over its placeholder.
+let settle_parts_comps! l = {
+    let pend = pending_comp l;
+    let waiting = list.fold (fn m one -> m.[one.[1] => true]) %{} pend;
+    let rows = list.map (fn one -> [one, list.filter (fn fi -> map_has waiting fi && fi != one.[1])
+                                                     (parts_dependencies (one.[1]) l)]) pend;
+    settle_parts_order! rows %{} () l
+};
+
+let rec settle_parts_order! rows done built l =
+    if list.is_empty rows { l }
+    else {
+        let ready = list.filter (fn row -> list.all (fn fi -> map_has done fi) row.[1]) rows;
+        if list.is_empty ready {
+            complain ast.no_span "cyclic dependency between compile-time expressions" l
+        } else {
+            let row = list.head ready;
+            let one = row.[0];
+            let fi = one.[1];
+            let image = match built {
+                () => parts_image (list.map (fn r -> r.[0].[1]) rows) l,
+                ready_made => ready_made,
+            };
+            let settled = settle_part_comp! (emit.with_entry image fi) one l;
+            if list.length (l_diags settled) > list.length (l_diags l) { settled }
+            else {
+                let rest = list.filter (fn r -> r.[0].[1] != fi) rows;
+                let wanted = list.any (fn r -> list.contains fi r.[1]) rest;
+                settle_parts_order! rest (done.[fi => true]) (if wanted { () } else { image }) settled
+            }
+        }
+    };
+
+/// `settle_comp!` for a lowering made in parts: see `settle_parts_comps!`.
+let settle_part_comp! bytes one l = {
+    let [_, fi, src, span] = one;
+    let value = try! { vm.eval_image! bytes } catch e { [:comp_error, e] };
+    match value {
+        [:comp_error, why] =>
+            l.[:diags => (list.append (l_diags l)
+                            [diag.in_source src (diag.error span
+                                ("this compile-time expression could not be evaluated: "
+                                 + to_string why))])],
+        v => {
+            let built = emit_const v l;
+            let placed = (list.head built).[:filled => ((list.head built).[:filled else (%{})]).[fi => list.nth 1 built]];
+            placed.[:comp_values => ((comp_values placed)).[comp_key src span => v]]
+        },
+    }
+};
+
+/// Intern every value of a part's pool into the program's: `[program, the
+/// program's index for each of the part's, in order]`.
+let intern_each intern vs p = {
+    let got = list.fold_strict (fn acc v -> {
+        let one = intern v (list.head acc);
+        [list.head one, list_cons (list.nth 1 one) (list.nth 1 acc)]
+    }) [p, []] vs;
+    [list.head got, array_of_list (list.reverse (list.nth 1 got))]
+};
+
+/// An atom as a part stored it -- the index of its name in the part's string
+/// pool -- interned into the program's atom pool by the name's index there.
+let intern_atom_at strs si p = {
+    let got = ir.intern (strs.[si]) (ir.atoms p);
+    [p.[:atoms => list.head got], list.nth 1 got]
+};
+
+/// The linked program of a lowering made in parts, before anything in it has
+/// been laid out: the constant pools merged, every function's record linked
+/// against where its body lies in the parts, and the parts as
+/// `opt.optimize_parts` reads them: `%{ :prog, :base, :arenas }`.
+let link_head r offsets parts = {
+    // The constant pools, part by part, and each part's table from its own
+    // indices to the program's.
+    let pooled = list.fold (fn acc part -> {
+        let p0 = list.head acc;
+        let [p1, ints] = intern_each ir.intern_int (part.[:ints]) p0;
+        let [p2, floats] = intern_each ir.intern_float (part.[:floats]) p1;
+        let [p3, strs] = intern_each ir.intern_str (part.[:strs]) p2;
+        let [p4, atoms] = intern_each (fn si q -> intern_atom_at strs si q) (part.[:atoms]) p3;
+        [p4, list_cons %{ :ints => ints, :floats => floats, :strs => strs, :atoms => atoms }
+                       (list.nth 1 acc)]
+    }) [ir.program, []] parts;
+    let remaps = list.reverse (list.nth 1 pooled);
+    // Every function's body, as the part it is in and its node there -- part
+    // k is `k + 1` here, part 0 being this lowering's own arena -- and under
+    // the function's index in the whole program: a part numbers its functions
+    // from where the declarations left off, and is moved past the parts before
+    // it (see "resolving in parts" in `scope`).
+    let bodies = list.fold (fn m k -> {
+        let fo = list.head (offsets.[k]);
+        list.fold (fn m2 fb -> m2.[list.head fb + fo => ((k + 1) * opt.part_base + list.nth 1 fb)])
+                  m ((parts.[k]).[:bodies])
+    }) %{} (list.range 0 (list.length parts));
+    let base = set_res r (lowering r (list.head pooled) 0);
+    let fs = link_funcs r bodies base;
+    let gs = link_globals r (list.head fs);
+    let is = link_imports r (list.head gs);
+    let p = ((((prog (list.head is)).[:funcs => (list.nth 1 fs)]).[:globals => (list.nth 1 gs)]))
+                .[:imports => (list.nth 1 is)];
+    let arenas = array_of_list (list_cons %{ :nodes => ir.nodes p, :kids => ir.kids p }
+        (list.map (fn k -> %{ :nodes => array_of_list ((parts.[k]).[:nodes]),
+                              :kids => array_of_list ((parts.[k]).[:kids]),
+                              :remap => remaps.[k],
+                              :fo => list.head (offsets.[k]), :go => list.nth 1 (offsets.[k]) })
+                  (list.range 0 (list.length parts))));
+    %{ :prog => p, :base => base, :arenas => arenas }
 };
 
 // --- compile-time values ------------------------------------------------------
@@ -1791,11 +2311,13 @@ let settle_comp! bytes_of one l = {
     }
 };
 
+let image : Lowering -> ir.Image;
 let image l = l.[:image else (ir.finish ir.program)];
 
 let diags l = l_diags l;
 
 /// Everything the resolver and the lowerer between them had to say.
+let all_diags : scope.Resolution -> Lowering -> [:map];
 let all_diags r l = list.append (scope.r_diags r) (l_diags l);
 
 // --- reading it back ------------------------------------------------------------
@@ -1804,6 +2326,7 @@ let all_diags r l = list.append (scope.r_diags r) (l_diags l);
 /// This is what `--ir` prints. A tree written out one node per line is far
 /// easier to check than a nest of indices, which is also why the tests compare
 /// against it rather than against node records.
+let dump : Lowering -> :string;
 let dump l = {
     let img = image l;
     let fs = img.[:funcs else []];

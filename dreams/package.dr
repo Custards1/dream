@@ -270,18 +270,102 @@ let packages_inside! dir s =
         }
         else { acc }) s (path.list_dir! dir);
 
+// --- names a package is imported by ------------------------------------------
+//
+// A package declares its own name, and that is what it is imported by. But the
+// package that *depends* on it chose a name too -- the key it is listed under
+// in `[dependencies]` -- and a reader of that manifest will expect
+// `json = { .. }` to mean `import json.x`, whatever the package calls itself.
+// So the key is a second name for the same package: an alias, recorded beside
+// the declared name and pointing at the same entry, so that the module a file
+// is loaded as (`canonical_name!`, which asks the declared name) does not
+// depend on which spelling reached it.
+//
+// The key is also what makes a directory with no manifest a package at all.
+// A folder of `.dr` files someone else wrote has nothing to declare a name
+// with, and "write it a `mind.toml`" is the one step a dependency list exists
+// to save. Listed under a key, the key names it.
+
+/// Record `n` as another name for the package at index `i`. A name that is
+/// already somebody else's is a note and the first owner keeps it, which is
+/// the same rule `add!` applies to two packages that declare one name.
+let alias! n i s =
+    match ((by_name s)).[n else ()] {
+        () => set (packages s) (((by_name s)).[n => i]) (current_index s) (notes s),
+        j if j == i => s,
+        j => if path.same_file! (root (at s j)) (root (at s i)) { s }
+             else {
+                 note ("`" + n + "` names two packages: " + root (at s j) + " and "
+                       + root (at s i) + "; using the first") s
+             },
+    };
+
+/// Where a package without a manifest keeps its modules: `src/` when there is
+/// one, as for a package with a manifest that does not say.
+let default_src! dir =
+    if io.is_dir! (path.join dir "src") { path.join dir "src" } else { dir };
+
+/// A package made of nothing but a directory, named by whoever listed it.
+let bare! n dir = make n "0.0.0" dir (default_src! dir) [] "";
+
+/// Add the package at `dir` so that it can be imported as `n` as well as by
+/// its own name. A directory whose manifest names no package, or that has no
+/// manifest, is the package `n`.
+let add_named! n dir s = {
+    let as_bare! acc = list.head (add! (bare! n dir) acc);
+    match manifest_at! dir {
+        () => as_bare! s,
+        m => match load_manifest! m {
+            [:ok, p] => match add! p s { [s2, i] => alias! n i s2 },
+            [:none] => as_bare! s,
+            [:error, why] => note why s,
+        },
+    }
+};
+
+/// Is `n` usable as the name half of a `NAME=DIR` root? A package name, in
+/// other words, and nothing that could be a path: a path containing `=` stays
+/// a path.
+let is_alias_name n = {
+    let ok c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+               || (c >= '0' && c <= '9') || c == '_' || c == '-';
+    not (str.is_empty n) && list.all ok (str.chars n)
+};
+
+/// A root as written: `DIR`, or `NAME=DIR` for the package at `DIR` imported
+/// as `NAME`. Answers `[name, dir]`, the name `()` when there is none.
+let split_root text =
+    match str.find "=" text {
+        i if i > 0 => {
+            let n = str.slice 0 i text;
+            if is_alias_name n { [n, str.slice (i + 1) (str.byte_length text - i - 1) text] }
+            else { [(), text] }
+        },
+        _ => [(), text],
+    };
+
+/// The directory half of a root, for the places that use roots as plain
+/// search paths.
+let root_dir text = list.nth 1 (split_root text);
+
 /// A root given with `-L` may be a package itself, or a directory holding
 /// several. A manifest that names no package is the second case -- and so is no
-/// manifest at all -- so both look inside.
-let add_from_root! dir s =
-    match manifest_at! dir {
-        () => packages_inside! dir s,
-        m =>
-            match load_manifest! m {
-                [:ok, p]      => list.head (add! p s),
-                [:error, why] => note why s,
-                [:none]       => packages_inside! dir s,
+/// manifest at all -- so both look inside. `NAME=DIR` is always one package.
+let add_from_root! spec s =
+    match split_root spec {
+        [(), dir] =>
+            match manifest_at! dir {
+                () => packages_inside! dir s,
+                m =>
+                    match load_manifest! m {
+                        [:ok, p]      => list.head (add! p s),
+                        [:error, why] => note why s,
+                        [:none]       => packages_inside! dir s,
+                    },
             },
+        [n, dir] =>
+            if io.is_dir! dir { add_named! n dir s }
+            else { note ("package `" + n + "` is given as " + dir + ", which is not a directory") s },
     };
 
 // --- discovery --------------------------------------------------------------
@@ -311,7 +395,8 @@ let rec find_enclosing! dir s =
             },
     };
 
-/// One package's dependencies, added to the set.
+/// One package's dependencies, added to the set, each under the key it was
+/// listed as as well as its own name.
 let add_deps! i s =
     list.fold (fn acc d -> {
         let owner = at acc i;
@@ -320,15 +405,10 @@ let add_deps! i s =
                         + "` but gives no path; only path dependencies are supported so far") acc,
             rel => {
                 let where = path.join (root owner) rel;
-                match manifest_at! where {
-                    () => note ("package `" + name owner + "` depends on `" + dep_name d
-                                + "` at " + where + ", which has no manifest") acc,
-                    m => match load_manifest! m {
-                        [:ok, p]      => list.head (add! p acc),
-                        [:error, why] => note why acc,
-                        [:none] => note ("package `" + name owner + "` depends on `" + dep_name d
-                                         + "` at " + where + ", whose manifest names no package") acc,
-                    },
+                if io.is_dir! where { add_named! (dep_name d) where acc }
+                else {
+                    note ("package `" + name owner + "` depends on `" + dep_name d
+                          + "` at " + where + ", which is not a directory") acc
                 }
             },
         }
@@ -380,6 +460,8 @@ when test {
         let b = make "b" "0.1.0" "/b" "/b" [] "/b/mind.toml";
         list.head (add! b (list.head (add! a empty)))
     };
+
+    let find_index s n = ((by_name s)).[n else ()];
 
     let tests = [
         test.case "a manifest names its package"
@@ -433,6 +515,20 @@ when test {
             $( test.eq! [true, true, true, false]
                         [is_noise "/p/target", is_noise "/p/build-dream", is_noise "/p/.git",
                          is_noise "/p/src"] ),
+        test.case "a root may name the package it is"
+            $( test.eq! [["json", "../vendor/json"], [(), "../plain"]]
+                        [split_root "json=../vendor/json", split_root "../plain"] ),
+        test.case "a path with an `=` in it is still a path"
+            $( test.eq! [[(), "./a/b=c"], [(), "=x"]] [split_root "./a/b=c", split_root "=x"] ),
+        test.case "the directory of a named root"
+            $( test.eq! ["d", "d"] [root_dir "n=d", root_dir "d"] ),
+        test.case "two names for one package keep one entry"
+            $( test.eq! [0, 0, 0]
+                        { let s = alias! "b_alias" 0 (alias! "a_alias" 0 two!);
+                          [find_index s "a", find_index s "a_alias", find_index s "b_alias"] } ),
+        test.case "an alias that is taken stays with its first owner"
+            $( test.eq! [1, 1] { let s = alias! "b" 0 two!;
+                                 [find_index s "b", list.length (notes s)] } ),
         test.case "a search path splits the way PATH does"
             $( test.eq! ["a", "b"] (split_roots "a::b:") ),
         test.case "an ordinary package name is allowed"

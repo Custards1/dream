@@ -37,7 +37,8 @@ const char* USAGE =
     "      --profile [n]    count reductions per function and print the hottest\n"
     "      --no-jit         stay in the interpreter\n"
     "      --jit-threshold <n>  calls before a function is compiled\n"
-    "      --dump-jit <fn>  print the LLVM IR generated for a function\n"
+    "      --dump-jit <fn>  print the LLVM IR generated for a function, named or\n"
+    "                       given as #N, its index -- generated functions share names\n"
     "      --mindv2         mindv2 path override\n"
     "      --mindv2-path    print the effective $MINDV2_PATH and exit\n"
     "  -h, --help           show this message\n";
@@ -479,6 +480,13 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!jit_owner) jit_owner = std::make_unique<Jit>(rt);
+        if (dump_jit_fn.size() > 1 && dump_jit_fn[0] == '#') {
+            const unsigned long i = std::strtoul(dump_jit_fn.c_str() + 1, nullptr, 10);
+            if (i < rt.image().func_count()) {
+                std::fputs(jit_owner->dump_ir(uint32_t(i)).c_str(), stdout);
+                return 0;
+            }
+        }
         for (uint32_t i = 0; i < rt.image().func_count(); ++i) {
             if (rt.image().str(rt.image().func(i).name).equals(dump_jit_fn.c_str())) {
                 std::fputs(jit_owner->dump_ir(i).c_str(), stdout);

@@ -15,6 +15,13 @@ let rec blow n = blow n - 1;
 
 let rec sum_to n = if n <= 0 { 0 } else { n + sum_to (n - 1) };
 
+// Runs away the other way round: the addition waits *in front of* the call.
+// Compiled, that is a loop carrying the pending sum, and it must still die of
+// the same limit rather than run for ever -- past `DREAM_MAX_DEPTH` pending
+// levels the loop hands the call to the interpreter, which overflows where it
+// always did.
+let rec climb n = 1 + climb (n + 1);
+
 let main! = {
     // Caught in the process that ran away.
     console.print! ("direct:    " + to_string (try! { blow 1 } catch e { e }))
@@ -25,6 +32,8 @@ let main! = {
 
     // The runtime is unharmed: other processes still run.
     console.print! ("survivors: " + to_string (join! (spawn! $( 6 * 7 ))))
+
+    console.print! ("climb:     " + to_string (try! { climb 1 } catch e { e }))
 
     // Recursion that is merely deep, rather than unbounded, is untouched.
     console.print! ("deep ok:   " + to_string (sum_to 20000))

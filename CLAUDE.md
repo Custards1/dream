@@ -39,10 +39,29 @@ The guarantee is byte equality: compiling this source with the seed produces an
 identical image, and so does the stage after that. When you change the compiler,
 run `just bootstrap` and copy `build/dreams.dream` over the seed.
 
+The pipeline a build runs -- resolve, lower and link, types, contracts, share,
+emit -- is written once, in [dreams/compile.dr](dreams/compile.dr):
+`compile.build!` answers a `Build` whose image and bytes are lazy, and
+`compile.check!`/`checked` are what `--check` and `lucid` ask. The command
+line, the REPL's session and the language server all call it rather than
+spelling the stages out, so a new stage is added in one place.
+
 `mind` finds its compiler through `--compiler`, then `[build] compiler`, then
 `$DREAMS`, then `dreams.dream` from the installation
 ([mind/tool/build.dr](mind/tool/build.dr#L139)). A name ending in `.dream`
 is an image and is run by the VM; anything else is executed directly.
+
+A dependency is used by listing it in `[dependencies]` and nothing else: the
+key is its import name, a bare string is a path or a pinned URL, and a
+directory with no `mind.toml` is still a package. `mind` walks the graph
+(`build.graph!`), fetches, reports two different directories under one name as
+a conflict, and hands each package to the compiler as `-L DIR`, or `-L KEY=DIR`
+when the key is not the package's own name. The compiler half of that -- a key
+as a second name for a package, and a manifest-less package -- is `alias!` and
+`add_named!` in [dreams/package.dr](dreams/package.dr), so `dreams` follows a
+path dependency the same way without `mind`. `mind add`/`remove` edit the
+manifest a line at a time and leave the rest of the file as written.
+[mind/tool/README.md](mind/tool/README.md) is the user-facing half.
 
 ## Building
 
@@ -277,6 +296,12 @@ What has already been learnt from them, so it is not learnt twice:
   computing one of those is cheaper than evaluating it. What the change did
   *not* do is make the self-compile finish sooner, and why not is the next
   section, which is the more useful half of this entry.
+- **A list searched more often than it is built wants to be a map -- a fifth
+  time.** `builtins.id` and `builtins.is_builtin` were linear scans of the
+  builtin table, and `opt.specialize` asked `id` three times for every `apply`
+  it rebuilt. `--profile` charged it to `index_of_from`, **7.2% of a
+  self-compile**; the table is indexed once at module level now (`ids`) and a
+  self-compile went 186.8M -> 172.8M reductions with a byte-identical image.
 - **A linear walk the machine can do is worth ten of the same walk in Dream.**
   This is the largest single lesson so far: `list.append` and `list.nth`,
   written as the obvious recursions, were between them *a third of a
@@ -2517,6 +2542,464 @@ arena settled, `opt` costs **no peak heap at all** -- 202 MB with it and 204 MB
 with `--no-opt` -- where before this it cost 61 MB, all of which was the pass
 forcing the suspended nodes it was handed.
 
+### List and map code in the JIT
+
+Done 2026-09-25. Until then the tier compiled numbers: a function was admitted
+only when every parameter was forced on every path and every op was in a short
+numeric table, and that refused essentially every list or map function --
+`cons`, `tail`, the empty test and `.[ ]` were not in the table at all, and any
+argument the callee might not force (a builder's accumulator, the tail of a new
+cell, a value stored under a key) refused the whole function. A self-compile
+made 40 functions hot enough to compile; it compiles 422 now. What changed, in
+[dream/src/jit.cpp](dream/src/jit.cpp) unless it says otherwise:
+
+- **The data ops are compiled.** `ListIsEmpty`, `ListTail`, `Cons`, `Get`,
+  `Set`, `MakeList`, `MakeArray`, `ConstStr` and `Global`, and the three natives
+  `match` lowers a list pattern to (`match_is_cons`, `match_head`,
+  `match_tail`). The reads a list loop makes every iteration -- the empty test,
+  a cell's head and tail, an in-range array element -- are written inline; the
+  rest (a map lookup, a walk, every error) is `dream_rt_get`/`dream_rt_set` in
+  [dream/src/jit_rt.cpp](dream/src/jit_rt.cpp), which are `container_get` and
+  `container_set` with the machine's continuation replaced by a nested force, and
+  say the same words when they raise.
+- **Strictness is a decision per argument, not a condition of admission.** A
+  self-call or peer argument is evaluated where the callee forces that parameter
+  on every path -- the standard strictness fixpoint, assume all and drop what the
+  assumption does not make strict, in `Analyzer::run` under "Which arguments are
+  evaluated" -- and is in a *lazy position* everywhere else.
+- **A lazy position is built or suspended, never evaluated.** Built in place
+  when that cannot be observed: a literal, a slot as it stands, a cell or a list
+  literal (a cell is a value and building one cannot raise), and exactly the
+  shapes `thunk_for` computes. Suspended otherwise, against a frame made on
+  demand from what the slots hold right now -- which is the frame the
+  interpreter would have been running this iteration in, so the thunk means what
+  its thunk would have meant, and needs nothing from this file to run. Before a
+  call's first back-edge the interpreter's own frame for the call *is* that
+  frame, and is adopted rather than copied; that took a self-compile from 3.7M
+  frames made to 0.6M. "Lazy positions" in jit.cpp is the design.
+- **A call the tier cannot make itself, the machine makes.** A closure in a
+  slot, a function the tier did not take, a partial application: `dream_rt_apply`
+  applies it in a nested loop with its arguments lazy and forces the answer. That
+  is what compiles a fold that calls the function it was given. An *impure*
+  callee -- which a pure function can only have been handed through a
+  parameter -- is never run from here: compiled code orders no effects and a
+  call under it that parks is retried from the top, so the whole call is given
+  back (`JIT_BAIL`) before anything has happened.
+- **`e + f ..` recursion is a loop.** `1 + len (tail xs)` used to be a machine
+  call a level and, past a few thousand levels, `JIT_DEEP` -- which gives the
+  function to the interpreter *for good*. It is a loop carrying the pending sum
+  now, and so is `let rest = f ..; .. rest` read as the answer (`filter`
+  skipping an element). The soundness of the first is the part to read before
+  touching it: the interpreter adds innermost first and a partial sum that
+  leaves the fixnum range turns every later addition into a float addition, so
+  the loop keeps the least and greatest prefix sum and proves at the end, in
+  128 bits, that every suffix sum the interpreter would have made fits. Anything
+  else -- a float, a string, a failed proof -- gives the call back (`JIT_BAIL`)
+  to be run from its frame, which answers what the interpreter answers because
+  nothing compiled code did was an effect. "Recursion that is a loop" in jit.cpp.
+- **Hot functions compile on a background thread.** See the finding below; a
+  threshold of 1, or `DREAM_JIT_SYNC`, keeps them synchronous.
+
+What it is worth, 2,000,000-element lists, against the VM before any of it
+(`JIT on`, best of a few runs, KB is what the call allocated):
+
+| | before | after |
+|---|---|---|
+| `sum_list` (empty test, head, tail) | 457 ms, 177 MB | **35 ms, 67 KB** |
+| `sum_match` (the same through `match`) | 173 ms, 345 KB | **47 ms, 104 KB** |
+| `len_rec` (`1 + len (tail xs)`) | 291 ms, 112 MB | **30 ms, 1 KB** |
+| `total` (`x + total rest` through `match`) | 922 ms, 208 MB | **45 ms, 3 KB** |
+| `upto` (`upto (i+1) n (cons i acc)`) | 567 ms, 364 MB | **95 ms, 99 MB** |
+| `rev` | 568 ms, 394 MB | **123 ms, 80 MB** |
+| `evens` (a hand-written `filter`) | 595 ms, 240 MB | **235 ms, 192 MB** |
+| fold calling a lambda | 422 ms, 272 MB | **110 ms, 80 MB** |
+| `list.map` then a sum | 973 ms, 557 MB | **452 ms, 336 MB** |
+| 200,000 map inserts | 380 ms, 367 MB | **127 ms, 194 MB** |
+| 200,000 map reads | 111 ms, 42 MB | **56 ms, 9 KB** |
+
+The consumers now allocate nothing at all, and a builder allocates its cells
+and nothing else: `upto`'s 99 MB is 48 MB of cells and the 44 MB `--stats`
+counts again when a minor collection promotes them, because the list is live.
+What is left in the last four rows is the program's own laziness -- `map`
+suspends `f x` and the rest of the list because the program says to -- and the
+frame the interpreter makes for each call of a closure.
+
+The self-compile: **9.35 s -> 7.37 s** (three interleaved rounds, same machine),
+173M -> 155M reductions, 3.25 -> 3.09 GB allocated, 481 -> 389 MB promoted, and
+a byte-identical image; `benchmark/benchmark/run.sh` moves `collatz` 134 ->
+105 ms and `strbuild` 85 -> 65, and the other five inside the noise.
+
+**Four findings, each of which cost more than the change that exposed it:**
+
+- **Four hundred compiles cost more than they buy, unless nobody waits for
+  them.** The first version made the self-compile 40% *slower*: `DREAM_JIT_TRACE=1`
+  (every compile, and what LLVM charged for it) said 4.7 s of LLVM for 425
+  functions, which was the entire regression -- the compiled code itself was
+  already ahead. Cheaper code generation only halves it (`CodeGenOptLevel::None`
+  2.6 s, `O1` 4.2 s). What removed it is that *when* a compiled body arrives is
+  not observable -- the interpreter runs the function exactly as it did while it
+  was cold -- so the compile moved to a thread of its own (`Jit::compile_worker`)
+  and the program never waits. A self-compile is one green process on a machine
+  with more cores than that. The cost is paid by short programs: a loop that is
+  hot for 30 ms runs interpreted while its compile finishes.
+- **A binding read both evaluated and lazily was computed twice.** A `let` is
+  written where its name is read, which for an evaluated read computes it, and
+  for a lazy read suspended it *again* -- so whoever forced the suspension
+  computed it a second time. `dreams` lowering every function body twice is
+  what it looked like: 24M extra reductions, found by bisecting the compiled
+  functions down to `lower.set_func_body`'s caller with `--profile` showing
+  `emit` and `lower_expr` exactly doubled. A `let` that calls anything is now
+  remembered per iteration and shared with its lazy reads, as the interpreter's
+  one slot thunk is ("A binding computed once" in jit.cpp).
+- **A yield must not write the frame a suspension may read.** A yielding loop
+  used to write its loop state back into the frame it was entered with. Once
+  that frame is adopted as a snapshot, a thunk made in the first iteration reads
+  its slots when forced, and the write-back hands it the *last* iteration's
+  accumulator -- which is the thunk itself: `loop value depends on itself`. A
+  yield returns a new frame now, and `enter_function` resumes in it.
+- **Every alloca belongs in the entry block.** The emitter made its
+  out-parameters where it needed them, and an alloca anywhere but the entry block
+  is a *dynamic* one that grows the machine stack each time it is reached. A
+  numeric loop reaches those blocks almost never. A list loop reaches `force`'s
+  slow path every iteration, and would have grown the stack by a word an
+  iteration for as long as it ran.
+
+**What it does not do yet, and where the rest is:**
+
+- *A call to a closure still makes the interpreter's frame.* The fold row above
+  is 80 MB of the lambda's frames. Taking them away needs a compiled function to
+  be callable with its arguments in registers from *outside* its own module --
+  an entry per function taking values rather than a frame -- which is a registry
+  the tier does not have.
+- *Only `+` accumulates.* `*` has the same shape and a harder proof (suffix
+  products), `-` is not associative, and `f .. + e` evaluates `e` after the
+  recursion returns, so its errors would move. List `+` (`[x] + f rest`) is
+  associative and falls back today because its left side is not a fixnum.
+- *The depth at which a recursion overflows can differ between the tiers.* The
+  loop gives a call back at `DREAM_MAX_DEPTH` pending levels, and the
+  interpreter, which can spend more than one continuation a level, may overflow
+  sooner. A recursion deep enough to overflow one tier and not the other is the
+  one difference this admits; `runaway.dr` holds the case that matters, a
+  recursion that never ends, to raising the same error in both.
+- *An accumulating function is not a peer.* It gives a call back by restarting
+  it from its frame, and a peer has none, so a compiled caller reaches one
+  through `dream_rt_apply`.
+
+`dream/tests/programs/jit_lists.dr` is what holds all of it to the interpreter's
+answers: every function above compiled from its first call (`jit_lists.jit`),
+and the awkward cases each written out -- a float in a sum, a suffix sum that
+overflows though the total does not, an error from the middle of a recursion, a
+lazy element that must never be evaluated, an infinite producer, a missing key
+with and without a default.
+
+**One bug this found that was not the JIT's.** `Scheduler::finish` notified
+`wait_for_all` without the mutex it waits under, so a process finishing between
+the main thread's test of `live_` and its going to sleep lost the wake-up and
+the VM waited for ever on a finished program -- every worker idle, nothing left
+to say so. Once in a few hundred runs on a loaded machine; the full e2e suite
+under a watchdog that took `gdb` backtraces is what caught it, in an `--no-jit`
+run. `Scheduler::notify_done` is the fix.
+
+### The self-compile on four cores: 8.8 s -> 5.8 s, and what 3 s would take
+
+Done 2026-09-25 against a stated goal of a self-compile in three seconds, on a
+four-core container where the commit before measured **8.6-9.0 s** (its own VM,
+its own compiler, interleaved). It is now **5.8 s**, and **5.1 s** under
+`just vm-pgo`. The goal is not met; the last paragraph of this section says
+what is left and why none of it is an edit. In the order the wins were found:
+
+- **A yielding process was moved to another core every 4000 reductions.**
+  `run_slice` ended in `enqueue`, which places round-robin, so a program of one
+  green process hopped workers forty thousand times a compile, each hop a futex
+  wake of a sleeping thread and a cold cache. `Scheduler::requeue` puts it back
+  on its own worker's queue and wakes nobody unless something is already waiting
+  behind it. **~2 s**, the largest single item here, and every stage paid it --
+  the collector's pause alone fell from 1.3 s to 0.56 s. It is invisible to
+  `--profile` and to `-j 1`, which is where it hid.
+- **A `comp` ran against an image of the whole unshared arena.** Six one-line
+  compile-time expressions paid for serializing 142,000 nodes. `comp_image` in
+  [dreams/lower.dr](dreams/lower.dr) gives every function the expressions
+  cannot reach one shared raising body and runs the optimizer, which copies only
+  what a body reaches: **~0.9 s -> 0.17 s**. Incomplete reachability is loud,
+  not wrong, for the reason the macro stub is.
+- **Parsing is spread across processes.** Before a file is parsed its
+  top-level `import` lines are read off the text, and every file they lead to is
+  read and handed to a process of its own (`prefetch!` in
+  [dreams/modules.dr](dreams/modules.dr)); the depth-first walk is unchanged
+  and joins each parse when it reaches the file. Loading went 2.2 s -> 0.75 s.
+  Two things had to be fixed first, and both are general:
+  - `Heap::copy_between` searched a vector for every object it had already
+    copied -- quadratic in what crossed, nothing for a message and minutes for
+    a syntax tree -- and recursed down a list's tail. It is an open-addressing
+    table and a loop along the spine now.
+  - A suspension carries its frame, so a `spawn!` written inside the loader's
+    walk copied the whole loader into the child. The thunk handed to `spawn!`
+    is made in a function of its own (`parse_elsewhere!`) whose frame holds the
+    text and nothing else. Read that before writing the next `spawn!` in the
+    compiler.
+- **The arena is shared in a child while the checker runs.** They need
+  nothing from each other; `share_elsewhere!` in
+  [dreams/compile.dr](dreams/compile.dr) hands the program's *tables* over
+  (the child flattens them, `opt.optimize_program`), and the checker's half
+  second comes off the critical path. Splitting the share itself in two and
+  walking the second half's arena into the first's table was built and gives
+  the same bytes -- the table is canonical -- but the merge costs as much as
+  the half it saves, so it is not kept.
+- **A rename is a wrapper.** `let node_op = Node.op;` was a global read and a
+  closure application at every call; `rename_wrapper` in
+  [dreams/scope.dr](dreams/scope.dr) records it as the wrapper it amounts to,
+  and an empty `[]` or `%{}` now counts as a literal, which makes every
+  `p.[:nodes else (%{})]` accessor a wrapper too. 4%.
+- **Forcing a small tree is `to_string`.** `ir.settled` and `scope.forced`
+  were a dozen reductions a node; one native that cannot answer without
+  evaluating everything does the same job. 5%.
+- **The JIT compiles on idle cycles** (`SCHED_IDLE`). With the compiler's work
+  now spread over every core, LLVM's thread made a compile slower with the JIT
+  on than off. When a compiled body arrives is not observable, so it may as
+  well arrive when nothing else wants the core.
+
+**A JIT bug this exposed, fixed.** A compiled lazy `fold` answering its
+accumulator forced it before returning, and forcing it ran the fold's function,
+which could park (`join!`); a park under compiled code retries the whole call
+from its frame, which builds the chain of suspensions afresh and performs every
+effect in it again. A fold whose function spawned and joined printed each step
+twice, and the loader's walk spun for ever. A loop now answers a parameter in
+tail position as it stands and `enter_function` forces it, where a park
+suspends rather than retries. `impure_callee` also looks at a lambda's body
+flag, since a lambda is never impure by spelling.
+
+**`just vm-pgo` trains with `DREAM_JIT_SYNC=1`.** A run ends in `os.exit!`
+whatever the background compile thread is doing, and its counters are then
+not flow-consistent, which `-fprofile-use` rejects for `jit.cpp`.
+
+**What 3 s would take.** The critical path is now load 0.75, expand 0.22,
+resolve 1.0, lower 2.4, then the share child 1.3 (beside the checker's 0.53),
+then emit 0.2. Lowering is **~240 reductions per node it emits, uniformly** --
+no body is an outlier, so there is no quadratic left to find there -- and the
+arena it emits is four times the one that survives sharing, 70,000 of its
+142,000 nodes being leaves of which 2,600 are distinct. Halving each of
+resolve, lower and share is a rewrite of their hot paths, not a finding. Two
+routes that would each take a second off and are designed but not built:
+sharing each function as soon as lowering finishes it (the share child fed by
+message, with the functions whose bodies hold a `comp` placeholder shared last,
+which changes the image's order but not its meaning), and interning leaves at
+emission, which is blocked on `set_node_flag` mutating a node in place -- 1,275
+leaves carry a flag, and a shared one would hand it to every user. Measure
+against a VM built from the commit before, in a worktree; this machine moves by
+10% between minutes.
+
+### Resolving, lowering and checking in parts: 5.75 s -> 3.7 s
+
+Done 2026-09-25, the next round after the one above, on the same four-core
+machine (the commit before measured 5.75 s here). Lowering was 2.4 s of the
+critical path and every body's lowering depends on the resolution and on
+nothing else, so it runs in four processes (`lower.link_parallel!`, used by
+`compile.build!` whenever the build is optimized). "Lowering in parts" in
+[dreams/lower.dr](dreams/lower.dr) is the design; what is worth carrying away:
+
+- **The split was worth nothing until copying stopped.** Four processes lower
+  in 0.62 s against 2.5 s for one, but handing each of them the resolution by
+  `spawn!` copied it -- 0.43 s, most of the saving. So the VM grew a
+  **shared area** (`SharedArea` in [dream/src/heap.hpp](dream/src/heap.hpp),
+  `vm.share!` in docs/builtins.md): a value forced all the way down and copied
+  once into memory the runtime owns, marked `GC_SHARED`, which every collector
+  stops at and every cross-heap copy passes by pointer. Sharing the resolution
+  is 40-90 ms; a spawn that holds it is a few. What makes it sound is that
+  nothing in the area can change (a suspension is refused rather than copied
+  in, and every object is born `AUX_DEEP_FORCED`) and nothing in it points
+  out. What it costs is that nothing in it is freed before the runtime is, so
+  only the command line uses it: `modules.load_shared!` for the parses and
+  `link_parallel!` for the resolution and the parts. The REPL builds with
+  `compile.scratch`, which is not optimized and so lowers whole, and `lucid`
+  never builds at all -- both would leak a program's worth per request.
+- **Deal the bodies round-robin.** Contiguous slices of equal source were a
+  third apart in nodes -- a byte of `typecheck.dr` lowers to three times what a
+  byte of `lexer.dr` does -- and the slowest slice is the stage. Dealt one at a
+  time the four parts come out within 12% of each other. The count is fixed at
+  four rather than the number of cores, because which part a body lands in
+  decides how the merged constant pools are numbered, and the image must not
+  depend on the machine.
+- **Share inside a part; do not share across them at the merge.** Each process
+  runs the optimizer over its own part (36K nodes -> 11K), and the merge lays
+  the parts end to end, renaming each part's constants into the program's pools
+  (`opt.renumber_part`) -- 0.35 s. A merge that deduplicated across parts was
+  built first, as the optimizer reading several arenas, and cost 0.8 s: at
+  ~17 us per node, a rebuild whose input is already shared is dearer per node
+  than one whose input is mostly leaves. The cross-part sharing still happens,
+  in the rebuild `compile.build!` already runs in a child while the types are
+  checked, so the image is as small as before (33,247 nodes against 32,898).
+- **A `comp` placeholder is `unit fi`, not `unit`.** Parts are optimized
+  before compile-time expressions are settled, and a bare `unit` would be
+  shared with every other one and then overwritten with them all. Carrying the
+  function index keeps it itself and makes it findable after the merge.
+- **The bootstrap needs two stages to settle.** The parts intern atoms in a
+  different order than the whole-program walk, and a `comp` that builds an
+  atom-keyed map quotes it in the compiling VM's atom order (the same effect as
+  "`mind/std/all.dr --test` is not byte-stable" below). So the stage the old
+  seed builds and the stage after it differ in 434 bytes, and the stage after
+  that is the fixpoint. It is deterministic run to run.
+
+- **The types pass is per body too.** `typecheck.analyze` builds one checker
+  from the signatures (40 ms) and then checks every body against it (600 ms),
+  and a body's check only ever *adds* to the diagnostics threaded through it.
+  So `typecheck.prepared` and `concluded` split the two, and
+  `compile.analyze_parallel!` shares the checker and deals the bodies to four
+  processes: 0.6 s -> 0.37 s, for identical diagnostics by construction.
+- **Compile-time contracts run against a pruned image**, as a `comp` does
+  (`lower.comp_image`), rather than a serialization of the whole arena.
+- **What did not work: sharing at the merge, twice.** Once as the optimizer
+  reading several arenas, once as a linear pass exploiting that a shared part
+  lists every node after its children (no recursion, no visit memo). Both
+  cost 0.8 s for 42,800 nodes. The price is not the walk but the per-node map
+  work -- keying the node, looking it up, recording where it went -- at ~200
+  reductions a node, and no rearrangement of the walk changes that. Sharing
+  the whole arena therefore stays in the child, where it overlaps the types.
+
+- **Resolving is per body too, and so is everything after it.** Declaring the
+  program's names is 40 ms; walking 2,205 bodies is the other 950. A walk reads
+  the declarations and nothing another body's walk wrote, except three
+  counters -- function indices, deforestation's invented globals, and the
+  queue of bodies -- so `scope.resolve_parts!` walks the bodies in four
+  processes from one shared starting state, each numbering its own functions
+  and globals from where the declarations left off, and `merge_parts` moves
+  part k's past the parts before it. The name tables (32K uses, 10K binders)
+  are **not merged at all**: lowering and checking a body only ever ask about
+  that body's names, so each part is lowered and checked in a process holding
+  the part that walked it (`scope.parts`), and the merged resolution carries
+  only what is about the whole program -- functions, globals, bodies,
+  diagnostics, wrappers. The renumbering happens once, where the arena is laid
+  out (`opt.renumber_part`: closures, thunks, placeholders, invented globals).
+  Wrappers are the one table every part reads and deciding one reads the
+  wrapper's own body, so a part says what each body can say about itself
+  (`wrapper_candidate`) and the merge finishes it (`wrapper_from`). 0.95 s ->
+  0.45 s, and the functions come out in part order rather than body order,
+  which changes the image and nothing it does.
+- **A merged resolution cannot be lowered whole.** It has no name tables, so a
+  `--no-opt` build (which lowers the arena whole) must resolve whole too;
+  `compile.build!` resolves in parts only when it will lower in parts. That was
+  a bug for one commit, caught writing `dreams/tests/parts.sh`, which holds the
+  parts to the whole: the same diagnostics as `--check`, in the same order, and
+  a program that prints the same built both ways.
+
+- **Sharing across the parts starts the moment they are joined.** The
+  re-share of the whole arena used to wait for the merge and the `comp`s, then
+  took 0.8 s. Now a child shares the four parts straight into one arena
+  (`opt.optimize_parts`, the rebuild reading several arenas, with leaves
+  memoized because a shared part is a DAG and not a tree) while the parent
+  merges, settles the `comp`s and checks the types; the parent then patches
+  the `comp` values into the child's image (`lower.patched`). The patch lowers
+  each value again, unshared, which is why the image is 1% more nodes than a
+  whole-arena share would give -- 34,428 against 33,860. 0.25 s.
+
+- **The parent no longer lays the parts out at all.** Its merge (0.4 s)
+  existed only to give it a runnable arena for the `comp`s and contracts, and
+  those need only what they reach. So their images are made from the parts
+  (`lower.parts_image`: reachability walked across parts, every other function
+  the shared stub, a settled `comp` substituted for its placeholder by the
+  rebuild through `:filled`), and the full image is the sharing child's. The
+  parent's critical path after the join is now the link head (pools,
+  function records), the `comp`s and the types.
+- **Each body is shared into its part as soon as it is lowered** -- the first
+  of the two changes the previous round designed and did not build. A body
+  lowers into an arena of its own, where flags can still be set late; once it
+  is finished the optimizer rebuilds it into the part's growing table and the
+  arena is dropped. The per-part optimizer run is gone and no table of a whole
+  part's unshared nodes is built. With it, "is any child impure?" -- asked of
+  every node lowering emits -- is answered by a per-arena flag while no node
+  in the arena is impure (`ir.has_impure`), which is most bodies. A part went
+  0.92 s -> 0.75 s measured alone.
+- **Two ways to check a change like these, and both were used.** The images
+  must be byte-identical to what the previous compiler emits from the same
+  source (`dreams` and `lucid`), since sharing is canonical in function order
+  whatever the parts looked like inside. And one part's lowering can be timed
+  alone in a driver, which the wall clock -- ±0.3 s between identical runs on
+  this machine now -- cannot resolve. A driver that times a lazy value must
+  force it before reading the clock; three measurements this round read 0 ms
+  for that reason before it was noticed.
+- **Measured, and not kept: making the sharing pass leaner.** It is ~280
+  reductions and ~6 KB a node, a third of it collection, and removing a fifth
+  of the reductions (a double reversal per run, re-specializing parts) moved
+  its time by nothing measurable -- the cost is the map inserts and what they
+  promote. A larger nursery did not help either. Only the reversal change was
+  kept, because it is simpler and the output is byte-identical.
+
+`Options.parallel` is what turns all of this on, and only the command line
+sets it; see the `Options` doc in [dreams/compile.dr](dreams/compile.dr).
+
+Where the time is now, wall clock from the start of a self-compile: loaded
+1.0 s (parsing 0.7, spread over processes and bound by 1.8 s of parse CPU;
+expansion 0.24), resolved 1.45 s, parts joined ~2.4 s, `comp`s settled and
+types checked ~3.0 s, the sharing child joined and patched ~3.45 s, written
+~3.65 s. The sharing child (0.8-0.9 s from the join) is the critical path at
+the end; loading is the largest stage before it.
+
+**Under `just vm-pgo` the same compile is 3.05-3.2 s** (five runs, best
+3.06; `DREAM_GC_THREADS=1` once reached 3.00, within the noise). One thing to
+know before running that recipe in a fresh container: a fresh `cmake`
+configure picks whichever `llvm-config` is first on the path, which here is
+LLVM 18, and the JIT needs 20 -- `build-dream` only works because its cache
+carries `-DDREAM_LLVM_CONFIG=/usr/lib/llvm-20/bin/llvm-config`. Pass the same
+flag to both `cmake` steps of `vm-pgo` or it fails in `jit.cpp`.
+
+**What is left, measured, for whoever takes it to 3 s without PGO:**
+
+- *The sharing child* is the end of the critical path: ~0.9 s from the join
+  under contention, 0.75 alone, of which a third is collection. It could
+  overlap lowering instead of following it: the parts are dealt round-robin,
+  so a sharing process that took bodies in body order, as each part sends
+  them, would produce the same deterministic image while the parts are still
+  lowering -- at the price of a message protocol and of agreeing the constant
+  pools with the parent. Estimated 0.3 s.
+- *Dropping the cross-part share* would take ~0.4 s off, and costs 24% more
+  nodes in the image (42.8K against 34.6K). That is a decision about the
+  output, not a finding, so it has not been made.
+- *Parsing* is ~250 reductions a token (lexing ~60 of them), 1.8 s of CPU for
+  the compiler's own source; it bounds loading at ~0.7 s on four cores.
+- *Expansion* is 0.25 s with one core busy, for 14 macro calls.
+
+### Fewer cores than the machine has: 15.6 s -> 9.1 s on one
+
+Done 2026-09-25. Everything above was measured with four cores to spare, and a
+self-compile had never been timed on fewer. `taskset -c 0` -- which is what a
+CI slot, a `docker --cpus=1` or a small VM amounts to -- found two things, both
+of which the four-core numbers could not show:
+
+- **The VM sized itself by the machine, not by what it was given.**
+  `std::thread::hardware_concurrency()` ignores the affinity mask and the
+  cgroup quota, so a VM pinned to one core of four still started four workers
+  and four collector helpers, and they spent their time taking turns: 15.6 s
+  where the same VM told `-j 1` took 11.7. `usable_cores()`
+  ([dream/src/cores.hpp](dream/src/cores.hpp)) is the smallest of the machine,
+  the affinity mask and the CFS quota (cgroup v2 or v1), and the scheduler's
+  default and `GcPool` both ask it. `DREAM_CORES=N` overrides it, which is how
+  to ask what a smaller machine does without owning one -- though `taskset` is
+  the honest version, because it also takes the cores away. 15.6 -> 11.5 s on
+  one core, 8.0 -> 6.6 s on two, four unchanged.
+- **`SCHED_IDLE` means "never" on a machine with no idle cycles.** The JIT's
+  compile thread only ran on idle cycles (see "Four hundred compiles cost more
+  than they buy"), so pinned to one core a self-compile compiled **2** of the
+  400 functions it made hot, and every benchmark ran interpreted from start to
+  finish: `fib` 55 ms -> 900, `collatz` 115 -> 2500, `pi` 50 -> 1100. The same
+  happens on any number of cores once a program keeps all of them busy. The
+  thread now runs at normal priority while its own CPU time is inside a budget
+  -- 100 ms, plus a tenth of what the rest of the process has spent
+  (`DREAM_JIT_SHARE` is the tenth, as a percentage) -- and drops to `SCHED_IDLE`
+  past it; an idle thread still gets the odd slice, which is where it notices
+  the budget has grown back. One core now runs the benchmarks at 1.2-1.8x the
+  four-core time instead of 10-20x, and the self-compile 11.5 -> **9.1 s**,
+  because compiled code pays for itself even when its compiles are not free.
+  Four cores do not move: shares of 0, 5, 10 and 25% were all inside this
+  machine's noise there.
+
+**Measured, and not kept: eight parts instead of four.** `lower.part_count` is
+fixed so that an image does not depend on the machine, so the only way to give
+an eight-core machine more to do is to raise it for everyone. At eight, one
+and two cores are unchanged (10.8/10.4 s against 10.7/10.3, 6.7/6.4 against
+6.8/6.9) and four are **7-10% slower** (5.06/5.18 against 4.77/4.53) -- the
+cross-part share, which is the end of the critical path, has twice the parts
+to merge. That is a loss on a machine anyone can measure for a gain on one
+nobody here has, so it waits for someone with eight cores to measure it.
+
 ### A JIT that can allocate -- the plan
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the
@@ -2617,7 +3100,14 @@ is one.
     about permission to allocate, and the stage below does not have to wait for
     it.
 
-- **Admit object-allocating self-recursion.** The draft read as though this
+- ~~**Admit object-allocating self-recursion.**~~ **Done** (2026-09-25), by
+  the route the last paragraph of this bullet names -- a parameter's argument is
+  evaluated only where the callee forces it, and is in a lazy position otherwise
+  -- and wider than it asked: an argument that is not "eagerly safe" is
+  suspended rather than refused. See "List and map code in the JIT" above. What
+  follows is kept because the reasoning is still the reason.
+
+  The draft read as though this
   were a widening of `op_is_supported`. It is not, and the gate that actually
   refuses a list builder is worth knowing before any of it is written.
 
@@ -2853,9 +3343,31 @@ not, each found by running the checker over this repository:
   compiler. A lambda passed as an argument takes its *parameter* types from
   what was solved (`solved_inputs`), and its answer is only bound, never
   checked against a solved variable.
-- `()` is "nothing there", and the checker does not narrow a `()` arm away.
-  So `map.get () ages k` solving `v` as `:integer | :unit` made every guarded
-  use of the answer a report. A `()` argument now never decides a variable
+- `()` is "nothing there", and a union with `:unit` in it is how the library
+  says "maybe". Two halves. A *test* narrows: an arm below `() =>` sees the
+  rest of the scrutinee's union (and so does a scrutinee that is a name),
+  and `x == ()`/`x != ()` under `if`, `&&`, `||`, `not` or a guard narrows
+  `x` in the branch the outcome decides; `type_of x == :kind`, and a `match`
+  on `type_of x` whose arms are kinds, narrow to that kind or away from it;
+  `x == :atom` picks one value out of a union (a fieldless `union` variant is
+  one), and `list.head x`, `x.[0]` or `x.[:kind]` compared with an atom picks
+  out the tagged lists or records that could carry it, which is how a
+  `union`'s variants with fields are told apart; and inside a `match` arm the
+  scrutinee is cut down to what the arm's pattern could match. Only atoms,
+  booleans and `()` narrow -- `3 == 3.0`, and a `bigstr` is `==` its string,
+  so a number or a string literal says less than it looks. A read with no
+  fallback that raises for a member drops that member from *both* branches:
+  `s.[0] == :circle` false leaves the square, not `:empty`. `list.head` is
+  known by its global index, as fusion knows `range` (`heads_of`).
+  `x` may be a global (keyed by its index, so a local of the same spelling
+  under the test is not it) but not an impure name, and `:any` is never
+  narrowed, so rule 1 still holds of unannotated code -- "narrowing" in
+  [dreams/typecheck.dr](dreams/typecheck.dr). It only ever removes members it
+  can see a value cannot be, so an incomplete answer narrows less and never
+  reports more. Before it, `if r == () { 0 } else { r + 1 }` was a report.
+  And a *default* is not a maybe: `map.get () ages k` solving `v` as
+  `:integer | :unit` made every use of the answer a report, though the
+  default was written so that nothing need test. A `()` argument never decides a variable
   (`solve`), fits one wherever it was written even once another argument has
   decided it (`admit_unit`), and fits a declared variable in an answer
   (`sub`), which is what lets `list.minimum` be `[a] -> a`. Two things std

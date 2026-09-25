@@ -1,0 +1,12 @@
+import std.console;
+let a x = x + nope1;
+let b x = nope2 x;
+let c = missing_three;
+let d x y = x + y + nope4;
+let e! = console.print! (undefined5);
+let f x = x + 1;
+let g = f nope7;
+let h x = match x { [] => nope8, _ => nope9 };
+let i x : :integer = "not an integer";
+let j = expand nothing_here 1;
+let main! = e!;

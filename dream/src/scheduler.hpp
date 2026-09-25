@@ -45,6 +45,9 @@ public:
     /// Eight is the same compromise `GcPool` makes, for the same reason and
     /// with the same escape hatch: `-j` is how a program that really does have
     /// twenty-four runnable processes asks for twenty-four workers.
+    ///
+    /// "Cores" is `usable_cores()`: the ones this process may run on, which
+    /// a pinned or containerized process has fewer of than the machine.
     static unsigned default_workers();
     Scheduler(const Scheduler&) = delete;
     Scheduler& operator=(const Scheduler&) = delete;
@@ -116,7 +119,8 @@ private:
     void worker_loop(unsigned index);
     std::shared_ptr<Process> take_local(unsigned index);
     std::shared_ptr<Process> steal(unsigned thief);
-    void run_slice(const std::shared_ptr<Process>& p);
+    void run_slice(const std::shared_ptr<Process>& p, unsigned index);
+    void requeue(unsigned index, const std::shared_ptr<Process>& p);
     void finish(const std::shared_ptr<Process>& p);
     void note_idle(bool idle);
 
@@ -176,6 +180,8 @@ private:
     std::mutex idle_mutex_;
     std::condition_variable work_cv_;
     std::condition_variable done_cv_;
+    /// Wake `wait_for_all` after changing what it waits on. See the definition.
+    void notify_done();
 };
 
 }  // namespace dream

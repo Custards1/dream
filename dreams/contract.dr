@@ -118,7 +118,8 @@ let emit_guarded f l = {
 // --- running them -------------------------------------------------------------
 
 /// The linked program with one function more, answering every contract's
-/// formula as a list, and that function's index: `[bytes, function]`.
+/// formula as a list, and that function's index: `[bytes, function]`. The
+/// bytes hold only what that function can reach.
 let batch_image low contracts = {
     let done = list.fold (fn acc c -> {
         let got = emit_guarded (list.nth 5 c) (list.head acc);
@@ -134,7 +135,10 @@ let batch_image low contracts = {
                     :slots => 1, :n_captures => 0, :captures_off => 0,
                     :span_start => 0, :span_end => 0 };
     let p2 = p1.[:funcs => (ir.funcs p1 + [record])];
-    [emit.with_entry (emit.to_binary (ir.finish p2)) fi, fi]
+    // Cut down to what the predicates can reach, as a `comp`'s image is: the
+    // rest of the program is a stub each, and was most of what a batch cost --
+    // 0.4 s of a self-compile to serialize an arena for a handful of calls.
+    [emit.with_entry (lower.comp_image [fi] (lower.set_prog p2 (list.head made))) fi, fi]
 };
 
 /// What a contract that did not hold says, at the place its value was written.

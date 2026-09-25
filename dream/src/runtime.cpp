@@ -72,7 +72,20 @@ void Runtime::enable_profile(size_t top) {
     alloc_.swap(fresh_alloc);
 }
 
+/// A function as a profile names it. A lambda or a thunk has no name of its
+/// own -- they are all `<lambda>` and `<thunk>` -- so it carries its index,
+/// which `dreams --ir` maps back to where it was written. Without it the
+/// largest row of a compile's profile was a sum of hundreds of unrelated
+/// functions.
+static std::string profile_name(const Image& img, uint32_t fi) {
+    StringRef name = img.str(img.func(fi).name);
+    std::string out(name.data, name.len);
+    if (!out.empty() && out[0] == '<') out += "#" + std::to_string(fi);
+    return out;
+}
+
 void Runtime::print_profile() const {
+    auto profile_name = [this](uint32_t fi) { return dream::profile_name(*image_, fi); };
     const size_t top = profile_top_;
     if (!profiling_ || !image_) return;
     std::vector<std::pair<uint64_t, uint32_t>> rows;
@@ -87,11 +100,10 @@ void Runtime::print_profile() const {
     std::fprintf(stderr, "; profile: %llu reductions in %zu functions\n",
                  static_cast<unsigned long long>(total), rows.size());
     for (size_t i = 0; i < rows.size() && i < top; ++i) {
-        StringRef name = image_->str(image_->func(rows[i].second).name);
         double pct = total ? 100.0 * double(rows[i].first) / double(total) : 0.0;
-        std::fprintf(stderr, ";  %5.1f%%  %12llu  %.*s\n", pct,
+        std::fprintf(stderr, ";  %5.1f%%  %12llu  %s\n", pct,
                      static_cast<unsigned long long>(rows[i].first),
-                     int(name.len), name.data);
+                     profile_name(rows[i].second).c_str());
     }
 
     // And the same by bytes. A function can be cheap in reductions and
@@ -109,11 +121,10 @@ void Runtime::print_profile() const {
     std::fprintf(stderr, "; allocated: %llu bytes in %zu functions\n",
                  static_cast<unsigned long long>(bytes), rows.size());
     for (size_t i = 0; i < rows.size() && i < top; ++i) {
-        StringRef name = image_->str(image_->func(rows[i].second).name);
         double pct = 100.0 * double(rows[i].first) / double(bytes);
-        std::fprintf(stderr, ";  %5.1f%%  %12llu  %.*s\n", pct,
+        std::fprintf(stderr, ";  %5.1f%%  %12llu  %s\n", pct,
                      static_cast<unsigned long long>(rows[i].first),
-                     int(name.len), name.data);
+                     profile_name(rows[i].second).c_str());
     }
 }
 

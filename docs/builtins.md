@@ -396,6 +396,33 @@ These report figures for the **calling** process.
 | `has_ffi` | `unit → bool` | Whether the VM was built with libffi support. |
 | `async_io` | `unit → bool` | Whether epoll-based async I/O is available. |
 
+### Sharing between processes
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `share!` | `value → value` | The same value, forced all the way down and moved into the runtime's shared area. From then on a `spawn!`, `send!` or `join!` carrying it copies a pointer rather than the value. |
+| `shared_bytes!` | `unit → integer` | Bytes in the runtime's shared area. |
+
+Processes share nothing: a value that crosses between two is copied, which is
+what lets each heap collect on its own. For a large table that many processes
+only *read*, the copy is the cost — a compiler handing its resolution to four
+workers spent more copying it than the split saved. `share!` copies it once,
+into memory every process of the runtime can read and none owns.
+
+Three things follow, and they are the contract:
+
+- The answer is equal to the argument in every way a program can observe; only
+  where it lives changes. A map put, a list cons or anything else built *on*
+  a shared value is an ordinary value of the process that built it.
+- A value must be data after forcing. A closure whose captured state is still
+  a suspension is refused with `:type_error` rather than shared, because
+  forcing a suspension writes to it and nothing shared may ever be written.
+- **Nothing shared is freed until the runtime ends.** That is the right bargain
+  for a table built once and read for the rest of a run, and the wrong one for
+  anything built in a loop: a language server that shared each request's parse
+  would grow for ever. `dreams` shares only when it is compiling from the
+  command line.
+
 ### Inspection
 
 | Name | Signature | Description |

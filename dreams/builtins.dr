@@ -70,7 +70,18 @@ let names = [
 
 ];
 
-let is_builtin name = list.contains name names;
+/// Each name's position in `names`, which is the runtime's ID for it.
+///
+/// Built once, at module level, because both questions below are asked of
+/// every name resolution falls through to and of every call the optimizer
+/// rebuilds -- and asked of the list they were a linear scan each time, which
+/// on a self-compile was 7% of every reduction the compiler made (`--profile`
+/// charged it to `index_of_from`). A list searched more often than it is built
+/// wants to be a map; see "Making it faster" in CLAUDE.md for the other four.
+let ids = list.fold (fn m [i, n] -> m.[n => i]) (%{}) (list.enumerate names);
+
+let is_builtin : :string -> :bool;
+let is_builtin name = map_has ids name;
 
 /// What each one takes and answers, as one line.
 ///
@@ -139,18 +150,17 @@ let signatures = %{
 };
 
 /// A builtin's signature, or its bare name for one that has none.
+let signature : :string -> :string;
 let signature name = signatures.[name else name];
 
-/// The runtime's index for a builtin, or `()`. Emission will want this; nothing
-/// does yet.
-let id name = {
-    let at = list.index_of name names;
-    if at < 0 { () } else { at }
-};
+/// The runtime's index for a builtin, or `()`.
+let id : :string -> :integer | :unit;
+let id name = ids.[name else ()];
 
 /// A name ending in `!` denotes something impure. That is the whole rule --
 /// there is no list of effectful builtins to keep in step with this one,
 /// because the spelling is the declaration.
+let is_impure_name : :string -> :bool;
 let is_impure_name name = str.ends_with "!" name;
 
 // --- tests -------------------------------------------------------------------

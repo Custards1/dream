@@ -237,7 +237,7 @@ Three knobs, all read once:
 
 | Variable | What it does |
 |---|---|
-| `DREAM_GC_THREADS` | The most threads one collection may use, the collecting one included. Default `min(hardware_concurrency, 8)`; `1` turns the helpers off. |
+| `DREAM_GC_THREADS` | The most threads one collection may use, the collecting one included. Default `min(cores, 8)`, where the cores are the ones this process may actually use (affinity mask and cgroup quota, `DREAM_CORES` to override; see `dream/src/cores.hpp`); `1` turns the helpers off. |
 | `DREAM_GC_PAR_MIN` | Bytes of work under which a collection is not divided. Default 1 MiB for a minor, four times that for a major. `0` divides every collection however small, which is how the race detector gets to see the parallel collector on a program small enough to run under one. |
 | `DREAM_GC_TRACE` | Report every collection on stderr as it happens, with the per-thread split of a parallel round. `--stats` gives the totals; this gives their shape. |
 

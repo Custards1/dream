@@ -26,6 +26,7 @@ import std.io;
 import std.list;
 import std.os;
 import std.str;
+import std.vm;
 
 import dreams.ast;
 import dreams.syntax;
@@ -50,6 +51,10 @@ let is_native p = list.contains p native_modules;
 
 
 // --- a loaded module ---------------------------------------------------------
+
+/// What `load!` answers: every module and file the program reaches, keyed by
+/// index, and what the loader had to say about them.
+type Loader = :map;
 
 /// `source` is an index into the loader's file list, so a diagnostic raised
 /// about this module can quote the line it came from.
@@ -112,6 +117,7 @@ let host_modules l = l.[:host_modules else []];
 /// that is wanted, which is what nearly every caller wanted.
 let modules l      = list.map (fn i -> module_at l i) (list.range 0 (module_count l));
 let module_map l   = l.[:modules else %{}];
+let module_count : Loader -> :integer;
 let module_count l = l.[:module_count else 0];
 let by_name l      = l.[:by_name else (%{})];
 let by_path l      = l.[:by_path else (%{})];
@@ -120,8 +126,10 @@ let by_path l      = l.[:by_path else (%{})];
 /// whole program's files once, at the end of a compile that has something to
 /// say. Every other reader knows the index it wants -- a diagnostic carries
 /// one -- and asks `file_at`.
+let files : Loader -> [:any];
 let files l        = list.map (fn i -> file_at l i) (list.range 0 (file_count l));
 let file_map l     = l.[:files else %{}];
+let file_count : Loader -> :integer;
 let file_count l   = l.[:file_count else 0];
 let file_at l i    = (file_map l).[i else ()];
 
@@ -147,8 +155,10 @@ let expanding l = l.[:expanding else %{}];
 let expand_sites l source = (expanding l).[source else []];
 let note_expanding source sites l =
     if list.is_empty sites { l } else { put :expanding ((expanding l).[source => sites]) l };
+let natives : Loader -> [:string];
 let natives l      = l.[:natives else []];
 let namespaces l   = l.[:namespaces else []];
+let diags : Loader -> [:map];
 let diags l        = l.[:diags else []];
 let visited l      = l.[:visited else (%{})];
 let in_progress l  = l.[:in_progress else []];
@@ -194,6 +204,7 @@ let expansions l   = l.[:expansions else []];
 /// compiler reads it, the way nothing reads `records` -- it is here because
 /// the pass that spends the time is the only one that can say where.
 let metering l     = l.[:metering else false];
+let with_metering : Loader -> Loader;
 let with_metering l = put :metering true l;
 let macro_meter l  = l.[:macro_meter else ()];
 
@@ -656,7 +667,111 @@ let rec hoist_mod! l parent source m =
         _ => [l, m],
     };
 
-let rec load_text! l text display name file = {
+// --- parsing ahead ------------------------------------------------------------
+//
+// Parsing is a fifth of a compile and every file's parse is independent of
+// every other's, but the loader cannot know which files it needs until it has
+// parsed the ones that import them -- it walks the imports depth first, and the
+// order it records modules in is the order that walk finishes them.
+//
+// So the walk stays exactly as it is, and only the parsing moves. When a
+// module has been parsed, each of its imports that names a file not yet seen
+// is read and handed to a process of its own to parse, all of them at once;
+// the walk then descends into the first while the others are being parsed on
+// other workers, and meets each one's answer waiting when it gets there. A
+// module's imports are usually several files, and each of those imports more,
+// so the machine stays busy from the root down. On a self-compile this is most
+// of the parse stage taken off the critical path.
+//
+// Nothing about what is loaded, or in what order, depends on this: a parse
+// fetched ahead is used only when the walk reaches the same file with the same
+// text, and anything else -- a dependency that resolves some other way, a file
+// the walk ends up reaching under another name -- is simply parsed where it
+// always was. A parse that raises is not the child's to report: it answers
+// `:crashed`, and the file is parsed again in place, where the raise happens
+// exactly as it did before there was a child.
+
+let fetched l = l.[:prefetch else (%{})];
+
+/// The text a file would be loaded with: the editor's buffer, then the disk.
+let text_of! l file = match ((overlay l)).[file else ()] {
+    () => path.read_file! file,
+    t => t,
+};
+
+/// A process parsing `text`. Its own function, and not written inline where it
+/// is used, because a suspension carries the frame it was made in and `spawn!`
+/// copies the suspension into the child whole: made inside the walk, that frame
+/// held the loader, and every child received a copy of every module parsed so
+/// far. Here the frame holds the text and nothing else.
+let parse_elsewhere! text =
+    spawn! $( try! { strict! (parser.parse_module text) } catch e { [:crashed, e] } );
+
+/// The same, answering through the shared area; see `load_shared!`. A parse
+/// the area refuses -- nothing in one should hold a suspension, but if it did
+/// -- comes back `:crashed` and is parsed again in place, like any other.
+let parse_shared! text =
+    spawn! $( try! { vm.share! (parser.parse_module text) } catch e { [:crashed, e] } );
+
+/// Start parsing, elsewhere, every file these imports of the module `name`
+/// will load and nothing has yet.
+/// The modules a file's text imports at the top level, read off the text
+/// without parsing it: every line that begins `import `, up to the end of the
+/// dotted name. A guess, and allowed to be one -- a name it misses is parsed
+/// where the walk meets it, and one it invents is a parse nobody joins -- and
+/// cheap enough to make before a file is parsed, which is what lets the
+/// parses of a whole program start at once rather than a level at a time.
+let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+
+let rec import_lines text at acc = {
+    let i = str_find text "\nimport " at;
+    if i < 0 { acc }
+    else {
+        let start = i + 8;
+        let stop = str_span text start name_bytes;
+        let named = str_slice text start (stop - start);
+        let bare = if str.ends_with "." named { str_slice named 0 (len named - 1) } else { named };
+        import_lines text stop (if len bare == 0 { acc } else { list_cons bare acc })
+    }
+};
+
+let scanned_imports text = list.reverse (import_lines ("\n" + text) 0 []);
+
+/// Start parsing, elsewhere, every file these dotted names will load and
+/// nothing has yet -- and, reading each one's imports off its text, every file
+/// those will load too.
+let rec prefetch! l deps = match deps {
+    [] => l,
+    [dep, ..rest] => {
+        let file = if is_host l dep || is_visited l dep { () } else { resolve_path! l dep };
+        let wanted = file != () && not (map_has (fetched l) file)
+                     && not (map_has (by_path l) (path.absolute! file));
+        let text = if wanted { text_of! l file } else { () };
+        if text == () { prefetch! l rest }
+        else {
+            let child = if l.[:share_parses else false] { parse_shared! text }
+                        else { parse_elsewhere! text };
+            let marked = put :prefetch ((fetched l).[file => [text, child]]) l;
+            prefetch! (prefetch! marked (scanned_imports text)) rest
+        }
+    },
+};
+
+/// This file's parse: the one fetched ahead if there is one for the same text,
+/// and one made here otherwise.
+let parse_of! l file text = match ((fetched l)).[file else ()] {
+    [same, child] if same == text => match join! child {
+        [:crashed, _] => parser.parse_module text,
+        answer => answer,
+    },
+    _ => parser.parse_module text,
+};
+
+let rec load_text! l0 text display name file = {
+    // Every file this one leads to is set parsing before this one is parsed.
+    // For the root that is the whole program; for any other file it is almost
+    // always nothing, because the root's scan already reached it.
+    let l = prefetch! l0 (scanned_imports text);
     let source = file_count l;
     let read = add_file (diag.source display text) l;
     // A same-text parse already in hand is reused rather than done again: an
@@ -666,12 +781,12 @@ let rec load_text! l text display name file = {
         [same, result] => {
             if same == text { load_items! read source result display name file text }
             else {
-                let parsed = parser.parse_module text;
+                let parsed = parse_of! l file text;
                 load_items! (put_parsed file [text, parsed] read) source parsed display name file text
             }
         },
         _ => {
-            let parsed = parser.parse_module text;
+            let parsed = parse_of! l file text;
             load_items! (put_parsed file [text, parsed] read) source parsed display name file text
         },
     }
@@ -848,7 +963,8 @@ let rec enclosing_minds! dir acc = {
 
 let default_search_paths! file extra =
     list.concat [
-        extra,
+        // A root may be written `NAME=DIR`; as a search path it is the directory.
+        list.map package.root_dir extra,
         [path.dirname file],
         enclosing_minds! (path.dirname (path.absolute! file)) [],
         match os.env! "MINDV2_PATH" {
@@ -858,14 +974,28 @@ let default_search_paths! file extra =
     ];
 
 /// The usual way in: discover packages around `file`, then load it.
+let load! : :string -> [:string] -> :any -> :bool -> Loader;
 let load! file roots cfg test_mode =
     load_root! (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])
+               file test_mode;
+
+/// The same, with every parse fetched ahead handed back through the runtime's
+/// shared area rather than copied (`vm.share!`), which is what a one-shot
+/// compile wants: its syntax trees live as long as it does, and the copy was
+/// most of what a parse elsewhere cost the walk that joins it. Not the
+/// default, because nothing in the shared area is freed before the runtime
+/// is, and a language server loads the program again at every keystroke.
+let load_shared! : :string -> [:string] -> :any -> :bool -> Loader;
+let load_shared! file roots cfg test_mode =
+    load_root! (put :share_parses true
+                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) []))
                file test_mode;
 
 /// The same, reading `ov` -- a map of path to text -- instead of the disk for
 /// the files it names. This is what a language server loads through: the
 /// program it must answer questions about is the one in the editor's buffers,
 /// which may differ from the one on disk in every file at once.
+let load_overlaid! : :string -> [:string] -> :any -> :bool -> %{ :string => :string } -> Loader;
 let load_overlaid! file roots cfg test_mode ov =
     load_overlaid_cached! file roots cfg test_mode ov (%{});
 

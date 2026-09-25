@@ -22,7 +22,7 @@ import util;
 /// Where fetched packages are kept. Shared between projects, because a
 /// repository at a given revision is the same bytes whoever asked for it.
 let cache_root! () =
-    match os.env! "MIND_HOME" {
+    match util.env_path! "MIND_HOME" {
         () => match os.env! "HOME" {
             () => ".mind",
             home => util.join home ".mind",
@@ -54,14 +54,15 @@ let dep_dir! d = {
 let run! what program args = {
     let r = os.exec_for! program args 600000;
     let code = r.[:code else (0 - 1)];
-    let timed = r.[:timed_out else false];
-    if timed { [:error, what + ": timed out after 10 minutes"] }
-    else if code != 0 {
-        let err = str.trim (r.[:err else ""]);
-        [:error, what + " failed (" + to_string code + ")"
-            + (if str.is_empty err { "" } else { ": " + err })]
+    match [r.[:timed_out else false], code] {
+        [true, _] => [:error, what + ": timed out after 10 minutes"],
+        [_, 0] => [:ok, r.[:out else ""]],
+        _ => {
+            let err = str.trim (r.[:err else ""]);
+            [:error, what + " failed (" + to_string code + ")"
+                + (if str.is_empty err { "" } else { ": " + err })]
+        },
     }
-    else { [:ok, r.[:out else ""]] }
 };
 
 let git_fetch! d dir = {
@@ -109,32 +110,54 @@ let url_fetch! d dir = {
     }
 };
 
+/// Written into a fetched directory once the fetch has finished. A dependency
+/// need not have a manifest, so "is there a `mind.toml`?" cannot be how a
+/// complete fetch is told from one that died halfway; this is. A directory from
+/// before the marker existed, which always had a manifest, still counts.
+let marker = ".mind-fetched";
+
+let is_fetched! dir =
+    io.exists! (util.join dir marker) || io.exists! (util.join dir "mind.toml");
+
+/// Throw away a fetched copy so that the next resolve fetches it again. What
+/// `mind update` does, and the only way a branch-pinned dependency moves.
+let forget! d =
+    match manifest.dep_kind d {
+        :git => run! "rm" "rm" ["-rf", dep_dir! d],
+        :url => run! "rm" "rm" ["-rf", dep_dir! d],
+        _ => [:ok, ""],
+    };
+
 /// Where `d` is on disk, fetching it first if it is not there yet.
 ///
 /// A fetched dependency is never re-fetched: it is pinned to a revision, so
-/// the copy in the cache is by definition the right one. `mind clean --deps`
-/// is how to change your mind.
+/// the copy in the cache is by definition the right one. `mind update` is how
+/// to change your mind about a branch.
 let resolve! from_root d = {
     match manifest.dep_kind d {
         :path => {
             // Relative to the manifest that named it, so moving a project
             // does not change what its dependencies mean.
             let p = util.join from_root (to_string (manifest.spec_get d "path"));
-            if io.exists! p { [:ok, p] }
+            if io.is_dir! p { [:ok, p] }
             else { [:error, manifest.dep_name d + ": no directory at " + p] }
         },
         :unknown => [:error, manifest.dep_name d + ": needs one of `path`, `git` or `url`"],
         kind => {
             let dir = dep_dir! d;
-            if io.exists! (util.join dir "mind.toml") { [:ok, dir] }
+            if is_fetched! dir { [:ok, dir] }
             else {
+                // A partial copy from a fetch that died is in the way of
+                // `git clone`, which refuses a directory that is not empty.
+                run! "rm" "rm" ["-rf", dir]
                 util.mkdir_p! (util.dirname dir)
                 let got = match kind { :git => git_fetch! d dir, _ => url_fetch! d dir };
                 match got {
                     [:error, why] => [:error, manifest.dep_name d + ": " + why],
-                    _ =>
-                        if io.exists! (util.join dir "mind.toml") { [:ok, dir] }
-                        else { [:error, manifest.dep_name d + ": fetched, but it has no mind.toml"] },
+                    _ => {
+                        util.write_file! (util.join dir marker) (manifest.dep_source d + "\n")
+                        [:ok, dir]
+                    },
                 }
             }
         },

@@ -15,35 +15,126 @@ import fetch;
 import manifest;
 import util;
 
-/// Every package the root needs, transitively, as directories to search.
-///
-/// Depth-first with a seen-set: a diamond is normal (two dependencies sharing
-/// a third) and must be visited once, and a cycle must not spin.
-let rec collect! m seen acc = {
-    let deps = manifest.dependencies m;
-    let rec each! ds seen acc =
-        match ds {
-            [] => [:ok, seen, acc],
-            [d, ..rest] => match fetch.resolve! (manifest.root m) d {
-                [:error, why] => [:error, why, acc],
-                [:ok, dir] =>
-                    if list.contains dir seen { each! rest seen acc }
-                    else {
-                        match manifest.load! dir {
-                            [:error, why] => [:error, why, acc],
-                            [:ok, dep_m] => {
-                                let deeper = collect! dep_m (list.cons dir seen) (list.cons dir acc);
-                                match deeper {
-                                    [:error, why, partial] => [:error, why, partial],
-                                    [:ok, seen2, acc2] => each! rest seen2 acc2,
+// --- the dependency graph ------------------------------------------------------
+//
+// Every package the root needs, transitively, each under the key it was listed
+// as. A key is the name a package is imported by (the compiler records it as an
+// alias of whatever the package calls itself), so the graph is keyed by it:
+// the whole program shares one namespace of package names, and two different
+// directories under one key is the one thing that cannot be built. That is
+// reported with both places and who asked for each, because in a project with
+// many dependencies "which one wanted which?" is the question.
+//
+// The same directory reached twice -- a diamond, two packages sharing a third
+// -- is one node. Directories are compared by their normalized absolute path,
+// so `../greet/../util` and `../util` agree.
+
+/// The key the root package's own dependencies are recorded under.
+let root_key = "";
+
+let empty_graph = %{ :order => [], :nodes => %{}, :edges => %{} };
+
+let order g = list.reverse (g.[:order else []]);
+let node g key = (g.[:nodes else (%{})]).[key else ()];
+let nodes g = list.map (fn k -> node g k) (order g);
+let children g key = list.reverse ((g.[:edges else (%{})]).[key else []]);
+
+let with_edge from to g = {
+    let es = g.[:edges else (%{})];
+    let now = es.[from else []];
+    if list.contains to now { g } else { g.[:edges => es.[from => list.cons to now]] }
+};
+
+let with_node key n g = {
+    let ordered = g.[:order => list.cons key (g.[:order else []])];
+    ordered.[:nodes => (g.[:nodes else (%{})]).[key => n]]
+};
+
+/// A node: the key, where it is, its manifest (`()` for a bare directory),
+/// the dependency as written, and who asked for it first.
+let make_node key dir m d by =
+    %{ :key => key, :dir => dir, :abs => (), :manifest => m, :dep => d, :by => by };
+
+let node_key n = n.[:key else ""];
+let node_dir n = n.[:dir else "."];
+let node_abs n = n.[:abs else node_dir n];
+let node_manifest n = n.[:manifest else ()];
+let node_dep n = n.[:dep else ()];
+let node_by n = n.[:by else root_key];
+
+/// Who asked, as a person reads it.
+let asker by = match by { "" => "this project", k => "`" + k + "`" };
+
+/// `[:ok, graph]` or `[:error, why]`.
+let rec walk! owner owner_key deps g =
+    match deps {
+        [] => [:ok, g],
+        [d, ..rest] => {
+            let key = manifest.dep_name d;
+            match fetch.resolve! (manifest.root owner) d {
+                [:error, why] => [:error, why + " (required by " + asker owner_key + ")"],
+                [:ok, dir] => {
+                    let abs = util.absolute! dir;
+                    match node g key {
+                        () => match manifest.load_dependency! dir {
+                            [:error, why] => [:error, why],
+                            [:none] => walk! owner owner_key rest
+                                             (with_edge owner_key key
+                                                 (with_node key ((make_node key dir () d owner_key).[:abs => abs]) g)),
+                            [:ok, dm] => {
+                                let g2 = with_edge owner_key key
+                                             (with_node key ((make_node key dir dm d owner_key).[:abs => abs]) g);
+                                match walk! dm key (manifest.dependencies dm) g2 {
+                                    [:error, why] => [:error, why],
+                                    [:ok, g3] => walk! owner owner_key rest g3,
                                 }
                             },
-                        }
-                    },
-            },
-        };
-    each! deps seen acc
-};
+                        },
+                        seen => match seen.[:abs else ()] == abs {
+                            true => walk! owner owner_key rest (with_edge owner_key key g),
+                            false => [:error, "two different packages are both called `" + key + "`:\n"
+                                              + "  " + node_abs seen + " (" + manifest.dep_source (node_dep seen)
+                                              + ", required by " + asker (node_by seen) + ")\n"
+                                              + "  " + abs + " (" + manifest.dep_source d
+                                              + ", required by " + asker owner_key + ")\n"
+                                              + "a program has one namespace of packages: point both at the same "
+                                              + "place, or list one of them under another name"],
+                        },
+                    }
+                },
+            }
+        },
+    };
+
+/// The root's dependencies, and with `dev` its `[dev-dependencies]` as well.
+let root_deps m dev =
+    if dev { list.append (manifest.dependencies m) (manifest.dev_dependencies m) }
+    else { manifest.dependencies m };
+
+/// Every package this build needs, transitively.
+let graph! m dev = walk! m root_key (root_deps m dev) empty_graph;
+
+/// How the compiler is told about one package. `-L DIR` when the package
+/// already calls itself by the key, which every compiler understands;
+/// `-L KEY=DIR` otherwise, which names it.
+let package_arg n =
+    match node_manifest n {
+        () => node_key n + "=" + node_dir n,
+        dm => if manifest.name dm == node_key n { node_dir n }
+              else { node_key n + "=" + node_dir n },
+    };
+
+/// What each dependency needs to be compiled, which is its business and not
+/// the business of every project that uses it: the directories of loose modules
+/// it searches (`-I`), and the host modules it imports. Its `defines` are not
+/// carried, because a `when` flag is a decision about the whole program and
+/// that belongs to the program.
+let dep_includes g =
+    list.concat (list.map (fn n -> match node_manifest n { () => [], dm => manifest.includes dm })
+                          (nodes g));
+let dep_hosts g =
+    list.concat (list.map (fn n -> match node_manifest n { () => [], dm => manifest.host_modules dm })
+                          (nodes g));
 
 /// Where the standard library is.
 ///
@@ -87,18 +178,14 @@ let rec find_upwards! from name = {
     }
 };
 
-/// `[:ok, [-L, dir, -L, dir, ..]]` -- the search paths for one build.
-/// `[:ok, [-L, dir, -L, dir, ..]]` -- the search paths for one build.
-let search_paths! m = {
-    match collect! m [manifest.root m] [] {
-        [:error, why, _] => [:error, why],
-        [:ok, _, dirs] => {
-            // The standard library, then every dependency.
-            let all = list.cons (stdlib_root! ()) (list.reverse dirs);
-            [:ok, list.flat_map (fn d -> ["-L", d]) all]
-        },
-    }
-};
+/// `[:ok, graph, [-L, dir, -L, dir, ..]]` -- the packages for one build: the
+/// standard library, then every dependency in the order it was found.
+let search_paths! m dev =
+    match graph! m dev {
+        [:error, why] => [:error, why],
+        [:ok, g] => [:ok, g, repeated "-L" (list.cons (stdlib_root! ())
+                                                      (list.map package_arg (nodes g)))],
+    };
 
 let target_dir m = util.join (manifest.root m) "target";
 let image m = util.join (target_dir m) (manifest.name m + ".dream");
@@ -112,7 +199,7 @@ let image m = util.join (target_dir m) (manifest.name m + ".dream");
 
 let options = %{ :compiler => (), :defines => [], :includes => [], :hosts => [],
                  :paths => [], :flags => [], :output => (), :extra => [],
-                 :verbose => false };
+                 :verbose => false, :dev => false };
 
 let with_option k v o = o.[k => v];
 let option o k default = o.[k else default];
@@ -168,15 +255,17 @@ let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
 /// takes the last of a repeated option: putting the command line last is what
 /// makes it win.
 let compile_args! m o =
-    match search_paths! m {
+    match search_paths! m (option o :dev false) {
         [:error, why] => [:error, why],
-        [:ok, paths] => [:ok, list.concat [
-            [manifest.entry m],
+        [:ok, g, paths] => [:ok, list.concat [
+            [manifest.entry! m],
             paths,
             repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
-            repeated "-I" (list.append (manifest.includes m) (option o :includes [])),
+            repeated "-I" (list.unique (list.concat [manifest.includes m, dep_includes g,
+                                                     option o :includes []])),
             repeated "--host-module"
-                     (list.append (manifest.host_modules m) (option o :hosts [])),
+                     (list.unique (list.concat [manifest.host_modules m, dep_hosts g,
+                                                option o :hosts []])),
             repeated "-D" (list.append (manifest.defines m) (option o :defines [])),
             ["-o", output_of m o],
             manifest.compiler_flags m,
@@ -277,9 +366,9 @@ let become_repl! m o args = {
 /// compiles is a scratch file somewhere else entirely -- so a `-L` on the root
 /// is what makes `import <this project>` work from the prompt.
 let repl! m o =
-    match search_paths! m {
+    match search_paths! m true {
         [:error, why] => [:error, why],
-        [:ok, paths] =>
+        [:ok, _, paths] =>
             become_repl! m o (list.concat [repl_args m o, paths, ["-L", root_of m]]),
     };
 

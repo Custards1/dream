@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <string>
 
 #include "builtins.hpp"
 #include "interp.hpp"
@@ -139,16 +140,6 @@ Value* dream_rt_frame_slots(Value frame) {
     return static_cast<FrameObj*>(as_obj(frame))->slots();
 }
 
-/// Store `v` into slot `index` of a frame, running the write barrier. A
-/// compiled function's own slots live in registers, so the interpreter's
-/// per-store barrier in Op::Bind never sees them; the spill back to the heap
-/// frame at a yield is where an old-to-young edge can appear, and where the
-/// next minor collection has to be told about it.
-void dream_rt_frame_store(Process* p, Value frame, uint32_t index, Value v) {
-    auto* f = static_cast<FrameObj*>(as_obj(frame));
-    p->heap().remember_if_old(f, v);
-    value_slot_store(&f->slots()[index], v);
-}
 
 // ---------------------------------------------------------------------------
 // Calling a host native
@@ -270,4 +261,338 @@ int dream_rt_builtin(Process* p, uint32_t builtin_id, uint32_t argc, Value a0, V
     return run_native(*p, make_builtin(builtin_id), bd.fn, argc, args, out);
 }
 
+// ---------------------------------------------------------------------------
+// Lists, arrays and maps
+//
+// Each of these is the matching case of `container_get`, `container_set` or
+// `step_eval` in interp.cpp, with the machine's continuation replaced by a
+// nested force where the interpreter would have pushed one. The messages are
+// the interpreter's, word for word, because the e2e harness compares the two
+// tiers' output and an error is output.
+//
+// Every one pins the heap, for the reason the helpers above do: the compiled
+// frame that called it holds its values in registers.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+inline bool is_sequence_value(Value v) {
+    return is_obj(v, ObjType::Array) || is_nil(v) || is_obj(v, ObjType::Cons);
+}
+
+inline Value rt_type_error(Process& p, const std::string& message) {
+    return raise_error(p, well_known(p.runtime()).type_error, message);
+}
+
+inline Value rt_out_of_bounds(Process& p, const std::string& message) {
+    return raise_error(p, well_known(p.runtime()).out_of_bounds, message);
+}
+
+}  // namespace
+
+int dream_rt_get(Process* p, Value c, Value k, int32_t has_default, Value* out) {
+    PinsTheHeap pinned(*p);
+    c = resolve(c);
+    k = resolve(k);
+    if (is_obj(c, ObjType::Map)) {
+        Value found;
+        if (map_lookup(*p, c, k, &found)) {
+            *out = found;
+            return 1;
+        }
+        if (has_default) return 2;
+        *out = raise_error(*p, well_known(p->runtime()).no_such_key,
+                           "the map has no key " + describe(*p, k));
+        return 0;
+    }
+    if (!is_sequence_value(c)) {
+        *out = rt_type_error(*p, "`.[ ]` reads a map, an array or a list, not " + describe(*p, c));
+        return 0;
+    }
+    if (!is_fixnum(k)) {
+        *out = rt_type_error(*p, "a position is an integer, not " + describe(*p, k));
+        return 0;
+    }
+    const int64_t i = fixnum_value(k);
+    if (is_obj(c, ObjType::Array)) {
+        auto* a = static_cast<ArrayObj*>(as_obj(c));
+        if (i >= 0 && i < int64_t(a->len)) {
+            *out = a->items()[i];
+            return 1;
+        }
+        if (has_default) return 2;
+        *out = rt_out_of_bounds(*p, "index " + std::to_string(i) + " is outside an array of " +
+                                        std::to_string(a->len));
+        return 0;
+    }
+    if (i < 0 || i > int64_t(0xFFFFFFFFu)) {
+        if (has_default) return 2;
+        *out = rt_out_of_bounds(*p, "index " + std::to_string(i) + " is not a position in a list");
+        return 0;
+    }
+    // The walk `list_get` makes, forcing each tail it has to step over. Nothing
+    // can collect underneath the pin, so a cell pointer taken before a force is
+    // still the cell after it.
+    const uint32_t index = uint32_t(i);
+    Value cur = c;
+    for (uint32_t walked = 0;; ++walked) {
+        cur = resolve(cur);
+        if (!is_obj(cur, ObjType::Cons)) {
+            if (has_default) return 2;
+            *out = rt_out_of_bounds(*p, "index " + std::to_string(index) +
+                                            " is past the end of a list of " +
+                                            std::to_string(walked));
+            return 0;
+        }
+        auto* cell = static_cast<ConsObj*>(as_obj(cur));
+        if (walked == index) {
+            *out = cell->head;
+            return 1;
+        }
+        Value tail = resolve(cell->tail);
+        if (!is_whnf(tail) && !force_whnf(*p, tail, &tail)) {
+            *out = p->result;
+            return 0;
+        }
+        cur = tail;
+    }
+}
+
+int dream_rt_set(Process* p, Value c, Value k, Value v, Value* out) {
+    PinsTheHeap pinned(*p);
+    c = resolve(c);
+    k = resolve(k);
+    if (is_obj(c, ObjType::Map)) {
+        *out = map_insert(*p, c, k, v);
+        return 1;
+    }
+    if (!is_sequence_value(c)) {
+        *out = rt_type_error(*p, "`.[ => ]` changes a map, an array or a list, not " +
+                                     describe(*p, c));
+        return 0;
+    }
+    if (!is_fixnum(k)) {
+        *out = rt_type_error(*p, "a position is an integer, not " + describe(*p, k));
+        return 0;
+    }
+    const int64_t i = fixnum_value(k);
+    if (is_obj(c, ObjType::Array)) {
+        const uint32_t n = static_cast<ArrayObj*>(as_obj(c))->len;
+        if (i < 0 || i >= int64_t(n)) {
+            *out = rt_out_of_bounds(*p, "index " + std::to_string(i) + " is outside an array of " +
+                                            std::to_string(n));
+            return 0;
+        }
+        Value copy = p->heap().make_array(n);
+        auto* src = static_cast<ArrayObj*>(as_obj(c));
+        auto* dst = static_cast<ArrayObj*>(as_obj(copy));
+        for (uint32_t j = 0; j < n; ++j) {
+            Value item = uint32_t(i) == j ? v : src->items()[j];
+            dst->items()[j] = item;
+            p->heap().remember_if_old(dst, item);
+        }
+        *out = copy;
+        return 1;
+    }
+    if (i < 0 || i > int64_t(0xFFFFFFFFu)) {
+        *out = rt_out_of_bounds(*p, "index " + std::to_string(i) + " is not a position in a list");
+        return 0;
+    }
+    // `list_set`: the cells in front of the one replaced are new, everything
+    // behind it is shared. The cells passed wait on the value stack, which is
+    // where the interpreter keeps them too.
+    const uint32_t index = uint32_t(i);
+    const size_t base = p->stack.size();
+    Value cur = c;
+    for (uint32_t walked = 0;; ++walked) {
+        cur = resolve(cur);
+        if (!is_obj(cur, ObjType::Cons)) {
+            p->stack.resize(base);
+            *out = rt_out_of_bounds(*p, "index " + std::to_string(index) +
+                                            " is past the end of a list of " +
+                                            std::to_string(walked));
+            return 0;
+        }
+        if (walked == index) {
+            Value built = p->heap().make_cons(v, static_cast<ConsObj*>(as_obj(cur))->tail);
+            while (p->stack.size() > base) {
+                Value head = static_cast<ConsObj*>(as_obj(p->stack.back()))->head;
+                built = p->heap().make_cons(head, built);
+                p->stack.pop_back();
+            }
+            *out = built;
+            return 1;
+        }
+        p->stack.push_back(cur);
+        Value tail = resolve(static_cast<ConsObj*>(as_obj(cur))->tail);
+        if (!is_whnf(tail) && !force_whnf(*p, tail, &tail)) {
+            p->stack.resize(base);
+            *out = p->result;
+            return 0;
+        }
+        cur = tail;
+    }
+}
+
+Value dream_rt_cons(Process* p, Value head, Value tail) { return p->heap().make_cons(head, tail); }
+
+Value dream_rt_make_list(Process* p, uint32_t n, const Value* items) {
+    Value list = NIL;
+    for (uint32_t i = n; i > 0; --i) list = p->heap().make_cons(items[i - 1], list);
+    return list;
+}
+
+Value dream_rt_make_array(Process* p, uint32_t n, const Value* items) {
+    // An array large enough to be born old is remembered at birth by the
+    // allocator, so filling it needs no barrier (see `alloc_bare`).
+    Value arr = p->heap().make_array(n);
+    auto* a = static_cast<ArrayObj*>(as_obj(arr));
+    for (uint32_t i = 0; i < n; ++i) a->items()[i] = items[i];
+    return arr;
+}
+
+Value dream_rt_literal_str(Process* p, uint32_t index) { return literal_string_value(*p, index); }
+
+Value dream_rt_global(Process* p, uint32_t index) { return global_value(*p, index); }
+
+Value dream_rt_snapshot(Process* p, Value closure, uint32_t nslots, const Value* vals,
+                        const uint32_t* binds) {
+    Value fr = p->heap().make_frame_filling(closure, nslots, nslots);
+    auto* fo = static_cast<FrameObj*>(as_obj(fr));
+    for (uint32_t i = 0; i < nslots; ++i) fo->slots()[i] = vals[i];
+    // After the plain slots, because a binding's thunk is against this very
+    // frame: it reads the parameters out of it when it is forced. A binding
+    // compiled code has already computed arrives as its value, and stays.
+    for (uint32_t i = 0; i < nslots; ++i) {
+        if (binds[i] != NO_NODE && vals[i] == NIL_SLOT) {
+            fo->slots()[i] = p->heap().make_thunk(binds[i], fr);
+        }
+    }
+    return fr;
+}
+
+Value dream_rt_yield_frame(Process* p, Value frame, uint32_t n, const Value* vals) {
+    auto* old = static_cast<FrameObj*>(as_obj(frame));
+    const uint32_t nslots = old->nslots;
+    const Value closure = old->closure;
+    Value fr = p->heap().make_frame_filling(closure, nslots, 0);
+    auto* fo = static_cast<FrameObj*>(as_obj(fr));
+    for (uint32_t i = 0; i < n && i < nslots; ++i) fo->slots()[i] = vals[i];
+    return fr;
+}
+
+void dream_rt_adopt(Process* p, Value frame, uint32_t nslots, const Value* vals,
+                    const uint32_t* binds) {
+    // The interpreter's frame for this call, taken over as the snapshot. What
+    // it lacks is what running the body would have written by now: a thunk in
+    // each binding's slot. Only into a slot still empty -- one the body has
+    // not written is all there can be before the first back-edge -- and through
+    // the barrier, because this is a frame compiled code did not make.
+    auto* fo = static_cast<FrameObj*>(as_obj(frame));
+    for (uint32_t i = 0; i < nslots && i < fo->nslots; ++i) {
+        if (binds[i] == NO_NODE || fo->slots()[i] != NIL_SLOT) continue;
+        // A binding compiled code has already computed goes in as its value.
+        Value th = vals[i] != NIL_SLOT ? vals[i] : p->heap().make_thunk(binds[i], frame);
+        p->heap().remember_if_old(fo, th);
+        value_slot_store(&fo->slots()[i], th);
+    }
+}
+
+Value dream_rt_thunk(Process* p, uint32_t node, Value frame) {
+    return p->heap().make_thunk(node, frame);
+}
+
+namespace {
+
+/// Would applying `v` perform an effect? Purity is spelling: a function record
+/// carries the `!` of its name as `FN_IMPURE`, and a native carries it in its
+/// name. A partial application is its function's.
+bool impure_callee(Process& p, Value v) {
+    v = resolve(v);
+    for (int depth = 0; depth < 64; ++depth) {
+        if (is_obj(v, ObjType::Pap)) {
+            v = resolve(static_cast<PapObj*>(as_obj(v))->fn);
+            continue;
+        }
+        if (is_obj(v, ObjType::Closure)) {
+            // A lambda is never impure by spelling -- it has no name to spell
+            // it with -- but one written inside an impure function may perform
+            // effects all the same, and the compiler marks its body for it.
+            // Run from here, such a lambda's effects happen and are then
+            // performed again when a park or a bail retries the call from the
+            // top: a fold whose function spawned a process spawned it forever.
+            const FuncRec& f = p.code->func(static_cast<ClosureObj*>(as_obj(v))->func);
+            if (f.flags & FN_IMPURE) return true;
+            return f.body != NO_NODE && (p.code->node(f.body).flags & F_IMPURE) != 0;
+        }
+        if (is_builtin(v)) {
+            const char* name = builtin_def(uint32_t(imm_payload(v))).name;
+            const size_t n = std::strlen(name);
+            return n > 0 && name[n - 1] == '!';
+        }
+        if (is_obj(v, ObjType::Native)) {
+            Value name = static_cast<NativeObj*>(as_obj(v))->name;
+            if (!is_obj(name, ObjType::Str)) return true;
+            auto* s = static_cast<StrObj*>(as_obj(name));
+            return s->len > 0 && s->data()[s->len - 1] == '!';
+        }
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+int dream_rt_apply(Process* p, Value callee, uint32_t argc, const Value* args, Value* out) {
+    // Compiled code orders no effects, and a call it makes is retried from the
+    // top if something under it parks -- so an impure function must never run
+    // from here. A pure caller is handed one only through a parameter, which
+    // the purity check cannot see through, and that is rare enough that the
+    // answer is to give the whole call back (2) before anything happens: the
+    // compiled body has performed no effect, since this is the only way it
+    // could have, and the interpreter runs it from its frame.
+    if (impure_callee(*p, callee)) return 2;
+    PinsTheHeap pinned(*p);
+    // A nested loop that runs the slice out re-arms it rather than stopping
+    // (`Process::slice_spent`), which is right for a native and wrong for a
+    // compiled loop around this call: it would see a full budget at its next
+    // back-edge and carry on under the pin, collecting nothing, for as long as
+    // the calls kept re-arming it. So a slice spent in here is left spent, and
+    // the loop yields at its next back-edge. Only one spent *here*: under a
+    // force that had already spent the slice, doing this would make every
+    // iteration yield.
+    const bool spent_before = p->slice_spent;
+    Value r;
+    const bool ok = apply_whnf(*p, callee, args, argc, &r);
+    if (!spent_before && p->slice_spent && p->reductions > 0) p->reductions = 0;
+    if (!ok) {
+        *out = p->result;
+        return 0;
+    }
+    *out = r;
+    return 1;
+}
+
 }  // extern "C"
+
+extern "C" Value dream_rt_peek(Value c, Value k) {
+    // `thunk_for`'s `Get`, and nothing more: an element found without forcing
+    // anything, or zero where it would have suspended the read.
+    c = resolve(c);
+    k = resolve(k);
+    if (!is_fixnum(k)) return NIL_SLOT;
+    const int64_t i = fixnum_value(k);
+    if (i < 0) return NIL_SLOT;
+    if (is_obj(c, ObjType::Array)) {
+        auto* a = static_cast<ArrayObj*>(as_obj(c));
+        return i < int64_t(a->len) ? a->items()[i] : NIL_SLOT;
+    }
+    if (!is_obj(c, ObjType::Cons) || i > 8) return NIL_SLOT;
+    Value cur = c;
+    for (int64_t step = 0; step < i; ++step) {
+        Value tail = resolve(static_cast<ConsObj*>(as_obj(cur))->tail);
+        if (!is_obj(tail, ObjType::Cons)) return NIL_SLOT;
+        cur = tail;
+    }
+    return static_cast<ConsObj*>(as_obj(cur))->head;
+}

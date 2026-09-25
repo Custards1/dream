@@ -67,7 +67,7 @@ public:
     CompiledFn tier(uint32_t func_index) {
         if (func_index >= cached_.size()) return nullptr;
         CompiledFn fn = cached_[func_index].load(std::memory_order_acquire);
-        if (fn) return reinterpret_cast<uintptr_t>(fn) == kRejectedBits ? nullptr : fn;
+        if (fn) return reinterpret_cast<uintptr_t>(fn) <= kQueuedBits ? nullptr : fn;
         // Counting is a heuristic, so it is a relaxed load and store rather
         // than a read-modify-write: two racing workers may lose a count
         // between them, and a function compiled one entry late is not an
@@ -78,7 +78,8 @@ public:
         return on_enter(func_index);
     }
 
-    /// The entry that made `func_index` hot: compile it, or mark it rejected
+    /// The entry that made `func_index` hot: hand it to the compile thread, or
+    /// -- when compiling synchronously -- compile it now or mark it rejected,
     /// so `tier` never asks again. The slow path, and the only one that locks.
     CompiledFn on_enter(uint32_t func_index);
 
@@ -124,6 +125,14 @@ private:
     /// the cheapest to compare against.
     static constexpr uintptr_t kRejectedBits = 1;
     static CompiledFn rejected() { return reinterpret_cast<CompiledFn>(kRejectedBits); }
+    /// What `cached_` holds for a function waiting on the compile thread. The
+    /// interpreter runs it meanwhile, exactly as it ran it while it was cold;
+    /// `tier` answers both of the markers with the same single compare.
+    static constexpr uintptr_t kQueuedBits = 2;
+    static CompiledFn queued() { return reinterpret_cast<CompiledFn>(kQueuedBits); }
+
+    /// The compile thread's loop. See "Compiling in the background" in jit.cpp.
+    void compile_worker();
 
     /// Dense per-function entry counters and compiled-body cache, indexed by
     /// image function index. They live on `Jit` rather than in `Impl` so

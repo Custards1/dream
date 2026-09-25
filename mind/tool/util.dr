@@ -56,6 +56,54 @@ let dirname path = {
     if at < 0 { "." } else if at == 0 { "/" } else { str.slice 0 at path }
 };
 
+/// `.` and `..` folded away, textually. Used only to ask whether two spellings
+/// name one directory -- `app/../util` and `util` reached through two packages
+/// -- and never to rewrite a path handed on to anything else.
+let normalize path = {
+    let absolute = str.starts_with "/" path;
+    let step acc seg =
+        match [seg, acc] {
+            ["", _] => acc,
+            [".", _] => acc,
+            ["..", []] => if absolute { [] } else { [".."] },
+            ["..", ["..", .._]] => list.cons ".." acc,
+            ["..", [_, ..up]] => up,
+            [s, _] => list.cons s acc,
+        };
+    let segs = list.reverse (list.fold step [] (str.split "/" path));
+    let joined = str.join_str "/" segs;
+    match [absolute, joined] {
+        [true, _] => "/" + joined,
+        [false, ""] => ".",
+        _ => joined,
+    }
+};
+
+/// `path` made absolute against the working directory, and normalized: the
+/// spelling two dependencies on one directory agree on.
+let absolute! path =
+    normalize (if str.starts_with "/" path { path } else { join (os.cwd! ()) path });
+
+/// `to` written relative to the directory `from`, both as the working
+/// directory would read them: what `mind add ../util`, typed in one place,
+/// has to become in a manifest that is read from another.
+let relative! from to = {
+    let a = str.split "/" (absolute! from);
+    let b = str.split "/" (absolute! to);
+    let rec common xs ys =
+        match [xs, ys] {
+            [[x, ..xr], [y, ..yr]] if x == y => common xr yr,
+            _ => [xs, ys],
+        };
+    match common a b {
+        [ups, downs] => match list.concat [list.map (fn _ -> "..") (list.filter (fn s -> s != "") ups),
+                                           list.filter (fn s -> s != "") downs] {
+            [] => ".",
+            segs => str.join_str "/" segs,
+        },
+    }
+};
+
 let basename path = {
     let parts = str.split "/" path;
     if list.is_empty parts { path } else { list.last parts }
@@ -132,6 +180,14 @@ when test {
         test.case "dirname nested"    $( test.eq! "/a" (dirname "/a/b") ),
 
         test.case "basename"          $( test.eq! "c" (basename "a/b/c") ),
+        test.case "relative walks up and down"
+            $( test.eq! ["../util", "lib/x", ".", "../../c"]
+                        [relative! "/w/app" "/w/util", relative! "/w" "/w/lib/x",
+                         relative! "/w/a" "/w/a/", relative! "/w/a/b" "/w/c"] ),
+        test.case "normalize folds .. and ."
+            $( test.eq! ["/a/c", "c", "../x", "/", "."]
+                        [normalize "/a/b/../c/.", normalize "a/../c", normalize "../x",
+                         normalize "/..", normalize "a/.."] ),
         test.case "basename of a bare name" $( test.eq! "c" (basename "c") ),
     ];
 }
