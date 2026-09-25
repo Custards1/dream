@@ -258,6 +258,7 @@ test-dreams-compile: build
     python3 dreams/tests/optional_types.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/static_types.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/type_codegen.py --dream {{dream}} --compiler {{image}}
+    python3 dreams/tests/contracts.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/core_primitives.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/modules.py --dream {{dream}} --compiler {{image}}
 

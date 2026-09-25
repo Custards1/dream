@@ -39,6 +39,7 @@ import dreams.path;
 import dreams.repl;
 import dreams.scope;
 import dreams.typecheck;
+import dreams.contract;
 
 let version = "0.1.0";
 
@@ -137,6 +138,20 @@ let check_program! l types = {
 /// nothing, so the image is the same either way.
 let type_diags types l r ds =
     if not types || diag.error_count ds > 0 { [] } else { typecheck.check_program l r };
+
+/// The same, for a program that has been built and so can be run: the type
+/// errors from `facts`, and then the compile-time contracts -- the refinements
+/// a value known while compiling has to satisfy, which `contract.settle!`
+/// answers by running their predicates. Only asked when the types found
+/// nothing, because a contract on an argument the checker already rejected
+/// would be a second report of the same mistake.
+let built_type_diags! types facts low ds =
+    if not types || diag.error_count ds > 0 { [] }
+    else {
+        let found = typecheck.Analysis.diags facts;
+        if diag.error_count found > 0 { found }
+        else { list.append found (contract.settle! low (typecheck.Analysis.contracts facts)) }
+    };
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
@@ -265,7 +280,10 @@ let build! l out shebang payloads optimize types = {
     let r = scope.resolve! l;
     let low = lower.link! l r;
     let ds0 = list.append (modules.diags l) (lower.all_diags r low);
-    let ds = list.append ds0 (type_diags types l r ds0);
+    // One checker for the diagnostics, the contracts and both of the JIT's
+    // parameter masks. Lazy, so `--no-types` never builds it.
+    let facts = typecheck.analyze l r (lower.comp_values low);
+    let ds = list.append ds0 (built_type_diags! types facts low ds0);
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
     strict! sizes
     let unreadable = list.filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
@@ -284,8 +302,8 @@ let build! l out shebang payloads optimize types = {
         // been settled into the placeholder that was waiting for it, and two
         // nodes that differ only in a flag are two nodes.
         let built = if optimize { optimizer.optimize (lower.image low) } else { lower.image low };
-        let floats = ((built.[:payloads => sizes])).[:float_params => (params_of built (if types { typecheck.float_params l r } else { %{} }))];
-        let img = floats.[:integer_params => (params_of built (if types { typecheck.integer_params l r } else { %{} }))];
+        let floats = ((built.[:payloads => sizes])).[:float_params => (params_of built (if types { typecheck.Analysis.float_params facts } else { %{} }))];
+        let img = floats.[:integer_params => (params_of built (if types { typecheck.Analysis.integer_params facts } else { %{} }))];
         let payload_bytes = list.fold (fn n k -> n + k) 0 sizes;
         // The shebang goes in front of the image rather than into it: the VM
         // skips a leading `#!` line when it loads a file, which is what makes

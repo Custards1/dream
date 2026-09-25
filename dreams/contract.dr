@@ -1,0 +1,170 @@
+// Compile-time contracts: the refinements a known value has to satisfy, run.
+//
+// `typecheck` finds them -- a literal, a local bound to one, or what a `comp`
+// produced, meeting a type with a `where` in it -- and writes each down as a
+// formula over the predicates that decide it. See "compile-time contracts"
+// there for what one is and why the formula has the shape it has. What is
+// left is to ask the predicates, and a predicate is Dream, so the only thing
+// that can ask one is the VM.
+//
+// The machinery is `comp`'s. A compile-time expression is lowered into a
+// function of its own and the finished program is entered there
+// (`lower.settle_comps!`); a contract is the same trick with the function
+// written here instead of by `lower`. The predicate is reached through the
+// value of the type's global -- `[:named, "Port", [:refine, t, p]]` holds `p`
+// at a path of keys -- so the program is run exactly as it is: nothing is
+// resolved again, nothing is recompiled, and the answer is the one
+// `types.check` would give the same value at run time, because it is the same
+// closure applied to the same value.
+//
+// **One run for every contract in the program.** A single function answers a
+// list with one element per contract, so a program with a hundred literal
+// arguments to a refined API pays one image and one VM start, not a hundred.
+// What makes a batch safe to take is that each element is its own `try`: a
+// predicate that raises answers `:raised` for its own contract and no other,
+// which is what the macro batch once lacked and had to run its calls one at a
+// time to recover from.
+//
+// Nothing here touches the image that is written. The function is appended to
+// a copy of the arena that is serialized, run and thrown away, so a program's
+// output is byte-identical whether or not it has a contract -- and one with no
+// contract does not even build the copy.
+
+import std.list;
+import std.str;
+import std.vm;
+
+import dreams.ast;
+import dreams.diag;
+import dreams.emit;
+import dreams.ir;
+import dreams.lower;
+
+// --- a datum, as nodes -------------------------------------------------------
+//
+// `typecheck` spells a compile-time value as a *datum* -- scalars as
+// themselves, atoms, lists, arrays and maps tagged -- and this is that
+// spelling lowered to the constants that rebuild it, the way `lower.emit_const`
+// does for a `comp`'s answer.
+
+let rec emit_datum d l = match type_of d {
+    :integer => lower.const_int d l,
+    :string => lower.const_str d l,
+    :float => lower.const_float d l,
+    :char => lower.const_char d l,
+    :bool => lower.const_bool d l,
+    :unit => lower.emit_leaf :unit l,
+    :list => match d {
+        [:atom_d, n] => lower.const_atom n l,
+        [:list_d, xs] => datum_seq :make_list xs (list.length xs) l,
+        [:array_d, xs] => datum_seq :make_array xs (list.length xs) l,
+        [:map_d, ps] => datum_seq :make_map (list.concat ps) (list.length ps) l,
+        _ => lower.emit_leaf :unit l,
+    },
+    _ => lower.emit_leaf :unit l,
+};
+
+/// The children first, then the run of kids naming them, then the node: a
+/// kid is an index, so it can only be written once what it names exists.
+let datum_seq op items n l = {
+    let done = list.fold (fn acc x -> {
+        let got = emit_datum x (list.head acc);
+        [list.head got, list_cons (list.nth 1 got) (list.nth 1 acc)]
+    }) [l, []] items;
+    let placed = lower.kids (list.reverse (list.nth 1 done)) (list.head done);
+    lower.emit (ir.node op (list.nth 1 placed) n ir.no_node) (list.head placed)
+};
+
+// --- a formula, as nodes -------------------------------------------------------
+
+/// `[lowering, node]` for one contract's formula. `:all` and `:any` become the
+/// short-circuiting `and` and `or`, so a union stops at the first member that
+/// accepts and a list stops at the first element that does not -- the same
+/// order `types.accepts` asks in.
+let rec emit_formula f l = match f {
+    [:pred, gi, path, d] => {
+        let g = lower.emit (ir.node :global gi ir.no_node ir.no_node) l;
+        let reached = list.fold (fn acc key -> {
+            let k = emit_datum key (list.head acc);
+            lower.emit (ir.node :get (list.nth 1 acc) (list.nth 1 k) ir.no_node) (list.head k)
+        }) g path;
+        let arg = emit_datum d (list.head reached);
+        lower.emit_apply (list.nth 1 reached) [list.nth 1 arg] (list.head arg)
+    },
+    [:all, fs] => chain :and fs l,
+    [:any, fs] => chain :or fs l,
+    b => lower.const_bool (b == true) l,
+};
+
+let rec chain op fs l = match fs {
+    [one] => emit_formula one l,
+    [first, ..rest] => {
+        let a = emit_formula first l;
+        let b = chain op rest (list.head a);
+        lower.emit (ir.node op (list.nth 1 a) (list.nth 1 b) ir.no_node) (list.head b)
+    },
+    [] => lower.const_bool true l,
+};
+
+/// One element of the batch: the formula, or `:raised` if asking it raised.
+/// Slot 0 is where a `try` puts what it caught, which is why the function this
+/// goes into has one slot and no parameters.
+let emit_guarded f l = {
+    let body = emit_formula f l;
+    let handler = lower.const_atom "raised" (list.head body);
+    lower.emit (ir.node :try (list.nth 1 body) (list.nth 1 handler) 0) (list.head handler)
+};
+
+// --- running them -------------------------------------------------------------
+
+/// The linked program with one function more, answering every contract's
+/// formula as a list, and that function's index: `[bytes, function]`.
+let batch_image low contracts = {
+    let done = list.fold (fn acc c -> {
+        let got = emit_guarded (list.nth 5 c) (list.head acc);
+        [list.head got, list_cons (list.nth 1 got) (list.nth 1 acc)]
+    }) [low, []] contracts;
+    let placed = lower.kids (list.reverse (list.nth 1 done)) (list.head done);
+    let made = lower.emit (ir.node :make_list (list.nth 1 placed) (list.length contracts) ir.no_node)
+                          (list.head placed);
+    let p = lower.prog (list.head made);
+    let [p1, name] = ir.intern_str "<contracts>" p;
+    let fi = list.length (ir.funcs p1);
+    let record = %{ :name => name, :body => list.nth 1 made, :arity => 0, :flags => 0,
+                    :slots => 1, :n_captures => 0, :captures_off => 0,
+                    :span_start => 0, :span_end => 0 };
+    let p2 = p1.[:funcs => (ir.funcs p1 + [record])];
+    [emit.with_entry (emit.to_binary (ir.finish p2)) fi, fi]
+};
+
+/// What a contract that did not hold says, at the place its value was written.
+let broken c answer = {
+    let [_, source, span, wanted, shown, _] = c;
+    let why = match answer {
+        :raised => "checking it raised at compile time",
+        false => "a `where` it has to satisfy answered `false` at compile time",
+        other => "a `where` it has to satisfy answered `" + to_string other
+                 + "` at compile time, which is not `true`",
+    };
+    diag.in_source source (diag.error span (wanted + ", but `" + shown + "` is not: " + why))
+};
+
+/// Every contract that does not hold, as diagnostics. Impure because asking is
+/// running the program, and a program with no contracts runs nothing.
+let settle! low contracts =
+    if list.is_empty contracts { [] }
+    else {
+        let [bytes, _] = batch_image low contracts;
+        let answers = try! { vm.eval_image! bytes } catch e { [:unrun, e] };
+        match answers {
+            [:unrun, why] => {
+                let [_, source, span, _, _, _] = list.head contracts;
+                [diag.in_source source (diag.error span
+                    ("the compile-time contracts of this program could not be checked: " + to_string why))]
+            },
+            _ => list.concat (list.map (fn ca -> match list.nth 1 ca {
+                true => [],
+                answer => [broken (list.nth 0 ca) answer],
+            }) (list.zip contracts answers)),
+        }
+    };

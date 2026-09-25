@@ -43,9 +43,11 @@ let lowering r p source =
        // met, because a lambda's body is lowered where it is written -- into
        // the same arena as everything else -- and only the entry point differs.
        :func_bodies => %{},
-       // Compile-time expressions waiting to be evaluated: `[node, function]`.
-       // The node is a placeholder that whatever the function comes to will
-       // overwrite, once the program has been built and can be run.
+       // Compile-time expressions waiting to be evaluated: `[node, function,
+       // source, span]`. The node is a placeholder that whatever the function
+       // comes to will overwrite, once the program has been built and can be
+       // run; the source and span are where it was written, which is where a
+       // failure is reported and what its value is filed under afterwards.
        :pending_comp => [],
        // Slots that are read but never written, and the expression each one
        // stands for. Only ever non-empty while a fused loop's body is being
@@ -81,7 +83,19 @@ let subst l = l.[:subst else (%{})];
 let set_subst m l = l.[:subst => m];
 
 let pending_comp l = l.[:pending_comp else []];
-let add_comp node fi l = l.[:pending_comp => (list.append (pending_comp l) [[node, fi]])];
+let add_comp node fi span l =
+    l.[:pending_comp => (list.append (pending_comp l) [[node, fi, source l, span]])];
+
+/// What each compile-time expression came to, once it has: `[source, start]
+/// => value`, keyed the way the checker names a `comp` it meets.
+///
+/// Kept because a value known at compile time is the best evidence of its
+/// type there is, and the checker runs after this pass rather than before it.
+/// `typecheck` reads it to give a `comp` the type of what it produced, and to
+/// run a refinement's predicate over it -- see "compile-time contracts" there.
+/// Nothing in the image depends on it.
+let comp_values l = l.[:comp_values else (%{})];
+let comp_key source span = source * 4294967296 + ast.span_start span;
 
 let complain span message l =
     l.[:diags => (list.append (l_diags l) [diag.in_source (source l) (diag.error span message)])];
@@ -498,7 +512,7 @@ let rec lower_expr e l =
                     let done = set_func_body fi (list.nth 1 inner)
                                              (mark_tail (list.nth 1 inner) (list.head inner));
                     let made = emit_leaf :unit done;
-                    [add_comp (list.nth 1 made) fi (list.head made), list.nth 1 made]
+                    [add_comp (list.nth 1 made) fi span (list.head made), list.nth 1 made]
                 },
                 _ => emit_leaf :unit l,
             },
@@ -1753,21 +1767,26 @@ let rec const_seq op items l = {
 /// which has already serialized the program can hand the same bytes back
 /// with only the entry changed -- see `emit.with_entry`.
 let settle_comp! bytes_of one l = {
-    let node = list.nth 0 one;
-    let fi = list.nth 1 one;
+    let [node, fi, src, span] = one;
     let value = try! { vm.eval_image! (bytes_of fi) }
                 catch e { [:comp_error, e] };
     match value {
+        // Reported where the `comp` is written. It used to be reported with no
+        // span at all, which for a compile-time API is the difference between
+        // "this call is wrong" and "something in the program is".
         [:comp_error, why] =>
-            complain (ast.no_span)
-                     ("a compile-time expression could not be evaluated: " + to_string why) l,
+            l.[:diags => (list.append (l_diags l)
+                            [diag.in_source src (diag.error span
+                                ("this compile-time expression could not be evaluated: "
+                                 + to_string why))])],
         v => {
             let built = emit_const v l;
             // The placeholder keeps its index -- everything already points at
             // it -- and becomes the node the value is.
-            set_prog (ir.set_node node (ir.node_at (list.nth 1 built) (prog (list.head built)))
-                                  (prog (list.head built)))
-                     (list.head built)
+            let placed = set_prog (ir.set_node node (ir.node_at (list.nth 1 built) (prog (list.head built)))
+                                               (prog (list.head built)))
+                                  (list.head built);
+            placed.[:comp_values => ((comp_values placed)).[comp_key src span => v]]
         },
     }
 };

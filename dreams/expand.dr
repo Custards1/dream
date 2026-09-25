@@ -208,7 +208,7 @@ let macro_definition l reference = {
 /// demanded by the macro VM. Unrelated runtime `comp!` effects must not run for
 /// every expansion. Its isolated function already has the right environment.
 let staged_lowering low = {
-    let ready = list.fold (fn acc [placeholder, function] -> {
+    let ready = list.fold (fn acc [placeholder, function, .._] -> {
         let [lowered, closure] = lower.emit (ir.node :make_closure function ir.no_node ir.no_node) acc;
         lower.set_prog (ir.set_node placeholder (ir.node :apply closure 0 0)
                                    (lower.prog lowered)) lowered
