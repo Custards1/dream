@@ -608,7 +608,8 @@ let fits k s t = sub k s t fuel;
 /// It is the library's "nothing there", and so the usual default: in
 /// `map.get () ages name` the value type is the map's, and were `()` to
 /// join it the answer would be `:integer | :unit` -- which every `+` on it
-/// reports, since the checker does not narrow a `()` arm away. So the
+/// that no test of `()` guards reports (see "narrowing"), and a default is
+/// written precisely so that nothing need test for it. So the
 /// variable is solved from the map alone, the way the caller reads it, and
 /// the `()` is left to fit it (see `sub`). What that gives up is
 /// `map.get () m k + 1`, which is not reported; rule 2 already says it would
@@ -722,11 +723,11 @@ let rec infer k h e ds = match e {
     [:binary, op, l, r, sp] => infer_binary k h op l r sp ds,
     [:if, c, t, el, _] => {
         let ds1 = check k h c :bool "the condition of an `if`" ds;
-        let [tt, ds2] = infer k h t ds1;
+        let [tt, ds2] = infer k (narrowing k h c true) t ds1;
         match el {
             () => [join tt :unit, ds2],
             x => {
-                let [et, ds3] = infer k h x ds2;
+                let [et, ds3] = infer k (narrowing k h c false) x ds2;
                 [join tt et, ds3]
             },
         }
@@ -824,11 +825,11 @@ let rec check k h e expected why ds =
             [:lambda, ps, body, sp] => list.nth 1 (lambda k h ps body expected sp ds),
             [:if, c, t, el, sp] => {
                 let ds1 = check k h c :bool "the condition of an `if`" ds;
-                let ds2 = check k h t expected why ds1;
+                let ds2 = check k (narrowing k h c true) t expected why ds1;
                 match el {
                     () => mismatch k h :unit expected sp
                               (why + " (this `if` has no `else`, so it can answer `()`)") ds2,
-                    x => check k h x expected why ds2,
+                    x => check k (narrowing k h c false) x expected why ds2,
                 }
             },
             [:block, stmts, _] => list.nth 1 (block k (Here.set_pending h %{}) stmts [expected, why] ds),
@@ -939,8 +940,12 @@ let number_type kind = match kind {
 };
 
 let infer_binary k h op l r sp ds = match op {
-    :and => [:bool, check k h r :bool "the right of `&&`" (check k h l :bool "the left of `&&`" ds)],
-    :or => [:bool, check k h r :bool "the right of `||`" (check k h l :bool "the left of `||`" ds)],
+    // The right of `&&` runs only where the left was true, and the right of
+    // `||` only where it was false, which is what `x != () && x > 0` leans on.
+    :and => [:bool, check k (narrowing k h l true) r :bool "the right of `&&`"
+                          (check k h l :bool "the left of `&&`" ds)],
+    :or => [:bool, check k (narrowing k h l false) r :bool "the right of `||`"
+                         (check k h l :bool "the left of `||`" ds)],
     :add => {
         let [lt, ds1] = infer k h l ds;
         let [rt, ds2] = infer k h r ds1;
@@ -1335,21 +1340,122 @@ let bind_items k h items rest found kind = {
 
 // --- match, and exhaustiveness ---------------------------------------------------------------
 
+/// Each arm is checked against what the arms above it have left: an arm is
+/// only reached by a value no earlier unguarded arm took, so after `() => 0`
+/// the next arm's binder is not `()` (see "narrowing" below). A scrutinee that
+/// is a local name is narrowed with it, so `_ => x + 1` reads `x` the same
+/// way. Exhaustiveness is asked of the scrutinee as written, not as narrowed.
 let infer_match k h s arms sp expected ds = {
     let [st, ds1] = infer k h s ds;
-    let [t, ds2] = list.fold (fn acc arm -> {
-        let [t, d] = acc;
-        let h2 = bind_pattern k h (ast.arm_pattern arm) st;
-        let d1 = match ast.arm_guard arm { () => d, g => check k h2 g :bool "a guard" d };
+    let [t, _, ds2] = list.fold (fn acc arm -> {
+        let [t, left, d] = acc;
+        let pattern = ast.arm_pattern arm;
+        let h1 = if left == st { h } else { narrow_scrutinee h s left };
+        let h2 = bind_pattern k h1 pattern left;
+        let [h3, d1] = match ast.arm_guard arm {
+            () => [h2, d],
+            g => [narrowing k h2 g true, check k h2 g :bool "a guard" d],
+        };
+        let rest = match ast.arm_guard arm { () => without k left pattern, _ => left };
         match expected {
             () => {
-                let [bt, d2] = infer k h2 (ast.arm_body arm) d1;
-                [join t bt, d2]
+                let [bt, d2] = infer k h3 (ast.arm_body arm) d1;
+                [join t bt, rest, d2]
             },
-            [et, why] => [et, check k h2 (ast.arm_body arm) et why d1],
+            [et, why] => [et, rest, check k h3 (ast.arm_body arm) et why d1],
         }
-    }) [:never, ds1] arms;
+    }) [:never, st, ds1] arms;
     [t, exhaustive k h st arms sp ds2]
+};
+
+let narrow_scrutinee h s t = match s {
+    [:name, n, _] => with_local n t h,
+    _ => h,
+};
+
+// --- narrowing -------------------------------------------------------------------------------
+//
+// A union that includes `:unit` is how the library says "maybe", and the one
+// thing a program always does with a maybe is test it before using it. Were
+// the test invisible to the checker, every use behind it would be reported --
+// `r + 1` after `if r == ()` is `:integer | :unit` plus one -- and that is a
+// report on code that works, which rule 2 forbids. So a test narrows, in the
+// two places a program writes one: the arms of a `match` below an arm that
+// took some members, and the branches of an `if` (and the right of `&&`/`||`)
+// behind a comparison of a local with `()`.
+//
+// Narrowing only ever *removes* a member the checker can see a value cannot
+// be, so the worst an incomplete answer does is narrow less, which is where
+// the checker was before. A name the resolver says is a global is not a
+// local, and `name_type` does not read the locals for it, so narrowing one is
+// harmless and does nothing.
+
+/// What is left of `t` for the arms below one whose pattern is `p`: every
+/// member `p` certainly matches is gone. Unchanged -- the same value, still
+/// folded if it was a named type -- when nothing is.
+let without k t p = {
+    let ms = members (peel k t 8);
+    let kept = list.filter (fn m -> not (covers p m)) ms;
+    if list.length kept == list.length ms { t } else { union_of kept }
+};
+
+/// Whether pattern `p` matches every value of type `m`, whatever it holds.
+/// `false` is always a safe answer.
+let rec covers p m = match p {
+    [:wildcard, _] => true,
+    [:bind, _, _] => true,
+    [:as_p, inner, _, _, _] => covers inner m,
+    [:literal, e, _] => match [literal_type e, m] {
+        [:unit, :unit] => true,
+        [[:lit, _, _], [:lit, _, _]] => literal_type e == m,
+        _ => false,
+    },
+    [:list_p, [], rest, _] if rest != () => match m {
+        [:tuple, _] => true,
+        [:list_of, _] => true,
+        _ => false,
+    },
+    [:list_p, items, rest, _] => match m {
+        [:tuple, ts] => {
+            let n = list.length items;
+            (if rest == () { n == list.length ts } else { n <= list.length ts })
+            && list.all (fn pt -> covers (list.nth 0 pt) (list.nth 1 pt)) (list.zip items ts)
+        },
+        _ => false,
+    },
+    _ => false,
+};
+
+/// `h` with what condition `c` says about the locals it tests, given that it
+/// came out `yes`. A comparison with `()` is the test; `not`, `&&` and `||`
+/// carry it through where the outcome of the whole says the outcome of the
+/// part -- `a && b` true means both were, `a || b` false means neither was.
+let rec narrowing k h c yes = match c {
+    [:binary, :eq, x, y, _] => unit_test k h x y yes,
+    [:binary, :ne, x, y, _] => unit_test k h x y (not yes),
+    [:unary, :not, x, _] => narrowing k h x (not yes),
+    [:binary, :and, l, r, _] => if yes { narrowing k (narrowing k h l true) r true } else { h },
+    [:binary, :or, l, r, _] => if yes { h } else { narrowing k (narrowing k h l false) r false },
+    _ => h,
+};
+
+let unit_test k h x y is_unit = match [x, y] {
+    [[:name, n, _], [:unit, _]] => narrow_unit k h x n is_unit,
+    [[:unit, _], [:name, n, _]] => narrow_unit k h y n is_unit,
+    _ => h,
+};
+
+/// A name known to be `()`, or known not to be. Only `()` equals `()` -- not
+/// `[]`, not `false` -- so the first is exact; it is taken only where `()`
+/// could have been there at all, so that a branch the signature says is dead
+/// does not have its uses reported against `:unit` instead.
+let narrow_unit k h x n is_unit = {
+    let t = list.head (infer k h x []);
+    match is_unit {
+        true if fits k :unit t => with_local n :unit h,
+        true => h,
+        _ => with_local n (without k t (ast.literal_p [:unit, [0, 0]] [0, 0])) h,
+    }
 };
 
 /// A `match` whose scrutinee is a declared union must say what happens for

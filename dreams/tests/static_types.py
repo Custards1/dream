@@ -180,6 +180,37 @@ let main! = console.print! (str.length (map.get () ages "ada"));
     failure(prelude + 'import std.list; let main! = console.print! (list.minimum [3, 1] + "x");',
             'but this is `:integer` and `"x"`')
 
+    # A maybe that is tested is not a maybe behind the test. A `match` arm
+    # below `() =>` sees the rest of the union, and so does a local scrutinee
+    # read in it; an `if`, `&&`, `||` or `not` over `x == ()` or `x != ()`
+    # narrows `x` in the branch the outcome decides. A use no test guards is
+    # still reported, and a narrowed one is reported as what it was narrowed to.
+    success(prelude + '''
+let find : :string -> :integer | :unit;
+let find s = if s == "a" { 1 } else { () };
+let a s = match find s { () => 0, n => n + 1 };
+let b s = { let r = find s; if r == () { 0 } else { r + 1 } };
+let c s = { let r = find s; if r != () { r * 2 } else { 0 } };
+let d s = { let r = find s; r != () && r > 0 };
+let e s = { let r = find s; r == () || r > 0 };
+let f s = { let r = find s; match r { () => 0, _ => r + 1 } };
+let g s = { let r = find s; if not (r == ()) { r + 1 } else { 0 } };
+let h s = { let r = find s; match r { n if n != () && n > 0 => n - 1, _ => 9 } };
+let main! = console.print! [a "a", b "a", c "b", d "a", e "b", f "a", g "a", h "a", h "b"];
+''', '[2, 2, 0, true, true, 2, 2, 0, 9]\n')
+    maybe = prelude + 'let find : :string -> :integer | :unit;\nlet find s = if s == "a" { 1 } else { () };\n'
+    failure(maybe + 'let main! = { let r = find "a"; console.print! (r + 1) };',
+            'but this is `:integer | :unit` and `1`')
+    failure(maybe + 'let main! = { let r = find "a"; console.print! (if r == () { 0 } else { r + "x" }) };',
+            'but this is `:integer` and `"x"`')
+    failure(maybe + 'let main! = console.print! (match find "a" { () => 0, n => n + "x" });',
+            'but this is `:integer` and `"x"`')
+    # Only an unguarded arm takes anything away, and `||` true says nothing.
+    failure(maybe + 'let main! = console.print! (match find "a" { () if false => 0, n => n + 1 });',
+            'but this is `:integer | :unit` and `1`')
+    failure(maybe + 'let main! = { let r = find "a"; console.print! (if r != () || true { r + 1 } else { 0 }) };',
+            'but this is `:integer | :unit` and `1`')
+
     # --- what is not ----------------------------------------------------------------
     #
     # Code no signature touches is never an error, however obviously it would

@@ -936,7 +936,17 @@ or `_ =>` to handle everything else
 A wildcard or a binder handles everything. An arm with a guard, or one that
 takes a field apart with a nested pattern, counts as handling its variant,
 since it might. A pattern also narrows: in `[:circle, r] => ..`, `r` is the
-radius's type, not the union of every variant's second field.
+radius's type, not the union of every variant's second field. So does an arm
+*above* it: after an unguarded `() => ..`, a later arm's binder is the rest
+of the union, and after `if x == ()` (or `!=`, under `not`, `&&` and `||`) a
+local `x` is known to be `()` in one branch and not to be in the other.
+
+```dream
+let find : :string -> :integer | :unit;
+
+let next s = match find s { () => 0, n => n + 1 };      // `n` is `:integer`
+let twice s = { let r = find s; if r != () { r * 2 } else { 0 } };
+```
 
 ### `import`
 

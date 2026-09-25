@@ -3343,9 +3343,17 @@ not, each found by running the checker over this repository:
   compiler. A lambda passed as an argument takes its *parameter* types from
   what was solved (`solved_inputs`), and its answer is only bound, never
   checked against a solved variable.
-- `()` is "nothing there", and the checker does not narrow a `()` arm away.
-  So `map.get () ages k` solving `v` as `:integer | :unit` made every guarded
-  use of the answer a report. A `()` argument now never decides a variable
+- `()` is "nothing there", and a union with `:unit` in it is how the library
+  says "maybe". Two halves. A *test* narrows: an arm below `() =>` sees the
+  rest of the scrutinee's union (and so does a local scrutinee read in it),
+  and `x == ()`/`x != ()` under `if`, `&&`, `||`, `not` or a guard narrows
+  `x` in the branch the outcome decides -- "narrowing" in
+  [dreams/typecheck.dr](dreams/typecheck.dr). It only ever removes members it
+  can see a value cannot be, so an incomplete answer narrows less and never
+  reports more. Before it, `if r == () { 0 } else { r + 1 }` was a report.
+  And a *default* is not a maybe: `map.get () ages k` solving `v` as
+  `:integer | :unit` made every use of the answer a report, though the
+  default was written so that nothing need test. A `()` argument never decides a variable
   (`solve`), fits one wherever it was written even once another argument has
   decided it (`admit_unit`), and fits a declared variable in an answer
   (`sub`), which is what lets `list.minimum` be `[a] -> a`. Two things std
