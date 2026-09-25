@@ -38,6 +38,7 @@ import dreams.parser;
 import dreams.path;
 import dreams.repl;
 import dreams.scope;
+import dreams.typecheck;
 
 let version = "0.1.0";
 
@@ -118,11 +119,24 @@ let parse_only! file src =
 
 // --- the whole program ---------------------------------------------------------
 
-/// Resolve and purity-check everything the root file reaches.
-let check_program! l = {
-    let ds = list.append (modules.diags l) (scope.check! l);
-    print_diags! (modules.files l) ds
+/// Resolve and purity-check everything the root file reaches, and hold it
+/// to its signatures.
+let check_program! l types = {
+    let r = scope.resolve! l;
+    let ds = list.append (modules.diags l) (scope.r_diags r);
+    print_diags! (modules.files l) (list.append ds (type_diags types l r ds))
 };
+
+/// What the program's signatures say is wrong with it.
+///
+/// Only asked of a program that resolved: a name that means nothing has no
+/// type to check, and every mistake downstream of it would be a second report
+/// of the same one. `--no-types` skips the pass, which is the other half of
+/// what makes the types optional -- a program that does not want them pays for
+/// nothing but the parse of its signatures, and every signature compiles to
+/// nothing, so the image is the same either way.
+let type_diags types l r ds =
+    if not types || diag.error_count ds > 0 { [] } else { typecheck.check_program l r };
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
@@ -231,10 +245,11 @@ let copy_payload! out path n =
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out shebang payloads optimize = {
+let build! l out shebang payloads optimize types = {
     let r = scope.resolve! l;
     let low = lower.link! l r;
-    let ds = list.append (modules.diags l) (lower.all_diags r low);
+    let ds0 = list.append (modules.diags l) (lower.all_diags r low);
+    let ds = list.append ds0 (type_diags types l r ds0);
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
     strict! sizes
     let unreadable = list.filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
@@ -401,6 +416,7 @@ let show_time! o file = {
     let l = value_of load;
     let resolved = timed! (scope.resolve! l);
     let r = value_of resolved;
+    let checked = timed! (type_diags (opt o :no_types != true) l r (scope.r_diags r));
     let linked = timed! (lower.link! l r);
     let low = value_of linked;
     let built = timed! (lower.image low);
@@ -411,7 +427,7 @@ let show_time! o file = {
     let bytes = value_of written;
 
     let stages = [["parse", read], ["expand", load], ["resolve", resolved],
-                  ["lower", linked], ["arena", built], ["share", shared],
+                  ["types", checked], ["lower", linked], ["arena", built], ["share", shared],
                   ["emit", written]];
     let total = list.fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
     let pad n text = str.repeat (n - str.byte_length text) " " + text;
@@ -429,7 +445,8 @@ let show_time! o file = {
                     + to_string (list.length (core.map_get img :nodes [])) + " nodes"
                     + " (from " + to_string (list.length (core.map_get lowered :nodes [])) + ")")
     show_macros! l
-    print_diags! (modules.files l) (list.append (modules.diags l) (lower.all_diags r low))
+    print_diags! (modules.files l) (list.append (list.append (modules.diags l) (lower.all_diags r low))
+                                                (value_of checked))
 };
 
 /// What macro expansion spent, broken into the things a round does.
@@ -725,6 +742,7 @@ let rec parse_args args o =
         // this, which is the point: when an image misbehaves it answers
         // whether the pass that rewrote it is why.
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
+        ["--no-types", ..rest] => parse_args rest (with_opt :no_types true o),
         ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
         ["--debug-cfg", ..rest] => parse_args rest (append_opt :defines "debug" o),
         ["-q", ..rest] => parse_args rest (with_opt :quiet true o),
@@ -774,6 +792,7 @@ let usage! () = {
         "                           each module exports",
         "  --release                define `release`",
         "  --no-opt                 emit the arena as lowered, unshared",
+        "  --no-types               do not hold the program to its signatures",
         "  --debug-cfg              define `debug`",
         "  -q, --quiet              print only what was asked for",
     ] |> strict!
@@ -816,9 +835,9 @@ let run_command! o file =
         :tokens    => with_source! file (fn src -> tokenize! file src),
         :ast       => with_source! file (fn src -> ast! file src),
         :parse     => with_source! file (fn src -> parse_only! file src),
-        :check     => check_program! (load! o file),
+        :check     => check_program! (load! o file) (opt o :no_types != true),
         :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :payloads)
-                             (opt o :no_opt != true),
+                             (opt o :no_opt != true) (opt o :no_types != true),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),

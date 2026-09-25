@@ -1782,6 +1782,9 @@ let rec check_block c stmts r =
                     check_block c rest
                         (bind_all (ctx_mi c) (ctx_source c) (pattern_bindings pattern) (list.head checked))
                 },
+                // A signature binds nothing and runs nothing; what its type
+                // names is the type checker's to resolve (`dreams.types`).
+                [:sig, _, _, _] => check_block c rest r,
                 _ => check_block c rest (check_expr c st r),
             },
     };

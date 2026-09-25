@@ -194,6 +194,9 @@ install-artifactsv2:
 install: vm dreams mind lucid
     just install-artifacts
 
+vscode:
+    rm -rf ~/.vscode/extensions/dreamo
+    cp -r editors/vscode/ ~/.vscode/extensions/dreamo
 
 # --- testing ----------------------------------------------------------------
 

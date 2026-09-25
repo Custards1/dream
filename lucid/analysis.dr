@@ -441,6 +441,7 @@ let stmt_binders st offset acc =
         // A destructuring `let` does not put its own names in scope in its
         // value -- `let [a, b] = f a` is the outer `a`.
         [:let_p, _, body, _] => expr_binders body offset acc,
+        [:sig, _, _, _] => acc,
         _ => expr_binders st offset acc,
     };
 

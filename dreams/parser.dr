@@ -99,12 +99,12 @@ let token_continues c t =
 /// no idea they are special.
 let keywords = ["let", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
-                "match", "macro", "expand", "group", "struct", "mapping", "type"];
+                "match", "macro", "expand", "group", "struct", "mapping", "type", "union"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
 let non_starters = ["let", "priv", "rec", "else", "import", "as", "catch", "virtual", "derive",
-                    "when", "mod", "macro", "type"];
+                    "when", "mod", "macro", "type", "union"];
 
 /// The lists above are the readable form; these are how they are asked. A
 /// linear scan answers "is this identifier a keyword" in a dozen reductions
@@ -617,7 +617,7 @@ let rec block_stmts c acc ts sp =
     else {
         match parse_statement (at_statement c ts) ts {
             [:error, m, s] => err m s,
-            [:ok, st, rest] => block_stmts c (core.cons st acc) rest sp,
+            [:ok, st, rest] => block_stmts c (spliced st acc) rest sp,
         }
     };
 
@@ -651,6 +651,8 @@ let rec parse_let c sp ts = {
         let name = peek_value after_rec;
         match let_params c [] (list.tail after_rec) {
             [:error, m, s] => err m s,
+            [:ok, params, rest] if at rest :colon =>
+                parse_annotated c sp name params is_rec (list.tail rest),
             [:ok, params, rest] =>
                 match expect rest :eq "`=` in a `let`" {
                     [:error, m, s] => err m s,
@@ -664,6 +666,75 @@ let rec parse_let c sp ts = {
                 },
         }
     }
+};
+
+// --- signatures ---------------------------------------------------------------
+//
+// `let name : type` says what `name` is, in the type grammar below, and nothing
+// else: it is a promise the type checker holds the definition to and holds
+// every use to, and it compiles to nothing at all. Three spellings, all of them
+// a `let` with a `:` where the `=` or the parameters would go:
+//
+//     let add : :integer -> :integer -> :integer;     a signature on its own
+//     let add x y = x + y;                             ..and the definition
+//
+//     let limit : :integer = 10;                       a value and its type
+//     let greet who : :string = "hi " + who;           what a function answers
+//
+// The first is the one that says everything, and it is written apart from the
+// definition because a curried function's type is one arrow per parameter and
+// a definition names its parameters rather than their types. The last is the
+// shorthand for a function whose parameters say enough by their names: the
+// type after the parameters is what the function *answers*, the reading every
+// language with this syntax gives it, so `greet` is `:any -> :string`.
+//
+// Both inline forms come back as a signature and a `let` side by side
+// (`[:sigged, sig, let]`), which whatever collects items or statements splices
+// into two. So no pass that reads a `let` has to know a signature could be
+// attached to one -- a `let` is the six-element node it always was.
+
+/// `let name params : type ..`, already past the `:`.
+let rec parse_annotated c sp name params is_rec ts =
+    match parse_type_expr c ts {
+        [:error, m, s] => err m s,
+        [:ok, annotation, rest] =>
+            if at rest :eq {
+                match parse_expr c (list.tail rest) {
+                    [:error, m, s] => err m s,
+                    [:ok, body, rest2] => {
+                        let at_sig = ast.span_to sp (ast.span annotation);
+                        ok [:sigged,
+                            ast.sig_d name (answering params annotation) at_sig,
+                            ast.let_d name params body is_rec (ast.span_to sp (ast.span body))]
+                           rest2
+                    },
+                }
+            }
+            else if not (list.is_empty params) {
+                err ("a signature is the type of the whole of `" + name
+                     + "`, so it names no parameters: write `let " + name
+                     + " : a -> b` and give the parameters to the definition, "
+                     + "or finish this one with `= ..` to say what it answers")
+                    (peek_span rest)
+            }
+            else if is_rec {
+                err "a signature is not recursive; `rec` belongs on the definition" sp
+            }
+            else { ok (ast.sig_d name annotation (ast.span_to sp (ast.span annotation))) rest },
+    };
+
+/// The type of a function whose parameters are untyped and whose answer is
+/// `annotation`: one `:any ->` per parameter in front of it.
+let answering params annotation = {
+    let sp = ast.span annotation;
+    list.fold (fn t p -> tagged "fn" [ast.atom_e "any" sp, t] sp) annotation params
+};
+
+/// Put one parsed item or statement onto a reversed list, splitting a `let`
+/// that carried its own signature into the signature and the `let`.
+let spliced item acc = match item {
+    [:sigged, sg, d] => core.cons d (core.cons sg acc),
+    _ => core.cons item acc,
 };
 
 // --- type expressions -------------------------------------------------------
@@ -1414,6 +1485,10 @@ let rec parse_item c ts = {
                 }
                 else { match (if is_kw rest "type" { parse_type c sp (list.tail rest) }
                               else { parse_let c sp (list.tail rest) }) {
+                    // The signature stays public: it describes the name, and
+                    // whether the name may be reached from outside is the
+                    // `let`'s business, not the promise about what it is.
+                    [:ok, [:sigged, sg, d], after] => ok [:sigged, sg, ast.priv_d d (ast.span d)] after,
                     [:ok, d, after] => ok (ast.priv_d d (ast.span d)) after,
                     other => other,
                 } }
@@ -1421,13 +1496,16 @@ let rec parse_item c ts = {
             "macro" => match parse_let c sp (list.tail ts) {
                 [:ok, [:let, n, ps, body, _, span], rest] =>
                     ok (ast.macro_d n ps body span) rest,
+                [:ok, [:sigged, _, _], _] => err "a macro takes and answers syntax, so it has no signature" sp,
+                [:ok, [:sig, _, _, _], _] => err "a macro takes and answers syntax, so it has no signature" sp,
                 [:ok, _, _] => err "a macro needs a name" sp,
                 other => other,
             },
+            "union" => parse_union c sp (list.tail ts),
             "group" => parse_record c :list sp (list.tail ts),
             "struct" => parse_record c :array sp (list.tail ts),
             "mapping" => parse_record c :map sp (list.tail ts),
-            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `priv let`, `macro`, `group`, `struct`, `mapping` or `type` at the top level, found "
+            _ => err ("expected `import`, `derive`, `virtual`, `mod`, `when`, `let`, `priv let`, `macro`, `group`, `struct`, `mapping`, `union` or `type` at the top level, found "
                       + describe ts) sp,
         },
         _ => err ("expected a declaration, found " + describe ts) sp,
@@ -1450,6 +1528,167 @@ let rec parse_record c kind sp ts =
                                 ok [:record, k, n, fs, ms, bases, span] after,
                             other => other,
                         },
+                },
+        }
+    };
+
+// --- unions -------------------------------------------------------------------
+//
+// `union Shape { circle(radius : :float), rect(w : :float, h : :float), empty }`
+// is a value that is exactly one of its variants, and which one is written on
+// the value: `[:circle, 2.0]`, `[:rect, 1.0, 3.0]`, `:empty`. That is the shape
+// this language already gives every result -- `[:ok, value] | [:error, why]` is
+// a union nobody had declared -- so a declared one is not a new kind of value,
+// and a `match` on it is the `match` it always was. What declaring it buys is
+// the constructors, the description, and a type checker that knows the list of
+// variants and so can say which one a `match` forgot.
+//
+// The body is separated like a record's: `,` or a line break. An entry is a
+// variant when it is a bare name or a name with its fields in parentheses, and
+// a member -- `area self = ..` -- when it has parameters and a `=`, which is
+// how a record tells a member from a field too.
+
+let rec parse_union c sp ts =
+    if not (at ts :ident) || is_keyword (peek_value ts) {
+        err "expected a union name" (peek_span ts)
+    } else if str.ends_with "!" (peek_value ts) {
+        err "a union name must be pure" (peek_span ts)
+    } else {
+        let name = peek_value ts;
+        match union_params [] (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, params, rest] =>
+                match expect rest :lbrace "`{` before the union's variants" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        union_body (ctx true false (ctx_indent c)) name params sp [] [] rest2,
+                },
+        }
+    };
+
+/// A union's type parameters: plain names, which its fields may use as types.
+let rec union_params acc ts =
+    if at ts :ident && not (is_keyword (peek_value ts)) {
+        if str.ends_with "!" (peek_value ts) {
+            err "a type parameter must be pure" (peek_span ts)
+        }
+        else { union_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts) }
+    }
+    else { ok (list.reverse acc) ts };
+
+let rec union_body c name params sp variants members ts =
+    if at ts :comma { union_body c name params sp variants members (list.tail ts) }
+    else if at ts :rbrace {
+        if list.is_empty variants {
+            err ("`" + name + "` has no variants, and a union is always one of them") sp
+        }
+        else {
+            ok (ast.union_d name params (list.reverse variants) (list.reverse members)
+                            (ast.span_to sp (peek_span ts))) (list.tail ts)
+        }
+    }
+    else if at_end ts { err "unterminated `union`: expected `}`" sp }
+    else {
+        match union_entry (at_statement c ts) name variants members ts {
+            [:error, m, s] => err m s,
+            [:ok, [:variant, v], rest] => union_body c name params sp (core.cons v variants) members rest,
+            [:ok, [:member, m], rest] => union_body c name params sp variants (core.cons m members) rest,
+        }
+    };
+
+/// One entry: `name`, `name(field : t, ..)`, or a member `name params = body`.
+let union_entry c name variants members ts =
+    if not (at ts :ident) {
+        err ("expected a variant, a member or `}` in `" + name + "`, found " + describe ts) (peek_span ts)
+    } else if is_keyword (peek_value ts) {
+        err ("`" + to_string (peek_value ts) + "` is a keyword and cannot name a variant or a member")
+            (peek_span ts)
+    } else {
+        let entry = peek_value ts;
+        let at_name = peek_span ts;
+        let after = list.tail ts;
+        if entry == "type" {
+            err ("`type` is the description `" + name + "` generates, so it cannot name a variant or a member") at_name
+        }
+        else if union_taken variants members entry {
+            err ("`" + entry + "` is already a variant or a member of `" + name + "`") at_name
+        }
+        else if at after :lparen && peek2_kind after != :rparen {
+            if str.ends_with "!" entry {
+                err "a variant must be a plain name: building one is pure" at_name
+            }
+            else {
+                match variant_fields (grouped c) [] (list.tail after) {
+                    [:error, m, s] => err m s,
+                    [:ok, [fields, close], rest] =>
+                        ok [:variant, ast.variant entry (ast.span_to at_name close) fields] rest,
+                }
+            }
+        }
+        else if at after :eq {
+            match parse_expr c (list.tail after) {
+                [:error, m, s] => err m s,
+                [:ok, body, rest] =>
+                    ok [:member, ast.record_member entry [] body (ast.span_to at_name (ast.span body))] rest,
+            }
+        }
+        else if at_end after || at after :comma || at after :rbrace
+                || not (token_continues c (list.head after)) {
+            if str.ends_with "!" entry { err "a variant must be a plain name: building one is pure" at_name }
+            else { ok [:variant, ast.variant entry at_name []] after }
+        }
+        else {
+            match let_params c [] after {
+                [:error, m, s] => err m s,
+                [:ok, params, rest] =>
+                    match expect rest :eq ("`=` after the parameters of `" + entry + "`") {
+                        [:error, m, s] => err m s,
+                        [:ok, _, rest2] => match parse_expr c rest2 {
+                            [:error, m, s] => err m s,
+                            [:ok, body, rest3] =>
+                                ok [:member, ast.record_member entry params body
+                                                               (ast.span_to at_name (ast.span body))] rest3,
+                        },
+                    },
+            }
+        }
+    };
+
+let union_taken variants members n =
+    list.any (fn v -> ast.variant_name v == n) variants
+    || list.any (fn m -> ast.member_name m == n) members;
+
+/// `field : t, field, ..)`, already past the `(`: `[[fields, close], rest]`.
+let rec variant_fields c acc ts =
+    if at ts :rparen { ok [list.reverse acc, peek_span ts] (list.tail ts) }
+    else if not (at ts :ident) || is_keyword (peek_value ts) {
+        err ("expected a field name, found " + describe ts) (peek_span ts)
+    }
+    else {
+        let fname = peek_value ts;
+        let fspan = peek_span ts;
+        let after = list.tail ts;
+        let typed = if at after :colon {
+                        match parse_type_expr c (list.tail after) {
+                            [:ok, t, rest] => [:ok, t, rest],
+                            other => other,
+                        }
+                    }
+                    else { [:ok, (), after] };
+        match typed {
+            [:error, m, s] => err m s,
+            [:ok, t, rest] =>
+                if list.any (fn f -> list.nth 0 f == fname) acc {
+                    err ("`" + fname + "` is already a field of this variant") fspan
+                }
+                else if str.ends_with "!" fname {
+                    err "a field must be a plain name: reading one is pure" fspan
+                }
+                else {
+                    let acc2 = core.cons [fname, fspan, t] acc;
+                    if at rest :comma { variant_fields c acc2 (list.tail rest) }
+                    else if at rest :rparen { ok [list.reverse acc2, peek_span rest] (list.tail rest) }
+                    else { err ("expected `,` or `)`, found " + describe rest) (peek_span rest) }
                 },
         }
     };
@@ -1739,7 +1978,8 @@ let rec parse_when c sp ts =
             else {
                 match parse_item c rest {
                     [:error, m, s] => err m s,
-                    [:ok, item, rest2] => ok (ast.when_d cond [item] (ast.span_to sp sp)) rest2,
+                    [:ok, item, rest2] =>
+                        ok (ast.when_d cond (list.reverse (spliced item [])) (ast.span_to sp sp)) rest2,
                 }
             },
     };
@@ -1815,7 +2055,7 @@ let rec item_list c acc ts braced =
     else {
         match parse_item (at_statement c ts) ts {
             [:error, m, s] => err m s,
-            [:ok, item, rest] => item_list c (core.cons item acc) rest braced,
+            [:ok, item, rest] => item_list c (spliced item acc) rest braced,
         }
     };
 

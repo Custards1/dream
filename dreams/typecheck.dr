@@ -1,0 +1,1501 @@
+// Static types: what a signature promises, held to where the compiler can see.
+//
+// Dream is dynamically typed and stays so. A value's type is decided when it
+// is made, and `std.types` has always been able to check one at run time. What
+// this pass adds is the other half of *optional*: a program that writes
+//
+//     let add : :integer -> :integer -> :integer;
+//
+// is told at compile time that `add "one" 2` is wrong, instead of finding out
+// from a `:type_error` whenever that line happens to be forced -- which, in a
+// lazy language, may be never, or may be in production.
+//
+// Three rules decide everything below, and every one of them is about not
+// rejecting a program that works:
+//
+//   1. **Nothing unannotated is ever an error.** A name with no signature is
+//      `:any`, and `:any` fits everywhere in both directions. So a program
+//      with no signatures checks exactly as it compiled before, and adding the
+//      first signature to a large one reports only what touches that name.
+//
+//   2. **Only a definite mismatch is reported.** `sub` answers "could this be
+//      that?", not "is this provably that?". A union is fine where one of its
+//      members is expected only if *every* member fits -- that one is not
+//      optimism, it is what the signature said -- but anything the checker
+//      cannot see into (an unannotated call, a thunk, a refinement's
+//      predicate) passes.
+//
+//   3. **The checker never changes the program.** Signatures compile to
+//      nothing, so an image is byte-identical with or without them, and this
+//      pass only produces diagnostics. `--no-types` skips it.
+//
+// The types are the ones `std.types` describes, read from the same grammar,
+// so a `type` declaration means the same thing to this pass and to
+// `types.check`. There are two additions that only a compile-time checker
+// needs. A free lowercase name in a signature is a **type variable**:
+// `let map : (a -> b) -> [a] -> [b]` is generic, and each use of `map`
+// solves `a` and `b` from its arguments. And a `match` over a declared union
+// must handle every variant -- see "exhaustiveness" below, which is the check
+// that makes `union` worth declaring.
+//
+// What the pass reads is the resolver's answer, not the syntax alone: every
+// name occurrence already says what it means (`scope.resolution`), so a call
+// of `list.map` is known to be *that* `map` however it was imported, and no
+// name lookup is written twice. Names inside signatures are the exception --
+// a signature is never resolved, because it never runs -- and they are looked
+// up in the module's environment the way `scope` would have (`type_ref`).
+
+import std.core;
+import std.list;
+import std.str;
+
+import dreams.ast;
+import dreams.diag;
+import dreams.modules;
+import dreams.scope;
+
+// --- types as the checker holds them ---------------------------------------------
+//
+//     :any  :never  :integer  :float  :string  ...     the kinds `type_of` answers
+//     [:lit, kind, value]        one value: `:ok`, `3`, `"fast"` -- an atom by name
+//     [:union, [t, ..]]          flattened, never nested, never one member
+//     [:fn, a, b]                curried, as the grammar writes it
+//     [:list_of, t]  [:tuple, [t, ..]]      [:array_of, t]  [:array_t, [t, ..]]
+//     [:map_of, k, v]  [:record, [[key, t], ..]]
+//     [:var, name]               a type variable of the signature being checked
+//     [:flex, name]              one of a *callee's*, to be solved at the call
+//     [:named, shown, gi, args]  a declared type, unfolded only when asked
+//
+// A named type stays folded because a type may be recursive -- `type Tree =
+// :unit | [:integer, Tree, Tree]` -- and unfolding eagerly would not stop.
+// `gi` is the global the declaration compiled to, which is its identity: two
+// modules may both declare `Tree`.
+
+let primitives = %{
+    "any" => :any, "never" => :never, "integer" => :integer, "float" => :float,
+    "string" => :string, "bool" => :bool, "char" => :char, "atom" => :atom,
+    "unit" => :unit, "list" => :list, "array" => :array, "map" => :map,
+    "pure_fn" => :pure_fn, "impure_fn" => :impure_fn, "process" => :process,
+    "error" => :error, "module" => :module, "bigstr" => :bigstr,
+};
+
+let lit kind v = [:lit, kind, v];
+
+let members t = match t { [:union, ts] => ts, _ => [t] };
+
+/// One union of all of these, flattened, without repeats. `:any` absorbs the
+/// lot and `:never` contributes nothing, which is what makes `raise!` in one
+/// branch of an `if` leave the other branch's type as the answer.
+let union_of ts = {
+    let flat = list.concat (list.map (fn t -> members t) ts);
+    if list.contains :any flat { :any }
+    else {
+        let kept = list.fold (fn acc t ->
+            if t == :never || list.contains t acc { acc } else { core.cons t acc }) [] flat;
+        match kept {
+            [] => :never,
+            [one] => one,
+            _ => [:union, list.reverse kept],
+        }
+    }
+};
+
+let join a b = if a == b { a } else { union_of [a, b] };
+
+/// A literal's kind, for binding a type variable. `list.map (fn x -> 1) xs` is
+/// a list of integers rather than a list of the number one; an atom stays an
+/// atom, because an atom *is* a tag and forgetting which one would lose the
+/// variant.
+let rec widen t = match t {
+    [:lit, :atom, _] => t,
+    [:lit, kind, _] => kind,
+    [:tuple, ts] => [:tuple, list.map (fn x -> widen x) ts],
+    [:union, ts] => union_of (list.map (fn x -> widen x) ts),
+    _ => t,
+};
+
+/// A callee's type variables, renamed so that solving them at a call cannot
+/// be confused with the caller's own: `map`'s `a` is not the `a` of the
+/// function calling it.
+let rec flexible t = match t {
+    [:var, n] => [:flex, n],
+    [:fn, a, b] => [:fn, flexible a, flexible b],
+    [:union, ts] => [:union, list.map (fn x -> flexible x) ts],
+    [:list_of, e] => [:list_of, flexible e],
+    [:tuple, ts] => [:tuple, list.map (fn x -> flexible x) ts],
+    [:array_of, e] => [:array_of, flexible e],
+    [:array_t, ts] => [:array_t, list.map (fn x -> flexible x) ts],
+    [:map_of, kt, vt] => [:map_of, flexible kt, flexible vt],
+    [:record, ps] => [:record, list.map (fn p -> list.take 1 p + [flexible (list.nth 1 p)] + list.drop 2 p) ps],
+    [:named, n, gi, args] => [:named, n, gi, list.map (fn x -> flexible x) args],
+    _ => t,
+};
+
+// --- showing one ---------------------------------------------------------------------
+
+/// A type as it would be written in a signature, which is what a diagnostic
+/// should quote back.
+let rec show t = match t {
+    [:lit, :atom, n] => ":" + n,
+    [:lit, :string, v] => "\"" + v + "\"",
+    [:lit, :char, v] => "'" + str.of_chars [v] + "'",
+    [:lit, _, v] => to_string v,
+    [:union, ts] => str.join_str " | " (list.map (fn x -> show_inner x) ts),
+    [:fn, a, b] => show_inner a + " -> " + show b,
+    [:list_of, e] => "[" + show e + "]",
+    [:tuple, ts] => "[" + str.join_str ", " (list.map (fn x -> show x) ts) + "]",
+    [:array_of, e] => "#[" + show e + "]",
+    [:array_t, ts] => "#[" + str.join_str ", " (list.map (fn x -> show x) ts) + "]",
+    [:map_of, kt, vt] => "%{" + show kt + " => " + show vt + "}",
+    [:record, ps] => "%{" + str.join_str ", " (list.map (fn p ->
+                        show (list.nth 0 p) + " => " + show (list.nth 1 p)
+                        + (if list.length p > 2 { "?" } else { "" })) ps) + "}",
+    [:var, n] => n,
+    [:flex, n] => n,
+    [:named, n, _, []] => n,
+    [:named, n, _, args] => n + " " + str.join_str " " (list.map (fn x -> show_arg x) args),
+    _ => to_string t,
+};
+
+/// Parenthesised where an arrow or a union would otherwise read as part of
+/// what surrounds it.
+let show_inner t = match t {
+    [:fn, _, _] => "(" + show t + ")",
+    [:union, _] => "(" + show t + ")",
+    _ => show t,
+};
+
+let show_arg t = match t {
+    [:named, _, _, [_, .._]] => "(" + show t + ")",
+    _ => show_inner t,
+};
+
+// --- the checker's context -------------------------------------------------------------
+//
+// Built once for the program. `named` is every type declaration by global,
+// `sigs` every signature by the global it describes, and `uses` the type a
+// *use* of that global has -- the signature with its variables made flexible,
+// computed once rather than at every occurrence.
+
+mapping Checker {
+    l = ()
+    r = ()
+    named = %{}
+    sigs = %{}
+    uses = %{}
+}
+
+let res k = Checker.r k;
+
+/// Where an expression is being checked: the module whose names it resolves
+/// against, the file it was written in, what its locals are known to be, the
+/// types declared in its blocks, the block signatures still waiting for their
+/// `let`, and whose body this is, for a message.
+mapping Here {
+    mi = 0
+    source = 0
+    locals = %{}
+    ltypes = %{}
+    pending = %{}
+    owner = ""
+}
+
+let here mi source owner = Here.make mi source %{} %{} %{} owner;
+
+let with_local n t h = Here.set_locals h ((Here.locals h).[n => t]);
+
+/// A diagnostic, unless it would point into generated code: a record's or a
+/// union's helpers carry spans past 2^31 that name no byte of any file, and
+/// what is wrong there is reported where the author wrote it instead.
+let bad h span message ds =
+    if ast.span_start span >= 2147483648 { ds }
+    else { core.cons (diag.in_source (Here.source h) (diag.error span message)) ds };
+
+// --- which declarations are types -------------------------------------------------------
+
+/// A `type` declaration's body, as the parser writes it: `[:named, "Name",
+/// description]`. Records and unions generate their `type` in the same shape.
+let named_body body = match body {
+    [:list, [[:atom, "named", _], [:str, shown, _], desc], _] => [shown, desc],
+    _ => (),
+};
+
+let env_of k mi = scope.r_env_at (res k) mi;
+
+let gi_of k mi n = match env_of k mi {
+    () => (),
+    e => scope.global_index e n,
+};
+
+// --- reading a type out of syntax -------------------------------------------------------
+//
+// An evaluation scope is `[mi, subst, ltypes]`: the module whose names a type
+// is read in, what the parameters of the declaration being unfolded stand
+// for, and the types declared in the enclosing blocks.
+
+let in_module mi = [mi, %{}, %{}];
+
+let rec eval_type k ev t = match t {
+    [:atom, n, _] => match primitives.[n else ()] { () => lit :atom n, p => p },
+    [:int, v, _] => lit :integer v,
+    [:float, v, _] => lit :float v,
+    [:str, v, _] => lit :string v,
+    [:char, v, _] => lit :char v,
+    [:bool, v, _] => lit :bool v,
+    [:unit, _] => :unit,
+    [:list, [[:atom, tag, _], ..parts], _] => tagged k ev tag parts,
+    [:name, n, _] => type_named k ev n [],
+    [:field, _, _, _] => type_dotted k ev t [],
+    [:apply, head, args, _] => {
+        let given = list.map (fn a -> eval_type k ev a) args;
+        match head {
+            [:name, n, _] => type_named k ev n given,
+            [:field, _, _, _] => type_dotted k ev head given,
+            _ => :any,
+        }
+    },
+    _ => :any,
+};
+
+/// The descriptions the grammar builds, by their tag. A refinement is its
+/// base: the predicate is a function, and running it is what `types.check`
+/// is for.
+let tagged k ev tag parts = {
+    let ev1 t = eval_type k ev t;
+    match [tag, parts] {
+        ["fn", [a, b]] => [:fn, ev1 a, ev1 b],
+        ["union", [[:list, ts, _]]] => union_of (list.map ev1 ts),
+        ["list_of", [e]] => [:list_of, ev1 e],
+        ["tuple", [[:list, ts, _]]] => [:tuple, list.map ev1 ts],
+        ["array_of", [e]] => [:array_of, ev1 e],
+        ["array", [[:list, ts, _]]] => [:array_t, list.map ev1 ts],
+        ["map_of", [kt, vt]] => [:map_of, ev1 kt, ev1 vt],
+        ["record", [[:map, pairs, _]]] =>
+            [:record, list.map (fn p -> [ev1 (list.nth 0 p), ev1 (list.nth 1 p)]) pairs],
+        ["refine", [base, _]] => ev1 base,
+        ["named", [_, desc]] => ev1 desc,
+        ["literal", [[:atom, n, _]]] => lit :atom n,
+        ["literal", [v]] => ev1 v,
+        ["shape", [[:atom, kind, _], [:list, fields, _]]] => shape_type k ev kind fields,
+        _ => :any,
+    }
+};
+
+/// A record's description: `[key, description, defaults]` per field.
+///
+/// A field with a default may be missing, because reading it falls back to
+/// the default -- `Person.greeting %{}` is `"Hi"`, and that is the point of
+/// writing one. So in a `mapping` such a field is optional, and a `group` or
+/// a `struct` may stop early, before any run of defaulted fields at its end:
+/// a position cannot be missing unless every one after it is too.
+let shape_type k ev kind fields = {
+    let parts = list.map (fn f -> match f {
+        [:list, [key, desc, [:list, defaults, _]], _] =>
+            [eval_type k ev key, eval_type k ev desc, not (list.is_empty defaults)],
+        _ => [:any, :any, false],
+    }) fields;
+    let types = list.map (fn p -> list.nth 1 p) parts;
+    let shortest = list.fold (fn n ip -> if list.nth 2 (list.nth 1 ip) { n } else { list.nth 0 ip + 1 })
+                             0 (indexed parts);
+    let lengths = list.range shortest (list.length parts + 1);
+    match kind {
+        "map" => [:record, list.map (fn p -> if list.nth 2 p { [list.nth 0 p, list.nth 1 p, :optional] }
+                                             else { [list.nth 0 p, list.nth 1 p] }) parts],
+        "array" => union_of (list.map (fn n -> [:array_t, list.take n types]) lengths),
+        _ => union_of (list.map (fn n -> [:tuple, list.take n types]) lengths),
+    }
+};
+
+/// A lowercase name nothing declares is a type variable; anything else that
+/// does not resolve is not a type, and is reported where the signature is
+/// collected rather than here.
+let is_type_var n = {
+    let b = core.str_byte n 0;
+    (b >= 97 && b <= 122) || b == 95
+};
+
+let rec type_named k ev n args = {
+    let [mi, subst, ltypes] = ev;
+    match subst.[n else ()] {
+        () => match ltypes.[n else ()] {
+            () => match type_ref k mi n {
+                () => if is_type_var n { [:var, n] } else { :any },
+                gi => named_type k gi args,
+            },
+            [params, desc, ev2] =>
+                if list.length params != list.length args { :any }
+                else { eval_type k (bound ev2 params args) desc },
+        },
+        t => t,
+    }
+};
+
+let named_type k gi args = match (Checker.named k).[gi else ()] {
+    () => :any,
+    [_, _, _, shown] => [:named, shown, gi, args],
+};
+
+/// An evaluation scope with a declaration's parameters standing for these.
+let bound ev params args = {
+    let [mi, subst, ltypes] = ev;
+    [mi, list.fold (fn m pa -> m.[list.nth 0 pa => list.nth 1 pa]) subst (pairs params args), ltypes]
+};
+
+let rec pairs xs ys = match [xs, ys] {
+    [[x, ..xt], [y, ..yt]] => core.cons [x, y] (pairs xt yt),
+    _ => [],
+};
+
+/// The global a type name denotes in module `mi`, or `()`.
+///
+/// A module name comes first, because that is how a record or a union is
+/// named: `Shape` is the module `union Shape` became, and its type is the
+/// module's `type`. A union also leaves a global of its own name in the
+/// parent, holding the same description at run time, which is why the module
+/// has to be asked before the global -- the global is not a declaration this
+/// pass can read.
+let type_ref k mi n = match env_of k mi {
+    () => (),
+    e => {
+        let as_module = match scope.alias_of e n {
+            [:dream, target] => module_type k target,
+            _ => (),
+        };
+        match as_module {
+            () =>
+                if scope.has_global e n { typed_global k (scope.global_index e n) }
+                else {
+                    match scope.only_of e n {
+                        () => (),
+                        sel => member_type k (list.nth 0 sel) (list.nth 1 sel),
+                    }
+                },
+            gi => gi,
+        }
+    },
+};
+
+let typed_global k gi = if core.map_has (Checker.named k) gi { gi } else { () };
+
+let module_type k target = match env_of k target {
+    () => (),
+    e => if scope.has_global e "type" { typed_global k (scope.global_index e "type") } else { () },
+};
+
+let member_type k r_ref field = match r_ref {
+    [:dream, target] => match env_of k target {
+        () => (),
+        e =>
+            if scope.has_global e field { typed_global k (scope.global_index e field) }
+            else {
+                match scope.alias_of e field {
+                    [:dream, inner] => module_type k inner,
+                    _ => (),
+                }
+            },
+    },
+    _ => (),
+};
+
+/// `mod.Name` and `mod.sub.Name`: the module the part in front of the last
+/// dot names, or `()`.
+let rec dotted_module k mi e = match e {
+    [:name, n, _] => match env_of k mi {
+        () => (),
+        env => match scope.alias_of env n { [:dream, t] => t, _ => () },
+    },
+    [:field, obj, f, _] => match dotted_module k mi obj {
+        () => (),
+        t => match env_of k t {
+            () => (),
+            env => match scope.alias_of env f {
+                [:dream, inner] =>
+                    if modules.module_name (modules.module_at (Checker.l k) inner)
+                       == modules.module_name (modules.module_at (Checker.l k) t) + "." + f { inner }
+                    else { () },
+                _ => (),
+            },
+        },
+    },
+    _ => (),
+};
+
+let type_dotted k ev e args = match e {
+    [:field, obj, f, _] => match dotted_module k (list.head ev) obj {
+        () => :any,
+        t =>
+            if modules.module_name (modules.module_at (Checker.l k) t) == "std.types" {
+                std_types f args
+            }
+            else {
+                match member_type k (scope.dream_ref t) f {
+                    () => :any,
+                    gi => named_type k gi args,
+                }
+            },
+    },
+    _ => :any,
+};
+
+/// `std.types`' constructors, written into a type: `types.optional :string`.
+/// They build the same descriptions the grammar does, so they read the same.
+/// A `[a, b]` argument has already been read as a tuple type, which is what
+/// `types.one_of [a, b]` means by its list.
+let std_types f args = match [f, args] {
+    ["optional", [t]] => union_of [:unit, t],
+    ["list_of", [t]] => [:list_of, t],
+    ["array_of", [t]] => [:array_of, t],
+    ["map_of", [kt, vt]] => [:map_of, kt, vt],
+    ["fn_of", [a, b]] => [:fn, a, b],
+    ["one_of", [[:tuple, ts]]] => union_of ts,
+    ["enum", [[:tuple, ts]]] => union_of (list.map (fn t -> as_literal t) ts),
+    ["literal", [t]] => as_literal t,
+    ["tuple", [[:tuple, ts]]] => [:tuple, ts],
+    ["number", []] => union_of [:integer, :float],
+    [name, []] => primitives.[name else :any],
+    _ => :any,
+};
+
+/// `:list` read as a value rather than a kind.
+let as_literal t = if type_of t == :atom && t != :any && t != :never {
+    lit :atom (str.slice 1 (str.byte_length (to_string t) - 1) (to_string t))
+} else { t };
+
+/// A named type's description, with its parameters bound. An unapplied
+/// parameterised type is not a type yet, so it is `:any`.
+let unfold k t = match t {
+    [:named, _, gi, args] => match (Checker.named k).[gi else ()] {
+        () => :any,
+        [mi, params, desc, _] =>
+            if list.length params != list.length args { :any }
+            else { eval_type k (bound (in_module mi) params args) desc },
+    },
+    _ => t,
+};
+
+/// Unfold until the outside is not a name.
+let rec peel k t fuel =
+    if fuel <= 0 { :any }
+    else { match t { [:named, _, _, _] => peel k (unfold k t) (fuel - 1), _ => t } };
+
+// --- does this fit that ------------------------------------------------------------------
+
+let fuel = 40;
+
+/// Could a value of type `s` be where `t` is expected? True when the checker
+/// cannot tell -- see rule 2 at the top of the file -- and false only when
+/// it can see that it cannot.
+let rec sub k s t n =
+    if n <= 0 || s == t { true }
+    else {
+        match [s, t] {
+            [:any, _] => true,
+            [_, :any] => true,
+            [:never, _] => true,
+            [[:flex, _], _] => true,
+            [_, [:flex, _]] => true,
+            [[:named, _, g1, a1], [:named, _, g2, a2]] if g1 == g2 && a1 == a2 => true,
+            [[:named, _, _, _], _] => sub k (unfold k s) t (n - 1),
+            [_, [:named, _, _, _]] => sub k s (unfold k t) (n - 1),
+            [[:union, ss], _] => list.all (fn m -> sub k m t n) ss,
+            [_, [:union, ts]] =>
+                list.any (fn m -> sub k s m n) ts
+                || (s == :bool && list.contains (lit :bool true) ts
+                                && list.contains (lit :bool false) ts),
+            [_, :never] => false,
+            [[:var, a], [:var, b]] => a == b,
+            [[:var, _], _] => false,
+            [_, [:var, _]] => false,
+            [_, [:lit, _, _]] => false,
+            [_, [:fn, a, b]] => match s {
+                [:fn, c, d] => sub k a c n && sub k d b n,
+                :pure_fn => true,
+                :impure_fn => true,
+                _ => false,
+            },
+            [_, [:list_of, e]] => match s {
+                [:list_of, e2] => sub k e2 e n,
+                [:tuple, ss] => list.all (fn x -> sub k x e n) ss,
+                :list => true,
+                _ => false,
+            },
+            [_, [:tuple, ts]] => match s {
+                [:tuple, ss] => list.length ss == list.length ts && pointwise k ss ts n,
+                [:list_of, e] => list.all (fn x -> sub k e x n) ts,
+                :list => true,
+                _ => false,
+            },
+            [_, [:array_of, e]] => match s {
+                [:array_of, e2] => sub k e2 e n,
+                [:array_t, ss] => list.all (fn x -> sub k x e n) ss,
+                :array => true,
+                _ => false,
+            },
+            [_, [:array_t, ts]] => match s {
+                [:array_t, ss] => list.length ss == list.length ts && pointwise k ss ts n,
+                [:array_of, e] => list.all (fn x -> sub k e x n) ts,
+                :array => true,
+                _ => false,
+            },
+            [_, [:map_of, kt, vt]] => match s {
+                [:map_of, k2, v2] => sub k k2 kt n && sub k v2 vt n,
+                [:record, ps] => list.all (fn p -> sub k (list.nth 0 p) kt n
+                                                  && sub k (list.nth 1 p) vt n) ps,
+                :map => true,
+                _ => false,
+            },
+            [_, [:record, tps]] => match s {
+                [:record, sps] => list.all (fn tp -> match field_in sps (list.nth 0 tp) {
+                    () => list.length tp > 2,
+                    st => sub k st (list.nth 1 tp) n,
+                }) tps,
+                [:map_of, _, v] => list.all (fn tp -> sub k v (list.nth 1 tp) n) tps,
+                :map => true,
+                _ => false,
+            },
+            [_, p] if type_of p == :atom => kind_fits s p,
+            _ => true,
+        }
+    };
+
+let rec pointwise k ss ts n = match [ss, ts] {
+    [[s, ..sr], [t, ..tr]] => sub k s t n && pointwise k sr tr n,
+    _ => true,
+};
+
+let field_in ps key = match list.filter (fn p -> list.nth 0 p == key) ps {
+    [] => (),
+    [p, .._] => list.nth 1 p,
+};
+
+/// Whether a value of type `s` is of the kind `p` names.
+///
+/// An atom is the one place a value and a kind share a spelling: `:error`
+/// names every error box and is also the tag of `[:error, why]`. `std.types`
+/// resolves that by letting the value decide -- an atom is compared against
+/// the kind's own name -- and this has to agree, or a signature and a
+/// `types.check` of the same description would disagree about `[:error, ..]`.
+let kind_fits s p = match s {
+    [:lit, :atom, n] => p == :atom || to_string p == ":" + n,
+    [:lit, kind, _] => kind == p,
+    [:fn, _, _] => p == :pure_fn || p == :impure_fn,
+    [:list_of, _] => p == :list,
+    [:tuple, _] => p == :list,
+    [:array_of, _] => p == :array,
+    [:array_t, _] => p == :array,
+    [:map_of, _, _] => p == :map,
+    [:record, _] => p == :map,
+    _ => s == p,
+};
+
+let fits k s t = sub k s t fuel;
+
+// --- solving a callee's type variables -----------------------------------------------------
+
+/// What the argument's type says each of the parameter's variables is. A
+/// variable met twice is the union of both, which is lenient on purpose: a
+/// call is never rejected over what a variable was *inferred* to be, only
+/// over the parts of a signature that were written down.
+let rec solve k p a subst = {
+    let a2 = match a { [:named, _, _, _] => peel k a 4, _ => a };
+    match p {
+        [:flex, n] => subst.[n => match subst.[n else ()] { () => widen a, prev => join prev (widen a) }],
+        [:fn, pa, pb] => match a2 {
+            [:fn, aa, ab] => solve k pb ab (solve k pa aa subst),
+            _ => subst,
+        },
+        [:list_of, pe] => match a2 {
+            [:list_of, ae] => solve k pe ae subst,
+            [:tuple, ts] => list.fold (fn m t -> solve k pe t m) subst ts,
+            _ => subst,
+        },
+        [:tuple, ps] => match a2 {
+            [:tuple, ts] if list.length ps == list.length ts =>
+                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (pairs ps ts),
+            _ => subst,
+        },
+        [:array_of, pe] => match a2 {
+            [:array_of, ae] => solve k pe ae subst,
+            [:array_t, ts] => list.fold (fn m t -> solve k pe t m) subst ts,
+            _ => subst,
+        },
+        [:map_of, pk, pv] => match a2 {
+            [:map_of, ak, av] => solve k pv av (solve k pk ak subst),
+            [:record, ps] => list.fold (fn m kv -> solve k pv (list.nth 1 kv) (solve k pk (list.nth 0 kv) m))
+                                       subst ps,
+            _ => subst,
+        },
+        [:named, _, g, pargs] => match a {
+            [:named, _, g2, aargs] if g == g2 && list.length pargs == list.length aargs =>
+                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (pairs pargs aargs),
+            _ => subst,
+        },
+        _ => subst,
+    }
+};
+
+/// A type with what has been solved put in. `settle` also turns what was not
+/// solved into `:any`, for an answer leaving the call.
+let rec solved subst t settle = match t {
+    [:flex, n] => match subst.[n else ()] { () => if settle { :any } else { t }, s => s },
+    [:fn, a, b] => [:fn, solved subst a settle, solved subst b settle],
+    [:union, ts] => union_of (list.map (fn x -> solved subst x settle) ts),
+    [:list_of, e] => [:list_of, solved subst e settle],
+    [:tuple, ts] => [:tuple, list.map (fn x -> solved subst x settle) ts],
+    [:array_of, e] => [:array_of, solved subst e settle],
+    [:array_t, ts] => [:array_t, list.map (fn x -> solved subst x settle) ts],
+    [:map_of, kt, vt] => [:map_of, solved subst kt settle, solved subst vt settle],
+    [:record, ps] => [:record, list.map (fn p -> list.take 1 p + [solved subst (list.nth 1 p) settle] + list.drop 2 p) ps],
+    [:named, n, gi, args] => [:named, n, gi, list.map (fn x -> solved subst x settle) args],
+    _ => t,
+};
+
+// --- the builtins -----------------------------------------------------------------------------
+
+let builtin_type n = match n {
+    "len" => [:fn, :any, :integer],
+    "to_string" => [:fn, :any, :string],
+    "type_of" => [:fn, :any, :atom],
+    "strict!" => [:fn, [:flex, "a"], [:flex, "a"]],
+    "raise!" => [:fn, :any, :never],
+    "spawn!" => [:fn, :any, :process],
+    "self!" => [:fn, :any, :process],
+    _ => :any,
+};
+
+// --- what an expression is ---------------------------------------------------------------
+//
+// `infer` answers `[type, diagnostics]` and `check` answers the diagnostics of
+// holding an expression to a type it was promised to have. Both thread the
+// diagnostics through as a reversed list, which is what keeps a walk of every
+// node in the program from appending to a list at every one of them.
+
+/// What a name means here. The resolver already decided which declaration a
+/// name is; this only asks that declaration's signature.
+let name_type k h n sp = match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
+    [:global, _, _, gi] => (Checker.uses k).[gi else :any],
+    [:member, _, _, gi] => if gi == () { :any } else { (Checker.uses k).[gi else :any] },
+    [:builtin, b] => builtin_type b,
+    _ => (Here.locals h).[n else :any],
+};
+
+let rec infer k h e ds = match e {
+    [:int, v, _] => [lit :integer v, ds],
+    [:float, v, _] => [lit :float v, ds],
+    [:str, v, _] => [lit :string v, ds],
+    [:char, v, _] => [lit :char v, ds],
+    [:bool, v, _] => [lit :bool v, ds],
+    [:atom, n, _] => [lit :atom n, ds],
+    [:unit, _] => [:unit, ds],
+    [:name, n, sp] => [name_type k h n sp, ds],
+    [:field, _, _, sp] => [name_type k h "" sp, ds],
+    [:apply, f, args, sp] => infer_apply k h f args sp ds,
+    [:pipe, lhs, rhs, sp] => match rhs {
+        [:apply, f, args, _] => infer_apply k h f (args + [lhs]) sp ds,
+        _ => infer_apply k h rhs [lhs] sp ds,
+    },
+    [:unary, :not, x, _] => [:bool, check k h x :bool "the operand of `not`" ds],
+    [:unary, _, x, sp] => {
+        let [t, ds1] = infer k h x ds;
+        numeric k h t x "the operand of `-`" ds1
+    },
+    [:binary, op, l, r, sp] => infer_binary k h op l r sp ds,
+    [:if, c, t, el, _] => {
+        let ds1 = check k h c :bool "the condition of an `if`" ds;
+        let [tt, ds2] = infer k h t ds1;
+        match el {
+            () => [join tt :unit, ds2],
+            x => {
+                let [et, ds3] = infer k h x ds2;
+                [join tt et, ds3]
+            },
+        }
+    },
+    [:block, stmts, _] => block k (Here.set_pending h %{}) stmts () ds,
+    [:thunk, x, _] => [:any, list.nth 1 (infer k h x ds)],
+    [:try, body, binder, handler, _] => {
+        let [bt, ds1] = infer k h body ds;
+        let [ht, ds2] = infer k (with_local binder :error h) handler ds1;
+        [join bt ht, ds2]
+    },
+    [:lambda, ps, body, sp] => lambda k h ps body :any sp ds,
+    [:comp, _, x, _] => infer k h x ds,
+    [:list, xs, _] => {
+        let [ts, ds1] = infer_all k h xs ds;
+        [[:tuple, ts], ds1]
+    },
+    [:array, xs, _] => {
+        let [ts, ds1] = infer_all k h xs ds;
+        [[:array_t, ts], ds1]
+    },
+    [:map, kvs, _] => infer_map k h kvs ds,
+    [:match, s, arms, sp] => infer_match k h s arms sp () ds,
+    [:get, c, key, fb, _] => {
+        let [ct, ds1] = infer k h c ds;
+        let [kt, ds2] = infer k h key ds1;
+        match fb {
+            () => [element k ct kt, ds2],
+            x => {
+                let [ft, ds3] = infer k h x ds2;
+                [join (element k ct kt) ft, ds3]
+            },
+        }
+    },
+    [:set, c, key, v, _] => {
+        let [ct, ds1] = infer k h c ds;
+        let ds2 = list.nth 1 (infer k h key ds1);
+        [ct, list.nth 1 (infer k h v ds2)]
+    },
+    _ => [:any, ds],
+};
+
+let infer_all k h xs ds = {
+    let [ts, ds1] = list.fold (fn acc x -> {
+        let [t, d] = infer k h x (list.nth 1 acc);
+        [core.cons t (list.head acc), d]
+    }) [[], ds] xs;
+    [list.reverse ts, ds1]
+};
+
+/// A map literal whose keys are all literals is a record -- which is what
+/// lets `%{ :host => "h", :port => 1 }` meet `Config` -- and any other is a
+/// map from the union of its keys to the union of its values.
+let infer_map k h kvs ds = {
+    let [ps, ds1] = list.fold (fn acc kv -> {
+        let [kt, d1] = infer k h (list.nth 0 kv) (list.nth 1 acc);
+        let [vt, d2] = infer k h (list.nth 1 kv) d1;
+        [core.cons [kt, vt] (list.head acc), d2]
+    }) [[], ds] kvs;
+    let entries = list.reverse ps;
+    if list.all (fn p -> match list.nth 0 p { [:lit, _, _] => true, _ => false }) entries {
+        [[:record, entries], ds1]
+    }
+    else {
+        [[:map_of, union_of (list.map (fn p -> list.nth 0 p) entries),
+                   union_of (list.map (fn p -> list.nth 1 p) entries)], ds1]
+    }
+};
+
+/// What `c.[key]` reads, when the container's type says.
+let element k ct kt = match [peel k ct 8, kt] {
+    [[:record, ps], [:lit, _, _]] => match field_in ps kt { () => :any, t => t },
+    [[:tuple, ts], [:lit, :integer, i]] => if i >= 0 && i < list.length ts { list.nth i ts } else { :any },
+    [[:array_t, ts], [:lit, :integer, i]] => if i >= 0 && i < list.length ts { list.nth i ts } else { :any },
+    [[:list_of, e], _] => e,
+    [[:array_of, e], _] => e,
+    [[:map_of, _, v], _] => v,
+    _ => :any,
+};
+
+/// Hold an expression to a type. Where the expression has parts that each
+/// answer -- the branches of an `if`, the arms of a `match`, the last
+/// statement of a block -- each part is held to it, so a mistake is reported
+/// at the branch that made it rather than at the whole.
+let rec check k h e expected why ds =
+    if expected == :any { list.nth 1 (infer k h e ds) }
+    else {
+        match e {
+            [:lambda, ps, body, sp] => list.nth 1 (lambda k h ps body expected sp ds),
+            [:if, c, t, el, sp] => {
+                let ds1 = check k h c :bool "the condition of an `if`" ds;
+                let ds2 = check k h t expected why ds1;
+                match el {
+                    () => mismatch k h :unit expected sp
+                              (why + " (this `if` has no `else`, so it can answer `()`)") ds2,
+                    x => check k h x expected why ds2,
+                }
+            },
+            [:block, stmts, _] => list.nth 1 (block k (Here.set_pending h %{}) stmts [expected, why] ds),
+            [:match, s, arms, sp] => list.nth 1 (infer_match k h s arms sp [expected, why] ds),
+            [:comp, _, x, _] => check k h x expected why ds,
+            _ => {
+                let [t, ds1] = infer k h e ds;
+                mismatch k h t expected (ast.span e) why ds1
+            },
+        }
+    };
+
+let mismatch k h t expected span why ds =
+    if fits k t expected { ds }
+    else { bad h span (why + " should be `" + show expected + "`, but this is `" + show t + "`") ds };
+
+// --- operators -------------------------------------------------------------------------------
+//
+// What the VM does with each, and only that: `+` adds numbers, joins two
+// strings and joins two lists; the other arithmetic is numbers only; `&&`,
+// `||` and `not` want a bool. A comparison answers a bool whatever it is
+// given, and whether it can order what it was given is not checked here.
+
+/// The kind of value a type is, as far as an operator cares: `:integer`,
+/// `:float`, `:number` for a mixture of the two, `:string`, `:list`, `:other`
+/// -- or `()` when it cannot be seen.
+let op_kind k t = {
+    let kinds = list.map (fn m -> one_kind k m) (members (peel k t 8));
+    if list.any (fn x -> x == ()) kinds { () }
+    else if list.all (fn x -> x == :integer) kinds { :integer }
+    else if list.all (fn x -> x == :integer || x == :float) kinds {
+        if list.all (fn x -> x == :float) kinds { :float } else { :number }
+    }
+    else {
+        match list.head kinds {
+            first if list.all (fn x -> x == first) kinds => first,
+            _ => :mixed,
+        }
+    }
+};
+
+let one_kind k m = match m {
+    [:lit, :integer, _] => :integer,
+    [:lit, :float, _] => :float,
+    [:lit, :string, _] => :string,
+    [:lit, _, _] => :other,
+    :integer => :integer,
+    :float => :float,
+    :string => :string,
+    :list => :list,
+    [:list_of, _] => :list,
+    [:tuple, _] => :list,
+    [:named, _, _, _] => one_kind k (peel k m 8),
+    [:union, _] => (),
+    :any => (),
+    :never => (),
+    [:var, _] => (),
+    [:flex, _] => (),
+    _ => :other,
+};
+
+let numeric_kind x = x == :integer || x == :float || x == :number;
+
+/// Whether a type says nothing but what literals were written.
+///
+/// An operator given the wrong kinds, or a value applied as a function, is
+/// reported only when a *declared* type is part of it. `1 + "x"` raises
+/// whenever it is forced, and a program may mean exactly that -- the tests of
+/// what `try!` catches are made of such lines, and in a lazy language a line
+/// nobody forces is not a mistake. So a literal is evidence of nothing but
+/// itself, and rule 1 holds: code that no signature touches is never
+/// rejected. `name + 1`, where `name : :string`, is reported, because the
+/// signature is what said it was a string.
+let rec from_literals t = match t {
+    [:lit, _, _] => true,
+    :unit => true,
+    [:tuple, ts] => list.all (fn x -> from_literals x) ts,
+    [:array_t, ts] => list.all (fn x -> from_literals x) ts,
+    [:record, ps] => list.all (fn p -> from_literals (list.nth 1 p)) ps,
+    [:union, ts] => list.all (fn x -> from_literals x) ts,
+    _ => false,
+};
+
+let numeric k h t x what ds = match op_kind k t {
+    () => [:any, ds],
+    kind if numeric_kind kind => [number_type kind, ds],
+    _ if from_literals t => [:any, ds],
+    _ => [:any, bad h (ast.span x) (what + " should be a number, but this is `" + show t + "`") ds],
+};
+
+let number_type kind = match kind {
+    :integer => :integer,
+    :float => :float,
+    _ => union_of [:integer, :float],
+};
+
+let infer_binary k h op l r sp ds = match op {
+    :and => [:bool, check k h r :bool "the right of `&&`" (check k h l :bool "the left of `&&`" ds)],
+    :or => [:bool, check k h r :bool "the right of `||`" (check k h l :bool "the left of `||`" ds)],
+    :add => {
+        let [lt, ds1] = infer k h l ds;
+        let [rt, ds2] = infer k h r ds1;
+        add k h lt rt l r sp ds2
+    },
+    :sub => arith k h "`-`" l r ds,
+    :mul => arith k h "`*`" l r ds,
+    :div => arith k h "`/`" l r ds,
+    :mod => arith k h "`%`" l r ds,
+    _ => {
+        let ds1 = list.nth 1 (infer k h l ds);
+        [:bool, list.nth 1 (infer k h r ds1)]
+    },
+};
+
+let arith k h what l r ds = {
+    let [lt, ds1] = infer k h l ds;
+    let [rt, ds2] = infer k h r ds1;
+    let [a, ds3] = numeric k h lt l ("the left of " + what) ds2;
+    let [b, ds4] = numeric k h rt r ("the right of " + what) ds3;
+    match [a, b] {
+        [:any, _] => [:any, ds4],
+        [_, :any] => [:any, ds4],
+        [:integer, :integer] => [:integer, ds4],
+        [:float, _] => [:float, ds4],
+        [_, :float] => [:float, ds4],
+        _ => [union_of [:integer, :float], ds4],
+    }
+};
+
+let add k h lt rt l r sp ds = match [op_kind k lt, op_kind k rt] {
+    [(), _] => [:any, ds],
+    [_, ()] => [:any, ds],
+    [a, b] if numeric_kind a && numeric_kind b => [number_type (if a == b { a } else { :number }), ds],
+    [:string, :string] => [:string, ds],
+    [:list, :list] => match [peel k lt 8, peel k rt 8] {
+        [[:tuple, xs], [:tuple, ys]] => [[:tuple, xs + ys], ds],
+        _ => [[:list_of, union_of [list_element k lt, list_element k rt]], ds],
+    },
+    _ if from_literals lt && from_literals rt => [:any, ds],
+    _ => [:any, bad h sp ("`+` adds two numbers, joins two strings or joins two lists, "
+                         + "but this is `" + show lt + "` and `" + show rt + "`") ds],
+};
+
+let list_element k t = union_of (list.map (fn m -> match peel k m 8 {
+    [:list_of, e] => e,
+    [:tuple, ts] => union_of ts,
+    _ => :any,
+}) (members (peel k t 8)));
+
+// --- calls -----------------------------------------------------------------------------------
+
+let callee_name f = match f {
+    [:name, n, _] => "`" + n + "`",
+    [:field, obj, n, _] => match callee_name obj {
+        "this function" => "this function",
+        base => str.slice 0 (str.byte_length base - 1) base + "." + n + "`",
+    },
+    _ => "this function",
+};
+
+/// The parameter types the first `n` arguments meet, and what is left:
+/// `[params, rest, stuck]`. `stuck` is a type that is plainly not a function,
+/// met while arguments were still to come, or `()`.
+let rec arrows k t n acc =
+    if n == 0 { [list.reverse acc, t, ()] }
+    else {
+        match peel k t 8 {
+            [:fn, a, b] => arrows k b (n - 1) (core.cons a acc),
+            p if not_a_function p => [list.reverse acc, :any, p],
+            _ => [list.reverse acc, :any, ()],
+        }
+    };
+
+let not_a_function t = match t {
+    [:lit, _, _] => true,
+    [:tuple, _] => true, [:list_of, _] => true,
+    [:array_t, _] => true, [:array_of, _] => true,
+    [:record, _] => true, [:map_of, _, _] => true,
+    :integer => true, :float => true, :string => true, :bool => true,
+    :char => true, :atom => true, :unit => true, :list => true, :array => true,
+    :map => true, :process => true, :error => true, :bigstr => true,
+    _ => false,
+};
+
+let is_lambda e = match e { [:lambda, _, _, _] => true, _ => false };
+
+let infer_apply k h f args sp ds = {
+    let [ft, ds1] = infer k h f ds;
+    let who = callee_name f;
+    let [params, rest, stuck] = arrows k ft (list.length args) [];
+    let given = list.length params;
+    let ds2 = match stuck {
+        () => ds1,
+        p if from_literals p => ds1,
+        p =>
+            if given == 0 {
+                bad h sp (who + " is `" + show p + "`, which is not a function, but it is given "
+                          + plural (list.length args) "argument") ds1
+            }
+            else {
+                bad h sp (who + " takes " + plural given "argument" + ", but it is given "
+                          + to_string (list.length args)) ds1
+            },
+    };
+    // The plain arguments first: they are what solves the variables, and a
+    // lambda among the arguments is best checked against a parameter type
+    // whose variables are already known -- `list.map (fn x -> ..) xs` learns
+    // what `x` is from `xs`, which is written after it.
+    let [plain, subst, ds3] = list.fold (fn acc ia -> {
+        let [i, a] = ia;
+        if is_lambda a { [core.cons () (list.nth 0 acc), list.nth 1 acc, list.nth 2 acc] }
+        else {
+            let [t, d] = infer k h a (list.nth 2 acc);
+            let s = if i < given { solve k (list.nth i params) t (list.nth 1 acc) } else { list.nth 1 acc };
+            [core.cons t (list.nth 0 acc), s, d]
+        }
+    }) [[], %{}, ds2] (indexed args);
+    let known = list.reverse plain;
+    let [subst2, ds4] = list.fold (fn acc ia -> {
+        let [i, a] = ia;
+        let [s, d] = acc;
+        if i >= given {
+            if is_lambda a { [s, list.nth 1 (infer k h a d)] } else { acc }
+        }
+        else {
+            let p = solved s (list.nth i params) false;
+            if is_lambda a {
+                let [lt, d2] = infer_lambda_at k h a p d;
+                [solve k (list.nth i params) lt s, d2]
+            }
+            else {
+                [s, mismatch k h (list.nth i known) p (ast.span a)
+                             ("argument " + to_string (i + 1) + " of " + who) d]
+            }
+        }
+    }) [subst, ds3] (indexed args);
+    [solved subst2 rest true, ds4]
+};
+
+let infer_lambda_at k h a p ds = match a {
+    [:lambda, ps, body, sp] => lambda k h ps body p sp ds,
+    _ => infer k h a ds,
+};
+
+let indexed xs = pairs (list.range 0 (list.length xs)) xs;
+
+let plural n word = to_string n + " " + word + (if n == 1 { "" } else { "s" });
+
+// --- functions -------------------------------------------------------------------------------
+
+/// A function's parameters, bound to what `expected` says they are, and its
+/// body held to what it says the function answers: `[type, ds]`. Used for a
+/// lambda, a local `let f x = ..` and a declaration alike, which is why the
+/// arity complaint is phrased about "this function".
+let lambda k h ps body expected sp ds = {
+    let n = list.length ps;
+    let [params, rest, stuck] = arrows k expected n [];
+    let ds1 = match stuck {
+        () => ds,
+        p => bad h sp ("this function takes " + plural n "parameter" + ", but it is expected to be `"
+                       + show expected + "`") ds,
+    };
+    let types = list.map (fn i -> if i < list.length params { list.nth i params } else { :any })
+                         (list.range 0 n);
+    let [h2, ds2] = list.fold (fn acc pt -> bind_param k (list.head acc) (list.nth 0 pt) (list.nth 1 pt) (list.nth 1 acc))
+                              [h, ds1] (pairs ps types);
+    let answers = list.length params == n && stuck == ();
+    let [body_t, ds3] =
+        if answers && rest != :any && not (has_flex rest) {
+            [rest, check k h2 body rest "what this function answers" ds2]
+        }
+        else { infer k h2 body ds2 };
+    [list.fold (fn t p -> [:fn, p, t]) body_t (list.reverse types), ds3]
+};
+
+let rec has_flex t = match t {
+    [:flex, _] => true,
+    [:fn, a, b] => has_flex a || has_flex b,
+    [:union, ts] => list.any (fn x -> has_flex x) ts,
+    [:list_of, e] => has_flex e,
+    [:tuple, ts] => list.any (fn x -> has_flex x) ts,
+    [:array_of, e] => has_flex e,
+    [:array_t, ts] => list.any (fn x -> has_flex x) ts,
+    [:map_of, a, b] => has_flex a || has_flex b,
+    [:record, ps] => list.any (fn p -> has_flex (list.nth 1 p)) ps,
+    [:named, _, _, args] => list.any (fn x -> has_flex x) args,
+    _ => false,
+};
+
+let bind_param k h p t ds = match ast.param_pattern p {
+    () => match ast.param_name p {
+        () => [h, ds],
+        n => [with_local n t h, ds],
+    },
+    pattern => [bind_pattern k h pattern t, ds],
+};
+
+// --- blocks ----------------------------------------------------------------------------------
+
+/// A block's statements in order, with what each `let` binds in scope for the
+/// ones after it. `expected` is `()` or `[type, why]` for the last statement.
+let rec block k h stmts expected ds = match stmts {
+    [] => [:unit, ds],
+    [st] => match st {
+        [:let, _, _, _, _, _] => [:unit, finish_block h (list.nth 1 (statement k h st ds))],
+        [:let_p, _, _, _] => [:unit, finish_block h (list.nth 1 (statement k h st ds))],
+        [:sig, _, _, _] => [:unit, finish_block h (list.nth 1 (statement k h st ds))],
+        _ => match expected {
+            () => {
+                let [t, ds1] = infer k h st ds;
+                [t, finish_block h ds1]
+            },
+            [t, why] => [t, finish_block h (check k h st t why ds)],
+        },
+    },
+    [st, ..rest] => {
+        let [h2, ds1] = statement k h st ds;
+        block k h2 rest expected ds1
+    },
+};
+
+/// A block signature that no `let` below it took up.
+let finish_block h ds =
+    list.fold (fn acc kv -> bad h (list.nth 2 (list.nth 1 kv))
+                                ("the signature of `" + list.nth 0 kv + "` has no `let` after it in this block") acc)
+              ds (core.map_pairs (Here.pending h));
+
+let statement k h st ds = match st {
+    [:sig, n, t, sp] => {
+        let ev = [Here.mi h, %{}, Here.ltypes h];
+        let ds1 = unknown_types k ev t (Here.source h) ds;
+        [Here.set_pending h ((Here.pending h).[n => [eval_type k ev t, sp]]), ds1]
+    },
+    [:let, n, ps, body, is_rec, sp] => match named_body body {
+        [_, desc] =>
+            [with_local n :any (Here.set_ltypes h ((Here.ltypes h).[n =>
+                [list.map (fn p -> ast.param_name p) ps, desc, [Here.mi h, %{}, Here.ltypes h]]])), ds],
+        () => {
+            let sig = match (Here.pending h).[n else ()] { () => (), [t, _] => t };
+            let h1 = Here.set_pending h (core.map_remove (Here.pending h) n);
+            let self_t = match sig { () => :any, t => flexible t };
+            let h2 = if is_rec { with_local n self_t h1 } else { h1 };
+            if list.is_empty ps {
+                match sig {
+                    () => {
+                        let [t, ds1] = infer k h2 body ds;
+                        [with_local n t h1, ds1]
+                    },
+                    t => [with_local n t h1, check k h2 body t ("`" + n + "`") ds],
+                }
+            }
+            else {
+                let [t, ds1] = lambda k h2 ps body (match sig { () => :any, t => t }) sp ds;
+                [with_local n (match sig { () => t, s => flexible s }) h1, ds1]
+            }
+        },
+    },
+    [:let_p, pattern, body, _] => {
+        let [t, ds1] = infer k h body ds;
+        [bind_pattern k h pattern t, ds1]
+    },
+    _ => [h, list.nth 1 (infer k h st ds)],
+};
+
+// --- patterns --------------------------------------------------------------------------------
+//
+// A pattern binds names, and what it binds them to is the part of the
+// scrutinee's type the pattern takes apart. Taking apart a union is where a
+// tag pays for itself: `[:circle, r]` against `Shape` keeps only the variants
+// whose tag is `:circle`, so `r` is the radius's type and not the union of
+// every variant's second field.
+
+let rec bind_pattern k h p t = match p {
+    [:bind, n, _] => with_local n t h,
+    [:as_p, inner, n, _, _] => with_local n t (bind_pattern k h inner t),
+    [:list_p, items, rest, _] => bind_items k h items rest (sequence_members k t :list items rest) :list,
+    [:array_p, items, rest, _] => bind_items k h items rest (sequence_members k t :array items rest) :array,
+    [:map_p, kvs, _] => list.fold (fn acc kv ->
+        bind_pattern k acc (list.nth 1 kv) (element k t (literal_type (list.nth 0 kv)))) h kvs,
+    _ => h,
+};
+
+/// The members of `t` a sequence pattern could match: `[:seq, [elements]]`
+/// for a fixed one, `[:rep, element]` for a homogeneous one, `:unknown` for one
+/// the checker cannot see into.
+let sequence_members k t kind items rest =
+    list.concat (list.map (fn m -> match [kind, peel k m 8] {
+        [:list, [:tuple, ts]] => if could_match k items rest ts { [[:seq, ts]] } else { [] },
+        [:array, [:array_t, ts]] => if could_match k items rest ts { [[:seq, ts]] } else { [] },
+        [:list, [:list_of, e]] => [[:rep, e]],
+        [:array, [:array_of, e]] => [[:rep, e]],
+        [_, :any] => [:unknown],
+        [_, [:var, _]] => [:unknown],
+        [_, [:flex, _]] => [:unknown],
+        [:list, :list] => [:unknown],
+        [:array, :array] => [:unknown],
+        _ => [],
+    }) (members (peel k t 8)));
+
+/// Whether a fixed-length member has room for these items, and agrees with
+/// every literal the pattern compares.
+let could_match k items rest ts = {
+    let n = list.length items;
+    let sized = if rest == () { n == list.length ts } else { n <= list.length ts };
+    sized && list.all (fn pt -> match list.nth 0 pt {
+        [:literal, e, _] => literal_fits (literal_type e) (list.nth 1 pt),
+        _ => true,
+    }) (pairs items ts)
+};
+
+let literal_fits l t = match [l, t] {
+    [_, :any] => true,
+    [[:lit, :atom, n], p] if type_of p == :atom => p == :atom || to_string p == ":" + n,
+    [[:lit, kind, _], p] if type_of p == :atom => kind == p,
+    [_, [:lit, _, _]] => l == t,
+    [_, [:union, ts]] => list.any (fn x -> literal_fits l x) ts,
+    _ => true,
+};
+
+let literal_type e = match e {
+    [:int, v, _] => lit :integer v,
+    [:float, v, _] => lit :float v,
+    [:str, v, _] => lit :string v,
+    [:char, v, _] => lit :char v,
+    [:bool, v, _] => lit :bool v,
+    [:atom, n, _] => lit :atom n,
+    [:unit, _] => :unit,
+    _ => :any,
+};
+
+let bind_items k h items rest found kind = {
+    let n = list.length items;
+    let at i = union_of (list.map (fn m -> match m {
+        [:seq, ts] => list.nth i ts,
+        [:rep, e] => e,
+        _ => :any,
+    }) found);
+    let rest_t = union_of (list.map (fn m -> match m {
+        [:seq, ts] => if kind == :list { [:tuple, list.drop n ts] } else { [:array_t, list.drop n ts] },
+        [:rep, e] => if kind == :list { [:list_of, e] } else { [:array_of, e] },
+        _ => :any,
+    }) found);
+    let h1 = list.fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (indexed items);
+    match rest {
+        [n2, _] => with_local n2 (if list.is_empty found { :any } else { rest_t }) h1,
+        _ => h1,
+    }
+};
+
+// --- match, and exhaustiveness ---------------------------------------------------------------
+
+let infer_match k h s arms sp expected ds = {
+    let [st, ds1] = infer k h s ds;
+    let [t, ds2] = list.fold (fn acc arm -> {
+        let [t, d] = acc;
+        let h2 = bind_pattern k h (ast.arm_pattern arm) st;
+        let d1 = match ast.arm_guard arm { () => d, g => check k h2 g :bool "a guard" d };
+        match expected {
+            () => {
+                let [bt, d2] = infer k h2 (ast.arm_body arm) d1;
+                [join t bt, d2]
+            },
+            [et, why] => [et, check k h2 (ast.arm_body arm) et why d1],
+        }
+    }) [:never, ds1] arms;
+    [t, exhaustive k h st arms sp ds2]
+};
+
+/// A `match` whose scrutinee is a declared union must say what happens for
+/// every variant. That is the check that makes declaring the union worth it:
+/// add a variant, and every `match` that has not heard of it is found.
+///
+/// It is deliberately narrow, because a false report here would teach people
+/// to write `_ =>` everywhere, which defeats it. The scrutinee's type has to
+/// be a *name* -- a union the program declared, not one the checker happened
+/// to infer from the branches of an `if` -- and every variant has to be told
+/// apart by a tag or be a single value. A variant is reported only when every
+/// arm certainly misses it: an arm with a guard, or one that takes a field
+/// apart with a pattern of its own, might match it, so it counts as a match.
+let exhaustive k h st arms sp ds = match st {
+    [:named, shown, _, _] => match variants k st 6 {
+        () => ds,
+        vs => {
+            let missing = list.filter (fn v ->
+                list.all (fn arm -> arm_misses (ast.arm_pattern arm) v) arms) vs;
+            if list.is_empty missing { ds }
+            else {
+                bad h sp ("this `match` on `" + shown + "` does not handle "
+                          + str.join_str " or " (list.map (fn v -> "`" + show_variant v + "`") missing)
+                          + "; add an arm for it, or `_ =>` to handle everything else") ds
+            }
+        },
+    },
+    _ => ds,
+};
+
+/// The variants a named type unfolds to, or `()` when they are not all
+/// distinguishable by a tag or a value.
+let variants k t n = {
+    let rec flat t n =
+        if n <= 0 { [:any] }
+        else {
+            match t {
+                [:named, _, _, _] => flat (unfold k t) (n - 1),
+                [:union, ts] => list.concat (list.map (fn x -> flat x (n - 1)) ts),
+                _ => [t],
+            }
+        };
+    let vs = flat t n;
+    if list.all (fn v -> tagged_variant v) vs { vs } else { () }
+};
+
+let tagged_variant v = match v {
+    [:lit, _, _] => true,
+    :unit => true,
+    [:tuple, [tag, .._]] => is_tag tag,
+    _ => false,
+};
+
+let is_tag t = match t {
+    [:lit, :atom, _] => true,
+    :any => false, :never => false, :atom => false,
+    p => type_of p == :atom,
+};
+
+let tag_name t = match t {
+    [:lit, :atom, n] => n,
+    p => str.slice 1 (str.byte_length (to_string p) - 1) (to_string p),
+};
+
+let show_variant v = match v {
+    [:tuple, [tag, ..fields]] =>
+        "[:" + tag_name tag + str.join_str "" (list.map (fn f -> ", _") fields) + "]",
+    _ => show v,
+};
+
+/// True when this pattern cannot match this variant, whatever the variant's
+/// fields hold.
+let rec arm_misses p v = match p {
+    [:as_p, inner, _, _, _] => arm_misses inner v,
+    [:literal, e, _] => match [literal_type e, v] {
+        [:unit, :unit] => false,
+        [l, [:lit, _, _]] => l != v,
+        _ => true,
+    },
+    [:list_p, items, rest, _] => match v {
+        [:tuple, ts] => {
+            let n = list.length items;
+            let sized = if rest == () { n == list.length ts } else { n <= list.length ts };
+            not sized || list.any (fn pt -> element_misses (list.nth 0 pt) (list.nth 1 pt)) (pairs items ts)
+        },
+        _ => true,
+    },
+    [:array_p, _, _, _] => true,
+    [:map_p, _, _] => true,
+    _ => false,
+};
+
+let element_misses p t = match p {
+    [:literal, e, _] => match [literal_type e, t] {
+        [[:lit, :atom, n], [:lit, :atom, m]] => n != m,
+        [[:lit, :atom, n], q] if is_tag q => ":" + n != to_string q,
+        [l, [:lit, _, _]] => l != t,
+        _ => false,
+    },
+    _ => false,
+};
+
+// --- signatures ------------------------------------------------------------------------------
+
+/// The names in a signature that are neither declared anywhere nor a type
+/// variable. A lowercase name is a variable by definition, so this is an
+/// uppercase name nothing declares -- `Shpae` for `Shape` -- or a dotted one
+/// whose module has no such member. What a `where` predicate names is an
+/// ordinary expression's business, and is not looked at.
+let rec unknown_types k ev t source ds = match t {
+    [:name, n, sp] =>
+        if (list.nth 1 ev).[n else ()] != () || (list.nth 2 ev).[n else ()] != () || is_type_var n { ds }
+        else if type_ref k (list.head ev) n != () { ds }
+        else { core.cons (diag.in_source source (diag.error sp ("cannot find the type `" + n + "`"))) ds },
+    [:field, obj, f, sp] => match dotted_module k (list.head ev) obj {
+        () => core.cons (diag.in_source source (diag.error sp ("cannot find the module in front of `." + f + "`"))) ds,
+        m =>
+            if modules.module_name (modules.module_at (Checker.l k) m) == "std.types" { ds }
+            else if member_type k (scope.dream_ref m) f != () { ds }
+            else { core.cons (diag.in_source source (diag.error sp ("cannot find the type `" + f + "` in `"
+                        + modules.module_name (modules.module_at (Checker.l k) m) + "`"))) ds },
+    },
+    [:apply, head, args, _] => list.fold (fn d a -> unknown_types k ev a source d) (unknown_types k ev head source ds) args,
+    [:list, [[:atom, "refine", _], base, _], _] => unknown_types k ev base source ds,
+    [:list, parts, _] => list.fold (fn d a -> unknown_types k ev a source d) ds parts,
+    [:map, kvs, _] => list.fold (fn d kv -> unknown_types k ev (list.nth 1 kv) source
+                                           (unknown_types k ev (list.nth 0 kv) source d)) ds kvs,
+    _ => ds,
+};
+
+// --- building the checker ------------------------------------------------------------------
+
+/// Every `type` declaration the program resolved, by the global it became:
+/// `gi => [module, parameter names, description, name]`.
+let named_table l r =
+    list.fold (fn acc b -> {
+        let mi = list.nth 0 b;
+        let d = list.nth 2 b;
+        match named_body (scope.decl_body d) {
+            () => acc,
+            [shown, desc] => match scope.r_env_at r mi {
+                () => acc,
+                e => match scope.global_index e (scope.decl_name d) {
+                    () => acc,
+                    gi => acc.[gi => [mi, list.map (fn p -> ast.param_name p) (scope.decl_params d), desc, shown]],
+                },
+            },
+        }
+    }) %{} (scope.bodies r);
+
+/// Every top-level signature, by the global it describes: `gi => [owner,
+/// type, span]`, and the diagnostics of the ones that describe nothing or
+/// describe something twice. A module's signatures include those of the
+/// modules it derives from, because so do its declarations.
+let sig_table l r =
+    list.fold (fn acc mi -> {
+        let items = list.head (scope.effective_items l mi []);
+        list.fold (fn acc2 oi -> match list.nth 1 oi {
+            [:sig, n, t, sp] => {
+                let [table, ds] = acc2;
+                let owner = list.nth 0 oi;
+                let source = modules.module_source (modules.module_at l owner);
+                match scope.r_env_at r mi {
+                    () => acc2,
+                    e => match scope.global_index e n {
+                        () => [table, core.cons (diag.in_source source (diag.error sp
+                                   ("the signature of `" + n + "` has no definition: write `let "
+                                    + n + " .. = ..` in this module"))) ds],
+                        gi => match table.[gi else ()] {
+                            [o, _, _] if o == owner =>
+                                [table, core.cons (diag.in_source source (diag.error sp
+                                    ("`" + n + "` already has a signature"))) ds],
+                            _ => [table.[gi => [owner, t, sp]], ds],
+                        },
+                    },
+                }
+            },
+            _ => acc2,
+        }) acc items
+    }) [%{}, []] (list.range 0 (modules.module_count l));
+
+/// The whole checker, ready to walk bodies: `[checker, diagnostics]`.
+let checker l r = {
+    let named = named_table l r;
+    let [sigs, ds] = sig_table l r;
+    let k0 = Checker.make l r named sigs %{};
+    let evaluated = list.fold (fn acc kv -> {
+        let [owner, t, _] = list.nth 1 kv;
+        acc.[list.nth 0 kv => eval_type k0 (in_module owner) t]
+    }) %{} (core.map_pairs sigs);
+    let uses = list.fold (fn acc kv -> acc.[list.nth 0 kv => flexible (list.nth 1 kv)]) %{}
+                         (core.map_pairs evaluated);
+    let unknown = list.fold (fn d kv -> {
+        let [owner, t, _] = list.nth 1 kv;
+        unknown_types k0 (in_module owner) t (modules.module_source (modules.module_at l owner)) d
+    }) ds (core.map_pairs sigs);
+    [Checker.set_sigs (Checker.set_uses k0 uses) evaluated, unknown]
+};
+
+/// One declaration's body, against its signature if it has one.
+let check_decl k b ds = {
+    let [mi, source, d, _] = b;
+    let n = scope.decl_name d;
+    if named_body (scope.decl_body d) != () || str.starts_with "<" n { ds }
+    else {
+        let h = here mi source n;
+        let sig = match gi_of k mi n { () => (), gi => (Checker.sigs k).[gi else ()] };
+        let ps = scope.decl_params d;
+        match [ps, sig] {
+            [[], ()] => list.nth 1 (infer k h (scope.decl_body d) ds),
+            [[], t] => check k h (scope.decl_body d) t ("`" + n + "`") ds,
+            [_, ()] => list.nth 1 (lambda k h ps (scope.decl_body d) :any (scope.decl_span d) ds),
+            [_, t] => list.nth 1 (lambda k h ps (scope.decl_body d) t (scope.decl_span d) ds),
+        }
+    }
+};
+
+/// Every type error in a resolved program, in the order the bodies were
+/// written. A body inherited through `derive` is walked once per module that
+/// derives it, and what it says is said once.
+let check_program l r = {
+    let [k, ds0] = checker l r;
+    let found = list.fold (fn ds b -> check_decl k b ds) ds0 (scope.bodies r);
+    let once = list.fold (fn acc d -> if list.contains d acc { acc } else { core.cons d acc }) [] found;
+    list.sort_by (fn a b -> place a < place b) once
+};
+
+/// Where a diagnostic points, as one number that orders them the way a reader
+/// would: by file, then by position in it.
+let place d = diag.source_of d * 4294967296 + ast.span_start (diag.span d);

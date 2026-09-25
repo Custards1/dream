@@ -364,6 +364,8 @@ let rec mentioned_stmts deep stmts =
                 },
             [:let_p, pattern, body, _] =>
                 list.append (pattern_names pattern) (mentioned_in deep body),
+            // A signature is read by the type checker and by nothing that runs.
+            [:sig, _, _, _] => [],
             _ => mentioned_in deep st,
         }) stmts);
 
@@ -445,6 +447,7 @@ let stmt_reads deep st =
             if not (list.is_empty ps) && not deep { [] }
             else { list.append (list.map (fn p -> param_name_of p) ps) (mentioned_in deep body) },
         [:let_p, _, body, _] => mentioned_in deep body,
+        [:sig, _, _, _] => [],
         _ => mentioned_in deep st,
     };
 

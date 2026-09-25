@@ -127,7 +127,130 @@ let record_derived kind name fields members bases span = {
                                               (ast.member_body m) true (ast.member_span m))
                            members;
     // Each field type occurs once, so retain its written spans for diagnostics.
-    ast.mod_d name (bases + generated + [description] + written) span
+    ast.mod_d name (bases + generated + [description] + record_sigs kind fields span + written) span
+};
+
+/// What every generated function of a record promises, for the type checker.
+///
+/// A signature compiles to nothing (see `ast.sig_d`), so these change no
+/// image; what they change is that `Point.make 1 "two"` and `Point.x 3` are
+/// mistakes the checker can see when the fields were given types. An
+/// unannotated field is `:any` here as it is in the description, so a record
+/// nobody annotated promises nothing it did not already.
+///
+/// The record's own type is spelled `type`, which is the description's global
+/// in the generated module -- so the checker resolves it the way it resolves
+/// any name in a signature, and nothing here has to know how.
+///
+/// Only a record with at least one annotated field gets them. One that
+/// annotates nothing has promised nothing, and code that uses it -- reading a
+/// defaulted field of an empty map, say, which is legitimate -- must check
+/// exactly as it compiled before any of this existed.
+///
+/// A `mapping`'s accessor asks only for the field it reads, and for any map
+/// at all when that field has a default: `Config.retries %{}` is `3`. A
+/// `group`'s or a `struct`'s reads by position, so it takes the record.
+let record_sigs kind fields span =
+    if list.all (fn f -> ast.field_type f == ()) fields { [] }
+    else {
+        let self = ast.name_e "type" span;
+        let field_t f = match ast.field_type f { () => ast.atom_e "any" span, t => t };
+        let arrows ts result = list.fold (fn acc t -> arrow t acc) result (list.reverse ts);
+        let required = list.filter (fn f -> ast.field_default f == ()) fields;
+        let takes fs = if list.is_empty fs { [ast.atom_e "any" span] } else { list.map field_t fs };
+        let reads f = match [kind, ast.field_default f] {
+            [:map, ()] => ast.list_e [ast.atom_e "record" span,
+                                      ast.map_e [[ast.atom_e (ast.field_name f) span, field_t f]] span] span,
+            [:map, _] => ast.atom_e "map" span,
+            _ => self,
+        };
+        [ast.sig_d "make" (arrows (takes fields) self) span,
+         ast.sig_d "new" (arrows (takes required) self) span]
+        + list.concat (list.map (fn f ->
+              [ast.sig_d (ast.field_name f) (arrow (reads f) (field_t f)) span,
+               ast.sig_d ("set_" + ast.field_name f) (arrow self (arrow (field_t f) self)) span])
+              fields)
+    };
+
+/// `a -> b` as the type grammar builds it.
+let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
+
+// --- unions --------------------------------------------------------------------
+
+/// `union Shape { circle(radius : :float), empty }`, as a module of ordinary
+/// functions: one constructor per variant, a description called `type`, the
+/// members as written, and a signature for every constructor. The parent gets
+/// a global of the union's own name holding the description, so `Shape` is a
+/// type wherever a type is written -- `[Shape]`, `types.check Shape v` --
+/// while `Shape.circle` still reaches the module, because a name in front of a
+/// dot is looked up as a module first. Answers the items that replace the
+/// declaration in its parent.
+///
+/// A variant is `[:tag, ..fields]`, and a variant with no fields is the atom
+/// `:tag` itself. Both are what this language already writes by hand --
+/// `[:ok, value]` and `:done` -- which is the point: a declared union
+/// describes the values programs already build, and matches them with the
+/// patterns they already use. So the description is exactly the one a `type`
+/// declaration would give (`[:circle, :float] | :empty`), except that the tag
+/// is written as a `literal`, so that a variant called `error` or `list` means
+/// the atom and not the kind of value `std.types` would otherwise read it as.
+///
+/// Parameters make it generic: `union Option a { some(value : a), none }`.
+/// The description is then a function of them, as a parameterised `type` is,
+/// and the constructors' signatures say `a -> Option a` -- `a` being free in a
+/// signature is what makes it a type variable.
+let union_decl name params variants members span = {
+    let at_ = span;
+    let lit_tag v = ast.list_e [ast.atom_e "literal" at_, ast.atom_e (ast.variant_name v) at_] at_;
+    let field_t f = match list.nth 2 f { () => ast.atom_e "any" at_, t => t };
+    let described v = match ast.variant_fields v {
+        [] => lit_tag v,
+        fs => ast.list_e [ast.atom_e "tuple" at_,
+                          ast.list_e (core.cons (lit_tag v) (list.map field_t fs)) at_] at_,
+    };
+    let description = ast.let_d "type" params
+        (ast.list_e [ast.atom_e "named" at_, ast.str_e name at_,
+                     ast.list_e [ast.atom_e "union" at_,
+                                 ast.list_e (list.map described variants) at_] at_] at_) false at_;
+    let constructors = list.map (fn v -> {
+        let fs = ast.variant_fields v;
+        let tag = ast.atom_e (ast.variant_name v) at_;
+        match fs {
+            [] => ast.let_d (ast.variant_name v) [] tag false at_,
+            _ => ast.let_d (ast.variant_name v)
+                    (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
+                    (ast.list_e (core.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)) at_)
+                    false at_,
+        }
+    }) variants;
+    // The union's own type, applied to its parameters: `type a b`, read in
+    // the generated module where `type` is the description's global.
+    let self = match params {
+        [] => ast.name_e "type" at_,
+        ps => ast.apply_e (ast.name_e "type" at_) (list.map (fn p -> ast.name_e (ast.param_name p) at_) ps) at_,
+    };
+    let sigs = list.map (fn v ->
+        ast.sig_d (ast.variant_name v)
+            (list.fold (fn acc f -> arrow (field_t f) acc) self (list.reverse (ast.variant_fields v)))
+            (ast.variant_span v)) variants;
+    // What the parent sees under the union's own name: the description.
+    let alias = ast.let_d name params
+        (match params {
+            [] => ast.field_e (ast.name_e name at_) "type" at_,
+            ps => ast.apply_e (ast.field_e (ast.name_e name at_) "type" at_)
+                              (list.map (fn p -> ast.name_e (ast.param_name p) at_) ps) at_,
+        }) false at_;
+    // Freshened together, so that no two generated nodes share an offset --
+    // resolution keys names and binders by where they start. The description
+    // is not: each field type occurs in it once, so it keeps the spans it was
+    // written at and a mistake in one is reported where it is, as a record's
+    // description does.
+    let [generated, _] = fresh (constructors + [alias]) (2147483648 + ast.span_start span * 128);
+    let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
+                                              (ast.member_body m) true (ast.member_span m))
+                           members;
+    let made = list.take (list.length constructors) generated;
+    [ast.mod_d name (made + [description] + sigs + written) span, list.last generated]
 };
 
 // Validate returned data before any compiler pass assumes an AST shape. Spans
@@ -158,6 +281,7 @@ let rec statement e = match e {
     [:let, n, ps, b, rec_, sp] => string n && sequence parameter ps && expression b
                               && type_of rec_ == :bool && is_span sp,
     [:let_p, p, b, sp] => pattern p && expression b && is_span sp,
+    [:sig, n, _, sp] => string n && is_span sp,
     _ => expression e,
 };
 let rec expression e = match e {

@@ -210,6 +210,26 @@ let member_span m = RecordMember.span m;
 
 let record_d kind name fields members span = [:record, kind, name, fields, members, [], span];
 
+/// `let name : type` -- a signature: what `name` promises to be, written in the
+/// type grammar. It is a declaration of its own rather than a field of the `let`
+/// it describes, because nothing but the type checker reads it: resolution,
+/// lowering and every pass after them walk past it, so a signature costs the
+/// compiled program nothing and changes no image. `let f x : t = ..` is read as
+/// a signature and a `let` side by side -- see `parse_let`.
+let sig_d name t span = [:sig, name, t, span];
+
+/// `union Name params { variant(field : t, ..), .., member self = .. }`: a
+/// discriminated union, which the loader rewrites into a module of
+/// constructors, a description and the members (`syntax.union_decl`).
+///
+/// A variant is `[name, span, fields]` and a field `[name, span, type]`, with
+/// `()` for a field written without a type.
+let union_d name params variants members span = [:union_decl, name, params, variants, members, span];
+let variant name span fields = [name, span, fields];
+let variant_name v = list.nth 0 v;
+let variant_span v = list.nth 1 v;
+let variant_fields v = list.nth 2 v;
+
 /// `let [a, b] = pair` -- a `let` that binds what a pattern names. A node of
 /// its own rather than a `let` whose name is a pattern, because everything
 /// that reads a `let` reads its name as a string.
@@ -381,6 +401,17 @@ let rec show e =
             "(let " + (if is_rec { "rec " } else { "" }) + n
             + (if list.is_empty ps { "" } else { " " + show_params ps }) + " " + show b + ")",
         [:priv, d, _] => "(priv " + show d + ")",
+        [:sig, n, t, _] => "(sig " + n + " " + show t + ")",
+        [:union_decl, n, ps, variants, members, _] =>
+            "(union " + n + (if list.is_empty ps { "" } else { " " + show_params ps })
+            + " " + str.join_str " " (list.map (fn v ->
+                  "(" + variant_name v
+                  + str.join_str "" (list.map (fn f ->
+                        " " + list.nth 0 f + match list.nth 2 f { () => "", t => " : " + show t })
+                        (variant_fields v)) + ")") variants
+                + list.map (fn m ->
+                  "(" + member_name m + " " + show_params (member_params m)
+                      + " = " + show (member_body m) + ")") members) + ")",
         [:let_p, pattern, b, _] => "(let " + show_pattern pattern + " " + show b + ")",
         [:import, segments, alias, names, _] =>
             "(import " + str.join_str "." segments

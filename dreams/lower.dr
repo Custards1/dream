@@ -644,6 +644,9 @@ let rec lower_block stmts span l = {
             // statement whose value could be discarded either.
             [:let, _, _, _, _, sp] if scope.staging (res l) (ctx l) (source l) sp == :elided =>
                 acc,
+            // A signature is a promise to the type checker. It lowers to
+            // nothing, so it is not a statement either.
+            [:sig, _, _, _] => acc,
 
             [:let, n, ps, body, _, sp] => {
                 let value =

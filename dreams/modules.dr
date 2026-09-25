@@ -523,6 +523,10 @@ let rec expand_items cfg items =
             [:priv, d, span] => [d, [:private, span]],
             [:record, kind, name, fields, members, bases, span] =>
                 [syntax.record_derived kind name fields members bases span],
+            // A union is a module and, in the parent, a global of the same
+            // name holding its description -- see `syntax.union_decl`.
+            [:union_decl, name, params, variants, members, span] =>
+                syntax.union_decl name params variants members span,
             other => [other],
         }) items);
 

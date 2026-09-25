@@ -148,6 +148,8 @@ let carried_ok slice =
             // A destructuring is `let`s by the time it is declared -- a hidden
             // global and one per name -- so it carries exactly as they do.
             [:let_p, _, _, _] => true,
+            // A signature compiles to nothing, so it carries as trivially.
+            [:sig, _, _, _] => true,
             _ => false,
         }) slice;
 
