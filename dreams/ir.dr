@@ -437,9 +437,13 @@ let set_node i n p =
 /// Put every pool the right way round. Everything downstream -- the dump, and
 /// eventually the image writer -- reads this rather than the building form.
 let finish : Program -> Image;
-let finish p = %{
-    :nodes => list.map (fn i -> node_at i p) (list.range 0 (node_count p)),
-    :kids => list.map (fn i -> kid_at i p) (list.range 0 (kid_count p)),
+let finish p = (finish_rest p).[:nodes => list.map (fn i -> node_at i p) (list.range 0 (node_count p))]
+                              .[:kids => list.map (fn i -> kid_at i p) (list.range 0 (kid_count p))];
+
+/// Everything `finish` makes but the arena itself, for a pass that reads the
+/// arena from its tables and writes a new one.
+let finish_rest : Program -> Image;
+let finish_rest p = %{
     :funcs => funcs p, :globals => globals p,
     :modules => prog_modules p, :imports => imports p,
     :ints => pool_list (ints p), :floats => pool_list (floats p),

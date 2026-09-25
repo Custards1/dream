@@ -2110,7 +2110,53 @@ namespace {
 /// ends. A hash map: it was a vector searched from the front for every object,
 /// which made a copy quadratic in the size of what crossed -- nothing for a
 /// message, and minutes for a syntax tree.
-using CopySeen = std::unordered_map<Value, Value>;
+///
+/// Open addressing rather than `std::unordered_map`, whose every insert is a
+/// heap allocation: a copy inserts one entry per object that crossed, and for
+/// a compiler handing an arena to another process that is a million of them.
+class CopySeen {
+public:
+    CopySeen() : slots_(64) {}
+    struct Found {
+        Value second;
+    };
+    const Found* find(Value key) const {
+        size_t mask = slots_.size() - 1;
+        for (size_t i = hash(key) & mask;; i = (i + 1) & mask) {
+            const Slot& s = slots_[i];
+            if (s.key == 0) return nullptr;
+            if (s.key == key) return reinterpret_cast<const Found*>(&s.value);
+        }
+    }
+    const Found* end() const { return nullptr; }
+    void emplace(Value key, Value value) {
+        if ((used_ + 1) * 2 > slots_.size()) grow();
+        put(key, value);
+    }
+
+private:
+    struct Slot {
+        Value key = 0;  // a pointer value is never 0, so 0 is "empty"
+        Value value = 0;
+    };
+    static size_t hash(Value v) { return size_t((v >> 3) * 0x9E3779B97F4A7C15ull >> 16); }
+    void put(Value key, Value value) {
+        size_t mask = slots_.size() - 1;
+        for (size_t i = hash(key) & mask;; i = (i + 1) & mask) {
+            Slot& s = slots_[i];
+            if (s.key == 0) { s.key = key; s.value = value; ++used_; return; }
+            if (s.key == key) { s.value = value; return; }
+        }
+    }
+    void grow() {
+        std::vector<Slot> old(slots_.size() * 2);
+        old.swap(slots_);
+        used_ = 0;
+        for (const Slot& s : old) if (s.key) put(s.key, s.value);
+    }
+    std::vector<Slot> slots_;
+    size_t used_ = 0;
+};
 
 /// Deep-copy with cycle handling. Values crossing a heap boundary are copied
 /// eagerly, which is why forcing must happen before a send: a thunk carries a
@@ -2120,7 +2166,7 @@ Value copy_value(Heap& dest, Value v, CopySeen& seen) {
     v = resolve(v);
     if (!is_ptr(v)) return v;
 
-    if (auto it = seen.find(v); it != seen.end()) return it->second;
+    if (auto* it = seen.find(v)) return it->second;
 
     Obj* o = as_obj(v);
     switch (o->type) {
@@ -2151,8 +2197,7 @@ Value copy_value(Heap& dest, Value v, CopySeen& seen) {
                 Value head = copy_value(dest, src->head, seen);
                 static_cast<ConsObj*>(as_obj(cell))->head = head;
                 Value next = resolve(src->tail);
-                if (is_ptr(next) && as_obj(next)->type == ObjType::Cons
-                    && seen.find(next) == seen.end()) {
+                if (is_ptr(next) && as_obj(next)->type == ObjType::Cons && !seen.find(next)) {
                     Value fresh = dest.make_cons(UNIT, NIL);
                     seen.emplace(next, fresh);
                     static_cast<ConsObj*>(as_obj(cell))->tail = fresh;

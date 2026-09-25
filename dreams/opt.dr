@@ -490,14 +490,21 @@ let place_captures f s = {
 /// untouched, which is what makes this safe to drop into the middle of a build:
 /// the constant pools keep their indices, so every `int`, `str` and `atom` node
 /// still names what it named, and `funcs` changes in exactly two fields.
-let optimize img = {
+let optimize img =
+    optimize_tables img (array_of_list (img.[:nodes else []])) (array_of_list (img.[:kids else []]));
+
+/// The same, for a program as `lower` builds it: straight from its tables,
+/// which a read indexes as well as it does an array, so the arena is never
+/// flattened into the lists an image of it would hold -- only the rebuild is.
+let optimize_program p = optimize_tables (ir.finish_rest p) (ir.nodes p) (ir.kids p);
+
+let optimize_tables img nodes kids = {
     let strings = array_of_list (img.[:strs else []]);
     let ids = list.map (fn at -> type_codes.[strings.[at else ""] else ()])
                       (img.[:atoms else []]);
     let type_ids = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
                             %{} (list.zip (list.range 0 (list.length ids)) ids);
-    let s0 = (state (array_of_list (img.[:nodes else []]))
-                    (array_of_list (img.[:kids else []]))).[:type_ids => type_ids];
+    let s0 = (state nodes kids).[:type_ids => type_ids];
     let walked = list.fold (fn acc f -> {
         let got = rebuild (f.[:body else ir.no_node]) (list.head acc);
         let caps = place_captures f (list.head got);

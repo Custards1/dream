@@ -79,6 +79,7 @@ mapping Build {
     facts
     diags
     options
+    shared = ()
 }
 
 /// Resolve, lower and link the program, and check it.
@@ -94,8 +95,33 @@ let build! l o = {
     // One checker for the diagnostics, the contracts and both of the JIT's
     // parameter masks. Lazy, so a build without types never makes it.
     let facts = typecheck.analyze l r (lower.comp_values low);
+    // Sharing the arena needs nothing the checker says, and the checker needs
+    // nothing sharing does, so the two run at once: the arena goes to a
+    // process of its own before the checker starts, and comes back when the
+    // checker is done. On a self-compile that is the checker's half second
+    // taken off the critical path. A build that has already failed shares
+    // nothing, and one whose checker fails never waits for the answer.
+    let ahead = if Options.optimize o && diag.error_count front == 0 { share_elsewhere! (lower.prog low) }
+                else { () };
     let checked = type_diags! (Options.types o) facts low front;
-    Build.make l r low facts (list.append front checked) o
+    let all = list.append front checked;
+    let shared = if ahead == () || diag.error_count all > 0 { () }
+                 else { match join! ahead { [:crashed, _] => (), done => done } };
+    Build.make l r low facts all o shared
+};
+
+/// A process sharing this program's arena. What crosses is the program as
+/// `lower` built it -- tables, not the flat lists `ir.finish` makes of them --
+/// so flattening it happens in the child too. It is forced first, because what
+/// crosses to the child is copied, and an unforced part of it would cross as a
+/// suspension carrying the whole lowering state. The function is its own so
+/// that the suspension handed to `spawn!` holds this frame and nothing else.
+/// A raise in the child is not the child's to report: it answers `:crashed`,
+/// and the image is shared again where it always was, where the raise happens
+/// as it did before.
+let share_elsewhere! p = {
+    strict! p
+    spawn! $( try! { strict! (optimizer.optimize_program p) } catch e { [:crashed, e] } )
 };
 
 /// What a program's signatures and contracts say is wrong with it, given what
@@ -181,7 +207,8 @@ let image : Build -> ir.Image;
 let image b = {
     let o = Build.options b;
     let arena = lower.image (lowered b);
-    let built = if Options.optimize o { optimizer.optimize arena } else { arena };
+    let built = if not (Options.optimize o) { arena }
+                else { match Build.shared b { () => optimizer.optimize arena, done => done } };
     let hints f = if Options.types o { param_masks built (f (Build.facts b)) } else { [] };
     built.[:payloads => Options.payloads o]
          .[:float_params => hints typecheck.Analysis.float_params]
