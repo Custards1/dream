@@ -56,6 +56,8 @@
 // The fast paths are inline; every slow path calls the interpreter's own
 // helper, so the two tiers cannot drift apart on what an operation means.
 
+#include <pthread.h>
+#include <sched.h>
 #include "jit.hpp"
 
 #include <algorithm>
@@ -4787,6 +4789,18 @@ Jit::~Jit() {
 }
 
 void Jit::compile_worker() {
+#if defined(__linux__)
+    // Only idle cycles. When a compiled body arrives is not observable -- the
+    // interpreter runs the function exactly as it did while it was cold -- so
+    // there is no reason for LLVM to take a core from anything that is doing
+    // the program's work. A self-compile keeps every core busy at once (the
+    // loader's parses, the arena being shared beside the checker, the
+    // collector's helpers), and at normal priority this thread, which spends
+    // seconds of CPU in a compile, made the compile *slower* with the JIT on
+    // than with it off.
+    sched_param idle{};
+    pthread_setschedparam(pthread_self(), SCHED_IDLE, &idle);
+#endif
     for (;;) {
         uint32_t func_index = 0;
         {
