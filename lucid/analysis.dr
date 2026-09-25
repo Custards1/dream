@@ -27,6 +27,7 @@ import dreams.diag;
 import dreams.expand as expansion;
 import dreams.modules;
 import dreams.scope;
+import dreams.typecheck;
 
 import pos;
 
@@ -173,9 +174,14 @@ let diagnostic_path a d = {
     }
 };
 
-/// Everything the front end had to say, in one list.
-let all_diagnostics a =
-    list.append (modules.diags (loader a)) (scope.r_diags (resolved a));
+/// Everything the front end had to say, in one list: the loader, the
+/// resolver, and -- for a program that resolved -- what its signatures say is
+/// wrong with it, which is the same pass and the same messages `dreams` gives.
+let all_diagnostics a = {
+    let ds = list.append (modules.diags (loader a)) (scope.r_diags (resolved a));
+    if diag.error_count ds > 0 { ds }
+    else { list.append ds (typecheck.check_program (loader a) (resolved a)) }
+};
 
 /// Diagnostics grouped by the file they belong to: `[[path, [diagnostic, ..]], ..]`.
 ///
@@ -757,10 +763,22 @@ let signature src name ps =
 /// How to show a global or a member: its signature when the declaration can be
 /// found, and its bare name when it cannot.
 let shown_signature a mi name =
-    match signature_decl a mi name {
+    (match signature_decl a mi name {
         () => name,
         [owner, d] => signature (module_text a owner) name (list.nth 2 d),
+    }) + match declared_type a mi name {
+        () => "",
+        t => " : " + typecheck.written t,
     };
+
+/// The type a signature gave this global, as written, or `()`. Read from the
+/// expanded items, because that is where a record's and a union's generated
+/// signatures are; a module's own signature follows any it inherited.
+let declared_type a mi name =
+    list.fold (fn found oi -> match list.nth 1 oi {
+        [:sig, n, t, _] if n == name => t,
+        _ => found,
+    }) () (list.head (scope.effective_items (loader a) mi []));
 
 // --- go to definition -------------------------------------------------------------
 
@@ -1207,6 +1225,14 @@ when test {
         // file is the only thing that still says it was a requirement. Both
         // are facts a reader can see and the resolver's answer cannot say, so
         // hover and the outline are where they have to be put back.
+        // A signature is what the author said a name is, so hover says it
+        // too -- as written, since it is the promise and not an inference.
+        test.case "hover shows a signature"
+            $( test.eq! "`add x y : :integer -> :integer -> :integer` -- a global of module `buf`"
+                        (hover_value! "let add : :integer -> :integer -> :integer;\nlet add x y = x + y;\nlet main! = add 1 2;\n" 2 12) ),
+        test.case "hover shows a union's constructor with its type"
+            $( test.true! (str.contains_str "circle radius : :float -> Shape"
+                              (hover_value! "union Shape { circle(radius : :float), empty }\nlet main! = Shape.circle 1.0;\n" 1 18)) ),
         test.case "hover says a global is private"
             $( test.eq! "`hidden x` -- a private global of module `buf`"
                         (hover_value! "priv let hidden x = x;\nlet main! = hidden 1;\n" 1 12) ),

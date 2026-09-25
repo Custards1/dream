@@ -4,7 +4,9 @@ A reference for the Dream language as it is actually implemented.
 
 Dream is **dynamically typed**, **lazily evaluated**, and **functional**, with
 green processes for concurrency and a purity rule enforced by the spelling of a
-name. Two programs implement it:
+name. Types are optional: a signature is checked at compile time where one is
+written, and code without one is never rejected ([§3](#signatures-checked-at-compile-time)).
+Two programs implement it:
 
 | | |
 |-|-|
@@ -97,7 +99,7 @@ Keywords, which may not be used as ordinary names:
 
 ```
 let  priv  rec  if  else  import  as  catch  true  false
-not  try!  fn  virtual  derive  comp  comp!  when  mod  type
+not  try!  fn  virtual  derive  comp  comp!  when  mod  type  union
 ```
 
 Of these, `let  priv  rec  else  import  as  catch  virtual  derive  when  mod` can
@@ -280,10 +282,63 @@ names from the surrounding module. Fields with no annotation accept anything.
 `group` checks lists, `struct` arrays, and `mapping` maps. A missing field is
 accepted when its accessor default satisfies the field's type; extra map keys
 are allowed, extra positional elements are not. Constructors, accessors and
-setters are unchanged — `types.check Name.type value` is how a boundary gets
-checked. These are structural, so a matching raw collection is accepted too,
-and `Name.type` is an ordinary named description that composes with
-everything above.
+setters do not check at run time — `types.check Name.type value` is how a
+boundary gets checked there — but a record with at least one annotated field
+gives them signatures, so the compiler checks their uses (below). These are
+structural, so a matching raw collection is accepted too, and `Name.type` is
+an ordinary named description that composes with everything above.
+
+### Signatures, checked at compile time
+
+A signature says what a name is, in the type grammar above, and the compiler
+holds the program to it:
+
+```dream
+let add : :integer -> :integer -> :integer;     // a signature on its own
+let add x y = x + y;                             // ..and the definition
+
+let limit : :integer = 10;                       // a value and its type
+let greet who : :string = "hi " + who;           // what a function answers
+
+let map : (a -> b) -> [a] -> [b];                // a free lowercase name is a type variable
+```
+
+The type after a function's parameters is what it *answers*, so `greet` is
+`:any -> :string`. A signature on its own names no parameters — the whole
+arrow is the type of the name — and must be followed by a `let` of the same
+name in the same module or block. Signatures work in blocks as well as at the
+top level.
+
+What is checked, all of it at compile time:
+
+- the definition against its signature — the body, each branch of an `if`,
+  each arm of a `match`, each parameter's use;
+- every use of a signed name — each argument against its parameter, and the
+  number of arguments against the number of arrows;
+- the standard library's own signatures (`std.list` has them), so
+  `list.map 5 xs` is an error in a program that annotated nothing;
+- every `match` over a declared union, for a variant it does not handle
+  ([§7](#union--discriminated-unions)).
+
+A lambda passed where a function type is expected takes its parameter types
+from it, so `list.map (fn w -> w * 2) words` knows `w` is a string if `words`
+is a `[:string]` — and says `*` wants a number. A generic function's variables
+are solved from each call's arguments.
+
+**It is optional in the sense that matters: code no signature touches is never
+rejected.** A name with no signature is `:any`, and `:any` fits everywhere in
+both directions. An operator given the wrong kinds, or a value applied as a
+function, is reported only when a declared type is involved: `1 + "x"` is left
+alone — it raises when forced, and a program may mean exactly that inside a
+`try!` — while `name + 1` with `name : :string` is an error. A union where one
+member is expected must fit in every member; beyond that, anything the checker
+cannot see into passes. A refinement is checked as its base type, since its
+predicate only runs at run time.
+
+Signatures compile to nothing: a program's image is byte-identical with the
+checker or without it, and `dreams --no-types` skips it. There is no runtime
+check on a signed function's arguments — `types.enforce` is that, where it is
+wanted.
 
 ### Scalars
 
@@ -749,6 +804,66 @@ Records can appear wherever module declarations can, including `mod` and
 `when` blocks, and their helper namespaces can be imported. `group`,
 `struct` and `mapping` are contextual declaration keywords; existing local
 bindings with those names continue to work.
+
+### `union` — discriminated unions
+
+A union is a value that is exactly one of its variants, and which one is
+written on the value:
+
+```dream
+union Shape {
+    circle(radius : :float)
+    rect(w : :float, h : :float)
+    empty
+
+    area self = match self {
+        [:circle, r]  => 3.14 * r * r,
+        [:rect, w, h] => w * h,
+        :empty        => 0.0,
+    }
+}
+
+union Option a { some(value : a), none }
+
+let s = Shape.circle 2.0;        // [:circle, 2.0]
+let e = Shape.empty;             // :empty
+Shape.area s                     // 12.56
+types.check Shape s              // the union's name is its description
+```
+
+A variant with fields is the list `[:tag, field, ..]`; one without is the
+atom `:tag`. That is the representation Dream code already uses by hand —
+`[:ok, value] | [:error, why]` — so a declared union describes the values
+existing code builds, and is taken apart with the patterns it already uses.
+`union Outcome v { ok(value : v), error(reason : :string) }` is exactly the
+shape of every result in the standard library.
+
+Entries are separated by `,` or a line break, as a record's are. A field's
+`: type` is optional (`:any` without one). An entry with parameters and a `=`
+is a member, compiled inside the union's module as a record's is. Parameters
+after the name make it generic, and a field may use them as types.
+
+The declaration becomes:
+
+- a module `Shape` holding one constructor per variant (`Shape.circle`,
+  `Shape.empty`), `Shape.type`, the members, and a signature for every
+  constructor — `circle : :float -> Shape`;
+- a global `Shape` in the enclosing module holding the description, so
+  `Shape` is a type wherever a type is written. `Shape.circle` still reaches
+  the module: a name in front of a dot is looked up as a module first.
+
+**A `match` on a declared union must handle every variant**, checked at compile
+time when the scrutinee's type is known to be that union:
+
+```
+error: this `match` on `Shape` does not handle `:empty`; add an arm for it,
+or `_ =>` to handle everything else
+```
+
+A wildcard or a binder handles everything. An arm with a guard, or one that
+takes a field apart with a nested pattern, counts as handling its variant,
+since it might. A pattern also narrows: in `[:circle, r] => ..`, `r` is the
+radius's type, not the union of every variant's second field.
 
 ### `import`
 

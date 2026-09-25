@@ -1607,10 +1607,7 @@ let union_entry c name variants members ts =
         let entry = peek_value ts;
         let at_name = peek_span ts;
         let after = list.tail ts;
-        if entry == "type" {
-            err ("`type` is the description `" + name + "` generates, so it cannot name a variant or a member") at_name
-        }
-        else if union_taken variants members entry {
+        if union_taken variants members entry {
             err ("`" + entry + "` is already a variant or a member of `" + name + "`") at_name
         }
         else if at after :lparen && peek2_kind after != :rparen {

@@ -108,6 +108,8 @@ let join a b = if a == b { a } else { union_of [a, b] };
 /// variant.
 let rec widen t = match t {
     [:lit, :atom, _] => t,
+    // An empty list says nothing about what it will hold.
+    [:tuple, []] => [:list_of, :never],
     [:lit, kind, _] => kind,
     [:tuple, ts] => [:tuple, list.map (fn x -> widen x) ts],
     [:union, ts] => union_of (list.map (fn x -> widen x) ts),
@@ -679,17 +681,19 @@ let name_type k h n sp = match scope.resolution (res k) (Here.mi h) (Here.source
     _ => (Here.locals h).[n else :any],
 };
 
+/// The arms are in the order nodes are common in, most first: a `match` tries
+/// them in turn, and names and calls are most of any program.
 let rec infer k h e ds = match e {
+    [:name, n, sp] => [name_type k h n sp, ds],
+    [:apply, f, args, sp] => infer_apply k h f args sp ds,
+    [:field, _, _, sp] => [name_type k h "" sp, ds],
+    [:str, v, _] => [lit :string v, ds],
+    [:atom, n, _] => [lit :atom n, ds],
     [:int, v, _] => [lit :integer v, ds],
     [:float, v, _] => [lit :float v, ds],
-    [:str, v, _] => [lit :string v, ds],
     [:char, v, _] => [lit :char v, ds],
     [:bool, v, _] => [lit :bool v, ds],
-    [:atom, n, _] => [lit :atom n, ds],
     [:unit, _] => [:unit, ds],
-    [:name, n, sp] => [name_type k h n sp, ds],
-    [:field, _, _, sp] => [name_type k h "" sp, ds],
-    [:apply, f, args, sp] => infer_apply k h f args sp ds,
     [:pipe, lhs, rhs, sp] => match rhs {
         [:apply, f, args, _] => infer_apply k h f (args + [lhs]) sp ds,
         _ => infer_apply k h rhs [lhs] sp ds,
@@ -971,6 +975,7 @@ let rec arrows k t n acc =
     else {
         match peel k t 8 {
             [:fn, a, b] => arrows k b (n - 1) (core.cons a acc),
+            :any => [list.reverse acc, :any, ()],
             p if not_a_function p => [list.reverse acc, :any, p],
             _ => [list.reverse acc, :any, ()],
         }
@@ -991,6 +996,17 @@ let is_lambda e = match e { [:lambda, _, _, _] => true, _ => false };
 
 let infer_apply k h f args sp ds = {
     let [ft, ds1] = infer k h f ds;
+    match ft {
+        // Nearly every call in a program is to something no signature
+        // describes, and there is nothing to hold its arguments to -- only
+        // their own insides to check. This is most of the calls the checker
+        // sees, and the bookkeeping below is most of what a call costs it.
+        :any => [:any, list.fold (fn d a -> list.nth 1 (infer k h a d)) ds1 args],
+        _ => typed_apply k h f ft args sp ds1,
+    }
+};
+
+let typed_apply k h f ft args sp ds1 = {
     let who = callee_name f;
     let [params, rest, stuck] = arrows k ft (list.length args) [];
     let given = list.length params;
@@ -1030,7 +1046,11 @@ let infer_apply k h f args sp ds = {
         else {
             let p = solved s (list.nth i params) false;
             if is_lambda a {
-                let [lt, d2] = infer_lambda_at k h a p d;
+                // What has been solved tells the lambda what its parameters
+                // are, but not what it must answer: a variable solved from
+                // `list.fold`'s seed `[]` is not a promise that the fold's
+                // function answers an empty list.
+                let [lt, d2] = infer_lambda_at k h a (solved_inputs s (list.nth i params) (lambda_arity a)) d;
                 [solve k (list.nth i params) lt s, d2]
             }
             else {
@@ -1041,6 +1061,19 @@ let infer_apply k h f args sp ds = {
     }) [subst, ds3] (indexed args);
     [solved subst2 rest true, ds4]
 };
+
+/// A function type with what is solved put into its first `n` parameters and
+/// nowhere else.
+let rec solved_inputs subst t n =
+    if n <= 0 { t }
+    else {
+        match t {
+            [:fn, a, b] => [:fn, solved subst a false, solved_inputs subst b (n - 1)],
+            _ => t,
+        }
+    };
+
+let lambda_arity a = match a { [:lambda, ps, _, _] => list.length ps, _ => 0 };
 
 let infer_lambda_at k h a p ds = match a {
     [:lambda, ps, body, sp] => lambda k h ps body p sp ds,
@@ -1126,7 +1159,7 @@ let rec block k h stmts expected ds = match stmts {
 
 /// A block signature that no `let` below it took up.
 let finish_block h ds =
-    list.fold (fn acc kv -> bad h (list.nth 2 (list.nth 1 kv))
+    list.fold (fn acc kv -> bad h (list.nth 1 (list.nth 1 kv))
                                 ("the signature of `" + list.nth 0 kv + "` has no `let` after it in this block") acc)
               ds (core.map_pairs (Here.pending h));
 
@@ -1499,3 +1532,50 @@ let check_program l r = {
 /// Where a diagnostic points, as one number that orders them the way a reader
 /// would: by file, then by position in it.
 let place d = diag.source_of d * 4294967296 + ast.span_start (diag.span d);
+
+// --- a signature as it was written ------------------------------------------------------
+
+/// A type as the grammar writes it, straight from the syntax -- for a tool
+/// that wants to show a signature without checking anything, such as hover in
+/// `lucid`. Names are shown as written rather than resolved, and a `where`
+/// predicate is abbreviated, because it is an ordinary expression and the
+/// point of showing a signature is the shape.
+let rec written t = match t {
+    [:atom, n, _] => ":" + n,
+    [:int, v, _] => to_string v,
+    [:float, v, _] => to_string v,
+    [:str, v, _] => "\"" + v + "\"",
+    [:char, v, _] => "'" + str.of_chars [v] + "'",
+    [:bool, v, _] => to_string v,
+    [:unit, _] => "()",
+    [:name, n, _] => n,
+    [:field, obj, f, _] => written obj + "." + f,
+    [:apply, head, args, _] => written head + " " + str.join_str " " (list.map (fn a -> written_arg a) args),
+    [:list, [[:atom, tag, _], ..parts], _] => match [tag, parts] {
+        ["fn", [a, b]] => written_inner a + " -> " + written b,
+        ["union", [[:list, ts, _]]] => str.join_str " | " (list.map (fn x -> written_inner x) ts),
+        ["list_of", [e]] => "[" + written e + "]",
+        ["tuple", [[:list, ts, _]]] => "[" + str.join_str ", " (list.map (fn x -> written x) ts) + "]",
+        ["array_of", [e]] => "#[" + written e + "]",
+        ["array", [[:list, ts, _]]] => "#[" + str.join_str ", " (list.map (fn x -> written x) ts) + "]",
+        ["map_of", [kt, vt]] => "%{" + written kt + " => " + written vt + "}",
+        ["record", [[:map, pairs, _]]] => "%{" + str.join_str ", " (list.map (fn p ->
+                                              written (list.nth 0 p) + " => " + written (list.nth 1 p)) pairs) + "}",
+        ["refine", [base, _]] => written base + " where ..",
+        ["literal", [v]] => written v,
+        ["named", [[:str, n, _], _]] => n,
+        _ => "..",
+    },
+    _ => "..",
+};
+
+let written_inner t = match t {
+    [:list, [[:atom, "fn", _], .._], _] => "(" + written t + ")",
+    [:list, [[:atom, "union", _], .._], _] => "(" + written t + ")",
+    _ => written t,
+};
+
+let written_arg t = match t {
+    [:apply, _, _, _] => "(" + written t + ")",
+    _ => written_inner t,
+};

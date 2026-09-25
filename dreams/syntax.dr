@@ -127,7 +127,7 @@ let record_derived kind name fields members bases span = {
                                               (ast.member_body m) true (ast.member_span m))
                            members;
     // Each field type occurs once, so retain its written spans for diagnostics.
-    ast.mod_d name (bases + generated + [description] + record_sigs kind fields span + written) span
+    ast.mod_d name (bases + generated + [description] + record_sigs kind name fields span + written) span
 };
 
 /// What every generated function of a record promises, for the type checker.
@@ -150,10 +150,10 @@ let record_derived kind name fields members bases span = {
 /// A `mapping`'s accessor asks only for the field it reads, and for any map
 /// at all when that field has a default: `Config.retries %{}` is `3`. A
 /// `group`'s or a `struct`'s reads by position, so it takes the record.
-let record_sigs kind fields span =
+let record_sigs kind name fields span =
     if list.all (fn f -> ast.field_type f == ()) fields { [] }
     else {
-        let self = ast.name_e "type" span;
+        let self = shown_as name (ast.name_e "type" span) span;
         let field_t f = match ast.field_type f { () => ast.atom_e "any" span, t => t };
         let arrows ts result = list.fold (fn acc t -> arrow t acc) result (list.reverse ts);
         let required = list.filter (fn f -> ast.field_default f == ()) fields;
@@ -171,6 +171,13 @@ let record_sigs kind fields span =
                ast.sig_d ("set_" + ast.field_name f) (arrow self (arrow (field_t f) self)) span])
               fields)
     };
+
+/// A type that reads as `name` wherever it is shown. Inside the generated
+/// module the record's own type is the global `type`, which is the right thing
+/// to resolve and the wrong thing to print: `circle : :float -> type` says
+/// nothing a reader can use. `[:named, name, t]` is what a `type` declaration
+/// is, and both the checker and a signature's printer read the name from it.
+let shown_as name t span = ast.list_e [ast.atom_e "named" span, ast.str_e name span, t] span;
 
 /// `a -> b` as the type grammar builds it.
 let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
@@ -225,10 +232,10 @@ let union_decl name params variants members span = {
     }) variants;
     // The union's own type, applied to its parameters: `type a b`, read in
     // the generated module where `type` is the description's global.
-    let self = match params {
+    let self = shown_as name (match params {
         [] => ast.name_e "type" at_,
         ps => ast.apply_e (ast.name_e "type" at_) (list.map (fn p -> ast.name_e (ast.param_name p) at_) ps) at_,
-    };
+    }) at_;
     let sigs = list.map (fn v ->
         ast.sig_d (ast.variant_name v)
             (list.fold (fn acc f -> arrow (field_t f) acc) self (list.reverse (ast.variant_fields v)))

@@ -23,6 +23,7 @@ let tail xs = core.tail xs;
 /// be defined in terms of itself.
 let cons x xs = core.cons x xs;
 
+let first_or : a -> [a] -> a;
 let first_or default xs = if core.is_empty xs { default } else { core.head xs };
 
 /// `acc` plus the length of `xs`. The accumulating form `length` was written
@@ -79,33 +80,41 @@ let last xs = {
 /// works, and only an endless list on the *left* is now a hang rather than an
 /// answer. Nothing in this repository appends to one, and an infinite left
 /// operand makes `ys` unreachable by definition.
+let append : [a] -> [a] -> [a];
 let append xs ys = xs + ys;
 
 let rec reverse_from acc xs =
     if core.is_empty xs { acc } else { reverse_from (core.cons (core.head xs) acc) (core.tail xs) };
 
+let reverse : [a] -> [a];
 let reverse xs = reverse_from [] xs;
 
 /// `range 1 4` is `[1, 2, 3]`: the end is not included, so `range 0 (length xs)`
 /// indexes a list exactly.
+let range : :integer -> :integer -> [:integer];
 let rec range from until =
     if from >= until { [] } else { core.cons from (range (from + 1) until) };
 
 /// The infinite list `n, n+1, n+2, ...`. Only ever as long as it is used.
+let from : :integer -> [:integer];
 let rec from n = core.cons n (from (n + 1));
 
 /// An infinite list of one value.
+let repeat : a -> [a];
 let rec repeat x = core.cons x (repeat x);
 
 /// `x` repeated `n` times.
+let replicate : :integer -> a -> [a];
 let rec replicate n x = if n <= 0 { [] } else { core.cons x (replicate (n - 1) x) };
 
 // --- transforming -----------------------------------------------------------
 
 /// Lazy: the result's tail is not built until it is asked for.
+let map : (a -> b) -> [a] -> [b];
 let rec map f xs =
     if core.is_empty xs { [] } else { core.cons (f (core.head xs)) (map f (core.tail xs)) };
 
+let filter : (a -> :bool) -> [a] -> [a];
 let rec filter keep xs =
     if core.is_empty xs { [] }
     else {
@@ -114,6 +123,7 @@ let rec filter keep xs =
         if keep x { core.cons x rest } else { rest }
     };
 
+let fold : (b -> a -> b) -> b -> [a] -> b;
 let rec fold f acc xs =
     if core.is_empty xs { acc } else { fold f (f acc (core.head xs)) (core.tail xs) };
 
@@ -141,6 +151,7 @@ let rec fold f acc xs =
 /// Only the head is forced. What is inside the accumulator stays lazy, which is
 /// where laziness earns its keep: `strict!` would walk the whole accumulator at
 /// every step and turn a linear fold into a quadratic one.
+let fold_strict : (b -> a -> b) -> b -> [a] -> b;
 let rec fold_strict f acc xs =
     if core.is_empty xs { acc }
     else {
@@ -149,27 +160,33 @@ let rec fold_strict f acc xs =
         else { fold_strict f next (core.tail xs) }
     };
 
+let fold_right : (a -> b -> b) -> b -> [a] -> b;
 let rec fold_right f acc xs =
     if core.is_empty xs { acc } else { f (core.head xs) (fold_right f acc (core.tail xs)) };
 
+let take : :integer -> [a] -> [a];
 let rec take n xs =
     if n <= 0 { [] }
     else if core.is_empty xs { [] }
     else { core.cons (core.head xs) (take (n - 1) (core.tail xs)) };
 
+let drop : :integer -> [a] -> [a];
 let rec drop n xs =
     if n <= 0 { xs } else if core.is_empty xs { [] } else { drop (n - 1) (core.tail xs) };
 
+let take_while : (a -> :bool) -> [a] -> [a];
 let rec take_while keep xs =
     if core.is_empty xs { [] }
     else if keep (core.head xs) { core.cons (core.head xs) (take_while keep (core.tail xs)) }
     else { [] };
 
+let drop_while : (a -> :bool) -> [a] -> [a];
 let rec drop_while skip xs =
     if core.is_empty xs { [] }
     else if skip (core.head xs) { drop_while skip (core.tail xs) }
     else { xs };
 
+let zip : [a] -> [b] -> [[a, b]];
 let rec zip xs ys =
     if core.is_empty xs { [] }
     else if core.is_empty ys { [] }
@@ -177,28 +194,35 @@ let rec zip xs ys =
         core.cons [core.head xs, core.head ys] (zip (core.tail xs) (core.tail ys))
     };
 
+let concat : [[a]] -> [a];
 let rec concat xss =
     if core.is_empty xss { [] } else { append (core.head xss) (concat (core.tail xss)) };
 
+let flat_map : (a -> [b]) -> [a] -> [b];
 let flat_map f xs = concat (map f xs);
 
 /// Every element with its index, as `[index, element]`.
+let enumerate : [a] -> [[:integer, a]];
 let enumerate xs = zip (from 0) xs;
 
 // --- asking -----------------------------------------------------------------
 
+let any : (a -> :bool) -> [a] -> :bool;
 let rec any pred xs =
     if core.is_empty xs { false }
     else if pred (core.head xs) { true }
     else { any pred (core.tail xs) };
 
+let all : (a -> :bool) -> [a] -> :bool;
 let rec all pred xs =
     if core.is_empty xs { true }
     else if pred (core.head xs) { all pred (core.tail xs) }
     else { false };
 
+let contains : a -> [a] -> :bool;
 let contains x xs = any (fn y -> y == x) xs;
 
+let count : (a -> :bool) -> [a] -> :integer;
 let count pred xs = fold (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
 
 let rec index_of_from i x xs =
@@ -207,6 +231,7 @@ let rec index_of_from i x xs =
     else { index_of_from (i + 1) x (core.tail xs) };
 
 /// The index of the first `x`, or -1.
+let index_of : a -> [a] -> :integer;
 let index_of x xs = index_of_from 0 x xs;
 
 let sum xs = fold (fn a b -> a + b) 0 xs;
@@ -229,6 +254,7 @@ let maximum xs =
     else { min_by_from (core.head xs) (fn a b -> core.compare a b > 0) (core.tail xs) };
 
 /// The elements that satisfy `pred`, then those that do not.
+let partition : (a -> :bool) -> [a] -> [[a], [a]];
 let partition pred xs = [filter pred xs, filter (fn x -> not (pred x)) xs];
 
 let rec unique_from seen xs =
@@ -241,6 +267,7 @@ let rec unique_from seen xs =
     };
 
 /// Keeps the first occurrence of each element.
+let unique : [a] -> [a];
 let unique xs = unique_from [] xs;
 
 // --- ordering ---------------------------------------------------------------
@@ -257,6 +284,7 @@ let rec merge_by before xs ys =
         else { core.cons x (merge_by before (core.tail xs) ys) }
     };
 
+let sort_by : (a -> a -> :bool) -> [a] -> [a];
 let rec sort_by before xs = {
     let n = length xs;
     if n <= 1 { xs }
@@ -267,6 +295,7 @@ let rec sort_by before xs = {
 };
 
 /// Ascending, by the runtime's total order over the flat types.
+let sort : [a] -> [a];
 let sort xs = sort_by (fn a b -> core.compare a b < 0) xs;
 
 /// Ascending by a key extracted from each element.

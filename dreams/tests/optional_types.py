@@ -169,6 +169,10 @@ group Untyped { anything }
 group Empty {}
 group Listy { xs : [:integer], tag : :ok | :no }
 let origin = comp types.check Point.type (Point.new 1);
+// Nothing the type checker can see through: the constructors themselves do
+// not check at run time, and holding them to the fields' types at compile
+// time is `static_types.py`'s business.
+let opaque x = x;
 let main! = {
     console.print! [origin, types.accepts Point.type [1], types.accepts Point.type [],
                     types.accepts Point.type [1, 2, 3], types.accepts Point.type ["x", 2]]
@@ -180,9 +184,9 @@ let main! = {
     console.print! [types.accepts Untyped.type (Untyped.make (1 / 0)),
                     types.accepts Empty.type []]
     console.print! [types.accepts Listy.type (Listy.make [1, 2] :ok),
-                    types.accepts Listy.type (Listy.make [1, 2] :maybe)]
-    console.print! (Point.make "still untyped" false)
-    console.print! (try! { types.check Point.type (Point.set_x origin "bad") }
+                    types.accepts Listy.type (Listy.make [1, 2] (opaque :maybe))]
+    console.print! (Point.make (opaque "still untyped") (opaque false))
+    console.print! (try! { types.check Point.type (Point.set_x origin (opaque "bad")) }
                     catch e { core.error_kind e })
 };
 ''', '[[1, 0], true, false, false, false]\n[true, false, false]\n[true, false, true]\n'
