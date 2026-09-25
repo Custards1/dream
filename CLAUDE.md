@@ -2805,6 +2805,72 @@ the ordinary image, and only then streams the files through a bounded buffer
 `--payload` emits neither section, so it writes the bytes it wrote before any of
 this existed — which is what the bootstrap compares.
 
+## Static types
+
+`let add : :integer -> :integer -> :integer` is checked at compile time, by
+[dreams/typecheck.dr](dreams/typecheck.dr), which runs after `scope.resolve!`
+and before lowering and produces diagnostics and nothing else. Its header is
+the design; what is here is what to know before changing it.
+
+**The three rules, and every false positive so far broke one of them.**
+Unannotated code is never an error (a name with no signature is `:any`); only
+a definite mismatch is reported (`sub` answers "could this be that?"); and the
+pass never changes the program. Three things that looked like checks and were
+not, each found by running the checker over this repository:
+
+- `1 + "x"` is not an error. `examples/05_errors.dr` and
+  `dream/tests/programs/errors.dr` write it on purpose inside `try!`, and in a
+  lazy language a line nobody forces never raises. So an operator mismatch, or
+  a value applied as a function, is reported only when a *declared* type is
+  part of it (`from_literals`): a literal is evidence of nothing but itself.
+- A record nobody annotated gets no signatures. `Person.greeting %{}` reads a
+  defaulted field of an empty map and is `"Hi"`; a signature saying the
+  accessor wants a whole `Person` rejected it. A `mapping`'s accessor now asks
+  only for the field it reads, and for any map when that field has a default.
+- A type variable *solved* from an argument is not a promise.
+  `list.fold (fn acc j -> acc + [j]) [] xs` solves the accumulator from `[]`,
+  and holding the lambda's answer to "an empty list" rejected half the
+  compiler. A lambda passed as an argument takes its *parameter* types from
+  what was solved (`solved_inputs`), and its answer is only bound, never
+  checked against a solved variable.
+
+The check to run after any change here: every `.dr` in the repository must
+check clean -- `std --test`, `dreams --test`, `lucid`, `mind`, the examples,
+`dream/tests/programs` and the benchmarks -- because every report on code that
+works is a report nobody asked for, and the first thing a user does with a
+checker that cries wolf is turn it off.
+
+**What it costs.** About 290 ms of a 5.5 s self-compile, ~5%, with every image
+byte-identical. The first version cost 578 ms, and nearly all of the
+difference was one case: most calls in any program are to something no
+signature describes, and a callee of type `:any` now skips the argument
+bookkeeping entirely (`infer_apply`). `infer`'s arms are ordered by how common
+each node is, because a `match` tries them in turn -- worth another 15%.
+
+**Where it reads from.** A name in an expression is the resolver's answer
+(`scope.resolution`), so the checker never re-implements name lookup. A name
+in a *signature* is the exception: signatures are never resolved, because they
+never run, so `type_ref` looks a type name up in the module's environment the
+way `scope` would -- a module alias first (that is how `Shape` names a union
+and `Point` a record), then a global, then a selective import.
+
+**Named types stay folded** (`[:named, shown, gi, args]`) and unfold on demand,
+because `type Tree = :unit | [:integer, Tree, Tree]` is recursive. `sub` spends
+fuel on each unfold, and runs out to *true*: an answer the checker cannot reach
+is not a mismatch.
+
+**Exhaustiveness is deliberately narrow.** Only a scrutinee whose type is a
+*name* -- a union somebody declared -- is held to it, and a variant is reported
+only when every arm certainly misses it. A guarded arm, or one that takes a
+field apart with a nested pattern, counts as handling. A false report here
+teaches people to write `_ =>` everywhere, which is worse than no check.
+
+**Bootstrap order.** The seed must parse a signature before `std` may contain
+one, because the compiler imports `std`. Changing the checker so that it
+accepts something the seed's checker rejects needs one build with `--no-types`
+first: build the new compiler with the seed and `--no-types`, let *that*
+compile the source twice, compare, and copy it over the seed.
+
 ## The language server
 
 `lucid` is the compiler answering an editor's questions. It imports `dreams` and
@@ -3054,6 +3120,18 @@ test.
   a `let`, so imports, `priv`, currying and local capture need no new rules.
   "Optional type descriptions" in [docs/language-spec.md](docs/language-spec.md)
   is the grammar and the one ambiguity it has to resolve.
+- `let name : type` is a **signature**, checked at compile time
+  ([dreams/typecheck.dr](dreams/typecheck.dr)); `let x : t = e` and
+  `let f x : answer = e` are the inline forms. A free lowercase name in one is
+  a type variable. Signatures compile to nothing, code no signature touches is
+  never rejected, and `--no-types` skips the pass. "Static types" below is the
+  design.
+- `union Shape { circle(radius : :float), empty }` declares a **discriminated
+  union**: a module of constructors whose values are `[:circle, r]` and
+  `:empty` -- the tagged lists Dream already writes by hand -- plus a global
+  `Shape` holding its description. A `match` on one must handle every
+  variant. Lists back it; an array opt-in, as `struct` is to `group`, is
+  planned and not built.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,
