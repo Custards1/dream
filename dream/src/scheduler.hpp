@@ -45,6 +45,9 @@ public:
     /// Eight is the same compromise `GcPool` makes, for the same reason and
     /// with the same escape hatch: `-j` is how a program that really does have
     /// twenty-four runnable processes asks for twenty-four workers.
+    ///
+    /// "Cores" is `usable_cores()`: the ones this process may run on, which
+    /// a pinned or containerized process has fewer of than the machine.
     static unsigned default_workers();
     Scheduler(const Scheduler&) = delete;
     Scheduler& operator=(const Scheduler&) = delete;

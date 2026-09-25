@@ -1,5 +1,7 @@
 #include "gc_pool.hpp"
 
+#include "cores.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -21,9 +23,7 @@ unsigned configured_capacity() {
         long long n = std::atoll(env);
         if (n > 0) return unsigned(std::min<long long>(n, 64));
     }
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 1;
-    return std::min(hw, 8u);
+    return std::min(usable_cores(), 8u);
 }
 
 }  // namespace

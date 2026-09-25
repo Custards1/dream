@@ -9,6 +9,7 @@
 #include <chrono>
 
 #include "builtins.hpp"
+#include "cores.hpp"
 #include "gc_pool.hpp"
 #include "interp.hpp"
 
@@ -27,9 +28,7 @@ Scheduler::Scheduler(Runtime& rt, unsigned worker_count) : rt_(rt) {
 Scheduler::~Scheduler() { stop(); }
 
 unsigned Scheduler::default_workers() {
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 1;
-    return std::min(hw, 8u);
+    return std::min(usable_cores(), 8u);
 }
 
 void Scheduler::start() {

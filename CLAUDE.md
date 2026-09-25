@@ -2957,6 +2957,49 @@ flag to both `cmake` steps of `vm-pgo` or it fails in `jit.cpp`.
   the compiler's own source; it bounds loading at ~0.7 s on four cores.
 - *Expansion* is 0.25 s with one core busy, for 14 macro calls.
 
+### Fewer cores than the machine has: 15.6 s -> 9.1 s on one
+
+Done 2026-09-25. Everything above was measured with four cores to spare, and a
+self-compile had never been timed on fewer. `taskset -c 0` -- which is what a
+CI slot, a `docker --cpus=1` or a small VM amounts to -- found two things, both
+of which the four-core numbers could not show:
+
+- **The VM sized itself by the machine, not by what it was given.**
+  `std::thread::hardware_concurrency()` ignores the affinity mask and the
+  cgroup quota, so a VM pinned to one core of four still started four workers
+  and four collector helpers, and they spent their time taking turns: 15.6 s
+  where the same VM told `-j 1` took 11.7. `usable_cores()`
+  ([dream/src/cores.hpp](dream/src/cores.hpp)) is the smallest of the machine,
+  the affinity mask and the CFS quota (cgroup v2 or v1), and the scheduler's
+  default and `GcPool` both ask it. `DREAM_CORES=N` overrides it, which is how
+  to ask what a smaller machine does without owning one -- though `taskset` is
+  the honest version, because it also takes the cores away. 15.6 -> 11.5 s on
+  one core, 8.0 -> 6.6 s on two, four unchanged.
+- **`SCHED_IDLE` means "never" on a machine with no idle cycles.** The JIT's
+  compile thread only ran on idle cycles (see "Four hundred compiles cost more
+  than they buy"), so pinned to one core a self-compile compiled **2** of the
+  400 functions it made hot, and every benchmark ran interpreted from start to
+  finish: `fib` 55 ms -> 900, `collatz` 115 -> 2500, `pi` 50 -> 1100. The same
+  happens on any number of cores once a program keeps all of them busy. The
+  thread now runs at normal priority while its own CPU time is inside a budget
+  -- 100 ms, plus a tenth of what the rest of the process has spent
+  (`DREAM_JIT_SHARE` is the tenth, as a percentage) -- and drops to `SCHED_IDLE`
+  past it; an idle thread still gets the odd slice, which is where it notices
+  the budget has grown back. One core now runs the benchmarks at 1.2-1.8x the
+  four-core time instead of 10-20x, and the self-compile 11.5 -> **9.1 s**,
+  because compiled code pays for itself even when its compiles are not free.
+  Four cores do not move: shares of 0, 5, 10 and 25% were all inside this
+  machine's noise there.
+
+**Measured, and not kept: eight parts instead of four.** `lower.part_count` is
+fixed so that an image does not depend on the machine, so the only way to give
+an eight-core machine more to do is to raise it for everyone. At eight, one
+and two cores are unchanged (10.8/10.4 s against 10.7/10.3, 6.7/6.4 against
+6.8/6.9) and four are **7-10% slower** (5.06/5.18 against 4.77/4.53) -- the
+cross-part share, which is the end of the critical path, has twice the parts
+to merge. That is a loss on a machine anyone can measure for a gain on one
+nobody here has, so it waits for someone with eight cores to measure it.
+
 ### A JIT that can allocate -- the plan
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the

@@ -69,6 +69,7 @@
 #include <deque>
 #include <thread>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -4788,18 +4789,68 @@ Jit::~Jit() {
     impl_->rt.set_jit(nullptr);
 }
 
+namespace {
+
+#if defined(__linux__)
+int64_t cpu_nanos(clockid_t clock) {
+    timespec ts{};
+    clock_gettime(clock, &ts);
+    return int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+}
+
+/// How much CPU the compile thread may take at normal priority: an allowance
+/// every program gets, plus a share of what the process has spent so far. See
+/// `compile_worker`. `DREAM_JIT_SHARE` is the share as a percentage.
+bool jit_within_budget(int64_t jit_ns) {
+    static const int64_t share_pct = [] {
+        if (const char* v = std::getenv("DREAM_JIT_SHARE")) return int64_t(std::atoll(v));
+        return int64_t(10);
+    }();
+    constexpr int64_t kAllowance = 100 * 1000000;  // 100 ms
+    const int64_t process_ns = cpu_nanos(CLOCK_PROCESS_CPUTIME_ID);
+    return jit_ns * 100 <= kAllowance * 100 + share_pct * (process_ns - jit_ns);
+}
+#endif
+
+}  // namespace
+
 void Jit::compile_worker() {
 #if defined(__linux__)
-    // Only idle cycles. When a compiled body arrives is not observable -- the
-    // interpreter runs the function exactly as it did while it was cold -- so
-    // there is no reason for LLVM to take a core from anything that is doing
-    // the program's work. A self-compile keeps every core busy at once (the
-    // loader's parses, the arena being shared beside the checker, the
-    // collector's helpers), and at normal priority this thread, which spends
-    // seconds of CPU in a compile, made the compile *slower* with the JIT on
-    // than with it off.
-    sched_param idle{};
-    pthread_setschedparam(pthread_self(), SCHED_IDLE, &idle);
+    // Idle cycles first, and a budget when there are none.
+    //
+    // When a compiled body arrives is not observable -- the interpreter runs
+    // the function exactly as it did while it was cold -- so there is no
+    // reason for LLVM to take a core from anything doing the program's work.
+    // A self-compile keeps every core busy at once (the loader's parses, the
+    // arena being shared beside the checker, the collector's helpers), and at
+    // normal priority without limit this thread, which spends seconds of CPU
+    // in a compile, made the compile *slower* with the JIT on than off.
+    //
+    // But `SCHED_IDLE` alone means "never" on a machine with no idle cycles.
+    // Pinned to one core, a self-compile compiled 2 functions of the 400 it
+    // made hot, and every benchmark ran interpreted from start to finish --
+    // `fib` 55 ms -> 900, `collatz` 115 -> 2500. The same happens on any number
+    // of cores once the program keeps them all busy. So the thread runs at
+    // normal priority while what it has spent is inside a budget -- 100 ms,
+    // plus a tenth of what the rest of the process has spent -- and at
+    // `SCHED_IDLE` past it. A numeric kernel's one or two functions fit in
+    // the allowance and arrive within milliseconds; a program with hundreds of
+    // hot functions gets the hottest of them promptly and the rest from idle
+    // cycles, and pays at most a tenth for the JIT on a machine that has
+    // none. An idle thread still gets the odd slice, which is where it
+    // notices the budget has grown back and promotes itself again.
+    const clockid_t self_clock = [] {
+        clockid_t c;
+        return pthread_getcpuclockid(pthread_self(), &c) == 0 ? c : CLOCK_THREAD_CPUTIME_ID;
+    }();
+    bool idle = false;
+    auto set_idle = [&](bool want) {
+        if (want == idle) return;
+        sched_param param{};
+        if (pthread_setschedparam(pthread_self(), want ? SCHED_IDLE : SCHED_OTHER, &param) == 0) {
+            idle = want;
+        }
+    };
 #endif
     for (;;) {
         uint32_t func_index = 0;
@@ -4810,6 +4861,9 @@ void Jit::compile_worker() {
             func_index = impl_->queue.front();
             impl_->queue.pop_front();
         }
+#if defined(__linux__)
+        set_idle(!jit_within_budget(cpu_nanos(self_clock)));
+#endif
         CompiledFn fn = nullptr;
         {
             std::lock_guard<std::mutex> g(impl_->mutex);
