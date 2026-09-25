@@ -1,11 +1,19 @@
-// Reading `mind.toml`.
+// Reading `mind.toml`, and writing the one part of it `mind` ever changes.
 //
 // A manifest describes one package: what it is called, where its modules live,
 // and what it depends on. A dependency is either somewhere on this machine
 // (`path`) or somewhere to fetch (`git`, `url`) -- there is no index and no
 // registry, so a dependency says where it is rather than naming a version the
 // world is expected to agree on.
+//
+// The rule every default here follows: **listing a dependency is the whole of
+// using it.** Its key is the name it is imported by, a bare string is a path,
+// a directory with no manifest of its own is still a package, and what a
+// dependency needs to be compiled (`[build] includes`, `host-modules`) travels
+// with it. `[build]` is for what is true of *this* package, never for making
+// somebody else's importable.
 
+import std.io;
 import std.list;
 import std.str;
 import std.toml;
@@ -26,13 +34,37 @@ let doc m = m.[:doc else (%{})];
 let name m = toml.get "" (doc m) "package" "name";
 let version m = toml.get "0.0.0" (doc m) "package" "version";
 
-/// Where this package's modules are, relative to the manifest. Defaults to the
-/// manifest's own directory, which is what a single-file project wants.
-let src m = util.join (root m) (toml.get "." (doc m) "package" "src");
+/// Where this package's modules are. What the manifest says, relative to it;
+/// otherwise a `src` directory when there is one, and the manifest's own
+/// directory when there is not. That is the compiler's rule too
+/// (`package.load_manifest!` in dreams), and the two must agree: `mind` looks
+/// for the entry file here and the compiler names the package's modules from
+/// here, so a project laid out as `src/main.dr` would otherwise build under one
+/// and not the other.
+let src! m =
+    match toml.get () (doc m) "package" "src" {
+        () => {
+            let conventional = util.join (root m) "src";
+            if io.is_dir! conventional { conventional } else { root m }
+        },
+        s => util.join (root m) s,
+    };
 
-/// The file a build starts from. `main.dr` beside the sources unless the
-/// manifest says otherwise.
-let entry m = util.join (src m) (toml.get "main.dr" (doc m) "package" "entry");
+/// The file a build starts from: what `[package] entry` says, relative to the
+/// sources; otherwise `main.dr` beside them, or beside the manifest when a
+/// project keeps its library in `src/` and its program at the top.
+let entry! m =
+    match toml.get () (doc m) "package" "entry" {
+        () => {
+            let beside_src = util.join (src! m) "main.dr";
+            let beside_root = util.join (root m) "main.dr";
+            match [io.exists! beside_src, io.exists! beside_root] {
+                [false, true] => beside_root,
+                _ => beside_src,
+            }
+        },
+        e => util.join (src! m) e,
+    };
 
 // --- `[build]`: how this package is compiled ---------------------------------
 //
@@ -47,7 +79,7 @@ let entry m = util.join (src m) (toml.get "main.dr" (doc m) "package" "entry");
 let build_list m key =
     match toml.get () (doc m) "build" key {
         () => [],
-        v => match v { [_, .._] => v, "" => [], one => [one] },
+        v => match type_of v { :list => v, _ => match v { "" => [], one => [one] } },
     };
 
 /// `when` flags this package is always compiled with: `defines = ["fast"]`.
@@ -73,8 +105,67 @@ let compiler m = toml.get () (doc m) "build" "compiler";
 /// Where the built image goes. `target/<name>.dream` unless the manifest says.
 let output m = toml.get () (doc m) "build" "output";
 
-/// `[[name, spec], ..]`, the spec being the inline table as written.
-let dependencies m = toml.entries (doc m) "dependencies";
+// --- dependencies -------------------------------------------------------------
+//
+// A dependency is `[key, spec]`, and the spec is always a map by the time
+// anything else sees it. Three spellings are read:
+//
+//   util = "../util"                                 a path
+//   json = "https://github.com/u/json#v1.0"          git, pinned after the `#`
+//   json = { git = "https://..", tag = "v1.0" }      the long form of either
+//
+// A string with `://` in it (or a `git@host:` address) is somewhere to fetch
+// and anything else is a directory, which is the only reading of a bare string
+// that does not need to be explained.
+
+/// A 7-to-40-digit hex string is a commit, which `git clone --branch` cannot
+/// take; anything else after the `#` is a tag or a branch, which it can.
+let looks_like_rev r = {
+    let hex c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    let n = str.byte_length r;
+    n >= 7 && n <= 40 && list.all hex (str.chars r)
+};
+
+let is_remote s = str.contains_str "://" s || str.starts_with "git@" s;
+
+let is_tarball s =
+    str.ends_with ".tar.gz" s || str.ends_with ".tgz" s;
+
+/// `"url#ref"` split at the `#`: `[url, ref]`, the ref `()` when there is none.
+let split_ref s =
+    match str.find "#" s {
+        i if i >= 0 => [str.slice 0 i s, str.slice (i + 1) (str.byte_length s - i - 1) s],
+        _ => [s, ()],
+    };
+
+/// The spec a bare string stands for.
+let string_spec s =
+    match [is_remote s, is_tarball s] {
+        [false, _] => %{ "path" => s },
+        [true, true] => %{ "url" => s },
+        [true, false] => match split_ref s {
+            [u, ()] => %{ "git" => u },
+            [u, r] => if looks_like_rev r { %{ "git" => u, "rev" => r } }
+                      else { %{ "git" => u, "tag" => r } },
+        },
+    };
+
+let normalize_spec spec =
+    match type_of spec {
+        :string => string_spec spec,
+        :map => spec,
+        _ => %{},
+    };
+
+let section_deps m section =
+    list.map (fn e -> [list.head e, normalize_spec (list.nth 1 e)])
+             (toml.entries (doc m) section);
+
+/// `[[key, spec], ..]` from `[dependencies]`, every spec a map.
+let dependencies m = section_deps m "dependencies";
+
+/// `[dev-dependencies]`: what `mind test` also sees, and nothing else does.
+let dev_dependencies m = section_deps m "dev-dependencies";
 
 let dep_name d = list.head d;
 let dep_spec d = list.nth 1 d;
@@ -103,6 +194,19 @@ let dep_rev d =
         [t, _, _] => [:tag, t],
     };
 
+/// Where a dependency comes from, as a person would write it: for `mind deps`
+/// and for an error about it.
+let dep_source d =
+    match dep_kind d {
+        :path => to_string (spec_get d "path"),
+        :url => to_string (spec_get d "url"),
+        :git => to_string (spec_get d "git") + match dep_rev d {
+            [:none, _] => "",
+            [_, r] => "#" + to_string r,
+        },
+        _ => "(nowhere)",
+    };
+
 /// Read the manifest in `dir`, or `[:error, message]`.
 let load! dir = {
     let path = util.join dir "mind.toml";
@@ -121,6 +225,23 @@ let load! dir = {
     }
 };
 
+/// The manifest of a dependency, which is allowed not to have one: a directory
+/// of `.dr` files is a package named by the key it was listed under. Answers
+/// `[:ok, m]`, `[:none]`, or `[:error, why]` for a manifest that is there and
+/// wrong -- that one is reported, because somebody meant it to say something.
+let load_dependency! dir =
+    match io.exists! (util.join dir "mind.toml") {
+        false => [:none],
+        true => match util.read_file! (util.join dir "mind.toml") {
+            () => [:error, "cannot read " + util.join dir "mind.toml"],
+            text => match toml.parse text {
+                [:ok, d] => [:ok, make dir d],
+                [:error, why] => [:error, util.join dir "mind.toml" + ": " + why],
+                _ => [:error, util.join dir "mind.toml" + ": could not be read"],
+            },
+        },
+    };
+
 /// Walk up from `dir` looking for a manifest, so `mind build` works from
 /// anywhere inside a project -- the same way `git` finds its root.
 let rec find! dir =
@@ -131,6 +252,98 @@ let rec find! dir =
             else { find! parent }
         },
         _ => load! dir,
+    };
+
+// --- editing a manifest ---------------------------------------------------------
+//
+// `mind add` and `mind remove` change one line of the file and leave every
+// other byte alone. A manifest is written by a person, with comments and an
+// order and a blank line where they wanted one, and reading it into a table and
+// printing the table back would throw all of that away. So this works on lines:
+// find the section, find the key in it, and replace, insert or drop that line.
+
+/// The line a dependency is written as.
+let quoted s = "\"" + s + "\"";
+
+let spec_line key spec = {
+    let field k = match spec.[k else ()] { () => [], v => [k + " = " + quoted (to_string v)] };
+    let fields = list.concat (list.map field ["path", "git", "url", "tag", "branch", "rev"]);
+    key + " = { " + str.join_str ", " fields + " }"
+};
+
+let is_header line = str.starts_with "[" (str.trim line);
+
+/// Does `line` set `key`? `key = ..`, `key= ..` and a quoted `"key" = ..` all do.
+let sets_key key line = {
+    let t = str.trim line;
+    let rest_after prefix =
+        if str.starts_with prefix t {
+            str.starts_with "=" (str.trim (str.slice (str.byte_length prefix)
+                                                      (str.byte_length t - str.byte_length prefix) t))
+        } else { false };
+    rest_after key || rest_after (quoted key)
+};
+
+/// `[before, header, body, after]`: the lines of the file split around
+/// `[section]`, the header `()` when there is no such section.
+let split_section section lines = {
+    let header = "[" + section + "]";
+    let rec in_body pre h acc ls =
+        match ls {
+            [] => [pre, h, list.reverse acc, []],
+            [l, ..rest] =>
+                if is_header l { [pre, h, list.reverse acc, ls] }
+                else { in_body pre h (list.cons l acc) rest },
+        };
+    let rec before acc ls =
+        match ls {
+            [] => [list.reverse acc, (), [], []],
+            [l, ..rest] =>
+                if str.trim l == header { in_body (list.reverse acc) l [] rest }
+                else { before (list.cons l acc) rest },
+        };
+    before [] lines
+};
+
+/// The body with `line` in place of the one setting `key`, or added after the
+/// last line that is not blank, so the blank line before the next section stays
+/// where it was.
+let put_line key line body =
+    match list.any (sets_key key) body {
+        true => list.map (fn l -> if sets_key key l { line } else { l }) body,
+        false => {
+            let trailing = list.reverse (list.take_while (fn l -> str.is_empty (str.trim l))
+                                                         (list.reverse body));
+            let kept = list.take (list.length body - list.length trailing) body;
+            list.concat [kept, [line], trailing]
+        },
+    };
+
+let join_lines ls = str.join_str "\n" ls;
+
+/// `text` with `key = spec` written into `[section]`, replacing what was there.
+let with_dependency section key spec text = {
+    let line = spec_line key spec;
+    match split_section section (str.split "\n" text) {
+        [pre, (), _, _] => {
+            let base = str.trim_end text;
+            (if str.is_empty base { "" } else { base + "\n\n" })
+                + "[" + section + "]\n" + line + "\n"
+        },
+        [pre, h, body, post] =>
+            join_lines (list.concat [pre, [h], put_line key line body, post]),
+    }
+};
+
+/// `[text, removed]`: `text` without the line setting `key` in `[section]`.
+let without_dependency section key text =
+    match split_section section (str.split "\n" text) {
+        [_, (), _, _] => [text, false],
+        [pre, h, body, post] => {
+            let kept = list.filter (fn l -> not (sets_key key l)) body;
+            [join_lines (list.concat [pre, [h], kept, post]),
+             list.length kept != list.length body]
+        },
     };
 
 when test {
@@ -166,21 +379,34 @@ when test {
         test.case "flags are passed through as written"
             $( test.eq! ["-q"] (compiler_flags (of "[build]\nflags = [\"-q\"]")) ),
 
-        test.case "src defaults to the manifest's directory"
-            $( test.eq! "." (src (of "[package]\nname = \"d\"")) ),
-        test.case "entry defaults to main.dr"
-            $( test.eq! "main.dr" (entry (of "[package]\nname = \"d\"")) ),
-        test.case "entry can be set"
-            $( test.eq! "cli.dr" (entry (of "[package]\nname=\"d\"\nentry=\"cli.dr\"")) ),
-
+        // --- dependencies ---
         test.case "a path dependency"
             $( test.eq! :path (dep_kind (dep_of "[dependencies]\na = { path = \"../a\" }")) ),
+        test.case "a bare string is a path"
+            $( test.eq! [:path, "../a"]
+                        { let d = dep_of "[dependencies]\na = \"../a\"";
+                          [dep_kind d, spec_get d "path"] } ),
+        test.case "a bare URL is git, pinned after the #"
+            $( test.eq! [:git, "https://h/u/j", [:tag, "v1.0"]]
+                        { let d = dep_of "[dependencies]\nj = \"https://h/u/j#v1.0\"";
+                          [dep_kind d, spec_get d "git", dep_rev d] } ),
+        test.case "a hex ref is a commit"
+            $( test.eq! [:rev, "abc1234"]
+                        (dep_rev (dep_of "[dependencies]\nj = \"https://h/u/j#abc1234\"")) ),
+        test.case "a bare URL with no ref is unpinned"
+            $( test.eq! [:none, ()] (dep_rev (dep_of "[dependencies]\nj = \"git@h:u/j\"")) ),
+        test.case "a bare tarball URL is a url dependency"
+            $( test.eq! :url (dep_kind (dep_of "[dependencies]\nj = \"https://h/j-1.0.tar.gz\"")) ),
         test.case "a git dependency"
             $( test.eq! :git (dep_kind (dep_of "[dependencies]\na = { git = \"u\" }")) ),
         test.case "a url dependency"
             $( test.eq! :url (dep_kind (dep_of "[dependencies]\na = { url = \"u\" }")) ),
         test.case "a dependency with no source"
             $( test.eq! :unknown (dep_kind (dep_of "[dependencies]\na = { x = 1 }")) ),
+        test.case "dev dependencies are their own list"
+            $( test.eq! [["a"], ["t"]]
+                        { let m = of "[dependencies]\na = \"../a\"\n[dev-dependencies]\nt = \"../t\"";
+                          [list.map dep_name (dependencies m), list.map dep_name (dev_dependencies m)] } ),
 
         test.case "pinned by tag"
             $( test.eq! [:tag, "v1"] (dep_rev (dep_of "[dependencies]\na={git=\"u\",tag=\"v1\"}")) ),
@@ -193,5 +419,30 @@ when test {
         test.case "a tag wins over a branch"
             $( test.eq! [:tag, "v1"]
                         (dep_rev (dep_of "[dependencies]\na={git=\"u\",tag=\"v1\",branch=\"m\"}")) ),
+        test.case "where a dependency comes from"
+            $( test.eq! "u#v1" (dep_source (dep_of "[dependencies]\na={git=\"u\",tag=\"v1\"}")) ),
+
+        // --- editing ---
+        test.case "adding to an existing section keeps what follows it"
+            $( test.eq! "[package]\nname = \"p\"\n\n[dependencies]\nold = \"x\"\nnew = { path = \"../n\" }\n\n[build]\n"
+                        (with_dependency "dependencies" "new" (%{ "path" => "../n" })
+                            "[package]\nname = \"p\"\n\n[dependencies]\nold = \"x\"\n\n[build]\n") ),
+        test.case "adding a key that is there replaces its line"
+            $( test.eq! "[dependencies]\na = { git = \"u\", tag = \"v2\" }\nb = \"y\""
+                        (with_dependency "dependencies" "a" (%{ "git" => "u", "tag" => "v2" })
+                            "[dependencies]\na = \"x\"\nb = \"y\"") ),
+        test.case "adding with no section makes one"
+            $( test.eq! "[package]\nname = \"p\"\n\n[dependencies]\na = { path = \"../a\" }\n"
+                        (with_dependency "dependencies" "a" (%{ "path" => "../a" })
+                            "[package]\nname = \"p\"\n") ),
+        test.case "a key is not a prefix of another"
+            $( test.eq! [false, true, true] [sets_key "a" "ab = 1", sets_key "a" "a= 1",
+                                              sets_key "a" "  \"a\" = 1"] ),
+        test.case "removing drops only that line"
+            $( test.eq! ["[dependencies]\nb = \"y\"\n[build]\na = 1", true]
+                        (without_dependency "dependencies" "a"
+                            "[dependencies]\na = \"x\"\nb = \"y\"\n[build]\na = 1") ),
+        test.case "removing what is not there says so"
+            $( test.eq! false (list.nth 1 (without_dependency "dependencies" "z" "[dependencies]\na = 1")) ),
     ];
 }

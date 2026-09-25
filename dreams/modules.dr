@@ -848,7 +848,8 @@ let rec enclosing_minds! dir acc = {
 
 let default_search_paths! file extra =
     list.concat [
-        extra,
+        // A root may be written `NAME=DIR`; as a search path it is the directory.
+        list.map package.root_dir extra,
         [path.dirname file],
         enclosing_minds! (path.dirname (path.absolute! file)) [],
         match os.env! "MINDV2_PATH" {

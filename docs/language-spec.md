@@ -1116,10 +1116,20 @@ src = "."
 
 [dependencies]
 other = { path = "../other" }
+json  = "../vendor/dream-json"
 ```
 
-`name` is required; `version` defaults to `0.0.0` and `src` to the manifest's
-own directory. Only path dependencies are supported so far.
+`name` is required; `version` defaults to `0.0.0` and `src` to a `src`
+directory when there is one and the manifest's own directory otherwise. The
+compiler follows path dependencies (`{ path = .. }`, or a bare string); `mind`
+also fetches git and tarball dependencies and hands them over with `-L`.
+
+**A dependency's key is a name it can be imported by.** `json = ..` above makes
+`import json.parse` work whatever the package at that path calls itself: the key
+is recorded as a second name for the same package, and a module's identity is
+still its file, so reaching it through either name is reaching one module. A
+dependency directory with **no manifest** is a package too, named by its key.
+On the command line, `-L NAME=DIR` says the same thing.
 
 A project is itself a package, so its own modules are reachable both as
 `mypkg.util` and, from inside, as plain `util`. Dropping a manifest into a
@@ -1842,7 +1852,7 @@ dreams FILE [-o OUT.dream] [options]
 |------|-|
 | `-o`, `--output PATH` | where to write the image |
 | `-I`, `--include DIR` | add a module search directory |
-| `-L`, `--package-path DIR` | add a package search root |
+| `-L`, `--package-path DIR` | add a package search root; `NAME=DIR` adds the package at `DIR`, importable as `NAME` |
 | `--host-module PATH` | a module the host registers at run time (repeatable) |
 | `-D`, `--define NAME[=VALUE]` | define a `when` flag |
 | `--test` | define `test` and generate a runner (see below) |

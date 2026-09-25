@@ -44,6 +44,18 @@ run `just bootstrap` and copy `build/dreams.dream` over the seed.
 ([mind/tool/build.dr](mind/tool/build.dr#L139)). A name ending in `.dream`
 is an image and is run by the VM; anything else is executed directly.
 
+A dependency is used by listing it in `[dependencies]` and nothing else: the
+key is its import name, a bare string is a path or a pinned URL, and a
+directory with no `mind.toml` is still a package. `mind` walks the graph
+(`build.graph!`), fetches, reports two different directories under one name as
+a conflict, and hands each package to the compiler as `-L DIR`, or `-L KEY=DIR`
+when the key is not the package's own name. The compiler half of that -- a key
+as a second name for a package, and a manifest-less package -- is `alias!` and
+`add_named!` in [dreams/package.dr](dreams/package.dr), so `dreams` follows a
+path dependency the same way without `mind`. `mind add`/`remove` edit the
+manifest a line at a time and leave the rest of the file as written.
+[mind/tool/README.md](mind/tool/README.md) is the user-facing half.
+
 ## Building
 
 ```
