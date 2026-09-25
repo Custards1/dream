@@ -1559,23 +1559,28 @@ let rec is_float_type k t = match peel k t 8 {
     _ => false,
 };
 
-/// Bit `i` set when parameter `i` of an `arity`-parameter function of type `t`
-/// is declared a float. Parameters past 62 are not described: a mask is a
-/// fixnum, and a function the JIT would take has fewer slots than that.
-let rec float_mask k t i arity bit acc =
+let rec is_integer_type k t = match peel k t 8 {
+    :integer => true,
+    [:lit, :integer, _] => true,
+    [:union, ts] => list.all (fn x -> is_integer_type k x) ts,
+    _ => false,
+};
+
+/// Parameters past 62 are not described: the mask itself is a fixnum.
+let rec param_mask k accepts t i arity bit acc =
     if i >= arity || i >= 62 { acc }
     else {
         match peel k t 8 {
             [:fn, a, b] =>
-                float_mask k b (i + 1) arity (bit * 2) (if is_float_type k a { acc + bit } else { acc }),
+                param_mask k accepts b (i + 1) arity (bit * 2)
+                    (if accepts k a { acc + bit } else { acc }),
             _ => acc,
         }
     };
 
-/// Every top-level function whose signature declares a float parameter, as a
-/// map from the global it is bound to to its mask. A map because a body
-/// inherited through `derive` is walked once per module that derives it.
-let float_params l r = {
+/// Declared parameter masks by global. A map because a body inherited through
+/// `derive` is walked once per module that derives it.
+let declared_params l r accepts = {
     let [k, _] = checker l r;
     list.fold (fn acc b -> {
         let [mi, _, d, _] = b;
@@ -1584,7 +1589,7 @@ let float_params l r = {
             () => acc,
             gi => match (Checker.sigs k).[gi else ()] {
                 () => acc,
-                t => match float_mask k t 0 arity 1 0 {
+                t => match param_mask k accepts t 0 arity 1 0 {
                     0 => acc,
                     mask => acc.[gi => mask],
                 },
@@ -1592,6 +1597,10 @@ let float_params l r = {
         }
     }) %{} (scope.bodies r)
 };
+
+let float_params l r = declared_params l r is_float_type;
+// ITYP favors the checked fixnum path; unlike TYPE it changes no representation.
+let integer_params l r = declared_params l r is_integer_type;
 
 /// Where a diagnostic points, as one number that orders them the way a reader
 /// would: by file, then by position in it.

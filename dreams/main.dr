@@ -240,12 +240,12 @@ let copy_payload! out path n =
         },
     };
 
-/// The checker's float parameters, by *function* rather than by global: `[fi,
-/// mask]`, in function order, which is what the image's `TYPE` section records
+/// The checker's parameter hints, by *function* rather than by global: `[fi,
+/// mask]`, in function order, which is what `TYPE` and `ITYP` record
 /// and what the JIT looks a function up by. A global names its function
 /// through its record, and a global that is not a function -- an alias of a
 /// module -- has no parameters to describe.
-let float_params_of img by_global = {
+let params_of img by_global = {
     let globals = core.map_get img :globals [];
     let found = list.fold (fn acc kv -> {
         let [gi, mask] = kv;
@@ -284,8 +284,10 @@ let build! l out shebang payloads optimize types = {
         // been settled into the placeholder that was waiting for it, and two
         // nodes that differ only in a flag are two nodes.
         let built = if optimize { optimizer.optimize (lower.image low) } else { lower.image low };
-        let img = core.map_put (core.map_put built :payloads sizes)
-                               :float_params (float_params_of built (if types { typecheck.float_params l r } else { %{} }));
+        let floats = core.map_put (core.map_put built :payloads sizes)
+                               :float_params (params_of built (if types { typecheck.float_params l r } else { %{} }));
+        let img = core.map_put floats :integer_params
+                    (params_of built (if types { typecheck.integer_params l r } else { %{} }));
         let payload_bytes = list.fold (fn n k -> n + k) 0 sizes;
         // The shebang goes in front of the image rather than into it: the VM
         // skips a leading `#!` line when it loads a file, which is what makes

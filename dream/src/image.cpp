@@ -317,6 +317,9 @@ bool Image::parse(std::string& error) {
             payload_off_ = s.offset;
             payload_ = reinterpret_cast<const char*>(base + 8);
             has_payload_ = true;
+        } else if (s.kind == tag("ITYP")) {
+            if (!fits(sizeof(TypeRec))) { error = "ITYP section is short"; return false; }
+            integer_types_ = reinterpret_cast<const TypeRec*>(base); n_integer_types_ = s.count;
         } else if (s.kind == tag("TYPE")) {
             if (!fits(sizeof(TypeRec))) { error = "TYPE section is short"; return false; }
             types_ = reinterpret_cast<const TypeRec*>(base); n_types_ = s.count;
@@ -329,7 +332,12 @@ bool Image::parse(std::string& error) {
     if (!validate(error)) return false;
     if (n_types_) {
         float_params_.assign(n_funcs_, 0);
-        for (uint32_t i = 0; i < n_types_; ++i) float_params_[types_[i].func] = types_[i].float_params;
+        for (uint32_t i = 0; i < n_types_; ++i) float_params_[types_[i].func] = types_[i].params;
+    }
+    if (n_integer_types_) {
+        integer_params_.assign(n_funcs_, 0);
+        for (uint32_t i = 0; i < n_integer_types_; ++i)
+            integer_params_[integer_types_[i].func] = integer_types_[i].params;
     }
     // Decode trivial record readers once, without changing the image format.
     accessors_.assign(n_funcs_, Accessor{});
@@ -442,6 +450,9 @@ bool Image::validate(std::string& error) {
         }
     }
 
+    for (uint32_t i = 0; i < n_integer_types_; ++i) {
+        if (integer_types_[i].func >= n_funcs_) return fail("integer type record names an out-of-range function");
+    }
     for (uint32_t i = 0; i < n_types_; ++i) {
         if (types_[i].func >= n_funcs_) return fail("type record names an out-of-range function");
     }

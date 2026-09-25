@@ -4,10 +4,11 @@
 What is held here: that a signature is checked where it is written and at
 every use, that code no signature touches is never rejected, that a `match`
 on a declared union must handle every variant, and that none of it changes
-what a program compiles to."""
+the executable code a program compiles to."""
 import argparse
 import pathlib
 import subprocess
+import struct
 import tempfile
 
 parser = argparse.ArgumentParser()
@@ -170,8 +171,8 @@ let main! = {
 };
 ''', ':type_error\n:not_a_function\n:type_error\n')
 
-    # `--no-types` skips the pass, and a signature compiles to nothing, so a
-    # program's image is the same bytes with the checker or without it.
+    # `--no-types` skips checking and signature hints. Executable sections
+    # stay identical; the typed image additionally records integer parameters.
     typed = prelude + '''
 let add : :integer -> :integer -> :integer;
 let add x y = x + y;
@@ -179,7 +180,29 @@ let main! = console.print! (add 1 2);
 '''
     assert compile_source(typed, out='a.dream').returncode == 0
     assert compile_source(typed, '--no-types', out='b.dream').returncode == 0
-    assert (temp / 'a.dream').read_bytes() == (temp / 'b.dream').read_bytes()
+    def sections(path):
+        data = path.read_bytes()
+        count, = struct.unpack_from('<I', data, 28)
+        result = {}
+        for i in range(count):
+            kind, offset, length, entries = struct.unpack_from('<4sIII', data, 32 + i * 16)
+            result[kind] = (entries, data[offset:offset + length])
+        return result
+
+    with_types = sections(temp / 'a.dream')
+    without_types = sections(temp / 'b.dream')
+    entries, hints = with_types.pop(b'ITYP')
+    records = list(struct.iter_unpack('<IIQ', hints))
+    assert len(records) == entries and all(reserved == 0 for _, reserved, _ in records)
+
+    def function_name(fi):
+        name_index, = struct.unpack_from('<I', with_types[b'FUNC'][1], fi * 32)
+        offset, length = struct.unpack_from('<II', with_types[b'KSTR'][1], name_index * 8)
+        return with_types[b'SBLB'][1][offset:offset + length]
+
+    assert any(function_name(fi) == b'add' and mask == 3 for fi, _, mask in records)
+    assert b'ITYP' not in without_types
+    assert with_types == without_types
     broken = prelude + 'let n : :string = 5; let main! = console.print! n;'
     assert compile_source(broken, '--no-types').returncode == 0
     count += 2

@@ -201,6 +201,12 @@ On a tail-recursive counting loop the compiled version runs about 14× faster
 than the interpreter and allocates nothing, where the interpreter allocated a
 thunk per iteration.
 
+Atom and list-head switches compile to LLVM dispatch with a default arm.
+List-head dispatch forces the head only for a cons, and branch analysis keeps
+lazy arguments and tail calls in the same order as the interpreter. Integer
+signature hints favor the existing checked fixnum fast paths; float hints can
+select guarded unboxed doubles.
+
 `--dump-jit <function>` prints the generated LLVM IR.
 
 ## Embedding

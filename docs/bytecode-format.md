@@ -65,6 +65,7 @@ Unknown section kinds must be skipped, not treated as an error.
 | `IMPT` | `u32 path, u32 alias`                               | imports; both are `KSTR` indices |
 | `MODS` | 24 bytes (below)                                    | module records: which globals belong to which module |
 | `SPAN` | `u32 start, u32 end`                                 | per-node source spans, parallel to `NODE` |
+| `ITYP` | `u32 func, u32 reserved, u64 integer_params`        | integer signature hints for the JIT |
 | `TYPE` | `u32 func, u32 reserved, u64 float_params`          | what signatures declared, for the JIT (below) |
 | `LDAT` | `u64 offset, u64 length`                            | large-data table, into `PAYL` |
 | `PAYL` | `u64 byte_length` header, then the bytes            | the payload; last in the file |
@@ -231,6 +232,19 @@ every program correctly; one that ignores it loses only speed.
 
 **Validation.** `count * 16 <= length`, and every `func` is below the number of
 function records.
+
+## Integer hints (`ITYP`)
+
+The optional `ITYP` section uses the same 16-byte record layout and validation
+as `TYPE`, with a mask of declared `:integer` parameters instead. It covers the
+first 62 parameters and is omitted when no signature supplies a hint. Aliases,
+integer literal types, and unions consisting entirely of integer types qualify.
+Older readers can skip the section without changing program behavior.
+
+The JIT uses these hints to favor the checked fixnum arithmetic path in code
+layout. Values remain tagged; neither the signature nor propagated arithmetic
+hints prove that a value fits a fixnum. Runtime type checks, overflow handling,
+and slow paths remain active, including for calls from untyped code.
 
 ## Large data (`LDAT` and `PAYL`)
 

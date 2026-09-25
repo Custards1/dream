@@ -20,6 +20,10 @@ extern "C" {
 /// which case *out holds the error).
 int dream_rt_force(dream::Process* p, dream::Value v, dream::Value* out);
 
+/// Force a cons head for switch_head, with the same success/error convention.
+/// Non-cons subjects produce UNIT, which dispatches to the default arm.
+int dream_rt_switch_head(dream::Process* p, dream::Value v, dream::Value* out);
+
 /// Arithmetic and comparison slow paths: floats, strings, overflow, and the
 /// type errors. `op` is the image opcode.
 int dream_rt_arith(dream::Process* p, int32_t op, dream::Value a, dream::Value b, dream::Value* out);

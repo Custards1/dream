@@ -69,6 +69,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/TargetSelect.h"
@@ -386,7 +387,9 @@ NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node, uint
         return site;
     }
 
-    if (!native_is_pure(name)) return site;
+    // Match failure is a raise, which the helper reports through the ordinary
+    // error status. It performs no external effect despite the bang suffix.
+    if (!native_is_pure(name) && !(site.builtin && std::strcmp(name, "raise!") == 0)) return site;
     if (arity == NATIVE_VARIADIC || arity != argc || arity > kMaxNativeArgs) return site;
     // A native that vouches for the collector is one this tier must not call:
     // it walks a lazy structure underneath itself and is written so a
@@ -400,10 +403,16 @@ NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node, uint
     return site;
 }
 
-/// The ops the emitter can write. `Op::ConstAtom` and `Op::Capture` are
-/// deliberately absent: an atom index has to be remapped through the runtime
-/// and a capture lives in the frame, and the emitter refuses both. It used to
-/// refuse them *after* the analysis had said yes, which cost nothing while a
+// The lowerer's catch-all arm is `if true`, followed by a match-error
+// fallback. That dead fallback must not weaken strictness or result types.
+int constant_condition(const Image& img, const Node& n) {
+    const Node& condition = img.node(n.a);
+    return Op(condition.op) == Op::ConstBool ? int(condition.a != 0) : -1;
+}
+
+/// The ops the emitter can write. `Op::Capture` is deliberately absent:
+/// a capture lives in the frame, beyond the parameters this emitter reads. The
+/// emitter used to refuse unsupported ops *after* the analysis had said yes, which cost nothing while a
 /// compile was one function -- the emitter gave up and the function was marked
 /// rejected. It is not free now: an emitter that gives up on a peer gives up on
 /// the whole closure, including a root that had nothing wrong with it. So the
@@ -411,7 +420,8 @@ NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node, uint
 bool op_is_supported(Op op) {
     switch (op) {
         case Op::ConstInt: case Op::ConstFloat: case Op::ConstBool:
-        case Op::ConstChar: case Op::Unit:
+        case Op::ConstChar: case Op::ConstAtom: case Op::Unit:
+        case Op::SwitchAtom: case Op::SwitchHead:
         case Op::Local:
         case Op::If: case Op::Block: case Op::Force:
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
@@ -639,9 +649,19 @@ private:
         }
 
         switch (op) {
-            case Op::If:
+            case Op::SwitchAtom: case Op::SwitchHead:
+                if (!check(n.a, depth + 1)) return false;
+                for (uint32_t i = 1; i < n.c; i += 2) {
+                    if (!check(img_.kid(n.b + i), depth + 1)) return false;
+                }
+                return check(img_.kid(n.b + n.c - 1), depth + 1);
+            case Op::If: {
+                const int c = constant_condition(img_, n);
+                if (c >= 0) return c ? check(n.b, depth + 1)
+                                    : (n.c == NO_NODE || check(n.c, depth + 1));
                 return check(n.a, depth + 1) && check(n.b, depth + 1) &&
                        (n.c == NO_NODE || check(n.c, depth + 1));
+            }
             case Op::Block:
                 for (uint32_t i = 0; i < n.b; ++i) {
                     uint32_t stmt = img_.kid(n.a + i);
@@ -827,12 +847,17 @@ private:
 
     /// A `let` statement. Answers false to refuse the whole function.
     bool check_bind(const Node& n, int depth) {
-        // An impure `let` is a statement, not a binding: the block runs it where
-        // it stands because the effect has to happen there, and writing it
-        // somewhere else would move the effect. Its value would have to be a
-        // call this tier refuses anyway -- but the reason to refuse is the
-        // order, which is worth saying where the order is decided.
-        if (n.flags & F_STRICT) return false;
+        // A strict binding must run where it stands. Only parameter aliases
+        // are substitutable without repeating its work; block() forces those
+        // at the binding point and load_slot caches the answer.
+        if (n.flags & F_STRICT) {
+            // The match lowerer binds its subject strictly. A parameter alias
+            // can still be substituted after forcing it at the binding point:
+            // load_slot remembers the forced value. Other strict bindings need
+            // real stored values and remain outside this tier.
+            const Node& value = img_.node(n.b);
+            if (Op(value.op) != Op::Local || value.a >= f_.arity) return false;
+        }
         // Into a parameter's slot, or past the end of the frame: neither is
         // something the compiler emits, and neither has a meaning here.
         if (n.a < f_.arity || n.a >= f_.slots) return false;
@@ -880,7 +905,16 @@ private:
             case Op::Apply:
                 *calls = true;
                 return 1;
+            case Op::SwitchAtom: case Op::SwitchHead: {
+                uint32_t c = 1 + expand_cost(n.a, depth + 1, calls);
+                for (uint32_t i = 1; i < n.c; i += 2)
+                    c += expand_cost(img_.kid(n.b + i), depth + 1, calls);
+                return c + expand_cost(img_.kid(n.b + n.c - 1), depth + 1, calls);
+            }
             case Op::If: {
+                if (constant_condition(img_, n) == 1) return expand_cost(n.b, depth + 1, calls);
+                if (constant_condition(img_, n) == 0)
+                    return n.c == NO_NODE ? 1 : expand_cost(n.c, depth + 1, calls);
                 uint32_t c = 1 + expand_cost(n.a, depth + 1, calls) +
                              expand_cost(n.b, depth + 1, calls);
                 if (n.c != NO_NODE) c += expand_cost(n.c, depth + 1, calls);
@@ -936,13 +970,24 @@ private:
         if (depth > 256) return 0;
         const Node& n = img_.node(node);
         switch (Op(n.op)) {
+            case Op::Bind:
+                return (n.flags & F_STRICT) ? strict_of(n.b, depth + 1) : 0;
             case Op::Local:
                 // A bound slot is the expression it was bound to, written here.
                 if (n.a >= f_.arity && binds_[n.a] != NO_NODE) {
                     return strict_of(binds_[n.a], depth + 1);
                 }
                 return SlotSet(1) << n.a;
+            case Op::SwitchAtom: case Op::SwitchHead: {
+                SlotSet arms = strict_of(img_.kid(n.b + n.c - 1), depth + 1);
+                for (uint32_t i = 1; i < n.c; i += 2)
+                    arms &= strict_of(img_.kid(n.b + i), depth + 1);
+                return strict_of(n.a, depth + 1) | arms;
+            }
             case Op::If:
+                if (constant_condition(img_, n) == 1) return strict_of(n.b, depth + 1);
+                if (constant_condition(img_, n) == 0)
+                    return n.c == NO_NODE ? 0 : strict_of(n.c, depth + 1);
                 // The condition always runs; a branch only counts when both
                 // arms force it.
                 return strict_of(n.a, depth + 1) |
@@ -1064,6 +1109,8 @@ private:
         if (depth > 128) return false;
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
+            case Op::Bind:
+                return !(n.flags & F_STRICT) || force_order(n.b, depth + 1, out);
             case Op::Local:
                 if (n.a >= f_.arity && binds_[n.a] != NO_NODE) {
                     return force_order(binds_[n.a], depth + 1, out);
@@ -1080,7 +1127,15 @@ private:
                 // on the left, so the order is only definite up to here.
                 force_order(n.a, depth + 1, out);
                 return false;
+            case Op::SwitchAtom: case Op::SwitchHead:
+                // The head may itself force work before any arm executes.
+                // Keep the entry prefix to the subject; peeling handles the rest.
+                force_order(n.a, depth + 1, out);
+                return false;
             case Op::If: {
+                if (constant_condition(img_, n) == 1) return force_order(n.b, depth + 1, out);
+                if (constant_condition(img_, n) == 0)
+                    return n.c == NO_NODE || force_order(n.c, depth + 1, out);
                 if (!force_order(n.a, depth + 1, out)) return false;
                 if (n.c == NO_NODE) return false;
                 std::vector<uint32_t> t, e;
@@ -1146,7 +1201,18 @@ private:
             return;
         }
         switch (Op(n.op)) {
+            case Op::SwitchAtom: case Op::SwitchHead:
+                collect_calls(n.a, depth + 1);
+                for (uint32_t i = 1; i < n.c; i += 2)
+                    collect_calls(img_.kid(n.b + i), depth + 1);
+                collect_calls(img_.kid(n.b + n.c - 1), depth + 1);
+                return;
             case Op::If:
+                if (constant_condition(img_, n) >= 0) {
+                    uint32_t arm = constant_condition(img_, n) ? n.b : n.c;
+                    if (arm != NO_NODE) collect_calls(arm, depth + 1);
+                    return;
+                }
                 collect_calls(n.a, depth + 1);
                 collect_calls(n.b, depth + 1);
                 if (n.c != NO_NODE) collect_calls(n.c, depth + 1);
@@ -1210,7 +1276,16 @@ public:
                 }
                 return n.a < slot_ty_.size() ? slot_ty_[n.a] : Ty::Any;
             case Op::Force: case Op::Neg: return ty(n.a, depth + 1);
+            case Op::SwitchAtom: case Op::SwitchHead: {
+                Ty t = ty(img_.kid(n.b + n.c - 1), depth + 1);
+                for (uint32_t i = 1; i < n.c; i += 2)
+                    t = join(t, ty(img_.kid(n.b + i), depth + 1));
+                return t;
+            }
             case Op::If: {
+                if (constant_condition(img_, n) == 1) return ty(n.b, depth + 1);
+                if (constant_condition(img_, n) == 0)
+                    return n.c == NO_NODE ? Ty::Any : ty(n.c, depth + 1);
                 // An arm that transfers control -- a tail call -- contributes
                 // nothing, which is what makes the type of a loop body the type
                 // of its base case.
@@ -1462,8 +1537,11 @@ private:
     struct JV {
         llvm::Value* v = nullptr;
         bool dbl = false;
+        // A layout hint only: integers can overflow, and gradual callers can
+        // pass other types. Every fast path still checks its operands.
+        bool integer_hint = false;
     };
-    static JV tag(llvm::Value* v) { return JV{v, false}; }
+    static JV tag(llvm::Value* v, bool integer_hint = false) { return JV{v, false, integer_hint}; }
     static JV flt(llvm::Value* v) { return JV{v, true}; }
     static JV none() { return JV{nullptr, false}; }
 
@@ -1491,6 +1569,7 @@ private:
     JV logic(const Node& n);
     JV unary(const Node& n);
     JV conditional(const Node& n);
+    JV switch_node(const Node& n);
     JV block(const Node& n);
     JV apply(const Node& n);
     JV native_call(KnownNative which, const Node& n);
@@ -1647,7 +1726,7 @@ private:
     // Declarations of the runtime helpers.
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
-        rt_frame_slots_, rt_frame_store_, rt_native_, rt_builtin_;
+        rt_frame_slots_, rt_frame_store_, rt_native_, rt_builtin_, rt_switch_head_;
 };
 
 llvm::Function* Emitter::emit(const std::string& name) {
@@ -1674,6 +1753,8 @@ void Emitter::declare_helpers() {
     dbl_ = llvm::Type::getDoubleTy(ctx_);
     ptr_ = llvm::PointerType::getUnqual(ctx_);
 
+    rt_switch_head_ = mod_.getOrInsertFunction(
+        "dream_rt_switch_head", llvm::FunctionType::get(i32_, {ptr_, i64_, ptr_}, false));
     rt_force_ = mod_.getOrInsertFunction(
         "dream_rt_force", llvm::FunctionType::get(i32_, {ptr_, i64_, ptr_}, false));
     rt_arith_ = mod_.getOrInsertFunction(
@@ -2027,7 +2108,7 @@ Emitter::JV Emitter::load_slot(uint32_t slot) {
     // Write the forced value back so a second read in the same iteration is
     // free; the thunk itself was already updated by the runtime.
     b_.CreateStore(forced, slots_[slot]);
-    return tag(forced);
+    return tag(forced, (img_.integer_params(fi_) >> slot) & 1);
 }
 
 Emitter::JV Emitter::load_slot_raw(uint32_t slot) {
@@ -2241,7 +2322,7 @@ Emitter::JV Emitter::node(uint32_t idx) {
                 failed_ = true;
                 return none();
             }
-            return tag(i64(make_fixnum(v)));
+            return tag(i64(make_fixnum(v)), true);
         }
         case Op::ConstBool: return tag(i64(n.a ? TRUE_V : FALSE_V));
         case Op::ConstChar: return tag(i64(make_char(n.a)));
@@ -2253,12 +2334,8 @@ Emitter::JV Emitter::node(uint32_t idx) {
             // that never left the loop.
             return flt(llvm::ConstantFP::get(dbl_, img_.real(n.a)));
         case Op::ConstAtom:
-            // An atom's index is remapped through the runtime at load, so
-            // naming one here would need a call. Unreachable: `op_is_supported`
-            // does not list it. Kept because a switch that answers every op is
-            // easier to check than one that answers most of them.
-            failed_ = true;
-            return none();
+            return tag(i64(make_atom(rt_.image_atom(n.a))));
+        case Op::SwitchAtom: case Op::SwitchHead: return switch_node(n);
         case Op::Local:
             // A `let` has no thunk and no slot here: its value is written where
             // its name is read, which is here. See `Analyzer::check_bind`.
@@ -2266,8 +2343,7 @@ Emitter::JV Emitter::node(uint32_t idx) {
             return load_slot(n.a);
         case Op::Capture:
             // A capture lives in the frame, and a compiled body is a function
-            // of its arguments. Unreachable, for the same reason as the atom
-            // above.
+            // of its arguments. Unreachable: op_is_supported refuses it.
             failed_ = true;
             return none();
         case Op::Force: return node(n.a);
@@ -2289,7 +2365,11 @@ Emitter::JV Emitter::block(const Node& n) {
         // name is read -- so there is nothing to emit where it stands. A block
         // whose *last* statement is one has the value a block of no statements
         // has, which is what the interpreter's `advance_block` ends with too.
-        if (Op(img_.node(stmt).op) == Op::Bind) continue;
+        if (Op(img_.node(stmt).op) == Op::Bind) {
+            const Node& binding = img_.node(stmt);
+            if ((binding.flags & F_STRICT) && !node(binding.b).v) return none();
+            continue;
+        }
         if (!is_last && !(img_.node(stmt).flags & F_STRICT)) continue;
         JV v = node(stmt);
         if (failed_) return none();
@@ -2299,7 +2379,65 @@ Emitter::JV Emitter::block(const Node& n) {
     return last;
 }
 
+Emitter::JV Emitter::switch_node(const Node& n) {
+    JV subject = node(n.a);
+    if (failed_ || !subject.v) return none();
+    llvm::Value* key = box(subject);
+    if (Op(n.op) == Op::SwitchHead) {
+        auto* out = b_.CreateAlloca(i64_);
+        auto* ok = b_.CreateCall(rt_switch_head_, {proc_, key, out});
+        key = b_.CreateLoad(i64_, out);
+        auto* ready = bb("switch.head");
+        auto* raised = bb("switch.raise");
+        b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), ready, raised);
+        b_.SetInsertPoint(raised);
+        emit_raise(key);
+        b_.SetInsertPoint(ready);
+    }
+    auto* fallback = bb("switch.default");
+    auto* done = bb("switch.end");
+    auto* dispatch = b_.CreateSwitch(key, fallback, n.c / 2);
+    std::vector<std::pair<JV, llvm::BasicBlock*>> values;
+    bool doubles = true;
+    // Preserve first-match semantics even for hand-built tables with repeated
+    // keys (including distinct image atoms interned to the same runtime id).
+    std::unordered_set<Value> keys;
+    for (uint32_t i = 0; i <= n.c / 2; ++i) {
+        const bool last = i == n.c / 2;
+        auto* arm = last ? fallback : bb("switch.arm");
+        if (!last) {
+            const Node& atom = img_.node(img_.kid(n.b + 2 * i));
+            Value key_value = make_atom(rt_.image_atom(atom.a));
+            if (keys.insert(key_value).second)
+                dispatch->addCase(llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(i64_), key_value), arm);
+        }
+        b_.SetInsertPoint(arm);
+        JV v = node(img_.kid(n.b + (last ? n.c - 1 : 2 * i + 1)));
+        if (failed_) return none();
+        if (v.v) {
+            doubles &= v.dbl;
+            values.emplace_back(v, b_.GetInsertBlock());
+        }
+    }
+    if (values.empty()) {
+        done->eraseFromParent();
+        return none();
+    }
+    b_.SetInsertPoint(done);
+    auto* phi = b_.CreatePHI(doubles ? dbl_ : i64_, values.size());
+    for (auto& [v, end] : values) {
+        b_.SetInsertPoint(end);
+        auto* value = doubles ? v.v : box(v);
+        b_.CreateBr(done);
+        phi->addIncoming(value, b_.GetInsertBlock());
+    }
+    b_.SetInsertPoint(done);
+    return JV{phi, doubles};
+}
+
 Emitter::JV Emitter::conditional(const Node& n) {
+    if (constant_condition(img_, n) == 1) return node(n.b);
+    if (constant_condition(img_, n) == 0) return n.c == NO_NODE ? tag(i64(UNIT)) : node(n.c);
     JV cond = node(n.a);
     if (failed_ || !cond.v) return none();
     // A condition that is a float is not a bool, and the tagged path below
@@ -2496,7 +2634,10 @@ Emitter::JV Emitter::binary(const Node& n) {
     auto* fast_bb = bb("bin.fast");
     auto* slow_bb = bb("bin.slow");
     auto* join_bb = bb("bin.end");
-    b_.CreateCondBr(b_.CreateAnd(is_fixnum(a), is_fixnum(bb_)), fast_bb, slow_bb);
+    auto* branch = b_.CreateCondBr(b_.CreateAnd(is_fixnum(a), is_fixnum(bb_)), fast_bb, slow_bb);
+    if (av.integer_hint && bv.integer_hint)
+        branch->setMetadata(llvm::LLVMContext::MD_prof,
+                            llvm::MDBuilder(ctx_).createBranchWeights(2000, 1));
 
     b_.SetInsertPoint(fast_bb);
     llvm::Value* fastv = nullptr;
@@ -2621,7 +2762,7 @@ Emitter::JV Emitter::binary(const Node& n) {
     auto* phi = b_.CreatePHI(i64_, 2);
     phi->addIncoming(fastv, fast_end);
     phi->addIncoming(slowv, slow_end);
-    return tag(phi);
+    return tag(phi, is_arith && av.integer_hint && bv.integer_hint);
 }
 
 // ---------------------------------------------------------------------------
@@ -3144,6 +3285,7 @@ bool Jit::Impl::ensure_jit(std::string* error) {
         syms[lljit->mangleAndIntern(name)] = llvm::orc::ExecutorSymbolDef(
             llvm::orc::ExecutorAddr::fromPtr(addr), llvm::JITSymbolFlags::Exported);
     };
+    add("dream_rt_switch_head", reinterpret_cast<void*>(&dream_rt_switch_head));
     add("dream_rt_force", reinterpret_cast<void*>(&dream_rt_force));
     add("dream_rt_arith", reinterpret_cast<void*>(&dream_rt_arith));
     add("dream_rt_compare", reinterpret_cast<void*>(&dream_rt_compare));

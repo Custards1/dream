@@ -32,6 +32,15 @@ int dream_rt_force(Process* p, Value v, Value* out) {
     return 1;
 }
 
+int dream_rt_switch_head(Process* p, Value v, Value* out) {
+    v = resolve(v);
+    if (!is_obj(v, ObjType::Cons)) {
+        *out = UNIT;
+        return 1;
+    }
+    return dream_rt_force(p, static_cast<ConsObj*>(as_obj(v))->head, out);
+}
+
 int dream_rt_arith(Process* p, int32_t op, Value a, Value b, Value* out) {
     PinsTheHeap pinned(*p);
     return jit_arith(*p, Op(op), a, b, out) ? 1 : 0;

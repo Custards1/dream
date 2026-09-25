@@ -74,7 +74,30 @@ for src in "$HERE"/programs/*.dr; do
     done < "$HERE/programs/$name.env"
   fi
 
-  jit_out="$(env "${env_args[@]}" "$dream" "$image" 2>&1)"
+  jit_args=()
+  if [[ -f "$HERE/programs/$name.jit" ]]; then
+    # These regressions must exercise compiled code even on their first call.
+    jit_args=(--jit-threshold 1)
+    compiled_ok=true
+    while IFS= read -r fn; do
+      ir="$("$dream" --dump-jit "$fn" "$image" 2>&1)"
+      if [[ "$ir" == "dream: this build has no JIT" ]]; then break; fi
+      if [[ "$ir" != *"define "* ]]; then
+        echo "FAIL $name ($fn did not compile)"
+        echo "$ir"
+        compiled_ok=false
+      fi
+      if [[ "$name" == jit_integer && "$fn" == calc && "$ir" != *branch_weights* ]]; then
+        echo "FAIL $name (integer hint missing from IR)"
+        compiled_ok=false
+      fi
+    done < "$HERE/programs/$name.jit"
+    if [[ "$compiled_ok" == false ]]; then
+      fail=$((fail + 1))
+      continue
+    fi
+  fi
+  jit_out="$(env "${env_args[@]}" "$dream" "${jit_args[@]}" "$image" 2>&1)"
   jit_rc=$?
   int_out="$(env "${env_args[@]}" "$dream" --no-jit "$image" 2>&1)"
   int_rc=$?

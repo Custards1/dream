@@ -142,13 +142,13 @@ struct DataRec {
 static_assert(sizeof(DataRec) == 16, "large-data records are 16 bytes on disk");
 
 /// What a function's signature declared, for the JIT: which parameters are
-/// `:float`. A hint and never a promise -- the types are gradual, so a caller
+/// `:float` (TYPE) or `:integer` (ITYP). A hint and never a promise -- the types are gradual, so a caller
 /// with no signature may pass such a parameter anything, and whoever acts on
 /// this guards the value first. See "Representation" in jit.cpp.
 struct TypeRec {
     uint32_t func;
     uint32_t reserved;
-    uint64_t float_params;
+    uint64_t params;
 };
 static_assert(sizeof(TypeRec) == 16, "type records are 16 bytes on disk");
 
@@ -238,6 +238,10 @@ public:
     uint64_t float_params(uint32_t func) const {
         return func < float_params_.size() ? float_params_[func] : 0;
     }
+    /// Integer signature hints from the optional ITYP section.
+    uint64_t integer_params(uint32_t func) const {
+        return func < integer_params_.size() ? integer_params_[func] : 0;
+    }
     /// The module a global belongs to, or -1.
     int module_of_global(uint32_t global_index) const;
     /// Source span for a node, or {0,0} when the image carries no debug info.
@@ -262,6 +266,7 @@ private:
     /// when the image has no such section, which is every image built from a
     /// program without a float in a signature.
     std::vector<uint64_t> float_params_;
+    std::vector<uint64_t> integer_params_;
     bool parse(std::string& error);
     bool validate(std::string& error);
 
@@ -290,6 +295,7 @@ private:
     const SpanRec* spans_ = nullptr;         uint32_t n_spans_ = 0;
     const ModuleRec* modules_ = nullptr;     uint32_t n_modules_ = 0;
     const DataRec* large_ = nullptr;         uint32_t n_large_ = 0;
+    const TypeRec* integer_types_ = nullptr; uint32_t n_integer_types_ = 0;
     const TypeRec* types_ = nullptr;         uint32_t n_types_ = 0;
 
     /// The payload bytes, and where its `u64` length header sits. The offset

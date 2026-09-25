@@ -782,6 +782,38 @@ void add_minimum(ImageBuilder& b) {
     b.add("SBLB", {}, 0);
 }
 
+static void test_integer_hints() {
+    std::printf("integer signature hints\n");
+    for (int mode = 0; mode < 4; ++mode) {
+        ImageBuilder b;
+        add_minimum(b);
+        std::vector<uint8_t> node(16, 0);
+        node[0] = uint8_t(Op::Unit);
+        b.add("NODE", node, 1);
+        std::vector<uint8_t> func(32, 0);
+        func[8] = 1;  // arity
+        func[12] = 1; // slots
+        b.add("FUNC", func, 1);
+        if (mode != 0) {
+            std::vector<uint8_t> hint;
+            ImageBuilder::put32(hint, mode == 3 ? 1 : 0);
+            ImageBuilder::put32(hint, 0);
+            ImageBuilder::put64(hint, 1);
+            b.add_claiming("ITYP", hint, 1, mode == 2 ? 8 : 16);
+        }
+        auto bytes = b.build();
+        Image img;
+        std::string error;
+        bool ok = img.load_bytes(bytes.data(), bytes.size(), error);
+        CHECK_EQ(ok, mode < 2);
+        if (ok) {
+            CHECK_EQ(img.integer_params(0), mode == 1 ? 1u : 0u);
+            CHECK_EQ(img.integer_params(1), 0u);
+            CHECK_EQ(img.float_params(0), 0u);
+        }
+    }
+}
+
 /// `LDAT` from a list of (offset, length), and a `PAYL` holding `bytes`.
 void add_payload(ImageBuilder& b, const std::vector<std::pair<uint64_t, uint64_t>>& table,
                  const std::string& bytes) {
@@ -1063,6 +1095,7 @@ int main() {
     test_heap_verifier_follows_every_object_kind();
     test_cross_heap_copy();
     test_image_rejects_bad_input();
+    test_integer_hints();
     test_payload_sections();
     test_bigstr_values();
     test_atom_interning();
