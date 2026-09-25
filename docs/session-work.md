@@ -53,7 +53,7 @@ green (10 `when test` cases in session.dr, 11 in repl.dr).
 
 ## The module as it is (dreams/session.dr)
 
-`session.dr` imports std.core, std.io, std.list, std.str; then dreams.diag,
+`session.dr` imports std.io, std.list, std.str; then dreams.diag,
 dreams.emit, dreams.ir, dreams.lower, dreams.modules, dreams.parser,
 dreams.scope. `dreams.ast` and `dreams.path` are not needed — the plan's
 earlier import list was wrong about those (repl's helpers stay out; `io.open!`
@@ -130,8 +130,8 @@ Until this last session the live session did not work, for two reasons:
    function gets the lowering record as `list.head ms` because `ms` is the
    `[l, recs]` pair that `link_modules` returns, but `finalize!`'s `low2`
    parameter *is* the lowering record itself. `lower.strk (modules.module_name
-   root) (list.head low2)` asked `core.head` for the head of a map record —
-   and `core.head` raises exactly that "not a list" error for any non-list
+   root) (list.head low2)` asked `head` for the head of a map record —
+   and `head` raises exactly that "not a list" error for any non-list
    (dream/src/builtins.cpp:903-907). The fix is `... root) low2`. It is a
    laziness trap to remember: nothing forces `low2` until a read reaches it,
    so the crash surfaced only at the bottom of `finalize!` (forcing

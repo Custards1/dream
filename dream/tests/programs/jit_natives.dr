@@ -1,40 +1,8 @@
-// Compiled code calling a host native.
-//
-// The tier used to refuse any function containing a call it could not write out
-// itself, which was every call to `std.native` but five numeric ones -- so a
-// loop that reads a byte, walks a list or asks two values which is larger was
-// not compiled at all, however hot it got. Such a call is now made the way the
-// interpreter makes one: same callee, same arguments on the same stack, same
-// native. `native_site` in dream/src/jit.cpp is the rule and `run_native` in
-// dream/src/jit_rt.cpp is the call.
-//
-// `std.native` rather than `std.core` throughout, because they are not the same
-// question. `std.core` is Dream, and five of its members -- `head`, `map_get`,
-// `map_put`, `array_get`, `array_set` -- are written as the language's own
-// `c.[k]`, which is an opcode and not a call at all. The rest of it is wrappers
-// the compiler rewrites into exactly the `native.` calls below, so this is the
-// spelling that says what is being tested.
-//
-// Everything here runs under both tiers and the two must agree, which is the
-// only check that matters. What is being asserted, case by case:
-//
-//   * a loop whose body is a native call gets the answer it always got;
-//   * a *carried* parameter -- one every self call hands straight back -- is
-//     moved and not forced, so a loop may carry something whose evaluation
-//     would raise and never raise, exactly as the interpreter leaves it;
-//   * an argument in a position the native does not force is not evaluated;
-//   * a native that hands back what it found unforced, and one that raises,
-//     both answer what they answer under the interpreter;
-//   * and the three things the tier has to decline -- an impure native, a lazy
-//     argument that is not safe to evaluate, and a parameter nothing forces --
-//     still run, and still say what they always said.
-//
-// The loops are all long enough to get past the JIT's threshold, because a case
-// that is never compiled tests nothing here.
-
+// Interpreter/JIT parity for primitive opcodes, builtins, and host calls.
+// Lazy defaults and carried arguments must remain unforced.
 import std.console;
 import std.math;
-import std.native;
+
 
 // --- a loop whose body is one native call ----------------------------------
 //
@@ -43,12 +11,12 @@ import std.native;
 // so the strictness rule the tier rests on cannot prove it strict -- and does
 // not have to, because every self call hands it straight back.
 let rec sum_bytes s i n acc =
-    if i >= n { acc } else { sum_bytes s (i + 1) n (acc + native.str_byte s i) };
+    if i >= n { acc } else { sum_bytes s (i + 1) n (acc + str_byte s i) };
 
 // A list walked through the two natives that walk one. Both parameters are
 // forced on every path here, so this is the shape the tier always could have
 // taken and never did, for want of being allowed to make the call.
-let rec spine xs acc = if native.is_empty xs { acc } else { spine (native.tail xs) (acc + 1) };
+let rec spine xs acc = if list_is_empty xs { acc } else { spine (list_tail xs) (acc + 1) };
 
 // --- a carried parameter is moved, not forced ------------------------------
 //
@@ -61,22 +29,20 @@ let rec ignoring x i n acc = if i >= n { acc } else { ignoring x (i + 1) n (acc 
 // of zero once the function is hot: the loop stops before it looks at `s`, so a
 // tier that forced its parameters on entry would raise where nothing should.
 let rec first_byte s i n acc =
-    if i >= n { acc } else { first_byte s (i + 1) n (acc + native.str_byte s i) };
+    if i >= n { acc } else { first_byte s (i + 1) n (acc + str_byte s i) };
 
 // --- the containers --------------------------------------------------------
 //
-// `map_get` is the native that hands back what it found without forcing it,
-// which the machine forces as the continuation of the call. Its third argument
-// is the default and the mask leaves it lazy, so what goes there is read rather
-// than evaluated -- here a literal, and below a carried parameter.
+// Container reads force their result in the machine and leave an unused
+// default lazy, including when the default is a carried parameter.
 let rec map_sum m i n acc =
-    if i >= n { acc } else { map_sum m (i + 1) n (acc + native.map_get m i 0) };
+    if i >= n { acc } else { map_sum m (i + 1) n (acc + m.[i else 0]) };
 
 let rec map_or m d i n acc =
-    if i >= n { acc } else { map_or m d (i + 1) n (acc + native.map_get m i d) };
+    if i >= n { acc } else { map_or m d (i + 1) n (acc + m.[i else d]) };
 
 let rec array_sum a i n acc =
-    if i >= n { acc } else { array_sum a (i + 1) n (acc + native.array_get a i) };
+    if i >= n { acc } else { array_sum a (i + 1) n (acc + a.[i]) };
 
 // --- the builtins, which are natives of the other shape --------------------
 //
@@ -89,11 +55,11 @@ let rec shown v i n acc =
 
 // --- ordering, which is a native over anything -----------------------------
 let rec ranks xs i n acc =
-    if i >= n { acc } else { ranks xs (i + 1) n (acc + native.compare i n) };
+    if i >= n { acc } else { ranks xs (i + 1) n (acc + compare i n) };
 
 // --- the numeric natives the tier writes out rather than calling -----------
 let rec roots i n acc =
-    if i >= n { acc } else { roots (i + 1) n (acc + math.sqrt (native.to_float i)) };
+    if i >= n { acc } else { roots (i + 1) n (acc + math.sqrt (to_float i)) };
 
 // --- what must be declined -------------------------------------------------
 //
@@ -106,27 +72,27 @@ let rec dots! i n = if i >= n { () } else { console.write! "."; dots! (i + 1) n 
 // there, so the interpreter never looks at the default; if the tier took this
 // call and evaluated it, the loop would raise instead of answering.
 let rec defaults m i n acc =
-    if i >= n { acc } else { defaults m (i + 1) n (acc + native.map_get m 3 (1 / 0)) };
+    if i >= n { acc } else { defaults m (i + 1) n (acc + m.[3 else (1 / 0)]) };
 
 // A parameter nothing forces and no call carries: `i` is looked at only where
 // the list runs out, and every self call *computes* a new one, so evaluating it
 // eagerly is work the interpreter might never do. Declined, and the answer is
 // the one it always gave.
 let rec index_from i x xs =
-    if native.is_empty xs { 0 - 1 }
-    else if native.head xs == x { i }
-    else { index_from (i + 1) x (native.tail xs) };
+    if list_is_empty xs { 0 - 1 }
+    else if xs.[0] == x { i }
+    else { index_from (i + 1) x (list_tail xs) };
 
 // A list builder, whose accumulator is neither forced nor carried -- `cons`
 // leaves both its arguments alone. Declined, and still a list.
-let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (native.cons i acc) };
+let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (list_cons i acc) };
 
 let show! name v = console.print! (name + " = " + to_string (try! { strict! v } catch e { e }));
 
 let main! = {
     let text = "the quick brown fox jumps over the lazy dog";
-    let m = native.map_put (native.map_put (native.map_new ()) 3 70) 7 900;
-    let a = native.array_new 64 5;
+    let m = ((((%{})).[3 => 70])).[7 => 900];
+    let a = array_new 64 5;
     let long = upto 1 20000 [];
 
     show! "sum_bytes"  (sum_bytes text 0 (len text) 0);

@@ -12,7 +12,7 @@
 // -- and a JIT that changes what a program prints is a broken JIT.
 
 import std.console;
-import std.core;
+
 import std.list;
 
 // A fold named once at the top of a file, which is how the benchmark this pass
@@ -50,7 +50,7 @@ let empty_kept = list.length [list.fold (fn a b -> b) (1 / 0) (list.range 3 3)];
 // Long enough that a chain of suspensions would be visible as memory rather
 // than as a wrong answer, and that the loop is worth compiling.
 let big = list.fold_strict (fn a b -> a + b) 0 (list.range 1 200_001);
-let big_float = list.fold_strict (fn a b -> a + core.to_float b) 0.0 (list.range 1 100_001);
+let big_float = list.fold_strict (fn a b -> a + to_float b) 0.0 (list.range 1 100_001);
 
 // --- what must not fuse ------------------------------------------------------
 

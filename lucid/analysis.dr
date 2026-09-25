@@ -16,7 +16,7 @@
 // it costs. In short: the resolver knows what is in scope while it walks and
 // forgets it when it returns, so the one question it cannot be asked is the one
 // a cursor sitting on empty space needs answered.
-import std.core;
+
 import std.list;
 import std.str;
 
@@ -64,13 +64,13 @@ let path_to_uri path = if str.starts_with "/" path { "file://" + path } else { "
 /// expanded tree loses `n`, which is the local the person typing most wants.
 let analysis l r mi src = %{ :loader => l, :resolved => r, :module => mi, :source => src };
 
-let loader a   = core.map_get a :loader ();
-let resolved a = core.map_get a :resolved ();
-let module_of a = core.map_get a :module ();
+let loader a   = a.[:loader else ()];
+let resolved a = a.[:resolved else ()];
+let module_of a = a.[:module else ()];
 
 /// The program as written. Falls back to the expanded one, which is the same
 /// program wherever nothing was expanded.
-let source a = core.map_get a :source (loader a);
+let source a = a.[:source else (loader a)];
 
 /// What a module's file says, as declarations -- `macro` still a `macro`, and
 /// every `expand` still a call rather than the code it turned into.
@@ -103,7 +103,7 @@ let analyse_cached! path roots open_docs parsed = {
     analysis l (scope.resolve! (l)) (module_index l path) src
 };
 
-let analyse! path roots open_docs = analyse_cached! path roots open_docs (core.map_new ());
+let analyse! path roots open_docs = analyse_cached! path roots open_docs (%{});
 
 /// The parse results this analysis produced, to hand to the next one.
 let parses a = modules.parsed (loader a);
@@ -207,14 +207,14 @@ let is_name_byte b =
 let name_start src offset = {
     let rec back i =
         if i <= 0 { 0 }
-        else if is_name_byte (core.str_byte src (i - 1)) { back (i - 1) }
+        else if is_name_byte (str_byte src (i - 1)) { back (i - 1) }
         else { i };
     back offset
 };
 
 let name_end src offset = {
     let n = str.byte_length src;
-    let rec forward i = if i >= n { i } else if is_name_byte (core.str_byte src i) { forward (i + 1) } else { i };
+    let rec forward i = if i >= n { i } else if is_name_byte (str_byte src i) { forward (i + 1) } else { i };
     forward offset
 };
 
@@ -233,7 +233,7 @@ let span_text src span =
 /// part they mean, and the part they mean is usually the field. So a name
 /// preceded by a dot asks its question at the head of the chain instead.
 let rec chain_start src at =
-    if at > 0 && core.str_byte src (at - 1) == 46 { chain_start src (name_start src (at - 1)) }
+    if at > 0 && str_byte src (at - 1) == 46 { chain_start src (name_start src (at - 1)) }
     else { at };
 
 /// What the name under this position resolves to: `[start, end, resolution]`,
@@ -1025,7 +1025,7 @@ when test {
 
     /// An analysis of one buffer and nothing else. Nothing below imports
     /// anything, so nothing has to be found on a package path.
-    let of! text = analyse! "/buf.dr" [] (core.map_put (core.map_new ()) "/buf.dr" text);
+    let of! text = analyse! "/buf.dr" [] (((%{})).["/buf.dr" => text]);
 
     /// The names in scope where the `|` is, innermost first.
     ///
@@ -1060,26 +1060,26 @@ when test {
     let hover_value! text line ch =
         match hover_at (of! text) line ch {
             () => "",
-            h => core.map_get (core.map_get h "contents" ()) "value" "",
+            h => ((h.["contents" else ()])).["value" else ""],
         };
     /// `[line, character]` of where go-to-definition lands, or `()`.
     let definition_start! text line ch =
         match definition_at (of! text) line ch {
             () => (),
-            d => match core.map_get (core.map_get d "range" ()) "start" () {
-                     at => [core.map_get at "line" (), core.map_get at "character" ()],
+            d => match ((d.["range" else ()])).["start" else ()] {
+                     at => [at.["line" else ()], at.["character" else ()]],
                  },
         };
-    let symbol_names! text = list.map (fn s -> core.map_get s "name" "") (symbols (of! text));
+    let symbol_names! text = list.map (fn s -> s.["name" else ""]) (symbols (of! text));
     /// The same, each name with whatever `detail` it was given -- `""` for an
     /// entry that has none, since the key is left off rather than set empty.
     let symbol_details! text =
-        list.map (fn s -> [core.map_get s "name" "", core.map_get s "detail" ""])
+        list.map (fn s -> [s.["name" else ""], s.["detail" else ""]])
                  (symbols (of! text));
     let child_names! text name =
-        list.concat (list.map (fn s -> list.map (fn c -> core.map_get c "name" "")
-                                                (core.map_get s "children" []))
-                              (list.filter (fn s -> core.map_get s "name" "" == name)
+        list.concat (list.map (fn s -> list.map (fn c -> c.["name" else ""])
+                                                (s.["children" else []]))
+                              (list.filter (fn s -> s.["name" else ""] == name)
                                            (symbols (of! text))));
 
     /// The same two questions asked of the buffer's own module.

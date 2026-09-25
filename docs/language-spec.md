@@ -401,7 +401,7 @@ value wants is usually decided by how it is read rather than by what it holds:
   standard library defines them that way rather than by recursion. `last` and
   anything ending in `_at` still walk in Dream. Building in front is O(1),
   which is why the idiom everywhere in the standard library is to accumulate
-  with `core.cons` and reverse once at the end. A *lazy* chain costs a cell
+  with `list_cons` and reverse once at the end. A *lazy* chain costs a cell
   each time a new element is forced, so a stream that will be walked twice
   builds every cell of a tail that the second walk then forces again.
 - **An array reads any index in one hop — constant-time like a list's head.**
@@ -409,14 +409,14 @@ value wants is usually decided by how it is read rather than by what it holds:
   built, because a list record reads every field by walking to it. The
   compiler's token is the precedent: as a six-element list, reading one field
   walked to its cell, and reading tokens was a fifth of everything the
-  compiler did. Arrays are built with `core.array_new` and `core.array_set`
+  compiler did. Arrays are built with `array_new` and `a.[index => value]`
   (or `std.array.of_list`), so the more a record is built relative to read,
   the less clear the win is.
 - **A membership test over a fixed set of names wants a map.** Checking a name
   against a flat table of keywords was a tenth of the compiler's work; the
   same check against `%{ }` is a probe of a trie.
 - **A string is a sequence of bytes with two costs.** Byte operations —
-  `core.str_len`, `core.str_byte`, `str.slice` on a byte offset — are O(1);
+  `len`, `str_byte`, `str.slice` on a byte offset — are O(1);
   anything that counts or indexes by *character* (`str.length`, `str.chars`)
   walks. The lexer counts columns in characters and spans in bytes for
   exactly this reason, and a program that slices a string a lot wants to
@@ -591,7 +591,7 @@ neighbours are not; a fallback is evaluated only when it is used; and the value
 a change stores stays a thunk. `[1 / 0, 7].[1]` is `7`.
 
 They are opcodes, not functions, and that is what makes reading a lazy field
-safe at any depth: see [`std.core`](#stdcore--what-the-language-cannot-express-in-itself).
+safe at any depth: see [runtime primitives](#runtime-primitives).
 
 ---
 
@@ -653,8 +653,8 @@ the way to get it compiled.
 
 ### Wrappers
 
-A global whose body is one application of its own parameters -- `let head xs =
-core.head xs`, `let kind t = core.array_get t 0` -- is a **wrapper**, and a
+A global whose body is one application of its own parameters -- `let tail xs =
+list_tail xs`, `let kind t = t.[0]` -- is a **wrapper**, and a
 saturated call of one is compiled as the call it stands for. The frame that
 disappears bound nothing but the arguments the inner call was going to be
 given, and every argument stays the same thunk in the same place, so nothing is
@@ -1242,7 +1242,7 @@ with `:stack_overflow` naming the depth, instead of exhausting memory.
 
 ```dream
 let squares = comp build 5;                    // evaluated by the compiler
-let digits  = comp! core.str_chars "12345";    // evaluated by running it on the VM
+let digits  = comp! str_chars "12345";    // evaluated by running it on the VM
 ```
 
 `comp e` evaluates `e` at compile time and bakes the result into the image.
@@ -1254,17 +1254,7 @@ back.
 `comp` binds tighter than any operator but looser than application, so
 `comp f x` folds the whole call and `comp (1 + 2) * 10` is `30`.
 
-**`comp` cannot reach a host module.** `std.console`, `std.core` and the rest
-are C++ in the VM, and the compiler's own evaluator has no VM to run them on:
-
-```
-error: `core` is not a Dream module, so `core.cons` is not available at compile time
-  = note: host modules perform effects; `comp` cannot run them
-```
-
-That is what `comp!` is for — it hands the expression to a real VM. So the rule
-is: `comp` for arithmetic and pure Dream code, `comp!` for anything that needs
-the runtime.
+Pure runtime primitives are available to `comp`; effects require `comp!`.
 
 ### Syntax macros
 
@@ -1560,44 +1550,18 @@ the observer ignores. Effectful observers still require an impure context.
 See [`11_standard_macros.dr`](../examples/11_standard_macros.dr) for a runnable
 example.
 
-### `std.core` — what the language cannot express in itself
+### Runtime primitives
 
-Everything here is either a primitive the representation hides (a string's
-bytes, a map's buckets) or something that must be a single machine step for the
-rest of the library to be worth writing.
+Runtime primitives are available without imports. Container reads and updates
+use `xs.[0]`, `m.[key else default]`, and `m.[key => value]`; empty maps use
+`%{}` and lengths use `len`. The list primitives are `list_cons`, `list_tail`,
+and `list_is_empty`.
 
-It is Dream source all the same — [`mind/std/core.dr`](../mind/std/core.dr),
-reached as `core` without an import. Nearly every member is a one-line wrapper
-over the host module `std.native`, where the C++ is, and a wrapper compiles to
-the call it stands for. `head`, `map_get`, `map_put`, `array_get` and
-`array_set` are not the host's: they are written as `.[ ]` ([§4](#reading-and-changing-a-container)),
-so a call of one is the opcode. That matters for more than speed. A native has
-to hand back a value, so a native reading a lazy field forced it underneath
-itself, on the C++ stack, and a record updated twenty thousand times before it
-was read was twenty thousand nested forces — which is how the compiler's own
-table of names ran an 8 MiB stack out. An opcode leaves the forcing to the
-machine, whose depth is heap and whose limit raises `:stack_overflow`.
-
-The VM still answers to `std.core` as a host module, for images built before it
-moved and for a program compiled with no standard library to find.
-
-`str_concat` is the second kind. Building a string out of n pieces with `+`
-copies everything written so far on every step, so it costs n² bytes of
-copying; `str_concat` walks the list once and copies each piece once. Anything
-that assembles a large output a piece at a time -- an image, a rendered
-diagnostic -- goes through it, and `std.str` builds `concat_all`, `join_str`
-and `repeat` on top of it.
-
-| Area | Members |
-|------|---------|
-| lists | `head` `tail` `cons` `is_empty` |
-| strings | `str_len` `str_chars` `str_of_chars` `str_of_bytes` `str_concat` `str_slice` `str_find` `str_byte` |
-| chars | `char_code` `char_of_code` |
-| numbers | `to_float` `to_int` `parse_int` `parse_float` `float_bytes` `float_of_bytes` |
-| atoms | `to_existing_atom` |
-| arrays | `array_new` `array_get` `array_set` `array_of_list` `array_to_list` |
-| maps | `map_new` `map_get` `map_has` `map_put` `map_remove` `map_pairs` |
-| ordering | `compare` |
+Saturated primitive calls compile to opcodes. Functions that traverse lazy
+lists (`str_of_chars`, `str_of_bytes`, `str_concat`, `array_of_list`) remain
+builtins. Both forms preserve laziness, support partial application, and may
+be shadowed by local bindings. See [the builtin reference](builtins.md#runtime-primitives).
+Scalar type descriptions are exported by `std.types`.
 
 ### `std.console`
 
@@ -2013,17 +1977,17 @@ dream --profile [N] IMG   # the hottest functions, by reductions
 has not been forced has not run. `--profile` attributes every reduction to the
 function whose frame is current, and **natives do not reduce** — the seconds
 inside a builtin are charged to its caller. That single rule explains three
-surprising facts about a profile: a thin member of a host module (`core.head`)
+surprising facts about a profile: a thin member of a host module (`head`)
 can look hot while really being the native it calls; a function that wraps
 another function in a frame shows up as its own cost; and a function that does
-`array_get` three times in a row is paying three distinct charges it could have
+`a.[index]` three times in a row is paying three distinct charges it could have
 spent once.
 
 ### Every value decides its own cost
 
-- **A list is read at the head.** `head`/`tail`/`core.cons` are one hop; `nth`,
+- **A list is read at the head.** `head`/`tail`/`list_cons` are one hop; `nth`,
   `length`, `last`, `append`, and anything ending in `_at` walk. Accumulate with
-  `core.cons` and reverse once. Prefer a lazy chain precisely where the head is
+  `list_cons` and reverse once. Prefer a lazy chain precisely where the head is
   the point — a stream — because a cell is allocated as it is forced and a
   stream that goes unread costs nothing.
 - **A walk the machine can do is worth ten of the same walk in Dream.** A
@@ -2031,7 +1995,7 @@ spent once.
   natives per element; the same walk behind an opcode or a builtin pays one
   machine step for the whole of it. `list.nth` is `xs.[n else ()]`,
   `list.length` is `len`, `list.append` is `+`, and a lexer's byte classes are
-  `core.str_span` and `core.str_upto` — spelling those four out as recursions
+  `str_span` and `str_upto` — spelling those four out as recursions
   instead was a third of a self-compile.
 - **A record is an array when it is read more than it is built.** Matching a
   list pattern (`[:ok, v, rest]`) binds by walking the cells; matching an
@@ -2068,9 +2032,9 @@ Two consequences matter for anything performance-shaped:
   directions costs O(1) per object after the first. A function that `strict!`s
   a value it does not know is shared pays once and forgets it.
 - **Natives are where the iron is, and thin accessors are free wrappers.** A
-  global whose body is one application of its parameters — `let head xs =
-  core.head xs` — is compiled as the call it stands for when it is applied
-  saturated (§5). The accessors that remain (`list.head`, `core.array_get`)
+  global whose body is one application of its parameters — `let tail xs =
+  list_tail xs` — is compiled as the call it stands for when it is applied
+  saturated (§5). The accessors that remain (`list.head`, `a.[index]`)
   are natives; each costs one native call, and paying for several on the same
   value — the peek-and-ask pattern — is what a profile shows. Fetch the value
   once and ask all your questions of that one reference.

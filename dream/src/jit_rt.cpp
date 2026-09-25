@@ -187,7 +187,9 @@ int run_native(Process& p, Value callee, NativeFn fn, uint32_t argc, const Value
     for (uint32_t i = 0; i < argc; ++i) p.stack.push_back(args[i]);
 
     NativeResult r = fn(p, callee, p.stack.data() + base, argc);
-    p.stack.resize(base);
+    // Not when a force inside the native was suspended: its work is on the
+    // stack above the arguments, and `enter_function` retries the call.
+    if (!p.park_requested) p.stack.resize(base);
 
     switch (r.outcome) {
         case NativeOutcome::Value:

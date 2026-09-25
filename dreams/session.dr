@@ -41,7 +41,6 @@
 //                `virtual`, `derive`) -- anything that can change which modules
 //                exist or what one exports, which a carried parse cannot know.
 
-import std.core;
 import std.io;
 import std.list;
 import std.str;
@@ -100,27 +99,27 @@ let engine loader state resolver low base root_globals_from funcs globals import
        :funcs => funcs, :globals => globals, :imports => imports,
        :modules => modules, :base_text => base_text };
 
-let engine_loader e    = core.map_get e :loader ();
-let engine_state e     = core.map_get e :state scope.state;
-let engine_resolver e  = core.map_get e :resolver ();
-let engine_low e       = core.map_get e :low ();
-let engine_base e      = core.map_get e :base 0;
-let engine_root_from e = core.map_get e :root_globals_from 0;
-let engine_funcs e     = core.map_get e :funcs [];
-let engine_globals e   = core.map_get e :globals [];
-let engine_imports e   = core.map_get e :imports [];
-let engine_modules e   = core.map_get e :modules [];
-let engine_base_text e = core.map_get e :base_text "";
+let engine_loader e    = e.[:loader else ()];
+let engine_state e     = e.[:state else scope.state];
+let engine_resolver e  = e.[:resolver else ()];
+let engine_low e       = e.[:low else ()];
+let engine_base e      = e.[:base else 0];
+let engine_root_from e = e.[:root_globals_from else 0];
+let engine_funcs e     = e.[:funcs else []];
+let engine_globals e   = e.[:globals else []];
+let engine_imports e   = e.[:imports else []];
+let engine_modules e   = e.[:modules else []];
+let engine_base_text e = e.[:base_text else ""];
 
-let pre_s_pre e    = core.map_get e :s_pre scope.state;
-let pre_resolver e = core.map_get e :resolver ();
-let pre_low e      = core.map_get e :low ();
-let pre_root_from e = core.map_get e :root_globals_from 0;
-let pre_funcs e    = core.map_get e :funcs [];
-let pre_globals e  = core.map_get e :globals [];
-let pre_imports e  = core.map_get e :imports [];
-let pre_modules e  = core.map_get e :modules [];
-let pre_booted e   = core.map_get e :booted false;
+let pre_s_pre e    = e.[:s_pre else scope.state];
+let pre_resolver e = e.[:resolver else ()];
+let pre_low e      = e.[:low else ()];
+let pre_root_from e = e.[:root_globals_from else 0];
+let pre_funcs e    = e.[:funcs else []];
+let pre_globals e  = e.[:globals else []];
+let pre_imports e  = e.[:imports else []];
+let pre_modules e  = e.[:modules else []];
+let pre_booted e   = e.[:booted else false];
 
 // --- the shape of an entry ---------------------------------------------------------
 
@@ -170,25 +169,9 @@ let route text base_text engine base =
             _ if expansion.has_expansion items || list.any ast_record items => :fresh,
             _ if engine == () => :reboot,
             _ if not (str.starts_with (engine_base_text engine) text) => :reboot,
-            _ if brings_core engine items base => :reboot,
             _ if carried_ok (list.head (entry_partition items base)) => [:proceed, items],
             _ => :fresh,
         },
-    };
-
-/// Does this entry name `core` in a session that has not loaded it? `core` needs
-/// no import, but it is a module all the same, and the loader brings it in ahead
-/// of the root -- which moves the root, and everything carried was numbered with
-/// the root where it was. So the first mention is a new import in all but
-/// spelling, and re-boots the way a new import does. A session built with no
-/// standard library settled for the host's module, and has nothing to load.
-let brings_core engine items base =
-    match engine_loader engine {
-        // Nothing carried to compare against. A real engine always has a
-        // loader, but routing is asked about stand-ins as well.
-        () => false,
-        l => modules.find l "std.core" == () && not (list.contains "std.core" (modules.natives l))
-             && list.any (fn item -> modules.item_mentions_core item) (list.drop base items),
     };
 
 // --- the pipeline -------------------------------------------------------------------
@@ -236,12 +219,11 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
 
     // The linked lists go into the program only long enough for the compile-time
     // expressions to be evaluated against a complete image.
-    let stuffed = core.map_put (core.map_put (core.map_put (lower.prog (list.head li))
-                            :funcs funcs1) :globals globals1) :imports imports1;
+    let stuffed = ((((((lower.prog (list.head li))).[:funcs => funcs1])).[:globals => globals1])).[:imports => imports1];
     let settled = lower.settle_comps! (lower.set_prog stuffed (list.head li));
     // Nothing may re-evaluate these: the values are nodes in the arena now, and
     // re-running a `comp!` would be an effect happening a second time.
-    let low1 = core.map_put settled :pending_comp [];
+    let low1 = settled.[:pending_comp => []];
 
     let ds = list.append (list.append (modules.diags l) (scope.diags state1))
                          (list.append (scope.r_diags r1) (lower.l_diags low1));
@@ -276,8 +258,7 @@ let rec main_step! l mi main_item en source image = {
     let lg = lower.link_globals_from r2 (list.head lm) (list.length (engine_globals en));
     let funcs2 = list.append (engine_funcs en) (list.nth 1 lm);
     let globals2 = list.append (engine_globals en) (list.nth 1 lg);
-    let p2 = core.map_put (core.map_put (lower.prog (list.head lg))
-                            :funcs funcs2) :globals globals2;
+    let p2 = ((((lower.prog (list.head lg))).[:funcs => funcs2])).[:globals => globals2];
     let low2 = lower.settle_comps! (lower.set_prog p2 (list.head lg));
 
     let ds = list.append (list.append (modules.diags l) (scope.diags state2))
@@ -305,12 +286,7 @@ let finalize! l mi en low2 r2 funcs2 globals2 source image = {
            :globals_count => list.length globals2 - engine_root_from en,
            :flags => 0, :derives => ir.no_node };
     let p =
-        core.map_put (core.map_put (core.map_put (core.map_put
-                            (lower.prog (list.head sourced))
-                            :modules (list.append (engine_modules en) [root_rec]))
-                            :entry (lower.find_entry l r2))
-                            :module_name (list.nth 1 named))
-                            :source_name (list.nth 1 sourced);
+        ((((((((lower.prog (list.head sourced))).[:modules => (list.append (engine_modules en) [root_rec])])).[:entry => (lower.find_entry l r2)])).[:module_name => (list.nth 1 named)])).[:source_name => (list.nth 1 sourced)];
     if write_file! image (emit.to_binary (ir.finish p)) { [:ok, image] }
     else { [:error, "dreams: cannot write " + image] }
 };
@@ -333,10 +309,7 @@ let boot! roots cfg source image text base_text engine base = {
     // diagnostics: those are checked from the scope state itself, which is how
     // a carried entry sees its own declaration errors too.
     let r0 =
-        core.map_put (core.map_put (core.map_put (scope.resolver (scope.envs state1))
-                            :imports (scope.s_imports state1))
-                            :module_recs (scope.s_module_recs state1))
-                            :diags [];
+        ((((((scope.resolver (scope.envs state1))).[:imports => (scope.s_imports state1)])).[:module_recs => (scope.s_module_recs state1)])).[:diags => []];
     let low0 = lower.lowering r0 ir.program 0;
     let pre_ = pre scope.state r0 low0 (scope.next_global state_deps) [] [] [] [] true;
     match compile_slice! l mi state1 pre_ (list.length slice)

@@ -55,8 +55,11 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
         for (uint64_t i = 0; i < count; ++i) out.push_back(kids[off + i]);
     };
     switch (static_cast<Op>(n.op)) {
-        case Op::Field: case Op::Force: case Op::Neg: case Op::Not:
+        case Op::Field: case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
             out.push_back(n.a);
+            break;
+        DREAM_PRIMITIVE_CASES
+            push_kids(n.b, n.c);
             break;
         case Op::Apply:
             out.push_back(n.a);
@@ -86,7 +89,7 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
             break;
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
-        case Op::And: case Op::Or:
+        case Op::And: case Op::Or: case Op::Cons:
             out.push_back(n.a);
             out.push_back(n.b);
             break;
@@ -127,6 +130,38 @@ const char* op_name(Op op) {
         case Op::MakeThunk: return "thunk";
         case Op::Try: return "try";
         case Op::Force: return "force";
+        case Op::TypeIs: return "type_is";
+        case Op::StrChars: return "str_chars";
+        case Op::ErrorNew: return "error_new";
+        case Op::ErrorKind: return "error_kind";
+        case Op::ErrorPayload: return "error_payload";
+        case Op::StrSlice: return "str_slice";
+        case Op::StrFind: return "str_find";
+        case Op::StrByte: return "str_byte";
+        case Op::StrLe: return "str_le";
+        case Op::StrSpan: return "str_span";
+        case Op::StrUpto: return "str_upto";
+        case Op::CharCode: return "char_code";
+        case Op::CharOfCode: return "char_of_code";
+        case Op::ToFloat: return "to_float";
+        case Op::FloatBytes: return "float_bytes";
+        case Op::FloatOfBytes: return "float_of_bytes";
+        case Op::ToInt: return "to_int";
+        case Op::ParseInt: return "parse_int";
+        case Op::ParseFloat: return "parse_float";
+        case Op::ToExistingAtom: return "to_existing_atom";
+        case Op::ArrayNew: return "array_new";
+        case Op::ArrayToList: return "array_to_list";
+        case Op::MapHas: return "map_has";
+        case Op::MapRemove: return "map_remove";
+        case Op::MapPairs: return "map_pairs";
+        case Op::DataCount: return "data_count";
+        case Op::DataAt: return "data_at";
+        case Op::Compare: return "compare";
+
+        case Op::Cons: return "cons";
+        case Op::ListTail: return "list_tail";
+        case Op::ListIsEmpty: return "list_is_empty";
         case Op::Add: return "add";
         case Op::Sub: return "sub";
         case Op::Mul: return "mul";
@@ -501,6 +536,10 @@ bool Image::validate(std::string& error) {
                 if (!node_ok(n.a)) return fail("bad field object node");
                 if (n.b >= n_strs_) return fail("bad field name index");
                 break;
+            DREAM_PRIMITIVE_CASES
+                if (n.a != primitive_builtin(Op(n.op)) || n.c != primitive_arity(Op(n.op))
+                    || !kids_ok(n.b, n.c)) return fail("bad primitive operands");
+                break;
             case Op::Apply:
                 if (!node_ok(n.a)) return fail("bad callee node");
                 if (!kids_ok(n.b, n.c)) return fail("bad argument list");
@@ -531,12 +570,14 @@ bool Image::validate(std::string& error) {
             case Op::Try:
                 if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad try body or handler");
                 break;
-            case Op::Force: case Op::Neg: case Op::Not:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
                 if (!node_ok(n.a)) return fail("bad unary operand");
+                if (Op(n.op) == Op::TypeIs && (n.b > DREAM_TYPE_MAP || n.c > 1))
+                    return fail("bad type test");
                 break;
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
-            case Op::And: case Op::Or:
+            case Op::And: case Op::Or: case Op::Cons:
                 if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad binary operand");
                 break;
             case Op::Get:
@@ -617,6 +658,9 @@ bool Image::validate(std::string& error) {
                     work.push_back(n.a);
                     work.push_back(n.b);
                     break;
+                DREAM_PRIMITIVE_CASES
+                    for (uint32_t k = 0; k < n.c; ++k) work.push_back(kids_[n.b + k]);
+                    break;
                 case Op::Apply:
                     work.push_back(n.a);
                     for (uint32_t k = 0; k < n.c; ++k) work.push_back(kids_[n.b + k]);
@@ -639,12 +683,12 @@ bool Image::validate(std::string& error) {
                     work.push_back(n.c);
                     break;
                 case Op::Field:
-                case Op::Force: case Op::Neg: case Op::Not:
+                case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
                     work.push_back(n.a);
                     break;
                 case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
                 case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
-                case Op::And: case Op::Or:
+                case Op::And: case Op::Or: case Op::Cons:
                     work.push_back(n.a);
                     work.push_back(n.b);
                     break;

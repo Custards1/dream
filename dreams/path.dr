@@ -18,7 +18,6 @@
 // Everything is pure except `absolute!`, which is the only part that has to ask
 // where the process is standing.
 
-import std.core;
 import std.io;
 import std.list;
 import std.macros;
@@ -130,10 +129,10 @@ let normalize p = {
             ["..", ..rest] =>
                 match acc {
                     [] => walk rest (if absolute { [] } else { [".."] }),
-                    ["..", .._] => walk rest (core.cons ".." acc),
+                    ["..", .._] => walk rest (list_cons ".." acc),
                     [_, ..up] => walk rest up,
                 },
-            [s, ..rest] => walk rest (core.cons s acc),
+            [s, ..rest] => walk rest (list_cons s acc),
         };
     let segs = walk (segments p) [];
     if list.is_empty segs { if absolute { separator } else { "." } }
@@ -191,7 +190,7 @@ let is_file! p = io.exists! p && not (io.is_dir! p);
 let rec read_chunks! h acc = {
     let chunk = io.read! h 65536;
     if len chunk == 0 { str.join_str "" (list.reverse acc) }
-    else { read_chunks! h (core.cons chunk acc) }
+    else { read_chunks! h (list_cons chunk acc) }
 };
 
 let read_file! p = {

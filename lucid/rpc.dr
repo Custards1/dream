@@ -13,7 +13,7 @@
 // after it wrong. So the body is read by byte count until it is full, and a
 // short read is a short read rather than the end of anything -- a pipe is
 // entitled to hand over one byte at a time.
-import std.core;
+
 import std.io;
 import std.json;
 import std.list;
@@ -57,7 +57,7 @@ let to_int text = {
             [] => if any { acc } else { () },
             [c, ..rest] =>
                 if c >= '0' && c <= '9' {
-                    walk rest (acc * 10 + (core.char_code c - 48)) true
+                    walk rest (acc * 10 + (char_code c - 48)) true
                 } else if any { acc } else { () },
         };
     walk cs 0 false
@@ -117,11 +117,11 @@ let write_message! h v = {
 
 // --- the shapes a JSON-RPC message comes in ----------------------------------
 
-let field v name default = core.map_get v name default;
+let field v name default = v.[name else default];
 
 let method m = field m "method" ();
 let id m = field m "id" ();
-let params m = field m "params" (core.map_new ());
+let params m = field m "params" (%{});
 
 /// A request expects an answer and carries an id; a notification does not.
 let is_request m = id m != () && method m != ();
@@ -165,10 +165,10 @@ when test {
             $( test.false! (is_request %{ "method" => "textDocument/didOpen" }) ),
 
         test.case "a response carries the id it answers"
-            $( test.eq! 3 (field (response 3 (core.map_new ())) "id" ()) ),
+            $( test.eq! 3 (field (response 3 (%{})) "id" ()) ),
         test.case "an error response carries a code"
             $( test.eq! (0 - 32601)
-                        (field (field (error_response 1 (0 - 32601) "no") "error" (core.map_new ()))
+                        (field (field (error_response 1 (0 - 32601) "no") "error" (%{}))
                                "code" ()) ),
     ];
 }

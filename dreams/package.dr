@@ -15,7 +15,6 @@
 // Adding appends, which is what makes an index into it stable while the set is
 // still growing -- the dependency walk below relies on that.
 
-import std.core;
 import std.io;
 import std.list;
 import std.macros;
@@ -114,7 +113,7 @@ let rec collect_modules! base dir acc =
         else if list.contains (path.extension entry) module_extensions {
             match module_name base entry {
                 () => found,
-                n  => core.cons n found,
+                n  => list_cons n found,
             }
         }
         else { found }) acc (path.list_dir! dir);
@@ -152,7 +151,7 @@ let manifest_at! dir = manifest_in! dir manifest_names;
 let dep_location spec =
     match type_of spec {
         :string => spec,
-        :map    => core.map_get spec "path" (),
+        :map    => spec.["path" else ()],
         _       => (),
     };
 
@@ -204,11 +203,11 @@ let load_manifest! file =
 let set packages by_name current notes =
     %{ :packages => packages, :by_name => by_name, :current => current, :notes => notes };
 
-let empty = set [] (core.map_new ()) () [];
+let empty = set [] (%{}) () [];
 
-let packages s = core.map_get s :packages [];
-let by_name s  = core.map_get s :by_name (core.map_new ());
-let notes s    = core.map_get s :notes [];
+let packages s = s.[:packages else []];
+let by_name s  = s.[:by_name else (%{})];
+let notes s    = s.[:notes else []];
 
 let at s i = list.nth i (packages s);
 
@@ -234,10 +233,10 @@ let note message s = set (packages s) (by_name s) (current_index s)
 /// directory is worth a note, and even then the first one wins rather than the
 /// compilation stopping.
 let add! p s =
-    match core.map_get (by_name s) (name p) () {
+    match ((by_name s)).[(name p) else ()] {
         () => {
             let i = list.length (packages s);
-            [set (list.append (packages s) [p]) (core.map_put (by_name s) (name p) i)
+            [set (list.append (packages s) [p]) (((by_name s)).[(name p) => i])
                  (current_index s) (notes s),
              i]
         },
@@ -363,7 +362,7 @@ let discover! file extra_roots = {
 when test {
     import std.test;
 
-    let doc text = match toml.parse text { [:ok, d] => d, _ => core.map_new () };
+    let doc text = match toml.parse text { [:ok, d] => d, _ => %{} };
 
     // `load_manifest!` reads a file, so what is tested here is everything that
     // does not: the naming rules, and the shapes read back out of a manifest.

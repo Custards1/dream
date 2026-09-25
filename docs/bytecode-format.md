@@ -128,6 +128,48 @@ lazy VM cannot work out for itself:
 | 40 | `set` | container | key | value |
 | 41 | `switch_head` | subject | `KIDS` offset | kid count (`2n + 1`: `key0 target0 … default`) |
 | 42 | `switch_atom` | subject | `KIDS` offset | kid count, as above |
+| 43 | `type_is` | subject | surface type (0–9) | invert (0 or 1) |
+| 44 | `cons` | head node (lazy) | tail node (lazy) | — |
+| 45 | `list_tail` | list node | — | — |
+| 46 | `list_is_empty` | value node | — | — |
+| 47 | `str_chars` | builtin ID 19 | kids offset | argument count 1 |
+| 48 | `error_new` | builtin ID 23 | kids offset | argument count 2 |
+| 49 | `error_kind` | builtin ID 24 | kids offset | argument count 1 |
+| 50 | `error_payload` | builtin ID 25 | kids offset | argument count 1 |
+| 51 | `str_slice` | builtin ID 26 | kids offset | argument count 3 |
+| 52 | `str_find` | builtin ID 27 | kids offset | argument count 3 |
+| 53 | `str_byte` | builtin ID 28 | kids offset | argument count 2 |
+| 54 | `str_le` | builtin ID 29 | kids offset | argument count 2 |
+| 55 | `str_span` | builtin ID 30 | kids offset | argument count 3 |
+| 56 | `str_upto` | builtin ID 31 | kids offset | argument count 3 |
+| 57 | `char_code` | builtin ID 32 | kids offset | argument count 1 |
+| 58 | `char_of_code` | builtin ID 33 | kids offset | argument count 1 |
+| 59 | `to_float` | builtin ID 34 | kids offset | argument count 1 |
+| 60 | `float_bytes` | builtin ID 35 | kids offset | argument count 1 |
+| 61 | `float_of_bytes` | builtin ID 36 | kids offset | argument count 1 |
+| 62 | `to_int` | builtin ID 37 | kids offset | argument count 1 |
+| 63 | `parse_int` | builtin ID 38 | kids offset | argument count 1 |
+| 64 | `parse_float` | builtin ID 39 | kids offset | argument count 1 |
+| 65 | `to_existing_atom` | builtin ID 40 | kids offset | argument count 1 |
+| 66 | `array_new` | builtin ID 41 | kids offset | argument count 2 |
+| 67 | `array_to_list` | builtin ID 43 | kids offset | argument count 1 |
+| 68 | `map_has` | builtin ID 44 | kids offset | argument count 2 |
+| 69 | `map_remove` | builtin ID 45 | kids offset | argument count 2 |
+| 70 | `map_pairs` | builtin ID 46 | kids offset | argument count 1 |
+| 71 | `data_count` | builtin ID 47 | kids offset | argument count 1 |
+| 72 | `data_at` | builtin ID 48 | kids offset | argument count 1 |
+| 73 | `compare` | builtin ID 49 | kids offset | argument count 2 |
+
+
+`type_is` forces its subject to WHNF and compares its runtime type, answering a
+bool. The kinds follow `dream_type`: integer, float, char, bool, unit, string,
+atom, list, array, map (0 through 9). With `c = 1` the answer is inverted.
+The optimizer fuses `type_of x == :kind` and `!=` (also with the literal on
+the left) into this instruction. This includes the checks emitted for container
+patterns. Function kinds and other atoms retain the ordinary comparison.
+These are runtime checks, never assumptions based on gradual signatures.
+The JIT tests tags and guarded object headers directly; a value already carried
+as an unboxed double has a known type, but its computation still runs.
 
 A `block` evaluates to its last statement. An empty block evaluates to unit.
 
@@ -290,7 +332,7 @@ payload must satisfy `PAYL.offset + 8 + byte_length <= file size`.
 
 **No opcode names it.** The payload is a host-level feature: nothing in `NODE`,
 `KIDS`, `FUNC` or `KSTR` points at it. A program reaches it through the
-`std.core` members `data_count` and `data_at` (see [builtins.md](builtins.md)),
+primitives `data_count` and `data_at` (see [builtins.md](builtins.md)),
 which is what keeps the addition additive — the format needed no new opcode and
 no wider index.
 
@@ -343,3 +385,54 @@ A binding of the same name shadows the builtin.
 Optional type descriptions use ordinary value nodes and need no new opcode.
 The builtin table appends `type_assert` at ID 15 (arity 3, strict mask `0b001`);
 existing builtin IDs are unchanged. Images that use it require an updated VM.
+
+### Primitive calls
+
+Opcodes 47–73 invoke a fixed primitive without evaluating a callee. Their
+argument run uses the corresponding builtin's strictness mask, in argument
+order; unforced arguments remain lazy. The loader validates the builtin ID,
+arity and every child index. Returning a stored value resumes evaluation in
+the machine rather than forcing on the C++ stack. The JIT shares these handlers
+and strictness rules. Opcodes 44–46 implement lazy cons construction, tail
+selection, and the empty-list predicate directly.
+
+The former core functions are builtin IDs 16–49, appended in this order:
+
+| ID | Name |
+|---:|------|
+| 16 | `list_tail` |
+| 17 | `list_cons` |
+| 18 | `list_is_empty` |
+| 19 | `str_chars` |
+| 20 | `str_of_chars` |
+| 21 | `str_of_bytes` |
+| 22 | `str_concat` |
+| 23 | `error_new` |
+| 24 | `error_kind` |
+| 25 | `error_payload` |
+| 26 | `str_slice` |
+| 27 | `str_find` |
+| 28 | `str_byte` |
+| 29 | `str_le` |
+| 30 | `str_span` |
+| 31 | `str_upto` |
+| 32 | `char_code` |
+| 33 | `char_of_code` |
+| 34 | `to_float` |
+| 35 | `float_bytes` |
+| 36 | `float_of_bytes` |
+| 37 | `to_int` |
+| 38 | `parse_int` |
+| 39 | `parse_float` |
+| 40 | `to_existing_atom` |
+| 41 | `array_new` |
+| 42 | `array_of_list` |
+| 43 | `array_to_list` |
+| 44 | `map_has` |
+| 45 | `map_remove` |
+| 46 | `map_pairs` |
+| 47 | `data_count` |
+| 48 | `data_at` |
+| 49 | `compare` |
+
+Images importing the removed `std.core` or `std.native` modules must be recompiled.

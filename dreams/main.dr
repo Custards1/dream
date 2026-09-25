@@ -14,7 +14,7 @@
 // editor asks, and they read the same tables lowering does.
 
 import std.console;
-import std.core;
+
 import std.io;
 import std.list;
 import std.os;
@@ -246,13 +246,13 @@ let copy_payload! out path n =
 /// through its record, and a global that is not a function -- an alias of a
 /// module -- has no parameters to describe.
 let params_of img by_global = {
-    let globals = core.map_get img :globals [];
+    let globals = img.[:globals else []];
     let found = list.fold (fn acc kv -> {
         let [gi, mask] = kv;
         let g = globals.[gi else ()];
-        if g == () || core.map_get g :kind ir.global_module != ir.global_function { acc }
-        else { core.cons [core.map_get g :target 0, mask] acc }
-    }) [] (core.map_pairs by_global);
+        if g == () || g.[:kind else ir.global_module] != ir.global_function { acc }
+        else { list_cons [g.[:target else 0], mask] acc }
+    }) [] (map_pairs by_global);
     list.sort_on (fn e -> list.head e) found
 };
 
@@ -284,10 +284,8 @@ let build! l out shebang payloads optimize types = {
         // been settled into the placeholder that was waiting for it, and two
         // nodes that differ only in a flag are two nodes.
         let built = if optimize { optimizer.optimize (lower.image low) } else { lower.image low };
-        let floats = core.map_put (core.map_put built :payloads sizes)
-                               :float_params (params_of built (if types { typecheck.float_params l r } else { %{} }));
-        let img = core.map_put floats :integer_params
-                    (params_of built (if types { typecheck.integer_params l r } else { %{} }));
+        let floats = ((built.[:payloads => sizes])).[:float_params => (params_of built (if types { typecheck.float_params l r } else { %{} }))];
+        let img = floats.[:integer_params => (params_of built (if types { typecheck.integer_params l r } else { %{} }))];
         let payload_bytes = list.fold (fn n k -> n + k) 0 sizes;
         // The shebang goes in front of the image rather than into it: the VM
         // skips a leading `#!` line when it loads a file, which is what makes
@@ -325,8 +323,8 @@ let build! l out shebang payloads optimize types = {
                     console.error! ("compiled -> " + out + " ("
                                 + to_string (str.byte_length bytes + payload_bytes)
                                 + " bytes, " + to_string (modules.module_count l)
-                                + " modules, " + to_string (list.length (core.map_get img :nodes []))
-                                + " nodes, " + to_string (list.length (core.map_get img :funcs []))
+                                + " modules, " + to_string (list.length (img.[:nodes else []]))
+                                + " nodes, " + to_string (list.length (img.[:funcs else []]))
                                 + " functions"
                                 + (if list.is_empty payloads { "" }
                                    else { ", " + to_string (list.length payloads) + " payloads, "
@@ -364,12 +362,12 @@ let show_stats! l = {
     // Both counts, because the interesting number about the arena is how much
     // of it was the same node written again: `nodes` is what the image carries
     // and `lowered` is what lowering emitted to get there.
-    count! "nodes" (list.length (core.map_get img :nodes []))
-    count! "lowered" (list.length (core.map_get lowered :nodes []))
-    count! "constants" (list.length (core.map_get img :ints [])
-                       + list.length (core.map_get img :floats [])
-                       + list.length (core.map_get img :strs [])
-                       + list.length (core.map_get img :atoms []))
+    count! "nodes" (list.length (img.[:nodes else []]))
+    count! "lowered" (list.length (lowered.[:nodes else []]))
+    count! "constants" (list.length (img.[:ints else []])
+                       + list.length (img.[:floats else []])
+                       + list.length (img.[:strs else []])
+                       + list.length (img.[:atoms else []]))
     count! "reductions" (vm.reductions! ())
     print_diags! (modules.files l) (list.append (modules.diags l) (scope.r_diags r))
 };
@@ -461,8 +459,8 @@ let show_time! o file = {
     line! "total" total ()
     console.print! ("image     " + to_string (str.byte_length bytes) + " bytes, "
                     + to_string (modules.module_count l) + " modules, "
-                    + to_string (list.length (core.map_get img :nodes [])) + " nodes"
-                    + " (from " + to_string (list.length (core.map_get lowered :nodes [])) + ")")
+                    + to_string (list.length (img.[:nodes else []])) + " nodes"
+                    + " (from " + to_string (list.length (lowered.[:nodes else []])) + ")")
     show_macros! l
     print_diags! (modules.files l) (list.append (list.append (modules.diags l) (lower.all_diags r low))
                                                 (value_of checked))
@@ -490,14 +488,14 @@ let show_time! o file = {
 let show_macros! l = match modules.macro_meter l {
     () => (),
     meter => {
-        let phases = core.map_get meter :phases %{};
-        let tallies = core.map_get meter :counts %{};
-        let count k = core.map_get tallies k 0;
+        let phases = meter.[:phases else %{}];
+        let tallies = meter.[:counts else %{}];
+        let count k = tallies.[k else 0];
         let rows = [[:discover, "discover"], [:stage, "stage"],
                     [:snapshot, "snapshot"], [:sites, "sites"],
                     [:resolve, "resolve"], [:image, "lower"], [:emit, "emit"],
                     [:vm, "run"], [:install, "install"]];
-        let at k = core.map_get phases k [0, 0, 0, 0];
+        let at k = phases.[k else [0, 0, 0, 0]];
         let ms r = list.nth 0 r / 1000000;
         let total = list.fold (fn n [k, _] -> n + ms (at k)) 0 rows;
         let pad n text = str.repeat (n - str.byte_length text) " " + text;
@@ -577,7 +575,7 @@ let is_name_byte b =
 let name_start src offset = {
     let rec back i =
         if i <= 0 { 0 }
-        else if is_name_byte (core.str_byte src (i - 1)) { back (i - 1) }
+        else if is_name_byte (str_byte src (i - 1)) { back (i - 1) }
         else { i };
     back offset
 };
@@ -586,7 +584,7 @@ let name_start src offset = {
 let name_at src at = {
     let rec forward i =
         if i >= str.byte_length src { i }
-        else if is_name_byte (core.str_byte src i) { forward (i + 1) }
+        else if is_name_byte (str_byte src i) { forward (i + 1) }
         else { i };
     str.slice at (forward at - at) src
 };
@@ -675,16 +673,16 @@ let defaults = %{ :command => :check, :file => (), :roots => [], :includes => []
                   :position => (), :output => (), :shebang => (), :payloads => [],
                   :error => () };
 
-let opt o k = core.map_get o k ();
-let with_opt k v o = core.map_put o k v;
-let append_opt k v o = core.map_put o k (list.append (core.map_get o k []) [v]);
+let opt o k = o.[k else ()];
+let with_opt k v o = o.[k => v];
+let append_opt k v o = o.[k => (list.append (o.[k else []]) [v])];
 
 /// `LINE:COL`, as `--at` takes it.
 let parse_position text = {
     let parts = str.split ":" text;
     if list.length parts != 2 { () }
     else {
-        match [core.parse_int (list.nth 0 parts), core.parse_int (list.nth 1 parts)] {
+        match [parse_int (list.nth 0 parts), parse_int (list.nth 1 parts)] {
             [(), _] => (),
             [_, ()] => (),
             both => both,
@@ -803,7 +801,7 @@ let usage! () = {
         "  -I, --include DIR        a directory to search for modules",
         "  --host-module PATH       treat PATH as provided by the host",
         "  --payload FILE           put FILE's bytes in the image, reachable as",
-        "                           `core.data_at N` in the order given",
+        "                           `data_at N` in the order given",
         "",
         "what to compile it as:",
         "  -D, --define NAME[=V]    define a `when` flag, or set a `when` value",

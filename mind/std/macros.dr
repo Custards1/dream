@@ -4,7 +4,7 @@
 // checked in the caller, just as if that code had been written there. Generated
 // code needs no imports beyond this module. Names chosen by a caller bind only
 // in the documented branch; internal names cannot be written as source names.
-import std.core;
+
 import std.list;
 
 // --- syntax helpers ---------------------------------------------------------
@@ -275,13 +275,13 @@ when test {
         test.case "assert does not evaluate the message on success"
             $( test.eq! () (expand assert true (1 / 0)) ),
         test.case "assert raises exactly its supplied message"
-            $( test.eq! :failed (try! { expand assert false :failed } catch e { core.error_payload e }) ),
+            $( test.eq! :failed (try! { expand assert false :failed } catch e { error_payload e }) ),
         test.case "attempt returns a success result"
             $( test.eq! [:ok, [1, 2]] (expand attempt [1, 2]) ),
         test.case "attempt catches errors deferred inside a collection"
             $({
                 let result = expand attempt [1, raise! :deferred];
-                test.eq! [:error, :deferred] [result.[0], core.error_payload result.[1]]
+                test.eq! [:error, :deferred] [result.[0], error_payload result.[1]]
             }),
         test.case "attempt evaluates and shares an effectful expression once"
             $({

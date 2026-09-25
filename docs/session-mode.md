@@ -32,7 +32,7 @@ The one counter and the reason it is safe
 
 ```
 let state = %{ :envs => [], :pending => [], :diags => [], :next_global => 0, ... };
-let take_global s = [core.map_put s :next_global (next_global s + 1), next_global s];
+let take_global s = [map_put s :next_global (next_global s + 1), next_global s];
 ```
 
 `declare_module` captures its offset before doing anything else
@@ -46,7 +46,7 @@ let globals_from = next_global s0;
 *range* ([dreams/scope.dr](dreams/scope.dr#L590)):
 
 ```
-core.map_put checked :module_recs
+map_put checked :module_recs
     (list.append (s_module_recs checked)
                  [[mi, globals_from, next_global checked - globals_from, ...]])
 ```
@@ -85,8 +85,8 @@ module that needs them, and the root is last.
 ```
 let fi = func_count r;
 let with_func =
-    core.map_put (core.map_put r :funcs
-                      (core.map_put (func_map r) fi (func_rec ...)))
+    map_put (map_put r :funcs
+                      (map_put (func_map r) fi (func_rec ...)))
                  :func_count (fi + 1);
 ```
 

@@ -55,6 +55,9 @@ enum class ContKind : uint8_t {
                  // v1 = frame; the cells stepped over so far are on the value stack
     SwitchOn,    // a = the switch node, v1 = frame; the result is its subject
     SwitchKey,   // a = the switch node, v1 = frame; the result is the key (a head)
+    EnterRetry,  // a = function index, b = value-stack height, v1 = frame; re-enter
+                 // a compiled call whose nested force was suspended (see
+                 // `enter_function`)
 };
 
 struct Cont {

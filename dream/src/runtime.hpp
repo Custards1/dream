@@ -154,7 +154,7 @@ public:
 
     /// The host module an import record names, remembered after the first ask.
     ///
-    /// Every `core.head xs` in a program goes through here, and the honest
+    /// Every `console.print! xs` in a program goes through here, and the honest
     /// lookup -- copy the path out of the image into a `std::string`, then walk
     /// the registered modules comparing names -- allocated and scanned on every
     /// single call. Modules cannot be registered once the program is running,

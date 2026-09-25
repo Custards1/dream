@@ -17,7 +17,7 @@
 // a program deciding at run time what it wants to check against. A
 // description made only of data can be baked into an image with `comp`; one
 // holding a refinement's predicate cannot, because a closure is not data.
-import std.core;
+
 import std.list;
 
 // --- the descriptions ---------------------------------------------------------
@@ -81,7 +81,7 @@ let fn_of input output = [:fn, input, output];
 // These return only data, including their constraints, so `comp` can bake the
 // result. A refinement holding a closure is what cannot make that promise.
 let enum values = one_of (list.map literal (members values));
-let variant tag fields = tuple (core.cons (literal tag) (members fields));
+let variant tag fields = tuple (list_cons (literal tag) (members fields));
 let range lower upper = [:range, lower, upper];
 let sized lower upper base = [:sized, base, lower, upper];
 let record_with required optional_fields =
@@ -116,11 +116,11 @@ let rec accepts description value = match description {
     [:list_of, element] => type_of value == :list
                         && list.all (fn x -> accepts element x) value,
     [:array_of, element] => type_of value == :array
-                        && list.all (fn x -> accepts element x) (core.array_to_list value),
+                        && list.all (fn x -> accepts element x) (array_to_list value),
     [:tuple, elements] => type_of elements == :list && type_of value == :list
                         && exactly elements value,
     [:array, elements] => type_of elements == :list && type_of value == :array
-                        && exactly elements (core.array_to_list value),
+                        && exactly elements (array_to_list value),
     // A function can only be asked whether it is one. `enforce` is what
     // checks an arrow's halves, and it can, because it has an application.
     [:fn, _, _] => type_of value == :pure_fn || type_of value == :impure_fn,
@@ -136,14 +136,14 @@ let rec accepts description value = match description {
                         && len value >= lower && len value <= upper,
     [:fields, required, optional_fields] => accepts (record required) value
                         && type_of optional_fields == :map
-                        && list.all (fn pair -> not (core.map_has value pair.[0])
-                            || accepts pair.[1] value.[pair.[0]]) (core.map_pairs optional_fields),
+                        && list.all (fn pair -> not (map_has value pair.[0])
+                            || accepts pair.[1] value.[pair.[0]]) (map_pairs optional_fields),
     [:map_of, key, item] => type_of value == :map
                         && list.all (fn pair -> accepts key pair.[0]
-                                             && accepts item pair.[1]) (core.map_pairs value),
+                                             && accepts item pair.[1]) (map_pairs value),
     [:record, fields] => type_of fields == :map && type_of value == :map
-                        && list.all (fn pair -> core.map_has value pair.[0]
-                            && accepts pair.[1] value.[pair.[0]]) (core.map_pairs fields),
+                        && list.all (fn pair -> map_has value pair.[0]
+                            && accepts pair.[1] value.[pair.[0]]) (map_pairs fields),
     [:refine, base, predicate] => accepts base value && predicate value == true,
     kind if type_of kind == :atom && primitive kind => primitive_accepts kind value,
     // Everything else -- an atom that names no kind, a number, a string, a
@@ -193,7 +193,7 @@ let rec exactly elements values = match elements {
 // Missing defaulted fields have the same meaning here as in their accessors.
 let shape_field kind field value = match field {
     [key, description, defaults] => {
-        let present = if kind == :map { core.map_has value key } else { key < len value };
+        let present = if kind == :map { map_has value key } else { key < len value };
         if present { accepts description value.[key] }
         else { match defaults { [fallback] => accepts description fallback, _ => false } }
     },
@@ -211,13 +211,13 @@ let check description value = type_assert (accepts description value) descriptio
 /// The non-raising form, for parsers and other result-returning APIs.
 let validate description value =
     if accepts description value { [:ok, value] }
-    else { [:error, core.error_new :type_error description] };
+    else { [:error, error_new :type_error description] };
 
 /// Check elements as they are demanded, which is the form that works on an
 /// infinite list. `list_of` cannot: deciding it walks the whole spine.
 let rec check_each description values = match values {
     [] => [],
-    [value, ..rest] => core.cons (check description value) (check_each description rest),
+    [value, ..rest] => list_cons (check description value) (check_each description rest),
 };
 
 /// Wrap a function so that an arrow description is checked at each
@@ -244,3 +244,14 @@ let rec name_of description = match description {
     [:named, name, _] => name,
     _ => to_string description,
 };
+
+// Scalar type descriptions shared by the standard library.
+
+type Integer = :integer;
+type Number = :integer | :float;
+type Boolean = :bool;
+type Character = :char;
+type Text = :string;
+type Atom = :atom;
+type Unit = :unit;
+type Function = :pure_fn | :impure_fn;

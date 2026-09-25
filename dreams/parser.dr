@@ -22,7 +22,6 @@
 //   indent    the column the current statement began at; a line indented past
 //             it continues that statement rather than starting a new one
 
-import std.core;
 import std.list;
 import std.str;
 
@@ -34,7 +33,7 @@ import dreams.lexer;
 let ok value rest = [:ok, value, rest];
 let err message span = [:error, message, span];
 
-let is_ok r = core.head r == :ok;
+let is_ok r = r.[0] == :ok;
 let value_of r = list.nth 1 r;
 let rest_of r = list.nth 2 r;
 let message_of r = list.nth 1 r;
@@ -122,9 +121,9 @@ let is_keyword name = match name {
     "group" => false,
     "struct" => false,
     "mapping" => false,
-    _ => core.map_has keyword_set name,
+    _ => map_has keyword_set name,
 };
-let is_non_starter name = core.map_has non_starter_set name;
+let is_non_starter name = map_has non_starter_set name;
 
 /// The token after this one, for the single place that needs to look ahead:
 /// telling `.field` from a `.` that is something else.
@@ -252,7 +251,7 @@ let rec gather_args c acc ts =
     else {
         match parse_postfix c ts {
             [:error, m, s] => err m s,
-            [:ok, a, rest] => gather_args c (core.cons a acc) rest,
+            [:ok, a, rest] => gather_args c (list_cons a acc) rest,
         }
     };
 
@@ -430,7 +429,7 @@ let rec comma_list c acc ts closer what =
         match parse_expr c ts {
             [:error, m, s] => err m s,
             [:ok, e, rest] => {
-                let acc2 = core.cons e acc;
+                let acc2 = list_cons e acc;
                 if at rest :comma { comma_list c acc2 (list.tail rest) closer what }
                 else if at rest closer { ok [list.reverse acc2, peek_span rest] (list.tail rest) }
                 else { err ("expected `,` or `" + what + "`, found " + describe rest) (peek_span rest) }
@@ -453,7 +452,7 @@ let rec map_entries c acc ts sp =
                         match parse_expr c rest2 {
                             [:error, m, s] => err m s,
                             [:ok, v, rest3] => {
-                                let acc2 = core.cons [k, v] acc;
+                                let acc2 = list_cons [k, v] acc;
                                 if at rest3 :comma { map_entries c acc2 (list.tail rest3) sp }
                                 else if at rest3 :rbrace {
                                     ok (ast.map_e (list.reverse acc2) (ast.span_to sp (peek_span rest3)))
@@ -540,17 +539,17 @@ let rec parse_lambda c sp ts =
 let rec lambda_params acc ts =
     if at ts :arrow { ok (list.reverse acc) (list.tail ts) }
     else if at ts :ident && not (is_keyword (peek_value ts)) {
-        lambda_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
+        lambda_params (list_cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
     }
     else if starts_strict_param ts {
         match strict_param ts {
             [:error, m, s] => err m s,
-            [:ok, p, rest] => lambda_params (core.cons p acc) rest,
+            [:ok, p, rest] => lambda_params (list_cons p acc) rest,
         }
     }
     else if at ts :lparen && peek2_kind ts == :rparen {
         // `()` -- a slot that binds no name.
-        lambda_params (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
+        lambda_params (list_cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
     }
     else if at ts :lparen {
         match paren_params acc (list.tail ts) {
@@ -561,7 +560,7 @@ let rec lambda_params acc ts =
     else if starts_param_pattern ts {
         match param_pattern ts {
             [:error, m, s] => err m s,
-            [:ok, p, rest] => lambda_params (core.cons p acc) rest,
+            [:ok, p, rest] => lambda_params (list_cons p acc) rest,
         }
     }
     else { err ("expected a parameter or `->`, found " + describe ts) (peek_span ts) };
@@ -739,8 +738,8 @@ let answering params annotation = {
 /// Put one parsed item or statement onto a reversed list, splitting a `let`
 /// that carried its own signature into the signature and the `let`.
 let spliced item acc = match item {
-    [:sigged, sg, d] => core.cons d (core.cons sg acc),
-    _ => core.cons item acc,
+    [:sigged, sg, d] => list_cons d (list_cons sg acc),
+    _ => list_cons item acc,
 };
 
 // --- type expressions -------------------------------------------------------
@@ -775,7 +774,7 @@ let spliced item acc = match item {
 
 /// A description of a kind the parser builds: `[tag, ..parts]`, as a list
 /// expression, which is what `std.types` would have returned.
-priv let tagged tag parts span = ast.list_e (core.cons (ast.atom_e tag span) parts) span;
+priv let tagged tag parts span = ast.list_e (list_cons (ast.atom_e tag span) parts) span;
 
 /// The whole of a type. `where` is last so that it refines everything in
 /// front of it, and its predicate is an *ordinary* expression -- a type
@@ -833,7 +832,7 @@ let rec type_union_tail c acc ts =
     else {
         match parse_type_apply c (list.tail ts) {
             [:error, m, s] => err m s,
-            [:ok, part, rest] => type_union_tail c (core.cons part acc) rest,
+            [:ok, part, rest] => type_union_tail c (list_cons part acc) rest,
         }
     };
 
@@ -860,7 +859,7 @@ let rec gather_type_args c acc ts =
     else {
         match parse_type_postfix c ts {
             [:error, m, s] => err m s,
-            [:ok, a, rest] => gather_type_args c (core.cons a acc) rest,
+            [:ok, a, rest] => gather_type_args c (list_cons a acc) rest,
         }
     };
 
@@ -927,7 +926,7 @@ priv let primitive_atom_set = comp set_of primitive_atoms;
 /// keys are strings is what `%{:string => :integer}` should mean.
 let type_key_is_literal ts =
     match peek_kind ts {
-        :atom => not (core.map_has primitive_atom_set (peek_value ts)),
+        :atom => not (map_has primitive_atom_set (peek_value ts)),
         :str => true, :int => true, :char => true,
         _ => false,
     };
@@ -1017,7 +1016,7 @@ let rec type_comma_list c acc ts closer what =
         match parse_type_expr (grouped c) ts {
             [:error, m, s] => err m s,
             [:ok, t, rest] => {
-                let acc2 = core.cons t acc;
+                let acc2 = list_cons t acc;
                 if at rest :comma { type_comma_list c acc2 (list.tail rest) closer what }
                 else if at rest closer { ok [list.reverse acc2, peek_span rest] (list.tail rest) }
                 else { err ("expected `,` or `" + what + "`, found " + describe rest) (peek_span rest) }
@@ -1072,7 +1071,7 @@ let rec parse_type_record c sp acc ts =
         match type_map_pair (grouped c) ts {
             [:error, m, s] => err m s,
             [:ok, pair, rest] => {
-                let acc2 = core.cons pair acc;
+                let acc2 = list_cons pair acc;
                 if at rest :comma { parse_type_record c sp acc2 (list.tail rest) }
                 else if at rest :rbrace {
                     let span = ast.span_to sp (peek_span rest);
@@ -1183,16 +1182,16 @@ let rec parse_let_pattern c sp ts =
 let rec let_params c acc ts =
     if at_end ts || not (token_continues c (list.head ts)) { ok (list.reverse acc) ts }
     else if at ts :ident && not (is_keyword (peek_value ts)) {
-        let_params c (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
+        let_params c (list_cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
     }
     else if starts_strict_param ts {
         match strict_param ts {
             [:error, m, s] => err m s,
-            [:ok, p, rest] => let_params c (core.cons p acc) rest,
+            [:ok, p, rest] => let_params c (list_cons p acc) rest,
         }
     }
     else if at ts :lparen && peek2_kind ts == :rparen {
-        let_params c (core.cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
+        let_params c (list_cons (ast.param () (peek_span ts)) acc) (list.tail (list.tail ts))
     }
     else if at ts :lparen {
         match paren_params acc (list.tail ts) {
@@ -1203,7 +1202,7 @@ let rec let_params c acc ts =
     else if starts_param_pattern ts {
         match param_pattern ts {
             [:error, m, s] => err m s,
-            [:ok, p, rest] => let_params c (core.cons p acc) rest,
+            [:ok, p, rest] => let_params c (list_cons p acc) rest,
         }
     }
     else { ok (list.reverse acc) ts };
@@ -1247,7 +1246,7 @@ let rec paren_params acc ts =
     match parse_pattern (grouped top) ts {
         [:error, m, s] => err m s,
         [:ok, p, rest] => {
-            let acc2 = core.cons (param_of p) acc;
+            let acc2 = list_cons (param_of p) acc;
             if at rest :comma { paren_params acc2 (list.tail rest) }
             else if at rest :rparen { ok acc2 (list.tail rest) }
             else { err ("expected `,` or `)` in a parameter list, found " + describe rest) (peek_span rest) }
@@ -1307,7 +1306,7 @@ let rec match_arms c acc ts =
                 match arm_guard_and_body c pat rest {
                     [:error, m, s] => err m s,
                     [:ok, a, rest2] => {
-                        let acc2 = core.cons a acc;
+                        let acc2 = list_cons a acc;
                         if at rest2 :comma { match_arms c acc2 (list.tail rest2) }
                         else if at rest2 :rbrace { ok [list.reverse acc2, peek_span rest2] (list.tail rest2) }
                         else { err ("expected `,` or `}` after a match arm, found " + describe rest2)
@@ -1436,7 +1435,7 @@ let rec pattern_items c acc ts closer build what sp =
         match parse_pattern c ts {
             [:error, m, s] => err m s,
             [:ok, p, rest] => {
-                let acc2 = core.cons p acc;
+                let acc2 = list_cons p acc;
                 if at rest :comma { pattern_items c acc2 (list.tail rest) closer build what sp }
                 else if at rest closer {
                     ok (build (list.reverse acc2) () (ast.span_to sp (peek_span rest))) (list.tail rest)
@@ -1461,7 +1460,7 @@ let rec pattern_map_entries c acc ts sp =
                         match parse_pattern c rest2 {
                             [:error, m, s] => err m s,
                             [:ok, p, rest3] => {
-                                let acc2 = core.cons [k, p] acc;
+                                let acc2 = list_cons [k, p] acc;
                                 if at rest3 :comma { pattern_map_entries c acc2 (list.tail rest3) sp }
                                 else if at rest3 :rbrace {
                                     ok (ast.map_p (list.reverse acc2) (ast.span_to sp (peek_span rest3)))
@@ -1606,7 +1605,7 @@ let rec union_params acc ts =
         if str.ends_with "!" (peek_value ts) {
             err "a type parameter must be pure" (peek_span ts)
         }
-        else { union_params (core.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts) }
+        else { union_params (list_cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts) }
     }
     else { ok (list.reverse acc) ts };
 
@@ -1625,8 +1624,8 @@ let rec union_body c name params sp variants members ts =
     else {
         match union_entry (at_statement c ts) name variants members ts {
             [:error, m, s] => err m s,
-            [:ok, [:variant, v], rest] => union_body c name params sp (core.cons v variants) members rest,
-            [:ok, [:member, m], rest] => union_body c name params sp variants (core.cons m members) rest,
+            [:ok, [:variant, v], rest] => union_body c name params sp (list_cons v variants) members rest,
+            [:ok, [:member, m], rest] => union_body c name params sp variants (list_cons m members) rest,
         }
     };
 
@@ -1716,7 +1715,7 @@ let rec variant_fields c acc ts =
                     err "a field must be a plain name: reading one is pure" fspan
                 }
                 else {
-                    let acc2 = core.cons [fname, fspan, t] acc;
+                    let acc2 = list_cons [fname, fspan, t] acc;
                     if at rest :comma { variant_fields c acc2 (list.tail rest) }
                     else if at rest :rparen { ok [list.reverse acc2, peek_span rest] (list.tail rest) }
                     else { err ("expected `,` or `)`, found " + describe rest) (peek_span rest) }
@@ -1753,9 +1752,9 @@ let rec record_body c kind name sp fields members ts =
         match record_entry (at_statement c ts) name fields members ts {
             [:error, m, s] => err m s,
             [:ok, [:field, f], rest] =>
-                record_body c kind name sp (core.cons f fields) members rest,
+                record_body c kind name sp (list_cons f fields) members rest,
             [:ok, [:member, m], rest] =>
-                record_body c kind name sp fields (core.cons m members) rest,
+                record_body c kind name sp fields (list_cons m members) rest,
         }
     };
 
@@ -1877,7 +1876,7 @@ let rec names_something e =
 let rec dotted_path acc ts =
     if not (at ts :ident) { err ("expected a module name, found " + describe ts) (peek_span ts) }
     else {
-        let acc2 = core.cons (peek_value ts) acc;
+        let acc2 = list_cons (peek_value ts) acc;
         let rest = list.tail ts;
         // Only follow the dot when a name comes after it -- `import a.{x}` has
         // a brace there, and that is a member list, not another segment.
@@ -1927,7 +1926,7 @@ let rec import_names acc ts =
         let renamed = is_kw after "as";
         let alias = if renamed && at (list.tail after) :ident { peek_value (list.tail after) } else { () };
         let rest = if renamed { list.tail (list.tail after) } else { after };
-        let acc2 = core.cons [name, alias] acc;
+        let acc2 = list_cons [name, alias] acc;
         if at rest :comma { import_names acc2 (list.tail rest) }
         else if at rest :rbrace { ok (list.reverse acc2) (list.tail rest) }
         else { err ("expected `,` or `}` in an import list, found " + describe rest) (peek_span rest) }
@@ -2119,7 +2118,7 @@ let rec expand_sites prev ts acc = match ts {
         let kind = lexer.kind t;
         expand_sites kind rest
             (if prev != :dot && kind == :ident && lexer.value t == "expand" {
-                 core.cons (lexer.span_start t) acc
+                 list_cons (lexer.span_start t) acc
              } else { acc })
     },
 };
@@ -2129,7 +2128,7 @@ let rec expand_sites prev ts acc = match ts {
 /// -- a caller that does not read it does not pay for the scan.
 ///
 /// The text is searched before the tokens are, and that is not belt and
-/// braces: `core.str_find` is one machine pass over the file where the scan
+/// braces: `str_find` is one machine pass over the file where the scan
 /// is a Dream loop over every token in it, and a file that does not contain
 /// the six bytes cannot contain the word. Nearly every file is such a file --
 /// in a program with no macros at all, every one of them is -- so this is

@@ -9,7 +9,7 @@ import std.agent;
 import std.array;
 import std.cli;
 import std.codec;
-import std.core;
+
 import std.error;
 import std.json;
 import std.list;
@@ -33,7 +33,7 @@ import std.types;
 let version = "0.1.0";
 
 /// The modules this build provides.
-let modules = ["std.agent", "std.array", "std.cli", "std.codec", "std.core", "std.error", "std.json", "std.list",
+let modules = ["std.agent", "std.array", "std.cli", "std.codec", "std.error", "std.json", "std.list",
                "std.map", "std.macros", "std.proc", "std.record", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];
@@ -122,7 +122,7 @@ when test {
         test.case "the right shape fits"    $( test.true! (User.fits ada) ),
         test.case "a named map fits"        $( test.true! (User.fits (User.to_map ada)) ),
         test.case "a JSON object fits"      $( test.true! (User.fits %{ "name" => "a", "age" => 1 }) ),
-        test.case "the wrong length does not" $( test.false! (User.fits (core.array_of_list [1])) ),
+        test.case "the wrong length does not" $( test.false! (User.fits (array_of_list [1])) ),
         test.case "a missing member does not" $( test.false! (User.fits %{ "name" => "a" }) ),
         test.case "a number is not a record"  $( test.false! (User.fits 1) ),
 
@@ -161,8 +161,8 @@ when test {
 
     let typing_tests = [
         test.case "core scalar types compose" $( test.eq! [true, false, true]
-            [types.accepts core.Integer 2, types.accepts core.Integer 2.0,
-             types.accepts core.Number 2.0] ),
+            [types.accepts types.Integer 2, types.accepts types.Integer 2.0,
+             types.accepts types.Number 2.0] ),
         test.case "collection type constructors check their members" $( test.eq! [true, false, true, false]
             [types.accepts (list.Of :integer) [1, 2], types.accepts (list.Of :integer) [1, "x"],
              types.accepts (array.Of :string) #["a"], types.accepts (map.Of :atom :integer) %{ :x => "bad" }] ),
@@ -187,7 +187,7 @@ when test {
         test.case "result validation preserves an existing error" $( test.eq! [:error, "original"]
             (result.validate_ok :integer [:error, "original"]) ),
         test.case "typed errors remain inspectable values" $( test.true!
-            (types.accepts (error.OfKind :type_error) (core.error_new :type_error :integer)) ),
+            (types.accepts (error.OfKind :type_error) (error_new :type_error :integer)) ),
         test.case "compile time option schemas are reusable runtime data" $( test.eq! "fast"
             (cli.get "" (result.unwrap! compiled_options) "mode") ),
         test.case "derived option schemas keep optional fields optional" $( test.true!

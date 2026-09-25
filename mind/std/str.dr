@@ -18,7 +18,7 @@ import std.list;
 
 /// Left to right over the characters, not the bytes.
 /// Strict in each step, for the reason `array.fold` gives.
-let fold f init s = list.fold_strict f init (core.str_chars s);
+let fold f init s = list.fold_strict f init (str_chars s);
 
 let name s = "string";
 
@@ -26,21 +26,21 @@ let name s = "string";
 
 /// The number of characters. Decodes the whole string, because UTF-8 does not
 /// know its own character count without looking.
-let length s = list.length (core.str_chars s);
+let length s = list.length (str_chars s);
 
 /// The number of bytes, which the runtime knows without decoding anything.
 /// For text that is all ASCII the two agree; for anything else they do not.
-let byte_length s = core.str_len s;
+let byte_length s = len s;
 
-let is_empty s = core.str_len s == 0;
+let is_empty s = len s == 0;
 
 // --- characters -------------------------------------------------------------
 
-let chars s = core.str_chars s;
+let chars s = str_chars s;
 
-let of_chars cs = core.str_of_chars cs;
+let of_chars cs = str_of_chars cs;
 
-let first_or default s = list.first_or default (core.str_chars s);
+let first_or default s = list.first_or default (str_chars s);
 
 // --- bytes ------------------------------------------------------------------
 
@@ -48,15 +48,15 @@ let first_or default s = list.first_or default (core.str_chars s);
 /// off the end is how a loop over a string finishes, and an error there would
 /// be noise. Slicing through the middle of a multi-byte character will split
 /// it, which is why the offsets to pass are the ones `find` returns.
-let slice from count s = core.str_slice s from count;
+let slice from count s = str_slice s from count;
 
 /// The byte at offset `i`, as an integer, or `-1` when there is none.
 ///
 /// Clamped the same way `slice` is, and for the same reason. This is the way
-/// into a big string (`core.data_at`), which has no `chars` and no `find`:
+/// into a big string (`data_at`), which has no `chars` and no `find`:
 /// indexing it is pointer arithmetic and costs nothing, while anything that
 /// would build a string out of it is refused.
-let byte i s = core.str_byte s i;
+let byte i s = str_byte s i;
 
 /// Past the run of bytes from `set` that starts at byte offset `from`: the
 /// offset of the first byte that is not one of them, or `byte_length s`.
@@ -65,25 +65,25 @@ let byte i s = core.str_byte s i;
 /// indentation and `span "0123456789" i s` skips a run of digits. The scan
 /// happens in the runtime, which is the point: doing it a byte at a time in
 /// Dream costs a call and a comparison chain per byte.
-let span set from s = core.str_span s from set;
+let span set from s = str_span s from set;
 
 /// The offset of the first byte from `set` at or after `from`, or
 /// `byte_length s` when there is none -- so `upto "\n" i s` is the end of the
 /// line whether or not the text ends with one.
-let upto set from s = core.str_upto s from set;
+let upto set from s = str_upto s from set;
 
 /// The byte offset of `needle` at or after byte offset `from`, or `-1`.
-let find_from from needle s = core.str_find s needle from;
+let find_from from needle s = str_find s needle from;
 
-let find needle s = core.str_find s needle 0;
+let find needle s = str_find s needle 0;
 
-let contains_str needle s = core.str_find s needle 0 >= 0;
+let contains_str needle s = str_find s needle 0 >= 0;
 
 
-let starts_with prefix s = core.str_slice s 0 (core.str_len prefix) == prefix;
+let starts_with prefix s = str_slice s 0 (len prefix) == prefix;
 
 let ends_with suffix s =
-    core.str_slice s (core.str_len s - core.str_len suffix) (core.str_len suffix) == suffix;
+    str_slice s (len s - len suffix) (len suffix) == suffix;
 
 // --- building ---------------------------------------------------------------
 
@@ -96,7 +96,7 @@ let concat a b = a + b;
 /// step, so assembling n pieces costs n^2 bytes of copying. Anything that
 /// builds a large output a piece at a time -- an image, a rendered diagnostic,
 /// a dump of a program -- should collect the pieces and come here once.
-let concat_all parts = core.str_concat parts;
+let concat_all parts = str_concat parts;
 
 /// The strings in `parts` with `sep` between them. `std.seq` supplies `join`,
 /// which renders each element with `to_string`; this one is for strings that
@@ -105,33 +105,33 @@ let join_str sep parts =
     match parts {
         [] => "",
         [first, ..rest] =>
-            core.str_concat (core.cons first (list.flat_map (fn s -> [sep, s]) rest)),
+            str_concat (list_cons first (list.flat_map (fn s -> [sep, s]) rest)),
     };
 
 /// `s` repeated `n` times.
-let repeat n s = if n <= 0 { "" } else { core.str_concat (list.replicate n s) };
+let repeat n s = if n <= 0 { "" } else { str_concat (list.replicate n s) };
 
 /// The parts of `s` between each occurrence of `sep`, as a list of strings.
 /// An empty separator would not make progress, so it yields the whole string.
 let split sep s = {
-    let seplen = core.str_len sep;
+    let seplen = len sep;
     let rec go from =
-        if from > core.str_len s { [] }
+        if from > len s { [] }
         else {
-            let at = core.str_find s sep from;
-            if at < 0 { [core.str_slice s from (core.str_len s - from)] }
-            else { core.cons (core.str_slice s from (at - from)) (go (at + seplen)) }
+            let at = str_find s sep from;
+            if at < 0 { [str_slice s from (len s - from)] }
+            else { list_cons (str_slice s from (at - from)) (go (at + seplen)) }
         };
     if seplen == 0 { [s] } else { go 0 }
 };
 
 // --- transforming -----------------------------------------------------------
 
-let map f s = core.str_of_chars (list.map f (core.str_chars s));
+let map f s = str_of_chars (list.map f (str_chars s));
 
-let filter keep s = core.str_of_chars (list.filter keep (core.str_chars s));
+let filter keep s = str_of_chars (list.filter keep (str_chars s));
 
-let reverse s = core.str_of_chars (list.reverse (core.str_chars s));
+let reverse s = str_of_chars (list.reverse (str_chars s));
 
 // --- case, for ASCII --------------------------------------------------------
 //
@@ -139,10 +139,10 @@ let reverse s = core.str_of_chars (list.reverse (core.str_chars s));
 // not carry, and pretending otherwise would be worse than saying so.
 
 let upper_char c =
-    if c >= 'a' && c <= 'z' { core.char_of_code (core.char_code c - 32) } else { c };
+    if c >= 'a' && c <= 'z' { char_of_code (char_code c - 32) } else { c };
 
 let lower_char c =
-    if c >= 'A' && c <= 'Z' { core.char_of_code (core.char_code c + 32) } else { c };
+    if c >= 'A' && c <= 'Z' { char_of_code (char_code c + 32) } else { c };
 
 let upper s = map upper_char s;
 
@@ -152,10 +152,10 @@ let lower s = map lower_char s;
 
 let is_space c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
 
-let trim_start s = core.str_of_chars (list.drop_while is_space (core.str_chars s));
+let trim_start s = str_of_chars (list.drop_while is_space (str_chars s));
 
 let trim_end s =
-    core.str_of_chars (list.reverse (list.drop_while is_space (list.reverse (core.str_chars s))));
+    str_of_chars (list.reverse (list.drop_while is_space (list.reverse (str_chars s))));
 
 let trim s = trim_end (trim_start s);
 

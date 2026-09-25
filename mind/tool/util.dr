@@ -1,5 +1,5 @@
 // Paths, files, and the small things every other module here needs.
-import std.core;
+
 import std.io;
 import std.list;
 import std.os;

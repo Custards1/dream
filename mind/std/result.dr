@@ -11,7 +11,7 @@
 // rewrites the same `match`. What follows is those matches, named. Nothing here
 // is clever -- the point is that `and_then` reads as "and then", so a pipeline
 // of steps that can each fail is written once and reads as the sequence it is.
-import std.core;
+
 import std.list;
 
 // --- making one ---------------------------------------------------------------
@@ -65,7 +65,7 @@ let rec all rs =
         else {
             let rest = all (list.tail rs);
             if is_error rest { rest }
-            else { ok (core.cons (list.nth 1 first) (list.nth 1 rest)) }
+            else { ok (list_cons (list.nth 1 first) (list.nth 1 rest)) }
         }
     };
 

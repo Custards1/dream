@@ -44,7 +44,7 @@ compiler is what makes that image self-contained:
   (lower.dr:292): "a cross-module call is one index by the time the image is
   written, which is the whole point of compiling the program as a whole"
   (scope.dr:68-72). The only imports left in an image are *host* modules
-  (`std.core`, `std.io`, …) provided from C++, resolved by name at runtime
+  (`std.console`, `std.io`, …) provided from C++, resolved by name at runtime
   (interp.cpp:721-763).
 
 So an image is not a library: its edges point into itself, and nothing in the

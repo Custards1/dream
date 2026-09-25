@@ -18,7 +18,7 @@
 //   * a first iteration that raises, which must raise what it raised before.
 
 import std.console;
-import std.core;
+
 
 // --- a loop the hint is for -------------------------------------------------
 //
@@ -43,7 +43,7 @@ let term : :float -> :float -> :float;
 let term k w = w / (k * k + 1.0);
 
 let rec sum_terms i n acc =
-    if i >= n { acc } else { sum_terms (i + 1) n (acc + term (core.to_float i) 2.0) };
+    if i >= n { acc } else { sum_terms (i + 1) n (acc + term (to_float i) 2.0) };
 
 // The same helper handed integers: `k * k + 1.0` is a float whatever `k` is,
 // but `w / ..` keeps the integer `w` an integer only until the float arrives.

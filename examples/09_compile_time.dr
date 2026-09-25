@@ -1,6 +1,6 @@
 // Work done before the program runs: `comp`, `comp!`, and `when`.
 import std.console;
-import std.core;
+
 import std.list;
 
 // --- comp: evaluated by the compiler, baked into the image ------------------
@@ -9,10 +9,7 @@ let rec fib n = if n < 2 { n } else { fib (n - 1) + fib (n - 2) };
 
 /// The first `n` Fibonacci numbers, built with list literals and `+`.
 ///
-/// It avoids `std.list` deliberately: `comp` runs on the compiler's own
-/// evaluator, which has no VM and so cannot reach a host module -- and every
-/// `std.list` function goes through `std.core`, which is C++ in the VM. See
-/// `digits` below for the other half of the story.
+/// Pure primitives and standard-library functions are available to `comp`.
 let rec fib_upto n = if n <= 0 { [] } else { fib_upto (n - 1) + [fib n] };
 
 /// Computed once, at compile time. The image holds the list, not the loop.
@@ -28,11 +25,9 @@ let mixed = comp (1 + 2) * 10;
 
 // --- comp!: evaluated by running it on a real VM ----------------------------
 //
-// `comp` uses the compiler's own evaluator, which has no VM and so cannot
-// reach a host module. `comp!` hands the expression to a real VM instead, so
-// anything in `std.core` and friends is available.
+// `comp!` also permits effects during compile-time evaluation.
 
-let digits = comp! core.str_chars "12345";
+let digits = comp! str_chars "12345";
 let squares = comp! list.map (fn x -> x * x) [1, 2, 3, 4];
 
 // --- when: items that exist only under a condition --------------------------
@@ -80,5 +75,5 @@ let main! = {
 
     // The compile-time and run-time answers agree; only the timing differs.
     console.print! ("same:       " + to_string (fib_table == fib_upto 14))
-    console.print! ("same:       " + to_string (digits == core.str_chars "12345"))
+    console.print! ("same:       " + to_string (digits == str_chars "12345"))
 };

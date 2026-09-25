@@ -3,12 +3,12 @@
 // This module lives at `stats/mod.dr` rather than `stats.dr`, which is how a
 // module grows into a directory without any importer changing: `import
 // textstats.stats` finds either spelling.
-import std.core;
+
 import std.list;
 import std.str;
 
 /// The mean of a list of numbers, or `()` for an empty one.
-let mean xs = if list.is_empty xs { () } else { core.to_float (list.sum xs) / core.to_float (list.length xs) };
+let mean xs = if list.is_empty xs { () } else { to_float (list.sum xs) / to_float (list.length xs) };
 
 /// The middle value once sorted. For an even count, the lower of the two --
 /// which keeps the result the same type as the input.

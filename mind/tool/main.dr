@@ -14,7 +14,7 @@
 // so a build is "find the packages, hand them to the compiler, run it".
 import std.cli;
 import std.console;
-import std.core;
+
 import std.io;
 import std.list;
 import std.os;

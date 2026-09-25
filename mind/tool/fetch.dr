@@ -10,7 +10,7 @@
 // protocols. They are already installed, already know about proxies and
 // credentials and certificate stores, and none of that is a build tool's
 // business.
-import std.core;
+
 import std.io;
 import std.list;
 import std.os;
@@ -53,15 +53,15 @@ let dep_dir! d = {
 /// Run a command, and answer `[:ok, out]` or `[:error, message]`.
 let run! what program args = {
     let r = os.exec_for! program args 600000;
-    let code = core.map_get r :code (0 - 1);
-    let timed = core.map_get r :timed_out false;
+    let code = r.[:code else (0 - 1)];
+    let timed = r.[:timed_out else false];
     if timed { [:error, what + ": timed out after 10 minutes"] }
     else if code != 0 {
-        let err = str.trim (core.map_get r :err "");
+        let err = str.trim (r.[:err else ""]);
         [:error, what + " failed (" + to_string code + ")"
             + (if str.is_empty err { "" } else { ": " + err })]
     }
-    else { [:ok, core.map_get r :out ""] }
+    else { [:ok, r.[:out else ""]] }
 };
 
 let git_fetch! d dir = {

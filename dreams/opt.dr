@@ -2,7 +2,7 @@
 //
 // Lowering emits a node wherever the source says one, and says nothing about
 // whether it has emitted that node before. It has, constantly. `local 3` is one
-// record and a self-compile writes ten thousand of them; `core.head` as a
+// record and a self-compile writes ten thousand of them; `head` as a
 // callee is a `builtin` beside an `apply` and there are seven thousand of those;
 // a whole `if x == () { .. }` written twice in two modules is two identical
 // subtrees. Nothing downstream can tell the copies apart, because a node record
@@ -51,18 +51,16 @@
 // `settle_comps!` rather than merely after lowering: a compile-time expression
 // overwrites its placeholder once the program has been built and run.
 //
-// Nothing here changes what the program computes. Every node emitted is a node
-// lowering already emitted, with its operands renumbered; no node is folded,
-// reordered or deleted except one that nothing could reach. That is a
-// deliberately narrow licence, and it is what lets the pass run unconditionally
-// on every build without a flag to turn it off -- there is no program it can be
-// wrong about. `--no-opt` exists anyway, because when an image misbehaves the
-// first question is whether the pass that rewrote it is why.
+// The one instruction rewrite fuses a primitive `type_of` comparison into a
+// runtime type test. It forces exactly the same subject and preserves errors;
+// it does not trust a gradual signature. Everything else is copied with its
+// operands renumbered or removed because no body reaches it. `--no-opt` keeps
+// the original arena for comparison.
 
-import std.core;
 import std.list;
 
 import dreams.ir;
+import dreams.builtins;
 
 // --- what an operand means ----------------------------------------------------
 //
@@ -90,6 +88,8 @@ let node_edges = [
     /// `a` is the body and `b` the handler; `c` is the slot the error binds to.
     [:try, [0, 1]],
     [:force, [0]],
+    [:type_is, [0]],
+    [:cons, [0, 1]], [:list_tail, [0]], [:list_is_empty, [0]],
     [:neg, [0]], [:not, [0]],
     [:add, [0, 1]], [:sub, [0, 1]], [:mul, [0, 1]],
     [:div, [0, 1]], [:mod, [0, 1]],
@@ -107,6 +107,34 @@ let node_edges = [
 /// operand, kids per count]`. The multiplier is for `map`, whose count is a
 /// number of pairs and whose run is two kids each.
 let node_runs = [
+    [:str_chars, 1, 2, 1],
+    [:error_new, 1, 2, 1],
+    [:error_kind, 1, 2, 1],
+    [:error_payload, 1, 2, 1],
+    [:str_slice, 1, 2, 1],
+    [:str_find, 1, 2, 1],
+    [:str_byte, 1, 2, 1],
+    [:str_le, 1, 2, 1],
+    [:str_span, 1, 2, 1],
+    [:str_upto, 1, 2, 1],
+    [:char_code, 1, 2, 1],
+    [:char_of_code, 1, 2, 1],
+    [:to_float, 1, 2, 1],
+    [:float_bytes, 1, 2, 1],
+    [:float_of_bytes, 1, 2, 1],
+    [:to_int, 1, 2, 1],
+    [:parse_int, 1, 2, 1],
+    [:parse_float, 1, 2, 1],
+    [:to_existing_atom, 1, 2, 1],
+    [:array_new, 1, 2, 1],
+    [:array_to_list, 1, 2, 1],
+    [:map_has, 1, 2, 1],
+    [:map_remove, 1, 2, 1],
+    [:map_pairs, 1, 2, 1],
+    [:data_count, 1, 2, 1],
+    [:data_at, 1, 2, 1],
+    [:compare, 1, 2, 1],
+
     [:apply, 1, 2, 1],
     [:block, 0, 1, 1],
     [:make_list, 0, 1, 1],
@@ -119,24 +147,24 @@ let node_runs = [
 // Asked once per node of the program, which is the shape of question that has
 // twice been the most expensive thing in a self-compile when it was answered by
 // walking a list. Both tables are built once, at module level.
-let edge_map = list.fold (fn m e -> core.map_put m (list.nth 0 e) (list.nth 1 e))
-                         (core.map_new ()) node_edges;
-let run_map = list.fold (fn m e -> core.map_put m (list.nth 0 e) [list.nth 1 e, list.nth 2 e, list.nth 3 e])
-                        (core.map_new ()) node_runs;
+let edge_map = list.fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
+                         (%{}) node_edges;
+let run_map = list.fold (fn m e -> m.[(list.nth 0 e) => [list.nth 1 e, list.nth 2 e, list.nth 3 e]])
+                        (%{}) node_runs;
 
-let edges_of op = core.map_get edge_map op [];
-let run_of op = core.map_get run_map op ();
+let edges_of op = edge_map.[op else []];
+let run_of op = run_map.[op else ()];
 
 /// An opcode with no children at all: every operand it has is a number that
 /// means something other than "the node over there". Half the arena is these --
 /// `local`, `builtin`, `global`, `atom`, `int` -- and the walk below treats
 /// them differently, so the question is asked once per node and gets its own
 /// table rather than two misses on the two above.
-let leaf_map = list.fold (fn m e -> core.map_put m (list.nth 0 e) false)
-                         (list.fold (fn m e -> core.map_put m (list.nth 0 e) false)
-                                    (core.map_new ()) node_edges)
+let leaf_map = list.fold (fn m e -> m.[(list.nth 0 e) => false])
+                         (list.fold (fn m e -> m.[(list.nth 0 e) => false])
+                                    (%{}) node_edges)
                          node_runs;
-let is_leaf op = core.map_get leaf_map op true;
+let is_leaf op = leaf_map.[op else true];
 
 /// Operand `k` of a node, and a node with operand `k` replaced. A node is
 /// `[op, flags, a, b, c]`, so operand `k` is at position `k + 2`.
@@ -170,28 +198,28 @@ let state nodes kids = %{
     // whole cost of the pass.
     :src => nodes, :src_kids => kids,
     // The arena being written.
-    :out => core.map_new (), :count => 0,
-    :out_kids => core.map_new (), :kid_count => 0,
+    :out => %{}, :count => 0,
+    :out_kids => %{}, :kid_count => 0,
     // Node record to the index it was given. This is what does the sharing.
-    :seen => core.map_new (),
+    :seen => %{},
     // Run of children to the offset it was given.
-    :runs => core.map_new (),
+    :runs => %{},
     // Old node index to new. This is not an optimization but a requirement: the
     // arena is a DAG rather than a tree -- `lower` shares a subtree whenever it
     // can and fusion shares more -- so a walk without it would copy a shared
     // node once per path to it and could not finish a large program.
-    :memo => core.map_new (),
+    :memo => %{},
 };
 
-let src s        = core.map_get s :src #[];
-let src_kids s   = core.map_get s :src_kids #[];
-let out s        = core.map_get s :out (core.map_new ());
-let count s      = core.map_get s :count 0;
-let out_kids s   = core.map_get s :out_kids (core.map_new ());
-let kid_count s  = core.map_get s :kid_count 0;
-let seen s       = core.map_get s :seen (core.map_new ());
-let runs s       = core.map_get s :runs (core.map_new ());
-let memo s       = core.map_get s :memo (core.map_new ());
+let src s        = s.[:src else #[]];
+let src_kids s   = s.[:src_kids else #[]];
+let out s        = s.[:out else (%{})];
+let count s      = s.[:count else 0];
+let out_kids s   = s.[:out_kids else (%{})];
+let kid_count s  = s.[:kid_count else 0];
+let seen s       = s.[:seen else (%{})];
+let runs s       = s.[:runs else (%{})];
+let memo s       = s.[:memo else (%{})];
 
 /// Force what has been built so far.
 ///
@@ -215,6 +243,89 @@ let settle s =
 let node_at i s = (src s).[i else ir.leaf :nop];
 let kid_at i s = (src_kids s).[i else ir.no_node];
 
+// These are runtime representation tests, not signature assumptions. Gradual
+// callers and integer overflow must still be observed as they are at runtime.
+// The numbers match dream_type in dream/include/dream/h.
+let type_codes = %{ "integer" => 0, "float" => 1, "char" => 2,
+    "bool" => 3, "unit" => 4, "string" => 5, "atom" => 6,
+    "list" => 7, "array" => 8, "map" => 9 };
+
+let type_test call atom invert flags s = {
+    let callee = node_at (ir.node_a call) s;
+    let code = (s.[:type_ids else %{}]).[ir.node_a atom else ()];
+    if ir.node_op call == :apply && ir.node_c call == 1
+       && ir.node_op callee == :builtin && ir.node_a callee == builtins.id "type_of"
+       && ir.node_op atom == :const_atom && code != () {
+        ir.with_flags flags (ir.node :type_is (kid_at (ir.node_b call) s) code invert)
+    } else { () }
+};
+
+/// Fuse before rebuilding children, so the unused call, atom and argument run
+/// never enter the new image. A literal on either side has no forcing effect.
+let primitive_ops = %{
+    19 => [:str_chars, 1],
+    23 => [:error_new, 2],
+    24 => [:error_kind, 1],
+    25 => [:error_payload, 1],
+    26 => [:str_slice, 3],
+    27 => [:str_find, 3],
+    28 => [:str_byte, 2],
+    29 => [:str_le, 2],
+    30 => [:str_span, 3],
+    31 => [:str_upto, 3],
+    32 => [:char_code, 1],
+    33 => [:char_of_code, 1],
+    34 => [:to_float, 1],
+    35 => [:float_bytes, 1],
+    36 => [:float_of_bytes, 1],
+    37 => [:to_int, 1],
+    38 => [:parse_int, 1],
+    39 => [:parse_float, 1],
+    40 => [:to_existing_atom, 1],
+    41 => [:array_new, 2],
+    43 => [:array_to_list, 1],
+    44 => [:map_has, 2],
+    45 => [:map_remove, 2],
+    46 => [:map_pairs, 1],
+    47 => [:data_count, 1],
+    48 => [:data_at, 1],
+    49 => [:compare, 2],
+};
+
+let specialize n s = match ir.node_op n {
+    :apply => {
+        let callee = node_at (ir.node_a n) s;
+        let id = ir.node_a callee;
+        let count = ir.node_c n;
+        let primitive = primitive_ops.[id else ()];
+        let op = if id == builtins.id "list_cons" && count == 2 { :cons }
+                 else if id == builtins.id "list_tail" && count == 1 { :list_tail }
+                 else if id == builtins.id "list_is_empty" && count == 1 { :list_is_empty }
+                 else { () };
+        if ir.node_op callee == :builtin && op != () {
+            ir.with_flags (ir.node_flags n) (ir.node op (kid_at (ir.node_b n) s)
+                (if count == 2 { kid_at (ir.node_b n + 1) s } else { ir.no_node }) ir.no_node)
+        } else if ir.node_op callee == :builtin && primitive != ()
+                  && count == list.nth 1 primitive {
+            ir.with_flags (ir.node_flags n)
+                (ir.node (list.head primitive) id (ir.node_b n) count)
+        } else { n }
+    },
+    op if op == :eq || op == :ne => {
+        let a = node_at (ir.node_a n) s;
+        let b = node_at (ir.node_b n) s;
+        let invert = if op == :ne { 1 } else { 0 };
+        match type_test a b invert (ir.node_flags n) s {
+            () => match type_test b a invert (ir.node_flags n) s {
+                () => n,
+                test => test,
+            },
+            test => test,
+        }
+    },
+    _ => n,
+};
+
 /// Append a node, or answer the index of one already emitted that says the same
 /// thing: `[state, index]`.
 ///
@@ -225,15 +336,13 @@ let kid_at i s = (src_kids s).[i else ir.no_node];
 let keep n s =
     if not (shareable n) {
         let i = count s;
-        [core.map_put (core.map_put s :out (core.map_put (out s) i n)) :count (i + 1), i]
+        [((s.[:out => (((out s)).[i => n])])).[:count => (i + 1)], i]
     } else {
         let key = to_string n;
-        match core.map_get (seen s) key () {
+        match ((seen s)).[key else ()] {
             () => {
                 let i = count s;
-                [core.map_put (core.map_put (core.map_put s :out (core.map_put (out s) i n))
-                                            :count (i + 1))
-                              :seen (core.map_put (seen s) key i),
+                [((((s.[:out => (((out s)).[i => n])])).[:count => (i + 1)])).[:seen => (((seen s)).[key => i])],
                  i]
             },
             found => [s, found],
@@ -244,19 +353,17 @@ let keep n s =
 /// placed: `[state, offset]`.
 let keep_run xs s = {
     let key = to_string xs;
-    match core.map_get (runs s) key () {
+    match ((runs s)).[key else ()] {
         () => {
             // One pass, carrying the index rather than zipping a counted list
             // alongside: `zip` and the `range` feeding it were between them 4%
             // of a self-compile's allocation, to number a list this already
             // walks in order.
             let filled = list.fold (fn acc x ->
-                [core.map_put (list.head acc) (list.nth 1 acc) x, list.nth 1 acc + 1])
+                [((list.head acc)).[(list.nth 1 acc) => x], list.nth 1 acc + 1])
                 [out_kids s, kid_count s] xs;
             let at = kid_count s;
-            [core.map_put (core.map_put (core.map_put s :out_kids (list.head filled))
-                                        :kid_count (list.nth 1 filled))
-                          :runs (core.map_put (runs s) key at),
+            [((((s.[:out_kids => (list.head filled)])).[:kid_count => (list.nth 1 filled)])).[:runs => (((runs s)).[key => at])],
              at]
         },
         found => [s, found],
@@ -290,12 +397,12 @@ let rec rebuild i s =
         let n = node_at i s;
         if is_leaf (ir.node_op n) { keep n s }
         else {
-            match core.map_get (memo s) i () {
+            match ((memo s)).[i else ()] {
                 () => {
                     let got = rebuild_node n s;
                     let s1 = list.head got;
                     let at = list.nth 1 got;
-                    [settle (core.map_put s1 :memo (core.map_put (memo s1) i at)), at]
+                    [settle (s1.[:memo => (((memo s1)).[i => at])]), at]
                 },
                 found => [s, found],
             }
@@ -304,6 +411,7 @@ let rec rebuild i s =
 
 /// The rebuild proper, for a node with children that has not been met before.
 let rec rebuild_node n s = {
+    let n = specialize n s;
     let op = ir.node_op n;
     // The edges, left to right. Each answers the state it left behind and the
     // node with that one operand renumbered.
@@ -326,7 +434,7 @@ let rec rebuild_run spec n s = {
     let many = operand (list.nth 1 spec) n * list.nth 2 spec;
     let built = list.fold (fn acc k -> {
         let got = rebuild (kid_at (off + k) (list.head acc)) (list.head acc);
-        [list.head got, core.cons (list.nth 1 got) (list.nth 1 acc)]
+        [list.head got, list_cons (list.nth 1 got) (list.nth 1 acc)]
     }) [s, []] (list.range 0 many);
     let placed = keep_run (list.reverse (list.nth 1 built)) (list.head built);
     [list.head placed, set_operand (list.nth 0 spec) (list.nth 1 placed) n]
@@ -335,7 +443,7 @@ let rec rebuild_run spec n s = {
 // --- the pass ----------------------------------------------------------------------
 
 /// Turn a table built by index back into the flat list the image writer wants.
-let flatten m n fill = list.map (fn i -> core.map_get m i fill) (list.range 0 n);
+let flatten m n fill = list.map (fn i -> m.[i else fill]) (list.range 0 n);
 
 /// Carry one function's capture descriptors across to the new pool.
 ///
@@ -353,8 +461,8 @@ let flatten m n fill = list.map (fn i -> core.map_get m i fill) (list.range 0 n)
 /// run is: the pool is a flat array of numbers, and two runs holding the same
 /// numbers are the same run to everyone who reads it.
 let place_captures f s = {
-    let off = core.map_get f :captures_off 0;
-    let many = core.map_get f :n_captures 0;
+    let off = f.[:captures_off else 0];
+    let many = f.[:n_captures else 0];
     if many == 0 { [s, 0] }
     else { keep_run (list.map (fn k -> kid_at (off + k) s) (list.range 0 many)) s }
 };
@@ -371,21 +479,22 @@ let place_captures f s = {
 /// the constant pools keep their indices, so every `int`, `str` and `atom` node
 /// still names what it named, and `funcs` changes in exactly two fields.
 let optimize img = {
-    let s0 = state (core.array_of_list (core.map_get img :nodes []))
-                   (core.array_of_list (core.map_get img :kids []));
+    let strings = array_of_list (img.[:strs else []]);
+    let ids = list.map (fn at -> type_codes.[strings.[at else ""] else ()])
+                      (img.[:atoms else []]);
+    let type_ids = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
+                            %{} (list.zip (list.range 0 (list.length ids)) ids);
+    let s0 = (state (array_of_list (img.[:nodes else []]))
+                    (array_of_list (img.[:kids else []]))).[:type_ids => type_ids];
     let walked = list.fold (fn acc f -> {
-        let got = rebuild (core.map_get f :body ir.no_node) (list.head acc);
+        let got = rebuild (f.[:body else ir.no_node]) (list.head acc);
         let caps = place_captures f (list.head got);
         [settle (list.head caps),
-         core.cons (core.map_put (core.map_put f :body (list.nth 1 got))
-                                 :captures_off (list.nth 1 caps))
+         list_cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
                    (list.nth 1 acc)]
-    }) [s0, []] (core.map_get img :funcs []);
+    }) [s0, []] (img.[:funcs else []]);
     let s = list.head walked;
-    core.map_put (core.map_put (core.map_put img
-                     :nodes (flatten (out s) (count s) (ir.leaf :nop)))
-                     :kids (flatten (out_kids s) (kid_count s) ir.no_node))
-                 :funcs (list.reverse (list.nth 1 walked))
+    ((((img.[:nodes => (flatten (out s) (count s) (ir.leaf :nop))])).[:kids => (flatten (out_kids s) (kid_count s) ir.no_node)])).[:funcs => (list.reverse (list.nth 1 walked))]
 };
 
 when test {
@@ -406,13 +515,13 @@ when test {
                   :n_captures => list.nth 1 (list.nth 1 pair) })
                (list.zip bodies caps) };
 
-    let nodes_of img = core.map_get img :nodes [];
-    let kids_of img = core.map_get img :kids [];
-    let bodies_of img = list.map (fn f -> core.map_get f :body ir.no_node)
-                                 (core.map_get img :funcs []);
-    let caps_of img = list.map (fn f -> [core.map_get f :captures_off 0,
-                                         core.map_get f :n_captures 0])
-                               (core.map_get img :funcs []);
+    let nodes_of img = img.[:nodes else []];
+    let kids_of img = img.[:kids else []];
+    let bodies_of img = list.map (fn f -> f.[:body else ir.no_node])
+                                 (img.[:funcs else []]);
+    let caps_of img = list.map (fn f -> [f.[:captures_off else 0],
+                                         f.[:n_captures else 0]])
+                               (img.[:funcs else []]);
 
     /// `local 0` twice over, as two bodies.
     let two_locals = optimize (image [ir.node :local 0 ir.no_node ir.no_node,

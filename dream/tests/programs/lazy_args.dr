@@ -14,7 +14,7 @@
 // case below would print an error instead of a number if that line were
 // crossed.
 import std.console;
-import std.core;
+
 
 /// Never looks at its argument. Under call-by-need nothing in it is evaluated.
 let ignore x = 42;
@@ -22,15 +22,15 @@ let ignore x = 42;
 let rec count_down n acc = if n == 0 { acc } else { count_down (n - 1) (acc + 1) };
 
 /// An infinite list. Nothing may walk it further than it has already been built.
-let rec forever n = core.cons n (forever (n + 1));
+let rec forever n = list_cons n (forever (n + 1));
 
 /// A list whose third element raises when forced.
-let landmine = core.cons 1 (core.cons 2 (core.cons (1 / 0) []));
+let landmine = list_cons 1 (list_cons 2 (list_cons (1 / 0) []));
 
 /// A call, so that passing one as an argument to a native is passing the shape
 /// `fill_native_args` exists for: an argument that has to be evaluated and
 /// cannot be read.
-let shout s = core.str_concat [s, "!"];
+let shout s = str_concat [s, "!"];
 
 let main! = {
     // Division by zero: raises when forced, so it must not be forced.
@@ -50,7 +50,7 @@ let main! = {
     console.print! (to_string (count_down 1000 0))
     console.print! (to_string (big + 1 - 1 == big))
     // Overflow still overflows into the right answer, not a wrapped one.
-    console.print! (to_string (ignore (big * 2) + core.str_len "ok"))
+    console.print! (to_string (ignore (big * 2) + len "ok"))
 
     // `c.[k]` as an argument. `thunk_for` reads an array in range and the
     // already-built prefix of a list without suspending them, so each of these
@@ -67,7 +67,7 @@ let main! = {
     console.print! (to_string ((forever 10).[3]))
     console.print! (to_string (ignore ((forever 10).[1000000])))
     // An array, read in range and out of it.
-    let arr = core.array_of_list [10, 20, 30];
+    let arr = array_of_list [10, 20, 30];
     console.print! (to_string (arr.[1] + arr.[2]))
     console.print! (to_string (arr.[7 else 0]))
     console.print! (to_string (ignore (arr.[7])))
@@ -80,14 +80,14 @@ let main! = {
     // A strict argument that is a call, and one whose argument is itself a
     // native call -- the second re-enters the same path with the argument list
     // half filled.
-    console.print! (to_string (core.str_len (shout "ok")))
-    console.print! (to_string (core.str_len (core.str_concat [shout "a", "bc"])))
+    console.print! (to_string (len (shout "ok")))
+    console.print! (to_string (len (str_concat [shout "a", "bc"])))
     // A strict argument that raises raises where it stood, and `try!` sees the
     // error the suspension would have delivered.
-    console.print! (to_string (try! { core.str_len (to_string (1 / 0)) } catch e { :caught }))
+    console.print! (to_string (try! { len (to_string (1 / 0)) } catch e { :caught }))
     // A lazy argument is still lazy: `cons` forces neither of its own, so a
     // cell whose tail raises can be built and its head read.
-    console.print! (to_string ((core.cons 5 (1 / 0)).[0]))
+    console.print! (to_string ((list_cons 5 (1 / 0)).[0]))
     // The callee is read back out of its node once per argument evaluated, so
     // it has to be the same native however it was named -- as a member of a
     // module above, as a local here, as a capture below.

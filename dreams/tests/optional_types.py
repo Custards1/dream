@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='dream-types-') as directory:
         assert message in result.stderr, result.stderr
         count += 1
 
-    prelude = 'import std.types; import std.console; import std.core;\n'
+    prelude = 'import std.types; import std.console; \n'
 
     # --- the shape of the syntax ---------------------------------------------
     #
@@ -89,7 +89,7 @@ let main! = {
                     types.accepts (Outcome :integer) [:ok, "x"],
                     types.accepts (Outcome :integer) [:error, 5],
                     types.accepts (Outcome :integer) [:nope, 5]]
-    console.print! [types.accepts Boxed (core.error_new :bad ()), types.accepts Boxed 3]
+    console.print! [types.accepts Boxed (error_new :bad ()), types.accepts Boxed 3]
     console.print! [types.accepts (types.literal :list) :list,
                     types.accepts (types.literal :list) [1, 2]]
 };
@@ -115,8 +115,8 @@ let main! = {
     console.print! [types.accepts Local (), types.accepts Local "hi", types.accepts Local 3]
     console.print! [types.accepts Tree (), types.accepts Tree [1, (), ()],
                     types.accepts Tree [1, [2, (), ()], ()], types.accepts Tree [1, ()]]
-    console.print! (try! { checked 0 } catch e { core.error_kind e })
-    console.print! (try! { checked "no" } catch e { types.name_of (core.error_payload e) })
+    console.print! (try! { checked 0 } catch e { error_kind e })
+    console.print! (try! { checked "no" } catch e { types.name_of (error_payload e) })
 };
 ''', '[3, [1, 2, 3], true]\n[true, true, false]\n[true, true, true, false]\n'
      ':type_error\nPositive\n')
@@ -137,9 +137,9 @@ type Sum = :integer -> :integer -> :integer;
 let main! = {
     let add = types.enforce Sum (fn a b -> a + b);
     console.print! (add 1 2)
-    console.print! (try! { add "x" 2 } catch e { core.error_kind e })
+    console.print! (try! { add "x" 2 } catch e { error_kind e })
     console.print! (try! { (types.enforce Sum (fn a b -> "no")) 1 2 }
-                    catch e { core.error_kind e })
+                    catch e { error_kind e })
 };
 ''', '3\n:type_error\n:type_error\n')
 
@@ -156,7 +156,7 @@ let main! = {
     console.print! (len xs)
     console.print! (list.take 2 (types.check_each :integer (list.from 1)))
     console.print! (try! { type_assert false :never (1 / 0) }
-                    catch e { core.error_payload e })
+                    catch e { error_payload e })
 };
 ''', 'true\ntrue\n1\n[1, 2]\n:never\n')
 
@@ -187,7 +187,7 @@ let main! = {
                     types.accepts Listy.type (Listy.make [1, 2] (opaque :maybe))]
     console.print! (Point.make (opaque "still untyped") (opaque false))
     console.print! (try! { types.check Point.type (Point.set_x origin (opaque "bad")) }
-                    catch e { core.error_kind e })
+                    catch e { error_kind e })
 };
 ''', '[[1, 0], true, false, false, false]\n[true, false, false]\n[true, false, true]\n'
      '[true, true]\n[true, false]\n["still untyped", false]\n:type_error\n')

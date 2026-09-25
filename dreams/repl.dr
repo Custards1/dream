@@ -25,7 +25,7 @@
 // definition keeps its meaning; its value does not, and neither does a file
 // left open or a process left running.
 import std.console;
-import std.core;
+
 import std.io;
 import std.list;
 import std.os;
@@ -52,23 +52,23 @@ let base_imports = ["import std.console;"];
 
 let session imports defs engine base =
     %{ :imports => imports, :defs => defs, :engine => engine, :base => base };
-let imports s = core.map_get s :imports base_imports;
-let defs s    = core.map_get s :defs [];
-let engine s  = core.map_get s :engine ();
-let base s    = core.map_get s :base 0;
+let imports s = s.[:imports else base_imports];
+let defs s    = s.[:defs else []];
+let engine s  = s.[:engine else ()];
+let base s    = s.[:base else 0];
 
 let empty_session = session base_imports [] () 0;
 
-let with_engine e b s = core.map_put (core.map_put s :engine e) :base b;
+let with_engine e b s = ((s.[:engine => e])).[:base => b];
 
 /// An import already in the session is not added twice -- a module imported
 /// twice is an error, and typing the same line again is not a mistake worth
 /// ending the session over.
 let with_import i s =
     if list.contains i (imports s) { s }
-    else { core.map_put s :imports (list.append (imports s) [i]) };
+    else { s.[:imports => (list.append (imports s) [i])] };
 
-let with_def d s = core.map_put s :defs (list.append (defs s) [d]);
+let with_def d s = s.[:defs => (list.append (defs s) [d])];
 
 /// Everything before the entry point: the imports and the definitions. This is
 /// the prefix a session grows, and `dreams.session` carries it so it can tell
@@ -180,8 +180,8 @@ let run! image = {
     match try! { os.exec! (vm! ()) [image] } catch e { [:failed, e] } {
         [:failed, e] => console.error! ("dreams: cannot run " + vm! () + ": " + to_string e),
         r => {
-            let out = core.map_get r :out "";
-            let err = core.map_get r :err "";
+            let out = r.[:out else ""];
+            let err = r.[:err else ""];
             if str.is_empty out { () } else { console.write! out }
             if str.is_empty err { () } else { console.write! err }
         },

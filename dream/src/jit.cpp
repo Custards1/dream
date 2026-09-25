@@ -2,8 +2,8 @@
 //
 // Scope, and why it is drawn where it is: this compiles the strict numeric
 // spine of a function -- arithmetic, comparisons, branches, `let`, calls to
-// itself and to other functions it can compile, and calls to the host natives
-// of `std.native` -- and leaves everything else to the interpreter. The limit is
+// itself and to other functions it can compile, primitive opcodes and host
+// calls -- and leaves everything else to the interpreter. The limit is
 // not laziness in general but a soundness requirement. Compiled code evaluates a
 // call's arguments eagerly, and doing that to an argument the callee would never
 // have forced can raise an error in a program that was going to terminate
@@ -255,8 +255,15 @@ enum class KnownNative : uint8_t { None, ToFloat, ToInt, Sqrt, Abs, Floor };
 /// so, and it is the same lookup the interpreter does; a module of the same
 /// member name from anywhere else resolves to a different `ModuleDef`, or to
 /// none, and is not recognised.
-KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node, uint32_t argc) {
-    const Node& c = img.node(callee_node);
+KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node,
+                         uint32_t argc, bool direct = false) {
+    const Node c = direct ? Node{uint8_t(Op::Builtin), 0, 0, callee_node, NO_NODE, NO_NODE}
+                          : img.node(callee_node);
+    if (Op(c.op) == Op::Builtin && argc == 1 && c.a < builtin_count()) {
+        const char* name = builtin_def(c.a).name;
+        if (std::strcmp(name, "to_float") == 0) return KnownNative::ToFloat;
+        if (std::strcmp(name, "to_int") == 0) return KnownNative::ToInt;
+    }
     if (Op(c.op) != Op::Field) return KnownNative::None;
     const Node& m = img.node(c.a);
     if (Op(m.op) != Op::Global) return KnownNative::None;
@@ -265,14 +272,7 @@ KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node, ui
     const ModuleDef* def = rt.module_for_import(g.target);
     if (!def || argc != 1) return KnownNative::None;
     StringRef name = img.str(c.b);
-    // The host module answers to both names: `std.core` is Dream source now and
-    // reaches the host through `std.native`, but images built before that move
-    // -- the bootstrap seed among them -- still import it by the old one, and
-    // the runtime registers it twice for exactly that reason.
-    if (def->name == "std.native" || def->name == "std.core") {
-        if (name.equals("to_float")) return KnownNative::ToFloat;
-        if (name.equals("to_int")) return KnownNative::ToInt;
-    } else if (def->name == "std.math") {
+    if (def->name == "std.math") {
         if (name.equals("sqrt")) return KnownNative::Sqrt;
         if (name.equals("abs")) return KnownNative::Abs;
         if (name.equals("floor")) return KnownNative::Floor;
@@ -285,11 +285,11 @@ KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node, ui
 //
 // The five above are natives compiled code *makes*: each is a few instructions,
 // so writing them out beats calling them. Everything else a program reaches
-// through `std.native` -- `str_byte`, `map_get`, `array_get`, `compare`, `len`
+// through primitive opcodes or builtins -- `str_byte`, `compare`, `len`
 // -- is a call, and until this existed a single one of them refused the whole
 // function. That refusal was most of what kept the tier to hand-shaped numeric
 // loops: a lexer that reads a byte, a resolver that looks a name up in a map and
-// a comparison written over `core.compare` are all arithmetic with one call in
+// a comparison written over `compare` are all arithmetic with one call in
 // the middle of them.
 //
 // A call is made the way the interpreter makes one -- same callee value, same
@@ -348,9 +348,11 @@ bool native_is_pure(const char* name) {
 /// looks like. `module_for_import` is the same lookup the interpreter does, so a
 /// member of the same name from anywhere else resolves to a different
 /// `ModuleDef`, or to none, and is not recognised.
-NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node, uint32_t argc) {
+NativeSite native_site(Runtime& rt, const Image& img, uint32_t callee_node,
+                       uint32_t argc, bool direct = false) {
     NativeSite site;
-    const Node& c = img.node(callee_node);
+    const Node c = direct ? Node{uint8_t(Op::Builtin), 0, 0, callee_node, NO_NODE, NO_NODE}
+                          : img.node(callee_node);
     const char* name = nullptr;
     uint32_t arity = 0;
     bool vouches = false;
@@ -426,7 +428,7 @@ bool op_is_supported(Op op) {
         case Op::If: case Op::Block: case Op::Force:
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
-        case Op::And: case Op::Or: case Op::Neg: case Op::Not:
+        case Op::And: case Op::Or: case Op::Neg: case Op::Not: case Op::TypeIs:
             return true;
         default:
             return false;
@@ -546,7 +548,7 @@ public:
         // precisely what the interpreter does with it (`thunk_for` of a `Local`
         // is the slot, unforced). So such a parameter needs no licence, and that
         // is what lets a loop carry a string, an array or a map it reads on one
-        // path and not on the other -- `f s (i + 1) n (acc + core.str_byte s i)`
+        // path and not on the other -- `f s (i + 1) n (acc + str_byte s i)`
         // is the shape, and before this it was refused for `s`.
         const SlotSet licensed = peer_depth_ > 0 ? strict : (strict | carried_);
         if ((licensed & params) != params) return a;
@@ -631,7 +633,7 @@ private:
         const Node& n = img_.node(node);
         Op op = Op(n.op);
 
-        if (op == Op::Apply) return check_apply(n, depth);
+        if (op == Op::Apply || is_primitive(op)) return check_apply(n, depth);
         if (!op_is_supported(op)) return false;
         // An integer too big for a fixnum is a boxed constant the emitter has
         // no way to name, so it is refused here rather than there -- same
@@ -672,7 +674,7 @@ private:
                     if (!check(stmt, depth + 1)) return false;
                 }
                 return true;
-            case Op::Force: case Op::Neg: case Op::Not:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
                 return check(n.a, depth + 1);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
@@ -713,7 +715,7 @@ private:
             }
             return true;
         }
-        if (known_native(rt_, img_, n.a, n.c) != KnownNative::None) {
+        if (known_native(rt_, img_, n.a, n.c, is_primitive(Op(n.op))) != KnownNative::None) {
             for (uint32_t i = 0; i < n.c; ++i) {
                 if (!check(img_.kid(n.b + i), depth + 1)) return false;
             }
@@ -723,7 +725,7 @@ private:
         // its strict mask claims is exactly what the interpreter does a step
         // later -- and for the ones it does not, is only allowed where
         // evaluating cannot be observed.
-        const NativeSite site = native_site(rt_, img_, n.a, n.c);
+        const NativeSite site = native_site(rt_, img_, n.a, n.c, is_primitive(Op(n.op)));
         if (site.ok) {
             for (uint32_t i = 0; i < n.c; ++i) {
                 const uint32_t arg = img_.kid(n.b + i);
@@ -826,7 +828,7 @@ private:
     /// module, and which arguments they force is a fact about them rather than
     /// about how this tier chooses to emit them.
     uint32_t native_mask(const Node& n) const {
-        const NativeSite site = native_site(rt_, img_, n.a, n.c);
+        const NativeSite site = native_site(rt_, img_, n.a, n.c, is_primitive(Op(n.op)));
         return site.ok ? site.strict_mask : 0;
     }
 
@@ -902,6 +904,7 @@ private:
                     return expand_cost(binds_[n.a], depth + 1, calls);
                 }
                 return 1;
+            DREAM_PRIMITIVE_CASES
             case Op::Apply:
                 *calls = true;
                 return 1;
@@ -929,7 +932,7 @@ private:
                 }
                 return c;
             }
-            case Op::Force: case Op::Neg: case Op::Not:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
                 return 1 + expand_cost(n.a, depth + 1, calls);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
@@ -1000,7 +1003,7 @@ private:
             case Op::And: case Op::Or:
                 // Short-circuiting: only the left operand is certain.
                 return strict_of(n.a, depth + 1);
-            case Op::Force: case Op::Neg: case Op::Not:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
                 return strict_of(n.a, depth + 1);
             case Op::Block: {
                 SlotSet s = 0;
@@ -1013,6 +1016,7 @@ private:
                 }
                 return s;
             }
+            DREAM_PRIMITIVE_CASES
             case Op::Apply: {
                 // A self call forces whatever its argument expressions do,
                 // because compiled code evaluates them all. A native forces
@@ -1117,7 +1121,7 @@ private:
                 }
                 out.push_back(n.a);
                 return true;
-            case Op::Force: case Op::Neg: case Op::Not:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
                 return force_order(n.a, depth + 1, out);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
@@ -1154,6 +1158,7 @@ private:
                 }
                 return true;
             }
+            DREAM_PRIMITIVE_CASES
             case Op::Apply: {
                 const uint32_t mask = evaluates_all_args(n) ? ~uint32_t(0) : native_mask(n);
                 const bool self = is_self_call(n);
@@ -1195,7 +1200,7 @@ private:
     void collect_calls(uint32_t idx, int depth) {
         if (depth > 256) return;
         const Node& n = img_.node(idx);
-        if (Op(n.op) == Op::Apply) {
+        if (Op(n.op) == Op::Apply || is_primitive(Op(n.op))) {
             if (is_self_call(n)) call_sites_.push_back(idx);
             for (uint32_t i = 0; i < n.c; ++i) collect_calls(img_.kid(n.b + i), depth + 1);
             return;
@@ -1226,7 +1231,7 @@ private:
                     collect_calls(Op(sn.op) == Op::Bind ? sn.b : stmt, depth + 1);
                 }
                 return;
-            case Op::Force: case Op::Neg: case Op::Not:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
                 collect_calls(n.a, depth + 1);
                 return;
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
@@ -1297,6 +1302,7 @@ public:
                 return n.b == 0 ? Ty::Any : ty(img_.kid(n.a + n.b - 1), depth + 1);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
                 return arith_ty(ty(n.a, depth + 1), ty(n.b, depth + 1));
+            DREAM_PRIMITIVE_CASES
             case Op::Apply: {
                 // A tail self call produces no value; a non-tail one comes back
                 // through the return register, which is a tagged `Value`
@@ -1312,7 +1318,7 @@ public:
                         return peer_call_ty(*peers_, gi, floats);
                     }
                 }
-                switch (known_native(rt_, img_, n.a, n.c)) {
+                switch (known_native(rt_, img_, n.a, n.c, is_primitive(Op(n.op)))) {
                     case KnownNative::ToFloat:
                     case KnownNative::Sqrt:
                         return Ty::Float;
@@ -1568,6 +1574,7 @@ private:
     JV binary(const Node& n);
     JV logic(const Node& n);
     JV unary(const Node& n);
+    JV type_test(const Node& n);
     JV conditional(const Node& n);
     JV switch_node(const Node& n);
     JV block(const Node& n);
@@ -2347,13 +2354,61 @@ Emitter::JV Emitter::node(uint32_t idx) {
             failed_ = true;
             return none();
         case Op::Force: return node(n.a);
+        case Op::TypeIs: return type_test(n);
         case Op::If: return conditional(n);
         case Op::Block: return block(n);
         case Op::And: case Op::Or: return logic(n);
         case Op::Neg: case Op::Not: return unary(n);
+        DREAM_PRIMITIVE_CASES
         case Op::Apply: return apply(n);
         default: return binary(n);
     }
+}
+
+// A type test consumes its subject even when its representation is already
+// known. In particular, do not erase an arithmetic error when folding a test
+// of an unboxed double. The object header is read only after a pointer guard.
+Emitter::JV Emitter::type_test(const Node& n) {
+    JV subject = node(n.a);
+    if (failed_ || !subject.v) return none();
+    llvm::Value* test = nullptr;
+    if (subject.dbl) {
+        test = llvm::ConstantInt::getBool(ctx_, n.b == DREAM_TYPE_FLOAT);
+    } else if (n.b == DREAM_TYPE_INTEGER) {
+        test = is_fixnum(subject.v);
+    } else if (n.b == DREAM_TYPE_CHAR || n.b == DREAM_TYPE_BOOL ||
+               n.b == DREAM_TYPE_UNIT || n.b == DREAM_TYPE_ATOM) {
+        ImmKind kind = n.b == DREAM_TYPE_CHAR ? IMM_CHAR :
+                       n.b == DREAM_TYPE_BOOL ? IMM_BOOL :
+                       n.b == DREAM_TYPE_UNIT ? IMM_UNIT : IMM_ATOM;
+        test = b_.CreateICmpEQ(b_.CreateAnd(subject.v, i64(255)), i64(make_imm(kind, 0)));
+    } else {
+        auto* object = bb("type.object");
+        auto* done = bb("type.done");
+        auto* immediate = b_.GetInsertBlock();
+        llvm::Value* immediate_test = n.b == DREAM_TYPE_LIST
+            ? b_.CreateICmpEQ(b_.CreateAnd(subject.v, i64(255)), i64(NIL))
+            : llvm::ConstantInt::getFalse(ctx_);
+        b_.CreateCondBr(is_heap_ptr(subject.v), object, done);
+        b_.SetInsertPoint(object);
+        llvm::Value* header = b_.CreateLoad(i8_, b_.CreateIntToPtr(subject.v, ptr_));
+        ObjType kind = n.b == DREAM_TYPE_FLOAT ? ObjType::Float :
+                       n.b == DREAM_TYPE_STRING ? ObjType::Str :
+                       n.b == DREAM_TYPE_LIST ? ObjType::Cons :
+                       n.b == DREAM_TYPE_ARRAY ? ObjType::Array : ObjType::Map;
+        llvm::Value* matches = b_.CreateICmpEQ(header, llvm::ConstantInt::get(i8_, uint8_t(kind)));
+        if (n.b == DREAM_TYPE_MAP)
+            matches = b_.CreateOr(matches, b_.CreateICmpEQ(
+                header, llvm::ConstantInt::get(i8_, uint8_t(ObjType::MapLeaf))));
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
+        auto* phi = b_.CreatePHI(llvm::Type::getInt1Ty(ctx_), 2, "type.matches");
+        phi->addIncoming(immediate_test, immediate);
+        phi->addIncoming(matches, object);
+        test = phi;
+    }
+    if (n.c) test = b_.CreateNot(test);
+    return tag(b_.CreateSelect(test, i64(TRUE_V), i64(FALSE_V)));
 }
 
 Emitter::JV Emitter::block(const Node& n) {
@@ -2770,11 +2825,11 @@ Emitter::JV Emitter::binary(const Node& n) {
 // ---------------------------------------------------------------------------
 
 Emitter::JV Emitter::apply(const Node& n) {
-    KnownNative which = known_native(rt_, img_, n.a, n.c);
+    KnownNative which = known_native(rt_, img_, n.a, n.c, is_primitive(Op(n.op)));
     if (which != KnownNative::None) return native_call(which, n);
     // Asked in the same order the analyzer asked it, which is what keeps the
     // two from disagreeing about which of the two native paths a call takes.
-    const NativeSite site = native_site(rt_, img_, n.a, n.c);
+    const NativeSite site = native_site(rt_, img_, n.a, n.c, is_primitive(Op(n.op)));
     if (site.ok) return host_call(site, n);
     // The analyzer admitted this call, so it is one of the two Dream-level
     // calls this tier makes: this function calling itself, or a peer. A peer's

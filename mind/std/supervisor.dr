@@ -35,7 +35,7 @@
 //         ..
 //         supervisor.stop! sup
 //     };
-import std.core;
+
 import std.error;
 import std.list;
 import std.map;
@@ -102,9 +102,9 @@ let affected strategy names name =
         :one_for_all => names,
         :rest_for_one => {
             let rec from_here rest =
-                if core.is_empty rest { [] }
-                else if core.head rest == name { rest }
-                else { from_here (core.tail rest) };
+                if list_is_empty rest { [] }
+                else if rest.[0] == name { rest }
+                else { from_here (list_tail rest) };
             from_here names
         },
         _ => [name],
@@ -125,7 +125,7 @@ let default_limits = limits 5 5000;
 
 /// The restart times inside the window, newest first, with `now` added.
 let recent window now times =
-    core.cons now (list.filter (fn t -> now - t < window) times);
+    list_cons now (list.filter (fn t -> now - t < window) times);
 
 // --- the supervisor's own state -------------------------------------------------
 
@@ -156,7 +156,7 @@ let names_of s = list.map (fn c -> child_name c) (s_children s);
 
 let child_named s name = {
     let hit = list.filter (fn c -> child_name c == name) (s_children s);
-    if core.is_empty hit { () } else { core.head hit }
+    if list_is_empty hit { () } else { hit.[0] }
 };
 
 // --- starting and watching ------------------------------------------------------

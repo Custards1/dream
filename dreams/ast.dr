@@ -15,7 +15,6 @@
 // Everything in this module is pure and total: these are constructors and
 // accessors, and none of them can fail.
 
-import std.core;
 import std.list;
 
 // --- spans ------------------------------------------------------------------
@@ -94,11 +93,11 @@ let set_e container key value span = [:set, container, key, value, span];
 
 // --- reading a node ---------------------------------------------------------
 
-let kind e = core.head e;
+let kind e = e.[0];
 
 /// Every node keeps its span last, however many fields it has.
 let rec span e = {
-    let rec last xs = if core.is_empty (core.tail xs) { core.head xs } else { last (core.tail xs) };
+    let rec last xs = if list_is_empty (list_tail xs) { xs.[0] } else { last (list_tail xs) };
     last e
 };
 
@@ -438,7 +437,7 @@ let rec show e =
             "(virtual " + n + (if list.is_empty ps { "" } else { " " + show_params ps })
             + (match body { () => "", b => " " + show b }) + ")",
         [:when, cond, items, _] => "(when " + show_cfg cond + " " + show_all items + ")",
-        other => "(?" + to_string (core.head other) + ")",
+        other => "(?" + to_string (other.[0]) + ")",
     }
 ;
 
@@ -480,7 +479,7 @@ let rec show_pattern p =
             "%{" + str.join_str " " (list.map (fn kv -> show (list.nth 0 kv) + " => "
                                                         + show_pattern (list.nth 1 kv)) pairs) + "}",
         [:as_p, inner, n, _, _] => "(" + show_pattern inner + " as " + n + ")",
-        other => "?" + to_string (core.head other),
+        other => "?" + to_string (other.[0]),
     }
 ;
 

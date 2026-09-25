@@ -5,12 +5,8 @@
 // so a `let len x = ..` in a module wins, but `import std.list.{head};` does not
 // silently take over `match_head`.
 //
-// The order is the order the VM knows them in. Nothing here depends on that
-// yet -- resolution only needs to know whether a name is one -- but the list is
-// kept in the runtime's order so that emission can use the position directly
-// when it arrives, rather than needing a second table that could disagree.
+// This append-only order is the runtime builtin ID table used by emission.
 
-import std.core;
 import std.list;
 import std.str;
 
@@ -37,6 +33,41 @@ let names = [
     "match_at",       // array -> index -> element, unforced
     "match_key",      // map -> key -> [value] if present, [] if not
     "type_assert",    // bool -> description -> value -> value, or :type_error
+    "list_tail",
+    "list_cons",
+    "list_is_empty",
+    "str_chars",
+    "str_of_chars",
+    "str_of_bytes",
+    "str_concat",
+    "error_new",
+    "error_kind",
+    "error_payload",
+    "str_slice",
+    "str_find",
+    "str_byte",
+    "str_le",
+    "str_span",
+    "str_upto",
+    "char_code",
+    "char_of_code",
+    "to_float",
+    "float_bytes",
+    "float_of_bytes",
+    "to_int",
+    "parse_int",
+    "parse_float",
+    "to_existing_atom",
+    "array_new",
+    "array_of_list",
+    "array_to_list",
+    "map_has",
+    "map_remove",
+    "map_pairs",
+    "data_count",
+    "data_at",
+    "compare",
+
 ];
 
 let is_builtin name = list.contains name names;
@@ -70,10 +101,45 @@ let signatures = %{
     "match_at"      => "array -> index -> element, unforced",
     "match_key"     => "map -> key -> [value] if present, [] if not",
     "type_assert"   => "bool -> description -> value -> value, or :type_error",
+    "list_tail" => "list -> list",
+    "list_cons" => "value -> list -> list",
+    "list_is_empty" => "value -> bool",
+    "str_chars" => "string -> list of char",
+    "str_of_chars" => "list of char -> string",
+    "str_of_bytes" => "list of integer -> string",
+    "str_concat" => "list of string -> string",
+    "error_new" => "atom -> value -> error",
+    "error_kind" => "value -> atom|unit",
+    "error_payload" => "value -> value",
+    "str_slice" => "string|bigstr -> start:integer -> len:integer -> string|bigstr",
+    "str_find" => "haystack:string -> needle:string -> from:integer -> integer",
+    "str_byte" => "string|bigstr -> index:integer -> integer",
+    "str_le" => "integer -> width:integer -> string",
+    "str_span" => "string|bigstr -> from:integer -> set:string -> integer",
+    "str_upto" => "string|bigstr -> from:integer -> set:string -> integer",
+    "char_code" => "char -> integer",
+    "char_of_code" => "integer -> char",
+    "to_float" => "integer|float -> float",
+    "float_bytes" => "number -> string",
+    "float_of_bytes" => "string -> float",
+    "to_int" => "integer|float -> integer",
+    "parse_int" => "string -> integer|unit",
+    "parse_float" => "string -> float|unit",
+    "to_existing_atom" => "string|bigstr -> atom|unit",
+    "array_new" => "length:integer -> fill:value -> array",
+    "array_of_list" => "list -> array",
+    "array_to_list" => "array -> list",
+    "map_has" => "map -> key -> bool",
+    "map_remove" => "map -> key -> map",
+    "map_pairs" => "map -> list",
+    "data_count" => "unit -> integer",
+    "data_at" => "integer -> bigstr",
+    "compare" => "a -> b -> integer",
+
 };
 
 /// A builtin's signature, or its bare name for one that has none.
-let signature name = core.map_get signatures name name;
+let signature name = signatures.[name else name];
 
 /// The runtime's index for a builtin, or `()`. Emission will want this; nothing
 /// does yet.
@@ -104,10 +170,10 @@ when test {
             $( test.false! (list.any (fn n -> not (str.starts_with "match_" n)
                                                && str.starts_with "match" n) names) ),
         test.case "every builtin has a signature"
-            $( test.eq! [] (list.filter (fn n -> not (core.map_has signatures n)) names) ),
+            $( test.eq! [] (list.filter (fn n -> not (map_has signatures n)) names) ),
         test.case "nothing has a signature that is not a builtin"
             $( test.eq! [] (list.filter (fn kv -> not (is_builtin (list.head kv)))
-                                        (core.map_pairs signatures)) ),
+                                        (map_pairs signatures)) ),
         test.case "a signature is what the name takes and answers"
             $( test.eq! ["value -> atom", "nope"] [signature "type_of", signature "nope"] ),
     ];

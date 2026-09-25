@@ -610,7 +610,7 @@ NativeResult bi_raise(Process& p, Value, Value* args, uint32_t) {
 /// could catch one and learn nothing from it: `catch e` bound a box with no way
 /// in, so the only thing to do with a failure was print it. With them, a caught
 /// error can be asked what went wrong and a program can raise a *typed* failure
-/// of its own -- `raise! (core.error_new :not_found path)` -- rather than
+/// of its own -- `raise! (error_new :not_found path)` -- rather than
 /// raising a string and hoping the reader parses it.
 ///
 /// Pure, all three: making and reading an error is not an effect. Only raising
@@ -742,7 +742,7 @@ NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
 /// only when every C++ frame above it has said its locals survive one. This
 /// frame's do: `args` is read before the force and never again, and everything
 /// the force needs is on the value stack or in the process. It is the same
-/// claim `core.str_of_chars` and `str.concat_all` already make, reached
+/// claim `str_of_chars` and `str.concat_all` already make, reached
 /// through the same audited chain -- `run_process`, `step_eval`,
 /// `resume_native` -- and it is what `force_deep`'s map case was rewritten for.
 NativeResult bi_strict(Process& p, Value, Value* args, uint32_t) {
@@ -830,35 +830,6 @@ NativeResult bi_match_key(Process& p, Value, Value* args, uint32_t) {
 
 // External linkage, because `builtin_def` is inline in the header now -- see
 // the note there. The entries stay next to the functions they name.
-const BuiltinDef BUILTINS[] = {
-    {"spawn!", 1, 0b0, bi_spawn},
-    {"join!", 1, 0b1, bi_join},
-    {"send!", 2, 0b11, bi_send},
-    {"recv!", 1, 0b1, bi_recv},
-    {"self!", 1, 0b1, bi_self},
-    {"raise!", 1, 0b1, bi_raise},
-    {"type_of", 1, 0b1, bi_type_of},
-    {"to_string", 1, 0b1, bi_to_string},
-    {"len", 1, 0b1, bi_len},
-    // Mask 0: the argument must arrive unforced, or the deep force below
-    // would be handed something already reduced to weak head normal form by
-    // the caller and could not report a raise from inside it. The last field
-    // is the vouch: `strict!` is the native that most needed one.
-    {"strict!", 1, 0b0, bi_strict, true},
-    // The container and the key are forced to WHNF for them, by the machine's
-    // own continuation (never by a force of their own, which would run a
-    // nested machine loop on the C++ stack); the piece they hand back stays
-    // unforced, because that is the point.
-    {"match_is_cons", 1, 0b1, bi_match_is_cons},
-    {"match_head", 1, 0b1, bi_match_head},
-    {"match_tail", 1, 0b1, bi_match_tail},
-    {"match_at", 2, 0b11, bi_match_at},
-    {"match_key", 2, 0b11, bi_match_key},
-    {"type_assert", 3, 0b001, bi_type_assert},
-};
-
-uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }
-
 // ---------------------------------------------------------------------------
 // std.console
 // ---------------------------------------------------------------------------
@@ -934,14 +905,6 @@ NativeResult math_floor(Process& p, Value, Value* args, uint32_t) {
 // the old code did, ran a nested machine loop on the C++ stack, and a tail
 // rebuilt a few hundred thousand times from the tail of the one before was a
 // segmentation fault the first time the list's length was read.
-NativeResult list_head(Process& p, Value, Value* args, uint32_t) {
-    Value v = resolve(args[0]);
-    if (!is_obj(v, ObjType::Cons)) {
-        return NativeResult::raise(
-            raise_error(p, well_known(p.runtime()).type_error, "head needs a non-empty list"));
-    }
-    return NativeResult::enter(static_cast<ConsObj*>(as_obj(v))->head);
-}
 
 NativeResult list_tail(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
@@ -1299,7 +1262,7 @@ ModuleDef make_math_module() {
 
 
 // ---------------------------------------------------------------------------
-// std.core -- the operations the language cannot express in itself
+// Runtime primitives and language builtins
 //
 // Everything here is either a primitive the representation hides (a string's
 // bytes, a map's buckets) or something that must be a single machine step for
@@ -1741,11 +1704,6 @@ void utf8_encode(uint32_t cp, std::string* out) {
 
 // --- strings ---
 
-NativeResult core_str_len(Process& p, Value, Value* args, uint32_t) {
-    Bytes b;
-    if (!string_bytes(args[0], &b)) return type_fail(p, "str_len needs a string");
-    return NativeResult::ok(make_fixnum(int64_t(b.len)));
-}
 
 NativeResult core_str_chars(Process& p, Value, Value* args, uint32_t) {
     if (is_obj(resolve(args[0]), ObjType::BigStr)) return bigstr_refused(p, "str_chars");
@@ -2043,7 +2001,7 @@ NativeResult core_str_byte(Process& p, Value, Value* args, uint32_t) {
 /// `str_le v n` -- `n` bytes of `v`, little-endian, as a string.
 ///
 /// A binary format is written a field at a time, and a field written in Dream
-/// was a list: `core.str_of_bytes [v % 256, byte_at v 256, ..]`. Four cons
+/// was a list: `str_of_bytes [v % 256, byte_at v 256, ..]`. Four cons
 /// cells, four thunks for the lazily-computed elements, a frame apiece, and a
 /// nested machine loop inside `str_of_bytes` to force them again -- about 210
 /// bytes of heap to produce four bytes of output, which on one self-compile
@@ -2166,7 +2124,7 @@ NativeResult core_parse_int(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_integer(p, int64_t(v)));
 }
 
-/// `core.to_existing_atom` -- the atom of this name, if there already is one.
+/// `to_existing_atom` -- the atom of this name, if there already is one.
 ///
 /// There is no `to_atom` beside this, and that is the design rather than an
 /// omission. An atom is an index into a table that only grows, so a program
@@ -2221,49 +2179,7 @@ NativeResult core_array_new(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(arr);
 }
 
-NativeResult core_array_get(Process& p, Value, Value* args, uint32_t) {
-    Value v = resolve(args[0]);
-    Value i = resolve(args[1]);
-    if (!is_obj(v, ObjType::Array) || !is_fixnum(i)) {
-        return type_fail(p, "array_get needs an array and an index");
-    }
-    auto* a = static_cast<ArrayObj*>(as_obj(v));
-    int64_t k = fixnum_value(i);
-    if (k < 0 || k >= a->len) {
-        return NativeResult::raise(raise_error(
-            p, p.runtime().intern_atom("out_of_bounds"),
-            "index " + std::to_string(k) + " is outside an array of " + std::to_string(a->len)));
-    }
-    // The element, unforced. An array's elements are stored as thunks; the
-    // machine forces whichever one is handed back as the continuation of the
-    // call (`NativeResult::enter`). Forcing it here, as the old code did,
-    // nested a machine loop on the C++ stack, and one read whose value read
-    // another grew the C++ stack as deep as the chain of reads was long.
-    return NativeResult::enter(a->items()[k]);
-}
 
-NativeResult core_array_set(Process& p, Value, Value* args, uint32_t) {
-    Value v = resolve(args[0]);
-    Value i = resolve(args[1]);
-    if (!is_obj(v, ObjType::Array) || !is_fixnum(i)) {
-        return type_fail(p, "array_set needs an array and an index");
-    }
-    auto* src = static_cast<ArrayObj*>(as_obj(v));
-    int64_t k = fixnum_value(i);
-    if (k < 0 || k >= src->len) {
-        return NativeResult::raise(raise_error(
-            p, p.runtime().intern_atom("out_of_bounds"),
-            "index " + std::to_string(k) + " is outside an array of " + std::to_string(src->len)));
-    }
-    // Copies: values are immutable, so updating in place would be visible to
-    // whoever else is holding this array.
-    Value out = p.heap().make_array(src->len);
-    src = static_cast<ArrayObj*>(as_obj(v));
-    auto* dst = static_cast<ArrayObj*>(as_obj(out));
-    for (uint32_t j = 0; j < src->len; ++j) dst->items()[j] = src->items()[j];
-    dst->items()[k] = args[2];
-    return NativeResult::ok(out);
-}
 
 NativeResult core_array_of_list(Process& p, Value, Value* args, uint32_t) {
     // Two passes: count, then fill. The elements stay lazy.
@@ -2308,21 +2224,7 @@ NativeResult core_array_to_list(Process& p, Value, Value* args, uint32_t) {
 
 // --- maps ---
 
-NativeResult core_map_new(Process& p, Value, Value*, uint32_t) {
-    return NativeResult::ok(p.heap().make_map(8));
-}
 
-NativeResult core_map_get(Process& p, Value, Value* args, uint32_t) {
-    Value m = resolve(args[0]);
-    if (!is_obj(m, ObjType::Map)) return type_fail(p, "map_get needs a map");
-    Value found;
-    // A map's values stay lazy, and so does the default -- an unused default
-    // should cost nothing. Whichever one is returned is handed back unforced
-    // and forced by the machine as the continuation of the call, for the same
-    // reason `core_array_get` gives.
-    if (!map_lookup(p, m, args[1], &found)) found = args[2];
-    return NativeResult::enter(found);
-}
 
 NativeResult core_map_has(Process& p, Value, Value* args, uint32_t) {
     Value m = resolve(args[0]);
@@ -2331,13 +2233,6 @@ NativeResult core_map_has(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_bool(map_lookup(p, m, args[1], &found)));
 }
 
-NativeResult core_map_put(Process& p, Value, Value* args, uint32_t) {
-    Value m = resolve(args[0]);
-    if (!is_obj(m, ObjType::Map)) return type_fail(p, "map_put needs a map");
-    // Shares everything the new entry does not sit on: about log32(n) nodes are
-    // rebuilt and the rest of the map is the one that came in.
-    return NativeResult::ok(map_insert(p, m, args[1], args[2]));
-}
 
 NativeResult core_map_remove(Process& p, Value, Value* args, uint32_t) {
     Value m = resolve(args[0]);
@@ -2435,68 +2330,68 @@ NativeResult core_data_at(Process& p, Value, Value* args, uint32_t) {
 
 }  // namespace
 
-ModuleDef make_core_module() {
-    return ModuleDef{
-        "std.core",
-        {
-            // lists
-            {"head", 1, 0b1, list_head},
-            {"tail", 1, 0b1, list_tail},
-            {"cons", 2, 0b0, list_cons},
-            {"is_empty", 1, 0b1, list_is_empty},
-            // strings. The three that walk a lazy list declare the vouch --
-            // the field after `user` -- because each of them forces one
-            // underneath itself and is written to survive a collection while it
-            // does. `NativeDef::vouches` says what that costs a caller that
-            // cannot allow one.
-            {"str_len", 1, 0b1, core_str_len},
-            {"str_chars", 1, 0b1, core_str_chars},
-            {"str_of_chars", 1, 0b1, core_str_of_chars, 0, true},
-            {"str_of_bytes", 1, 0b1, core_str_of_bytes, 0, true},
-            {"str_concat", 1, 0b1, core_str_concat, 0, true},
-            // An error is a kind and a payload; these are the way in and out.
-            // `error_new`'s payload is left lazy, so the mask forces only the
-            // kind.
-            {"error_new", 2, 0b01, core_error_new},
-            {"error_kind", 1, 0b1, core_error_kind},
-            {"error_payload", 1, 0b1, core_error_payload},
-            {"str_slice", 3, 0b111, core_str_slice},
-            {"str_find", 3, 0b111, core_str_find},
-            {"str_byte", 2, 0b11, core_str_byte},
-            {"str_le", 2, 0b11, core_str_le},
-            {"str_span", 3, 0b111, core_str_span},
-            {"str_upto", 3, 0b111, core_str_upto},
-            // chars
-            {"char_code", 1, 0b1, core_char_code},
-            {"char_of_code", 1, 0b1, core_char_of_code},
-            // numbers
-            {"to_float", 1, 0b1, core_to_float},
-            {"float_bytes", 1, 0b1, core_float_bytes},
-            {"float_of_bytes", 1, 0b1, core_float_of_bytes},
-            {"to_int", 1, 0b1, core_to_int},
-            {"parse_int", 1, 0b1, core_parse_int},
-            {"parse_float", 1, 0b1, core_parse_float},
-            // atoms
-            {"to_existing_atom", 1, 0b1, core_to_existing_atom},
-            // arrays
-            {"array_new", 2, 0b01, core_array_new},
-            {"array_get", 2, 0b11, core_array_get},
-            {"array_set", 3, 0b011, core_array_set},
-            {"array_of_list", 1, 0b0, core_array_of_list},
-            {"array_to_list", 1, 0b1, core_array_to_list},
-            // maps
-            {"map_new", 1, 0b1, core_map_new},
-            {"map_get", 3, 0b011, core_map_get},
-            {"map_has", 2, 0b11, core_map_has},
-            {"map_put", 3, 0b011, core_map_put},
-            {"map_remove", 2, 0b11, core_map_remove},
-            {"map_pairs", 1, 0b1, core_map_pairs},
-            // large data
-            {"data_count", 1, 0b1, core_data_count},
-            {"data_at", 1, 0b1, core_data_at},
-            // ordering
-            {"compare", 2, 0b11, core_compare},
-        }};
-}
+const BuiltinDef BUILTINS[] = {
+    {"spawn!", 1, 0b0, bi_spawn},
+    {"join!", 1, 0b1, bi_join},
+    {"send!", 2, 0b11, bi_send},
+    {"recv!", 1, 0b1, bi_recv},
+    {"self!", 1, 0b1, bi_self},
+    {"raise!", 1, 0b1, bi_raise},
+    {"type_of", 1, 0b1, bi_type_of},
+    {"to_string", 1, 0b1, bi_to_string},
+    {"len", 1, 0b1, bi_len},
+    // Mask 0: the argument must arrive unforced, or the deep force below
+    // would be handed something already reduced to weak head normal form by
+    // the caller and could not report a raise from inside it. The last field
+    // is the vouch: `strict!` is the native that most needed one.
+    {"strict!", 1, 0b0, bi_strict, true},
+    // The container and the key are forced to WHNF for them, by the machine's
+    // own continuation (never by a force of their own, which would run a
+    // nested machine loop on the C++ stack); the piece they hand back stays
+    // unforced, because that is the point.
+    {"match_is_cons", 1, 0b1, bi_match_is_cons},
+    {"match_head", 1, 0b1, bi_match_head},
+    {"match_tail", 1, 0b1, bi_match_tail},
+    {"match_at", 2, 0b11, bi_match_at},
+    {"match_key", 2, 0b11, bi_match_key},
+    {"type_assert", 3, 0b001, bi_type_assert},
+    {"list_tail", 1, 0b1, list_tail},
+    {"list_cons", 2, 0b0, list_cons},
+    {"list_is_empty", 1, 0b1, list_is_empty},
+    {"str_chars", 1, 0b1, core_str_chars},
+    {"str_of_chars", 1, 0b1, core_str_of_chars, true},
+    {"str_of_bytes", 1, 0b1, core_str_of_bytes, true},
+    {"str_concat", 1, 0b1, core_str_concat, true},
+    {"error_new", 2, 0b01, core_error_new},
+    {"error_kind", 1, 0b1, core_error_kind},
+    {"error_payload", 1, 0b1, core_error_payload},
+    {"str_slice", 3, 0b111, core_str_slice},
+    {"str_find", 3, 0b111, core_str_find},
+    {"str_byte", 2, 0b11, core_str_byte},
+    {"str_le", 2, 0b11, core_str_le},
+    {"str_span", 3, 0b111, core_str_span},
+    {"str_upto", 3, 0b111, core_str_upto},
+    {"char_code", 1, 0b1, core_char_code},
+    {"char_of_code", 1, 0b1, core_char_of_code},
+    {"to_float", 1, 0b1, core_to_float},
+    {"float_bytes", 1, 0b1, core_float_bytes},
+    {"float_of_bytes", 1, 0b1, core_float_of_bytes},
+    {"to_int", 1, 0b1, core_to_int},
+    {"parse_int", 1, 0b1, core_parse_int},
+    {"parse_float", 1, 0b1, core_parse_float},
+    {"to_existing_atom", 1, 0b1, core_to_existing_atom},
+    {"array_new", 2, 0b01, core_array_new},
+    {"array_of_list", 1, 0b0, core_array_of_list},
+    {"array_to_list", 1, 0b1, core_array_to_list},
+    {"map_has", 2, 0b11, core_map_has},
+    {"map_remove", 2, 0b11, core_map_remove},
+    {"map_pairs", 1, 0b1, core_map_pairs},
+    {"data_count", 1, 0b1, core_data_count},
+    {"data_at", 1, 0b1, core_data_at},
+    {"compare", 2, 0b11, core_compare},
+};
+
+uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }
+
 
 }  // namespace dream

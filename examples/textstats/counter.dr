@@ -2,17 +2,17 @@
 //
 // A map's keys are forced so they can be hashed; its values stay lazy. Counts
 // are forced the moment they are compared, so nothing accumulates here.
-import std.core;
+
 import std.list;
 
 /// An empty tally.
 let empty = %{};
 
 /// `counts` with one more occurrence of `key`.
-let bump counts key = core.map_put counts key (core.map_get counts key 0 + 1);
+let bump counts key = counts.[key => (counts.[key else 0] + 1)];
 
 /// How many times `key` was seen.
-let count_of counts key = core.map_get counts key 0;
+let count_of counts key = counts.[key else 0];
 
 /// Tally every element of `xs`.
 let tally xs = list.fold bump empty xs;
@@ -21,7 +21,7 @@ let tally xs = list.fold bump empty xs;
 /// so the order is total -- otherwise the same input could report differently
 /// from one run to the next.
 let ranked counts = {
-    let pairs = core.map_pairs counts;
+    let pairs = map_pairs counts;
     let before a b = {
         let ca = list.nth 1 a;
         let cb = list.nth 1 b;
@@ -37,7 +37,7 @@ let top n counts = list.take n (ranked counts);
 let distinct counts = len counts;
 
 /// How many occurrences in total.
-let total counts = list.sum (list.map (fn p -> list.nth 1 p) (core.map_pairs counts));
+let total counts = list.sum (list.map (fn p -> list.nth 1 p) (map_pairs counts));
 
 when test {
     import std.test;

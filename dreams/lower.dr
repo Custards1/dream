@@ -17,7 +17,6 @@
 // time and so need a VM to run them on, and the image writer that turns this
 // arena into bytes. Both are their own step.
 
-import std.core;
 import std.list;
 import std.str;
 import std.macros;
@@ -43,7 +42,7 @@ let lowering r p source =
        // Which node is each function's body. Filled in as the functions are
        // met, because a lambda's body is lowered where it is written -- into
        // the same arena as everything else -- and only the entry point differs.
-       :func_bodies => core.map_new (),
+       :func_bodies => %{},
        // Compile-time expressions waiting to be evaluated: `[node, function]`.
        // The node is a placeholder that whatever the function comes to will
        // overwrite, once the program has been built and can be run.
@@ -51,23 +50,23 @@ let lowering r p source =
        // Slots that are read but never written, and the expression each one
        // stands for. Only ever non-empty while a fused loop's body is being
        // emitted -- see "deforestation" below.
-       :subst => core.map_new () };
+       :subst => %{} };
 
-let res l    = core.map_get l :r ();
-let prog l   = core.map_get l :prog ir.program;
-let source l = core.map_get l :source 0;
+let res l    = l.[:r else ()];
+let prog l   = l.[:prog else ir.program];
+let source l = l.[:source else 0];
 /// The module whose names this body was resolved against. Not always the module
 /// it was written in: a body inherited through `derive` is lowered once per
 /// deriving module, and resolves differently each time.
-let ctx l = core.map_get l :ctx 0;
-let l_diags l = core.map_get l :diags [];
+let ctx l = l.[:ctx else 0];
+let l_diags l = l.[:diags else []];
 
-let set_prog p l = core.map_put l :prog p;
-let set_res r l = core.map_put l :r r;
-let set_source i l = core.map_put l :source i;
-let set_ctx i l = core.map_put l :ctx i;
+let set_prog p l = l.[:prog => p];
+let set_res r l = l.[:r => r];
+let set_source i l = l.[:source => i];
+let set_ctx i l = l.[:ctx => i];
 
-let func_bodies l = core.map_get l :func_bodies (core.map_new ());
+let func_bodies l = l.[:func_bodies else (%{})];
 /// The node index is forced before it is stored, for the reason `ir.settled`
 /// gives: an unforced one is a thunk holding the frame that would compute it,
 /// and that frame holds this state -- which holds the arena as it stood when
@@ -75,22 +74,21 @@ let func_bodies l = core.map_get l :func_bodies (core.map_new ());
 /// one *whole arena* apiece.
 let set_func_body fi n l =
     if type_of n != :nothing {
-        core.map_put l :func_bodies (core.map_put (func_bodies l) fi n)
+        l.[:func_bodies => (((func_bodies l)).[fi => n])]
     } else { l };
 
-let subst l = core.map_get l :subst (core.map_new ());
-let set_subst m l = core.map_put l :subst m;
+let subst l = l.[:subst else (%{})];
+let set_subst m l = l.[:subst => m];
 
-let pending_comp l = core.map_get l :pending_comp [];
-let add_comp node fi l = core.map_put l :pending_comp (list.append (pending_comp l) [[node, fi]]);
+let pending_comp l = l.[:pending_comp else []];
+let add_comp node fi l = l.[:pending_comp => (list.append (pending_comp l) [[node, fi]])];
 
 let complain span message l =
-    core.map_put l :diags (list.append (l_diags l) [diag.in_source (source l) (diag.error span message)]);
+    l.[:diags => (list.append (l_diags l) [diag.in_source (source l) (diag.error span message)])];
 
 let warn span message note l =
-    core.map_put l :diags
-        (list.append (l_diags l)
-                     [diag.in_source (source l) (diag.with_note note (diag.warning span message))]);
+    l.[:diags => (list.append (l_diags l)
+                     [diag.in_source (source l) (diag.with_note note (diag.warning span message))])];
 
 /// Emit a node: `[lowering, index]`.
 let emit n l = {
@@ -144,7 +142,7 @@ let const_atom v l = {
     emit (ir.node :const_atom index ir.no_node ir.no_node) (set_prog program l)
 };
 
-let const_char c l = emit (ir.node :const_char (core.char_code c) ir.no_node ir.no_node) l;
+let const_char c l = emit (ir.node :const_char (char_code c) ir.no_node ir.no_node) l;
 let const_bool b l = emit (ir.node :const_bool (if b { 1 } else { 0 }) ir.no_node ir.no_node) l;
 
 // --- calls ----------------------------------------------------------------------
@@ -156,7 +154,7 @@ let emit_apply callee args l = {
     let made = emit (ir.node :apply callee (list.nth 1 placed) (list.length args))
                     (list.head placed);
     let i = list.nth 1 made;
-    let inherited = inherit i (core.cons callee args) (list.head made);
+    let inherited = inherit i (list_cons callee args) (list.head made);
     // Calling an impure value is itself an effect, and the callee has to be
     // forced where it stands for that effect to happen in written order.
     let sequenced =
@@ -215,7 +213,7 @@ let eq_const v k l = binary :eq v k l;
 // parameters and literals, and nothing else. Here a saturated call of one
 // becomes the call it stands for, which removes a frame and a call per use.
 // Chained wrappers unwrap together: `at_end` is `list.is_empty` is
-// `core.is_empty`, and a call of the first emits the last.
+// `list_is_empty`, and a call of the first emits the last.
 //
 // The depth cap is not a guess about how deep a chain goes -- two wrappers that
 // name each other would unwrap forever, and a compiler must terminate on a
@@ -271,7 +269,7 @@ let rec unwrap found args fuel l =
     };
 
 let unwrap_global found g args fuel l =
-    match core.map_get (scope.wrappers (res l)) g () {
+    match ((scope.wrappers (res l))).[g else ()] {
         () => (),
         [target, plan, arity] =>
             if list.length args != arity { () }
@@ -350,10 +348,10 @@ let emit_name span l = emit_resolution (lookup span l) l;
 /// stop rather than spin; nothing builds one, and a compiler must terminate on
 /// a program that will not run.
 let emit_local slot l =
-    match core.map_get (subst l) slot () {
+    match ((subst l)).[slot else ()] {
         () => emit (ir.node :local slot ir.no_node ir.no_node) l,
         e  => {
-            let got = lower_expr e (set_subst (core.map_remove (subst l) slot) l);
+            let got = lower_expr e (set_subst (map_remove (subst l) slot) l);
             [set_subst (subst l) (list.head got), list.nth 1 got]
         },
     };
@@ -683,7 +681,7 @@ let rec lower_block stmts span l = {
                 let parts = destructure pattern (list.nth 1 reader) (list.head reader);
                 [list.head parts,
                  list.append (list.nth 1 acc)
-                     (list.map (fn k -> [k, st]) (core.cons (list.nth 1 bound) (list.nth 1 parts)))]
+                     (list.map (fn k -> [k, st]) (list_cons (list.nth 1 bound) (list.nth 1 parts)))]
             },
             _ => {
                 let got = lower_expr st (list.head acc);
@@ -777,8 +775,8 @@ let lower_fused p l = {
 };
 
 let subst_of p =
-    list.fold (fn m e -> core.map_put m (list.nth 0 e) (list.nth 1 e))
-              (core.map_new ()) (fuse.plan_subst p);
+    list.fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
+              (%{}) (fuse.plan_subst p);
 
 /// The loop itself, emitted into the same arena as everything else -- a
 /// function is a body node and a descriptor, not an arena of its own.
@@ -1370,7 +1368,7 @@ let rec lower_arms arms held span l =
              list.nth 1 made,
              // Where each arm's test starts, and the raise after the last:
              // what a switch in front of the chain jumps to (`dispatch`).
-             core.cons (list.nth 1 made) (list.nth 2 otherwise)]
+             list_cons (list.nth 1 made) (list.nth 2 otherwise)]
         },
     };
 
@@ -1432,7 +1430,7 @@ let place_captures caps l = {
     kids encoded l
 };
 
-/// The four `link_*` folds below build their record lists with `core.cons` and
+/// The four `link_*` folds below build their record lists with `list_cons` and
 /// reverse once at the end rather than appending. `list.append xs [x]` is one
 /// reduction and a copy of `xs`, so a profile counts none of it and the list
 /// costs O(n^2) bytes to build -- these three fold lambdas were, between them,
@@ -1459,22 +1457,22 @@ let link_funcs_from r bodies l from = {
         let named = strk (scope.func_name f) l0;
         let placed = place_captures (scope.func_captures f) (list.head named);
         let flags = (if scope.func_impure f { ir.fn_impure } else { 0 })
-                  + (if core.map_get f :rec false { ir.fn_rec } else { 0 })
-                  + (if core.map_get f :thunk false { ir.fn_thunk } else { 0 })
+                  + (if f.[:rec else false] { ir.fn_rec } else { 0 })
+                  + (if f.[:thunk else false] { ir.fn_thunk } else { 0 })
                   // A parameterless pure binding is a value the VM forces once
                   // and remembers; an impure one has to run again every time.
-                  + (if core.map_get f :thunk false && not (scope.func_impure f) {
+                  + (if f.[:thunk else false] && not (scope.func_impure f) {
                          ir.fn_global_value
                      } else { 0 });
         [list.head placed,
-         core.cons
-             %{ :name => list.nth 1 named, :body => core.map_get bodies fi ir.no_node,
+         list_cons
+             %{ :name => list.nth 1 named, :body => bodies.[fi else ir.no_node],
                  :arity => scope.func_arity f, :flags => flags,
                  :slots => scope.func_slots f,
                  :n_captures => list.length (scope.func_captures f),
                  :captures_off => list.nth 1 placed,
-                 :span_start => ast.span_start (core.map_get f :span ast.no_span),
-                 :span_end => ast.span_end (core.map_get f :span ast.no_span) }
+                 :span_start => ast.span_start (f.[:span else ast.no_span]),
+                 :span_end => ast.span_end (f.[:span else ast.no_span]) }
              (list.nth 1 acc)]
     }) [l, []] zip;
     [list.head built, list.reverse (list.nth 1 built)]
@@ -1490,7 +1488,7 @@ let link_globals_from r l from = {
         let named = strk (list.nth 1 g) (list.head acc);
         let is_module = list.nth 2 g == :module;
         [list.head named,
-         core.cons
+         list_cons
              %{ :name => list.nth 1 named,
                 :kind => if is_module { ir.global_module } else { ir.global_function },
                 :target => match list.nth 3 g { () => ir.no_node, t => t },
@@ -1507,7 +1505,7 @@ let link_imports r l = {
         let path = strk (list.nth 0 i) (list.head acc);
         let alias = strk (list.nth 1 i) (list.head path);
         [list.head alias,
-         core.cons %{ :path => list.nth 1 path, :alias => list.nth 1 alias }
+         list_cons %{ :path => list.nth 1 path, :alias => list.nth 1 alias }
                    (list.nth 1 acc)]
     }) [l, []] (scope.r_imports r);
     [list.head built, list.reverse (list.nth 1 built)]
@@ -1520,7 +1518,7 @@ let link_modules ld r l = {
         let named = strk (modules.module_name mod_at) (list.head acc);
         let src = strk (modules.module_path mod_at) (list.head named);
         [list.head src,
-         core.cons
+         list_cons
              %{ :name => list.nth 1 named, :source => list.nth 1 src,
                 :globals_start => list.nth 1 m, :globals_count => list.nth 2 m,
                 :flags => if list.nth 3 m { ir.m_abstract } else { 0 },
@@ -1588,10 +1586,8 @@ let lower_program r = {
     let is = link_imports r (list.head gs);
     let linked = list.head is;
 
-    let p = core.map_put (core.map_put (core.map_put (prog linked) :funcs (list.nth 1 fs))
-                                       :globals (list.nth 1 gs))
-                         :imports (list.nth 1 is);
-    core.map_put (set_prog p linked) :image (ir.finish p)
+    let p = ((((((prog linked)).[:funcs => (list.nth 1 fs)])).[:globals => (list.nth 1 gs)])).[:imports => (list.nth 1 is)];
+    ((set_prog p linked)).[:image => (ir.finish p)]
 };
 
 /// Evaluate every compile-time expression the program contains, and put the
@@ -1607,10 +1603,10 @@ let lower_program r = {
 let rec comp_dependencies todo seen found pending p funcs globals = match todo {
     [] => found,
     [index, ..rest] =>
-        if not (ir.is_node index) || core.map_has seen index {
+        if not (ir.is_node index) || map_has seen index {
             comp_dependencies rest seen found pending p funcs globals
-        } else if core.map_has pending index {
-            comp_dependencies rest (seen.[index => true]) (core.cons index found) pending p funcs globals
+        } else if map_has pending index {
+            comp_dependencies rest (seen.[index => true]) (list_cons index found) pending p funcs globals
         } else {
             let n = ir.node_at index p;
             let op = ir.node_op n;
@@ -1655,7 +1651,7 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
 let rec settle_comp_order! rows done built l =
     if list.is_empty rows { l }
     else {
-        let ready = list.filter (fn row -> list.all (fn node -> core.map_has done node) row.[1]) rows;
+        let ready = list.filter (fn row -> list.all (fn node -> map_has done node) row.[1]) rows;
         if list.is_empty ready {
             complain ast.no_span "cyclic dependency between compile-time expressions" l
         } else {
@@ -1683,8 +1679,8 @@ let settle_comps! l = {
     if list.is_empty pend { l }
     else {
         let p = prog l;
-        let funcs = core.array_of_list (ir.funcs p);
-        let globals = core.array_of_list (ir.globals p);
+        let funcs = array_of_list (ir.funcs p);
+        let globals = array_of_list (ir.globals p);
         let pending = list.fold (fn m one -> m.[one.[0] => true]) %{} pend;
         let rows = list.map (fn one -> [one,
             comp_dependencies [funcs.[one.[1]].[:body]] %{} [] pending p funcs globals]) pend;
@@ -1704,14 +1700,8 @@ let link! ld r = {
     let sourced = strk (modules.module_path (modules.module_at ld
                             (modules.module_count ld - 1)))
                        (list.head named);
-    let p = core.map_put
-                (core.map_put
-                    (core.map_put (core.map_put (prog (list.head sourced))
-                                                :modules (list.nth 1 ms))
-                                  :entry (find_entry ld r))
-                    :module_name (list.nth 1 named))
-                :source_name (list.nth 1 sourced);
-    core.map_put (set_prog p (list.head sourced)) :image (ir.finish p)
+    let p = ((((((((prog (list.head sourced))).[:modules => (list.nth 1 ms)])).[:entry => (find_entry ld r)])).[:module_name => (list.nth 1 named)])).[:source_name => (list.nth 1 sourced)];
+    ((set_prog p (list.head sourced))).[:image => (ir.finish p)]
 };
 
 // --- compile-time values ------------------------------------------------------
@@ -1733,10 +1723,10 @@ let rec emit_const v l =
         // the name the image stores.
         :atom    => const_atom (str.slice 1 (str.byte_length (to_string v) - 1) (to_string v)) l,
         :list    => const_seq :make_list (list.map (fn x -> x) v) l,
-        :array   => const_seq :make_array (core.array_to_list v) l,
+        :array   => const_seq :make_array (array_to_list v) l,
         :map     => const_seq :make_map
                         (list.concat (list.map (fn kv -> [list.nth 0 kv, list.nth 1 kv])
-                                               (core.map_pairs v))) l,
+                                               (map_pairs v))) l,
         _ => emit_leaf :unit l,
     };
 
@@ -1782,7 +1772,7 @@ let settle_comp! bytes_of one l = {
     }
 };
 
-let image l = core.map_get l :image (ir.finish ir.program);
+let image l = l.[:image else (ir.finish ir.program)];
 
 let diags l = l_diags l;
 
@@ -1797,22 +1787,22 @@ let all_diags r l = list.append (scope.r_diags r) (l_diags l);
 /// against it rather than against node records.
 let dump l = {
     let img = image l;
-    let fs = core.map_get img :funcs [];
-    let strs = core.map_get img :strs [];
+    let fs = img.[:funcs else []];
+    let strs = img.[:strs else []];
     let name_of i = if i < list.length strs { list.nth i strs } else { "?" };
     str.join_str "\n"
         (list.append
             (list.map (fn i -> {
                 let f = list.nth i fs;
-                "fn" + to_string i + " " + name_of (core.map_get f :name 0)
-                + "/" + to_string (core.map_get f :arity 0)
-                + "  slots=" + to_string (core.map_get f :slots 0)
-                + (match core.map_get f :n_captures 0 {
+                "fn" + to_string i + " " + name_of (f.[:name else 0])
+                + "/" + to_string (f.[:arity else 0])
+                + "  slots=" + to_string (f.[:slots else 0])
+                + (match f.[:n_captures else 0] {
                        0 => "",
                        n => "  captures=" + to_string n
-                             + "@" + to_string (core.map_get f :captures_off 0),
+                             + "@" + to_string (f.[:captures_off else 0]),
                    })
-                + "  body=" + to_string (core.map_get f :body ir.no_node)
+                + "  body=" + to_string (f.[:body else ir.no_node])
              }) (list.range 0 (list.length fs)))
             [ir.dump img])
 };

@@ -327,6 +327,7 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             // number derived from it meaningless whenever the JIT was on.
             const int64_t before = p.reductions;
             const uint64_t before_total = p.total_reductions;
+            const size_t stack_before = p.stack.size();
             Value r = fn(&p, frame, &status);
             // Clamped, because a nested force underneath this call may have
             // re-armed the budget (`Process::slice_spent`), which leaves more
@@ -339,6 +340,22 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             // And attributed, which nothing did before: a function the JIT
             // compiled was invisible to `--profile` however hot it was.
             if (own && p.runtime().profiling()) p.runtime().note_reductions(func_index, own);
+            // A force underneath the compiled body reached a blocking native
+            // -- a `receive` inside an impure call that a pure function was
+            // handed unevaluated, which is how `agent.value_as!` reaches
+            // `types.check` -- and `force_whnf` suspended it rather than
+            // finishing. Compiled code sees that as a failed force and
+            // unwinds with whatever `p.result` held, which is not an error:
+            // treating it as a raise killed the process with `()`. The answer
+            // is "not yet", exactly as for a native (`apply_native`): leave
+            // the suspended work where it is and run the whole call again
+            // once it has finished. Compiled bodies are pure, and forcing is
+            // memoised, so the second run repeats no effect.
+            if (p.park_requested) {
+                push_retry(p, ContKind::EnterRetry, func_index, uint32_t(stack_before), 0,
+                           frame);
+                return;  // the park left the mode at Return
+            }
             if (status == JitOk) {
                 jit->note_ran(func_index);
                 ret(p, r);
@@ -970,8 +987,7 @@ bool compare(Process& p, Op op, Value a, Value b, Value* out) {
 
 /// `obj.member`, where `obj` is a host module.
 ///
-/// This runs on every call of every `std.core` member, which in a program of
-/// any size means millions of times, so what it does *not* do matters. The
+/// Host-module calls share an import cache. The
 /// module is found through a cache indexed by the import record, and which
 /// member was wanted is remembered against the node that asked -- packed as
 /// the import index and the member's position in one word, so a node that
@@ -1034,8 +1050,7 @@ bool compare(Process& p, Op op, Value a, Value b, Value* out) {
 
 /// `obj.member`, where `obj` is a host module.
 ///
-/// This runs on every call of every `std.core` member, which in a program of
-/// any size means millions of times, so what it does *not* do matters. Warm,
+/// Host-module calls use a cache. Warm,
 /// it is three loads and a compare: the module's import index out of the
 /// object, the cache slot out of the site that asked, and the function value
 /// out of this process's table. No name is copied, no module is searched, and
@@ -1560,8 +1575,24 @@ void finish_logic(Process& p, Op op, Value lhs, uint32_t right_node, Value frame
     eval_node(p, right_node, frame);
 }
 
-/// `-x` and `not x`, with the operand in hand.
-void finish_unary(Process& p, Op op, Value v) {
+/// Negation, logical not and surface type tests, with the operand in hand.
+void finish_unary(Process& p, Op op, Value v, uint32_t type, uint32_t invert) {
+    if (op == Op::ListIsEmpty) {
+        ret(p, make_bool(is_nil(v)));
+        return;
+    }
+    if (op == Op::ListTail) {
+        if (!is_obj(v, ObjType::Cons)) {
+            do_raise(p, type_error(p, "tail needs a non-empty list"));
+            return;
+        }
+        enter(p, static_cast<ConsObj*>(as_obj(v))->tail);
+        return;
+    }
+    if (op == Op::TypeIs) {
+        ret(p, make_bool((surface_type(v) == dream_type(type)) != bool(invert)));
+        return;
+    }
     if (op == Op::Neg) {
         if (is_fixnum(v)) { ret(p, make_integer(p, -fixnum_value(v))); return; }
         if (is_obj(v, ObjType::Float)) {
@@ -1652,6 +1683,9 @@ void step_eval(Process& p) {
             return;
         }
 
+        DREAM_PRIMITIVE_CASES
+            fill_native_args(p, p.node, make_builtin(n.a), uint32_t(p.stack.size()), 0, frame);
+            return;
         case Op::Apply: {
             const uint32_t* kids = img.kids_at(n.b);
             // Almost every call names its callee -- a global, a builtin, a
@@ -1822,17 +1856,23 @@ void step_eval(Process& p) {
             return;
         }
 
-        case Op::Neg: case Op::Not: {
+        case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty: {
             Value v;
             if (!operand_value(p, img, n.a, frame, &v)) {
-                push_cont(p, ContKind::UnaryFinish, n.op, 0, 0, UNIT);
+                push_cont(p, ContKind::UnaryFinish, n.op, n.b, n.c, UNIT);
                 eval_node(p, n.a, frame);
                 return;
             }
-            finish_unary(p, Op(n.op), v);
+            finish_unary(p, Op(n.op), v, n.b, n.c);
             return;
         }
 
+        case Op::Cons: {
+            Value head = thunk_for(p, n.a, frame);
+            Value tail = thunk_for(p, n.b, frame);
+            ret(p, p.heap().make_cons(head, tail));
+            return;
+        }
         case Op::MakeList: {
             const uint32_t* kids = img.kids_at(n.a);
             Value list = NIL;
@@ -1951,6 +1991,14 @@ void step_return(Process& p, size_t floor) {
             eval_node(p, switch_target(p, img_of(p).node(c.a), resolve(p.result)), c.v1);
             return;
 
+        case ContKind::EnterRetry:
+            // The suspended work has finished and popped what it pushed, so
+            // anything above the recorded height is what the abandoned
+            // compiled call left there (a native's arguments).
+            p.stack.resize(c.b);
+            enter_function(p, c.a, img_of(p).func(c.a), c.v1);
+            return;
+
         case ContKind::BinRight: {
             // The right operand is often a constant or a bound local, in which
             // case the operator finishes here rather than after another round
@@ -1990,7 +2038,7 @@ void step_return(Process& p, size_t floor) {
             return;
 
         case ContKind::UnaryFinish:
-            finish_unary(p, Op(c.a), p.result);
+            finish_unary(p, Op(c.a), p.result, c.b, c.c);
             return;
 
         case ContKind::BlockNext:
@@ -2017,7 +2065,9 @@ void step_return(Process& p, size_t floor) {
             p.stack.push_back(p.result);
             const Image& img = img_of(p);
             Value callee;
-            if (!callee_operand(p, img, img.node(c.a).a, c.v1, &callee)) {
+            if (is_primitive(Op(img.node(c.a).op))) {
+                callee = make_builtin(img.node(c.a).a);
+            } else if (!callee_operand(p, img, img.node(c.a).a, c.v1, &callee)) {
                 p.unreachable("the callee of a native call stopped being a name");
             }
             fill_native_args(p, c.a, resolve(callee), c.b, c.c + 1, c.v1);

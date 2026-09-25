@@ -5,7 +5,7 @@
 // files -- which means a build is: find the packages, hand `dreams` their
 // directories, run it. There is nothing to cache and no link step.
 import std.console;
-import std.core;
+
 import std.io;
 import std.list;
 import std.os;
@@ -114,8 +114,8 @@ let options = %{ :compiler => (), :defines => [], :includes => [], :hosts => [],
                  :paths => [], :flags => [], :output => (), :extra => [],
                  :verbose => false };
 
-let with_option k v o = core.map_put o k v;
-let option o k default = core.map_get o k default;
+let with_option k v o = o.[k => v];
+let option o k default = o.[k else default];
 
 /// Where this build writes its image.
 let output_of m o =
@@ -208,11 +208,11 @@ let compile! m o = {
                         console.error! (str.join_str " " (list.cons program (list.append lead args)))
                     }
                     let r = os.exec! program (list.append lead args);
-                    let code = core.map_get r :code (0 - 1);
-                    if code == 0 { [:ok, core.map_get r :out ""] }
+                    let code = r.[:code else (0 - 1)];
+                    if code == 0 { [:ok, r.[:out else ""]] }
                     else {
-                        let err = core.map_get r :err "";
-                        let out = core.map_get r :out "";
+                        let err = r.[:err else ""];
+                        let out = r.[:out else ""];
                         [:error, str.trim (err + out)]
                     }
                 },
@@ -293,5 +293,5 @@ let bare_repl! o =
 /// Run a built image, passing `args` to the program.
 let run_image! m o args = {
     let r = os.exec! (vm_command! ()) (list.cons (output_of m o) args);
-    [core.map_get r :code (0 - 1), core.map_get r :out "", core.map_get r :err ""]
+    [r.[:code else (0 - 1)], r.[:out else ""], r.[:err else ""]]
 };

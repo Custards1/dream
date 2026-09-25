@@ -4,13 +4,13 @@
 > [bytecode-format.md](bytecode-format.md), which is the spec to read and the
 > one to keep current. `MODS` is documented there in the section table and
 > beside the global record; `LDAT`/`PAYL` have a section of their own, and the
-> `std.core` members that reach the payload are in [builtins.md](builtins.md).
+> primitives that reach the payload are in [builtins.md](builtins.md).
 > This file is kept only as the record of what was argued for and why; it can
 > go whenever that is no longer worth having.
 >
 > Two things the proposal did not say, settled during the work: a bigstr and a
 > string of the same bytes compare equal and hash alike (otherwise
-> `str.slice 0 4 data == "%PDF"` is quietly false), and `core.data_count` was
+> `str.slice 0 4 data == "%PDF"` is quietly false), and `data_count` was
 > added beside `data_at`, because without it nothing can ask how many data an
 > image carries. `str.byte`, which the proposal lists as supported, did not
 > exist in `std.str` and was added.
@@ -114,7 +114,7 @@ unknown kinds, exactly as it does any section today.
   so a `u32` index can name a payload without a 64-bit offset in every use.
   `LDAT` must not appear without `PAYL`, nor `PAYL` without `LDAT`.
 - The payload is a *host-level* feature, not an instruction: nothing in `NODE`,
-  `KIDS`, `FUNC`, or `KSTR` points at it. The `std.core` member `data_at`
+  `KIDS`, `FUNC`, or `KSTR` points at it. The primitive `data_at`
   (see `builtins.md`) materializes payload `i` as a zero-copy view. This is
   what keeps the change additive -- an image that never uses its payload runs
   on any reader, and the format does not need a new opcode.

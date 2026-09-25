@@ -43,7 +43,7 @@
 // back as a list. That is the format's limit rather than this module's, and
 // `round_trips` is here so a format can state in its own tests exactly which
 // values survive it.
-import std.core;
+
 import std.list;
 import std.result;
 import std.str;
@@ -112,13 +112,13 @@ virtual let decode text;
 
 /// A map's pairs in a settled order.
 ///
-/// `core.map_pairs` answers in whatever order the trie happens to walk, which
+/// `map_pairs` answers in whatever order the trie happens to walk, which
 /// depends on the hashes and not on the program -- so the same map could encode
 /// two ways in one run, and two programs that agree about a value would
-/// disagree about its bytes. A map's keys are flat values and `core.compare`
+/// disagree about its bytes. A map's keys are flat values and `compare`
 /// totally orders those, so one sort buys an encoding that is a function of the
 /// value alone: comparable, hashable, cacheable, and testable.
-let map_entries m = list.sort_on (fn p -> list.nth 0 p) (core.map_pairs m);
+let map_entries m = list.sort_on (fn p -> list.nth 0 p) (map_pairs m);
 
 /// The value, in this format.
 ///
@@ -134,7 +134,7 @@ let rec encode v = match type_of v {
     :string  => write_string v,
     :atom    => write_atom v,
     :list    => write_list (list.map encode v),
-    :array   => write_array (list.map encode (core.array_to_list v)),
+    :array   => write_array (list.map encode (array_to_list v)),
     :map     => write_map (map_entries v),
     _        => write_opaque v,
 };
@@ -182,12 +182,12 @@ let frame_header = 4;
 /// `v` as one whole message: its length, then its encoding.
 let frame v = {
     let body = encode v;
-    core.str_concat [core.str_le (core.str_len body) frame_header, body]
+    str_concat [str_le (len body) frame_header, body]
 };
 
 /// Every value, each as its own message, back to back. A batch is bytes that
 /// can be split again, not a bigger message.
-let frame_all vs = core.str_concat (list.map frame vs);
+let frame_all vs = str_concat (list.map frame vs);
 
 /// The length of the message whose prefix is at the front of `buf`, or `-1`
 /// when `buf` does not yet hold a whole prefix.
@@ -203,12 +203,12 @@ let frame_all vs = core.str_concat (list.map frame vs);
 /// Little-endian, and read a byte at a time because that is what a string is
 /// indexed by.
 let frame_size buf =
-    if core.str_len buf < frame_header { 0 - 1 }
+    if len buf < frame_header { 0 - 1 }
     else {
-        core.str_byte buf 0
-        + core.str_byte buf 1 * 256
-        + core.str_byte buf 2 * 65536
-        + core.str_byte buf 3 * 16777216
+        str_byte buf 0
+        + str_byte buf 1 * 256
+        + str_byte buf 2 * 65536
+        + str_byte buf 3 * 16777216
     };
 
 /// The first whole message in `buf` and what follows it: `[result, rest]`,
@@ -221,22 +221,22 @@ let frame_size buf =
 /// caller can report and carry on from, because the frame said where the next
 /// message starts whether or not this one made sense.
 let next_frame buf = {
-    let have = core.str_len buf;
+    let have = len buf;
     if have < frame_header { () }
     else {
         let size = frame_size buf;
         let total = frame_header + size;
         if have < total { () }
         else {
-            [decode (core.str_slice buf frame_header size),
-             core.str_slice buf total (have - total)]
+            [decode (str_slice buf frame_header size),
+             str_slice buf total (have - total)]
         }
     }
 };
 
 priv let rec frames_from acc buf = match next_frame buf {
     ()        => [list.reverse acc, buf],
-    [r, rest] => frames_from (core.cons r acc) rest,
+    [r, rest] => frames_from (list_cons r acc) rest,
 };
 
 /// Every whole message in `buf`, and the bytes left over: `[results, rest]`.

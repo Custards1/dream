@@ -17,13 +17,13 @@
 // out right now that `match_key` hands its value back unforced.
 import std.console;
 
-let rec shift_tail xs n = if n <= 0 { xs } else { shift_tail (core.cons 0 (core.tail xs)) (n - 1) };
+let rec shift_tail xs n = if n <= 0 { xs } else { shift_tail (list_cons 0 (list_tail xs)) (n - 1) };
 
 let rec shift_rest xs n =
-    if n <= 0 { xs } else { shift_rest (match xs { [_, ..rest] => core.cons 0 rest, _ => xs }) (n - 1) };
+    if n <= 0 { xs } else { shift_rest (match xs { [_, ..rest] => list_cons 0 rest, _ => xs }) (n - 1) };
 
 let rec bump_head xs n =
-    if n <= 0 { xs } else { bump_head (match xs { [h, ..rest] => core.cons (h + 1) rest, _ => xs }) (n - 1) };
+    if n <= 0 { xs } else { bump_head (match xs { [h, ..rest] => list_cons (h + 1) rest, _ => xs }) (n - 1) };
 
 let rec bump_at a n =
     if n <= 0 { a } else { bump_at (match a { #[x, y] => #[x + 1, y], _ => a }) (n - 1) };
@@ -36,7 +36,7 @@ let depth = 300000;
 let main! = {
     console.print! ("tail:  " + to_string (len (shift_tail [1, 2] depth)))
     console.print! ("rest:  " + to_string (len (shift_rest [1, 2] depth)))
-    console.print! ("head:  " + to_string (core.head (bump_head [0] depth)))
+    console.print! ("head:  " + to_string (((bump_head [0] depth)).[0]))
     console.print! ("array: " + to_string (bump_at #[0, 0] depth).[0])
     console.print! ("map:   " + to_string (bump_key %{ :count => 0 } depth).[:count])
 };

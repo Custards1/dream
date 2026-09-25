@@ -129,6 +129,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::Force:
         case Op::Neg:
         case Op::Not:
+        case Op::TypeIs:
             dump_node(img, n.a, depth + 1, out);
             break;
         case Op::Apply:

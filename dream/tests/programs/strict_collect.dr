@@ -28,7 +28,7 @@
 // what it did instead of changing them.
 import std.array;
 import std.console;
-import std.core;
+
 import std.list;
 import std.str;
 
@@ -38,7 +38,7 @@ let show! label v = { console.print! (label + to_string v) };
 /// string, so the nursery fills while `force_deep` is part-way along.
 let rec pieces n =
     if n == 0 { [] }
-    else { core.cons (str.repeat (n % 7 + 1) "ab") (pieces (n - 1)) };
+    else { list_cons (str.repeat (n % 7 + 1) "ab") (pieces (n - 1)) };
 
 /// The lengths of every element, added up. Reading this *after* the deep force
 /// is what notices a head that was stored somewhere other than the cell the
@@ -67,5 +67,5 @@ let main! = {
     // forced once, and the second read must find what the first one wrote.
     let shared = pieces 2000;
     let pair = strict! [shared, shared];
-    show! "shared agree:   " (total (core.head pair) == total (core.head (core.tail pair)))
+    show! "shared agree:   " (total (pair.[0]) == total (((list_tail pair)).[0]))
 };

@@ -81,7 +81,7 @@ void dream_rt_frame_store(dream::Process* p, dream::Value frame, uint32_t index,
 ///
 /// The two shapes a native comes in are the two entry points: a *builtin* is an
 /// immediate carrying an index into a static table, and a *member* is one
-/// function of one host module -- `std.native`'s `str_byte`, `std.math`'s
+/// function of one host module -- `std.math`'s
 /// `sqrt` -- named by where it sits rather than by a pointer, so that the
 /// callee value this process already built for it is what gets called.
 ///

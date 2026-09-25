@@ -163,7 +163,7 @@ fi
 # --- payloads ---------------------------------------------------------------
 #
 # `--payload` puts a file's bytes in the image past everything the rest of the
-# container can address, and `core.data_at` hands them back as a view rather
+# container can address, and `data_at` hands them back as a view rather
 # than a string. Its own block rather than a program in the loop above, because
 # it is the compile that differs: the flag, and the files it names.
 #
@@ -184,21 +184,21 @@ cat > "$payload_dir/payload.dr" <<'EOF'
 // path, so `std.str` -- which is Dream source in `mind/std` -- is not reachable.
 // `str.byte` and `str.slice` are one-line wrappers over these two anyway.
 import std.console;
-import std.core;
+
 import std.io;
 
 let main! = {
-    let a = core.data_at 0;
-    let b = core.data_at 1;
-    console.print! ("count " + to_string (core.data_count ()))
+    let a = data_at 0;
+    let b = data_at 1;
+    console.print! ("count " + to_string (data_count ()))
     console.print! ("type " + to_string (type_of a))
     console.print! ("lens " + to_string (len a) + " " + to_string (len b))
-    console.print! ("byte " + to_string (core.str_byte a 4))
-    console.print! ("slice " + to_string (core.str_slice a 4 5 == "quick"))
+    console.print! ("byte " + to_string (str_byte a 4))
+    console.print! ("slice " + to_string (str_slice a 4 5 == "quick"))
     console.print! ("whole " + to_string (a == "the quick brown fox"))
     console.print! ("order " + to_string (b < a))
     // A slice is a view too, so slicing one again must land in the same place.
-    console.print! ("again " + to_string (core.str_slice (core.str_slice a 4 9) 0 5 == "quick"))
+    console.print! ("again " + to_string (str_slice (str_slice a 4 9) 0 5 == "quick"))
     // The bytes cross a process boundary as a view, not as a copy.
     console.print! ("child " + to_string (join! (spawn! $( len b ))))
     // Concatenating one is refused, and the message says what to do instead.
@@ -207,8 +207,8 @@ let main! = {
     // it the way it is for `len` and `==`. `:quick` exists because this line
     // writes it; `:the` is written nowhere, so the same call over the other
     // slice has nothing to find.
-    console.print! ("atom " + to_string (core.to_existing_atom (core.str_slice a 4 5) == :quick))
-    console.print! ("noatom " + to_string (core.to_existing_atom (core.str_slice a 0 3)))
+    console.print! ("atom " + to_string (to_existing_atom (str_slice a 4 5) == :quick))
+    console.print! ("noatom " + to_string (to_existing_atom (str_slice a 0 3)))
     io.write! (io.stdout! ()) b
 };
 EOF

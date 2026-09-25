@@ -5,7 +5,7 @@
 // (`path`) or somewhere to fetch (`git`, `url`) -- there is no index and no
 // registry, so a dependency says where it is rather than naming a version the
 // world is expected to agree on.
-import std.core;
+
 import std.list;
 import std.str;
 import std.toml;
@@ -18,10 +18,10 @@ let make root doc = %{ :root => root, :doc => doc };
 /// No project at all: every setting at its default. A command that also works
 /// outside a project reads its settings through this, so "there is no manifest"
 /// is a manifest that says nothing rather than a second code path.
-let empty = make "." (core.map_new ());
+let empty = make "." (%{});
 
-let root m = core.map_get m :root ".";
-let doc m = core.map_get m :doc (core.map_new ());
+let root m = m.[:root else "."];
+let doc m = m.[:doc else (%{})];
 
 let name m = toml.get "" (doc m) "package" "name";
 let version m = toml.get "0.0.0" (doc m) "package" "version";
@@ -79,7 +79,7 @@ let dependencies m = toml.entries (doc m) "dependencies";
 let dep_name d = list.head d;
 let dep_spec d = list.nth 1 d;
 
-let spec_get d key = core.map_get (dep_spec d) key ();
+let spec_get d key = ((dep_spec d)).[key else ()];
 
 /// How a dependency is obtained: `:path`, `:git`, `:url`, or `:unknown`.
 let dep_kind d =

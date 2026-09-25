@@ -49,7 +49,7 @@
 //         [:error, why] => ..,
 //         [:ok, c] => cli.command_name c,   // the spelling that was used
 //     }
-import std.core;
+
 import std.list;
 import std.str;
 
@@ -60,11 +60,11 @@ import std.str;
 let opt short long kind meta help =
     %{ :short => short, :long => long, :kind => kind, :meta => meta, :help => help };
 
-let short o = core.map_get o :short "";
-let long o  = core.map_get o :long "";
-let kind o  = core.map_get o :kind :flag;
-let meta o  = core.map_get o :meta "";
-let help o  = core.map_get o :help "";
+let short o = o.[:short else ""];
+let long o  = o.[:long else ""];
+let kind o  = o.[:kind else :flag];
+let meta o  = o.[:meta else ""];
+let help o  = o.[:help else ""];
 
 /// Present or absent, and nothing else to say.
 let flag short long help = opt short long :flag "" help;
@@ -97,28 +97,28 @@ let is_option o = kind o != :section;
 
 /// The value must be one of `cs`. Enforced at parse time and printed in the
 /// usage message, so the choices live next to the option that has them.
-let choices cs o = core.map_put o :choices cs;
+let choices cs o = o.[:choices => cs];
 
 /// The option must be written. Satisfied by a `default_to`, which records a
 /// value as if it had been typed. Checked after the whole line is walked, so
 /// `--output a --output b` is present however it ends.
-let required o = core.map_put o :required true;
+let required o = o.[:required => true];
 
 /// The value recorded when the option is never written, printed as
 /// `(default X)` in the usage message. Makes `get` answer without a fallback
 /// argument, because the description carries the answer.
-let default_to v o = core.map_put o :default v;
+let default_to v o = o.[:default => v];
 
 // --- what parsing produced ---------------------------------------------------
 
 let parsed values rest = %{ :values => values, :rest => rest };
 
-let values c = core.map_get c :values (core.map_new ());
+let values c = c.[:values else (%{})];
 /// The arguments that were not options, in order.
-let rest c = core.map_get c :rest [];
+let rest c = c.[:rest else []];
 
 /// The value given for a `value` option, or `default`.
-let get default c name = core.map_get (values c) name default;
+let get default c name = ((values c)).[name else default];
 
 /// Whether a `flag` was given.
 let flag_set c name = get false c name == true;
@@ -132,12 +132,12 @@ let all c name = get [] c name;
 /// options the command alone parses.
 let command name help opts = %{ :name => name, :help => help, :opts => opts };
 
-let command_name cm = core.map_get cm :name "";
-let command_help cm = core.map_get cm :help "";
-let command_opts cm = core.map_get cm :opts [];
+let command_name cm = cm.[:name else ""];
+let command_help cm = cm.[:help else ""];
+let command_opts cm = cm.[:opts else []];
 
 /// The command a `commands` parse chose, or `()` when there was no subcommand.
-let chosen c = core.map_get c :command ();
+let chosen c = c.[:command else ()];
 
 // --- parsing -----------------------------------------------------------------
 
@@ -157,18 +157,15 @@ let by_command cmds name = {
 };
 
 let add_count c o n =
-    core.map_put c :values
-        (core.map_put (values c) (long o) ((core.map_get (values c) (long o) 0) + n));
+    c.[:values => (((values c)).[(long o) => ((((values c)).[(long o) else 0]) + n)])];
 
 /// Record one option's value. A `list` option appends; everything else assigns.
 /// `count` is recorded through `add_count`, which knows how many to add.
 let record c o v =
-    core.map_put c :values
-        (core.map_put (values c) (long o)
-             (if kind o == :list { list.append (core.map_get (values c) (long o) []) [v] }
-              else { v }));
+    c.[:values => (((values c)).[(long o) => (if kind o == :list { list.append (((values c)).[(long o) else []]) [v] }
+              else { v })])];
 
-let add_rest c a = core.map_put c :rest (list.append (rest c) [a]);
+let add_rest c a = c.[:rest => (list.append (rest c) [a])];
 
 let missing o spelling =
     [:error, spelling + " needs " + (if str.is_empty (meta o) { "a value" } else { meta o })];
@@ -176,7 +173,7 @@ let missing o spelling =
 /// A `choices` option was given a value it does not know; say so, naming the
 /// option and the value and everything it would have accepted.
 let choice_ok o v = {
-    let cs = core.map_get o :choices [];
+    let cs = o.[:choices else []];
     if list.is_empty cs { :ok }
     else if list.contains v cs { :ok }
     else { [:error, "--" + long o + " expects one of " + str.join_str ", " cs +
@@ -309,10 +306,10 @@ let rec fill_default os c =
     match os {
         [] => c,
         [o, ..more] =>
-            if is_option o && core.map_has o :default &&
-               not (core.map_has (values c) (long o)) {
-                let v = core.map_get o :default ();
-                let cc = core.map_put c :values (core.map_put (values c) (long o) v);
+            if is_option o && map_has o :default &&
+               not (map_has (values c) (long o)) {
+                let v = o.[:default else ()];
+                let cc = c.[:values => (((values c)).[(long o) => v])];
                 fill_default more cc
             }
             else { fill_default more c },
@@ -324,8 +321,8 @@ let rec missing_required os c =
     match os {
         [] => [:ok, ()],
         [o, ..more] =>
-            if core.map_get o :required false == true &&
-               not (core.map_has (values c) (long o)) {
+            if o.[:required else false] == true &&
+               not (map_has (values c) (long o)) {
                 [:error, "missing required option --" + long o]
             }
             else { missing_required more c },
@@ -343,7 +340,7 @@ let finalize os c = {
 
 /// `[:ok, parsed]`, or `[:error, message]` naming the option at fault.
 let parse os args =
-    match walk os (parsed (core.map_new ()) []) args {
+    match walk os (parsed (%{}) []) args {
         [:error, m] => [:error, m],
         [:ok, c] => finalize os c,
     };
@@ -360,7 +357,7 @@ let finish_command globals cmds c cmd args = {
                 [:error, m] => [:error, m],
                 [:ok, c2] => match finalize opts c2 {
                     [:error, m] => [:error, m],
-                    [:ok, c3] => [:ok, core.map_put c3 :command cm],
+                    [:ok, c3] => [:ok, c3.[:command => cm]],
                 },
             }
         },
@@ -392,7 +389,7 @@ let rec scan globals cmds c args =
             else { finish_command globals cmds c a more },
     };
 
-let commands globals cmds args = scan globals cmds (parsed (core.map_new ()) []) args;
+let commands globals cmds args = scan globals cmds (parsed (%{}) []) args;
 
 // --- the usage message -------------------------------------------------------
 
@@ -418,16 +415,16 @@ let spelling o = {
 /// the help grows exactly as the contract grows.
 let suffixed_help o = {
     let choices_text = {
-        let cs = core.map_get o :choices [];
+        let cs = o.[:choices else []];
         if list.is_empty cs { "" } else { " (one of " + str.join_str ", " cs + ")" }
     };
     let default_text =
-        if core.map_has o :default {
-            " (default " + to_string (core.map_get o :default ()) + ")"
+        if map_has o :default {
+            " (default " + to_string (o.[:default else ()]) + ")"
         }
         else { "" };
     let required_text =
-        if core.map_get o :required false == true { " (required)" } else { "" };
+        if o.[:required else false] == true { " (required)" } else { "" };
     help o + choices_text + default_text + required_text
 };
 
@@ -644,7 +641,7 @@ let parse_as description options args = match parse options args {
 /// Calling this under `comp` freezes option kinds, choices and required/default
 /// presence into a reusable data schema, without running the parser.
 let option_type option = {
-    let element = if core.map_has option :choices {
+    let element = if map_has option :choices {
         types.enum option.[:choices]
     } else { :string };
     match kind option {
@@ -661,9 +658,9 @@ let values_type options = {
         if not (is_option o) { [required_fields, optional_fields] }
         else {
             let schema = option_type o;
-            if core.map_get o :required false == true || core.map_has o :default {
-                [core.map_put required_fields (long o) schema, optional_fields]
-            } else { [required_fields, core.map_put optional_fields (long o) schema] }
+            if o.[:required else false] == true || map_has o :default {
+                [required_fields.[(long o) => schema], optional_fields]
+            } else { [required_fields, optional_fields.[(long o) => schema]] }
         }
     }) [%{}, %{}] options;
     types.record_with required_fields optional_fields

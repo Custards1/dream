@@ -12,20 +12,20 @@
 //         test.case "reverse" $( test.eq! [3, 2, 1] (list.reverse [1, 2, 3]) ),
 //     ]
 
-// Only `std.core` is imported, never `std.list`. A module's own tests import
+// Only `std.console` is imported, never `std.list`. A module's own tests import
 // this framework, so anything it depends on could not have tests of its own --
 // the import would be a cycle. Walking lists with the primitives directly is a
 // small price for letting every module test itself.
 import std.console;
-import std.core;
+
 
 // --- cases ------------------------------------------------------------------
 
 /// A case is a name and a suspended computation, as made by `$( .. )`.
 let case name body = [name, body];
 
-let case_name c = core.head c;
-let case_body c = core.head (core.tail c);
+let case_name c = c.[0];
+let case_body c = ((list_tail c)).[0];
 
 // --- assertions -------------------------------------------------------------
 //
@@ -66,9 +66,9 @@ let near! tolerance expected actual = {
 };
 
 let rec has_element x xs =
-    if core.is_empty xs { false }
-    else if core.head xs == x { true }
-    else { has_element x (core.tail xs) };
+    if list_is_empty xs { false }
+    else if xs.[0] == x { true }
+    else { has_element x (list_tail xs) };
 
 let contains! x xs = {
     if has_element x xs { :ok }
@@ -76,7 +76,7 @@ let contains! x xs = {
 };
 
 let empty! xs = {
-    if core.is_empty xs { :ok }
+    if list_is_empty xs { :ok }
     else { raise! ("expected an empty list, got " + to_string xs) }
 };
 
@@ -92,9 +92,9 @@ let fail! message = raise! message;
 // --- running ----------------------------------------------------------------
 
 let rec run_cases! passed failed cases = {
-    if core.is_empty cases { [passed, failed] }
+    if list_is_empty cases { [passed, failed] }
     else {
-        let c = core.head cases;
+        let c = cases.[0];
         let name = case_name c;
         // Running the case in its own process means a failure -- including one
         // the case did not intend -- comes back as a value instead of taking
@@ -102,10 +102,10 @@ let rec run_cases! passed failed cases = {
         let outcome = try! { join! (spawn! (case_body c)); :pass } catch e { e };
         if outcome == :pass {
             console.write! ("  ok    " + name + "\n")
-            run_cases! (passed + 1) failed (core.tail cases)
+            run_cases! (passed + 1) failed (list_tail cases)
         } else {
             console.write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n")
-            run_cases! passed (failed + 1) (core.tail cases)
+            run_cases! passed (failed + 1) (list_tail cases)
         }
     }
 };
@@ -115,8 +115,8 @@ let rec run_cases! passed failed cases = {
 let suite! name cases = {
     console.write! ("\n" + name + "\n")
     let counts = run_cases! 0 0 cases;
-    let passed = core.head counts;
-    let failed = core.head (core.tail counts);
+    let passed = counts.[0];
+    let failed = ((list_tail counts)).[0];
     console.write! ("  " + to_string passed + " passed"
                     + (if failed > 0 { ", " + to_string failed + " FAILED" } else { "" })
                     + "\n")
@@ -125,11 +125,11 @@ let suite! name cases = {
 
 /// Run several suites and report the total. Each entry is `[name, cases]`.
 let rec run_suites! failed suites = {
-    if core.is_empty suites { failed }
+    if list_is_empty suites { failed }
     else {
-        let s = core.head suites;
-        let f = suite! (core.head s) (core.head (core.tail s));
-        run_suites! (failed + f) (core.tail suites)
+        let s = suites.[0];
+        let f = suite! (s.[0]) (((list_tail s)).[0]);
+        run_suites! (failed + f) (list_tail suites)
     }
 };
 

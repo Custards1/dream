@@ -22,7 +22,6 @@
 // happen in. Nothing has to be undone, and there is no point at which half a
 // module is registered.
 
-import std.core;
 import std.io;
 import std.list;
 import std.os;
@@ -45,93 +44,10 @@ import dreams.path;
 /// compilable. It is deliberately not a wildcard: naming the module is what
 /// keeps a typo in an import an error rather than a mystery later.
 let native_modules =
-    ["std.console", "std.ffi", "std.io", "std.math", "std.native", "std.net", "std.os", "std.vm"];
+    ["std.console", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.vm"];
 
 let is_native p = list.contains p native_modules;
 
-/// Modules that are Dream source where the source can be found, and the host's
-/// where it cannot. `std.core` is written in Dream (`mind/std/core.dr`), but the
-/// VM still answers to the name: every image built before it moved imports it
-/// that way, and a program compiled with no standard library on the path -- a
-/// script in `/tmp`, the VM's own test programs -- still has a `core` to reach.
-let host_fallbacks = ["std.core"];
-
-// --- `core`, without an import ----------------------------------------------------
-//
-// A module that names `core` and does not bind it gets `std.core` as though it
-// had imported it. The loader has to know that, and not only resolution: the
-// module is a file to load, and a dependency is loaded before whatever needs it,
-// which is what keeps a program's modules in dependency order with the root last.
-
-/// Does this tree mention `core`?
-///
-/// A structural search rather than a walk per node kind: the only thing that can
-/// be a use of `core` is a `[:name, "core", _]`, and no other node has that
-/// shape, so looking for it directly cannot drift out of step with the grammar.
-let rec mentions_name target e =
-    match e {
-        [:name, n, _] => n == target,
-        _ => if type_of e == :list { list.any (fn x -> mentions_name target x) e }
-             else { false },
-    };
-
-/// Can a file whose source reads like this possibly contain a use of `core`?
-///
-/// A gate in front of the walk above, and the only reason it is worth having is
-/// that it is exact in the direction that costs: every `[:name, "core", _]` was
-/// lexed from an identifier spelled `core`, so text without those four bytes
-/// anywhere in it cannot produce one, and the answer is `false` without reading
-/// a single node. The converse is not exact -- `x.core`, `mod core`, a comment,
-/// a string literal all match the bytes and none is a use -- which is why this
-/// only ever *skips* the walk and never stands in for it. Both callers spell
-/// that as `&&`.
-///
-/// It is worth having because the expensive case and the common case are
-/// opposites. `list.any` stops at the first declaration that mentions `core`,
-/// and every module of this compiler names it in its first few lines, so the
-/// walk is free here and complete -- every node of every declaration -- for a
-/// module that never touches it. That is the module this gate answers in one
-/// machine scan of the file: 9.2% of the compile of a 3,200-declaration program
-/// that uses `std.list` and nothing else, and nothing at all of a self-compile.
-/// See "Declaring a program was mostly a search for the word `core`" in
-/// CLAUDE.md for how the walk came to be asked once, and why asking it once
-/// still was not cheap enough.
-let text_may_mention_core text = str.contains_str "core" text;
-
-let item_mentions_core item =
-    match item {
-        [:let, _, _, body, _, _] => mentions_name "core" body,
-        [:macro, _, _, body, _] => mentions_name "core" body,
-        // A map pattern's keys are expressions too.
-        [:let_p, pattern, body, _] => mentions_name "core" body || mentions_name "core" pattern,
-        [:virtual, _, _, body, _] => match body { () => false, b => mentions_name "core" b },
-        _ => false,
-    };
-
-/// Does a module with these items need `std.core` brought in? It names `core`,
-/// it does not bind the name itself, and it is not `std.core`, which would be
-/// importing itself. Resolution asks the same question more carefully, of what a
-/// module inherits as well as what it says; an answer that differs costs a
-/// module loaded for nothing, or `core` meaning the host's module, and neither
-/// changes what a program does.
-///
-/// `mentions` arrives rather than being computed here, because it is the one
-/// expensive part of the question and two passes want the answer. See
-/// `module_mentions_core`.
-let needs_core name items mentions =
-    name != "std.core"
-    && not (list.any (fn item ->
-                match item {
-                    [:let, "core", _, _, _, _] => true,
-                    [:import, segs, alias, _, _] =>
-                        (match alias { () => list.last segs, a => a }) == "core",
-                    _ => false,
-                }) items)
-    && mentions;
-
-/// A module's dependencies, `std.core` first when it needs one it did not write.
-let with_core name items mentions deps =
-    if needs_core name items mentions { core.cons ["std.core", ast.no_span] deps } else { deps };
 
 // --- a loaded module ---------------------------------------------------------
 
@@ -144,48 +60,18 @@ mapping Module {
     items = []
 }
 
-// Visibility is module metadata; later passes still walk ordinary declarations.
-//
-// `mentions` is the one thing recorded here that is not metadata but an
-// *answer*: whether anything in this module names `core`. It is carried rather
-// than asked for twice because asking is a walk of every node of every
-// declaration, and two passes need it -- the loader, to decide whether to open
-// `std.core` at all, and `scope.declare_core`, to decide whether to bind the
-// name. It arrives unforced, so a module whose question is settled another way
-// (`std.core` itself, a module that binds `core`) never pays the walk.
-let loaded name path source items mentions =
-    core.map_put
-        (core.map_put (Module.make name path source
-            (list.filter (fn item -> ast.kind item != :private) items)) :private_spans
-            (list.map ast.span (list.filter (fn item -> ast.kind item == :private) items)))
-        :mentions_core mentions;
+// Visibility travels with the module's declarations.
+let loaded name path source items =
+    (Module.make name path source
+        (list.filter (fn item -> ast.kind item != :private) items)).[:private_spans =>
+            list.map ast.span (list.filter (fn item -> ast.kind item == :private) items)];
 
-/// Whether this module names `core`, from the record rather than from a walk.
-///
-/// A module whose items have been rewritten since it was loaded has no stored
-/// answer and is asked the old way -- see `with_new_items`, which is what
-/// expansion rewrites one through.
-let module_mentions_core m =
-    core.map_get m :mentions_core
-        (list.any (fn item -> item_mentions_core item) (Module.items m));
-
-/// The module a rewritten item list makes, with what it mentions forgotten.
-///
-/// Expansion is the one pass that can put a name into a module its source
-/// never had -- a transformer may hand back `core.head` -- so the stored
-/// answer cannot be carried across one. Replacing an item list that only
-/// *loses* names (staging an `expand` as `1 / 0`) could keep it, and the
-/// difference would be a `core` alias bound in a module that no longer uses
-/// it; recomputing for the handful of modules a macro is written in is
-/// cheaper than having to know which of the two a caller is doing.
-let with_new_items m items =
-    core.map_put (core.map_put m :items items) :mentions_core
-        (list.any (fn item -> item_mentions_core item) items);
+let with_new_items m items = m.[:items => items];
 
 let private_declaration m span =
     list.any (fn sp -> ast.span_start sp <= ast.span_start span
                    && ast.span_end span <= ast.span_end sp)
-             (core.map_get m :private_spans []);
+             (m.[:private_spans else []]);
 
 let module_name m = Module.name m;
 let module_path m = Module.path m;
@@ -202,41 +88,41 @@ let loader packages cfg search_paths host_modules =
        // everything it imports has been -- and it is why the table is keyed by
        // a dense index rather than by name: the index *is* the order.
        :modules => %{}, :module_count => 0,
-       :by_name => core.map_new (), :by_path => core.map_new (),
+       :by_name => %{}, :by_path => %{},
        :files => %{}, :file_count => 0, :expanding => %{},
        :natives => [], :namespaces => [],
-       :diags => [], :visited => core.map_new (), :in_progress => [],
+       :diags => [], :visited => %{}, :in_progress => [],
        // Files whose contents come from memory rather than from disk. An
        // editor holds a buffer that has not been saved -- often has never been
        // saved -- and every question it asks is about the buffer.
-       :overlay => core.map_new (),
+       :overlay => %{},
        // Files whose text has been parsed before: path -> [text, parse result].
        // A language server reuses a module's parse across requests -- the only
        // file that changes is the buffer being edited, and re-lexing and
        // re-parsing every reachable module on every keystroke is the whole cost
        // of answering one -- so a same-text hit skips the parse entirely.
-       :parsed => core.map_new () };
+       :parsed => %{} };
 
-let packages l     = core.map_get l :packages package.empty;
-let config_of l    = core.map_get l :config config.empty;
-let search_paths l = core.map_get l :search_paths [];
-let host_modules l = core.map_get l :host_modules [];
+let packages l     = l.[:packages else package.empty];
+let config_of l    = l.[:config else config.empty];
+let search_paths l = l.[:search_paths else []];
+let host_modules l = l.[:host_modules else []];
 /// Every module that was loaded, in order. Derived, because the table it
 /// comes from is keyed by index -- so ask `module_count` when the count is all
 /// that is wanted, which is what nearly every caller wanted.
 let modules l      = list.map (fn i -> module_at l i) (list.range 0 (module_count l));
-let module_map l   = core.map_get l :modules %{};
-let module_count l = core.map_get l :module_count 0;
-let by_name l      = core.map_get l :by_name (core.map_new ());
-let by_path l      = core.map_get l :by_path (core.map_new ());
+let module_map l   = l.[:modules else %{}];
+let module_count l = l.[:module_count else 0];
+let by_name l      = l.[:by_name else (%{})];
+let by_path l      = l.[:by_path else (%{})];
 /// Every source file, in order. Derived from the table below, and wanted in
 /// this shape by exactly one caller: `diag.render_all`, which is handed the
 /// whole program's files once, at the end of a compile that has something to
 /// say. Every other reader knows the index it wants -- a diagnostic carries
 /// one -- and asks `file_at`.
 let files l        = list.map (fn i -> file_at l i) (list.range 0 (file_count l));
-let file_map l     = core.map_get l :files %{};
-let file_count l   = core.map_get l :file_count 0;
+let file_map l     = l.[:files else %{}];
+let file_count l   = l.[:file_count else 0];
 let file_at l i    = (file_map l).[i else ()];
 
 /// Record a file's text and say where it went. Keyed by index like the module
@@ -257,29 +143,29 @@ let set_file i f l = put :files ((file_map l).[i => f]) l;
 /// self-compile and every program paid it, macros or not, because "has this
 /// declaration got an `expand` in it?" was asked by reading the whole
 /// program's syntax. See `parser.expand_sites` for why the answer is sound.
-let expanding l = core.map_get l :expanding %{};
+let expanding l = l.[:expanding else %{}];
 let expand_sites l source = (expanding l).[source else []];
 let note_expanding source sites l =
     if list.is_empty sites { l } else { put :expanding ((expanding l).[source => sites]) l };
-let natives l      = core.map_get l :natives [];
-let namespaces l   = core.map_get l :namespaces [];
-let diags l        = core.map_get l :diags [];
-let visited l      = core.map_get l :visited (core.map_new ());
-let in_progress l  = core.map_get l :in_progress [];
+let natives l      = l.[:natives else []];
+let namespaces l   = l.[:namespaces else []];
+let diags l        = l.[:diags else []];
+let visited l      = l.[:visited else (%{})];
+let in_progress l  = l.[:in_progress else []];
 /// Path to text, for the files this loader should not read from disk.
-let overlay l      = core.map_get l :overlay (core.map_new ());
-let with_overlay o l = core.map_put l :overlay o;
+let overlay l      = l.[:overlay else (%{})];
+let with_overlay o l = l.[:overlay => o];
 /// Path to a `[text, parse result]` pair for a file that has been parsed
 /// before. Feeding a loader a previous loader's map is what makes two analyses
 /// of the same program parse nothing twice.
-let parsed l       = core.map_get l :parsed (core.map_new ());
-let with_parsed p l = core.map_put l :parsed p;
-let put_parsed file v l = with_parsed (core.map_put (parsed l) file v) l;
+let parsed l       = l.[:parsed else (%{})];
+let with_parsed p l = l.[:parsed => p];
+let put_parsed file v l = with_parsed (((parsed l)).[file => v]) l;
 
 /// `[owner, kind, name, fields, members, span]` for each `group`, `struct` or
 /// `mapping` declaration, where `owner` is the module it was written in.
 /// `note_records` is the only thing that adds to this and says why it exists.
-let records l      = core.map_get l :records [];
+let records l      = l.[:records else []];
 
 /// What each `expand` in the program named: `[module, source, offset, what]`,
 /// one entry per call site, where `what` is the resolution of the macro's own
@@ -291,7 +177,7 @@ let records l      = core.map_get l :records [];
 /// question -- hover and go-to-definition are "what is this name" -- so the
 /// pass that did resolve it says so here, and `scope.resolve!` seeds its
 /// occurrence table with these. See `note_macro` in dreams/expand.dr.
-let expansions l   = core.map_get l :expansions [];
+let expansions l   = l.[:expansions else []];
 
 /// Should macro expansion measure itself, and what did it measure?
 ///
@@ -307,14 +193,14 @@ let expansions l   = core.map_get l :expansions [];
 /// `expand.publish_meter` and read by `main.show_time!`. Nothing in the
 /// compiler reads it, the way nothing reads `records` -- it is here because
 /// the pass that spends the time is the only one that can say where.
-let metering l     = core.map_get l :metering false;
+let metering l     = l.[:metering else false];
 let with_metering l = put :metering true l;
-let macro_meter l  = core.map_get l :macro_meter ();
+let macro_meter l  = l.[:macro_meter else ()];
 
-let put k v l = core.map_put l k v;
+let put k v l = l.[k => v];
 
 /// The index of a module, by any name it answers to, or `()`.
-let find l name = core.map_get (by_name l) name ();
+let find l name = ((by_name l)).[name else ()];
 
 let module_at l i = (module_map l).[i else ()];
 
@@ -349,8 +235,8 @@ let complain span message source l = note (diag.in_source source (diag.error spa
 let complain_note span message extra source l =
     note (diag.in_source source (diag.with_note extra (diag.error span message))) l;
 
-let mark_visited name l = put :visited (core.map_put (visited l) name true) l;
-let is_visited l name = core.map_has (visited l) name;
+let mark_visited name l = put :visited (((visited l)).[name => true]) l;
+let is_visited l name = map_has (visited l) name;
 
 /// Native modules are recorded in first-seen order, because that order is the
 /// index a call to one is compiled to.
@@ -554,7 +440,7 @@ let rec record_items cfg items =
 /// answered `x ` and the end of the file. This is that, kept, and nothing in
 /// the compiler reads it: `owner + "." + name` is the module the rewrite made.
 let note_records owner items l =
-    put :records (records l + list.map (fn r -> core.cons owner r)
+    put :records (records l + list.map (fn r -> list_cons owner r)
                                        (record_items (config_of l) items)) l;
 
 // --- loading -----------------------------------------------------------------
@@ -614,7 +500,6 @@ let rec load_named! l dotted at from_source =
     else {
         match resolve_path! l dotted {
             // No file, for a module the host provides when there is none.
-            () if list.contains dotted host_fallbacks => record_native dotted (mark_visited dotted l),
             // No module by that name -- but a *package* by that name is
             // `import std;`, which brings in everything the package provides.
             () => {
@@ -626,11 +511,11 @@ let rec load_named! l dotted at from_source =
                 let tried = load_package! containing dotted at from_source;
                 if nested != () {
                     mark_visited dotted (put :by_name
-                        (core.map_put (by_name containing) dotted nested) containing)
+                        (((by_name containing)).[dotted => nested]) containing)
                 }
                 else if owner != () {
                     // Resolution binds the final segment like a selective import.
-                    put :by_name (core.map_put (by_name containing) parent owner) containing
+                    put :by_name (((by_name containing)).[parent => owner]) containing
                 }
                 else if list.nth 1 tried { list.head tried }
                 else {
@@ -642,7 +527,7 @@ let rec load_named! l dotted at from_source =
                 // Identity is the file. Already loaded under another spelling
                 // means another name for the same module, not another module.
                 let abs = path.absolute! file;
-                match core.map_get (by_path l) abs () {
+                match ((by_path l)).[abs else ()] {
                     () => {
                         let name = canonical_name! l file dotted;
                         // The check above compares the name as *written*, which
@@ -660,14 +545,14 @@ let rec load_named! l dotted at from_source =
                             // way to reach the module it found.
                             let aliased = match find after name {
                                 () => after,
-                                i  => put :by_name (core.map_put (by_name after) dotted i) after,
+                                i  => put :by_name (((by_name after)).[dotted => i]) after,
                             };
                             mark_visited dotted aliased
                         }
                     },
                     existing =>
                         mark_visited dotted
-                            (put :by_name (core.map_put (by_name l) dotted existing) l),
+                            (put :by_name (((by_name l)).[dotted => existing]) l),
                 }
             },
         }
@@ -711,7 +596,7 @@ let rec load_file! l file name at from_source =
     else {
         // The overlay first: a file that is open in an editor is whatever the
         // editor says it is, and what is on disk is out of date by definition.
-        let text = match core.map_get (overlay l) file () {
+        let text = match ((overlay l)).[file else ()] {
             () => path.read_file! file,
             t => t,
         };
@@ -727,7 +612,7 @@ let rec load_file! l file name at from_source =
 /// The submodule shares the parent's source file, so its diagnostics point at
 /// the right lines. It is deliberately *not* recorded by path: identity there
 /// is the file, and the file already belongs to the parent.
-let rec hoist_mod! l parent source may m =
+let rec hoist_mod! l parent source m =
     match m {
         [:mod, child, items, span] => {
             let full = parent + "." + child;
@@ -742,16 +627,12 @@ let rec hoist_mod! l parent source may m =
                 let nested = list.fold (fn acc item ->
                     match item {
                         [:mod, _, _, _] => {
-                            let done = hoist_mod! (list.head acc) full source may item;
+                            let done = hoist_mod! (list.head acc) full source item;
                             [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                         },
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
                     }) [note_records full items l, []] kept;
                 let inner_items = list.nth 1 nested;
-                // One walk for the two readers below: the dependency list, and
-                // the record. Neither forces it unless it gets that far.
-                let mentions = may
-                    && list.any (fn item -> item_mentions_core item) inner_items;
 
                 // A submodule may import, so follow those before it is recorded.
                 let followed = list.fold (fn acc d -> {
@@ -762,13 +643,13 @@ let rec hoist_mod! l parent source may m =
                     if find acc dep != () || local_module acc full dep != () { acc }
                     else { load_named! acc dep (list.nth 1 d) source }
                 }) (enter full (list.head nested))
-                   (with_core full inner_items mentions (dependencies inner_items));
+                   (dependencies inner_items);
 
                 let recorded = leave followed;
                 let index = module_count recorded;
                 [mark_visited full
-                    (put :by_name (core.map_put (by_name recorded) full index)
-                        (add_module (loaded full full source inner_items mentions) recorded)),
+                    (put :by_name (((by_name recorded)).[full => index])
+                        (add_module (loaded full full source inner_items) recorded)),
                  stand_in]
             }
         },
@@ -781,7 +662,7 @@ let rec load_text! l text display name file = {
     // A same-text parse already in hand is reused rather than done again: an
     // editor sends the whole buffer with every change, and every request after
     // the change is about that same buffer.
-    match core.map_get (parsed l) file () {
+    match ((parsed l)).[file else ()] {
         [same, result] => {
             if same == text { load_items! read source result display name file text }
             else {
@@ -805,10 +686,6 @@ let load_items! l source parsed display name file text = {
     match parsed {
         [:error, message, span] => complain span message source l,
         [:ok, items, sites] => {
-            // One machine scan of the file, in front of every `core` walk this
-            // module and its submodules would otherwise do. Lazy, so a module
-            // whose question is settled another way never even scans.
-            let may = text_may_mention_core text;
             // Resolve `when` before anything else looks at the module.
             let kept = expand_items (config_of l) items;
             let noted = note_records name items (note_expanding source sites l);
@@ -821,19 +698,12 @@ let load_items! l source parsed display name file text = {
             let hoisted = list.fold (fn acc item ->
                 match item {
                     [:mod, _, _, _] => {
-                        let done = hoist_mod! (list.head acc) name source may item;
+                        let done = hoist_mod! (list.head acc) name source item;
                         [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                     },
                     other => [list.head acc, list.append (list.nth 1 acc) [other]],
                 }) [enter name noted, []] kept;
             let items_out = list.nth 1 hoisted;
-            // As in `hoist_mod!`: asked once, read by the dependency list and
-            // by the record, forced by whichever of them gets there first --
-            // and only asked at all when the file's own bytes say it could be
-            // true. A submodule is written inside this file, so the same answer
-            // gates its walk too.
-            let mentions = may
-                && list.any (fn item -> item_mentions_core item) items_out;
 
             // Follow this module's own imports before recording it, so the
             // module list comes out with dependencies first.
@@ -845,14 +715,14 @@ let load_items! l source parsed display name file text = {
                 if local_module acc name dep != () { acc }
                 else { load_named! acc dep (list.nth 1 d) source }
             }) (list.head hoisted)
-               (with_core name items_out mentions (dependencies items_out));
+               (dependencies items_out);
 
             let recorded = leave followed;
             let index = module_count recorded;
             mark_visited name
-                (put :by_path (core.map_put (by_path recorded) (path.absolute! file) index)
-                    (put :by_name (core.map_put (by_name recorded) name index)
-                        (add_module (loaded name file source items_out mentions) recorded)))
+                (put :by_path (((by_path recorded)).[(path.absolute! file) => index])
+                    (put :by_name (((by_name recorded)).[name => index])
+                        (add_module (loaded name file source items_out) recorded)))
         },
     }
 };
@@ -938,10 +808,10 @@ let reload_root! l file test_mode = {
             let last = module_count l - 1;
             let unmounted =
                 put :module_count last
-                    (put :modules (core.map_remove (module_map l) last)
-                        (put :by_name (core.map_remove (by_name l) name)
-                            (put :by_path (core.map_remove (by_path l) (path.absolute! file))
-                                (put :visited (core.map_remove (visited l) name) l))));
+                    (put :modules (map_remove (module_map l) last)
+                        (put :by_name (map_remove (by_name l) name)
+                            (put :by_path (map_remove (by_path l) (path.absolute! file))
+                                (put :visited (map_remove (visited l) name) l))));
             load_file! unmounted file name ast.no_span 0
         }
     }
@@ -998,7 +868,7 @@ let load! file roots cfg test_mode =
 /// program it must answer questions about is the one in the editor's buffers,
 /// which may differ from the one on disk in every file at once.
 let load_overlaid! file roots cfg test_mode ov =
-    load_overlaid_cached! file roots cfg test_mode ov (core.map_new ());
+    load_overlaid_cached! file roots cfg test_mode ov (%{});
 
 /// `load_overlaid!` with the previous loader's parse cache carried in. Every
 /// file whose text has not changed since that loader parsed it is loaded from
@@ -1038,24 +908,6 @@ when test {
     let on = config.define "test" config.empty;
 
     let items_of src = match parser.parse_module src { [:ok, items, _] => items, _ => [] };
-
-    // The gate and the walk it stands in front of, as a pair, so that the
-    // direction of the implication is visible in every case below.
-    let gate_and_walk src =
-        [text_may_mention_core src,
-         list.any (fn i -> item_mentions_core i) (expand_items on (items_of src))];
-
-    // The same pair, asked of the declarations a record generates. A record
-    // becomes a `mod`, and `hoist_mod!` walks a submodule's items under the
-    // *parent* file's gate answer, so the generated bodies are covered by the
-    // bytes of the file the record was written in and by nothing else.
-    let gate_and_inner src =
-        [text_may_mention_core src,
-         list.any (fn item ->
-             match item {
-                 [:mod, _, inner, _] => list.any (fn i -> item_mentions_core i) inner,
-                 i => item_mentions_core i,
-             }) (expand_items on (items_of src))];
 
     let tests = [
         // --- names ---
@@ -1101,29 +953,6 @@ when test {
             $( test.eq! [] (natives (from_text! config.empty "when test { import std.console; }")) ),
         test.case "an import inside a when that holds is"
             $( test.eq! ["std.console"] (natives (from_text! on "when test { import std.console; }")) ),
-
-        // --- the gate in front of the `core` walk ---
-        //
-        // What has to hold is an implication and not an equality. The gate may
-        // say `true` of a file that turns out not to use `core`, because it
-        // reads bytes and not nodes; it must never say `false` of one that
-        // does, because `false` is what skips the walk. Each case states both
-        // answers, and the ones that would be a bug are those whose second
-        // answer is `true` and whose first is not.
-        test.case "a use of `core` is seen by the gate and by the walk"
-            $( test.eq! [true, true] (gate_and_walk "let f x = core.head x;") ),
-        test.case "a file that never spells `core` is answered without a walk"
-            $( test.eq! [false, false] (gate_and_walk "let f x = x + 1;") ),
-        test.case "a field named `core` is not a use, and the gate may say so wrongly"
-            $( test.eq! [true, false] (gate_and_walk "let f x = x.core;") ),
-        // This is the one that would rot silently. `syntax.record` invents
-        // declarations, and it reads and writes fields with the `get` and `set`
-        // opcodes rather than through `core`; if that ever changed, a file with
-        // a record and no `core` in its bytes would have its walk skipped.
-        test.case "a record's generated declarations do not name `core`"
-            $( test.eq! [false, false] (gate_and_inner "group Point { x, y }") ),
-        test.case "a record whose field is named `core` is spelled in the source"
-            $( test.eq! true (list.head (gate_and_inner "group P { core }")) ),
 
         // --- what a module depends on ---
         test.case "imports and derives are both dependencies"
@@ -1175,14 +1004,12 @@ when test {
         // --- the module a name is already loaded under ---
         test.case "a sibling is found by walking outwards"
             $( test.eq! ["a.shape", ()]
-                        { let l = put :by_name (core.map_put (core.map_new ()) "a.shape" 0)
+                        { let l = put :by_name (((%{})).["a.shape" => 0])
                                       (bare on);
                           [local_module l "a.circle" "shape", local_module l "a.circle" "nope"] } ),
         test.case "a module's own submodule is found first"
             $( test.eq! "a.b.util"
-                        (local_module (put :by_name (core.map_put
-                                          (core.map_put (core.map_new ()) "a.b.util" 0)
-                                          "a.util" 1) (bare on))
+                        (local_module (put :by_name (((((%{})).["a.b.util" => 0])).["a.util" => 1]) (bare on))
                                       "a.b" "util") ),
 
         // --- the stack that catches a cycle ---
@@ -1192,13 +1019,11 @@ when test {
                           [is_loading l "a", is_loading (leave l) "b", is_loading (bare on) "a"] } ),
 
         // --- the generated test runner ---
-        // `false` is the `core` answer, which none of these three items needs
-        // and which a loader would have worked out before recording them.
         test.case "a module exports tests by defining `tests`"
             $( test.eq! [true, false, false]
-                        [exports_tests (loaded "m" "m" 0 (items_of "let tests = [];") false),
-                         exports_tests (loaded "m" "m" 0 (items_of "let tests x = [];") false),
-                         exports_tests (loaded "m" "m" 0 (items_of "let other = [];") false)] ),
+                        [exports_tests (loaded "m" "m" 0 (items_of "let tests = [];")),
+                         exports_tests (loaded "m" "m" 0 (items_of "let tests x = [];")),
+                         exports_tests (loaded "m" "m" 0 (items_of "let other = [];"))] ),
         test.case "a runner is generated even when nothing exports tests"
             $( test.eq! ["t", "dreams.test_main"]
                         (names (add_test_runner! (from_text! on "let a = 1;"))) ),

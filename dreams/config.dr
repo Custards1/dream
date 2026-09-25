@@ -14,7 +14,6 @@
 // it is -- the platform -- does so in `defaults!`, which is the only impure
 // function in the file and is called once, at startup.
 
-import std.core;
 import std.list;
 import std.os;
 import std.str;
@@ -59,10 +58,10 @@ let rec define_args args c =
         [a, ..rest] => define_args rest (define_arg a c),
     };
 
-let is_defined name c = core.map_has (flags c) name;
+let is_defined name c = map_has (flags c) name;
 
 /// The value of a setting, or `()` when it has none.
-let value key c = core.map_get (values c) key ();
+let value key c = ((values c)).[key else ()];
 
 // --- what the compiler knows about itself -----------------------------------
 
@@ -92,7 +91,7 @@ let rec eval c cond =
     match cond {
         [:const, b]     => b,
         // A setting that has a value counts as defined.
-        [:flag, name]   => is_defined name c || core.map_has (values c) name,
+        [:flag, name]   => is_defined name c || map_has (values c) name,
         [:equals, k, v] => value k c == v,
         [:not, inner]   => not (eval c inner),
         [:and, l, r]    => eval c l && eval c r,
@@ -108,9 +107,9 @@ let rec eval c cond =
 /// Every flag and setting, one per line, sorted -- what `--print-cfg` shows.
 /// Settings are quoted so that a value with a space in it still reads as one.
 let describe c = {
-    let named = list.map (fn [name, _] -> name) (core.map_pairs (flags c));
+    let named = list.map (fn [name, _] -> name) (map_pairs (flags c));
     let valued = list.map (fn [name, value] -> name + " = \"" + value + "\"")
-                          (core.map_pairs (values c));
+                          (map_pairs (values c));
     list.sort (list.append named valued)
 };
 

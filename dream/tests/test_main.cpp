@@ -782,6 +782,26 @@ void add_minimum(ImageBuilder& b) {
     b.add("SBLB", {}, 0);
 }
 
+static void test_type_test_nodes() {
+    std::printf("type test nodes\n");
+    for (int mode = 0; mode < 6; ++mode) {
+        ImageBuilder b;
+        add_minimum(b);
+        std::vector<uint8_t> nodes(16, 0);
+        nodes[0] = uint8_t(Op::Unit);
+        nodes.insert(nodes.end(), {uint8_t(Op::TypeIs), 0, 0, 0});
+        ImageBuilder::put32(nodes, mode == 2 ? 2 : mode == 5 ? 1 : 0);
+        ImageBuilder::put32(nodes, mode == 3 ? DREAM_TYPE_PURE_FN : DREAM_TYPE_MAP);
+        ImageBuilder::put32(nodes, mode == 4 ? 2 : mode == 1 ? 1 : 0);
+        b.add("NODE", nodes, 2);
+        auto bytes = b.build();
+        Image img;
+        std::string error;
+        // Valid equality/inequality; reject bad subject, kind, inversion and cycle.
+        CHECK_EQ(img.load_bytes(bytes.data(), bytes.size(), error), mode < 2);
+    }
+}
+
 static void test_integer_hints() {
     std::printf("integer signature hints\n");
     for (int mode = 0; mode < 4; ++mode) {
@@ -996,7 +1016,42 @@ static void test_builtin_table_matches_compiler() {
     const char* expected[] = {"spawn!",  "join!",   "send!",     "recv!", "self!",
                               "raise!",  "type_of", "to_string", "len",   "strict!",
                               "match_is_cons", "match_head", "match_tail",
-                              "match_at", "match_key", "type_assert"};
+                              "match_at", "match_key", "type_assert",
+                              "list_tail",
+                              "list_cons",
+                              "list_is_empty",
+                              "str_chars",
+                              "str_of_chars",
+                              "str_of_bytes",
+                              "str_concat",
+                              "error_new",
+                              "error_kind",
+                              "error_payload",
+                              "str_slice",
+                              "str_find",
+                              "str_byte",
+                              "str_le",
+                              "str_span",
+                              "str_upto",
+                              "char_code",
+                              "char_of_code",
+                              "to_float",
+                              "float_bytes",
+                              "float_of_bytes",
+                              "to_int",
+                              "parse_int",
+                              "parse_float",
+                              "to_existing_atom",
+                              "array_new",
+                              "array_of_list",
+                              "array_to_list",
+                              "map_has",
+                              "map_remove",
+                              "map_pairs",
+                              "data_count",
+                              "data_at",
+                              "compare",
+    };
     const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
     CHECK_EQ(builtin_count(), n);
     // Bounded by both, so a table that has grown past this list reports the
@@ -1007,6 +1062,12 @@ static void test_builtin_table_matches_compiler() {
     // `spawn!` must not force its argument, or spawning would run the work here.
     CHECK_EQ(builtin_def(0).strict_mask, 0u);
     CHECK_EQ(builtin_def(15).strict_mask, 1u);
+#define CHECK_PRIMITIVE(name, code, builtin, nargs) \
+    CHECK_EQ(primitive_builtin(Op::name), uint32_t(builtin)); \
+    CHECK_EQ(builtin_def(builtin).arity, uint32_t(nargs));
+    DREAM_PRIMITIVES(CHECK_PRIMITIVE)
+#undef CHECK_PRIMITIVE
+
 }
 
 static void test_maps() {
@@ -1096,6 +1157,7 @@ int main() {
     test_cross_heap_copy();
     test_image_rejects_bad_input();
     test_integer_hints();
+    test_type_test_nodes();
     test_payload_sections();
     test_bigstr_values();
     test_atom_interning();

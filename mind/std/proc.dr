@@ -28,7 +28,7 @@
 // for anything else that was sent to it; and a process that will not stop
 // cannot be stopped from outside. Both are why the server loop below is written
 // around a handler that sees every message and decides.
-import std.core;
+
 import std.error;
 import std.list;
 
@@ -94,7 +94,7 @@ let try_map! f xs = outcomes! (start_each! (fn x -> f x) xs);
 
 let call_message from body = [:call, from, body];
 
-let is_call m = core.is_empty m == false && list.nth 0 m == :call;
+let is_call m = list_is_empty m == false && list.nth 0 m == :call;
 let call_from m = list.nth 1 m;
 let call_body m = list.nth 2 m;
 

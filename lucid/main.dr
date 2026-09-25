@@ -26,7 +26,7 @@
 // its cases was transcribed from.
 import std.cli;
 import std.console;
-import std.core;
+
 import std.io;
 import std.json;
 import std.list;
@@ -51,15 +51,15 @@ let version = "0.1.0";
 /// this server decides: a file's text either changed or it did not, and the
 /// loader checks which for itself. So the parse map is carried, and it is the
 /// difference between a request costing 793 ms and 127. See `analyse_cached!`.
-let state docs roots = %{ :docs => docs, :roots => roots, :parsed => core.map_new () };
+let state docs roots = %{ :docs => docs, :roots => roots, :parsed => %{} };
 
-let docs s  = core.map_get s :docs (core.map_new ());
-let roots s = core.map_get s :roots [];
-let parses s = core.map_get s :parsed (core.map_new ());
+let docs s  = s.[:docs else (%{})];
+let roots s = s.[:roots else []];
+let parses s = s.[:parsed else (%{})];
 
-let with_doc path text s = core.map_put s :docs (core.map_put (docs s) path text);
-let without_doc path s = core.map_put s :docs (core.map_remove (docs s) path);
-let with_roots rs s = core.map_put s :roots rs;
+let with_doc path text s = s.[:docs => (((docs s)).[path => text])];
+let without_doc path s = s.[:docs => (map_remove (docs s) path)];
+let with_roots rs s = s.[:roots => rs];
 /// Add to what has been parsed. **Merged, never replaced**, and that is not a
 /// detail: a buffer that does not parse names no imports, so the loader for it
 /// never reaches the other modules and its parse map comes back holding only
@@ -72,7 +72,7 @@ let with_roots rs s = core.map_put s :roots rs;
 /// A stale entry cannot do any harm. The loader keeps the text it parsed beside
 /// the result and compares it to the text it is given, so an entry for a file
 /// that has since changed is re-parsed rather than believed.
-let with_parses ps s = core.map_put s :parsed (map.merge (parses s) ps);
+let with_parses ps s = s.[:parsed => (map.merge (parses s) ps)];
 
 /// The two halves of every request that analyses. They are a pair on purpose:
 /// an analysis made without `analysed!` does not reuse the parses, and one
@@ -83,13 +83,13 @@ let carrying a s = with_parses (analysis.parses a) s;
 
 // --- reading the parts of a request ---------------------------------------------
 
-let text_document p = core.map_get p "textDocument" (core.map_new ());
-let uri_of p = core.map_get (text_document p) "uri" "";
+let text_document p = p.["textDocument" else (%{})];
+let uri_of p = ((text_document p)).["uri" else ""];
 let path_of p = analysis.uri_to_path (uri_of p);
 
-let position_of p = core.map_get p "position" (core.map_new ());
-let line_of p = core.map_get (position_of p) "line" 0;
-let character_of p = core.map_get (position_of p) "character" 0;
+let position_of p = p.["position" else (%{})];
+let line_of p = ((position_of p)).["line" else 0];
+let character_of p = ((position_of p)).["character" else 0];
 
 // --- diagnostics ------------------------------------------------------------------
 
@@ -151,13 +151,13 @@ let capabilities =
 /// The workspace root, as a package search path. An editor opens a directory,
 /// and that directory is where this project's packages are.
 let roots_from p = {
-    let folders = core.map_get p "workspaceFolders" ();
+    let folders = p.["workspaceFolders" else ()];
     let from_folders =
         match folders {
             () => [],
-            fs => list.map (fn f -> analysis.uri_to_path (core.map_get f "uri" "")) fs,
+            fs => list.map (fn f -> analysis.uri_to_path (f.["uri" else ""])) fs,
         };
-    match core.map_get p "rootUri" () {
+    match p.["rootUri" else ()] {
         () => from_folders,
         u  => list.append from_folders [analysis.uri_to_path u],
     }
@@ -188,16 +188,16 @@ let handle! out s m = {
         "exit" => [:exit, 0],
 
         "textDocument/didOpen" => {
-            let text = core.map_get (text_document p) "text" "";
+            let text = ((text_document p)).["text" else ""];
             let s2 = refresh! out (with_doc path text s) path;
             [:go, s2]
         },
         "textDocument/didChange" => {
             // Full sync: the last change carries the whole document.
-            let changes = core.map_get p "contentChanges" [];
+            let changes = p.["contentChanges" else []];
             let text = match list.reverse changes {
-                           [] => core.map_get (docs s) path "",
-                           [c, .._] => core.map_get c "text" "",
+                           [] => ((docs s)).[path else ""],
+                           [c, .._] => c.["text" else ""],
                        };
             let s2 = refresh! out (with_doc path text s) path;
             [:go, s2]
@@ -305,6 +305,6 @@ let main! =
             else if cli.flag_set c "version" { console.print! ("lucid " + version) }
             else {
                 let roots = list.append (stdlib_roots! ()) (cli.all c "package-path");
-                os.exit! (serve! (io.stdin! ()) (io.stdout! ()) (state (core.map_new ()) roots))
+                os.exit! (serve! (io.stdin! ()) (io.stdout! ()) (state (%{}) roots))
             },
     };

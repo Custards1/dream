@@ -19,7 +19,6 @@
 // (from 1)` has to work on an infinite list, and it cannot if it goes through a
 // fold.
 
-import std.core;
 
 // --- the hole ---------------------------------------------------------------
 
@@ -85,8 +84,8 @@ let maximum_by rank xs =
 /// rather than appending at every step.
 let to_list xs = {
     let rec rev acc ys =
-        if core.is_empty ys { acc } else { rev (core.cons (core.head ys) acc) (core.tail ys) };
-    rev [] (fold (fn acc x -> core.cons x acc) [] xs)
+        if list_is_empty ys { acc } else { rev (list_cons (ys.[0]) acc) (list_tail ys) };
+    rev [] (fold (fn acc x -> list_cons x acc) [] xs)
 };
 
 /// Every element rendered and joined with `sep` between them.

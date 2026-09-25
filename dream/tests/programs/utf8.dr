@@ -1,4 +1,4 @@
-// `core.str_chars` -- decoding UTF-8, and refusing what only looks like it.
+// `str_chars` -- decoding UTF-8, and refusing what only looks like it.
 //
 // A char is one Unicode scalar value. Bytes with the right shape are not
 // always one: an overlong form spells an ASCII character in more bytes than it
@@ -6,12 +6,12 @@
 // not a character at all. Each of those must come out as U+FFFD (65533), one
 // per byte consumed, rather than as the value its bits would add up to.
 import std.console;
-import std.core;
+
 import std.list;
 
 let show! label v = { console.print! (to_string label + (to_string v)) };
 
-let codes bytes = list.map core.char_code (core.str_chars (core.str_of_bytes bytes));
+let codes bytes = list.map char_code (str_chars (str_of_bytes bytes));
 
 let main! = {
     // Every length, and the edges either side of the ranges that are refused.
@@ -41,14 +41,14 @@ let main! = {
     show! "lead then A    C3 41       -> " (codes [195, 65])
 
     // `char_of_code` holds the same line from the other side.
-    show! "char_of_code D7FF   -> " (core.char_code (core.char_of_code 55295))
-    show! "char_of_code E000   -> " (core.char_code (core.char_of_code 57344))
-    show! "char_of_code D800   -> " (try! { core.char_of_code 55296 } catch e { e })
-    show! "char_of_code DFFF   -> " (try! { core.char_of_code 57343 } catch e { e })
-    show! "char_of_code 110000 -> " (try! { core.char_of_code 1114112 } catch e { e })
+    show! "char_of_code D7FF   -> " (char_code (char_of_code 55295))
+    show! "char_of_code E000   -> " (char_code (char_of_code 57344))
+    show! "char_of_code D800   -> " (try! { char_of_code 55296 } catch e { e })
+    show! "char_of_code DFFF   -> " (try! { char_of_code 57343 } catch e { e })
+    show! "char_of_code 110000 -> " (try! { char_of_code 1114112 } catch e { e })
 
     // What `str_of_chars` writes, `str_chars` reads back.
     let edges = [0, 127, 128, 2047, 2048, 55295, 57344, 65533, 65535, 65536, 1114111];
-    let back = list.map core.char_code (core.str_chars (core.str_of_chars (list.map core.char_of_code edges)));
+    let back = list.map char_code (str_chars (str_of_chars (list.map char_of_code edges)));
     show! "round trip -> " (back == edges)
 }

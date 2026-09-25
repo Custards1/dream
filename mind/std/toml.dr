@@ -20,7 +20,6 @@
 // Like `std.json`, nothing here raises: `parse` answers `[:ok, table]` or
 // `[:error, message]`, because reading a file is not an effect.
 
-import std.core;
 import std.list;
 import std.str;
 
@@ -117,7 +116,7 @@ let parse_number cs = {
     let rest = list.nth 2 taken;
     if str.is_empty text { () }
     else {
-        let n = if floaty { core.parse_float text } else { core.parse_int text };
+        let n = if floaty { parse_float text } else { parse_int text };
         if n == () { () } else { step n rest }
     }
 };
@@ -140,7 +139,7 @@ let rec parse_value cs = {
         if c == '"' { quoted_body (list.tail s) [] }
         else if c == '\'' { literal_body (list.tail s) [] }
         else if c == '[' { parse_array (list.tail s) [] }
-        else if c == '{' { parse_inline (list.tail s) (core.map_new ()) true }
+        else if c == '{' { parse_inline (list.tail s) (%{}) true }
         else if starts s (str.chars "true") { step true (drop_n 4 s) }
         else if starts s (str.chars "false") { step false (drop_n 5 s) }
         else if is_digit c || c == '-' || c == '+' { parse_number s }
@@ -191,7 +190,7 @@ let rec parse_inline cs acc first = {
                     let v = parse_value (list.tail eq);
                     if v == () { () }
                     else {
-                        let grown = core.map_put acc (step_value k) (step_value v);
+                        let grown = acc.[(step_value k) => (step_value v)];
                         parse_inline (step_rest v) grown false
                     }
                 }
@@ -233,17 +232,17 @@ let parse_header cs = {
 let rec parse_items cs table section current = {
     let s = skip_blank cs;
     if list.is_empty s {
-        [:ok, core.map_put table section current]
+        [:ok, table.[section => current]]
     }
     else if list.head s == '[' {
         let h = parse_header (list.tail s);
         if h == () { [:error, "a section header is not closed"] }
         else {
-            let done = core.map_put table section current;
+            let done = table.[section => current];
             let name = str.trim (step_value h);
             // A header seen twice keeps what the first one collected, so
             // `[a]` .. `[b]` .. `[a]` adds to `a` rather than emptying it.
-            let existing = core.map_get done name (core.map_new ());
+            let existing = done.[name else (%{})];
             parse_items (step_rest h) done name existing
         }
     }
@@ -261,7 +260,7 @@ let rec parse_items cs table section current = {
                     let after = end_of_line (step_rest v);
                     if after == () { [:error, "unexpected text after the value of " + step_value k] }
                     else {
-                        let grown = core.map_put current (step_value k) (step_value v);
+                        let grown = current.[(step_value k) => (step_value v)];
                         parse_items after table section grown
                     }
                 }
@@ -271,7 +270,7 @@ let rec parse_items cs table section current = {
 };
 
 /// `[:ok, table]`, or `[:error, message]`.
-let parse text = parse_items (str.chars text) (core.map_new ()) "" (core.map_new ());
+let parse text = parse_items (str.chars text) (%{}) "" (%{});
 
 let ok r = list.head r == :ok;
 let value r = list.nth 1 r;
@@ -285,16 +284,16 @@ let parse_or default text = {
 
 /// The map for `[name]`, or an empty one. A missing section reads like an
 /// empty section, so a manifest with no `[dependencies]` needs no special case.
-let section table name = core.map_get table name (core.map_new ());
+let section table name = table.[name else (%{})];
 
 /// `table[section][key]`, or `default`.
-let get default table sec key = core.map_get (section table sec) key default;
+let get default table sec key = ((section table sec)).[key else default];
 
 /// The names of every section, in the order the map holds them.
-let sections table = list.map (fn p -> list.head p) (core.map_pairs table);
+let sections table = list.map (fn p -> list.head p) (map_pairs table);
 
 /// The `key = value` pairs of one section, as `[key, value]` lists.
-let entries table name = core.map_pairs (section table name);
+let entries table name = map_pairs (section table name);
 
 // --- tests ------------------------------------------------------------------
 
@@ -323,7 +322,7 @@ when test {
         test.case "array over lines" $( test.eq! [1, 2] (at "a = [\n1,\n2\n]" "" "a") ),
         test.case "nested array"  $( test.eq! [[1]] (at "a = [[1]]" "" "a") ),
         test.case "inline table"
-            $( test.eq! "v" (core.map_get (at "a = { k = \"v\" }" "" "a") "k" ()) ),
+            $( test.eq! "v" (((at "a = { k = \"v\" }" "" "a")).["k" else ()]) ),
         test.case "empty inline table"
             $( test.eq! 0 (len (at "a = {}" "" "a")) ),
         test.case "inline table, two keys"
@@ -363,10 +362,8 @@ when test {
                             "package" "name") ),
         test.case "a dependency table"
             $( test.eq! "../util"
-                        (core.map_get
-                           (at "[dependencies]\nutil = { path = \"../util\" }\n"
-                               "dependencies" "util")
-                           "path" ()) ),
+                        (((at "[dependencies]\nutil = { path = \"../util\" }\n"
+                               "dependencies" "util")).["path" else ()]) ),
     ];
 }
 

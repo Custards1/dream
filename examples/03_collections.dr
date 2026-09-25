@@ -4,7 +4,7 @@
 //   array  #[a, b, c]   flat, finite, constant-time indexing
 //   map    %{ k => v }  keys forced to be hashed, values lazy
 import std.console;
-import std.core;
+
 import std.list;
 import std.array;
 
@@ -48,12 +48,12 @@ let main! = {
     // --- maps ---
     let ages = %{ "ana" => 34, "bo" => 27, "cy" => 41 };
     console.print! ("map:        " + to_string (len ages))
-    console.print! ("get:        " + to_string (core.map_get ages "ana" 0))
-    console.print! ("missing:    " + to_string (core.map_get ages "zz" :none))
-    console.print! ("has:        " + to_string (core.map_has ages "bo"))
-    console.print! ("put:        " + to_string (len (core.map_put ages "di" 30)))
-    console.print! ("remove:     " + to_string (len (core.map_remove ages "bo")))
-    console.print! ("pairs:      " + to_string (list.length (core.map_pairs ages)))
+    console.print! ("get:        " + to_string (ages.["ana" else 0]))
+    console.print! ("missing:    " + to_string (ages.["zz" else :none]))
+    console.print! ("has:        " + to_string (map_has ages "bo"))
+    console.print! ("put:        " + to_string (len (ages.["di" => 30])))
+    console.print! ("remove:     " + to_string (len (map_remove ages "bo")))
+    console.print! ("pairs:      " + to_string (list.length (map_pairs ages)))
 
     // --- conversions and types ---
     console.print! ("types:      " + to_string (type_of nums) + " " + to_string (type_of arr) + " " + to_string (type_of ages))

@@ -50,7 +50,6 @@
 // a signature is never resolved, because it never runs -- and they are looked
 // up in the module's environment the way `scope` would have (`type_ref`).
 
-import std.core;
 import std.list;
 import std.str;
 
@@ -96,7 +95,7 @@ let union_of ts = {
     if list.contains :any flat { :any }
     else {
         let kept = list.fold (fn acc t ->
-            if t == :never || list.contains t acc { acc } else { core.cons t acc }) [] flat;
+            if t == :never || list.contains t acc { acc } else { list_cons t acc }) [] flat;
         match kept {
             [] => :never,
             [one] => one,
@@ -216,7 +215,7 @@ let with_local n t h = Here.set_locals h ((Here.locals h).[n => t]);
 /// what is wrong there is reported where the author wrote it instead.
 let bad h span message ds =
     if ast.span_start span >= 2147483648 { ds }
-    else { core.cons (diag.in_source (Here.source h) (diag.error span message)) ds };
+    else { list_cons (diag.in_source (Here.source h) (diag.error span message)) ds };
 
 // --- which declarations are types -------------------------------------------------------
 
@@ -317,7 +316,7 @@ let shape_type k ev kind fields = {
 /// does not resolve is not a type, and is reported where the signature is
 /// collected rather than here.
 let is_type_var n = {
-    let b = core.str_byte n 0;
+    let b = str_byte n 0;
     (b >= 97 && b <= 122) || b == 95
 };
 
@@ -349,7 +348,7 @@ let bound ev params args = {
 };
 
 let rec pairs xs ys = match [xs, ys] {
-    [[x, ..xt], [y, ..yt]] => core.cons [x, y] (pairs xt yt),
+    [[x, ..xt], [y, ..yt]] => list_cons [x, y] (pairs xt yt),
     _ => [],
 };
 
@@ -382,7 +381,7 @@ let type_ref k mi n = match env_of k mi {
     },
 };
 
-let typed_global k gi = if core.map_has (Checker.named k) gi { gi } else { () };
+let typed_global k gi = if map_has (Checker.named k) gi { gi } else { () };
 
 let module_type k target = match env_of k target {
     () => (),
@@ -761,7 +760,7 @@ let rec infer k h e ds = match e {
 let infer_all k h xs ds = {
     let [ts, ds1] = list.fold (fn acc x -> {
         let [t, d] = infer k h x (list.nth 1 acc);
-        [core.cons t (list.head acc), d]
+        [list_cons t (list.head acc), d]
     }) [[], ds] xs;
     [list.reverse ts, ds1]
 };
@@ -773,7 +772,7 @@ let infer_map k h kvs ds = {
     let [ps, ds1] = list.fold (fn acc kv -> {
         let [kt, d1] = infer k h (list.nth 0 kv) (list.nth 1 acc);
         let [vt, d2] = infer k h (list.nth 1 kv) d1;
-        [core.cons [kt, vt] (list.head acc), d2]
+        [list_cons [kt, vt] (list.head acc), d2]
     }) [[], ds] kvs;
     let entries = list.reverse ps;
     if list.all (fn p -> match list.nth 0 p { [:lit, _, _] => true, _ => false }) entries {
@@ -979,7 +978,7 @@ let rec arrows k t n acc =
     if n == 0 { [list.reverse acc, t, ()] }
     else {
         match peel k t 8 {
-            [:fn, a, b] => arrows k b (n - 1) (core.cons a acc),
+            [:fn, a, b] => arrows k b (n - 1) (list_cons a acc),
             :any => [list.reverse acc, :any, ()],
             p if not_a_function p => [list.reverse acc, :any, p],
             _ => [list.reverse acc, :any, ()],
@@ -1034,11 +1033,11 @@ let typed_apply k h f ft args sp ds1 = {
     // what `x` is from `xs`, which is written after it.
     let [plain, subst, ds3] = list.fold (fn acc ia -> {
         let [i, a] = ia;
-        if is_lambda a { [core.cons () (list.nth 0 acc), list.nth 1 acc, list.nth 2 acc] }
+        if is_lambda a { [list_cons () (list.nth 0 acc), list.nth 1 acc, list.nth 2 acc] }
         else {
             let [t, d] = infer k h a (list.nth 2 acc);
             let s = if i < given { solve k (list.nth i params) t (list.nth 1 acc) } else { list.nth 1 acc };
-            [core.cons t (list.nth 0 acc), s, d]
+            [list_cons t (list.nth 0 acc), s, d]
         }
     }) [[], %{}, ds2] (indexed args);
     let known = list.reverse plain;
@@ -1166,7 +1165,7 @@ let rec block k h stmts expected ds = match stmts {
 let finish_block h ds =
     list.fold (fn acc kv -> bad h (list.nth 1 (list.nth 1 kv))
                                 ("the signature of `" + list.nth 0 kv + "` has no `let` after it in this block") acc)
-              ds (core.map_pairs (Here.pending h));
+              ds (map_pairs (Here.pending h));
 
 let statement k h st ds = match st {
     [:sig, n, t, sp] => {
@@ -1180,7 +1179,7 @@ let statement k h st ds = match st {
                 [list.map (fn p -> ast.param_name p) ps, desc, [Here.mi h, %{}, Here.ltypes h]]])), ds],
         () => {
             let sig = match (Here.pending h).[n else ()] { () => (), [t, _] => t };
-            let h1 = Here.set_pending h (core.map_remove (Here.pending h) n);
+            let h1 = Here.set_pending h (map_remove (Here.pending h) n);
             let self_t = match sig { () => :any, t => flexible t };
             let h2 = if is_rec { with_local n self_t h1 } else { h1 };
             if list.is_empty ps {
@@ -1420,13 +1419,13 @@ let rec unknown_types k ev t source ds = match t {
     [:name, n, sp] =>
         if (list.nth 1 ev).[n else ()] != () || (list.nth 2 ev).[n else ()] != () || is_type_var n { ds }
         else if type_ref k (list.head ev) n != () { ds }
-        else { core.cons (diag.in_source source (diag.error sp ("cannot find the type `" + n + "`"))) ds },
+        else { list_cons (diag.in_source source (diag.error sp ("cannot find the type `" + n + "`"))) ds },
     [:field, obj, f, sp] => match dotted_module k (list.head ev) obj {
-        () => core.cons (diag.in_source source (diag.error sp ("cannot find the module in front of `." + f + "`"))) ds,
+        () => list_cons (diag.in_source source (diag.error sp ("cannot find the module in front of `." + f + "`"))) ds,
         m =>
             if modules.module_name (modules.module_at (Checker.l k) m) == "std.types" { ds }
             else if member_type k (scope.dream_ref m) f != () { ds }
-            else { core.cons (diag.in_source source (diag.error sp ("cannot find the type `" + f + "` in `"
+            else { list_cons (diag.in_source source (diag.error sp ("cannot find the type `" + f + "` in `"
                         + modules.module_name (modules.module_at (Checker.l k) m) + "`"))) ds },
     },
     [:apply, head, args, _] => list.fold (fn d a -> unknown_types k ev a source d) (unknown_types k ev head source ds) args,
@@ -1472,12 +1471,12 @@ let sig_table l r =
                 match scope.r_env_at r mi {
                     () => acc2,
                     e => match scope.global_index e n {
-                        () => [table, core.cons (diag.in_source source (diag.error sp
+                        () => [table, list_cons (diag.in_source source (diag.error sp
                                    ("the signature of `" + n + "` has no definition: write `let "
                                     + n + " .. = ..` in this module"))) ds],
                         gi => match table.[gi else ()] {
                             [o, _, _] if o == owner =>
-                                [table, core.cons (diag.in_source source (diag.error sp
+                                [table, list_cons (diag.in_source source (diag.error sp
                                     ("`" + n + "` already has a signature"))) ds],
                             _ => [table.[gi => [owner, t, sp]], ds],
                         },
@@ -1496,13 +1495,13 @@ let checker l r = {
     let evaluated = list.fold (fn acc kv -> {
         let [owner, t, _] = list.nth 1 kv;
         acc.[list.nth 0 kv => eval_type k0 (in_module owner) t]
-    }) %{} (core.map_pairs sigs);
+    }) %{} (map_pairs sigs);
     let uses = list.fold (fn acc kv -> acc.[list.nth 0 kv => flexible (list.nth 1 kv)]) %{}
-                         (core.map_pairs evaluated);
+                         (map_pairs evaluated);
     let unknown = list.fold (fn d kv -> {
         let [owner, t, _] = list.nth 1 kv;
         unknown_types k0 (in_module owner) t (modules.module_source (modules.module_at l owner)) d
-    }) ds (core.map_pairs sigs);
+    }) ds (map_pairs sigs);
     [Checker.set_sigs (Checker.set_uses k0 uses) evaluated, unknown]
 };
 
@@ -1530,7 +1529,7 @@ let check_decl k b ds = {
 let check_program l r = {
     let [k, ds0] = checker l r;
     let found = list.fold (fn ds b -> check_decl k b ds) ds0 (scope.bodies r);
-    let once = list.fold (fn acc d -> if list.contains d acc { acc } else { core.cons d acc }) [] found;
+    let once = list.fold (fn acc d -> if list.contains d acc { acc } else { list_cons d acc }) [] found;
     list.sort_by (fn a b -> place a < place b) once
 };
 

@@ -24,7 +24,6 @@
 
 derive std.codec;
 
-import std.core;
 import std.list;
 import std.str;
 
@@ -56,9 +55,9 @@ let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
 
 /// The four hex digits of a `\uXXXX` escape, as a number.
 let hex_value c =
-    if c >= '0' && c <= '9' { core.char_code c - 48 }
-    else if c >= 'a' && c <= 'f' { core.char_code c - 87 }
-    else if c >= 'A' && c <= 'F' { core.char_code c - 55 }
+    if c >= '0' && c <= '9' { char_code c - 48 }
+    else if c >= 'a' && c <= 'f' { char_code c - 87 }
+    else if c >= 'A' && c <= 'F' { char_code c - 55 }
     else { 0 - 1 };
 
 let rec hex4 cs n acc =
@@ -78,14 +77,14 @@ let rec hex4 cs n acc =
 /// half with no partner becomes U+FFFD -- what `str_chars` makes of bytes that
 /// do not spell a character -- rather than failing the whole document.
 let unicode_escape code cs =
-    if code < 55296 || code > 57343 { [core.char_of_code code, cs] }
-    else if code > 56319 || list.take 2 cs != ['\\', 'u'] { [core.char_of_code 65533, cs] }
+    if code < 55296 || code > 57343 { [char_of_code code, cs] }
+    else if code > 56319 || list.take 2 cs != ['\\', 'u'] { [char_of_code 65533, cs] }
     else {
         let low = hex4 (list.drop 2 cs) 4 0;
-        if low == () { [core.char_of_code 65533, cs] }
-        else if list.head low < 56320 || list.head low > 57343 { [core.char_of_code 65533, cs] }
+        if low == () { [char_of_code 65533, cs] }
+        else if list.head low < 56320 || list.head low > 57343 { [char_of_code 65533, cs] }
         else {
-            [core.char_of_code (65536 + (code - 55296) * 1024 + (list.head low - 56320)),
+            [char_of_code (65536 + (code - 55296) * 1024 + (list.head low - 56320)),
              list.head (list.tail low)]
         }
     };
@@ -107,8 +106,8 @@ let rec string_body cs acc =
             if e == 'n' { string_body after (list.cons '\n' acc) }
             else if e == 't' { string_body after (list.cons '\t' acc) }
             else if e == 'r' { string_body after (list.cons '\r' acc) }
-            else if e == 'b' { string_body after (list.cons (core.char_of_code 8) acc) }
-            else if e == 'f' { string_body after (list.cons (core.char_of_code 12) acc) }
+            else if e == 'b' { string_body after (list.cons (char_of_code 8) acc) }
+            else if e == 'f' { string_body after (list.cons (char_of_code 12) acc) }
             else if e == '"' { string_body after (list.cons '"' acc) }
             else if e == '\\' { string_body after (list.cons '\\' acc) }
             else if e == '/' { string_body after (list.cons '/' acc) }
@@ -147,7 +146,7 @@ let parse_number cs = {
     let rest = list.nth 2 taken;
     if str.is_empty text { () }
     else {
-        let n = if floaty { core.parse_float text } else { core.parse_int text };
+        let n = if floaty { parse_float text } else { parse_int text };
         if n == () { () } else { step n rest }
     }
 };
@@ -160,7 +159,7 @@ let rec parse_value cs = {
     else {
         let c = list.head s;
         if c == '"' { string_body (list.tail s) [] }
-        else if c == '{' { parse_object (list.tail s) (core.map_new ()) true }
+        else if c == '{' { parse_object (list.tail s) (%{}) true }
         else if c == '[' { parse_array (list.tail s) [] true }
         else if starts s (str.chars "true") { step true (drop_n 4 s) }
         else if starts s (str.chars "false") { step false (drop_n 5 s) }
@@ -194,7 +193,7 @@ let rec parse_object cs acc first = {
                     let v = parse_value (list.tail colon);
                     if v == () { () }
                     else {
-                        let grown = core.map_put acc (step_value k) (step_value v);
+                        let grown = acc.[(step_value k) => (step_value v)];
                         parse_object (step_rest v) grown false
                     }
                 }
@@ -261,7 +260,7 @@ let escape_char c = match c {
     '\n' => "\\n",
     '\t' => "\\t",
     '\r' => "\\r",
-    _ => match core.char_code c {
+    _ => match char_code c {
         8  => "\\b",
         12 => "\\f",
         // The only characters JSON insists on escaping, and the only ones that
@@ -345,7 +344,7 @@ let write v = encode v;
 /// indented output agree about what comes first.
 let rec write_indented depth v = match type_of v {
     :list  => indented_items depth v,
-    :array => indented_items depth (core.array_to_list v),
+    :array => indented_items depth (array_to_list v),
     :map   => indented_members depth v,
     _      => write v,
 };
@@ -406,15 +405,15 @@ when test {
         test.case "nested array"   $( test.eq! [[1], [2]] (parsed "[[1],[2]]") ),
         test.case "mixed array"    $( test.eq! [1, "a", true, ()] (parsed "[1,\"a\",true,null]") ),
         test.case "empty object"   $( test.eq! 0 (len (parsed "{}")) ),
-        test.case "object member"  $( test.eq! 1 (core.map_get (parsed "{\"a\":1}") "a" 0) ),
+        test.case "object member"  $( test.eq! 1 (((parsed "{\"a\":1}")).["a" else 0]) ),
         test.case "two members"    $( test.eq! 2 (len (parsed "{\"a\":1,\"b\":2}")) ),
         test.case "nested object"
-            $( test.eq! 2 (core.map_get (core.map_get (parsed "{\"x\":{\"y\":2}}") "x" ()) "y" 0) ),
+            $( test.eq! 2 (((((parsed "{\"x\":{\"y\":2}}")).["x" else ()])).["y" else 0]) ),
 
         // whitespace is not significant
         test.case "leading space"  $( test.eq! 1 (parsed "   1") ),
         test.case "spaces everywhere"
-            $( test.eq! 1 (core.map_get (parsed " { \"a\" : 1 } ") "a" 0) ),
+            $( test.eq! 1 (((parsed " { \"a\" : 1 } ")).["a" else 0]) ),
         test.case "newlines"       $( test.eq! [1, 2] (parsed "[\n1,\n2\n]") ),
 
         // failures are values, not raises
@@ -432,7 +431,7 @@ when test {
         test.case "write bool"     $( test.eq! "true" (write true) ),
         test.case "write string"   $( test.eq! "\"a\"" (write "a") ),
         test.case "write escapes"  $( test.eq! "\"a\\nb\"" (write "a\nb") ),
-        test.case "write control"  $( test.eq! "\"\\u0001\"" (write (core.char_of_code 1 |> fn c -> str.of_chars [c])) ),
+        test.case "write control"  $( test.eq! "\"\\u0001\"" (write (char_of_code 1 |> fn c -> str.of_chars [c])) ),
         test.case "write array"    $( test.eq! "[1,2]" (write [1, 2]) ),
         test.case "write empty"    $( test.eq! "[]" (write []) ),
         test.case "write atom drops the colon" $( test.eq! "\"ok\"" (write :ok) ),
@@ -444,7 +443,7 @@ when test {
         test.case "round trip quotes"
             $( test.eq! "q\"uote" (parsed (write "q\"uote")) ),
         test.case "round trip object"
-            $( test.eq! 1 (core.map_get (parsed (write %{ "a" => 1 })) "a" 0) ),
+            $( test.eq! 1 (((parsed (write %{ "a" => 1 }))).["a" else 0]) ),
         test.case "pretty round trips"
             $( test.eq! [1, 2] (parsed (pretty [1, 2])) ),
 
@@ -470,14 +469,14 @@ when test {
         test.case "two framed messages come back in order"
             $( test.eq! [[:ok, 1], [:ok, "two"]] (list.nth 0 (frames (frame_all [1, "two"]))) ),
         test.case "half a message is not an answer"
-            $( test.eq! () (next_frame (core.str_slice (frame "hello") 0 6)) ),
+            $( test.eq! () (next_frame (str_slice (frame "hello") 0 6)) ),
 
         // and what this format loses, stated rather than left to be discovered
         test.case "a list round trips"     $( test.true! (round_trips [1, 2]) ),
         test.case "a string round trips"   $( test.true! (round_trips "hi") ),
         test.case "an atom does not"       $( test.false! (round_trips :ok) ),
         test.case "an array comes back a list"
-            $( test.eq! [1, 2] (parsed (write (core.array_of_list [1, 2]))) ),
+            $( test.eq! [1, 2] (parsed (write (array_of_list [1, 2]))) ),
     ];
 }
 

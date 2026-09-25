@@ -4,7 +4,7 @@
 // `minimum`, `join` -- comes from `std.seq`, which is derived below. Only what
 // is genuinely about arrays is written here.
 //
-// Unlike a list, an array is strict and finite: `core.array_new` fills every
+// Unlike a list, an array is strict and finite: `array_new` fills every
 // slot, and indexing does not walk anything.
 
 derive std.seq;
@@ -21,8 +21,8 @@ import std.list;
 /// unforced, and only what `f` answers is forced.
 let fold f init xs = {
     let n = len xs;
-    let rec go i !acc = if i >= n { acc } else { go (i + 1) (f acc (core.array_get xs i)) };
-    if n == 0 { init } else { go 1 (f init (core.array_get xs 0)) }
+    let rec go i !acc = if i >= n { acc } else { go (i + 1) (f acc (xs.[i])) };
+    if n == 0 { init } else { go 1 (f init (xs.[0])) }
 };
 
 let name xs = "array";
@@ -38,9 +38,9 @@ let is_empty xs = len xs == 0;
 
 /// The element at `i`. Raises `:out_of_bounds` outside the array; `get_or` is
 /// the total form.
-let get xs i = core.array_get xs i;
+let get xs i = xs.[i];
 
-let get_or default xs i = if i < 0 || i >= len xs { default } else { core.array_get xs i };
+let get_or default xs i = if i < 0 || i >= len xs { default } else { xs.[i] };
 
 let first_or default xs = get_or default xs 0;
 
@@ -49,43 +49,43 @@ let last_or default xs = get_or default xs (len xs - 1);
 // --- building ---------------------------------------------------------------
 
 /// `n` slots, every one holding `fill`.
-let new n fill = core.array_new n fill;
+let new n fill = array_new n fill;
 
-let of_list xs = core.array_of_list xs;
+let of_list xs = array_of_list xs;
 
 /// Overrides `std.seq`'s fold-and-reverse with the primitive.
-let to_list xs = core.array_to_list xs;
+let to_list xs = array_to_list xs;
 
 /// `#[f 0, f 1, .., f (n - 1)]`.
 let build n f = {
-    let rec fill a i = if i >= n { a } else { fill (core.array_set a i (f i)) (i + 1) };
-    if n <= 0 { core.array_of_list [] } else { fill (core.array_new n (f 0)) 0 }
+    let rec fill a i = if i >= n { a } else { fill (a.[i => (f i)]) (i + 1) };
+    if n <= 0 { array_of_list [] } else { fill (array_new n (f 0)) 0 }
 };
 
 /// A copy with index `i` replaced. The original is untouched.
-let set xs i v = core.array_set xs i v;
+let set xs i v = xs.[i => v];
 
 // --- transforming -----------------------------------------------------------
 //
 // These go through lists because that is where `std.list` already has them,
 // and an array is finite so the round trip terminates.
 
-let map f xs = core.array_of_list (list.map f (core.array_to_list xs));
+let map f xs = array_of_list (list.map f (array_to_list xs));
 
-let filter keep xs = core.array_of_list (list.filter keep (core.array_to_list xs));
+let filter keep xs = array_of_list (list.filter keep (array_to_list xs));
 
-let reverse xs = core.array_of_list (list.reverse (core.array_to_list xs));
+let reverse xs = array_of_list (list.reverse (array_to_list xs));
 
-let sort xs = core.array_of_list (list.sort (core.array_to_list xs));
+let sort xs = array_of_list (list.sort (array_to_list xs));
 
-let sort_by before xs = core.array_of_list (list.sort_by before (core.array_to_list xs));
+let sort_by before xs = array_of_list (list.sort_by before (array_to_list xs));
 
 let append xs ys =
-    core.array_of_list (list.append (core.array_to_list xs) (core.array_to_list ys));
+    array_of_list (list.append (array_to_list xs) (array_to_list ys));
 
 /// The elements from `from` up to but not including `until`.
 let slice from until xs =
-    core.array_of_list (list.take (until - from) (list.drop from (core.array_to_list xs)));
+    array_of_list (list.take (until - from) (list.drop from (array_to_list xs)));
 
 // --- tests ------------------------------------------------------------------
 //

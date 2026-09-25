@@ -1,6 +1,6 @@
 // Syntax macros run on the same VM as `comp!`, before runtime name resolution.
 // This layer sits above scope/lower to keep the compiler's imports acyclic.
-import std.core;
+
 import std.list;
 import std.str;
 import std.vm;
@@ -41,10 +41,10 @@ let rec stage tree = match tree {
     _ => if type_of tree == :list { list.map (fn x -> stage x) tree } else { tree },
 };
 let replace_module l mi m = modules.set_module mi m l;
-let with_items m items = core.map_put m :items items;
-let loader s = core.map_get s :loader ();
-let next s = core.map_get s :next 3221225472;
-let put_loader l s = core.map_put s :loader l;
+let with_items m items = m.[:items => items];
+let loader s = s.[:loader else ()];
+let next s = s.[:next else 3221225472];
+let put_loader l s = s.[:loader => l];
 
 // --- what a round of expansion costs -------------------------------------------
 //
@@ -72,8 +72,8 @@ let put_loader l s = core.map_put s :loader l;
 
 let no_meter = %{ :phases => %{}, :counts => %{} };
 let metering s = modules.metering (loader s);
-let meter_of s = core.map_get s :meter no_meter;
-let put_meter m s = core.map_put s :meter m;
+let meter_of s = s.[:meter else no_meter];
+let put_meter m s = s.[:meter => m];
 
 /// The clock, the reduction count and the bytes allocated, as one reading, so
 /// that three questions about a phase cannot be answered from three moments.
@@ -108,11 +108,10 @@ let charge! on value =
     };
 
 let add_reading meter name r = {
-    let phases = core.map_get meter :phases %{};
-    let cur = core.map_get phases name [0, 0, 0, 0];
-    core.map_put meter :phases (core.map_put phases name
-        [list.nth 0 cur + list.nth 0 r, list.nth 1 cur + list.nth 1 r,
-         list.nth 2 cur + list.nth 2 r, list.nth 3 cur + 1])
+    let phases = meter.[:phases else %{}];
+    let cur = phases.[name else [0, 0, 0, 0]];
+    meter.[:phases => (phases.[name => [list.nth 0 cur + list.nth 0 r, list.nth 1 cur + list.nth 1 r,
+         list.nth 2 cur + list.nth 2 r, list.nth 3 cur + 1]])]
 };
 
 /// Charge a reading already taken to `s`, for the phases whose value *is* the
@@ -129,22 +128,21 @@ let phase! s name value = {
 /// answered, times a fallback was taken.
 let counted s name n = if not (metering s) { s } else {
     let meter = meter_of s;
-    let tallies = core.map_get meter :counts %{};
-    put_meter (core.map_put meter :counts
-        (core.map_put tallies name (core.map_get tallies name 0 + n))) s
+    let tallies = meter.[:counts else %{}];
+    put_meter (meter.[:counts => (tallies.[name => (tallies.[name else 0] + n)])]) s
 };
 /// Several at once. The counts arrive as thunks and a meter that is off never
 /// forces one, so a round pays nothing for being countable.
 let counts s pairs = list.fold (fn acc [name, n] -> counted acc name n) s pairs;
-let tally s name = core.map_get (core.map_get (meter_of s) :counts %{}) name 0;
+let tally s name = ((((meter_of s)).[:counts else %{}])).[name else 0];
 let vm_starts s = tally s :vm_starts;
 
 /// Two meters added together, which the fallback paths need: a batch that
 /// failed spent its phases before the path that answered spent its own, and a
 /// reader wants the compile rather than the half of it that worked.
 let merge_meter a b = {
-    let join key combine = list.fold (fn m [k, v] -> core.map_put m k (combine (core.map_get m k ()) v))
-                                     (core.map_get a key %{}) (core.map_pairs (core.map_get b key %{}));
+    let join key combine = list.fold (fn m [k, v] -> m.[k => (combine (m.[k else ()]) v)])
+                                     (a.[key else %{}]) (map_pairs (b.[key else %{}]));
     %{ :phases => join :phases (fn old v -> match old {
            () => v,
            _ => list.map (fn [x, y] -> x + y) (list.zip old v),
@@ -215,7 +213,7 @@ let staged_lowering low = {
         lower.set_prog (ir.set_node placeholder (ir.node :apply closure 0 0)
                                    (lower.prog lowered)) lowered
     }) low (lower.pending_comp low);
-    core.map_put ready :pending_comp []
+    ready.[:pending_comp => []]
 };
 
 /// The whole program, staged and compiled, for the macro VM to be given calls
@@ -300,9 +298,9 @@ let prepare_work! l work = {
 /// and `MODS` is the only statement in the container of which globals are
 /// whose. Without it the image loads, runs, and has no member of any name.
 let invocation_image ld resolved = {
-    let low = staged_lowering (core.map_remove (lower.lower_program resolved) :image);
+    let low = staged_lowering (map_remove (lower.lower_program resolved) :image);
     let ms = lower.link_modules ld resolved low;
-    ir.finish (core.map_put (lower.prog (list.head ms)) :modules (list.nth 1 ms))
+    ir.finish (((lower.prog (list.head ms))).[:modules => (list.nth 1 ms)])
 };
 
 /// The two halves of a call, which is all a session needs of one.
@@ -394,10 +392,10 @@ let evaluate_round! base s session0 jobs = {
         let body = if alone { list.head named } else { ast.list_e named sp };
         let [wrapper, after] = syntax.fresh
             (ast.let_d "<macro expansion>!" [] body false sp) n;
-        [core.cons [mi, calls, alone, wrapper] acc, after]
+        [list_cons [mi, calls, alone, wrapper] acc, after]
     }) [[], next s] jobs;
     let plans = list.reverse (list.head prepared);
-    let s1 = counts (core.map_put s :next (list.nth 1 prepared))
+    let s1 = counts (s.[:next => (list.nth 1 prepared)])
         [[:rounds, 1], [:wrappers, list.length plans],
          [:calls, list.fold (fn n plan -> n + list.length (list.nth 1 plan)) 0 plans]];
 
@@ -439,7 +437,7 @@ let evaluate_round! base s session0 jobs = {
                  let source = diag.with_origin (next st) after_expression at
                                                (modules.file_at (loader st) si);
                  let s2 = put_loader (modules.set_file si source (loader st)) st;
-                 [core.map_put s2 :next after_expression, expression]
+                 [s2.[:next => after_expression], expression]
              } else {
                  [fail st mi at "a macro must return a valid expression syntax tree", ()]
              },
@@ -527,7 +525,7 @@ let evaluate_round! base s session0 jobs = {
             let at = list.nth 1 (list.nth i calls);
             match objection i {
                 why if why != () =>
-                    [fail (counted st :refused 1) mi at why, session, core.cons () answers],
+                    [fail (counted st :refused 1) mi at why, session, list_cons () answers],
                 _ => {
                     let [target_mi, target_name] = macro_target (list.nth i references);
                     let opened = open_round! st session;
@@ -552,7 +550,7 @@ let evaluate_round! base s session0 jobs = {
                         // again.
                         [:error, why] if base.[:whole else false] =>
                             [fail ran mi at ("macro evaluation failed: " + why),
-                             handle, core.cons () answers],
+                             handle, list_cons () answers],
                         // A session of its own, because the base is a
                         // different one: the whole program resolves to a
                         // different image, and this one must not be mistaken
@@ -566,13 +564,13 @@ let evaluate_round! base s session0 jobs = {
                                 other => vm.close_image! other,
                             };
                             strict! spent
-                            [list.head got, handle, core.cons (list.nth 2 got) answers]
+                            [list.head got, handle, list_cons (list.nth 2 got) answers]
                         },
                         [:ok, value] => {
                             let installing = charge! (metering ran) (install! mi m ran value at);
                             let done = list.head installing;
                             [charged (list.head done) :install (list.nth 1 installing),
-                             handle, core.cons (list.nth 1 done) answers]
+                             handle, list_cons (list.nth 1 done) answers]
                         },
                     }
                 },
@@ -584,7 +582,7 @@ let evaluate_round! base s session0 jobs = {
         let got = run! st session plan;
         strict! got
         [list.head got, list.nth 1 got,
-         core.cons (list.reverse (list.nth 2 got)) acc]
+         list_cons (list.reverse (list.nth 2 got)) acc]
     }) [s2, session0, []] plans;
     strict! done
     // The session is handed back rather than closed. It holds an image, a heap
@@ -605,13 +603,13 @@ let evaluate_round! base s session0 jobs = {
 let rec punch tree acc = match tree {
     [:expand, call, sp] => {
         let [calls, n] = acc;
-        [[:expansion_hole, n, sp], [core.cons [call, sp] calls, n + 1]]
+        [[:expansion_hole, n, sp], [list_cons [call, sp] calls, n + 1]]
     },
     _ => if type_of tree != :list { [tree, acc] }
          else {
              let done = list.fold (fn [parts, a] part -> {
                  let got = punch part a;
-                 [core.cons (list.head got) parts, list.nth 1 got]
+                 [list_cons (list.head got) parts, list.nth 1 got]
              }) [[], acc] tree;
              [list.reverse (list.head done), list.nth 1 done]
          },
@@ -706,7 +704,7 @@ let rec rounds_all! base s session items depth = {
         let filled = list.fold (fn [acc, remaining] j -> {
             let calls = list.nth 3 j;
             if list.is_empty calls {
-                [core.cons [list.nth 0 j, list.nth 1 j, list.nth 2 j] acc, remaining]
+                [list_cons [list.nth 0 j, list.nth 1 j, list.nth 2 j] acc, remaining]
             } else {
                 let mi = list.head j;
                 let mine = remaining.[mi else []];
@@ -714,7 +712,7 @@ let rec rounds_all! base s session items depth = {
                     () => ast.unit_e (list.nth 1 (list.nth 1 pair)),
                     answer => answer,
                 }) (list.zip (list.take (list.length calls) mine) calls);
-                [core.cons [mi, list.nth 1 j, fill (list.nth 2 j) answers] acc,
+                [list_cons [mi, list.nth 1 j, fill (list.nth 2 j) answers] acc,
                  remaining.[mi => list.drop (list.length calls) mine]]
             }
         }) [[], pool] punched;
@@ -722,8 +720,8 @@ let rec rounds_all! base s session items depth = {
     }
 };
 
-let base_of s  = core.map_get s :base ();
-let put_base b s = core.map_put s :base b;
+let base_of s  = s.[:base else ()];
+let put_base b s = s.[:base => b];
 
 /// Declaration `i` of module `mi`, expanded and put back where it was.
 ///
@@ -764,7 +762,7 @@ let picks_of l mi = {
     if list.is_empty sites { [mi, source, [], [], []] }
     else {
         let numbered = list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
-            [i + 1, core.cons [i, item] acc]) [0, []] (modules.module_items m)));
+            [i + 1, list_cons [i, item] acc]) [0, []] (modules.module_items m)));
         [mi, source, sites, numbered,
          list.filter (fn [_, item] -> in_item sites item) numbered]
     }

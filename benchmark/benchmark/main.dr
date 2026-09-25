@@ -23,7 +23,7 @@
 // not so much that a round of run.sh drags.
 
 import std.console;
-import std.core;
+
 import std.list;
 import std.os;
 import std.debug;
@@ -33,7 +33,7 @@ import std.debug;
 // fold over a `range`: `list.fold_strict`, not `list.fold`, because a plain
 // fold sits on a chain of suspended accumulators and forces it all at the end
 // (see the note above `fold_strict` in mind/std/list.dr). `strbuild` builds a
-// string the linear way (`core.str_concat` copies each piece once) and reports
+// string the linear way (`str_concat` copies each piece once) and reports
 // its length, so the result is a small integer and the 2.4 MB string is not
 // printed.
 
@@ -56,31 +56,31 @@ let sum_range n = fold (fn acc x -> acc + x) 0 (list.range 1 (n + 1));
 
 let pi_terms n = fold
     (fn acc k -> acc
-        + 1.0 / core.to_float (4 * k - 3)
-        - 1.0 / core.to_float (4 * k - 1))
+        + 1.0 / to_float (4 * k - 3)
+        - 1.0 / to_float (4 * k - 1))
     0.0
     (list.range 1 (n + 1));
 
 let pi_terms2 n = {
     let accum = fn acc k -> acc
-        + 1.0 / core.to_float (4 * k - 3)
-        - 1.0 / core.to_float (4 * k - 1);
+        + 1.0 / to_float (4 * k - 3)
+        - 1.0 / to_float (4 * k - 1);
     let range = list.range 1 (n + 1);
     fold accum 0.0 range
 }
 
-let strbuild n = core.str_len (core.str_concat (list.replicate n "hello "));
+let strbuild n = len (str_concat (list.replicate n "hello "));
 
 // A byte scan: a loop whose body is a call to a host native, which is the shape
 // a lexer is and the one the JIT could not take until it could make the call.
-// `core.str_byte` is a wrapper the compiler rewrites into `std.native`'s, so
+// `str_byte` compiles to a primitive opcode, so
 // what the loop body holds is one native call and an addition.
 //
 // The text is a global rather than something the workload builds, because
 // building it is `strbuild` and is not what this measures: `main!` forces it
 // before the clock starts, exactly as the Python side builds its bytes before
 // the call it times.
-let scan_text = core.str_concat (list.replicate (bytescan_n / 6) "hello ");
+let scan_text = str_concat (list.replicate (bytescan_n / 6) "hello ");
 
 // The guard on `acc` is not decoration. Without it the accumulator is three
 // million suspended additions and forcing that chain runs the machine out of
@@ -95,7 +95,7 @@ let scan_text = core.str_concat (list.replicate (bytescan_n / 6) "hello ");
 let rec scan_bytes s i n acc =
     if i >= n { acc }
     else if acc < 0 { acc }
-    else { scan_bytes s (i + 1) n (acc + core.str_byte s i) };
+    else { scan_bytes s (i + 1) n (acc + str_byte s i) };
 
 let bytescan n = scan_bytes scan_text 0 n 0;
 
@@ -150,7 +150,7 @@ let result! name value = show! name value;
 
 let main! = {
     let args = os.args! ();
-    let run_all = core.is_empty args;
+    let run_all = list_is_empty args;
     let want name = run_all || list.contains name args;
     if want "fib" {
         bench! "fib" (fn () -> fib fib_n)

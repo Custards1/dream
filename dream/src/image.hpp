@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include "primitive_ops.hpp"
 #include <string>
 #include <vector>
 
@@ -56,8 +57,35 @@ enum class Op : uint8_t {
     // switch only skips the arms that cannot match. See `lower_match` in
     // dreams/lower.dr.
     SwitchHead = 41, SwitchAtom = 42,
+    // Force a, test its surface type b (DREAM_TYPE_INTEGER..DREAM_TYPE_MAP).
+    // c is 0 for equality, 1 for inequality. No atom or native call is needed.
+    TypeIs = 43,
+    Cons = 44, ListTail = 45, ListIsEmpty = 46,
+#define DREAM_PRIMITIVE_ENUM(name, code, builtin, arity) name = code,
+    DREAM_PRIMITIVES(DREAM_PRIMITIVE_ENUM)
+#undef DREAM_PRIMITIVE_ENUM
     Count
 };
+
+// Primitive nodes carry their builtin ID in a, and their argument run in b/c.
+// Unlike Apply, they do not evaluate or resolve a callee.
+inline constexpr uint32_t primitive_builtin(Op op) {
+    switch (op) {
+#define DREAM_PRIMITIVE_ID(name, code, builtin, arity) case Op::name: return builtin;
+        DREAM_PRIMITIVES(DREAM_PRIMITIVE_ID)
+#undef DREAM_PRIMITIVE_ID
+        default: return 0xFFFFFFFFu;
+    }
+}
+inline constexpr uint32_t primitive_arity(Op op) {
+    switch (op) {
+#define DREAM_PRIMITIVE_ARITY(name, code, builtin, arity) case Op::name: return arity;
+        DREAM_PRIMITIVES(DREAM_PRIMITIVE_ARITY)
+#undef DREAM_PRIMITIVE_ARITY
+        default: return 0;
+    }
+}
+inline constexpr bool is_primitive(Op op) { return primitive_builtin(op) != 0xFFFFFFFFu; }
 
 const char* op_name(Op op);
 

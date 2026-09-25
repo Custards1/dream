@@ -3,13 +3,13 @@
 // Both `raise!` and `try!` are impure, so error handling is an effect and the
 // purity rule keeps it out of pure functions.
 import std.console;
-import std.core;
+
 import std.list;
 
 let div a b = a / b;
 
 let parse_age! s = {
-    let n = core.parse_int s;
+    let n = parse_int s;
     if n == () { raise! ("not a number: " + s) }
     else if n < 0 { raise! :negative_age }
     else { n }
@@ -24,7 +24,7 @@ let main! = {
     console.print! ("type:      " + to_string (try! { 1 + "x" } catch e { e }))
     console.print! ("not a fn:  " + to_string (try! { (1) 2 } catch e { e }))
     console.print! ("no member: " + to_string (try! { console.nope! 1 } catch e { e }))
-    console.print! ("bounds:    " + to_string (try! { core.array_get #[1] 9 } catch e { e }))
+    console.print! ("bounds:    " + to_string (try! { (#[1]).[9] } catch e { e }))
 
     // Raising a value of your own.
     console.print! ("custom:    " + to_string (try! { raise! :my_problem } catch e { e }))

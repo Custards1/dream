@@ -25,7 +25,7 @@
 // would be a lie the compiler could not catch.
 
 import std.console;
-import std.core;
+
 import std.list;
 import std.str;
 import std.vm;
@@ -67,7 +67,7 @@ let show_count n = {
 /// reading all describe the same instant.
 let now! () = vm.stats! ();
 
-let stat r key = core.map_get r key 0;
+let stat r key = r.[key else 0];
 
 /// What happened between two readings.
 let since before after =
@@ -80,11 +80,11 @@ let since before after =
        :peak => stat after :peak_bytes,
        :live => stat after :live_bytes };
 
-let elapsed d    = core.map_get d :elapsed 0;
-let allocated d  = core.map_get d :allocated 0;
-let reductions d = core.map_get d :reductions 0;
-let collections d = core.map_get d :collections 0;
-let peak d       = core.map_get d :peak 0;
+let elapsed d    = d.[:elapsed else 0];
+let allocated d  = d.[:allocated else 0];
+let reductions d = d.[:reductions else 0];
+let collections d = d.[:collections else 0];
+let peak d       = d.[:peak else 0];
 
 /// A reading as one line.
 let show d =

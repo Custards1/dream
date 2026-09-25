@@ -33,7 +33,7 @@
 // at every use or quietly behave differently. The tag costs nothing and the
 // confusion costs a bug.
 //
-// **Little-endian, because `core.str_le` is.** A field written in Dream is a
+// **Little-endian, because `str_le` is.** A field written in Dream is a
 // list of byte expressions, and that is a cons cell, a thunk and a frame per
 // byte to produce one byte of output; `str_le` is the same field and no list.
 // The reader is the other half and is written a byte at a time, because that is
@@ -74,18 +74,18 @@ let width = 4;
 
 // --- writing ------------------------------------------------------------------
 
-priv let byte n = core.str_le n 1;
+priv let byte n = str_le n 1;
 
 /// A count or a length, in the fixed width above.
-priv let count n = core.str_le n width;
+priv let count n = str_le n width;
 
 /// A tag and its payload.
-priv let tagged t payload = core.str_concat [byte t, payload];
+priv let tagged t payload = str_concat [byte t, payload];
 
 /// A tag, a count, and that many already-encoded pieces after it. The shape of
 /// every collection here, so the three of them are one line each.
 priv let sequence t pieces =
-    core.str_concat (core.cons (byte t) (core.cons (count (list.length pieces)) pieces));
+    str_concat (list_cons (byte t) (list_cons (count (list.length pieces)) pieces));
 
 let write_unit u = byte tag_unit;
 
@@ -94,26 +94,26 @@ let write_bool b = byte (if b { tag_true } else { tag_false });
 /// Eight bytes, two's complement, which is what `str_le` writes for a negative
 /// number. A Dream integer is sixty-three bits, so the eighth byte is sign and
 /// the reader checks it -- see `read_int`.
-let write_int n = tagged tag_int (core.str_le n 8);
+let write_int n = tagged tag_int (str_le n 8);
 
-let write_float x = tagged tag_float (core.float_bytes x);
+let write_float x = tagged tag_float (float_bytes x);
 
 /// The string's own bytes, length first. No escaping and no copy of anything
 /// but the string: a length-prefixed field can hold any byte, including a zero
 /// and including text that is not valid UTF-8, and it comes back as it went in.
-let write_string s = core.str_concat [byte tag_string, count (core.str_len s), s];
+let write_string s = str_concat [byte tag_string, count (len s), s];
 
 /// An atom is its name, and the name is what `to_string` gives without the
 /// colon it writes in front.
 let write_atom a = {
     let text = to_string a;
-    let name = core.str_slice text 1 (core.str_len text - 1);
-    core.str_concat [byte tag_atom, count (core.str_len name), name]
+    let name = str_slice text 1 (len text - 1);
+    str_concat [byte tag_atom, count (len name), name]
 };
 
 /// The Unicode scalar, not the UTF-8 it would encode to: a char is a code
 /// point in this language and this format keeps it one.
-let write_char c = tagged tag_char (core.str_le (core.char_code c) width);
+let write_char c = tagged tag_char (str_le (char_code c) width);
 
 let write_list parts = sequence tag_list parts;
 
@@ -125,9 +125,9 @@ let write_array parts = sequence tag_array parts;
 /// hands the pairs over raw for exactly this: a key here needs no stringifying
 /// and would lose its type if it got any.
 let write_map pairs = {
-    let entry p = core.str_concat [encode (list.nth 0 p), encode (list.nth 1 p)];
-    core.str_concat (core.cons (byte tag_map)
-                               (core.cons (count (list.length pairs)) (list.map entry pairs)))
+    let entry p = str_concat [encode (list.nth 0 p), encode (list.nth 1 p)];
+    str_concat (list_cons (byte tag_map)
+                               (list_cons (count (list.length pairs)) (list.map entry pairs)))
 };
 
 let format_name u = "wire";
@@ -148,12 +148,12 @@ let format_name u = "wire";
 /// `str_byte` answers `-1` past the end rather than failing -- which is right
 /// for a scan and wrong for a field, where the missing byte would silently
 /// become part of a number.
-priv let has buf at n = at + n <= core.str_len buf;
+priv let has buf at n = at + n <= len buf;
 
 /// `n` bytes at `at`, little-endian, as a non-negative number. Assembled from
 /// the top byte down, so each step is one multiply and one add.
 priv let rec le_from buf at n acc =
-    if n <= 0 { acc } else { le_from buf at (n - 1) (acc * 256 + core.str_byte buf (at + n - 1)) };
+    if n <= 0 { acc } else { le_from buf at (n - 1) (acc * 256 + str_byte buf (at + n - 1)) };
 
 priv let le buf at n = le_from buf at n 0;
 
@@ -172,7 +172,7 @@ priv let le buf at n = le_from buf at n 0;
 priv let read_int buf at =
     if not (has buf at 8) { () }
     else {
-        let top = core.str_byte buf (at + 7);
+        let top = str_byte buf (at + 7);
         if top < 64 { [le buf at 8, at + 8] }
         else if top >= 192 {
             // The magnitude of the complement, then negated. `0 - m - 1` rather
@@ -189,10 +189,10 @@ priv let read_int buf at =
 /// assembled the same way, which is one less than the value's absolute value.
 priv let rec complement buf at n acc =
     if n <= 0 { acc }
-    else { complement buf at (n - 1) (acc * 256 + (255 - core.str_byte buf (at + n - 1))) };
+    else { complement buf at (n - 1) (acc * 256 + (255 - str_byte buf (at + n - 1))) };
 
 priv let read_float buf at =
-    if not (has buf at 8) { () } else { [core.float_of_bytes (core.str_slice buf at 8), at + 8] };
+    if not (has buf at 8) { () } else { [float_of_bytes (str_slice buf at 8), at + 8] };
 
 /// A length, then that many bytes, as a string.
 priv let read_bytes buf at =
@@ -200,12 +200,12 @@ priv let read_bytes buf at =
     else {
         let n = le buf at width;
         if not (has buf (at + width) n) { () }
-        else { [core.str_slice buf (at + width) n, at + width + n] }
+        else { [str_slice buf (at + width) n, at + width + n] }
     };
 
 /// A name, as the atom this program already has for it.
 ///
-/// `core.to_existing_atom` never creates one, and that is what makes it safe to
+/// `to_existing_atom` never creates one, and that is what makes it safe to
 /// read a name off a socket: an atom is an index into a table the runtime never
 /// shrinks, so a decoder that interned whatever arrived would be a way to kill
 /// the program by sending it names. The cost is that a name this program does
@@ -215,7 +215,7 @@ priv let read_bytes buf at =
 /// makes it an atom.
 priv let read_atom buf at = match read_bytes buf at {
     () => (),
-    [name, next] => match core.to_existing_atom name {
+    [name, next] => match to_existing_atom name {
         () => (),
         a  => [a, next],
     },
@@ -228,7 +228,7 @@ priv let read_char buf at =
         // `char_of_code` raises on a surrogate or anything past U+10FFFF, and a
         // decoder must not raise, so the range is checked here instead.
         if code > 1114111 || (code >= 55296 && code <= 57343) { () }
-        else { [core.char_of_code code, at + width] }
+        else { [char_of_code code, at + width] }
     };
 
 /// `n` values in a row: `[values, next]`, or `()` if any of them is not one.
@@ -237,7 +237,7 @@ priv let rec read_n buf at n acc =
     else {
         match read buf at {
             () => (),
-            [v, next] => read_n buf next (n - 1) (core.cons v acc),
+            [v, next] => read_n buf next (n - 1) (list_cons v acc),
         }
     };
 
@@ -257,11 +257,11 @@ priv let read_map buf at =
 
 priv let rec map_of flat =
     if list.is_empty flat { %{} }
-    else { core.map_put (map_of (list.drop 2 flat)) (list.nth 0 flat) (list.nth 1 flat) };
+    else { ((map_of (list.drop 2 flat))).[(list.nth 0 flat) => (list.nth 1 flat)] };
 
 /// One value at `at`. The tag decides, and a byte that is not a tag -- or the
 /// `-1` that `str_byte` answers past the end -- falls through to `()`.
-priv let rec read buf at = match core.str_byte buf at {
+priv let rec read buf at = match str_byte buf at {
     0  => [(), at + 1],
     1  => [false, at + 1],
     2  => [true, at + 1],
@@ -273,7 +273,7 @@ priv let rec read buf at = match core.str_byte buf at {
     8  => read_seq buf (at + 1),
     9  => match read_seq buf (at + 1) {
               ()          => (),
-              [xs, next]  => [core.array_of_list xs, next],
+              [xs, next]  => [array_of_list xs, next],
           },
     10 => read_map buf (at + 1),
     _  => (),
@@ -289,7 +289,7 @@ priv let rec read buf at = match core.str_byte buf at {
 let decode text = match read text 0 {
     () => result.error ("not a " + format_name () + " value"),
     [v, at] =>
-        if at == core.str_len text { result.ok v }
+        if at == len text { result.ok v }
         else { result.error ("trailing bytes after a " + format_name () + " value") },
 };
 
@@ -319,13 +319,13 @@ when test {
         test.case "char"        $( test.true! (trip 'a') ),
         test.case "list"        $( test.true! (trip [1, 2, 3]) ),
         test.case "empty list"  $( test.true! (trip []) ),
-        test.case "array"       $( test.true! (trip (core.array_of_list [1, 2])) ),
+        test.case "array"       $( test.true! (trip (array_of_list [1, 2])) ),
         test.case "map"         $( test.true! (trip %{ "a" => 1, "b" => 2 }) ),
         test.case "empty map"   $( test.true! (trip %{}) ),
 
         // the kinds stay apart, which is the whole reason for this format
         test.case "an array does not come back a list"
-            $( test.eq! :array (type_of (result.or_else () (decode (encode (core.array_of_list [1]))))) ),
+            $( test.eq! :array (type_of (result.or_else () (decode (encode (array_of_list [1]))))) ),
         test.case "an atom does not come back a string"
             $( test.eq! :atom (type_of (result.or_else () (decode (encode :ok)))) ),
         test.case "an integer does not come back a float"
@@ -359,22 +359,22 @@ when test {
 
         // a message that is wrong is an answer, not a raise
         test.case "empty input"     $( test.true! (result.is_error (decode "")) ),
-        test.case "an unknown tag"  $( test.true! (result.is_error (decode (core.str_of_bytes [99]))) ),
+        test.case "an unknown tag"  $( test.true! (result.is_error (decode (str_of_bytes [99]))) ),
         test.case "a truncated integer"
-            $( test.true! (result.is_error (decode (core.str_slice (encode 42) 0 5))) ),
+            $( test.true! (result.is_error (decode (str_slice (encode 42) 0 5))) ),
         test.case "a truncated string"
-            $( test.true! (result.is_error (decode (core.str_slice (encode "hello") 0 6))) ),
+            $( test.true! (result.is_error (decode (str_slice (encode "hello") 0 6))) ),
         test.case "a truncated list"
-            $( test.true! (result.is_error (decode (core.str_slice (encode [1, 2]) 0 7))) ),
+            $( test.true! (result.is_error (decode (str_slice (encode [1, 2]) 0 7))) ),
         test.case "trailing bytes"
             $( test.true! (result.is_error (decode (encode 1 + encode 2))) ),
         test.case "an integer too large for this runtime"
             $( test.true! (result.is_error
-                   (decode (core.str_concat [core.str_of_bytes [3], core.str_le 0 4,
-                                             core.str_of_bytes [0, 0, 0, 128]]))) ),
+                   (decode (str_concat [str_of_bytes [3], str_le 0 4,
+                                             str_of_bytes [0, 0, 0, 128]]))) ),
         test.case "a name this program has no atom for"
             $( test.true! (result.is_error
-                   (decode (core.str_concat [core.str_of_bytes [6], core.str_le 3 4, "zzq"]))) ),
+                   (decode (str_concat [str_of_bytes [6], str_le 3 4, "zzq"]))) ),
 
         // decode_or, from std.codec
         test.case "decode_or on a bad message" $( test.eq! :fallback (decode_or :fallback "!") ),
@@ -382,23 +382,23 @@ when test {
 
         // framing, also from std.codec
         test.case "a frame is longer than its body"
-            $( test.eq! (core.str_len (encode 1) + 4) (core.str_len (frame 1)) ),
+            $( test.eq! (len (encode 1) + 4) (len (frame 1)) ),
         test.case "one frame"
             $( test.eq! [:ok, 42] (list.nth 0 (next_frame (frame 42))) ),
         test.case "a frame leaves nothing over"
             $( test.eq! "" (list.nth 1 (next_frame (frame 42))) ),
         test.case "half a frame is not an answer"
-            $( test.eq! () (next_frame (core.str_slice (frame 42) 0 3)) ),
+            $( test.eq! () (next_frame (str_slice (frame 42) 0 3)) ),
         test.case "half a body is not an answer either"
-            $( test.eq! () (next_frame (core.str_slice (frame "hello") 0 8)) ),
+            $( test.eq! () (next_frame (str_slice (frame "hello") 0 8)) ),
         test.case "two frames come back in order"
             $( test.eq! [[:ok, 1], [:ok, :two]] (list.nth 0 (frames (frame_all [1, :two]))) ),
         test.case "a partial frame is left for later"
-            $( test.eq! 3 (core.str_len (list.nth 1 (frames (frame 1 + core.str_slice (frame 2) 0 3)))) ),
+            $( test.eq! 3 (len (list.nth 1 (frames (frame 1 + str_slice (frame 2) 0 3)))) ),
         test.case "a frame whose body is nonsense still says where the next one starts"
             $( test.eq! [:ok, 9]
-                        (list.nth 1 (list.nth 0 (frames (core.str_concat
-                            [core.str_le 1 4, core.str_of_bytes [99], frame 9])))) ),
+                        (list.nth 1 (list.nth 0 (frames (str_concat
+                            [str_le 1 4, str_of_bytes [99], frame 9])))) ),
         test.case "nothing at all frames to nothing"
             $( test.eq! [[], ""] (frames "") ),
         test.case "frame_all of nothing is nothing"

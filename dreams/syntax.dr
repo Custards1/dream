@@ -1,6 +1,6 @@
 // Utilities shared by declaration sugar and macro expansion. Generated syntax
 // needs distinct occurrence offsets: resolution keys names and binders by span.
-import std.core;
+
 import std.list;
 import dreams.ast;
 
@@ -19,7 +19,7 @@ let rec fresh tree next =
         let parts = if has_span { list.take (list.length tree - 1) tree } else { tree };
         let [reversed, end] = list.fold (fn [acc, offset] part -> {
             let [child, after_child] = fresh part offset;
-            [core.cons child acc, after_child]
+            [list_cons child acc, after_child]
         }) [[], next] parts;
         let items = list.reverse reversed;
         if has_span { [items + [[end, end + 1]], end + 2] }
@@ -36,9 +36,9 @@ let rec literal value span = match type_of value {
     :atom => ast.atom_e (ast.atom_name value) span,
     :unit => ast.unit_e span,
     :list => ast.list_e (list.map (fn v -> literal v span) value) span,
-    :array => ast.array_e (list.map (fn v -> literal v span) (core.array_to_list value)) span,
+    :array => ast.array_e (list.map (fn v -> literal v span) (array_to_list value)) span,
     :map => ast.map_e (list.map (fn kv -> list.map (fn v -> literal v span) kv)
-                              (core.map_pairs value)) span,
+                              (map_pairs value)) span,
     _ => ast.unit_e span,
 };
 
@@ -213,7 +213,7 @@ let union_decl name params variants members span = {
     let described v = match ast.variant_fields v {
         [] => lit_tag v,
         fs => ast.list_e [ast.atom_e "tuple" at_,
-                          ast.list_e (core.cons (lit_tag v) (list.map field_t fs)) at_] at_,
+                          ast.list_e (list_cons (lit_tag v) (list.map field_t fs)) at_] at_,
     };
     let description = ast.let_d "type" params
         (ast.list_e [ast.atom_e "named" at_, ast.str_e name at_,
@@ -226,7 +226,7 @@ let union_decl name params variants members span = {
             [] => ast.let_d (ast.variant_name v) [] tag false at_,
             _ => ast.let_d (ast.variant_name v)
                     (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
-                    (ast.list_e (core.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)) at_)
+                    (ast.list_e (list_cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)) at_)
                     false at_,
         }
     }) variants;

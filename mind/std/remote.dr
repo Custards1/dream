@@ -73,7 +73,7 @@
 //     trip. A server meant to be reached over a socket says `[:put, k, v]`
 //     where a local one might have said "run this on the state". The same is
 //     true of a reply.
-import std.core;
+
 import std.error;
 import std.io;
 import std.list;
@@ -98,11 +98,11 @@ import std.wire;
 /// loop; the pieces are collected and joined once, because building the answer
 /// with `+` would copy everything read so far at every step.
 priv let rec exactly! sock n acc =
-    if n <= 0 { core.str_concat (list.reverse acc) }
+    if n <= 0 { str_concat (list.reverse acc) }
     else {
         let chunk = io.read! sock n;
-        if core.str_len chunk == 0 { core.str_concat (list.reverse acc) }
-        else { exactly! sock (n - core.str_len chunk) (core.cons chunk acc) }
+        if len chunk == 0 { str_concat (list.reverse acc) }
+        else { exactly! sock (n - len chunk) (list_cons chunk acc) }
     };
 
 /// The next message: a `std.result` of the value, or `()` at end of stream.
@@ -113,13 +113,13 @@ priv let rec exactly! sock n acc =
 /// goodbye look like one.
 priv let next! sock = {
     let header = exactly! sock wire.frame_header [];
-    if core.str_len header < wire.frame_header { () }
+    if len header < wire.frame_header { () }
     else {
         let size = wire.frame_size header;
         if size < 0 { () }
         else {
             let body = exactly! sock size [];
-            if core.str_len body < size { () } else { wire.decode body }
+            if len body < size { () } else { wire.decode body }
         }
     }
 };

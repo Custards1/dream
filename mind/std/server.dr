@@ -61,7 +61,7 @@
 // is linear in *data* and not in paths, because a forced object says so
 // (`AUX_DEEP_FORCED`), so re-forcing a state that only grew at one edge costs
 // the edge.
-import std.core;
+
 import std.debug;
 import std.list;
 import std.proc;
@@ -139,11 +139,11 @@ priv let reply_of to value   = [:server_reply, to, value];
 /// The tag of a message, or `()` for a message that has none.
 ///
 /// A message is any value at all -- an atom, a number, a string -- so this
-/// cannot simply read element zero: `core.head` of an atom raises, and a server
+/// cannot simply read element zero: `head` of an atom raises, and a server
 /// brought down by a stray `send!` is a server that cannot be trusted with a
 /// mailbox.
 priv let tag_of m =
-    if type_of m == :list && not (core.is_empty m) { core.head m } else { () };
+    if type_of m == :list && not (list_is_empty m) { m.[0] } else { () };
 
 // --- driving the handlers from a mailbox -------------------------------------------
 
@@ -271,7 +271,7 @@ priv let rec await_reply! me kept = {
         requeue! (list.reverse kept)
         list.nth 2 m
     }
-    else { await_reply! me (core.cons m kept) }
+    else { await_reply! me (list_cons m kept) }
 };
 
 priv let requeue! ms = {

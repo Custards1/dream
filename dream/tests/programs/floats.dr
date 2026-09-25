@@ -21,7 +21,7 @@
 // answers -- a test that only ever ran interpreted would pass for the wrong
 // reason.
 import std.console;
-import std.core;
+
 import std.list;
 import std.math;
 
@@ -29,8 +29,8 @@ import std.math;
 // which deforestation turns into a tail loop and the tier then compiles whole.
 let pi_terms n = list.fold_strict
     (fn acc k -> acc
-        + 1.0 / core.to_float (4 * k - 3)
-        - 1.0 / core.to_float (4 * k - 1))
+        + 1.0 / to_float (4 * k - 3)
+        - 1.0 / to_float (4 * k - 1))
     0.0
     (list.range 1 (n + 1));
 
@@ -53,13 +53,13 @@ let rec wrap i hi acc = if i >= hi { acc } else { wrap (i + 1) hi ((acc + 1.5) %
 
 /// The numeric natives the tier makes rather than calls.
 let rec roots i hi acc =
-    if i >= hi { acc } else { roots (i + 1) hi (acc + math.sqrt (core.to_float i)) };
+    if i >= hi { acc } else { roots (i + 1) hi (acc + math.sqrt (to_float i)) };
 let rec floors i hi acc =
-    if i >= hi { acc } else { floors (i + 1) hi (acc + math.floor (core.to_float i / 3.0)) };
+    if i >= hi { acc } else { floors (i + 1) hi (acc + math.floor (to_float i / 3.0)) };
 let rec absum i hi acc =
-    if i >= hi { acc } else { absum (i + 1) hi (acc + math.abs (0.0 - core.to_float i)) };
+    if i >= hi { acc } else { absum (i + 1) hi (acc + math.abs (0.0 - to_float i)) };
 let rec ints i hi acc =
-    if i >= hi { acc } else { ints (i + 1) hi (acc + core.to_int (core.to_float i / 2.0)) };
+    if i >= hi { acc } else { ints (i + 1) hi (acc + to_int (to_float i / 2.0)) };
 
 /// A self call that is *not* in tail position, which is the other shape the
 /// tier emits: the body becomes a function of its arguments, and a float
@@ -107,7 +107,7 @@ let main! = {
     console.print! ("not a num: " + bad)
     let worse = try! { roots 1 4 "acc" } catch e { to_string e };
     console.print! ("bad acc:   " + worse)
-    let notnum = try! { core.to_float "x" } catch e { to_string e };
+    let notnum = try! { to_float "x" } catch e { to_string e };
     console.print! ("to_float:  " + notnum)
 
     // A float divided by an integer zero raises; divided by a float zero it is

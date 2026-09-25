@@ -26,7 +26,7 @@ let main! = {
     // The same value, in both formats. JSON is text; the wire format is bytes,
     // so what is shown is how many of them.
     console.print! (json.write (User.to_map ada));
-    console.print! (to_string (core.str_len (wire.encode (User.to_map ada))) + " bytes");
+    console.print! (to_string (len (wire.encode (User.to_map ada))) + " bytes");
 
     // The wire format keeps the kinds apart, so what comes back is `==` to
     // what went in -- including the atom, which JSON has to spell as a string.
@@ -39,8 +39,8 @@ let main! = {
     // Framing is what makes a stream of bytes a sequence of messages. Two
     // messages and a third that has only half arrived: the whole ones are
     // answered, and the remainder is kept for the next read.
-    let stream = wire.frame_all [:hello, ada] + core.str_slice (wire.frame :bye) 0 3;
+    let stream = wire.frame_all [:hello, ada] + str_slice (wire.frame :bye) 0 3;
     let read = wire.frames stream;
     console.print! (to_string (list.nth 0 read));
-    console.print! (to_string (core.str_len (list.nth 1 read)) + " bytes left over")
+    console.print! (to_string (len (list.nth 1 read)) + " bytes left over")
 };

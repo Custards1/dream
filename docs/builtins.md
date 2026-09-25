@@ -38,30 +38,29 @@ These are emitted by the compiler for `match` expressions. They are technically 
 | `match_at v i` | Returns element `i` of array `v`, unforced. |
 | `match_key map key` | Returns `[value]` if `key` is in `map`, `[]` if absent; the value unforced. |
 
-Each takes its arguments forced by the machine, through its strictness mask, and hands back what it found without forcing it: the machine forces the piece as the continuation of the call. That is what lets a chain of reads through patterns — a list rebuilt many times from the rest of the one before — go as deep as the heap allows rather than as deep as the C++ stack. The `std.native` members that hand back a stored value (`head`, `tail`, `array_get`, `map_get`) answer the same way.
+Each takes its arguments forced by the machine, through its strictness mask, and hands back what it found without forcing it: the machine forces the piece as the continuation of the call. That is what lets a chain of reads through patterns — a list rebuilt many times from the rest of the one before — go as deep as the heap allows rather than as deep as the C++ stack. The list-tail opcode and container reads use the same machine continuation.
 
 ---
 
-## `std.core`
+## Runtime primitives
 
-Primitives that the language cannot express in itself — things the runtime representation hides (string bytes, map buckets) or operations that must be a single machine step.
+These names are available without imports and can be shadowed. Saturated calls
+compile directly to opcodes; partial applications and function values retain
+ordinary builtin semantics. `str_of_chars`, `str_of_bytes`, `str_concat`, and
+`array_of_list` remain builtin calls because they traverse lazy lists.
 
-```dream
-import std.core;
-```
-
-`std.core` is Dream source, [`mind/std/core.dr`](../mind/std/core.dr), and a module that names `core` gets it without an import. Almost every member is a one-line wrapper over the host module **`std.native`**, which holds the C++ implementations, and a wrapper compiles to the call it stands for. Five are not: `head`, `map_get`, `map_put`, `array_get` and `array_set` are written as the language's container operations — `xs.[0]`, `m.[k else d]`, `m.[k => v]`, `a.[i]`, `a.[i => v]` — so a call of one compiles to the `get` or `set` opcode, and like the operations they accept any container.
-
-The VM still answers to `std.core` as a host module with the full set of natives. Images built before `std.core` moved import it by that name, and a program compiled with no standard library on its path falls back to it.
+Container access and updates use `xs.[0]`, `m.[key else default]`, and
+`m.[key => value]`. An empty map is `%{}`; byte length is `len s`.
+The former `std.core` and `std.native` modules have been removed.
+Scalar type descriptions such as `Integer` and `Number` live in `std.types`.
 
 ### Lists
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `head` | `list → value` | `xs.[0]`: the first element, forced to WHNF. Raises `:out_of_bounds` on an empty list. |
-| `tail` | `list → list` | Everything after the first element. Raises `:type_error` on an empty list. |
-| `cons` | `value → list → list` | A new cons cell with the given head and tail. Both sides stay lazy. |
-| `is_empty` | `list → bool` | `true` if the list is `[]`. |
+| `list_tail` | `list → list` | Everything after the first element. Raises `:type_error` on an empty list. |
+| `list_cons` | `value → list → list` | A new cons cell with the given head and tail. Both sides stay lazy. |
+| `list_is_empty` | `list → bool` | `true` if the list is `[]`. |
 
 ### Strings
 
@@ -69,7 +68,6 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `str_len` | `string\|bigstr → integer` | The byte length of the string. |
 | `str_chars` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). Bytes that do not spell a Unicode scalar value — a stray or truncated sequence, an overlong form, a surrogate, anything past U+10FFFF — each become U+FFFD, one per byte, so every char it yields is one `char_of_code` would accept. Raises `:type_error` on a bigstr. |
 | `str_of_chars` | `list of char → string` | Encodes a list of characters into a UTF-8 string. |
 | `str_of_bytes` | `list of integer → string` | Builds a string from raw byte values, each `0`–`255`. The inverse of `str_byte`, and the way to produce **binary** output: `str_of_chars` UTF-8-encodes its input, so byte `0x80` would become two bytes. Raises `:type_error` for a non-integer or a value outside `0`–`255`. A `0` byte is an ordinary byte and does not end the string. |
@@ -116,8 +114,6 @@ Arrays are fixed-length, eagerly allocated sequences. Indexing is O(1). All upda
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `array_new` | `length:integer → fill:value → array` | Creates a new array of `length` slots, each initialized to `fill`. |
-| `array_get` | `array → index:integer → value` | `a.[index]`. Returns the element at `index` (forced to WHNF). Raises `:out_of_bounds` if index is out of range. |
-| `array_set` | `array → index:integer → value → array` | `a.[index => value]`. Returns a new array with the element at `index` replaced; `value` stays lazy. The original is unchanged. Raises `:out_of_bounds` if out of range. |
 | `array_of_list` | `list → array` | Converts a list to an array. Elements remain lazy. |
 | `array_to_list` | `array → list` | Converts an array to a list. Elements remain lazy. |
 
@@ -125,14 +121,11 @@ Arrays are fixed-length, eagerly allocated sequences. Indexing is O(1). All upda
 
 Maps are persistent hash maps — a hash array mapped trie, branching 32 ways on five bits of the key's hash at a time. Keys are compared by value for flat types (integers, floats, strings, atoms, chars, bools, pids) and by identity for everything else. All updates return a new map.
 
-Persistent means *shared*, not copied: `map_put` rebuilds only the path from the root to the entry it changes — about `log32(n)` nodes — and the map it was given keeps every other node and stays valid. So the ordinary functional way to build a map, folding `map_put` over a sequence, costs `O(n log n)` in total rather than the `O(n²)` a copy-on-write table would. `len` is constant time: every node knows how many entries hang below it.
+Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path from the root to the entry it changes — about `log32(n)` nodes — and the map it was given keeps every other node and stays valid. So the ordinary functional way to build a map, folding `m.[key => value]` over a sequence, costs `O(n log n)` in total rather than the `O(n²)` a copy-on-write table would. `len` is constant time: every node knows how many entries hang below it.
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `map_new` | `unit → map` | Creates a new empty map. |
-| `map_get` | `map → key → default → value` | `m.[key else default]`. Returns the value for `key`, forced to WHNF, or `default` if not present. `key` is forced; `default` is evaluated only when it is the answer. |
 | `map_has` | `map → key → bool` | Returns `true` if `key` is in the map. |
-| `map_put` | `map → key → value → map` | `m.[key => value]`. Returns a new map with `key` mapped to `value`, which stays lazy. The original is unchanged. |
 | `map_remove` | `map → key → map` | Returns a new map with `key` removed. |
 | `map_pairs` | `map → list` | Returns a list of `[key, value]` pairs in unspecified order. |
 
@@ -188,11 +181,10 @@ what it looks like. `type_of` still tells them apart, so a branch written for
 `:string` is never handed one.
 
 ```dream
-import std.core;
 import std.io;
 
 let main! = {
-    let data = core.data_at 0;
+    let data = data_at 0;
     if str.slice 0 4 data == "%PDF" {
         io.write! (io.stdout! ()) data       // the whole of it, never in memory
     } else { console.error! "not a PDF" }
@@ -555,14 +547,14 @@ A lazy singly-linked list. Most operations work on infinite lists. Functions tha
 | `index_of x xs` | Index of the first occurrence of `x`, or `-1`. |
 | `sum xs` | Sum of all elements. |
 | `product xs` | Product of all elements. |
-| `minimum xs` | Smallest element by `core.compare`, or `unit` if empty. |
-| `maximum xs` | Largest element by `core.compare`, or `unit` if empty. |
+| `minimum xs` | Smallest element by `compare`, or `unit` if empty. |
+| `maximum xs` | Largest element by `compare`, or `unit` if empty. |
 | `partition pred xs` | `[passing, failing]` — two lists. |
 | `unique xs` | Removes duplicates, keeping the first occurrence. |
-| `sort xs` | Stable sort in ascending order by `core.compare`. Forces the entire spine. |
+| `sort xs` | Stable sort in ascending order by `compare`. Forces the entire spine. |
 | `sort_by before xs` | Stable sort with a custom comparator `before a b → bool`. |
 | `sort_on key xs` | Stable sort ascending by `key` applied to each element. |
-| `to_array xs` | Converts to an array (calls `core.array_of_list`). |
+| `to_array xs` | Converts to an array (calls `array_of_list`). |
 | `of_array a` | Converts an array to a list. |
 | `force xs` | Forces every element. Useful before `send!`. |
 
@@ -657,7 +649,7 @@ Fixed-length sequences with O(1) indexing, written `#[a, b, c]`. Derives `std.se
 | `map f xs` | Apply `f` to every element, return a new array. |
 | `filter keep xs` | Elements satisfying `keep`, as a new (shorter) array. |
 | `reverse xs` | Elements in reverse order. |
-| `sort xs` | Sorted ascending by `core.compare`. |
+| `sort xs` | Sorted ascending by `compare`. |
 | `sort_by before xs` | Sorted with a custom comparator. |
 | `append xs ys` | Concatenation of two arrays. |
 | `slice from until xs` | Elements from index `from` up to (not including) `until`. |
@@ -757,7 +749,7 @@ json.quote "he said \"hi\""                      // 16 characters, including the
 > they were written in. JSON objects are unordered, so this is valid output —
 > but it does mean two maps that compare equal can render as different text,
 > and that output is not stable enough to compare byte-for-byte in a test. Sort
-> `core.map_pairs` yourself if you need a canonical rendering.
+> `map_pairs` yourself if you need a canonical rendering.
 
 #### Parser internals
 
@@ -830,7 +822,7 @@ map — which is what lets a dependency carry `path`, `git`, `tag` and the rest.
 | `section table name` | The map for `[name]`, or an **empty map** if there is no such section. A missing section reads exactly like an empty one, so a manifest with no `[dependencies]` needs no special case. |
 | `get default table sec key` | `table[sec][key]`, or `default` if either the section or the key is absent. |
 | `sections table` | The name of every section. Includes `""` when the file had keys before its first header. |
-| `entries table name` | One section's `key = value` pairs as `[key, value]` lists — `core.map_pairs` of that section. |
+| `entries table name` | One section's `key = value` pairs as `[key, value]` lists — `map_pairs` of that section. |
 
 ```dream
 let t = toml.value (toml.parse text);
@@ -875,7 +867,7 @@ of the suite, and its failure arrives at the runner as an ordinary value
 through `join!` rather than as something that has already unwound the runner's
 own stack.
 
-`std.test` imports only `std.console` and `std.core` — never `std.list`.
+`std.test` imports only `std.console` — never `std.list`.
 A module's own tests import this framework, so anything the framework depended
 on could not have tests of its own; the import would be a cycle. Walking lists
 with the primitives directly is the price of letting every module test itself.
@@ -976,7 +968,7 @@ run.
 import std.map;
 ```
 
-Maps, and sets written as maps. `std.core` provides the operations that have to
+Maps, and sets written as maps. Builtins provide the operations that have to
 be primitive; this is the grain most code actually wants — "the value there, or
 this one, updated" is one call rather than three and a conditional.
 
@@ -1033,7 +1025,7 @@ import std.error;
 ```
 
 The **kind** and the **payload** of a failure. `try! .. catch e` binds the error
-itself, and until `std.core` grew `error_kind` and `error_payload` there was no
+itself, and before the `error_kind` and `error_payload` primitives there was no
 way into one: a caught error could be printed and nothing else. With them a
 failure is an ordinary value to `match` on, and a program can raise failures as
 distinguishable as the runtime's own.
@@ -1157,7 +1149,7 @@ compiles fails the build rather than being quietly skipped.
 
 ```dream
 all.version     // "0.1.0"
-all.modules     // ["std.array", "std.cli", "std.core", "std.error", "std.json",
+all.modules     // ["std.array", "std.cli", "std.error", "std.json",
                 //  "std.list", "std.map", "std.proc", "std.result", "std.seq",
                 //  "std.str", "std.streams", "std.supervisor", "std.test",
                 //  "std.toml"]

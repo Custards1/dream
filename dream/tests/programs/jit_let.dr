@@ -14,7 +14,7 @@
 // the question could not come up.
 
 import std.console;
-import std.core;
+
 
 // --- the plain case --------------------------------------------------------
 let rec squares i n acc =

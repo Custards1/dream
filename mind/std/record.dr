@@ -51,7 +51,7 @@
 // module, so a `User` that derives this cannot also derive `std.seq` or a
 // behavior of its own. Where that collides, the way out is the one the language
 // already offers: the operations are ordinary functions, so pass them.
-import std.core;
+
 import std.list;
 import std.map;
 import std.str;
@@ -84,7 +84,7 @@ virtual let record_name u = "record";
 /// is right for all three and why it cannot disagree with the value it is given
 /// -- a wrong `backing` breaks construction and leaves reading alone.
 virtual let to_fields self = match type_of self {
-    :array => core.array_to_list self,
+    :array => array_to_list self,
     :map   => list.map (fn k -> self.[k else ()]) (fields ()),
     _      => self,
 };
@@ -95,7 +95,7 @@ virtual let to_fields self = match type_of self {
 /// declare. A record overrides it only to do something the declaration cannot
 /// express -- validating, defaulting, or renaming a field that moved.
 virtual let of_fields values = match backing () {
-    :array => core.array_of_list values,
+    :array => array_of_list values,
     :map   => map.from_pairs (list.zip (fields ()) values),
     _      => values,
 };
@@ -143,7 +143,7 @@ let arity u = list.length (fields ());
 let fits v = match type_of v {
     :list  => list.length v == arity (),
     :array => len v == arity (),
-    :map   => list.all (fn k -> core.map_has v k || core.map_has v (text_of k)) (fields ()),
+    :map   => list.all (fn k -> map_has v k || map_has v (text_of k)) (fields ()),
     _      => false,
 };
 
@@ -177,7 +177,7 @@ let with_field self k v = {
 let with_fields self changes = {
     let pick p = {
         let k = list.nth 0 p;
-        if core.map_has changes k || core.map_has changes (text_of k) { value_of changes k }
+        if map_has changes k || map_has changes (text_of k) { value_of changes k }
         else { list.nth 1 p }
     };
     of_fields (list.map pick (list.zip (fields ()) (to_fields self)))

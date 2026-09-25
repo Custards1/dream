@@ -16,7 +16,7 @@
 // program still says what it always said.
 
 import std.console;
-import std.core;
+
 import std.list;
 
 // --- the plain case: a loop that names a helper ----------------------------
