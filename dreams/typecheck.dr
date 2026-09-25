@@ -2033,6 +2033,13 @@ let prepared l r comps = {
     [with_comp_globals r (Checker.set_comps k0 comps), ds0]
 };
 
+/// The checker, asking `r` what a name means. A resolution made in parts knows
+/// the names of the bodies it walked and no others (see "resolving in parts" in
+/// `scope`), so a part's bodies are checked with the part's resolution and
+/// everything else the checker holds -- the signatures, the named types, what
+/// the `comp`s came to -- is the whole program's.
+let with_resolution k r = Checker.set_r k r;
+
 /// The analysis, given what each body said on its own -- `check_decl k b []`,
 /// in the order the resolver queued the bodies. Checking threads the
 /// diagnostics through a body only to add to them, never to read them, so

@@ -1,0 +1,26 @@
+// A program that exercises everything a part renumbers: closures
+// (function indices), compile-time expressions (placeholders), fused loops
+// (invented globals), wrappers and renames defined in one body and called
+// from others, and records. Built in parts and built whole, it must print
+// the same thing.
+import std.console;
+import std.list;
+
+group Point { x, y }
+
+let table = comp list.fold (fn m i -> m.[i => i * i]) %{} (list.range 0 10);
+let squares = comp list.map (fn i -> i * i) (list.range 0 5);
+let first xs = list.head xs;
+let pick = first;
+let adder n = fn x -> x + n;
+
+let summed n = list.fold (fn acc x -> acc + x) 0 (list.range 1 (n + 1));
+let odd_squares n = list.fold (fn acc x -> acc + x) 0
+                        (list.filter (fn x -> x % 2 == 1) (list.map (fn x -> x * x) (list.range 0 n)));
+let describe p = "(" + to_string (Point.x p) + ", " + to_string (Point.y p) + ")";
+
+let main! = {
+    console.print! (to_string [table.[7], squares, pick [3, 4], (adder 5) 10])
+    console.print! (to_string [summed 100, odd_squares 10])
+    console.print! (describe (Point.make 1 2))
+};

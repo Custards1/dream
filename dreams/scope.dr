@@ -26,6 +26,7 @@
 // then every body is checked against the finished environments.
 
 import std.list;
+import std.vm;
 import std.str;
 import std.macros;
 
@@ -2039,6 +2040,15 @@ let resolve_names! l declared ps = {
 /// the empty `state` -- so one function serves both, and a session cannot take
 /// a different path from a build of the same text.
 let resolve_from! l declared r0 from s_pre = {
+    let walked = list.fold (fn acc p -> check_body l p acc) (walk_base l declared r0 from)
+                           (list.drop from (pending declared));
+    finish_walk declared r0 s_pre walked (bodies walked)
+                (list.map (fn b -> wrapper_candidate walked b) (bodies walked))
+};
+
+/// The state a walk of the bodies starts from: the declarations' environments,
+/// and what deforestation has to know before the first body is walked.
+let walk_base l declared r0 from = {
     let base0 = ((r0.[:envs => (envs declared)])).[:frames => []];
     // Deforestation needs three things settled before a body is walked: which
     // global is which `std.list` member, where the globals it invents start,
@@ -2053,13 +2063,19 @@ let resolve_from! l declared r0 from s_pre = {
     let new_pending = list.drop from (pending declared);
     // The global behind a destructuring is how one was compiled, not something
     // anyone defined, so it stays out of an outline.
-    let named = base.[:defs => (list.append (defs base)
-                     (list.map (fn p -> [list.nth 0 p, list.nth 1 p, decl_name (list.nth 2 p),
-                                         decl_span (list.nth 2 p)])
-                               (list.filter (fn p -> not (is_hidden_name (decl_name (list.nth 2 p))))
-                                            new_pending)))];
-    let walked = list.fold (fn acc p -> check_body l p acc) named new_pending;
+    base.[:defs => (list.append (defs base)
+                   (list.map (fn p -> [list.nth 0 p, list.nth 1 p, decl_name (list.nth 2 p),
+                                       decl_span (list.nth 2 p)])
+                             (list.filter (fn p -> not (is_hidden_name (decl_name (list.nth 2 p))))
+                                          new_pending)))]
+};
 
+/// Everything after the walk: which function each global names, which globals
+/// are wrappers, and the global records. `bs` are the bodies the walk queued,
+/// in order, and `candidates` what `wrapper_candidate` said of each -- passed
+/// in rather than worked out here because a walk made in parts can only ask
+/// a body about itself in the part that walked it (see "resolving in parts").
+let finish_walk declared r0 s_pre walked bs candidates = {
     // A global that names a function could not say which function until the
     // function existed, which is now. Joining here rather than threading a
     // half-filled record through the walk keeps the walk about names.
@@ -2069,26 +2085,23 @@ let resolve_from! l declared r0 from s_pre = {
             () => acc,
             gi => acc.[gi => (list.nth 3 b)],
         }
-    }) (%{}) (bodies walked);
+    }) (%{}) bs;
     // Which globals are wrappers, so lowering can emit what they stand for.
-    let aliased = list.fold (fn acc b -> {
+    let aliased = list.fold (fn acc bc -> {
+        let [b, candidate] = bc;
         let mi = list.nth 0 b;
-        let source = list.nth 1 b;
         let d = list.nth 2 b;
         match global_index (env_at declared mi) (decl_name d) {
             () => acc,
             gi =>
-                match (match wrapper_of walked mi source d {
-                           () => rename_wrapper walked by_global mi source d,
-                           w => w,
-                       }) {
+                match wrapper_from walked by_global candidate {
                     () => acc,
                     found =>
                         if target_global (list.head found) == gi { acc }
                         else { acc.[gi => found] },
                 },
         }
-    }) (%{}) (bodies walked);
+    }) (%{}) (list.zip bs candidates);
 
     // Only the globals this declaration added get records, and they go on the
     // end of the ones already in the carried resolution.
@@ -2128,6 +2141,143 @@ let resolve! l = {
         r0 (modules.expansions l);
     resolve_from! l declared seeded 0 state
 };
+
+// --- resolving in parts ------------------------------------------------------------
+//
+// Walking a body reads the declarations and nothing another body's walk wrote,
+// so the bodies can be walked in several processes at once, each from the
+// same starting state -- 0.95 s of a self-compile, which is almost all of
+// resolving, spread over four cores. What one walk shares with the next is
+// three counters and one table, and each is why this section exists:
+//
+//   - **Function indices** are handed out in the order the walk meets
+//     functions. Each part numbers its own from where the declarations left
+//     off, and the merge moves part k's by the count of every part before it.
+//     So the program's functions come in part order rather than body order,
+//     which changes the image and nothing else: an index is a name.
+//   - **Invented globals** (deforestation's loops) are numbered the same way
+//     and moved the same way.
+//   - **Name uses and binders** are recorded by span, in two tables that are
+//     most of what a resolution weighs. They are not merged at all. Lowering
+//     and checking a body ask about that body's names and no other's, so each
+//     part is lowered and checked in a process holding its own resolution
+//     (`lower.link_parallel!`, `compile.analyze_parallel!`), and what the
+//     merge answers carries only what is about the whole program: the
+//     functions, the globals, the bodies, the diagnostics, the wrappers. A
+//     caller asking the merged resolution what a name means finds nothing;
+//     the part that walked the name knows.
+//   - **Wrappers** are a table of the whole program read by every part's
+//     lowering, and deciding one reads the wrapper's own body. So each part
+//     says what its bodies can say about themselves (`wrapper_candidate`) and
+//     the merge finishes them against every function (`wrapper_from`).
+//
+// Diagnostics are kept against the position of the body that said them, and
+// put back in that order, so a program resolved in parts reports what one
+// resolved whole does, in the same order.
+
+/// The resolution of every part, in part order, or `()` for one walked whole.
+let parts r = r.[:parts else ()];
+
+/// Where a part's function indices and invented globals start in the whole
+/// program's, relative to where the declarations left them: `[functions,
+/// globals]`. What `lower` renumbers a part's arena by.
+let part_offsets r = r.[:part_offsets else [0, 0]];
+
+/// The first index an invented global may have: every index below it is a
+/// declaration's, and is the same in every part.
+let invented_from r = r.[:invented_from else 0];
+
+/// The bodies a part walked, `[position, body]` each, the position being the
+/// body's place in the whole program's queue.
+let part_bodies r = r.[:part_bodies else []];
+
+/// Walk some bodies -- `[position, pending entry]` each -- from the shared
+/// starting state `walk_base` made: the part `merge_parts` combines.
+let walk_part l base numbered = {
+    let walked = list.fold_strict (fn acc np -> {
+        let done = check_body l (list.nth 1 np) ((list.head acc).[:diags => []]);
+        let said = r_diags done;
+        let notes = if list.is_empty said { list.nth 1 acc }
+                    else { list_cons [list.head np, said] (list.nth 1 acc) };
+        // Both forced before they are carried, the `ir.settled` way.
+        if type_of notes != :nothing && type_of done != :nothing { [done, notes] }
+        else { [done, notes] }
+    }) [base, []] numbered;
+    let r = list.head walked;
+    let placed = list.zip (list.map (fn np -> list.head np) numbered) (bodies r);
+    ((((r.[:part_notes => list.reverse (list.nth 1 walked)])).[:part_bodies => placed]))
+        .[:part_candidates => list.map (fn pb -> wrapper_candidate r (list.nth 1 pb)) placed]
+};
+
+/// The parts as one resolution, with the parts kept in it (`parts`) and each
+/// part told where it starts (`part_offsets`). See "resolving in parts".
+let merge_parts declared r0 base walked = {
+    let f0 = func_count base;
+    let g0 = next_global base;
+    let counted = list.fold (fn acc r -> {
+        let [fo, go, out] = acc;
+        [fo + func_count r - f0, go + next_global r - g0, list_cons [fo, go] out]
+    }) [0, 0, []] walked;
+    let offsets = list.reverse (list.nth 2 counted);
+    let told = list.map (fn k -> (walked.[k]).[:part_offsets => offsets.[k]])
+                        (list.range 0 (list.length walked));
+    let funcs = list.fold (fn m k -> {
+        let r = told.[k];
+        let fo = list.head (offsets.[k]);
+        list.fold (fn m2 i -> m2.[i + fo => func_at r i]) m (list.range f0 (func_count r))
+    }) (func_map base) (list.range 0 (list.length told));
+    let moved_body pb fo = {
+        let [mi, source, d, fi] = list.nth 1 pb;
+        [list.head pb, [mi, source, d, fi + fo]]
+    };
+    let placed = list.sort_on (fn pb -> list.head pb) (list.concat (list.map (fn k -> {
+        let fo = list.head (offsets.[k]);
+        list.map (fn pb -> moved_body pb fo) (part_bodies (told.[k]))
+    }) (list.range 0 (list.length told))));
+    let candidates = list.sort_on (fn pc -> list.head pc) (list.concat (list.map (fn r ->
+        list.zip (list.map (fn pb -> list.head pb) (part_bodies r)) (r.[:part_candidates else []])) told));
+    let invented = list.concat (list.map (fn k -> {
+        let [fo, go] = offsets.[k];
+        list.map (fn g -> [list.nth 0 g + go, list.nth 1 g, list.nth 2 g, list.nth 3 g + fo])
+                 (fused (told.[k]))
+    }) (list.range 0 (list.length told)));
+    let notes = list.sort_on (fn n -> list.head n) (list.concat (list.map (fn r -> r.[:part_notes else []]) told));
+    let bs = list.map (fn pb -> list.nth 1 pb) placed;
+    let said = list.concat (list.map (fn n -> list.nth 1 n) notes);
+    let numbered = (base.[:funcs => funcs]).[:func_count => f0 + list.head counted];
+    let queued = (numbered.[:bodies => list.reverse bs]).[:next_global => g0 + list.nth 1 counted];
+    let whole = (((queued.[:fused => list.reverse invented]).[:diags => list.append (r_diags base) said])
+                    .[:parts => told]).[:invented_from => g0];
+    finish_walk declared r0 state whole bs (list.map (fn pc -> list.nth 1 pc) candidates)
+};
+
+/// `resolve!`, with the bodies walked in `part_count` processes. The loader,
+/// the starting state and every part are shared (`vm.share!`), so what crosses
+/// between processes is pointers; see "resolving in parts" for what the
+/// answer does and does not hold.
+let resolve_parts! l part_count = {
+    let declared = declare! l;
+    let r0 = ((((((((resolver (envs declared))).[:imports => (s_imports declared)])).[:module_recs => (s_module_recs declared)])).[:diags => (diags declared)])).[:fuse => true];
+    let seeded = list.fold (fn r e ->
+        r.[:refs => (((refs r)).[(ref_key (list.nth 0 e) (list.nth 1 e) (list.nth 2 e)) => (list.nth 3 e)])])
+        r0 (modules.expansions l);
+    let shared_l = vm.share! l;
+    let base = vm.share! (walk_base shared_l declared seeded 0);
+    let all = pending declared;
+    let numbered = list.zip (list.range 0 (list.length all)) all;
+    // Dealt before any process starts, for the reason `lower.link_parallel!`
+    // gives.
+    let slices = strict! (list.map (fn k -> list.filter (fn np -> list.head np % part_count == k) numbered)
+                                   (list.range 0 part_count));
+    let running = strict! (list.map (fn slice -> walk_elsewhere! shared_l base slice) slices);
+    let walked = strict! (list.map (fn pr -> join! pr) running);
+    merge_parts declared seeded base walked
+};
+
+/// A process walking one part. Its own function so that the suspension
+/// `spawn!` copies holds the loader, the state and the slice -- all shared, or
+/// small -- and nothing else.
+let walk_elsewhere! l base slice = spawn! $( vm.share! (walk_part l base slice) );
 
 // --- wrappers ---------------------------------------------------------------------
 //
@@ -2279,9 +2429,35 @@ let wrapper_of r mi source d = {
     }
 };
 
+/// What a body can say about being a wrapper by itself: `[:wrapper, found]`
+/// when it is one outright, `[:rename, target]` when it is a bare name that may
+/// be a rename, or `()`. A rename needs the target's function to say its
+/// arity, and so the whole program's functions, which is why `wrapper_from`
+/// finishes it: a walk made in parts can only ask a body about its own name
+/// uses in the part that walked it, and only knows every function once every
+/// part is in (see "resolving in parts").
+let wrapper_candidate r b = {
+    let [mi, source, d, _] = b;
+    match wrapper_of r mi source d {
+        () => if not (list.is_empty (decl_params d)) { () }
+              else {
+                  let target = match decl_body d {
+                      [:name, _, span]     => resolution r mi source span,
+                      [:field, _, _, span] => resolution r mi source span,
+                      _ => (),
+                  };
+                  if target_global target == () { () } else { [:rename, target] }
+              },
+        found => [:wrapper, found],
+    }
+};
+
+/// The wrapper a candidate comes to, given every function: `[target, plan,
+/// arity]`, or `()`.
+///
 /// A declaration that only renames a function -- `let node_op = Node.op;`,
-/// `let nth = list.nth;` -- as the wrapper it amounts to: `[target, plan,
-/// arity]`, with every parameter passed on in order, or `()`.
+/// `let nth = list.nth;` -- is the wrapper it amounts to, with every parameter
+/// passed on in order.
 ///
 /// Such a global's value is the function it names, so a saturated call of it
 /// is a call of that function with the same arguments, and nothing is
@@ -2296,26 +2472,18 @@ let wrapper_of r mi source d = {
 /// Only a function the program declares, with parameters, is followed: its
 /// arity is what says a call is saturated, and a global with no parameters is a
 /// value rather than a function.
-let rename_wrapper r by_global mi source d =
-    if not (list.is_empty (decl_params d)) { () }
-    else {
-        let target = match decl_body d {
-            [:name, _, span]     => resolution r mi source span,
-            [:field, _, _, span] => resolution r mi source span,
-            _ => (),
-        };
-        match target_global target {
-            () => (),
-            g => match by_global.[g else ()] {
-                () => (),
-                fi => {
-                    let arity = func_arity (func_at r fi);
-                    if arity < 1 { () }
-                    else { [target, list.map (fn k -> [:param, k]) (list.range 0 arity), arity] }
-                },
-            },
-        }
-    };
+let wrapper_from r by_global candidate = match candidate {
+    [:wrapper, found] => found,
+    [:rename, target] => match by_global.[target_global target else ()] {
+        () => (),
+        fi => {
+            let arity = func_arity (func_at r fi);
+            if arity < 1 { () }
+            else { [target, list.map (fn k -> [:param, k]) (list.range 0 arity), arity] }
+        },
+    },
+    _ => (),
+};
 
 /// A wrapper whose body is one container operation: `[[:op, kind], plan, arity]`.
 /// The plan is the operands in order, and each is held to the rule a call's

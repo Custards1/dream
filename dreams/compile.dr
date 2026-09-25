@@ -99,15 +99,19 @@ mapping Build {
 let build! : modules.Loader -> Options -> Build;
 let build! l o = {
     let parallel = Options.parallel o;
-    // In a parallel build the resolution is shared before anything reads it,
-    // so the checker built from it, and every process handed either, reads
-    // the one copy.
-    let r = if parallel { vm.share! (scope.resolve! l) } else { scope.resolve! l };
+    // A parallel build resolves in parts, in several processes, and lowers
+    // and checks each part in a process of its own against the part's
+    // resolution (see "resolving in parts" in `scope`).
+    // Only a build that is also lowered in parts: a resolution made in parts
+    // keeps each part's name uses in the part, and lowering the arena whole
+    // (`--no-opt`) asks them all of one resolution.
+    let parted = parallel && Options.optimize o;
+    let r = if parted { scope.resolve_parts! l lower.part_count } else { scope.resolve! l };
     // A build that will be optimized is lowered in parts, in several processes
     // at once (`lower.link_parallel!`); one that will not keeps the arena
     // exactly as `lower` builds it, which the parts cannot, since each is
     // shared before it is merged.
-    let low = if parallel && Options.optimize o { lower.link_parallel! l r } else { lower.link! l r };
+    let low = if parted { lower.link_parallel! l r } else { lower.link! l r };
     let front = list.append (modules.diags l) (lower.all_diags r low);
     // One checker for the diagnostics, the contracts and both of the JIT's
     // parameter masks. Lazy, so a build without types never makes it -- and
@@ -154,11 +158,17 @@ let share_elsewhere! p = {
 let analyze_parallel! l r comps = {
     let kd = vm.share! (typecheck.prepared l r comps);
     let k = list.head kd;
-    let all = scope.bodies r;
-    let numbered = list.zip (list.range 0 (list.length all)) all;
-    let slices = strict! (list.map (fn j -> list.filter (fn nb -> list.head nb % lower.part_count == j) numbered)
-                                   (list.range 0 lower.part_count));
-    let running = strict! (list.map (fn slice -> check_elsewhere! k slice) slices);
+    let work = match scope.parts r {
+        () => {
+            let all = scope.bodies r;
+            let numbered = list.zip (list.range 0 (list.length all)) all;
+            list.map (fn j -> [k, list.filter (fn nb -> list.head nb % lower.part_count == j) numbered])
+                     (list.range 0 lower.part_count)
+        },
+        walked => list.map (fn pr -> [typecheck.with_resolution k pr, scope.part_bodies pr]) walked,
+    };
+    strict! work
+    let running = strict! (list.map (fn w -> check_elsewhere! (list.head w) (list.nth 1 w)) work);
     let said = list.concat (strict! (list.map (fn pr -> join! pr) running));
     let ordered = list.map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said);
     strict! (typecheck.concluded k r (list.nth 1 kd) ordered)

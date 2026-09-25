@@ -1898,15 +1898,28 @@ let part_elsewhere! r slice = spawn! $( vm.share! (lower_part r slice) );
 let link_parallel! : modules.Loader -> scope.Resolution -> Lowering;
 let link_parallel! ld r = {
     let rs = vm.share! r;
-    let all = scope.bodies rs;
-    let numbered = list.zip (list.range 0 (list.length all)) all;
+    // A resolution made in parts is lowered in the same parts, each against
+    // the part that walked it -- which is the only one that knows what its
+    // names mean (`scope.parts`) -- with the wrappers of the whole program.
+    // One resolved whole is dealt out here instead.
+    let work = match scope.parts rs {
+        () => {
+            let all = scope.bodies rs;
+            let numbered = list.zip (list.range 0 (list.length all)) all;
+            list.map (fn k -> [rs, list.filter (fn nb -> list.head nb % part_count == k) numbered])
+                     (list.range 0 part_count)
+        },
+        walked => {
+            let wrappers = vm.share! (scope.wrappers rs);
+            list.map (fn pr -> [pr.[:wrappers => wrappers], scope.part_bodies pr]) walked
+        },
+    };
     // Dealt before any process starts: a slice left lazy would cross into its
     // child as a suspension holding every body, and be dealt there.
-    let slices = strict! (list.map (fn k -> list.filter (fn nb -> list.head nb % part_count == k) numbered)
-                                   (list.range 0 part_count));
-    let running = strict! (list.map (fn slice -> part_elsewhere! rs slice) slices);
+    strict! work
+    let running = strict! (list.map (fn w -> part_elsewhere! (list.head w) (list.nth 1 w)) work);
     let parts = strict! (list.map (fn pr -> join! pr) running);
-    link_rest! ld rs (link_parts rs parts)
+    link_rest! ld rs (link_parts rs (list.map (fn w -> scope.part_offsets (list.head w)) work) parts)
 };
 
 /// Intern every value of a part's pool into the program's: `[program, the
@@ -1928,7 +1941,8 @@ let intern_atom_at strs si p = {
 
 /// Merge the parts into one lowering, linked. The arenas are laid one after
 /// another, renumbered but not shared again -- see `opt.renumber_part`.
-let link_parts r parts = {
+let link_parts r offsets parts = {
+    let invented_from = scope.invented_from r;
     // The constant pools, part by part, and each part's table from its own
     // indices to the program's.
     let pooled = list.fold (fn acc part -> {
@@ -1945,11 +1959,14 @@ let link_parts r parts = {
     let starts = list.reverse (list.nth 1 (list.fold (fn acc part ->
         [list.head acc + list.length (part.[:nodes]), list_cons (list.head acc) (list.nth 1 acc)])
         [0, []] parts));
-    // Every function's body, as the program numbers it.
-    let bodies = list.fold (fn m pair -> {
-        let [part, at] = pair;
-        list.fold (fn m2 fb -> m2.[list.head fb => (at + list.nth 1 fb)]) m (part.[:bodies])
-    }) %{} (list.zip parts starts);
+    // Every function's body, as the program numbers it: a part numbers its
+    // functions from where the declarations left off, and is moved past the
+    // parts before it (see "resolving in parts" in `scope`).
+    let bodies = list.fold (fn m k -> {
+        let at = starts.[k];
+        let fo = list.head (offsets.[k]);
+        list.fold (fn m2 fb -> m2.[list.head fb + fo => (at + list.nth 1 fb)]) m ((parts.[k]).[:bodies])
+    }) %{} (list.range 0 (list.length parts));
     let base = set_res r (lowering r (list.head pooled) 0);
     let fs = link_funcs r bodies base;
     let gs = link_globals r (list.head fs);
@@ -1960,12 +1977,13 @@ let link_parts r parts = {
     // parts' runs follow them.
     let laid = list.fold (fn acc trio -> {
         let [nodes_rev, kids_rev, kat] = acc;
-        let [part, at, m] = trio;
-        [opt.renumber_part (part.[:nodes]) at kat m nodes_rev,
+        let [part, at, m, moved] = trio;
+        [opt.renumber_part (part.[:nodes]) at kat m (list.head moved) (list.nth 1 moved) invented_from
+                           nodes_rev,
          opt.renumber_kids (part.[:kids]) at kids_rev,
          kat + list.length (part.[:kids])]
     }) [[], [], ir.kid_count p]
-       (list.map (fn k -> [parts.[k], starts.[k], remaps.[k]]) (list.range 0 (list.length parts)));
+       (list.map (fn k -> [parts.[k], starts.[k], remaps.[k], offsets.[k]]) (list.range 0 (list.length parts)));
     let nodes = list.reverse (list.head laid);
     let kids = list.reverse (list.nth 1 laid);
     let merged = ((((p.[:nodes => ir.fill_kids %{} 0 nodes]).[:node_count => list.length nodes])
@@ -1977,7 +1995,18 @@ let link_parts r parts = {
         [if ir.node_op n == :unit && ir.is_node (ir.node_a n) { m.[ir.node_a n => i] } else { m }, i + 1]
     }) [%{}, 0] nodes;
     let at = list.head placed;
-    let notes = list.sort_on (fn note -> list.head note) (list.concat (list.map (fn part -> part.[:notes]) parts));
+    // What each body said, back in the order of the bodies, with a waiting
+    // expression's function moved as the part's functions were.
+    let notes = list.sort_on (fn note -> list.head note) (list.concat (list.map (fn k -> {
+        let fo = list.head (offsets.[k]);
+        list.map (fn note -> {
+            let [position, said, waiting] = note;
+            [position, said, list.map (fn one -> {
+                let [node, fi, src, span] = one;
+                [node, fi + fo, src, span]
+            }) waiting]
+        }) ((parts.[k]).[:notes])
+    }) (list.range 0 (list.length parts))));
     let said = list.concat (list.map (fn note -> list.nth 1 note) notes);
     let waiting = list.map (fn one -> {
         let [node, fi, src, span] = one;

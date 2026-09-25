@@ -544,11 +544,20 @@ let walk_funcs fs s0 =
 /// parts is merged with: sharing is a rebuild, and the build shares the arena
 /// once more in a process of its own while the types are checked, so doing it
 /// here too was 0.8 s on the critical path to save work that happens anyway.
-let renumber_part nodes at kids_at m acc =
+///
+/// A part resolved in parts also numbered its own functions and invented
+/// globals, from where the declarations left off: `fo` moves the first --
+/// every closure, thunk and compile-time placeholder names one -- and `go`
+/// the second, which are every global at or past `invented_from`.
+let renumber_part nodes at kids_at m fo go invented_from acc =
     list.fold (fn out n -> {
         let op = ir.node_op n;
         let renamed = match op {
             :field => set_operand 1 ((m.[:strs]).[ir.node_b n]) n,
+            :make_closure => set_operand 0 (ir.node_a n + fo) n,
+            :make_thunk => set_operand 0 (ir.node_a n + fo) n,
+            :unit => if ir.is_node (ir.node_a n) { set_operand 0 (ir.node_a n + fo) n } else { n },
+            :global => if ir.node_a n >= invented_from { set_operand 0 (ir.node_a n + go) n } else { n },
             _ => remap_leaf_by m n,
         };
         let edged = list.fold (fn e k -> {

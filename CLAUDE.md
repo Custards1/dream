@@ -2788,7 +2788,7 @@ leaves carry a flag, and a shared one would hand it to every user. Measure
 against a VM built from the commit before, in a worktree; this machine moves by
 10% between minutes.
 
-### Lowering in parts, and a heap every process can read: 5.75 s -> 4.6 s
+### Resolving, lowering and checking in parts: 5.75 s -> 4.1 s
 
 Done 2026-09-25, the next round after the one above, on the same four-core
 machine (the commit before measured 5.75 s here). Lowering was 2.4 s of the
@@ -2855,15 +2855,41 @@ nothing else, so it runs in four processes (`lower.link_parallel!`, used by
   reductions a node, and no rearrangement of the walk changes that. Sharing
   the whole arena therefore stays in the child, where it overlaps the types.
 
+- **Resolving is per body too, and so is everything after it.** Declaring the
+  program's names is 40 ms; walking 2,205 bodies is the other 950. A walk reads
+  the declarations and nothing another body's walk wrote, except three
+  counters -- function indices, deforestation's invented globals, and the
+  queue of bodies -- so `scope.resolve_parts!` walks the bodies in four
+  processes from one shared starting state, each numbering its own functions
+  and globals from where the declarations left off, and `merge_parts` moves
+  part k's past the parts before it. The name tables (32K uses, 10K binders)
+  are **not merged at all**: lowering and checking a body only ever ask about
+  that body's names, so each part is lowered and checked in a process holding
+  the part that walked it (`scope.parts`), and the merged resolution carries
+  only what is about the whole program -- functions, globals, bodies,
+  diagnostics, wrappers. The renumbering happens once, where the arena is laid
+  out (`opt.renumber_part`: closures, thunks, placeholders, invented globals).
+  Wrappers are the one table every part reads and deciding one reads the
+  wrapper's own body, so a part says what each body can say about itself
+  (`wrapper_candidate`) and the merge finishes it (`wrapper_from`). 0.95 s ->
+  0.45 s, and the functions come out in part order rather than body order,
+  which changes the image and nothing it does.
+- **A merged resolution cannot be lowered whole.** It has no name tables, so a
+  `--no-opt` build (which lowers the arena whole) must resolve whole too;
+  `compile.build!` resolves in parts only when it will lower in parts. That was
+  a bug for one commit, caught writing `dreams/tests/parts.sh`, which holds the
+  parts to the whole: the same diagnostics as `--check`, in the same order, and
+  a program that prints the same built both ways.
+
 `Options.parallel` is what turns all of this on, and only the command line
 sets it; see the `Options` doc in [dreams/compile.dr](dreams/compile.dr).
 
 Where the time is now, wall clock from the start of a self-compile: loaded
-0.9 s, resolved 1.95 s, lowered (parts joined, merged, comps settled) 3.6 s,
-types checked 4.0 s, the child's re-share joined 4.4 s, written 4.6 s. The
-re-share child is the critical path after lowering; before it, parsing
-(already spread across processes, 1.8 s of CPU) and resolving (one walk
-threading one state, 1.0 s) are the two serial stages left.
+0.95 s, resolved 1.4 s, parts lowered and joined 2.5 s, merged 2.85 s, `comp`s
+settled 3.05 s, types checked 3.45 s, the child's re-share joined 3.9 s,
+written 4.1 s. Loading (parsing is spread across processes already, 1.8 s of
+CPU) is now the largest serial stage; after lowering, the re-share child
+(0.8 s, started once the `comp`s are settled) is the critical path.
 
 ### A JIT that can allocate -- the plan
 

@@ -1,0 +1,12 @@
+import std.console;
+let a : :integer -> :integer;
+let a x = x + 1;
+let b = a "one";
+let c : :string = 3;
+let d x : :bool = "no";
+let e = a "two";
+let f = a 3.5;
+let g x = a (x == 1);
+let h : :integer = "h";
+let i = a :atom;
+let main! = console.print! (to_string [b, c, e, f, h, i]);
