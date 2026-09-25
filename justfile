@@ -64,8 +64,12 @@ vm-pgo:
     # Then the workload the profile is for -- the compiler compiling itself,
     # both stages. `os.exit!` flushes the counters explicitly (see os.cpp);
     # `_Exit` would skip GCC's own writer and every one of these runs ends there.
-    build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/main.dr
-    build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/main.dr
+    # Compiles in the JIT's background thread are made synchronous for the
+    # training runs: a run ends in `os.exit!` whether or not that thread is
+    # mid-compile, and counters flushed from under it are not flow-consistent,
+    # which `-fprofile-use` rejects outright for `jit.cpp`.
+    DREAM_JIT_SYNC=1 build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/main.dr
+    DREAM_JIT_SYNC=1 build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/main.dr
     cmp build-pgo/train/stage2.dream build-pgo/train/stage3.dream
     cmake -S . -B build-pgo -DDREAM_PGO=USE
     cmake --build build-pgo -j

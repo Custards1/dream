@@ -1026,11 +1026,11 @@ let ref_key ctx source start = (ctx * 65536 + source) * 4294967296 + start;
 /// `list.fold_strict` both use, and for the reason given there: an argument is
 /// not evaluated, so `record .. (forced what)` would suspend the call and
 /// change nothing.
-let rec forced v =
-    match type_of v {
-        :list => list.is_empty v || (forced (list.head v) && forced (list.tail v)),
-        _ => true,
-    };
+///
+/// Asked through `to_string`, which cannot answer without evaluating all of
+/// its argument, and does it in one native call where a walk written here was
+/// a call per cell -- three million reductions of a self-compile.
+let forced v = type_of (to_string v) == :string;
 
 /// Force the two tables' spines.
 ///

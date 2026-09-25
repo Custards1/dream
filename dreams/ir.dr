@@ -328,9 +328,12 @@ let atoms p  = p.[:atoms else pool_new];
 /// cannot answer without evaluating, `:nothing` is not one of its answers, so
 /// every clause is true, `&&` reaches the last of them, and the answer is
 /// always true -- which is why the caller's `else` is unreachable and says so.
-let settled n = type_of (node_op n) != :nothing && type_of (node_flags n) != :nothing
-    && type_of (node_a n) != :nothing && type_of (node_b n) != :nothing
-    && type_of (node_c n) != :nothing;
+///
+/// Asked through `to_string`, which is one native call that cannot answer
+/// without evaluating every part of what it is given: the five questions
+/// written out were a dozen reductions a node, and this is asked of every node
+/// the compiler emits and every flag it sets.
+let settled n = type_of (to_string n) == :string;
 
 /// Force the arena's spine.
 ///
