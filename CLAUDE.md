@@ -2700,6 +2700,94 @@ to say so. Once in a few hundred runs on a loaded machine; the full e2e suite
 under a watchdog that took `gdb` backtraces is what caught it, in an `--no-jit`
 run. `Scheduler::notify_done` is the fix.
 
+### The self-compile on four cores: 8.8 s -> 5.8 s, and what 3 s would take
+
+Done 2026-09-25 against a stated goal of a self-compile in three seconds, on a
+four-core container where the commit before measured **8.6-9.0 s** (its own VM,
+its own compiler, interleaved). It is now **5.8 s**, and **5.1 s** under
+`just vm-pgo`. The goal is not met; the last paragraph of this section says
+what is left and why none of it is an edit. In the order the wins were found:
+
+- **A yielding process was moved to another core every 4000 reductions.**
+  `run_slice` ended in `enqueue`, which places round-robin, so a program of one
+  green process hopped workers forty thousand times a compile, each hop a futex
+  wake of a sleeping thread and a cold cache. `Scheduler::requeue` puts it back
+  on its own worker's queue and wakes nobody unless something is already waiting
+  behind it. **~2 s**, the largest single item here, and every stage paid it --
+  the collector's pause alone fell from 1.3 s to 0.56 s. It is invisible to
+  `--profile` and to `-j 1`, which is where it hid.
+- **A `comp` ran against an image of the whole unshared arena.** Six one-line
+  compile-time expressions paid for serializing 142,000 nodes. `comp_image` in
+  [dreams/lower.dr](dreams/lower.dr) gives every function the expressions
+  cannot reach one shared raising body and runs the optimizer, which copies only
+  what a body reaches: **~0.9 s -> 0.17 s**. Incomplete reachability is loud,
+  not wrong, for the reason the macro stub is.
+- **Parsing is spread across processes.** Before a file is parsed its
+  top-level `import` lines are read off the text, and every file they lead to is
+  read and handed to a process of its own (`prefetch!` in
+  [dreams/modules.dr](dreams/modules.dr)); the depth-first walk is unchanged
+  and joins each parse when it reaches the file. Loading went 2.2 s -> 0.75 s.
+  Two things had to be fixed first, and both are general:
+  - `Heap::copy_between` searched a vector for every object it had already
+    copied -- quadratic in what crossed, nothing for a message and minutes for
+    a syntax tree -- and recursed down a list's tail. It is an open-addressing
+    table and a loop along the spine now.
+  - A suspension carries its frame, so a `spawn!` written inside the loader's
+    walk copied the whole loader into the child. The thunk handed to `spawn!`
+    is made in a function of its own (`parse_elsewhere!`) whose frame holds the
+    text and nothing else. Read that before writing the next `spawn!` in the
+    compiler.
+- **The arena is shared in a child while the checker runs.** They need
+  nothing from each other; `share_elsewhere!` in
+  [dreams/compile.dr](dreams/compile.dr) hands the program's *tables* over
+  (the child flattens them, `opt.optimize_program`), and the checker's half
+  second comes off the critical path. Splitting the share itself in two and
+  walking the second half's arena into the first's table was built and gives
+  the same bytes -- the table is canonical -- but the merge costs as much as
+  the half it saves, so it is not kept.
+- **A rename is a wrapper.** `let node_op = Node.op;` was a global read and a
+  closure application at every call; `rename_wrapper` in
+  [dreams/scope.dr](dreams/scope.dr) records it as the wrapper it amounts to,
+  and an empty `[]` or `%{}` now counts as a literal, which makes every
+  `p.[:nodes else (%{})]` accessor a wrapper too. 4%.
+- **Forcing a small tree is `to_string`.** `ir.settled` and `scope.forced`
+  were a dozen reductions a node; one native that cannot answer without
+  evaluating everything does the same job. 5%.
+- **The JIT compiles on idle cycles** (`SCHED_IDLE`). With the compiler's work
+  now spread over every core, LLVM's thread made a compile slower with the JIT
+  on than off. When a compiled body arrives is not observable, so it may as
+  well arrive when nothing else wants the core.
+
+**A JIT bug this exposed, fixed.** A compiled lazy `fold` answering its
+accumulator forced it before returning, and forcing it ran the fold's function,
+which could park (`join!`); a park under compiled code retries the whole call
+from its frame, which builds the chain of suspensions afresh and performs every
+effect in it again. A fold whose function spawned and joined printed each step
+twice, and the loader's walk spun for ever. A loop now answers a parameter in
+tail position as it stands and `enter_function` forces it, where a park
+suspends rather than retries. `impure_callee` also looks at a lambda's body
+flag, since a lambda is never impure by spelling.
+
+**`just vm-pgo` trains with `DREAM_JIT_SYNC=1`.** A run ends in `os.exit!`
+whatever the background compile thread is doing, and its counters are then
+not flow-consistent, which `-fprofile-use` rejects for `jit.cpp`.
+
+**What 3 s would take.** The critical path is now load 0.75, expand 0.22,
+resolve 1.0, lower 2.4, then the share child 1.3 (beside the checker's 0.53),
+then emit 0.2. Lowering is **~240 reductions per node it emits, uniformly** --
+no body is an outlier, so there is no quadratic left to find there -- and the
+arena it emits is four times the one that survives sharing, 70,000 of its
+142,000 nodes being leaves of which 2,600 are distinct. Halving each of
+resolve, lower and share is a rewrite of their hot paths, not a finding. Two
+routes that would each take a second off and are designed but not built:
+sharing each function as soon as lowering finishes it (the share child fed by
+message, with the functions whose bodies hold a `comp` placeholder shared last,
+which changes the image's order but not its meaning), and interning leaves at
+emission, which is blocked on `set_node_flag` mutating a node in place -- 1,275
+leaves carry a flag, and a shared one would hand it to every user. Measure
+against a VM built from the commit before, in a worktree; this machine moves by
+10% between minutes.
+
 ### A JIT that can allocate -- the plan
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the
