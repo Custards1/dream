@@ -69,6 +69,11 @@ dream::Value dream_rt_type_error(dream::Process* p, const char* message);
 /// the loop back-edge can decrement it without a call.
 int64_t* dream_rt_reduction_slot(dream::Process* p);
 
+/// The frame a yielding loop resumes in: `frame`'s closure and size, the first
+/// `n` slots from `vals`, the rest empty. See `Emitter::emit_yield`.
+dream::Value dream_rt_yield_frame(dream::Process* p, dream::Value frame, uint32_t n,
+                                  const dream::Value* vals);
+
 /// Slots of the frame, for writing loop-carried values back when yielding.
 dream::Value* dream_rt_frame_slots(dream::Value frame);
 
@@ -101,5 +106,78 @@ int dream_rt_native(dream::Process* p, uint32_t module_index, uint32_t member_in
                     dream::Value* out);
 int dream_rt_builtin(dream::Process* p, uint32_t builtin_id, uint32_t argc, dream::Value a0,
                      dream::Value a1, dream::Value a2, dream::Value a3, dream::Value* out);
+
+// ---------------------------------------------------------------------------
+// Lists, arrays and maps
+//
+// What a compiled body needs to read and build the data a program is made of.
+// The fast paths -- the head of a cell, an in-range array element, the empty
+// test -- are written inline by the emitter; these are everything else, and
+// each is the interpreter's own code for the same opcode, so the tiers agree on
+// every message and every edge.
+// ---------------------------------------------------------------------------
+
+/// `c.[k]` with both in hand. Answers 1 with the element, *unforced*, in
+/// `*out` (the emitter forces it, which is where the machine's `enter` forces
+/// it); 2 when nothing is there and `has_default` says the node has an `else`;
+/// and 0 with the error in `*out` otherwise. A list is walked, forcing its
+/// spine as the machine's walk would.
+int dream_rt_get(dream::Process* p, dream::Value c, dream::Value k, int32_t has_default,
+                 dream::Value* out);
+
+/// `c.[k => v]` with the container and the key in hand. `v` is stored as it
+/// stands. 1 with the new container, or 0 with the error.
+int dream_rt_set(dream::Process* p, dream::Value c, dream::Value k, dream::Value v,
+                 dream::Value* out);
+
+/// `thunk_for`'s read of `c.[k]`: the element, unforced, when it is already in
+/// hand -- an array in range, or within the part of a list already built -- and
+/// zero where `thunk_for` would have suspended the read. Forces nothing.
+dream::Value dream_rt_peek(dream::Value c, dream::Value k);
+
+/// A list cell, an array, a list literal. None of them can raise.
+dream::Value dream_rt_cons(dream::Process* p, dream::Value head, dream::Value tail);
+dream::Value dream_rt_make_list(dream::Process* p, uint32_t n, const dream::Value* items);
+dream::Value dream_rt_make_array(dream::Process* p, uint32_t n, const dream::Value* items);
+
+/// The string, or the boxed float, for an image constant: the per-process
+/// shared copy the interpreter hands out, so a literal keeps one identity.
+dream::Value dream_rt_literal_str(dream::Process* p, uint32_t index);
+
+/// The value of image global `index` -- a module, a function, or a 0-arity
+/// pure value -- as the interpreter's `global_value` answers it, unforced.
+dream::Value dream_rt_global(dream::Process* p, uint32_t index);
+
+// ---------------------------------------------------------------------------
+// Suspending an expression
+//
+// Compiled code has no heap frame of its own -- its slots are registers -- so
+// an expression it must *not* evaluate cannot simply be wrapped in a thunk
+// against one. These make a frame on demand: a copy of what the slots hold
+// right now, which is exactly the frame the interpreter would have been
+// running this iteration in. A thunk against it means what a thunk against
+// that frame would have meant. See "Lazy positions" in jit.cpp.
+// ---------------------------------------------------------------------------
+
+/// A frame of `nslots` slots under `closure`, filled from `vals`. A slot whose
+/// entry in `binds` is not `NO_NODE` is one a `let` bound, whose value compiled
+/// code wrote out where it was read; the frame gets what the interpreter would
+/// have put there, a thunk of the binding's expression against this frame.
+dream::Value dream_rt_snapshot(dream::Process* p, dream::Value closure, uint32_t nslots,
+                               const dream::Value* vals, const uint32_t* binds);
+
+/// The interpreter's own frame for this call adopted as the snapshot: the
+/// slots `binds` names get the thunks `dream_rt_snapshot` would have made.
+void dream_rt_adopt(dream::Process* p, dream::Value frame, uint32_t nslots,
+                    const dream::Value* vals, const uint32_t* binds);
+
+/// `node` suspended against `frame`.
+dream::Value dream_rt_thunk(dream::Process* p, uint32_t node, dream::Value frame);
+
+/// Apply a closure -- or any value that can be applied -- to `argc` arguments
+/// as they stand, and force the answer to weak head normal form. 1 with the
+/// answer, 0 with the error. A nested machine loop, pinned like a force.
+int dream_rt_apply(dream::Process* p, dream::Value callee, uint32_t argc,
+                   const dream::Value* args, dream::Value* out);
 
 }  // extern "C"

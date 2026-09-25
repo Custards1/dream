@@ -15,6 +15,8 @@ namespace dream {
 std::atomic<uint64_t> g_thunk_counts[64];
 const bool g_probe_thunk = std::getenv("DREAM_PROBE_THUNK") != nullptr;
 
+bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out);
+
 namespace {
 
 inline const Image& img_of(Process& p) { return *p.code; }
@@ -392,10 +394,13 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
                 return;
             }
             jit->note_ran(func_index);
-            // Yielded: the compiled loop spent its budget and wrote its
-            // loop-carried state back to the frame. Fall through to the
-            // interpreter, which resumes the body and lets the scheduler
-            // preempt at the next safepoint.
+            // Yielded: the compiled loop spent its budget and handed back a
+            // frame holding its loop-carried state -- a new one, because the
+            // frame it was entered with may already be what suspensions it
+            // made read their slots from. Resume the body in it, and let the
+            // scheduler preempt at the next safepoint.
+            eval_node(p, f.body, r);
+            return;
         }
     }
     eval_node(p, f.body, frame);
@@ -2578,12 +2583,27 @@ void run_process(Process& p, int64_t budget) {
 }
 
 bool force_whnf(Process& p, Value v, Value* out) {
-    ForceNest nest(p);
     v = resolve(v);
     if (is_whnf(v)) {
         *out = v;
         return true;
     }
+    return nested_whnf(p, v, nullptr, 0, out);
+}
+
+bool apply_whnf(Process& p, Value callee, const Value* args, uint32_t argc, Value* out) {
+    return nested_whnf(p, callee, args, argc, out);
+}
+
+Value literal_string_value(Process& p, uint32_t index) { return literal_string(p, index); }
+
+/// The nested machine loop behind `force_whnf` and `apply_whnf`: force `v`,
+/// or -- when `args` is given -- apply `v` to them, which is the same loop
+/// primed the way `prime_apply` primes a fresh process. The arguments go on the
+/// value stack under an `ApplyTo`, where `do_apply` looks for them and where
+/// the collector can see them.
+bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out) {
+    ForceNest nest(p);
     // Run a nested machine loop down to the current continuation depth.
     //
     // Whether it may collect is decided here and nowhere else. The caller
@@ -2615,6 +2635,10 @@ bool force_whnf(Process& p, Value v, Value* out) {
     Pin saved_frame(p, p.frame);
     Pin saved_result(p, p.result);
 
+    if (args) {
+        for (uint32_t i = 0; i < argc; ++i) p.stack.push_back(args[i]);
+        push_cont(p, ContKind::ApplyTo, argc, 0, 0, UNIT);
+    }
     enter(p, v);
     bool ok = true;
     bool blocked = false;
