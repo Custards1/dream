@@ -48,25 +48,33 @@ mapping Diagnostic {
     source = 0
 }
 
+let error : :any -> :string -> :map;
 let error span message = Diagnostic.make :error span message () 0;
+let warning : :any -> :string -> :map;
 let warning span message = Diagnostic.make :warning span message () 0;
 
 // Record defaults preserve reads of partial diagnostics.
 
+let severity : :map -> :atom;
 let severity d = Diagnostic.severity d;
 let span d = Diagnostic.span d;
+let message : :map -> :string;
 let message d = Diagnostic.message d;
 let note d = Diagnostic.note d;
+let source_of : :map -> :integer;
 let source_of d = Diagnostic.source d;
 
 let with_note n d = Diagnostic.set_note d n;
 
 /// Which file the span points into. Set as the diagnostic leaves the pass that
 /// made it, so that a pass working on one file at a time need not thread it.
+let in_source : :integer -> :map -> :map;
 let in_source i d = Diagnostic.set_source d i;
 
+let is_error : :map -> :bool;
 let is_error d = severity d == :error;
 
+let error_count : [:map] -> :integer;
 let error_count ds = list.count (fn d -> is_error d) ds;
 
 // --- rendering --------------------------------------------------------------
@@ -76,6 +84,7 @@ let error_count ds = list.count (fn d -> is_error d) ds;
 /// A continuation byte does not advance the column, so a column counts
 /// characters rather than bytes -- which is what a person reading the message
 /// is counting, and what an editor will put the cursor on.
+let line_col : :string -> :integer -> [:integer, :integer];
 let line_col text offset = {
     let rec walk i line col =
         if i >= offset || i >= str.byte_length text { [line, col] }
@@ -92,6 +101,7 @@ let line_col text offset = {
 /// position in one place. A column past the end of its line clamps to the end
 /// of that line rather than running into the next one -- a cursor resting past
 /// the last character is a real position, not an error.
+let offset_of : :string -> :integer -> :integer -> :integer;
 let offset_of text line col = {
     let n = str.byte_length text;
     let rec to_line i at =
@@ -111,15 +121,18 @@ let offset_of text line col = {
 };
 
 /// `path:line:col`, the prefix every message carries.
+let position : :string -> :string -> :integer -> :string;
 let position path text offset = {
     let [line, col] = line_col text offset;
     path + ":" + to_string line + ":" + to_string col
 };
 
+let label : :atom -> :string;
 let label s = match s { :warning => "warning", _ => "error" };
 
 /// One diagnostic as the lines it prints as. A note is indented under its
 /// message so that the two read as one thing rather than two.
+let render : [:any] -> :map -> [:string];
 let render sources d = {
     let src = if source_of d < list.length sources { list.nth (source_of d) sources }
               else { source "<unknown>" "" };
@@ -132,6 +145,7 @@ let render sources d = {
 };
 
 /// Every diagnostic, as one block of text.
+let render_all : [:any] -> [:map] -> :string;
 let render_all sources ds =
     str.join_str "\n" (list.concat (list.map (fn d -> render sources d) ds));
 

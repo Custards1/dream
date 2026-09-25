@@ -304,7 +304,7 @@ let shape_type k ev kind fields = {
     }) fields;
     let types = list.map (fn p -> list.nth 1 p) parts;
     let shortest = list.fold (fn n ip -> if list.nth 2 (list.nth 1 ip) { n } else { list.nth 0 ip + 1 })
-                             0 (indexed parts);
+                             0 (list.enumerate parts);
     let lengths = list.range shortest (list.length parts + 1);
     match kind {
         "map" => [:record, list.map (fn p -> if list.nth 2 p { [list.nth 0 p, list.nth 1 p, :optional] }
@@ -346,12 +346,7 @@ let named_type k gi args = match (Checker.named k).[gi else ()] {
 /// An evaluation scope with a declaration's parameters standing for these.
 let bound ev params args = {
     let [mi, subst, ltypes] = ev;
-    [mi, list.fold (fn m pa -> m.[list.nth 0 pa => list.nth 1 pa]) subst (pairs params args), ltypes]
-};
-
-let rec pairs xs ys = match [xs, ys] {
-    [[x, ..xt], [y, ..yt]] => list_cons [x, y] (pairs xt yt),
-    _ => [],
+    [mi, list.fold (fn m pa -> m.[list.nth 0 pa => list.nth 1 pa]) subst (list.zip params args), ltypes]
 };
 
 /// The global a type name denotes in module `mi`, or `()`.
@@ -634,7 +629,7 @@ let rec solve k p a subst = {
         },
         [:tuple, ps] => match a2 {
             [:tuple, ts] if list.length ps == list.length ts =>
-                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (pairs ps ts),
+                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip ps ts),
             _ => subst,
         },
         [:array_of, pe] => match a2 {
@@ -650,7 +645,7 @@ let rec solve k p a subst = {
         },
         [:named, _, g, pargs] => match a {
             [:named, _, g2, aargs] if g == g2 && list.length pargs == list.length aargs =>
-                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (pairs pargs aargs),
+                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip pargs aargs),
             _ => subst,
         },
         _ => subst,
@@ -1075,7 +1070,7 @@ let typed_apply k h f ft args sp ds1 = {
             let s = if i < given { solve k (list.nth i params) t (list.nth 1 acc) } else { list.nth 1 acc };
             [list_cons t (list.nth 0 acc), s, d]
         }
-    }) [[], %{}, ds2] (indexed args);
+    }) [[], %{}, ds2] (list.enumerate args);
     let known = list.reverse plain;
     let [subst2, ds4] = list.fold (fn acc ia -> {
         let [i, a] = ia;
@@ -1104,7 +1099,7 @@ let typed_apply k h f ft args sp ds1 = {
                              ("argument " + to_string (i + 1) + " of " + who) d]
             }
         }
-    }) [subst, ds3] (indexed args);
+    }) [subst, ds3] (list.enumerate args);
     [solved subst2 rest true, ds4]
 };
 
@@ -1135,8 +1130,6 @@ let infer_lambda_at k h a p ds = match a {
     _ => infer k h a ds,
 };
 
-let indexed xs = pairs (list.range 0 (list.length xs)) xs;
-
 let plural n word = to_string n + " " + word + (if n == 1 { "" } else { "s" });
 
 // --- functions -------------------------------------------------------------------------------
@@ -1156,7 +1149,7 @@ let lambda k h ps body expected sp ds = {
     let types = list.map (fn i -> if i < list.length params { list.nth i params } else { :any })
                          (list.range 0 n);
     let [h2, ds2] = list.fold (fn acc pt -> bind_param k (list.head acc) (list.nth 0 pt) (list.nth 1 pt) (list.nth 1 acc))
-                              [h, ds1] (pairs ps types);
+                              [h, ds1] (list.zip ps types);
     let answers = list.length params == n && stuck == ();
     let [body_t, ds3] =
         if answers && rest != :any && not (has_flex rest) {
@@ -1298,7 +1291,7 @@ let could_match k items rest ts = {
     sized && list.all (fn pt -> match list.nth 0 pt {
         [:literal, e, _] => literal_fits (literal_type e) (list.nth 1 pt),
         _ => true,
-    }) (pairs items ts)
+    }) (list.zip items ts)
 };
 
 let literal_fits l t = match [l, t] {
@@ -1333,7 +1326,7 @@ let bind_items k h items rest found kind = {
         [:rep, e] => if kind == :list { [:list_of, e] } else { [:array_of, e] },
         _ => :any,
     }) found);
-    let h1 = list.fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (indexed items);
+    let h1 = list.fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (list.enumerate items);
     match rest {
         [n2, _] => with_local n2 (if list.is_empty found { :any } else { rest_t }) h1,
         _ => h1,
@@ -1440,7 +1433,7 @@ let rec arm_misses p v = match p {
         [:tuple, ts] => {
             let n = list.length items;
             let sized = if rest == () { n == list.length ts } else { n <= list.length ts };
-            not sized || list.any (fn pt -> element_misses (list.nth 0 pt) (list.nth 1 pt)) (pairs items ts)
+            not sized || list.any (fn pt -> element_misses (list.nth 0 pt) (list.nth 1 pt)) (list.zip items ts)
         },
         _ => true,
     },
@@ -1669,12 +1662,12 @@ let rec refinement k d t n =
             },
             [:tuple, ts] => match d {
                 [:list_d, xs] if list.length xs == list.length ts =>
-                    f_all (list.map (fn p -> refinement k (list.nth 0 p) (list.nth 1 p) (n - 1)) (pairs xs ts)),
+                    f_all (list.map (fn p -> refinement k (list.nth 0 p) (list.nth 1 p) (n - 1)) (list.zip xs ts)),
                 _ => static_fit k d t,
             },
             [:array_t, ts] => match d {
                 [:array_d, xs] if list.length xs == list.length ts =>
-                    f_all (list.map (fn p -> refinement k (list.nth 0 p) (list.nth 1 p) (n - 1)) (pairs xs ts)),
+                    f_all (list.map (fn p -> refinement k (list.nth 0 p) (list.nth 1 p) (n - 1)) (list.zip xs ts)),
                 _ => static_fit k d t,
             },
             [:map_of, kt, vt] => match d {
@@ -1709,7 +1702,7 @@ let rec refine_desc k d mi desc gi path n =
                 ["named", [_, inner]] => refine_desc k d mi inner gi (path + [2]) (n - 1),
                 ["union", [[:list, ts, _]]] =>
                     f_any (list.map (fn it -> refine_desc k d mi (list.nth 1 it) gi (path + [1, list.nth 0 it]) (n - 1))
-                                    (indexed ts)),
+                                    (list.enumerate ts)),
                 ["list_of", [e]] => match d {
                     [:list_d, xs] => f_all (list.map (fn x -> refine_desc k x mi e gi (path + [1]) (n - 1)) xs),
                     _ => false,
@@ -1744,7 +1737,7 @@ let rec refine_desc k d mi desc gi path n =
                 },
                 ["shape", [[:atom, kind, _], [:list, fields, _]]] =>
                     f_all (list_cons (whole) (list.map (fn it -> shape_field k d kind mi gi path n it)
-                                                          (indexed fields))),
+                                                          (list.enumerate fields))),
                 _ => whole,
             },
             _ => whole,
@@ -1755,7 +1748,7 @@ let positions k xs ts mi gi path n =
     f_all (list.map (fn it -> {
         let i = list.nth 0 it;
         refine_desc k (list.nth i xs) mi (list.nth 1 it) gi (path + [i]) (n - 1)
-    }) (indexed ts));
+    }) (list.enumerate ts));
 
 /// One field of a record's description, `[key, description, defaults]` at
 /// position `i` of the shape. A field the value does not have is the static

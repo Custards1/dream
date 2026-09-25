@@ -254,7 +254,7 @@ let type_test call atom invert flags s = {
     let callee = node_at (ir.node_a call) s;
     let code = (s.[:type_ids else %{}]).[ir.node_a atom else ()];
     if ir.node_op call == :apply && ir.node_c call == 1
-       && ir.node_op callee == :builtin && ir.node_a callee == builtins.id "type_of"
+       && ir.node_op callee == :builtin && ir.node_a callee == type_of_id
        && ir.node_op atom == :const_atom && code != () {
         ir.with_flags flags (ir.node :type_is (kid_at (ir.node_b call) s) code invert)
     } else { () }
@@ -292,16 +292,28 @@ let primitive_ops = %{
     49 => [:compare, 2],
 };
 
+/// The three list builtins that become opcodes of their own, keyed by the
+/// runtime ID of the builtin they replace. Looked up per `apply` the pass
+/// rebuilds, so the IDs are settled here once rather than asked of
+/// `builtins.id` three times a node.
+let list_ops = %{
+    builtins.id "list_cons" => [:cons, 2],
+    builtins.id "list_tail" => [:list_tail, 1],
+    builtins.id "list_is_empty" => [:list_is_empty, 1],
+};
+
+let type_of_id = builtins.id "type_of";
+
 let specialize n s = match ir.node_op n {
     :apply => {
         let callee = node_at (ir.node_a n) s;
         let id = ir.node_a callee;
         let count = ir.node_c n;
         let primitive = primitive_ops.[id else ()];
-        let op = if id == builtins.id "list_cons" && count == 2 { :cons }
-                 else if id == builtins.id "list_tail" && count == 1 { :list_tail }
-                 else if id == builtins.id "list_is_empty" && count == 1 { :list_is_empty }
-                 else { () };
+        let op = match list_ops.[id else ()] {
+            [op, arity] if arity == count => op,
+            _ => (),
+        };
         if ir.node_op callee == :builtin && op != () {
             ir.with_flags (ir.node_flags n) (ir.node op (kid_at (ir.node_b n) s)
                 (if count == 2 { kid_at (ir.node_b n + 1) s } else { ir.no_node }) ir.no_node)

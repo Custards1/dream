@@ -51,6 +51,10 @@ let is_native p = list.contains p native_modules;
 
 // --- a loaded module ---------------------------------------------------------
 
+/// What `load!` answers: every module and file the program reaches, keyed by
+/// index, and what the loader had to say about them.
+type Loader = :map;
+
 /// `source` is an index into the loader's file list, so a diagnostic raised
 /// about this module can quote the line it came from.
 mapping Module {
@@ -112,6 +116,7 @@ let host_modules l = l.[:host_modules else []];
 /// that is wanted, which is what nearly every caller wanted.
 let modules l      = list.map (fn i -> module_at l i) (list.range 0 (module_count l));
 let module_map l   = l.[:modules else %{}];
+let module_count : Loader -> :integer;
 let module_count l = l.[:module_count else 0];
 let by_name l      = l.[:by_name else (%{})];
 let by_path l      = l.[:by_path else (%{})];
@@ -120,8 +125,10 @@ let by_path l      = l.[:by_path else (%{})];
 /// whole program's files once, at the end of a compile that has something to
 /// say. Every other reader knows the index it wants -- a diagnostic carries
 /// one -- and asks `file_at`.
+let files : Loader -> [:any];
 let files l        = list.map (fn i -> file_at l i) (list.range 0 (file_count l));
 let file_map l     = l.[:files else %{}];
+let file_count : Loader -> :integer;
 let file_count l   = l.[:file_count else 0];
 let file_at l i    = (file_map l).[i else ()];
 
@@ -147,8 +154,10 @@ let expanding l = l.[:expanding else %{}];
 let expand_sites l source = (expanding l).[source else []];
 let note_expanding source sites l =
     if list.is_empty sites { l } else { put :expanding ((expanding l).[source => sites]) l };
+let natives : Loader -> [:string];
 let natives l      = l.[:natives else []];
 let namespaces l   = l.[:namespaces else []];
+let diags : Loader -> [:map];
 let diags l        = l.[:diags else []];
 let visited l      = l.[:visited else (%{})];
 let in_progress l  = l.[:in_progress else []];
@@ -194,6 +203,7 @@ let expansions l   = l.[:expansions else []];
 /// compiler reads it, the way nothing reads `records` -- it is here because
 /// the pass that spends the time is the only one that can say where.
 let metering l     = l.[:metering else false];
+let with_metering : Loader -> Loader;
 let with_metering l = put :metering true l;
 let macro_meter l  = l.[:macro_meter else ()];
 
@@ -859,6 +869,7 @@ let default_search_paths! file extra =
     ];
 
 /// The usual way in: discover packages around `file`, then load it.
+let load! : :string -> [:string] -> :any -> :bool -> Loader;
 let load! file roots cfg test_mode =
     load_root! (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])
                file test_mode;
@@ -867,6 +878,7 @@ let load! file roots cfg test_mode =
 /// the files it names. This is what a language server loads through: the
 /// program it must answer questions about is the one in the editor's buffers,
 /// which may differ from the one on disk in every file at once.
+let load_overlaid! : :string -> [:string] -> :any -> :bool -> %{ :string => :string } -> Loader;
 let load_overlaid! file roots cfg test_mode ov =
     load_overlaid_cached! file roots cfg test_mode ov (%{});
 

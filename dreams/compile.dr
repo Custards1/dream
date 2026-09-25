@@ -1,0 +1,211 @@
+// The compiler as a library: a loaded program in, a build out.
+//
+// Every consumer of `dreams` -- the command line, the REPL's session, and
+// anything that imports the compiler the way `lucid` does -- wants the same
+// pipeline: resolve, lower and link, hold the program to its signatures, run
+// its compile-time contracts, share the arena, write the bytes. That pipeline
+// used to be written out by hand in each of them, in five slightly different
+// orders, and the differences were not decisions: `--time` checked types
+// without contracts, the session never looked at a signature, and the JIT's
+// parameter masks were worked out in the middle of the function that opened
+// the output file. This is the one place the order is written, so a new stage
+// is added once and every caller gets it.
+//
+// What comes back is a `Build`, and the shape is the point. Three stages run
+// a VM -- a `comp` in lowering, a contract in the checker's answer, a macro in
+// the loader before any of this -- and are impure, so they are forced here, in
+// order, where the block says. Everything after them is pure and lazy: an
+// image nobody asks for is never optimized, and bytes nobody writes are never
+// laid out. So `build!` costs what a `--check` costs plus lowering, and a
+// caller that only wants the diagnostics pays for nothing else.
+//
+// Nothing here opens a file. Writing an image -- where to, with what `#!`
+// line, and the payload streamed after it -- is the command line's business,
+// and the REPL writes somewhere else entirely.
+
+import std.list;
+
+import dreams.diag;
+import dreams.emit;
+import dreams.ir;
+import dreams.lower;
+import dreams.modules;
+import dreams.opt as optimizer;
+import dreams.scope;
+import dreams.typecheck;
+import dreams.contract;
+
+// --- what to compile it as ------------------------------------------------------
+
+/// The choices a build makes that are not the program's.
+///
+/// `types` holds the program to its signatures and runs its compile-time
+/// contracts; off, a signature compiles to nothing and costs nothing but its
+/// parse, which is what `--no-types` is for. `optimize` shares the arena
+/// (`dreams/opt.dr`); off, the image is the arena exactly as `lower` built it,
+/// which is what to reach for when an image misbehaves. `payloads` are the
+/// *sizes* of what `--payload` appends, because they are part of the section
+/// table and so of what the image is -- the bytes themselves never come near
+/// a Dream string.
+mapping Options {
+    types = true
+    optimize = true
+    payloads = []
+}
+
+/// The defaults: checked, shared, no payload.
+let options = Options.new ();
+
+/// The REPL's: a scratch image that runs once, compiled as `lower` left it and
+/// held to nothing a session has not always been held to.
+let scratch = Options.make false false [];
+
+// --- a build --------------------------------------------------------------------
+
+/// A diagnostic, as `dreams/diag.dr` makes one.
+type Diagnostics = [:map];
+
+/// One program, compiled as far as it goes.
+///
+/// `diags` is everything the build had to say: the loader's, the resolver's,
+/// lowering's, the checker's and the contracts', in that order and each only
+/// if the one before it found no error -- a name that means nothing has no
+/// type to check, and a contract on an argument the checker already rejected
+/// would be a second report of the same mistake.
+mapping Build {
+    loader
+    resolution
+    lowered
+    facts
+    diags
+    options
+}
+
+/// Resolve, lower and link the program, and check it.
+///
+/// Impure because lowering settles `comp` expressions and checking runs the
+/// contracts, both on a VM. Everything the record holds past that is lazy: see
+/// the head of this file.
+let build! : modules.Loader -> Options -> Build;
+let build! l o = {
+    let r = scope.resolve! l;
+    let low = lower.link! l r;
+    let front = list.append (modules.diags l) (lower.all_diags r low);
+    // One checker for the diagnostics, the contracts and both of the JIT's
+    // parameter masks. Lazy, so a build without types never makes it.
+    let facts = typecheck.analyze l r (lower.comp_values low);
+    let checked = type_diags! (Options.types o) facts low front;
+    Build.make l r low facts (list.append front checked) o
+};
+
+/// What a program's signatures and contracts say is wrong with it, given what
+/// the earlier stages said. Nothing, when they already found an error or the
+/// types are off.
+let type_diags! : :bool -> typecheck.Analysis -> lower.Lowering -> Diagnostics -> Diagnostics;
+let type_diags! types facts low ds =
+    if not types || diag.error_count ds > 0 { [] }
+    else {
+        let found = typecheck.Analysis.diags facts;
+        if diag.error_count found > 0 { found }
+        else { list.append found (contract.settle! low (typecheck.Analysis.contracts facts)) }
+    };
+
+/// Resolve and check the program without lowering it: what `--check` asks, and
+/// what an editor asks on every keystroke. Lowering is where `comp`s run, so a
+/// check never runs one -- which is why its type pass cannot see what a `comp`
+/// came to, and why a contract on one is a build's to report, not a check's.
+let check! : modules.Loader -> Options -> Diagnostics;
+let check! l o = checked l (scope.resolve! l) o;
+
+/// The same, for a program already resolved. Separate because a language
+/// server keeps the resolution -- it is what hover and go-to-definition read --
+/// and must not resolve the program twice to be told what is wrong with it.
+let checked : modules.Loader -> scope.Resolution -> Options -> Diagnostics;
+let checked l r o = {
+    let ds = list.append (modules.diags l) (scope.r_diags r);
+    list.append ds (if not (Options.types o) || diag.error_count ds > 0 { [] }
+                    else { typecheck.check_program l r })
+};
+
+// --- reading one ---------------------------------------------------------------
+
+let loader : Build -> modules.Loader;
+let loader b = Build.loader b;
+
+let resolution : Build -> scope.Resolution;
+let resolution b = Build.resolution b;
+
+let lowered : Build -> lower.Lowering;
+let lowered b = Build.lowered b;
+
+let diags : Build -> Diagnostics;
+let diags b = Build.diags b;
+
+/// Did it compile? Warnings do not stop a build; errors do.
+let ok : Build -> :bool;
+let ok b = diag.error_count (diags b) == 0;
+
+/// Every file the program was read from, as `diag.render_all` wants them.
+let files : Build -> [:any];
+let files b = modules.files (loader b);
+
+/// The diagnostics, rendered against the source they point into.
+let rendered : Build -> :string;
+let rendered b = diag.render_all (files b) (diags b);
+
+// --- the image ------------------------------------------------------------------
+
+/// Which parameters of each function a signature declares, as
+/// `[function, mask]` sorted by function: the shape the `TYPE` and `ITYP`
+/// sections are written in, and what the JIT looks a function up by. A global
+/// names its function through its record, and a global that is not a function
+/// -- an alias of a module -- has no parameters to describe.
+let param_masks : ir.Image -> %{ :integer => :integer } -> [[:integer, :integer]];
+let param_masks img by_global = {
+    let globals = img.[:globals else []];
+    let found = list.fold (fn acc [gi, mask] -> {
+        let g = globals.[gi else ()];
+        if g == () || g.[:kind else ir.global_module] != ir.global_function { acc }
+        else { list_cons [g.[:target else 0], mask] acc }
+    }) [] (map_pairs by_global);
+    list.sort_on (fn e -> list.head e) found
+};
+
+/// The image as a map, ready for `emit.to_binary`: the arena, shared if the
+/// options say so, with the payload sizes and the JIT's parameter hints. The
+/// optimizer runs here rather than inside `lower` because what it rewrites is
+/// the *finished* arena -- a node's flags are final only once every body has
+/// been lowered and every `comp` settled, and two nodes that differ only in a
+/// flag are two nodes.
+let image : Build -> ir.Image;
+let image b = {
+    let o = Build.options b;
+    let arena = lower.image (lowered b);
+    let built = if Options.optimize o { optimizer.optimize arena } else { arena };
+    let hints f = if Options.types o { param_masks built (f (Build.facts b)) } else { [] };
+    built.[:payloads => Options.payloads o]
+         .[:float_params => hints typecheck.Analysis.float_params]
+         .[:integer_params => hints typecheck.Analysis.integer_params]
+};
+
+/// The image as the bytes a `.dream` file holds, payload excepted.
+let bytes : Build -> :string;
+let bytes b = emit.to_binary (image b);
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "the defaults check and share"
+            $( test.eq! [true, true, []]
+                        [Options.types options, Options.optimize options, Options.payloads options] ),
+        test.case "a scratch build does neither"
+            $( test.eq! [false, false] [Options.types scratch, Options.optimize scratch] ),
+        test.case "a mask is found through the global's function, sorted"
+            $( test.eq! [[3, 1], [7, 2]]
+                        (param_masks %{ :globals => [%{ :kind => ir.global_function, :target => 7 },
+                                                     %{ :kind => ir.global_module },
+                                                     %{ :kind => ir.global_function, :target => 3 }] }
+                                     %{ 0 => 2, 1 => 4, 2 => 1 }) ),
+    ];
+}

@@ -96,10 +96,7 @@ let set_e container key value span = [:set, container, key, value, span];
 let kind e = e.[0];
 
 /// Every node keeps its span last, however many fields it has.
-let rec span e = {
-    let rec last xs = if list_is_empty (list_tail xs) { xs.[0] } else { last (list_tail xs) };
-    last e
-};
+let span e = list.last e;
 
 // --- operators --------------------------------------------------------------
 //

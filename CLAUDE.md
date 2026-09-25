@@ -39,6 +39,13 @@ The guarantee is byte equality: compiling this source with the seed produces an
 identical image, and so does the stage after that. When you change the compiler,
 run `just bootstrap` and copy `build/dreams.dream` over the seed.
 
+The pipeline a build runs -- resolve, lower and link, types, contracts, share,
+emit -- is written once, in [dreams/compile.dr](dreams/compile.dr):
+`compile.build!` answers a `Build` whose image and bytes are lazy, and
+`compile.check!`/`checked` are what `--check` and `lucid` ask. The command
+line, the REPL's session and the language server all call it rather than
+spelling the stages out, so a new stage is added in one place.
+
 `mind` finds its compiler through `--compiler`, then `[build] compiler`, then
 `$DREAMS`, then `dreams.dream` from the installation
 ([mind/tool/build.dr](mind/tool/build.dr#L139)). A name ending in `.dream`
@@ -289,6 +296,12 @@ What has already been learnt from them, so it is not learnt twice:
   computing one of those is cheaper than evaluating it. What the change did
   *not* do is make the self-compile finish sooner, and why not is the next
   section, which is the more useful half of this entry.
+- **A list searched more often than it is built wants to be a map -- a fifth
+  time.** `builtins.id` and `builtins.is_builtin` were linear scans of the
+  builtin table, and `opt.specialize` asked `id` three times for every `apply`
+  it rebuilt. `--profile` charged it to `index_of_from`, **7.2% of a
+  self-compile**; the table is indexed once at module level now (`ids`) and a
+  self-compile went 186.8M -> 172.8M reductions with a byte-identical image.
 - **A linear walk the machine can do is worth ten of the same walk in Dream.**
   This is the largest single lesson so far: `list.append` and `list.nth`,
   written as the obvious recursions, were between them *a third of a

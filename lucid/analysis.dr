@@ -22,6 +22,7 @@ import std.str;
 
 import dreams.ast;
 import dreams.builtins;
+import dreams.compile;
 import dreams.config;
 import dreams.diag;
 import dreams.expand as expansion;
@@ -177,11 +178,7 @@ let diagnostic_path a d = {
 /// Everything the front end had to say, in one list: the loader, the
 /// resolver, and -- for a program that resolved -- what its signatures say is
 /// wrong with it, which is the same pass and the same messages `dreams` gives.
-let all_diagnostics a = {
-    let ds = list.append (modules.diags (loader a)) (scope.r_diags (resolved a));
-    if diag.error_count ds > 0 { ds }
-    else { list.append ds (typecheck.check_program (loader a) (resolved a)) }
-};
+let all_diagnostics a = compile.checked (loader a) (resolved a) compile.options;
 
 /// Diagnostics grouped by the file they belong to: `[[path, [diagnostic, ..]], ..]`.
 ///

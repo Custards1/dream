@@ -37,6 +37,10 @@ import dreams.scope;
 // The arena being built, the resolutions being read, and which file the code
 // came from, so a diagnostic raised this late still points at a line.
 
+/// The lowering state: the arena being built, and -- once `link!` has run --
+/// the finished image and what each `comp` came to.
+type Lowering = :map;
+
 let lowering r p source =
     %{ :r => r, :prog => p, :source => source, :ctx => 0, :diags => [],
        // Which node is each function's body. Filled in as the functions are
@@ -94,6 +98,7 @@ let add_comp node fi span l =
 /// `typecheck` reads it to give a `comp` the type of what it produced, and to
 /// run a refinement's predicate over it -- see "compile-time contracts" there.
 /// Nothing in the image depends on it.
+let comp_values : Lowering -> :map;
 let comp_values l = l.[:comp_values else (%{})];
 let comp_key source span = source * 4294967296 + ast.span_start span;
 
@@ -1592,6 +1597,7 @@ let lower_from r low bodies =
                                   (mark_tail (list.nth 1 got) (list.head got)))
     }) (set_res r low) bodies;
 
+let lower_program : scope.Resolution -> Lowering;
 let lower_program r = {
     let walked = lower_from r (lowering r ir.program 0) (scope.bodies r);
 
@@ -1705,6 +1711,7 @@ let settle_comps! l = {
 /// The whole thing, with the module table an image also needs. The loader is
 /// wanted here and nowhere else, which is why it is a separate way in rather
 /// than an argument threaded through every step.
+let link! : modules.Loader -> scope.Resolution -> Lowering;
 let link! ld r = {
     let low = settle_comps! (lower_program r);
     let ms = link_modules ld r low;
@@ -1791,11 +1798,13 @@ let settle_comp! bytes_of one l = {
     }
 };
 
+let image : Lowering -> ir.Image;
 let image l = l.[:image else (ir.finish ir.program)];
 
 let diags l = l_diags l;
 
 /// Everything the resolver and the lowerer between them had to say.
+let all_diags : scope.Resolution -> Lowering -> [:map];
 let all_diags r l = list.append (scope.r_diags r) (l_diags l);
 
 // --- reading it back ------------------------------------------------------------
@@ -1804,6 +1813,7 @@ let all_diags r l = list.append (scope.r_diags r) (l_diags l);
 /// This is what `--ir` prints. A tree written out one node per line is far
 /// easier to check than a nest of indices, which is also why the tests compare
 /// against it rather than against node records.
+let dump : Lowering -> :string;
 let dump l = {
     let img = image l;
     let fs = img.[:funcs else []];

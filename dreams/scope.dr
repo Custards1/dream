@@ -55,6 +55,10 @@ let ref_target r = list.nth 1 r;
 
 // --- a module's environment ---------------------------------------------------
 
+/// What `resolve!` answers: every name's meaning, every function and global
+/// the program declares, and what resolution had to say about them.
+type Resolution = :map;
+
 mapping Environment {
     name = ""
     source = 0
@@ -872,6 +876,7 @@ let r_module_recs r = r.[:module_recs else []];
 /// to call -- and calling it is what raises.
 let no_function = ();
 let frames r   = r.[:frames else []];
+let r_diags : Resolution -> [:map];
 let r_diags r  = r.[:diags else []];
 let refs r     = r.[:refs else (%{})];
 let binds r    = r.[:binds else (%{})];
@@ -2104,6 +2109,7 @@ let resolve_from! l declared r0 from s_pre = {
 /// every name turned out to mean, every function the program contains, and
 /// which function holds each module's globals. Lowering reads all of that
 /// rather than deriving it a second time.
+let resolve! : modules.Loader -> Resolution;
 let resolve! l = {
     let declared = declare! l;
     let r0 = ((((((((resolver (envs declared))).[:imports => (s_imports declared)])).[:module_recs => (s_module_recs declared)])).[:diags => (diags declared)])).[:fuse => true];

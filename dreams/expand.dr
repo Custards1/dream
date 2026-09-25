@@ -688,8 +688,7 @@ let rec rounds_all! base s session items depth = {
         // One job per module, its declarations' calls in the order they were
         // punched, so the answers come back in an order the walk below can
         // hand out again without keying anything.
-        let mods = list.fold (fn acc j ->
-            if list.contains (list.head j) acc { acc } else { acc + [list.head j] }) [] active;
+        let mods = list.unique (list.map (fn j -> list.head j) active);
         let jobs = list.map (fn mi -> [mi, list.concat (list.map (fn j -> list.nth 3 j)
             (list.filter (fn j -> list.head j == mi) active))]) mods;
         let result = evaluate_round! base s session jobs;

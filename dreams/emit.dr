@@ -50,6 +50,7 @@ let flag_debug = 1;
 // Little-endian throughout, because every machine this runs on is, and a loader
 // that has to swap bytes cannot map the file and use it where it lies.
 
+let byte_at : :integer -> :integer -> :integer;
 let byte_at v n = (v / n) % 256;
 
 /// Each of these answers a *string* of the bytes. `str_le` is what makes
@@ -61,8 +62,11 @@ let byte_at v n = (v / n) % 256;
 /// cons cell and a thunk per byte, a frame for each `byte_at`, and a nested
 /// force inside `str_of_bytes` to read them back, for 128 MB of garbage per
 /// self-compile. `str_le` is the same field with no list in the middle.
+let u8 : :integer -> :string;
 let u8 v = str_le v 1;
+let u16 : :integer -> :string;
 let u16 v = str_le v 2;
+let u32 : :integer -> :string;
 let u32 v = str_le v 4;
 
 /// A 64-bit signed integer. Two's complement, so a negative one is written as
@@ -73,6 +77,7 @@ let u32 v = str_le v 4;
 /// literal that large is read as a *float* -- which turns every byte computed
 /// from it into a float too, and an image is bytes or it is nothing. Nothing
 /// here may leave the range where integers are exact.
+let i64 : :integer -> :string;
 let i64 v =
     if v < 0 {
         // -v, split into its low and high 32-bit halves.
@@ -93,6 +98,7 @@ let i64 v =
 /// what it writes is a *length* -- a payload's, or a datum's position inside
 /// one -- and a length is never negative. Nothing a payload table holds comes
 /// near the range where a Dream integer stops being exact.
+let u64 : :integer -> :string;
 let u64 v = u32 (v % 4294967296) + u32 ((v / 4294967296) % 4294967296);
 
 /// A node index, or the all-ones word that means there is none.
@@ -128,6 +134,7 @@ let sec_len s = Section.len s;
 /// A four-character tag, read as a little-endian word the way the loader reads
 /// it. Written out as the characters so that a hex dump of an image says what
 /// each section is.
+let tag : :integer -> :integer -> :integer -> :integer -> :integer;
 let tag a b c d = a + b * 256 + c * 65536 + d * 16777216;
 
 let t_kint = tag 75 73 78 84;   // KINT
@@ -214,6 +221,7 @@ let align8 n = (n + 7) - ((n + 7) % 8);
 
 /// `n` zero bytes. Sections are eight-byte aligned so a loader can point a
 /// struct at one where it lies.
+let zeros : :integer -> :string;
 let zeros n = str.repeat n (str_of_bytes [0]);
 
 // --- large data ---------------------------------------------------------------------
@@ -301,6 +309,7 @@ let sections_of img = {
 /// written so far every time, which for a megabyte of image is a hundred
 /// megabytes of copying and was the difference between compiling this compiler
 /// and running out of memory trying.
+let emit : ir.Image -> :string;
 let emit img = {
     let secs = sections_of img;
     let table_end = header_size + list.length secs * section_entry_size;
@@ -349,6 +358,7 @@ let emit img = {
 /// The image as a string, which is what `io.write!` takes. It is one already:
 /// every piece was built as bytes rather than as characters, which is the
 /// difference between binary and UTF-8.
+let to_binary : ir.Image -> :string;
 let to_binary img = emit img;
 
 /// Where the header keeps `entry`. Fixed by the format -- see the header
@@ -368,6 +378,7 @@ let entry_offset = 24;
 ///
 /// This is the same lesson `expand` learnt about macros, which is that a
 /// compile-time evaluation should cost its *expression*, not its program.
+let with_entry : :string -> :integer -> :string;
 let with_entry bytes fi = str.concat_all [
     str.slice 0 entry_offset bytes,
     index fi,

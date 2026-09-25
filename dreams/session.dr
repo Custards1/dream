@@ -44,7 +44,9 @@
 import std.io;
 import std.list;
 import std.str;
+import std.streams;
 
+import dreams.compile;
 import dreams.diag;
 import dreams.emit;
 import dreams.expand as expansion;
@@ -56,16 +58,6 @@ import dreams.scope;
 
 // --- writing and naming ---------------------------------------------------------
 
-/// A short write is not an error, so writing means looping until it is all out.
-let rec write_all! handle text = {
-    let n = str.byte_length text;
-    if n == 0 { :done }
-    else {
-        let wrote = io.write! handle text;
-        if wrote >= n { :done } else { write_all! handle (str.slice wrote (n - wrote) text) }
-    }
-};
-
 /// `true` if the file was written. The REPL's scratch files live wherever the
 /// system puts temporary files, and a session that cannot write one has nowhere
 /// to compile to, which is worth saying rather than crashing on.
@@ -73,7 +65,7 @@ let write_file! path text =
     match try! { io.open! path :write } catch e { () } {
         () => false,
         h => {
-            write_all! h text
+            streams.write_all! h text
             io.close! h
             true
         },
@@ -350,14 +342,10 @@ let proceed! source image items engine base_text base = {
 /// not `let`s. Whatever mission there was, the whole of it is compiled the
 /// ordinary way, and the session re-boots on the next entry.
 let fresh_build! roots cfg source image text engine base = {
-    let l = expansion.expand! (modules.load! source roots cfg false);
-    let r = scope.resolve! l;
-    let low = lower.link! l r;
-    let ds = list.append (modules.diags l) (lower.all_diags r low);
-    if diag.error_count ds > 0 {
-        [[:error, as_session source (diag.render_all (modules.files l) ds)], engine, base]
-    }
-    else if write_file! image (emit.to_binary (lower.image low)) { [[:ok, image], (), 0] }
+    let b = compile.build! (expansion.expand! (modules.load! source roots cfg false))
+                           compile.scratch;
+    if not (compile.ok b) { [[:error, as_session source (compile.rendered b)], engine, base] }
+    else if write_file! image (compile.bytes b) { [[:ok, image], (), 0] }
     else { [[:error, "dreams: cannot write " + image], engine, base] }
 };
 
