@@ -97,6 +97,7 @@ import std.wire;
 /// A read answers what has arrived rather than what was asked for, so this is a
 /// loop; the pieces are collected and joined once, because building the answer
 /// with `+` would copy everything read so far at every step.
+priv let exactly! : :any -> :integer -> [:string] -> :string;
 priv let rec exactly! sock n acc =
     if n <= 0 { str_concat (list.reverse acc) }
     else {
@@ -111,30 +112,34 @@ priv let rec exactly! sock n acc =
 /// the same answer: a connection that closed cleanly between messages is how a
 /// conversation ends, and calling that a failure would make every ordinary
 /// goodbye look like one.
+priv let next! : :any -> :any;
 priv let next! sock = {
-    let header = exactly! sock wire.frame_header [];
-    if len header < wire.frame_header { () }
-    else {
-        let size = wire.frame_size header;
-        if size < 0 { () }
-        else {
+    // `frame_size` answers -1 for a header cut short, which is how a closed
+    // connection arrives here.
+    match wire.frame_size (exactly! sock wire.frame_header []) {
+        size if size < 0 => (),
+        size => {
             let body = exactly! sock size [];
             if len body < size { () } else { wire.decode body }
-        }
+        },
     }
 };
 
+priv let send! : :any -> :any -> :atom;
 priv let send! sock value = streams.write_all! sock (wire.frame value);
 
 // --- serving ------------------------------------------------------------------
 
 /// A listening socket. `0` asks the system for a free port; `port_of!` says
 /// which one it gave.
+let listen! : :integer -> :any;
 let listen! port = net.listen! port;
 
+let port_of! : :any -> :integer;
 let port_of! listener = net.port! listener;
 
 /// Stop listening. The accept loop ends with it.
+let stop_serving! : :any -> :any;
 let stop_serving! listener = io.close! listener;
 
 /// Answer one request, as bytes ready to write.
@@ -156,6 +161,7 @@ let stop_serving! listener = io.close! listener;
 /// Nobody there is a reply rather than a silence, for the reason the `try!`
 /// above exists: the client is waiting on this socket, and the only thing
 /// worse than telling it no is telling it nothing.
+priv let reply_bytes! : (:unit -> :any) -> :any -> :string;
 priv let reply_bytes! find! request = try! {
     match find! () {
         () => strict! (wire.frame [:error, "nothing is serving this listener now"]),
@@ -171,12 +177,14 @@ priv let reply_bytes! find! request = try! {
 /// Nothing comes back from a cast, including the news that there was nobody --
 /// which is what a cast means everywhere else here, and is why this is not the
 /// error the same situation is for a call.
+priv let cast_to! : (:unit -> :any) -> :any -> :any;
 priv let cast_to! find! message = match find! () {
     () => (),
     pid => server.cast! pid message,
 };
 
 /// One connection, until it ends.
+priv let serve_connection! : :any -> (:unit -> :any) -> :any;
 priv let rec serve_connection! sock find! = match next! sock {
     () => io.close! sock,
     [:error, why] => {
@@ -208,6 +216,7 @@ priv let rec serve_connection! sock find! = match next! sock {
 /// rather than as a return, because from `accept!`'s side a closed handle is an
 /// error like any other. Binding the accept inside the `try!` is what forces it
 /// there; in the lazy position of a list it would raise at whoever looked.
+priv let accept_loop! : :any -> (:unit -> :any) -> :atom;
 priv let rec accept_loop! listener find! =
     match try! {
         let sock = net.accept! listener;
@@ -222,6 +231,7 @@ priv let rec accept_loop! listener find! =
 
 /// Serve whatever `find!` answers, on an existing listener, in a process of
 /// its own. `find!` is a function of unit and is asked once per request.
+let serve_on_via! : :any -> (:unit -> :any) -> :process;
 let serve_on_via! listener find! = spawn! $( accept_loop! listener find! );
 
 /// Listen on `port` and serve whatever `find!` answers there.
@@ -230,6 +240,7 @@ let serve_on_via! listener find! = spawn! $( accept_loop! listener find! );
 /// what usually answers: `serve_via! 0 (registry.finder! reg "store")` goes on
 /// serving "store" across every restart of it, because the name is resolved
 /// when a request arrives rather than when the listener started.
+let serve_via! : :integer -> (:unit -> :any) -> :any;
 let serve_via! port find! = {
     let listener = net.listen! port;
     serve_on_via! listener find!
@@ -241,9 +252,11 @@ let serve_via! port find! = {
 /// Spelled without a `!` because it performs no effect -- it is the constant
 /// function, and the `!` on everything around it is about what a *lookup* may
 /// do, not about what this one does.
+priv let fixed : :process -> :unit -> :process;
 priv let fixed pid u = pid;
 
 /// Serve `pid` on an existing listener, in a process of its own.
+let serve_on! : :any -> :process -> :process;
 let serve_on! listener pid = serve_on_via! listener (fixed pid);
 
 /// Listen on `port` and serve `pid` there. Answers the listener, which is what
@@ -252,12 +265,15 @@ let serve_on! listener pid = serve_on_via! listener (fixed pid);
 /// A pid is the right thing to serve when the server is not going to be
 /// replaced. When it is -- when something supervises it -- `serve_via!` is the
 /// one that keeps working, and the note at the head of this file says why.
+let serve! : :integer -> :process -> :any;
 let serve! port pid = serve_via! port (fixed pid);
 
 // --- calling ---------------------------------------------------------------------
 
+let connect! : :string -> :integer -> :any;
 let connect! host port = net.connect! host port;
 
+let close! : :any -> :any;
 let close! conn = io.close! conn;
 
 /// Ask, and wait for the answer: `[:ok, value]` or `[:error, reason]`.
@@ -265,6 +281,7 @@ let close! conn = io.close! conn;
 /// Every way this can go wrong is a value, because most of them are not the
 /// program's fault: the connection ended, the reply did not decode, the handler
 /// raised. `call!` is the same thing for a caller that would rather not check.
+let try_call! : :any -> :any -> result.Of :any :any;
 let try_call! conn request = {
     streams.write_all! conn (wire.frame [:call, request])
     match next! conn {
@@ -281,12 +298,14 @@ let try_call! conn request = {
 /// This is what makes a remote call read like a local one -- `remote.call! c
 /// [:add, 5]` beside `counter.call! p [:add, 5]` -- and the difference that
 /// remains is the honest one: a local call cannot fail to arrive.
+let call! : :any -> :any -> :any;
 let call! conn request = match try_call! conn request {
     [:ok, value] => value,
     [:error, why] => error.raise_as! :remote_error why,
 };
 
 /// Tell, and carry on. Nothing comes back, including a failure to arrive.
+let cast! : :any -> :any -> :atom;
 let cast! conn message = streams.write_all! conn (wire.frame [:cast, message]);
 
 // --- tests -----------------------------------------------------------------------
@@ -508,4 +527,5 @@ when test {
 import std.types;
 type Request body = [:call, body] | [:cast, body];
 type Response value = [:ok, value] | [:error, :string];
+let call_as! : :any -> :any -> :any -> :any;
 let call_as! description connection request = types.check description (call! connection request);

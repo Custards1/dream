@@ -34,22 +34,28 @@ import std.vm;
 
 /// Nanoseconds as something a person can compare at a glance. Three
 /// significant figures is as much as a wall-clock measurement deserves.
-let show_duration ns =
-    if ns < 1000 { to_string ns + "ns" }
-    else if ns < 1000000 { to_string (ns / 1000) + "." + pad2 ((ns % 1000) / 10) + "us" }
-    else if ns < 1000000000 { to_string (ns / 1000000) + "." + pad2 ((ns % 1000000) / 10000) + "ms" }
-    else { to_string (ns / 1000000000) + "." + pad2 ((ns % 1000000000) / 10000000) + "s" };
+let show_duration : :integer -> :string;
+let show_duration ns = match ns {
+    _ if ns < 1000 => to_string ns + "ns",
+    _ if ns < 1000000 => to_string (ns / 1000) + "." + pad2 ((ns % 1000) / 10) + "us",
+    _ if ns < 1000000000 => to_string (ns / 1000000) + "." + pad2 ((ns % 1000000) / 10000) + "ms",
+    _ => to_string (ns / 1000000000) + "." + pad2 ((ns % 1000000000) / 10000000) + "s",
+};
 
+let pad2 : :integer -> :string;
 let pad2 n = if n < 10 { "0" + to_string n } else { to_string n };
 
 /// Bytes in the units people actually use.
-let show_bytes b =
-    if b < 1024 { to_string b + "B" }
-    else if b < 1048576 { to_string (b / 1024) + "." + pad2 ((b % 1024) * 100 / 1024) + "KB" }
-    else if b < 1073741824 { to_string (b / 1048576) + "." + pad2 ((b % 1048576) * 100 / 1048576) + "MB" }
-    else { to_string (b / 1073741824) + "." + pad2 ((b % 1073741824) * 100 / 1073741824) + "GB" };
+let show_bytes : :integer -> :string;
+let show_bytes b = match b {
+    _ if b < 1024 => to_string b + "B",
+    _ if b < 1048576 => to_string (b / 1024) + "." + pad2 ((b % 1024) * 100 / 1024) + "KB",
+    _ if b < 1073741824 => to_string (b / 1048576) + "." + pad2 ((b % 1048576) * 100 / 1048576) + "MB",
+    _ => to_string (b / 1073741824) + "." + pad2 ((b % 1073741824) * 100 / 1073741824) + "GB",
+};
 
 /// A count with thousands separated, because six digits in a row are unreadable.
+let show_count : :integer -> :string;
 let show_count n = {
     let rec group digits acc =
         if list.length digits <= 3 { str.of_chars digits + acc }
@@ -65,11 +71,14 @@ let show_count n = {
 
 /// Everything at one moment. Taken in a single call so that the numbers in a
 /// reading all describe the same instant.
+let now! : :unit -> %{ :atom => :integer };
 let now! () = vm.stats! ();
 
+let stat : %{ :atom => :integer } -> :atom -> :integer;
 let stat r key = r.[key else 0];
 
 /// What happened between two readings.
+let since : %{ :atom => :integer } -> %{ :atom => :integer } -> Measurement;
 let since before after =
     %{ :elapsed => stat after :now_ns - stat before :now_ns,
        :allocated => stat after :allocated - stat before :allocated,
@@ -80,13 +89,19 @@ let since before after =
        :peak => stat after :peak_bytes,
        :live => stat after :live_bytes };
 
+let elapsed : Measurement -> :integer;
 let elapsed d    = d.[:elapsed else 0];
+let allocated : Measurement -> :integer;
 let allocated d  = d.[:allocated else 0];
+let reductions : Measurement -> :integer;
 let reductions d = d.[:reductions else 0];
+let collections : Measurement -> :integer;
 let collections d = d.[:collections else 0];
+let peak : Measurement -> :integer;
 let peak d       = d.[:peak else 0];
 
 /// A reading as one line.
+let show : Measurement -> :string;
 let show d =
     show_duration (elapsed d)
     + "  " + show_bytes (allocated d) + " allocated"
@@ -105,6 +120,7 @@ let show d =
 ///
 /// Forced here rather than in a spawned process, because a process has its own
 /// heap and the allocation would be measured on the wrong one.
+let measure! : :string -> a -> a;
 let measure! label value = {
     let before = now! ();
     let value = strict! value;
@@ -114,10 +130,12 @@ let measure! label value = {
     value
 };
 
+let max : :integer -> :integer -> :integer;
 let max a b = if a > b { a } else { b };
 
 /// The same, without printing: `[value, reading]`, for a caller collecting its
 /// own report.
+let timed! : a -> [a, Measurement];
 let timed! value = {
     let before = now! ();
     let forced = strict! value;
@@ -130,6 +148,7 @@ let timed! value = {
 /// This one takes a function rather than a value, because a value is computed
 /// once and remembered -- that is what laziness is -- so running it again would
 /// measure a lookup. `bench! "parse" 100 (fn () -> parse text)`.
+let bench! : :string -> :integer -> (:unit -> a) -> :any;
 let bench! label n f = {
     let before = now! ();
     let rec go! i last = if i <= 0 { last } else { go! (i - 1) (strict! (f ())) };
@@ -147,6 +166,7 @@ let bench! label n f = {
 /// Print a value and return it, for putting into the middle of an expression
 /// without restructuring it. The classic debugging move, and the one a lazy
 /// language most needs a helper for: `to_string` forces enough to print.
+let trace! : :string -> a -> a;
 let trace! label value = {
     console.error! ("  " + label + " = " + to_string value)
     value
@@ -154,6 +174,7 @@ let trace! label value = {
 
 /// The same, forcing all the way down. `trace!` shows the outside of a lazy
 /// structure; this shows what is in it.
+let trace_deep! : :string -> a -> a;
 let trace_deep! label value = {
     console.error! ("  " + label + " = " + to_string (strict! value))
     value
@@ -161,6 +182,7 @@ let trace_deep! label value = {
 
 /// Say where the program has got to, and what it has cost so far. Handed the
 /// previous checkpoint, it reports the interval; handed `()`, it starts one.
+let checkpoint! : :string -> :any -> %{ :atom => :integer };
 let checkpoint! label before = {
     let after = now! ();
     match before {

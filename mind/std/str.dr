@@ -18,28 +18,42 @@ import std.list;
 
 /// Left to right over the characters, not the bytes.
 /// Strict in each step, for the reason `array.fold` gives.
+///
+/// The element is a `:char`, but the signature says `:any`: `std.seq` is
+/// checked against this `fold`, and it offers `sum` and `product` to every
+/// container, a string included. Those are wrong on a string and nobody calls
+/// them on one, and a checker that reports code nobody runs is one people turn
+/// off.
+let fold : (a -> :any -> a) -> a -> :string -> a;
 let fold f init s = list.fold_strict f init (str_chars s);
 
+let name : :any -> :string;
 let name s = "string";
 
 // --- size -------------------------------------------------------------------
 
 /// The number of characters. Decodes the whole string, because UTF-8 does not
 /// know its own character count without looking.
+let length : :string -> :integer;
 let length s = list.length (str_chars s);
 
 /// The number of bytes, which the runtime knows without decoding anything.
 /// For text that is all ASCII the two agree; for anything else they do not.
+let byte_length : (:string | :bigstr) -> :integer;
 let byte_length s = len s;
 
+let is_empty : (:string | :bigstr) -> :bool;
 let is_empty s = len s == 0;
 
 // --- characters -------------------------------------------------------------
 
+let chars : :string -> [:char];
 let chars s = str_chars s;
 
+let of_chars : [:char] -> :string;
 let of_chars cs = str_of_chars cs;
 
+let first_or : a -> :string -> (a | :char);
 let first_or default s = list.first_or default (str_chars s);
 
 // --- bytes ------------------------------------------------------------------
@@ -48,6 +62,11 @@ let first_or default s = list.first_or default (str_chars s);
 /// off the end is how a loop over a string finishes, and an error there would
 /// be noise. Slicing through the middle of a multi-byte character will split
 /// it, which is why the offsets to pass are the ones `find` returns.
+///
+/// A slice of a `:string` is a `:string` and of a `:bigstr` a `:bigstr`, which
+/// is what the variable says: an answer of `:string | :bigstr` would refuse
+/// `"--" + slice ..` on every caller holding an ordinary string.
+let slice : :integer -> :integer -> s -> s;
 let slice from count s = str_slice s from count;
 
 /// The byte at offset `i`, as an integer, or `-1` when there is none.
@@ -56,6 +75,7 @@ let slice from count s = str_slice s from count;
 /// into a big string (`data_at`), which has no `chars` and no `find`:
 /// indexing it is pointer arithmetic and costs nothing, while anything that
 /// would build a string out of it is refused.
+let byte : :integer -> (:string | :bigstr) -> :integer;
 let byte i s = str_byte s i;
 
 /// Past the run of bytes from `set` that starts at byte offset `from`: the
@@ -65,28 +85,36 @@ let byte i s = str_byte s i;
 /// indentation and `span "0123456789" i s` skips a run of digits. The scan
 /// happens in the runtime, which is the point: doing it a byte at a time in
 /// Dream costs a call and a comparison chain per byte.
+let span : :string -> :integer -> (:string | :bigstr) -> :integer;
 let span set from s = str_span s from set;
 
 /// The offset of the first byte from `set` at or after `from`, or
 /// `byte_length s` when there is none -- so `upto "\n" i s` is the end of the
 /// line whether or not the text ends with one.
+let upto : :string -> :integer -> (:string | :bigstr) -> :integer;
 let upto set from s = str_upto s from set;
 
 /// The byte offset of `needle` at or after byte offset `from`, or `-1`.
+let find_from : :integer -> :string -> :string -> :integer;
 let find_from from needle s = str_find s needle from;
 
+let find : :string -> :string -> :integer;
 let find needle s = str_find s needle 0;
 
+let contains_str : :string -> :string -> :bool;
 let contains_str needle s = str_find s needle 0 >= 0;
 
 
+let starts_with : :string -> (:string | :bigstr) -> :bool;
 let starts_with prefix s = str_slice s 0 (len prefix) == prefix;
 
+let ends_with : :string -> (:string | :bigstr) -> :bool;
 let ends_with suffix s =
     str_slice s (len s - len suffix) (len suffix) == suffix;
 
 // --- building ---------------------------------------------------------------
 
+let concat : :string -> :string -> :string;
 let concat a b = a + b;
 
 /// One string from many, with nothing between them.
@@ -96,11 +124,13 @@ let concat a b = a + b;
 /// step, so assembling n pieces costs n^2 bytes of copying. Anything that
 /// builds a large output a piece at a time -- an image, a rendered diagnostic,
 /// a dump of a program -- should collect the pieces and come here once.
+let concat_all : [:string] -> :string;
 let concat_all parts = str_concat parts;
 
 /// The strings in `parts` with `sep` between them. `std.seq` supplies `join`,
 /// which renders each element with `to_string`; this one is for strings that
 /// are already strings and should not gain quotes.
+let join_str : :string -> [:string] -> :string;
 let join_str sep parts =
     match parts {
         [] => "",
@@ -109,10 +139,12 @@ let join_str sep parts =
     };
 
 /// `s` repeated `n` times.
+let repeat : :integer -> :string -> :string;
 let repeat n s = if n <= 0 { "" } else { str_concat (list.replicate n s) };
 
 /// The parts of `s` between each occurrence of `sep`, as a list of strings.
 /// An empty separator would not make progress, so it yields the whole string.
+let split : :string -> :string -> [:string];
 let split sep s = {
     let seplen = len sep;
     let rec go from =
@@ -127,10 +159,13 @@ let split sep s = {
 
 // --- transforming -----------------------------------------------------------
 
+let map : (:char -> :char) -> :string -> :string;
 let map f s = str_of_chars (list.map f (str_chars s));
 
+let filter : (:char -> :bool) -> :string -> :string;
 let filter keep s = str_of_chars (list.filter keep (str_chars s));
 
+let reverse : :string -> :string;
 let reverse s = str_of_chars (list.reverse (str_chars s));
 
 // --- case, for ASCII --------------------------------------------------------
@@ -138,25 +173,33 @@ let reverse s = str_of_chars (list.reverse (str_chars s));
 // Only the ASCII range. Real Unicode case folding is a table this library does
 // not carry, and pretending otherwise would be worse than saying so.
 
+let upper_char : :char -> :char;
 let upper_char c =
     if c >= 'a' && c <= 'z' { char_of_code (char_code c - 32) } else { c };
 
+let lower_char : :char -> :char;
 let lower_char c =
     if c >= 'A' && c <= 'Z' { char_of_code (char_code c + 32) } else { c };
 
+let upper : :string -> :string;
 let upper s = map upper_char s;
 
+let lower : :string -> :string;
 let lower s = map lower_char s;
 
 // --- trimming ---------------------------------------------------------------
 
+let is_space : :char -> :bool;
 let is_space c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
 
+let trim_start : :string -> :string;
 let trim_start s = str_of_chars (list.drop_while is_space (str_chars s));
 
+let trim_end : :string -> :string;
 let trim_end s =
     str_of_chars (list.reverse (list.drop_while is_space (list.reverse (str_chars s))));
 
+let trim : :string -> :string;
 let trim s = trim_end (trim_start s);
 
 // --- tests ------------------------------------------------------------------

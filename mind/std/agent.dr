@@ -27,6 +27,7 @@ derive std.server;
 
 import std.list;
 
+let server_name : :any -> :string;
 let server_name u = "agent";
 
 // --- the holes std.server declares ---------------------------------------------
@@ -34,8 +35,10 @@ let server_name u = "agent";
 /// The value to hold. Forced, because everything else here forces: an agent
 /// started with a suspended computation would run it in whichever client
 /// happened to look first.
+let init! : a -> a;
 let init! value = strict! value;
 
+let handle_call! : :any -> :any -> :any -> Action :any :any;
 let handle_call! request from state = match request {
     :value        => reply state state,
     [:get, f]     => reply (strict! (f state)) state,
@@ -57,6 +60,7 @@ let handle_call! request from state = match request {
     _ => reply [:error, :unknown_request] state,
 };
 
+let handle_cast! : :any -> :any -> Action :any :any;
 let handle_cast! message state = match message {
     [:update, f] => noreply (strict! (f state)),
     _            => noreply state,
@@ -69,12 +73,15 @@ let handle_cast! message state = match message {
 // the mailbox carries.
 
 /// The value itself.
+let value! : Handle -> :any;
 let value! pid = call! pid :value;
 
 /// `f` of the value, computed in the agent and answered here.
+let get! : Handle -> (:any -> b) -> b;
 let get! pid f = call! pid [:get, f];
 
 /// Replace the value with `f` of it, and wait until that has happened.
+let update! : Handle -> (:any -> :any) -> :ok;
 let update! pid f = call! pid [:update, f];
 
 /// The same, without waiting.
@@ -83,9 +90,11 @@ let update! pid f = call! pid [:update, f];
 /// the update has happened, so a `value!` immediately afterwards from the
 /// *same* process still sees the new one -- messages from one sender arrive in
 /// order -- and one from any other process may not.
+let send_update! : Handle -> (:any -> :any) -> :any;
 let send_update! pid f = cast! pid [:update, f];
 
 /// `f` answers `[value, next]`: the value to give back and the value to keep.
+let get_and_update! : Handle -> (:any -> [:any, :any]) -> :any;
 let get_and_update! pid f = call! pid [:get_and_update, f];
 
 // --- tests ---------------------------------------------------------------------
@@ -267,7 +276,9 @@ when test {
 
 import std.types;
 // Checking a state is an explicit boundary; ordinary updates stay generic.
+let value_as! : :any -> Handle -> :any;
 let value_as! description pid = types.check description (value! pid);
 
 /// Atomic validation: [:ok, ()] on replacement, [:error, error] on mismatch.
+let update_as! : :any -> Handle -> (:any -> :any) -> :any;
 let update_as! description pid f = call! pid [:update_as, description, f];

@@ -9,35 +9,53 @@ import std.list;
 
 // --- syntax helpers ---------------------------------------------------------
 
+let span : [:integer, :integer];
 let span = [0, 0];
+let unit : Syntax;
 let unit = [:unit, span];
+let name : :string -> Syntax;
 let name n = [:name, n, span];
+let boolean : :bool -> Syntax;
 let boolean b = [:bool, b, span];
+let atom : :string -> Syntax;
 let atom n = [:atom, n, span];
+let call : Syntax -> [Syntax] -> Syntax;
 let call f args = [:apply, f, args, span];
+let binary : :atom -> Syntax -> Syntax -> Syntax;
 let binary op a b = [:binary, op, a, b, span];
+let branch : Syntax -> Syntax -> Syntax -> Syntax;
 let branch condition yes no = [:if, condition, yes, no, span];
+let binding : :string -> Syntax -> Syntax;
 let binding n value = [:let, n, [], value, false, span];
+let bind_pattern : :string -> Syntax;
 let bind_pattern n = [:bind, n, span];
+let literal_pattern : Syntax -> Syntax;
 let literal_pattern value = [:literal, value, span];
+let arm : Syntax -> Syntax -> Syntax;
 let arm pattern body = [pattern, (), body, span];
+let choose : Syntax -> [Syntax] -> Syntax;
 let choose value arms = [:match, value, arms, span];
+let block : [Syntax] -> Syntax;
 let block statements = [:block, statements, span];
+let invalid : :string -> [:error, :string];
 let invalid message = [:error, "std.macros: " + message];
 
 // Fresh relative to the supplied syntax, including trees made by another
 // macro. Checking every string also covers binders and pattern names. Reserved
 // punctuation prevents ordinary caller identifiers from colliding at all.
+let contains_string : :string -> :any -> :bool;
 let rec contains_string target tree = match type_of tree {
     :string => tree == target,
     :list => list.any (fn child -> contains_string target child) tree,
     _ => false,
 };
+let fresh_from : :string -> :any -> :integer -> :string;
 let rec fresh_from label trees index = {
     let candidate = "<std.macros." + label + "." + to_string index + ">";
     if contains_string candidate trees { fresh_from label trees (index + 1) }
     else { candidate }
 };
+let fresh : :string -> :any -> :string;
 let fresh label trees = fresh_from label trees 0;
 
 // --- conditions -------------------------------------------------------------
@@ -48,6 +66,7 @@ macro when_true condition body = branch condition body unit;
 /// Evaluate body only when condition is false; otherwise return ().
 macro unless condition body = branch condition unit body;
 
+let boolean_chain : :atom -> :bool -> [Syntax] -> Syntax;
 let rec boolean_chain op identity expressions = match expressions {
     [] => boolean identity,
     [first, ..rest] => binary op first (boolean_chain op identity rest),
@@ -65,6 +84,7 @@ macro or_any conditions = match conditions {
     _ => invalid "or_any expects a literal list of conditions",
 };
 
+let conditional_arms : [Syntax] -> Syntax -> Syntax;
 let rec conditional_arms pairs fallback = match pairs {
     [] => fallback,
     [[:list, [condition, body], _], ..rest] => {
@@ -311,3 +331,10 @@ when test {
                 (fresh "present" [[:name, "<std.macros.present.0>", span]]) ),
     ];
 }
+
+// --- optional types ---------------------------------------------------------
+
+/// What a transformer takes and answers: a node of the syntax tree, which is an
+/// ordinary tagged list with its span last. Nothing finer is worth saying here;
+/// the compiler checks what a macro answers when it substitutes it.
+type Syntax = :list;

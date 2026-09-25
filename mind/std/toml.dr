@@ -19,96 +19,141 @@
 //
 // Like `std.json`, nothing here raises: `parse` answers `[:ok, table]` or
 // `[:error, message]`, because reading a file is not an effect.
+//
+// And like `std.json`, it derives `std.codec`, so it writes as well as reads
+// and gets `decode_or`, `round_trips` and framing for nothing. One thing is
+// TOML's own: a *message* is a document -- the table above, written back as
+// `[section]` headers and `key = value` lines -- while a value in the middle
+// of one is written inline, `{ git = "https://..." }`. So this module
+// overrides `encode`, which is the message, and not `encode_value`, which is
+// the walk; see `encode` below.
+
+derive std.codec;
 
 import std.list;
+import std.result;
 import std.str;
 
 // --- characters -------------------------------------------------------------
 
+let is_ws : :char -> :bool;
 let is_ws c = c == ' ' || c == '\t';
+let is_digit : :char -> :bool;
 let is_digit c = c >= '0' && c <= '9';
 
+let is_bare : :char -> :bool;
 let is_bare c =
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit c || c == '_' || c == '-';
 
-let rec skip_ws cs =
-    if list.is_empty cs { cs }
-    else if is_ws (list.head cs) { skip_ws (list.tail cs) }
-    else { cs };
+let skip_ws : [:char] -> [:char];
+let rec skip_ws cs = match cs {
+    [c, ..rest] if is_ws c => skip_ws rest,
+    _ => cs,
+};
 
 /// Whitespace, comments and line breaks: everything between one item and the
 /// next. A `#` runs to the end of its line.
-let rec skip_blank cs = {
-    let s = skip_ws cs;
-    if list.is_empty s { s }
-    else {
-        let c = list.head s;
-        if c == '\n' || c == '\r' { skip_blank (list.tail s) }
-        else if c == '#' { skip_blank (drop_line s) }
-        else { s }
-    }
+let skip_blank : [:char] -> [:char];
+let rec skip_blank cs = match skip_ws cs {
+    ['\n', ..rest] => skip_blank rest,
+    ['\r', ..rest] => skip_blank rest,
+    ['#', ..rest] => skip_blank (drop_line rest),
+    s => s,
 };
 
-let rec drop_line cs =
-    if list.is_empty cs { cs }
-    else if list.head cs == '\n' { list.tail cs }
-    else { drop_line (list.tail cs) };
+let drop_line : [:char] -> [:char];
+let rec drop_line cs = match cs {
+    [] => cs,
+    ['\n', ..rest] => rest,
+    [_, ..rest] => drop_line rest,
+};
 
 /// Whitespace and a comment, but not the line break: what may follow a value.
-let rec end_of_line cs = {
-    let s = skip_ws cs;
-    if list.is_empty s { s }
-    else if list.head s == '#' { drop_line s }
-    else if list.head s == '\n' { list.tail s }
-    else if list.head s == '\r' { end_of_line (list.tail s) }
-    else { () }          // something else on the line: not valid
+let end_of_line : [:char] -> :any;
+let rec end_of_line cs = match skip_ws cs {
+    [] => [],
+    ['\n', ..rest] => rest,
+    ['\r', ..rest] => end_of_line rest,
+    ['#', ..rest] => drop_line rest,
+    _ => (),             // something else on the line: not valid
 };
 
+let step : a -> [:char] -> [a, [:char]];
 let step value rest = [value, rest];
+let step_value : :list -> :any;
 let step_value s = list.head s;
+let step_rest : :list -> [:char];
 let step_rest s = list.head (list.tail s);
 
 // --- scalars ----------------------------------------------------------------
 
-let rec quoted_body cs acc =
-    if list.is_empty cs { () }
-    else {
-        let c = list.head cs;
-        let rest = list.tail cs;
-        if c == '"' { step (str.of_chars (list.reverse acc)) rest }
-        else if c == '\n' { () }                       // a basic string is one line
-        else if c != '\\' { quoted_body rest (list.cons c acc) }
-        else if list.is_empty rest { () }
-        else {
-            let e = list.head rest;
-            let after = list.tail rest;
-            if e == 'n' { quoted_body after (list.cons '\n' acc) }
-            else if e == 't' { quoted_body after (list.cons '\t' acc) }
-            else if e == 'r' { quoted_body after (list.cons '\r' acc) }
-            else if e == '"' { quoted_body after (list.cons '"' acc) }
-            else if e == '\\' { quoted_body after (list.cons '\\' acc) }
-            else { () }
-        }
-    };
+let quoted_body : [:char] -> [:char] -> :any;
+let rec quoted_body cs acc = match cs {
+    [] => (),
+    ['"', ..rest] => step (str.of_chars (list.reverse acc)) rest,
+    ['\n', ..] => (),                                   // a basic string is one line
+    ['\\', e, ..after] => match e {
+        'n'  => quoted_body after (list.cons '\n' acc),
+        't'  => quoted_body after (list.cons '\t' acc),
+        'r'  => quoted_body after (list.cons '\r' acc),
+        'b'  => quoted_body after (list.cons (char_of_code 8) acc),
+        'f'  => quoted_body after (list.cons (char_of_code 12) acc),
+        '"'  => quoted_body after (list.cons '"' acc),
+        '\\' => quoted_body after (list.cons '\\' acc),
+        'u'  => escaped_scalar after 4 acc,
+        'U'  => escaped_scalar after 8 acc,
+        _ => (),
+    },
+    ['\\'] => (),
+    [c, ..rest] => quoted_body rest (list.cons c acc),
+};
+
+/// `\uXXXX` and `\UXXXXXXXX`: a Unicode scalar in hex, which is what the writer
+/// uses for a control character. Anything that is not a scalar -- a surrogate,
+/// or past U+10FFFF -- is refused, as the spec says it must be.
+let escaped_scalar : [:char] -> :integer -> [:char] -> :any;
+let escaped_scalar cs digits acc = match hex_n cs digits 0 {
+    () => (),
+    [code, rest] =>
+        if (code >= 55296 && code <= 57343) || code > 1114111 { () }
+        else { quoted_body rest (list.cons (char_of_code code) acc) },
+};
+
+let hex_value : :char -> :integer;
+let hex_value c = match c {
+    _ if c >= '0' && c <= '9' => char_code c - 48,
+    _ if c >= 'a' && c <= 'f' => char_code c - 87,
+    _ if c >= 'A' && c <= 'F' => char_code c - 55,
+    _ => 0 - 1,
+};
+
+/// `n` hex digits as `[value, rest]`, or `()` if there are not `n` of them.
+let hex_n : [:char] -> :integer -> :integer -> :any;
+let rec hex_n cs n acc = match cs {
+    _ if n <= 0 => [acc, cs],
+    [c, ..rest] if hex_value c >= 0 => hex_n rest (n - 1) (acc * 16 + hex_value c),
+    _ => (),
+};
 
 /// A literal string: single quotes, no escapes at all, which is what makes it
 /// the right thing for a Windows path or a regular expression.
-let rec literal_body cs acc =
-    if list.is_empty cs { () }
-    else if list.head cs == '\'' { step (str.of_chars (list.reverse acc)) (list.tail cs) }
-    else if list.head cs == '\n' { () }
-    else { literal_body (list.tail cs) (list.cons (list.head cs) acc) };
+let literal_body : [:char] -> [:char] -> :any;
+let rec literal_body cs acc = match cs {
+    [] => (),
+    ['\'', ..rest] => step (str.of_chars (list.reverse acc)) rest,
+    ['\n', ..] => (),
+    [c, ..rest] => literal_body rest (list.cons c acc),
+};
 
-let rec number_chars cs acc floaty =
-    if list.is_empty cs { [list.reverse acc, floaty, cs] }
-    else {
-        let c = list.head cs;
-        if is_digit c || c == '-' || c == '+' { number_chars (list.tail cs) (list.cons c acc) floaty }
-        else if c == '.' || c == 'e' || c == 'E' { number_chars (list.tail cs) (list.cons c acc) true }
-        else if c == '_' { number_chars (list.tail cs) acc floaty }   // 1_000 is 1000
-        else { [list.reverse acc, floaty, cs] }
-    };
+let number_chars : [:char] -> [:char] -> :bool -> [[:char], :bool, [:char]];
+let rec number_chars cs acc floaty = match cs {
+    [c, ..rest] if is_digit c || c == '-' || c == '+' => number_chars rest (list.cons c acc) floaty,
+    [c, ..rest] if c == '.' || c == 'e' || c == 'E' => number_chars rest (list.cons c acc) true,
+    ['_', ..rest] => number_chars rest acc floaty,               // 1_000 is 1000
+    _ => [list.reverse acc, floaty, cs],
+};
 
+let parse_number : [:char] -> :any;
 let parse_number cs = {
     let taken = number_chars cs [] false;
     let text = str.of_chars (list.head taken);
@@ -121,106 +166,98 @@ let parse_number cs = {
     }
 };
 
-let rec starts cs word =
-    if list.is_empty word { true }
-    else if list.is_empty cs { false }
-    else if list.head cs == list.head word { starts (list.tail cs) (list.tail word) }
-    else { false };
+let starts : [:char] -> [:char] -> :bool;
+let rec starts cs word = match [cs, word] {
+    [_, []] => true,
+    [[c, ..more], [w, ..rest]] if c == w => starts more rest,
+    _ => false,
+};
 
+let drop_n : :integer -> [:char] -> [:char];
 let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
 
 // --- values -----------------------------------------------------------------
 
-let rec parse_value cs = {
-    let s = skip_ws cs;
-    if list.is_empty s { () }
-    else {
-        let c = list.head s;
-        if c == '"' { quoted_body (list.tail s) [] }
-        else if c == '\'' { literal_body (list.tail s) [] }
-        else if c == '[' { parse_array (list.tail s) [] }
-        else if c == '{' { parse_inline (list.tail s) (%{}) true }
-        else if starts s (str.chars "true") { step true (drop_n 4 s) }
-        else if starts s (str.chars "false") { step false (drop_n 5 s) }
-        else if is_digit c || c == '-' || c == '+' { parse_number s }
-        else { () }
-    }
+let parse_value : [:char] -> :any;
+let rec parse_value cs = match skip_ws cs {
+    [] => (),
+    ['"', ..rest] => quoted_body rest [],
+    ['\'', ..rest] => literal_body rest [],
+    ['[', ..rest] => parse_array rest [],
+    ['{', ..rest] => parse_inline rest (%{}) true,
+    s => match list.head s {
+        _ if starts s (str.chars "true") => step true (drop_n 4 s),
+        _ if starts s (str.chars "false") => step false (drop_n 5 s),
+        c if is_digit c || c == '-' || c == '+' => parse_number s,
+        _ => (),
+    },
 };
 
 /// An array. TOML allows a trailing comma and line breaks inside, so this
 /// skips blanks between elements rather than only spaces.
-let rec parse_array cs acc = {
-    let s = skip_blank cs;
-    if list.is_empty s { () }
-    else if list.head s == ']' { step (list.reverse acc) (list.tail s) }
-    else {
-        let v = parse_value s;
-        if v == () { () }
-        else {
-            let after = skip_blank (step_rest v);
+let parse_array : [:char] -> [Value] -> :any;
+let rec parse_array cs acc = match skip_blank cs {
+    [] => (),
+    [']', ..rest] => step (list.reverse acc) rest,
+    s => match parse_value s {
+        () => (),
+        v => {
             let grown = list.cons (step_value v) acc;
-            if list.is_empty after { () }
-            else if list.head after == ',' { parse_array (list.tail after) grown }
-            else if list.head after == ']' { step (list.reverse grown) (list.tail after) }
-            else { () }
-        }
-    }
+            match skip_blank (step_rest v) {
+                [',', ..rest] => parse_array rest grown,
+                [']', ..rest] => step (list.reverse grown) rest,
+                _ => (),
+            }
+        },
+    },
 };
 
-let rec parse_inline cs acc first = {
-    let s = skip_blank cs;
-    if list.is_empty s { () }
-    else if list.head s == '}' { step acc (list.tail s) }
-    else {
-        let after_comma =
-            if first { s }
-            else if list.head s == ',' { skip_blank (list.tail s) }
-            else { () };
-        if after_comma == () { () }
-        else if list.is_empty after_comma { () }
-        else if list.head after_comma == '}' { step acc (list.tail after_comma) }
-        else {
-            let k = parse_key after_comma;
-            if k == () { () }
-            else {
-                let eq = skip_ws (step_rest k);
-                if list.is_empty eq { () }
-                else if list.head eq != '=' { () }
-                else {
-                    let v = parse_value (list.tail eq);
-                    if v == () { () }
-                    else {
-                        let grown = acc.[(step_value k) => (step_value v)];
-                        parse_inline (step_rest v) grown false
-                    }
-                }
-            }
-        }
-    }
+let parse_inline : [:char] -> %{ :string => Value } -> :bool -> :any;
+let rec parse_inline cs acc first = match skip_blank cs {
+    [] => (),
+    ['}', ..rest] => step acc rest,
+    // A comma is required between members and forbidden before the first; a
+    // trailing one is allowed, which is the `}` case of what follows it.
+    s => match (if first { s } else { match s { [',', ..more] => skip_blank more, _ => [] } }) {
+        [] => (),
+        ['}', ..rest] => step acc rest,
+        after => match parse_key after {
+            () => (),
+            k => match skip_ws (step_rest k) {
+                ['=', ..more] => match parse_value more {
+                    () => (),
+                    v => parse_inline (step_rest v) (acc.[(step_value k) => (step_value v)]) false,
+                },
+                _ => (),
+            },
+        },
+    },
 };
 
 /// A key: bare, or quoted when it has characters a bare key may not.
-let parse_key cs = {
-    let s = skip_ws cs;
-    if list.is_empty s { () }
-    else if list.head s == '"' { quoted_body (list.tail s) [] }
-    else if list.head s == '\'' { literal_body (list.tail s) [] }
-    else {
-        let rec bare cs acc =
-            if list.is_empty cs || not (is_bare (list.head cs)) {
-                if list.is_empty acc { () } else { step (str.of_chars (list.reverse acc)) cs }
-            } else { bare (list.tail cs) (list.cons (list.head cs) acc) };
+let parse_key : [:char] -> :any;
+let parse_key cs = match skip_ws cs {
+    [] => (),
+    ['"', ..rest] => quoted_body rest [],
+    ['\'', ..rest] => literal_body rest [],
+    s => {
+        let rec bare cs acc = match cs {
+            [c, ..rest] if is_bare c => bare rest (list.cons c acc),
+            _ => if list.is_empty acc { () } else { step (str.of_chars (list.reverse acc)) cs },
+        };
         bare s []
-    }
+    },
 };
 
 /// A `[section]` or `[a.b]` header, as the name between the brackets.
+let parse_header : [:char] -> :any;
 let parse_header cs = {
-    let rec take cs acc =
-        if list.is_empty cs { () }
-        else if list.head cs == ']' { step (str.of_chars (list.reverse acc)) (list.tail cs) }
-        else if list.head cs == '\n' { () }
-        else { take (list.tail cs) (list.cons (list.head cs) acc) };
+    let rec take cs acc = match cs {
+        [] => (),
+        [']', ..rest] => step (str.of_chars (list.reverse acc)) rest,
+        ['\n', ..] => (),
+        [c, ..rest] => take rest (list.cons c acc),
+    };
     take cs []
 };
 
@@ -229,52 +266,45 @@ let parse_header cs = {
 /// `[table, section_name, section_map, rest]` threaded through the loop below.
 /// A section is collected into its own map and folded into the document when
 /// the next header arrives, so a key can never land in the wrong section.
-let rec parse_items cs table section current = {
-    let s = skip_blank cs;
-    if list.is_empty s {
-        [:ok, table.[section => current]]
-    }
-    else if list.head s == '[' {
-        let h = parse_header (list.tail s);
-        if h == () { [:error, "a section header is not closed"] }
-        else {
+let parse_items : [:char] -> Document -> :string -> %{ :string => Value } -> result.Of Document :string;
+let rec parse_items cs table section current = match skip_blank cs {
+    [] => [:ok, table.[section => current]],
+    ['[', ..rest] => match parse_header rest {
+        () => [:error, "a section header is not closed"],
+        h => {
             let done = table.[section => current];
             let name = str.trim (step_value h);
             // A header seen twice keeps what the first one collected, so
             // `[a]` .. `[b]` .. `[a]` adds to `a` rather than emptying it.
             let existing = done.[name else (%{})];
             parse_items (step_rest h) done name existing
-        }
-    }
-    else {
-        let k = parse_key s;
-        if k == () { [:error, "expected a key"] }
-        else {
-            let eq = skip_ws (step_rest k);
-            if list.is_empty eq { [:error, "expected `=` after " + step_value k] }
-            else if list.head eq != '=' { [:error, "expected `=` after " + step_value k] }
-            else {
-                let v = parse_value (list.tail eq);
-                if v == () { [:error, "the value of " + step_value k + " is not valid TOML"] }
-                else {
-                    let after = end_of_line (step_rest v);
-                    if after == () { [:error, "unexpected text after the value of " + step_value k] }
-                    else {
-                        let grown = current.[(step_value k) => (step_value v)];
-                        parse_items after table section grown
-                    }
-                }
-            }
-        }
-    }
+        },
+    },
+    s => match parse_key s {
+        () => [:error, "expected a key"],
+        k => match skip_ws (step_rest k) {
+            ['=', ..more] => match parse_value more {
+                () => [:error, "the value of " + step_value k + " is not valid TOML"],
+                v => match end_of_line (step_rest v) {
+                    () => [:error, "unexpected text after the value of " + step_value k],
+                    after => parse_items after table section current.[(step_value k) => (step_value v)],
+                },
+            },
+            _ => [:error, "expected `=` after " + step_value k],
+        },
+    },
 };
 
 /// `[:ok, table]`, or `[:error, message]`.
+let parse : :string -> result.Of Document :string;
 let parse text = parse_items (str.chars text) (%{}) "" (%{});
 
+let ok : result.Of a e -> :bool;
 let ok r = list.head r == :ok;
+let value : result.Of a e -> :any;
 let value r = list.nth 1 r;
 
+let parse_or : :any -> :string -> :any;
 let parse_or default text = {
     let r = parse text;
     if ok r { value r } else { default }
@@ -284,16 +314,162 @@ let parse_or default text = {
 
 /// The map for `[name]`, or an empty one. A missing section reads like an
 /// empty section, so a manifest with no `[dependencies]` needs no special case.
+let section : Document -> :string -> %{ :string => Value };
 let section table name = table.[name else (%{})];
 
 /// `table[section][key]`, or `default`.
+let get : :any -> Document -> :string -> :string -> :any;
 let get default table sec key = ((section table sec)).[key else default];
 
 /// The names of every section, in the order the map holds them.
+let sections : Document -> [:string];
 let sections table = list.map (fn p -> list.head p) (map_pairs table);
 
 /// The `key = value` pairs of one section, as `[key, value]` lists.
+let entries : Document -> :string -> [[:string, Value]];
 let entries table name = map_pairs (section table name);
+
+// --- writing ----------------------------------------------------------------
+//
+// As in `std.json`, the walk over a value is `std.codec`'s and what is here is
+// the spelling of each kind. Three losses are TOML's and worth knowing:
+//
+// - **There is no null.** A table entry holding `()` is left out, which is
+//   exact: `get` answers a default for a key that is not there, and `()` is
+//   what this library means by "not there". A `()` anywhere else -- an array
+//   element, or the whole message -- has no spelling and is written `""`.
+// - **No atoms, one sequence**, as in JSON: `:ok` comes back `"ok"` and an
+//   array comes back a list.
+// - **A document is a table of tables.** `parse` puts a key written before any
+//   header in the `""` section -- and answers a `""` section always, empty
+//   when there was no such key -- so a document's top level holds only
+//   sections, and one that round trips has a `""`. A top-level entry that is
+//   not a table is written before the first header, and so comes back inside
+//   `""`.
+
+priv let hex_digit : :integer -> :string;
+priv let hex_digit n = str.slice n 1 "0123456789abcdef";
+
+/// A basic string's escapes: the five TOML names, and `\u00XX` for any other
+/// control character, which a basic string may not hold as itself.
+let escape_char : :char -> :string;
+let escape_char c = match c {
+    '"'  => "\\\"",
+    '\\' => "\\\\",
+    '\n' => "\\n",
+    '\t' => "\\t",
+    '\r' => "\\r",
+    _ => match char_code c {
+        code if code < 32 || code == 127 =>
+            "\\u00" + hex_digit ((code / 16) % 16) + hex_digit (code % 16),
+        _ => str.of_chars [c],
+    },
+};
+
+let quote : :string -> :string;
+let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
+
+priv let atom_name : :atom -> :string;
+priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a);
+
+/// The text a key or a section name stands for, by the rule `std.json` uses:
+/// an atom is its name, a string itself, anything else its digits.
+priv let key_text : :any -> :string;
+priv let key_text k = match type_of k {
+    :atom   => atom_name k,
+    :string => k,
+    _       => to_string k,
+};
+
+/// A key as TOML writes it: bare when every character may be, quoted
+/// otherwise -- so `name` stays `name` and `"a b"` stays readable.
+let write_key : :any -> :string;
+let write_key k = {
+    let t = key_text k;
+    let cs = str.chars t;
+    if not (list.is_empty cs) && list.all is_bare cs { t } else { quote t }
+};
+
+// --- the holes std.codec declares --------------------------------------------
+
+let write_unit : :unit -> :string;
+let write_unit u = "\"\"";
+
+let write_bool : :bool -> :string;
+let write_bool b = if b { "true" } else { "false" };
+
+let write_int : :integer -> :string;
+let write_int n = to_string n;
+
+/// A float always has a `.` or an exponent in TOML, and that is how the reader
+/// tells it from an integer: `to_string 2.0` is `2`, which would come back as
+/// the integer, so a whole float gains its `.0`.
+let write_float : :float -> :string;
+let write_float x = {
+    let t = to_string x;
+    if str.contains_str "." t || str.contains_str "e" t || str.contains_str "n" t { t }
+    else { t + ".0" }
+};
+
+let write_string : :string -> :string;
+let write_string s = quote s;
+
+let write_atom : :atom -> :string;
+let write_atom a = quote (atom_name a);
+
+let write_list : [:string] -> :string;
+let write_list parts = "[" + str.join_str ", " parts + "]";
+
+/// An inline table, `{ k = v, .. }`. An entry holding `()` is left out; see
+/// "there is no null" above.
+let write_map : [[:any, :any]] -> :string;
+let write_map pairs = {
+    let kept = list.filter (fn p -> list.nth 1 p != ()) pairs;
+    let entry p = write_key (list.nth 0 p) + " = " + encode_value (list.nth 1 p);
+    if list.is_empty kept { "{}" } else { "{ " + str.join_str ", " (list.map entry kept) + " }" }
+};
+
+let format_name : :any -> :string;
+let format_name u = "toml";
+
+let decode : :string -> result.Of Document :string;
+let decode text = parse text;
+
+/// A message is a document, not a value: a map is written as `key = value`
+/// lines under `[section]` headers, which is what `decode` reads back. Every
+/// value *inside* it is `encode_value`'s, so a table below a section is an
+/// inline one. Anything but a map has no document to be and is written as the
+/// value it is -- which `decode` refuses, and `round_trips` says so.
+let encode : :any -> :string;
+let encode v = match type_of v {
+    :map => write_document v,
+    _ => encode_value v,
+};
+
+/// `table` as a document. The `""` section, and any top-level entry that is
+/// not a table, come first and under no header, because a key after a header
+/// belongs to that header; then each section in `map_entries` order.
+let write_document : :map -> :string;
+let write_document table = {
+    let present m = list.filter (fn p -> list.nth 1 p != ()) (map_entries m);
+    let line p = write_key (list.nth 0 p) + " = " + encode_value (list.nth 1 p) + "\n";
+    let lines m = str.concat_all (list.map line (present m));
+    let is_section p = type_of (list.nth 1 p) == :map && list.nth 0 p != "";
+    let loose = str.concat_all (list.map line
+        (list.filter (fn p -> not (is_section p) && list.nth 0 p != "") (present table)));
+    let unnamed = match table.["" else ()] {
+        m if type_of m == :map => lines m,
+        () => "",
+        other => line ["", other],
+    };
+    let section p = "[" + key_text (list.nth 0 p) + "]\n" + lines (list.nth 1 p);
+    let sections = list.map section (list.filter is_section (present table));
+    str.join_str "\n" (list.filter (fn t -> not (str.is_empty t)) (list_cons (loose + unnamed) sections))
+};
+
+/// The document as text: `encode` under the name a TOML caller would look for.
+let write : :map -> :string;
+let write table = encode table;
 
 // --- tests ------------------------------------------------------------------
 
@@ -364,13 +540,54 @@ when test {
             $( test.eq! "../util"
                         (((at "[dependencies]\nutil = { path = \"../util\" }\n"
                                "dependencies" "util")).["path" else ()]) ),
+
+        // escapes the writer uses must read back
+        test.case "\\u escape"      $( test.eq! "\t" (at "a = \"\\u0009\"" "" "a") ),
+        test.case "\\U escape"      $( test.eq! "A" (at "a = \"\\U00000041\"" "" "a") ),
+        test.case "\\b and \\f"      $( test.eq! 2 (str.byte_length (at "a = \"\\b\\f\"" "" "a")) ),
+        test.case "a surrogate is refused" $( test.false! (ok (parse "a = \"\\ud800\"")) ),
+
+        // writing: the spelling of each kind
+        test.case "write an integer"  $( test.eq! "42" (encode_value 42) ),
+        test.case "a whole float keeps its point" $( test.eq! "2.0" (encode_value 2.0) ),
+        test.case "a string is quoted and escaped"
+            $( test.eq! "\"a\\\"b\\u0001\"" (encode_value ("a\"b" + str.of_chars [char_of_code 1])) ),
+        test.case "an inline table"   $( test.eq! "{ a = 1, \"b c\" = [true] }"
+                                                    (encode_value %{ "a" => 1, "b c" => [true] }) ),
+        test.case "() is left out of a table" $( test.eq! "{ a = 1 }" (encode_value %{ "a" => 1, "b" => () }) ),
+        test.case "a document"
+            $( test.eq! "k = 1\n\n[p]\nn = \"d\"\nt = { x = 2 }\n"
+                        (write %{ "" => %{ "k" => 1 }, "p" => %{ "n" => "d", "t" => %{ "x" => 2 } } }) ),
+
+        // what survives the trip: a document of TOML's own kinds
+        test.case "a manifest round trips"
+            $( test.true! (round_trips %{
+                   "" => %{},
+                   "package" => %{ "name" => "demo", "version" => "0.1.0", "n" => 3, "x" => 1.5,
+                                   "on" => true, "tags" => ["a", "b"] },
+                   "dependencies" => %{ "json" => %{ "git" => "https://x", "deep" => %{ "y" => [1, 2] } } },
+               }) ),
+        test.case "keys before a header round trip"
+            $( test.true! (round_trips %{ "" => %{ "k" => "v" }, "a" => %{ "j" => 2.0 } }) ),
+        test.case "control characters round trip"
+            $( test.true! (round_trips %{ "" => %{}, "s" => %{ "t" => "tab\there\nline" + str.of_chars [char_of_code 7] } }) ),
+        test.case "a table that is not a section lands in \"\""
+            $( test.eq! 1 (get () (decode_or %{} (encode %{ "k" => 1 })) "" "k") ),
+        test.case "a value is not a document" $( test.false! (round_trips 5) ),
+        test.case "an atom comes back its name"
+            $( test.eq! "ok" (get () (decode_or %{} (encode %{ "s" => %{ "a" => :ok } })) "s" "a") ),
+
+        // framing comes from std.codec
+        test.case "frames"
+            $( test.eq! [decode "[a]\nb = 1", decode "[c]\nd = 2"]
+                        (list.head (frames (frame %{ "a" => %{ "b" => 1 } } + frame %{ "c" => %{ "d" => 2 } }))) ),
     ];
 }
 
 // --- optional types ---------------------------------------------------------
 
-import std.result;
 type Value = :string | :integer | :float | :bool
            | [Value] | %{ :string => Value };
 type Document = %{ :string => %{ :string => Value } };
-let parse_as description text = result.validate_ok description (parse text);
+let parse_as : :any -> :string -> result.Of Document :any;
+let parse_as description text = decode_as description text;

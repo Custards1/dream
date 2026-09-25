@@ -25,15 +25,25 @@ import std.list;
 // A primitive is spelled as the atom `type_of` answers with, so there is one
 // name for a kind of value and it is the name the runtime already uses.
 
+let any : :atom;
 let any = :any;
+let never : :atom;
 let never = :never;
+let integer : :atom;
 let integer = :integer;
+let float : :atom;
 let float = :float;
+let number : Description;
 let number = [:union, [:integer, :float]];
+let string : :atom;
 let string = :string;
+let bool : :atom;
 let bool = :bool;
+let char : :atom;
 let char = :char;
+let atom : :atom;
 let atom = :atom;
+let unit : :atom;
 let unit = :unit;
 
 /// A list of descriptions, however it was written.
@@ -43,6 +53,7 @@ let unit = :unit;
 /// ordinary expression is handed `[a, b]`. Both mean the same list of
 /// descriptions, and unwrapping here is what lets `enum [:flag, :value]` be
 /// written in either place instead of only in one.
+priv let members : :any -> :any;
 priv let members xs = match xs {
     [:tuple, items] => items,
     [:array, items] => items,
@@ -50,40 +61,58 @@ priv let members xs = match xs {
 };
 
 /// The same, for the map of a record.
+priv let fields_of : :any -> :any;
 priv let fields_of m = match m { [:record, fields] => fields, _ => m };
 
+let list_of : Description -> Description;
 let list_of element = [:list_of, element];
+let array_of : Description -> Description;
 let array_of element = [:array_of, element];
+let map_of : Description -> Description -> Description;
 let map_of key value = [:map_of, key, value];
 /// A list of exactly these, in this order: `tuple [:ok, value]`.
+let tuple : :any -> Description;
 let tuple elements = [:tuple, members elements];
 /// An array of exactly these, which is to `tuple` what an array is to a list.
+let array : :any -> Description;
 let array elements = [:array, members elements];
+let one_of : :any -> Description;
 let one_of choices = [:union, members choices];
+let all_of : :any -> Description;
 let all_of requirements = [:intersection, members requirements];
+let optional : Description -> Description;
 let optional element = one_of [:unit, element];
 /// Accepts one value and nothing else. A non-primitive atom, a string, a
 /// number or a character already means this on its own; `literal` is for the
 /// value that would otherwise read as something else -- `literal :integer`
 /// is the atom, where `:integer` is every integer.
+let literal : :any -> Description;
 let literal value = [:literal, value];
 /// A structural map: the named keys must be there and must match. Additional
 /// keys are welcome, because a record describes what a value has rather than
 /// what it lacks.
+let record : :any -> Description;
 let record fields = [:record, fields_of fields];
+let refine : Description -> (:any -> :bool) -> Description;
 let refine base predicate = [:refine, base, predicate];
 /// A function. What membership can ask of one is that it is a function --
 /// there is no way to see what it would do with an argument without applying
 /// it, which a test of a value may not do. `enforce` is the other half: it
 /// wraps a function so that each application is checked against the arrow.
+let fn_of : Description -> Description -> Description;
 let fn_of input output = [:fn, input, output];
 
 // These return only data, including their constraints, so `comp` can bake the
 // result. A refinement holding a closure is what cannot make that promise.
+let enum : :any -> Description;
 let enum values = one_of (list.map literal (members values));
+let variant : :atom -> :any -> Description;
 let variant tag fields = tuple (list_cons (literal tag) (members fields));
+let range : (:integer | :float) -> (:integer | :float) -> Description;
 let range lower upper = [:range, lower, upper];
+let sized : :integer -> :integer -> Description -> Description;
 let sized lower upper base = [:sized, base, lower, upper];
+let record_with : :any -> :any -> Description;
 let record_with required optional_fields =
     [:fields, fields_of required, fields_of optional_fields];
 
@@ -92,6 +121,7 @@ let record_with required optional_fields =
 /// `:one_for_one` be written as types without ceremony, and what makes a
 /// misspelled primitive a literal rather than an error. `dreams/parser.dr`
 /// holds the same list for one narrower purpose, and says why.
+let primitive : :atom -> :bool;
 let primitive kind = list.contains kind
     [:integer, :float, :string, :bool, :char, :atom, :unit,
      :list, :array, :map, :pure_fn, :impure_fn, :process, :error, :module, :bigstr];
@@ -104,6 +134,7 @@ let primitive kind = list.contains kind
 /// at all, a union stops at its first match, and a list type walks the spine
 /// it is asked about and no further. A description nothing here recognises is
 /// a literal, and a literal is compared with `==`.
+let accepts : Description -> :any -> :bool;
 let rec accepts description value = match description {
     :any => true,
     :never => false,
@@ -173,6 +204,7 @@ let rec accepts description value = match description {
 /// list. Both are over-acceptance in cases that do not arise in practice, and
 /// `literal` is the exact form for a program that does care:
 /// `literal :list` is the atom and nothing else.
+priv let primitive_accepts : :atom -> :any -> :bool;
 priv let primitive_accepts kind value =
     if kind == :atom { type_of value == :atom }
     else if type_of value == :atom { value == kind }
@@ -181,6 +213,7 @@ priv let primitive_accepts kind value =
 /// Element by element, and the lengths must agree. Written as a walk rather
 /// than a length test and a zip so that a mismatch stops at the first
 /// element that decides it, forcing no more of either side than it has to.
+let exactly : [Description] -> [:any] -> :bool;
 let rec exactly elements values = match elements {
     [] => list.is_empty values,
     [t, ..ts] => match values {
@@ -191,6 +224,7 @@ let rec exactly elements values = match elements {
 
 // Generated records carry a key, a description, and zero or one default.
 // Missing defaulted fields have the same meaning here as in their accessors.
+let shape_field : :atom -> :any -> :any -> :bool;
 let shape_field kind field value = match field {
     [key, description, defaults] => {
         let present = if kind == :map { map_has value key } else { key < len value };
@@ -206,15 +240,18 @@ let shape_field kind field value = match field {
 /// expected. Like a failed pattern or an index out of range, this is a
 /// partial operation in pure code: it happens when the result is demanded,
 /// and not at all if it never is.
+let check : Description -> a -> a;
 let check description value = type_assert (accepts description value) description value;
 
 /// The non-raising form, for parsers and other result-returning APIs.
+let validate : Description -> a -> ([:ok, a] | [:error, :error]);
 let validate description value =
     if accepts description value { [:ok, value] }
     else { [:error, error_new :type_error description] };
 
 /// Check elements as they are demanded, which is the form that works on an
 /// infinite list. `list_of` cannot: deciding it walks the whole spine.
+let check_each : Description -> [a] -> [a];
 let rec check_each description values = match values {
     [] => [],
     [value, ..rest] => list_cons (check description value) (check_each description rest),
@@ -227,6 +264,7 @@ let rec check_each description values = match values {
 /// This is what an arrow type is *for*. `accepts` can only see that a value
 /// is a function; applying it is the only way to learn anything else, and
 /// that is a thing a caller may do and a membership test may not.
+let enforce : Description -> f -> f;
 let rec enforce description f = match description {
     [:named, _, inner] => enforce inner f,
     [:fn, input, output] => fn value -> enforce output (f (check input value)),
@@ -236,10 +274,12 @@ let rec enforce description f = match description {
 /// A checked unary function, for the common case where naming the arrow is
 /// more ceremony than it is worth. The argument is still only checked if the
 /// wrapped function demands it.
+let function : Description -> Description -> (a -> b) -> (a -> b);
 let function input output f = fn value -> check output (f (check input value));
 
 /// What a description calls itself, for a diagnostic that wants to name the
 /// type rather than print the data it expanded to.
+let name_of : Description -> :string;
 let rec name_of description = match description {
     [:named, name, _] => name,
     _ => to_string description,
@@ -255,3 +295,9 @@ type Text = :string;
 type Atom = :atom;
 type Unit = :unit;
 type Function = :pure_fn | :impure_fn;
+
+// What every function above takes and answers. A description is data of no one
+// shape -- an atom, a tagged list, a literal value that stands for itself -- so
+// as a static type it is `:any`, and the name is there for the reader: in a
+// signature, `Description -> a -> a` says which argument is the type.
+type Description = :any;

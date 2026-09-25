@@ -56,55 +56,77 @@ import std.str;
 // number beside each name is what another program reads, so changing one is a
 // change to the format and should read like one.
 
+let tag_unit : :integer;
 let tag_unit   = 0;
+let tag_false : :integer;
 let tag_false  = 1;
+let tag_true : :integer;
 let tag_true   = 2;
+let tag_int : :integer;
 let tag_int    = 3;
+let tag_float : :integer;
 let tag_float  = 4;
+let tag_string : :integer;
 let tag_string = 5;
+let tag_atom : :integer;
 let tag_atom   = 6;
+let tag_char : :integer;
 let tag_char   = 7;
+let tag_list : :integer;
 let tag_list   = 8;
+let tag_array : :integer;
 let tag_array  = 9;
+let tag_map : :integer;
 let tag_map    = 10;
 
 /// The bytes a count or a length takes. Four, so a string or a collection stops
 /// at 4 GiB -- the ceiling an image already has.
+let width : :integer;
 let width = 4;
 
 // --- writing ------------------------------------------------------------------
 
+priv let byte : :integer -> :string;
 priv let byte n = str_le n 1;
 
 /// A count or a length, in the fixed width above.
+priv let count : :integer -> :string;
 priv let count n = str_le n width;
 
 /// A tag and its payload.
+priv let tagged : :integer -> :string -> :string;
 priv let tagged t payload = str_concat [byte t, payload];
 
 /// A tag, a count, and that many already-encoded pieces after it. The shape of
 /// every collection here, so the three of them are one line each.
+priv let sequence : :integer -> [:string] -> :string;
 priv let sequence t pieces =
     str_concat (list_cons (byte t) (list_cons (count (list.length pieces)) pieces));
 
+let write_unit : :unit -> :string;
 let write_unit u = byte tag_unit;
 
+let write_bool : :bool -> :string;
 let write_bool b = byte (if b { tag_true } else { tag_false });
 
 /// Eight bytes, two's complement, which is what `str_le` writes for a negative
 /// number. A Dream integer is sixty-three bits, so the eighth byte is sign and
 /// the reader checks it -- see `read_int`.
+let write_int : :integer -> :string;
 let write_int n = tagged tag_int (str_le n 8);
 
+let write_float : :float -> :string;
 let write_float x = tagged tag_float (float_bytes x);
 
 /// The string's own bytes, length first. No escaping and no copy of anything
 /// but the string: a length-prefixed field can hold any byte, including a zero
 /// and including text that is not valid UTF-8, and it comes back as it went in.
+let write_string : :string -> :string;
 let write_string s = str_concat [byte tag_string, count (len s), s];
 
 /// An atom is its name, and the name is what `to_string` gives without the
 /// colon it writes in front.
+let write_atom : :atom -> :string;
 let write_atom a = {
     let text = to_string a;
     let name = str_slice text 1 (len text - 1);
@@ -113,23 +135,28 @@ let write_atom a = {
 
 /// The Unicode scalar, not the UTF-8 it would encode to: a char is a code
 /// point in this language and this format keeps it one.
+let write_char : :char -> :string;
 let write_char c = tagged tag_char (str_le (char_code c) width);
 
+let write_list : [:string] -> :string;
 let write_list parts = sequence tag_list parts;
 
 /// The override that earns `std.codec` its default: an array is a list to a
 /// format that has one sequence, and is not one here.
+let write_array : [:string] -> :string;
 let write_array parts = sequence tag_array parts;
 
 /// A map's keys are values, so both halves go through the walk. `std.codec`
 /// hands the pairs over raw for exactly this: a key here needs no stringifying
 /// and would lose its type if it got any.
+let write_map : [[:any, :any]] -> :string;
 let write_map pairs = {
-    let entry p = str_concat [encode (list.nth 0 p), encode (list.nth 1 p)];
+    let entry p = str_concat [encode_value (list.nth 0 p), encode_value (list.nth 1 p)];
     str_concat (list_cons (byte tag_map)
                                (list_cons (count (list.length pairs)) (list.map entry pairs)))
 };
 
+let format_name : :any -> :string;
 let format_name u = "wire";
 
 // --- reading -------------------------------------------------------------------
@@ -148,13 +175,16 @@ let format_name u = "wire";
 /// `str_byte` answers `-1` past the end rather than failing -- which is right
 /// for a scan and wrong for a field, where the missing byte would silently
 /// become part of a number.
+priv let has : :string -> :integer -> :integer -> :bool;
 priv let has buf at n = at + n <= len buf;
 
 /// `n` bytes at `at`, little-endian, as a non-negative number. Assembled from
 /// the top byte down, so each step is one multiply and one add.
+priv let le_from : :string -> :integer -> :integer -> :integer -> :integer;
 priv let rec le_from buf at n acc =
     if n <= 0 { acc } else { le_from buf at (n - 1) (acc * 256 + str_byte buf (at + n - 1)) };
 
+priv let le : :string -> :integer -> :integer -> :integer;
 priv let le buf at n = le_from buf at n 0;
 
 /// The same eight bytes `write_int` wrote, back as an integer.
@@ -169,32 +199,34 @@ priv let le buf at n = le_from buf at n 0;
 /// A positive fixnum stops at `2^62 - 1`, so its top byte is under `0x40`; a
 /// negative one stops at `-2^62`, whose two's complement top byte is `0xC0`.
 /// Between those is a number this runtime cannot hold.
+priv let read_int : :string -> :integer -> :any;
 priv let read_int buf at =
     if not (has buf at 8) { () }
     else {
-        let top = str_byte buf (at + 7);
-        if top < 64 { [le buf at 8, at + 8] }
-        else if top >= 192 {
+        match str_byte buf (at + 7) {
+            top if top < 64 => [le buf at 8, at + 8],
             // The magnitude of the complement, then negated. `0 - m - 1` rather
             // than `0 - (m + 1)` because at the very bottom of the range `m + 1`
             // is one past the largest fixnum and would become a float, where
             // both steps of this stay inside it.
-            let m = complement buf at 8 0;
-            [(0 - m) - 1, at + 8]
+            top if top >= 192 => [(0 - complement buf at 8 0) - 1, at + 8],
+            _ => (),
         }
-        else { () }
     };
 
 /// The magnitude of the two's complement at `at`: every byte inverted,
 /// assembled the same way, which is one less than the value's absolute value.
+priv let complement : :string -> :integer -> :integer -> :integer -> :integer;
 priv let rec complement buf at n acc =
     if n <= 0 { acc }
     else { complement buf at (n - 1) (acc * 256 + (255 - str_byte buf (at + n - 1))) };
 
+priv let read_float : :string -> :integer -> :any;
 priv let read_float buf at =
     if not (has buf at 8) { () } else { [float_of_bytes (str_slice buf at 8), at + 8] };
 
 /// A length, then that many bytes, as a string.
+priv let read_bytes : :string -> :integer -> :any;
 priv let read_bytes buf at =
     if not (has buf at width) { () }
     else {
@@ -213,6 +245,7 @@ priv let read_bytes buf at =
 /// decode -- which is the right failure. A program that means to accept a name
 /// it does not use has to write it down somewhere, and writing it down is what
 /// makes it an atom.
+priv let read_atom : :string -> :integer -> :any;
 priv let read_atom buf at = match read_bytes buf at {
     () => (),
     [name, next] => match to_existing_atom name {
@@ -221,6 +254,7 @@ priv let read_atom buf at = match read_bytes buf at {
     },
 };
 
+priv let read_char : :string -> :integer -> :any;
 priv let read_char buf at =
     if not (has buf at width) { () }
     else {
@@ -232,6 +266,7 @@ priv let read_char buf at =
     };
 
 /// `n` values in a row: `[values, next]`, or `()` if any of them is not one.
+priv let read_n : :string -> :integer -> :integer -> [Value] -> :any;
 priv let rec read_n buf at n acc =
     if n <= 0 { [list.reverse acc, at] }
     else {
@@ -242,10 +277,12 @@ priv let rec read_n buf at n acc =
     };
 
 /// A count, then that many values.
+priv let read_seq : :string -> :integer -> :any;
 priv let read_seq buf at =
     if not (has buf at width) { () } else { read_n buf (at + width) (le buf at width) [] };
 
 /// A count, then twice that many values, taken in pairs.
+priv let read_map : :string -> :integer -> :any;
 priv let read_map buf at =
     if not (has buf at width) { () }
     else {
@@ -255,12 +292,14 @@ priv let read_map buf at =
         }
     };
 
+priv let map_of : [Value] -> %{ Value => Value };
 priv let rec map_of flat =
     if list.is_empty flat { %{} }
     else { ((map_of (list.drop 2 flat))).[(list.nth 0 flat) => (list.nth 1 flat)] };
 
 /// One value at `at`. The tag decides, and a byte that is not a tag -- or the
 /// `-1` that `str_byte` answers past the end -- falls through to `()`.
+priv let read : :string -> :integer -> :any;
 priv let rec read buf at = match str_byte buf at {
     0  => [(), at + 1],
     1  => [false, at + 1],
@@ -286,6 +325,7 @@ priv let rec read buf at = match str_byte buf at {
 /// sender and the reader disagree about the format, and carrying on would read
 /// the next message as part of this one. A stream of several messages is
 /// `frames`, which knows where each ends because the frame says so.
+let decode : :string -> result.Of :any :string;
 let decode text = match read text 0 {
     () => result.error ("not a " + format_name () + " value"),
     [v, at] =>

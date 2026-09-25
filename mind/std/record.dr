@@ -64,6 +64,7 @@ import std.str;
 /// not tell a module about itself: a generated module knows how to read field
 /// `name`, and does not know that `name` is what it is called. The parameter is
 /// ignored -- a virtual needs one, and the answer is a constant.
+let fields : :any -> Fields;
 virtual let fields u;
 
 /// Which collection this record is built on: `:list` for a `group`, `:array`
@@ -73,9 +74,11 @@ virtual let fields u;
 /// asked (`to_fields` uses `type_of`), and asking beats being told; but
 /// `of_fields` is handed the field values and nothing else, so something has to
 /// say what to put them in. The default is `:list`, so a `group` says nothing.
+let backing : :any -> :atom;
 virtual let backing u = :list;
 
 /// What to call this record where a person will read it.
+let record_name : :any -> :string;
 virtual let record_name u = "record";
 
 /// The field values, in `fields` order.
@@ -83,6 +86,7 @@ virtual let record_name u = "record";
 /// The default reads whichever backing the value actually has, which is why it
 /// is right for all three and why it cannot disagree with the value it is given
 /// -- a wrong `backing` breaks construction and leaves reading alone.
+let to_fields : :any -> [:any];
 virtual let to_fields self = match type_of self {
     :array => array_to_list self,
     :map   => list.map (fn k -> self.[k else ()]) (fields ()),
@@ -94,6 +98,7 @@ virtual let to_fields self = match type_of self {
 /// The default builds `backing`, which covers every record the language can
 /// declare. A record overrides it only to do something the declaration cannot
 /// express -- validating, defaulting, or renaming a field that moved.
+let of_fields : [:any] -> :any;
 virtual let of_fields values = match backing () {
     :array => array_of_list values,
     :map   => map.from_pairs (list.zip (fields ()) values),
@@ -107,10 +112,12 @@ virtual let of_fields values = match backing () {
 /// The form to send. It is self-describing, so a reader needs the field *names*
 /// rather than the declaration, and it survives a format with no atoms -- which
 /// `of_map` is written to read back.
+let to_map : :any -> %{:atom => :any};
 let to_map self = map.from_pairs (list.zip (fields ()) (to_fields self));
 
 /// The record's field name `k` spelled as text, which is what a format with no
 /// atoms will have made of it.
+priv let text_of : :atom -> :string;
 priv let text_of k = str.slice 1 (str.byte_length (to_string k)) (to_string k);
 
 /// The value `m` holds for field `k`, under either spelling, or `()`.
@@ -121,16 +128,19 @@ priv let text_of k = str.slice 1 (str.byte_length (to_string k)) (to_string k);
 /// could only read the first would be a record that cannot talk to anything but
 /// Dream, and a record that could only read the second would have thrown away
 /// the exactness `std.wire` exists to keep.
+let value_of : :map -> :atom -> :any;
 let value_of m k = m.[k else m.[text_of k else ()]];
 
 /// One of these, from such a map. A field the map does not mention is `()`,
 /// which is what every other reader in this library answers for a missing
 /// thing, and what a record's own accessor answers for a field with no default.
+let of_map : :map -> :any;
 let of_map m = of_fields (list.map (fn k -> value_of m k) (fields ()));
 
 // --- asking about a value ---------------------------------------------------------
 
 /// How many fields this record has.
+let arity : :any -> :integer;
 let arity u = list.length (fields ());
 
 /// Could this value be one of these?
@@ -140,6 +150,7 @@ let arity u = list.length (fields ());
 /// `User`" can only ever mean "is this the right shape", and a message that
 /// fits is not thereby one that was meant. Check the shape and then check the
 /// values; this is the first half only.
+let fits : :any -> :bool;
 let fits v = match type_of v {
     :list  => list.length v == arity (),
     :array => len v == arity (),
@@ -152,6 +163,7 @@ let fits v = match type_of v {
 /// In the order the fields were declared, which is `fields` and not the order a
 /// map walks: `to_map` exists to be sent and a map has no order worth reading,
 /// but a person reading a record expects to see it as it was written.
+let describe : :any -> :string;
 let describe self = {
     let one p = text_of (list.nth 0 p) + ": " + to_string (list.nth 1 p);
     record_name () + "("
@@ -165,6 +177,7 @@ let describe self = {
 /// A generated `set_name` is per field and is the one to reach for where the
 /// field is known when the code is written. This is for where it is not: a
 /// patch that arrived as data names its field at run time.
+let with_field : :any -> :atom -> :any -> :any;
 let with_field self k v = {
     let swap p = if list.nth 0 p == k { v } else { list.nth 1 p };
     of_fields (list.map swap (list.zip (fields ()) (to_fields self)))
@@ -174,6 +187,7 @@ let with_field self k v = {
 /// mention are left alone, which is what makes this a patch rather than a
 /// second constructor -- and either spelling of a key is accepted, so a patch
 /// that arrived as JSON applies without being translated first.
+let with_fields : :any -> :map -> :any;
 let with_fields self changes = {
     let pick p = {
         let k = list.nth 0 p;
@@ -198,4 +212,5 @@ import std.types;
 // Field metadata and named record data can be checked before conversion.
 type Fields = [:atom];
 type Backing = types.enum [:list, :array, :map];
+let of_map_as : :any -> :map -> :any;
 let of_map_as description value = types.check description (of_map value);

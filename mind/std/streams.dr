@@ -1,6 +1,7 @@
 import std.io;
 import std.str;
 /// A short write is not an error, so writing means looping until it is all out.
+let write_all! : :any -> :string -> :atom;
 let rec write_all! handle text = {
     let n = str.byte_length text;
     if n == 0 { :done }
@@ -16,4 +17,5 @@ let rec write_all! handle text = {
 import std.types;
 type Text = :string;
 // Preserve the existing write loop; callers opt into validation at entry.
+let write_as! : :any -> :any -> :string -> :atom;
 let write_as! description handle text = write_all! handle (types.check description text);

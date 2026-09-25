@@ -55,37 +55,48 @@ import std.str;
 // not to care about.
 
 /// Nothing: the absent value, `()`.
+let write_unit : :unit -> :string;
 virtual let write_unit u;
 
+let write_bool : :bool -> :string;
 virtual let write_bool b;
 
+let write_int : :integer -> :string;
 virtual let write_int n;
 
+let write_float : :float -> :string;
 virtual let write_float x;
 
 /// A string's text. Whatever quoting or escaping the format needs is here.
+let write_string : :string -> :string;
 virtual let write_string s;
 
 /// An atom. A format with no atoms of its own writes the name; `std.json`
 /// does exactly that, and the colon is not part of the name.
+let write_atom : :atom -> :string;
 virtual let write_atom a;
 
 /// A list, its elements already encoded. Joining them is what is left.
+let write_list : [:string] -> :string;
 virtual let write_list parts;
 
 /// A map, as `[key, value]` pairs in a settled order -- see `map_entries`.
 /// Both halves arrive *raw* rather than encoded, because a format's keys are
 /// not always its values: JSON's must become strings and a binary format's
-/// need not. Call `encode` on whichever half wants it.
+/// need not. Call `encode_value` on whichever half wants it -- not `encode`,
+/// which is a whole message and may not be a value at all (see there).
+let write_map : [[:any, :any]] -> :string;
 virtual let write_map pairs;
 
 /// One character. The default spells it as a string of one, which is what a
 /// text format wants and what every format can read back as *something*.
+let write_char : :char -> :string;
 virtual let write_char c = write_string (str.of_chars [c]);
 
 /// An array, its elements already encoded. The default spells it as a list,
 /// which is the right answer for any format that has one sequence and not two;
 /// a format that keeps them apart overrides this and gets an exact round trip.
+let write_array : [:string] -> :string;
 virtual let write_array parts = write_list parts;
 
 /// A value that cannot cross a wire at all -- a function, a module, a process,
@@ -97,15 +108,24 @@ virtual let write_array parts = write_list parts;
 /// string. On a bigstr the default raises, and that is the honest outcome
 /// rather than a gap -- a bigstr is a view into the mapped image precisely so
 /// that nothing copies it, and encoding one is a copy.
+let write_opaque : :any -> :string;
 virtual let write_opaque v = write_string (to_string v);
 
 /// What this format is called, for a diagnostic that has to name one.
+let format_name : :any -> :string;
 virtual let format_name u = "codec";
 
 /// The text, as `[:ok, value]` or `[:error, reason]`.
 ///
 /// The one hole with no default: a format that cannot read what it writes is
 /// half a codec, and everything below this line is built on both halves.
+///
+/// What comes back is `:any` and not the format's `Value`, though `Value` is
+/// exactly what can arrive. The reader knows what *this* message is -- a
+/// request, a record, a map -- and `Value` would tell it only that the message
+/// might be a list instead, so that every `.[k]` on a decoded map is reported.
+/// `decode_as` is the way to hold a message to a description.
+let decode : :string -> Decoded :any;
 virtual let decode text;
 
 // --- the walk ----------------------------------------------------------------
@@ -118,14 +138,16 @@ virtual let decode text;
 /// disagree about its bytes. A map's keys are flat values and `compare`
 /// totally orders those, so one sort buys an encoding that is a function of the
 /// value alone: comparable, hashable, cacheable, and testable.
+let map_entries : :map -> [[:any, :any]];
 let map_entries m = list.sort_on (fn p -> list.nth 0 p) (map_pairs m);
 
-/// The value, in this format.
+/// The value, in this format, wherever it stands.
 ///
 /// The whole of the traversal, and the reason this module exists. Every format
 /// shares it, so a value nests the same way in all of them and a format that
 /// spells seven kinds gets the eighth -- a map of lists of maps -- for nothing.
-let rec encode v = match type_of v {
+let encode_value : :any -> :string;
+let rec encode_value v = match type_of v {
     :unit    => write_unit v,
     :bool    => write_bool v,
     :integer => write_int v,
@@ -133,29 +155,46 @@ let rec encode v = match type_of v {
     :char    => write_char v,
     :string  => write_string v,
     :atom    => write_atom v,
-    :list    => write_list (list.map encode v),
-    :array   => write_array (list.map encode (array_to_list v)),
+    :list    => write_list (list.map encode_value v),
+    :array   => write_array (list.map encode_value (array_to_list v)),
     :map     => write_map (map_entries v),
     _        => write_opaque v,
 };
 
+/// The value as one whole message: what `decode` reads back, and what `frame`
+/// puts on a stream.
+///
+/// For most formats that is the value and nothing more, which is the default.
+/// It is a hole because it is not for all of them. A TOML file is a
+/// *document* -- `key = value` lines under `[section]` headers -- and a
+/// document is not how TOML writes a value in the middle of one, where a table
+/// is `{ k = v }`. So `std.toml` overrides this and leaves `encode_value`
+/// alone, and the walk above keeps calling `encode_value`: were it to recurse
+/// through `encode`, every nested table would come out as a document.
+let encode : :any -> :string;
+virtual let encode v = encode_value v;
+
 /// Every value, each encoded on its own. Not the encoding of the list -- that
 /// is `encode xs`.
+let encode_all : [:any] -> [:string];
 let encode_all vs = list.map encode vs;
 
 // --- decoding, once a format can ---------------------------------------------
 
 /// The value, or `default` when the text does not decode. The form for when a
 /// fallback is more use than a diagnosis.
+let decode_or : :any -> :string -> :any;
 let decode_or default text = result.or_else default (decode text);
 
 /// Does this value survive the trip? What a format's own tests are written
 /// with, and the honest way to state its limits: a format says which values
 /// round trip by listing the ones for which this is true.
+let round_trips : :any -> :bool;
 let round_trips v = decode (encode v) == result.ok v;
 
 /// Every value in the text, where the text is a sequence of whole messages --
 /// see framing below.
+let decode_stream : :string -> [Decoded :any];
 let decode_stream buf = list.head (frames buf);
 
 // --- framing: the same problem for every format -------------------------------
@@ -177,9 +216,11 @@ let decode_stream buf = list.head (frames buf);
 // same ceiling an image has and for the same reason.
 
 /// The bytes a length prefix takes.
+let frame_header : :integer;
 let frame_header = 4;
 
 /// `v` as one whole message: its length, then its encoding.
+let frame : :any -> :string;
 let frame v = {
     let body = encode v;
     str_concat [str_le (len body) frame_header, body]
@@ -187,6 +228,7 @@ let frame v = {
 
 /// Every value, each as its own message, back to back. A batch is bytes that
 /// can be split again, not a bigger message.
+let frame_all : [:any] -> :string;
 let frame_all vs = str_concat (list.map frame vs);
 
 /// The length of the message whose prefix is at the front of `buf`, or `-1`
@@ -202,6 +244,7 @@ let frame_all vs = str_concat (list.map frame vs);
 ///
 /// Little-endian, and read a byte at a time because that is what a string is
 /// indexed by.
+let frame_size : :string -> :integer;
 let frame_size buf =
     if len buf < frame_header { 0 - 1 }
     else {
@@ -220,6 +263,7 @@ let frame_size buf =
 /// that arrived and did not decode is `[[:error, reason], rest]`, which the
 /// caller can report and carry on from, because the frame said where the next
 /// message starts whether or not this one made sense.
+let next_frame : :string -> :any;
 let next_frame buf = {
     let have = len buf;
     if have < frame_header { () }
@@ -234,6 +278,7 @@ let next_frame buf = {
     }
 };
 
+priv let frames_from : [Decoded :any] -> :string -> [[Decoded :any], :string];
 priv let rec frames_from acc buf = match next_frame buf {
     ()        => [list.reverse acc, buf],
     [r, rest] => frames_from (list_cons r acc) rest,
@@ -244,6 +289,7 @@ priv let rec frames_from acc buf = match next_frame buf {
 /// The leftover is the point. A reader keeps it, appends what arrives next, and
 /// asks again -- which is the whole of a stream reader, and is why this answers
 /// the tail rather than discarding it or calling it an error.
+let frames : :string -> [[Decoded :any], :string];
 let frames buf = frames_from [] buf;
 
 // --- optional types ---------------------------------------------------------
@@ -252,7 +298,10 @@ import std.types;
 type Decoded value = result.Of value :any;
 // Syntax errors stay in the codec's error channel; a schema mismatch is a
 // :type_error value in that same channel. No exception is needed by a parser.
+let decode_as : :any -> :string -> Decoded :any;
 let decode_as description text = result.validate_ok description (decode text);
+let encode_as : :any -> :any -> :string;
 let encode_as description value = encode (types.check description value);
 
+let frame_as : :any -> :any -> :string;
 let frame_as description value = frame (types.check description value);

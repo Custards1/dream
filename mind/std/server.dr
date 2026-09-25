@@ -75,6 +75,7 @@ import std.supervisor;
 // still spelled with it, because the contract is the name.
 
 /// The state to begin with, from whatever `start!` was given.
+let init! : :any -> :any;
 virtual let init! args;
 
 /// A request that wants an answer. `from` is who asked.
@@ -85,22 +86,28 @@ virtual let init! args;
 ///
 /// The default answers every request the same way, which is what a server that
 /// only takes casts should do: refuse clearly rather than hang.
+/// `from` is a `Handle`, or `:nobody` when `answer!` runs a handler in place.
+let handle_call! : :any -> :any -> :any -> Action :any :any;
 virtual let handle_call! request from state = reply [:error, :unhandled] state;
 
 /// A message that wants no answer. `noreply state` or `stop reason state`.
+let handle_cast! : :any -> :any -> Action :any :any;
 virtual let handle_cast! message state = noreply state;
 
 /// Anything else that arrived: a raw `send!`, a reply to something this server
 /// asked for, a notification from a supervisor. The default ignores it, which
 /// is the only safe default -- a server that stopped on an unrecognised message
 /// could be stopped by anyone who sent it one.
+let handle_info! : :any -> :any -> Action :any :any;
 virtual let handle_info! message state = noreply state;
 
 /// Run as the server stops, for whatever has to be let go of. Its answer is
 /// ignored; the process's value is the final state.
+let terminate! : :any -> :any -> :any;
 virtual let terminate! reason state = ();
 
 /// What this server is called, where a person will read it.
+let server_name : :any -> :string;
 virtual let server_name u = "server";
 
 // --- what a handler answers -------------------------------------------------------
@@ -108,14 +115,18 @@ virtual let server_name u = "server";
 // Named rather than written out, so that a handler says what it means and the
 // shapes below stay this module's business.
 
+let reply : v -> s -> [:reply, v, s];
 let reply value state = [:reply, value, state];
 
+let noreply : s -> [:noreply, s];
 let noreply state = [:noreply, state];
 
 /// Stop, with no reply outstanding. From `handle_cast!` or `handle_info!`.
+let stop : :any -> s -> [:stop, :any, s];
 let stop reason state = [:stop, reason, state];
 
 /// Stop, answering the call that asked for it first.
+let stop_with_reply : :any -> v -> s -> [:stop, :any, v, s];
 let stop_with_reply reason value state = [:stop, reason, value, state];
 
 // --- the protocol ------------------------------------------------------------------
@@ -132,8 +143,11 @@ let stop_with_reply reason value state = [:stop, reason, value, state];
 // answer later. Adding a timeout would break that argument and would need a
 // real reference.
 
+priv let call_of : Handle -> r -> Call r;
 priv let call_of from request = [:server_call, from, request];
+priv let cast_of : m -> Cast m;
 priv let cast_of message     = [:server_cast, message];
+priv let reply_of : Handle -> v -> [:server_reply, Handle, v];
 priv let reply_of to value   = [:server_reply, to, value];
 
 /// The tag of a message, or `()` for a message that has none.
@@ -142,6 +156,7 @@ priv let reply_of to value   = [:server_reply, to, value];
 /// cannot simply read element zero: `head` of an atom raises, and a server
 /// brought down by a stray `send!` is a server that cannot be trusted with a
 /// mailbox.
+priv let tag_of : :any -> :any;
 priv let tag_of m =
     if type_of m == :list && not (list_is_empty m) { m.[0] } else { () };
 
@@ -152,23 +167,23 @@ priv let tag_of m =
 /// `from` is what `handle_call!` was given. Holding on to one and replying
 /// later is how a server answers something it must wait for without making
 /// every other client wait too.
+let reply_to! : Handle -> :any -> :any;
 let reply_to! from value = send! from (reply_of from value);
 
 /// What one message does to the server: `[:continue, state]` or `[:done, value]`.
-priv let step! state m =
-    if m == proc.shutdown {
+priv let step! : :any -> :any -> [:atom, :any];
+priv let step! state m = match tag_of m {
+    _ if m == proc.shutdown => {
         terminate! :shutdown state
         [:done, state]
-    }
-    else {
-        match tag_of m {
-            :server_call => after_call! (list.nth 1 m)
-                                        (handle_call! (list.nth 2 m) (list.nth 1 m) state),
-            :server_cast => after! (handle_cast! (list.nth 1 m) state),
-            _            => after! (handle_info! m state),
-        }
-    };
+    },
+    :server_call => after_call! (list.nth 1 m)
+                                (handle_call! (list.nth 2 m) (list.nth 1 m) state),
+    :server_cast => after! (handle_cast! (list.nth 1 m) state),
+    _            => after! (handle_info! m state),
+};
 
+priv let after_call! : Handle -> :any -> [:atom, :any];
 priv let after_call! from answer = match answer {
     [:reply, value, next] => {
         reply_to! from value
@@ -186,6 +201,7 @@ priv let after_call! from answer = match answer {
     other => [:done, other],
 };
 
+priv let after! : :any -> [:atom, :any];
 priv let after! answer = match answer {
     [:noreply, next] => [:continue, next],
     [:stop, reason, next] => {
@@ -202,6 +218,7 @@ priv let after! answer = match answer {
 /// server whose handler answers `state + 1` holds a chain of suspended
 /// additions as long as its uptime, and forcing that chain is what runs a
 /// program out of depth.
+let loop! : :any -> :any;
 let rec loop! state = {
     let m = recv! ();
     match step! state m {
@@ -212,9 +229,11 @@ let rec loop! state = {
 
 /// The whole of a server, in the process that calls it: initialize, then loop.
 /// This is what `start!` spawns and what a supervisor starts.
+let run! : :any -> :any;
 let run! args = loop! (strict! (init! args));
 
 /// Start one, and answer its process.
+let start! : :any -> Handle;
 let start! args = spawn! $( run! args );
 
 /// This server as a `std.supervisor` child, ready to be restarted.
@@ -233,17 +252,21 @@ let start! args = spawn! $( run! args );
 /// says so where `child_with` is declared: it spells its parameter without the
 /// `!` so that describing a child stays pure for everyone who already holds a
 /// starter. Nothing here performs an effect until the supervisor starts it.
+priv let started! : :any -> :unit -> :any;
 priv let started! args u = run! args;
 
+let child! : :string -> :any -> supervisor.Child;
 let child! name args = supervisor.child name (started! args);
 
 /// The same, with when it should be restarted: `:permanent`, `:transient` or
 /// `:temporary`.
+let child_with! : :string -> :any -> supervisor.Restart -> supervisor.Child;
 let child_with! name args restart = supervisor.child_with name (started! args) restart;
 
 // --- talking to one ------------------------------------------------------------------
 
 /// Ask, and wait for the answer.
+let call! : Handle -> :any -> :any;
 let call! pid request = {
     let me = self! ();
     send! pid (call_of me request)
@@ -265,6 +288,7 @@ let call! pid request = {
 /// meant for the caller's own loop are waiting for it when the call returns.
 /// Two servers calling *each other* still deadlock, as they do in Erlang --
 /// each is waiting on a reply the other will not send until its own arrives.
+priv let await_reply! : Handle -> [:any] -> :any;
 priv let rec await_reply! me kept = {
     let m = recv! ();
     if tag_of m == :server_reply && list.nth 1 m == me {
@@ -274,6 +298,7 @@ priv let rec await_reply! me kept = {
     else { await_reply! me (list_cons m kept) }
 };
 
+priv let requeue! : [:any] -> :unit;
 priv let requeue! ms = {
     let me = self! ();
     strict! (list.map (fn m -> send! me m) ms)
@@ -283,12 +308,14 @@ priv let requeue! ms = {
 /// Tell, and carry on. Nothing comes back, including a failure: a cast to a
 /// server that is not there is a message into a void, which is what makes it
 /// the right shape for a notification and the wrong one for a question.
+let cast! : Handle -> :any -> :any;
 let cast! pid message = send! pid (cast_of message);
 
 /// Ask it to stop, and wait until it has. The answer is its final state.
 ///
 /// This is `proc.shutdown`, the same message `std.supervisor` sends, so a
 /// server stops the same way whoever is asking.
+let stop! : Handle -> :any;
 let stop! pid = {
     send! pid proc.shutdown
     join! pid
@@ -305,6 +332,7 @@ let stop! pid = {
 /// is a diagnostic rather than something to put inside a loop that matters.
 /// What it costs is two snapshots per call, and what it buys is that the same
 /// `std.debug` vocabulary describes a call as describes everything else.
+let timed_call! : Handle -> :any -> [:any, :integer];
 let timed_call! pid request = {
     let before = debug.now! ();
     let value = strict! (call! pid request);
@@ -325,6 +353,7 @@ let timed_call! pid request = {
 /// `from` is `:nobody`, because there is nobody to reply to later. A handler
 /// that answers `noreply` is therefore answered `()`; one that means to be
 /// driven this way should reply directly.
+let answer! : :any -> :any -> [:any, :any];
 let answer! request state = match handle_call! request :nobody state {
     [:reply, value, next] => [value, next],
     [:noreply, next] => [(), next],
@@ -345,10 +374,13 @@ type Action value state = [:reply, value, state]
 import std.types;
 
 /// Validate a handler's action explicitly, before handing it to the server.
+let check_action : :any -> :any -> Action a b -> Action a b;
 let check_action value state action = types.check (Action value state) action;
 
 /// Checks on the caller's side: an invalid request is rejected before sending,
 /// and an invalid reply is rejected after it has been received.
+let call_as! : :any -> :any -> Handle -> :any -> :any;
 let call_as! request_type reply_type pid request =
     types.check reply_type (call! pid (types.check request_type request));
+let cast_as! : :any -> Handle -> :any -> :any;
 let cast_as! message_type pid message = cast! pid (types.check message_type message);

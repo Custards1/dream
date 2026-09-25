@@ -22,9 +22,12 @@ import std.console;
 // --- cases ------------------------------------------------------------------
 
 /// A case is a name and a suspended computation, as made by `$( .. )`.
+let case : :string -> :any -> Case;
 let case name body = [name, body];
 
+let case_name : Case -> :string;
 let case_name c = c.[0];
+let case_body : Case -> :any;
 let case_body c = ((list_tail c)).[0];
 
 // --- assertions -------------------------------------------------------------
@@ -32,6 +35,7 @@ let case_body c = ((list_tail c)).[0];
 // Each raises a message describing the difference. Raising is what ends a case
 // at its first failure, and what the runner catches.
 
+let eq! : :any -> :any -> :ok;
 let eq! expected actual = {
     if expected == actual { :ok }
     else {
@@ -39,22 +43,26 @@ let eq! expected actual = {
     }
 };
 
+let ne! : :any -> :any -> :ok;
 let ne! unexpected actual = {
     if unexpected != actual { :ok }
     else { raise! ("expected anything but " + to_string unexpected) }
 };
 
+let true! : :any -> :ok;
 let true! actual = {
     if actual == true { :ok }
     else { raise! ("expected true, got " + to_string actual) }
 };
 
+let false! : :any -> :ok;
 let false! actual = {
     if actual == false { :ok }
     else { raise! ("expected false, got " + to_string actual) }
 };
 
 /// Floats rarely compare exactly, so compare within a tolerance.
+let near! : (:integer | :float) -> (:integer | :float) -> (:integer | :float) -> :ok;
 let near! tolerance expected actual = {
     let d = expected - actual;
     let magnitude = if d < 0 { 0 - d } else { d };
@@ -65,32 +73,38 @@ let near! tolerance expected actual = {
     }
 };
 
+let has_element : a -> [a] -> :bool;
 let rec has_element x xs =
     if list_is_empty xs { false }
     else if xs.[0] == x { true }
     else { has_element x (list_tail xs) };
 
+let contains! : a -> [a] -> :ok;
 let contains! x xs = {
     if has_element x xs { :ok }
     else { raise! (to_string xs + " does not contain " + to_string x) }
 };
 
+let empty! : [a] -> :ok;
 let empty! xs = {
     if list_is_empty xs { :ok }
     else { raise! ("expected an empty list, got " + to_string xs) }
 };
 
 /// The computation must raise. Used to check that errors are reported.
+let raises! : :any -> :ok;
 let raises! body = {
     let outcome = try! { join! (spawn! body); :did_not_raise } catch e { :raised };
     if outcome == :raised { :ok } else { raise! "expected this to raise, but it returned" }
 };
 
 /// Fail unconditionally, for a branch that should be unreachable.
+let fail! : :any -> :never;
 let fail! message = raise! message;
 
 // --- running ----------------------------------------------------------------
 
+let run_cases! : :integer -> :integer -> [Case] -> [:integer, :integer];
 let rec run_cases! passed failed cases = {
     if list_is_empty cases { [passed, failed] }
     else {
@@ -112,6 +126,7 @@ let rec run_cases! passed failed cases = {
 
 /// Run a suite. Returns the number of failures, so a caller can sum several
 /// suites and exit accordingly.
+let suite! : :string -> [Case] -> :integer;
 let suite! name cases = {
     console.write! ("\n" + name + "\n")
     let counts = run_cases! 0 0 cases;
@@ -124,6 +139,7 @@ let suite! name cases = {
 };
 
 /// Run several suites and report the total. Each entry is `[name, cases]`.
+let run_suites! : :integer -> [Suite] -> :integer;
 let rec run_suites! failed suites = {
     if list_is_empty suites { failed }
     else {
@@ -134,6 +150,7 @@ let rec run_suites! failed suites = {
 };
 
 /// The usual entry point: run everything and print a summary.
+let main_of! : [Suite] -> :ok;
 let main_of! suites = {
     let failed = run_suites! 0 suites;
     if failed > 0 {
@@ -144,3 +161,12 @@ let main_of! suites = {
         :ok
     }
 };
+
+// --- optional types ---------------------------------------------------------
+
+/// A case: its name, and the suspended body that is run in a process of its
+/// own. The body is `:any` because a `$( .. )` is a value of whatever it will
+/// be, and nothing about it is known until it runs.
+type Case = [:string, :any];
+/// A suite, as `main_of!` takes them: a module's name and its cases.
+type Suite = [:string, [Case]];

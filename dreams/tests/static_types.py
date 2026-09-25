@@ -154,6 +154,32 @@ let main! = {
 };
 ''', '[2, 4, 6]\n[2, 3]\n')
 
+    # `()` is "nothing there": it neither decides a type variable nor fails to
+    # fit one. So a `()` default leaves `map.get`'s answer the map's value type
+    # -- a guarded use is not told its value might be unit, and a wrong use of
+    # the value is still reported -- and `minimum : [a] -> a` may answer `()`.
+    success(prelude + '''
+import std.list;
+import std.map;
+let ages : %{ :string => :integer } = %{ "ada" => 36 };
+let next = match map.get () ages "bob" { () => 0, n => n + 1 };
+let pair = [1, ()];
+let main! = {
+    console.print! next
+    console.print! (list.minimum [3, 1] + 1)
+    console.print! (list.head pair + 1)
+    console.print! (map.get () (%{ "k" => "v" }) "k")
+};
+''', '0\n2\n2\nv\n')
+    failure(prelude + '''
+import std.map;
+import std.str;
+let ages : %{ :string => :integer } = %{ "ada" => 36 };
+let main! = console.print! (str.length (map.get () ages "ada"));
+''', 'argument 1 of `str.length` should be `:string`, but this is `:integer`')
+    failure(prelude + 'import std.list; let main! = console.print! (list.minimum [3, 1] + "x");',
+            'but this is `:integer` and `"x"`')
+
     # --- what is not ----------------------------------------------------------------
     #
     # Code no signature touches is never an error, however obviously it would

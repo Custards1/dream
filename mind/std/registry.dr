@@ -62,6 +62,7 @@ import std.supervisor;
 // --- the table ------------------------------------------------------------
 
 /// An empty registry, in a process of its own.
+let start! : :unit -> server.Handle;
 let start! u = agent.start! map.empty;
 
 /// Stop it, and answer the table it stopped with.
@@ -70,6 +71,7 @@ let start! u = agent.start! map.empty;
 /// processes they name; a supervisor owns those, and it should be stopped
 /// first -- a child restarted after this has gone cannot register itself and
 /// dies of trying.
+let stop! : server.Handle -> :any;
 let stop! reg = agent.stop! reg;
 
 /// Bind `name` to `pid`, over whatever was there. Answers what it replaced,
@@ -79,6 +81,7 @@ let stop! reg = agent.stop! reg;
 /// name is still bound to the process that just died, and the one that
 /// replaced it has to win. `claim!` is the other answer, for a name that is
 /// supposed to be free.
+let register! : server.Handle -> :any -> :process -> :any;
 let register! reg name pid = {
     // Forced here, in the caller, because it is about to be put in a closure
     // and sent. A message is deep-copied and an unforced thunk inside one is
@@ -95,6 +98,7 @@ let register! reg name pid = {
 /// The check and the write happen in the registry, in one message, which is
 /// the difference between this and a `whereis!` followed by a `register!` --
 /// two processes claiming the same name would both find it free.
+let claim! : server.Handle -> :any -> :process -> ([:ok, :process] | [:taken, :process]);
 let claim! reg name pid = {
     let p = strict! pid;
     agent.get_and_update! reg (fn m -> match map.get () m name {
@@ -104,10 +108,12 @@ let claim! reg name pid = {
 };
 
 /// Forget `name`. Answers the pid it held, or `()`.
+let unregister! : server.Handle -> :any -> :any;
 let unregister! reg name =
     agent.get_and_update! reg (fn m -> [map.get () m name, map.remove m name]);
 
 /// Forget every name `pid` holds, for a process registered under several.
+let forget! : server.Handle -> :process -> :ok;
 let forget! reg pid = {
     let p = strict! pid;
     agent.update! reg (fn m -> map.filter (fn _ v -> v != p) m)
@@ -116,14 +122,18 @@ let forget! reg pid = {
 // --- asking it things -------------------------------------------------------
 
 /// The process registered as `name`, or `()`.
+let whereis! : server.Handle -> :any -> :any;
 let whereis! reg name = agent.get! reg (fn m -> map.get () m name);
 
+let has! : server.Handle -> :any -> :bool;
 let has! reg name = agent.get! reg (fn m -> map.has m name);
 
 /// Every name, in order.
+let names! : server.Handle -> [:any];
 let names! reg = agent.get! reg (fn m -> map.sorted_keys m);
 
 /// The whole table, as a map of name to pid.
+let all! : server.Handle -> Entries;
 let all! reg = agent.value! reg;
 
 /// `whereis!` as a function of unit, for something that will ask again later.
@@ -133,6 +143,7 @@ let all! reg = agent.value! reg;
 /// `fn u -> whereis! reg name` is a *pure* function naming an impure one,
 /// which the purity checker refuses. `std.server` takes the same route for the
 /// same reason, and says so where `child!` is declared.
+let finder! : server.Handle -> :any -> :unit -> :any;
 let finder! reg name u = whereis! reg name;
 
 // --- talking to a name -------------------------------------------------------
@@ -147,6 +158,7 @@ let finder! reg name u = whereis! reg name;
 /// value: a call that was never made has no reply, and `[:error, ..]` would
 /// give it the shape of one the server chose to send. A caller that would
 /// rather branch asks `whereis!` first.
+let call! : server.Handle -> :any -> :any -> :any;
 let call! reg name request = match whereis! reg name {
     () => error.raise_as! :not_registered ("nothing is registered as " + to_string name),
     pid => server.call! pid request,
@@ -156,6 +168,7 @@ let call! reg name request = match whereis! reg name {
 /// including when the answer is that nobody does. A cast into a name that is
 /// not registered is the same void as a cast to a server that has stopped,
 /// which is what makes it the shape for a notification and not for a question.
+let cast! : server.Handle -> :any -> :any -> :any;
 let cast! reg name message = match whereis! reg name {
     () => (),
     pid => server.cast! pid message,
@@ -176,6 +189,7 @@ let cast! reg name message = match whereis! reg name {
 /// begins. That ordering is the whole value of doing it here: the name is
 /// bound before the server has read its first message, so there is no instant
 /// at which the process is running and the name does not reach it.
+priv let registered! : :any -> :any -> (:unit -> :any) -> :unit -> :any;
 priv let registered! reg name start u = {
     let me = self! ();
     register! reg name me
@@ -195,6 +209,10 @@ priv let registered! reg name start u = {
 /// whatever built one -- `store.child! "store" %{}`, `agent.child! "n" 0`, or a
 /// plain `supervisor.child` -- and keeps the name and the restart policy that
 /// child was given.
+///
+/// The registry is only read when the child starts, so it is `:any` here: a
+/// child built to be looked at, as a test does, need not have one.
+let child! : :any -> :any -> :any;
 let child! reg c =
     supervisor.child_with (supervisor.child_name c)
                           (registered! reg (supervisor.child_name c)
@@ -467,4 +485,5 @@ when test {
 
 import std.types;
 type Entries = %{ :any => :process };
+let all_as! : server.Handle -> Entries;
 let all_as! reg = types.check Entries (all! reg);

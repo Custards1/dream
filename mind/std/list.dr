@@ -4,22 +4,47 @@
 // what follows works on lists that are never fully built -- `take 5 (from 1)`
 // asks for five cells of an infinite list and no more. Functions that must see
 // the whole list to answer (`length`, `reverse`, `sort`) say so.
+//
+// Two rules decide the signatures below, and both are about the checker never
+// reporting a program that works (see the head of `dreams/typecheck.dr`):
+//
+// - **A read by position answers `:any`.** A list in this library and in the
+//   compiler is as often a record -- `[name, index]`, a span, a token -- as it
+//   is a sequence, and the element type of a fixed-length list is the union of
+//   its fields. `head [0, []]` answering `:integer | [:never]` is true and
+//   useless: no one position holds that, and every `+` on it would be
+//   reported. So `head`, `nth` and `last` say what they take and not what they
+//   answer. Everything that treats the list as a sequence -- `map`, `fold`,
+//   `filter` -- is generic in the element, because there the union is right.
+// - **`()` is "nothing there", and the checker knows it.** `minimum` answers
+//   `()` for an empty list, and the default handed to `first_or`, `map.get`
+//   or `result.or_else` is `()` as often as not. So `()` fits any type
+//   variable and never decides one (`solve` and `sub` in
+//   `dreams/typecheck.dr`): `minimum` is `[a] -> a` although its body can
+//   answer `()`, and `map.get () ages name` answers the map's value type
+//   rather than that type or unit -- which a caller that guards with a `()`
+//   arm, exactly as it should, could not otherwise use.
 
 
+let empty : [a];
 let empty = [];
 
 // --- looking at a list ------------------------------------------------------
 
+let is_empty : [a] -> :bool;
 let is_empty xs = list_is_empty xs;
 
 /// The first element. Raises on an empty list; `first_or` is the total form.
+let head : [a] -> :any;
 let head xs = xs.[0];
 
 /// Everything after the first element.
+let tail : [a] -> [a];
 let tail xs = list_tail xs;
 
 /// A new list with `x` on the front. Lazy in both, which is what lets a list
 /// be defined in terms of itself.
+let cons : a -> [a] -> [a];
 let cons x xs = list_cons x xs;
 
 let first_or : a -> [a] -> a;
@@ -27,6 +52,7 @@ let first_or default xs = if list_is_empty xs { default } else { xs.[0] };
 
 /// `acc` plus the length of `xs`. The accumulating form `length` was written
 /// in terms of; both walk the spine in the machine now.
+let length_from : :integer -> [a] -> :integer;
 let length_from acc xs = acc + len xs;
 
 /// Forces the whole spine, so it does not terminate on an infinite list.
@@ -35,6 +61,7 @@ let length_from acc xs = acc + len xs;
 /// cells in Dream instead was a call, an `is_empty` and a `tail` each -- and
 /// `sort` asks for a length at every level of its recursion, so the corpus
 /// paid for it in the thousands.
+let length : [a] -> :integer;
 let length xs = len xs;
 
 /// The element at `n`, counting from zero, or `()` when there is none.
@@ -53,8 +80,10 @@ let length xs = len xs;
 /// end does. The recursion this replaces treated any `n <= 0` as the head,
 /// which was an accident of how it counted down rather than anything anyone
 /// asked for -- and the opposite of what a caller guarding on `()` expects.
+let nth : :integer -> [a] -> :any;
 let nth n xs = xs.[n else ()];
 
+let last : [a] -> :any;
 let last xs = {
     let rec go xs =
         if list_is_empty (list_tail xs) { xs.[0] } else { go (list_tail xs) };
@@ -82,6 +111,7 @@ let last xs = {
 let append : [a] -> [a] -> [a];
 let append xs ys = xs + ys;
 
+let reverse_from : [a] -> [a] -> [a];
 let rec reverse_from acc xs =
     if list_is_empty xs { acc } else { reverse_from (list_cons (xs.[0]) acc) (list_tail xs) };
 
@@ -152,6 +182,7 @@ let fold_strict : (b -> a -> b) -> b -> [a] -> b;
 let fold_strict f acc xs =
     if list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (list_tail xs) };
 
+priv let strict_steps : (b -> a -> b) -> b -> [a] -> b;
 priv let rec strict_steps f !acc xs =
     if list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (list_tail xs) };
 
@@ -220,6 +251,7 @@ let contains x xs = any (fn y -> y == x) xs;
 let count : (a -> :bool) -> [a] -> :integer;
 let count pred xs = fold_strict (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
 
+let index_of_from : :integer -> a -> [a] -> :integer;
 let rec index_of_from !i x xs =
     if list_is_empty xs { 0 - 1 }
     else if xs.[0] == x { i }
@@ -232,12 +264,15 @@ let index_of x xs = index_of_from 0 x xs;
 // Strict, because a sum is a number and a lazy one is a million suspended
 // additions waiting to overflow the machine. A `sum` over a `range` is fused
 // and runs none of this.
+let sum : [(:integer | :float)] -> (:integer | :float);
 let sum xs = fold_strict (fn a b -> a + b) 0 xs;
+let product : [(:integer | :float)] -> (:integer | :float);
 let product xs = fold_strict (fn a b -> a * b) 1 xs;
 
 // `best` is strict because `next` below is a suspended `if` that names the
 // last one, so a lazy `best` is a chain as long as the list. Both callers
 // compare it on every step anyway, so this forces nothing they did not.
+let min_by_from : a -> (a -> a -> :bool) -> [a] -> a;
 let rec min_by_from !best less xs =
     if list_is_empty xs { best }
     else {
@@ -246,10 +281,12 @@ let rec min_by_from !best less xs =
         min_by_from next less (list_tail xs)
     };
 
+let minimum : [a] -> a;
 let minimum xs =
     if list_is_empty xs { () }
     else { min_by_from (xs.[0]) (fn a b -> compare a b < 0) (list_tail xs) };
 
+let maximum : [a] -> a;
 let maximum xs =
     if list_is_empty xs { () }
     else { min_by_from (xs.[0]) (fn a b -> compare a b > 0) (list_tail xs) };
@@ -258,6 +295,7 @@ let maximum xs =
 let partition : (a -> :bool) -> [a] -> [[a], [a]];
 let partition pred xs = [filter pred xs, filter (fn x -> not (pred x)) xs];
 
+let unique_from : [a] -> [a] -> [a];
 let rec unique_from seen xs =
     if list_is_empty xs { [] }
     else {
@@ -273,6 +311,7 @@ let unique xs = unique_from [] xs;
 
 // --- ordering ---------------------------------------------------------------
 
+let merge_by : (a -> a -> :bool) -> [a] -> [a] -> [a];
 let rec merge_by before xs ys =
     if list_is_empty xs { ys }
     else if list_is_empty ys { xs }
@@ -300,11 +339,14 @@ let sort : [a] -> [a];
 let sort xs = sort_by (fn a b -> compare a b < 0) xs;
 
 /// Ascending by a key extracted from each element.
+let sort_on : (a -> b) -> [a] -> [a];
 let sort_on key xs = sort_by (fn a b -> compare (key a) (key b) < 0) xs;
 
 // --- conversion -------------------------------------------------------------
 
+let to_array : [a] -> #[a];
 let to_array xs = array_of_list xs;
+let of_array : #[a] -> [a];
 let of_array a = array_to_list a;
 
 

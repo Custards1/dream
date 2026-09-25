@@ -57,121 +57,156 @@ import std.str;
 
 /// `short` may be `""`, for an option with no one-letter form. `long` is the
 /// name the parsed value is looked up under, so it is the one that must exist.
+let opt : :string -> :string -> Kind -> :string -> :string -> Option;
 let opt short long kind meta help =
     %{ :short => short, :long => long, :kind => kind, :meta => meta, :help => help };
 
+let short : Option -> :string;
 let short o = o.[:short else ""];
+let long : Option -> :string;
 let long o  = o.[:long else ""];
+let kind : Option -> Kind;
 let kind o  = o.[:kind else :flag];
+let meta : Option -> :string;
 let meta o  = o.[:meta else ""];
+let help : Option -> :string;
 let help o  = o.[:help else ""];
 
 /// Present or absent, and nothing else to say.
+let flag : :string -> :string -> :string -> Option;
 let flag short long help = opt short long :flag "" help;
 
 /// Takes a value. Given twice, the last one wins -- which is what a reader of
 /// a command line expects, and what lets a wrapper script append an override.
+let value : :string -> :string -> :string -> :string -> Option;
 let value short long meta help = opt short long :value meta help;
 
 /// Takes a value and may be given again, collecting them in order. `-L` is the
 /// example: search paths are a list, and the order is part of the meaning.
+let list_of : :string -> :string -> :string -> :string -> Option;
 let list_of short long meta help = opt short long :list meta help;
 
 /// Present or absent, and either way round: `--color` and `--no-color` are both
 /// spelled out, so a wrapper can force something off as easily as on. The
 /// recorded value is `true` or `false`; never given, it stays whatever `get`
 /// is called with (or a `default_to`).
+let toggle : :string -> :string -> :string -> Option;
 let toggle short long help = opt short long :toggle "" help;
 
 /// Repeatable, and the count is the value: `-v -v` and `--verbose --verbose`
 /// both record 2, and `-vv` is two as well. Reading the option back with
 /// `get 0 c "verbose"` is how verbosity is written.
+let count : :string -> :string -> :string -> Option;
 let count short long help = opt short long :count "" help;
 
 /// A heading in the usage message. It parses as nothing.
+let section : :string -> Option;
 let section title = opt "" "" :section "" title;
 
+let is_option : Option -> :bool;
 let is_option o = kind o != :section;
 
 // --- enriching an option -----------------------------------------------------
 
 /// The value must be one of `cs`. Enforced at parse time and printed in the
 /// usage message, so the choices live next to the option that has them.
+let choices : [:string] -> Option -> Option;
 let choices cs o = o.[:choices => cs];
 
 /// The option must be written. Satisfied by a `default_to`, which records a
 /// value as if it had been typed. Checked after the whole line is walked, so
 /// `--output a --output b` is present however it ends.
+let required : Option -> Option;
 let required o = o.[:required => true];
 
 /// The value recorded when the option is never written, printed as
 /// `(default X)` in the usage message. Makes `get` answer without a fallback
 /// argument, because the description carries the answer.
+let default_to : :any -> Option -> Option;
 let default_to v o = o.[:default => v];
 
 // --- what parsing produced ---------------------------------------------------
 
+let parsed : %{ :string => :any } -> Arguments -> Parsed;
 let parsed values rest = %{ :values => values, :rest => rest };
 
+let values : Parsed -> %{ :string => :any };
 let values c = c.[:values else (%{})];
 /// The arguments that were not options, in order.
+let rest : Parsed -> Arguments;
 let rest c = c.[:rest else []];
 
 /// The value given for a `value` option, or `default`.
+let get : :any -> Parsed -> :string -> :any;
 let get default c name = ((values c)).[name else default];
 
 /// Whether a `flag` was given.
+let flag_set : Parsed -> :string -> :bool;
 let flag_set c name = get false c name == true;
 
 /// Everything collected for a `list` option, in the order it was written.
+let all : Parsed -> :string -> [:string];
 let all c name = get [] c name;
 
 // --- describing a subcommand -------------------------------------------------
 
 /// One entry in a `commands` table: the spelling, a line of help, and the
 /// options the command alone parses.
+let command : :string -> :string -> [Option] -> Command;
 let command name help opts = %{ :name => name, :help => help, :opts => opts };
 
+let command_name : Command -> :string;
 let command_name cm = cm.[:name else ""];
+let command_help : Command -> :string;
 let command_help cm = cm.[:help else ""];
+let command_opts : Command -> [Option];
 let command_opts cm = cm.[:opts else []];
 
 /// The command a `commands` parse chose, or `()` when there was no subcommand.
+let chosen : Parsed -> :any;
 let chosen c = c.[:command else ()];
 
 // --- parsing -----------------------------------------------------------------
 
+let by_long : [Option] -> :string -> :any;
 let by_long os name = {
     let hit = list.filter (fn o -> is_option o && long o == name) os;
     if list.is_empty hit { () } else { list.head hit }
 };
 
+let by_short : [Option] -> :string -> :any;
 let by_short os c = {
     let hit = list.filter (fn o -> is_option o && short o == c) os;
     if list.is_empty hit { () } else { list.head hit }
 };
 
+let by_command : [Command] -> :string -> :any;
 let by_command cmds name = {
     let hit = list.filter (fn cm -> command_name cm == name) cmds;
     if list.is_empty hit { () } else { list.head hit }
 };
 
+let add_count : Parsed -> Option -> :integer -> Parsed;
 let add_count c o n =
     c.[:values => (((values c)).[(long o) => ((((values c)).[(long o) else 0]) + n)])];
 
 /// Record one option's value. A `list` option appends; everything else assigns.
 /// `count` is recorded through `add_count`, which knows how many to add.
+let record : Parsed -> Option -> :any -> Parsed;
 let record c o v =
     c.[:values => (((values c)).[(long o) => (if kind o == :list { list.append (((values c)).[(long o) else []]) [v] }
               else { v })])];
 
+let add_rest : Parsed -> :string -> Parsed;
 let add_rest c a = c.[:rest => (list.append (rest c) [a])];
 
+let missing : Option -> :string -> [:error, :string];
 let missing o spelling =
     [:error, spelling + " needs " + (if str.is_empty (meta o) { "a value" } else { meta o })];
 
 /// A `choices` option was given a value it does not know; say so, naming the
 /// option and the value and everything it would have accepted.
+let choice_ok : Option -> :any -> (:ok | [:error, :string]);
 let choice_ok o v = {
     let cs = o.[:choices else []];
     if list.is_empty cs { :ok }
@@ -181,6 +216,7 @@ let choice_ok o v = {
 };
 
 /// Carry one option's value into `c` once its `choices` have approved it.
+let use_value : Parsed -> Option -> :any -> Arguments -> Step;
 let use_value c o v rest =
     match choice_ok o v {
         :ok => [:ok, record c o v, rest],
@@ -188,6 +224,7 @@ let use_value c o v rest =
     };
 
 /// Everything after `--` is a positional, whatever it looks like.
+let take_rest : Parsed -> Arguments -> Outcome;
 let rec take_rest c args =
     match args {
         [] => [:ok, c],
@@ -197,6 +234,7 @@ let rec take_rest c args =
 /// `--no-` in front of a toggle's name is the toggle spelled off: `--color` and
 /// `--no-color` are two ways of writing one option. For anything else it is
 /// just an unknown option name.
+let unnegate : :string -> [:atom, :string];
 let unnegate name =
     if str.starts_with "no-" name && str.byte_length name > 3 {
         [:neg, str.slice 3 (str.byte_length name - 3) name]
@@ -208,6 +246,7 @@ let unnegate name =
 /// `--`), consuming its value from `rest` when it takes one and does not carry
 /// it inline. Returns `[:ok, c, rest']` -- what the option became, and the line
 /// it left -- or `[:error, why]`.
+let step : [Option] -> Parsed -> :string -> Arguments -> Step;
 let step os c a rest = {
     if str.starts_with "--" a {
         let body = str.slice 2 (str.byte_length a - 2) a;
@@ -229,24 +268,17 @@ let step os c a rest = {
                     },
                 [:plain, _] => [:error, "unknown option --" + name],
             },
-            o =>
-                if kind o == :flag || kind o == :toggle {
-                    if inline != () { [:error, "--" + name + " takes no value"] }
-                    else { [:ok, record c o true, rest] }
-                }
-                else if kind o == :count {
-                    if inline != () { [:error, "--" + name + " takes no value"] }
-                    else { [:ok, add_count c o 1, rest] }
-                }
-                else {
-                    match inline {
-                        () => match rest {
-                            [] => missing o ("--" + name),
-                            [v, ..rest2] => use_value c o v rest2,
-                        },
-                        v => use_value c o v rest,
-                    }
+            o => match [kind o, inline] {
+                [:count, ()] => [:ok, add_count c o 1, rest],
+                [k, ()] if k == :flag || k == :toggle => [:ok, record c o true, rest],
+                [k, _] if k == :flag || k == :toggle || k == :count =>
+                    [:error, "--" + name + " takes no value"],
+                [_, ()] => match rest {
+                    [] => missing o ("--" + name),
+                    [v, ..rest2] => use_value c o v rest2,
                 },
+                [_, v] => use_value c o v rest,
+            },
         }
     }
     else {
@@ -254,35 +286,32 @@ let step os c a rest = {
         let attached = str.slice 2 (str.byte_length a - 2) a;
         match by_short os name {
             () => [:error, "unknown option -" + name],
-            o =>
-                if kind o == :flag || kind o == :toggle {
+            o => match kind o {
+                k if k == :flag || k == :toggle =>
                     if not (str.is_empty attached) { [:error, "-" + name + " takes no value"] }
-                    else { [:ok, record c o true, rest] }
-                }
-                else if kind o == :count {
-                    // `-vv` is `-v -v`: an attached run of the same letter counts.
-                    match str.to_list name {
-                        [ch, ..] =>
-                            if list.all (fn x -> x == ch) (str.to_list attached) {
-                                [:ok, add_count c o (1 + str.byte_length attached), rest]
-                            }
-                            else { [:error, "unknown option -" + name] },
-                        _ => [:ok, add_count c o 1, rest],
-                    }
-                }
+                    else { [:ok, record c o true, rest] },
+                // `-vv` is `-v -v`: an attached run of the same letter counts.
+                :count => match str.to_list name {
+                    [ch, ..] =>
+                        if list.all (fn x -> x == ch) (str.to_list attached) {
+                            [:ok, add_count c o (1 + str.byte_length attached), rest]
+                        }
+                        else { [:error, "unknown option -" + name] },
+                    _ => [:ok, add_count c o 1, rest],
+                },
                 // `-oPATH` as well as `-o PATH`: the attached form is what
                 // people write for short options.
-                else if not (str.is_empty attached) { use_value c o attached rest }
-                else {
-                    match rest {
-                        [] => missing o ("-" + name),
-                        [v, ..rest2] => use_value c o v rest2,
-                    }
+                _ if not (str.is_empty attached) => use_value c o attached rest,
+                _ => match rest {
+                    [] => missing o ("-" + name),
+                    [v, ..rest2] => use_value c o v rest2,
                 },
+            },
         }
     }
 };
 
+let walk : [Option] -> Parsed -> Arguments -> Outcome;
 let rec walk os c args =
     match args {
         [] => [:ok, c],
@@ -302,6 +331,7 @@ let rec walk os c args =
 
 /// Every option's `default_to` value is recorded when the option was not
 /// written, so the parsed table can answer `get` with no fallback.
+let fill_default : [Option] -> Parsed -> Parsed;
 let rec fill_default os c =
     match os {
         [] => c,
@@ -317,6 +347,7 @@ let rec fill_default os c =
 
 /// A `required` option that was never written -- and has no default to stand in
 /// for it -- is an error in the line itself, named like the others.
+let missing_required : [Option] -> Parsed -> ([:ok, :unit] | [:error, :string]);
 let rec missing_required os c =
     match os {
         [] => [:ok, ()],
@@ -330,6 +361,7 @@ let rec missing_required os c =
 
 /// Finish a parsed table: fill defaults, then complain about a required option
 /// still absent.
+let finalize : [Option] -> Parsed -> Outcome;
 let finalize os c = {
     let c2 = fill_default os c;
     match missing_required os c2 {
@@ -339,12 +371,14 @@ let finalize os c = {
 };
 
 /// `[:ok, parsed]`, or `[:error, message]` naming the option at fault.
+let parse : [Option] -> Arguments -> Outcome;
 let parse os args =
     match walk os (parsed (%{}) []) args {
         [:error, m] => [:error, m],
         [:ok, c] => finalize os c,
     };
 
+let finish_command : [Option] -> [Command] -> Parsed -> :string -> Arguments -> Outcome;
 let finish_command globals cmds c cmd args = {
     match by_command cmds cmd {
         () => [:error, "unknown command `" + cmd + "`"],
@@ -371,6 +405,7 @@ let finish_command globals cmds c cmd args = {
 /// included). The result is a `parsed` worth every getter, plus the chosen
 /// command in `:command` -- or none at all when the line never named one, so a
 /// tool that wants to show its usage on a bare command line can.
+let scan : [Option] -> [Command] -> Parsed -> Arguments -> Outcome;
 let rec scan globals cmds c args =
     match args {
         [] => [:ok, c],
@@ -389,30 +424,33 @@ let rec scan globals cmds c args =
             else { finish_command globals cmds c a more },
     };
 
+let commands : [Option] -> [Command] -> Arguments -> Outcome;
 let commands globals cmds args = scan globals cmds (parsed (%{}) []) args;
 
 // --- the usage message -------------------------------------------------------
 
+let pad_to : :integer -> :string -> :string;
 let rec pad_to n s = if str.byte_length s >= n { s } else { pad_to n (s + " ") };
 
 /// How an option is written, as the help should show it: both spellings when
 /// there are two, and the value's name when it takes one. A `toggle` spells its
 /// negation in the help: `--[no-]color`.
+let spelling : Option -> :string;
 let spelling o = {
-    let names =
-        if str.is_empty (short o) {
-            if kind o == :toggle { "    --[no-]" + long o } else { "    --" + long o }
-        }
-        else if kind o == :toggle { "-" + short o + ", --[no-]" + long o }
-        else { "-" + short o + ", --" + long o };
-    if kind o == :flag || kind o == :toggle || kind o == :count { names }
-    else { names + " " + meta o }
+    let lead = if str.is_empty (short o) { "    " } else { "-" + short o + ", " };
+    match kind o {
+        :toggle => lead + "--[no-]" + long o,
+        :flag => lead + "--" + long o,
+        :count => lead + "--" + long o,
+        _ => lead + "--" + long o + " " + meta o,
+    }
 };
 
 /// The help, plus whatever the description knows on top of the spelling: the
 /// choices an option is limited to, its default, and whether it is required.
 /// Each suffix only appears when the corresponding enrichment was written, so
 /// the help grows exactly as the contract grows.
+let suffixed_help : Option -> :string;
 let suffixed_help o = {
     let choices_text = {
         let cs = o.[:choices else []];
@@ -428,19 +466,24 @@ let suffixed_help o = {
     help o + choices_text + default_text + required_text
 };
 
+let line : Option -> :string;
 let line o =
     if kind o == :section { "\n" + help o + ":" }
     else { "  " + pad_to 26 (spelling o) + suffixed_help o };
 
 /// The options, one per line, with a heading wherever a `section` was put.
+let options_help : [Option] -> :string;
 let options_help os = str.join_str "\n" (list.map line os);
 
 /// One subcommand, as the help should show it.
+let command_line : Command -> :string;
 let command_line cm = "  " + pad_to 22 (command_name cm) + command_help cm;
 
+let commands_help : [Command] -> :string;
 let commands_help cmds = str.join_str "\n" (list.map command_line cmds);
 
 /// A whole usage message: what the program is, how it is called, its options.
+let usage : :string -> :string -> :string -> [Option] -> :string;
 let usage program summary calling os =
     program + " -- " + summary + "\n\nusage: " + calling + "\n" + options_help os + "\n";
 
@@ -623,12 +666,19 @@ when test {
 
 import std.types;
 type Arguments = [:string];
-type Option = %{ :short => :string, :long => :string,
-                 :kind => types.enum [:flag, :value, :list, :toggle, :count, :section],
+// An enum rather than a union of atoms: `:list` written in a type is every
+// list, and here it is the atom.
+type Kind = types.enum [:flag, :value, :list, :toggle, :count, :section];
+type Option = %{ :short => :string, :long => :string, :kind => Kind,
                  :meta => :string, :help => :string };
 type Parsed = %{ :values => %{ :string => :any }, :rest => Arguments };
 type Command = %{ :name => :string, :help => :string, :opts => [Option] };
+// What `parse` and `commands` answer, and what one step of the walk answers:
+// the table so far and the arguments it has not read.
+type Outcome = [:ok, Parsed] | [:error, :string];
+type Step = [:ok, Parsed, Arguments] | [:error, :string];
 // The caller describes the values table after options and defaults are read.
+let parse_as : :any -> [Option] -> Arguments -> ([:ok, Parsed] | [:error, :any]);
 let parse_as description options args = match parse options args {
     [:ok, parsed] => match types.validate description (values parsed) {
         [:ok, _] => [:ok, parsed],
@@ -640,6 +690,7 @@ let parse_as description options args = match parse options args {
 /// Infer the parser's output contract from the option declarations themselves.
 /// Calling this under `comp` freezes option kinds, choices and required/default
 /// presence into a reusable data schema, without running the parser.
+let option_type : Option -> :any;
 let option_type option = {
     let element = if map_has option :choices {
         types.enum option.[:choices]
@@ -653,6 +704,7 @@ let option_type option = {
     }
 };
 
+let values_type : [Option] -> :any;
 let values_type options = {
     let [required_fields, optional_fields] = list.fold (fn [required_fields, optional_fields] o -> {
         if not (is_option o) { [required_fields, optional_fields] }
@@ -668,4 +720,5 @@ let values_type options = {
 
 /// Validate against the option-derived schema, including programmer-provided
 /// defaults. `parse_as` accepts a precomputed schema to reuse across parses.
+let parse_typed : [Option] -> Arguments -> ([:ok, Parsed] | [:error, :any]);
 let parse_typed options args = parse_as (values_type options) options args;

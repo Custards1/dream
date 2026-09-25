@@ -2853,6 +2853,18 @@ not, each found by running the checker over this repository:
   compiler. A lambda passed as an argument takes its *parameter* types from
   what was solved (`solved_inputs`), and its answer is only bound, never
   checked against a solved variable.
+- `()` is "nothing there", and the checker does not narrow a `()` arm away.
+  So `map.get () ages k` solving `v` as `:integer | :unit` made every guarded
+  use of the answer a report. A `()` argument now never decides a variable
+  (`solve`), fits one wherever it was written even once another argument has
+  decided it (`admit_unit`), and fits a declared variable in an answer
+  (`sub`), which is what lets `list.minimum` be `[a] -> a`. Two things std
+  still answers `:any` for, deliberately: a read by *position* (`head`,
+  `nth`, `array.get`), because a list here is as often a record as a
+  sequence and a tuple's element type is the union of its fields; and a
+  decoded message, because the reader knows its shape and the format's
+  `Value` would only say it might be a list. The head of
+  [mind/std/list.dr](mind/std/list.dr) says the same.
 
 The check to run after any change here: every `.dr` in the repository must
 check clean -- `std --test`, `dreams --test`, `lucid`, `mind`, the examples,

@@ -30,9 +30,11 @@ import std.toml;
 import std.wire;
 import std.types;
 /// The library's own version, so a program can report what it was built with.
+let version : :string;
 let version = "0.1.0";
 
 /// The modules this build provides.
+let modules : [:string];
 let modules = ["std.agent", "std.array", "std.cli", "std.codec", "std.error", "std.json", "std.list",
                "std.map", "std.macros", "std.proc", "std.record", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.str", "std.streams",

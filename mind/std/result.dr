@@ -16,38 +16,49 @@ import std.list;
 
 // --- making one ---------------------------------------------------------------
 
+let ok : a -> Of a e;
 let ok value = [:ok, value];
+let error : e -> Of a e;
 let error reason = [:error, reason];
 
+let is_ok : Of a e -> :bool;
 let is_ok r = list.nth 0 r == :ok;
+let is_error : Of a e -> :bool;
 let is_error r = list.nth 0 r == :error;
 
 /// The value, or `default` for an error. The usual way out of a result.
+let or_else : a -> Of a e -> a;
 let or_else default r = if is_ok r { list.nth 1 r } else { default };
 
 /// The reason, or `default` when there is none.
+let reason : e -> Of a e -> e;
 let reason default r = if is_error r { list.nth 1 r } else { default };
 
 /// The value, raising the reason if there is not one. Impure by name, because
 /// raising is an effect -- which is the whole reason this module exists.
+let unwrap! : Of a e -> a;
 let unwrap! r = if is_ok r { list.nth 1 r } else { raise! (list.nth 1 r) };
 
 // --- carrying on ----------------------------------------------------------------
 
 /// Change the value, leave an error alone.
-let map f r = if is_ok r { ok (f (list.nth 1 r)) } else { r };
+let map : (a -> b) -> Of a e -> Of b e;
+let map f r = match r { [:ok, v] => ok (f v), [:error, why] => error why };
 
 /// Change the reason, leave a value alone. What to use when a failure needs to
 /// be reported in the caller's terms rather than the callee's.
-let map_error f r = if is_error r { error (f (list.nth 1 r)) } else { r };
+let map_error : (e -> f) -> Of a e -> Of a f;
+let map_error f r = match r { [:error, why] => error (f why), [:ok, v] => ok v };
 
 /// The next step, which may itself fail. This is the one that makes a pipeline:
 ///
 ///     read path |> and_then parse |> and_then validate
-let and_then f r = if is_ok r { f (list.nth 1 r) } else { r };
+let and_then : (a -> Of b e) -> Of a e -> Of b e;
+let and_then f r = match r { [:ok, v] => f v, [:error, why] => error why };
 
 /// The first result if it is ok, otherwise the second. `r` is not forced when
 /// it does not have to be, so the fallback can be expensive.
+let or_try : Of a e -> Of a e -> Of a e;
 let or_try other r = if is_ok r { r } else { other };
 
 // --- several at once ------------------------------------------------------------
@@ -57,31 +68,36 @@ let or_try other r = if is_ok r { r } else { other };
 /// Stops at the first failure, which for a lazy list means the ones after it
 /// are never computed -- validating a thousand things costs one when the first
 /// is wrong.
+let all : [Of a e] -> Of [a] e;
 let rec all rs =
     if list.is_empty rs { ok [] }
     else {
-        let first = list.head rs;
-        if is_error first { first }
-        else {
-            let rest = all (list.tail rs);
-            if is_error rest { rest }
-            else { ok (list_cons (list.nth 1 first) (list.nth 1 rest)) }
+        match list.head rs {
+            [:error, why] => error why,
+            [:ok, v] => match all (list.tail rs) {
+                [:error, why] => error why,
+                [:ok, vs] => ok (list_cons v vs),
+            },
         }
     };
 
 /// The values of every ok, dropping the errors. For when a failure is worth
 /// skipping rather than stopping for.
+let oks : [Of a e] -> [a];
 let oks rs = list.map (fn r -> list.nth 1 r) (list.filter is_ok rs);
 
 /// The reasons of every error.
+let errors : [Of a e] -> [e];
 let errors rs = list.map (fn r -> list.nth 1 r) (list.filter is_error rs);
 
 /// `[:ok, v]` when `v` is not `()`, and `[:error, reason]` when it is. The
 /// bridge from the other convention this library uses -- a lookup that answers
 /// `()` for "nothing there".
+let of_option : e -> a -> Of a e;
 let of_option reason v = match v { () => error reason, found => ok found };
 
 /// And back: the value, or `()`.
+let to_option : Of a e -> a;
 let to_option r = if is_ok r { list.nth 1 r } else { () };
 
 // --- tests -------------------------------------------------------------------
@@ -128,12 +144,16 @@ when test {
 
 import std.types;
 type Of value reason = [:ok, value] | [:error, reason];
+let check : :any -> :any -> Of a e -> Of a e;
 let check value reason outcome = types.check (Of value reason) outcome;
 // Validate a success while preserving an existing error unchanged.
+let validate_ok : :any -> Of a e -> Of a (e | :error);
 let validate_ok description outcome = match outcome {
     [:ok, value] => types.validate description value,
     other => other,
 };
 
+let ok_as : :any -> a -> Of a e;
 let ok_as description value = ok (types.check description value);
+let error_as : :any -> e -> Of a e;
 let error_as description reason = error (types.check description reason);

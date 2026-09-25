@@ -743,10 +743,9 @@ let exports_tests m =
 /// Generating the runner from what was actually loaded means there is no
 /// registry to keep in step, and no test that is silently never run.
 let add_test_runner! l = {
-    let suites = list.filter (fn s -> s != ())
-        (list.map (fn i ->
-            if exports_tests (module_at l i) { [module_name (module_at l i), i] } else { () })
-         (list.range 0 (module_count l)));
+    let suites = list.flat_map (fn i ->
+            if exports_tests (module_at l i) { [[module_name (module_at l i), i]] } else { [] })
+        (list.range 0 (module_count l));
     let src =
         if list.is_empty suites {
             // Still a valid program: it reports that there was nothing to run,

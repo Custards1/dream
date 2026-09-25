@@ -21,46 +21,63 @@ import std.list;
 
 // --- making one -------------------------------------------------------------
 
+let empty : %{ k => v };
 let empty = %{};
 
 /// A map from `[key, value]` pairs. A later pair wins, which is what makes
 /// `from_pairs (list.append defaults overrides)` mean what it looks like.
+let from_pairs : [[k, v]] -> %{ k => v };
 let from_pairs ps =
     list.fold_strict (fn m p -> m.[(list.nth 0 p) => (list.nth 1 p)]) empty ps;
 
 /// The pairs of two maps, the second winning where they overlap.
+let merge : %{ k => v } -> %{ k => v } -> %{ k => v };
 let merge a b = list.fold_strict (fn m p -> m.[(list.nth 0 p) => (list.nth 1 p)]) a (map_pairs b);
 
 // --- looking ----------------------------------------------------------------
 
+let get : v -> %{ k => v } -> k -> v;
 let get default m k = m.[k else default];
+let has : %{ k => v } -> k -> :bool;
 let has m k = map_has m k;
+let pairs : %{ k => v } -> [[k, v]];
 let pairs m = map_pairs m;
+let keys : %{ k => v } -> [k];
 let keys m = list.map (fn p -> list.nth 0 p) (map_pairs m);
+let values : %{ k => v } -> [v];
 let values m = list.map (fn p -> list.nth 1 p) (map_pairs m);
+let size : %{ k => v } -> :integer;
 let size m = list.length (map_pairs m);
+let is_empty : %{ k => v } -> :bool;
 let is_empty m = list.is_empty (map_pairs m);
 
 /// The keys in order. The only operation here that imposes one, and it costs a
 /// sort every time it is asked -- a map does not remember it.
+let sorted_keys : %{ k => v } -> [k];
 let sorted_keys m = list.sort (keys m);
 
 // --- changing ---------------------------------------------------------------
 
+let put : %{ k => v } -> k -> v -> %{ k => v };
 let put m k v = m.[k => v];
+let remove : %{ k => v } -> k -> %{ k => v };
 let remove m k = map_remove m k;
 
 /// Apply `f` to what is at `k`, or to `default` when nothing is:
 /// `update 0 (fn n -> n + 1) counts word` is the whole of counting.
+let update : v -> (v -> v) -> %{ k => v } -> k -> %{ k => v };
 let update default f m k = m.[k => (f (m.[k else default]))];
 
 /// Add only if the key is absent, so a fold over pairs keeps the first.
+let put_new : %{ k => v } -> k -> v -> %{ k => v };
 let put_new m k v = if map_has m k { m } else { m.[k => v] };
 
+let map_values : (v -> w) -> %{ k => v } -> %{ k => w };
 let map_values f m =
     list.fold_strict (fn acc p -> acc.[(list.nth 0 p) => (f (list.nth 1 p))]) empty (map_pairs m);
 
 /// Keep the pairs `keep k v` answers true for.
+let filter : (k -> v -> :bool) -> %{ k => v } -> %{ k => v };
 let filter keep m =
     list.fold_strict (fn acc p ->
         if keep (list.nth 0 p) (list.nth 1 p) { acc.[(list.nth 0 p) => (list.nth 1 p)] }
@@ -74,9 +91,11 @@ let filter keep m =
 /// lazy fold suspends each `map_put` on the one before, so the map arrives as
 /// a chain of every version of itself -- see "A lazy value stored in a map
 /// pins the map it was made in" in CLAUDE.md.
+let fold : (a -> k -> v -> a) -> a -> %{ k => v } -> a;
 let fold f init m = list.fold_strict (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (map_pairs m);
 
 /// Every key of `m` that `other` does not have.
+let without : %{ k => v } -> %{ k => w } -> %{ k => v };
 let without m other = filter (fn k _ -> not (map_has other k)) m;
 
 // --- sets, which are maps whose values say nothing ---------------------------
@@ -86,9 +105,13 @@ let without m other = filter (fn k _ -> not (map_has other k)) m;
 // this is a hash -- and because a set written as a list of members reads
 // better at the definition than a map literal does.
 
+let set_of : [a] -> %{ a => :bool };
 let set_of xs = list.fold_strict (fn m x -> m.[x => true]) empty xs;
+let member : %{ a => :bool } -> a -> :bool;
 let member s x = map_has s x;
+let add : %{ a => :bool } -> a -> %{ a => :bool };
 let add s x = s.[x => true];
+let members : %{ a => :bool } -> [a];
 let members s = keys s;
 
 // --- tests -------------------------------------------------------------------
@@ -138,4 +161,5 @@ when test {
 import std.types;
 type Of key value = %{ key => value };
 type Entry key value = [key, value];
+let check : :any -> :any -> %{ k => v } -> %{ k => v };
 let check key value entries = types.check (Of key value) entries;

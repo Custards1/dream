@@ -53,13 +53,18 @@ import std.proc;
 /// makes every function that touches it impure, and describing a child performs
 /// no effect. The effect happens where the child is started, and that function
 /// says so in its own name.
+let child_with : :string -> :any -> Restart -> Child;
 let child_with name start restart = %{ :name => name, :start => start, :restart => restart };
 
 /// The usual child: restarted however it ends.
+let child : :string -> :any -> Child;
 let child name start = child_with name start :permanent;
 
+let child_name : Child -> :any;
 let child_name c = map.get "" c :name;
+let child_start : Child -> :any;
 let child_start c = map.get () c :start;
+let child_restart : Child -> :any;
 let child_restart c = map.get :permanent c :restart;
 
 /// When a child is restarted:
@@ -71,6 +76,7 @@ let child_restart c = map.get :permanent c :restart;
 /// `:permanent` is the default because a supervised child is usually a server
 /// that is not supposed to end at all, and one that returns has ended for a
 /// reason the supervisor cannot know.
+let should_restart : Child -> :list -> :bool;
 let should_restart c outcome =
     match child_restart c {
         :temporary => false,
@@ -93,18 +99,20 @@ let should_restart c outcome =
 /// The last two have to stop their siblings, and stopping is a request (see the
 /// note at the top). A child that does not answer `proc.shutdown` will hold up
 /// the restart it is part of.
+let strategies : [Strategy];
 let strategies = [:one_for_one, :one_for_all, :rest_for_one];
 
 /// Which children a strategy takes down with the one that died, given the
 /// running names in start order.
+let affected : Strategy -> [:string] -> :string -> [:string];
 let affected strategy names name =
     match strategy {
         :one_for_all => names,
         :rest_for_one => {
-            let rec from_here rest =
-                if list_is_empty rest { [] }
-                else if rest.[0] == name { rest }
-                else { from_here (list_tail rest) };
+            let rec from_here rest = match rest {
+                [] => [],
+                [n, ..more] => if n == name { rest } else { from_here more },
+            };
             from_here names
         },
         _ => [name],
@@ -117,18 +125,22 @@ let affected strategy names name =
 // window: more than `limit` of them within `window_ms` and the supervisor gives
 // up and stops, which is the same thing a person would do.
 
+let limits : :integer -> :integer -> Limits;
 let limits limit window_ms = %{ :limit => limit, :window => window_ms };
 
 /// Five restarts in five seconds, which is a compromise nobody will love and
 /// everybody can override.
+let default_limits : Limits;
 let default_limits = limits 5 5000;
 
 /// The restart times inside the window, newest first, with `now` added.
+let recent : :integer -> :integer -> [:integer] -> [:integer];
 let recent window now times =
     list_cons now (list.filter (fn t -> now - t < window) times);
 
 // --- the supervisor's own state -------------------------------------------------
 
+let state : Strategy -> [Child] -> Limits -> State;
 let state strategy children lim =
     %{ :strategy => strategy, :children => children, :lim => lim,
        // name -> the process now running it, for the children that are running.
@@ -137,23 +149,36 @@ let state strategy children lim =
        :watchers => [],
        :restarts => [], :stopping => false };
 
+let s_strategy : State -> :any;
 let s_strategy s = map.get :one_for_one s :strategy;
+let s_children : State -> :any;
 let s_children s = map.get [] s :children;
+let s_limits : State -> :any;
 let s_limits s   = map.get default_limits s :lim;
+let s_running : State -> :any;
 let s_running s  = map.get map.empty s :running;
+let s_restarts : State -> :any;
 let s_restarts s = map.get [] s :restarts;
+let s_watchers : State -> :any;
 let s_watchers s = map.get [] s :watchers;
+let s_stopping : State -> :any;
 let s_stopping s = map.get false s :stopping;
 
+let with_running : %{ :string => :process } -> State -> State;
 let with_running r s = map.put s :running r;
+let with_restarts : [:integer] -> State -> State;
 let with_restarts r s = map.put s :restarts r;
+let with_watcher : :process -> State -> State;
 let with_watcher w s = map.put s :watchers (list.append (s_watchers s) [w]);
+let stopping : State -> State;
 let stopping s = map.put s :stopping true;
 
 /// The children in start order. Order is part of `:rest_for_one`'s meaning, so
 /// it is kept as a list and never as a map.
+let names_of : State -> [:string];
 let names_of s = list.map (fn c -> child_name c) (s_children s);
 
+let child_named : State -> :string -> :any;
 let child_named s name = {
     let hit = list.filter (fn c -> child_name c == name) (s_children s);
     if list_is_empty hit { () } else { hit.[0] }
@@ -165,12 +190,14 @@ let child_named s name = {
 /// and joining is the whole of it: `join!` is the only way to learn that a
 /// process is done, and it blocks, so it happens somewhere the supervisor is
 /// not.
+let watch! : :process -> :string -> :process -> :any;
 let watch! sup name p = {
     let outcome = proc.outcome! p;
     send! sup [:down, name, outcome]
 };
 
 /// Start one child and the watcher that reports it.
+let start_child! : :process -> Child -> :process;
 let start_child! sup c = {
     let go = child_start c;
     let p = spawn! $( go () );
@@ -178,6 +205,7 @@ let start_child! sup c = {
     p
 };
 
+let start_named! : :process -> State -> :string -> State;
 let start_named! sup s name =
     match child_named s name {
         () => s,
@@ -190,6 +218,7 @@ let start_named! sup s name =
 /// while the old one is still holding whatever it holds is the bug this is
 /// meant to prevent. A child that ignores `shutdown` waits for ever, which is
 /// the runtime's shape and is written on the tin.
+let stop_child! : State -> :string -> State;
 let stop_child! s name =
     match map.get () (s_running s) name {
         () => s,
@@ -200,11 +229,13 @@ let stop_child! s name =
         },
     };
 
+let stop_all! : State -> [:string] -> State;
 let stop_all! s names = list.fold (fn acc n -> stop_child! acc n) s names |> strict!;
 
 // --- the loop -------------------------------------------------------------------
 
 /// Has this supervisor restarted too often to keep trying?
+let over_limit : State -> [:integer] -> :bool;
 let over_limit s times =
     list.length times > map.get 5 (s_limits s) :limit;
 
@@ -213,10 +244,12 @@ let over_limit s times =
 /// Registration is a moment, not a promise about the past: a child that died
 /// before anyone was listening is not reported to a listener who arrives after.
 /// Anything that must not miss a death registers before the work starts.
+let tell_watchers! : State -> :string -> :any -> [:any];
 let tell_watchers! s name outcome =
     list.map (fn w -> send! w [:down, name, outcome]) (s_watchers s) |> strict!;
 
 /// One `[:down, name, outcome]`.
+let handle_down! : :process -> State -> :string -> :any -> ([:go, State] | [:stop, :any]);
 let handle_down! sup s name outcome = {
     tell_watchers! s name outcome
     let c = child_named s name;
@@ -255,6 +288,7 @@ let handle_down! sup s name outcome = {
 
 /// The message loop. Everything a supervisor does happens here, because
 /// everything it learns arrives as a message.
+let handle! : :process -> State -> :any -> ([:go, State] | [:stop, :any]);
 let handle! sup s m =
     match m {
         [:down, name, outcome] => handle_down! sup s name outcome,
@@ -290,6 +324,7 @@ let handle! sup s m =
 /// child's death to itself. The supervisor waited for a message it had asked
 /// somebody else to send to themselves, and the runtime called that a deadlock,
 /// which it was.
+let serve! : State -> :any;
 let serve! s = {
     let me = strict! self! ();
     proc.serve! s (fn st m -> handle! me st m)
@@ -300,6 +335,7 @@ let serve! s = {
 /// The children are started by the supervisor itself, not by the caller, so
 /// that every watcher reports to the process that will still be there to hear
 /// it.
+let start_with! : Strategy -> [Child] -> Limits -> :process;
 let start_with! strategy children lim = {
     let s = state strategy children lim;
     spawn! $( {
@@ -309,11 +345,13 @@ let start_with! strategy children lim = {
     } )
 };
 
+let start! : Strategy -> [Child] -> :process;
 let start! strategy children = start_with! strategy children default_limits;
 
 // --- asking it things -----------------------------------------------------------
 
 /// The names of the children now running, in order.
+let which! : :process -> [:string];
 let which! sup = {
     strict! (send! sup [:which, self! ()])
     recv! ()
@@ -324,6 +362,7 @@ let which! sup = {
 /// The supervisor starts children itself, so this is how anything else asks for
 /// one: a child that ended and was not restarted, or one deliberately started
 /// late. A name that is already running is left alone.
+let restart! : :process -> :string -> :any;
 let restart! sup name = {
     strict! (send! sup [:restart, self! (), name])
     recv! ()
@@ -332,6 +371,7 @@ let restart! sup name = {
 /// Hear about every child that goes down from now on, as `[:down, name,
 /// outcome]` messages. Answers once the supervisor has taken note, so a caller
 /// that registers before starting the work cannot miss the first failure.
+let notify! : :process -> :any;
 let notify! sup = {
     strict! (send! sup [:notify, self! ()])
     recv! ()
@@ -342,6 +382,7 @@ let notify! sup = {
 /// A supervisor left running is a process parked on `recv!`, and a program that
 /// ends with one of those is reported as deadlocked rather than finished --
 /// whoever starts one owns stopping it.
+let stop! : :process -> :any;
 let stop! sup = {
     strict! (send! sup [:stop_all, self! ()])
     recv! ()
@@ -515,13 +556,19 @@ type Strategy = :one_for_one | :one_for_all | :rest_for_one;
 type Restart = :permanent | :transient | :temporary;
 type Child = %{ :name => :string, :start => :pure_fn | :impure_fn,
                 :restart => Restart };
+let checked_child : :string -> :any -> Restart -> Child;
 let checked_child name start restart = types.check Child (child_with name start restart);
 
 type Limits = %{ :limit => :integer where fn n -> n >= 0,
                  :window => :integer where fn n -> n >= 1 };
+let start_checked! : :any -> :any -> :any -> :process;
 let start_checked! strategy children lim = {
     let checked_strategy = strict! (types.check Strategy strategy);
     let checked_children = strict! (types.check (types.list_of Child) children);
     let checked_limits = strict! (types.check Limits lim);
     start_with! checked_strategy checked_children checked_limits
 };
+
+/// What the supervisor process holds between messages. A map, read and written
+/// only through the `s_` accessors and `with_` setters above.
+type State = :map;

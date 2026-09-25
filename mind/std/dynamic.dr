@@ -43,15 +43,20 @@ mod get {
     }
 }
 
+let fold : (b -> :any -> b) -> b -> Collection -> b;
 let fold f init xa = (get.fold_from (type_of xa)) f init xa;
 
+let map : :any -> :any -> Collection -> :any;
 let map f init xa = (get.map_from (type_of xa)) f init xa;
 
+let nth : :integer -> Collection -> :any;
 let nth i l = (get.nth_from (type_of l)) i l;
 
+let reverse : Collection -> Collection;
 let reverse c = (get.reverse_from (type_of c) c); 
 
 
+let name : :any -> :string;
 let name x = "dynamic"
 
 

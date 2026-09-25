@@ -25,41 +25,53 @@
 derive std.codec;
 
 import std.list;
+import std.result;
 import std.str;
 
 // --- reading ----------------------------------------------------------------
 
+let is_ws : :char -> :bool;
 let is_ws c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
 
+let skip_ws : [:char] -> [:char];
 let rec skip_ws cs = if list.is_empty cs { cs }
                      else if is_ws (list.head cs) { skip_ws (list.tail cs) }
                      else { cs };
 
+let is_digit : :char -> :bool;
 let is_digit c = c >= '0' && c <= '9';
 
 /// `[value, rest]`, the shape every parser below returns.
+let step : a -> [:char] -> [a, [:char]];
 let step value rest = [value, rest];
+let step_value : :list -> :any;
 let step_value s = list.head s;
+let step_rest : :list -> [:char];
 let step_rest s = list.head (list.tail s);
 
 /// Does `cs` begin with the characters of `word`?
+let starts : [:char] -> [:char] -> :bool;
 let rec starts cs word =
     if list.is_empty word { true }
     else if list.is_empty cs { false }
     else if list.head cs == list.head word { starts (list.tail cs) (list.tail word) }
     else { false };
 
+let drop_n : :integer -> [:char] -> [:char];
 let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
 
 // --- strings ----------------------------------------------------------------
 
 /// The four hex digits of a `\uXXXX` escape, as a number.
-let hex_value c =
-    if c >= '0' && c <= '9' { char_code c - 48 }
-    else if c >= 'a' && c <= 'f' { char_code c - 87 }
-    else if c >= 'A' && c <= 'F' { char_code c - 55 }
-    else { 0 - 1 };
+let hex_value : :char -> :integer;
+let hex_value c = match c {
+    _ if c >= '0' && c <= '9' => char_code c - 48,
+    _ if c >= 'a' && c <= 'f' => char_code c - 87,
+    _ if c >= 'A' && c <= 'F' => char_code c - 55,
+    _ => 0 - 1,
+};
 
+let hex4 : [:char] -> :integer -> :integer -> :any;
 let rec hex4 cs n acc =
     if n <= 0 { [acc, cs] }
     else if list.is_empty cs { () }
@@ -76,6 +88,7 @@ let rec hex4 cs n acc =
 /// character and `char_of_code` refuses one, so the halves are joined here. A
 /// half with no partner becomes U+FFFD -- what `str_chars` makes of bytes that
 /// do not spell a character -- rather than failing the whole document.
+let unicode_escape : :integer -> [:char] -> [:char, [:char]];
 let unicode_escape code cs =
     if code < 55296 || code > 57343 { [char_of_code code, cs] }
     else if code > 56319 || list.take 2 cs != ['\\', 'u'] { [char_of_code 65533, cs] }
@@ -92,6 +105,7 @@ let unicode_escape code cs =
 /// The body of a string, after the opening quote. `acc` collects characters in
 /// reverse, because consing is constant time and reversing once at the end is
 /// cheaper than appending at every step.
+let string_body : [:char] -> [:char] -> :any;
 let rec string_body cs acc =
     if list.is_empty cs { () }
     else {
@@ -101,25 +115,25 @@ let rec string_body cs acc =
         else if c != '\\' { string_body rest (list.cons c acc) }
         else if list.is_empty rest { () }
         else {
-            let e = list.head rest;
             let after = list.tail rest;
-            if e == 'n' { string_body after (list.cons '\n' acc) }
-            else if e == 't' { string_body after (list.cons '\t' acc) }
-            else if e == 'r' { string_body after (list.cons '\r' acc) }
-            else if e == 'b' { string_body after (list.cons (char_of_code 8) acc) }
-            else if e == 'f' { string_body after (list.cons (char_of_code 12) acc) }
-            else if e == '"' { string_body after (list.cons '"' acc) }
-            else if e == '\\' { string_body after (list.cons '\\' acc) }
-            else if e == '/' { string_body after (list.cons '/' acc) }
-            else if e == 'u' {
-                let h = hex4 after 4 0;
-                if h == () { () }
-                else {
-                    let u = unicode_escape (list.head h) (list.head (list.tail h));
-                    string_body (list.head (list.tail u)) (list.cons (list.head u) acc)
-                }
+            match list.head rest {
+                'n'  => string_body after (list.cons '\n' acc),
+                't'  => string_body after (list.cons '\t' acc),
+                'r'  => string_body after (list.cons '\r' acc),
+                'b'  => string_body after (list.cons (char_of_code 8) acc),
+                'f'  => string_body after (list.cons (char_of_code 12) acc),
+                '"'  => string_body after (list.cons '"' acc),
+                '\\' => string_body after (list.cons '\\' acc),
+                '/'  => string_body after (list.cons '/' acc),
+                'u'  => match hex4 after 4 0 {
+                    () => (),
+                    h => {
+                        let u = unicode_escape (list.head h) (list.head (list.tail h));
+                        string_body (list.head (list.tail u)) (list.cons (list.head u) acc)
+                    },
+                },
+                _ => (),
             }
-            else { () }
         }
     };
 
@@ -128,6 +142,7 @@ let rec string_body cs acc =
 /// Take the characters that can belong to a JSON number, and note whether any
 /// of them made it a float. JSON has no hex or leading `+`, so this is exactly
 /// the set `parse_int`/`parse_float` will accept.
+let number_chars : [:char] -> [:char] -> :bool -> [[:char], :bool, [:char]];
 let rec number_chars cs acc floaty =
     if list.is_empty cs { [list.reverse acc, floaty, cs] }
     else {
@@ -139,6 +154,7 @@ let rec number_chars cs acc floaty =
         } else { [list.reverse acc, floaty, cs] }
     };
 
+let parse_number : [:char] -> :any;
 let parse_number cs = {
     let taken = number_chars cs [] false;
     let text = str.of_chars (list.head taken);
@@ -153,74 +169,60 @@ let parse_number cs = {
 
 // --- values -----------------------------------------------------------------
 
+let parse_value : [:char] -> :any;
 let rec parse_value cs = {
     let s = skip_ws cs;
     if list.is_empty s { () }
     else {
-        let c = list.head s;
-        if c == '"' { string_body (list.tail s) [] }
-        else if c == '{' { parse_object (list.tail s) (%{}) true }
-        else if c == '[' { parse_array (list.tail s) [] true }
-        else if starts s (str.chars "true") { step true (drop_n 4 s) }
-        else if starts s (str.chars "false") { step false (drop_n 5 s) }
-        else if starts s (str.chars "null") { step () (drop_n 4 s) }
-        else if is_digit c || c == '-' { parse_number s }
-        else { () }
-    }
-};
-
-let rec parse_object cs acc first = {
-    let s = skip_ws cs;
-    if list.is_empty s { () }
-    else if list.head s == '}' { step acc (list.tail s) }
-    else {
-        // A comma is required between members and forbidden before the first.
-        let after_comma =
-            if first { s }
-            else if list.head s == ',' { skip_ws (list.tail s) }
-            else { () };
-        if after_comma == () { () }
-        else if list.is_empty after_comma { () }
-        else if list.head after_comma != '"' { () }
-        else {
-            let k = string_body (list.tail after_comma) [];
-            if k == () { () }
-            else {
-                let colon = skip_ws (step_rest k);
-                if list.is_empty colon { () }
-                else if list.head colon != ':' { () }
-                else {
-                    let v = parse_value (list.tail colon);
-                    if v == () { () }
-                    else {
-                        let grown = acc.[(step_value k) => (step_value v)];
-                        parse_object (step_rest v) grown false
-                    }
-                }
-            }
+        match list.head s {
+            '"' => string_body (list.tail s) [],
+            '{' => parse_object (list.tail s) (%{}) true,
+            '[' => parse_array (list.tail s) [] true,
+            _ if starts s (str.chars "true") => step true (drop_n 4 s),
+            _ if starts s (str.chars "false") => step false (drop_n 5 s),
+            _ if starts s (str.chars "null") => step () (drop_n 4 s),
+            c if is_digit c || c == '-' => parse_number s,
+            _ => (),
         }
     }
 };
 
-let rec parse_array cs acc first = {
-    let s = skip_ws cs;
-    if list.is_empty s { () }
-    else if list.head s == ']' { step (list.reverse acc) (list.tail s) }
-    else {
-        let after_comma =
-            if first { s }
-            else if list.head s == ',' { list.tail s }
-            else { () };
-        if after_comma == () { () }
-        else {
-            let v = parse_value after_comma;
-            if v == () { () }
-            else { parse_array (step_rest v) (list.cons (step_value v) acc) false }
-        }
-    }
+let parse_object : [:char] -> %{ :string => Value } -> :bool -> :any;
+let rec parse_object cs acc first = match skip_ws cs {
+    [] => (),
+    ['}', ..rest] => step acc rest,
+    // A comma is required between members and forbidden before the first.
+    s => match (if first { s } else { match s { [',', ..more] => skip_ws more, _ => [] } }) {
+        ['"', ..key] => match string_body key [] {
+            () => (),
+            k => match skip_ws (step_rest k) {
+                [':', ..more] => match parse_value more {
+                    () => (),
+                    v => parse_object (step_rest v) (acc.[(step_value k) => (step_value v)]) false,
+                },
+                _ => (),
+            },
+        },
+        _ => (),
+    },
+};
+
+let parse_array : [:char] -> [Value] -> :bool -> :any;
+let rec parse_array cs acc first = match skip_ws cs {
+    [] => (),
+    [']', ..rest] => step (list.reverse acc) rest,
+    // A comma is required between elements and forbidden before the first.
+    s => match (if first { s } else { match s { [',', ..more] => more, _ => [] } }) {
+        [] => (),
+        after => match parse_value after {
+            () => (),
+            v => parse_array (step_rest v) (list.cons (step_value v) acc) false,
+        },
+    },
 };
 
 /// `[:ok, value]`, or `[:error, message]`.
+let parse : :string -> result.Of :any :string;
 let parse text = {
     let r = parse_value (str.chars text);
     if r == () { [:error, "not valid JSON"] }
@@ -231,10 +233,13 @@ let parse text = {
     }
 };
 
+let ok : result.Of a e -> :bool;
 let ok r = list.head r == :ok;
+let value : result.Of a e -> :any;
 let value r = list.nth 1 r;
 
 /// The parsed value, or `default` if the text is not valid JSON.
+let parse_or : :any -> :string -> :any;
 let parse_or default text = {
     let r = parse text;
     if ok r { value r } else { default }
@@ -254,6 +259,7 @@ let parse_or default text = {
 // array comes back a list. `std.wire` is the format for when that matters; the
 // tests at the foot of this file say exactly which values survive this one.
 
+let escape_char : :char -> :string;
 let escape_char c = match c {
     '"'  => "\\\"",
     '\\' => "\\\\",
@@ -275,28 +281,36 @@ let escape_char c = match c {
     },
 };
 
+let quote : :string -> :string;
 let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
 
 // --- the holes std.codec declares --------------------------------------------
 
+let write_unit : :unit -> :string;
 let write_unit u = "null";
 
+let write_bool : :bool -> :string;
 let write_bool b = if b { "true" } else { "false" };
 
 /// Dream renders a whole float as `2` where JSON readers generally expect `2.0`
 /// back, but both parse to the same value, and forcing a `.0` on would
 /// misrepresent an integer. So both numbers are simply `to_string`.
+let write_int : :integer -> :string;
 let write_int n = to_string n;
 
+let write_float : :float -> :string;
 let write_float x = to_string x;
 
+let write_string : :string -> :string;
 let write_string s = quote s;
 
 /// JSON has no atoms, so an atom is its name -- without the colon `to_string`
 /// writes in front of one. It comes back a string, which is the loss this
 /// format takes and `std.wire` does not.
+let write_atom : :atom -> :string;
 let write_atom a = quote (atom_name a);
 
+priv let atom_name : :atom -> :string;
 priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a);
 
 /// The text of a key.
@@ -308,32 +322,38 @@ priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a)
 /// not come out spelled two different ways. They used to: `:a` was `"a"` as a
 /// value and `":a"` as a key, which no reader on the far side could be expected
 /// to guess at.
+priv let key_text : :any -> :string;
 priv let key_text k = match type_of k {
     :atom   => atom_name k,
     :string => k,
     _       => to_string k,
 };
 
+let write_list : [:string] -> :string;
 let write_list parts = "[" + str.join_str "," parts + "]";
 
 /// An object. `std.codec` hands the pairs over raw, so the key is stringified
 /// here -- JSON has no other kind of key, and a number or an atom used as one
 /// comes back as its text.
+let write_map : [[:any, :any]] -> :string;
 let write_map pairs = {
-    let entry p = quote (key_text (list.nth 0 p)) + ":" + encode (list.nth 1 p);
+    let entry p = quote (key_text (list.nth 0 p)) + ":" + encode_value (list.nth 1 p);
     "{" + str.join_str "," (list.map entry pairs) + "}"
 };
 
+let format_name : :any -> :string;
 let format_name u = "json";
 
 /// The other hole: reading is `parse`, which already answers the result shape
 /// `std.codec` asks for.
+let decode : :string -> result.Of :any :string;
 let decode text = parse text;
 
 // --- the names this module had before it derived anything ---------------------
 
 /// A value as JSON. `encode` is the same function under the name every codec
 /// answers to; this is the one JSON callers already write.
+let write : :any -> :string;
 let write v = encode v;
 
 /// The same, spread over lines with two-space indentation.
@@ -342,6 +362,7 @@ let write v = encode v;
 /// which is why this is written out here rather than filled into a hole. It
 /// orders a map's members the way `codec.map_entries` does, so that compact and
 /// indented output agree about what comes first.
+let write_indented : :integer -> :any -> :string;
 let rec write_indented depth v = match type_of v {
     :list  => indented_items depth v,
     :array => indented_items depth (array_to_list v),
@@ -349,8 +370,10 @@ let rec write_indented depth v = match type_of v {
     _      => write v,
 };
 
+priv let indent : :integer -> :string;
 priv let indent depth = str.repeat depth "  ";
 
+priv let indented_items : :integer -> [:any] -> :string;
 priv let indented_items depth items =
     if list.is_empty items { "[]" }
     else {
@@ -358,6 +381,7 @@ priv let indented_items depth items =
         "[\n" + str.join_str ",\n" (list.map one items) + "\n" + indent depth + "]"
     };
 
+priv let indented_members : :integer -> :map -> :string;
 priv let indented_members depth v = {
     let entries = map_entries v;
     if list.is_empty entries { "{}" }
@@ -368,6 +392,7 @@ priv let indented_members depth v = {
     }
 };
 
+let pretty : :any -> :string;
 let pretty v = write_indented 0 v;
 
 // --- tests ------------------------------------------------------------------
@@ -485,4 +510,5 @@ when test {
 // These describe decoded JSON, whose object keys are always strings.
 type Value = :unit | :bool | :integer | :float | :string
            | [Value] | %{ :string => Value };
+let parse_as : :any -> :string -> result.Of :any :any;
 let parse_as description text = decode_as description text;

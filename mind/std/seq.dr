@@ -24,37 +24,52 @@
 
 /// Combine every element into an accumulator, left to right:
 /// `fold f init [a, b]` is `f (f init a) b`.
+// The container is `:any` throughout this module, and so is its element: a
+// signature here is checked once per deriving module, against *that* module's
+// `fold`, and nothing in the grammar can say "the element type of whatever
+// container derives this". So what a callback is handed is `:any`, and the
+// deriving module's own `fold` signature is where the element is named.
+let fold : (b -> a -> b) -> b -> :any -> b;
 virtual let fold f init xs;
 
 /// What this kind of sequence is called, for error messages and `describe`.
 /// A deriving module may leave this alone.
+let name : :any -> :string;
 virtual let name xs = "sequence";
 
 // --- size -------------------------------------------------------------------
 
 /// Counts by folding, so it costs a walk even where the container knows its
 /// own size. `std.array` overrides it with the constant-time answer.
+let length : :any -> :integer;
 let length xs = fold (fn n _ -> n + 1) 0 xs;
 
+let is_empty : :any -> :bool;
 let is_empty xs = length xs == 0;
 
 // --- arithmetic -------------------------------------------------------------
 
+let sum : :any -> (:integer | :float);
 let sum xs = fold (fn acc x -> acc + x) 0 xs;
 
+let product : :any -> (:integer | :float);
 let product xs = fold (fn acc x -> acc * x) 1 xs;
 
 // --- searching --------------------------------------------------------------
 
 /// How many elements satisfy `keep`.
+let count : (:any -> :bool) -> :any -> :integer;
 let count keep xs = fold (fn n x -> if keep x { n + 1 } else { n }) 0 xs;
 
 /// Does any element satisfy `keep`? Folds the whole sequence either way, so it
 /// does not short-circuit; that is the price of having only `fold`.
+let any : (:any -> :bool) -> :any -> :bool;
 let any keep xs = fold (fn seen x -> seen || keep x) false xs;
 
+let all : (:any -> :bool) -> :any -> :bool;
 let all keep xs = fold (fn ok x -> ok && keep x) true xs;
 
+let contains : :any -> :any -> :bool;
 let contains wanted xs = any (fn x -> x == wanted) xs;
 
 // --- extremes ---------------------------------------------------------------
@@ -63,17 +78,22 @@ let contains wanted xs = any (fn x -> x == wanted) xs;
 // out of range: a total function that says "nothing" rather than one that
 // raises.
 
+let extreme_by : (:any -> :any -> :bool) -> :any -> :any;
 let extreme_by better xs =
     fold (fn best x -> if best == () { x } else if better x best { x } else { best }) () xs;
 
+let minimum : :any -> :any;
 let minimum xs = extreme_by (fn a b -> a < b) xs;
 
+let maximum : :any -> :any;
 let maximum xs = extreme_by (fn a b -> a > b) xs;
 
 /// The element for which `rank` is smallest.
+let minimum_by : (:any -> :any) -> :any -> :any;
 let minimum_by rank xs =
     fold (fn best x -> if best == () { x } else if rank x < rank best { x } else { best }) () xs;
 
+let maximum_by : (:any -> :any) -> :any -> :any;
 let maximum_by rank xs =
     fold (fn best x -> if best == () { x } else if rank x > rank best { x } else { best }) () xs;
 
@@ -82,6 +102,7 @@ let maximum_by rank xs =
 /// The elements as a list, in order. `fold` builds it reversed -- consing is
 /// what makes each step constant time -- so this reverses once at the end
 /// rather than appending at every step.
+let to_list : :any -> [:any];
 let to_list xs = {
     let rec rev acc ys =
         if list_is_empty ys { acc } else { rev (list_cons (ys.[0]) acc) (list_tail ys) };
@@ -89,6 +110,7 @@ let to_list xs = {
 };
 
 /// Every element rendered and joined with `sep` between them.
+let join : :string -> :any -> :string;
 let join sep xs = {
     let step acc x =
         if acc == () { to_string x } else { acc + sep + to_string x };
@@ -96,6 +118,7 @@ let join sep xs = {
     if joined == () { "" } else { joined }
 };
 
+let describe : :any -> :string;
 let describe xs = name xs + " of " + to_string (length xs)
 
 // --- optional types ---------------------------------------------------------
@@ -103,5 +126,6 @@ let describe xs = name xs + " of " + to_string (length xs)
 // A derived container's actual traversal defines membership. The descriptor
 // contains a closure, so it can check inside comp but is not itself bakeable.
 import std.types;
+let elements_type : :any -> :any;
 let elements_type element = types.refine :any
     (fn values -> fold (fn valid value -> valid && types.accepts element value) true values);

@@ -511,6 +511,10 @@ let rec sub k s t n =
             [_, :never] => false,
             [[:var, a], [:var, b]] => a == b,
             [[:var, _], _] => false,
+            // `()` is "nothing there" throughout the library, so a function
+            // declared to answer `a` may answer it -- `minimum : [a] -> a`
+            // does, for an empty list. See `solve` for the other half.
+            [:unit, [:var, _]] => true,
             [_, [:var, _]] => false,
             [_, [:lit, _, _]] => false,
             [_, [:fn, a, b]] => match s {
@@ -602,9 +606,20 @@ let fits k s t = sub k s t fuel;
 /// variable met twice is the union of both, which is lenient on purpose: a
 /// call is never rejected over what a variable was *inferred* to be, only
 /// over the parts of a signature that were written down.
+///
+/// `()` says nothing about a variable, and is not allowed to decide one.
+/// It is the library's "nothing there", and so the usual default: in
+/// `map.get () ages name` the value type is the map's, and were `()` to
+/// join it the answer would be `:integer | :unit` -- which every `+` on it
+/// reports, since the checker does not narrow a `()` arm away. So the
+/// variable is solved from the map alone, the way the caller reads it, and
+/// the `()` is left to fit it (see `sub`). What that gives up is
+/// `map.get () m k + 1`, which is not reported; rule 2 already says it would
+/// not be, for anything the checker cannot see is wrong.
 let rec solve k p a subst = {
     let a2 = match a { [:named, _, _, _] => peel k a 4, _ => a };
     match p {
+        [:flex, _] if a == :unit => subst,
         [:flex, n] => subst.[n => match subst.[n else ()] { () => widen a, prev => join prev (widen a) }],
         [:fn, pa, pb] => match a2 {
             [:fn, aa, ab] => solve k pb ab (solve k pa aa subst),
@@ -1057,6 +1072,10 @@ let typed_apply k h f ft args sp ds1 = {
                 let [lt, d2] = infer_lambda_at k h a (solved_inputs s (list.nth i params) (lambda_arity a)) d;
                 [solve k (list.nth i params) lt s, d2]
             }
+            // Checked against the variables admitting `()` and reported
+            // against them as solved, so a message never gains a `| :unit`
+            // nobody wrote.
+            else if fits k (list.nth i known) (solved (admit_unit s) (list.nth i params) false) { [s, d] }
             else {
                 [s, mismatch k h (list.nth i known) p (ast.span a)
                              ("argument " + to_string (i + 1) + " of " + who) d]
@@ -1065,6 +1084,15 @@ let typed_apply k h f ft args sp ds1 = {
     }) [subst, ds3] (indexed args);
     [solved subst2 rest true, ds4]
 };
+
+/// What an argument is checked against: every variable as solved, and `()`
+/// besides. `solve` does not let a `()` decide a variable, and this is the
+/// other half -- it may still stand where the variable is, once another
+/// argument has decided it. `map.get () c :start` solves `v` from the record
+/// `c` and then asks whether the default fits `v`, and `list.head [n, ()]`
+/// solves `a` from `n` and asks whether the `()` does.
+let admit_unit subst =
+    list.fold (fn m p -> m.[list.nth 0 p => union_of [list.nth 1 p, :unit]]) subst (map_pairs subst);
 
 /// A function type with what is solved put into its first `n` parameters and
 /// nowhere else.
