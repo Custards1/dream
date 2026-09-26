@@ -421,9 +421,9 @@ let rec close_deps! i s =
     if i >= list.length (packages s) { s }
     else { close_deps! (i + 1) (add_deps! i s) };
 
-/// Split a `:`-separated search path, the way `PATH` is written.
+/// Split a search path using the runtime platform's PATH separator.
 let split_roots text =
-    list.filter (fn p -> not (str.is_empty p)) (str.split ":" text);
+    list.filter (fn p -> not (str.is_empty p)) (str.split (match os.platform () { :windows => ";", _ => ":" }) text);
 
 /// Find the package containing `file`, its dependencies, and any packages
 /// reachable from the extra roots.
@@ -530,7 +530,7 @@ when test {
             $( test.eq! [1, 1] { let s = alias! "b" 0 two!;
                                  [find_index s "b", list.length (notes s)] } ),
         test.case "a search path splits the way PATH does"
-            $( test.eq! ["a", "b"] (split_roots "a::b:") ),
+            $( test.eq! ["a", "b"] (split_roots (match os.platform () { :windows => "a;;b;", _ => "a::b:" })) ),
         test.case "an ordinary package name is allowed"
             $( test.eq! [(), ()] [name_error "std", name_error "my_pkg"] ),
         test.case "a package name may not contain a dot"

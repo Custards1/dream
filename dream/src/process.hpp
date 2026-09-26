@@ -100,7 +100,12 @@ public:
     /// costing 6% of a self-compile after it stopped being a `std::vector`.
     /// The body is a compare and two stores; it is smaller than its own call
     /// sequence.
-    __attribute__((always_inline)) inline void push_back(const Cont& c) {
+#if defined(_MSC_VER)
+    __forceinline void push_back
+#else
+    __attribute__((always_inline)) inline void push_back
+#endif
+    (const Cont& c) {
         if (size_ == cap_) grow();
         data_[size_++] = c;
     }

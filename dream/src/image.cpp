@@ -2,15 +2,25 @@
 
 #include "builtins.hpp"
 
+#include "windows.hpp"
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cstring>
+#include <bit>
+#include <limits>
 #include <vector>
 
 namespace dream {
+static_assert(std::endian::native == std::endian::little,
+              "The mapped Dream image reader requires a little-endian host");
+static_assert(sizeof(void*) == 8, "The Dream VM requires a 64-bit host");
+static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559,
+              "Dream images store IEEE 754 binary64 floats");
 
 namespace {
 
@@ -193,13 +203,45 @@ bool StringRef::equals(const char* s) const {
     return n == len && std::memcmp(data, s, n) == 0;
 }
 
+namespace {
+void unmap_image(void* address, size_t size) {
+#ifdef _WIN32
+    UnmapViewOfFile(address);
+#else
+    ::munmap(address, size);
+#endif
+}
+}
+
 Image::~Image() {
     if (owns_mapping_ && mapping_) {
-        ::munmap(mapping_, mapping_size_);
+        unmap_image(mapping_, mapping_size_);
     }
 }
 
 bool Image::load_file(const std::string& path, std::string& error) {
+#ifdef _WIN32
+    HANDLE file = CreateFileW(windows::wide(path).c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = "cannot open " + path + ": " + windows::error();
+        return false;
+    }
+    LARGE_INTEGER length{};
+    if (!GetFileSizeEx(file, &length) || length.QuadPart < int64_t(HEADER_SIZE) ||
+        uint64_t(length.QuadPart) > SIZE_MAX) {
+        error = path + " has an invalid bytecode image size";
+        CloseHandle(file);
+        return false;
+    }
+    HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(file);
+    void* p = mapping ? MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) : nullptr;
+    if (mapping) CloseHandle(mapping);
+    if (!p) { error = "cannot map " + path + ": " + windows::error(); return false; }
+    size_t file_size = size_t(length.QuadPart);
+#else
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         error = "cannot open " + path + ": " + std::strerror(errno);
@@ -222,23 +264,25 @@ bool Image::load_file(const std::string& path, std::string& error) {
         error = "cannot map " + path;
         return false;
     }
+    size_t file_size = static_cast<size_t>(st.st_size);
+#endif
     // The mapping is what gets unmapped, whatever the image turns out to start
     // at: skipping a shebang below moves `data_` off the page boundary, and
     // munmap only accepts the address it handed out.
     mapping_ = p;
-    mapping_size_ = static_cast<size_t>(st.st_size);
+    mapping_size_ = file_size;
 
     // A shebang line, so that an image can be marked executable and run
     // directly. The compiler's `--shebang` writes one. Anything before the first
     // newline is skipped; an image is binary and never starts with '#'
     // otherwise, since the magic number begins with 'D'.
     const uint8_t* start = static_cast<const uint8_t*>(p);
-    size_t size = static_cast<size_t>(st.st_size);
+    size_t size = file_size;
     if (size > 0 && *start == '#') {
         const void* nl = std::memchr(start, '\n', size);
         if (nl == nullptr) {
             error = path + " begins with `#` and has no newline, so it is not an image";
-            ::munmap(mapping_, mapping_size_);
+            unmap_image(mapping_, mapping_size_);
             mapping_ = nullptr;
             return false;
         }

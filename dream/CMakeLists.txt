@@ -19,6 +19,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 option(DREAM_ENABLE_JIT "Build the LLVM JIT tier" ON)
 option(DREAM_ENABLE_FFI "Build the C foreign function interface" ON)
+option(DREAM_PORTABLE_POLLER "Use the portable readiness poller even on Linux" OFF)
 option(DREAM_BUILD_TESTS "Build the VM test suite" ON)
 
 # ---------------------------------------------------------------------------
@@ -41,7 +42,7 @@ if(DREAM_ENABLE_JIT)
             llvm-config-17 llvm-config-16 llvm-config-15)
   endif()
 
-  if(NOT DREAM_LLVM_CONFIG)
+  if(NOT DREAM_LLVM_CONFIG AND UNIX AND NOT CMAKE_CROSSCOMPILING)
     # Nix keeps llvm-config in the -dev output, which is usually not in PATH.
     file(GLOB DREAM_NIX_LLVM_CONFIGS "/nix/store/*llvm-*-dev/bin/llvm-config")
     if(DREAM_NIX_LLVM_CONFIGS)
@@ -92,6 +93,9 @@ if(DREAM_ENABLE_JIT)
                                       transformutils)
       set(DREAM_LLVM_INCLUDEDIR ${LLVM_INCLUDE_DIRS})
       set(DREAM_LLVM_LIBDIR ${LLVM_LIBRARY_DIRS})
+      if(LLVM_ENABLE_RTTI)
+        set(DREAM_LLVM_RTTI "YES")
+      endif()
       set(DREAM_HAVE_LLVM ON)
       message(STATUS "Dream: JIT enabled against LLVM ${LLVM_PACKAGE_VERSION} (${LLVM_DIR})")
     endif()
@@ -113,7 +117,7 @@ set(DREAM_HAVE_FFI OFF)
 if(DREAM_ENABLE_FFI)
   find_path(DREAM_FFI_INCLUDE ffi.h PATH_SUFFIXES ffi)
   find_library(DREAM_FFI_LIB NAMES ffi)
-  if(NOT DREAM_FFI_INCLUDE OR NOT DREAM_FFI_LIB)
+  if(UNIX AND NOT CMAKE_CROSSCOMPILING AND (NOT DREAM_FFI_INCLUDE OR NOT DREAM_FFI_LIB))
     # Nix keeps headers in a separate -dev output that is not on the default
     # search path.
     file(GLOB DREAM_NIX_FFI_INC "/nix/store/*libffi-*-dev/include")
@@ -165,11 +169,16 @@ add_library(dream SHARED ${DREAM_SOURCES})
 set_target_properties(dream PROPERTIES
   OUTPUT_NAME dream
   VERSION 0.1
-  SOVERSION 0)
+  SOVERSION 0
+  WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(dream
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if(DREAM_PORTABLE_POLLER)
+  target_compile_definitions(dream PRIVATE DREAM_PORTABLE_POLLER=1)
+endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(dream PUBLIC Threads::Threads)
@@ -181,7 +190,15 @@ if(DREAM_HAVE_FFI)
   target_link_libraries(dream PRIVATE ${DREAM_FFI_LIB})
 endif()
 
-target_compile_options(dream PRIVATE -Wall -Wextra -Wno-unused-parameter)
+if(MSVC)
+  target_compile_options(dream PRIVATE /W4 /permissive- /utf-8)
+else()
+  target_compile_options(dream PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(WIN32)
+  target_compile_definitions(dream PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
+  target_link_libraries(dream PRIVATE ws2_32)
+endif()
 
 # ---------------------------------------------------------------------------
 # Codegen for the interpreter
@@ -207,9 +224,11 @@ foreach(flag -fno-semantic-interposition -fno-plt)
     target_compile_options(dream PRIVATE ${flag})
   endif()
 endforeach()
-target_compile_options(dream PRIVATE
-  $<$<CONFIG:RelWithDebInfo>:-O3>
-  $<$<CONFIG:Release>:-O3>)
+if(NOT MSVC)
+  target_compile_options(dream PRIVATE
+    $<$<CONFIG:RelWithDebInfo>:-O3>
+    $<$<CONFIG:Release>:-O3>)
+endif()
 
 # The inliner's default ceilings are wrong for this interpreter, and knowing
 # why is worth more than the numbers.
@@ -270,7 +289,11 @@ if(DREAM_HAVE_LLVM)
   # LLVM is normally built without RTTI; matching it avoids undefined vtable
   # references when we inherit from or dynamic_cast its types.
   if(NOT DREAM_LLVM_RTTI STREQUAL "YES")
-    set_source_files_properties(src/jit.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+    if(MSVC)
+      set_source_files_properties(src/jit.cpp PROPERTIES COMPILE_OPTIONS "/GR-")
+    else()
+      set_source_files_properties(src/jit.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+    endif()
   endif()
 endif()
 
@@ -280,6 +303,9 @@ endif()
 add_executable(dream_cli src/cli.cpp)
 set_target_properties(dream_cli PROPERTIES OUTPUT_NAME dream)
 target_link_libraries(dream_cli PRIVATE dream)
+if(WIN32)
+  target_link_libraries(dream_cli PRIVATE shell32)
+endif()
 target_include_directories(dream_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # ---------------------------------------------------------------------------
@@ -292,6 +318,7 @@ if(DREAM_BUILD_TESTS)
   target_include_directories(dream_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME dream_tests COMMAND dream_tests)
 
+  if(UNIX)
   # End-to-end tests need the compiler, so they are skipped when it is absent
   # rather than failing a VM-only build.
   add_test(NAME dream_e2e
@@ -315,6 +342,7 @@ if(DREAM_BUILD_TESTS)
   set_tests_properties(dream_e2e_verified_heap PROPERTIES
     ENVIRONMENT "dream=$<TARGET_FILE:dream_cli>;DREAM_VERIFY_HEAP=1"
     SKIP_RETURN_CODE 1)
+  endif()
 endif()
 
 # A worked example of embedding the VM from C. Building it keeps the public
@@ -330,5 +358,6 @@ include(GNUInstallDirs)
 
 install(TARGETS dream dream_cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

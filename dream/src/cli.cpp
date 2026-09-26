@@ -1,3 +1,7 @@
+#include "windows.hpp"
+#ifdef _WIN32
+#include <shellapi.h>
+#endif
 // The `dream` command: load a bytecode image and run it.
 
 #include <cctype>
@@ -207,7 +211,7 @@ void dump_image(const Image& img) {
 
 bool is_directory(const std::string& path) {
     std::error_code ec;
-    return std::filesystem::is_directory(path, ec);
+    return std::filesystem::is_directory(std::filesystem::path(std::u8string(path.begin(), path.end())), ec);
 }
 
 /// Where installed images live: the directories in `$MINDV2_PATH`, or
@@ -303,7 +307,7 @@ std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* f
         }
     }
     for (const std::string& candidate : candidates) {
-        if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
+        if (std::filesystem::exists(std::filesystem::path(std::u8string(candidate.begin(), candidate.end()))) && !is_directory(candidate)) return candidate;
     }
 
     *file_ok = false;
@@ -333,7 +337,7 @@ std::string installed_image(const std::string& name, const std::string& MINDV2_P
             dir + "/" + name + ".dream",
         };
         for (const std::string& candidate : candidates) {
-            if (std::filesystem::exists(candidate) && !is_directory(candidate)) return candidate;
+            if (std::filesystem::exists(std::filesystem::path(std::u8string(candidate.begin(), candidate.end()))) && !is_directory(candidate)) return candidate;
         }
     }
     std::fprintf(stderr, "dream: no installed image `%s` in %s\n", name.c_str(),
@@ -349,11 +353,11 @@ std::string get_mindv2_path() {
     const std::string home = home_dir();
     if (home.empty()) return "";
     std::string candidate = home + "/.mindv2";
-    if (std::filesystem::exists(candidate)) return candidate;
+    if (std::filesystem::exists(std::filesystem::path(std::u8string(candidate.begin(), candidate.end())))) return candidate;
     return "";
 }
 
-int main(int argc, char** argv) {
+int dream_main(int argc, char** argv) {
     std::string path, entry;
     std::string dump_jit_fn;
     unsigned workers = 0;
@@ -570,4 +574,22 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "; %u workers, jit %s\n", workers, jit_owner ? "on" : "off");
     }
     return status;
+}
+
+int main(int argc, char** argv) {
+#ifdef _WIN32
+    // The CRT's narrow argv follows the active ANSI code page, not UTF-8.
+    int count = 0;
+    wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (!wide) return 1;
+    std::vector<std::string> strings;
+    for (int i = 0; i < count; ++i) strings.push_back(dream::windows::utf8(wide[i]));
+    LocalFree(wide);
+    std::vector<char*> pointers;
+    for (auto& text : strings) pointers.push_back(text.data());
+    pointers.push_back(nullptr);
+    return dream_main(count, pointers.data());
+#else
+    return dream_main(argc, argv);
+#endif
 }

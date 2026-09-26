@@ -1,0 +1,35 @@
+name: Portable Dream images
+on: [push, pull_request]
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF -DDREAM_ENABLE_FFI=OFF
+      - run: cmake --build build --parallel 2
+      - run: python3 dream/tests/portable.py compile --vm build/bin/dream --images portable-images
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-images
+          path: portable-images
+  run:
+    needs: images
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: portable-images
+          path: portable-images
+      - run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF -DDREAM_ENABLE_FFI=OFF
+      - run: cmake --build build --config Release --parallel 2
+      - run: ctest --test-dir build -C Release -R "^dream_tests$" --output-on-failure
+      - if: runner.os != 'Windows'
+        run: python3 dream/tests/portable.py run --vm build/bin/dream --images portable-images
+      - if: runner.os == 'Windows'
+        run: python dream/tests/portable.py run --vm build/bin/Release/dream.exe --images portable-images

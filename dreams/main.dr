@@ -275,7 +275,7 @@ let build! l out shebang payloads o = {
                 // There is no `chmod` builtin, and the execute bit is the whole
                 // point of the `#!` line, so this is one place where shelling
                 // out is the implementation rather than a shortcut.
-                match shebang { () => (), _ => os.exec! "chmod" ["+x", out] }
+                match [shebang, os.platform ()] { [(), _] => (), [_, :windows] => (), _ => os.exec! "chmod" ["+x", out] }
                 if not copied {
                     console.error! ("dreams: a payload was shorter than it measured; "
                                     + out + " is incomplete")

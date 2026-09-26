@@ -165,7 +165,7 @@ let stdlib_root! () = {
     }
 };
 
-let home_dir! () = match os.env! "HOME" { () => ".", h => h };
+let home_dir! () = match util.home! () { () => ".", h => h };
 
 /// The nearest `name` directory at or above `from`, or `()`. Holds a library
 /// whose `std` is a package, so it is the *parent* that becomes a `-L` root.

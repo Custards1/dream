@@ -12,6 +12,35 @@ import std.str;
 // here would only lose information -- a relative dependency path is meaningful
 // relative to the manifest that named it.
 
+// Windows accepts both separators. Keep the platform query at runtime so
+// this compiler image can be copied unchanged between operating systems.
+let slashes p = match os.platform () {
+    :windows => str.join_str "/" (str.split "\\" p),
+    _ => p,
+};
+
+let root p = match os.platform () {
+    :windows => match p {
+        _ if str.byte_length p >= 3 && str.slice 1 2 p == ":/" => str.slice 0 3 p,
+        _ if str.starts_with "//" p => {
+            let parts = list.filter (fn s -> not (str.is_empty s)) (str.split "/" p);
+            match parts {
+                [server, share, .._] => "//" + server + "/" + share,
+                _ => "/",
+            }
+        },
+        _ if str.starts_with "/" p => "/",
+        _ => "",
+    },
+    _ => if str.starts_with "/" p { "/" } else { "" },
+};
+
+let is_absolute p = not (str.is_empty (root (slashes p)));
+let home! () = match os.env! "HOME" {
+    () => os.env! "USERPROFILE",
+    home => home,
+};
+
 /// A leading `~` means the home directory.
 ///
 /// A shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
@@ -23,7 +52,7 @@ import std.str;
 /// than not answering.
 let expand_home! p =
     if p == "~" || str.starts_with "~/" p {
-        match os.env! "HOME" {
+        match home! () {
             () => p,
             home => home + str.slice 1 (str.byte_length p - 1) p,
         }
@@ -40,27 +69,43 @@ let env_path! name =
 /// `.` is dropped rather than kept, so a project at `.` gets `main.dr` and not
 /// `././main.dr` -- these paths end up in error messages and in the `-L` flags
 /// handed to the compiler, and both are read by people.
-let join a b =
-    if str.is_empty a || a == "." { b }
-    else if str.is_empty b || b == "." { a }
-    else if str.ends_with "/" a { a + b }
-    else { a + "/" + b };
+let join original_a original_b = {
+    let a = slashes original_a;
+    let b = slashes original_b;
+    match [a, b] {
+        ["", _] => b,
+        [".", _] => b,
+        [_, ""] => a,
+        [_, "."] => a,
+        _ if is_absolute b => b,
+        _ if str.ends_with "/" a => a + b,
+        _ => a + "/" + b,
+    }
+};
 
 /// Everything before the last `/`, or "." when there is none.
-let dirname path = {
+let dirname original = {
+    let path = slashes original;
     let rec last_slash i best =
         if i >= str.byte_length path { best }
         else if str.slice i 1 path == "/" { last_slash (i + 1) i }
         else { last_slash (i + 1) best };
     let at = last_slash 0 (0 - 1);
-    if at < 0 { "." } else if at == 0 { "/" } else { str.slice 0 at path }
+    match at {
+        _ if at < 0 => ".",
+        _ if at < str.byte_length (root path) => root path,
+        0 => "/",
+        _ => str.slice 0 at path,
+    }
 };
 
 /// `.` and `..` folded away, textually. Used only to ask whether two spellings
 /// name one directory -- `app/../util` and `util` reached through two packages
 /// -- and never to rewrite a path handed on to anything else.
-let normalize path = {
-    let absolute = str.starts_with "/" path;
+let normalize original = {
+    let path = slashes original;
+    let anchor = root path;
+    let absolute = not (str.is_empty anchor);
     let step acc seg =
         match [seg, acc] {
             ["", _] => acc,
@@ -70,10 +115,11 @@ let normalize path = {
             ["..", [_, ..up]] => up,
             [s, _] => list.cons s acc,
         };
-    let segs = list.reverse (list.fold step [] (str.split "/" path));
+    let segs = list.reverse (list.fold step [] (str.split "/" (str.slice (str.byte_length anchor) (str.byte_length path - str.byte_length anchor) path)));
     let joined = str.join_str "/" segs;
     match [absolute, joined] {
-        [true, _] => "/" + joined,
+        [true, ""] => anchor,
+        [true, _] => join anchor joined,
         [false, ""] => ".",
         _ => joined,
     }
@@ -82,7 +128,7 @@ let normalize path = {
 /// `path` made absolute against the working directory, and normalized: the
 /// spelling two dependencies on one directory agree on.
 let absolute! path =
-    normalize (if str.starts_with "/" path { path } else { join (os.cwd! ()) path });
+    normalize (if is_absolute path { path } else { join (os.cwd! ()) path });
 
 /// `to` written relative to the directory `from`, both as the working
 /// directory would read them: what `mind add ../util`, typed in one place,

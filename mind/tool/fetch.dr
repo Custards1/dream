@@ -23,7 +23,7 @@ import util;
 /// repository at a given revision is the same bytes whoever asked for it.
 let cache_root! () =
     match util.env_path! "MIND_HOME" {
-        () => match os.env! "HOME" {
+        () => match util.home! () {
             () => ".mind",
             home => util.join home ".mind",
         },

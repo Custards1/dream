@@ -10,6 +10,10 @@ loader can `mmap` the file, slice the `NODE` and `KIDS` sections, and begin
 forcing nodes immediately — no parsing, no relocation, no allocation
 proportional to program size.
 
+A compiled image is shared unchanged across Linux, Windows, and macOS VMs.
+Native addresses and JIT machine code are never serialized into it. See
+[platform portability](platforms.md) for the host requirements and exceptions.
+
 All multi-byte integers are little-endian. All section offsets are 8-byte
 aligned. The sentinel `0xFFFFFFFF` (`NO_NODE`) marks an absent edge.
 

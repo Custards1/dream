@@ -29,7 +29,10 @@
 #include "runtime.hpp"
 
 #if DREAM_HAVE_FFI
+#include "windows.hpp"
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <ffi.h>
 #endif
 
@@ -213,9 +216,18 @@ NativeResult ffi_open(Process& p, Value, Value* args, uint32_t) {
     std::string name = self ? std::string() : string_arg(v);
     if (!self && name.empty()) return fail(p, "open! needs a library name, or \"\" for this program");
 
+#ifdef _WIN32
+    void* handle = self ? GetModuleHandleW(nullptr) : LoadLibraryW(windows::wide(name).c_str());
+#else
     void* handle = ::dlopen(self ? nullptr : name.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!handle) {
+#ifdef _WIN32
+        std::string message = windows::error();
+        const char* err = message.c_str();
+#else
         const char* err = ::dlerror();
+#endif
         return fail(p, "cannot open `" + (self ? std::string("<this program>") : name) +
                            "`: " + (err ? err : "unknown error"));
     }
@@ -254,9 +266,15 @@ NativeResult ffi_bind(Process& p, Value, Value* args, uint32_t) {
                            "` is not a return type");
     }
 
+#ifdef _WIN32
+    void* fn = reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(lib), symbol.c_str()));
+    std::string message = fn ? "" : windows::error();
+    const char* dl_err = fn ? nullptr : message.c_str();
+#else
     ::dlerror();
     void* fn = ::dlsym(lib, symbol.c_str());
     const char* dl_err = ::dlerror();
+#endif
     if (dl_err) return fail(p, "cannot find `" + symbol + "`: " + dl_err);
 
     auto binding = std::make_unique<Binding>();

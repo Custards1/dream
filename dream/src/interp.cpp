@@ -1,3 +1,4 @@
+#include "arithmetic.hpp"
 #include <cstdlib>
 
 #include "interp.hpp"
@@ -899,9 +900,9 @@ bool arith(Process& p, Op op, Value a, Value b, Value* out) {
         int64_t x = fixnum_value(a), y = fixnum_value(b), r = 0;
         bool overflow = false;
         switch (op) {
-            case Op::Add: overflow = __builtin_add_overflow(x, y, &r); break;
-            case Op::Sub: overflow = __builtin_sub_overflow(x, y, &r); break;
-            case Op::Mul: overflow = __builtin_mul_overflow(x, y, &r); break;
+            case Op::Add: overflow = add_overflow(x, y, &r); break;
+            case Op::Sub: overflow = sub_overflow(x, y, &r); break;
+            case Op::Mul: overflow = mul_overflow(x, y, &r); break;
             case Op::Div:
                 if (y == 0) {
                     *out = raise_error(p, wk.divide_by_zero, "division by zero");
@@ -1432,19 +1433,19 @@ void finish_binary(Process& p, Op op, Value lhs, Value rhs) {
         int64_t r;
         switch (op) {
             case Op::Add:
-                if (!__builtin_add_overflow(x, y, &r) && fixnum_fits(r)) {
+                if (!add_overflow(x, y, &r) && fixnum_fits(r)) {
                     ret(p, make_fixnum(r));
                     return;
                 }
                 break;
             case Op::Sub:
-                if (!__builtin_sub_overflow(x, y, &r) && fixnum_fits(r)) {
+                if (!sub_overflow(x, y, &r) && fixnum_fits(r)) {
                     ret(p, make_fixnum(r));
                     return;
                 }
                 break;
             case Op::Mul:
-                if (!__builtin_mul_overflow(x, y, &r) && fixnum_fits(r)) {
+                if (!mul_overflow(x, y, &r) && fixnum_fits(r)) {
                     ret(p, make_fixnum(r));
                     return;
                 }
@@ -2254,9 +2255,9 @@ Value thunk_for(Process& p, uint32_t node, Value frame) {
                 int64_t r;
                 bool over = true;
                 switch (Op(n.op)) {
-                    case Op::Add: over = __builtin_add_overflow(x, y, &r); break;
-                    case Op::Sub: over = __builtin_sub_overflow(x, y, &r); break;
-                    default: over = __builtin_mul_overflow(x, y, &r); break;
+                    case Op::Add: over = add_overflow(x, y, &r); break;
+                    case Op::Sub: over = sub_overflow(x, y, &r); break;
+                    default: over = mul_overflow(x, y, &r); break;
                 }
                 if (!over && fixnum_fits(r)) return make_fixnum(r);
             }

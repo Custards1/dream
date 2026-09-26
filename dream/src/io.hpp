@@ -8,7 +8,7 @@
 // So IO never blocks a worker. A native tries the operation without blocking;
 // if the file descriptor is not ready it registers interest with a poller and
 // returns `NativeResult::block()`, which parks the *process* through the same
-// handshake `recv!` uses. A poller thread waits in `epoll_wait` and wakes the
+// handshake `recv!` uses. A readiness poller (epoll on Linux) wakes the
 // process when the descriptor is ready, and the native is called again. From
 // Dream the call looks like an ordinary synchronous one.
 //
@@ -46,8 +46,7 @@ void io_init();
 void io_shutdown();
 
 /// Whether this build can wait on a descriptor without blocking a worker.
-/// False on platforms with no poller, where stream IO falls back to blocking
-/// calls and the reason is reported by `io.async ()`.
+/// False if initialization failed; reported by `io.async ()`.
 bool io_async_available();
 
 /// One open handle, as `std.vm` reports it.

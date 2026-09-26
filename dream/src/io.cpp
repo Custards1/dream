@@ -19,7 +19,7 @@
 #include "process.hpp"
 #include "scheduler.hpp"
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(DREAM_PORTABLE_POLLER)
 #define DREAM_HAVE_EPOLL 1
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -27,20 +27,14 @@
 #define DREAM_HAVE_EPOLL 0
 #endif
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "platform_io.hpp"
+#include <chrono>
+#include <condition_variable>
 
 namespace dream {
 namespace {
 
-bool trace_on() { static bool on = ::getenv("DREAM_IO_TRACE") != nullptr; return on; }
+[[maybe_unused]] bool trace_on() { static bool on = ::getenv("DREAM_IO_TRACE") != nullptr; return on; }
 #define IOTRACE(...) do { if (trace_on()) { std::fprintf(stderr, "[io] " __VA_ARGS__); std::fprintf(stderr, "\n"); } } while (0)
 
 
@@ -137,7 +131,7 @@ public:
         std::lock_guard<std::mutex> g(mutex_);
         size_t i = 0;
         for (; i < slots_.size(); ++i) {
-            if (!slots_[i].open) break;
+            if (!slots_[i].open && slots_[i].busy == 0) break;
         }
         if (i == slots_.size()) slots_.push_back(Handle{});
         Handle& h = slots_[i];
@@ -191,7 +185,7 @@ public:
                 h.fd = -1;
             }
         }
-        if (to_close >= 0) ::close(to_close);
+        if (to_close >= 0) sys::close(to_close);
     }
 
     /// Every open handle, for `std.vm`.
@@ -215,7 +209,7 @@ public:
     void close_all() {
         std::lock_guard<std::mutex> g(mutex_);
         for (Handle& h : slots_) {
-            if (h.open && h.owned && h.fd >= 0) ::close(h.fd);
+            if (h.open && h.owned && h.fd >= 0) sys::close(h.fd);
             h.open = false;
         }
     }
@@ -279,7 +273,7 @@ public:
         return p;
     }
 
-    bool available() const { return epoll_fd_ >= 0; }
+    bool available() const { return running_.load(); }
 
     void start() {
 #if DREAM_HAVE_EPOLL
@@ -299,6 +293,9 @@ public:
             ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev);
         }
         thread_ = std::thread([this] { loop(); });
+#else
+        if (running_.exchange(true)) return;
+        thread_ = std::thread([this] { loop_portable(); });
 #endif
     }
 
@@ -307,13 +304,17 @@ public:
         if (!running_.exchange(false)) return;
         if (wake_fd_ >= 0) {
             uint64_t one = 1;
-            [[maybe_unused]] ssize_t n = ::write(wake_fd_, &one, sizeof one);
+            [[maybe_unused]] sys::Count n = sys::write(wake_fd_, &one, sizeof one);
         }
         if (thread_.joinable()) thread_.join();
-        if (wake_fd_ >= 0) ::close(wake_fd_);
-        if (epoll_fd_ >= 0) ::close(epoll_fd_);
+        if (wake_fd_ >= 0) sys::close(wake_fd_);
+        if (epoll_fd_ >= 0) sys::close(epoll_fd_);
         wake_fd_ = -1;
         epoll_fd_ = -1;
+#else
+        if (!running_.exchange(false)) return;
+        changed_.notify_all();
+        if (thread_.joinable()) thread_.join();
 #endif
     }
 
@@ -344,8 +345,12 @@ public:
         IOTRACE("arm fd=%d %s pid=%llu", fd, writable ? "w" : "r", (unsigned long long)pid);
         return true;
 #else
-        (void)fd; (void)writable; (void)pid; (void)sched;
-        return false;
+        std::lock_guard<std::mutex> g(mutex_);
+        if (!running_ || waiters_.count(fd)) return false;
+        sched->note_io_wait(true);
+        waiters_[fd] = Waiter{pid, sched, writable};
+        changed_.notify_all();
+        return true;
 #endif
     }
 
@@ -382,7 +387,16 @@ public:
             w.sched->note_io_wait(false);
         }
 #else
-        (void)fd;
+        Waiter w{};
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = waiters_.find(fd);
+            if (it == waiters_.end()) return;
+            w = it->second;
+            waiters_.erase(it);
+        }
+        w.sched->wake(w.pid);
+        w.sched->note_io_wait(false);
 #endif
     }
 
@@ -390,6 +404,7 @@ private:
     struct Waiter {
         uint64_t pid = 0;
         Scheduler* sched = nullptr;
+        bool writable = false;
     };
 
 #if DREAM_HAVE_EPOLL
@@ -405,7 +420,7 @@ private:
                 int fd = events[i].data.fd;
                 if (fd == wake_fd_) {
                     uint64_t drain = 0;
-                    [[maybe_unused]] ssize_t r = ::read(wake_fd_, &drain, sizeof drain);
+                    [[maybe_unused]] sys::Count r = sys::read(wake_fd_, &drain, sizeof drain);
                     continue;
                 }
                 Waiter w{};
@@ -427,6 +442,22 @@ private:
     }
 #endif
 
+#if !DREAM_HAVE_EPOLL
+    void loop_portable() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (running_) {
+            for (auto it = waiters_.begin(); it != waiters_.end();) {
+                if (!sys::ready(it->first, it->second.writable)) { ++it; continue; }
+                Waiter w = it->second;
+                it = waiters_.erase(it);
+                w.sched->wake(w.pid);
+                w.sched->note_io_wait(false);
+            }
+            changed_.wait_for(lock, std::chrono::milliseconds(5));
+        }
+    }
+    std::condition_variable changed_;
+#endif
     std::atomic<bool> running_{false};
     int epoll_fd_ = -1;
     int wake_fd_ = -1;
@@ -463,9 +494,7 @@ NativeResult wait_for(Process& p, int fd, bool writable) {
 }
 
 bool set_nonblocking(int fd) {
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return false;
-    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+    return sys::nonblocking(fd);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +519,7 @@ NativeResult io_read(Process& p, Value, Value* args, uint32_t) {
 
     std::vector<char> buf(want);
     for (;;) {
-        ssize_t got = ::read(h.fd(), buf.data(), want);
+        sys::Count got = sys::read(h.fd(), buf.data(), want);
         if (got >= 0) return NativeResult::ok(p.heap().make_string(buf.data(), uint32_t(got)));
         if (errno == EINTR) continue;
         if ((errno == EAGAIN || errno == EWOULDBLOCK) && h.pollable()) {
@@ -517,7 +546,7 @@ NativeResult io_write(Process& p, Value, Value* args, uint32_t) {
         // larger than memory costs no memory to write. `write` takes a size_t
         // and answers how much it took, and a short write is the caller's loop
         // either way, so nothing here has to know which kind it was handed.
-        ssize_t put = ::write(h.fd(), str.data, size_t(str.len));
+        sys::Count put = sys::write(h.fd(), str.data, size_t(str.len));
         if (put >= 0) return NativeResult::ok(make_fixnum(int64_t(put)));
         if (errno == EINTR) continue;
         if ((errno == EAGAIN || errno == EWOULDBLOCK) && h.pollable()) {
@@ -543,14 +572,14 @@ NativeResult io_open(Process& p, Value, Value* args, uint32_t) {
     else if (mode == "update") flags = O_RDWR | O_CREAT;
     else return fail(p, "bad_argument", "`:" + mode + "` is not a mode; use :read, :write, :append or :update");
 
-    int fd = ::open(path.c_str(), flags | O_CLOEXEC, 0644);
+    int fd = sys::open(path.c_str(), flags | O_CLOEXEC, 0644);
     if (fd < 0) return fail_errno(p, "open " + path, errno);
 
     // What it actually is decides how it can be waited on: opening a fifo by
     // name gives a descriptor that must be polled, not read straight through.
-    struct stat st{};
+    sys::FileStat st{};
     HandleKind kind = HandleKind::File;
-    if (::fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) {
+    if (sys::fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) {
         kind = HandleKind::Stream;
         set_nonblocking(fd);
     }
@@ -579,7 +608,7 @@ NativeResult io_close(Process& p, Value, Value* args, uint32_t) {
     // otherwise park that reader for ever. It wakes, retries, and gets the
     // "closed" error.
     Poller::get().forget(fd);
-    if (close_now) ::close(fd);
+    if (close_now) sys::close(fd);
     return NativeResult::ok(UNIT);
 }
 
@@ -588,7 +617,7 @@ NativeResult io_flush(Process& p, Value, Value* args, uint32_t) {
     if (!h.open(args[0])) return fail(p, "io_closed", "this handle is closed");
     // Only a regular file has anything buffered in the kernel worth forcing
     // out; asking a socket to fsync is an error, not a no-op.
-    if (h.kind() == HandleKind::File && ::fsync(h.fd()) < 0) {
+    if (h.kind() == HandleKind::File && sys::fsync(h.fd()) < 0) {
         return fail_errno(p, "flush", errno);
     }
     return NativeResult::ok(UNIT);
@@ -599,7 +628,7 @@ NativeResult io_seek(Process& p, Value, Value* args, uint32_t) {
     if (!h.open(args[0])) return fail(p, "io_closed", "this handle is closed");
     Value off = resolve(args[1]);
     if (!is_fixnum(off)) return fail(p, "type_error", "seek! needs a byte offset");
-    off_t where = ::lseek(h.fd(), off_t(fixnum_value(off)), SEEK_SET);
+    sys::Offset where = sys::lseek(h.fd(), sys::Offset(fixnum_value(off)), SEEK_SET);
     if (where < 0) return fail_errno(p, "seek", errno);
     return NativeResult::ok(make_fixnum(int64_t(where)));
 }
@@ -607,8 +636,8 @@ NativeResult io_seek(Process& p, Value, Value* args, uint32_t) {
 NativeResult io_size(Process& p, Value, Value* args, uint32_t) {
     Held h;
     if (!h.open(args[0])) return fail(p, "io_closed", "this handle is closed");
-    struct stat st{};
-    if (::fstat(h.fd(), &st) < 0) return fail_errno(p, "size", errno);
+    sys::FileStat st{};
+    if (sys::fstat(h.fd(), &st) < 0) return fail_errno(p, "size", errno);
     return NativeResult::ok(make_fixnum(int64_t(st.st_size)));
 }
 
@@ -643,8 +672,8 @@ int64_t std_handle(int fd) {
     static int64_t ids[3] = {-1, -1, -1};
     std::lock_guard<std::mutex> g(mutex);
     if (ids[fd] < 0) {
-        struct stat st{};
-        bool regular = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+        sys::FileStat st{};
+        bool regular = sys::fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
         ids[fd] = HandleTable::get().add(fd, regular ? HandleKind::File : HandleKind::Stream,
                                          /*owned=*/false);
     }
@@ -665,21 +694,21 @@ NativeResult io_stderr(Process&, Value, Value*, uint32_t) {
 
 NativeResult io_exists(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "exists! needs a path");
-    struct stat st{};
-    return NativeResult::ok(make_bool(::stat(string_arg(args[0]).c_str(), &st) == 0));
+    sys::FileStat st{};
+    return NativeResult::ok(make_bool(sys::stat(string_arg(args[0]).c_str(), &st) == 0));
 }
 
 NativeResult io_is_dir(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "is_dir! needs a path");
-    struct stat st{};
-    if (::stat(string_arg(args[0]).c_str(), &st) != 0) return NativeResult::ok(make_bool(false));
+    sys::FileStat st{};
+    if (sys::stat(string_arg(args[0]).c_str(), &st) != 0) return NativeResult::ok(make_bool(false));
     return NativeResult::ok(make_bool(S_ISDIR(st.st_mode)));
 }
 
 NativeResult io_remove(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "remove! needs a path");
     std::string path = string_arg(args[0]);
-    if (::remove(path.c_str()) != 0) return fail_errno(p, "remove " + path, errno);
+    if (sys::remove(path.c_str()) != 0) return fail_errno(p, "remove " + path, errno);
     return NativeResult::ok(UNIT);
 }
 
@@ -688,7 +717,7 @@ NativeResult io_rename(Process& p, Value, Value* args, uint32_t) {
         return fail(p, "type_error", "rename! needs two paths");
     }
     std::string from = string_arg(args[0]);
-    if (::rename(from.c_str(), string_arg(args[1]).c_str()) != 0) {
+    if (sys::rename(from.c_str(), string_arg(args[1]).c_str()) != 0) {
         return fail_errno(p, "rename " + from, errno);
     }
     return NativeResult::ok(UNIT);
@@ -697,7 +726,7 @@ NativeResult io_rename(Process& p, Value, Value* args, uint32_t) {
 NativeResult io_mkdir(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "mkdir! needs a path");
     std::string path = string_arg(args[0]);
-    if (::mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+    if (sys::mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
         return fail_errno(p, "mkdir " + path, errno);
     }
     return NativeResult::ok(UNIT);
@@ -718,26 +747,26 @@ NativeResult net_listen(Process& p, Value, Value* args, uint32_t) {
     if (!is_fixnum(v) || fixnum_value(v) < 0 || fixnum_value(v) > 65535) {
         return fail(p, "bad_argument", "listen! needs a port between 0 and 65535");
     }
-    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = sys::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return fail_errno(p, "socket", errno);
 
     // Without this, a listener that has just exited leaves the port unusable
     // for a minute or two, which makes every restart of a server a coin toss.
     int on = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    sys::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(uint16_t(fixnum_value(v)));
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
+    if (sys::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
         int e = errno;
-        ::close(fd);
+        sys::close(fd);
         return fail_errno(p, "bind", e);
     }
-    if (::listen(fd, 128) < 0) {
+    if (sys::listen(fd, 128) < 0) {
         int e = errno;
-        ::close(fd);
+        sys::close(fd);
         return fail_errno(p, "listen", e);
     }
     set_nonblocking(fd);
@@ -753,12 +782,12 @@ NativeResult net_accept(Process& p, Value, Value* args, uint32_t) {
     }
 
     for (;;) {
-        int client = ::accept(h.fd(), nullptr, nullptr);
+        int client = sys::accept(h.fd(), nullptr, nullptr);
         if (client >= 0) {
             set_nonblocking(client);
             int on = 1;
             // Small writes should go out now, not wait for more to accumulate.
-            ::setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+            sys::setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
             return NativeResult::ok(
                 make_fixnum(HandleTable::get().add(client, HandleKind::Stream)));
         }
@@ -801,24 +830,24 @@ NativeResult net_connect(Process& p, Value, Value* args, uint32_t) {
         return fail(p, "not_found", "cannot resolve " + host + ": " + ::gai_strerror(gai));
     }
 
-    int fd = ::socket(found->ai_family, found->ai_socktype | SOCK_CLOEXEC, found->ai_protocol);
+    int fd = sys::socket(found->ai_family, found->ai_socktype, found->ai_protocol);
     if (fd < 0) {
         int e = errno;
         ::freeaddrinfo(found);
         return fail_errno(p, "socket", e);
     }
     set_nonblocking(fd);
-    int rc = ::connect(fd, found->ai_addr, found->ai_addrlen);
+    int rc = sys::connect(fd, found->ai_addr, found->ai_addrlen);
     int e = errno;
     ::freeaddrinfo(found);
 
     if (rc == 0) {
         int on = 1;
-        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+        sys::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
         return NativeResult::ok(make_fixnum(HandleTable::get().add(fd, HandleKind::Stream)));
     }
     if (e != EINPROGRESS && e != EINTR) {
-        ::close(fd);
+        sys::close(fd);
         return fail_errno(p, "connect to " + host, e);
     }
 
@@ -844,18 +873,18 @@ NativeResult net_connect_finish(Process& p) {
     h->connecting = false;
 
     int err = 0;
-    socklen_t len = sizeof err;
-    if (::getsockopt(h->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) err = errno;
+    sys::SockLen len = sizeof err;
+    if (sys::getsockopt(h->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) err = errno;
     if (err != 0) {
         int fd = h->fd;
         h->open = false;
         h->fd = -1;
         lock.unlock();
-        ::close(fd);
+        sys::close(fd);
         return fail_errno(p, "connect", err);
     }
     int on = 1;
-    ::setsockopt(h->fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+    sys::setsockopt(h->fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
     lock.unlock();
     return NativeResult::ok(make_fixnum(id));
 }
@@ -865,8 +894,8 @@ NativeResult net_peer(Process& p, Value, Value* args, uint32_t) {
     Held h;
     if (!h.open(args[0])) return fail(p, "io_closed", "this socket is closed");
     sockaddr_in addr{};
-    socklen_t len = sizeof addr;
-    if (::getpeername(h.fd(), reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
+    sys::SockLen len = sizeof addr;
+    if (sys::getpeername(h.fd(), reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
         return fail_errno(p, "peer", errno);
     }
     char text[INET_ADDRSTRLEN] = {0};
@@ -881,8 +910,8 @@ NativeResult net_port(Process& p, Value, Value* args, uint32_t) {
     Held h;
     if (!h.open(args[0])) return fail(p, "io_closed", "this socket is closed");
     sockaddr_in addr{};
-    socklen_t len = sizeof addr;
-    if (::getsockname(h.fd(), reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
+    sys::SockLen len = sizeof addr;
+    if (sys::getsockname(h.fd(), reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
         return fail_errno(p, "port", errno);
     }
     return NativeResult::ok(make_fixnum(int64_t(ntohs(addr.sin_port))));
@@ -893,7 +922,7 @@ NativeResult net_port(Process& p, Value, Value* args, uint32_t) {
 NativeResult net_shutdown(Process& p, Value, Value* args, uint32_t) {
     Held h;
     if (!h.open(args[0])) return fail(p, "io_closed", "this socket is closed");
-    ::shutdown(h.fd(), SHUT_WR);
+    sys::shutdown(h.fd(), SHUT_WR);
     return NativeResult::ok(UNIT);
 }
 
@@ -903,7 +932,7 @@ NativeResult net_shutdown(Process& p, Value, Value* args, uint32_t) {
 // Wiring
 // ---------------------------------------------------------------------------
 
-void io_init() { Poller::get().start(); }
+void io_init() { if (sys::init()) Poller::get().start(); }
 
 void io_shutdown() {
     Poller::get().stop();

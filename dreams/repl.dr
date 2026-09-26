@@ -226,7 +226,10 @@ let command_argument text = str.trim (str.slice (str.find " " text)
 /// Where this session's scratch files go. One pair per process, so two sessions
 /// on one machine do not compile over each other.
 let scratch! name =
-    (match os.env! "TMPDIR" { () => "/tmp", d => path.expand_home! d })
+    (match os.env! "TMPDIR" {
+        () => match os.env! "TEMP" { () => match os.platform () { :windows => ".", _ => "/tmp" }, d => d },
+        d => path.expand_home! d,
+    })
     + "/dream-repl-" + to_string (os.pid! ()) + name;
 
 /// Enter one declaration: keep it only if the session still compiles with it.

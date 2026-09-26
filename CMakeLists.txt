@@ -9,17 +9,16 @@
 cmake_minimum_required(VERSION 3.20)
 project(dream LANGUAGES CXX)
 
+# Register subdirectory tests when configuring from the repository root.
+include(CTest)
 add_subdirectory(dream)
 
-# 3. Configure CPack for Debian generation
-set(CPACK_GENERATOR "DEB")
-set(CPACK_PACKAGE_NAME "my-awesome-app")
-set(CPACK_PACKAGE_VENDOR "My Company or Name")
-set(CPACK_PACKAGE_CONTACT "maintainer@example.com")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "A brief summary of my awesome application")
-
-# Optional: Automatically calculate runtime dependencies (like libc6, etc.)
-set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-
-# 4. Include CPack (this must be at the very end)
+set(CPACK_PACKAGE_NAME "dream")
+set(CPACK_PACKAGE_VERSION "0.1.0")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Dream language virtual machine")
+if(WIN32)
+  set(CPACK_GENERATOR "ZIP")
+else()
+  set(CPACK_GENERATOR "TGZ")
+endif()
 include(CPack)

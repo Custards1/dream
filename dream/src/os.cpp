@@ -16,7 +16,8 @@
 #include "os.hpp"
 
 #include <algorithm>
-#include <algorithm>
+#include <filesystem>
+#include "windows.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <cerrno>
@@ -30,6 +31,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#else
 #include <dirent.h>
 #include <fcntl.h>
 #include <spawn.h>
@@ -37,13 +42,16 @@
 #include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include "builtins.hpp"
 #include "interp.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
 
+#ifndef _WIN32
 extern char** environ;
+#endif
 
 namespace dream {
 namespace {
@@ -175,6 +183,99 @@ private:
     int64_t next_ = 1;
 };
 
+#ifdef _WIN32
+// Pipe reads live on helper threads, just as on POSIX. Only the explicitly
+// listed standard handles are inherited by the child.
+std::string slurp(HANDLE pipe) {
+    std::string out;
+    char buf[4096];
+    DWORD n;
+    while (ReadFile(pipe, buf, sizeof buf, &n, nullptr) && n) out.append(buf, n);
+    CloseHandle(pipe);
+    return out;
+}
+
+void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
+               uint64_t pid, Scheduler* sched) {
+    auto finish = [&] {
+        job->done.store(true, std::memory_order_release);
+        if (sched) { sched->wake(pid); sched->note_io_wait(false); }
+    };
+    HANDLE out_read = nullptr, out_write = nullptr, err_read = nullptr, err_write = nullptr;
+    HANDLE input = INVALID_HANDLE_VALUE;
+    auto cleanup = [&] {
+        for (HANDLE h : {out_read, out_write, err_read, err_write, input})
+            if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    };
+    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    if (!CreatePipe(&out_read, &out_write, &security, 0) ||
+        !CreatePipe(&err_read, &err_write, &security, 0) ||
+        !SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0)) {
+        job->error = "cannot create pipes: " + windows::error();
+        cleanup(); finish(); return;
+    }
+    HANDLE current_input = GetStdHandle(STD_INPUT_HANDLE);
+    if (!current_input || current_input == INVALID_HANDLE_VALUE ||
+        !DuplicateHandle(GetCurrentProcess(), current_input, GetCurrentProcess(),
+                         &input, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            &security, OPEN_EXISTING, 0, nullptr);
+    }
+    STARTUPINFOEXW start{};
+    start.StartupInfo.cb = sizeof(start);
+    start.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    start.StartupInfo.hStdInput = input;
+    start.StartupInfo.hStdOutput = out_write;
+    start.StartupInfo.hStdError = err_write;
+    SIZE_T bytes = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+    std::vector<unsigned char> attributes(bytes);
+    start.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    if (!InitializeProcThreadAttributeList(start.lpAttributeList, 1, 0, &bytes)) {
+        job->error = windows::error(); cleanup(); finish(); return;
+    }
+    HANDLE inherited[] = {input, out_write, err_write};
+    bool ready = UpdateProcThreadAttribute(start.lpAttributeList, 0,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr);
+    std::wstring command;
+    for (const auto& arg : argv) {
+        if (!command.empty()) command += L' ';
+        command += windows::quote(arg);
+    }
+    PROCESS_INFORMATION child{};
+    bool created = ready && CreateProcessW(nullptr, command.data(), nullptr, nullptr,
+        TRUE, EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &start.StartupInfo, &child);
+    DWORD error = GetLastError();
+    DeleteProcThreadAttributeList(start.lpAttributeList);
+    CloseHandle(out_write); out_write = nullptr;
+    CloseHandle(err_write); err_write = nullptr;
+    if (!created) {
+        job->error = "cannot run `" + argv[0] + "`: " + windows::error(error);
+        cleanup(); finish(); return;
+    }
+    CloseHandle(input); input = nullptr;
+    CloseHandle(child.hThread);
+    job->started = true;
+    std::thread out_reader([&] { job->out = slurp(out_read); });
+    std::thread err_reader([&] { job->err = slurp(err_read); });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(job->timeout_ms);
+    while (WaitForSingleObject(child.hProcess, 50) == WAIT_TIMEOUT) {
+        if (job->timeout_ms > 0 && std::chrono::steady_clock::now() >= deadline) {
+            job->timed_out = true;
+            TerminateProcess(child.hProcess, 124);
+            WaitForSingleObject(child.hProcess, INFINITE);
+            break;
+        }
+    }
+    DWORD code = 0;
+    GetExitCodeProcess(child.hProcess, &code);
+    job->code = int(code);
+    CloseHandle(child.hProcess);
+    out_reader.join(); err_reader.join();
+    finish();
+}
+#else
 /// Read everything from `fd` until end of file, then close it.
 std::string slurp(int fd) {
     std::string out;
@@ -294,6 +395,8 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     finish();
 }
 
+#endif
+
 NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms);
 
 NativeResult os_exec(Process& p, Value, Value* args, uint32_t) {
@@ -346,6 +449,16 @@ NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms) {
         return fail(p, "type_error", "exec! needs a list of string arguments");
     }
 
+    for (const auto& arg : argv) {
+        if (arg.find('\0') != std::string::npos)
+            return fail(p, "bad_argument", "subprocess arguments cannot contain NUL bytes");
+#ifdef _WIN32
+        try { (void)windows::wide(arg); }
+        catch (const std::system_error& error) { return fail(p, "bad_argument", error.what()); }
+#endif
+    }
+    if (argv[0].empty()) return fail(p, "bad_argument", "exec! needs a non-empty program name");
+
     Scheduler* sched = p.runtime().scheduler();
     if (!sched) return fail(p, "os_error", "no scheduler is running to wake this process");
 
@@ -377,58 +490,68 @@ NativeResult os_args(Process& p, Value, Value*, uint32_t) {
 
 NativeResult os_env(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "env! needs a name");
+#ifdef _WIN32
+    const wchar_t* v = _wgetenv(windows::wide(string_arg(args[0])).c_str());
+    return NativeResult::ok(v ? text(p, windows::utf8(v)) : UNIT);
+#else
     const char* v = ::getenv(string_arg(args[0]).c_str());
     return NativeResult::ok(v ? text(p, v) : UNIT);
+#endif
 }
 
 NativeResult os_set_env(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0]) || !is_string(args[1])) {
         return fail(p, "type_error", "set_env! needs a name and a value");
     }
+#ifdef _WIN32
+    _wputenv_s(windows::wide(string_arg(args[0])).c_str(), windows::wide(string_arg(args[1])).c_str());
+#else
     ::setenv(string_arg(args[0]).c_str(), string_arg(args[1]).c_str(), 1);
+#endif
     return NativeResult::ok(UNIT);
 }
 
 NativeResult os_cwd(Process& p, Value, Value*, uint32_t) {
-    char buf[4096];
-    if (!::getcwd(buf, sizeof buf)) return fail(p, "os_error", std::strerror(errno));
-    return NativeResult::ok(text(p, buf));
+    std::error_code ec;
+    auto path = std::filesystem::current_path(ec);
+    if (ec) return fail(p, "os_error", ec.message());
+    auto bytes = path.generic_u8string();
+    return NativeResult::ok(text(p, std::string(bytes.begin(), bytes.end())));
 }
 
 NativeResult os_chdir(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "chdir! needs a path");
-    std::string path = string_arg(args[0]);
-    if (::chdir(path.c_str()) != 0) {
-        return fail(p, errno == ENOENT ? "not_found" : "os_error",
-                    "cannot enter " + path + ": " + std::strerror(errno));
-    }
+    std::string path_bytes = string_arg(args[0]);
+    std::error_code ec;
+    std::filesystem::current_path(std::filesystem::path(std::u8string(path_bytes.begin(), path_bytes.end())), ec);
+    if (ec) return fail(p, ec == std::errc::no_such_file_or_directory ? "not_found" : "os_error", ec.message());
     return NativeResult::ok(UNIT);
 }
 
-/// The names in a directory, without `.` and `..`. Sorted, so a build that
-/// walks a tree does the same thing twice -- readdir order is whatever the
-/// file system feels like.
 NativeResult os_list_dir(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "list_dir! needs a path");
-    std::string path = string_arg(args[0]);
-    DIR* dir = ::opendir(path.c_str());
-    if (!dir) {
-        return fail(p, errno == ENOENT ? "not_found" : "os_error",
-                    "cannot read " + path + ": " + std::strerror(errno));
-    }
+    std::string path_bytes = string_arg(args[0]);
+    std::error_code ec;
+    std::filesystem::directory_iterator it(std::filesystem::path(std::u8string(path_bytes.begin(), path_bytes.end())), ec), end;
     std::vector<std::string> names;
-    while (dirent* e = ::readdir(dir)) {
-        std::string name = e->d_name;
-        if (name == "." || name == "..") continue;
-        names.push_back(std::move(name));
+    while (!ec && it != end) {
+        auto bytes = it->path().filename().u8string();
+        names.emplace_back(bytes.begin(), bytes.end());
+        it.increment(ec);
     }
-    ::closedir(dir);
+    if (ec) return fail(p, ec == std::errc::no_such_file_or_directory ? "not_found" : "os_error", ec.message());
     std::sort(names.begin(), names.end());
     return NativeResult::ok(string_list(p, names));
 }
 
 NativeResult os_pid(Process& p, Value, Value*, uint32_t) {
-    return NativeResult::ok(make_integer(p, int64_t(::getpid())));
+    return NativeResult::ok(make_integer(p, int64_t(
+#ifdef _WIN32
+        ::_getpid()
+#else
+        ::getpid()
+#endif
+    )));
 }
 
 NativeResult os_platform(Process& p, Value, Value*, uint32_t) {
@@ -528,7 +651,27 @@ NativeResult os_replace(Process& p, Value, Value* args, uint32_t) {
     // Anything still sitting in a stdio buffer would be lost with the address
     // space, so it goes out first.
     std::fflush(nullptr);
+#ifdef _WIN32
+    std::wstring command;
+    for (const auto& arg : argv) {
+        if (!command.empty()) command += L' ';
+        command += windows::quote(arg);
+    }
+    STARTUPINFOW start{};
+    start.cb = sizeof(start);
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0,
+                        nullptr, nullptr, &start, &child))
+        return fail(p, "not_found", windows::error());
+    CloseHandle(child.hThread);
+    WaitForSingleObject(child.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(child.hProcess, &code);
+    CloseHandle(child.hProcess);
+    std::_Exit(int(code));
+#else
     ::execvp(raw[0], raw.data());
+#endif
     return fail(p, "not_found",
                 std::string("cannot run `") + argv[0] + "`: " + std::strerror(errno));
 }

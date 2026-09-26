@@ -16,6 +16,7 @@
 // object needs a lock or an atomic field.
 
 #pragma once
+#include <bit>
 
 #include <atomic>
 #include <cstdint>
@@ -238,7 +239,7 @@ constexpr uint32_t MAP_MASK = MAP_WIDTH - 1;
 
 inline uint32_t map_bit_count(uint32_t x) {
 #if defined(__GNUC__) || defined(__clang__)
-    return uint32_t(__builtin_popcount(x));
+    return uint32_t(std::popcount(x));
 #else
     uint32_t n = 0;
     while (x) { x &= x - 1; ++n; }

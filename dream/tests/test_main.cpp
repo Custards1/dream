@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "arithmetic.hpp"
 #include "builtins.hpp"
 #include "gc_pool.hpp"
 #include "heap.hpp"
@@ -409,7 +410,11 @@ static void test_parallel_major_collects_across_threads() {
 static void test_declined_concurrent_mark() {
     std::printf("declined concurrent marking rolls back root marks\n");
     if (GcPool::instance().capacity() < 2) return;
+#ifdef _WIN32
+    _putenv_s("DREAM_GC_CONCURRENT", "1");
+#else
     setenv("DREAM_GC_CONCURRENT", "1", 1);
+#endif
     Heap h(64 * 1024);
     VectorRoots roots;
     roots.values.push_back(h.make_cons(h.make_float(42.0), NIL));
@@ -439,7 +444,11 @@ static void test_concurrent_mark_period() {
     // The mode is read once, by the first `start_concurrent_mark` call, so the
     // knob must be set before this test's own call -- which is also the
     // binary's first. Forcing it is what makes the size gate below not matter.
+#ifdef _WIN32
+    _putenv_s("DREAM_GC_CONCURRENT", "1");
+#else
     setenv("DREAM_GC_CONCURRENT", "1", 1);
+#endif
 
     Heap h(64 * 1024);
     VectorRoots roots;
@@ -1187,7 +1196,30 @@ static void test_maps() {
     CHECK_EQ(fixnum_value(found), int64_t(1));
 }
 
+static void test_arithmetic_boundaries() {
+    int64_t result = 0;
+    CHECK(add_overflow(INT64_MAX, 1, &result));
+    CHECK(add_overflow(INT64_MIN, -1, &result));
+    CHECK(!add_overflow(INT64_MIN, INT64_MAX, &result));
+    CHECK_EQ(result, int64_t(-1));
+    CHECK(sub_overflow(INT64_MIN, 1, &result));
+    CHECK(sub_overflow(INT64_MAX, -1, &result));
+    CHECK(!sub_overflow(INT64_MIN, INT64_MIN, &result));
+    CHECK_EQ(result, int64_t(0));
+    CHECK(mul_overflow(INT64_MIN, -1, &result));
+    CHECK(mul_overflow(-1, INT64_MIN, &result));
+    CHECK(mul_overflow(INT64_MAX, 2, &result));
+    CHECK(mul_overflow(INT64_MIN, 2, &result));
+    CHECK(!mul_overflow(INT64_MIN, 1, &result));
+    CHECK_EQ(result, INT64_MIN);
+    CHECK(!mul_overflow(0, INT64_MIN, &result));
+    CHECK_EQ(result, int64_t(0));
+    CHECK(!mul_overflow(-3, -7, &result));
+    CHECK_EQ(result, int64_t(21));
+}
+
 int main() {
+    test_arithmetic_boundaries();
     test_value_tagging();
     test_heap_alloc();
     test_gc_keeps_live_and_drops_dead();

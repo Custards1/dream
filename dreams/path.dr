@@ -28,12 +28,41 @@ let separator = "/";
 
 // --- taking a path apart ----------------------------------------------------
 
-let is_absolute p = str.starts_with "/" p;
+// Windows accepts both separators. Keep the platform query at runtime so
+// this compiler image can be copied unchanged between operating systems.
+let slashes p = match os.platform () {
+    :windows => str.join_str "/" (str.split "\\" p),
+    _ => p,
+};
+
+let root p = match os.platform () {
+    :windows => match p {
+        _ if str.byte_length p >= 3 && str.slice 1 2 p == ":/" => str.slice 0 3 p,
+        _ if str.starts_with "//" p => {
+            let parts = list.filter (fn s -> not (str.is_empty s)) (str.split "/" p);
+            match parts {
+                [server, share, .._] => "//" + server + "/" + share,
+                _ => "/",
+            }
+        },
+        _ if str.starts_with "/" p => "/",
+        _ => "",
+    },
+    _ => if str.starts_with "/" p { "/" } else { "" },
+};
+
+let is_absolute p = not (str.is_empty (root (slashes p)));
+let home! () = match os.env! "HOME" {
+    () => os.env! "USERPROFILE",
+    home => home,
+};
+
+
 
 /// The non-empty pieces between the slashes. A leading slash is not one of
 /// them -- `is_absolute` is what remembers it -- so `of_segments` needs telling
 /// which kind of path it is rebuilding.
-let segments p = list.filter (fn s -> not (str.is_empty s)) (str.split separator p);
+let segments p = list.filter (fn s -> not (str.is_empty s)) (str.split separator (slashes p));
 
 let of_segments absolute segs = {
     let body = str.join_str separator segs;
@@ -42,7 +71,9 @@ let of_segments absolute segs = {
 
 /// Everything before the last `/`, or `"."` when there is none. The parent of
 /// `"/"` is itself, which is what stops a walk up the tree.
-let dirname p = {
+let dirname original = {
+    let p = slashes original;
+    let anchor = root p;
     let rec last_slash i best =
         if i >= str.byte_length p { best }
         else if str.slice i 1 p == separator { last_slash (i + 1) i }
@@ -50,6 +81,7 @@ let dirname p = {
     let at = last_slash 0 (0 - 1);
     match at {
         _ if at < 0 => ".",
+        _ if at < str.byte_length anchor => anchor,
         0 => separator,
         _ => str.slice 0 at p,
     }
@@ -63,7 +95,10 @@ let basename p = {
 /// `a/b` -- but an empty or `.` side is dropped rather than kept, because these
 /// paths are read by people in diagnostics and `././main.dr` helps nobody. An
 /// absolute right-hand side wins outright: it is already anchored.
-let join a b = match [a, b] {
+let join original_a original_b = {
+    let a = slashes original_a;
+    let b = slashes original_b;
+    match [a, b] {
     [_, ""] => a,
     [_, "."] => a,
     ["", _] => b,
@@ -71,6 +106,7 @@ let join a b = match [a, b] {
     _ if is_absolute b => b,
     _ if str.ends_with separator a => a + b,
     _ => a + separator + b,
+    }
 };
 
 let rec join_all base parts =
@@ -92,7 +128,8 @@ let rec last_dot p i best =
 
 /// The dot's offset, or `-1`. A leading dot names a hidden file rather than
 /// starting an extension, so `.gitignore` has none.
-let dot_at p = {
+let dot_at original = {
+    let p = slashes original;
     let at = last_dot p 0 (0 - 1);
     let base_at = str.byte_length p - str.byte_length (basename p);
     if at <= base_at { 0 - 1 } else { at }
@@ -120,8 +157,10 @@ let stem p = drop_extension (basename p);
 /// Fold away `.` and `..`. A `..` that would climb above the root of an
 /// absolute path is dropped, since `/..` is `/`; one at the front of a relative
 /// path is kept, since there is nothing yet to cancel it against.
-let normalize p = {
-    let absolute = is_absolute p;
+let normalize original = {
+    let p = slashes original;
+    let anchor = root p;
+    let absolute = not (str.is_empty anchor);
     let rec walk segs acc =
         match segs {
             [] => list.reverse acc,
@@ -134,9 +173,14 @@ let normalize p = {
                 },
             [s, ..rest] => walk rest (list_cons s acc),
         };
-    let segs = walk (segments p) [];
-    if list.is_empty segs { if absolute { separator } else { "." } }
-    else { of_segments absolute segs }
+    let body = str.slice (str.byte_length anchor) (str.byte_length p - str.byte_length anchor) p;
+    let segs = walk (segments body) [];
+    match [anchor, segs] {
+        ["", []] => ".",
+        [_, []] => anchor,
+        ["", _] => str.join_str separator segs,
+        _ => join anchor (str.join_str separator segs),
+    }
 };
 
 /// A leading `~` means the home directory.
@@ -149,7 +193,7 @@ let normalize p = {
 /// be worse than not answering.
 let expand_home! p =
     if p == "~" || str.starts_with "~/" p {
-        expand macros.if_some home (os.env! "HOME")
+        expand macros.if_some home (home! ())
             (home + str.slice 1 (str.byte_length p - 1) p) p
     }
     else { p };

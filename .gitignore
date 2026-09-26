@@ -20,3 +20,5 @@ result/
 result
 lib/
 bin/
+
+build-portable*/
