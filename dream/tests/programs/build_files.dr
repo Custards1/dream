@@ -1,0 +1,48 @@
+// What a build asks of the file system: stamps, digests, links and trees.
+// See "Running a plan" in docs/build.md for why each one is a native.
+import std.console;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+let write_file! path text = {
+    let h = io.open! path :write;
+    io.write! h text
+    io.close! h
+};
+
+let main! = {
+    let root = "/tmp/dream-build-files-" + to_string (os.pid! ());
+    io.remove_all! root
+    console.print! (io.stat! root)
+
+    io.mkdir_all! (root + "/a/b")
+    io.mkdir_all! (root + "/a/b")
+    console.print! (io.stat! root).[:kind]
+
+    // The standard's own examples, and one long enough to take several
+    // blocks, checked against `sha256sum`.
+    console.print! (io.digest "abc")
+    console.print! (io.digest "")
+    let long = str.repeat 300 "dream ";
+    write_file! (root + "/a/b/long.txt") long
+    let theirs = list.head (str.split " " (os.exec! "sha256sum" [root + "/a/b/long.txt"]).[:out]);
+    console.print! [io.digest long == theirs, io.digest! (root + "/a/b/long.txt") == theirs]
+
+    let stat = io.stat! (root + "/a/b/long.txt");
+    console.print! [stat.[:kind], stat.[:size], stat.[:modified] > 0]
+
+    // A link is the same file under another name, and must be new.
+    write_file! (root + "/top.txt") "top"
+    console.print! (io.link! (root + "/top.txt") (root + "/a/top-link.txt"))
+    console.print! (io.digest! (root + "/a/top-link.txt") == io.digest "top")
+    console.print! (try! { io.link! (root + "/top.txt") (root + "/a/top-link.txt") } catch e { :already_there })
+
+    io.chmod! (root + "/top.txt") 493
+    console.print! (os.exec! "test" ["-x", root + "/top.txt"]).[:code]
+
+    console.print! (io.walk! root)
+    console.print! (io.remove_all! root)
+    console.print! (io.remove_all! root)
+};

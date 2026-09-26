@@ -2,8 +2,10 @@
 
 #include "io.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
@@ -18,6 +20,7 @@
 #include "interp.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
+#include "sha256.hpp"
 
 #if defined(__linux__) && !defined(DREAM_PORTABLE_POLLER)
 #define DREAM_HAVE_EPOLL 1
@@ -926,6 +929,205 @@ NativeResult net_shutdown(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(UNIT);
 }
 
+// ---------------------------------------------------------------------------
+// What a build asks of the file system
+//
+// Stamps, digests, links, trees. A build that has nothing to do must cost a
+// stat per input and nothing more (docs/build.md, "Running a plan"), so the
+// stamp is one native, and a digest is read here rather than a file being
+// read into a Dream string and hashed there.
+//
+// These run on the worker. A stat is too quick to be worth parking for; a
+// digest of a large file is not, and if a build turns out to spend its time
+// here, `digest!` is the one to move to a helper thread as `exec!` was.
+// ---------------------------------------------------------------------------
+
+std::filesystem::path fs_path(const std::string& utf8) {
+    return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
+
+std::string fs_text(const std::filesystem::path& path) {
+    auto bytes = path.generic_u8string();
+    return std::string(bytes.begin(), bytes.end());
+}
+
+NativeResult fail_fs(Process& p, const std::string& what, const std::error_code& ec) {
+    const char* kind = "io_error";
+    if (ec == std::errc::no_such_file_or_directory) kind = "not_found";
+    else if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) kind = "permission_denied";
+    else if (ec == std::errc::file_exists) kind = "already_exists";
+    else if (ec == std::errc::not_a_directory || ec == std::errc::is_a_directory) kind = "wrong_kind";
+    return fail(p, kind, what + ": " + ec.message());
+}
+
+/// `stat! path` -- `%{ :kind, :size, :modified }`, or `()` when there is
+/// nothing there. `:modified` is in nanoseconds and means nothing but itself:
+/// it is a stamp to compare with the last one, never a time to show anyone.
+/// A missing file is an answer rather than an error, because "is it still
+/// there" is half of what a stamp is asked.
+NativeResult io_stat(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "stat! needs a path");
+    std::string path = string_arg(args[0]);
+    const char* kind = "other";
+    int64_t size = 0, modified = 0;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExW(windows::wide(path).c_str(), GetFileExInfoStandard, &data)) {
+        return NativeResult::ok(UNIT);
+    }
+    kind = data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? "dir" : "file";
+    size = int64_t((uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow);
+    // 100ns ticks since 1601, made nanoseconds since 1970 so the two platforms
+    // agree on what a stamp is.
+    uint64_t ticks = (uint64_t(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
+    modified = (int64_t(ticks) - 116444736000000000LL) * 100;
+#else
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return NativeResult::ok(UNIT);
+        return fail_errno(p, "stat " + path, errno);
+    }
+    kind = S_ISREG(st.st_mode) ? "file" : S_ISDIR(st.st_mode) ? "dir" : "other";
+    size = int64_t(st.st_size);
+#if defined(__APPLE__)
+    modified = int64_t(st.st_mtimespec.tv_sec) * 1000000000 + st.st_mtimespec.tv_nsec;
+#else
+    modified = int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+#endif
+#endif
+    Value m = p.heap().make_map(4);
+    m = resolve(map_insert(p, m, make_atom(p.runtime().intern_atom("kind")),
+                           make_atom(p.runtime().intern_atom(kind))));
+    m = resolve(map_insert(p, m, make_atom(p.runtime().intern_atom("size")), make_integer(p, size)));
+    m = resolve(map_insert(p, m, make_atom(p.runtime().intern_atom("modified")), make_integer(p, modified)));
+    return NativeResult::ok(m);
+}
+
+/// `digest! path` -- the SHA-256 of a file's contents, as 64 hex digits.
+NativeResult io_digest_file(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "digest! needs a path");
+    std::string path = string_arg(args[0]);
+    int fd = sys::open(path.c_str(), O_RDONLY, 0);
+    if (fd < 0) return fail_errno(p, "digest " + path, errno);
+    Sha256 sha;
+    std::vector<char> buf(1 << 16);
+    for (;;) {
+        auto n = sys::read(fd, buf.data(), buf.size());
+        if (n > 0) { sha.update(buf.data(), size_t(n)); continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            int e = errno;
+            sys::close(fd);
+            return fail_errno(p, "digest " + path, e);
+        }
+        break;
+    }
+    sys::close(fd);
+    std::string hex = sha.hex();
+    return NativeResult::ok(p.heap().make_string(hex.data(), uint32_t(hex.size())));
+}
+
+/// `digest text` -- the SHA-256 of a string. Pure: the same text always has
+/// the same digest, which is what lets a step's key be worked out in a plan.
+NativeResult io_digest_text(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    Sha256 sha;
+    if (is_obj(v, ObjType::Str)) {
+        auto* s = static_cast<StrObj*>(as_obj(v));
+        sha.update(s->data(), s->len);
+    } else if (is_obj(v, ObjType::BigStr)) {
+        auto* s = static_cast<BigStrObj*>(as_obj(v));
+        sha.update(s->data, size_t(s->len));
+    } else {
+        return fail(p, "type_error", "digest needs a string");
+    }
+    std::string hex = sha.hex();
+    return NativeResult::ok(p.heap().make_string(hex.data(), uint32_t(hex.size())));
+}
+
+/// `link! from to` -- `to` becomes another name for `from`: a hard link, or a
+/// copy where one cannot be made (another volume, a file system without
+/// them). Either way `to` is new and must not exist yet. A step's outputs are
+/// never written to again once made, so a link is as good as a copy and costs
+/// nothing; placing a result is a link beside it and a `rename!` over it.
+NativeResult io_link(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0]) || !is_string(args[1])) return fail(p, "type_error", "link! needs two paths");
+    auto from = fs_path(string_arg(args[0]));
+    auto to = fs_path(string_arg(args[1]));
+    std::error_code ec;
+    std::filesystem::create_hard_link(from, to, ec);
+    if (!ec) return NativeResult::ok(make_atom(p.runtime().intern_atom("linked")));
+    if (ec == std::errc::file_exists || ec == std::errc::no_such_file_or_directory) {
+        return fail_fs(p, "link " + fs_text(from) + " to " + fs_text(to), ec);
+    }
+    ec.clear();
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::none, ec);
+    if (ec) return fail_fs(p, "copy " + fs_text(from) + " to " + fs_text(to), ec);
+    return NativeResult::ok(make_atom(p.runtime().intern_atom("copied")));
+}
+
+/// `chmod! path mode` -- set the permission bits, `0o755` being `493`. On
+/// Windows only the owner's write bit means anything (it is the read-only
+/// attribute), and the rest are accepted and ignored, so a build can mark its
+/// outputs executable without asking what it is running on.
+NativeResult io_chmod(Process& p, Value, Value* args, uint32_t) {
+    Value mode = resolve(args[1]);
+    if (!is_string(args[0]) || !is_fixnum(mode) || fixnum_value(mode) < 0 || fixnum_value(mode) > 07777) {
+        return fail(p, "type_error", "chmod! needs a path and a mode");
+    }
+    std::error_code ec;
+    std::filesystem::permissions(fs_path(string_arg(args[0])),
+                                 std::filesystem::perms(fixnum_value(mode)), ec);
+    if (ec) return fail_fs(p, "chmod " + string_arg(args[0]), ec);
+    return NativeResult::ok(UNIT);
+}
+
+/// `walk! dir` -- every file under `dir`, as paths relative to it with `/`
+/// between the parts, sorted. Directories are walked and not listed, and a
+/// link to a directory is not followed, so a tree that links back into itself
+/// is still finite. Picking files by pattern is left to the caller.
+NativeResult io_walk(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "walk! needs a directory");
+    auto root = fs_path(string_arg(args[0]));
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(
+        root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+    if (ec) return fail_fs(p, "walk " + fs_text(root), ec);
+    std::vector<std::string> files;
+    for (; it != end; it.increment(ec)) {
+        if (ec) return fail_fs(p, "walk " + fs_text(root), ec);
+        std::error_code kind_ec;
+        if (it->is_regular_file(kind_ec)) files.push_back(fs_text(it->path().lexically_relative(root)));
+    }
+    std::sort(files.begin(), files.end());
+    Value list = NIL;
+    for (size_t i = files.size(); i-- > 0;) {
+        list = p.heap().make_cons(p.heap().make_string(files[i].data(), uint32_t(files[i].size())), list);
+    }
+    return NativeResult::ok(list);
+}
+
+/// `mkdir_all! path` -- the directory and any parents it needs. Already there
+/// is not an error.
+NativeResult io_mkdir_all(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "mkdir_all! needs a path");
+    std::error_code ec;
+    std::filesystem::create_directories(fs_path(string_arg(args[0])), ec);
+    if (ec) return fail_fs(p, "mkdir " + string_arg(args[0]), ec);
+    return NativeResult::ok(UNIT);
+}
+
+/// `remove_all! path` -- the path and everything under it, answering how many
+/// entries went. Nothing there is not an error and answers 0: a scratch
+/// directory is cleared whether or not the last run got as far as making it.
+NativeResult io_remove_all(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "remove_all! needs a path");
+    std::error_code ec;
+    auto removed = std::filesystem::remove_all(fs_path(string_arg(args[0])), ec);
+    if (ec) return fail_fs(p, "remove " + string_arg(args[0]), ec);
+    return NativeResult::ok(make_integer(p, int64_t(removed)));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1172,14 @@ ModuleDef make_io_module() {
                          {"remove!", 1, 0b1, io_remove},
                          {"rename!", 2, 0b11, io_rename},
                          {"mkdir!", 1, 0b1, io_mkdir},
+                         {"mkdir_all!", 1, 0b1, io_mkdir_all},
+                         {"remove_all!", 1, 0b1, io_remove_all},
+                         {"stat!", 1, 0b1, io_stat},
+                         {"digest!", 1, 0b1, io_digest_file},
+                         {"digest", 1, 0b1, io_digest_text},
+                         {"link!", 2, 0b11, io_link},
+                         {"chmod!", 2, 0b11, io_chmod},
+                         {"walk!", 1, 0b1, io_walk},
                          {"async", 1, 0b1, io_async},
                      }};
 }

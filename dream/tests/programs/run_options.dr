@@ -1,0 +1,36 @@
+// `os.run!`: `exec!` with a working directory, an environment, a timeout, a
+// log and an input of its own. Each of these is something a build step needs
+// and a whole VM cannot change around one call, because it runs several
+// children at once.
+import std.console;
+import std.os;
+
+let sh! script options = os.run! "sh" ["-c", script] options;
+
+let main! = {
+    console.print! (sh! "pwd" %{ :cwd => "/" }).[:out]
+
+    // Set over what this VM has, not in addition to it.
+    os.set_env! "DREAM_RUN_TEST" "inherited"
+    console.print! (sh! "echo $DREAM_RUN_TEST" %{}).[:out]
+    console.print! (sh! "echo $DREAM_RUN_TEST" %{ :env => %{ "DREAM_RUN_TEST" => "given" } }).[:out]
+    console.print! (sh! "echo ${DREAM_RUN_TEST:-unset} $ONLY" %{ :clear_env => true, :env => %{ "ONLY" => "this" } }).[:out]
+
+    console.print! (os.run! "cat" [] %{ :stdin => "fed in\n" }).[:out]
+    // A child that never reads its input is not an error.
+    console.print! (sh! "exit 3" %{ :stdin => "ignored" }).[:code]
+
+    // Both streams into one file, and nothing in `:out` or `:err`.
+    let log = "/tmp/dream-run-options-" + to_string (os.pid! ()) + ".log";
+    let logged = sh! "echo to out; echo to err >&2" %{ :log => log };
+    console.print! [logged.[:code], logged.[:out], logged.[:err]]
+    console.print! (os.exec! "sort" [log]).[:out]
+    os.exec! "rm" ["-f", log]
+
+    let slow = sh! "sleep 5" %{ :timeout => 100 };
+    console.print! slow.[:timed_out]
+
+    // A misspelt option is an error that names it, never a default.
+    console.print! (try! { sh! "true" %{ :cdw => "/" } } catch e { :bad_option })
+    console.print! (try! { os.run! "no-such-program-here" [] %{ :cwd => "/" } } catch e { :not_found })
+};

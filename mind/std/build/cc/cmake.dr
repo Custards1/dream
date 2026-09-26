@@ -1,0 +1,272 @@
+// `std.build.cc`'s targets as a `CMakeLists.txt`.
+//
+// Two uses, one translation. `--toolchain cmake` builds a script's targets
+// through CMake, for a machine where CMake is how a compiler is found; and
+// `export` writes the file an embedder builds the VM with, which is generated
+// rather than kept beside the build (docs/build.md, "CMake as a backend").
+//
+// Flags are not translated a second time here. Each setting is asked of
+// `std.build.cc.gnu` and `std.build.cc.msvc`, as GCC, Clang and MSVC would
+// each be asked for it, and the answers are wrapped in the generator
+// expression for that compiler and that language. So what CMake passes is
+// what `cc` itself would have passed, and the two cannot drift apart.
+//
+// Optimization and debug information are left to `CMAKE_BUILD_TYPE`, which is
+// how anyone building a CMake project expects to choose them.
+
+import std.build.cc;
+import std.build.cc.gnu;
+import std.build.cc.msvc;
+import std.list;
+import std.str;
+
+// --- text ---------------------------------------------------------------------
+
+/// A CMake argument, quoted. `${..}` and `$<..>` inside still mean what they
+/// mean, and a `;` inside a generator expression still separates a list.
+let quoted : :string -> :string;
+let quoted s =
+    "\"" + str_concat (list.map (fn c -> match c { '"' => "\\\"", '\\' => "/", _ => str_of_chars [c] }) (str.chars s)) + "\"";
+
+/// A path from the script's root, as seen from the `CMakeLists.txt`. One that
+/// is already absolute -- a probe found it -- is left alone.
+let place : :string -> :string -> :string;
+let place root p =
+    if str.starts_with "/" p || (str.byte_length p > 1 && str.slice 1 1 p == ":") || root == "" { p }
+    else { root + "/" + p };
+
+let command : :string -> [:string] -> :string;
+let command name args = match args {
+    [] => "",
+    _ => name + "(" + str.join_str "\n    " args + ")\n",
+};
+
+// --- which compiler ------------------------------------------------------------
+
+/// The compilers CMake knows by these ids, and a toolchain to ask for each.
+let compilers = [
+    [["GNU"], cc.gcc :linux],
+    [["Clang", "AppleClang"], cc.clang :linux],
+    [["MSVC"], cc.msvc],
+];
+
+let lang_id lang = match lang { :c => "C", _ => "CXX" };
+
+/// One generator expression per compiler, for the flags `translate` gives it.
+/// Compilers that would be given the same flags share one expression, which
+/// is what keeps the file readable.
+let per_compiler : (cc.Toolchain -> [:string]) -> (:string -> :string) -> [:string];
+let per_compiler translate condition = {
+    let answered = list.map (fn [ids, tc] -> [ids, translate tc]) compilers;
+    let grouped = list.fold (fn groups [ids, flags] -> match flags {
+        [] => groups,
+        _ => match list.index_of flags (list.map (fn g -> list.nth 1 g) groups) {
+            i if i >= 0 => list.map (fn [gi, g] -> if gi == i { [list.append (list.head g) ids, flags] } else { g })
+                                    (list.enumerate groups),
+            _ => list.append groups [[ids, flags]],
+        },
+    }) [] answered;
+    list.map (fn [ids, flags] -> quoted ("$<$<" + condition (str.join_str "," ids) + ">:"
+                                          + str.join_str ";" flags + ">"))
+             grouped
+};
+
+let family_of sel = match sel {
+    :gnu => ["GNU", "Clang", "AppleClang"],
+    :gcc => ["GNU"],
+    :clang => ["Clang", "AppleClang"],
+    _ => ["MSVC"],
+};
+
+let platform_id os = match os { :linux => "Linux", :macos => "Darwin", :windows => "Windows", _ => to_string os };
+
+// --- which settings go where ---------------------------------------------------------
+
+/// Settings CMake has a word of its own for, and so are not written as flags.
+let native : cc.Setting -> :bool;
+let native s = match s {
+    [:standard, _] => true, [:optimize, _] => true, [:debug_info, _] => true,
+    [:define, _, _] => true, [:define_for, _, _] => true, [:include, _] => true,
+    [:pic, _] => true, :threads => true, :export_all => true,
+    [:system, _] => true, [:system_for, _, _] => true, [:library_dir, _] => true,
+    [:link_file, _] => true, [:runtime_path, _] => true,
+    _ => false,
+};
+
+let flags_of translate tc lang settings =
+    list.flat_map (fn s -> if native s { [] } else { translate tc lang s }) settings;
+
+let compile_options lang settings =
+    list.append (per_compiler (fn tc -> match cc.Toolchain.family tc {
+                                   :msvc => flags_of msvc.compile_flags tc lang settings,
+                                   _ => flags_of gnu.compile_flags tc lang settings,
+                               })
+                              (fn ids -> "COMPILE_LANG_AND_ID:" + lang_id lang + "," + ids))
+                [];
+
+let link_options settings =
+    per_compiler (fn tc -> list.flat_map (fn s -> if native s { [] } else {
+                               match cc.Toolchain.family tc {
+                                   :msvc => msvc.link_flags tc s,
+                                   _ => gnu.link_flags tc s,
+                               }
+                           }) settings)
+                 (fn ids -> "CXX_COMPILER_ID:" + ids);
+
+let definitions settings = list.flat_map (fn s -> match s {
+    [:define, n, ()] => [quoted n],
+    [:define, n, v] => [quoted (n + "=" + gnu.value_text v)],
+    [:define_for, sel, n] => [quoted ("$<$<CXX_COMPILER_ID:" + str.join_str "," (family_of sel) + ">:" + n + ">")],
+    _ => [],
+}) settings;
+
+let includes root settings = list.flat_map (fn s -> match s {
+    [:include, d] => [quoted (place root d)],
+    _ => [],
+}) settings;
+
+let libraries root settings = list.flat_map (fn s -> match s {
+    :threads => ["Threads::Threads"],
+    [:system, l] => [l],
+    [:system_for, os, l] => [quoted ("$<$<PLATFORM_ID:" + platform_id os + ">:" + l + ">")],
+    [:link_file, p] => [quoted (place root p)],
+    _ => [],
+}) settings;
+
+let standards settings = list.flat_map (fn s -> match s {
+    [:standard, l] => {
+        let lang = if cc.standard_is_for :cxx l { "CXX" } else { "C" };
+        [lang + "_STANDARD " + cc.standard_version l, lang + "_STANDARD_REQUIRED ON", lang + "_EXTENSIONS OFF"]
+    },
+    _ => [],
+}) settings;
+
+// --- targets ---------------------------------------------------------------------
+
+/// A target's name in CMake. An executable and a library may share a name in
+/// `cc`, where they are two files, but not in CMake, where they are two
+/// targets; the executable gives way and keeps its file name.
+let target_id : [cc.Target] -> cc.Target -> :string;
+let target_id all t = match cc.kind t {
+    :executable if list.any (fn o -> cc.kind o != :executable && cc.name o == cc.name t) all => cc.name t + "_exe",
+    _ => cc.name t,
+};
+
+let languages t = list.unique (list.filter (fn l -> l != :other) (list.map (fn [p, _] -> cc.language p) (cc.sources t)));
+
+let target_text : :string -> [cc.Target] -> cc.Target -> :string;
+let target_text root all t = {
+    let id = target_id all t;
+    let srcs = list.map (fn [p, _] -> quoted (place root p)) (cc.sources t);
+    let own = cc.settings t;
+    let pub = cc.public t;
+    let scope_of kind = if cc.kind t == :external { "INTERFACE" } else { kind };
+    let head = match cc.kind t {
+        :executable => command "add_executable" (list.cons id srcs),
+        :shared => command "add_library" (list.concat [[id, "SHARED"], srcs]),
+        :static => command "add_library" (list.concat [[id, "STATIC"], srcs]),
+        _ => command "add_library" [id, "INTERFACE"],
+    };
+    let properties = list.concat [
+        standards own,
+        (if id != cc.name t { ["OUTPUT_NAME " + cc.name t] } else { [] }),
+        (if list.contains cc.Setting.export_all own { ["WINDOWS_EXPORT_ALL_SYMBOLS ON"] } else { [] }),
+        (if list.contains (cc.Setting.pic true) own { ["POSITION_INDEPENDENT_CODE ON"] } else { [] }),
+    ];
+    let with_scopes f = list.concat [
+        (match f pub { [] => [], xs => list.cons (scope_of "PUBLIC") xs }),
+        (match f own { [] => [], xs => list.cons (scope_of "PRIVATE") xs }),
+    ];
+    let languages_here = languages t;
+    let per_source = list.flat_map (fn [p, settings] -> match settings {
+        [] => [],
+        _ => [command "set_source_files_properties"
+                      [quoted (place root p), "PROPERTIES", "COMPILE_OPTIONS",
+                       quoted (str.join_str ";" (compile_options (cc.language p) settings))]],
+    }) (cc.sources t);
+    str_concat (list.concat [
+        [head],
+        [command "set_target_properties" (match properties { [] => [], ps => list.concat [[id, "PROPERTIES"], ps] })],
+        [command "target_compile_definitions" (match with_scopes definitions { [] => [], xs => list.cons id xs })],
+        [command "target_include_directories" (match with_scopes (includes root) { [] => [], xs => list.cons id xs })],
+        [command "target_compile_options"
+                 (match list.flat_map (fn l -> compile_options l own) languages_here {
+                      [] => [], xs => list.concat [[id, scope_of "PRIVATE"], xs] })],
+        [command "target_link_options" (match link_options (list.append own pub) {
+                      [] => [], xs => list.concat [[id, scope_of "PRIVATE"], xs] })],
+        [command "target_link_libraries"
+                 (match list.append (with_scopes (libraries root))
+                                    (match list.map (fn u -> target_id all u) (cc.uses t) {
+                                         [] => [], ids => list.cons (scope_of "PUBLIC") ids }) {
+                      [] => [], xs => list.cons id xs })],
+        per_source,
+        ["\n"],
+    ])
+};
+
+/// A `CMakeLists.txt` for `targets`, which must come after anything they use.
+/// `root` is the path from the file's directory to the one the targets'
+/// paths are relative to, as CMake says it: `${CMAKE_CURRENT_SOURCE_DIR}/..`.
+/// `note` is the comment the file opens with.
+let export : :string -> :string -> :string -> [cc.Target] -> :string;
+let export note project root targets = {
+    let langs = list.unique (list.flat_map languages targets);
+    let wants_threads = list.any (fn t -> list.contains cc.Setting.threads (list.append (cc.settings t) (cc.public t)))
+                                 targets;
+    str_concat (list.concat [
+        list.map (fn line -> "# " + line + "\n") (str.split "\n" note),
+        ["\ncmake_minimum_required(VERSION 3.20)\n",
+         "project(" + project + " LANGUAGES "
+             + str.join_str " " (list.map lang_id (list.sort (list.map (fn l -> match l { :c => 0, _ => 1 }) langs)
+                                                    |> list.map (fn n -> if n == 0 { :c } else { :cxx })))
+             + ")\n\n"],
+        (if wants_threads { ["find_package(Threads REQUIRED)\n\n"] } else { [] }),
+        list.map (fn t -> target_text root targets t) targets,
+    ])
+};
+
+when test {
+    import std.test;
+
+    let vm = cc.shared "dream" ["dream/src/interp.cpp"]
+             |> cc.standard :cxx20
+             |> cc.optimize 3
+             |> cc.warnings :extra
+             |> cc.public_include "dream/include"
+             |> cc.include "dream/src"
+             |> cc.threads
+             |> cc.flags_for :gcc ["--param", "x=1"]
+             |> cc.flags_for :msvc ["/permissive-"]
+             |> cc.define_for :msvc "_CRT_SECURE_NO_WARNINGS"
+             |> cc.system_for :windows "ws2_32"
+             |> cc.export_all
+             |> cc.source_with "dream/src/jit.cpp" [cc.Setting.rtti false];
+    let cli = cc.executable "dream" ["dream/src/cli.cpp"] |> cc.use vm;
+    let text = export "generated" "dream" "${CMAKE_CURRENT_SOURCE_DIR}/.." [vm, cli];
+    let has s = str.contains_str s text;
+
+    let tests = [
+        test.case "each compiler gets what cc would have given it, and alike ones share"
+            $( test.eq! [true, true, true]
+                        [has "\"$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wall;-Wextra;--param;x=1>\"",
+                         has "\"$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wall;-Wextra>\"",
+                         has "\"$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4;/permissive->\""] ),
+        test.case "what CMake has words for is said in them"
+            $( test.eq! [true, true, true, true]
+                        [has "CXX_STANDARD 20", has "WINDOWS_EXPORT_ALL_SYMBOLS ON",
+                         has "\"$<$<CXX_COMPILER_ID:MSVC>:_CRT_SECURE_NO_WARNINGS>\"",
+                         has "\"$<$<PLATFORM_ID:Windows>:ws2_32>\""] ),
+        test.case "optimization is left to the build type"
+            $( test.eq! [false, false] [has "-O3", has "/O2"] ),
+        test.case "paths are placed from the file's directory"
+            $( test.eq! [true, true]
+                        [has "PUBLIC\n    \"${CMAKE_CURRENT_SOURCE_DIR}/../dream/include\"",
+                         has "\"${CMAKE_CURRENT_SOURCE_DIR}/../dream/src/interp.cpp\""] ),
+        test.case "an executable named like a library gives way, and keeps its file name"
+            $( test.eq! [true, true, true]
+                        [has "add_executable(dream_exe", has "OUTPUT_NAME dream",
+                         has "target_link_libraries(dream_exe\n    PUBLIC\n    dream)"] ),
+        test.case "one source's own settings are its own"
+            $( test.eq! true (has "set_source_files_properties(\"${CMAKE_CURRENT_SOURCE_DIR}/../dream/src/jit.cpp\"") ),
+    ];
+}

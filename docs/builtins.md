@@ -282,8 +282,16 @@ import std.io;
 | `exists!` | `path:string → bool` | Returns whether a path exists. |
 | `is_dir!` | `path:string → bool` | Returns whether a path is a directory. |
 | `remove!` | `path:string → unit` | Deletes a file. Raises on failure. |
-| `rename!` | `from:string → to:string → unit` | Renames or moves a file. Raises on failure. |
+| `rename!` | `from:string → to:string → unit` | Renames or moves a file, replacing `to` if it exists. The replacement is atomic: a reader sees the old file or the new one, never a truncated one. Raises on failure. |
 | `mkdir!` | `path:string → unit` | Creates a directory. Silently succeeds if it already exists. |
+| `mkdir_all!` | `path:string → unit` | Creates a directory and any parents it needs. Silently succeeds if it already exists. |
+| `remove_all!` | `path:string → integer` | Removes a path and everything under it, answering how many entries went. Nothing there answers `0`. |
+| `stat!` | `path:string → map\|unit` | `%{ :kind, :size, :modified }` for what is at `path`, or `unit` if nothing is. `:kind` is `:file`, `:dir` or `:other`; `:modified` is nanoseconds, a stamp to compare with an earlier one rather than a time to display. Follows links. |
+| `digest!` | `path:string → string` | The SHA-256 of a file's contents, as 64 lowercase hex digits. |
+| `digest` | `text:string → string` | The SHA-256 of a string. Pure. |
+| `link!` | `from:string → to:string → atom` | Makes `to` a hard link to `from`, or a copy where a link cannot be made, answering `:linked` or `:copied`. `to` must not exist. |
+| `chmod!` | `path:string → mode:integer → unit` | Sets permission bits (`493` is `0o755`). On Windows only the owner's write bit has an effect. |
+| `walk!` | `dir:string → list of string` | Every file under `dir`, relative to it with `/` separators, sorted. Links to directories are not followed. |
 
 ### Error atoms
 
@@ -346,6 +354,7 @@ import std.os;
 |------|-----------|-------------|
 | `exec!` | `program:string → args:list of string → map` | Runs `program` to completion and returns a map `%{ :code, :out, :err, :timed_out }`. `program` is resolved via `PATH`. Parks the calling process — not the worker thread — while the child runs. |
 | `exec_for!` | `program:string → args:list of string → timeout_ms:integer → map` | Same as `exec!` but kills the child after `timeout_ms` milliseconds. Sets `:timed_out true` in the result map when the deadline is hit, so the caller can distinguish that from an ordinary non-zero exit code. |
+| `run!` | `program:string → args:list of string → options:map → map` | `exec!` with a say in how the child starts. The options, all optional: `:cwd` the directory it runs in; `:env` a map of names to values set over the inherited environment; `:clear_env` inherit nothing but what `:env` sets; `:timeout` milliseconds, as for `exec_for!`; `:log` a file both streams are written to, leaving `:out` and `:err` empty; `:stdin` a string given as its input, which is then closed. An option it does not know raises `:bad_argument` naming it. A program named by a relative path is found from this VM's directory, not from `:cwd`; a bare name is looked up on this VM's `PATH`. A `:cwd` that is not a directory raises `:not_found`. |
 | `replace!` | `program:string → args:list of string → never` | **Becomes** `program`: `execvp`, so this VM — image, heap and every thread — is gone and the named program takes over the process, inheriting the terminal and every open descriptor. Stdio is flushed first. It returns only by failing, raising `:not_found` when the program cannot be run. Use it to hand over to something interactive; `exec!` gives its child pipes, which is right for a compiler and useless for anything that prompts. |
 
 The result map fields:
@@ -355,7 +364,7 @@ The result map fields:
 | `:code` | `integer` | Exit code. 128 + signal number if killed by a signal. |
 | `:out` | `string` | Everything the child wrote to stdout. |
 | `:err` | `string` | Everything the child wrote to stderr. |
-| `:timed_out` | `bool` | `true` only when killed by `exec_for!`'s timeout. |
+| `:timed_out` | `bool` | `true` only when killed by `exec_for!`'s or `run!`'s timeout. |
 
 ### Process and platform
 

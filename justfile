@@ -208,7 +208,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-std test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
+test: test-vm test-e2e test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
 
 test-vm: vm
     ./{{build_dir}}/bin/dream_tests
@@ -293,6 +293,14 @@ test-lucid-session: build
 
 # The bootstrap: the seed reproduces itself from this source.
 test-bootstrap: bootstrap-check
+
+# `std.build.cc` put to the compilers themselves: one description of a C++
+# library and a program, built with GCC, with Clang, and through the
+# `CMakeLists.txt` `std.build.cc.cmake` writes for it, each result run. A
+# toolchain the machine does not have is skipped and says so.
+test-build: build
+    ./{{dreams}} -L mind mind/std/build/tests/toolchains.dr -o /tmp/dream-toolchains.dream
+    ./{{dream}} /tmp/dream-toolchains.dream
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build

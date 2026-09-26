@@ -461,6 +461,18 @@ let show r = match r { [:ok, n] => to_string (n + 1), [:error, why] => why };
 let main! = console.print! [show (parse "1"), show (parse "2")];
 ''', '["2", "not one: 2"]\n')
 
+    # A union declared in another module is a type there too, by its dotted
+    # name. The global the union leaves beside its module holds a run-time
+    # description and is not a declaration, so the module has to be asked first.
+    success(prelude + '''
+mod shapes {
+    union Shape { circle(radius : :float), empty }
+}
+let area : shapes.Shape -> :float;
+let area s = match s { [:circle, r] => 3.0 * r * r, :empty => 0.0 };
+let main! = console.print! (area (shapes.Shape.circle 2.0));
+''', '12\n')
+
     failure('union U {}', 'has no variants')
     failure('union U { a, a }', '`a` is already a variant or a member of `U`')
     failure('union U { type }', '`type` is a keyword and cannot name a variant or a member')

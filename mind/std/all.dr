@@ -7,6 +7,10 @@
 
 import std.agent;
 import std.array;
+import std.build.cc;
+import std.build.cc.cmake;
+import std.build.cc.gnu;
+import std.build.cc.msvc;
 import std.cli;
 import std.codec;
 
@@ -37,7 +41,8 @@ let version = "0.1.0";
 
 /// The modules this build provides.
 let modules : [:string];
-let modules = ["std.agent", "std.array", "std.cli", "std.codec", "std.error", "std.json", "std.list",
+let modules = ["std.agent", "std.array", "std.build.cc", "std.build.cc.cmake", "std.build.cc.gnu",
+               "std.build.cc.msvc", "std.cli", "std.codec", "std.error", "std.json", "std.list",
                "std.map", "std.macros", "std.proc", "std.record", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];

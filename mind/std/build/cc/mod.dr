@@ -1,0 +1,259 @@
+// C and C++, with whichever compiler the machine has.
+//
+// A target is described in a vocabulary of settings -- `standard :cxx20`,
+// `optimize 3`, `define "NDEBUG"` -- rather than in any one compiler's flags,
+// and each family of compilers translates it: `std.build.cc.gnu` for GCC and
+// Clang, `std.build.cc.msvc` for `cl` and `clang-cl`, `std.build.cc.cmake` for
+// a `CMakeLists.txt` that CMake then builds with whatever it finds. So one
+// `build.dr` builds with any of them, and what is really about one compiler
+// says which: `flags_for :msvc ["/permissive-"]` is left out by the rest.
+// docs/build.md, "One script, every compiler", is the design.
+//
+// Everything here is pure. A target is a value built with `|>`, and turning
+// it into command lines needs only a description of the toolchain (`Toolchain`,
+// which a probe answers). Running those commands is `std.build`'s business, so
+// the translation can be tested on a machine that has none of the compilers.
+
+import std.list;
+import std.str;
+
+// --- the vocabulary ------------------------------------------------------------
+
+/// One setting of a target, of one of its sources, or of what it hands to the
+/// targets that use it.
+union Setting {
+    standard(language : :atom)              // :c11 :c17 :cxx17 :cxx20 :cxx23
+    optimize(level : :any)                  // 0 to 3, or :size
+    debug_info(on : :bool)
+    warnings(level : :atom)                 // :none :default :all :extra
+    warnings_as_errors(on : :bool)
+    define(name : :string, value : :any)    // `()` for a bare name
+    include(dir : :string)
+    rtti(on : :bool)
+    sanitize(kind : :atom)                  // :none :address :thread :undefined
+    pic(on : :bool)
+    threads
+    flags_for(selector : :atom, flags : [:string])
+    link_flags_for(selector : :atom, flags : [:string])
+    define_for(selector : :atom, name : :string)
+    system(library : :string)
+    system_for(os : :atom, library : :string)
+    library_dir(dir : :string)
+    link_file(path : :string)
+    runtime_path(dir : :string)
+    export_all
+}
+
+/// What there is to build. `:external` is a library something else made: a
+/// probe's answer, which brings its include directories and what to link.
+type Kind = :executable | :shared | :static | :external;
+
+mapping Target {
+    kind : :atom        // a Kind
+    name : :string
+    sources = []        // [[path, [Setting]]]: each file, and its own settings
+    settings = []       // [Setting], for every source of this target
+    public = []         // [Setting], for this target and every target using it
+    uses = []           // [Target]
+}
+
+let executable : :string -> [:string] -> Target;
+let executable name sources = Target.make :executable name (list.map (fn s -> [s, []]) sources) [] [] [];
+let shared : :string -> [:string] -> Target;
+let shared name sources = Target.make :shared name (list.map (fn s -> [s, []]) sources) [] [] [];
+let static : :string -> [:string] -> Target;
+let static name sources = Target.make :static name (list.map (fn s -> [s, []]) sources) [] [] [];
+
+/// A library that was built some other way, described by what a user of it
+/// needs: `external "ffi" [Setting.include "/usr/include", Setting.system "ffi"]`.
+let external : :string -> [Setting] -> Target;
+let external name public = Target.make :external name [] [] public [];
+
+let kind t = Target.kind t;
+let name t = Target.name t;
+let sources t = Target.sources t;
+let settings t = Target.settings t;
+let public t = Target.public t;
+let uses t = Target.uses t;
+
+// --- modifiers -------------------------------------------------------------------
+//
+// Each takes the target last, so a description reads as a pipeline.
+
+let set s t = Target.set_settings t (list.append (settings t) [s]);
+let set_public s t = Target.set_public t (list.append (public t) [s]);
+
+let standard language t = set (Setting.standard language) t;
+let optimize level t = set (Setting.optimize level) t;
+let debug_info on t = set (Setting.debug_info on) t;
+let warnings level t = set (Setting.warnings level) t;
+let warnings_as_errors on t = set (Setting.warnings_as_errors on) t;
+let define name t = set (Setting.define name ()) t;
+let define_value name value t = set (Setting.define name value) t;
+let include dir t = set (Setting.include dir) t;
+let rtti on t = set (Setting.rtti on) t;
+let sanitize kind t = set (Setting.sanitize kind) t;
+let pic on t = set (Setting.pic on) t;
+let threads t = set_public Setting.threads t;
+let flags_for selector flags t = set (Setting.flags_for selector flags) t;
+let link_flags_for selector flags t = set (Setting.link_flags_for selector flags) t;
+let define_for selector name t = set (Setting.define_for selector name) t;
+let system library t = set_public (Setting.system library) t;
+let system_for os library t = set_public (Setting.system_for os library) t;
+let export_all t = set Setting.export_all t;
+let runtime_path dir t = set (Setting.runtime_path dir) t;
+
+let public_include dir t = set_public (Setting.include dir) t;
+let public_define name t = set_public (Setting.define name ()) t;
+
+/// Another source file, with no settings of its own.
+let source path t = Target.set_sources t (list.append (sources t) [[path, []]]);
+/// A source file with settings for it alone: `-fno-rtti` for `jit.cpp`.
+let source_with path own t = Target.set_sources t (list.append (sources t) [[path, own]]);
+
+/// Build against another target: its public settings apply to this one's
+/// sources, and it is linked into this one.
+let use other t = Target.set_uses t (list.append (uses t) [other]);
+
+// --- toolchains --------------------------------------------------------------
+//
+// What a probe finds out about a compiler. `family` is the flag dialect; `name`
+// is the compiler, for settings that only one of a family takes.
+
+mapping Toolchain {
+    name : :atom        // :gcc :clang :msvc :clang_cl
+    family : :atom      // :gnu :msvc
+    os : :atom          // :linux :macos :windows, where its output runs
+    c = "cc"            // the C compiler
+    cxx = "c++"         // the C++ compiler, which links too for :gnu
+    archiver = "ar"     // `ar`, or `lib.exe`
+    linker = ""         // `link.exe`; unused for :gnu
+    version = ""
+}
+
+let gcc os = Toolchain.make :gcc :gnu os "gcc" "g++" "ar" "" "";
+let clang os = Toolchain.make :clang :gnu os "clang" "clang++" "ar" "" "";
+let msvc = Toolchain.make :msvc :msvc :windows "cl.exe" "cl.exe" "lib.exe" "link.exe" "";
+
+/// Does a `flags_for` selector name this toolchain? A family (`:gnu`, `:msvc`)
+/// or a compiler (`:gcc`, `:clang`).
+let applies : :atom -> Toolchain -> :bool;
+let applies selector tc = selector == Toolchain.family tc || selector == Toolchain.name tc;
+
+// --- languages and names ---------------------------------------------------------
+
+/// `:c` or `:cxx`, by extension. A header is not compiled, so it is neither.
+let language : :string -> :atom;
+let language path =
+    if str.ends_with ".c" path { :c }
+    else if list.any (fn e -> str.ends_with e path) [".cpp", ".cc", ".cxx", ".C", ".c++"] { :cxx }
+    else { :other };
+
+/// Does a `standard` setting speak of this language? `:cxx20` is C++'s, `:c11`
+/// is C's, and a target of both languages carries one of each.
+let standard_is_for : :atom -> :atom -> :bool;
+let standard_is_for lang standard_name = {
+    let cxx = str.starts_with ":cxx" (to_string standard_name);
+    match lang { :cxx => cxx, :c => not cxx, _ => false }
+};
+
+/// The version part of a standard: `:cxx20` is `20`, `:c11` is `11`.
+let standard_version : :atom -> :string;
+let standard_version s = {
+    let text = to_string s;
+    let skip = if str.starts_with ":cxx" text { 4 } else { 2 };
+    str.slice skip (str.byte_length text - skip) text
+};
+
+/// What a target's file is called where it runs.
+let file_name : Toolchain -> Kind -> :string -> :string;
+let file_name tc k n = match [k, Toolchain.os tc, Toolchain.family tc] {
+    [:executable, :windows, _] => n + ".exe",
+    [:executable, _, _] => n,
+    [:shared, :windows, _] => n + ".dll",
+    [:shared, :macos, _] => "lib" + n + ".dylib",
+    [:shared, _, _] => "lib" + n + ".so",
+    [:static, _, :msvc] => n + ".lib",
+    [:static, _, _] => "lib" + n + ".a",
+    _ => n,
+};
+
+/// What another target links against to use a shared library. On Windows
+/// that is not the DLL but its import library.
+let import_name : Toolchain -> :string -> :string;
+let import_name tc n = match [Toolchain.os tc, Toolchain.family tc] {
+    [:windows, :msvc] => n + ".lib",
+    [:windows, _] => "lib" + n + ".dll.a",
+    _ => file_name tc :shared n,
+};
+
+/// An object's name, made from its source's path, so that the same source is
+/// the same object in every step that compiles it. A profile is filed under
+/// that name (docs/build.md, "Profile-guided builds").
+let object_name : Toolchain -> :string -> :string;
+let object_name tc path = {
+    let flat = str_concat (list.map (fn c -> match c { '/' => "#", '\\' => "#", ':' => "_", _ => str_of_chars [c] })
+                                    (str.chars path));
+    flat + (match Toolchain.family tc { :msvc => ".obj", _ => ".o" })
+};
+
+// --- what applies where ------------------------------------------------------------
+
+/// The public settings of everything a target uses, however deep, in the
+/// order they were used.
+let inherited : Target -> [Setting];
+let rec inherited t =
+    list.flat_map (fn u -> list.append (public u) (inherited u)) (uses t);
+
+/// Every setting that applies to one source of a target: the target's own,
+/// its public ones, what it inherits, and the source's.
+let settings_for : Target -> [Setting] -> [Setting];
+let settings_for t own = list.concat [settings t, public t, inherited t, own];
+
+/// The settings that decide a link: the target's, and everything it inherits.
+let link_settings : Target -> [Setting];
+let link_settings t = list.concat [settings t, public t, inherited t];
+
+/// Everything this target links against that another target makes.
+let linked_targets : Target -> [Target];
+let linked_targets t = list.filter (fn u -> kind u != :external) (uses t);
+
+when test {
+    import std.test;
+
+    let lib = shared "dream" ["src/a.cpp"]
+              |> standard :cxx20
+              |> public_include "include"
+              |> threads
+              |> source_with "src/jit.cpp" [Setting.rtti false];
+    let app = executable "dream" ["src/cli.cpp"] |> use lib;
+
+    let tests = [
+        test.case "a source's settings are the target's, its public ones, what it uses, and its own"
+            $( test.eq! [Setting.standard :cxx20, Setting.include "include", Setting.threads, Setting.rtti false]
+                        (settings_for lib [Setting.rtti false]) ),
+        test.case "a user of a library gets its public settings and not its private ones"
+            $( test.eq! [Setting.include "include", Setting.threads] (settings_for app []) ),
+        test.case "files are named for where they run"
+            $( test.eq! ["libdream.so", "libdream.dylib", "dream.dll", "dream.exe", "dream.lib", "libdream.a"]
+                        [file_name (gcc :linux) :shared "dream", file_name (clang :macos) :shared "dream",
+                         file_name msvc :shared "dream", file_name msvc :executable "dream",
+                         file_name msvc :static "dream", file_name (gcc :windows) :static "dream"] ),
+        test.case "a DLL is linked through its import library"
+            $( test.eq! ["dream.lib", "libdream.dll.a", "libdream.so"]
+                        [import_name msvc "dream", import_name (gcc :windows) "dream",
+                         import_name (gcc :linux) "dream"] ),
+        test.case "an object is named by its source, so every step agrees on it"
+            $( test.eq! ["dream#src#interp.cpp.o", "dream#src#interp.cpp.obj"]
+                        [object_name (gcc :linux) "dream/src/interp.cpp",
+                         object_name msvc "dream\\src\\interp.cpp"] ),
+        test.case "a selector is a family or one compiler"
+            $( test.eq! [true, true, false, true, false]
+                        [applies :gnu (clang :linux), applies :clang (clang :linux),
+                         applies :gcc (clang :linux), applies :msvc msvc, applies :gnu msvc] ),
+        test.case "a standard belongs to one language"
+            $( test.eq! [true, false, true, "20", "11"]
+                        [standard_is_for :cxx :cxx20, standard_is_for :c :cxx20, standard_is_for :c :c11,
+                         standard_version :cxx20, standard_version :c11] ),
+    ];
+}

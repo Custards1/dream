@@ -1760,6 +1760,7 @@ waiting for a value.
 | `list_dir! path` | the names in a directory, sorted, without `.` and `..` |
 | `exec! program args` | run a child to completion → `%{ :code, :out, :err, :timed_out }` |
 | `exec_for! program args ms` | the same, killing the child after `ms` |
+| `run! program args options` | the same, with `:cwd`, `:env`, `:clear_env`, `:timeout`, `:log` and `:stdin` |
 | `replace! program args` | **become** `program`: this VM is gone and it takes over the process |
 | `monotonic! ()` | milliseconds from a fixed point, from a clock that never jumps |
 | `now! ()` | milliseconds since the Unix epoch, from the wall clock |
@@ -1792,6 +1793,21 @@ finish in one second on a single worker.
 clone` against an unreachable host would otherwise wait for ever. A child that
 outlives the deadline is killed, and `timed_out` distinguishes that from an
 ordinary non-zero exit.
+
+`run!` is what a build runs its steps with. Each step has a directory and an
+environment of its own, and changing this VM's around a call would change them
+for every other process running a child at the same time:
+
+```dream
+os.run! "c++" ["-c", "a.cpp", "-o", "a.o"] %{
+    :cwd => step_dir,
+    :env => %{ "CCACHE_DISABLE" => "1" },
+    :log => step_dir + "/log",
+    :timeout => 600000,
+}
+```
+
+A misspelt option is an error that names it, never a default quietly taken.
 
 ### `std.vm` — the runtime describing itself
 

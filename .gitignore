@@ -5,7 +5,7 @@ compile_commands.json
 *.dream
 *.cache
 *.vscode
-build/
+/build/
 build-dream/
 build-nojit/
 build-pgo/
