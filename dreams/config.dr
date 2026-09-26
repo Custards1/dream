@@ -25,31 +25,108 @@ import std.str;
 // `when nonsense { .. }` is false -- but a flag has no value to compare, and
 // `when test == "x"` should be false rather than an error.
 
+//
+// A package's options are a third kind, and are *scoped*: `-D sqlite:vendored`
+// is `vendored` for the modules of `sqlite` and for nobody else, which is what
+// lets a dependency's settings be kept at all -- a program-wide `vendored`
+// would switch on every `when vendored` in every package. `scoped` holds them
+// by package, `here` is the package whose module is being read, and `aliases`
+// takes any name a package is known by -- the key it was listed under, or its
+// own -- to the one it is filed under. The loader fills in the last two;
+// nothing else here knows what a package is.
+
 mapping Configuration {
     flags = %{}
     values = %{}
+    scoped = %{}
+    aliases = %{}
+    here = ()
 }
-
-let make = Configuration.make;
 
 let flags c = Configuration.flags c;
 let values c = Configuration.values c;
+let scoped c = Configuration.scoped c;
 
 /// A configuration with nothing defined. `defaults!` is what a compilation
 /// actually starts from; this is what a test starts from.
 let empty = Configuration.new ();
 
-let define name c = make ((flags c).[name => true]) (values c);
+let define name c = Configuration.set_flags c ((flags c).[name => true]);
 
-let set key value c = make (flags c) ((values c).[key => value]);
+let set key value c = Configuration.set_values c ((values c).[key => value]);
 
-/// Accepts `name` or `name=value`, which is what `-D` takes. A `=` with
-/// nothing after it defines the setting as the empty string rather than being
-/// rejected: `-D features=` is a legitimate way to say "none".
+/// The name a package's settings are filed under.
+let canonical c key = (Configuration.aliases c).[key else key];
+
+/// Set `name` to `value` for package `key` alone.
+let set_in key name value c = {
+    let k = canonical c key;
+    let now = (scoped c).[k else (%{})];
+    Configuration.set_scoped c ((scoped c).[k => now.[name => value]])
+};
+
+/// Accepts `name`, `name=value`, `key:name` or `key:name=value`, which is what
+/// `-D` takes. A `=` with nothing after it defines the setting as the empty
+/// string rather than being rejected: `-D features=` is a legitimate way to say
+/// "none". The scope is marked with a colon rather than a dot because a key may
+/// have dots in it and a name may not; a bare scoped name is `true`, the value
+/// a `bool` option is written with.
 let define_arg arg c = {
     let at = str.find "=" arg;
-    if at < 0 { define arg c }
-    else { set (str.slice 0 at arg) (str.slice (at + 1) (str.byte_length arg - at - 1) arg) c }
+    let lhs = if at < 0 { arg } else { str.slice 0 at arg };
+    let rhs = if at < 0 { () } else { str.slice (at + 1) (str.byte_length arg - at - 1) arg };
+    let colon = str.find ":" lhs;
+    match [colon >= 0, rhs] {
+        [true, _] => {
+            let key = str.slice 0 colon lhs;
+            let name = str.slice (colon + 1) (str.byte_length lhs - colon - 1) lhs;
+            set_in key name (match rhs { () => "true", v => v }) c
+        },
+        [false, ()] => define arg c,
+        [false, v] => set lhs v c,
+    }
+};
+
+/// The same configuration, read from inside package `key`'s modules. `()` is
+/// a module that belongs to no package, which sees the program's settings only.
+let within key c = Configuration.set_here c (match key { () => (), k => canonical c k });
+
+/// Refile every scope under its canonical name, now that the names are known:
+/// `-D` is read before the packages are found, so a scope set through a key
+/// is keyed by it until here. Answers `[configuration, unknown keys]`, a key
+/// being unknown when `known` says so -- a `-D` that names no package is a
+/// typo, and a typo that is quietly ignored is the worst answer to one.
+let with_aliases aliases known c = {
+    let named = Configuration.set_aliases c aliases;
+    let refiled = list.fold (fn m [k, table] -> {
+        let to = canonical named k;
+        m.[to => list.fold (fn t [n, v] -> t.[n => v]) (m.[to else (%{})]) (map_pairs table)]
+    }) (%{}) (map_pairs (scoped c));
+    [Configuration.set_scoped named refiled,
+     list.filter (fn k -> not (known k)) (list.map (fn [k, _] -> k) (map_pairs (scoped c)))]
+};
+
+/// A package option as a condition reads it: `[:ok, value]` when the name is
+/// one -- `sqlite.vendored` anywhere, `vendored` inside `sqlite` -- and `()`
+/// when it is not, so the program's settings answer instead. A dotted name is
+/// only ever an option, so `[:ok, ()]` for one nobody set rather than falling
+/// through to a flag no `-D` could have spelled.
+let option c name = {
+    let dot = str.find "." name;
+    match dot >= 0 {
+        true => {
+            let key = str.slice 0 dot name;
+            let rest = str.slice (dot + 1) (str.byte_length name - dot - 1) name;
+            [:ok, ((scoped c).[canonical c key else (%{})]).[rest else ()]]
+        },
+        false => match Configuration.here c {
+            () => (),
+            k => match ((scoped c).[k else (%{})]).[name else ()] {
+                () => (),
+                v => [:ok, v],
+            },
+        },
+    }
 };
 
 let rec define_args args c =
@@ -90,9 +167,17 @@ let defaults! () = {
 let rec eval c cond =
     match cond {
         [:const, b]     => b,
-        // A setting that has a value counts as defined.
-        [:flag, name]   => is_defined name c || map_has (values c) name,
-        [:equals, k, v] => value k c == v,
+        // A package's own option first. One set to `false` is off, which is
+        // how a `bool` option says so; one never set is off too.
+        [:flag, name]   => match option c name {
+            [:ok, v] => v != () && v != "false",
+            // A setting that has a value counts as defined.
+            _ => is_defined name c || map_has (values c) name,
+        },
+        [:equals, k, v] => match option c k {
+            [:ok, found] => found == v,
+            _ => value k c == v,
+        },
         [:not, inner]   => not (eval c inner),
         [:and, l, r]    => eval c l && eval c r,
         [:or, l, r]     => eval c l || eval c r,
@@ -127,7 +212,11 @@ let describe c = {
     let named = list.map (fn [name, _] -> name) (map_pairs (flags c));
     let valued = list.map (fn [name, value] -> name + " = \"" + value + "\"")
                           (map_pairs (values c));
-    list.sort (list.append named valued)
+    // Each package's options under its name, after the program's settings.
+    let options = list.sort (list.flat_map (fn [key, table] ->
+        list.map (fn [name, value] -> key + ":" + name + " = \"" + value + "\"") (map_pairs table))
+        (map_pairs (scoped c)));
+    list.append (list.sort (list.append named valued)) options
 };
 
 // --- tests -------------------------------------------------------------------
@@ -177,6 +266,40 @@ when test {
                                 [:equals, "arch", "x86_64"]]) ),
         test.case "describe lists flags and quoted settings, sorted"
             $( test.eq! ["os = \"linux\"", "test"] (describe with_flags) ),
+        test.case "-D key:name sets a package's option"
+            $( test.eq! [%{ "sqlite" => %{ "vendored" => "true", "threads" => "off" } }, %{}]
+                        { let c = empty |> define_arg "sqlite:vendored" |> define_arg "sqlite:threads=off";
+                          [scoped c, flags c] } ),
+        test.case "an option is read inside its package and nowhere else"
+            $( test.eq! [true, false, false]
+                        { let c = define_arg "sqlite:vendored" empty;
+                          [eval (within "sqlite" c) [:flag, "vendored"],
+                           eval (within "app" c) [:flag, "vendored"],
+                           eval c [:flag, "vendored"]] } ),
+        test.case "an option set to false is off, and shadows the program's flag"
+            $( test.eq! [false, true]
+                        { let c = empty |> define "vendored" |> define_arg "sqlite:vendored=false";
+                          [eval (within "sqlite" c) [:flag, "vendored"],
+                           eval (within "app" c) [:flag, "vendored"]] } ),
+        test.case "a dotted name reads another package's option"
+            $( test.eq! [true, false, true]
+                        { let c = empty |> define_arg "sqlite:threads=off" |> within "app";
+                          [eval c [:equals, "sqlite.threads", "off"],
+                           eval c [:flag, "json.pretty"],
+                           eval c [:flag, "sqlite.threads"]] } ),
+        test.case "the program's settings answer where the package has no option"
+            $( test.true! (eval (within "sqlite" (define_arg "sqlite:x" with_flags))
+                                [:equals, "os", "linux"]) ),
+        test.case "a scope set through a key is refiled under the package's name"
+            $( test.eq! ["true", ["nope"]]
+                        { let [c, unknown] = with_aliases (%{ "sqlite" => "sqlite3" })
+                                                          (fn k -> k != "nope")
+                                                          (empty |> define_arg "sqlite:v"
+                                                                 |> define_arg "nope:x");
+                          [(scoped c).["sqlite3" else (%{})].["v" else ()], unknown] } ),
+        test.case "describe lists each package's options after the program's"
+            $( test.eq! ["os = \"linux\"", "test", "sqlite:v = \"true\""]
+                        (describe (define_arg "sqlite:v" with_flags)) ),
         test.case "the platform's atom loses its colon"
             $( test.eq! "linux" (platform_name :linux) ),
     ];

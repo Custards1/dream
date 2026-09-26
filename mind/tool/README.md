@@ -27,6 +27,7 @@ dream build/mind help
 | `mind update [name]` | fetch git and url dependencies again |
 | `mind deps` | list every package the project resolves to |
 | `mind tree` | the same, as the tree of who needs what |
+| `mind options` | every package's options, and what this build sets them to |
 | `mind clean` | remove `target/` |
 
 Every command but `new` looks for a `mind.toml` here or above, so they work
@@ -76,7 +77,9 @@ What that buys, and each was something you used to have to do by hand:
   `src/` when there is one, as for any package.
 - **What a dependency needs travels with it.** Its own `[build] includes`
   and `host-modules` are added to every build that uses it. Its `defines` are
-  not: a `when` flag is a decision about the whole program.
+  not, except for the options it declares: a program-wide `when` flag is a
+  decision about the whole program, and a package's options are how it is
+  configured instead (below).
 - **Transitive dependencies are found.** Every dependency's own
   `[dependencies]` is followed; a package reached twice (a diamond) is
   compiled once.
@@ -159,6 +162,76 @@ Fetching shells out to `git`, `curl` and `tar` rather than speaking those
 protocols. They are already installed, already know about proxies and
 credentials and certificate stores, and none of that is a build tool's
 business. It is also why `mind` needs no TLS in the VM.
+
+## Options
+
+A package declares what it can be built as. Each option has a type -- `bool`,
+`integer`, `string`, or a list of choices -- and a default; a bare value
+declares its own type:
+
+```toml
+[options]
+vendored = { type = "bool", default = false, doc = "build sqlite from source" }
+threads  = { type = ["off", "single", "multi"], default = "multi" }
+cache_mb = 64
+```
+
+`when vendored` in that package's code reads the option, and `when
+sqlite.vendored` reads it from anywhere else. An option is set, a later place
+winning:
+
+1. its default;
+2. the package's own `[build] defines` (`defines = ["vendored"]`);
+3. `[config.KEY]` in any manifest that depends on it, however deep;
+4. the profile's `[profile.NAME.config.KEY]`;
+5. `mind build -D KEY:name=value`.
+
+```toml
+[config.sqlite]
+threads = "off"
+```
+
+The root's `[config.KEY]` wins over its dependencies'. Two dependencies that
+configure a third two ways are a conflict, and `mind` names both; the root
+settles it by saying which. Every name and value is checked against the
+declaration, so a typo is an error that lists what the package accepts, not a
+setting that is quietly ignored. The root declares options the same way, and
+`-D name` sets one of them rather than defining a program-wide flag.
+`mind options` shows every package's options and where this build left them.
+
+A dependency may hang on an option of the package that lists it:
+
+```toml
+[dependencies]
+sqlite_sys = { path = "../sqlite-sys", when = "not vendored" }
+```
+
+The condition is the compiler's grammar (`not`, `&&`, `||`, `==`, `!=`,
+parentheses, dotted names), read against the package's settled options and
+the program's settings (`os`, `family`, `test`, the root's defines). An edge
+whose condition is false is not in the graph: not fetched, not built, and not
+a conflict.
+
+### Profiles
+
+A profile is a named way to build the whole program:
+
+```toml
+[profile.release]
+defines = ["release"]
+flags   = ["--no-types"]    # compiler flags
+target  = "linux"           # --target
+
+[profile.release.config.sqlite]
+threads = "multi"
+```
+
+`--profile NAME` picks one, `--release` is `--profile release`, and `debug` is
+the default. `debug` and `release` exist whether declared or not; an
+undeclared `release` defines `release`, as `--release` always has. A
+dependency's profiles are ignored: how the program is built is the root's
+decision. `[build] target` is the target when neither `--target` nor the
+profile says.
 
 ## Environment
 

@@ -44,10 +44,8 @@ let header = "# What this project's dependencies resolved to. Written by `mind`;
 
 /// Sorted by section, `program` first, then by key.
 let sorted entries = {
-    // A string, because `compare` orders flat values only: two lists
-    // compare equal, and a sort on them keeps whatever order it was given.
-    let rank e = if section_of e == "program" { "0" } else { "1" };
-    list.sort_on (fn e -> rank e + section_of e + "\n" + key_of e) entries
+    let rank e = if section_of e == "program" { 0 } else { 1 };
+    list.sort_on (fn e -> [rank e, section_of e, key_of e]) entries
 };
 
 let field name v = match v { () => [], x => [name + " = " + toml.quote (to_string x)] };

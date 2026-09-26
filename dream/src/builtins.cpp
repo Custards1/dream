@@ -2286,42 +2286,115 @@ NativeResult core_map_pairs(Process& p, Value, Value* args, uint32_t) {
 
 // --- ordering ---
 
-/// A total order over the flat types, so sorting can be written in Dawn.
-/// Values of different types order by type, which keeps it total without
-/// pretending an integer and a string are comparable.
-NativeResult core_compare(Process& p, Value, Value* args, uint32_t) {
-    Value a = resolve(args[0]);
-    Value b = resolve(args[1]);
-    auto rank = [](Value v) -> int {
-        if (is_fixnum(v) || is_obj(v, ObjType::Float)) return 0;
-        if (is_char(v)) return 1;
-        if (is_bool(v)) return 2;
-        if (is_atom(v)) return 3;
-        if (is_stringish(v)) return 4;
-        if (is_unit(v)) return 5;
-        return 6;
-    };
-    int ra = rank(a), rb = rank(b);
-    if (ra != rb) return NativeResult::ok(make_fixnum(ra < rb ? -1 : 1));
+/// A total order, so sorting can be written in Dream. Values of different
+/// types order by type, which keeps it total without pretending an integer and
+/// a string are comparable.
+///
+/// Lists and arrays order element by element, the shorter first when one is a
+/// prefix of the other, forcing as they go the way `==` does. They used to
+/// rank with functions and maps and all compare equal, and a stable sort on a
+/// list key then left everything exactly where it was: no error, just an order
+/// that was never applied. Maps, functions and pids still compare equal within
+/// their kind; there is no order on them worth promising.
+///
+/// The force is not vouched (see "VouchesForGc"), so a collection it wants
+/// waits for the machine, and holding `Obj*` across it is safe.
+int compare_rank(Value v) {
+    if (is_fixnum(v) || is_obj(v, ObjType::Float)) return 0;
+    if (is_char(v)) return 1;
+    if (is_bool(v)) return 2;
+    if (is_atom(v)) return 3;
+    if (is_stringish(v)) return 4;
+    if (is_unit(v)) return 5;
+    if (v == NIL || is_obj(v, ObjType::Cons)) return 6;
+    if (is_obj(v, ObjType::Array)) return 7;
+    return 8;
+}
 
-    int cmp = 0;
-    if (ra == 0) {
-        double x = is_fixnum(a) ? double(fixnum_value(a)) : static_cast<FloatObj*>(as_obj(a))->value;
-        double y = is_fixnum(b) ? double(fixnum_value(b)) : static_cast<FloatObj*>(as_obj(b))->value;
-        cmp = x < y ? -1 : (x > y ? 1 : 0);
-    } else if (ra == 1 || ra == 2) {
-        uint64_t x = imm_payload(a), y = imm_payload(b);
-        cmp = x < y ? -1 : (x > y ? 1 : 0);
-    } else if (ra == 3) {
-        const std::string& x = p.runtime().atom_name(uint32_t(imm_payload(a)));
-        const std::string& y = p.runtime().atom_name(uint32_t(imm_payload(b)));
-        cmp = x < y ? -1 : (x > y ? 1 : 0);
-    } else if (ra == 4) {
-        Bytes x, y;
-        string_bytes(a, &x);
-        string_bytes(b, &y);
-        cmp = bytes_compare(x, y);
+bool compare_values(Process& p, Value a, Value b, int depth, int* out) {
+    if (depth > 512) {
+        p.result = raise_error(p, well_known(p.runtime()).type_error,
+                               "structure is too deeply nested to compare");
+        return false;
     }
+    a = resolve(a);
+    b = resolve(b);
+    if ((!is_whnf(a) && !force_whnf(p, a, &a)) || (!is_whnf(b) && !force_whnf(p, b, &b)))
+        return false;
+
+    int ra = compare_rank(a), rb = compare_rank(b);
+    if (ra != rb) {
+        *out = ra < rb ? -1 : 1;
+        return true;
+    }
+    auto order = [](auto x, auto y) { return x < y ? -1 : (x > y ? 1 : 0); };
+    switch (ra) {
+        case 0: {
+            if (is_fixnum(a) && is_fixnum(b)) {
+                *out = order(fixnum_value(a), fixnum_value(b));
+            } else {
+                double x = is_fixnum(a) ? double(fixnum_value(a)) : static_cast<FloatObj*>(as_obj(a))->value;
+                double y = is_fixnum(b) ? double(fixnum_value(b)) : static_cast<FloatObj*>(as_obj(b))->value;
+                *out = order(x, y);
+            }
+            return true;
+        }
+        case 1:
+        case 2: *out = order(imm_payload(a), imm_payload(b)); return true;
+        case 3: {
+            const std::string& x = p.runtime().atom_name(uint32_t(imm_payload(a)));
+            const std::string& y = p.runtime().atom_name(uint32_t(imm_payload(b)));
+            *out = order(x, y);
+            return true;
+        }
+        case 4: {
+            Bytes x, y;
+            string_bytes(a, &x);
+            string_bytes(b, &y);
+            *out = bytes_compare(x, y);
+            return true;
+        }
+        case 6: {
+            // Iterate down the spine rather than recursing on the tail, so a
+            // long list is not a deep one; only the elements recurse.
+            for (;;) {
+                // An improper tail is compared as whatever it is.
+                if (compare_rank(a) != 6 || compare_rank(b) != 6)
+                    return compare_values(p, a, b, depth + 1, out);
+                if (a == NIL || b == NIL) {
+                    *out = a == b ? 0 : (a == NIL ? -1 : 1);
+                    return true;
+                }
+                auto* x = static_cast<ConsObj*>(as_obj(a));
+                auto* y = static_cast<ConsObj*>(as_obj(b));
+                if (!compare_values(p, x->head, y->head, depth + 1, out)) return false;
+                if (*out != 0) return true;
+                Value ta = resolve(x->tail), tb = resolve(y->tail);
+                if ((!is_whnf(ta) && !force_whnf(p, ta, &ta)) ||
+                    (!is_whnf(tb) && !force_whnf(p, tb, &tb)))
+                    return false;
+                a = ta;
+                b = tb;
+            }
+        }
+        case 7: {
+            auto* x = static_cast<ArrayObj*>(as_obj(a));
+            auto* y = static_cast<ArrayObj*>(as_obj(b));
+            uint32_t n = std::min(x->len, y->len);
+            for (uint32_t i = 0; i < n; ++i) {
+                if (!compare_values(p, x->items()[i], y->items()[i], depth + 1, out)) return false;
+                if (*out != 0) return true;
+            }
+            *out = order(x->len, y->len);
+            return true;
+        }
+        default: *out = 0; return true;
+    }
+}
+
+NativeResult core_compare(Process& p, Value, Value* args, uint32_t) {
+    int cmp = 0;
+    if (!compare_values(p, args[0], args[1], 0, &cmp)) return NativeResult::raise(p.result);
     return NativeResult::ok(make_fixnum(cmp));
 }
 

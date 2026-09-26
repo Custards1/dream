@@ -10,8 +10,10 @@ import std.io;
 import std.list;
 import std.os;
 import std.str;
+import std.toml;
 import std.version;
 
+import config;
 import fetch;
 import lock;
 import manifest;
@@ -86,6 +88,11 @@ let rec build_graphs g =
     }) (map_pairs (g.[:builds else (%{})])));
 
 let with_build_graph key sub g = g.[:builds => (g.[:builds else (%{})]).[key => sub]];
+
+/// An empty graph that reads options as `g` does: a build script's packages
+/// are a program of their own, but one package has one set of options per
+/// build, whichever program it is compiled into.
+let inherit g = empty_graph.[:assumed => g.[:assumed else (%{})]].[:settings => g.[:settings else (%{})]];
 
 /// A node: the key, where it is, its manifest (`()` for a bare directory),
 /// the dependency as written, who asked for it first, and every version
@@ -198,7 +205,16 @@ let shown! p = util.relative! (os.cwd! ()) p;
 let rec walk! owner owner_key deps kind path g =
     match deps {
         [] => [:ok, g],
-        [d, ..rest] => {
+        [d, ..rest] => match edge_on! owner owner_key d g {
+            [:error, why] => [:error, why],
+            [:off, g2] => walk! owner owner_key rest kind path g2,
+            [:on, g2] => follow! owner owner_key d rest kind path g2,
+        },
+    };
+
+/// Add one dependency that is in the graph, and everything below it, then go
+/// on with the rest.
+let follow! owner owner_key d rest kind path g = {
             let key = manifest.dep_name d;
             match fetch.resolve! (manifest.root owner) d {
                 [:error, why] => [:error, why + " (required by " + asker owner_key + ")"],
@@ -235,8 +251,73 @@ let rec walk! owner owner_key deps kind path g =
                     }
                 },
             }
+};
+
+// --- conditional edges ------------------------------------------------------------
+//
+// `sqlite_sys = { path = "..", when = "not vendored" }` is in the graph only
+// when the condition holds against the options of the package that lists it.
+// Those options are not known until the graph is -- a package is configured by
+// the packages that depend on it -- so the walk reads what `graph!` assumed
+// they are (`:assumed`, by directory), and keeps every value it read. When
+// settling the options gives a different value for any of them, the walk is
+// run again with the settled ones; see `graph!`.
+
+/// `[:on, g]`, `[:off, g]`, or `[:error, why]` for a condition that does not
+/// parse. An edge that is off is remembered, so that `[config.KEY]` for a
+/// package that is only sometimes there is not called a typo.
+let edge_on! owner owner_key d g =
+    match manifest.dep_condition d {
+        () => [:on, g],
+        text => match config.parse_condition text {
+            [:error, why] => [:error, shown! (manifest.path owner) + ": `when = \"" + text + "\"` on `"
+                                      + manifest.dep_name d + "`: " + why],
+            [:ok, cond] => {
+                let reads = list.fold (fn m n -> m.[n => option_read! owner g n]) (%{}) (config.names cond);
+                let option n = match reads.[n else ()] { () => (), r => [:ok, list.nth 2 r] };
+                let kept = g.[:reads => list.append (g.[:reads else []])
+                                                    (list.filter (fn r -> r != ()) (list.map (fn [_, r] -> r) (map_pairs reads)))];
+                if config.holds option (g.[:settings else (%{})]) cond { [:on, kept] }
+                else { [:off, kept.[:off => list.cons [owner_key, manifest.dep_name d] (kept.[:off else []])]] }
+            },
         },
     };
+
+/// What a condition in `owner` reads for `name`: `[dir, option, value,
+/// default]` for an option -- its own, or another package's when the name is
+/// dotted -- and `()` for a name that is the program's.
+let option_read! owner g name = {
+    let dot = str.find "." name;
+    if dot >= 0 {
+        let key = str.slice 0 dot name;
+        let opt = str.slice (dot + 1) (str.byte_length name - dot - 1) name;
+        match node g key {
+            () => [(), opt, (), ()],
+            n => match node_manifest n {
+                () => [node_abs n, opt, (), ()],
+                dm => read_of (node_abs n) dm opt g,
+            },
+        }
+    } else {
+        match (declared owner).[name else ()] {
+            () => (),
+            _ => read_of (util.absolute! (manifest.root owner)) owner name g,
+        }
+    }
+};
+
+/// A package's declarations, errors aside: they are reported by `settle!`.
+let declared dm = list.head (config.declarations (manifest.options dm));
+
+let read_of abs dm name g = {
+    let default = (list.head (config.initial (declared dm) (manifest.defines dm))).[name else ()];
+    [abs, name, ((g.[:assumed else (%{})]).[abs else (%{})]).[name else default], default]
+};
+
+/// Did settling leave every value a condition read as it was read?
+let steady assumed reads =
+    list.all (fn [abs, name, seen, default] ->
+        abs == () || (assumed.[abs else (%{})]).[name else default] == seen) reads;
 
 /// Everything below a package just added: its own dependencies in this graph,
 /// and its build dependencies in a graph of their own. A directory with no
@@ -256,11 +337,12 @@ let below! dm key path g =
 let builds! m key path g =
     match manifest.build_dependencies m {
         [] => [:ok, g],
-        bdeps => match walk! m key bdeps :builds path empty_graph {
+        bdeps => match walk! m key bdeps :builds path (inherit g) {
             [:error, why] => [:error, why],
             [:ok, sub] => match check_versions sub {
                 [:error, why] => [:error, why],
-                _ => [:ok, with_build_graph key sub g],
+                _ => [:ok, with_build_graph key sub
+                                (g.[:reads => list.append (g.[:reads else []]) (sub.[:reads else []])])],
             },
         },
     };
@@ -341,26 +423,223 @@ let root_deps m dev =
     if dev { [[manifest.dependencies m, :uses], [manifest.dev_dependencies m, :dev]] }
     else { [[manifest.dependencies m, :uses]] };
 
-/// Every package this build needs, transitively, or the first reason it
-/// cannot be built: a cycle, a conflict, or a version nobody accepts.
-let graph! m dev = {
+/// One walk of the whole graph, reading options as `assumed` says.
+let walk_graph! m o assumed = {
     let root_abs = util.absolute! (manifest.root m);
     let name = match manifest.name m { "" => "this project", n => n };
     let path = [step_of root_abs name (shown! (manifest.path m)) :uses];
+    let start = empty_graph.[:assumed => assumed].[:settings => settings! m o];
     let walked = list.fold (fn acc wk -> match acc {
         [:error, why] => acc,
         [:ok, g] => walk! m root_key (list.head wk) (list.nth 1 wk) path g,
-    }) [:ok, empty_graph] (root_deps m dev);
+    }) [:ok, start] (root_deps m (option o :dev false));
     match walked {
         [:error, why] => [:error, why],
-        [:ok, g] => match builds! m root_key path g {
-            [:error, why] => [:error, why],
-            [:ok, g2] => match check_versions g2 {
-                [:error, why] => [:error, why],
-                _ => [:ok, g2],
-            },
-        },
+        [:ok, g] => builds! m root_key path g,
     }
+};
+
+/// How many times the walk may be run before the options are declared not to
+/// settle. Each run can only follow a change of value a condition read, so a
+/// real graph settles in two; more than a few is a loop -- an edge that, once
+/// in, configures its own condition off.
+let max_rounds = 8;
+
+/// Every package this build needs, transitively, with every package's
+/// options settled (`:options`), or the first reason it cannot be built: a
+/// cycle, a conflict, a version nobody accepts, or an option set wrongly.
+///
+/// The options and the graph decide each other: a conditional edge reads the
+/// options of the package listing it, and those options are set by the
+/// packages that depend on it, which are only known once the graph is. So
+/// this walks with what it assumes the options are -- the defaults, at first
+/// -- settles them over the graph that came out, and walks again if a
+/// condition read a value that settling changed.
+let graph! m o =
+    match has_profile m o {
+        false => [:error, "no profile is called `" + profile_of o + "`; this project has "
+                          + str.join_str ", " (list.unique (list.append ["debug", "release"] (manifest.profiles m)))],
+        true => settle_graph! m o (%{}) 1,
+    };
+
+let rec settle_graph! m o assumed round =
+    match walk_graph! m o assumed {
+        [:error, why] => [:error, why],
+        [:ok, g] => {
+            let [values, errors] = settle! m o g;
+            let next = by_dir! m g values;
+            match [steady next (g.[:reads else []]), round >= max_rounds] {
+                [true, _] => match [errors, check_versions g] {
+                    [[_, .._], _] => [:error, str.join_str "\n" errors],
+                    [_, [:error, why]] => [:error, why],
+                    _ => [:ok, g.[:options => values]],
+                },
+                [false, true] => [:error, "the options and the dependencies that hang on them do not settle: "
+                                          + "each way of building includes a package that configures it the other way"],
+                [false, false] => settle_graph! m o next (round + 1),
+            }
+        },
+    };
+
+/// Settled values by package directory, which is how a walk reads them.
+let by_dir! m g values =
+    list.fold (fn acc [key, vs] -> {
+        let abs = if key == root_key { util.absolute! (manifest.root m) }
+                  else { node_abs (node g key) };
+        acc.[abs => vs]
+    }) (%{}) (map_pairs values);
+
+// --- settling the options -------------------------------------------------------
+//
+// Every package's options, each set in turn by, a later one winning:
+//
+//   1. its default in `[options]`;
+//   2. its own `[build] defines`, for a flag it always wants;
+//   3. `[config.KEY]` in any manifest in the graph -- a table rather than a
+//      field of `[dependencies]`, so that a dependency of a dependency, which
+//      the root never lists, can still be configured. The root's wins; two
+//      others that disagree are a conflict, unless the root settles it;
+//   4. the profile's `[profile.NAME.config.KEY]`;
+//   5. `-D KEY:name=value`.
+//
+// The root is set the same way, its `-D name=value` and its profile's
+// defines standing at 2 for the options it declares. Every value is checked
+// against the declaration, and so is every name: a setting nobody declared is
+// an error that lists what the package does declare.
+
+let profile_of o = option o :profile "debug";
+let has_profile m o = manifest.has_profile m (profile_of o);
+
+/// The program's defines: the root's own, the profile's, and the command
+/// line's, in the order that lets the command line win.
+let all_defines m o =
+    list.concat [manifest.defines m, manifest.profile_defines m (profile_of o), option o :defines []];
+
+/// Of those, the ones that are the program's rather than the root's options:
+/// a root that declares `fast` is configured by `-D fast`, and the program
+/// does not also get a `fast` of its own to leak into every package.
+let program_defines m o = {
+    let own = declared m;
+    list.filter (fn d -> own.[list.head (config.split_define d) else ()] == ()) (all_defines m o)
+};
+
+/// What a condition in a manifest reads besides options: the platform, `test`
+/// for a test build, and the program's defines -- the settings the compiler
+/// gives every module.
+let settings! m o = {
+    let p = to_string (os.platform ());
+    let os_name = str.slice 1 (str.byte_length p - 1) p;
+    let base = %{ "os" => os_name, "family" => if os_name == "windows" { "windows" } else { "unix" } };
+    let tested = if option o :dev false { base.["test" => true] } else { base };
+    list.fold (fn acc d -> match config.split_define d {
+        [n, v] => acc.[n => if str.contains_str "=" d { v } else { true }],
+    }) tested (program_defines m o)
+};
+
+/// The packages that have a manifest, root first, as `[key, manifest]`.
+let manifests m g =
+    list.cons [root_key, m]
+              (list.flat_map (fn n -> match node_manifest n { () => [], dm => [[node_key n, dm]] }) (nodes g));
+
+/// Who a setting came from, for a message.
+let setter_words key = match key { "" => "this project", k => "`" + k + "`" };
+
+/// `[values, errors]`: `values` a map of key to that package's settled
+/// options, for every package that declares any.
+let settle! m o g = {
+    let packages = manifests m g;
+    // Where each manifest is, as a message shows it.
+    let places = list.fold (fn acc [k, at] -> acc.[k => at]) (%{})
+                           (list.zip (list.map list.head packages)
+                                     (list.map shown! (list.map (fn p -> manifest.path (list.nth 1 p)) packages)));
+    let at k = places.[k else "mind.toml"];
+    let profile = profile_of o;
+    // The names a package answers to in a `[config.X]` or a `-D X:..`: the
+    // key it is listed under, and what it calls itself.
+    let names_of key pm = list.unique [if key == root_key { manifest.name pm } else { key }, manifest.name pm];
+    let addressed key pm = { let ns = names_of key pm; fn x -> list.contains x ns };
+    let every_name = list.flat_map (fn [k, pm] -> names_of k pm) packages;
+    let off_keys = list.map (fn e -> list.nth 1 e) (g.[:off else []]);
+    let known x = list.contains x every_name || list.contains x off_keys;
+    // A key nobody answers to is a typo, wherever it was written.
+    let stray = list.concat [
+        list.flat_map (fn [sk, sm] -> list.flat_map (fn [ck, _] ->
+            if known ck { [] }
+            else { ["[config." + ck + "] in " + at sk + ": no package here is called `" + ck + "`"] })
+            (manifest.configs sm)) packages,
+        list.flat_map (fn [ck, _] ->
+            if known ck { [] }
+            else { ["[profile." + profile + ".config." + ck + "] in " + at root_key
+                    + ": no package here is called `" + ck + "`"] })
+            (manifest.profile_configs m profile),
+        list.flat_map (fn [k, n, _] ->
+            if known k { [] } else { ["-D " + k + ":" + n + ": no package here is called `" + k + "`"] })
+            (option o :sets []),
+    ];
+    let settled = list.map (fn [key, pm] -> settle_one m o packages at key pm (addressed key pm)) packages;
+    [list.fold (fn acc [key, vs, _] -> if map_is_empty vs { acc } else { acc.[key => vs] }) (%{}) settled,
+     list.concat (list.cons stray (list.map (fn s -> list.nth 2 s) settled))]
+};
+
+let map_is_empty m = list.is_empty (map_pairs m);
+
+/// One package: `[key, values, errors]`. `at` says where a package's
+/// manifest is.
+let settle_one m o packages at key pm addressed = {
+    let [decls, derrs] = config.declarations (manifest.options pm);
+    let where = at key;
+    let who = if key == root_key { "this project" } else { "`" + key + "`" };
+    let own_defines = if key == root_key { all_defines m o } else { manifest.defines pm };
+    let [start, ierrs] = config.initial decls own_defines;
+    // One setting: `[values, errors]` with it applied, or its error added.
+    let apply [vs, errs] [name, raw, from] =
+        match decls.[name else ()] {
+            () => [vs, list.append errs [who + " has no option `" + name + "` (" + from + ")\n"
+                                         + config.listing decls]],
+            d => match config.check d raw {
+                [:ok, v] => [vs.[name => v], errs],
+                [:error, why] => [vs, list.append errs [why + " (" + from + ")"]],
+            },
+        };
+    let entries table from = list.map (fn [n, v] -> [n, v, from]) (map_pairs table);
+    let configured_by sk sm =
+        list.flat_map (fn [ck, table] -> if addressed ck { entries table ("[config." + ck + "] in " + at sk) } else { [] })
+                      (manifest.configs sm);
+    let from_root = configured_by root_key m;
+    let from_profile =
+        list.flat_map (fn [ck, table] ->
+            if addressed ck { entries table ("[profile." + profile_of o + ".config." + ck + "] in " + at root_key) }
+            else { [] })
+            (manifest.profile_configs m (profile_of o));
+    let from_cli = list.flat_map (fn [k, n, v] -> if addressed k { [[n, v, "-D " + k + ":" + n]] } else { [] })
+                                 (option o :sets []);
+    // The other packages' settings, which have to agree with each other on
+    // anything the root leaves unsaid.
+    let said = list.map (fn e -> list.head e) (list.concat [from_root, from_profile, from_cli]);
+    let others = list.flat_map (fn [sk, sm] ->
+        if sk == root_key || sk == key { [] }
+        else { list.map (fn e -> list.append e [sk]) (configured_by sk sm) }) packages;
+    let unsettled = list.filter (fn e -> not (list.contains (list.head e) said)) others;
+    let conflicts = list.flat_map (fn name -> {
+        let votes = list.filter (fn e -> list.head e == name) unsettled;
+        match list.unique (list.map (fn e -> config.shown (list.nth 1 e)) votes) {
+            [_, _, .._] => {
+                let said_as e = list.head e + " = " + toml.encode_value (list.nth 1 e);
+                let width = list.fold (fn w e -> { let n = str.byte_length (said_as e); if n > w { n } else { w } }) 0 votes;
+                [who + " is configured two ways, and this project does not say which:\n"
+                            + str.join_str "\n" (list.map (fn [n, v, from, sk] -> {
+                                  let l = said_as [n, v];
+                                  "  " + l + str.repeat (width - str.byte_length l) " " + "  by " + setter_words sk + " (" + from + ")"
+                              }) votes)
+                            + "\nsettle it in this project's [config." + key + "]"]
+            },
+            _ => [],
+        }
+    }) (list.unique (list.map (fn e -> list.head e) unsettled));
+    let layered = list.fold apply [start, []]
+                            (list.concat [list.map (fn e -> list.take 3 e) others, from_root, from_profile, from_cli]);
+    let [values, errs] = layered;
+    [key, values, list.concat [list.map (fn e -> where + ": " + e) derrs, ierrs, conflicts, errs]]
 };
 
 // --- the lock ------------------------------------------------------------------
@@ -407,8 +686,8 @@ let short c = if str.byte_length c > 10 { str.slice 0 10 c } else { c };
 /// The graph, checked against the lock and the lock brought up to date:
 /// what every command resolves through. `accept` is `mind update`'s: the
 /// commits have moved because it moved them, and the lock follows.
-let resolve! m dev accept =
-    match graph! m dev {
+let resolve! m o accept =
+    match graph! m o {
         [:error, why] => [:error, why],
         [:ok, g] => {
             let name = match manifest.name m { "" => "root", n => n };
@@ -418,7 +697,11 @@ let resolve! m dev accept =
             match [accept, lock.drift before now] {
                 [false, [e, ..more]] => [:error, drift_message before (list.cons e more)],
                 _ => {
-                    lock.save! root (lock.merge before now dev)
+                    // A walk that left something out -- the dev dependencies,
+                    // or an edge whose condition is off in this build -- keeps
+                    // what the lock says about it.
+                    let complete = option o :dev false && list.is_empty (g.[:off else []]);
+                    lock.save! root (lock.merge before now complete)
                     [:ok, g]
                 },
             }
@@ -491,8 +774,8 @@ let rec find_upwards! from name = {
 
 /// `[:ok, graph, [-L, dir, -L, dir, ..]]` -- the packages for one build: the
 /// standard library, then every dependency in the order it was found.
-let search_paths! m dev =
-    match resolve! m dev false {
+let search_paths! m o =
+    match resolve! m o false {
         [:error, why] => [:error, why],
         [:ok, g] => [:ok, g, repeated "-L" (list.cons (stdlib_root! ())
                                                       (list.map package_arg (nodes g)))],
@@ -510,7 +793,10 @@ let image m = util.join (target_dir m) (manifest.name m + ".dream");
 
 let options = %{ :compiler => (), :defines => [], :includes => [], :hosts => [],
                  :paths => [], :flags => [], :output => (), :extra => [],
-                 :verbose => false, :dev => false };
+                 :verbose => false, :dev => false,
+                 // `-D KEY:name=value`, as `[key, name, value]`; `--profile`;
+                 // and `--target`, as many as were given.
+                 :sets => [], :profile => "debug", :targets => [] };
 
 let with_option k v o = o.[k => v];
 let option o k default = o.[k else default];
@@ -566,7 +852,7 @@ let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
 /// takes the last of a repeated option: putting the command line last is what
 /// makes it win.
 let compile_args! m o =
-    match search_paths! m (option o :dev false) {
+    match search_paths! m o {
         [:error, why] => [:error, why],
         [:ok, g, paths] => [:ok, list.concat [
             [manifest.entry! m],
@@ -577,12 +863,38 @@ let compile_args! m o =
             repeated "--host-module"
                      (list.unique (list.concat [manifest.host_modules m, dep_hosts g,
                                                 option o :hosts []])),
-            repeated "-D" (list.append (manifest.defines m) (option o :defines [])),
+            setting_args m o g,
             ["-o", output_of m o],
             manifest.compiler_flags m,
+            manifest.profile_flags m (profile_of o),
             option o :extra [],
             option o :flags [],
         ]],
+    };
+
+/// What the program is compiled as: its defines, every package's options
+/// scoped to it, and where it may run. Every declared option is passed,
+/// defaults included, because that is what makes it scoped -- a package's
+/// `vendored = false` shadows a program-wide `vendored` -- and the root's are
+/// scoped too, under its own name.
+let setting_args m o g =
+    list.concat [
+        repeated "-D" (program_defines m o),
+        repeated "-D" (list.flat_map (fn [key, vs] -> {
+            let scope = if key == root_key { manifest.name m } else { key };
+            list.map (fn [n, v] -> scope + ":" + n + "=" + config.shown v) (map_pairs vs)
+        }) (map_pairs (g.[:options else (%{})]))),
+        repeated "--target" (targets m o),
+    ];
+
+/// Where the image may run: `--target`, then the profile's, then `[build]`'s.
+let targets m o =
+    match option o :targets [] {
+        [] => match manifest.profile_target m (profile_of o) {
+            [] => manifest.target m,
+            t => t,
+        },
+        t => t,
     };
 
 /// The command as it would be typed, for `--verbose` and for a bug report.
@@ -638,15 +950,18 @@ let compile! m o = {
 let root_of m = manifest.root m;
 
 /// The arguments a session is started with, without the compiler's own name.
-let repl_args m o =
+/// `settings` is what the program is compiled as (`setting_args`), which
+/// needs the graph when there is a project.
+let repl_args m o settings =
     list.concat [
         ["--repl"],
         repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
         repeated "-I" (list.append (manifest.includes m) (option o :includes [])),
         repeated "--host-module"
                  (list.append (manifest.host_modules m) (option o :hosts [])),
-        repeated "-D" (list.append (manifest.defines m) (option o :defines [])),
+        settings,
         manifest.compiler_flags m,
+        manifest.profile_flags m (profile_of o),
         option o :flags [],
     ];
 
@@ -676,19 +991,22 @@ let become_repl! m o args = {
 /// the entry file, and a session has no entry file to walk up from -- what it
 /// compiles is a scratch file somewhere else entirely -- so a `-L` on the root
 /// is what makes `import <this project>` work from the prompt.
-let repl! m o =
-    match search_paths! m true {
+let repl! m o = {
+    let dev = with_option :dev true o;
+    match search_paths! m dev {
         [:error, why] => [:error, why],
-        [:ok, _, paths] =>
-            become_repl! m o (list.concat [repl_args m o, paths, ["-L", root_of m]]),
-    };
+        [:ok, g, paths] =>
+            become_repl! m o (list.concat [repl_args m o (setting_args m dev g), paths, ["-L", root_of m]]),
+    }
+};
 
 /// A session outside one. The standard library is enough to explore the
 /// language with, and demanding a `mind.toml` before answering would make the
 /// quickest thing here the most ceremonious.
 let bare_repl! o =
     become_repl! manifest.empty o
-                 (list.append (repl_args manifest.empty o) ["-L", stdlib_root! ()]);
+                 (list.append (repl_args manifest.empty o (repeated "-D" (option o :defines [])))
+                              ["-L", stdlib_root! ()]);
 
 /// Run a built image, passing `args` to the program.
 let run_image! m o args = {

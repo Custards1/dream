@@ -127,6 +127,7 @@ test-mind: build
     ./{{dream}} /tmp/dream-mind-tests.dream
     ./{{dreams}} -L mind/std mind/tool/main.dr -o /tmp/dream-mind-graph.dream
     dream={{dream}} mind=/tmp/dream-mind-graph.dream mind/tool/tests/graph.sh
+    dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/options.sh
 
 clean:
     rm -rf {{build_dir}} build-nojit build-tsan

@@ -1,0 +1,388 @@
+// Options: the settings a package declares, the values they are given, and
+// the conditions that read them.
+//
+// A package says what it can be built as in `[options]`, each option with a
+// type and a default:
+//
+//     [options]
+//     vendored = { type = "bool", default = false, doc = "build sqlite from source" }
+//     threads  = { type = ["off", "single", "multi"], default = "multi" }
+//     cache_mb = 64
+//
+// and every value it is given, from wherever, is checked against that. An
+// option nobody declared, a value of the wrong type and a choice outside the
+// list are all errors that show the declarations: the common mistake is a
+// typo, and a setting that is quietly ignored is the worst answer to one.
+//
+// What is here is pure and knows nothing of the graph. Which value wins --
+// the default, the package's own defines, `[config.KEY]`, the profile, `-D`
+// -- is `build.settle`, because only the graph knows who depends on whom.
+//
+// The compiler is handed the result as `-D KEY:name=value`, every declared
+// option of every package, defaults included. Passing the defaults is what
+// makes an option *scoped*: a package's `vendored`, set, shadows any
+// program-wide `vendored`, so `when vendored` in that package reads the
+// package's answer even when the answer is no.
+
+import std.list;
+import std.str;
+import std.toml;
+
+// --- declarations -----------------------------------------------------------
+
+/// What an option holds: `:bool`, `:integer`, `:string`, or `[:choice, names]`.
+type Kind = :bool | :integer | :string | [:choice, [:string]];
+
+mapping Decl {
+    name : :string
+    // A `Kind`, which a field's annotation cannot name from inside the record.
+    kind
+    default
+    doc : :string = ""
+}
+
+/// The kind a manifest writes, as `type = ..` spells it.
+let kind_of : :any -> [:ok, Kind] | [:error, :string];
+let kind_of t =
+    match [type_of t, t] {
+        [:string, "bool"] => [:ok, :bool],
+        [:string, "integer"] => [:ok, :integer],
+        [:string, "string"] => [:ok, :string],
+        [:list, []] => [:error, "a list of choices needs at least one"],
+        [:list, cs] => if list.all (fn c -> type_of c == :string) cs { [:ok, [:choice, cs]] }
+                       else { [:error, "a list of choices must be strings"] },
+        _ => [:error, "`type` is \"bool\", \"integer\", \"string\", or a list of choices, not "
+                      + toml.encode_value t],
+    };
+
+/// How a kind reads in a message.
+let kind_words : Kind -> :string;
+let kind_words k =
+    match k {
+        [:choice, cs] => "one of " + str.join_str ", " (list.map toml.quote cs),
+        :bool => "bool",
+        :integer => "integer",
+        _ => "string",
+    };
+
+/// The value a kind starts from when a declaration gives none: off, and the
+/// first choice. A number or a string has no default worth guessing at.
+let implicit_default : Kind -> :any;
+let implicit_default k = match k { :bool => false, [:choice, [c, .._]] => c, _ => () };
+
+/// One `name = spec` line of `[options]`, or why it is not a declaration.
+/// A bare value is a declaration too: `vendored = false` is a `bool` that
+/// defaults to off, which is what most options are.
+let declare : :string -> :any -> [:ok, Decl] | [:error, :string];
+let declare name spec =
+    match type_of spec {
+        :bool => [:ok, Decl.make name :bool spec ""],
+        :integer => [:ok, Decl.make name :integer spec ""],
+        :string => [:ok, Decl.make name :string spec ""],
+        :map => match kind_of (spec.["type" else "bool"]) {
+            [:error, why] => [:error, "option `" + name + "`: " + why],
+            [:ok, k] => {
+                let doc = match spec.["doc" else ""] { d => to_string d };
+                match spec.["default" else ()] {
+                    () => match implicit_default k {
+                        () => [:error, "option `" + name + "` is " + kind_words k + " and needs a `default`"],
+                        d => [:ok, Decl.make name k d doc],
+                    },
+                    given => match check (Decl.make name k given doc) given {
+                        [:error, why] => [:error, "the default of `" + name + "` is not one: " + why],
+                        [:ok, v] => [:ok, Decl.make name k v doc],
+                    },
+                }
+            },
+        },
+        _ => [:error, "option `" + name + "` is declared with " + toml.encode_value spec
+                      + "; write `{ type = .., default = .. }`"],
+    };
+
+/// Every declaration in a manifest's `[options]`, as `[decls, errors]`, the
+/// declarations a map of name to `Decl`.
+let declarations : %{ :string => :any } -> [%{ :string => :any }, [:string]];
+let declarations section =
+    list.fold (fn [ds, errs] [name, spec] ->
+        match declare name spec {
+            [:ok, d] => [ds.[name => d], errs],
+            [:error, why] => [ds, list.append errs [why]],
+        }) [%{}, []] (map_pairs section);
+
+// --- values -----------------------------------------------------------------
+
+/// A value for `decl`, or why it is not one. What arrives from a manifest is
+/// already typed; what arrives from `-D` is text, and is read as the kind asks,
+/// so `-D sqlite:cache_mb=128` is a number and `-D sqlite:vendored` is `true`.
+let check : Decl -> :any -> [:ok, :any] | [:error, :string];
+let check decl v = {
+    let wrong = [:error, "`" + Decl.name decl + "` is " + kind_words (Decl.kind decl) + ", and "
+                         + toml.encode_value v + " is not"];
+    match [Decl.kind decl, type_of v] {
+        [:bool, :bool] => [:ok, v],
+        [:bool, :string] => match v { "true" => [:ok, true], "false" => [:ok, false], _ => wrong },
+        [:integer, :integer] => [:ok, v],
+        [:integer, :string] => match parse_int v { () => wrong, n => [:ok, n] },
+        [:string, :string] => [:ok, v],
+        [[:choice, cs], :string] => if list.contains v cs { [:ok, v] } else { wrong },
+        _ => wrong,
+    }
+};
+
+/// A value as `-D` and a condition write it.
+let shown : :any -> :string;
+let shown v =
+    match type_of v {
+        :bool => if v { "true" } else { "false" },
+        :string => v,
+        _ => to_string v,
+    };
+
+/// What a declaration accepts and what it is for, without its name.
+let summary : Decl -> :string;
+let summary d =
+    "(" + kind_words (Decl.kind d) + ", default " + toml.encode_value (Decl.default d) + ")"
+    + match Decl.doc d { "" => "", doc => "  " + doc };
+
+/// One declaration, the way an error lists what a package accepts.
+let describe : Decl -> :string;
+let describe d = Decl.name d + " " + summary d;
+
+/// Every declaration of a package, for the end of a message about it.
+let listing : %{ :string => :any } -> :string;
+let listing decls =
+    match map_pairs decls {
+        [] => "it declares no options",
+        pairs => "its options:\n" + str.join_str "\n" (list.map (fn [_, d] -> "  " + describe d)
+                                                                (list.sort_on (fn [n, _] -> n) pairs)),
+    };
+
+/// `name` or `name=value`, as `[name, value]`: a bare name is `true`, which is
+/// how a define turns a `bool` option on.
+let split_define : :string -> [:string, :any];
+let split_define text =
+    match str.find "=" text {
+        at if at >= 0 => [str.slice 0 at text, str.slice (at + 1) (str.byte_length text - at - 1) text],
+        _ => [text, "true"],
+    };
+
+/// `KEY:name[=value]`, as `[key, name, value]`, or `()` for a define that is
+/// the program's rather than a package's. The colon is what marks a scope,
+/// and it only counts before any `=`: `-D path=a:b` is a program setting.
+let split_scoped : :string -> [:string, :string, :any] | :unit;
+let split_scoped text = {
+    let eq = str.find "=" text;
+    let lhs = if eq < 0 { text } else { str.slice 0 eq text };
+    match str.find ":" lhs {
+        at if at > 0 => {
+            let [name, value] = split_define (str.slice (at + 1) (str.byte_length text - at - 1) text);
+            [str.slice 0 at text, name, value]
+        },
+        _ => (),
+    }
+};
+
+/// The values a package starts from: every default, then its own `[build]
+/// defines` for the options they name. `[values, errors]`.
+let initial : %{ :string => :any } -> [:string] -> [%{ :string => :any }, [:string]];
+let initial decls defines = {
+    let defaults = list.fold (fn m [n, d] -> m.[n => Decl.default d]) (%{}) (map_pairs decls);
+    list.fold (fn [vs, errs] text -> {
+        let [name, raw] = split_define text;
+        match decls.[name else ()] {
+            () => [vs, errs],
+            d => match check d raw {
+                [:ok, v] => [vs.[name => v], errs],
+                [:error, why] => [vs, list.append errs [why + " ([build] defines)"]],
+            },
+        }
+    }) [defaults, []] defines
+};
+
+// --- conditions ---------------------------------------------------------------
+//
+// `when = "not vendored"` on a dependency is the compiler's condition grammar,
+// read here because `mind` decides the edge before the compiler is ever run:
+// `true`, `false`, a name, `name == "value"`, `name != "value"`, `not`, `&&`,
+// `||` and parentheses. A dotted name is another package's option. The tree is
+// the one the compiler's parser builds, so the two cannot drift in meaning.
+
+let is_name_char : :char -> :bool;
+let is_name_char c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                     || c == '_' || c == '.';
+
+let rec lex_string cs acc =
+    match cs {
+        [] => [:error, "a string in a condition is not closed"],
+        ['"', ..rest] => [:ok, str.of_chars (list.reverse acc), rest],
+        [c, ..rest] => lex_string rest (list.cons c acc),
+    };
+
+/// The tokens of a condition: `[:name, s]`, `[:str, s]`, and the operators as
+/// atoms.
+let rec lex cs acc =
+    match cs {
+        [] => [:ok, list.reverse acc],
+        [' ', ..rest] => lex rest acc,
+        ['\t', ..rest] => lex rest acc,
+        ['(', ..rest] => lex rest (list.cons :lparen acc),
+        [')', ..rest] => lex rest (list.cons :rparen acc),
+        ['=', '=', ..rest] => lex rest (list.cons :eq acc),
+        ['!', '=', ..rest] => lex rest (list.cons :ne acc),
+        ['&', '&', ..rest] => lex rest (list.cons :and acc),
+        ['|', '|', ..rest] => lex rest (list.cons :or acc),
+        ['"', ..rest] => match lex_string rest [] {
+            [:ok, s, more] => lex more (list.cons [:str, s] acc),
+            e => e,
+        },
+        [c, ..rest] => if is_name_char c {
+                           let word = list.take_while is_name_char cs;
+                           lex (list.drop (list.length word) cs) (list.cons [:name, str.of_chars word] acc)
+                       }
+                       else { [:error, "`" + str.of_chars [c] + "` cannot be in a condition"] },
+    };
+
+let rec parse_or ts =
+    match parse_and ts {
+        [:ok, l, [:or, ..rest]] => match parse_or rest {
+            [:ok, r, more] => [:ok, [:or, l, r], more],
+            e => e,
+        },
+        other => other,
+    };
+
+let rec parse_and ts =
+    match parse_unary ts {
+        [:ok, l, [:and, ..rest]] => match parse_and rest {
+            [:ok, r, more] => [:ok, [:and, l, r], more],
+            e => e,
+        },
+        other => other,
+    };
+
+let rec parse_unary ts =
+    match ts {
+        [[:name, "not"], ..rest] => match parse_unary rest {
+            [:ok, e, more] => [:ok, [:not, e], more],
+            e => e,
+        },
+        [:lparen, ..rest] => match parse_or rest {
+            [:ok, e, [:rparen, ..more]] => [:ok, e, more],
+            [:ok, _, _] => [:error, "a `(` in the condition is not closed"],
+            e => e,
+        },
+        [[:name, "true"], ..rest] => [:ok, [:const, true], rest],
+        [[:name, "false"], ..rest] => [:ok, [:const, false], rest],
+        [[:name, n], :eq, [:str, v], ..rest] => [:ok, [:equals, n, v], rest],
+        [[:name, n], :ne, [:str, v], ..rest] => [:ok, [:not, [:equals, n, v]], rest],
+        [[:name, n], :eq, [:name, v], ..rest] => [:ok, [:equals, n, v], rest],
+        [[:name, n], :ne, [:name, v], ..rest] => [:ok, [:not, [:equals, n, v]], rest],
+        [[:name, n], ..rest] => [:ok, [:flag, n], rest],
+        [] => [:error, "the condition ends where a name was expected"],
+        _ => [:error, "expected a name, `not` or `(` in the condition"],
+    };
+
+/// A condition from its text, or why it is not one.
+let parse_condition : :string -> [:ok, :any] | [:error, :string];
+let parse_condition text =
+    match lex (str.chars text) [] {
+        [:error, why] => [:error, why],
+        [:ok, ts] => match parse_or ts {
+            [:ok, cond, []] => [:ok, cond],
+            [:ok, _, _] => [:error, "the condition has more after its end"],
+            e => e,
+        },
+    };
+
+/// Every name a condition reads.
+let rec names cond =
+    match cond {
+        [:flag, n] => [n],
+        [:equals, n, _] => [n],
+        [:not, c] => names c,
+        [:and, l, r] => list.append (names l) (names r),
+        [:or, l, r] => list.append (names l) (names r),
+        _ => [],
+    };
+
+/// Is an option's value on? `false`, and an option nobody set, are off.
+let on : :any -> :bool;
+let on v = v != () && v != false && v != "false";
+
+/// Evaluate a condition. `option name` answers `[:ok, value]` for a name that
+/// is a package option and `()` for one that is not; `settings` is the
+/// program's, a map of name to value with `true` for a bare flag.
+let rec holds option settings cond =
+    match cond {
+        [:const, b] => b,
+        [:flag, n] => match option n {
+            [:ok, v] => on v,
+            _ => settings.[n else ()] != (),
+        },
+        [:equals, n, lit] => match option n {
+            [:ok, v] => v != () && shown v == lit,
+            _ => match settings.[n else ()] {
+                () => false,
+                true => false,
+                v => shown v == lit,
+            },
+        },
+        [:not, c] => not (holds option settings c),
+        [:and, l, r] => holds option settings l && holds option settings r,
+        [:or, l, r] => holds option settings l || holds option settings r,
+        _ => false,
+    };
+
+when test {
+    import std.test;
+
+    let decl_of name spec = list.nth 1 (declare name spec);
+    let cond text = list.nth 1 (parse_condition text);
+    let none n = ();
+
+    let tests = [
+        test.case "a declaration with a type and a default"
+            $( test.eq! [:bool, false, "from source"]
+                        { let d = decl_of "v" (%{ "type" => "bool", "default" => false, "doc" => "from source" });
+                          [Decl.kind d, Decl.default d, Decl.doc d] } ),
+        test.case "a bare value declares its own type"
+            $( test.eq! [:integer, 64] { let d = decl_of "c" 64; [Decl.kind d, Decl.default d] } ),
+        test.case "choices default to the first"
+            $( test.eq! "off" (Decl.default (decl_of "t" (%{ "type" => ["off", "on"] }))) ),
+        test.case "a number needs a default"
+            $( test.eq! :error (list.head (declare "n" (%{ "type" => "integer" }))) ),
+        test.case "a default of the wrong type is refused"
+            $( test.eq! :error (list.head (declare "n" (%{ "type" => "integer", "default" => "x" }))) ),
+        test.case "an unknown type is refused"
+            $( test.eq! :error (list.head (declare "n" (%{ "type" => "float" }))) ),
+        test.case "text from -D is read as the kind asks"
+            $( test.eq! [[:ok, true], [:ok, 128], [:ok, "multi"]]
+                        [check (decl_of "v" false) "true", check (decl_of "c" 64) "128",
+                         check (decl_of "t" (%{ "type" => ["off", "multi"] })) "multi"] ),
+        test.case "a choice outside the list is refused"
+            $( test.eq! :error (list.head (check (decl_of "t" (%{ "type" => ["off"] })) "on")) ),
+        test.case "a scoped define splits at the colon"
+            $( test.eq! [["sqlite", "threads", "off"], ["sqlite", "vendored", "true"], ()]
+                        [split_scoped "sqlite:threads=off", split_scoped "sqlite:vendored",
+                         split_scoped "path=a:b"] ),
+        test.case "a package's own defines set its options, and only those"
+            $( test.eq! %{ "v" => true, "c" => 8 }
+                        (list.head (initial (%{ "v" => decl_of "v" false, "c" => decl_of "c" 64 })
+                                            ["v", "c=8", "unrelated"])) ),
+        test.case "conditions parse to the compiler's tree"
+            $( test.eq! [[:not, [:flag, "vendored"]],
+                         [:and, [:equals, "threads", "off"], [:not, [:equals, "sqlite.mode", "x"]]],
+                         [:or, [:flag, "a"], [:and, [:flag, "b"], [:flag, "c"]]]]
+                        [cond "not vendored", cond "threads == \"off\" && sqlite.mode != \"x\"",
+                         cond "a || (b && c)"] ),
+        test.case "a condition that does not end is refused"
+            $( test.eq! [:error, :error] [list.head (parse_condition "a b"), list.head (parse_condition "(a")] ),
+        test.case "an option answers before the program's settings"
+            $( test.eq! [false, true, true]
+                        [holds (fn n -> [:ok, false]) (%{ "v" => true }) [:flag, "v"],
+                         holds none (%{ "v" => true }) [:flag, "v"],
+                         holds (fn n -> [:ok, 64]) (%{}) [:equals, "c", "64"]] ),
+        test.case "a flag has no value to compare"
+            $( test.false! (holds none (%{ "test" => true }) [:equals, "test", "true"]) ),
+    ];
+}

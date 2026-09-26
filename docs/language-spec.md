@@ -1147,6 +1147,18 @@ Everything else comes from `-D name`, `-D name=value`, `--test` (defines
 `test`), `--release` (defines `release`), and `--debug-cfg` (defines `debug`).
 `dreams --print-cfg` prints the lot.
 
+A package's **options** are settings scoped to it. `-D sqlite:vendored` and
+`-D sqlite:threads=off` set them for the modules of the package `sqlite`
+(named by its own name or by the key it was listed under) and for nobody
+else. Inside `sqlite`, `when vendored` reads its own option first and the
+program's settings only when it has no option of that name. An option whose
+value is `false` is off, which is how a `bool` option says no, so it shadows a
+program-wide `vendored` rather than falling through to it. Any module may read
+another package's option by its dotted name, `when sqlite.threads == "off"`,
+and a dotted name nobody set is off. A `-D KEY:..` whose key names no package
+is an error. `mind` passes every declared option of every package this way,
+defaults included, from `[options]` and `[config.KEY]` ([build](build.md)).
+
 ---
 
 ## 8. Modules and packages
@@ -1947,7 +1959,7 @@ dreams FILE [-o OUT.dream] [options]
 | `-I`, `--include DIR` | add a module search directory |
 | `-L`, `--package-path DIR` | add a package search root; `NAME=DIR` adds the package at `DIR`, importable as `NAME` |
 | `--host-module PATH` | a module the host registers at run time (repeatable) |
-| `-D`, `--define NAME[=VALUE]` | define a `when` flag |
+| `-D`, `--define NAME[=VALUE]` | define a `when` flag; `KEY:NAME[=VALUE]` sets package `KEY`'s option |
 | `--target SPEC` | where the image may run: `os=NAME,arch=NAME` or bare names, repeatable; `any` records nothing ([platforms](platforms.md)) |
 | `--test` | define `test` and generate a runner (see below) |
 | `--release` / `--debug-cfg` | define `release` / `debug` |

@@ -2276,8 +2276,9 @@ let rec parse_cfg_unary c ts =
     else if is_kw ts "true"  { ok [:const, true] (list.tail ts) }
     else if is_kw ts "false" { ok [:const, false] (list.tail ts) }
     else if at ts :ident {
-        let name = peek_value ts;
-        let rest = list.tail ts;
+        // `sqlite.vendored` is another package's option, so a name may be
+        // dotted; the dots are kept in it, and `config` splits it.
+        let [name, rest] = cfg_name (peek_value ts) (list.tail ts);
         // `os == "linux"` compares a setting; a bare name asks whether a flag
         // is defined. A setting that has a value counts as defined.
         if at rest :eq_eq && peek_kind (list.tail rest) == :str {
@@ -2286,6 +2287,13 @@ let rec parse_cfg_unary c ts =
         else { ok [:flag, name] rest }
     }
     else { err ("expected a `when` condition, found " + describe ts) (peek_span ts) };
+
+/// `a.b.c` in a condition, as `["a.b.c", rest]`.
+let rec cfg_name name ts =
+    if at ts :dot && peek_kind (list.tail ts) == :ident {
+        cfg_name (name + "." + peek_value (list.tail ts)) (list.tail (list.tail ts))
+    }
+    else { [name, ts] };
 
 /// The items of a file, or of a `mod`/`when` body when `braced` is true.
 let rec item_list c acc ts braced =
@@ -2762,6 +2770,9 @@ when test {
                         (items "mod math { let square x = x }") ),
         test.case "when with a flag"
             $( test.eq! "(when (flag test) (let x (int 1)))" (items "when test { let x = 1 }") ),
+        test.case "a when condition may name another package's option"
+            $( test.eq! "(when (equals sqlite.threads \"off\") (let x (int 1)))"
+                        (items "when sqlite.threads == \"off\" { let x = 1 }") ),
         test.case "when with a single item and no braces"
             $( test.eq! "(when (flag release) (let x (int 1)))" (items "when release let x = 1;") ),
         test.case "a when condition uses the language's own vocabulary"

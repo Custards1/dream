@@ -516,6 +516,13 @@ An option is set, a later place winning over an earlier:
 4. the active profile's `[profile.NAME.config.KEY]`;
 5. `mind build -D KEY:name=value`.
 
+`mind` hands the compiler every declared option of every package, defaults
+included, and the root's under its own name. Passing the defaults is what
+makes an option scoped: a package's `vendored = false` shadows a program-wide
+`vendored` where a missing one would fall through to it. An option whose
+value is `false` is off. A plain `-D name` for an option the root declares
+sets the option rather than defining a program-wide flag.
+
 Every value is checked against the declaration. An option the package does
 not declare, a value of the wrong type, and a choice outside the list are
 errors that give the declaration. A typo in a key or a name is the common
@@ -541,6 +548,17 @@ sqlite_sys = { path = "../sqlite-sys", when = "not vendored" }
 options once they are settled, and an edge whose condition is false is not
 in the graph: not fetched, not built, and not a conflict.
 
+The two decide each other: an edge reads the options of the package listing
+it, and those are set by the packages depending on it, which are only known
+once the graph is. So `mind` walks with the options it assumes (the defaults
+at first), settles them over the graph that came out, and walks again if a
+condition read a value that settling changed. A real graph settles in two
+walks; one that has not settled in eight is reported as a loop, an edge that
+configures its own condition off. A `[config.KEY]` for a package whose edge is
+off is not a typo. A package has one set of options per build, whichever
+program it is compiled into, so an edge in a build script's graph reads the
+program's settled values.
+
 The compiler takes a scoped setting as `-D KEY:name=value`. It is a colon
 because a key may contain dots and a name may not. `--print-cfg` shows each
 package's settings under its key.
@@ -560,7 +578,9 @@ threads = "multi"
 ```
 
 `mind build --profile release` (and `--release` for that one) picks it.
-`debug` is the default. The profile is `ctx.profile` in every script and part
+`debug` is the default. `debug` and `release` exist whether they are declared
+or not, and an undeclared `release` defines `release`, which is what
+`--release` meant before profiles existed. `--debug` is still just `-D debug`. The profile is `ctx.profile` in every script and part
 of every step's key, so switching profiles and back reuses both builds. A
 dependency's profiles are ignored: how the program is built is the root's
 decision, as it is in every other build tool that has profiles.
@@ -665,9 +685,11 @@ they are built says is not optional.
    requirements and `std.version`, revision conflicts reported as such,
    three kinds of edge, and `mind.lock`. None of this needs build scripts,
    and every project with dependencies wants it now.
-5. **Options and profiles.** `[options]`, `[config.KEY]`, scoped
+5. **Options and profiles. Built.** `[options]`, `[config.KEY]`, scoped
    `-D KEY:name=value`, conditions evaluated per package, dotted names in
-   `when`, conditional dependencies, and `[profile.*]`.
+   `when`, conditional dependencies, `[profile.*]`, `[build] target`, and
+   `mind options`. What is left for item 6 is `ctx.options` and a script's
+   `build.define`, since there are no scripts to hand them to yet.
 6. **`mind` runs scripts.** Script discovery, `[build-dependencies]`, drivers, outcome
    reuse, folding outcomes into the compile, `--target` and `-j`.
 7. **Tools.** `cc`, `probe` and `fetch`, and `dream/tests/ffi` rebuilt as a

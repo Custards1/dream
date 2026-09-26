@@ -133,7 +133,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Works on flat types in this rank order: integers and floats (numerically), chars, bools, atoms, strings, unit. A bigstr ranks with the strings and compares by its bytes. Values of different types order by their type rank. |
+| `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
 
 ### Large data
 

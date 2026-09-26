@@ -105,6 +105,63 @@ let compiler m = toml.get () (doc m) "build" "compiler";
 /// Where the built image goes. `target/<name>.dream` unless the manifest says.
 let output m = toml.get () (doc m) "build" "output";
 
+/// Where the image may run: `[build] target`, as `--target` takes it, one
+/// entry per `--target`. `any`, `linux`, `["linux", "macos"]`.
+let target m = build_list m "target";
+
+// --- options, configuration and profiles ----------------------------------------
+//
+// `[options]` is what this package can be built as, `[config.KEY]` is how it
+// builds a package it depends on however deep, and `[profile.NAME]` is a
+// named way to build the whole program. TOML hands a dotted header back as the
+// one section name `config.sqlite`, so each of these is found by its prefix.
+// config.dr says what the values mean and build.settle who wins.
+
+/// The `[options]` table, as written.
+let options m = toml.section (doc m) "options";
+
+/// The sections whose name is `prefix` followed by one more part, as
+/// `[[part, table], ..]`: `[config.sqlite]` is `["sqlite", ..]` under `config.`.
+let sections_under m prefix =
+    list.flat_map (fn [name, table] ->
+        if str.starts_with prefix name {
+            let rest = str.slice (str.byte_length prefix) (str.byte_length name - str.byte_length prefix) name;
+            if str.is_empty rest || str.contains_str "." rest { [] } else { [[rest, table]] }
+        } else { [] })
+        (map_pairs (doc m));
+
+/// `[[key, table], ..]` from every `[config.KEY]`.
+let configs m = sections_under m "config.";
+
+/// The profiles a manifest declares, by name.
+let profiles m = list.map (fn [n, _] -> n) (sections_under m "profile.");
+
+/// Is `name` a profile this manifest can be built with? `debug` and `release`
+/// always are, declared or not.
+let has_profile m name =
+    name == "debug" || name == "release" || map_has (doc m) ("profile." + name);
+
+/// A list-valued key of `[profile.NAME]`, read as `[build]`'s are. An
+/// undeclared `release` defines `release`, which is what `--release` has
+/// always meant; a declared one says for itself.
+let profile_list m name key = {
+    let section = "profile." + name;
+    match [map_has (doc m) section, name, key] {
+        [false, "release", "defines"] => ["release"],
+        _ => match toml.get () (doc m) section key {
+            () => [],
+            v => match type_of v { :list => v, _ => [v] },
+        },
+    }
+};
+
+let profile_defines m name = profile_list m name "defines";
+let profile_flags m name = profile_list m name "flags";
+let profile_target m name = profile_list m name "target";
+
+/// `[[key, table], ..]` from every `[profile.NAME.config.KEY]`.
+let profile_configs m name = sections_under m ("profile." + name + ".config.");
+
 // --- dependencies -------------------------------------------------------------
 //
 // A dependency is `[key, spec]`, and the spec is always a map by the time
@@ -201,6 +258,10 @@ let dep_rev d =
         [(), r, _] => [:rev, r],
         [t, _, _] => [:tag, t],
     };
+
+/// The condition it hangs on, as written (`"not vendored"`), or `()` when
+/// it is always there. Read against the options of the package listing it.
+let dep_condition d = match spec_get d "when" { () => (), c => to_string c };
 
 /// Which versions it accepts, as written (`"^1.2"`), or `()` for any. Only
 /// the long form can say: `json = { git = .., tag = .., version = "^1.2" }`.
@@ -390,6 +451,25 @@ when test {
             $( test.eq! () (output (of "[package]\nname = \"d\"")) ),
         test.case "flags are passed through as written"
             $( test.eq! ["-q"] (compiler_flags (of "[build]\nflags = [\"-q\"]")) ),
+
+        // --- options, configuration and profiles ---
+        test.case "each [config.KEY] is a table under its key"
+            $( test.eq! [["sqlite", %{ "threads" => "off" }]]
+                        (configs (of "[config.sqlite]\nthreads = \"off\"\n[profile.release.config.x]\na = 1")) ),
+        test.case "a profile's config is its own"
+            $( test.eq! [["x", %{ "a" => 1 }]]
+                        (profile_configs (of "[config.sqlite]\nt = 1\n[profile.release.config.x]\na = 1") "release") ),
+        test.case "declared profiles, and the two that always exist"
+            $( test.eq! [["bench"], true, true, false]
+                        { let m = of "[profile.bench]\nflags = [\"-q\"]";
+                          [profiles m, has_profile m "debug", has_profile m "bench", has_profile m "fast"] } ),
+        test.case "an undeclared release defines release; a declared one says for itself"
+            $( test.eq! [["release"], [], ["fast"]]
+                        [profile_defines (of "") "release", profile_defines (of "") "debug",
+                         profile_defines (of "[profile.release]\ndefines = \"fast\"") "release"] ),
+        test.case "a dependency may hang on a condition"
+            $( test.eq! "not vendored"
+                        (dep_condition (dep_of "[dependencies]\na = { path = \"../a\", when = \"not vendored\" }")) ),
 
         // --- dependencies ---
         test.case "a path dependency"

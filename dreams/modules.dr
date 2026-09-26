@@ -85,9 +85,10 @@ let module_items m = Module.items m;
 
 // --- the loader --------------------------------------------------------------
 
-let loader packages cfg search_paths host_modules =
-    %{ :packages => packages, :config => cfg, :search_paths => search_paths,
-       :host_modules => host_modules,
+let loader packages cfg search_paths host_modules = {
+    let [scoped, unknown] = scoped_config packages cfg;
+    %{ :packages => packages, :config => scoped, :unknown_scopes => unknown,
+       :search_paths => search_paths, :host_modules => host_modules,
        // Dependencies first, so a later pass never meets a module before what
        // it uses. That ordering is the reason a module is recorded only once
        // everything it imports has been -- and it is why the table is keyed by
@@ -106,10 +107,34 @@ let loader packages cfg search_paths host_modules =
        // file that changes is the buffer being edited, and re-lexing and
        // re-parsing every reachable module on every keystroke is the whole cost
        // of answering one -- so a same-text hit skips the parse entirely.
-       :parsed => %{} };
+       :parsed => %{} }
+};
+
+/// The configuration with every package's options filed under the name it
+/// goes by, now that the packages are known, and every `-D KEY:..` whose key
+/// names none of them.
+let scoped_config ps cfg = {
+    let aliases = list.fold (fn m [n, i] -> m.[n => package.name (package.at ps i)])
+                            (%{}) (map_pairs (package.by_name ps));
+    config.with_aliases aliases (fn k -> package.find ps k != ()) cfg
+};
 
 let packages l     = l.[:packages else package.empty];
 let config_of l    = l.[:config else config.empty];
+
+/// The package module `name` belongs to: the one its first segment names,
+/// which is how it was found, and otherwise the one the root file is in.
+let owner_of l name = {
+    let ps = packages l;
+    match package.find ps (list.head (dotted_segments name)) {
+        () => match package.current ps { () => (), p => package.name p },
+        p => package.name p,
+    }
+};
+
+/// What a `when` in module `name` is evaluated against: the program's
+/// settings, with its own package's options in front of them.
+let config_in l name = config.within (owner_of l name) (config_of l);
 let search_paths l = l.[:search_paths else []];
 let host_modules l = l.[:host_modules else []];
 /// Every module that was loaded, in order. Derived, because the table it
@@ -464,7 +489,7 @@ let rec record_items cfg items =
 /// the compiler reads it: `owner + "." + name` is the module the rewrite made.
 let note_records owner items l =
     put :records (records l + list.map (fn r -> list_cons owner r)
-                                       (record_items (config_of l) items)) l;
+                                       (record_items (config_in l owner) items)) l;
 
 /// The settings the `when` conditions among these items read: each condition
 /// that is evaluated, and inside a branch only when the branch is taken --
@@ -480,8 +505,8 @@ let rec when_reads cfg items =
 
 /// Remember what the conditions in these items read. Most files have none, and
 /// then the table is left exactly as it was.
-let note_reads items l =
-    match when_reads (config_of l) items {
+let note_reads name items l =
+    match when_reads (config_in l name) items {
         [] => l,
         rs => put_reads (list.fold (fn m r -> m.[r => true]) (l.[:reads else (%{})]) rs) l,
     };
@@ -508,7 +533,7 @@ let rec foreign_items cfg items =
 /// compiler reads this either.
 let note_foreigns owner items l =
     put :foreigns (foreigns l + list.map (fn f -> list_cons owner f)
-                                         (foreign_items (config_of l) items)) l;
+                                         (foreign_items (config_in l owner) items)) l;
 
 // --- loading -----------------------------------------------------------------
 
@@ -690,7 +715,7 @@ let rec hoist_mod! l parent source m =
             else {
                 // Its own `when`s and nested `mod`s, resolved the way a file's
                 // are: by the time this is recorded it is an ordinary module.
-                let kept = expand_items (config_of l) items;
+                let kept = expand_items (config_in l full) items;
                 let nested = list.fold (fn acc item ->
                     match item {
                         [:mod, _, _, _] => {
@@ -698,7 +723,7 @@ let rec hoist_mod! l parent source m =
                             [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                         },
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                    }) [note_reads items (note_foreigns full items (note_records full items l)), []] kept;
+                    }) [note_reads full items (note_foreigns full items (note_records full items l)), []] kept;
                 let inner_items = list.nth 1 nested;
 
                 // A submodule may import, so follow those before it is recorded.
@@ -858,8 +883,8 @@ let load_items! l source parsed display name file text = {
         [:error, message, span] => complain span message source l,
         [:ok, items, sites] => {
             // Resolve `when` before anything else looks at the module.
-            let kept = expand_items (config_of l) items;
-            let noted = note_reads items
+            let kept = expand_items (config_in l name) items;
+            let noted = note_reads name items
                             (note_foreigns name items (note_records name items (note_expanding source sites l)));
 
             // A `mod name { .. }` is a module written inside another. Register
@@ -954,9 +979,16 @@ let load_root! l file test_mode = {
     // Name the root the way any other module in its package would be, so that a
     // module's identity does not depend on it being the entry point.
     let name = canonical_name! l file (path.stem file);
-    let loaded_all = load_file! l file name ast.no_span 0;
+    let loaded_all = unknown_scopes (load_file! l file name ast.no_span 0);
     if test_mode { add_test_runner! loaded_all } else { loaded_all }
 };
+
+/// Report every `-D KEY:name` whose key is no package here.
+let unknown_scopes l =
+    list.fold (fn acc k ->
+        complain_note ast.no_span ("-D " + k + ":.. sets an option of `" + k + "`, and no package is called that")
+                      ("known packages: " + comma_list (package.names (packages l))) 0 acc)
+              l (l.[:unknown_scopes else []]);
 
 /// The session form of `load_root!`: a loader that already holds a program is
 /// given the root file again, and the root is re-read in place at the *same*

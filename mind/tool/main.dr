@@ -23,8 +23,10 @@ import std.io;
 import std.list;
 import std.os;
 import std.str;
+import std.toml;
 
 import build;
+import config;
 import fetch;
 import manifest;
 import util;
@@ -43,9 +45,11 @@ let opts = [
     cli.list_of "" "host-module" "PATH" "a module the host provides at run time",
 
     cli.section "what to compile it as",
-    cli.list_of "D" "define" "NAME[=V]" "define a `when` flag, or set a `when` value",
-    cli.flag "" "release" "define `release`",
+    cli.list_of "D" "define" "NAME[=V]" "define a `when` flag or value; KEY:NAME[=V] sets KEY's option",
+    cli.value "" "profile" "NAME" "build with [profile.NAME] (default: debug)",
+    cli.flag "" "release" "the same as --profile release",
     cli.flag "" "debug" "define `debug`",
+    cli.list_of "" "target" "PLATFORM" "where the image may run: linux, os=macos,arch=arm64, any",
     cli.list_of "f" "flag" "ARG" "pass this to the compiler as written",
 
     cli.section "adding a dependency",
@@ -79,6 +83,7 @@ let command_spec = [
     cli.command "deps"  "list every package this project resolves to" [],
     cli.command "tree"  "show the dependency tree" [],
     cli.command "info"  "show what this build would run, without running it" [],
+    cli.command "options" "every package's options, and what this build sets them to" [],
     cli.command "clean" "remove target/" [],
     cli.command "help"  "this message" [],
 ];
@@ -128,6 +133,29 @@ command-line spelling that wins over it:
 The compiler is chosen in this order: --compiler, then [build] compiler, then
 $DREAMS, then `dreams.dream` from the installation. A name ending
 in `.dream` is an image and is run by the VM; anything else is executed.
+
+A package declares what it can be built as, and a project configures the
+packages it depends on, however deep:
+
+  [options]                                           # this package's own
+  vendored = { type = \"bool\", default = false, doc = \"build from source\" }
+  threads  = { type = [\"off\", \"multi\"], default = \"multi\" }
+
+  [config.sqlite]                                     # a dependency's
+  threads = \"off\"
+
+  [dependencies]
+  sqlite_sys = { path = \"../sqlite-sys\", when = \"not vendored\" }
+
+  [profile.release]                                   # mind build --release
+  defines = [\"release\"]
+  flags   = [\"--no-types\"]
+  [profile.release.config.sqlite]
+  threads = \"multi\"
+
+`when vendored` in a package's code reads that package's option, and
+`when sqlite.vendored` another's. `-D sqlite:threads=off` sets one from the
+command line, and `mind options` shows them all.
 
 `mind run -- ARGS` passes ARGS to the program rather than to mind.
 
@@ -256,6 +284,7 @@ let cmd_info! m o = {
     console.print! ("  root     " + to_string (manifest.root m))
     console.print! ("  entry    " + to_string (manifest.entry! m))
     console.print! ("  output   " + to_string (build.output_of m o))
+    console.print! ("  profile  " + to_string (build.profile_of o))
     console.print! ("  compiler " + to_string (build.choose_compiler! m (build.option o :compiler ())))
     match build.command_line! m o {
         [:ok, line] => console.print! ("  command  " + line),
@@ -263,9 +292,38 @@ let cmd_info! m o = {
     }
 };
 
+/// Every package's options: what each declares, and what this build sets it
+/// to. A setting has five places it can come from, so "what is `threads`
+/// going to be?" deserves an answer that does not need them all read.
+let cmd_options! m o = {
+    let g = graph_of! m o;
+    let values = g.[:options else (%{})];
+    let show! key dm = {
+        let decls = build.declared dm;
+        match map_pairs decls {
+            [] => (),
+            pairs => {
+                console.print! (match key { "" => to_string (manifest.name m) + " (this project)", k => k })
+                let lines = list.map (fn [n, d] ->
+                    [n + " = " + toml.encode_value ((values.[key else (%{})]).[n else config.Decl.default d]),
+                     config.summary d]) (list.sort_on (fn [n, _] -> n) pairs);
+                let width = list.fold (fn w [l, _] -> if str.byte_length l > w { str.byte_length l } else { w }) 0 lines;
+                list.map (fn [l, why] -> console.print! ("  " + l + str.repeat (width - str.byte_length l + 4) " " + why))
+                         lines |> strict!
+                ()
+            },
+        }
+    };
+    show! build.root_key m
+    strict! (list.map (fn n -> match build.node_manifest n { () => (), dm => show! (build.node_key n) dm })
+                      (build.nodes g))
+    if map_pairs values == [] { console.print! "no package in this build declares an option" }
+    :ok
+};
+
 /// Load the graph, or stop with the reason.
-let graph_of! m dev =
-    match build.resolve! m dev false {
+let graph_of! m o =
+    match build.resolve! m (build.with_option :dev true o) false {
         [:error, why] => fail! why,
         [:ok, g] => g,
     };
@@ -285,9 +343,9 @@ let describe n = {
     key + version + called + "  " + manifest.dep_source (build.node_dep n)
 };
 
-let cmd_deps! m = {
+let cmd_deps! m o = {
     console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
-    let g = graph_of! m true;
+    let g = graph_of! m o;
     let ns = build.nodes g;
     if list.is_empty ns { console.print! "  (no dependencies)" }
     let dev_keys = list.map manifest.dep_name (manifest.dev_dependencies m);
@@ -313,9 +371,9 @@ let cmd_deps! m = {
 
 /// Who needs what. A package reached a second time is shown once and marked,
 /// so a diamond does not print its whole subtree twice and a cycle stops.
-let cmd_tree! m = {
+let cmd_tree! m o = {
     console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
-    let g = graph_of! m true;
+    let g = graph_of! m o;
     // A package's build dependencies hang under it, marked, in the graph of
     // their own they were walked into; what they use is shown from there.
     let rec branch! g key indent shown = {
@@ -342,8 +400,8 @@ let cmd_tree! m = {
     :ok
 };
 
-let cmd_fetch! m = {
-    let g = graph_of! m true;
+let cmd_fetch! m o = {
+    let g = graph_of! m o;
     let fetched = list.filter (fn n -> manifest.dep_kind (build.node_dep n) != :path) (build.nodes g);
     console.print! ("resolved " + to_string (list.length (build.nodes g)) + " packages, "
                     + to_string (list.length fetched) + " of them fetched")
@@ -353,10 +411,10 @@ let cmd_fetch! m = {
 /// named -- and fetch them again. A tag or a commit comes back the same bytes,
 /// so this is only ever interesting for a branch; it does them all because
 /// "the cache is wrong" is the other reason to run it.
-let cmd_update! m names = {
+let cmd_update! m o names = {
     // Not through the lock: the lock disagreeing is often why this is being
     // run, and this walk only decides what to fetch again.
-    let g = match build.graph! m true { [:error, why] => fail! why, [:ok, g] => g };
+    let g = match build.graph! m (build.with_option :dev true o) { [:error, why] => fail! why, [:ok, g] => g };
     let wanted n =
         manifest.dep_kind (build.node_dep n) != :path
         && (list.is_empty names || list.contains (build.node_key n) names);
@@ -372,7 +430,7 @@ let cmd_update! m names = {
                           [:error, why] => fail! why,
                           _ => :ok,
                       }) chosen)
-    match build.resolve! m true true { [:error, why] => fail! why, _ => () }
+    match build.resolve! m (build.with_option :dev true o) true { [:error, why] => fail! why, _ => () }
     match chosen {
         [] => console.print! "nothing to update: every dependency is a directory",
         _ => strict! (list.map (fn n -> console.print! ("updated " + describe n)) chosen),
@@ -451,7 +509,7 @@ let cmd_add! m c args = {
             // Reading it back through the whole graph is the check that
             // matters: a new dependency can bring a conflict with it.
             match manifest.load! (manifest.root m) {
-                [:ok, m2] => match build.graph! m2 true {
+                [:ok, m2] => match build.graph! m2 (build.with_option :dev true (options_of! c)) {
                     [:error, why] => console.error! ("warning: " + why),
                     _ => :ok,
                 },
@@ -545,14 +603,25 @@ let rec split_at_dashes args =
             },
     };
 
-/// `--release` and `--debug` are `-D release` and `-D debug` spelled the way
-/// people reach for them.
+/// The program's defines: every `-D` that is not scoped to a package, and
+/// `--debug`, which is `-D debug` spelled the way people reach for it.
 let defines_of c =
-    list.concat [cli.all c "define",
-                 if cli.flag_set c "release" { ["release"] } else { [] },
-                 if cli.flag_set c "debug" { ["debug"] } else { [] }];
+    list.append (list.filter (fn d -> config.split_scoped d == ()) (cli.all c "define"))
+                (if cli.flag_set c "debug" { ["debug"] } else { [] });
 
-let options_of c =
+/// Every `-D KEY:name=value`, as `[key, name, value]`.
+let sets_of c = list.flat_map (fn d -> match config.split_scoped d { () => [], s => [s] }) (cli.all c "define");
+
+/// `--profile NAME`, or `--release` for that one; `debug` when neither.
+let profile_of! c =
+    match [cli.get () c "profile", cli.flag_set c "release"] {
+        [(), false] => "debug",
+        [(), true] => "release",
+        [p, false] => p,
+        [p, true] => if p == "release" { p } else { fail! ("--release and --profile " + p + " say two different things") },
+    };
+
+let options_of! c =
     list.fold (fn o kv -> build.with_option (list.head kv) (list.nth 1 kv) o)
               build.options
               [[:compiler, cli.get () c "compiler"],
@@ -562,10 +631,13 @@ let options_of c =
                [:hosts,    cli.all c "host-module"],
                [:flags,    cli.all c "flag"],
                [:defines,  defines_of c],
+               [:sets,     sets_of c],
+               [:profile,  profile_of! c],
+               [:targets,  cli.all c "target"],
                [:verbose,  cli.flag_set c "verbose"]];
 
 let run_command! c theirs = {
-    let o = options_of c;
+    let o = options_of! c;
     // The project is loaded inside the arm that needs one. `mind new` and
     // `mind help` are answers you can give outside a project, and asking for a
     // manifest before knowing the command made them fail where they should
@@ -583,14 +655,15 @@ let run_command! c theirs = {
                   "check" => cmd_check! (project_in! here) o,
                   "run"   => cmd_run! (project_in! here) o (list.append (cli.rest c) theirs),
                   "test"  => cmd_test! (project_in! here) o (list.append (cli.rest c) theirs),
-                  "deps"  => cmd_deps! (project_in! here),
-                  "tree"  => cmd_tree! (project_in! here),
-                  "fetch" => cmd_fetch! (project_in! here),
-                  "update" => cmd_update! (project_in! here) (cli.rest c),
+                  "deps"  => cmd_deps! (project_in! here) o,
+                  "tree"  => cmd_tree! (project_in! here) o,
+                  "fetch" => cmd_fetch! (project_in! here) o,
+                  "update" => cmd_update! (project_in! here) o (cli.rest c),
                   "add"   => cmd_add! (project_in! here) c (cli.rest c),
                   "remove" => cmd_remove! (project_in! here) (cli.rest c),
                   "clean" => cmd_clean! (project_in! here),
                   "info"  => cmd_info! (project_in! here) o,
+                  "options" => cmd_options! (project_in! here) o,
                   "repl"  => cmd_repl! here o,
               },
     }
