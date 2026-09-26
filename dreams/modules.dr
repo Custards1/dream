@@ -176,6 +176,10 @@ let put_parsed file v l = with_parsed (((parsed l)).[file => v]) l;
 /// `mapping` declaration, where `owner` is the module it was written in.
 /// `note_records` is the only thing that adds to this and says why it exists.
 let records l      = l.[:records else []];
+/// Every setting a `when` condition read while loading, taken or not, as a
+/// set. What pins an image to the platform it was compiled for.
+let reads : Loader -> [:string];
+let reads l        = map_pairs (l.[:reads else (%{})]) |> list.map (fn [k, _] -> k) |> list.sort;
 
 /// `[owner, name, library, entries, span]` for each `foreign` declaration,
 /// as the parser left it (`ast.foreign_d`). `note_foreigns` adds to this, for
@@ -462,6 +466,30 @@ let note_records owner items l =
     put :records (records l + list.map (fn r -> list_cons owner r)
                                        (record_items (config_of l) items)) l;
 
+/// The settings the `when` conditions among these items read: each condition
+/// that is evaluated, and inside a branch only when the branch is taken --
+/// exactly the conditions `expand_items` evaluates.
+let rec when_reads cfg items =
+    list.concat (list.map (fn item ->
+        match item {
+            [:when, cond, inner, _] =>
+                list.append (config.reads cond)
+                            (if config.eval cfg cond { when_reads cfg inner } else { [] }),
+            _ => [],
+        }) items);
+
+/// Remember what the conditions in these items read. Most files have none, and
+/// then the table is left exactly as it was.
+let note_reads items l =
+    match when_reads (config_of l) items {
+        [] => l,
+        rs => put_reads (list.fold (fn m r -> m.[r => true]) (l.[:reads else (%{})]) rs) l,
+    };
+
+/// Forced as it is stored, so the table does not hold a suspension that pins
+/// the loader it was made from.
+let put_reads (strict m) l = put :reads m l;
+
 /// Every `foreign` block `expand_items` is about to rewrite, as `record_items`
 /// finds records.
 let rec foreign_items cfg items =
@@ -670,7 +698,7 @@ let rec hoist_mod! l parent source m =
                             [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                         },
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                    }) [note_foreigns full items (note_records full items l), []] kept;
+                    }) [note_reads items (note_foreigns full items (note_records full items l)), []] kept;
                 let inner_items = list.nth 1 nested;
 
                 // A submodule may import, so follow those before it is recorded.
@@ -831,7 +859,8 @@ let load_items! l source parsed display name file text = {
         [:ok, items, sites] => {
             // Resolve `when` before anything else looks at the module.
             let kept = expand_items (config_of l) items;
-            let noted = note_foreigns name items (note_records name items (note_expanding source sites l));
+            let noted = note_reads items
+                            (note_foreigns name items (note_records name items (note_expanding source sites l)));
 
             // A `mod name { .. }` is a module written inside another. Register
             // it as `parent.name` and leave the parent importing it, so from
@@ -1127,6 +1156,11 @@ when test {
         // --- loading ---
         test.case "a module is recorded under its name"
             $( test.eq! ["t"] (names (from_text! on "let a = 1;")) ),
+        test.case "every setting a condition read is recorded, taken or not"
+            $( test.eq! ["os", "test"]
+                        (reads (from_text! on "when test { let a = 1; }\nwhen os == \"x\" { let b = 2; }")) ),
+        test.case "a file with no conditions records none"
+            $( test.eq! [] (reads (from_text! on "let a = 1;")) ),
         test.case "a host module is recorded rather than searched for"
             $( test.eq! [["std.console"], ["t"]]
                         { let l = from_text! on "import std.console;";

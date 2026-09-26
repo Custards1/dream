@@ -264,6 +264,7 @@ test-dreams-corpus: build
 test-dreams-compile: build
     dream={{dream}} seed={{seed}} dreams/tests/compile.sh
     dream={{dream}} image={{image}} dreams/tests/parts.sh
+    dream={{dream}} image={{image}} dreams/tests/target.sh
     python3 dreams/tests/macros.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/optional_types.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/static_types.py --dream {{dream}} --compiler {{image}}

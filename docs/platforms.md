@@ -32,6 +32,15 @@ Platform-specific work remains platform-specific:
   requires the external programs it invokes, such as Git, curl, and tar.
 - A shebang is optional metadata for Unix launchers. Use `dream program.dream`
   on every OS; Windows does not execute a `.dream` file as a native executable.
+- An image records where it may run when it cannot run everywhere. A payload
+  that is a native library (ELF, Mach-O or PE) pins it to that library's
+  system and machine, and so does a `when os == ..` it was compiled through.
+  `dreams --target os=linux,arch=x86_64` states it outright, which is also
+  how to cross-build: a single `os` sets the `os` that `when` compares
+  against. `--target any` records nothing, for an image that carries one
+  library per system and chooses at run time. The VM refuses a mismatched
+  image before it runs; `dream --any-target` runs it anyway. The header bits
+  are in [the image format](bytecode-format.md#the-images-target).
 - `os.platform ()` reports the **running** VM's OS. Use it for runtime selection
   when one image needs several implementations. `when os == "..."` selects
   code at **compile time** and therefore intentionally specializes an image.

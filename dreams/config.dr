@@ -102,6 +102,23 @@ let rec eval c cond =
         _ => false,
     };
 
+/// Every flag and setting a condition names, whatever its answer.
+///
+/// A condition that came out false was still decided by what it read, and an
+/// image compiled through `when os == "windows"` on Linux is missing the
+/// Windows branch as surely as it holds the Linux one. So the loader keeps
+/// this for every condition it evaluates, and the image's target is pinned by
+/// it (`target.from_reads`).
+let rec reads cond =
+    match cond {
+        [:flag, name]   => [name],
+        [:equals, k, _] => [k],
+        [:not, inner]   => reads inner,
+        [:and, l, r]    => list.append (reads l) (reads r),
+        [:or, l, r]     => list.append (reads l) (reads r),
+        _ => [],
+    };
+
 // --- reporting --------------------------------------------------------------
 
 /// Every flag and setting, one per line, sorted -- what `--print-cfg` shows.
@@ -154,6 +171,10 @@ when test {
                          eval with_flags [:and, [:flag, "test"], [:flag, "nope"]]] ),
         test.case "an unknown condition is off rather than on"
             $( test.false! (eval with_flags [:nonsense, "test"]) ),
+        test.case "a condition reads every name in it, taken or not"
+            $( test.eq! ["os", "test", "arch"]
+                        (reads [:or, [:and, [:equals, "os", "linux"], [:not, [:flag, "test"]]],
+                                [:equals, "arch", "x86_64"]]) ),
         test.case "describe lists flags and quoted settings, sorted"
             $( test.eq! ["os = \"linux\"", "test"] (describe with_flags) ),
         test.case "the platform's atom loses its colon"

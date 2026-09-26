@@ -1948,6 +1948,7 @@ dreams FILE [-o OUT.dream] [options]
 | `-L`, `--package-path DIR` | add a package search root; `NAME=DIR` adds the package at `DIR`, importable as `NAME` |
 | `--host-module PATH` | a module the host registers at run time (repeatable) |
 | `-D`, `--define NAME[=VALUE]` | define a `when` flag |
+| `--target SPEC` | where the image may run: `os=NAME,arch=NAME` or bare names, repeatable; `any` records nothing ([platforms](platforms.md)) |
 | `--test` | define `test` and generate a runner (see below) |
 | `--release` / `--debug-cfg` | define `release` / `debug` |
 | `--print-cfg` | print the flags that are defined |
@@ -1976,6 +1977,7 @@ dream PROGRAM.dream [options]
 | `-e`, `--entry NAME` | entry point (default `main!`) |
 | `-j`, `--workers N` | scheduler threads; `0` means one per hardware thread |
 | `--no-jit` | interpreter only |
+| `--any-target` | run an image built for another platform anyway |
 | `--jit-threshold N` | calls before a function is compiled (default 32) |
 | `--dump-jit FN` | print the LLVM IR generated for one function |
 | `-x`, `--exec NAME` | run `$MINDV2_PATH/NAME.dream`, and nothing from here |

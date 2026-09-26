@@ -40,6 +40,7 @@ import dreams.parser;
 import dreams.path;
 import dreams.repl;
 import dreams.scope;
+import dreams.target;
 import dreams.typecheck;
 
 let version = "0.1.0";
@@ -213,6 +214,20 @@ let payload_size! path =
         },
     };
 
+/// The first bytes of a payload, which say whether it is a native binary and
+/// for what (`target.sniff`). Empty when it cannot be read, which `sniff`
+/// takes as data -- an unreadable payload is reported on its own.
+let payload_head! path =
+    match try! { io.open! path :read } catch e { () } {
+        () => "",
+        h => {
+            let head = try! { io.read! h target.sniff_length } catch e { "" };
+            strict! head
+            io.close! h
+            head
+        },
+    };
+
 /// Copy exactly `n` bytes of `path` into an open handle.
 ///
 /// Exactly `n`, rather than "until the end": `n` is what `io.size!` reported
@@ -248,7 +263,7 @@ let copy_payload! out path n =
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out shebang specs o = {
+let build! l out shebang specs said o = {
     let named = list.map payload_spec specs;
     let payloads = list.map (fn e -> list.nth 1 e) named;
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
@@ -258,13 +273,28 @@ let build! l out shebang specs o = {
                             (list.map (fn e -> list.head e) named);
     let b = compile.build! l with_payloads;
     let unreadable = list.filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
+    // Where the image may run, which is only worth reading the payloads' first
+    // bytes for when nobody has said.
+    let carried = if said == () && list.is_empty unreadable {
+                      target.of_payloads (list.map payload_head! payloads)
+                  } else { () };
+    let aim = target.decide said carried
+                            (target.from_reads (modules.config_of l) (modules.reads l));
     if not (compile.ok b) { print_diags! (compile.files b) (compile.diags b) }
     else if not (list.is_empty unreadable) {
         console.error! ("dreams: cannot read payload " + list.head (list.head unreadable))
         1
     }
+    else if list.head aim == :error {
+        console.error! ("dreams: " + list.nth 1 aim)
+        1
+    }
     else {
-        let img = compile.image b;
+        let aimed = list.nth 1 aim;
+        // Set here, on the image this command writes, and never in
+        // `compile.image`: a `comp` runs an image of the same program on the
+        // compiler's own VM, and a cross-build's target is not that machine.
+        let img = (compile.image b).[:target_flags => target.flags aimed];
         let payload_bytes = list.sum sizes;
         // The shebang goes in front of the image rather than into it: the VM
         // skips a leading `#!` line when it loads a file, which is what makes
@@ -303,6 +333,8 @@ let build! l out shebang specs o = {
                                 + " modules, " + to_string (list.length (img.[:nodes else []]))
                                 + " nodes, " + to_string (list.length (img.[:funcs else []]))
                                 + " functions"
+                                + (if target.is_any aimed { "" }
+                                   else { ", for " + target.describe aimed })
                                 + (if list.is_empty payloads { "" }
                                    else { ", " + to_string (list.length payloads) + " payloads, "
                                           + to_string payload_bytes + " payload bytes" })
@@ -639,7 +671,7 @@ let describe_resolution l r found =
 let defaults = %{ :command => :check, :file => (), :roots => [], :includes => [],
                   :defines => [], :hosts => [], :test => false, :quiet => false,
                   :position => (), :output => (), :shebang => (), :payloads => [],
-                  :error => () };
+                  :targets => [], :said => (), :error => () };
 
 let opt o k = o.[k else ()];
 let with_opt k v o = o.[k => v];
@@ -719,6 +751,8 @@ let rec parse_args args o =
         ["--payload", f, ..rest] => parse_args rest (append_opt :payloads f o),
 
         // What to compile it as.
+        ["--target"] => with_opt :error "--target needs a platform, or `any`" o,
+        ["--target", t, ..rest] => parse_args rest (append_opt :targets t o),
         ["-D"] => with_opt :error "-D needs a name or name=value" o,
         ["-D", d, ..rest] => parse_args rest (append_opt :defines d o),
         ["--define", d, ..rest] => parse_args rest (append_opt :defines d o),
@@ -776,6 +810,10 @@ let usage! () = {
         "",
         "what to compile it as:",
         "  -D, --define NAME[=V]    define a `when` flag, or set a `when` value",
+        "  --target SPEC            where the image may run: os=NAME,arch=NAME, or a",
+        "                           bare name (linux, macos, windows, x86_64, aarch64);",
+        "                           given twice, either; `any` records nothing. Without",
+        "                           it, native payloads and `when os` decide",
         "  --test                   define `test`, and add a runner for the tests",
         "                           each module exports",
         "  --release                define `release`",
@@ -799,10 +837,15 @@ let with_source! file k =
         text => k text,
     };
 
-let configured! o =
-    config.define_args (opt o :defines)
-        (if opt o :test { config.define "test" (config.defaults! ()) }
-         else { config.defaults! () });
+/// The configuration a compile starts from: the machine, then the target if
+/// one was named (so `when os` follows a cross-build), then `-D`, which is the
+/// most specific thing anyone said and so wins.
+let configured! o = {
+    let base = if opt o :test { config.define "test" (config.defaults! ()) }
+               else { config.defaults! () };
+    let aimed = match opt o :said { () => base, :any => base, t => target.configure t base };
+    config.define_args (opt o :defines) aimed
+};
 
 /// Load the whole program the file is the root of, before macros. The include
 /// directories are search paths as well as package roots, which is what `-I`
@@ -825,7 +868,7 @@ let run_command! o file =
         :parse     => with_source! file (fn src -> parse_only! file src),
         :check     => check_program! (load! o file) (compile_options o),
         :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :payloads)
-                             (compile_options o),
+                             (opt o :said) (compile_options o),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),
@@ -839,7 +882,11 @@ let run_command! o file =
     };
 
 let run! args = {
-    let o = parse_args args defaults;
+    let parsed = parse_args args defaults;
+    let o = match target.parse_all (opt parsed :targets) {
+        [:ok, said] => with_opt :said said parsed,
+        [:error, why] => if opt parsed :error == () { with_opt :error why parsed } else { parsed },
+    };
     match opt o :error {
         () =>
             match opt o :command {

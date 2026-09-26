@@ -36,11 +36,41 @@ aligned. The sentinel `0xFFFFFFFF` (`NO_NODE`) marks an absent edge.
 | 0      | 8    | `magic`         | ASCII `DAGNCAAF`                             |
 | 8      | 2    | `version_major` | `0`; a mismatch must be rejected             |
 | 10     | 2    | `version_minor` | `1`; a higher minor is forward-compatible    |
-| 12     | 4    | `flags`         | bit 0: a `SPAN` debug section is present     |
+| 12     | 4    | `flags`         | bit 0: a `SPAN` debug section is present; bits 8-23: the target (below) |
 | 16     | 4    | `module_name`   | string-table index                           |
 | 20     | 4    | `source_name`   | string-table index; the original source path |
 | 24     | 4    | `entry`         | function index of `main!`, or `NO_NODE`      |
 | 28     | 4    | `section_count` |                                              |
+
+### The image's target
+
+Bits 8-15 of `flags` are the operating systems the image may run on and bits
+16-23 the architectures, each a set with one bit per member:
+
+| Bits | Field | `0x01` | `0x02` | `0x04` |
+|---|---|---|---|---|
+| 8-15 | systems | linux | macos | windows |
+| 16-23 | architectures | x86_64 | aarch64 | |
+
+An empty set means **any**, so every image written before these bits existed,
+and every image whose program does not care, means what it always did. A
+non-empty set must contain the running machine's bit. The two sets are
+independent: an image carrying a Linux x86-64 library and a Windows ARM64 one
+records both systems and both architectures, and so also admits Linux on
+ARM64. The header cannot say more, and a library for the wrong machine fails
+where it always did.
+
+The compiler decides the sets (`dreams/target.dr`). `--target` states them,
+and `--target any` leaves them empty. Otherwise they come from what the
+program is made of: a payload that is an ELF, Mach-O or PE binary contributes
+its system and machine, and a `when` condition that read `os`, `family` or
+`arch` pins the image to the value it was compiled with. The `dream` command
+refuses a mismatched image before running it, and `--any-target` overrides
+that. The check belongs to the command and not to the loader, because the
+compiler runs images of a cross-built program for `comp` on its own machine.
+
+Constraints that are not a set of platforms, such as a minimum libc or a
+minimum VM, would go in a section of their own, which does not exist yet.
 
 ### Section table entry (16 bytes)
 

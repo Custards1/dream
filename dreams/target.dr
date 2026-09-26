@@ -1,0 +1,421 @@
+// Where an image may run.
+//
+// An image is portable bytecode, and most images run on every VM. Some do not:
+// one that carries a Linux `.so` in its payload runs on Linux and nowhere else,
+// and one compiled through `when os == "linux"` is missing whatever the other
+// branch held. The image records that in its header -- a set of operating
+// systems and a set of architectures, each empty for "any" -- and the VM
+// refuses to start a program on a machine it was not built for, rather than
+// letting it fail at the first `dlopen` with an error about a file it never
+// mentioned. docs/bytecode-format.md has the bits; docs/build.md the design.
+//
+// A target is decided in one of two ways. It can be said (`--target`), which
+// wins outright, including `--target any` to say "I know what I carry". Or it
+// is read off the program: the payloads that are native binaries, and the
+// `when` conditions that consulted `os`, `family` or `arch`. The two readings
+// are met, not merged, because each is a constraint -- a program with a Linux
+// library and a `when os == "windows"` runs nowhere, and saying so while
+// compiling is kinder than an image that refuses every VM it meets.
+//
+// Everything here is pure. Reading a payload's first bytes is the caller's
+// business; recognising them is this module's.
+
+import std.list;
+import std.str;
+
+import dreams.config;
+
+// --- the vocabulary ------------------------------------------------------------
+
+type Os = :linux | :macos | :windows;
+type Arch = :x86_64 | :aarch64;
+
+/// A set of each, as a list with no repeats. Empty is not "nowhere" but
+/// "anything", because that is what an image that says nothing has always
+/// meant -- and nowhere is an error, reported before an image exists.
+mapping Target {
+    os = []
+    arch = []
+}
+
+let any : Target;
+let any = Target.new ();
+
+/// Kept in the order `every_os` and `every_arch` give, so two targets that
+/// allow the same things are equal and read the same way in a message.
+let make : [Os] -> [Arch] -> Target;
+let make os arch = Target.make (list.filter (fn o -> list.contains o os) every_os)
+                               (list.filter (fn a -> list.contains a arch) every_arch);
+
+let is_any : Target -> :bool;
+let is_any t = list.is_empty (Target.os t) && list.is_empty (Target.arch t);
+
+/// The platform names as `when` compares them and `--target` takes them, and
+/// the spellings other tools use for the same thing.
+let os_named : :string -> Os | :unit;
+let os_named s = match s {
+    "linux" => :linux,
+    "macos" => :macos, "darwin" => :macos, "osx" => :macos,
+    "windows" => :windows, "win32" => :windows,
+    _ => (),
+};
+
+let arch_named : :string -> Arch | :unit;
+let arch_named s = match s {
+    "x86_64" => :x86_64, "amd64" => :x86_64, "x64" => :x86_64,
+    "aarch64" => :aarch64, "arm64" => :aarch64,
+    _ => (),
+};
+
+/// The name without its colon, which is how a person and `when` both write it.
+let name : :atom -> :string;
+let name a = config.platform_name a;
+
+/// Which `family` each system belongs to, as `config.defaults!` reports it.
+let family_of : Os -> :string;
+let family_of o = match o { :windows => "windows", _ => "unix" };
+
+let every_os : [Os];
+let every_os = [:linux, :macos, :windows];
+
+let every_arch : [Arch];
+let every_arch = [:x86_64, :aarch64];
+
+// --- the header word -------------------------------------------------------------
+//
+// Bits 8-15 of the header's `flags` are the systems and 16-23 the
+// architectures, one bit each, so the word is the two sets side by side. The
+// bit a member gets is fixed by the format and never renumbered: an image
+// written today has to mean the same thing to next year's VM.
+
+let os_bit : Os -> :integer;
+let os_bit o = match o { :linux => 1, :macos => 2, :windows => 4 };
+
+let arch_bit : Arch -> :integer;
+let arch_bit a = match a { :x86_64 => 1, :aarch64 => 2 };
+
+/// The header bits this target sets. An image with no target writes zero, the
+/// bytes it wrote before targets existed, which is what keeps the bootstrap
+/// byte-for-byte what it was.
+let flags : Target -> :integer;
+let flags t = {
+    let bits f xs = list.fold_strict (fn n x -> n + f x) 0 xs;
+    bits os_bit (Target.os t) * 256 + bits arch_bit (Target.arch t) * 65536
+};
+
+// --- combining -------------------------------------------------------------------
+
+/// Where a program built for any of these may run: the union of each set,
+/// where one target that allows any system allows any system.
+let join : [Target] -> Target;
+let join ts = {
+    let side f = if list.any (fn t -> list.is_empty (f t)) ts { [] }
+                 else { list.concat (list.map f ts) };
+    if list.is_empty ts { any } else { make (side Target.os) (side Target.arch) }
+};
+
+/// Where a program must run to satisfy both: the intersection, with "any" the
+/// identity. `[:error, side]` when a side comes out empty -- a program that
+/// can run nowhere -- naming which side it was.
+let meet : Target -> Target -> [:ok, Target] | [:error, :string];
+let meet a b = {
+    let side x y = match [x, y] {
+        [[], _] => y,
+        [_, []] => x,
+        _ => list.filter (fn e -> list.contains e y) x,
+    };
+    let os = side (Target.os a) (Target.os b);
+    let arch = side (Target.arch a) (Target.arch b);
+    let wanted x y = not (list.is_empty x && list.is_empty y);
+    if list.is_empty os && wanted (Target.os a) (Target.os b)
+       && not (list.is_empty (Target.os a) || list.is_empty (Target.os b)) {
+        [:error, "os"]
+    }
+    else if list.is_empty arch && wanted (Target.arch a) (Target.arch b)
+            && not (list.is_empty (Target.arch a) || list.is_empty (Target.arch b)) {
+        [:error, "arch"]
+    }
+    else { [:ok, make os arch] }
+};
+
+/// `linux, macos (x86_64)`, or `any platform`, for a message.
+let describe : Target -> :string;
+let describe t = {
+    let names xs = str.join_str ", " (list.map name xs);
+    match [Target.os t, Target.arch t] {
+        [[], []] => "any platform",
+        [[], arch] => names arch,
+        [os, []] => names os,
+        [os, arch] => names os + " (" + names arch + ")",
+    }
+};
+
+// --- saying it: `--target` ---------------------------------------------------------
+
+/// One `--target`: `any`, or items separated by commas, each `os=NAME`,
+/// `arch=NAME` or a bare name that is one or the other. `linux`,
+/// `os=linux,arch=arm64` and `macos,x86_64` are all targets.
+///
+/// `any` answers `()` rather than a target, because it means something a
+/// target cannot: not "any platform" as a constraint to meet with the
+/// program's, but "record nothing, whatever the program carries".
+let parse : :string -> [:ok, Target | :unit] | [:error, :string];
+let parse spec =
+    if spec == "any" { [:ok, ()] }
+    else {
+        let item acc part = match acc {
+            [:error, why] => [:error, why],
+            [:ok, os, arch] => {
+                let at = str.find "=" part;
+                let key = if at < 0 { "" } else { str.slice 0 at part };
+                let value = if at < 0 { part } else { str.slice (at + 1) (str.byte_length part - at - 1) part };
+                match [key, os_named value, arch_named value] {
+                    ["os", (), _] => [:error, "`" + value + "` is not an operating system; "
+                                              + "say linux, macos or windows"],
+                    ["arch", _, ()] => [:error, "`" + value + "` is not an architecture; "
+                                                + "say x86_64 or aarch64"],
+                    ["os", o, _] => [:ok, list.append os [o], arch],
+                    ["arch", _, a] => [:ok, os, list.append arch [a]],
+                    ["", (), ()] => [:error, "`" + value + "` is neither a system nor an architecture"],
+                    ["", (), a] => [:ok, os, list.append arch [a]],
+                    ["", o, _] => [:ok, list.append os [o], arch],
+                    _ => [:error, "a target is os=NAME or arch=NAME, not `" + key + "=`"],
+                }
+            },
+        };
+        match list.fold item [:ok, [], []] (list.filter (fn p -> not (str.is_empty p))
+                                                        (str.split "," spec)) {
+            [:error, why] => [:error, "--target " + spec + ": " + why],
+            [:ok, os, arch] => [:ok, make os arch],
+        }
+    };
+
+/// Every `--target` given, as one: `[:ok, ()]` for none or for `any`, which
+/// leave the target to the program; otherwise the union of what they said.
+/// `any` beside another target is a contradiction and is reported as one.
+let parse_all : [:string] -> [:ok, Target | :unit | :any] | [:error, :string];
+let parse_all specs = {
+    let parsed = list.map parse specs;
+    match list.filter (fn r -> list.head r == :error) parsed {
+        [[:error, why], ..rest] => [:error, why],
+        _ => {
+            let said = list.map (fn r -> list.nth 1 r) parsed;
+            match [list.contains () said, list.filter (fn t -> t != ()) said] {
+                [false, []] => [:ok, ()],
+                [true, []] => [:ok, :any],
+                [true, _] => [:error, "--target any cannot be given beside another target"],
+                [false, ts] => [:ok, join ts],
+            }
+        },
+    }
+};
+
+/// What a stated target means for `when`: a single system or architecture is
+/// what `os` and `arch` compare against, so `when os == "windows"` follows a
+/// cross-build rather than the machine doing it. More than one leaves the
+/// setting as it was, since no one value would be true.
+let configure : Target -> config.Configuration -> config.Configuration;
+let configure t cfg = {
+    let with_os = match Target.os t {
+        [o] => cfg |> config.set "os" (name o) |> config.set "family" (family_of o),
+        _ => cfg,
+    };
+    match Target.arch t { [a] => config.set "arch" (name a) with_os, _ => with_os }
+};
+
+// --- reading it off the program -----------------------------------------------------
+
+/// The target the `when` conditions pinned. A condition that read `os` was
+/// true or false *because* of the system being compiled for, so the image is
+/// that system's; one that read `family` is that family's; one that read
+/// `arch` is that architecture's, if one was defined -- an undefined `arch`
+/// pins nothing, because nothing was known to pin it to.
+let from_reads : config.Configuration -> [:string] -> Target;
+let from_reads cfg reads = {
+    let setting k = match config.value k cfg { () => "", v => v };
+    let os_now = os_named (setting "os");
+    let by_os = if list.contains "os" reads && os_now != () { [os_now] } else { [] };
+    let by_family = match [list.contains "family" reads, config.value "family" cfg] {
+        [true, fam] if fam != () => list.filter (fn o -> family_of o == fam) every_os,
+        _ => [],
+    };
+    let os = match [by_os, by_family] {
+        [[], f] => f,
+        [o, []] => o,
+        [o, f] => list.filter (fn x -> list.contains x f) o,
+    };
+    let arch_now = arch_named (setting "arch");
+    make os (if list.contains "arch" reads && arch_now != () { [arch_now] } else { [] })
+};
+
+// --- native binaries ----------------------------------------------------------------
+//
+// A payload is recognised by its first bytes, which every executable format
+// begins with, and by the machine field each keeps near the front. Only the
+// three formats the VM's systems load are known -- ELF on Linux, Mach-O on
+// macOS, PE on Windows -- and anything else is data, which says nothing about
+// where the program runs. An architecture the VM does not run on is left out
+// rather than guessed at, which makes that side "any": the system is still
+// known, and a library for a machine no VM runs on fails where it always did.
+
+/// How many leading bytes `sniff` wants. A PE file keeps its machine field
+/// behind an offset in the DOS header, which is nearly always under this.
+let sniff_length = 4096;
+
+let byte : :string -> :integer -> :integer;
+let byte s i = str_byte s i;
+
+let le16 s i = byte s i + byte s (i + 1) * 256;
+let le32 s i = le16 s i + le16 s (i + 2) * 65536;
+let be32 s i = ((byte s i * 256 + byte s (i + 1)) * 256 + byte s (i + 2)) * 256 + byte s (i + 3);
+
+let starts_with : [:integer] -> :string -> :bool;
+let starts_with prefix s =
+    list.all (fn [i, b] -> byte s i == b) (list.zip (list.range 0 (list.length prefix)) prefix);
+
+let elf_arch m = match m { 62 => :x86_64, 183 => :aarch64, _ => () };
+let pe_arch m = match m { 34404 => :x86_64, 43620 => :aarch64, _ => () };
+/// Mach-O's CPU types are the 64-bit flag, `0x01000000`, over a family.
+let macho_arch m = match m { 16777223 => :x86_64, 16777228 => :aarch64, _ => () };
+
+let one os arch = make [os] (match arch { () => [], a => [a] });
+
+/// A universal binary: a big-endian count, then twenty bytes per slice with
+/// the CPU type first. Java class files share the magic, and are told apart by
+/// the count, which in a class file is a version in the forties or above.
+let fat s = {
+    let n = be32 s 4;
+    if n < 1 || n > 20 || str.byte_length s < 8 + n * 20 { () }
+    else {
+        let archs = list.map (fn i -> macho_arch (be32 s (8 + i * 20))) (list.range 0 n);
+        make [:macos] (if list.contains () archs { [] } else { archs })
+    }
+};
+
+/// A Windows image: `MZ`, then at 0x3C the offset of the `PE\0\0` header,
+/// whose machine field follows it.
+let pe s = {
+    let at = le32 s 60;
+    if byte s (at + 5) < 0 || not (starts_with [80, 69, 0, 0] (str.slice at 4 s)) { one :windows () }
+    else { one :windows (pe_arch (le16 s (at + 4))) }
+};
+
+/// Where a native binary with these leading bytes runs, or `()` for anything
+/// that is not one.
+let sniff : :string -> Target | :unit;
+let sniff s =
+    if str.byte_length s < 8 { () }
+    else if starts_with [127, 69, 76, 70] s { one :linux (elf_arch (le16 s 18)) }
+    else if starts_with [207, 250, 237, 254] s { one :macos (macho_arch (le32 s 4)) }
+    else if starts_with [206, 250, 237, 254] s { one :macos () }
+    else if starts_with [202, 254, 186, 190] s { fat s }
+    else if starts_with [77, 90] s && str.byte_length s >= 64 { pe s }
+    else { () };
+
+/// What the payloads say, given each one's leading bytes: the union of the
+/// binaries among them, or `()` when none is one.
+let of_payloads : [:string] -> Target | :unit;
+let of_payloads heads =
+    match list.concat (list.map (fn h -> match sniff h { () => [], t => [t] }) heads) {
+        [] => (),
+        ts => join ts,
+    };
+
+// --- deciding -----------------------------------------------------------------------
+
+/// The target an image records, from what was said and what the program is
+/// made of: `[:ok, target]`, or `[:error, why]` when the program's own
+/// constraints leave nowhere for it to run.
+///
+/// `said` is what `parse_all` answered: `()` for nothing said, `:any` for
+/// `--target any`, or a target, which wins -- a cross-build carries libraries
+/// for the machine it is built *for*, and it is the person building who knows
+/// which that is.
+let decide : Target | :unit | :any -> Target | :unit -> Target -> [:ok, Target] | [:error, :string];
+let decide said carried pinned =
+    match said {
+        :any => [:ok, any],
+        () => match carried {
+            () => [:ok, pinned],
+            c => match meet c pinned {
+                [:ok, t] => [:ok, t],
+                [:error, side] =>
+                    [:error, "this program can run nowhere: its payloads are for "
+                             + describe c + ", but its `when` conditions chose "
+                             + describe pinned + " (by `" + side + "`). "
+                             + "Say where it runs with --target, or --target any"],
+            },
+        },
+        t => [:ok, t],
+    };
+
+// --- tests ---------------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let bytes n xs = str.concat_all [str_of_bytes xs, str.repeat (n - list.length xs) (str_of_bytes [0])];
+    let with_at s i xs = str.concat_all [str.slice 0 i s, str_of_bytes xs,
+                                         str.slice (i + list.length xs) (str.byte_length s - i - list.length xs) s];
+
+    let elf64 = with_at (bytes 64 [127, 69, 76, 70, 2, 1, 1]) 18 [62, 0];
+    let elf_arm = with_at elf64 18 [183, 0];
+    let macho = bytes 64 [207, 250, 237, 254, 12, 0, 0, 1];
+    let pe_x64 = with_at (with_at (bytes 256 [77, 90]) 60 [128, 0, 0, 0]) 128 [80, 69, 0, 0, 100, 134];
+    let universal = bytes 64 [202, 254, 186, 190, 0, 0, 0, 2,
+                              1, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              1, 0, 0, 12];
+    let java = bytes 64 [202, 254, 186, 190, 0, 0, 0, 52];
+
+    let tests = [
+        test.case "no target is the header's zero"
+            $( test.eq! 0 (flags any) ),
+        test.case "systems are bits 8-15 and architectures 16-23"
+            $( test.eq! [256, 1280, 65536 * 3 + 256]
+                        [flags (make [:linux] []), flags (make [:linux, :windows] []),
+                         flags (make [:linux] [:x86_64, :aarch64])] ),
+        test.case "a target names systems and architectures, bare or keyed"
+            $( test.eq! [[:ok, make [:linux] []], [:ok, make [:macos] [:aarch64]],
+                         [:ok, make [:windows] [:x86_64]], [:ok, ()]]
+                        [parse "linux", parse "os=darwin,arch=arm64", parse "windows,x64", parse "any"] ),
+        test.case "a target that names nothing known is refused"
+            $( test.eq! [:error, :error, :error]
+                        [list.head (parse "beos"), list.head (parse "os=x86_64"),
+                         list.head (parse "cpu=arm64")] ),
+        test.case "several targets are their union; any beside one is a contradiction"
+            $( test.eq! [[:ok, make [:linux, :macos] []], [:ok, ()], [:ok, :any], :error]
+                        [parse_all ["linux", "macos,arm64"], parse_all [], parse_all ["any"],
+                         list.head (parse_all ["any", "linux"])] ),
+        test.case "the union of a target that allows any architecture allows any"
+            $( test.eq! (make [:linux, :windows] [])
+                        (join [make [:linux] [:x86_64], make [:windows] []]) ),
+        test.case "meeting is intersection, with any as the identity"
+            $( test.eq! [[:ok, make [:linux] [:x86_64]], [:ok, make [:linux] []], [:error, "os"]]
+                        [meet (make [:linux, :windows] [:x86_64]) (make [:linux] []),
+                         meet any (make [:linux] []),
+                         meet (make [:windows] []) (make [:linux] [])] ),
+        test.case "native binaries are recognised with their architecture"
+            $( test.eq! [make [:linux] [:x86_64], make [:linux] [:aarch64], make [:macos] [:aarch64],
+                         make [:windows] [:x86_64], make [:macos] [:x86_64, :aarch64]]
+                        (list.map sniff [elf64, elf_arm, macho, pe_x64, universal]) ),
+        test.case "data, and a Java class, are not binaries"
+            $( test.eq! [(), (), ()] (list.map sniff [bytes 64 [104, 105], java, "short"]) ),
+        test.case "an image carrying libraries for two systems runs on either"
+            $( test.eq! (make [:linux, :windows] [:x86_64]) (of_payloads [elf64, pe_x64, "data"]) ),
+        test.case "reading os pins the system; reading family pins the family"
+            $( test.eq! [make [:linux] [], make [:linux, :macos] [], any]
+                        (list.map (fn rs -> from_reads (config.empty |> config.set "os" "linux"
+                                                                     |> config.set "family" "unix") rs)
+                                  [["os", "test"], ["family"], ["arch", "test"]]) ),
+        test.case "a stated target sets os and family for when"
+            $( test.eq! ["windows", "windows", "aarch64"]
+                        { let c = configure (make [:windows] [:aarch64]) config.empty;
+                          [config.value "os" c, config.value "family" c, config.value "arch" c] } ),
+        test.case "what was said wins; any records nothing"
+            $( test.eq! [[:ok, make [:macos] []], [:ok, any]]
+                        [decide (make [:macos] []) (make [:linux] []) (make [:linux] []),
+                         decide :any (make [:linux] []) any] ),
+        test.case "a program whose payloads and conditions disagree runs nowhere"
+            $( test.eq! :error (list.head (decide () (make [:windows] []) (make [:linux] []))) ),
+    ];
+}

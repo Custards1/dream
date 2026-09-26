@@ -230,6 +230,11 @@ public:
     uint16_t version_major() const { return version_major_; }
     uint16_t version_minor() const { return version_minor_; }
     bool has_debug_info() const { return (flags_ & 1) != 0; }
+    /// Where the image may run: bits 8-15 of the header's flags are a set of
+    /// systems, 16-23 a set of architectures, and an empty set is any. See
+    /// "The image's target" in docs/bytecode-format.md.
+    uint8_t target_os() const { return uint8_t(flags_ >> 8); }
+    uint8_t target_arch() const { return uint8_t(flags_ >> 16); }
     uint32_t entry() const { return entry_; }
 
     StringRef module_name() const { return str(module_name_); }

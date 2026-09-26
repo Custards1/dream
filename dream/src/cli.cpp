@@ -40,12 +40,77 @@ const char* USAGE =
     "      --stats          print reduction and heap statistics\n"
     "      --profile [n]    count reductions per function and print the hottest\n"
     "      --no-jit         stay in the interpreter\n"
+    "      --any-target     run an image built for another platform anyway\n"
     "      --jit-threshold <n>  calls before a function is compiled\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function, named or\n"
     "                       given as #N, its index -- generated functions share names\n"
     "      --mindv2         mindv2 path override\n"
     "      --mindv2-path    print the effective $MINDV2_PATH and exit\n"
     "  -h, --help           show this message\n";
+// --- the image's target ---------------------------------------------------------
+//
+// An image records the systems and architectures it may run on, as two sets of
+// bits in its header (dreams/target.dr decides them). One built for another
+// machine is refused here, before anything runs, because the alternative is a
+// program that fails at its first `dlopen` with an error about a library it
+// never mentioned. The check is the command's and not the loader's: the
+// compiler runs images of the program it is compiling for `comp`, and a
+// cross-build's target is not the machine doing the compiling.
+
+/// This VM's bit in each set, fixed by the format.
+constexpr uint8_t HOST_OS =
+#if defined(__linux__)
+    0x01;
+#elif defined(__APPLE__)
+    0x02;
+#elif defined(_WIN32)
+    0x04;
+#else
+    0x00;
+#endif
+constexpr uint8_t HOST_ARCH =
+#if defined(__x86_64__) || defined(_M_X64)
+    0x01;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    0x02;
+#else
+    0x00;
+#endif
+
+/// `linux, windows`, for a set; the names are the ones `--target` takes.
+std::string target_names(uint8_t bits, const char* const names[], size_t n) {
+    std::string out;
+    for (size_t i = 0; i < n; ++i) {
+        if (!(bits & (1u << i))) continue;
+        if (!out.empty()) out += ", ";
+        out += names[i];
+    }
+    return out;
+}
+
+const char* const OS_NAMES[] = {"linux", "macos", "windows"};
+const char* const ARCH_NAMES[] = {"x86_64", "aarch64"};
+
+/// `linux (x86_64)`: a set as a person reads it, with an empty side left out.
+std::string describe_target(uint8_t os, uint8_t arch) {
+    if (!os) return arch ? target_names(arch, ARCH_NAMES, 2) : "any platform";
+    std::string out = target_names(os, OS_NAMES, 3);
+    if (arch) out += " (" + target_names(arch, ARCH_NAMES, 2) + ")";
+    return out;
+}
+
+/// Empty when the image may run here, and otherwise why not. A set is either
+/// empty, meaning any, or has to contain this machine's bit.
+std::string target_mismatch(const Image& img, const std::string& name) {
+    const uint8_t os = img.target_os(), arch = img.target_arch();
+    const bool os_ok = os == 0 || (os & HOST_OS) != 0;
+    const bool arch_ok = arch == 0 || (arch & HOST_ARCH) != 0;
+    if (os_ok && arch_ok) return {};
+    return name + " was built for " + describe_target(os, arch) + "; this is " +
+           describe_target(HOST_OS, HOST_ARCH) +
+           ".\nRebuild it for this platform, or run it anyway with --any-target.";
+}
+
 void dump_node(const Image& img, uint32_t idx, int depth, std::string& out);
 
 void indent(std::string& out, int depth) { out.append(size_t(depth) * 2, ' '); }
@@ -361,7 +426,7 @@ int dream_main(int argc, char** argv) {
     std::string path, entry;
     std::string dump_jit_fn;
     unsigned workers = 0;
-    bool dump = false, stats = false, use_jit = true;
+    bool dump = false, stats = false, use_jit = true, any_target = false;
     size_t profile_top = 0;
     uint32_t jit_threshold = 0;
 
@@ -411,6 +476,8 @@ int dream_main(int argc, char** argv) {
             }
         } else if (a == "--no-jit") {
             use_jit = false;
+        } else if (a == "--any-target") {
+            any_target = true;
         }else if (a == "-m" || a == "--mindv2") {
             MINDV2_PATH = expand_home(next("--mindv2"));
         } else if (a == "--mindv2-path") {
@@ -466,6 +533,16 @@ int dream_main(int argc, char** argv) {
     }
 
     if (profile_top) rt.enable_profile(profile_top);
+
+    // `--dump` only reads the image, so it is allowed whatever it was built
+    // for; running it is what the target is about.
+    if (!dump && !any_target) {
+        const std::string why = target_mismatch(rt.image(), asked);
+        if (!why.empty()) {
+            std::fprintf(stderr, "dream: %s\n", why.c_str());
+            return 1;
+        }
+    }
 
     if (dump) {
         dump_image(rt.image());

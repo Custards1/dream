@@ -336,7 +336,9 @@ let emit img = {
     let header = str.concat_all [
         magic,
         u16 version_major, u16 version_minor,
-        u32 0,                                    // flags: no span section yet
+        // flags: no span section yet; bits 8-23 are where the image may run
+        // (`dreams/target.dr`), zero for anywhere.
+        u32 (img.[:target_flags else 0]),
         u32 (img.[:module_name else 0]),
         u32 (img.[:source_name else 0]),
         index (img.[:entry else ir.no_node]),
