@@ -127,6 +127,17 @@ pkg own/sq "$sq_opts" "$sq_code"
 check "the root's options are passed under its name" own 0 "-D app:vendored=false" info
 check "and a plain -D of one sets it rather than defining a flag" own 0 "-D app:vendored=true" info -D vendored
 
+# Each target and profile its own image: a build that says where it runs
+# does not overwrite one that says somewhere else, however the target was
+# spelled, and a release build does not overwrite the debug one.
+app tgt '[build]\ntarget = "linux"\n[profile.mac]\ntarget = "os=macos,arch=arm64"\n'
+check "[build] target names the image's directory" tgt 0 "target/linux/debug/app.dream" info
+check "a profile's target is a different file" tgt 0 "target/macos-aarch64/mac/app.dream" info --profile mac
+check "several targets are joined, in one order" tgt 0 "target/linux-macos/debug/app.dream" info --target macos --target os=linux
+check "a profile is a directory of its own" tgt 0 "target/linux/release/app.dream" info --release
+check "and so is the default build's" prof 0 "target/debug/app.dream" info
+check "and --output is used as written" tgt 0 "  output   elsewhere.dream" info --target macos -o elsewhere.dream
+
 echo
 echo "$pass option cases passed, $fail failed"
 [ "$fail" -eq 0 ]

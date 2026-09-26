@@ -102,7 +102,8 @@ let compiler_flags m = build_list m "flags";
 /// environment or the command line decides.
 let compiler m = toml.get () (doc m) "build" "compiler";
 
-/// Where the built image goes. `target/<name>.dream` unless the manifest says.
+/// Where the built image goes. `target/[<platforms>/]<profile>/<name>.dream`
+/// unless the manifest says; `build.output_of` says why.
 let output m = toml.get () (doc m) "build" "output";
 
 /// Where the image may run: `[build] target`, as `--target` takes it, one

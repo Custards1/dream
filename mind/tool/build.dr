@@ -782,7 +782,6 @@ let search_paths! m o =
     };
 
 let target_dir m = util.join (manifest.root m) "target";
-let image m = util.join (target_dir m) (manifest.name m + ".dream");
 
 // --- what one build is --------------------------------------------------------
 //
@@ -801,15 +800,89 @@ let options = %{ :compiler => (), :defines => [], :includes => [], :hosts => [],
 let with_option k v o = o.[k => v];
 let option o k default = o.[k else default];
 
-/// Where this build writes its image.
+/// Where this build writes its image: `target/[<platforms>/]<profile>/`, as
+/// Cargo lays out its own. Two builds share a file only when they would write
+/// the same image. A target is in the path because an image carries where it
+/// may run in its header, so a Linux build and a macOS build are two files --
+/// sharing one meant each overwrote the other, and `mind run` after a
+/// cross-build ran an image the VM would refuse. A profile is in it because
+/// it changes the defines, flags and configuration the program is compiled
+/// with, and `mind build --release` should not cost the next debug build its
+/// image. A build that states no target leaves that level out. A path
+/// somebody wrote down, `--output` or `[build] output`, is used as written.
 let output_of m o =
     match option o :output () {
         () => match manifest.output m {
-            () => image m,
+            () => {
+                let under = match target_subdir (targets m o) {
+                    () => target_dir m,
+                    dir => util.join (target_dir m) dir,
+                };
+                util.join (util.join under (profile_of o)) (manifest.name m + ".dream")
+            },
             p  => util.join (manifest.root m) p,
         },
         p => p,
     };
+
+// --- naming a target ------------------------------------------------------------
+//
+// The directory is named for what the compiler will record, not for how it
+// was asked: `linux` and `os=linux` are one target, `arm64` is `aarch64`, and
+// several `--target`s are joined as `dreams/target.dr` joins them -- each side
+// the union of what was said, or "any" where some target left it open. So one
+// image is one directory however it was spelled, and two builds share a file
+// only when they would have written the same header.
+
+let os_names : [:string];
+let os_names = ["linux", "macos", "windows"];
+
+let arch_names : [:string];
+let arch_names = ["x86_64", "aarch64"];
+
+/// The spelling `target.dr` settles on for another tool's name.
+let platform_spelled : :string -> :string;
+let platform_spelled s = match s {
+    "darwin" => "macos", "osx" => "macos", "win32" => "windows",
+    "amd64" => "x86_64", "x64" => "x86_64", "arm64" => "aarch64",
+    _ => s,
+};
+
+/// One `--target` as `[systems, architectures]`. A name that is neither goes
+/// with the systems; the compiler refuses it before anything is written.
+let target_sides : :string -> [[:string]];
+let target_sides spec = {
+    let value part = {
+        let at = str.find "=" part;
+        if at < 0 { part } else { str.slice (at + 1) (str.byte_length part - at - 1) part }
+    };
+    let names = list.map (fn p -> platform_spelled (value p))
+                         (list.filter (fn p -> not (str.is_empty p)) (str.split "," spec));
+    [list.filter (fn n -> not (list.contains n arch_names)) names,
+     list.filter (fn n -> list.contains n arch_names) names]
+};
+
+/// The directory an image for these `--target`s goes in, or `()` when none
+/// was stated and the program decides where it runs.
+let target_subdir : [:string] -> :string | :unit;
+let target_subdir specs = {
+    let sides = list.map target_sides specs;
+    let side pick known =
+        if list.any (fn s -> list.is_empty (pick s)) sides { [] }
+        else {
+            let named = list.concat (list.map pick sides);
+            list.append (list.filter (fn n -> list.contains n named) known)
+                        (list.unique (list.filter (fn n -> not (list.contains n known)) named))
+        };
+    match [specs, list.contains "any" specs] {
+        [[], _] => (),
+        [_, true] => "any",
+        _ => match list.append (side list.head os_names) (side (list.nth 1) arch_names) {
+            [] => "any",
+            names => str.join_str "-" names,
+        },
+    }
+};
 
 let vm_command! () = match util.env_path! "DREAM" { () => "dream", v => v };
 

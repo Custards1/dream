@@ -17,7 +17,7 @@ dream build/mind help
 | | |
 |-|-|
 | `mind new <name>` | create a project in `./<name>` |
-| `mind build` | compile to `target/<name>.dream` |
+| `mind build` | compile to `target/<profile>/<name>.dream` |
 | `mind run [args]` | compile, then run with the arguments given |
 | `mind test` | compile with `--test` and run the result |
 | `mind check` | compile without writing an image |
@@ -232,6 +232,14 @@ undeclared `release` defines `release`, as `--release` always has. A
 dependency's profiles are ignored: how the program is built is the root's
 decision. `[build] target` is the target when neither `--target` nor the
 profile says.
+
+The image goes to `target/<profile>/<name>.dream`, and a build that states a
+target puts the platforms first: `target/linux/debug/`,
+`target/macos-aarch64/release/`, `target/linux-macos/debug/` for two. So a
+release build does not overwrite the debug image, and building for one
+platform does not overwrite the image for another. The directory is named for
+the target the compiler records, so `linux` and `os=linux` are one directory.
+`--output` and `[build] output` are used as written.
 
 ## Environment
 

@@ -71,7 +71,7 @@ let opts = [
 /// own -- `new <name>`, `run [args]` -- read them from the parsed rest.
 let command_spec = [
     cli.command "new"   "create a project in ./<name>" [],
-    cli.command "build" "compile the project to target/<name>.dream" [],
+    cli.command "build" "compile the project to target/<profile>/<name>.dream" [],
     cli.command "run"   "compile, then run it with the arguments given" [],
     cli.command "test"  "compile with --test and run the result" [],
     cli.command "check" "compile without writing an image" [],
