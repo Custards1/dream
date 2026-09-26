@@ -599,6 +599,20 @@ NativeResult os_now(Process& p, Value, Value*, uint32_t) {
 extern "C" void __gcov_dump();
 #endif
 
+/// End the process now, running nothing on the way out -- POSIX `_Exit`.
+///
+/// On Windows `_Exit` is not that. It is `ExitProcess`, which kills every other
+/// thread and then runs each DLL's static destructors, the VM's among them,
+/// against a heap and a collector whose threads vanished mid-step. So Windows
+/// ends with `TerminateProcess` on itself, which is what `_Exit` means
+/// everywhere else. Callers flush first; nothing after this runs.
+[[noreturn]] static void exit_now(int code) {
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+    std::_Exit(code);
+}
+
 // Its training-only flush changes this cold function's control-flow graph;
 // exclude it from GCC's profile rather than applying mismatched counters.
 #if defined(__GNUC__) && !defined(__clang__)
@@ -620,7 +634,7 @@ NativeResult os_exit(Process& p, Value, Value* args, uint32_t) {
     __gcov_dump();
 #endif
     std::fflush(nullptr);
-    std::_Exit(int(fixnum_value(v)));
+    exit_now(int(fixnum_value(v)));
 }
 
 /// `replace! program args` -- become another program.
@@ -668,7 +682,8 @@ NativeResult os_replace(Process& p, Value, Value* args, uint32_t) {
     DWORD code = 1;
     GetExitCodeProcess(child.hProcess, &code);
     CloseHandle(child.hProcess);
-    std::_Exit(int(code));
+    std::fflush(nullptr);
+    exit_now(int(code));
 #else
     ::execvp(raw[0], raw.data());
 #endif

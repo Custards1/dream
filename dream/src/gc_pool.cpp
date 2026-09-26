@@ -41,9 +41,18 @@ GcPool::~GcPool() {
     }
 }
 
+/// The pool is made once and never destroyed, deliberately. Its destructor
+/// joins helper threads, and a static's destructor runs at a point where that
+/// cannot be done safely on every platform: on Windows the VM is a DLL, and
+/// `ExitProcess` -- which is what `exit` and `_Exit` both come to there --
+/// kills every other thread where it stands and only *then* runs the DLL's
+/// static destructors, under the loader lock. The helpers are gone, possibly
+/// holding `mutex_`, and a self-compile ended in `0xC0000409` instead of 0.
+/// Exiting the process takes the threads with it everywhere, so there is
+/// nothing a destructor could do that the exit does not.
 GcPool& GcPool::instance() {
-    static GcPool pool;
-    return pool;
+    static GcPool* pool = new GcPool;
+    return *pool;
 }
 
 void GcPool::ensure_threads(unsigned n) {
