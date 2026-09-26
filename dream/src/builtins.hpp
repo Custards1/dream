@@ -69,7 +69,4 @@ ModuleDef make_math_module();
 ModuleDef make_vm_module();
 ModuleDef make_ffi_module();
 
-/// True when this build can call C.
-bool ffi_available();
-
 }  // namespace dream

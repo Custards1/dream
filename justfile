@@ -215,8 +215,7 @@ test-e2e: build
     dream/tests/e2e.sh
 
 # `std.ffi` and `std.foreign` against a C library built from dream/tests/ffi,
-# carried in the image as a payload. Skips on a VM built without libffi or a
-# machine with no C compiler.
+# carried in the image as a payload. Skips on a machine with no C compiler.
 test-ffi: build
     dream/tests/ffi/run.sh
 

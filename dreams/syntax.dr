@@ -2,6 +2,7 @@
 // needs distinct occurrence offsets: resolution keys names and binders by span.
 
 import std.list;
+import std.str;
 import dreams.ast;
 
 let is_span x = match x {
@@ -258,6 +259,297 @@ let union_decl name params variants members span = {
                            members;
     let made = list.take (list.length constructors) generated;
     [ast.mod_d name (made + [description] + sigs + written) span, list.last generated]
+};
+
+// --- foreign libraries -------------------------------------------------------------
+
+/// `foreign name from lib { .. }`, as a module: the library, a `type` for each
+/// resource, a module for each struct, and for each function the binding
+/// `std.ffi` makes of it together with the signature that says what it is on
+/// this side. So one line of C signature is both halves of a binding, and
+/// what the checker knows about `add! : Counter -> :long -> :long` is
+/// `Counter -> :integer -> :integer`: a cursor where a counter is wanted is a
+/// compile error in the program that passed it, and a runtime one only where
+/// the checker could not see.
+///
+/// Purity is the name's, as it is everywhere: `add!` is bound with
+/// `ffi.function` and `scale` with `ffi.pure_function`. Only the program can
+/// know that a C function has no effects, and the name is where it says so.
+///
+/// A resource's tag is `name.Resource`, so two libraries that each declare a
+/// `Db` do not accept each other's.
+///
+/// Everything here assumes the entries were checked by `foreign_problem`,
+/// which the parser runs so that a C type that means nothing is reported where
+/// it was written.
+let foreign_decl name library entries span = {
+    let at_ = span;
+    let env = foreign_env name entries;
+    let atom a = ast.atom_e a at_;
+    let name_ n = ast.name_e n at_;
+    let apply f args = ast.apply_e f args at_;
+    let from_foreign member = ast.field_e (name_ "foreign") member at_;
+    let imports = [ast.import_d ["std", "ffi"] () () at_, ast.import_d ["std", "foreign"] () () at_];
+    let lib = ast.let_d "library" [] (match library { () => ast.unit_e at_, l => l }) false at_;
+    let resources = list.concat (list.map (fn e -> match e {
+        [:resource, r, _, _] => [ast.let_d r []
+            (ast.list_e [atom "named", ast.str_e r at_,
+                         apply (from_foreign "Handle") [ast.str_e (name + "." + r) at_]] at_) false at_],
+        _ => [],
+    }) entries);
+    let structs = list.concat (list.map (fn e -> match e {
+        [:c_struct, s, fields, sp] => [c_struct_module s fields sp],
+        _ => [],
+    }) entries);
+    let functions = list.concat (list.map (fn e -> match e {
+        [:c_function, f, t, symbol, sp] => match c_function env t {
+            [:ok, args, result, dream] => {
+                let bind = if str.ends_with "!" f { "function" } else { "pure_function" };
+                [[ast.let_d f [] (apply (ast.field_e (name_ "ffi") bind at_)
+                                        [name_ "library", ast.str_e symbol at_,
+                                         ast.list_e args at_, result]) false at_,
+                  ast.sig_d f dream sp]]
+            },
+            _ => [],
+        },
+        _ => [],
+    }) entries);
+    let lets = list.map (fn pair -> list.head pair) functions;
+    let sigs = list.map (fn pair -> list.nth 1 pair) functions;
+    let [generated, _] = fresh (imports + [lib] + resources + structs + lets)
+                               (2147483648 + ast.span_start span * 128);
+    [ast.mod_d name (generated + sigs) span]
+};
+
+/// A struct as a module over its layout, which `comp` settles while compiling:
+/// `Point.new!` is a zeroed one, `read!` and `write!` go through a map of its
+/// fields, and `layout` is there for `foreign.read_struct!` at an offset --
+/// an array of them.
+priv let c_struct_module s fields at_ = {
+    let name_ n = ast.name_e n at_;
+    let apply f args = ast.apply_e f args at_;
+    let from_foreign member = ast.field_e (name_ "foreign") member at_;
+    let buffer = from_foreign "Buffer";
+    let described = ast.list_e (list.map (fn f ->
+        ast.list_e [ast.atom_e (list.nth 0 f) (list.nth 1 f), list.nth 2 f] at_) fields) at_;
+    let p n = ast.param n at_;
+    ast.mod_d s [
+        ast.import_d ["std", "foreign"] () () at_,
+        ast.let_d "layout" [] (ast.comp_e false (apply (from_foreign "layout") [described]) at_) false at_,
+        ast.let_d "size" [] (ast.get_e (name_ "layout") (ast.atom_e "size" at_) () at_) false at_,
+        ast.let_d "new!" [p "u"] (apply (from_foreign "struct_buffer!") [name_ "layout"]) false at_,
+        ast.let_d "read!" [p "b"]
+            (apply (from_foreign "read_struct!") [name_ "b", ast.int_e 0 at_, name_ "layout"]) false at_,
+        ast.let_d "write!" [p "b", p "values"]
+            (apply (from_foreign "write_struct!") [name_ "b", ast.int_e 0 at_, name_ "layout", name_ "values"])
+            false at_,
+        ast.let_d "offset" [p "field"]
+            (apply (from_foreign "offset_of") [name_ "layout", name_ "field"]) false at_,
+        ast.sig_d "size" (ast.atom_e "integer" at_) at_,
+        ast.sig_d "new!" (arrow (ast.atom_e "unit" at_) buffer) at_,
+        ast.sig_d "read!" (arrow buffer (ast.atom_e "map" at_)) at_,
+        ast.sig_d "write!" (arrow buffer (arrow (ast.atom_e "map" at_) (ast.atom_e "unit" at_))) at_,
+        ast.sig_d "offset" (arrow (ast.atom_e "atom" at_) (ast.atom_e "integer" at_)) at_,
+    ] at_
+};
+
+/// What every entry of one `foreign` block can see of the others.
+priv let foreign_env lib entries = %{
+    :lib => lib,
+    :resources => list.fold (fn m e -> match e { [:resource, r, d, _] => m.[r => [d]], _ => m }) %{} entries,
+    :structs => list.fold (fn m e -> match e { [:c_struct, s, _, _] => m.[s => true], _ => m }) %{} entries,
+};
+
+/// The first thing wrong with a `foreign` block's entries, as `[message,
+/// span]`, or `()`. The parser asks, because only it can report one.
+let foreign_problem lib entries = {
+    let env = foreign_env lib entries;
+    let problem r = match r { [:error, m, sp] => [m, sp], _ => () };
+    list.fold (fn found e -> if found != () { found } else {
+        match e {
+            [:c_function, _, t, _, _] => problem (c_function env t),
+            [:c_struct, _, fields, _] =>
+                list.fold (fn f field -> if f != () { f } else { problem (c_type env :field (list.nth 2 field)) })
+                          () fields,
+            _ => (),
+        }
+    }) () entries
+};
+
+/// A function's C signature, `a -> b -> result`, as `[:ok, args, result,
+/// dream]`: the argument and result expressions `std.ffi` reads, and the Dream
+/// type of the function it makes. An `out` is not an argument on this side,
+/// so it leaves the Dream arrow and joins the result: `[result, out, ..]`.
+let c_function env t = {
+    let sp = ast.span t;
+    match arrow_parts t {
+        [[], _] => [:error, "a C signature is an arrow, `args -> result`; a function of nothing is `:void -> result`", sp],
+        [params, result] => {
+            let taken = match params { [p] if is_void p => [], ps => ps };
+            match c_types env :arg taken {
+                [:error, m, s] => [:error, m, s],
+                [:ok, args, dreams] => match c_type env :result result {
+                    [:error, m, s] => [:error, m, s],
+                    [:ok, r, rd] => {
+                        let visible = list.filter (fn i -> not (is_out (list.nth i taken)))
+                                                  (list.range 0 (list.length taken));
+                        let outs = list.filter (fn i -> is_out (list.nth i taken))
+                                               (list.range 0 (list.length taken));
+                        let answer = if list.is_empty outs { rd }
+                                     else { ast.list_e [ast.atom_e "tuple" sp,
+                                                        ast.list_e (list_cons rd (list.map (fn i -> list.nth i dreams) outs)) sp] sp };
+                        let dream_args = match visible { [] => [ast.atom_e "unit" sp], is => list.map (fn i -> list.nth i dreams) is };
+                        [:ok, args, r, arrows dream_args answer]
+                    },
+                },
+            }
+        },
+    }
+};
+
+priv let is_void t = match t { [:atom, "void", _] => true, [:unit, _] => true, _ => false };
+priv let is_out t = match t { [:apply, [:name, "out", _], _, _] => true, _ => false };
+priv let is_unit_type t = match t { [:atom, "unit", _] => true, [:unit, _] => true, _ => false };
+
+/// `a -> b -> c` as `[[a, b], c]`; a type that is no arrow is `[[], t]`.
+priv let rec arrow_parts t = match t {
+    [:list, [[:atom, "fn", _], a, b], _] => {
+        let [rest, result] = arrow_parts b;
+        [list_cons a rest, result]
+    },
+    _ => [[], t],
+};
+
+priv let arrows ts result = list.fold (fn acc t -> arrow t acc) result (list.reverse ts);
+
+priv let rec c_types env place ts = match ts {
+    [] => [:ok, [], []],
+    [t, ..rest] => match c_type env place t {
+        [:error, m, s] => [:error, m, s],
+        [:ok, f, d] => match c_types env place rest {
+            [:error, m, s] => [:error, m, s],
+            [:ok, fs, ds] => [:ok, list_cons f fs, list_cons d ds],
+        },
+    },
+};
+
+/// The C numbers, as `std.foreign` names them (`foreign.Scalar`) and the VM
+/// reads them (`scalar_types` in dream/src/ffi.cpp). The compiler cannot
+/// import the library it would be checking against, so the list is here too.
+priv let c_scalars = ["bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
+                      "char", "uchar", "short", "ushort", "int", "uint", "long", "ulong",
+                      "longlong", "ulonglong", "size", "ssize", "intptr", "uintptr", "double"];
+
+/// One C type, where it stands: `:arg`, `:result`, `:out` (what C writes
+/// through a pointer), `:callback_arg`, `:callback_result` or `:field`. The
+/// place matters because a word means different things in different places --
+/// a resource is a handle passed in and an owned pointer handed back -- and
+/// most mean nothing in some: a struct is only ever passed, by pointer.
+///
+/// Answers `[:ok, ffi, dream]`: the expression of what `std.ffi` reads, and
+/// the Dream type of the value on this side.
+let rec c_type env place t = {
+    let sp = ast.span t;
+    let atom a = ast.atom_e a sp;
+    let fail m = [:error, m, sp];
+    let lib = env.[:lib];
+    match t {
+        [:atom, a, _] => c_atom place a sp,
+        [:unit, _] => c_atom place "void" sp,
+        [:name, n, _] =>
+            match [env.[:resources].[n else ()], map_has env.[:structs] n] {
+                [[dtor], _] => match place {
+                    :arg => [:ok, ast.list_e [atom "handle", ast.str_e (lib + "." + n) sp] sp, ast.name_e n sp],
+                    :result => owned lib n dtor sp,
+                    :out => owned lib n dtor sp,
+                    _ => fail ("a resource is a handle, and only numbers cross a callback or sit in a struct"),
+                },
+                [_, true] =>
+                    if place == :arg { [:ok, atom "buffer", ast.field_e (ast.name_e "foreign" sp) "Buffer" sp] }
+                    else { fail ("a struct is passed by pointer, as a buffer, and nowhere else; `" + n + ".new!` makes one") },
+                _ => fail ("`" + n + "` is not a resource or a struct of `" + lib + "`"),
+            },
+        [:apply, [:name, "out", _], [inner], _] =>
+            if place != :arg { fail "`out` is a parameter C writes through, so it is only an argument" }
+            else {
+                match c_type env :out inner {
+                    [:ok, f, d] => [:ok, ast.list_e [atom "out", f] sp, d],
+                    other => other,
+                }
+            },
+        [:apply, [:name, "borrow", _], [[:name, r, _]], _] =>
+            if place != :result && place != :out { fail "`borrow` is a pointer C hands back and keeps" }
+            else if not (map_has env.[:resources] r) { fail ("`" + r + "` is not a resource of `" + lib + "`") }
+            else { [:ok, ast.list_e [atom "borrow", ast.str_e (lib + "." + r) sp] sp, ast.name_e r sp] },
+        [:apply, [:name, "taken", _], [dtor], _] =>
+            if place != :result && place != :out { fail "`taken` is a string C hands over, so it is only a result" }
+            else {
+                match dtor {
+                    [:name, d, _] => [:ok, ast.list_e [atom "cstr", ast.str_e d sp] sp, atom "string"],
+                    [:str, d, _] => [:ok, ast.list_e [atom "cstr", ast.str_e d sp] sp, atom "string"],
+                    _ => fail "`taken` names the function that frees the string: `taken free`",
+                }
+            },
+        [:list, [[:atom, "fn", _], _, _], _] =>
+            if place != :arg { fail "a callback is only an argument: C cannot hand a function back" }
+            else {
+                let [params, result] = arrow_parts t;
+                let taken = match params { [p] if is_void p => [], ps => ps };
+                match c_types env :callback_arg taken {
+                    [:error, m, s] => [:error, m, s],
+                    [:ok, args, dreams] => match c_type env :callback_result result {
+                        [:error, m, s] => [:error, m, s],
+                        [:ok, r, rd] =>
+                            [:ok, ast.list_e [atom "callback", ast.list_e args sp, r] sp,
+                             arrows (if list.is_empty dreams { [atom "unit"] } else { dreams }) rd],
+                    },
+                }
+            },
+        // `t | ()`: a pointer that may be NULL, which is `()` on this side.
+        [:list, [[:atom, "union", _], [:list, parts, _]], _] => {
+            let others = list.filter (fn p -> not (is_unit_type p)) parts;
+            match others {
+                [one] if place == :result || place == :out => match c_type env place one {
+                    [:ok, f, d] => [:ok, f, ast.list_e [atom "union", ast.list_e [d, atom "unit"] sp] sp],
+                    other => other,
+                },
+                _ => fail "a C type is one type; `t | ()` is the one union, for a result that may be NULL",
+            }
+        },
+        _ => fail "this is not a C type",
+    }
+};
+
+priv let owned lib r dtor sp = match dtor {
+    () => [:error, "`" + r + "` has no destructor, so C cannot hand one over; `borrow " + r
+                   + "` is a pointer C keeps", sp],
+    d => [:ok, ast.list_e [ast.atom_e "own" sp, ast.str_e (lib + "." + r) sp, ast.str_e d sp] sp,
+          ast.name_e r sp],
+};
+
+priv let c_atom place a sp = {
+    let atom x = ast.atom_e x sp;
+    let fail m = [:error, m, sp];
+    let is_ places = list.contains place places;
+    if list.contains a c_scalars {
+        [:ok, atom a, atom (match a { "f32" => "float", "f64" => "float", "double" => "float",
+                                      "bool" => "bool", _ => "integer" })]
+    }
+    else {
+        match a {
+            "void" => if is_ [:result, :callback_result] { [:ok, atom "void", atom "unit"] }
+                      else { fail "`:void` is only a result; a function of nothing is `:void -> result`" },
+            "ptr" => [:ok, atom "ptr", atom "any"],
+            "cstr" => if is_ [:arg, :result, :out, :callback_arg] { [:ok, atom "cstr", atom "string"] }
+                      else { fail "a string cannot stand here: only numbers and `:ptr` can" },
+            "bytes" => if place == :arg { [:ok, atom "bytes", atom "any"] }
+                       else { fail "`:bytes` is only an argument" },
+            "buffer" => if place == :arg { [:ok, atom "buffer", ast.field_e (ast.name_e "foreign" sp) "Buffer" sp] }
+                        else { fail "`:buffer` is only an argument" },
+            "float" => fail "there is no `:float` in C here, because in Dream that is a double: write `:f32` or `:double`",
+            _ => fail ("`:" + a + "` is not a C type"),
+        }
+    }
 };
 
 // Validate returned data before any compiler pass assumes an AST shape. Spans

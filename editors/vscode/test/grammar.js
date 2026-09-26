@@ -74,6 +74,11 @@ const cases = [
   ['group Pool { values, count }', 'Pool', 'entity.name.function.dream'],
   ['struct Token { kind, value }', 'struct', 'keyword.declaration.dream'],
   ['struct Token { kind, value }', 'Token', 'entity.name.function.dream'],
+  // `foreign` declares a C library and is a module's name everywhere else.
+  ['foreign sample from "libs.so" {', 'foreign', 'keyword.declaration.dream'],
+  ['foreign sample from "libs.so" {', 'sample', 'entity.name.function.dream'],
+  ['    resource Db = sqlite3_close', 'resource', 'keyword.declaration.dream'],
+  ['    resource Db = sqlite3_close', 'Db', 'entity.name.function.dream'],
   // A behavior: the base declares the hole and the deriving module fills it.
   // `derive` reads as a declaration keyword in both of the places it is
   // written -- as a statement of its own, and as a record's base clause, where

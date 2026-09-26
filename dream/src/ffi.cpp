@@ -65,7 +65,6 @@
 #include "process.hpp"
 #include "runtime.hpp"
 
-#if DREAM_HAVE_FFI
 #include "windows.hpp"
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -76,7 +75,6 @@
 #endif
 #endif
 #include <ffi.h>
-#endif
 
 namespace dream {
 
@@ -203,14 +201,14 @@ const KindName* scalar_named(const std::string& name) {
     return nullptr;
 }
 
-[[maybe_unused]] const char* kind_name(Kind k) {
+const char* kind_name(Kind k) {
     for (const auto& e : KINDS) {
         if (e.kind == k) return e.name;
     }
     return "?";
 }
 
-[[maybe_unused]] bool is_scalar(Kind k) { return k >= K_BOOL && k <= K_F64; }
+bool is_scalar(Kind k) { return k >= K_BOOL && k <= K_F64; }
 
 constexpr uint32_t MAX_ARGS = 16;
 
@@ -221,15 +219,13 @@ NativeResult fail(Process& p, const std::string& msg) {
 /// A failure while reading what a program passed: either a sentence to raise
 /// as an `:ffi_error`, or an error a forced argument raised itself, which is
 /// handed on as it is rather than reworded.
-// Some of what follows is only reached with libffi; a build without it keeps
-// the helpers rather than hiding them behind the same `#if` twice.
 struct Err {
     std::string text;
     bool raised = false;
     Value value = UNIT;
 };
 
-[[maybe_unused]] NativeResult raise_err(Process& p, const Err& e, const std::string& prefix = "") {
+NativeResult raise_err(Process& p, const Err& e, const std::string& prefix = "") {
     if (e.raised) return NativeResult::raise(e.value);
     return fail(p, prefix + e.text);
 }
@@ -247,7 +243,7 @@ bool say(Err* e, const std::string& text) {
 }
 
 /// A Dream list, spine and elements forced to weak head normal form.
-[[maybe_unused]] bool list_items(Process& p, Value v, std::vector<Value>* out, Err* e, const char* what) {
+bool list_items(Process& p, Value v, std::vector<Value>* out, Err* e, const char* what) {
     Value cur;
     if (!force(p, v, &cur, e)) return false;
     for (;;) {
@@ -261,7 +257,7 @@ bool say(Err* e, const std::string& text) {
     }
 }
 
-[[maybe_unused]] bool str_value(Value v, std::string* out) {
+bool str_value(Value v, std::string* out) {
     v = resolve(v);
     if (!is_obj(v, ObjType::Str)) return false;
     auto* s = static_cast<StrObj*>(as_obj(v));
@@ -274,38 +270,6 @@ std::string atom_text(Process& p, Value v) {
 }
 
 }  // namespace
-
-// ---------------------------------------------------------------------------
-// Without libffi
-// ---------------------------------------------------------------------------
-
-#if !DREAM_HAVE_FFI
-
-namespace {
-
-NativeResult ffi_unavailable(Process& p, Value, Value*, uint32_t) {
-    return fail(p, "this build has no FFI: libffi was not found when the VM was configured");
-}
-
-NativeResult ffi_sizeof(Process& p, Value, Value* args, uint32_t) {
-    Value v = resolve(args[0]);
-    if (!is_atom(v)) return fail(p, "sizeof needs a type atom");
-    const KindName* k = scalar_named(atom_text(p, v));
-    if (!k) return fail(p, "`:" + atom_text(p, v) + "` is not an FFI type");
-    return NativeResult::ok(make_fixnum(int64_t(k->size)));
-}
-
-NativeResult ffi_alignof(Process& p, Value, Value* args, uint32_t) {
-    Value v = resolve(args[0]);
-    if (!is_atom(v)) return fail(p, "alignof needs a type atom");
-    const KindName* k = scalar_named(atom_text(p, v));
-    if (!k) return fail(p, "`:" + atom_text(p, v) + "` is not an FFI type");
-    return NativeResult::ok(make_fixnum(int64_t(k->align)));
-}
-
-}  // namespace
-
-#else
 
 namespace {
 
@@ -1523,10 +1487,7 @@ NativeResult ffi_write_u8(Process& p, Value, Value* args, uint32_t) {
 
 }  // namespace
 
-#endif  // DREAM_HAVE_FFI
-
 ModuleDef make_ffi_module() {
-#if DREAM_HAVE_FFI
     // Strict masks: a signature is read by forcing it here, element by
     // element, so only the positions that are read whole are forced first.
     return ModuleDef{"std.ffi",
@@ -1558,47 +1519,6 @@ ModuleDef make_ffi_module() {
                          {"read_u8!", 2, 0b11, ffi_read_u8},
                          {"write_u8!", 3, 0b111, ffi_write_u8},
                      }};
-#else
-    // The module still exists so that `import std.ffi` compiles everywhere and
-    // the failure is a clear message at the call, not a missing module.
-    return ModuleDef{"std.ffi",
-                     {
-                         {"function", 4, 0, ffi_unavailable},
-                         {"pure_function", 4, 0, ffi_unavailable},
-                         {"call!", 2, 0, ffi_unavailable},
-                         {"release!", 1, 0, ffi_unavailable},
-                         {"alive!", 1, 0, ffi_unavailable},
-                         {"owned!", 1, 0, ffi_unavailable},
-                         {"buffer!", 1, 0, ffi_unavailable},
-                         {"size!", 1, 0, ffi_unavailable},
-                         {"address!", 1, 0, ffi_unavailable},
-                         {"peek!", 3, 0, ffi_unavailable},
-                         {"poke!", 4, 0, ffi_unavailable},
-                         {"read!", 3, 0, ffi_unavailable},
-                         {"read_string!", 2, 0, ffi_unavailable},
-                         {"write!", 3, 0, ffi_unavailable},
-                         {"sizeof", 1, 0b1, ffi_sizeof},
-                         {"alignof", 1, 0b1, ffi_alignof},
-                         {"payload_index", 1, 0, ffi_unavailable},
-                         {"open!", 1, 0b1, ffi_unavailable},
-                         {"close!", 1, 0b1, ffi_unavailable},
-                         {"bind!", 4, 0b1111, ffi_unavailable},
-                         {"load!", 4, 0b1111, ffi_unavailable},
-                         {"alloc!", 1, 0b1, ffi_unavailable},
-                         {"free!", 1, 0b1, ffi_unavailable},
-                         {"read_cstr!", 1, 0b1, ffi_unavailable},
-                         {"read_u8!", 2, 0b11, ffi_unavailable},
-                         {"write_u8!", 3, 0b111, ffi_unavailable},
-                     }};
-#endif
-}
-
-bool ffi_available() {
-#if DREAM_HAVE_FFI
-    return true;
-#else
-    return false;
-#endif
 }
 
 }  // namespace dream

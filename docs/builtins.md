@@ -393,7 +393,6 @@ These report figures for the **calling** process.
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `modules!` | `unit → list of string` | The names of all loaded modules. |
-| `has_ffi` | `unit → bool` | Whether the VM was built with libffi support. |
 | `async_io` | `unit → bool` | Whether epoll-based async I/O is available. |
 
 ### Sharing between processes
@@ -478,10 +477,9 @@ arguments to what it comes to; that is what makes an alias callable.
 
 ## `std.ffi`
 
-Calling C. Requires libffi at build time; without it every member except
-`sizeof` and `alignof` raises `:ffi_error`, and `vm.has_ffi ()` is `false`.
-`import std.ffi` always compiles. [`std.foreign`](ffi.md) is the Dream-level
-half, and the one to write a wrapper against: it gives the vocabulary below
+Calling C. A required module: every VM provides it, and the VM's build fails
+without libffi rather than produce one that cannot call C.
+[`std.foreign`](ffi.md) is the Dream-level half, and the one to write a wrapper against: it gives the vocabulary below
 types, so a signature written as a literal is checked while compiling.
 
 ```dream
@@ -558,8 +556,8 @@ directly; that is the point.
 | `read!` | `buffer → offset → length → string` | Bytes, as a string. |
 | `read_string!` | `buffer → offset → string` | Up to a NUL or the end of the buffer. |
 | `write!` | `buffer → offset → string → unit` | A string's (or payload view's) bytes. |
-| `sizeof` | `type → integer` | Size in bytes of a scalar type. Works without libffi. |
-| `alignof` | `type → integer` | Its alignment. Works without libffi. |
+| `sizeof` | `type → integer` | Size in bytes of a scalar type. |
+| `alignof` | `type → integer` | Its alignment. |
 | `payload_index` | `name → integer\|unit` | Which payload `--payload NAME=FILE` called `name`. |
 
 ### The first interface

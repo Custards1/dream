@@ -8,8 +8,9 @@
 # running underneath C, which is precisely the kind of re-entry the two tiers
 # could disagree about.
 #
-# A VM built without libffi, or a machine with no C compiler, skips rather than
-# fails: both are supported configurations, and `std.ffi` says so at the call.
+# A machine with no C compiler skips rather than fails, since the library
+# cannot be built. There is no VM without libffi to skip for: `std.ffi` is a
+# required part of the VM, and the build refuses to make one that lacks it.
 set -u
 
 dream=${dream:-build-dream/bin/dream}
@@ -21,17 +22,6 @@ trap 'rm -rf "$tmp"' EXIT
 cc=${CC:-cc}
 if ! command -v "$cc" >/dev/null 2>&1; then
     echo "skip ffi: no C compiler"
-    exit 0
-fi
-
-cat >"$tmp/probe.dr" <<'EOF'
-import std.console;
-import std.vm;
-let main! = console.print! (vm.has_ffi ());
-EOF
-timeout 60 "$dream" "$dreams" -L mind -o "$tmp/probe.dream" "$tmp/probe.dr" >/dev/null 2>&1 || exit 1
-if [ "$(timeout 10 "$dream" "$tmp/probe.dream")" != "true" ]; then
-    echo "skip ffi: this VM was built without libffi"
     exit 0
 fi
 

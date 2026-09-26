@@ -18,7 +18,6 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 option(DREAM_ENABLE_JIT "Build the LLVM JIT tier" ON)
-option(DREAM_ENABLE_FFI "Build the C foreign function interface" ON)
 option(DREAM_PORTABLE_POLLER "Use the portable readiness poller even on Linux" OFF)
 option(DREAM_BUILD_TESTS "Build the VM test suite" ON)
 
@@ -110,34 +109,33 @@ endif()
 # ---------------------------------------------------------------------------
 # libffi, for std.ffi
 #
-# Optional in the same way the JIT is: without it the VM builds and runs, and
-# `std.ffi` reports at the call site that this build cannot reach C.
+# Required, unlike LLVM. `std.ffi` is part of what a VM is: `std.foreign` and
+# every `foreign` declaration compile to calls into it, so a VM that cannot
+# reach C would run some valid images and fail others at the call site. There
+# is no such build; without libffi the configure stops here.
 # ---------------------------------------------------------------------------
-set(DREAM_HAVE_FFI OFF)
-if(DREAM_ENABLE_FFI)
-  find_path(DREAM_FFI_INCLUDE ffi.h PATH_SUFFIXES ffi)
-  find_library(DREAM_FFI_LIB NAMES ffi)
-  if(UNIX AND NOT CMAKE_CROSSCOMPILING AND (NOT DREAM_FFI_INCLUDE OR NOT DREAM_FFI_LIB))
-    # Nix keeps headers in a separate -dev output that is not on the default
-    # search path.
-    file(GLOB DREAM_NIX_FFI_INC "/nix/store/*libffi-*-dev/include")
-    file(GLOB DREAM_NIX_FFI_LIB "/nix/store/*libffi-*/lib/libffi.so")
-    if(DREAM_NIX_FFI_INC AND DREAM_NIX_FFI_LIB)
-      list(SORT DREAM_NIX_FFI_INC)
-      list(REVERSE DREAM_NIX_FFI_INC)
-      list(GET DREAM_NIX_FFI_INC 0 DREAM_FFI_INCLUDE)
-      list(SORT DREAM_NIX_FFI_LIB)
-      list(REVERSE DREAM_NIX_FFI_LIB)
-      list(GET DREAM_NIX_FFI_LIB 0 DREAM_FFI_LIB)
-    endif()
-  endif()
-  if(DREAM_FFI_INCLUDE AND DREAM_FFI_LIB)
-    set(DREAM_HAVE_FFI ON)
-    message(STATUS "Dream: FFI enabled (${DREAM_FFI_LIB})")
-  else()
-    message(WARNING "Dream: libffi not found; std.ffi will report that C is unreachable")
+find_path(DREAM_FFI_INCLUDE ffi.h PATH_SUFFIXES ffi)
+find_library(DREAM_FFI_LIB NAMES ffi)
+if(UNIX AND NOT CMAKE_CROSSCOMPILING AND (NOT DREAM_FFI_INCLUDE OR NOT DREAM_FFI_LIB))
+  # Nix keeps headers in a separate -dev output that is not on the default
+  # search path.
+  file(GLOB DREAM_NIX_FFI_INC "/nix/store/*libffi-*-dev/include")
+  file(GLOB DREAM_NIX_FFI_LIB "/nix/store/*libffi-*/lib/libffi.so")
+  if(DREAM_NIX_FFI_INC AND DREAM_NIX_FFI_LIB)
+    list(SORT DREAM_NIX_FFI_INC)
+    list(REVERSE DREAM_NIX_FFI_INC)
+    list(GET DREAM_NIX_FFI_INC 0 DREAM_FFI_INCLUDE)
+    list(SORT DREAM_NIX_FFI_LIB)
+    list(REVERSE DREAM_NIX_FFI_LIB)
+    list(GET DREAM_NIX_FFI_LIB 0 DREAM_FFI_LIB)
   endif()
 endif()
+if(NOT DREAM_FFI_INCLUDE OR NOT DREAM_FFI_LIB)
+  message(FATAL_ERROR "Dream: libffi not found. std.ffi is a required part of the VM; "
+                      "install libffi, or point -DDREAM_FFI_INCLUDE=<dir with ffi.h> and "
+                      "-DDREAM_FFI_LIB=<path to libffi> at it.")
+endif()
+message(STATUS "Dream: FFI enabled (${DREAM_FFI_LIB})")
 
 # ---------------------------------------------------------------------------
 # The VM library
@@ -184,11 +182,8 @@ find_package(Threads REQUIRED)
 target_link_libraries(dream PUBLIC Threads::Threads)
 target_link_libraries(dream PRIVATE ${CMAKE_DL_LIBS})
 
-if(DREAM_HAVE_FFI)
-  target_compile_definitions(dream PRIVATE DREAM_HAVE_FFI=1)
-  target_include_directories(dream SYSTEM PRIVATE ${DREAM_FFI_INCLUDE})
-  target_link_libraries(dream PRIVATE ${DREAM_FFI_LIB})
-endif()
+target_include_directories(dream SYSTEM PRIVATE ${DREAM_FFI_INCLUDE})
+target_link_libraries(dream PRIVATE ${DREAM_FFI_LIB})
 
 if(MSVC)
   # C4100 is unused-parameter, which the GCC line below turns off too: a

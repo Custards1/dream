@@ -994,10 +994,6 @@ NativeResult vm_modules(Process& p, Value, Value*, uint32_t) {
     return NativeResult::ok(list);
 }
 
-NativeResult vm_has_ffi(Process&, Value, Value*, uint32_t) {
-    return NativeResult::ok(make_bool(ffi_available()));
-}
-
 // --- introspection ----------------------------------------------------------
 //
 // What the VM is doing, as ordinary Dream values. This exists because the
@@ -1236,7 +1232,6 @@ ModuleDef make_vm_module() {
                          {"shared_bytes!", 1, 0b1, vm_shared_bytes},
                          {"modules!", 1, 0b1, vm_modules},
                          {"host_members", 1, 0b1, vm_host_members},
-                         {"has_ffi", 1, 0b1, vm_has_ffi},
                          {"async_io", 1, 0b1, vm_async_io},
                          {"processes_info!", 1, 0b1, vm_process_list},
                          {"process_info!", 1, 0b1, vm_process_info},

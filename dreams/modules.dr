@@ -424,6 +424,9 @@ let rec expand_items cfg items =
             // name holding its description -- see `syntax.union_decl`.
             [:union_decl, name, params, variants, members, span] =>
                 syntax.union_decl name params variants members span,
+            // A C library is a module of bindings -- see `syntax.foreign_decl`.
+            [:foreign_decl, name, library, entries, span] =>
+                syntax.foreign_decl name library entries span,
             other => [other],
         }) items);
 

@@ -2,9 +2,9 @@
 #
 #   nix-shell        then ./build.sh
 #
-# LLVM and libffi are both optional to the build; they are here because with
-# them you get the JIT and `std.ffi`, and reproducing a build without them is
-# the unusual case rather than the default.
+# libffi is required (`std.ffi` is part of every VM). LLVM is optional; it is
+# here because with it you get the JIT, and a build without it is the unusual
+# case rather than the default.
 { pkgs ? import <nixpkgs> { } }:
 
 pkgs.mkShell {
@@ -22,7 +22,7 @@ pkgs.mkShell {
   ];
 
   buildInputs = with pkgs; [
-    libffi                     # std.ffi
+    libffi                     # std.ffi, required
     zlib                       # LLVM links against it
   ];
 

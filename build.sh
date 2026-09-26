@@ -2,9 +2,10 @@
 # Build Dream from a clean checkout.
 #
 # The aim is that this either produces a working toolchain or tells you exactly
-# what is missing and what you lose without it. Two dependencies are optional
-# and the build adapts to both: LLVM gives the JIT, libffi gives `std.ffi`.
-# Neither is required to get a working compiler and interpreter.
+# what is missing and what you lose without it. libffi is required: `std.ffi`
+# is part of every VM, and a VM that cannot call C is not a valid one. LLVM is
+# optional and the build adapts to it: with it you get the JIT, without it an
+# interpreter that is still correct, just slower.
 #
 #   ./build.sh                 build and test
 #   ./build.sh --release       optimized
@@ -12,7 +13,6 @@
 #   ./build.sh --clean         start from scratch
 #   ./build.sh --prefix DIR    also install there
 #   ./build.sh --no-jit        skip LLVM even if present
-#   ./build.sh --no-ffi        skip libffi even if present
 
 set -euo pipefail
 
@@ -25,7 +25,6 @@ RUN_TESTS=1
 DO_CLEAN=0
 PREFIX=""
 ENABLE_JIT=ON
-ENABLE_FFI=ON
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,7 +33,6 @@ while [[ $# -gt 0 ]]; do
     --no-tests)  RUN_TESTS=0 ;;
     --clean)     DO_CLEAN=1 ;;
     --no-jit)    ENABLE_JIT=OFF ;;
-    --no-ffi)    ENABLE_FFI=OFF ;;
     --prefix)    PREFIX="${2:?--prefix needs a directory}"; shift ;;
     --build-dir) BUILD_DIR="${2:?--build-dir needs a directory}"; shift ;;
     -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -83,9 +81,23 @@ else
   missing=1
 fi
 
+# libffi is not optional: `std.ffi` is part of the VM. CMake has the last word
+# (and a way to point it at an unusual install), but this is where the news
+# should arrive, before a configure whose errors the filter below hides.
+if pkg-config --exists libffi 2>/dev/null || \
+   compgen -G "/nix/store/*libffi-*/lib/libffi.so" >/dev/null || \
+   compgen -G "/usr/include/ffi.h" >/dev/null || \
+   compgen -G "/usr/include/*/ffi.h" >/dev/null || \
+   compgen -G "/usr/local/include/ffi.h" >/dev/null; then
+  ok "libffi found"
+else
+  printf '    %smissing: libffi  (std.ffi, a required part of the VM)%s\n' "$RED" "$RESET"
+  missing=1
+fi
+
 [[ $missing -eq 0 ]] || die "install the tools above and run this again"
 
-# Optional pieces. Report them now rather than letting CMake bury the news.
+# The optional piece. Report it now rather than letting CMake bury the news.
 if [[ "$ENABLE_JIT" == ON ]]; then
   if command -v llvm-config >/dev/null 2>&1; then
     ok "LLVM $(llvm-config --version)  -- the JIT will be built"
@@ -96,17 +108,6 @@ if [[ "$ENABLE_JIT" == ON ]]; then
   fi
 else
   note "JIT disabled by --no-jit"
-fi
-
-if [[ "$ENABLE_FFI" == ON ]]; then
-  if compgen -G "/nix/store/*libffi-*/lib/libffi.so" >/dev/null || \
-     [[ -f /usr/include/ffi.h || -f /usr/local/include/ffi.h ]]; then
-    ok "libffi found -- std.ffi will be able to call C"
-  else
-    warn "no libffi: std.ffi will report that C is unreachable"
-  fi
-else
-  note "FFI disabled by --no-ffi"
 fi
 
 # --- clean ------------------------------------------------------------------
@@ -122,8 +123,7 @@ fi
 step "Building the VM (libdream, dream)"
 cmake -S . -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-      -DDREAM_ENABLE_JIT="$ENABLE_JIT" \
-      -DDREAM_ENABLE_FFI="$ENABLE_FFI" 2>&1 | sed -n 's/^-- Dream: /    /p'
+      -DDREAM_ENABLE_JIT="$ENABLE_JIT" 2>&1 | sed -n 's/^-- Dream: /    /p'
 cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | \
   grep -E 'error|warning:' | sed 's/^/    /' || true
 

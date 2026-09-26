@@ -27,6 +27,7 @@ import std.str;
 
 import dreams.ast;
 import dreams.lexer;
+import dreams.syntax;
 
 // --- results ----------------------------------------------------------------
 
@@ -1535,6 +1536,10 @@ let rec parse_item c ts = {
                 other => other,
             },
             "union" => parse_union c sp (list.tail ts),
+            // Contextual, like the record introducers: `foreign` is also the
+            // name every program gives `std.foreign`, and `foreign.x` cannot
+            // begin an item anyway.
+            "foreign" => parse_foreign c sp (list.tail ts),
             "group" => parse_record c :list sp (list.tail ts),
             "struct" => parse_record c :array sp (list.tail ts),
             "mapping" => parse_record c :map sp (list.tail ts),
@@ -1720,6 +1725,213 @@ let rec variant_fields c acc ts =
                     else if at rest :rparen { ok [list.reverse acc2, peek_span rest] (list.tail rest) }
                     else { err ("expected `,` or `)`, found " + describe rest) (peek_span rest) }
                 },
+        }
+    };
+
+// --- foreign libraries ----------------------------------------------------------
+//
+//     foreign sample from embedded "sample" {
+//         resource Counter = counter_free
+//         struct Point { x : :i32, y : :double }
+//
+//         new! : :long -> Counter = counter_new
+//         add! : Counter -> :long -> :long = counter_add
+//         scale : :f32 -> :double -> :double
+//     }
+//
+// is a C library and what this program calls in it, and the loader makes it a
+// module (`syntax.foreign_decl`). Nothing here knows what `:long` or `out`
+// means: every C type is read in the type grammar -- `(:int -> :int)` is a
+// callback because a parenthesised arrow is one, `out :int` an application --
+// and `syntax` decides what the result stands for. So the grammar of a binding
+// is the grammar of a signature, which is what a binding is.
+//
+// The library is a path (`from "libm.so.6"`), a payload the image carries
+// (`from embedded "sqlite"`), any expression in parentheses, or nothing, for
+// the running program. Entries are separated as a union's are.
+
+let rec parse_foreign c sp ts =
+    if not (at ts :ident) || is_keyword (peek_value ts) {
+        err "expected a name for the library after `foreign`" (peek_span ts)
+    } else if str.ends_with "!" (peek_value ts) {
+        err "a library's name must be pure" (peek_span ts)
+    } else {
+        let name = peek_value ts;
+        match foreign_library c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, library, rest] =>
+                match expect rest :lbrace "`{` before the library's declarations" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        foreign_body (ctx true false (ctx_indent c)) name library sp [] rest2,
+                },
+        }
+    };
+
+/// `from "path"`, `from embedded "name"`, `from (expr)`, or nothing.
+let foreign_library c ts =
+    if not (is_kw ts "from") { ok () ts }
+    else {
+        let rest = list.tail ts;
+        let sp = peek_span rest;
+        match peek_kind rest {
+            :str => ok (ast.str_e (peek_value rest) sp) (list.tail rest),
+            :lparen =>
+                match parse_expr (grouped c) (list.tail rest) {
+                    [:error, m, s] => err m s,
+                    [:ok, e, rest2] =>
+                        match expect rest2 :rparen "`)` after the library" {
+                            [:error, m, s] => err m s,
+                            [:ok, _, rest3] => ok e rest3,
+                        },
+                },
+            :ident if peek_value rest == "embedded" => {
+                let after = list.tail rest;
+                if not (at after :str) {
+                    err "expected the payload's name, as a string, after `embedded`" (peek_span after)
+                }
+                else {
+                    let at_ = ast.span_to sp (peek_span after);
+                    ok (ast.list_e [ast.atom_e "payload" at_, ast.str_e (peek_value after) (peek_span after)] at_)
+                       (list.tail after)
+                }
+            },
+            _ => err ("expected a path, `embedded \"name\"` or `(expression)` after `from`, found "
+                      + describe rest) sp,
+        }
+    };
+
+let rec foreign_body c name library sp entries ts =
+    if at ts :comma { foreign_body c name library sp entries (list.tail ts) }
+    else if at ts :rbrace {
+        let written = list.reverse entries;
+        match syntax.foreign_problem name written {
+            () => ok (ast.foreign_d name library written (ast.span_to sp (peek_span ts))) (list.tail ts),
+            [m, at_] => err m at_,
+        }
+    }
+    else if at_end ts { err "unterminated `foreign`: expected `}`" sp }
+    else {
+        match foreign_entry (at_statement c ts) name entries ts {
+            [:error, m, s] => err m s,
+            [:ok, entry, rest] => foreign_body c name library sp (list_cons entry entries) rest,
+        }
+    };
+
+/// The name every kind of entry declares, for telling two apart.
+let foreign_entry_name e = list.nth 1 e;
+
+/// `resource Name = destructor`, `struct Name { field : t, .. }`, or a
+/// function: `name : type`, and `= symbol` when the C name is not `name`
+/// without its `!`.
+let foreign_entry c lib entries ts =
+    if not (at ts :ident) {
+        err ("expected a function, `resource`, `struct` or `}` in `" + lib + "`, found " + describe ts)
+            (peek_span ts)
+    } else {
+        let word = peek_value ts;
+        let at_word = peek_span ts;
+        let after = list.tail ts;
+        let taken n at_ =
+            if list.any (fn e -> foreign_entry_name e == n) entries {
+                err ("`" + n + "` is already declared in `" + lib + "`") at_
+            }
+            else { ok () () };
+        if word == "resource" && at after :ident {
+            let rname = peek_value after;
+            let rspan = peek_span after;
+            match taken rname rspan {
+                [:error, m, s] => err m s,
+                _ =>
+                    if not (at (list.tail after) :eq) {
+                        ok [:resource, rname, (), ast.span_to at_word rspan] (list.tail after)
+                    }
+                    else {
+                        match c_symbol (list.tail (list.tail after)) {
+                            [:error, m, s] => err m s,
+                            [:ok, [dtor, dspan], rest] =>
+                                ok [:resource, rname, dtor, ast.span_to at_word dspan] rest,
+                        }
+                    },
+            }
+        }
+        else if word == "struct" && at after :ident {
+            let sname = peek_value after;
+            let sspan = peek_span after;
+            match taken sname sspan {
+                [:error, m, s] => err m s,
+                _ => match expect (list.tail after) :lbrace ("`{` before the fields of `" + sname + "`") {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest] =>
+                        match c_struct_fields (ctx true false 0) sname [] rest {
+                            [:error, m, s] => err m s,
+                            [:ok, [fields, close], rest2] =>
+                                ok [:c_struct, sname, fields, ast.span_to at_word close] rest2,
+                        },
+                },
+            }
+        }
+        else if is_keyword word {
+            err ("`" + word + "` is a keyword and cannot name a function") at_word
+        }
+        else {
+            match taken word at_word {
+                [:error, m, s] => err m s,
+                _ => match expect after :colon ("`:` and the C signature of `" + word + "`") {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest] =>
+                        match parse_type_expr c rest {
+                            [:error, m, s] => err m s,
+                            [:ok, t, rest2] =>
+                                if not (at rest2 :eq) {
+                                    let plain = if str.ends_with "!" word {
+                                                    str.slice 0 (str.byte_length word - 1) word
+                                                } else { word };
+                                    ok [:c_function, word, t, plain, ast.span_to at_word (ast.span t)] rest2
+                                }
+                                else {
+                                    match c_symbol (list.tail rest2) {
+                                        [:error, m, s] => err m s,
+                                        [:ok, [sym, symspan], rest3] =>
+                                            ok [:c_function, word, t, sym, ast.span_to at_word symspan] rest3,
+                                    }
+                                },
+                        },
+                },
+            }
+        }
+    };
+
+/// A C name: an identifier, or a string for one that is not a Dream identifier.
+let c_symbol ts = match peek_kind ts {
+    :ident => ok [peek_value ts, peek_span ts] (list.tail ts),
+    :str => ok [peek_value ts, peek_span ts] (list.tail ts),
+    _ => err ("expected a C name, found " + describe ts) (peek_span ts),
+};
+
+/// `field : t, ..}`, already past the `{`: `[[fields, close], rest]`. Fields
+/// are separated by `,` or a line break, as a record's are.
+let rec c_struct_fields c sname acc ts =
+    if at ts :comma { c_struct_fields c sname acc (list.tail ts) }
+    else if at ts :rbrace { ok [list.reverse acc, peek_span ts] (list.tail ts) }
+    else if not (at ts :ident) || is_keyword (peek_value ts) {
+        err ("expected a field of `" + sname + "`, found " + describe ts) (peek_span ts)
+    }
+    else {
+        let fname = peek_value ts;
+        let fspan = peek_span ts;
+        if list.any (fn f -> list.nth 0 f == fname) acc {
+            err ("`" + fname + "` is already a field of `" + sname + "`") fspan
+        }
+        else {
+            match expect (list.tail ts) :colon ("`:` and the C type of `" + fname + "`") {
+                [:error, m, s] => err m s,
+                [:ok, _, rest] =>
+                    match parse_type_expr (at_statement c ts) rest {
+                        [:error, m, s] => err m s,
+                        [:ok, t, rest2] => c_struct_fields c sname (list_cons [fname, fspan, t] acc) rest2,
+                    },
+            }
         }
     };
 
@@ -2557,6 +2769,39 @@ when test {
                         (items "when os == \"linux\" && not release { let x = 1 }") ),
         test.case "top-level lets need no rec"
             $( test.eq! "(let go n (apply (name go) (name n)))" (items "let go n = go n") ),
+
+        // --- foreign ---
+        //
+        // The parser reads a binding's C signature in the type grammar and
+        // knows nothing of what it means; `syntax` does, and is asked here
+        // only so that a C type that means nothing is reported where it was
+        // written.
+        test.case "a C signature is read in the type grammar"
+            $( test.eq! "(foreign m (str \"m.so\") (resource R r_free) (f! (list (atom fn) (atom int) (list (atom fn) (apply (name out) (name R)) (atom int))) make_r))"
+                        (items "foreign m from \"m.so\" {\n    resource R = r_free\n    f! : :int -> out R -> :int = make_r\n}") ),
+        test.case "the C name is the Dream name without its bang"
+            $( test.eq! "(foreign m (f! (list (atom fn) (atom void) (atom int)) f))"
+                        (items "foreign m { f! : :void -> :int }") ),
+        test.case "a struct's fields are separated as a record's are"
+            $( test.eq! "(foreign m (struct P (x (atom i32)) (y (atom double))))"
+                        (items "foreign m {\n    struct P {\n        x : :i32\n        y : :double\n    }\n}") ),
+        test.case "a payload is a library"
+            $( test.eq! "(foreign m (list (atom payload) (str \"lib\")))"
+                        (items "foreign m from embedded \"lib\" {}") ),
+        test.case "`foreign` is still a name everywhere else"
+            $( test.eq! "(let x (apply (field (name foreign) run!) (int 1)))"
+                        (items "let x = foreign.run! 1;") ),
+        test.case "a C type that is not one is reported where it is written"
+            $( test.true! (str.contains_str "`:float`" (fails_module "foreign m { f : :float -> :int }")) ),
+        test.case "a name in a C signature must be declared in the block"
+            $( test.true! (str.contains_str "not a resource or a struct"
+                                            (fails_module "foreign m { f : Db -> :int }")) ),
+        test.case "C cannot hand over a resource with no destructor"
+            $( test.true! (str.contains_str "no destructor"
+                                            (fails_module "foreign m {\n    resource R\n    f : :void -> R\n}")) ),
+        test.case "one name, one entry"
+            $( test.true! (str.contains_str "already declared"
+                                            (fails_module "foreign m {\n    f : :void -> :int\n    f : :void -> :int\n}")) ),
 
         // --- errors ---
         test.case "an unclosed parenthesis"

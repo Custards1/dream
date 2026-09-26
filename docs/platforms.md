@@ -25,8 +25,8 @@ not a claim of identical throughput or latency to epoll.
 Platform-specific work remains platform-specific:
 
 - FFI library names, exported symbols, and C ABIs require matching libraries
-  on the receiving system. An optional feature such as FFI must be enabled in
-  that VM when a program uses it.
+  on the receiving system. `std.ffi` itself is present in every VM; the
+  library it opens is what has to exist there.
 - Executable names, shell commands, environment variables, permissions, and
   filesystem case sensitivity depend on the host. `mind` dependency fetching
   requires the external programs it invokes, such as Git, curl, and tar.
@@ -42,20 +42,22 @@ Platform-specific work remains platform-specific:
 ## Building
 
 Use a C++20 compiler and CMake 3.20 or newer. GCC, Clang, and MSVC are supported
-by the build configuration. Start with the interpreter to avoid optional
-LLVM and libffi dependencies:
+by the build configuration. libffi is required -- `std.ffi` is part of every
+VM -- and LLVM is optional. Start with the interpreter to avoid LLVM:
 
 ```text
-cmake -S . -B build -DDREAM_ENABLE_JIT=OFF -DDREAM_ENABLE_FFI=OFF
+cmake -S . -B build -DDREAM_ENABLE_JIT=OFF
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release -R "^dream_tests$" --output-on-failure
 ```
 
 Single-configuration builds put the VM in `build/bin/dream` (or `dream.exe`).
 Visual Studio puts it in `build/bin/Release/dream.exe`. Keep the Windows VM DLL
-beside the executable. Enable LLVM and libffi with `DREAM_ENABLE_JIT` and
-`DREAM_ENABLE_FFI`; missing dependencies produce an interpreter or a VM without
-FFI, respectively. On Windows, use libraries built for the same compiler ABI.
+beside the executable. Enable LLVM with `DREAM_ENABLE_JIT`; without it the
+build produces an interpreter. Without libffi the configure stops: point
+`DREAM_FFI_INCLUDE` and `DREAM_FFI_LIB` at an unusual install, or on Windows use
+vcpkg's `libffi` through its toolchain file. On Windows, use libraries built for
+the same compiler ABI.
 
 ## Verification
 
@@ -64,8 +66,9 @@ artifacts to Linux, Windows, and macOS runners. Each runner verifies SHA-256
 hashes before execution. The bundle covers language operations, binary I/O,
 Unicode filenames, subprocess quoting, deadlines, TCP I/O with one worker, and
 using the same compiler image to compile a new program on the receiving OS.
-The initial matrix exercises the interpreter; optional JIT/FFI configurations
-need separate validation on each host.
+The initial matrix exercises the interpreter, with `std.ffi` built in as it
+always is; the JIT, and calls into C libraries, need separate validation on
+each host.
 
 To reproduce locally:
 

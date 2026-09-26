@@ -6,7 +6,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF -DDREAM_ENABLE_FFI=OFF
+      - run: sudo apt-get update && sudo apt-get install -y libffi-dev
+      - run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF
       - run: cmake --build build --parallel 2
       - run: python3 dream/tests/portable.py compile --vm build/bin/dream --images portable-images
       - uses: actions/upload-artifact@v4
@@ -26,7 +27,21 @@ jobs:
         with:
           name: portable-images
           path: portable-images
-      - run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF -DDREAM_ENABLE_FFI=OFF
+      # libffi is required on every platform: `std.ffi` is part of the VM.
+      # Windows takes it from vcpkg, whose toolchain also copies the DLL
+      # beside the executables; Homebrew's is keg-only and has to be named.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev
+      - if: runner.os == 'macOS'
+        run: brew install libffi
+      - if: runner.os == 'Windows'
+        run: vcpkg install libffi:x64-windows
+      - if: runner.os == 'Linux'
+        run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF
+      - if: runner.os == 'macOS'
+        run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF -DCMAKE_PREFIX_PATH="$(brew --prefix libffi)"
+      - if: runner.os == 'Windows'
+        run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
       - run: cmake --build build --config Release --parallel 2
       - run: ctest --test-dir build -C Release -R "^dream_tests$" --output-on-failure
       - if: runner.os != 'Windows'

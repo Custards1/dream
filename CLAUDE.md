@@ -116,8 +116,9 @@ warning-free in both modes.
 into it: `dreams.dream`, `mind`, `lucid.dream`. Do not reach for a `dream`
 binary under `build/`.
 
-`./build.sh` builds from a clean checkout and reports what optional dependencies
-are missing (LLVM gives the JIT, libffi gives `std.ffi`; neither is required).
+`./build.sh` builds from a clean checkout and reports what dependencies are
+missing. libffi is required: `std.ffi` is a module every VM must provide, and a
+VM built without it is not a valid VM. LLVM is optional and gives the JIT.
 
 ## Testing
 
@@ -310,10 +311,14 @@ The lessons that keep coming back:
   `Shape` holding its description. A `match` on one must handle every
   variant. Lists back it; an array opt-in, as `struct` is to `group`, is
   planned and not built.
-- `std.foreign` wraps C: a signature is data checked as a type, a pointer C
-  hands back is a handle owned by the calling process and destroyed when it is
-  released or the process ends, and a library can run as a server process
-  that owns what is made through it. [docs/ffi.md](docs/ffi.md).
+- `foreign lib from "libx.so" { resource Db = db_close; open! : :cstr -> out Db -> :int = db_open }`
+  declares a C library: each line a C signature in the type grammar, which the
+  loader (`syntax.foreign_decl`) binds through `std.ffi` *and* signs with its
+  Dream type, so a wrong handle is a compile error. A pointer C hands back is
+  a handle owned by the calling process and destroyed when it is released or
+  the process ends; `foreign.run! server (fn () -> ..)` does work in a library
+  server that owns what is made through it. `foreign` is contextual -- still
+  the name of `std.foreign`. [docs/ffi.md](docs/ffi.md).
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

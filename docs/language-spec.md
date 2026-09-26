@@ -970,6 +970,60 @@ let radius : [:circle, :float] -> :float;
 let r s = if s != :empty && s.[0] == :circle { radius s } else { 0.0 };
 ```
 
+### `foreign` — a C library
+
+```dream
+foreign sqlite from "libsqlite3.so.0" {
+    resource Db = sqlite3_close
+    resource Stmt = sqlite3_finalize
+    struct Point { x : :i32, y : :double }
+
+    open! : :cstr -> out Db -> :int = sqlite3_open
+    prepare! : Db -> :cstr -> :int -> out Stmt -> :ptr -> :int = sqlite3_prepare_v2
+    errmsg : Db -> :cstr = sqlite3_errmsg
+    libversion : :void -> :cstr = sqlite3_libversion
+}
+
+let [status, db] = sqlite.open! "notes.db";
+```
+
+declares a C library and what the program calls in it. Each function is
+written as its C signature, in the type grammar, and bound to a name; `= sym`
+gives the C name when it is not the Dream name without its `!`. The words a
+C signature is written in:
+
+| Written | In C | On this side |
+|---|---|---|
+| `:int`, `:long`, `:size`, `:i32`, `:u8`, .. | that number | `:integer` |
+| `:f32`, `:f64`, `:double` | that float | `:float` |
+| `:cstr` | `const char *` | `:string` |
+| `:void -> t` | a function of no arguments | `:unit -> t` |
+| a `resource` `R` | `R *` passed in | the handle type `R` |
+| `R` as a result | `R *` handed over, freed by `R`'s destructor | `R` |
+| `borrow R` | `R *` C keeps | `R` |
+| `out t` | `t *` C writes through | leaves the arguments, joins the result: `[result, out, ..]` |
+| `taken free` | a `char *` the caller frees with `free` | `:string` |
+| `(a -> b)` | a function pointer | a pure Dream function |
+| a `struct` `P` | `P *` | `foreign.Buffer` |
+| `t \| ()` | a result that may be `NULL` | `t \| :unit` |
+
+There is no `:float`, because in Dream that is a double and a signature is
+exactly where the two would be confused.
+
+The declaration becomes a module `sqlite` holding `library`, a type for each
+resource (`sqlite.Db`), a module for each struct (`sqlite.Point.new!`,
+`.read!`, `.write!`, `.offset`, `.size`, `.layout`), and each function, bound
+through `std.ffi` and **signed with its type on this side** — so a `Stmt`
+where a `Db` is wanted is a compile error. A name with `!` is bound as an
+effect; one without is a pure function, which only the program can know a C
+function is. A C type that means nothing (`Nope`, `:float`, `out` as a result)
+is reported where it was written.
+
+The library is `from "path"`, `from embedded "name"` (a payload: `dreams
+--payload NAME=FILE`), `from (expression)`, or nothing for the running program.
+`foreign` is contextual: it is still the name every program gives
+`std.foreign`. [ffi.md](ffi.md) is the guide.
+
 ### `import`
 
 ```dream
@@ -1730,7 +1784,7 @@ ordinary non-zero exit.
 ### `std.vm` — the runtime describing itself
 
 `processes! ()` · `reductions! ()` · `collections! ()` · `heap_bytes! ()` ·
-`modules! ()` · `has_ffi ()` · `async_io ()`
+`modules! ()` · `async_io ()`
 
 And, for when a program has stopped doing what it looked like it would:
 
@@ -1751,25 +1805,17 @@ Dream code can run to ask on its own.
 ### `std.ffi` and `std.foreign`
 
 `std.ffi` binds a C symbol to a signature, written as data, and answers an
-ordinary Dream function; `std.foreign` is the library to wrap C against. Its
-signature vocabulary is a set of types, so a bad signature is a compile error.
-A pointer C hands back is *owned*: it becomes a handle, `[:foreign, tag, id]`,
-and the process that made the call owns it until it says `release!` or ends.
-Releasing a handle releases what was made from it first. A library can also
-run as a server process that owns everything made through it. A library can
-be carried in the image with `dreams --payload NAME=FILE`.
+ordinary Dream function; a [`foreign` declaration](#foreign--a-c-library) is
+how a program writes one, and `std.foreign` is the rest of the library to wrap
+C against. A pointer C hands back is *owned*: it becomes a handle,
+`[:foreign, tag, id]`, and the process that made the call owns it until it
+says `release!` or ends. Releasing a handle releases what was made from it
+first. A library can also run as a server process that owns everything made
+through it, and `foreign.run! server (fn () -> ..)` is work done there. A
+library can be carried in the image with `dreams --payload NAME=FILE`.
 
-```dream
-import std.foreign;
-
-let lib  = foreign.library "libsqlite3.so.0";
-type Db  = foreign.Handle "sqlite3";
-let open! = foreign.function lib "sqlite3_open"
-                [:cstr, [:out, foreign.own "sqlite3" "sqlite3_close"]] :int;
-```
-
-Built only when libffi is found; without it the calls raise and
-`vm.has_ffi ()` is `false`. [ffi.md](ffi.md) is the guide, and
+Every VM provides it: a VM built without libffi is not a valid VM, and the
+build refuses to make one. [ffi.md](ffi.md) is the guide, and
 [builtins.md](builtins.md#stdffi) the reference.
 
 ### `mind/std` — the Dream-level library

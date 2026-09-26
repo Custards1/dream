@@ -1,9 +1,9 @@
 # The virtual machine: C++, built by CMake.
 #
-# LLVM and libffi are both optional to the build. They are on by default here
-# because without them you lose the JIT tier and `std.ffi`, and a build without
-# them is the unusual case rather than the expected one -- but `withJit = false`
-# is a real configuration the VM supports, and the tests run under it.
+# libffi is required: `std.ffi` is part of every VM, and one that cannot call C
+# is not a valid build. LLVM is optional. It is on by default here because
+# without it you lose the JIT tier -- but `withJit = false` is a real
+# configuration the VM supports, and the tests run under it.
 #
 # The compiler is `dreams`, built from the seed in its own derivation; the VM's
 # build does not see it.
@@ -15,7 +15,6 @@
 , libffi
 , zlib
 , withJit ? true
-, withFfi ? true
 , doCheck ? true
 }:
 
@@ -39,12 +38,11 @@ stdenv.mkDerivation {
   nativeBuildInputs = [ cmake pkg-config ]
     ++ lib.optional withJit llvmPackages_21.llvm.dev;
 
-  buildInputs = lib.optional withFfi libffi
+  buildInputs = [ libffi ]
     ++ lib.optional withJit zlib;   # LLVM links against it
 
   cmakeFlags = [
     "-DDREAM_ENABLE_JIT=${if withJit then "ON" else "OFF"}"
-    "-DDREAM_ENABLE_FFI=${if withFfi then "ON" else "OFF"}"
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
   ];
 

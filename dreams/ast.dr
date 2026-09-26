@@ -235,6 +235,20 @@ let sig_d name t span = [:sig, name, t, span];
 /// A variant is `[name, span, fields]` and a field `[name, span, type]`, with
 /// `()` for a field written without a type.
 let union_d name params variants members span = [:union_decl, name, params, variants, members, span];
+/// `foreign name from lib { .. }`: a C library, which the loader rewrites into
+/// a module of bound functions, resource types and struct layouts
+/// (`syntax.foreign_decl`). `library` is the expression that names it, or `()`
+/// for the running program.
+///
+/// An entry is one of
+///
+///     [:resource, name, destructor, span]     destructor `()` when there is none
+///     [:c_struct, name, fields, span]         a field is `[name, span, c type]`
+///     [:c_function, name, c type, symbol, span]
+///
+/// where a C type is written in the type grammar and read by `syntax`.
+let foreign_d name library entries span = [:foreign_decl, name, library, entries, span];
+
 let variant name span fields = [name, span, fields];
 let variant_name v = list.nth 0 v;
 let variant_span v = list.nth 1 v;
@@ -422,6 +436,16 @@ let rec show e =
                 + list.map (fn m ->
                   "(" + member_name m + " " + show_params (member_params m)
                       + " = " + show (member_body m) + ")") members) + ")",
+        [:foreign_decl, n, lib, entries, _] =>
+            "(foreign " + n + (match lib { () => "", l => " " + show l })
+            + str.join_str "" (list.map (fn e -> " " + match e {
+                  [:resource, r, (), _] => "(resource " + r + ")",
+                  [:resource, r, d, _] => "(resource " + r + " " + d + ")",
+                  [:c_struct, s, fs, _] =>
+                      "(struct " + s + str.join_str "" (list.map (fn f ->
+                          " (" + list.nth 0 f + " " + show (list.nth 2 f) + ")") fs) + ")",
+                  [:c_function, f, t, sym, _] => "(" + f + " " + show t + " " + sym + ")",
+              }) entries) + ")",
         [:let_p, pattern, b, _] => "(let " + show_pattern pattern + " " + show b + ")",
         [:import, segments, alias, names, _] =>
             "(import " + str.join_str "." segments

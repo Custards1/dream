@@ -122,8 +122,8 @@
       "match": "\\b(spawn!|join!|send!|recv!|self!|raise!|strict!)|\\b(type_of|to_string|len)\\b"
     },
     "declaration": {
-      "comment": "The name a `let` introduces, so a definition stands out from a use.",
-      "match": "\\b(let|macro|group|struct|mapping|type)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
+      "comment": "The name a `let` introduces, so a definition stands out from a use. `foreign` and `resource` are contextual -- `foreign.run!` is a module -- so they are keywords only here, in front of the name they declare.",
+      "match": "\\b(let|macro|group|struct|mapping|type|union|foreign|resource)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
       "captures": {
         "1": {
           "name": "keyword.declaration.dream"

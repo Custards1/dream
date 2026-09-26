@@ -1,54 +1,87 @@
 # Wrapping a C library
 
-Dream reaches C through two modules. `std.ffi` is the VM's half: it binds a
-symbol to a signature, owns what C hands back, and checks every pointer that
-crosses. `std.foreign` is the half a wrapper is written against. This page is
-about the second, and [builtins.md](builtins.md#stdffi) is the reference for
-the first.
-
-The design adds no syntax. A C function is described by data, and what the
-description answers is an ordinary Dream function, so a wrapper is an ordinary
-module and every tool that works on Dream works on it.
+Dream reaches C through two modules and one declaration. `std.ffi` is the VM's
+half: it binds a symbol to a signature, owns what C hands back, and checks
+every pointer that crosses. A `foreign` declaration is how a program says what
+it calls, and `std.foreign` is the rest of what a wrapper is written against.
+This page is about the last two, and [builtins.md](builtins.md#stdffi) is the
+reference for the first.
 
 ## A first binding
 
 ```dream
-import std.foreign;
+import std.console;
 
-let libm = foreign.library "libm.so.6";
+foreign libm from "libm.so.6" {
+    sqrt : :double -> :double
+}
 
-let sqrt = foreign.pure_function libm "sqrt" [:double] :double;
-let puts! = foreign.function foreign.this_program "puts" [:cstr] :int;
+foreign libc {
+    puts! : :cstr -> :int
+}
 
-let main! = puts! (to_string (sqrt 2.0));
+let main! = libc.puts! (to_string (libm.sqrt 2.0));
 ```
 
-`function` and `pure_function` differ only in what the answer is called, and
-that is the whole of how purity works here, as it is everywhere in Dream: a
-function bound to a `!` name is an effect, and one that is not may be called
-from pure code. Only the program can know whether a C function is pure. Say
-`pure_function` of one that is not, and it will be run lazily, perhaps twice,
-perhaps never.
+Each line is a C function, written as its C signature and bound to a name.
+The block becomes a module, so `libm.sqrt` is an ordinary Dream function, and
+every tool that works on Dream works on it. When the C name is not the Dream
+name without its `!`, say it: `add! : Counter -> :long -> :long = counter_add`.
+
+Purity is the name's, as it is everywhere in Dream: a function bound to a `!`
+name is an effect, and one that is not may be called from pure code. Only the
+program can know whether a C function is pure. Leave the `!` off one that is
+not, and it will be run lazily, perhaps twice, perhaps never.
 
 Nothing is loaded until a name is first used, and a library is opened once per
-VM however many processes use it.
+VM however many processes use it. `from` is a path the platform's loader
+understands, `embedded "name"` for a library the image carries (below), or an
+expression in parentheses; without it, the library is the running program,
+which is the C library on any normal system.
 
 ## Signatures are types
 
-The vocabulary (`:int`, `[:out, t]`, `[:own, tag, destructor]` and the rest)
-is declared in `std.foreign` as the types `Arg` and `Result`, and `function` is
-signed with them. A signature is nearly always written as a literal, so the
-compiler checks it:
+A C signature is written in the type grammar, and means two things at once:
+what `std.ffi` passes, and the Dream type of the function on this side. So the
+checker knows `add! : Counter -> :long -> :long` as `Counter -> :integer ->
+:integer`:
 
 ```
-error: argument 3 of `foreign.pure_function` should be `[Arg]`, but this is `[:f46]`
-error: argument 4 of `foreign.function` should be `Result`, but this is `[:own, "db"]`
+error: argument 1 of `sample.add!` should be `Counter`, but this is `Cursor`
+error: argument 2 of `sample.add!` should be `:integer`, but this is `"one"`
 ```
+
+| Written | In C | On this side |
+|---|---|---|
+| `:int`, `:long`, `:size`, `:i32`, `:u8`, .. | that number | `:integer` |
+| `:f32`, `:f64`, `:double` | that float | `:float` |
+| `:bool` | `bool` | `:bool` |
+| `:cstr` | `const char *`, copied | `:string` |
+| `:bytes` | `const char *` with no promise of a terminator; also a payload view | a string |
+| `:ptr` | a raw address, the escape hatch | an integer, or `()` for `NULL` |
+| `:void -> t` | a function of no arguments | `:unit -> t` |
+| a `resource` `R` | `R *` passed in | the handle type `R` |
+| `R` as a result | `R *` handed over, freed by `R`'s destructor | `R` |
+| `borrow R` | `R *` C keeps | `R` |
+| `out t` | `t *` C writes through | leaves the arguments, and joins the result: `[result, out, ..]` |
+| `taken free` | a `char *` the caller must free, with `free` | `:string` |
+| `(a -> b)` | a function pointer | a pure Dream function |
+| a `struct` `P`, or `:buffer` | `P *` | `foreign.Buffer` |
+| `t \| ()` | a result that may be `NULL` | `t \| :unit` |
 
 The C-named scalars (`:int`, `:long`, `:size`, ...) have the platform's widths,
 settled by the VM, so a binding written from a header is right on each platform
 it runs on. There is no `:float`: in Dream that is a double, and a signature is
 exactly where the two readings would get confused. Write `:f32`.
+
+A C type that means nothing is reported where it was written, before anything
+runs:
+
+```
+error: there is no `:float` in C here, because in Dream that is a double: write `:f32` or `:double`
+error: `Nope` is not a resource or a struct of `sample`
+error: `out` is a parameter C writes through, so it is only an argument
+```
 
 ## Pointers are owned
 
@@ -57,27 +90,28 @@ after it is freed, freed twice, passed where another kind was wanted. So a
 pointer C hands back is not given to Dream at all:
 
 ```dream
-type Db   = foreign.Handle "sqlite3";
-type Stmt = foreign.Handle "sqlite3_stmt";
+foreign sqlite from embedded "sqlite" {
+    resource Db = sqlite3_close
+    resource Stmt = sqlite3_finalize
 
-let open! = foreign.function lib "sqlite3_open"
-                [:cstr, foreign.out (foreign.own "sqlite3" "sqlite3_close")] :int;
-let prepare! = foreign.function lib "sqlite3_prepare_v2"
-                [foreign.handle "sqlite3", :cstr, :int,
-                 foreign.out (foreign.own "sqlite3_stmt" "sqlite3_finalize"), :ptr] :int;
+    open! : :cstr -> out Db -> :int = sqlite3_open
+    prepare! : Db -> :cstr -> :int -> out Stmt -> :ptr -> :int = sqlite3_prepare_v2
+}
 ```
 
-`[:own, tag, destructor]` makes the result a handle, `[:foreign, "sqlite3", 17]`,
-and keeps the pointer in a table the calling process owns. A handle is only a
-name for an entry, so:
+`resource Db = sqlite3_close` declares a kind of pointer and the C function
+that lets one go. Where C hands one back, the answer is a handle,
+`[:foreign, "sqlite.Db", 17]`, and the pointer stays in a table the calling
+process owns. A handle is only a name for an entry, so:
 
 - a handle that has been released is an `:ffi_error`, not a use-after-free;
-- `[:handle, "sqlite3"]` refuses a statement handle;
+- a `Db` parameter refuses a statement handle -- at compile time where the
+  checker can see it, and at run time where it cannot;
 - a handle names nothing in any process but the one that owns it;
 - releasing twice is an error, not a double free.
 
-The two tags are two types, so `Db` and `Stmt` are also told apart by the
-checker wherever it can see both.
+The tag is the library's name and the resource's, so two libraries that each
+declare a `Db` do not accept each other's.
 
 **When the destructor runs.** When the program calls `foreign.release!`; or,
 for whatever it did not release, when the owning process ends, whether it
@@ -94,9 +128,13 @@ answered or raised. The answer is forced before the release, because a lazy
 answer that read through `h` would otherwise be read later, from a handle that
 is gone.
 
-Out-parameters (`[:out, t]`) are not passed. C is given somewhere to write,
-and the call answers `[result, out1, out2, ..]`, so the C idiom of a status
-code plus a pointer through `**` reads as `let [status, db] = open! "notes.db";`.
+Out-parameters are not passed. C is given somewhere to write, and the call
+answers `[result, out1, out2, ..]`, so the C idiom of a status code plus a
+pointer through `**` reads as `let [status, db] = sqlite.open! "notes.db";`.
+
+A resource with no destructor, `resource Env`, is one C only ever lends:
+`borrow Env` as a result. C cannot hand one over, and saying it does is an
+error.
 
 ## A library as a process
 
@@ -105,15 +143,24 @@ most own things that must be let go. Both are what a process is for here:
 
 ```dream
 let db_server = foreign.start! ();
-let [status, db] = foreign.run! db_server open! ["notes.db"];
-foreign.run! db_server exec! [db, "create table t (x)"]
+let db = foreign.run! db_server (fn () -> {
+    let [status, db] = sqlite.open! "notes.db";
+    sqlite.exec! db "create table t (x)"
+    db
+});
 foreign.stop! db_server        // every destructor runs
 ```
 
-The server owns every resource made through it. Calls reach the library one at
-a time, so a library with global state needs no lock. A call that raises comes
-back to the caller as the caller's error, and the server carries on. When the
-server stops (asked, crashed, or restarted by a supervisor, via
+`run!` sends a function of unit to the server, which calls it and answers
+what it answered, forced. It is a function and not a `$( .. )` because a
+message is evaluated before it leaves: a thunk would run in the process that
+sent it. A function travels as it stands, with what it captured. So any amount
+of work with a library's resources is one message and one answer.
+
+The server owns every resource made through it. Work reaches the library one
+piece at a time, so a library with global state needs no lock. Work that raises
+comes back to the caller as the caller's error, and the server carries on. When
+the server stops (asked, crashed, or restarted by a supervisor, via
 `foreign.child!`), everything it owned is released. Its clients hold handles
 that name its resources and mean nothing anywhere else, so a handle from a
 server that has been restarted raises rather than reaching freed memory.
@@ -122,52 +169,52 @@ server that has been restarted raises rather than reaching freed memory.
 place serves both uses:
 
 ```dream
-let open_db! place path = foreign.run! place open! [path];
+let open_db! place path = foreign.run! place (fn () -> sqlite.open! path);
 
 open_db! foreign.here "a.db"      // in this process
 open_db! db_server "b.db"         // in the library's
 ```
-
-Buffers in a server are reached with `buffer_in!`, `peek_in!`, `poke_in!`,
-`read_in!`, `write_in!`, `release_in!`, `alive_in!` and `owned_in!`, which take
-the same place.
-
-A foreign function is a value like any other and can be sent in a message, so
-a program can also write its own server around `ffi.call! f args`.
 
 ## Memory and structs
 
 `foreign.buffer! n` is `n` zeroed bytes this process owns, of a known size, so
 every `peek!`, `poke!`, `read!` and `write!` is checked against it. A pointer C
 hands back has no size, and Dream does not read one directly, because that
-would mean trusting C about where it ends. `:buffer` in a signature passes
-one.
+would mean trusting C about where it ends. A buffer is what a `:buffer` or a
+struct parameter passes.
 
-A struct is laid out as C lays it out: each field at the next offset its
-alignment allows, and the whole padded to its widest alignment. `layout` is
-pure, so `comp` settles it while compiling:
+A struct is declared in the block, and laid out as C lays it out: each field
+at the next offset its alignment allows, and the whole padded to its widest
+alignment. The layout is settled while compiling:
 
 ```dream
-let point = comp foreign.layout [[:x, :i32], [:y, :double], [:tag, :u8]];
+foreign sample from embedded "sample" {
+    struct Point { x : :i32, y : :double, tag : :u8 }
+    fill! : Point -> :i32 -> :double -> :void = point_fill
+}
 
-let b = foreign.struct_buffer! point;
-fill! b 3 1.5
-foreign.read_struct! b 0 point               // %{ :x => 3, :y => 1.5, :tag => 7 }
-foreign.write_struct! b 0 point %{ :x => 10 }
+let b = sample.Point.new! ();
+sample.fill! b 3 1.5
+sample.Point.read! b                        // %{ :x => 3, :y => 1.5, :tag => 7 }
+sample.Point.write! b %{ :x => 10 }         // the fields it names, and no others
+sample.Point.offset :y                      // 8
 ```
 
-`array_of! t xs` and `read_array! b at t n` do the same for a C array.
+`Point.layout` is the layout itself, for `foreign.read_struct! b at layout`
+over an array of them. `array_of! t xs` and `read_array! b at t n` do the same
+for a C array of numbers.
 
 ## Callbacks
 
-`[:callback, [args], result]` passes a Dream function where C wants a function
+A parenthesised arrow passes a Dream function where C wants a function
 pointer, so `qsort` and `sqlite3_exec`-style iteration work:
 
 ```dream
-let fold_range = foreign.pure_function lib "fold_range"
-                     [:long, [:callback, [:long, :long], :long], :long] :long;
+foreign sample from embedded "sample" {
+    fold_range : :long -> (:long -> :long -> :long) -> :long -> :long
+}
 
-fold_range 10 (fn acc i -> acc + i * i) 0      // 385
+sample.fold_range 10 (fn acc i -> acc + i * i) 0      // 385
 ```
 
 A callback runs Dream while C is on the stack, which is why it has rules of
@@ -192,19 +239,35 @@ its own. Each rule is checked rather than trusted:
 dreams --payload sqlite=libsqlite3.so -o notes.dream main.dr
 ```
 
-puts the file's bytes at the end of the image, and `foreign.embedded "sqlite"`
-names them. On Linux the library is loaded straight from memory
+puts the file's bytes at the end of the image, and `foreign sqlite from embedded
+"sqlite" { .. }` names them. On Linux the library is loaded straight from memory
 (`memfd_create`), so nothing is written to disk. Elsewhere it is written to
 the temporary directory and loaded from there, and removed at once where the
 platform allows that, which is everywhere but Windows. A program that needs a
 particular build of a library can carry exactly that build. The name is stored
 in the image's `LNAM` section ([bytecode-format.md](bytecode-format.md)).
 
+## Signatures built at run time
+
+A declaration compiles to calls of `std.ffi`, and `foreign.function` and
+`foreign.pure_function` are those calls, for a program whose signature is data
+it computed:
+
+```dream
+let low_byte = foreign.pure_function (foreign.embedded "sample") "low_byte" [:u32] :u8;
+```
+
+The vocabulary is `std.foreign`'s `Arg` and `Result` types: the same words as
+a declaration's, spelled as data -- `[:out, t]`, `[:own, tag, destructor]`,
+`[:handle, tag]`, `[:callback, [args], result]`, `[:cstr, destructor]`.
+`function` is signed with them, so a literal signature is still checked while
+compiling; what is lost is the Dream type of the answer, which is `:any`.
+
 ## What this cannot make safe
 
 A signature that does not match the C function corrupts the call, exactly as
 it would in C, and nothing can see it. `:ptr` is a raw address and checks
-nothing; it is the escape hatch, and so are `foreign.address!` and the
+nothing; it is the escape hatch, and so are `ffi.address!` and the
 original `alloc!`/`read_u8!` members of `std.ffi`. Everything else is checked
 at the boundary: argument kinds, handle liveness, ownership and tag, and buffer
 bounds.
