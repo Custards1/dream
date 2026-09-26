@@ -19,6 +19,15 @@
       "include": "#number"
     },
     {
+      "include": "#foreign"
+    },
+    {
+      "include": "#binding"
+    },
+    {
+      "include": "#c_type"
+    },
+    {
       "include": "#declaration"
     },
     {
@@ -121,9 +130,48 @@
       "name": "support.function.builtin.dream",
       "match": "\\b(spawn!|join!|send!|recv!|self!|raise!|strict!)|\\b(type_of|to_string|len)\\b"
     },
+    "foreign": {
+      "comment": "A C library's header: `foreign name from \"lib\" {`, `from embedded \"name\"`, `from (expr)`, or no `from` at all. Its own rule rather than a word in `declaration`, because `from` and `embedded` are keywords only here.",
+      "match": "\\b(foreign)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(from)(?:\\s+(embedded)\\b)?)?",
+      "captures": {
+        "1": {
+          "name": "keyword.declaration.dream"
+        },
+        "2": {
+          "name": "entity.name.function.dream"
+        },
+        "3": {
+          "name": "keyword.declaration.dream"
+        },
+        "4": {
+          "name": "keyword.declaration.dream"
+        }
+      }
+    },
+    "binding": {
+      "comment": "A line that begins `name : type` declares that name: a function in a `foreign` block, or an annotated field of a record or a C struct. A reader's guess, since a line is all a grammar sees, but nothing else begins a line that way -- a signature starts with `let`, and `::` is not Dream.",
+      "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*!?)\\s*(?=:\\s)",
+      "captures": {
+        "1": {
+          "name": "entity.name.function.dream"
+        }
+      }
+    },
+    "c_type": {
+      "comment": "`out`, `borrow` and `taken` modify a C type: `out Db`, `borrow Db`, `taken free`. All three are ordinary names everywhere else, so they are keywords only after a signature's `:` or `->` and before the type they modify.",
+      "match": "(?:(->)|(?<=:))\\s*\\b(out|borrow|taken)\\s+(?=[:A-Za-z_(])",
+      "captures": {
+        "1": {
+          "name": "keyword.operator.arrow.dream"
+        },
+        "2": {
+          "name": "storage.modifier.foreign.dream"
+        }
+      }
+    },
     "declaration": {
-      "comment": "The name a `let` introduces, so a definition stands out from a use. `foreign` and `resource` are contextual -- `foreign.run!` is a module -- so they are keywords only here, in front of the name they declare.",
-      "match": "\\b(let|macro|group|struct|mapping|type|union|foreign|resource)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
+      "comment": "The name a `let` introduces, so a definition stands out from a use. `resource` is contextual -- a C library's handle type, and a name anywhere else -- so it is a keyword only here, in front of the name it declares; `foreign` has a rule of its own.",
+      "match": "\\b(let|macro|group|struct|mapping|type|union|resource)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
       "captures": {
         "1": {
           "name": "keyword.declaration.dream"

@@ -177,6 +177,11 @@ let put_parsed file v l = with_parsed (((parsed l)).[file => v]) l;
 /// `note_records` is the only thing that adds to this and says why it exists.
 let records l      = l.[:records else []];
 
+/// `[owner, name, library, entries, span]` for each `foreign` declaration,
+/// as the parser left it (`ast.foreign_d`). `note_foreigns` adds to this, for
+/// the reason `note_records` gives.
+let foreigns l     = l.[:foreigns else []];
+
 /// What each `expand` in the program named: `[module, source, offset, what]`,
 /// one entry per call site, where `what` is the resolution of the macro's own
 /// name wrapped as `[:macro, ..]`.
@@ -457,6 +462,26 @@ let note_records owner items l =
     put :records (records l + list.map (fn r -> list_cons owner r)
                                        (record_items (config_of l) items)) l;
 
+/// Every `foreign` block `expand_items` is about to rewrite, as `record_items`
+/// finds records.
+let rec foreign_items cfg items =
+    list.concat (list.map (fn item ->
+        match item {
+            [:when, cond, inner, _] =>
+                if config.eval cfg cond { foreign_items cfg inner } else { [] },
+            [:foreign_decl, name, library, entries, span] => [[name, library, entries, span]],
+            _ => [],
+        }) items);
+
+/// The same for a `foreign` block, which loses more than a record does: its
+/// functions become `ffi` calls at generated offsets, and the C signature each
+/// was written with -- the one thing a reader of `sample.add!` wants to see --
+/// survives only as the Dream type it was translated into. Nothing in the
+/// compiler reads this either.
+let note_foreigns owner items l =
+    put :foreigns (foreigns l + list.map (fn f -> list_cons owner f)
+                                         (foreign_items (config_of l) items)) l;
+
 // --- loading -----------------------------------------------------------------
 
 /// The dotted paths a module depends on, with the span to blame: its imports
@@ -645,7 +670,7 @@ let rec hoist_mod! l parent source m =
                             [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
                         },
                         other => [list.head acc, list.append (list.nth 1 acc) [other]],
-                    }) [note_records full items l, []] kept;
+                    }) [note_foreigns full items (note_records full items l), []] kept;
                 let inner_items = list.nth 1 nested;
 
                 // A submodule may import, so follow those before it is recorded.
@@ -806,7 +831,7 @@ let load_items! l source parsed display name file text = {
         [:ok, items, sites] => {
             // Resolve `when` before anything else looks at the module.
             let kept = expand_items (config_of l) items;
-            let noted = note_records name items (note_expanding source sites l);
+            let noted = note_foreigns name items (note_records name items (note_expanding source sites l));
 
             // A `mod name { .. }` is a module written inside another. Register
             // it as `parent.name` and leave the parent importing it, so from
@@ -1078,6 +1103,11 @@ when test {
                         (list.map (fn f -> ast.field_span f)
                                   (list.nth 2 (list.head (record_items on
                                       (items_of "group Point { x, y }"))))) ),
+        test.case "a foreign block is remembered as it was written"
+            $( test.eq! [["m", ["R", "f!"]]]
+                        (list.map (fn f -> [list.head f, list.map (fn e -> list.nth 1 e) (list.nth 2 f)])
+                                  (foreign_items on (items_of
+                                      "foreign m {\n    resource R = r_free\n    f! : :void -> R\n}"))) ),
         test.case "a nested when is resolved too"
             $( test.eq! 1 (list.length (expand_items on
                    (items_of "when test { when test { let a = 1; } }"))) ),

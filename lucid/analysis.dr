@@ -726,6 +726,151 @@ let record_role r n =
         _ => "a member of the " + record_keyword r + " `" + record_name r + "`",
     } };
 
+// --- foreign libraries -------------------------------------------------------------
+//
+// `foreign m from "libm.so.6" { cos : :double -> :double }` is a module by the
+// time anything resolves it, as a record is, and loses more on the way: `cos`
+// becomes a call to `ffi.pure_function` at a generated offset, and its C
+// signature survives only as the Dream type it was translated into. The
+// signature is the thing a reader of `m.cos` most wants, so -- as with
+// records -- what the block was written as is kept (`modules.foreigns`), and
+// everything below reads that and the text it points into.
+//
+// A struct inside the block is a module of its own, `m.P`, of generated
+// functions over its layout; it is answered for from the block too.
+
+/// The `foreign` block a module was generated from: `[:library, f]` for the
+/// block's own module, `[:struct, f, entry]` for one of its structs, or `()`.
+/// `f` is `[owner, name, library, entries, span]`.
+let foreign_of a mi = {
+    let l = loader a;
+    let full = modules.module_name (modules.module_at l mi);
+    list.fold (fn found f ->
+        if found != () { found }
+        else {
+            let own = foreign_owner f + "." + foreign_name f;
+            if own == full { [:library, f] }
+            else {
+                match list.filter (fn e -> match e {
+                          [:c_struct, s, _, _] => own + "." + s == full,
+                          _ => false,
+                      }) (foreign_entries f) {
+                    [e, .._] => [:struct, f, e],
+                    [] => (),
+                }
+            }
+        }) () (modules.foreigns l)
+};
+
+let foreign_owner f   = list.nth 0 f;
+let foreign_name f    = list.nth 1 f;
+let foreign_library f = list.nth 2 f;
+let foreign_entries f = list.nth 3 f;
+let foreign_span f    = list.nth 4 f;
+
+/// Every entry names what it declares second and keeps its span last.
+let entry_name e = list.nth 1 e;
+let entry_span e = list.last e;
+
+let foreign_entry f n =
+    list.first_or () (list.filter (fn e -> entry_name e == n) (foreign_entries f));
+
+/// The text of the file a block was written in, which every span in it is an
+/// offset into. `""` if the owner cannot be found, which slices to nothing.
+let foreign_text a f =
+    match modules.find (loader a) (foreign_owner f) { () => "", mi => module_text a mi };
+
+/// Where the library comes from, as written: `"libm.so.6"`, `embedded
+/// "sqlite"`, or an expression.
+let library_words a f =
+    match foreign_library f {
+        () => "the running program",
+        lib => "`" + span_text (foreign_text a f) (ast.span lib) + "`",
+    };
+
+/// A function entry's C signature, as written.
+let c_signature a f e =
+    match e { [:c_function, _, t, _, _] => span_text (foreign_text a f) (ast.span t), _ => "" };
+
+/// Where to send a reader who asked about one of a block's names: the entry
+/// that declared it, or the block itself for `library` and for anything a
+/// struct generated, all of which the struct's own line accounts for.
+let foreign_site part n =
+    match part {
+        [:library, f] => match foreign_entry f n { () => foreign_span f, e => entry_span e },
+        [:struct, _, e] => entry_span e,
+        _ => (),
+    };
+
+/// What one of a block's names does, in the words of the line that made it.
+let foreign_role a part n =
+    match part {
+        [:library, f] => {
+            let lib = " of the foreign library `" + foreign_name f + "`";
+            match foreign_entry f n {
+                () => if n == "library" { "what the foreign library `" + foreign_name f
+                                          + "` is loaded from: " + library_words a f }
+                      else { "a member" + lib },
+                [:resource, _, (), _] => "a resource" + lib + ", which C keeps: it has no destructor",
+                [:resource, _, d, _] => "a resource" + lib + ", released by `" + d + "`",
+                [:c_struct, _, _, _] => "a C struct" + lib,
+                [:c_function, _, _, sym, _] as e =>
+                    "binds the C function `" + sym + "`" + lib + ", written `" + c_signature a f e + "`",
+                _ => "a member" + lib,
+            }
+        },
+        [:struct, f, e] => {
+            let it = "the C struct `" + entry_name e + "` of the foreign library `" + foreign_name f + "`";
+            match n {
+                "layout" => "the layout of " + it,
+                "size" => "the size in bytes of " + it,
+                "new!" => "makes a zeroed " + str.slice 4 (str.byte_length it - 4) it,
+                "read!" => "reads every field of " + it + " into a map",
+                "write!" => "writes a map of fields into " + it,
+                "offset" => "the byte offset of a field of " + it,
+                _ => "a member of " + it,
+            }
+        },
+        _ => "",
+    };
+
+/// Which of a module's exports the author declared. A `foreign` block's module
+/// imports `std.ffi` to make its bindings, and that import is a name of the
+/// module like any other -- `m.ffi` -- which nobody wrote and nobody should be
+/// offered. What the block declares is its entries and `library`, and a
+/// struct's module is all generated names but its own import.
+let declared_members a target names =
+    match foreign_of a target {
+        () => names,
+        [:library, f] => list.filter (fn n -> n == "library" || foreign_entry f n != ()) names,
+        _ => list.filter (fn n -> n != "foreign") names,
+    };
+
+/// What a declaration the loader generated -- a record's or a foreign
+/// block's -- does, or `()` for a module somebody wrote.
+let generated_role a target n =
+    match record_of a target {
+        () => match foreign_of a target { () => (), part => foreign_role a part n },
+        r => record_role r n,
+    };
+
+/// Where a generated declaration should send a reader, as a `Location`, or
+/// `()` for a module somebody wrote.
+let generated_location a target n =
+    match record_of a target {
+        () => match foreign_of a target {
+            () => (),
+            part => match modules.find (loader a) (foreign_owner (list.nth 1 part)) {
+                () => (),
+                owner => location a owner (foreign_site part n),
+            },
+        },
+        r => match modules.find (loader a) (record_owner r) {
+            () => (),
+            owner => location a owner (record_site r n),
+        },
+    };
+
 /// Was this global declared with `macro`?
 ///
 /// Read off the source tree, because expansion rewrites a `macro` into an
@@ -823,16 +968,15 @@ let rec located a found =
         // field was written, which is in the module the record was written
         // *in* -- a record's own module has a dotted name where a path goes
         // and `location` would make a URI out of it.
+        // A foreign block's are the same, and go to the line that declared
+        // them.
         [:member, [:dream, target], field, _] =>
-            match record_of a target {
+            match generated_location a target field {
                 () => match scope.definition (resolved a) target field {
                           () => (),
                           d => location_in a (list.nth 1 d) (list.nth 2 d),
                       },
-                r => match modules.find (loader a) (record_owner r) {
-                         () => (),
-                         owner => location a owner (record_site r field),
-                     },
+                there => there,
             },
         // The name an `expand` named. A macro is an ordinary global by the
         // time the program is resolved -- expansion rewrites the declaration
@@ -864,10 +1008,17 @@ let rec navigation_expr tree here end =
     };
 
 let rec namespace_location a ref = match ref {
-    [:dream, target] => match record_of a target {
-        r if r != () => match modules.find (loader a) (record_owner r) {
+    [:dream, target] => match [record_of a target, foreign_of a target] {
+        [r, _] if r != () => match modules.find (loader a) (record_owner r) {
             () => (),
             owner => location a owner (record_span r),
+        },
+        [_, part] if part != () => match modules.find (loader a) (foreign_owner (list.nth 1 part)) {
+            () => (),
+            owner => location a owner (match part {
+                [:struct, _, e] => entry_span e,
+                [_, f] => foreign_span f,
+            }),
         },
         _ => {
             let m = modules.module_at (loader a) target;
@@ -1037,11 +1188,11 @@ let describe a offset name found =
             + inherited_note a mi name,
         [:builtin, name] => "`" + builtins.signature name + "` -- a builtin",
         [:member, [:dream, target], field, _] =>
-            match record_of a target {
+            match generated_role a target field {
                 () => "`" + shown_signature a target field + "` of module `"
                       + modules.module_name (modules.module_at (loader a) target) + "`"
                       + inherited_note a target field,
-                r => "`" + shown_signature a target field + "` -- " + record_role r field,
+                role => "`" + shown_signature a target field + "` -- " + role,
             },
         [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
         // An `expand` site. The declaration is an ordinary global by now, so
@@ -1091,6 +1242,12 @@ let symbol_field = 8;
 /// means here -- and showing it as one is what tells it from a field in the
 /// outline without a word of explanation.
 let symbol_method = 6;
+/// A `foreign` block is a module the author declared in place, and its entries
+/// are what they are in C: a function, a struct, and a resource -- an opaque
+/// handle type with a destructor, which is nearest to what LSP calls a class.
+let symbol_module = 2;
+let symbol_function = 12;
+let symbol_class = 5;
 
 /// LSP shows `detail` beside the name, and an empty one is an empty column
 /// rather than nothing, so it is added only when there is something to say.
@@ -1111,6 +1268,27 @@ let child_symbols at r =
                                      "range" => at (ast.member_span m),
                                      "selectionRange" => at (ast.member_span m) }])
                         (record_members r)));
+
+/// A `foreign` block's entries, as outline children, each with what it is in
+/// C beside it: the signature as written, the destructor, or `struct`.
+let foreign_symbols a at f = {
+    let text = foreign_text a f;
+    let entry kind name span detail children =
+        detailed detail %{ "name" => name, "kind" => kind, "range" => at span,
+                           "selectionRange" => at span, "children" => children };
+    list.map (fn e -> match e {
+        [:resource, r, d, sp] =>
+            entry symbol_class r sp (match d { () => "resource", _ => "resource = " + d }) [],
+        [:c_struct, n, fields, sp] =>
+            entry symbol_struct n sp "struct"
+                  (list.map (fn fd -> {
+                       let whole = ast.span_to (list.nth 1 fd) (ast.span (list.nth 2 fd));
+                       entry symbol_field (list.nth 0 fd) whole
+                             (span_text text (ast.span (list.nth 2 fd))) []
+                   }) fields),
+        [:c_function, n, t, _, sp] => entry symbol_function n sp (span_text text (ast.span t)) [],
+    }) (foreign_entries f)
+};
 
 /// What this file declares, for the outline and for the symbol search.
 ///
@@ -1163,9 +1341,22 @@ let symbols a =
                     // declaration nobody wrote.
                     "children" => child_symbols at r }]
             }) (list.filter (fn r -> record_owner r == mine) (modules.records (loader a)));
+            // A `foreign` block is missing from the globals for the same
+            // reason, and its entries are its children as a record's fields
+            // are -- in the order written, which is the order they are kept.
+            let foreigns = list.map (fn f -> {
+                let span = foreign_span f;
+                [ast.span_start span,
+                 %{ "name" => foreign_name f,
+                    "detail" => "foreign",
+                    "kind" => symbol_module,
+                    "range" => at span,
+                    "selectionRange" => at span,
+                    "children" => foreign_symbols a at f }]
+            }) (list.filter (fn f -> foreign_owner f == mine) (modules.foreigns (loader a)));
             list.map (fn s -> list.nth 1 s)
                      (list.sort_by (fn x y -> list.head x < list.head y)
-                                   (list.append globals records))
+                                   (globals + records + foreigns))
         },
     };
 
@@ -1207,6 +1398,11 @@ when test {
     /// The same, with a member written in it. One line again, and the member
     /// is last so that the fields keep the columns `record_src` uses.
     let member_src = "group Point { x, y, len self = x self + y self }\nlet main! = Point.len (Point.new 1 2);\n";
+
+    /// A `foreign` block, and a use of each kind of thing it declares. Line 3
+    /// is `cos` at column 4 and line 2 the struct; on line 6 `m` is at column
+    /// 12 and `cos` at 14, and on line 7 `P` is at 11 and `new!` at 13.
+    let foreign_src = "foreign m from \"libm.so.6\" {\n    resource R = r_free\n    struct P { x : :i32, y : :double }\n    cos : :double -> :double\n    open! : :cstr -> R = r_open\n}\nlet main! = m.cos 1.0;\nlet p! = m.P.new! ();\n";
 
     let hover_value! text line ch =
         match hover_at (of! text) line ch {
@@ -1402,6 +1598,29 @@ when test {
                                   [[".", :list, "a", [], [0, 0]],
                                    [".", :array, "a", [], [0, 0]],
                                    [".", :map, "a", [], [0, 0]]]) ),
+
+        // --- foreign libraries ------------------------------------------------
+        //
+        // A `foreign` block is generated modules too, and every answer here
+        // comes from `modules.foreigns` and the text it points into.
+        test.case "a foreign binding shows the C signature it was written with"
+            $( test.eq! "`cos : :float -> :float` -- binds the C function `cos` of the foreign library `m`, written `:double -> :double`"
+                        (hover_value! foreign_src 6 14) ),
+        test.case "going to a foreign binding goes to its line"
+            $( test.eq! [3, 4] (definition_start! foreign_src 6 14) ),
+        test.case "going to a foreign library goes to the block"
+            $( test.eq! [0, 0] (definition_start! foreign_src 6 12) ),
+        test.case "a C struct's generated functions say which struct they are over"
+            $( test.eq! "`new! u : :unit -> foreign.Buffer` -- makes a zeroed C struct `P` of the foreign library `m`"
+                        (hover_value! foreign_src 7 13) ),
+        test.case "going to a C struct goes to where it was declared"
+            $( test.eq! [2, 4] (definition_start! foreign_src 7 11) ),
+        test.case "going to a C struct's generated function goes to the struct"
+            $( test.eq! [2, 4] (definition_start! foreign_src 7 13) ),
+        test.case "a foreign block is in the outline, in the order it was written"
+            $( test.eq! [["m", "foreign"], ["main!", ""], ["p!", ""]] (symbol_details! foreign_src) ),
+        test.case "a foreign block's entries are in the outline underneath it"
+            $( test.eq! ["R", "P", "cos", "open!"] (child_names! foreign_src "m") ),
 
         // --- `priv` and `virtual` ---------------------------------------------
         //

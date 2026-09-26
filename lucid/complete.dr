@@ -236,14 +236,15 @@ let host_item path member = {
 ///
 /// A record's members are generated, so what they are is better said by the
 /// declaration they came from than by the module they ended up in: nobody
-/// wrote `ws.app.Point`, they wrote `group Point { x, y }`.
+/// wrote `ws.app.Point`, they wrote `group Point { x, y }`. A `foreign`
+/// block's bindings are the same, and say which C function they call.
 let member_item a target e n =
     item n (entry_kind a target e n)
          (analysis.shown_signature a target n)
-         (match analysis.record_of a target {
+         (match analysis.generated_role a target n {
               () => "A member of module `"
                     + modules.module_name (modules.module_at (analysis.loader a) target) + "`.",
-              r => "Generated: " + analysis.record_role r n + ".",
+              role => "Generated: " + role + ".",
           }
           + if builtins.is_impure_name n { " Impure." } else { "" })
          rank_local;
@@ -252,7 +253,8 @@ let member_items a segs =
     match namespace_of a segs {
         [:dream, target] => {
             let e = scope.r_env_at (analysis.resolved a) target;
-            list.map (fn n -> member_item a target e n) (scope.exports e)
+            list.map (fn n -> member_item a target e n)
+                     (analysis.declared_members a target (scope.exports e))
         },
         [:group, prefix] =>
             list.map (fn n -> item n kind_module ("module " + prefix + "." + n)
@@ -320,8 +322,15 @@ let import_items a e = {
             let n = list.head kv;
             match list.nth 1 kv {
                 [:dream, target] =>
-                    match analysis.record_of a target {
-                        () => item n kind_module
+                    match [analysis.record_of a target, analysis.foreign_of a target] {
+                        // A `foreign` block is reached the same way, and is
+                        // a module the author wrote here rather than one
+                        // they imported.
+                        [(), [:library, f]] =>
+                            item n kind_module ("foreign " + n)
+                                 ("The foreign library `" + n + "`, from "
+                                  + analysis.library_words a f + ".") rank_import,
+                        [(), _] => item n kind_module
                                    ("module " + modules.module_name
                                                     (modules.module_at (analysis.loader a) target))
                                    "An imported module." rank_import,
@@ -329,7 +338,7 @@ let import_items a e = {
                         // rewrite leaves the module it made behind an import
                         // of that name -- but calling it one says the wrong
                         // thing about a declaration written right here.
-                        r => item n kind_struct
+                        [r, _] => item n kind_struct
                                   (analysis.record_keyword r + " " + n)
                                   ("The " + analysis.record_keyword r + " `" + n + "`"
                                    + match analysis.record_fields r {
@@ -687,6 +696,18 @@ when test {
         test.case "a mapping says which keyword declared it"
             $( test.eq! "The mapping `Named`, with `first`."
                         (import_doc! "mapping Named { first }\n" "Named") ),
+        // A `foreign` block is the same kind of rewrite, and what is worth
+        // saying about each binding is which C function it calls.
+        test.case "a foreign library is offered as the declaration it was written as"
+            $( test.eq! "The foreign library `m`, from `\"libm.so.6\"`."
+                        (import_doc! "foreign m from \"libm.so.6\" { cos : :double -> :double }\n" "m") ),
+        test.case "a foreign binding is offered with its Dream type"
+            $( test.eq! [["cos", "cos : :float -> :float"], ["library", "library"]]
+                        (member_details! "foreign m from \"libm.so.6\" { cos : :double -> :double }\n" ["m"]) ),
+        test.case "a C struct's functions are offered, and not the import that made them"
+            $( test.eq! ["layout", "new!", "offset", "read!", "size", "write!"]
+                        (list.map (fn d -> list.head d)
+                            (member_details! "foreign m { struct P { x : :i32 } }\n" ["m", "P"])) ),
         test.case "a record with no fields says so rather than trailing off"
             $( test.eq! "The struct `Empty`, with no fields."
                         (import_doc! "struct Empty {}\n" "Empty") ),

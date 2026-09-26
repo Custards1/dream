@@ -30,7 +30,9 @@ const registry = new textmate.Registry({
     ),
 });
 
-// [line, the text to find in it, the scope that must apply to it]
+// [line, the text to find in it, the scope that must apply to it] -- or, with
+// a leading `!`, the scope that must not: a contextual keyword is only right
+// if it stays a name everywhere else.
 const cases = [
   ['type Int = :integer;', 'type', 'keyword.declaration.dream'],
   ['type Int = :integer;', 'Int', 'entity.name.function.dream'],
@@ -79,6 +81,22 @@ const cases = [
   ['foreign sample from "libs.so" {', 'sample', 'entity.name.function.dream'],
   ['    resource Db = sqlite3_close', 'resource', 'keyword.declaration.dream'],
   ['    resource Db = sqlite3_close', 'Db', 'entity.name.function.dream'],
+  ['foreign sample from "libs.so" {', 'from', 'keyword.declaration.dream'],
+  ['foreign sqlite from embedded "sqlite" {', 'embedded', 'keyword.declaration.dream'],
+  ['foreign sqlite from embedded "sqlite" {', 'sqlite', 'entity.name.function.dream'],
+  ['foreign here {', 'here', 'entity.name.function.dream'],
+  ['let r = foreign.run! s f;', 'foreign', '!keyword.declaration.dream'],
+  // A binding is `name : C signature`, and the name is what it declares.
+  ['    open! : :cstr -> out Db -> :int = sqlite3_open', 'open!', 'entity.name.function.dream'],
+  ['    scale : :f32 -> :double', 'scale', 'entity.name.function.dream'],
+  ['    open! : :cstr -> out Db -> :int = sqlite3_open', 'out', 'storage.modifier.foreign.dream'],
+  ['    open! : :cstr -> out Db -> :int = sqlite3_open', '->', 'keyword.operator.arrow.dream'],
+  ['    db : Stmt -> borrow Db', 'borrow', 'storage.modifier.foreign.dream'],
+  ['    name : Db -> taken free', 'taken', 'storage.modifier.foreign.dream'],
+  ['    x : out Db -> :int', 'out', 'storage.modifier.foreign.dream'],
+  // `out` is an ordinary name everywhere else.
+  ['let out = f x;', 'out', 'entity.name.function.dream'],
+  ['let y = g out 1;', 'out', '!storage.modifier.foreign.dream'],
   // A behavior: the base declares the hole and the deriving module fills it.
   // `derive` reads as a declaration keyword in both of the places it is
   // written -- as a statement of its own, and as a record's base clause, where
@@ -108,7 +126,9 @@ registry.loadGrammar('source.dream').then((grammar) => {
     }
     const token = result.tokens.find((t) => t.startIndex <= column && column < t.endIndex);
     const scopes = token ? token.scopes : [];
-    if (!scopes.includes(want)) {
+    const negated = want.startsWith('!');
+    const scope = negated ? want.slice(1) : want;
+    if (scopes.includes(scope) === negated) {
       console.log(`FAIL  ${JSON.stringify(needle)} in ${JSON.stringify(line)}`);
       console.log(`        want ${want}`);
       console.log(`        got  ${scopes.join(' ')}`);
