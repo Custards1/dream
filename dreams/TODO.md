@@ -5,12 +5,12 @@
 Priority: was high. **The first two items below are done**, and a separate
 round has taken the compiler from quadratic to linear in the number of
 declarations -- see "The compiler was quadratic in the size of the program" in
-`CLAUDE.md`. On a generated 6,400-declaration program that is 40.2 s and 6.7 GB
+`docs/notes/compiler-scaling.md`. On a generated 6,400-declaration program that is 40.2 s and 6.7 GB
 down to **9.8 s and 1.7 GB**, with byte-identical output. Macro cost is no
 longer the thing that stops a large project; peak heap is.
 
 The macro work itself is recorded under "A macro reaches a handful of
-declarations, not the program" in `CLAUDE.md` -- what landed, what it cost and
+declarations, not the program" in `docs/notes/macro-expansion.md` -- what landed, what it cost and
 what it did not buy. What is left in this section is the part still linear in
 the program, and the two redesigns that would remove the rest of it.
 
@@ -32,7 +32,7 @@ walk was taken out of `scope.declare!`:
 
 Every image is byte-identical to what the previous compiler emitted -- with the
 one standing exception `mind/std/all.dr --test` is, for reasons that are not
-about any of this work and are written up in `CLAUDE.md` -- and the bootstrap
+about any of this work and are written up in `docs/notes/macro-expansion.md` -- and the bootstrap
 reaches a fixpoint in one stage.
 
 **What is still linear in the program** is one phase, and it is now smaller
@@ -40,12 +40,12 @@ than the two rounds before it left it. It was two: every declaration the
 transformer does not reach cost a stub body, a function record and its nodes,
 *and* `scope.declare!` walks every declaration for its name. The first of those
 is gone -- every unreached global names one shared stub (see "The stub every
-unreached declaration shares" in `CLAUDE.md`). The second turned out not to be
+unreached declaration shares" in `docs/notes/macro-expansion.md`). The second turned out not to be
 a walk for *names* at all: four fifths of it was `declare_core` asking "does
 this module mention `core`?" by walking every node of every declaration, an
 answer the loader had already worked out and thrown away. It is carried on the
 module record now -- "Declaring a program was mostly a search for the word
-`core`" in `CLAUDE.md` -- which took `snapshot` from 229 ms to **51** at 3,200
+`core`" in `docs/notes/macro-expansion.md` -- which took `snapshot` from 229 ms to **51** at 3,200
 declarations and the whole macro tax from 267 ms to **99**, with every image
 byte-identical.
 
@@ -62,7 +62,7 @@ is 51 ms of a 99 ms tax on a 3.7 s compile.
   emit, run, install, each with milliseconds, reductions and bytes, plus rounds,
   wrappers, calls, images, image bytes and VM starts -- and `dreams --time`
   prints it. See "What a macro call actually costs, phase by phase" in
-  `CLAUDE.md` for the numbers and for why the meter is off by default.
+  `docs/notes/macro-expansion.md` for the numbers and for why the meter is off by default.
 
   **It changed the order of everything below**, which is what it was for. On a
   1,600-declaration program with one macro call the tax is 306 ms, of which
@@ -94,7 +94,7 @@ is 51 ms of a 99 ms tax on a 3.7 s compile.
   is only the part this item is actually about -- telling a stale snapshot from
   a real exception -- and it is still spelled as "run the round again with the
   whole program a root". See "The image was the calls, and now it is the
-  transformers" in `CLAUDE.md`.
+  transformers" in `docs/notes/macro-expansion.md`.
 
 - [~] **Radical option: a dedicated incremental compile-time VM.** *Half
   done.* The item said to "prototype an in-memory module/call API against the
@@ -102,7 +102,7 @@ is 51 ms of a 99 ms tax on a 3.7 s compile.
   exists and is what expansion runs on: `vm.open_image!`, `vm.call_image!`,
   `vm.close_image!` (see "Compile-time evaluation" in
   [docs/builtins.md](../docs/builtins.md), and "The image was the calls, and now
-  it is the transformers" in `CLAUDE.md`). Generated wrapper ASTs for the
+  it is the transformers" in `docs/notes/macro-expansion.md`). Generated wrapper ASTs for the
   *calls* are gone, header patching is gone from this path, and a call's
   arguments cross as values rather than as quoted code. GC ownership is
   explicit and is not the collector's: a handle is an integer naming a slot on
@@ -196,7 +196,7 @@ section named below) and a 6,400-declaration program's from 926 MB to 755 MB,
 at no cost in wall clock, and a generated
 program of **8,000 declarations that could not compile under the default cap
 now does** (9,600 too; 12,800 still cannot). See "A lazy value stored in a map
-pins the map it was made in" in `CLAUDE.md`.
+pins the map it was made in" in `docs/notes/compiler-scaling.md`.
 
 So the wall is between 9,600 and 12,800 declarations, not 4,000-5,000, and
 about a hundred megabytes of a self-compile's peak is *still* retained versions
@@ -213,7 +213,7 @@ it is no longer the only thing that moves the wall.
 
 - [x] **Make `envs` indexable.** Done, and it did not buy what this list
   predicted -- read "A table indexed by module wants to be a map, not a list" in
-  `CLAUDE.md` before the next one, because the reason is the useful part. The
+  `docs/notes/compiler-scaling.md` before the next one, because the reason is the useful part. The
   O(modules) *read* per name resolution, which is what this item was written
   about, is nearly free: it is the `get` opcode, one pointer chase per element.
   What cost was the O(modules) *write*: `set_env` was `list_set`, which
@@ -235,7 +235,7 @@ it is no longer the only thing that moves the wall.
   in two more places, and taking all three took peak heap on the modules axis
   from 623 MB to **409 MB** and made it flat: 364/385/393/409 across 400 to
   3,200 modules, where it had been 372/390/387/623. Read "The three lists the
-  loader still grew one entry at a time" in `CLAUDE.md` -- the transferable
+  loader still grew one entry at a time" in `docs/notes/compiler-scaling.md` -- the transferable
   part is that the *named* candidate was the smallest of the three, and the
   two that mattered were found by measuring again rather than by acting on the
   earlier note.
@@ -312,7 +312,7 @@ it is no longer the only thing that moves the wall.
   lower anywhere else in the same run. It is worth paying only because an image
   that is a function of the program's transformers is the same image on every
   build and so *can* be kept, where one that is a function of the round can
-  only be built again. See "One image for the whole expansion" in `CLAUDE.md`.
+  only be built again. See "One image for the whole expansion" in `docs/notes/macro-expansion.md`.
 
 
 ## What to do next, in order
@@ -360,7 +360,7 @@ the work.
    self-compile's expand row 415 ms to **242**. Whole compiles are 5-9% faster,
    the new build winning all six interleaved rounds. Every image in the
    repository is byte-identical and the bootstrap is a fixpoint in one stage.
-   See "The stub every unreached declaration shares" in `CLAUDE.md` for the
+   See "The stub every unreached declaration shares" in `docs/notes/macro-expansion.md` for the
    numbers and for the one design point worth keeping: the stub is
    parameterless and pure whatever the declarations pointing at it were, so
    naming one *raises* rather than handing back a closure.
@@ -375,7 +375,7 @@ the work.
    new build winning all nine interleaved rounds. The self-compile does not
    move, for a reason worth reading: `list.any` stops at the first mention, and
    every module of this compiler names `core` in its first few lines. See
-   "Declaring a program was mostly a search for the word `core`" in `CLAUDE.md`.
+   "Declaring a program was mostly a search for the word `core`" in `docs/notes/macro-expansion.md`.
 
    What is left of `snapshot` really is names -- one declared, numbered and
    recorded, ~16 microseconds each -- and the macro tax is 2.7% of a
@@ -434,7 +434,7 @@ the work.
    `mind/std/all.dr --test` and 194 -> 147 on a self-compile, with every image
    in the repository byte-identical bar the 12 generated-span bytes of
    `std --test`, and the bootstrap a fixpoint in one stage. See "The image was
-   the calls, and now it is the transformers" in `CLAUDE.md`.
+   the calls, and now it is the transformers" in `docs/notes/macro-expansion.md`.
 
    **And the half that belonged to 3 landed the next day**: the session
    outlives the round now, because what is in it is a function of the program's
@@ -466,7 +466,7 @@ the work.
    `std.macros`'s sites are inside declarations that survive. Every image in the
    repository changed in exactly one field -- `span_end` of a `FUNC` record --
    and the bootstrap reaches a fixpoint in one stage. See "Discovery was a walk
-   of two whole modules" in `CLAUDE.md`, and note what deleted itself with it:
+   of two whole modules" in `docs/notes/macro-expansion.md`, and note what deleted itself with it:
    `lucid`'s `reach` walk existed solely to work around the same span.
 
    The axis this item asked for exists now: `scale.py --call-in-module` writes

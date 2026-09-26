@@ -103,7 +103,7 @@ Process::Process(Runtime& rt, uint64_t id) : rt_(rt), id_(id), heap_(64 * 1024) 
     code = rt.has_image() ? &rt.image() : nullptr;
 }
 
-Process::~Process() = default;
+Process::~Process() { release_foreign(*this); }
 
 void Process::maybe_collect() {
     // A mark the helpers are still on is not a state to launch anything from:

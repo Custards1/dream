@@ -1886,7 +1886,7 @@ let declare! l =
 /// declared once and every unreached global points at it, which takes the
 /// per-declaration work out of three phases at once -- `check_body` does not
 /// run, no function record is built, and no nodes are lowered or serialized
-/// for it. See "The stub every unreached declaration shares" in CLAUDE.md for
+/// for it. See "The stub every unreached declaration shares" in docs/notes/macro-expansion.md for
 /// what that was worth.
 ///
 /// It is **parameterless and pure** on purpose, whatever the declarations

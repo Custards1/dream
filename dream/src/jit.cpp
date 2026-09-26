@@ -27,7 +27,7 @@
 // point the interpreter would have forced it, only that it is forced. Where two
 // errors are reachable that can decide which one a program gets; the repro and
 // why it is not fixed are under "The tier's eager arguments can change *which*
-// error a program raises" in CLAUDE.md.
+// error a program raises" in docs/notes/vm-performance.md.
 //
 // A `let` has nowhere to live here -- no thunks, and the frame's slots are
 // registers -- so its value is emitted where its name is read, which is where

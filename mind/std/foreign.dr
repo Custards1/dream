@@ -1,0 +1,470 @@
+// Wrapping a C library.
+//
+// `std.ffi` is the VM's half: it binds a symbol to a signature, owns what C
+// hands back, and checks every pointer that crosses. This is the half a person
+// writes against, and it has three parts.
+//
+// **A signature is a type.** `Arg` and `Result` below are the vocabulary
+// `std.ffi` reads, spelled in the type grammar, and `function` is signed with
+// them -- so a signature written as a literal, which is how nearly every one
+// is written, is checked while compiling. `[:f46]` and `[:own, "db"]` (no
+// destructor) are compile errors in the program that wrote them, not
+// `:ffi_error`s the first time something runs.
+//
+//     let libm = foreign.library "libm.so.6";
+//     let sqrt = foreign.pure_function libm "sqrt" [:double] :double;
+//
+//     let lib = foreign.embedded "sqlite";            // from the image; see below
+//     type Db = foreign.Handle "sqlite3";
+//     let open! = foreign.function lib "sqlite3_open"
+//                     [:cstr, [:out, foreign.own "sqlite3" "sqlite3_close"]] :int;
+//
+// **A pointer is owned.** What `[:own, tag, destructor]` answers is a handle,
+// and the process that made the call owns the pointer behind it until it says
+// `release!` or ends. Releasing a handle releases what was made from it first,
+// so closing a database cannot leave a statement pointing into it. `using!`
+// is the scoped form. The rules are at the head of dream/src/ffi.cpp.
+//
+// **A library can be a process.** Most C libraries were not written for a
+// program with many threads in it, and most own things that must be let go.
+// Both are what a process is for here. `start!` makes a server that owns every
+// resource made through it: calls reach the library one at a time, a call that
+// raises is answered as an error rather than stopping the server, and when the
+// server stops -- asked, or crashed, or by its supervisor -- every destructor
+// runs, newest first. Its clients hold handles that name its resources and
+// mean nothing anywhere else.
+//
+//     let lib_server = foreign.start! ();
+//     let db = foreign.run! lib_server open! ["notes.db"];
+//
+// `run!` takes either a server or `foreign.here`, so a wrapper written once
+// over a place serves both: the same `open!` runs in the calling process when
+// that is what the program wants, and in the library's own when it is not.
+//
+// **Carrying the library in the image.** `dreams --payload sqlite=libsqlite3.so
+// ...` puts the file's bytes at the end of the image, and `embedded "sqlite"`
+// names them. They are loaded from memory where the platform allows it and
+// from a temporary file where it does not, once per VM, so a program that
+// needs a particular build of a library can carry exactly that build.
+
+import std.ffi;
+import std.list;
+
+// --- the vocabulary ------------------------------------------------------------
+
+/// A number, in C's width. The first row is exact; the second is C's own
+/// names, whose widths are the platform's (`:long` is 32 bits on Windows) and
+/// are settled by the VM, so a binding written from a header is right wherever
+/// it runs. There is no `:float`: in Dream that is a double, and a signature is
+/// exactly where the two readings would be confused -- say `:f32`.
+type Scalar = :bool | :i8 | :i16 | :i32 | :i64 | :u8 | :u16 | :u32 | :u64 | :f32 | :f64
+            | :char | :uchar | :short | :ushort | :int | :uint | :long | :ulong
+            | :longlong | :ulonglong | :size | :ssize | :intptr | :uintptr | :double;
+
+/// What C hands back, by return or through an `out`.
+///
+/// `:cstr` copies the string and leaves the pointer alone; `[:cstr, "free"]`
+/// copies it and then frees it with the named destructor. `:ptr` is a raw
+/// address, as an integer or `()` for null -- the escape hatch, and the one
+/// type here that checks nothing.
+type Result = :void | Scalar | :ptr | :cstr
+            | [:own, :string, :string]
+            | [:borrow, :string]
+            | [:cstr, :string];
+
+/// What a callback may take and answer. Numbers and addresses only: a callback
+/// runs while C is on the stack, and nothing that needs managing may cross.
+type CallbackArg = Scalar | :ptr | :cstr;
+type CallbackResult = Scalar | :void | :ptr;
+
+/// What C takes.
+///
+/// `:cstr` is a string passed as a NUL-terminated pointer, and `:bytes` the
+/// same without the promise of a terminator, which is also how a payload view
+/// is passed. `[:handle, tag]` is a live handle of that tag and nothing else;
+/// `:buffer` is `[:handle, "buffer"]`. `[:out, t]` is not passed at all: C is
+/// given somewhere to write, and the call answers `[result, out, ..]`.
+type Arg = Scalar | :ptr | :cstr | :bytes | :buffer
+         | [:handle, :string]
+         | [:out, Result]
+         | [:callback, [CallbackArg], CallbackResult];
+
+/// Where a library is: a path the platform's loader understands, `()` for the
+/// program itself (which is the C library, on any normal system), or a file
+/// carried in the image's payload.
+type Library = :unit | :string | [:payload, :string | :integer];
+
+/// A pointer this process owns, by its tag: `type Db = foreign.Handle "sqlite3"`.
+/// Two tags are two types, so a statement where a database is wanted is a
+/// compile error wherever the checker can see both.
+type Handle tag = [:foreign, tag, :integer];
+
+type Buffer = Handle "buffer";
+
+// Spelled as functions too, for a signature built rather than written.
+
+let own : :string -> :string -> Result;
+let own tag destructor = [:own, tag, destructor];
+
+let borrow : :string -> Result;
+let borrow tag = [:borrow, tag];
+
+let handle : :string -> Arg;
+let handle tag = [:handle, tag];
+
+let out : Result -> Arg;
+let out t = [:out, t];
+
+let callback : [CallbackArg] -> CallbackResult -> Arg;
+let callback args result = [:callback, args, result];
+
+/// A string C allocated and the caller must free.
+let taken : :string -> Result;
+let taken destructor = [:cstr, destructor];
+
+// --- libraries and functions -------------------------------------------------------
+
+let library : :string -> Library;
+let library path = path;
+
+/// The running program, and everything linked into it.
+let this_program : Library = ();
+
+/// A library the image carries: `dreams --payload NAME=FILE`.
+let embedded : :string -> Library;
+let embedded name = [:payload, name];
+
+/// A C function, as a Dream function of its arguments -- every one that is not
+/// an `out`. Calling it is an effect, so bind it to a name that says so:
+/// `let puts! = foreign.function ..`. Nothing is loaded until the name is
+/// first used, and then once per VM.
+let function : Library -> :string -> [Arg] -> Result -> :any;
+let function lib symbol args result = ffi.function lib symbol args result;
+
+/// The same, for a C function with no effects -- `sqrt`, `strlen` -- which a
+/// pure function may call. Only the program can know that it is pure, and a
+/// function that is not will be run lazily, perhaps twice, perhaps never.
+let pure_function : Library -> :string -> [Arg] -> Result -> :any;
+let pure_function lib symbol args result = ffi.pure_function lib symbol args result;
+
+// --- owning -------------------------------------------------------------------------
+
+/// Let go of a handle now, and of everything made from it first.
+let release! : Handle :string -> :unit;
+let release! h = ffi.release! h;
+
+/// Whether this process still owns `h`.
+let alive! : Handle :string -> :bool;
+let alive! h = ffi.alive! h;
+
+/// Every handle this process owns, oldest first.
+let owned! : :unit -> [Handle :string];
+let owned! u = ffi.owned! u;
+
+/// `f h`, and then `h` released, whether `f` answered or raised.
+///
+/// The answer is forced all the way down before the release: a lazy answer
+/// that read through `h` would otherwise be forced later, against a handle
+/// that is gone. So `f` should answer data, not an infinite structure.
+let using! : Handle :string -> (Handle :string -> a) -> a;
+let using! h f = {
+    let answer = try! { strict! (f h) } catch e {
+        release_if_alive! h
+        raise! e
+    };
+    release_if_alive! h
+    answer
+};
+
+/// `f` may have released `h` itself, or released its parent.
+priv let release_if_alive! : Handle :string -> :unit;
+priv let release_if_alive! h = if ffi.alive! h { ffi.release! h } else { () };
+
+// --- memory -------------------------------------------------------------------------
+//
+// A buffer is memory this process allocated and owns, of a known size, so
+// every read and write of it is checked against that size. It is the only
+// foreign memory Dream reads directly: a pointer C hands back has no size, and
+// reading one would be trusting C about where it ends.
+
+/// `n` bytes, zeroed.
+let buffer! : :integer -> Buffer;
+let buffer! n = ffi.buffer! n;
+
+/// The bytes of a string, and a terminator, in a buffer C may write to.
+let buffer_of! : :string -> Buffer;
+let buffer_of! s = {
+    let b = ffi.buffer! (len s + 1);
+    ffi.write! b 0 s
+    b
+};
+
+let peek! : Buffer -> :integer -> Scalar | :ptr -> :any;
+let peek! b at t = ffi.peek! b at t;
+
+let poke! : Buffer -> :integer -> Scalar | :ptr -> :any -> :unit;
+let poke! b at t v = ffi.poke! b at t v;
+
+/// `n` bytes at `at`, as a string.
+let read! : Buffer -> :integer -> :integer -> :string;
+let read! b at n = ffi.read! b at n;
+
+/// The NUL-terminated string at `at`, stopping at the end of the buffer if C
+/// did not terminate it.
+let read_string! : Buffer -> :integer -> :string;
+let read_string! b at = ffi.read_string! b at;
+
+let write! : Buffer -> :integer -> :string -> :unit;
+let write! b at s = ffi.write! b at s;
+
+let sizeof : Scalar | :ptr -> :integer;
+let sizeof t = ffi.sizeof t;
+
+let alignof : Scalar | :ptr -> :integer;
+let alignof t = ffi.alignof t;
+
+/// A C array of `t`, filled from `xs`.
+let array_of! : Scalar | :ptr -> [:any] -> Buffer;
+let array_of! t xs = {
+    let b = ffi.buffer! (len xs * ffi.sizeof t);
+    write_array! b 0 t xs
+    b
+};
+
+let write_array! : Buffer -> :integer -> Scalar | :ptr -> [:any] -> :unit;
+let rec write_array! b at t xs = match xs {
+    [] => (),
+    [x, ..rest] => {
+        ffi.poke! b at t x
+        write_array! b (at + ffi.sizeof t) t rest
+    },
+};
+
+let read_array! : Buffer -> :integer -> Scalar | :ptr -> :integer -> [:any];
+let read_array! b at t n = read_array_into! b at t n [];
+
+priv let read_array_into! : Buffer -> :integer -> Scalar | :ptr -> :integer -> [:any] -> [:any];
+priv let rec read_array_into! b at t n acc =
+    // Read from the end, so consing puts the elements in order.
+    if n <= 0 { acc }
+    else {
+        let x = ffi.peek! b (at + (n - 1) * ffi.sizeof t) t;
+        read_array_into! b at t (n - 1) (list_cons (strict! x) acc)
+    };
+
+// --- structs -------------------------------------------------------------------------
+//
+// A struct is laid out the way C lays it out: each field at the next offset
+// its alignment allows, and the whole padded to the widest alignment in it.
+// `layout` is pure, so `comp foreign.layout [..]` settles the offsets while
+// compiling and the program carries the answer rather than the arithmetic.
+//
+//     let point = comp foreign.layout [[:x, :i32], [:y, :double], [:tag, :u8]];
+//     let b = foreign.struct_buffer! point;
+//     fill! b 3 1.5
+//     foreign.read_struct! b 0 point          // %{ :x => 3, :y => 1.5, :tag => 7 }
+
+type Layout = %{ :size => :integer, :align => :integer, :fields => :map, :order => [:atom] };
+
+let layout : [[:atom, Scalar | :ptr]] -> Layout;
+let layout fields = {
+    let raw = list.fold place_field %{ :size => 0, :align => 1, :fields => %{}, :order => [] } fields;
+    raw.[:size => round_up raw.[:size] raw.[:align]]
+};
+
+priv let place_field : Layout -> [:atom, Scalar | :ptr] -> Layout;
+priv let place_field acc [name, t] = {
+    let a = ffi.alignof t;
+    let at = round_up acc.[:size] a;
+    %{
+        :size => at + ffi.sizeof t,
+        :align => if a > acc.[:align] { a } else { acc.[:align] },
+        :fields => acc.[:fields].[name => [at, t]],
+        :order => acc.[:order] + [name],
+    }
+};
+
+priv let round_up : :integer -> :integer -> :integer;
+priv let round_up n a = (n + a - 1) / a * a;
+
+/// The offset of a field, for a program that wants to `peek!` one alone.
+let offset_of : Layout -> :atom -> :integer;
+let offset_of shape name = shape.[:fields].[name].[0];
+
+/// A zeroed buffer the size of one struct.
+let struct_buffer! : Layout -> Buffer;
+let struct_buffer! shape = ffi.buffer! shape.[:size];
+
+/// Every field of the struct at `at`, as a map.
+let read_struct! : Buffer -> :integer -> Layout -> :map;
+let read_struct! b at shape = read_fields! b at shape shape.[:order] %{};
+
+priv let read_fields! : Buffer -> :integer -> Layout -> [:atom] -> :map -> :map;
+priv let rec read_fields! b at shape names acc = match names {
+    [] => acc,
+    [name, ..rest] => {
+        let [offset, t] = shape.[:fields].[name];
+        let v = ffi.peek! b (at + offset) t;
+        read_fields! b at shape rest acc.[name => strict! v]
+    },
+};
+
+/// Write the fields `values` has into the struct at `at`, leaving the rest.
+let write_struct! : Buffer -> :integer -> Layout -> :map -> :unit;
+let write_struct! b at shape values = write_fields! b at shape shape.[:order] values;
+
+priv let write_fields! : Buffer -> :integer -> Layout -> [:atom] -> :map -> :unit;
+priv let rec write_fields! b at shape names values = match names {
+    [] => (),
+    [name, ..rest] => {
+        let [offset, t] = shape.[:fields].[name];
+        let v = values.[name else ()];
+        if v == () { () } else { ffi.poke! b (at + offset) t v }
+        write_fields! b at shape rest values
+    },
+};
+
+// --- a library as a process ------------------------------------------------------------
+
+/// Where a call runs: `here`, in the calling process, or a library server.
+type Place = :here | :process;
+
+let here : Place = :here;
+
+/// A foreign function applied to a list of arguments, where `place` says. In a
+/// server, the handles it answers are the server's, and are only good for
+/// passing back to it.
+let run! : Place -> :any -> [:any] -> :any;
+let run! place f args =
+    if place == :here { ffi.call! f args } else { answer_of! (server.call! place [:call, f, args]) };
+
+/// Start a library server. What it owns, it owns until it stops.
+let start! : :unit -> :process;
+let start! u = server.start! u;
+
+/// Stop one, which releases everything it owns.
+let stop! : :process -> :any;
+let stop! pid = server.stop! pid;
+
+/// A library server as a `std.supervisor` child. A restart is a fresh server
+/// that owns nothing, which is the honest answer: every handle the last one
+/// gave out died with it, and using one now raises rather than reaching memory
+/// that has been freed.
+let child! : :string -> :any;
+let child! name = server.child! name ();
+
+/// The server's side of `release!`, `alive!`, `owned!` and the buffer calls.
+let release_in! : Place -> Handle :string -> :unit;
+let release_in! place h = in! place [:release, h];
+
+let alive_in! : Place -> Handle :string -> :bool;
+let alive_in! place h = in! place [:alive, h];
+
+let owned_in! : Place -> [Handle :string];
+let owned_in! place = in! place [:owned];
+
+let buffer_in! : Place -> :integer -> Buffer;
+let buffer_in! place n = in! place [:buffer, n];
+
+let peek_in! : Place -> Buffer -> :integer -> Scalar | :ptr -> :any;
+let peek_in! place b at t = in! place [:peek, b, at, t];
+
+let poke_in! : Place -> Buffer -> :integer -> Scalar | :ptr -> :any -> :unit;
+let poke_in! place b at t v = in! place [:poke, b, at, t, v];
+
+let read_in! : Place -> Buffer -> :integer -> :integer -> :string;
+let read_in! place b at n = in! place [:read, b, at, n];
+
+let write_in! : Place -> Buffer -> :integer -> :string -> :unit;
+let write_in! place b at s = in! place [:write, b, at, s];
+
+priv let in! : Place -> :any -> :any;
+priv let in! place request =
+    if place == :here { answer_of! (server.answer_here! request) }
+    else { answer_of! (server.call! place request) };
+
+/// A server answers `[:ok, value]` or `[:error, e]`, so that a call which
+/// raised can be raised again in the process that asked -- where it is that
+/// process's error, and not the reason the server stopped.
+priv let answer_of! : :any -> :any;
+priv let answer_of! outcome = match outcome {
+    [:ok, value] => value,
+    [:error, e] => raise! e,
+    other => raise! other,
+};
+
+mod server {
+    derive std.server;
+
+    import std.ffi;
+
+    let server_name : :any -> :string;
+    let server_name u = "foreign library";
+
+    let init! : :any -> :any;
+    let init! u = :serving;
+
+    /// Every request is run inside `try!`, and the answer is forced before it
+    /// is sent. That is the whole of this server's correctness rather than
+    /// tidiness: a reply is copied to the client *as it stands*, so an
+    /// unforced answer arrives as the suspended call itself -- and runs in the
+    /// client, against the client's resources, where it raises the error this
+    /// server was supposed to catch.
+    let handle_call! : :any -> :any -> :any -> Action :any :any;
+    let handle_call! request from state = {
+        let answer = strict! (answer_here! request);
+        reply answer state
+    };
+
+    let answer_here! : :any -> :any;
+    let answer_here! request = try! {
+        // A statement, not an element: `[:ok, strict! x]` suspends the
+        // element like any other, and it would raise after `try!` returned.
+        let value = strict! (perform! request);
+        [:ok, value]
+    } catch e { [:error, e] };
+
+    priv let perform! : :any -> :any;
+    priv let perform! request = match request {
+        [:call, f, args] => ffi.call! f args,
+        [:release, h] => ffi.release! h,
+        [:alive, h] => ffi.alive! h,
+        [:owned] => ffi.owned! (),
+        [:buffer, n] => ffi.buffer! n,
+        [:peek, b, at, t] => ffi.peek! b at t,
+        [:poke, b, at, t, v] => ffi.poke! b at t v,
+        [:read, b, at, n] => ffi.read! b at n,
+        [:write, b, at, s] => ffi.write! b at s,
+        _ => raise! [:unknown_request, request],
+    };
+
+    // `terminate!` is left as the default. The resources go with the process,
+    // released by the VM as it finishes -- which also covers a server that
+    // crashed, where no handler would have run.
+}
+
+when test {
+    import std.test;
+
+    // What can be checked without a C library: the layout arithmetic, which is
+    // also what a `comp` bakes into a program. The sizes are the ones every
+    // 64-bit ABI this VM is built for agrees on; dream/tests/ffi checks the
+    // same layout against the C compiler's own `sizeof`.
+    let tests = [
+        test.case "a field waits for its alignment, and the whole is padded to the widest"
+            $( test.eq! [0, 8, 16, 24, 8]
+                        (with_shape (layout [[:x, :i32], [:y, :f64], [:tag, :u8]])) ),
+        test.case "fields keep the order they were written in"
+            $( test.eq! [:b, :a] (layout [[:b, :u8], [:a, :u16]]).[:order] ),
+        test.case "small fields pack together"
+            $( test.eq! [0, 1, 2, 4, 2]
+                        (with_shape (layout [[:a, :u8], [:b, :u8], [:c, :u16]])) ),
+        test.case "an empty struct is empty"
+            $( test.eq! 0 (layout []).[:size] ),
+        test.case "C's own names are the platform's widths"
+            $( test.eq! [sizeof :i32, sizeof :size] [sizeof :int, sizeof :uintptr] ),
+    ];
+
+    priv let with_shape shape =
+        list.map (fn name -> offset_of shape name) shape.[:order] + [shape.[:size], shape.[:align]];
+}

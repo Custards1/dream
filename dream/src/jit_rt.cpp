@@ -158,7 +158,7 @@ Value* dream_rt_frame_slots(Value frame) {
 // same bargain `dream_rt_force` makes, and it has the same cost -- a native that
 // walks a long lazy structure allocates for the length of the walk with nothing
 // able to collect any of it. See `PinsTheHeap`, and "A JIT that can allocate" in
-// CLAUDE.md, whose de-pinning stage is what would remove it.
+// docs/notes/vm-performance.md, whose de-pinning stage is what would remove it.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -507,7 +507,7 @@ namespace {
 /// Would applying `v` perform an effect? Purity is spelling: a function record
 /// carries the `!` of its name as `FN_IMPURE`, and a native carries it in its
 /// name. A partial application is its function's.
-bool impure_callee(Process& p, Value v) {
+bool callee_is_impure(Process& p, Value v) {
     v = resolve(v);
     for (int depth = 0; depth < 64; ++depth) {
         if (is_obj(v, ObjType::Pap)) {
@@ -551,7 +551,7 @@ int dream_rt_apply(Process* p, Value callee, uint32_t argc, const Value* args, V
     // answer is to give the whole call back (2) before anything happens: the
     // compiled body has performed no effect, since this is the only way it
     // could have, and the interpreter runs it from its frame.
-    if (impure_callee(*p, callee)) return 2;
+    if (callee_is_impure(*p, callee)) return 2;
     PinsTheHeap pinned(*p);
     // A nested loop that runs the slice out re-arms it rather than stopping
     // (`Process::slice_spent`), which is right for a native and wrong for a
@@ -574,6 +574,8 @@ int dream_rt_apply(Process* p, Value callee, uint32_t argc, const Value* args, V
 }
 
 }  // extern "C"
+
+bool dream::impure_callee(Process& p, Value v) { return callee_is_impure(p, v); }
 
 extern "C" Value dream_rt_peek(Value c, Value k) {
     // `thunk_for`'s `Get`, and nothing more: an element found without forcing

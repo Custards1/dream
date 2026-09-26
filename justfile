@@ -205,7 +205,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-std test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
+test: test-vm test-e2e test-std test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
 
 test-vm: vm
     ./{{build_dir}}/bin/dream_tests
@@ -213,6 +213,12 @@ test-vm: vm
 # Real programs, run under both the interpreter and the JIT, which must agree.
 test-e2e: build
     dream/tests/e2e.sh
+
+# `std.ffi` and `std.foreign` against a C library built from dream/tests/ffi,
+# carried in the image as a payload. Skips on a VM built without libffi or a
+# machine with no C compiler.
+test-ffi: build
+    dream/tests/ffi/run.sh
 
 # Every example program, compiled and run, output checked against what is
 # recorded beside it. `just examples-bless` re-records after a deliberate change.

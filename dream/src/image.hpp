@@ -12,6 +12,7 @@
 #include <cstdint>
 #include "primitive_ops.hpp"
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dream {
@@ -261,6 +262,19 @@ public:
     uint32_t data_count() const { return n_large_; }
     const char* data_bytes(uint32_t i) const { return payload_ + large_[i].offset; }
     uint64_t data_length(uint32_t i) const { return large_[i].length; }
+    /// The name `--payload NAME=FILE` gave datum `i`, or empty when the image
+    /// has no `LNAM` section. Names are optional and additive: an image built
+    /// before them, or by a tool that does not write them, is reached by index.
+    std::string_view data_name(uint32_t i) const {
+        return i < data_names_.size() ? data_names_[i] : std::string_view();
+    }
+    /// The index of the datum called `name`, or -1.
+    int64_t data_index(std::string_view name) const {
+        for (size_t i = 0; i < data_names_.size(); ++i) {
+            if (data_names_[i] == name) return int64_t(i);
+        }
+        return -1;
+    }
     /// One bit per parameter the function's signature declares `:float`, or
     /// zero when it declares none or the image has no `TYPE` section.
     uint64_t float_params(uint32_t func) const {
@@ -334,6 +348,9 @@ private:
     uint64_t payload_len_ = 0;
     size_t payload_off_ = 0;
     bool has_payload_ = false;
+    /// `LNAM`, read at load: one name per datum, pointing into the mapping.
+    const uint8_t* names_ = nullptr;  uint32_t names_len_ = 0; uint32_t n_names_ = 0;
+    std::vector<std::string_view> data_names_;
 };
 
 }  // namespace dream

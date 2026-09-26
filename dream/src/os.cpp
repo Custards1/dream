@@ -628,6 +628,10 @@ NativeResult os_exit(Process& p, Value, Value* args, uint32_t) {
     // all until this line existed.
     p.runtime().print_profile();
     p.runtime().print_stats();
+    // `_Exit` runs no destructors, and a C library's are often where it
+    // writes out what it was holding. The exiting process's are the ones it
+    // can run safely: every other process is still running on its own worker.
+    release_foreign(p);
 #ifdef DREAM_PROFILE_GENERATE
     // _Exit bypasses GCC's normal profile writer. Compiler training runs
     // finish through this native, so flush explicitly in instrumented builds.

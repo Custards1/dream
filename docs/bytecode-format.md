@@ -72,6 +72,7 @@ Unknown section kinds must be skipped, not treated as an error.
 | `ITYP` | `u32 func, u32 reserved, u64 integer_params`        | integer signature hints for the JIT |
 | `TYPE` | `u32 func, u32 reserved, u64 float_params`          | what signatures declared, for the JIT (below) |
 | `LDAT` | `u64 offset, u64 length`                            | large-data table, into `PAYL` |
+| `LNAM` | `u32 length`, then the bytes, per datum, unpadded   | payload names; optional |
 | `PAYL` | `u64 byte_length` header, then the bytes            | the payload; last in the file |
 
 Atoms are interned separately from strings so the VM can compare them by
@@ -328,6 +329,16 @@ at every use. Descriptors are consecutive and unpadded.
 
 Neither may appear without the other: a table describing nothing, or bytes
 nothing can name, is an image that was built wrong.
+
+**`LNAM`** names the data, in `LDAT`'s order: for each, a `u32 length` and
+that many bytes, consecutive and unpadded, with `count` the number of names.
+`dreams --payload NAME=FILE` writes it (a bare `FILE` is named for its last
+path component), and it is what lets a program ask for a datum by what it is
+-- `std.foreign`'s `[:payload, "sqlite"]` -- rather than by where it fell on
+the command line. It is optional and additive like the other two: an image
+without it is reached by index, and a reader that does not know it skips it.
+It must not appear without a payload, and may not name more data than `LDAT`
+describes.
 
 **Validation.** `count * 16 <= length` for `LDAT`; each descriptor must satisfy
 `offset + length <= byte_length` in 64-bit arithmetic, written as a subtraction

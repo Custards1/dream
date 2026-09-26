@@ -478,51 +478,98 @@ arguments to what it comes to; that is what makes an alias callable.
 
 ## `std.ffi`
 
-Foreign function interface for calling C libraries. Requires libffi at build time. Check `vm.has_ffi ()` before using; without it every function except `sizeof` raises. `import std.ffi` always compiles — the failure is at call time, not at load time.
+Calling C. Requires libffi at build time; without it every member except
+`sizeof` and `alignof` raises `:ffi_error`, and `vm.has_ffi ()` is `false`.
+`import std.ffi` always compiles. [`std.foreign`](ffi.md) is the Dream-level
+half, and the one to write a wrapper against: it gives the vocabulary below
+types, so a signature written as a literal is checked while compiling.
 
 ```dream
 import std.ffi;
+
+let sqrt  = ffi.pure_function "libm.so.6" "sqrt" [:f64] :f64;
+let puts! = ffi.function () "puts" [:cstr] :int;
 ```
 
-### Loading libraries
+### Foreign functions
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `open!` | `name:string\|unit → handle` | Opens a shared library by name. Pass `unit` or `""` to get the current program (everything already linked, which includes the C library on any normal system). |
-| `close!` | `handle → unit` | Marks a library handle as closed. Does **not** unmap the library — existing bound functions remain valid to avoid dangling pointers. |
+| `function` | `library → symbol → [arg type] → result type → fn` | A C function as a Dream function of its arguments -- every one that is not `[:out, t]`. Named `symbol!`, so the runtime treats calling it as an effect; bind it to a `!` name. |
+| `pure_function` | same | The same, named `symbol`: for a C function with no effects, which a pure function may call. |
+| `call!` | `fn → [args] → value` | A foreign function applied to a list -- what lets a function and its arguments travel in one message. |
 
-### Binding functions
+Both constructors are pure and lazy: nothing is loaded until the function is
+made, and a library is opened once per VM. A library is a path, `()` or `""`
+for the running program (the C library on any normal system), or
+`[:payload, name]` / `[:payload, index]` for one carried in the image by
+`dreams --payload NAME=FILE`.
+
+**Types.** Scalars: `:void` (result only), `:bool`, `:i8`…`:i64`, `:u8`…`:u64`,
+`:f32`, `:f64`, and C's own names, whose widths are the platform's: `:char`,
+`:uchar`, `:short`, `:ushort`, `:int`, `:uint`, `:long`, `:ulong`, `:longlong`,
+`:ulonglong`, `:size`, `:ssize`, `:intptr`, `:uintptr`, `:double`. There is no
+`:float`, since in Dream that is a double; C's `float` is `:f32`.
+
+| Type | Where | Meaning |
+|------|-------|---------|
+| `:ptr` | anywhere | a raw address, as an integer, or `()` for null. Accepts any handle as an argument. Checks nothing |
+| `:cstr` | anywhere | a string as a NUL-terminated pointer; a result is copied, `NULL` is `()` |
+| `:bytes` | argument | a string's bytes, or a payload view's, with no terminator promised |
+| `[:handle, tag]` | argument | a live handle of that tag, owned by this process; passes its pointer |
+| `:buffer` | argument | `[:handle, "buffer"]` |
+| `[:own, tag, destructor]` | result, `out` | the pointer becomes a handle this process owns; `destructor` is a symbol in the library, run on release |
+| `[:borrow, tag]` | result, `out` | a handle with no destructor, for a pointer something else frees |
+| `[:cstr, destructor]` | result, `out` | copy the string, then free the pointer with `destructor` |
+| `[:out, t]` | argument | not passed by the caller: C is given somewhere to write a `t`, and the call answers `[result, out1, ..]` |
+| `[:callback, [args], result]` | argument | a pure Dream function C may call during this call; numbers, `:ptr` and `:cstr` only |
+
+### Owning C resources
+
+A handle is `[:foreign, tag, id]`. The pointer stays in the VM, in a table
+belonging to the process that made the call; the handle is only a name for an
+entry. So a released handle, one belonging to another process, and one of the
+wrong tag are all `:ffi_error`s rather than undefined behaviour.
+
+A resource made by a call that took handles records them as its *parents*.
+Releasing a parent releases its children first, newest first. Whatever a
+process has not released is released when it ends, whether it returned, raised
+or called `os.exit!`, newest first, which is always children before parents.
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `bind!` | `handle → symbol:string → arg_types:list of atom → ret_type:atom → fn` | Resolves `symbol` in `handle` and returns a callable native function with the given type signature. |
-| `load!` | `name → symbol → arg_types → ret_type → fn` | Convenience: `open!` then `bind!` in one call. |
+| `release!` | `handle → unit` | Run the destructor now, after releasing everything made from it. Raises for a handle that is not live here. |
+| `alive!` | `handle → bool` | Whether this process still owns it. |
+| `owned!` | `unit → [handle]` | Every handle this process owns, oldest first. |
+| `address!` | `handle → integer` | The raw address. The one way to take a pointer out of the table. |
 
-**Type atoms** for `bind!` and `sizeof`:
+### Buffers
 
-| Atom | C type |
-|------|--------|
-| `:void` | `void` (return only) |
-| `:bool` | `_Bool` / `uint8_t` |
-| `:i8` / `:u8` | `int8_t` / `uint8_t` |
-| `:i16` / `:u16` | `int16_t` / `uint16_t` |
-| `:i32` / `:u32` | `int32_t` / `uint32_t` |
-| `:i64` / `:u64` | `int64_t` / `uint64_t` |
-| `:f32` | `float` |
-| `:f64` | `double` |
-| `:ptr` | `void*` (passed as an integer address) |
-| `:cstr` | `const char*` (Dream string → NUL-terminated pointer; return → Dream string) |
-
-### Raw memory
+Memory this process allocated, of a known size, so that every access is
+checked against it. A pointer C hands back has no size and cannot be read
+directly; that is the point.
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `sizeof` | `type:atom → integer` | Size in bytes for a type atom. Works even without libffi. |
-| `alloc!` | `size:integer → integer` | Allocates `size` zero-initialized bytes with `calloc` and returns the address as an integer. |
-| `free!` | `address:integer → unit` | Frees memory previously allocated with `alloc!`. |
-| `read_cstr!` | `address:integer → string\|unit` | Reads a NUL-terminated C string from `address`. Returns `unit` for a null pointer. |
-| `read_u8!` | `base:integer → offset:integer → integer` | Reads one byte at `base + offset`. |
-| `write_u8!` | `base:integer → offset:integer → byte:integer → unit` | Writes one byte at `base + offset`. |
+| `buffer!` | `size → handle` | `size` zeroed bytes, owned, tagged `"buffer"`. |
+| `size!` | `handle → integer\|unit` | A buffer's size; `()` for a handle whose size is unknown. |
+| `peek!` | `buffer → offset → type → value` | Read one scalar or `:ptr`. |
+| `poke!` | `buffer → offset → type → value → unit` | Write one. |
+| `read!` | `buffer → offset → length → string` | Bytes, as a string. |
+| `read_string!` | `buffer → offset → string` | Up to a NUL or the end of the buffer. |
+| `write!` | `buffer → offset → string → unit` | A string's (or payload view's) bytes. |
+| `sizeof` | `type → integer` | Size in bytes of a scalar type. Works without libffi. |
+| `alignof` | `type → integer` | Its alignment. Works without libffi. |
+| `payload_index` | `name → integer\|unit` | Which payload `--payload NAME=FILE` called `name`. |
+
+### The first interface
+
+Kept, and now read by the same signature reader, so `bind!` takes every type
+above: `open! name → handle`, `close! handle`, `bind! handle symbol args result`,
+`load! name symbol args result`, and raw addresses as integers: `alloc! size`,
+`free! address`, `read_cstr! address`, `read_u8! base offset`,
+`write_u8! base offset byte`. None of the raw-address members is checked;
+new code wants buffers.
 
 ---
 

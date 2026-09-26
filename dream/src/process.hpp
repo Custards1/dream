@@ -202,6 +202,13 @@ const char* wait_reason_name(WaitReason r);
 const char* mode_name(Mode m);
 const char* cont_kind_name(ContKind k);
 
+class Process;
+
+/// Run the destructor of every C resource `p` still owns, newest first, and
+/// forget them. Called as a process finishes, from `os.exit!`, and from the
+/// process's destructor as a backstop; a second call finds nothing to do.
+void release_foreign(Process& p);
+
 class Process final : public RootSource {
 public:
     Process(Runtime& rt, uint64_t id);
@@ -261,7 +268,7 @@ public:
     /// machine, which re-enters another compiled body, which forces again. One
     /// real C++ frame per link of a lazy chain, against a fixed machine stack.
     /// That was the SIGSEGV under "Fixed: compiled code forcing a long thunk
-    /// chain crashed" in CLAUDE.md; `enter_function` declines the compiled tier
+    /// chain crashed" in docs/notes/vm-performance.md; `enter_function` declines the compiled tier
     /// past `kMaxForceNestForCompiled`, and the interpreter, whose recursion is
     /// heap continuations and so has a limit it can check, finishes the chain.
     uint32_t force_nest = 0;
@@ -365,6 +372,14 @@ public:
     /// allocation each: a loop over `1.0 / x` allocated one per iteration for
     /// a value the image already held.
     std::vector<Value> float_cache;
+
+    /// The C resources this process owns through `std.ffi`: every handle it
+    /// was given by a foreign call, with the destructor that lets it go. Null
+    /// until the first one, so a process that never touches C pays a pointer.
+    /// A process owns its resources the way it owns its heap -- nobody else can
+    /// reach them, and when it ends they end, in the reverse of the order they
+    /// were made. `release_foreign` is what does that; see dream/src/ffi.cpp.
+    struct ForeignTable* foreign = nullptr;
 
     /// Set once the process stops; `failed` distinguishes a raised error.
     Value exit_value = UNIT;

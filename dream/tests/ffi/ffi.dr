@@ -1,0 +1,218 @@
+// std.ffi and std.foreign, against `sample.c`.
+//
+// Built by run.sh with `--payload sample=libsample.so`, so the library under
+// test is the one the image carries -- which is also the test of that. Every
+// destructor in the C library writes to a log, and most checks below read it:
+// what matters about a resource is not only that it was let go but when, and
+// in what order.
+//
+// Handles are printed as their tag rather than whole, because their ids come
+// from one counter for the runtime and would make this file's expectations a
+// record of how many things happened to be made before.
+
+import std.console;
+import std.ffi;
+import std.foreign;
+import std.list;
+
+let lib = foreign.embedded "sample";
+
+type Counter = foreign.Handle "counter";
+type Cursor = foreign.Handle "cursor";
+
+let new! = foreign.function lib "counter_new" [:long] (foreign.own "counter" "counter_free");
+let add! = foreign.function lib "counter_add" [foreign.handle "counter", :long] :long;
+let open! = foreign.function lib "cursor_open" [foreign.handle "counter"] (foreign.own "cursor" "cursor_close");
+let read! = foreign.function lib "cursor_read" [foreign.handle "cursor"] :long;
+let make! = foreign.function lib "counter_make" [:long, foreign.out (foreign.own "counter" "counter_free")] :int;
+let null! = foreign.function lib "counter_null" [] (foreign.own "counter" "counter_free");
+let log! = foreign.function lib "sample_log" [] :cstr;
+let clear! = foreign.function lib "sample_clear_log" [] :void;
+
+let divmod = foreign.pure_function lib "divmod" [:int, :int, [:out, :int], [:out, :int]] :int;
+let scale = foreign.pure_function lib "scale" [:f32, :double] :double;
+let low_byte = foreign.pure_function lib "low_byte" [:u32] :u8;
+let negate8 = foreign.pure_function lib "negate8" [:i8] :i8;
+let greet = foreign.pure_function lib "greet" [:cstr] (foreign.taken "free");
+let count_byte = foreign.pure_function lib "count_byte" [:bytes, :size, :int] :size;
+let fold_range = foreign.pure_function lib "fold_range" [:long, [:callback, [:long, :long], :long], :long] :long;
+let apply_twice = foreign.pure_function lib "apply_twice" [[:callback, [:double], :double], :double] :double;
+let sort! = foreign.function lib "sort_ints" [:buffer, :size, [:callback, [:int, :int], :int]] :void;
+let fill! = foreign.function lib "point_fill" [:buffer, :i32, :double] :void;
+let point_sum = foreign.pure_function lib "point_sum" [:buffer] :double;
+let point_size = foreign.pure_function lib "point_size" [] :size;
+
+/// A function of the program itself: whatever the VM is linked against.
+let strlen = foreign.pure_function foreign.this_program "strlen" [:cstr] :size;
+
+let point = comp foreign.layout [[:x, :i32], [:y, :double], [:tag, :u8]];
+
+let tag_of h = if h == () { () } else { h.[1] };
+
+let section! title = console.print! ("-- " + title);
+
+// --- in this process -------------------------------------------------------------
+
+let scalars! u = {
+    section! "scalars"
+    console.print! (strlen "dream")
+    console.print! (divmod 17 5)
+    console.print! (divmod 1 0)
+    console.print! (scale 1.5 2.0)
+    console.print! (low_byte 511)
+    console.print! (negate8 5)
+    console.print! (greet "world")
+    console.print! (count_byte "banana" 6 97)
+};
+
+let ownership! u = {
+    section! "ownership"
+    clear! ()
+    let c = new! 10;
+    console.print! (tag_of c)
+    console.print! (add! c 5)
+    let k = open! c;
+    console.print! (read! k)
+    // The cursor was made from the counter, so it goes first.
+    ffi.release! c
+    console.print! (log! ())
+    console.print! [ffi.alive! c, ffi.alive! k]
+    console.print! (try! { read! k } catch e { e })
+    console.print! (try! { ffi.release! c } catch e { e })
+    // A cursor where a counter is wanted.
+    let c2 = new! 1;
+    let k2 = open! c2;
+    console.print! (try! { add! k2 1 } catch e { e })
+    console.print! (try! { add! [:foreign, "counter", 424242] 1 } catch e { e })
+    console.print! (tag_of (null! ()))
+    let [status, made] = make! 3;
+    console.print! [status, tag_of made]
+    console.print! (make! (0 - 1))
+    console.print! (list.map tag_of (ffi.owned! ()))
+};
+
+let bump! h = add! h 99;
+
+let raises! h = {
+    add! h 1
+    raise! :from_inside
+};
+
+let scoped! u = {
+    section! "using!"
+    clear! ()
+    console.print! (foreign.using! (new! 1) bump!)
+    console.print! (try! { foreign.using! (new! 2) raises! } catch e { e })
+    console.print! (log! ())
+};
+
+let callbacks! u = {
+    section! "callbacks"
+    console.print! (fold_range 10 (fn acc i -> acc + i * i) 0)
+    console.print! (apply_twice (fn x -> x * 3.0) 2.0)
+    let xs = foreign.array_of! :int [5, 1, 9, 3, 7];
+    sort! xs 5 (fn a b -> b - a)
+    console.print! (foreign.read_array! xs 0 :int 5)
+    // An error in a callback is raised once C has returned.
+    console.print! (try! { fold_range 3 (fn acc i -> if i == 2 { acc / 0 } else { acc + i }) 0 } catch e { e })
+    // An impure one is refused before C is called at all.
+    console.print! (try! { sort! xs 5 compare! } catch e { e })
+};
+
+let compare! a b = { console.print! "never"; a - b };
+
+let memory! u = {
+    section! "memory"
+    console.print! (point_size ())
+    console.print! point
+    let b = foreign.struct_buffer! point;
+    fill! b 3 1.5
+    console.print! (foreign.read_struct! b 0 point)
+    foreign.write_struct! b 0 point %{ :x => 10 }
+    console.print! (point_sum b)
+    console.print! (foreign.offset_of point :y)
+    let s = foreign.buffer_of! "abc";
+    console.print! [ffi.size! s, foreign.read_string! s 0, foreign.read! s 1 2]
+    console.print! (try! { foreign.peek! s 2 :i32 } catch e { e })
+    console.print! (try! { foreign.write! s 3 "xy" } catch e { e })
+    console.print! (try! { ffi.size! (new! 0) } catch e { e })
+};
+
+// --- across processes ------------------------------------------------------------------
+
+let leaky! u = {
+    let c = new! 1;
+    let k = open! c;
+    let d = new! 2;
+    strict! [c, k, d]
+    :done
+};
+
+let crashy! u = {
+    strict! (new! 3)
+    raise! :boom
+};
+
+let handed_to! parent = {
+    let [h] = recv! ();
+    send! parent (try! { add! h 1 } catch e { e })
+};
+
+let processes! u = {
+    section! "processes"
+    clear! ()
+    // Nothing released, and still every destructor runs as the process ends --
+    // newest first, so the cursor before the counter it reads.
+    console.print! (join! (spawn! $( leaky! () )))
+    console.print! (log! ())
+    clear! ()
+    console.print! (try! { join! (spawn! $( crashy! () )) } catch e { e })
+    console.print! (log! ())
+    // A handle names nothing in a process that does not own it.
+    let mine = new! 5;
+    let me = self! ();
+    let other = spawn! $( handed_to! me );
+    send! other [mine]
+    console.print! (recv! ())
+    join! other
+};
+
+// --- a library as a process ------------------------------------------------------------
+
+let served! u = {
+    section! "a library server"
+    clear! ()
+    let srv = foreign.start! ();
+    let c = foreign.run! srv new! [5];
+    console.print! (tag_of c)
+    console.print! (foreign.run! srv add! [c, 2])
+    let k = foreign.run! srv open! [c];
+    console.print! (foreign.run! srv read! [k])
+    // The server owns them, so they mean nothing here...
+    console.print! (try! { add! c 1 } catch e { e })
+    // ...and a call that raises is the caller's error, not the server's end.
+    console.print! (try! { foreign.run! srv add! [k, 1] } catch e { e })
+    console.print! (foreign.run! srv add! [c, 3])
+    let b = foreign.buffer_in! srv 8;
+    foreign.poke_in! srv b 0 :i64 77
+    console.print! (foreign.peek_in! srv b 0 :i64)
+    console.print! (list.map tag_of (foreign.owned_in! srv))
+    foreign.release_in! srv k
+    console.print! (foreign.alive_in! srv k)
+    // Stopping it lets go of the rest.
+    foreign.stop! srv
+    console.print! (log! ())
+    // `here` is the same interface, in this process.
+    let mine = foreign.run! foreign.here new! [1];
+    console.print! (foreign.run! foreign.here add! [mine, 1])
+};
+
+let main! = {
+    scalars! ()
+    ownership! ()
+    scoped! ()
+    callbacks! ()
+    memory! ()
+    processes! ()
+    served! ()
+};

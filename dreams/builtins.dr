@@ -77,7 +77,7 @@ let names = [
 /// rebuilds -- and asked of the list they were a linear scan each time, which
 /// on a self-compile was 7% of every reduction the compiler made (`--profile`
 /// charged it to `index_of_from`). A list searched more often than it is built
-/// wants to be a map; see "Making it faster" in CLAUDE.md for the other four.
+/// wants to be a map; see "Making it faster" in docs/notes/vm-performance.md for the other four.
 let ids = list.fold (fn m [i, n] -> m.[n => i]) (%{}) (list.enumerate names);
 
 let is_builtin : :string -> :bool;

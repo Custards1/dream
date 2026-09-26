@@ -1748,14 +1748,29 @@ the whole answer. `DREAM_STUCK_SECONDS=n` prints the same report from the
 runtime when nothing has spent a reduction for that long — at which point no
 Dream code can run to ask on its own.
 
-### `std.ffi`
+### `std.ffi` and `std.foreign`
 
-`open!` · `close!` · `bind!` · `load!` · `sizeof` · `alloc!` · `free!` ·
-`read_cstr!` · `read_u8!` · `write_u8!`
+`std.ffi` binds a C symbol to a signature, written as data, and answers an
+ordinary Dream function; `std.foreign` is the library to wrap C against. Its
+signature vocabulary is a set of types, so a bad signature is a compile error.
+A pointer C hands back is *owned*: it becomes a handle, `[:foreign, tag, id]`,
+and the process that made the call owns it until it says `release!` or ends.
+Releasing a handle releases what was made from it first. A library can also
+run as a server process that owns everything made through it. A library can
+be carried in the image with `dreams --payload NAME=FILE`.
 
-Built only when libffi is found. Without it every member except `sizeof` raises,
-and `vm.has_ffi ()` reports `false`, so a program can degrade rather than fail
-to load.
+```dream
+import std.foreign;
+
+let lib  = foreign.library "libsqlite3.so.0";
+type Db  = foreign.Handle "sqlite3";
+let open! = foreign.function lib "sqlite3_open"
+                [:cstr, [:out, foreign.own "sqlite3" "sqlite3_close"]] :int;
+```
+
+Built only when libffi is found; without it the calls raise and
+`vm.has_ffi ()` is `false`. [ffi.md](ffi.md) is the guide, and
+[builtins.md](builtins.md#stdffi) the reference.
 
 ### `mind/std` — the Dream-level library
 

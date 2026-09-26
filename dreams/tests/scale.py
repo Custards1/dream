@@ -7,7 +7,7 @@ quadratic. This repository is too small to contain one: `dreams` is fifty
 modules of a hundred-odd declarations, and n^2 on a hundred is invisible. Four
 quadratics lived here for the whole life of the compiler for exactly that
 reason -- see "The compiler was quadratic in the size of the program" in
-CLAUDE.md.
+docs/notes/compiler-scaling.md.
 
     dreams/tests/scale.py --sizes 800 1600 3200
     dreams/tests/scale.py --sizes 400 1600 --modules 50   # many modules, few decls each
@@ -34,7 +34,7 @@ What made `dreams` pay 49 ms for eighteen one-line calls was not that axis but
 the fallback behind it -- a module whose offsets cannot be matched to its
 declarations is walked node by node -- and a generated program never trips it,
 because nothing generated here is written as a `match`. See "Discovery was a
-walk of two whole modules" in CLAUDE.md.
+walk of two whole modules" in docs/notes/macro-expansion.md.
 
 The modules axis has to be run *far* out before it says anything. `envs` was a
 list indexed by module for the whole life of the compiler, and at 400 modules

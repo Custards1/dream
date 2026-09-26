@@ -142,6 +142,11 @@ std::string describe(Process& p, Value v);
 
 Value make_integer(Process& p, int64_t v);
 
+/// Would applying `v` perform an effect? Purity is spelling: a function's `!`,
+/// a native's name, a partial application's function. Anything it cannot see
+/// through counts as impure.
+bool impure_callee(Process& p, Value v);
+
 /// Build a callable host function. `user` is host state the native can read
 /// back from its own object, which is how FFI bindings distinguish themselves.
 Value make_native(Process& p, NativeFn fn, Value name, uint32_t arity,

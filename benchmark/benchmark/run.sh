@@ -11,7 +11,7 @@
 # what is reported. Best rather than mean because what is being compared is how
 # long the work takes, and everything a repeat adds to that -- a scheduler
 # decision, a page fault, another process on the machine -- is added, never
-# subtracted. Read the numbers with the noise floor in mind: CLAUDE.md, "Two
+# subtracted. Read the numbers with the noise floor in mind: docs/notes/vm-performance.md, "Two
 # things that will lie to you about a change to the interpreter".
 #
 #   ./run.sh                    # all six, three runs each

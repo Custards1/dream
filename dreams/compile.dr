@@ -47,7 +47,8 @@ import std.vm;
 /// which is what to reach for when an image misbehaves. `payloads` are the
 /// *sizes* of what `--payload` appends, because they are part of the section
 /// table and so of what the image is -- the bytes themselves never come near
-/// a Dream string.
+/// a Dream string. `payload_names` are what `--payload NAME=FILE` called
+/// them, one per payload, which become the image's `LNAM` section.
 ///
 /// `parallel` spreads lowering and checking across processes, handing them
 /// the program through the runtime's shared area (`vm.share!`). That is most
@@ -60,6 +61,7 @@ mapping Options {
     optimize = true
     payloads = []
     parallel = false
+    payload_names = []
 }
 
 /// The defaults: checked, shared, no payload.
@@ -67,7 +69,7 @@ let options = Options.new ();
 
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
-let scratch = Options.make false false [] false;
+let scratch = Options.make false false [] false [];
 
 // --- a build --------------------------------------------------------------------
 
@@ -276,6 +278,7 @@ let image b = {
                 else { match Build.shared b { () => optimizer.optimize arena, done => done } };
     let hints f = if Options.types o { param_masks built (f (Build.facts b)) } else { [] };
     built.[:payloads => Options.payloads o]
+         .[:payload_names => Options.payload_names o]
          .[:float_params => hints typecheck.Analysis.float_params]
          .[:integer_params => hints typecheck.Analysis.integer_params]
 };

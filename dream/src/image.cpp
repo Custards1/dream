@@ -386,6 +386,10 @@ bool Image::parse(std::string& error) {
         } else if (s.kind == tag("LDAT")) {
             if (!fits(sizeof(DataRec))) { error = "LDAT section is short"; return false; }
             large_ = reinterpret_cast<const DataRec*>(base); n_large_ = s.count;
+        } else if (s.kind == tag("LNAM")) {
+            // Variable-length records, so there is no stride to check here;
+            // `validate` walks them.
+            names_ = base; names_len_ = s.length; n_names_ = s.count;
         } else if (s.kind == tag("PAYL")) {
             // The section table entry describes only the 8-byte header -- the
             // honest size of what the layout reserved. The payload itself
@@ -526,6 +530,25 @@ bool Image::validate(std::string& error) {
             if (d.offset > payload_len_ || d.length > payload_len_ - d.offset) {
                 return fail("large datum " + std::to_string(i) + " extends past the payload");
             }
+        }
+    }
+    // Payload names: `u32 length` then the bytes, once per datum, unpadded.
+    // A name table is only meaningful beside the data it names, and naming a
+    // datum that does not exist is a build error rather than something to
+    // tolerate.
+    data_names_.clear();
+    if (names_) {
+        if (!has_payload_) return fail("LNAM section without a payload");
+        if (n_names_ > n_large_) return fail("LNAM names more data than LDAT describes");
+        uint32_t at = 0;
+        for (uint32_t i = 0; i < n_names_; ++i) {
+            if (names_len_ - at < 4) return fail("LNAM section is short");
+            uint32_t n = uint32_t(names_[at]) | uint32_t(names_[at + 1]) << 8 |
+                         uint32_t(names_[at + 2]) << 16 | uint32_t(names_[at + 3]) << 24;
+            at += 4;
+            if (n > names_len_ - at) return fail("LNAM name extends past its section");
+            data_names_.emplace_back(reinterpret_cast<const char*>(names_ + at), n);
+            at += n;
         }
     }
 

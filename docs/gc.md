@@ -409,7 +409,7 @@ It was built to ask why a large compile runs out of heap, and it answered
 immediately and not as expected: more than half of a self-compile's live set
 was map *branches*, at five times the count and three times the size a map of
 that many entries should have. The cause is not the collector's and is written
-up in `CLAUDE.md` under "A lazy value stored in a map pins the map it was made
+up in `docs/notes/compiler-scaling.md` under "A lazy value stored in a map pins the map it was made
 in" -- a lazily stored value holds the frame that would compute it, and in a
 fold that threads a persistent map that frame holds the map one version ago.
 Worth knowing here for two reasons: the ratio of map branches to map entries

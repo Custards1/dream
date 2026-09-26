@@ -219,7 +219,7 @@ let module_at l i = (module_map l).[i else ()];
 /// by. The two writers are `load_items!` and `hoist_mod!`, and both used to say
 /// `list.append (modules l) [m]` -- which copies the list, so loading a program
 /// was O(modules^2) bytes. See "A table indexed by module wants to be a map" in
-/// CLAUDE.md: this is the same finding as `scope.envs`, on the loader's copy of
+/// docs/notes/compiler-scaling.md: this is the same finding as `scope.envs`, on the loader's copy of
 /// the same table.
 let add_module m l =
     put :module_count (module_count l + 1) (put :modules ((module_map l).[module_count l => m]) l);

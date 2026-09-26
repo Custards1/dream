@@ -59,8 +59,8 @@ twice per poll. The default was the worst setting on the curve (2.67 s at
 `-j 1`, 2.46 s at `-j 4`, 2.70 s at `-j 24`). The default is now cores capped
 at 8 and `steal` short-circuits on a counter: **3.097 s -> 2.805 s**
 interpreted, **3.215 s -> 2.949 s** by default, non-PGO, `just test` and
-`just test-races` clean. See "An idle worker is not free" in the root
-`CLAUDE.md` for the measurement and for the one edit next to it that is
+`just test-races` clean. See "An idle worker is not free" in
+`docs/notes/vm-performance.md` for the measurement and for the one edit next to it that is
 unsound.
 
 ### Where the two changes leave it, measured together
@@ -109,8 +109,8 @@ most useful thing in this section: PGO 12%, the GCC inliner ceilings 4%, the
 scheduler's idle workers 9%, and **every source-level change to the interpreter
 together under 1%**. Three separate hot symbols were attacked on the strength
 of a `perf` profile and all three came back inside the noise floor. See "`step_eval`
-is too big for the inliner" and the two entries after it in the root
-`CLAUDE.md` for why, and for what to read a profile *for* in this interpreter.
+is too big for the inliner" and the two entries after it in
+`docs/notes/vm-performance.md` for why, and for what to read a profile *for* in this interpreter.
 
 What the profile says now, at default workers, is that the collector is
 **35% of all CPU samples** across three parallel lambdas -- but only 284 ms of

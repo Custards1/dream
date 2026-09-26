@@ -2290,6 +2290,29 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
             }
             return cl;
         }
+        case ObjType::Native: {
+            // A host function is a pointer into the VM and whatever id it was
+            // bound with -- both good for every process of the runtime -- so it
+            // travels as itself. A foreign function sent to a library's server
+            // process is the case that needs it; it used to arrive as `()`.
+            if constexpr (to_shared) {
+                dest.refuse(obj_type_name(o->type));
+                return UNIT;
+            } else {
+                auto* src = static_cast<NativeObj*>(o);
+                Value name = copy_value(dest, src->name, seen);
+                auto* nat = static_cast<NativeObj*>(dest.alloc(
+                    ObjType::Native, sizeof(void*) + sizeof(Value) + 8 + sizeof(uint64_t)));
+                nat->fn = src->fn;
+                nat->name = name;
+                nat->arity = src->arity;
+                nat->strict_mask = src->strict_mask;
+                nat->user = src->user;
+                Value out = from_obj(nat);
+                seen.emplace(v, out);
+                return out;
+            }
+        }
         case ObjType::Pap: {
             auto* src = static_cast<PapObj*>(o);
             Value fn = copy_value(dest, src->fn, seen);

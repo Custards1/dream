@@ -246,6 +246,9 @@ std::vector<std::string> Scheduler::take_failures() {
 }
 
 void Scheduler::finish(const std::shared_ptr<Process>& p) {
+    // Before anyone can be told the process is done: a joiner that goes on to
+    // look at what the C side holds must find its resources already let go.
+    release_foreign(*p);
     std::vector<uint64_t> waiters;
     bool had_waiters = false;
     {

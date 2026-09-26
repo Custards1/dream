@@ -128,7 +128,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
-    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true;
+    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true [];
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
@@ -182,6 +182,17 @@ let show_ir! l = {
 // string counts its length in 32 bits, which is the very limit the payload
 // exists to get past. So a file is measured before the layout and copied after
 // it, and at no point is it a value.
+
+/// `NAME=FILE`, or `FILE` alone, as `[name, path]`. A file given no name is
+/// called by its last path component, so `--payload lib/libz.so` is
+/// `"libz.so"`. What is in front of the first `=` is a name only when it could
+/// not be a path, so a file whose own name has an `=` in it still works.
+let payload_spec spec = {
+    let at = str.find "=" spec;
+    if at > 0 && not (str.contains_str "/" (str.slice 0 at spec)) {
+        [str.slice 0 at spec, str.slice (at + 1) (str.byte_length spec - at - 1) spec]
+    } else { [path.basename spec, spec] }
+};
 
 /// How much of a payload is in memory at once. Anything would do; a megabyte
 /// is large enough that the loop is not the cost and small enough to be free.
@@ -237,10 +248,15 @@ let copy_payload! out path n =
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out shebang payloads o = {
+let build! l out shebang specs o = {
+    let named = list.map payload_spec specs;
+    let payloads = list.map (fn e -> list.nth 1 e) named;
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
     strict! sizes
-    let b = compile.build! l (compile.Options.set_payloads o sizes);
+    let with_payloads = compile.Options.set_payload_names
+                            (compile.Options.set_payloads o sizes)
+                            (list.map (fn e -> list.head e) named);
+    let b = compile.build! l with_payloads;
     let unreadable = list.filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
     if not (compile.ok b) { print_diags! (compile.files b) (compile.diags b) }
     else if not (list.is_empty unreadable) {
@@ -753,8 +769,10 @@ let usage! () = {
         "                           NAME=DIR is the package at DIR, imported as NAME",
         "  -I, --include DIR        a directory to search for modules",
         "  --host-module PATH       treat PATH as provided by the host",
-        "  --payload FILE           put FILE's bytes in the image, reachable as",
-        "                           `data_at N` in the order given",
+        "  --payload [NAME=]FILE    put FILE's bytes in the image, reachable as",
+        "                           `data_at N` in the order given; NAME (FILE's",
+        "                           own name by default) is how `std.foreign`",
+        "                           finds a library carried this way",
         "",
         "what to compile it as:",
         "  -D, --define NAME[=V]    define a `when` flag, or set a `when` value",

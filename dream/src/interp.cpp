@@ -311,7 +311,7 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
     // lets a small bound here be free for every healthy program. See
 
     // `Process::force_nest`, `dream/tests/programs/force_chain.dr`, and "Fixed:
-    // compiled code forcing a long thunk chain crashed" in CLAUDE.md.
+    // compiled code forcing a long thunk chain crashed" in docs/notes/vm-performance.md.
     if (jit && p.force_nest <= kMaxForceNestForCompiled) {
         // One inlined, lock-free read of the tier table (see `Jit::tier`), so
         // a process whose functions never grow hot -- most of a compile --

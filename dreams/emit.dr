@@ -151,6 +151,7 @@ let t_span = tag 83 80 65 78;   // SPAN
 let t_mods = tag 77 79 68 83;   // MODS
 let t_ldat = tag 76 68 65 84;   // LDAT
 let t_payl = tag 80 65 89 76;   // PAYL
+let t_lnam = tag 76 78 65 77;   // LNAM
 let t_ityp = tag 73 84 89 80;   // ITYP
 let t_type = tag 84 89 80 69;   // TYPE
 
@@ -244,13 +245,18 @@ let data_offsets lens =
         [list.head acc + n, list_cons (list.head acc) (list.nth 1 acc)])
         [0, []] lens));
 
-/// `LDAT` and `PAYL`, or nothing at all.
+/// `LDAT`, `LNAM` and `PAYL`, or nothing at all.
 ///
 /// Nothing at all is the important half. A build with no payload must write the
 /// bytes it wrote before any of this existed -- that is what the bootstrap
 /// compares, and an empty section pair would break the equality without
 /// carrying anything.
-let data_sections lens =
+///
+/// `LNAM` is the payloads' names, `u32 length` and the bytes, once per datum
+/// and unpadded. It is additive -- a reader that does not know it skips it --
+/// and it is what lets a program ask for a datum by what it is (`[:payload,
+/// "sqlite"]`) rather than by where it happened to fall on the command line.
+let data_sections lens names =
     if list.is_empty lens { [] }
     else {
         let offsets = data_offsets lens;
@@ -259,10 +265,14 @@ let data_sections lens =
         // follow it in the file but not in the section, because the section
         // table counts in 32 bits and the payload may not fit there. The real
         // size is the header, which is why it is written at all.
-        [section t_ldat (concat_map (fn e -> u64 (list.head e) + u64 (list.nth 1 e))
-                                    (list.zip offsets lens))
-                 (list.length lens),
-         section t_payl (u64 total) 0]
+        let named = if list.is_empty names { [] }
+                    else { [section t_lnam (concat_map (fn n -> u32 (str.byte_length n) + n) names)
+                                    (list.length names)] };
+        list.concat [[section t_ldat (concat_map (fn e -> u64 (list.head e) + u64 (list.nth 1 e))
+                                                 (list.zip offsets lens))
+                              (list.length lens)],
+                     named,
+                     [section t_payl (u64 total) 0]]
     };
 
 /// `TYPE` or `ITYP`, or nothing: one 16-byte record per function whose signature
@@ -299,7 +309,7 @@ let sections_of img = {
     // `u32` offset could not reach.
     list.concat [base, type_sections t_type (img.[:float_params else []]),
                  type_sections t_ityp (img.[:integer_params else []]),
-                 data_sections (img.[:payloads else []])]
+                 data_sections (img.[:payloads else []]) (img.[:payload_names else []])]
 };
 
 /// The image, as bytes.

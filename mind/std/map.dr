@@ -90,7 +90,7 @@ let filter keep m =
 /// Every fold in this module is `list.fold_strict`. Building a map with a
 /// lazy fold suspends each `map_put` on the one before, so the map arrives as
 /// a chain of every version of itself -- see "A lazy value stored in a map
-/// pins the map it was made in" in CLAUDE.md.
+/// pins the map it was made in" in docs/notes/compiler-scaling.md.
 let fold : (a -> k -> v -> a) -> a -> %{ k => v } -> a;
 let fold f init m = list.fold_strict (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (map_pairs m);
 
