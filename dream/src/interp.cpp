@@ -1006,8 +1006,13 @@ bool compare(Process& p, Op op, Value a, Value b, Value* out) {
 /// reading the wrong member out of the right one.
 /// The slow half: find the member, number it, and build its function value.
 /// Reached once per call site, and then never again.
-[[gnu::noinline]] bool member_value_slow(Process& p, uint32_t imp, uint32_t name_index,
-                                         uint32_t node_index, Value* out) {
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+[[gnu::noinline]]
+#endif
+bool member_value_slow(Process& p, uint32_t imp, uint32_t name_index,
+                       uint32_t node_index, Value* out) {
     const Image& img = img_of(p);
     StringRef member = img.str(name_index);
     const ModuleDef* def = p.runtime().module_for_import(imp);
@@ -2884,9 +2889,9 @@ bool force_deep(Process& p, Value v, Value* out) {
             std::vector<std::pair<Value, Value>> entries;
             map_collect(p.stack.back(), entries);
             const size_t first = p.stack.size();
-            for (auto& [k, v] : entries) {
+            for (auto& [k, val] : entries) {
                 (void)k;
-                p.stack.push_back(v);
+                p.stack.push_back(val);
             }
             const size_t count = entries.size();
             entries.clear();

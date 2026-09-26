@@ -837,7 +837,7 @@ NativeResult net_connect(Process& p, Value, Value* args, uint32_t) {
         return fail_errno(p, "socket", e);
     }
     set_nonblocking(fd);
-    int rc = sys::connect(fd, found->ai_addr, found->ai_addrlen);
+    int rc = sys::connect(fd, found->ai_addr, static_cast<sys::SockLen>(found->ai_addrlen));
     int e = errno;
     ::freeaddrinfo(found);
 

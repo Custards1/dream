@@ -191,7 +191,13 @@ if(DREAM_HAVE_FFI)
 endif()
 
 if(MSVC)
-  target_compile_options(dream PRIVATE /W4 /permissive- /utf-8)
+  # C4100 is unused-parameter, which the GCC line below turns off too: a
+  # native's signature is fixed by the table whether it reads `p` or not.
+  # _CRT_SECURE_NO_WARNINGS silences MSVC's deprecation of `getenv`,
+  # `strerror` and `_wopen` in favour of its own `_s` variants; the calls are
+  # the portable ones every other platform makes, and a warning is a failure.
+  target_compile_options(dream PRIVATE /W4 /permissive- /utf-8 /wd4100)
+  target_compile_definitions(dream PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
   target_compile_options(dream PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()

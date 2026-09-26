@@ -35,7 +35,20 @@ struct BuiltinDef {
 /// of a self-compile to fetch a pointer the caller could have computed itself.
 /// Nothing writes to it; `builtin_count` still reports its extent, because the
 /// size belongs to the definition.
-extern const BuiltinDef BUILTINS[];
+///
+/// Being data rather than a function is what makes it need `DREAM_DATA_API`.
+/// On Windows the VM is a DLL built with `WINDOWS_EXPORT_ALL_SYMBOLS`, which
+/// exports every function and no variable, so `dream.exe` and `dream_tests`
+/// inlining `builtin_def` reached for a symbol the DLL never offered. CMake
+/// defines `dream_EXPORTS` while it builds the library itself.
+#if defined(_WIN32) && defined(dream_EXPORTS)
+#define DREAM_DATA_API __declspec(dllexport)
+#elif defined(_WIN32)
+#define DREAM_DATA_API __declspec(dllimport)
+#else
+#define DREAM_DATA_API
+#endif
+extern DREAM_DATA_API const BuiltinDef BUILTINS[];
 inline const BuiltinDef& builtin_def(uint32_t id) { return BUILTINS[id]; }
 uint32_t builtin_count();
 
