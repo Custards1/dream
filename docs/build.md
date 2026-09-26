@@ -8,8 +8,9 @@ vocabulary a script is written in. Tools such as a C compiler, a parser
 generator or `protoc` add to that vocabulary through one behavior, so each of
 them extends the same build rather than bringing its own.
 
-This document is the design. Only the image's target is built so far; the
-last section is the order to build the rest in and what is still open.
+This document is the design. The image's target and the package graph are
+built; the last section is the order to build the rest in and what is still
+open.
 
 ## What it has to be
 
@@ -435,10 +436,10 @@ one, and allowing it would make "dependencies before the packages that use
 them" mean nothing for scripts, options and targets. Module imports within
 and across packages are unaffected, because this is about manifests.
 
-Today's `walk!` treats a key it has already seen as a diamond and adds the
-edge, so a cycle passes without complaint. Telling the two apart is the
-first change: the node is on the current path (a cycle), or it was finished
-earlier (a diamond).
+The walk tells the two apart by where the key is. A key on the path the
+walk is still descending is a cycle, and a key finished earlier is a diamond.
+The path is kept by directory rather than by key, because it runs through
+every namespace (`mind/tool/build.dr`).
 
 ### Versions
 
@@ -476,8 +477,9 @@ checking. The requirement is kept as data (`std.version.Requirement`) so that
 a registry, when one exists, adds a solver in `mind` without changing a
 manifest.
 
-`mind.lock` records what the graph resolved to: every key's source, revision,
-version and content digest. A later build that resolves differently says so
+`mind.lock` records what the graph resolved to: every key's source, version
+and, for git, commit, in a section per program (`[program]`,
+`[build.NAME]`). A content digest joins them once `io.digest!` exists. A later build that resolves differently says so
 rather than quietly building something else. `mind update` is how the lock
 moves.
 
@@ -659,7 +661,7 @@ they are built says is not optional.
 3. **`std.build` core.** The vocabulary, keys, the runner (sequential
    first, then concurrent), the stamp cache, outcomes, `write`, `command`,
    and `when test` blocks for each.
-4. **The graph.** Cycle detection with the loop in the message, version
+4. **The graph. Built.** Cycle detection with the loop in the message, version
    requirements and `std.version`, revision conflicts reported as such,
    three kinds of edge, and `mind.lock`. None of this needs build scripts,
    and every project with dependencies wants it now.

@@ -10,8 +10,10 @@ import std.io;
 import std.list;
 import std.os;
 import std.str;
+import std.version;
 
 import fetch;
+import lock;
 import manifest;
 import util;
 
@@ -28,21 +30,46 @@ import util;
 // The same directory reached twice -- a diamond, two packages sharing a third
 // -- is one node. Directories are compared by their normalized absolute path,
 // so `../greet/../util` and `../util` agree.
+//
+// An edge has a kind, and all three mean "must be ready first":
+//
+//   :uses     [dependencies]         compiled into the program
+//   :dev      [dev-dependencies]     the root's only, compiled into its tests
+//   :builds   [build-dependencies]   compiled into the package's build script
+//
+// A build script is a separate program, so its packages are a separate
+// namespace: each package's build dependencies are walked into a graph of
+// their own, kept under the package's key in `:builds`, and a tool may use a
+// `json` the program does not. The *path* the walk is on runs through all of
+// them, though, because "must be ready first" does: a package whose build
+// script needs a tool that uses the package can never be built, and that is a
+// cycle across two namespaces. So the path is kept by directory, not by key.
+//
+// A key already in the graph is one of two things. Finished earlier, it is a
+// diamond and gets another edge. On the path the walk is still descending,
+// it is a cycle, and nothing in it can be built first -- which is reported
+// with the whole loop, since "a cycle somewhere" is not something a person can
+// fix and the loop is.
 
 /// The key the root package's own dependencies are recorded under.
 let root_key = "";
 
-let empty_graph = %{ :order => [], :nodes => %{}, :edges => %{} };
+let empty_graph = %{ :order => [], :nodes => %{}, :edges => %{}, :builds => %{} };
 
 let order g = list.reverse (g.[:order else []]);
 let node g key = (g.[:nodes else (%{})]).[key else ()];
 let nodes g = list.map (fn k -> node g k) (order g);
-let children g key = list.reverse ((g.[:edges else (%{})]).[key else []]);
+/// `[[to, kind], ..]`, in the order they were listed.
+let edges_of g key = list.reverse ((g.[:edges else (%{})]).[key else []]);
+let children g key = list.map (fn e -> list.head e) (edges_of g key);
+/// The graph a package's build script is compiled from, or `()` when it has
+/// no build dependencies.
+let build_graph g key = (g.[:builds else (%{})]).[key else ()];
 
-let with_edge from to g = {
+let with_edge from to kind g = {
     let es = g.[:edges else (%{})];
     let now = es.[from else []];
-    if list.contains to now { g } else { g.[:edges => es.[from => list.cons to now]] }
+    if list.contains [to, kind] now { g } else { g.[:edges => es.[from => list.cons [to, kind] now]] }
 };
 
 let with_node key n g = {
@@ -50,10 +77,22 @@ let with_node key n g = {
     ordered.[:nodes => (g.[:nodes else (%{})]).[key => n]]
 };
 
+/// Every build script's graph, however deep, as `[owner, graph]`: a package's
+/// build dependencies may have build dependencies of their own.
+let rec build_graphs g =
+    list.concat (list.map (fn pair -> {
+        let [owner, sub] = pair;
+        list.cons [owner, sub] (build_graphs sub)
+    }) (map_pairs (g.[:builds else (%{})])));
+
+let with_build_graph key sub g = g.[:builds => (g.[:builds else (%{})]).[key => sub]];
+
 /// A node: the key, where it is, its manifest (`()` for a bare directory),
-/// the dependency as written, and who asked for it first.
+/// the dependency as written, who asked for it first, and every version
+/// requirement put on it, as `[requirement, asker, manifest path]`.
 let make_node key dir m d by =
-    %{ :key => key, :dir => dir, :abs => (), :manifest => m, :dep => d, :by => by };
+    %{ :key => key, :dir => dir, :abs => (), :manifest => m, :dep => d, :by => by, :at => (),
+       :wants => [] };
 
 let node_key n = n.[:key else ""];
 let node_dir n = n.[:dir else "."];
@@ -61,12 +100,102 @@ let node_abs n = n.[:abs else node_dir n];
 let node_manifest n = n.[:manifest else ()];
 let node_dep n = n.[:dep else ()];
 let node_by n = n.[:by else root_key];
+let node_wants n = n.[:wants else []];
+/// The manifest that first asked for it, as `shown!` writes it.
+let node_at n = n.[:at else "mind.toml"];
+/// The version the package says it is, or `()` for a directory with no
+/// manifest, which says nothing.
+let node_version n = match node_manifest n { () => (), m => manifest.version m };
+
+/// Record one more requirement on a node already in the graph.
+let with_want key want g = match [want, node g key] {
+    [(), _] => g,
+    [_, ()] => g,
+    [w, n] => with_node_in_place key (n.[:wants => list.append (node_wants n) [w]]) g,
+};
+let with_node_in_place key n g = g.[:nodes => (g.[:nodes else (%{})]).[key => n]];
 
 /// Who asked, as a person reads it.
 let asker by = match by { "" => "this project", k => "`" + k + "`" };
 
+/// How an edge reads in a sentence.
+let edge_words kind = match kind { :uses => "uses", :dev => "tests with", :builds => "builds with", _ => "needs" };
+
+// --- the walk ------------------------------------------------------------------
+//
+// The walk carries where it is: the manifest whose dependencies it is reading,
+// the key that manifest is known by, and the path -- `[abs, name, manifest
+// path, kind]` for every package it is inside, innermost first, `kind` being
+// the edge it was entered by.
+
+let step_of abs name where kind = [abs, name, where, kind];
+
+/// The loop, when `abs` is already on the path: from where it was entered to
+/// here, then the edge that closes it.
+let cycle_message path abs name kind = {
+    let inside = list.reverse path;
+    let from = list.drop_while (fn st -> list.head st != abs) inside;
+    let lines = list.map (fn pair -> {
+        let [a, b] = pair;
+        [list.nth 1 a, edge_words (list.nth 3 b), list.nth 1 b, list.nth 2 a]
+    }) (list.zip from (list.append (list.tail from) [step_of abs name "" kind]));
+    let width f = list.fold (fn w l -> { let n = str.byte_length (f l); if n > w { n } else { w } }) 0 lines;
+    let pad n t = t + str.repeat (n - str.byte_length t) " ";
+    let w1 = width (fn l -> list.nth 0 l);
+    let w2 = width (fn l -> list.nth 1 l);
+    let w3 = width (fn l -> list.nth 2 l);
+    "these packages need each other, so none of them can be built first:\n"
+    + str.join_str "\n" (list.map (fn l -> "  " + pad w1 (list.nth 0 l) + "  " + pad w2 (list.nth 1 l)
+                                            + "  " + pad w3 (list.nth 2 l) + "  (" + list.nth 3 l + ")")
+                                   lines)
+};
+
+/// What to say about two packages under one key. Two revisions of one
+/// repository is its own message, because it is the common case and the one
+/// with an obvious fix; anything else is two different packages.
+let conflict_message key seen d owner_key owner_at abs = {
+    let git_of x = manifest.spec_get x "git";
+    let same_repo = manifest.dep_kind (node_dep seen) == :git && manifest.dep_kind d == :git
+                    && git_of (node_dep seen) == git_of d;
+    let line n src by = "  " + n + " (" + src + ", required by " + asker by + ")\n";
+    let rev x = to_string (list.nth 1 (manifest.dep_rev x));
+    if same_repo {
+        let w = { let a = str.byte_length (rev (node_dep seen)); let b = str.byte_length (rev d);
+                  if a > b { a } else { b } };
+        let at r by where = "  " + r + str.repeat (w - str.byte_length r) " "
+                            + "  required by " + asker by + " (" + where + ")\n";
+        "two revisions of `" + key + "` (" + to_string (git_of d) + ") are required:\n"
+        + at (rev (node_dep seen)) (node_by seen) (node_at seen)
+        + at (rev d) owner_key owner_at
+        + "a program has one `" + key + "`: pin both to the same revision"
+    } else {
+        "two different packages are both called `" + key + "`:\n"
+        + line (node_abs seen) (manifest.dep_source (node_dep seen)) (node_by seen)
+        + line abs (manifest.dep_source d) owner_key
+        + "a program has one namespace of packages: point both at the same "
+        + "place, or list one of them under another name"
+    }
+};
+
+/// A requirement as it is kept on the node: what was written, who wrote it,
+/// and where.
+let want_of d owner_key where =
+    match manifest.dep_requirement d {
+        () => (),
+        r => [r, owner_key, where],
+    };
+
+/// A file as a person at this prompt would type it: relative to the working
+/// directory, and without the `../a/..` a walk accumulates.
+let shown! p = util.relative! (os.cwd! ()) p;
+
 /// `[:ok, graph]` or `[:error, why]`.
-let rec walk! owner owner_key deps g =
+///
+/// `owner` is the manifest whose `deps` these are, known as `owner_key` in
+/// this graph; `kind` is the edge every one of them is; `path` is where the
+/// walk is (above). Build dependencies go into a graph of their own, walked
+/// with the same path.
+let rec walk! owner owner_key deps kind path g =
     match deps {
         [] => [:ok, g],
         [d, ..rest] => {
@@ -75,44 +204,226 @@ let rec walk! owner owner_key deps g =
                 [:error, why] => [:error, why + " (required by " + asker owner_key + ")"],
                 [:ok, dir] => {
                     let abs = util.absolute! dir;
-                    match node g key {
-                        () => match manifest.load_dependency! dir {
-                            [:error, why] => [:error, why],
-                            [:none] => walk! owner owner_key rest
-                                             (with_edge owner_key key
-                                                 (with_node key ((make_node key dir () d owner_key).[:abs => abs]) g)),
-                            [:ok, dm] => {
-                                let g2 = with_edge owner_key key
-                                             (with_node key ((make_node key dir dm d owner_key).[:abs => abs]) g);
-                                match walk! dm key (manifest.dependencies dm) g2 {
-                                    [:error, why] => [:error, why],
-                                    [:ok, g3] => walk! owner owner_key rest g3,
-                                }
+                    let name = if str.is_empty key { "this project" } else { key };
+                    let on_path = list.any (fn st -> list.head st == abs) path;
+                    let owner_at = shown! (manifest.path owner);
+                    if on_path { [:error, cycle_message path abs name kind] }
+                    else {
+                        match node g key {
+                            () => match manifest.load_dependency! dir {
+                                [:error, why] => [:error, why],
+                                loaded => {
+                                    let dm = match loaded { [:ok, m] => m, _ => () };
+                                    let n = (make_node key dir dm d owner_key).[:abs => abs].[:at => owner_at]
+                                                .[:wants => match want_of d owner_key owner_at { () => [], w => [w] }];
+                                    let g2 = with_edge owner_key key kind (with_node key n g);
+                                    let inner = list.cons (step_of abs key (shown! (util.join abs "mind.toml")) kind)
+                                                          path;
+                                    match below! dm key inner g2 {
+                                        [:error, why] => [:error, why],
+                                        [:ok, g3] => walk! owner owner_key rest kind path g3,
+                                    }
+                                },
                             },
-                        },
-                        seen => match seen.[:abs else ()] == abs {
-                            true => walk! owner owner_key rest (with_edge owner_key key g),
-                            false => [:error, "two different packages are both called `" + key + "`:\n"
-                                              + "  " + node_abs seen + " (" + manifest.dep_source (node_dep seen)
-                                              + ", required by " + asker (node_by seen) + ")\n"
-                                              + "  " + abs + " (" + manifest.dep_source d
-                                              + ", required by " + asker owner_key + ")\n"
-                                              + "a program has one namespace of packages: point both at the same "
-                                              + "place, or list one of them under another name"],
-                        },
+                            seen => match node_abs seen == abs {
+                                true => walk! owner owner_key rest kind path
+                                              (with_want key (want_of d owner_key owner_at)
+                                                         (with_edge owner_key key kind g)),
+                                false => [:error, conflict_message key seen d owner_key owner_at abs],
+                            },
+                        }
                     }
                 },
             }
         },
     };
 
-/// The root's dependencies, and with `dev` its `[dev-dependencies]` as well.
-let root_deps m dev =
-    if dev { list.append (manifest.dependencies m) (manifest.dev_dependencies m) }
-    else { manifest.dependencies m };
+/// Everything below a package just added: its own dependencies in this graph,
+/// and its build dependencies in a graph of their own. A directory with no
+/// manifest has neither.
+let below! dm key path g =
+    match dm {
+        () => [:ok, g],
+        _ => match walk! dm key (manifest.dependencies dm) :uses path g {
+            [:error, why] => [:error, why],
+            [:ok, g2] => builds! dm key path g2,
+        },
+    };
 
-/// Every package this build needs, transitively.
-let graph! m dev = walk! m root_key (root_deps m dev) empty_graph;
+/// A package's build dependencies, walked into their own namespace and kept
+/// under its key. Nothing is kept for a package with none, so a graph with no
+/// build scripts anywhere is exactly the graph it was before they existed.
+let builds! m key path g =
+    match manifest.build_dependencies m {
+        [] => [:ok, g],
+        bdeps => match walk! m key bdeps :builds path empty_graph {
+            [:error, why] => [:error, why],
+            [:ok, sub] => match check_versions sub {
+                [:error, why] => [:error, why],
+                _ => [:ok, with_build_graph key sub g],
+            },
+        },
+    };
+
+// --- versions ------------------------------------------------------------------
+//
+// There is no registry, so there is nothing to choose between: a key is one
+// package, and resolving is *checking* that what was fetched is a version
+// everyone who asked for it accepts. Every requirement is kept on the node
+// with who wrote it, so a miss can be reported with all of them -- the fix is
+// usually to bring two of them together, and that needs both in view.
+
+/// `[:ok, ()]`, or `[:error, why]` for the first package some requirement on
+/// it does not accept.
+let check_versions g =
+    list.fold (fn acc n -> match acc {
+        [:error, why] => acc,
+        _ => check_node n,
+    }) [:ok, ()] (nodes g);
+
+let check_node n =
+    match node_wants n {
+        [] => [:ok, ()],
+        wants => {
+            let key = node_key n;
+            let found = node_version n;
+            let parsed = list.map (fn w -> [w, version.parse_requirement (list.head w)]) wants;
+            match list.filter (fn p -> list.head (list.nth 1 p) == :error) parsed {
+                [[w, [:error, why]], ..more] =>
+                    [:error, list.nth 2 w + ": the version required of `" + key + "` is not one: " + why],
+                _ => match found {
+                    () => [:error, "`" + key + "` has no manifest, so it has no version, but "
+                                   + asker (list.nth 1 (list.head wants)) + " requires "
+                                   + list.head (list.head wants)
+                                   + ": give it a mind.toml, or drop the requirement"],
+                    text => match version.parse text {
+                        [:error, _] => [:error, "`" + key + "` says its version is `" + text
+                                                + "`, which is not a version ("
+                                                + manifest.path (node_manifest n) + ")"],
+                        [:ok, v] => {
+                            let misses = list.filter (fn p -> not (version.matches (list.nth 1 (list.nth 1 p)) v))
+                                                     parsed;
+                            if list.is_empty misses { [:ok, ()] }
+                            else { [:error, version_message key text v n parsed] }
+                        },
+                    },
+                },
+            }
+        },
+    };
+
+/// Every requirement on the package, the ones it misses marked, and whether
+/// any single version could have met them all -- which decides the advice.
+let version_message key text v n parsed = {
+    let width = list.fold (fn w p -> { let k = str.byte_length (asker (list.nth 1 (list.head p)));
+                                       if k > w { k } else { w } }) 0 parsed;
+    let reqs = list.map (fn p -> list.nth 1 (list.nth 1 p)) parsed;
+    let req_width = list.fold (fn w p -> { let k = str.byte_length (list.head (list.head p));
+                                           if k > w { k } else { w } }) 0 parsed;
+    let together = list.all (fn a -> list.all (fn b -> version.compatible a b) reqs) reqs;
+    "`" + key + "` is " + text + " (" + manifest.dep_source (node_dep n) + "), but\n"
+    + str.join_str "\n" (list.map (fn p -> {
+          let [w, [_, req]] = p;
+          let who = asker (list.nth 1 w);
+          "  " + who + str.repeat (width - str.byte_length who) " " + " requires "
+          + list.head w + str.repeat (req_width - str.byte_length (list.head w)) " "
+          + "  (" + list.nth 2 w + ")"
+          + (if version.matches req v { "" } else { "  <- not " + text })
+      }) parsed)
+    + (if together { "\npoint `" + key + "` at a version they all accept" }
+       else { "\nno version meets all of these: bring the requirements together, "
+              + "or list one of them under another name" })
+};
+
+/// The root's dependencies, and with `dev` its `[dev-dependencies]` as well,
+/// as `[deps, kind]` walks.
+let root_deps m dev =
+    if dev { [[manifest.dependencies m, :uses], [manifest.dev_dependencies m, :dev]] }
+    else { [[manifest.dependencies m, :uses]] };
+
+/// Every package this build needs, transitively, or the first reason it
+/// cannot be built: a cycle, a conflict, or a version nobody accepts.
+let graph! m dev = {
+    let root_abs = util.absolute! (manifest.root m);
+    let name = match manifest.name m { "" => "this project", n => n };
+    let path = [step_of root_abs name (shown! (manifest.path m)) :uses];
+    let walked = list.fold (fn acc wk -> match acc {
+        [:error, why] => acc,
+        [:ok, g] => walk! m root_key (list.head wk) (list.nth 1 wk) path g,
+    }) [:ok, empty_graph] (root_deps m dev);
+    match walked {
+        [:error, why] => [:error, why],
+        [:ok, g] => match builds! m root_key path g {
+            [:error, why] => [:error, why],
+            [:ok, g2] => match check_versions g2 {
+                [:error, why] => [:error, why],
+                _ => [:ok, g2],
+            },
+        },
+    }
+};
+
+// --- the lock ------------------------------------------------------------------
+//
+// What the graph resolved to is checked against `mind.lock` and written back.
+// See lock.dr for why and for the format; what is here is only what the graph
+// knows -- which packages, and which section of the lock each belongs in.
+
+/// The lock section a build script's packages go in. Named for the chain of
+/// packages whose script it is, the root by its own name, so each program in
+/// the build has a section of its own however deep the scripts go.
+let script_section parent owner name =
+    match [parent, owner] {
+        ["program", ""] => "build." + name,
+        ["program", k] => "build." + k,
+        [s, k] => s + "." + k,
+    };
+
+/// Every package the build resolved to, as lock entries.
+let rec lock_entries! g section name =
+    list.concat [
+        list.map (fn n -> lock.entry section (node_key n) (manifest.dep_source (node_dep n))
+                                     (fetch.commit! (node_dep n) (node_dir n)) (node_version n))
+                 (nodes g),
+        list.concat (list.map (fn pair -> {
+            let [owner, sub] = pair;
+            lock_entries! sub (script_section section owner name) name
+        }) (map_pairs (g.[:builds else (%{})]))),
+    ];
+
+/// What to say about packages that moved under the lock.
+let drift_message old moved =
+    "these dependencies resolved to a different commit than mind.lock records:\n"
+    + str.join_str "\n" (list.map (fn e -> {
+          let o = lock.locked old e;
+          "  " + lock.key_of e + " (" + lock.source_of e + ") is now " + short (lock.commit_of e)
+          + ", but the lock says " + short (lock.commit_of o)
+          + (if lock.section_of e == "program" { "" } else { "  [" + lock.section_of e + "]" })
+      }) moved)
+    + "\na tag was moved, or the cache was changed by hand. `mind update` accepts what is there now";
+
+let short c = if str.byte_length c > 10 { str.slice 0 10 c } else { c };
+
+/// The graph, checked against the lock and the lock brought up to date:
+/// what every command resolves through. `accept` is `mind update`'s: the
+/// commits have moved because it moved them, and the lock follows.
+let resolve! m dev accept =
+    match graph! m dev {
+        [:error, why] => [:error, why],
+        [:ok, g] => {
+            let name = match manifest.name m { "" => "root", n => n };
+            let now = lock_entries! g "program" name;
+            let root = manifest.root m;
+            let before = lock.load! root;
+            match [accept, lock.drift before now] {
+                [false, [e, ..more]] => [:error, drift_message before (list.cons e more)],
+                _ => {
+                    lock.save! root (lock.merge before now dev)
+                    [:ok, g]
+                },
+            }
+        },
+    };
 
 /// How the compiler is told about one package. `-L DIR` when the package
 /// already calls itself by the key, which every compiler understands;
@@ -181,7 +492,7 @@ let rec find_upwards! from name = {
 /// `[:ok, graph, [-L, dir, -L, dir, ..]]` -- the packages for one build: the
 /// standard library, then every dependency in the order it was found.
 let search_paths! m dev =
-    match graph! m dev {
+    match resolve! m dev false {
         [:error, why] => [:error, why],
         [:ok, g] => [:ok, g, repeated "-L" (list.cons (stdlib_root! ())
                                                       (list.map package_arg (nodes g)))],

@@ -167,6 +167,14 @@ let dependencies m = section_deps m "dependencies";
 /// `[dev-dependencies]`: what `mind test` also sees, and nothing else does.
 let dev_dependencies m = section_deps m "dev-dependencies";
 
+/// `[build-dependencies]`: what the package's build script is compiled with.
+/// A separate program from the package's own, so a separate namespace: a tool
+/// may use one `json` while the program uses another.
+let build_dependencies m = section_deps m "build-dependencies";
+
+/// The manifest file itself, for a message that has to say where a line was.
+let path m = util.join (root m) "mind.toml";
+
 let dep_name d = list.head d;
 let dep_spec d = list.nth 1 d;
 
@@ -193,6 +201,10 @@ let dep_rev d =
         [(), r, _] => [:rev, r],
         [t, _, _] => [:tag, t],
     };
+
+/// Which versions it accepts, as written (`"^1.2"`), or `()` for any. Only
+/// the long form can say: `json = { git = .., tag = .., version = "^1.2" }`.
+let dep_requirement d = match spec_get d "version" { () => (), r => to_string r };
 
 /// Where a dependency comes from, as a person would write it: for `mind deps`
 /// and for an error about it.

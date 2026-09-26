@@ -1,0 +1,152 @@
+// `mind.lock`: what the dependency graph resolved to, written down.
+//
+// A tag can be moved and a branch always moves, so "json at v1.0" is not the
+// same bytes on every machine that asks. The lock records, for every package
+// every program in the build resolved to, where it came from, which version
+// it said it was, and -- for a git dependency -- the commit that was checked
+// out. A later build that resolves to a different commit from the same place
+// stops and says so, rather than quietly building something else; `mind
+// update` is how the lock is told to move.
+//
+// A program's packages and each build script's are separate namespaces, so the
+// lock has a section for each: `[program]`, `[build]` for this project's
+// script, and `[build.KEY]` for a dependency's. Each package is one line, an
+// inline table under its key, because `std.toml` reads no `[[array]]` headers
+// and a line per package diffs well.
+//
+// The file is written by hand rather than through `toml.encode`, sorted by
+// section and then key: a lock that reorders itself when nothing changed is
+// noise in every commit. It is only written when its text changes.
+//
+// This module is pure but for reading and writing the file; what the entries
+// are is `build.dr`'s business.
+
+import std.list;
+import std.str;
+import std.toml;
+
+import util;
+
+/// `[section, key, source, commit, version]`; `commit` and `version` may be
+/// `()` -- a path dependency has no commit, and a bare directory no version.
+let entry section key source commit version = [section, key, source, commit, version];
+
+let section_of e = list.nth 0 e;
+let key_of e = list.nth 1 e;
+let source_of e = list.nth 2 e;
+let commit_of e = list.nth 3 e;
+let version_of e = list.nth 4 e;
+
+let file_name = "mind.lock";
+
+let header = "# What this project's dependencies resolved to. Written by `mind`;\n"
+             + "# `mind update` moves it. Commit it with the manifest.\n";
+
+/// Sorted by section, `program` first, then by key.
+let sorted entries = {
+    // A string, because `compare` orders flat values only: two lists
+    // compare equal, and a sort on them keeps whatever order it was given.
+    let rank e = if section_of e == "program" { "0" } else { "1" };
+    list.sort_on (fn e -> rank e + section_of e + "\n" + key_of e) entries
+};
+
+let field name v = match v { () => [], x => [name + " = " + toml.quote (to_string x)] };
+
+let line e =
+    toml.quote (key_of e) + " = { "
+    + str.join_str ", " (list.concat [field "source" (source_of e), field "version" (version_of e),
+                                      field "commit" (commit_of e)])
+    + " }";
+
+/// The file's text.
+let render entries = {
+    let rec go es current acc =
+        match es {
+            [] => acc,
+            [e, ..rest] => {
+                let head = if section_of e == current { [] }
+                           else { ["", "[" + section_of e + "]"] };
+                go rest (section_of e) (list.concat [acc, head, [line e]])
+            },
+        };
+    header + str.join_str "\n" (go (sorted entries) () []) + "\n"
+};
+
+/// The entries a lock file holds, or `[]` for one that cannot be read -- a
+/// broken lock is rewritten rather than trusted.
+let parse text =
+    match toml.parse text {
+        [:ok, doc] => list.concat (list.map (fn pair -> {
+            let [section, table] = pair;
+            list.map (fn kv -> {
+                let [key, v] = kv;
+                let get k = if type_of v == :map { v.[k else ()] } else { () };
+                entry section key (get "source") (get "commit") (get "version")
+            }) (map_pairs table)
+        }) (list.filter (fn pair -> list.head pair != "") (map_pairs doc))),
+        _ => [],
+    };
+
+/// Every package that resolved to a different commit from the same source as
+/// the lock says: the one change a lock exists to catch. A changed source is
+/// the manifest being edited, which is somebody's decision, so it is not one.
+let drift old new = {
+    let at e = section_of e + "\n" + key_of e;
+    let before = list.fold (fn m e -> m.[at e => e]) (%{}) old;
+    list.filter (fn e -> match before.[at e else ()] {
+        () => false,
+        o => source_of o == source_of e && commit_of o != () && commit_of e != ()
+             && commit_of o != commit_of e,
+    }) new
+};
+
+/// What the lock says about one package, for the message about it.
+let locked old e =
+    list.head (list.filter (fn o -> section_of o == section_of e && key_of o == key_of e) old);
+
+/// A walk that did not see everything -- a build without dev dependencies --
+/// keeps the entries it did not see, so building and testing do not rewrite
+/// the lock back and forth. A full walk (`complete`) replaces it.
+let merge old new complete =
+    if complete { new }
+    else {
+        let at e = section_of e + "\n" + key_of e;
+        let seen = list.fold (fn m e -> m.[at e => true]) (%{}) new;
+        list.append new (list.filter (fn o -> not (seen.[at o else false])) old)
+    };
+
+let load! root = match util.read_file! (util.join root file_name) { () => [], text => parse text };
+
+/// Write the lock when its text would change, and not otherwise: a build that
+/// resolved the same graph leaves the file, and its timestamp, alone.
+let save! root entries = {
+    let path = util.join root file_name;
+    let text = render entries;
+    if util.read_file! path == text { () } else { util.write_file! path text }
+};
+
+when test {
+    import std.test;
+
+    let a = entry "program" "json" "https://x/json#v1" "abc" "1.0.0";
+    let b = entry "build" "gen" "../gen" () "0.2.0";
+
+    let tests = [
+        test.case "a lock is sections of one line per package, sorted"
+            $( test.eq! (header + "\n[program]\n\"json\" = { source = \"https://x/json#v1\", version = \"1.0.0\", commit = \"abc\" }\n\n[build]\n\"gen\" = { source = \"../gen\", version = \"0.2.0\" }\n")
+                        (render [b, a]) ),
+        test.case "a lock reads back as what was written"
+            $( test.eq! (sorted [a, b]) (sorted (parse (render [a, b]))) ),
+        test.case "a new commit from the same source is drift"
+            $( test.eq! [["program", "json"]]
+                        (list.map (fn e -> [section_of e, key_of e])
+                                  (drift [a, b] [entry "program" "json" "https://x/json#v1" "def" "1.0.0", b])) ),
+        test.case "a new source is an edit, not drift"
+            $( test.eq! [] (drift [a] [entry "program" "json" "https://x/json#v2" "def" "2.0.0"]) ),
+        test.case "a partial walk keeps what it did not see"
+            $( test.eq! [["program", "json"], ["build", "gen"]]
+                        (list.map (fn e -> [section_of e, key_of e]) (merge [a, b] [a] false)) ),
+        test.case "a complete walk replaces the lock"
+            $( test.eq! 1 (list.length (merge [a, b] [a] true)) ),
+    ];
+}

@@ -28,6 +28,7 @@ import std.streams;
 import std.supervisor;
 import std.test;
 import std.toml;
+import std.version;
 import std.wire;
 import std.types;
 /// The library's own version, so a program can report what it was built with.

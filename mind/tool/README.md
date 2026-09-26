@@ -95,6 +95,60 @@ The details:
   not say why.
 - **`url`** is a `.tar.gz` whose single top-level directory holds the package.
 
+### Versions
+
+A dependency may say which versions it accepts, in the long form:
+
+```toml
+[dependencies]
+json = { git = "https://github.com/u/dream-json", tag = "v1.4.0", version = "^1.2" }
+util = { path = "../util", version = ">=0.3, <0.5" }
+```
+
+`^1.2` is compatible with 1.2 (below 2.0; below 1.0 the minor is the
+breaking number, so `^0.3` is below 0.4), `~1.2.3` takes patch releases,
+`=`, `<`, `<=`, `>`, `>=` compare, `,` joins, `*` is anything, and a bare
+`1.2` means `^1.2`. `std.version` is the grammar, for a build script too.
+
+There is no registry, so there is nothing to choose between: a program has
+one package under each key, and `mind` checks that the version it fetched --
+its `[package] version` -- is one every requirement on it accepts. When one
+is not, it says what was found and lists every requirement with where it was
+written, and whether any version could have met them all. A directory with
+no manifest has no version, so a requirement on one is an error.
+
+### Build dependencies
+
+`[build-dependencies]` are what a package's build script is compiled with
+(docs/build.md). The script is a program of its own, so its packages are a
+namespace of their own: a tool may use `json` 1.x while the program uses 2.x.
+`mind deps` marks them `[build: ...]` and `mind tree` hangs them under
+`[build]`.
+
+### Cycles
+
+Every kind of dependency means "must be ready first", so a loop cannot be
+built, including one through a build script (a package whose script needs a
+tool that uses the package). It is reported as the whole loop, each edge with
+the manifest that made it:
+
+```
+mind: these packages need each other, so none of them can be built first:
+  app      uses         sqlite   (mind.toml)
+  sqlite   builds with  codegen  (../sqlite/mind.toml)
+  codegen  uses         app      (../codegen/mind.toml)
+```
+
+### `mind.lock`
+
+What the graph resolved to is written to `mind.lock` beside the manifest:
+every package of the program and of each build script, with its source, its
+version, and for git the commit that was checked out. Commit it. A build
+that resolves a package to a different commit from the same source -- a tag
+moved, a cache edited -- stops and says so; `mind update` fetches again and
+accepts what it finds. Changing a dependency in the manifest is not drift,
+and the lock simply follows. The lock is only rewritten when it changes.
+
 Fetched packages go in `$MIND_HOME/cache` (default `~/.mind/cache`), keyed by
 URL and revision, and are shared between projects — a repository at a given
 revision is the same bytes whoever asked for it. A cached dependency is never
@@ -123,6 +177,7 @@ business. It is also why `mind` needs no TLS in the VM.
 | `manifest.dr` | reading `mind.toml`, and the line edits `add` and `remove` make |
 | `fetch.dr` | resolving a dependency to a directory, fetching if needed |
 | `build.dr` | the dependency graph, and calling the compiler |
+| `lock.dr` | `mind.lock`: writing it, reading it, and what counts as drift |
 | `util.dr` | paths and files |
 
 Run its own tests with `just test-mind`.

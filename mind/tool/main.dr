@@ -265,7 +265,7 @@ let cmd_info! m o = {
 
 /// Load the graph, or stop with the reason.
 let graph_of! m dev =
-    match build.graph! m dev {
+    match build.resolve! m dev false {
         [:error, why] => fail! why,
         [:ok, g] => g,
     };
@@ -297,6 +297,17 @@ let cmd_deps! m = {
         console.print! ("      -> " + to_string (build.node_abs n))
     };
     strict! (list.map show! ns)
+    // What each build script is compiled from, which is a program of its own
+    // and so may hold a different package under a key the program also uses.
+    let show_build! pair = {
+        let [owner, sub] = pair;
+        let whose = if owner == build.root_key { "this project" } else { "`" + owner + "`" };
+        list.map (fn n -> {
+            console.print! ("  " + describe n + "  [build: " + whose + "]")
+            console.print! ("      -> " + to_string (build.node_abs n))
+        }) (build.nodes sub) |> strict!
+    };
+    strict! (list.map show_build! (build.build_graphs g))
     :ok
 };
 
@@ -305,18 +316,29 @@ let cmd_deps! m = {
 let cmd_tree! m = {
     console.print! (to_string (manifest.name m) + " v" + to_string (manifest.version m))
     let g = graph_of! m true;
-    let rec branch! key indent shown =
-        list.fold (fn seen k -> {
+    // A package's build dependencies hang under it, marked, in the graph of
+    // their own they were walked into; what they use is shown from there.
+    let rec branch! g key indent shown = {
+        let seen = list.fold (fn seen k -> {
             let n = build.node g k;
             if list.contains k seen {
                 console.print! (indent + describe n + " (*)")
                 seen
             } else {
                 console.print! (indent + describe n)
-                branch! k (indent + "  ") (list.cons k seen)
+                branch! g k (indent + "  ") (list.cons k seen)
             }
         }) shown (build.children g key);
-    strict! (branch! build.root_key "  " [])
+        match build.build_graph g key {
+            () => seen,
+            sub => {
+                console.print! (indent + "[build]")
+                branch! sub key (indent + "  ") []
+                seen
+            },
+        }
+    };
+    strict! (branch! g build.root_key "  " [])
     :ok
 };
 
@@ -332,18 +354,25 @@ let cmd_fetch! m = {
 /// so this is only ever interesting for a branch; it does them all because
 /// "the cache is wrong" is the other reason to run it.
 let cmd_update! m names = {
-    let g = graph_of! m true;
+    // Not through the lock: the lock disagreeing is often why this is being
+    // run, and this walk only decides what to fetch again.
+    let g = match build.graph! m true { [:error, why] => fail! why, [:ok, g] => g };
     let wanted n =
         manifest.dep_kind (build.node_dep n) != :path
         && (list.is_empty names || list.contains (build.node_key n) names);
-    let chosen = list.filter wanted (build.nodes g);
-    let unknown = list.filter (fn k -> build.node g k == ()) names;
+    // Every program's packages, build scripts' included: a tool pinned to a
+    // branch moves the same way a library does.
+    let every = list.concat (list.cons (build.nodes g)
+                                       (list.map (fn pair -> build.nodes (list.nth 1 pair))
+                                                 (build.build_graphs g)));
+    let chosen = list.unique (list.filter wanted every);
+    let unknown = list.filter (fn k -> not (list.any (fn n -> build.node_key n == k) every)) names;
     if not (list.is_empty unknown) { fail! ("no dependency is called " + str.join_str ", " unknown) }
     strict! (list.map (fn n -> match fetch.forget! (build.node_dep n) {
                           [:error, why] => fail! why,
                           _ => :ok,
                       }) chosen)
-    graph_of! m true
+    match build.resolve! m true true { [:error, why] => fail! why, _ => () }
     match chosen {
         [] => console.print! "nothing to update: every dependency is a directory",
         _ => strict! (list.map (fn n -> console.print! ("updated " + describe n)) chosen),

@@ -1,0 +1,277 @@
+// Versions, and which versions a dependency accepts.
+//
+// A version is `MAJOR.MINOR.PATCH`, optionally with a pre-release after a `-`
+// (`1.4.0-rc.1`) and build metadata after a `+`, which is ignored, as semantic
+// versioning says it must be. A leading `v` is accepted, because that is how a
+// git tag is usually spelled, and a missing minor or patch is zero, because
+// `1.2` in a manifest means `1.2.0` to everyone who writes it.
+//
+// A requirement is what a dependency says it will take, in the grammar every
+// package manager has converged on:
+//
+//     ^1.2      at least 1.2.0, below 2.0.0: compatible with 1.2
+//     ~1.2.3    at least 1.2.3, below 1.3.0: patch releases only
+//     =1.2.3    exactly that
+//     >=1.2, <2 comparisons, all of which must hold
+//     *         anything
+//     1.2       the same as ^1.2
+//
+// Below 1.0 the caret is narrower, since the minor number is the breaking
+// one there: `^0.3` is below 0.4, and `^0.0.3` is 0.0.3 exactly.
+//
+// A requirement is data -- a list of `[op, version]` comparisons -- rather than
+// a function, so it can be printed, compared, and kept in a lock file, and so a
+// resolver that has to choose between versions can read it rather than only
+// call it. `mind` checks every dependency's requirement against the version of
+// what it fetched; a build script asks the same questions of its context.
+//
+// Nothing here raises. Parsing answers `[:ok, value]` or `[:error, why]`, the
+// shape `std.result` names.
+
+import std.list;
+import std.str;
+
+// --- versions --------------------------------------------------------------------
+
+/// `[major, minor, patch, pre]`, where `pre` is the pre-release and `""` for
+/// a release. Build metadata is dropped when parsing, because it never takes
+/// part in a comparison.
+type Version = [:integer, :integer, :integer, :string];
+
+type Comparison = :eq | :lt | :le | :gt | :ge;
+
+let make : :integer -> :integer -> :integer -> Version;
+let make major minor patch = [major, minor, patch, ""];
+
+let major : Version -> :integer;
+let major [n, _, _, _] = n;
+let minor : Version -> :integer;
+let minor [_, n, _, _] = n;
+let patch : Version -> :integer;
+let patch [_, _, n, _] = n;
+let pre : Version -> :string;
+let pre [_, _, _, p] = p;
+
+/// A number of the version, or `()` when the text is not one. A leading zero
+/// is refused, as the standard refuses it, since `01` and `1` would otherwise
+/// be two spellings of one version.
+let number : :string -> :integer | :unit;
+let number s =
+    if str.is_empty s || (str.byte_length s > 1 && str.starts_with "0" s) { () }
+    else if list.all (fn c -> c >= '0' && c <= '9') (str.chars s) { parse_int s }
+    else { () };
+
+/// The text before the first `sep`, and after it (`""` when there is none).
+let split_at : :string -> :string -> [:string];
+let split_at sep s = match str.find sep s {
+    i if i >= 0 => [str.slice 0 i s, str.slice (i + 1) (str.byte_length s - i - 1) s],
+    _ => [s, ""],
+};
+
+/// `[:ok, version]` or `[:error, why]`.
+let parse : :string -> [:ok, Version] | [:error, :string];
+let parse text = {
+    let t = str.trim text;
+    let bare = if str.starts_with "v" t { str.slice 1 (str.byte_length t - 1) t } else { t };
+    let [core, rest] = split_at "-" (list.head (split_at "+" bare));
+    let parts = list.map number (str.split "." core);
+    match parts {
+        [ma] if ma != () => [:ok, [ma, 0, 0, rest]],
+        [ma, mi] if ma != () && mi != () => [:ok, [ma, mi, 0, rest]],
+        [ma, mi, pa] if ma != () && mi != () && pa != () => [:ok, [ma, mi, pa, rest]],
+        _ => [:error, "`" + text + "` is not a version; write MAJOR.MINOR.PATCH, as in 1.4.0"],
+    }
+};
+
+/// The version, or `()` when the text is not one.
+let parse_or_unit : :string -> Version | :unit;
+let parse_or_unit text = match parse text { [:ok, v] => v, _ => () };
+
+let show : Version -> :string;
+let show v = to_string (major v) + "." + to_string (minor v) + "." + to_string (patch v)
+             + (if str.is_empty (pre v) { "" } else { "-" + pre v });
+
+/// `-1`, `0` or `1`. A pre-release comes before the release it leads up to,
+/// and pre-releases are compared by their text, which orders `rc.1` before
+/// `rc.2` and is as much as a build tool needs.
+let compare_versions : Version -> Version -> :integer;
+let compare_versions a b = {
+    let by x y = if x < y { 0 - 1 } else if x > y { 1 } else { 0 };
+    let numbers = list.fold (fn acc pair -> if acc != 0 { acc } else { by (list.head pair) (list.nth 1 pair) })
+                            0 [[major a, major b], [minor a, minor b], [patch a, patch b]];
+    if numbers != 0 { numbers }
+    else {
+        match [str.is_empty (pre a), str.is_empty (pre b)] {
+            [true, true] => 0,
+            [true, false] => 1,
+            [false, true] => 0 - 1,
+            _ => compare (pre a) (pre b),
+        }
+    }
+};
+
+// --- requirements ------------------------------------------------------------------
+
+/// Every comparison must hold. `[]` is `*`: it accepts anything.
+type Requirement = [[Comparison, Version]];
+
+let any : Requirement;
+let any = [];
+
+/// The comparisons `^v` stands for: at least `v`, below the next version
+/// that could break it.
+let caret : Version -> :integer -> Requirement;
+let caret v given = {
+    let upper = if major v > 0 || given == 1 { make (major v + 1) 0 0 }
+                else if minor v > 0 || given == 2 { make 0 (minor v + 1) 0 }
+                else { make 0 0 (patch v + 1) };
+    [[:ge, v], [:lt, upper]]
+};
+
+/// `~v`: at least `v`, below the next minor -- or the next major, when only a
+/// major was written.
+let tilde : Version -> :integer -> Requirement;
+let tilde v given =
+    [[:ge, v], [:lt, if given == 1 { make (major v + 1) 0 0 } else { make (major v) (minor v + 1) 0 }]];
+
+/// How many numbers a version was written with: `1.2` is two, which is what
+/// decides the upper bound of `^1.2` against `^1.2.0` below 1.0.
+let written : :string -> :integer;
+let written s = list.length (str.split "." (list.head (split_at "-" s)));
+
+/// One comparison, as `[:ok, [[op, v], ..]]`.
+let clause : :string -> [:ok, Requirement] | [:error, :string];
+let clause text = {
+    let t = str.trim text;
+    let after n = str.trim (str.slice n (str.byte_length t - n) t);
+    let versioned n k = {
+        let rest = after n;
+        match parse rest { [:ok, v] => [:ok, k v (written rest)], [:error, why] => [:error, why] }
+    };
+    if t == "*" || t == "" { [:ok, any] }
+    else if str.starts_with ">=" t { versioned 2 (fn v n -> [[:ge, v]]) }
+    else if str.starts_with "<=" t { versioned 2 (fn v n -> [[:le, v]]) }
+    else if str.starts_with ">" t { versioned 1 (fn v n -> [[:gt, v]]) }
+    else if str.starts_with "<" t { versioned 1 (fn v n -> [[:lt, v]]) }
+    else if str.starts_with "=" t { versioned 1 (fn v n -> [[:eq, v]]) }
+    else if str.starts_with "~" t { versioned 1 tilde }
+    else if str.starts_with "^" t { versioned 1 caret }
+    else { versioned 0 caret }
+};
+
+/// `[:ok, requirement]` or `[:error, why]`, from comparisons joined by `,`.
+let parse_requirement : :string -> [:ok, Requirement] | [:error, :string];
+let parse_requirement text =
+    list.fold (fn acc part -> match [acc, clause part] {
+        [[:error, why], _] => [:error, why],
+        [_, [:error, why]] => [:error, "`" + text + "`: " + why],
+        [[:ok, have], [:ok, more]] => [:ok, list.append have more],
+    }) [:ok, any] (str.split "," text);
+
+let holds : [Comparison, Version] -> Version -> :bool;
+let holds [op, bound] v = {
+    let c = compare_versions v bound;
+    match op { :eq => c == 0, :lt => c < 0, :le => c <= 0, :gt => c > 0, :ge => c >= 0 }
+};
+
+/// Whether `v` satisfies every comparison.
+///
+/// A pre-release satisfies a requirement only when some comparison in it names
+/// a pre-release of the same `MAJOR.MINOR.PATCH`. Without that rule `^1.2`
+/// would accept `2.0.0-rc.1`, which is below 2.0.0 and is exactly the breaking
+/// release the caret exists to keep out.
+let matches : Requirement -> Version -> :bool;
+let matches req v = {
+    let same_core b = major b == major v && minor b == minor v && patch b == patch v;
+    let pre_ok = str.is_empty (pre v)
+                 || list.any (fn [op, b] -> not (str.is_empty (pre b)) && same_core b) req;
+    pre_ok && list.all (fn c -> holds c v) req
+};
+
+/// Parse both and test: `[:ok, bool]`, or the first parse error.
+let satisfies : :string -> :string -> [:ok, :bool] | [:error, :string];
+let satisfies requirement version =
+    match [parse_requirement requirement, parse version] {
+        [[:error, why], _] => [:error, why],
+        [_, [:error, why]] => [:error, why],
+        [[:ok, r], [:ok, v]] => [:ok, matches r v],
+    };
+
+/// `>=1.2.0, <2.0.0`, or `*`.
+let show_requirement : Requirement -> :string;
+let show_requirement req = match req {
+    [] => "*",
+    cs => str.join_str ", " (list.map (fn [op, v] -> (match op { :eq => "=", :lt => "<", :le => "<=",
+                                                                 :gt => ">", :ge => ">=" }) + show v) cs),
+};
+
+/// Whether any version could satisfy both: the question to ask of two
+/// requirements that one package must meet at once, before there is a
+/// version to test them against.
+///
+/// Exact over the bounds these requirements are made of: the lowest version
+/// both allow, if there is one, is one of their lower bounds or `0.0.0`.
+let compatible : Requirement -> Requirement -> :bool;
+let compatible a b = {
+    let both = list.append a b;
+    // The candidates: nothing at all, every inclusive lower bound, and the
+    // version just past every exclusive one.
+    let lows = list.concat (list.map (fn [op, v] -> match op {
+        :ge => [v], :eq => [v],
+        :gt => [make (major v) (minor v) (patch v + 1)],
+        _ => [],
+    }) both);
+    list.any (fn v -> list.all (fn c -> holds c v) both) (list.cons (make 0 0 0) lows)
+};
+
+// --- tests -----------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let v s = parse_or_unit s;
+    let ok r = match r { [:ok, x] => x, _ => () };
+    let sat r s = ok (satisfies r s);
+
+    let tests = [
+        test.case "a version may be short, or spelled as a tag"
+            $( test.eq! ["1.0.0", "1.2.0", "1.2.3", "1.2.3-rc.1"]
+                        (list.map (fn s -> show (v s)) ["1", "1.2", "v1.2.3", "1.2.3-rc.1+build.7"]) ),
+        test.case "what is not a version is said to be one"
+            $( test.eq! [:error, :error, :error]
+                        (list.map (fn s -> list.head (parse s)) ["one", "1.x", "01.2"]) ),
+        test.case "versions order by number, a pre-release before its release"
+            $( test.eq! [0 - 1, 1, 0, 0 - 1, 0 - 1]
+                        [compare_versions (v "1.2.3") (v "1.10.0"), compare_versions (v "2.0.0") (v "1.99.99"),
+                         compare_versions (v "1.2") (v "1.2.0"), compare_versions (v "1.0.0-rc.1") (v "1.0.0"),
+                         compare_versions (v "1.0.0-rc.1") (v "1.0.0-rc.2")] ),
+        test.case "a caret accepts what is compatible"
+            $( test.eq! [true, true, false, false]
+                        [sat "^1.2" "1.2.0", sat "^1.2" "1.9.4", sat "^1.2" "2.0.0", sat "^1.2" "1.1.9"] ),
+        test.case "below 1.0 the caret is narrower"
+            $( test.eq! [true, false, true, false]
+                        [sat "^0.3" "0.3.7", sat "^0.3" "0.4.0", sat "^0.0.3" "0.0.3", sat "^0.0.3" "0.0.4"] ),
+        test.case "a bare version is a caret"
+            $( test.eq! [true, false] [sat "1.2" "1.5.0", sat "1.2" "2.0.0"] ),
+        test.case "a tilde accepts patch releases"
+            $( test.eq! [true, false, true] [sat "~1.2.3" "1.2.9", sat "~1.2.3" "1.3.0", sat "~1" "1.9.0"] ),
+        test.case "comparisons joined by commas must all hold"
+            $( test.eq! [true, false, false]
+                        [sat ">=0.3, <0.5" "0.4.1", sat ">=0.3, <0.5" "0.5.0", sat "=1.2.3" "1.2.4"] ),
+        test.case "a star accepts anything released"
+            $( test.eq! [true, true] [sat "*" "0.0.1", sat "*" "12.0.0"] ),
+        test.case "a pre-release is accepted only when asked for"
+            $( test.eq! [false, true]
+                        [sat "^1.2" "2.0.0-rc.1", sat ">=2.0.0-rc.1" "2.0.0-rc.2"] ),
+        test.case "a requirement that is not one says where"
+            $( test.eq! :error (list.head (parse_requirement ">=1.2, <two")) ),
+        test.case "a requirement reads back as its comparisons"
+            $( test.eq! [">=1.2.0, <2.0.0", "*"]
+                        [show_requirement (ok (parse_requirement "^1.2")), show_requirement any] ),
+        test.case "two requirements are compatible when one version meets both"
+            $( test.eq! [true, false, true]
+                        [compatible (ok (parse_requirement "^1.2")) (ok (parse_requirement ">=1.5")),
+                         compatible (ok (parse_requirement "^1.2")) (ok (parse_requirement "^2.0")),
+                         compatible (ok (parse_requirement ">1.2.3")) (ok (parse_requirement "<=1.2.4"))] ),
+    ];
+}

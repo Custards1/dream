@@ -156,6 +156,7 @@ let resolve! from_root d = {
                     [:error, why] => [:error, manifest.dep_name d + ": " + why],
                     _ => {
                         util.write_file! (util.join dir marker) (manifest.dep_source d + "\n")
+                        commit! d dir
                         [:ok, dir]
                     },
                 }
@@ -163,6 +164,31 @@ let resolve! from_root d = {
         },
     }
 };
+
+/// Where a fetched git dependency records the commit it checked out.
+let commit_file = ".mind-commit";
+
+/// The commit a git dependency's fetched copy is at, or `()` for anything
+/// else. Read from `commit_file`, which the fetch wrote, so a build that
+/// changes nothing starts no `git` at all -- the lock is checked on every
+/// build, and a process per dependency per build is exactly the cost a large
+/// graph cannot pay. A copy fetched before the file existed is asked once and
+/// the answer kept.
+let commit! d dir =
+    match manifest.dep_kind d {
+        :git => match util.read_file! (util.join dir commit_file) {
+            () => match run! "git rev-parse" "git" ["-C", dir, "rev-parse", "HEAD"] {
+                [:ok, out] => {
+                    let c = str.trim out;
+                    util.write_file! (util.join dir commit_file) (c + "\n")
+                    c
+                },
+                _ => (),
+            },
+            text => str.trim text,
+        },
+        _ => (),
+    };
 
 when test {
     import std.test;
