@@ -1,0 +1,115 @@
+// The Dream VM, built by `std.build` rather than CMake: what the root
+// `build.dr` will say about it (docs/build.md, "The script"), written as a
+// program until plans and goals exist to hold it.
+//
+// It says what `dream/CMakeLists.txt` says -- the sources, C++20, `-O3`, the
+// warnings, libffi, the flags that let the interpreter's calls inline, GCC's
+// inliner ceilings -- in `std.build.cc`'s words, so the same description
+// builds with GCC or Clang (and, by the same translation, MSVC). The JIT is
+// built when `llvm-config` answers, as CMake decides it; that question will be
+// `probe.llvm` once probes are steps.
+//
+//     dream vm.dream [JOBS]     build into target/build, print where `dream` is
+
+import std.build;
+import std.build.cc;
+import std.build.cc.steps;
+import std.console;
+import std.list;
+import std.os;
+import std.str;
+
+let sources = ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins",
+               "ffi", "io", "os", "scheduler", "runtime", "capi", "jit_rt"]
+              |> list.map (fn s -> "dream/src/" + s + ".cpp");
+
+/// GCC's inliner ceilings: dream/CMakeLists.txt says why at length. The
+/// reduction loop is one enormous function, past which GCC will not inline
+/// anything, however small.
+let inliner = ["--param", "large-function-growth=400", "--param", "large-function-insns=10000",
+               "--param", "inline-unit-growth=120", "--param", "max-inline-insns-auto=120",
+               "--param", "max-inline-insns-single=800"];
+
+/// What `llvm-config` says, or `()` when there is none: `[includes, libdir,
+/// libraries, rtti]`.
+let llvm! () = {
+    let ask! args = match try! { os.run! "llvm-config" args %{ :timeout => 30000 } } catch e { () } {
+        () => (),
+        r => if r.[:code] == 0 { str.trim r.[:out] } else { () },
+    };
+    // Once it has answered at all, a question it cannot answer is an empty one.
+    let told! args = match ask! args { () => "", text => text };
+    match ask! ["--includedir"] {
+        () => (),
+        includes => [includes, told! ["--libdir"],
+                     list.filter (fn w -> w != "")
+                                 (list.append (str.split " " (told! ["--libs", "core", "orcjit", "native", "support",
+                                                                     "target", "analysis", "passes", "ipo",
+                                                                     "instcombine", "scalaropts", "transformutils"]))
+                                              (str.split " " (told! ["--system-libs"]))),
+                     told! ["--has-rtti"] == "YES"],
+    }
+};
+
+let jit llvm t = match llvm {
+    () => cc.source "dream/src/jit_stub.cpp" t,
+    [includes, libdir, libraries, rtti] =>
+        t |> cc.source_with "dream/src/jit.cpp" (if rtti { [] } else { [cc.Setting.rtti false] })
+          |> cc.define "DREAM_HAVE_LLVM"
+          |> cc.define "__STDC_CONSTANT_MACROS" |> cc.define "__STDC_FORMAT_MACROS" |> cc.define "__STDC_LIMIT_MACROS"
+          // `-isystem`, so LLVM's own headers are not held to this build's warnings.
+          |> cc.flags_for :gnu ["-isystem", includes]
+          |> cc.flags_for :msvc ["/external:I" + includes, "/external:W0"]
+          |> cc.set (cc.Setting.library_dir libdir)
+          |> cc.link_flags_for :gnu libraries,
+};
+
+let libdream : :any -> cc.Target;
+let libdream llvm =
+    cc.shared "dream" sources
+    |> cc.standard :cxx20
+    |> cc.optimize 3
+    |> cc.debug_info true
+    |> cc.warnings :extra
+    |> cc.flags_for :gnu ["-Wno-unused-parameter", "-fno-semantic-interposition", "-fno-plt"]
+    |> cc.flags_for :gcc inliner
+    |> cc.flags_for :msvc ["/permissive-", "/utf-8", "/wd4100"]
+    |> cc.define_for :msvc "_CRT_SECURE_NO_WARNINGS"
+    |> cc.public_include "dream/include"
+    |> cc.include "dream/src"
+    |> cc.threads
+    |> cc.system "ffi"
+    |> cc.system_for :linux "dl"
+    |> cc.system_for :windows "ws2_32"
+    |> cc.export_all
+    |> jit llvm;
+
+let program name source lib =
+    cc.executable name [source]
+    |> cc.standard :cxx20
+    |> cc.optimize 3
+    |> cc.debug_info true
+    |> cc.warnings :extra
+    |> cc.flags_for :gnu ["-Wno-unused-parameter"]
+    |> cc.include "dream/src"
+    |> cc.use lib;
+
+let main! = {
+    let jobs = match os.args! () { [n, .._] => parse_int n, _ => 8 };
+    let ctx = build.Context.set_jobs (build.context! ".") jobs;
+    let tc = steps.detect! (os.platform ());
+    let llvm = llvm! ();
+    strict! llvm
+    let lib = libdream llvm;
+    let before = os.monotonic! ();
+    let [state, paths] = build.build! ctx [steps.artifact tc (program "dream" "dream/src/cli.cpp" lib),
+                                           steps.artifact tc (program "dream_tests" "dream/tests/test_main.cpp" lib)];
+    strict! paths
+    let took = os.monotonic! () - before;
+    console.error! ("built with " + cc.Toolchain.version tc + (if llvm == () { ", no JIT" } else { ", with the JIT" })
+                    + ": " + to_string (list.length (build.State.ran state)) + " steps ran, "
+                    + to_string (build.State.reused state) + " were already made, "
+                    + to_string took + " ms")
+    console.print! (list.head paths)
+    console.print! (list.nth 1 paths)
+};

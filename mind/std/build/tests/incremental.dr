@@ -1,0 +1,87 @@
+// A library and a program built through `std.build`'s runner with the
+// machine's compiler, then built again after each kind of change, checking
+// which steps ran. This is the claim the runner exists for: a build with
+// nothing to do runs nothing, and a change reruns what depends on it and
+// nothing else.
+
+import std.build;
+import std.build.cc;
+import std.build.cc.steps;
+import std.console;
+import std.error;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+let header = "#pragma once\nint answer(int);\n";
+let extra = "#pragma once\n#define GREETING \"answer\"\n";
+let library_source = "#include \"demo.h\"\nint answer(int x) { return x * 2; }\n";
+let main_source = "#include \"demo.h\"\n#include \"extra.h\"\n#include <cstdio>\nint main() { std::printf(\"%s %d\\n\", GREETING, answer(21)); return 0; }\n";
+
+let library opt = cc.shared "demo" ["src/demo.cpp"] |> cc.standard :cxx20 |> cc.optimize opt
+                  |> cc.warnings :extra |> cc.public_include "include";
+let program opt = cc.executable "demo" ["src/main.cpp"] |> cc.standard :cxx20 |> cc.use (library opt);
+
+/// Build, run what was built, and say which steps ran.
+let round! ctx tc what opt = {
+    let [state, paths] = build.build! ctx [steps.artifact tc (program opt)];
+    let said = str.trim ((os.exec! (list.head paths) []).[:out]);
+    let line = what + ": ran " + to_string (list.sort (build.State.ran state)) + ", printed " + said;
+    console.print! line
+    line
+};
+
+let expected = [
+    "first build: ran [\"demo\", \"demo\", \"src/demo.cpp\", \"src/main.cpp\"], printed answer 42",
+    "nothing changed: ran [], printed answer 42",
+    "a source rewritten as it was: ran [], printed answer 42",
+    "a header only the program reads: ran [\"demo\", \"src/main.cpp\"], printed the answer 42",
+    "a header both read: ran [\"demo\", \"demo\", \"src/demo.cpp\", \"src/main.cpp\"], printed the answer 42",
+    "the library's optimization: ran [\"demo\", \"demo\", \"src/demo.cpp\"], printed the answer 42",
+    "a compile error: failed in src/demo.cpp",
+    "the error undone: ran [], printed the answer 42",
+];
+
+let main! = {
+    let root = "/tmp/dream-incremental-" + to_string (os.pid! ());
+    io.remove_all! root
+    io.mkdir_all! (root + "/include")
+    io.mkdir_all! (root + "/src")
+    build.write_file! (root + "/include/demo.h") header
+    build.write_file! (root + "/include/extra.h") extra
+    build.write_file! (root + "/src/demo.cpp") library_source
+    build.write_file! (root + "/src/main.cpp") main_source
+    // Several at once, so the schedule is exercised as well as the keys.
+    let ctx = build.Context.set_jobs (build.context! root) 4;
+    let tc = steps.detect! (os.platform ());
+
+    let r1 = round! ctx tc "first build" 2;
+    let r2 = round! ctx tc "nothing changed" 2;
+    // Rewritten with the same text: the stamp moves, the digest does not.
+    build.write_file! (root + "/src/main.cpp") main_source
+    let r3 = round! ctx tc "a source rewritten as it was" 2;
+    build.write_file! (root + "/include/extra.h") "#pragma once\n#define GREETING \"the answer\"\n"
+    let r4 = round! ctx tc "a header only the program reads" 2;
+    build.write_file! (root + "/include/demo.h") "#pragma once\n// changed\nint answer(int);\n"
+    let r5 = round! ctx tc "a header both read" 2;
+    let r6 = round! ctx tc "the library's optimization" 3;
+    // A failed step leaves nothing where a finished one is expected, so
+    // undoing the mistake finds the last good build still there.
+    build.write_file! (root + "/src/demo.cpp") "int answer(int x) { return x * ; }\n"
+    let r7 = match try! { round! ctx tc "a compile error" 3 } catch e { error.payload e } {
+        [:step_failed, name, _] => "a compile error: failed in " + name,
+        e => "a compile error: " + to_string e,
+    };
+    console.print! r7
+    build.write_file! (root + "/src/demo.cpp") library_source
+    let r8 = round! ctx tc "the error undone" 3;
+    let got = [r1, r2, r3, r4, r5, r6, r7, r8];
+    strict! got
+    io.remove_all! root
+    if got == expected { console.print! "incremental builds rerun what changed and nothing else" }
+    else {
+        console.print! "MISMATCH against what was expected"
+        os.exit! 1
+    }
+};

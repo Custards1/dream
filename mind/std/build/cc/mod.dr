@@ -128,12 +128,13 @@ mapping Toolchain {
     cxx = "c++"         // the C++ compiler, which links too for :gnu
     archiver = "ar"     // `ar`, or `lib.exe`
     linker = ""         // `link.exe`; unused for :gnu
-    version = ""
+    version = ""        // what the compiler says it is, so a new one rebuilds
+    includes = ""       // what `cl /showIncludes` begins a header's line with
 }
 
-let gcc os = Toolchain.make :gcc :gnu os "gcc" "g++" "ar" "" "";
-let clang os = Toolchain.make :clang :gnu os "clang" "clang++" "ar" "" "";
-let msvc = Toolchain.make :msvc :msvc :windows "cl.exe" "cl.exe" "lib.exe" "link.exe" "";
+let gcc os = Toolchain.make :gcc :gnu os "gcc" "g++" "ar" "" "" "";
+let clang os = Toolchain.make :clang :gnu os "clang" "clang++" "ar" "" "" "";
+let msvc = Toolchain.make :msvc :msvc :windows "cl.exe" "cl.exe" "lib.exe" "link.exe" "" "Note: including file:";
 
 /// Does a `flags_for` selector name this toolchain? A family (`:gnu`, `:msvc`)
 /// or a compiler (`:gcc`, `:clang`).

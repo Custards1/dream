@@ -35,6 +35,13 @@ vm:
     cmake --build {{build_dir}} -j
 
 
+# The VM built by `std.build.cc` rather than CMake, with whichever compiler
+# `$CXX` or the platform names: what the root `build.dr` will say about it.
+# Prints where the `dream` it made is; everything lands in target/build.
+vm-cc JOBS="16": dreams
+    ./{{dreams}} -L mind mind/std/build/tests/vm.dr -o /tmp/dream-vm-cc.dream
+    ./{{dream}} /tmp/dream-vm-cc.dream {{JOBS}}
+
 # Interpreter only, to check the VM still builds without LLVM.
 vm-no-jit:
     cmake -S . -B build-nojit -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -297,10 +304,14 @@ test-bootstrap: bootstrap-check
 # `std.build.cc` put to the compilers themselves: one description of a C++
 # library and a program, built with GCC, with Clang, and through the
 # `CMakeLists.txt` `std.build.cc.cmake` writes for it, each result run. A
-# toolchain the machine does not have is skipped and says so.
+# toolchain the machine does not have is skipped and says so. Then the same
+# kind of build through `std.build`'s runner, changed a piece at a time, to
+# check that each change reruns what depends on it and nothing else.
 test-build: build
     ./{{dreams}} -L mind mind/std/build/tests/toolchains.dr -o /tmp/dream-toolchains.dream
     ./{{dream}} /tmp/dream-toolchains.dream
+    ./{{dreams}} -L mind mind/std/build/tests/incremental.dr -o /tmp/dream-incremental.dream
+    ./{{dream}} /tmp/dream-incremental.dream
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build

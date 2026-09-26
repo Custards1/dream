@@ -178,7 +178,7 @@ mapping Step {
     inputs = []         // [Input]: their contents are part of the key
     config = ()         // data: everything else that changes the output
     outputs = []        // [:string]: files it makes in its own directory
-    action              // Job -> result.Of :unit :string, called by the runner
+    action              // Job -> $( [:ok, log] | [:error, log] ), run by the runner
     discovers = false   // it reports the files it read ("Discovered inputs")
     workspace = false   // it keeps a directory between runs ("Workspaces")
     cache = :shared     // :shared | :local | :never
@@ -227,7 +227,15 @@ rather than a compile per file.
 The key still comes from the declared inputs alone, since the discovered
 ones are not known until the step has run. So a key can have several records
 in a shared cache, one for each set of discovered files it was seen with, and
-the runner takes the one whose files all match.
+the runner takes the one whose files all match. (The runner as built keeps
+one record per key, and replaces it when the reads differ.)
+
+What a step **downstream** is keyed on is therefore not the key but the
+step's **result**: the key and the digests of what it read. An object whose
+header changed is compiled again under the same key, and the program linked
+from it must still see a different input, or it would not be relinked. The
+test that found this is `mind/std/build/tests/incremental.dr`, which changes
+a header only the program includes and checks what it prints.
 
 ### Workspaces
 
@@ -249,6 +257,15 @@ workspace is never shared between projects, and `cache` is at most `:local`
 for its step.
 
 ### Jobs
+
+An action is a function from a job to a **thunk**: `fn job -> $( exec! job
+[..] )`. Dream has no impure lambda, and a pure function may not name an
+impure one, but it may suspend a call to one. So describing a step stays
+pure, and a plan is still a pure function of its context; the effect happens
+when the runner runs the thunk, which it does in a process of its own
+(`join! (spawn! ..)`). An action that raises is then the step failing, with
+the error as its log, not the build stopping. A tool's `run!` hole is used
+the same way: the behavior's `step` wraps it as `fn job -> $( run! job cfg )`.
 
 What an action receives:
 
@@ -1349,9 +1366,19 @@ they are built says is not optional.
    image with an embedded library.
 2. **VM primitives. Built**, but for `dreams --depfile`: the table under
    "Running a plan".
-3. **`std.build` core.** The vocabulary, keys, the runner (sequential
-   first, then concurrent), the stamp cache, discovered inputs, workspaces,
-   outcomes, `write`, `command`, `files`, and `when test` blocks for each.
+3. **`std.build` core. Built, sequentially** (`mind/std/build/mod.dr`):
+   contexts, inputs, steps and their identities, keys and results, the
+   stamp cache, discovered inputs, scratch directories renamed into place,
+   `write` and `command`; and `std.build.cc.steps`, which makes a `cc` target
+   a compile step per source and a link step. `just test-build` builds a
+   library and a program through it and checks, change by change, that
+   exactly the right steps rerun, with several steps running at once. `just
+   vm-cc` builds the VM this way, JIT included, from
+   `mind/std/build/tests/vm.dr`: 21 steps in 21 s on 24 jobs against 25.6 s
+   for a clean CMake build, no warnings, 203 ms for a build with nothing to
+   do, and the result passes `dream_tests` and every e2e program. What is
+   left: workspaces, `cache = :local`, probes as steps, plans with goals and
+   checks, and `given`.
 4. **The graph. Built.** Cycle detection with the loop in the message, version
    requirements and `std.version`, revision conflicts reported as such,
    three kinds of edge, and `mind.lock`. None of this needs build scripts,

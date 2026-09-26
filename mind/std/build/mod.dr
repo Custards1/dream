@@ -1,0 +1,568 @@
+// Builds: steps that make files, run only when what they were made from has
+// changed.
+//
+// A step is a value: a tool's name, a configuration, the inputs it reads and
+// the outputs it will write, and an action that writes them. Its **identity**
+// is a digest of all of that but the inputs' contents, and its **key** adds
+// the contents: the digest of every file it reads and the key of every step it
+// reads from. A step runs in a scratch directory that is renamed to one named
+// by its key, so a step whose key has a directory has already been made, and
+// two steps cannot collide. docs/build.md is the design; this is its core,
+// "Inputs and artifacts" through "Running a plan".
+//
+// What makes a build that has nothing to do cheap is the **stamp**: a file's
+// size and modified time, kept beside its digest, so that a file is read only
+// when its stamp has moved. A build that changed nothing costs a `stat!` per
+// file, and runs nothing.
+//
+// Some steps cannot say what they read until they have: a C file's headers,
+// a Dream program's modules. Such a step `discovers` its inputs, writing a
+// make rule to `deps.d` in its directory (`gcc -MD` writes exactly that,
+// and `dreams --depfile` does too). The runner keeps what was read, with each
+// file's digest, and a step whose key matches is still run again if one of
+// those files has changed.
+//
+// Independent steps run at once, up to the context's job count, each action
+// in a process of its own. A step that fails raises `[:step_failed, name,
+// log]`, after what was running has finished. Plans, goals and checks are
+// what comes next.
+
+import std.error;
+import std.io;
+import std.list;
+import std.map;
+import std.os;
+import std.str;
+import std.wire;
+
+// --- where a build runs ----------------------------------------------------------
+
+mapping Platform {
+    os : :atom          // :linux | :macos | :windows
+    arch = :x86_64      // :x86_64 | :aarch64
+}
+
+/// What a build is told about the world: the package it builds, where, for
+/// what, and nothing else. `root` and `out` are absolute.
+mapping Context {
+    root : :string          // the package's directory; inputs are relative to it
+    out : :string           // where steps are made: <root>/target/build
+    target : :any           // Platform, where the result will run
+    host : :any             // Platform, where this build is running
+    profile = "debug"
+    options = %{}
+    env = %{}
+    jobs = 1
+}
+
+/// A context for building the package in `root` on this machine, for this
+/// machine.
+let context! : :string -> Context;
+let context! root = {
+    let here = os.cwd! ();
+    let absolute = if str.starts_with "/" root || (str.byte_length root > 1 && str.slice 1 1 root == ":") { root }
+                   else if root == "." { here } else { here + "/" + root };
+    let me = Platform.make (os.platform ()) :x86_64;
+    Context.make absolute (absolute + "/target/build") me me "debug" %{} %{} 1
+};
+
+let root ctx = Context.root ctx;
+let profile ctx = Context.profile ctx;
+let option ctx name = (Context.options ctx).[name else ()];
+let with_option name value ctx = Context.set_options ctx ((Context.options ctx).[name => value]);
+let target_os ctx = Platform.os (Context.target ctx);
+
+// --- inputs ----------------------------------------------------------------------
+
+/// What a step reads. A file is relative to the package's root. A tree is every
+/// file under a directory whose name ends with `suffix` (`""` for every one).
+/// An artifact is a file a step makes, and holds the step, so the graph is
+/// whatever is reachable from what was asked for.
+union Input {
+    file(path : :string)
+    tree(dir : :string, suffix : :string)
+    artifact(step : :any, name : :string)
+}
+
+let file p = Input.file p;
+let tree dir suffix = Input.tree dir suffix;
+
+// --- steps ------------------------------------------------------------------------
+
+mapping Step {
+    tool : :string
+    name : :string              // for people and logs; not part of the key
+    inputs = []                 // [Input]
+    config = ()                 // data: everything else that changes the output
+    outputs = []                // [:string], files it makes in its own directory
+    action = ()                 // Job -> $( [:ok, log] | [:error, log] ): see below
+    discovers = false           // it writes `deps.d`: the files it read
+    cache = :shared             // :shared | :never
+    version = "1"               // change it to make every earlier step stale
+    id = ""                     // its identity: see `step`
+}
+
+/// What an input is, for an identity: a file by its path, an artifact by its
+/// step's identity. Never by contents, which is what a key adds.
+let describe input = match input {
+    [:artifact, s, n] => [:artifact, Step.id s, n],
+    other => other,
+};
+
+/// A step. Its identity is worked out once, when it is first asked for, and
+/// kept in the step: an artifact asks for the identity of the step it holds,
+/// and a graph where many steps read one would otherwise work it out again for
+/// every reader.
+let step : :string -> :string -> [Input] -> :any -> [:string] -> :any -> Step;
+let step tool name inputs config outputs action = {
+    let s = Step.make tool name inputs config outputs action false :shared "1" "";
+    Step.set_id s (io.digest (wire.encode [tool, Step.version s, config, outputs,
+                                           list.map describe inputs]))
+};
+
+let discovering s = Step.set_discovers s true;
+let uncached s = Step.set_cache s :never;
+
+/// One of a step's outputs, as an input to another.
+let artifact s n = Input.artifact s n;
+/// A step's first output: what most callers want.
+let output s = Input.artifact s (list.head (Step.outputs s));
+
+// --- jobs --------------------------------------------------------------------------
+//
+// What an action is handed: where to write, the context, and every input
+// already made and resolved to a path.
+//
+// An action answers a **thunk**, `fn job -> $( exec! job [..] )`, and the
+// runner runs it in a process of its own. There is no impure lambda, and a
+// pure function may not name an impure one, but it may suspend a call to one:
+// so describing a step stays pure, which is what lets a whole plan be a pure
+// function of its context, and the effect happens only when the runner says.
+// A process of its own also means an action that raises is reported as the
+// step failing rather than taking the build with it, and it is what running
+// independent steps at once will be made of.
+
+mapping Job {
+    dir : :string
+    ctx : :any
+    paths = %{}
+}
+
+/// The name an input is filed under in a job's `paths`. A string rather than
+/// the input itself, because a map compares a compound key by identity, and
+/// a job is copied into the process its action runs in: the copy's inputs
+/// are not the map's.
+let slot : Input -> :string;
+let slot input = match input {
+    [:file, p] => "file:" + p,
+    [:tree, d, suffix] => "tree:" + d + ":" + suffix,
+    [:artifact, s, n] => "artifact:" + Step.id s + ":" + n,
+};
+
+/// Where an input is on disk, absolute.
+let path : Job -> Input -> :string;
+let path job input = (Job.paths job).[slot input else ""];
+/// Where an output of this step goes.
+let out : Job -> :string -> :string;
+let out job name = Job.dir job + "/" + name;
+/// Where a discovering step writes what it read.
+let depfile : Job -> :string;
+let depfile job = out job "deps.d";
+
+/// Run one command from the package's root. `[:ok, output]` or
+/// `[:error, output]`, the output being the command line and all it printed.
+let exec! : Job -> [:string] -> [:atom, :string];
+let exec! job argv = {
+    let said = str.join_str " " argv + "\n";
+    match try! { os.run! (list.head argv) (list.tail argv)
+                         %{ :cwd => Context.root (Job.ctx job), :timeout => 3600000 } } catch e { e } {
+        r if type_of r == :map => {
+            let text = said + r.[:out] + r.[:err];
+            if r.[:code] == 0 { [:ok, text] }
+            else if r.[:timed_out] { [:error, text + "(timed out)\n"] }
+            else { [:error, text + "(exit " + to_string r.[:code] + ")\n"] }
+        },
+        e => [:error, said + to_string e + "\n"],
+    }
+};
+
+/// Commands in order, stopping at the first that fails. The log is all of
+/// their output.
+let exec_all! : Job -> [[:string]] -> [:atom, :string];
+let exec_all! job commands =
+    list.fold (fn [status, log] argv -> match status {
+        :ok => { let [s, text] = exec! job argv; strict! s; [s, log + text] },
+        _ => [status, log],
+    }) [:ok, ""] commands;
+
+// --- files -------------------------------------------------------------------------
+
+let read_file! path = match try! { io.open! path :read } catch e { () } {
+    () => (),
+    h => {
+        let rec more! acc = { let chunk = io.read! h 65536; if str.byte_length chunk == 0 { acc } else { more! (acc + chunk) } };
+        let text = more! "";
+        io.close! h
+        text
+    },
+};
+
+let write_file! path text = {
+    let h = io.open! path :write;
+    io.write! h text
+    io.close! h
+};
+
+/// A make rule's prerequisites, as `gcc -MD` and `dreams --depfile` write it:
+/// a target, a colon, and names separated by spaces, a line continued by a
+/// backslash at its end, a space inside a name escaped by one before it.
+let depfile_reads : :string -> [:string];
+let depfile_reads text = {
+    let joined = str_concat (str.split "\\\n" (str_concat (str.split "\r" text)));
+    let body = match str.find ": " joined {
+        i if i >= 0 => str.slice (i + 2) (str.byte_length joined - i - 2) joined,
+        _ => "",
+    };
+    let [names, current, escaped] = list.fold (fn [acc, cur, esc] c ->
+        if esc { [acc, list.cons c cur, false] }
+        else {
+            match c {
+                '\\' => [acc, cur, true],
+                ' ' => [(if list.is_empty cur { acc } else { list.cons (str_of_chars (list.reverse cur)) acc }), [], false],
+                '\n' => [(if list.is_empty cur { acc } else { list.cons (str_of_chars (list.reverse cur)) acc }), [], false],
+                '\t' => [(if list.is_empty cur { acc } else { list.cons (str_of_chars (list.reverse cur)) acc }), [], false],
+                _ => [acc, list.cons c cur, false],
+            }
+        }) [[], [], false] (str.chars body);
+    let all = if list.is_empty current { names } else { list.cons (str_of_chars (list.reverse current)) names };
+    list.map (fn n -> str.join_str "$" (str.split "$$" n)) (list.reverse all)
+};
+
+// --- the runner ---------------------------------------------------------------------
+
+/// What the runner carries from step to step. `stamps` is path => `[size,
+/// modified, digest]`; `done` is identity => `[result, dir]` for the steps
+/// this build has settled.
+mapping State {
+    stamps = %{}
+    done = %{}
+    ran = []            // the names of the steps that ran, latest first
+    reused = 0
+}
+
+let stamps_path ctx = Context.out ctx + "/stamps";
+
+/// The runner's state, with the stamps an earlier build left.
+let start! : Context -> State;
+let start! ctx = {
+    io.mkdir_all! (Context.out ctx + "/steps")
+    io.mkdir_all! (Context.out ctx + "/scratch")
+    let stamps = match read_file! (stamps_path ctx) {
+        () => %{},
+        bytes => match wire.decode bytes { [:ok, m] => m, _ => %{} },
+    };
+    State.make stamps %{} [] 0
+};
+
+/// Keep the stamps for the next build. Written beside and renamed over, so a
+/// build stopped halfway through leaves the last whole table.
+let finish! : Context -> State -> State;
+let finish! ctx state = {
+    let temp = stamps_path ctx + "." + to_string (os.pid! ());
+    write_file! temp (wire.encode (State.stamps state))
+    io.rename! temp (stamps_path ctx)
+    state
+};
+
+/// A file's digest, read only when its stamp has moved. `()` for a file that
+/// is not there.
+let digest_of! : State -> :string -> [State, :any];
+let digest_of! state p = match io.stat! p {
+    () => [state, ()],
+    st => {
+        let stamp = [st.[:size], st.[:modified]];
+        match (State.stamps state).[p else ()] {
+            [size, modified, d] if [size, modified] == stamp => [state, d],
+            _ => {
+                let d = io.digest! p;
+                [State.set_stamps state ((State.stamps state).[p => [st.[:size], st.[:modified], d]]), d]
+            },
+        }
+    },
+};
+
+/// Every file a tree input names, sorted, relative to the root.
+let tree_files! ctx dir suffix =
+    list.map (fn f -> dir + "/" + f)
+             (list.filter (fn f -> str.ends_with suffix f)
+                          (try! { io.walk! (Context.root ctx + "/" + dir) } catch e { [] }));
+
+let absolute ctx p = if str.starts_with "/" p || (str.byte_length p > 1 && str.slice 1 1 p == ":") { p }
+                     else { Context.root ctx + "/" + p };
+
+/// Do the files a step read last time still have the digests they had?
+let reads_hold! state reads =
+    list.fold (fn [st, ok] [p, d] -> if not ok { [st, false] } else {
+        let [st2, now] = digest_of! st p;
+        [st2, now == d]
+    }) [state, true] reads;
+
+let record_of! dir = match read_file! (dir + "/.record") {
+    () => (),
+    bytes => match wire.decode bytes { [:ok, r] => r, _ => () },
+};
+
+/// What a step that reads this one is keyed on: its key and what it read.
+/// The key alone would not do for a step that discovers its inputs, since
+/// the key comes from the inputs it declared: a header changed would
+/// recompile an object and leave the program linked from it stale.
+let result_of key reads = if list.is_empty reads { key } else { io.digest (wire.encode [key, reads]) };
+
+// --- the graph -------------------------------------------------------------------------
+
+/// Every step reachable from `inputs`, by identity, and the identities each
+/// one reads from: `[steps, deps]`.
+let collect : [Input] -> [:any, :any];
+let collect inputs = {
+    let rec visit acc input = match input {
+        [:artifact, s, _] => {
+            let [steps, deps] = acc;
+            if steps.[Step.id s else ()] != () { acc }
+            else {
+                let mine = list.flat_map (fn i -> match i { [:artifact, d, _] => [Step.id d], _ => [] }) (Step.inputs s);
+                list.fold visit [steps.[Step.id s => s], deps.[Step.id s => list.unique mine]] (Step.inputs s)
+            }
+        },
+        _ => acc,
+    };
+    list.fold visit [%{}, %{}] inputs
+};
+
+// --- one step, in three parts ----------------------------------------------------------
+//
+// The runner keeps every piece of bookkeeping -- stamps, keys, records -- in
+// the one process that owns the state, and hands out only the part that
+// takes time: running an action. So `prepare!` and `commit!` run in the
+// runner, and `perform!` in a process of its own.
+
+/// A step whose inputs are all made: its key, its directory, its inputs'
+/// paths, and whether that directory already holds it.
+let prepare! ctx state s = {
+    let [after_inputs, contributions, paths] = list.fold (fn [st, cs, ps] input -> match input {
+        [:file, p] => {
+            let [st2, d] = digest_of! st (absolute ctx p);
+            [st2, list.cons [p, d] cs, ps.[slot input => absolute ctx p]]
+        },
+        [:tree, dir, suffix] => {
+            let [st2, ds] = list.fold (fn [stx, acc] f -> {
+                let [sty, d] = digest_of! stx (absolute ctx f);
+                [sty, list.cons [f, d] acc]
+            }) [st, []] (tree_files! ctx dir suffix);
+            [st2, list.cons ds cs, ps.[slot input => absolute ctx dir]]
+        },
+        [:artifact, dep, n] => {
+            let [result, dir] = (State.done st).[Step.id dep];
+            [st, list.cons result cs, ps.[slot input => dir + "/" + n]]
+        },
+    }) [state, [], %{}] (Step.inputs s);
+    let key = io.digest (wire.encode [Step.id s, list.reverse contributions]);
+    let dir = Context.out ctx + "/steps/" + key;
+    let [checked, current] = match [Step.cache s, record_of! dir] {
+        [:never, _] => [after_inputs, false],
+        [_, ()] => [after_inputs, false],
+        [_, r] => reads_hold! after_inputs (r.[:reads else []]),
+    };
+    [checked, key, dir, paths, current]
+};
+
+/// A step's action, run in a process of its own. A raise inside it is the
+/// step failing, with the error as its log.
+let act! s job = {
+    let answer = try! { join! (spawn! ((Step.action s) job)) } catch e { [:error, to_string e + "\n"] };
+    strict! answer
+    answer
+};
+
+/// Run a step's action in its scratch directory and check that it made what
+/// it said it would. `[:ok, log]` or `[:error, log]`.
+let perform! ctx s paths scratch = {
+    io.remove_all! scratch
+    io.mkdir_all! scratch
+    let [status, log] = act! s (Job.make scratch ctx paths);
+    strict! status
+    write_file! (scratch + "/log") log
+    let missing = list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) (Step.outputs s);
+    match [status, missing] {
+        [:ok, []] => [:ok, log],
+        [:ok, _] => [:error, log + "did not make: " + str.join_str ", " missing + "\n"],
+        _ => [:error, log],
+    }
+};
+
+/// What a worker is handed: a thunk that performs one step and tells the
+/// runner how it went. Made here, in a function of its own, because a thunk
+/// carries its frame into the process it is spawned as, and the runner's
+/// frame holds the whole state.
+let task parent id ctx s paths scratch =
+    $( send! parent [:build_step, id,
+                     try! { perform! ctx s paths scratch } catch e { [:error, to_string e + "\n"] }] );
+
+/// A performed step, put in place: what it read recorded, its scratch
+/// directory renamed to the one its key names.
+let commit! ctx state s key dir scratch = {
+    let read = if Step.discovers s {
+        match read_file! (scratch + "/deps.d") { () => [], text => depfile_reads text }
+    } else { [] };
+    let [after, reads] = list.fold (fn [st, acc] p -> {
+        let full = absolute ctx p;
+        let [st2, d] = digest_of! st full;
+        [st2, list.cons [full, d] acc]
+    }) [state, []] read;
+    let kept = list.reverse reads;
+    write_file! (scratch + "/.record") (wire.encode %{ :key => key, :reads => kept })
+    io.remove_all! dir
+    io.rename! scratch dir
+    let ran = State.set_ran after (list.cons (Step.name s) (State.ran after));
+    State.set_done ran ((State.done ran).[Step.id s => [result_of key kept, dir]])
+};
+
+// --- the schedule --------------------------------------------------------------------------
+
+/// The runner between one event and the next: the state, the steps not yet
+/// started, the steps running (identity => `[key, dir, scratch]`), and the
+/// first failure, after which nothing more is started.
+mapping Run {
+    state : :any
+    steps : :any            // identity => Step
+    deps : :any             // identity => [identity]
+    waiting : :any          // [identity]
+    running = %{}
+    failure = ()
+}
+
+let ready run id = list.all (fn d -> (State.done (Run.state run)).[d else ()] != ()) ((Run.deps run).[id else []]);
+
+/// Start what can be started: every step whose inputs are made, up to the
+/// job count. A step found already made is settled here and starts nothing.
+let rec launch! ctx run = {
+    let capacity = Context.jobs ctx - list.length (map.keys (Run.running run));
+    let candidates = if Run.failure run != () { [] } else { list.filter (fn id -> ready run id) (Run.waiting run) };
+    match candidates {
+        [] => run,
+        [id, .._] if capacity <= 0 => run,
+        [id, .._] => {
+            let s = (Run.steps run).[id];
+            let rest = list.filter (fn w -> w != id) (Run.waiting run);
+            let [state, key, dir, paths, current] = prepare! ctx (Run.state run) s;
+            if current {
+                let r = record_of! dir;
+                let reused = State.set_reused state (State.reused state + 1);
+                let settled = State.set_done reused ((State.done reused).[id => [result_of key (r.[:reads else []]), dir]]);
+                launch! ctx (Run.set_waiting (Run.set_state run settled) rest)
+            } else {
+                let scratch = Context.out ctx + "/scratch/" + key + "." + to_string (os.pid! ());
+                // Forced here: an argument is lazy, and `self! ()` asked inside
+                // the worker would be the worker, which would then report to
+                // itself.
+                let me = self! ();
+                strict! me
+                spawn! (task me id ctx s paths scratch)
+                launch! ctx (Run.set_running (Run.set_waiting (Run.set_state run state) rest)
+                                             ((Run.running run).[id => [key, dir, scratch]]))
+            }
+        },
+    }
+};
+
+/// Run the graph to the end: start what can start, take whichever step
+/// finishes next, and go again. A failure stops anything new from starting,
+/// and is raised once what was running has finished.
+let rec drive! ctx run = {
+    let started = launch! ctx run;
+    match [list.is_empty (map.keys (Run.running started)), Run.failure started] {
+        [true, ()] if list.is_empty (Run.waiting started) => started,
+        [true, ()] => raise! [:step_failed, "the build", "these steps could not start: "
+                                                        + str.join_str ", " (Run.waiting started) + "\n"],
+        [true, f] => raise! f,
+        _ => {
+            let [tag, id, outcome] = recv! ();
+            strict! outcome
+            let [key, dir, scratch] = (Run.running started).[id];
+            let running = map_remove (Run.running started) id;
+            let s = (Run.steps started).[id];
+            match outcome {
+                [:ok, _] => drive! ctx (Run.set_running (Run.set_state started (commit! ctx (Run.state started) s key dir scratch))
+                                                        running),
+                [_, log] => {
+                    io.remove_all! scratch
+                    let failure = match Run.failure started { () => [:step_failed, Step.name s, log], f => f };
+                    drive! ctx (Run.set_failure (Run.set_running started running) failure)
+                },
+            }
+        },
+    }
+};
+
+/// Make several inputs in one build, from the stamps the last one left, and
+/// keep the stamps for the next: `[state, [path]]`. Up to `ctx.jobs` steps run
+/// at once. A step that fails raises `[:step_failed, name, log]`.
+let build! : Context -> [Input] -> [State, [:string]];
+let build! ctx inputs = {
+    let [steps, deps] = collect inputs;
+    let run = Run.make (start! ctx) steps deps (map.keys steps) %{} ();
+    let finished = try! { drive! ctx run } catch e { { finish! ctx (Run.state run); raise! (error.payload e) } };
+    let state = finish! ctx (Run.state finished);
+    let paths = list.map (fn i -> match i {
+        [:artifact, s, n] => list.nth 1 ((State.done state).[Step.id s]) + "/" + n,
+        [:file, p] => absolute ctx p,
+        [:tree, d, _] => absolute ctx d,
+    }) inputs;
+    [state, paths]
+};
+
+// --- tools every build needs -----------------------------------------------------------
+
+/// A file whose contents are `text`. Keyed on the text, so it is rewritten only
+/// when the text changes: generating a module is ordinary Dream code.
+let write : :string -> :string -> Step;
+let write name text =
+    step "write" name [] text [name] (fn job -> $( { write_file! (out job name) text; [:ok, ""] } ));
+
+/// Any program, whose arguments are strings, inputs (`Input.file`,
+/// `artifact`, ...) and outputs (`[:out, "name"]`). The step's inputs, outputs
+/// and key all come from the one list the program is run with.
+let command : :string -> [:any] -> Step;
+let command name argv = {
+    let inputs = list.filter (fn a -> type_of a != :string && list.head a != :out) argv;
+    let outputs = list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) argv;
+    let described = list.map (fn a -> if type_of a == :string { a } else { describe a }) argv;
+    step "command" name inputs described outputs (fn job ->
+        $( exec! job (list.map (fn a -> match a {
+               s if type_of s == :string => s,
+               [:out, n] => out job n,
+               i => path job i,
+           }) argv) ))
+};
+
+let out_arg n = [:out, n];
+
+when test {
+    import std.test;
+
+    let a = write "a.txt" "hello";
+    let b = command "copy" ["cp", output a, out_arg "b.txt"];
+
+    let tests = [
+        test.case "a make rule's prerequisites, continued and escaped"
+            $( test.eq! ["src/a.cpp", "include/a b.h", "/usr/include/stdio.h", "x$y"]
+                        (depfile_reads "obj/a.o: src/a.cpp include/a\\ b.h \\\n  /usr/include/stdio.h x$$y\n") ),
+        test.case "an identity is its tool, configuration, outputs and inputs, not its name"
+            $( test.eq! [true, false]
+                        [Step.id (write "a.txt" "hello") == Step.id (Step.set_name a "another name"),
+                         Step.id a == Step.id (write "a.txt" "bye")] ),
+        test.case "an artifact is described by the identity of the step that makes it"
+            $( test.eq! [:artifact, Step.id a, "a.txt"] (describe (output a)) ),
+        test.case "a command's inputs and outputs come from its arguments"
+            $( test.eq! [[output a], ["b.txt"]] [Step.inputs b, Step.outputs b] ),
+    ];
+}
