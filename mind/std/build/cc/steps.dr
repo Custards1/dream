@@ -27,6 +27,7 @@ import std.io;
 import std.list;
 import std.os;
 import std.str;
+import std.wire;
 
 // --- finding the compiler ----------------------------------------------------------
 
@@ -59,6 +60,18 @@ let detect! platform = {
         cc.Toolchain.make :gcc :gnu platform c cxx "ar" "" first ""
     }
 };
+
+/// The machine's compiler, as a probe: never kept, since installing another
+/// compiler changes no file of the project's. Its answer is a `cc.Toolchain`
+/// (`probe.answer`), for a plan to build with through `build.given`.
+let toolchain : :atom -> build.Step;
+let toolchain platform =
+    build.uncached (build.step "probe" "compiler" [] [:compiler, platform] ["answer"] [toolchain_run, platform]);
+
+let toolchain_run job platform = $( {
+    build.write_file! (build.out job "answer") (wire.encode (detect! platform))
+    [:ok, ""]
+} );
 
 // --- where things go ------------------------------------------------------------------
 
@@ -114,6 +127,14 @@ let compile! tc t src object job = match family tc {
     _ => build.exec! job (gnu.compile tc t src (build.out job object) (build.depfile job)),
 };
 
+// Actions as `std.build` wants them: a top-level function and plain data,
+// with inputs by their slots (see "jobs" there).
+let compile_run job [tc, t, src, object] = $( compile! tc t src object job );
+let link_run job [tc, t, objects, libraries, runtime] =
+    $( link! tc t (list.map (fn o -> build.path_of job o) objects)
+                  (list.map (fn l -> build.path_of job l) libraries)
+                  (list.map (fn [i, n] -> [build.path_of job i, n]) runtime) job );
+
 /// The step that compiles one source of `t`.
 let compile_step : cc.Toolchain -> cc.Target -> [:any] -> build.Step;
 let compile_step tc t src = {
@@ -123,8 +144,7 @@ let compile_step tc t src = {
     // What reaches this source and nothing else of the target, so that two
     // targets compiling it alike share the object.
     let alike = cc.Target.make (cc.kind t) "" [src] settings [] [];
-    build.step "cc.compile" path [build.file path] [tc, alike] [object]
-               (fn job -> $( compile! tc alike src object job ))
+    build.step "cc.compile" path [build.file path] [tc, alike] [object] [compile_run, [tc, alike, src, object]]
     |> build.discovering
 };
 
@@ -177,9 +197,8 @@ let link_step tc target = {
     ];
     build.step "cc.link" (cc.name t) (list.concat [objects, libraries, list.map list.head runtime])
                [tc, t] outputs
-               (fn job -> $( link! tc t (list.map (fn o -> build.path job o) objects)
-                                   (list.map (fn l -> build.path job l) libraries)
-                                   (list.map (fn [i, n] -> [build.path job i, n]) runtime) job ))
+               [link_run, [tc, t, list.map build.slot objects, list.map build.slot libraries,
+                           list.map (fn [i, n] -> [build.slot i, n]) runtime]]
 };
 
 /// The file a target makes, as an input to anything else: the program, or the

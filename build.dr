@@ -1,0 +1,221 @@
+// The Dream repository's build: the VM, the compiler built from its seed and
+// then by itself, `mind`, `lucid`, and the tests.
+//
+//     mind build              the default: vm, dreams, mind, lucid
+//     mind build vm           build-dream/bin/dream, and its library beside it
+//     mind build seed         the compiler, rebuilt by itself, over the seed
+//     mind test               every check; `mind test e2e` those that begin so
+//     mind goals              what there is to ask for
+//
+// This is docs/build.md, "Building this repository", as it can be written
+// today: the goals place what they make where the `justfile` always has, so
+// every script and note that names `build-dream/bin/dream` or
+// `build/dreams.dream` stays right. There is no `mind.toml` beside it, because
+// `-L .` means "a directory of packages" to the compiler and a manifest here
+// would make it one package.
+//
+// Everything a step runs is something this build made: the compiler is run by
+// the VM built here, and the checks run what the goals make. So `mind test`
+// after an edit to one file of the VM rebuilds the VM, then whatever that
+// changes, and runs the checks that read it.
+
+import std.build;
+import std.build.cc;
+import std.build.cc.steps;
+import std.build.check;
+import std.build.dream;
+import std.build.probe;
+import std.list;
+import std.str;
+
+// --- the VM -------------------------------------------------------------------------
+
+let vm_sources = ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins",
+                  "ffi", "io", "os", "scheduler", "runtime", "capi", "jit_rt"]
+                 |> list.map (fn s -> "dream/src/" + s + ".cpp");
+
+/// GCC's inliner ceilings: dream/CMakeLists.txt says why at length. The
+/// reduction loop is one enormous function, past which GCC will not inline
+/// anything, however small.
+let inliner = ["--param", "large-function-growth=400", "--param", "large-function-insns=10000",
+               "--param", "inline-unit-growth=120", "--param", "max-inline-insns-auto=120",
+               "--param", "max-inline-insns-single=800"];
+
+/// `jit.cpp` when LLVM answered and the JIT was not turned off, the stub
+/// otherwise. `-D jit=on` makes a missing LLVM an error rather than a slower VM.
+let jit ctx llvm t = match [build.option ctx "jit", llvm] {
+    ["off", _] => cc.source "dream/src/jit_stub.cpp" t,
+    [_, ()] => cc.source "dream/src/jit_stub.cpp" t,
+    [_, l] =>
+        t |> cc.source_with "dream/src/jit.cpp" (if l.[:rtti] { [] } else { [cc.Setting.rtti false] })
+          |> cc.define "DREAM_HAVE_LLVM"
+          |> cc.define "__STDC_CONSTANT_MACROS" |> cc.define "__STDC_FORMAT_MACROS" |> cc.define "__STDC_LIMIT_MACROS"
+          // `-isystem`, so LLVM's headers are not held to this build's warnings.
+          |> cc.flags_for :gnu ["-isystem", l.[:includes]]
+          |> cc.flags_for :msvc ["/external:I" + l.[:includes], "/external:W0"]
+          |> cc.set (cc.Setting.library_dir l.[:libdir])
+          |> cc.link_flags_for :gnu l.[:libraries],
+};
+
+let optimized ctx t = match build.profile ctx {
+    "debug" => t |> cc.optimize 3 |> cc.debug_info true,
+    _ => t |> cc.optimize 3,
+};
+
+let libdream ctx llvm =
+    cc.shared "dream" vm_sources
+    |> cc.standard :cxx20
+    |> optimized ctx
+    |> cc.warnings :extra
+    |> cc.flags_for :gnu ["-Wno-unused-parameter", "-fno-semantic-interposition", "-fno-plt"]
+    |> cc.flags_for :gcc inliner
+    |> cc.flags_for :msvc ["/permissive-", "/utf-8", "/wd4100"]
+    |> cc.define_for :msvc "_CRT_SECURE_NO_WARNINGS"
+    |> cc.public_include "dream/include"
+    |> cc.include "dream/src"
+    |> cc.threads
+    |> cc.system "ffi"
+    |> cc.system_for :linux "dl"
+    |> cc.system_for :windows "ws2_32"
+    |> cc.export_all
+    |> jit ctx llvm;
+
+let native ctx name source lib =
+    cc.executable name [source]
+    |> cc.standard :cxx20
+    |> optimized ctx
+    |> cc.warnings :extra
+    |> cc.flags_for :gnu ["-Wno-unused-parameter"]
+    |> cc.include "dream/src"
+    |> cc.use lib;
+
+// --- Dream programs ------------------------------------------------------------------
+
+let seed = build.file "dreams/bootstrap/dreams.dream";
+
+/// The compiler, compiled by `compiler`.
+let dreams_by vm compiler = dream.program "dreams" "dreams/main.dr" compiler vm |> dream.paths ["mind", "."];
+
+/// An image compiled by the compiler this build made.
+let compiled vm dreams name entry paths =
+    dream.artifact (dream.program name entry dreams vm |> dream.paths paths);
+
+let tests_of vm dreams name entry paths =
+    dream.artifact (dream.program name entry dreams vm |> dream.paths paths |> dream.flags ["--test"]);
+
+// --- checks ----------------------------------------------------------------------------
+
+let name_of path = {
+    let file = list.last (str.split "/" path);
+    str.slice 0 (str.byte_length file - 3) file
+};
+
+/// `NAME=value` lines, as a program's `.env` beside it has them.
+let env_of text = list.fold (fn m line -> match str.find "=" line {
+    i if i > 0 && not (str.starts_with "#" line) =>
+        m.[str.slice 0 i line => str.slice (i + 1) (str.byte_length line - i - 1) line],
+    _ => m,
+}) %{} (str.split "\n" text);
+
+/// One program of dream/tests/programs, under both tiers, each against what
+/// is recorded beside it: two checks that agree with one file agree with each
+/// other. What e2e.sh adds -- the JIT's IR for a `.jit` program, shebang and
+/// payload images -- is `e2e.script`.
+let e2e_program vm dreams files path = {
+    let name = name_of path;
+    let base = str.slice 0 (str.byte_length path - 3) path;
+    let image = compiled vm dreams name path ["mind"];
+    let checks env = {
+        let jit_args = if list.contains (base + ".jit") files { ["--jit-threshold", "1"] } else { [] };
+        build.empty
+        |> build.check ("e2e." + name)
+                       (check.output_with name env (list.concat [[vm], jit_args, [image]]) (base + ".expected"))
+        |> build.check ("e2e." + name + ".interpreted")
+                       (check.output_with name env [vm, "--no-jit", image] (base + ".expected"))
+    };
+    if list.contains (base + ".env") files {
+        build.given (build.file (base + ".env")) (fn text -> checks (env_of text)) build.empty
+    } else { checks %{} }
+};
+
+/// One example, compiled with no warnings and run against what is recorded
+/// beside it, as examples/run.sh does.
+let example vm dreams path = {
+    let name = name_of path;
+    let image = dream.artifact (dream.program name path dreams vm |> dream.paths ["mind", "examples"]
+                                |> dream.no_warnings);
+    build.empty
+    |> build.check ("examples." + name)
+                   (check.output name [vm, image] (str.slice 0 (str.byte_length path - 3) path + ".expected"))
+};
+
+let compiler_scripts = ["macros", "optional_types", "static_types", "type_codegen", "contracts",
+                        "core_primitives", "modules"];
+
+let checks ctx vm tests dreams stage3 = build.all [
+    build.empty
+    |> build.check "vm.units" (check.succeeds "dream_tests" [tests])
+    |> build.check "bootstrap" (check.same "stages 2 and 3" dreams stage3)
+    |> build.check "bootstrap.seed" (check.same "the seed and stage 2" seed dreams)
+    |> build.note "bootstrap.seed" "the checked-in seed is what this source compiles to; `mind build seed` if not"
+    |> build.check "std.units" (check.succeeds "std" [vm, tests_of vm dreams "std_tests" "mind/std/all.dr" ["mind"]])
+    |> build.check "dreams.units" (check.succeeds "dreams" [vm, tests_of vm dreams "dreams_tests" "dreams/main.dr" ["mind", "."]])
+    |> build.check "mind.units" (check.succeeds "mind" [vm, tests_of vm dreams "mind_tests" "mind/tool/main.dr" ["mind/std"]])
+    |> build.check "lucid.units" (check.succeeds "lucid" [vm, tests_of vm dreams "lucid_tests" "lucid/main.dr" ["mind", "."]])
+    |> build.check "e2e.script"
+                   (check.succeeds_with "e2e.sh" %{ "dream" => vm, "DREAMS" => dreams }
+                                        ["dream/tests/e2e.sh", check.reads (build.tree "dream/tests" "")]),
+    build.all (list.map (fn s ->
+        build.empty |> build.check ("dreams." + s)
+                                   (check.succeeds s ["python3", "dreams/tests/" + s + ".py",
+                                                      "--dream", vm, "--compiler", dreams]))
+                        compiler_scripts),
+    build.empty |> build.given_files "dream/tests/programs" "" (fn files ->
+        build.all (list.map (fn p -> e2e_program vm dreams files p)
+                            (list.filter (fn f -> str.ends_with ".dr" f
+                                                  && list.contains (str.slice 0 (str.byte_length f - 3) f + ".expected") files)
+                                         files))),
+    build.empty |> build.given_files "examples" "" (fn files ->
+        build.all (list.map (fn p -> example vm dreams p)
+                            (list.filter (fn f -> str.ends_with ".dr" f && list.length (str.split "/" f) == 2
+                                                  && list.contains (str.slice 0 (str.byte_length f - 3) f + ".expected") files)
+                                         files))),
+];
+
+// --- the plan -------------------------------------------------------------------------------
+
+let with_vm ctx tc llvm = {
+    let lib = libdream ctx llvm;
+    let cli = native ctx "dream" "dream/src/cli.cpp" lib;
+    let tests_exe = native ctx "dream_tests" "dream/tests/test_main.cpp" lib;
+    let vm = steps.artifact tc cli;
+    let tests = steps.artifact tc tests_exe;
+    let dreams = dream.artifact (dreams_by vm seed);
+    let stage3 = dream.artifact (dreams_by vm dreams);
+    build.empty
+    |> build.goal "vm" (build.place "build-dream" (build.artifact (steps.link_step tc cli) ""))
+    |> build.note "vm" "the VM, and its library beside it, in build-dream/"
+    |> build.goal "vm-tests" (build.place "build-dream/bin/dream_tests" tests)
+    |> build.goal "dreams" (build.place "build/dreams.dream" dreams)
+    |> build.note "dreams" "the compiler, built by the seed"
+    |> build.goal "seed" (build.place "dreams/bootstrap/dreams.dream" stage3)
+    |> build.note "seed" "the compiler built by itself, over the checked-in seed"
+    |> build.goal "mind" (build.place "build/mind"
+                                      (dream.artifact (dream.program "mind" "mind/tool/main.dr" dreams vm
+                                                       |> dream.paths ["mind/std"] |> dream.flags ["--shebang"])))
+    |> build.goal "lucid" (build.place "build/lucid.dream" (compiled vm dreams "lucid" "lucid/main.dr" ["mind", "."]))
+    |> build.goal "default" (build.each ["vm", "dreams", "mind", "lucid"])
+    |> build.merge (checks ctx vm tests dreams stage3)
+};
+
+let llvm_parts = ["core", "orcjit", "native", "support", "target", "analysis", "passes", "ipo",
+                  "instcombine", "scalaropts", "transformutils"];
+
+/// Two questions come first: which compiler, and whether there is an LLVM.
+/// Everything else follows from the answers.
+let plan ctx =
+    build.empty
+    |> build.given (probe.answer_of (steps.toolchain (build.target_os ctx))) (fn compiler ->
+           build.empty
+           |> build.given (probe.answer_of (probe.llvm llvm_parts)) (fn llvm ->
+                  with_vm ctx (probe.answer compiler) (probe.answer llvm)));

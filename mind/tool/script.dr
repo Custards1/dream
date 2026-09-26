@@ -1,0 +1,105 @@
+// Build scripts: a project's `build.dr`, compiled and run by `mind`.
+//
+// A script is a pure function from a context to a plan (docs/build.md, "The
+// shape of a script"), and has no `main!` of its own. `mind` compiles it with
+// one line added at the end,
+//
+//     import std.build as build_driver__; let main! = build_driver__.main! plan;
+//
+// into `target/build/script/`, and becomes it (`os.replace!`) in the project's
+// root, with the goals and flags it was given. Added at the end rather than
+// the start, so that every line of the script is where its author wrote it and
+// an error in it points at the right line.
+//
+// The script is compiled again only when a file it was compiled from has
+// changed, which `dreams --depfile` says: a build that has nothing to do does
+// not pay for compiling the thing that decides that.
+//
+// A directory with a `build.dr` and no `mind.toml` is a project too, one that
+// is nothing but its build. That is what the root of the Dream repository is:
+// a manifest there would make it one package, where `-L .` has always meant a
+// directory of them.
+
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+import build;
+import util;
+
+let driver_line = "\nimport std.build as build_driver__;\nlet main! = build_driver__.main! plan;\n";
+
+/// The nearest directory at or above `dir` that is a project: one with a
+/// `mind.toml`, or with a `build.dr` and nothing else. `[root, has_manifest]`,
+/// or `()`.
+let rec project_root! dir = {
+    if io.exists! (util.join dir "mind.toml") { [dir, true] }
+    else if io.exists! (util.join dir "build.dr") { [dir, false] }
+    else {
+        let up = util.dirname dir;
+        if up == dir || up == "." || up == "" { () } else { project_root! up }
+    }
+};
+
+/// Does the project at `root` have a build script?
+let has_script! root = io.exists! (util.join root "build.dr");
+
+/// Every prerequisite a make rule names, as `dreams --depfile` writes it.
+let depfile_reads text = {
+    let joined = str_concat (str.split "\\\n" text);
+    match str.find ": " joined {
+        i if i >= 0 => list.filter (fn w -> w != "" && w != "\n")
+                                   (list.map str.trim (str.split " " (str.slice (i + 2) (str.byte_length joined - i - 2) joined))),
+        _ => [],
+    }
+};
+
+/// Is the compiled script at least as new as everything it was made from?
+let fresh! image depfile = match [io.stat! image, util.read_file! depfile] {
+    [(), _] => false,
+    [_, ()] => false,
+    [made, text] => list.all (fn p -> match io.stat! p {
+        () => false,
+        st => st.[:modified] <= made.[:modified],
+    }) (depfile_reads text),
+};
+
+/// Compile the script at `root` if it has changed: `[:ok, image]` or
+/// `[:error, why]`.
+let compile! root o = {
+    let dir = util.join root "target/build/script";
+    util.mkdir_p! dir
+    let source = util.join dir "build.dr";
+    let image = util.join dir "build.dream";
+    let depfile = util.join dir "build.d";
+    let text = match util.read_file! (util.join root "build.dr") { () => "", t => t } + driver_line;
+    let unchanged = util.read_file! source == text;
+    if unchanged && fresh! image depfile { [:ok, image] }
+    else {
+        if not unchanged { util.write_file! source text }
+        let chosen = match build.option o :compiler () {
+            () => match util.env_path! "DREAMS" { () => build.default_compiler, d => d },
+            c => c,
+        };
+        let [program, first] = build.compiler_command! chosen;
+        let r = os.run! program (list.concat [first, [source, "-L", build.stdlib_root! (), "-o", image,
+                                                      "--depfile", depfile]])
+                        %{ :timeout => 600000 };
+        if r.[:code] == 0 { [:ok, image] }
+        else { [:error, "mind: the build script did not compile\n" + r.[:out] + r.[:err]] }
+    }
+};
+
+/// Compile the script, and become it: the build's output is the terminal's,
+/// and its exit code is `mind`'s.
+let run! root o args = match compile! root o {
+    [:error, why] => {
+        io.write! (io.stderr! ()) why
+        os.exit! 1
+    },
+    [:ok, image] => {
+        os.chdir! root
+        os.replace! (build.vm_command! ()) (list.append [image] args)
+    },
+};

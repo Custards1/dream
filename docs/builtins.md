@@ -290,6 +290,7 @@ import std.io;
 | `digest!` | `path:string → string` | The SHA-256 of a file's contents, as 64 lowercase hex digits. |
 | `digest` | `text:string → string` | The SHA-256 of a string. Pure. |
 | `link!` | `from:string → to:string → atom` | Makes `to` a hard link to `from`, or a copy where a link cannot be made, answering `:linked` or `:copied`. `to` must not exist. |
+| `copy!` | `from:string → to:string → unit` | Makes `to` a copy of `from` with its permissions, replacing `to` if it is there. What a build places outside its cache is copied rather than linked, so editing it in place cannot reach the cache. |
 | `chmod!` | `path:string → mode:integer → unit` | Sets permission bits (`493` is `0o755`). On Windows only the owner's write bit has an effect. |
 | `walk!` | `dir:string → list of string` | Every file under `dir`, relative to it with `/` separators, sorted. Links to directories are not followed. |
 

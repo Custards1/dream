@@ -27,6 +27,7 @@
 // log]`, after what was running has finished. Plans, goals and checks are
 // what comes next.
 
+import std.console;
 import std.error;
 import std.io;
 import std.list;
@@ -95,7 +96,7 @@ mapping Step {
     inputs = []                 // [Input]
     config = ()                 // data: everything else that changes the output
     outputs = []                // [:string], files it makes in its own directory
-    action = ()                 // Job -> $( [:ok, log] | [:error, log] ): see below
+    action = ()                 // [f, data]: see "jobs" below
     discovers = false           // it writes `deps.d`: the files it read
     cache = :shared             // :shared | :never
     version = "1"               // change it to make every earlier step stale
@@ -133,14 +134,26 @@ let output s = Input.artifact s (list.head (Step.outputs s));
 // What an action is handed: where to write, the context, and every input
 // already made and resolved to a path.
 //
-// An action answers a **thunk**, `fn job -> $( exec! job [..] )`, and the
-// runner runs it in a process of its own. There is no impure lambda, and a
-// pure function may not name an impure one, but it may suspend a call to one:
-// so describing a step stays pure, which is what lets a whole plan be a pure
-// function of its context, and the effect happens only when the runner says.
+// An action is **data**: `[f, data]`, where `f` is a top-level function and
+// `f job data` answers a thunk, `$( exec! job [..] )`, which the runner runs
+// in a process of its own. Three things decide that shape.
+//
+// - There is no impure lambda, and a pure function may not name an impure
+//   one, but it may suspend a call to one. So describing a step stays pure,
+//   and a whole plan is a pure function of its context; the effect happens
+//   when the runner says.
+// - An action is copied into the process it runs in, and a closure carries
+//   its frame, lazy arguments and all. A closure made where a step's inputs
+//   were in scope would carry them, and an input holds its step, which holds
+//   its action -- the whole graph upstream, copied once for every way of
+//   reaching each part of it. The first real build ran out of memory that
+//   way. A top-level `f` captures nothing, and the runner forces `data` all
+//   the way down before it is copied, so what crosses is exactly the data.
+// - For the same reason `data` names inputs by their slot (`slotted`,
+//   `path_of`), never by the inputs themselves.
+//
 // A process of its own also means an action that raises is reported as the
-// step failing rather than taking the build with it, and it is what running
-// independent steps at once will be made of.
+// step failing rather than taking the build with it.
 
 mapping Job {
     dir : :string
@@ -162,6 +175,9 @@ let slot input = match input {
 /// Where an input is on disk, absolute.
 let path : Job -> Input -> :string;
 let path job input = (Job.paths job).[slot input else ""];
+/// The same, by the input's slot, for an action that holds only slots.
+let path_of : Job -> :string -> :string;
+let path_of job k = (Job.paths job).[k else ""];
 /// Where an output of this step goes.
 let out : Job -> :string -> :string;
 let out job name = Job.dir job + "/" + name;
@@ -377,21 +393,21 @@ let prepare! ctx state s = {
 
 /// A step's action, run in a process of its own. A raise inside it is the
 /// step failing, with the error as its log.
-let act! s job = {
-    let answer = try! { join! (spawn! ((Step.action s) job)) } catch e { [:error, to_string e + "\n"] };
+let act! [f, data] job = {
+    let answer = try! { join! (spawn! (f job data)) } catch e { [:error, to_string e + "\n"] };
     strict! answer
     answer
 };
 
 /// Run a step's action in its scratch directory and check that it made what
 /// it said it would. `[:ok, log]` or `[:error, log]`.
-let perform! ctx s paths scratch = {
+let perform! ctx action outputs paths scratch = {
     io.remove_all! scratch
     io.mkdir_all! scratch
-    let [status, log] = act! s (Job.make scratch ctx paths);
+    let [status, log] = act! action (Job.make scratch ctx paths);
     strict! status
     write_file! (scratch + "/log") log
-    let missing = list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) (Step.outputs s);
+    let missing = list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) outputs;
     match [status, missing] {
         [:ok, []] => [:ok, log],
         [:ok, _] => [:error, log + "did not make: " + str.join_str ", " missing + "\n"],
@@ -402,10 +418,12 @@ let perform! ctx s paths scratch = {
 /// What a worker is handed: a thunk that performs one step and tells the
 /// runner how it went. Made here, in a function of its own, because a thunk
 /// carries its frame into the process it is spawned as, and the runner's
-/// frame holds the whole state.
-let task parent id ctx s paths scratch =
+/// frame holds the whole state. It is handed the step's action and outputs,
+/// not the step, since a step holds its inputs and an artifact holds the step
+/// that makes it: the step would bring the graph upstream of it along.
+let task parent id ctx action outputs paths scratch =
     $( send! parent [:build_step, id,
-                     try! { perform! ctx s paths scratch } catch e { [:error, to_string e + "\n"] }] );
+                     try! { perform! ctx action outputs paths scratch } catch e { [:error, to_string e + "\n"] }] );
 
 /// A performed step, put in place: what it read recorded, its scratch
 /// directory renamed to the one its key names.
@@ -421,7 +439,10 @@ let commit! ctx state s key dir scratch = {
     let kept = list.reverse reads;
     write_file! (scratch + "/.record") (wire.encode %{ :key => key, :reads => kept })
     io.remove_all! dir
-    io.rename! scratch dir
+    try! { io.rename! scratch dir } catch e {
+        raise! [:step_failed, Step.name s, "could not put it in place: " + to_string e + "\nsteps: "
+                                           + to_string (io.stat! (parent_of dir)) + "\n"]
+    }
     let ran = State.set_ran after (list.cons (Step.name s) (State.ran after));
     State.set_done ran ((State.done ran).[Step.id s => [result_of key kept, dir]])
 };
@@ -430,23 +451,29 @@ let commit! ctx state s key dir scratch = {
 
 /// The runner between one event and the next: the state, the steps not yet
 /// started, the steps running (identity => `[key, dir, scratch]`), and the
-/// first failure, after which nothing more is started.
+/// steps that failed (identity => `[name, log]`). A build that is not told to
+/// keep going starts nothing after its first failure; one that is starts
+/// everything that does not depend on one, which is what a run of checks
+/// wants.
 mapping Run {
     state : :any
     steps : :any            // identity => Step
     deps : :any             // identity => [identity]
     waiting : :any          // [identity]
     running = %{}
-    failure = ()
+    failures = %{}
+    keep_going = false
 }
 
 let ready run id = list.all (fn d -> (State.done (Run.state run)).[d else ()] != ()) ((Run.deps run).[id else []]);
+
+let stopped run = not (Run.keep_going run) && not (list.is_empty (map.keys (Run.failures run)));
 
 /// Start what can be started: every step whose inputs are made, up to the
 /// job count. A step found already made is settled here and starts nothing.
 let rec launch! ctx run = {
     let capacity = Context.jobs ctx - list.length (map.keys (Run.running run));
-    let candidates = if Run.failure run != () { [] } else { list.filter (fn id -> ready run id) (Run.waiting run) };
+    let candidates = if stopped run { [] } else { list.filter (fn id -> ready run id) (Run.waiting run) };
     match candidates {
         [] => run,
         [id, .._] if capacity <= 0 => run,
@@ -466,7 +493,13 @@ let rec launch! ctx run = {
                 // itself.
                 let me = self! ();
                 strict! me
-                spawn! (task me id ctx s paths scratch)
+                // All of it forced before it crosses: see "jobs".
+                let action = Step.action s;
+                strict! action
+                let outputs = Step.outputs s;
+                strict! outputs
+                strict! paths
+                spawn! (task me id ctx action outputs paths scratch)
                 launch! ctx (Run.set_running (Run.set_waiting (Run.set_state run state) rest)
                                              ((Run.running run).[id => [key, dir, scratch]]))
             }
@@ -475,49 +508,79 @@ let rec launch! ctx run = {
 };
 
 /// Run the graph to the end: start what can start, take whichever step
-/// finishes next, and go again. A failure stops anything new from starting,
-/// and is raised once what was running has finished.
+/// finishes next, and go again. What is left waiting at the end depends on a
+/// step that failed, or, with no failure to blame, is a cycle.
 let rec drive! ctx run = {
     let started = launch! ctx run;
-    match [list.is_empty (map.keys (Run.running started)), Run.failure started] {
-        [true, ()] if list.is_empty (Run.waiting started) => started,
-        [true, ()] => raise! [:step_failed, "the build", "these steps could not start: "
-                                                        + str.join_str ", " (Run.waiting started) + "\n"],
-        [true, f] => raise! f,
-        _ => {
-            let [tag, id, outcome] = recv! ();
-            strict! outcome
-            let [key, dir, scratch] = (Run.running started).[id];
-            let running = map_remove (Run.running started) id;
-            let s = (Run.steps started).[id];
-            match outcome {
-                [:ok, _] => drive! ctx (Run.set_running (Run.set_state started (commit! ctx (Run.state started) s key dir scratch))
-                                                        running),
-                [_, log] => {
-                    io.remove_all! scratch
-                    let failure = match Run.failure started { () => [:step_failed, Step.name s, log], f => f };
-                    drive! ctx (Run.set_failure (Run.set_running started running) failure)
-                },
-            }
-        },
+    if list.is_empty (map.keys (Run.running started)) {
+        if list.is_empty (Run.waiting started) || not (list.is_empty (map.keys (Run.failures started))) { started }
+        else {
+            raise! [:step_failed, "the build", "these steps wait on each other: "
+                                               + str.join_str ", " (list.map (fn id -> Step.name ((Run.steps started).[id]))
+                                                                             (Run.waiting started)) + "\n"]
+        }
+    } else {
+        let [tag, id, outcome] = recv! ();
+        strict! outcome
+        let [key, dir, scratch] = (Run.running started).[id];
+        let running = Run.set_running started (map_remove (Run.running started) id);
+        let s = (Run.steps started).[id];
+        match outcome {
+            [:ok, _] => {
+                // Put in place now, not whenever the state is next read.
+                let committed = commit! ctx (Run.state running) s key dir scratch;
+                strict! committed
+                drive! ctx (Run.set_state running committed)
+            },
+            [_, log] => {
+                io.remove_all! scratch
+                drive! ctx (Run.set_failures running ((Run.failures running).[id => [Step.name s, log]]))
+            },
+        }
     }
+};
+
+/// Where an input is, once built, or `()` when its step did not finish.
+let located ctx state input = match input {
+    [:artifact, s, n] => match (State.done state).[Step.id s else ()] {
+        () => (),
+        [_, dir] => if n == "" { dir } else { dir + "/" + n },
+    },
+    [:file, p] => absolute ctx p,
+    [:tree, d, _] => absolute ctx d,
+};
+
+/// Make every input it can, going on past a step that fails: `[state,
+/// [path | ()], failures]`, `failures` being identity => `[name, log]`. A
+/// path is `()` for an input whose step failed or waited on one that did.
+let build_all! : Context -> [Input] -> [State, [:any], :any];
+let build_all! ctx inputs = {
+    let [steps, deps] = collect inputs;
+    // Forced here, as a statement: an argument is lazy, and a `start!` left to
+    // be forced when something first reads the state had not made the steps'
+    // directory by the time the first step with no inputs finished.
+    let started = start! ctx;
+    strict! started
+    let finished = drive! ctx (Run.make started steps deps (map.keys steps) %{} %{} true);
+    let state = finish! ctx (Run.state finished);
+    [state, list.map (fn i -> located ctx state i) inputs, Run.failures finished]
 };
 
 /// Make several inputs in one build, from the stamps the last one left, and
 /// keep the stamps for the next: `[state, [path]]`. Up to `ctx.jobs` steps run
-/// at once. A step that fails raises `[:step_failed, name, log]`.
+/// at once. The first step that fails stops anything new from starting, and
+/// is raised as `[:step_failed, name, log]` once what was running is done.
 let build! : Context -> [Input] -> [State, [:string]];
 let build! ctx inputs = {
     let [steps, deps] = collect inputs;
-    let run = Run.make (start! ctx) steps deps (map.keys steps) %{} ();
-    let finished = try! { drive! ctx run } catch e { { finish! ctx (Run.state run); raise! (error.payload e) } };
+    let started = start! ctx;
+    strict! started
+    let finished = drive! ctx (Run.make started steps deps (map.keys steps) %{} %{} false);
     let state = finish! ctx (Run.state finished);
-    let paths = list.map (fn i -> match i {
-        [:artifact, s, n] => list.nth 1 ((State.done state).[Step.id s]) + "/" + n,
-        [:file, p] => absolute ctx p,
-        [:tree, d, _] => absolute ctx d,
-    }) inputs;
-    [state, paths]
+    match map_pairs (Run.failures finished) {
+        [] => [state, list.map (fn i -> located ctx state i) inputs],
+        [[_, [name, log]], .._] => raise! [:step_failed, name, log],
+    }
 };
 
 // --- tools every build needs -----------------------------------------------------------
@@ -526,7 +589,9 @@ let build! ctx inputs = {
 /// when the text changes: generating a module is ordinary Dream code.
 let write : :string -> :string -> Step;
 let write name text =
-    step "write" name [] text [name] (fn job -> $( { write_file! (out job name) text; [:ok, ""] } ));
+    step "write" name [] text [name] [write_run, [name, text]];
+
+let write_run job [name, text] = $( { write_file! (out job name) text; [:ok, ""] } );
 
 /// Any program, whose arguments are strings, inputs (`Input.file`,
 /// `artifact`, ...) and outputs (`[:out, "name"]`). The step's inputs, outputs
@@ -536,15 +601,311 @@ let command name argv = {
     let inputs = list.filter (fn a -> type_of a != :string && list.head a != :out) argv;
     let outputs = list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) argv;
     let described = list.map (fn a -> if type_of a == :string { a } else { describe a }) argv;
-    step "command" name inputs described outputs (fn job ->
-        $( exec! job (list.map (fn a -> match a {
-               s if type_of s == :string => s,
-               [:out, n] => out job n,
-               i => path job i,
-           }) argv) ))
+    step "command" name inputs described outputs [command_run, slotted argv]
 };
 
+/// Arguments with every input replaced by its slot: `[:in, slot]`. What an
+/// action holds has to be this and not the inputs, because an action is
+/// copied into the process it runs in, and an input holds its step, its step
+/// holds its action, and so on up the graph: see "jobs".
+let slotted : [:any] -> [:any];
+let slotted argv = list.map (fn a -> match a {
+    s if type_of s == :string => s,
+    [:out, n] => [:out, n],
+    i => [:in, slot i],
+}) argv;
+
+/// Slotted arguments made real, for this job.
+let arguments : Job -> [:any] -> [:string];
+let arguments job argv = list.map (fn a -> match a {
+    s if type_of s == :string => s,
+    [:out, n] => out job n,
+    [:in, k] => (Job.paths job).[k else ""],
+}) argv;
+
+let command_run job argv = $( exec! job (arguments job argv) );
+
 let out_arg n = [:out, n];
+
+/// Every file under `dir` whose name ends with `suffix`, one to a line,
+/// relative to the root. Never kept, since a file can be added under a
+/// directory without anything this build knows of changing: it is how a plan
+/// asks what is there (`given_files`).
+let glob : :string -> :string -> Step;
+let glob dir suffix =
+    uncached (step "glob" (dir + "/*" + suffix) [] [dir, suffix] ["files"] [glob_run, [dir, suffix]]);
+
+let glob_run job [dir, suffix] = $( {
+    write_file! (out job "files") (str.join_str "\n" (tree_files! (Job.ctx job) dir suffix))
+    [:ok, ""]
+} );
+
+// --- plans -------------------------------------------------------------------------------
+//
+// What a script answers: the things there are to ask for by name (goals),
+// the tests there are to run (checks), and what cannot be said until
+// something has been asked of the machine (`given`). Every contribution takes
+// the plan last, so they chain with `|>`.
+
+/// Something to ask for by name. `make` builds an input and says where it is;
+/// `place` puts it somewhere of the project's choosing as well; `each` is
+/// several goals under one name; `effect` runs a step every time it is asked
+/// for, for installing and anything else whose point is outside `target/`.
+union Goal {
+    make(input : :any)
+    place(path : :string, input : :any)
+    each(names : [:string])
+    effect(step : :any)
+}
+
+mapping Plan {
+    goals = %{}         // name => Goal
+    checks = %{}        // name => Input
+    notes = %{}         // name => a line saying what it is for
+    later = []          // [[Input, fn]]: `given`
+    clashes = []        // names two parts of a plan both claimed
+}
+
+let empty : Plan;
+let empty = Plan.make %{} %{} %{} [] [];
+
+/// Set `name` in one of a plan's tables, noting a clash rather than letting
+/// one quietly win.
+let claim table name value plan = {
+    let current = table plan;
+    let noted = if current.[name else ()] == () { plan }
+                else { Plan.set_clashes plan (list.cons name (Plan.clashes plan)) };
+    [noted, current.[name => value]]
+};
+
+let goal : :string -> Goal -> Plan -> Plan;
+let goal name g plan = { let [p, goals] = claim Plan.goals name g plan; Plan.set_goals p goals };
+let check : :string -> Step -> Plan -> Plan;
+let check name s plan = { let [p, checks] = claim Plan.checks name (output s) plan; Plan.set_checks p checks };
+/// A line of explanation for a goal or a check, which `goals` prints.
+let note : :string -> :string -> Plan -> Plan;
+let note name text plan = Plan.set_notes plan ((Plan.notes plan).[name => text]);
+
+let make input = Goal.make input;
+let place p input = Goal.place p input;
+let each names = Goal.each names;
+let effect s = Goal.effect (uncached s);
+
+/// A plan that depends on something only the machine can say: `input` is
+/// built, its contents read, and `f` of them is merged in.
+let given : Input -> (:string -> Plan) -> Plan -> Plan;
+let given input f plan = Plan.set_later plan (list.append (Plan.later plan) [[input, f]]);
+
+/// A plan that depends on which files are under a directory: `f` is handed
+/// their paths, relative to the root.
+let given_files : :string -> :string -> ([:string] -> Plan) -> Plan -> Plan;
+let given_files dir suffix f plan =
+    given (output (glob dir suffix))
+          (fn text -> f (list.filter (fn l -> l != "") (str.split "\n" text))) plan;
+
+/// Two plans as one. A name both of them claim is a clash, reported when the
+/// plan is run.
+let merge : Plan -> Plan -> Plan;
+let merge a b = {
+    let with_goals = list.fold (fn p [n, g] -> goal n g p) a (map_pairs (Plan.goals b));
+    let with_checks = list.fold (fn p [n, i] -> {
+        let [q, checks] = claim Plan.checks n i p;
+        Plan.set_checks q checks
+    }) with_goals (map_pairs (Plan.checks b));
+    let with_notes = list.fold (fn p [n, t] -> note n t p) with_checks (map_pairs (Plan.notes b));
+    Plan.set_clashes (Plan.set_later with_notes (list.append (Plan.later with_notes) (Plan.later b)))
+                     (list.append (Plan.clashes with_notes) (Plan.clashes b))
+};
+
+let all : [Plan] -> Plan;
+let all plans = list.fold merge empty plans;
+
+// --- running a plan --------------------------------------------------------------------------
+
+/// Resolve a plan's `given`s: build what they wait on, hand each its answer,
+/// and go again with whatever that adds, until nothing is waiting.
+let settle! : Context -> Plan -> Plan;
+let rec settle! ctx plan = match Plan.later plan {
+    [] => plan,
+    later => {
+        let [_, paths] = build! ctx (list.map list.head later);
+        let answers = list.map (fn [[_, f], p] -> f (match read_file! p { () => "", text => text }))
+                               (list.zip later paths);
+        settle! ctx (list.fold merge (Plan.set_later plan []) answers)
+    },
+};
+
+/// Where the files of a built input go when it is placed at `dest`: one file
+/// for a named output, or every output of the step, beneath `dest`, for a
+/// whole step (`artifact s ""`).
+let placements ctx state input dest = match input {
+    [:artifact, s, ""] => list.map (fn o -> [located ctx state (artifact s o), dest + "/" + o]) (Step.outputs s),
+    _ => [[located ctx state input, dest]],
+};
+
+let parent_of p = {
+    let parts = str.split "/" p;
+    str.join_str "/" (list.take (list.length parts - 1) parts)
+};
+
+/// Put a built file at `dest` without ever writing to `dest`: a copy beside
+/// it, renamed over it. A program that has the old file mapped -- a VM running
+/// the old image -- keeps the pages it had. A copy rather than a link, because
+/// what is placed is the project's to change, and a link would share every
+/// change with the cache.
+let place_file! from dest = {
+    io.mkdir_all! (parent_of dest)
+    let temp = dest + ".placing." + to_string (os.pid! ());
+    io.remove_all! temp
+    io.copy! from temp
+    io.rename! temp dest
+};
+
+/// The goals a name stands for, `each` followed through.
+let rec goals_named plan name = match (Plan.goals plan).[name else ()] {
+    () => [[name, ()]],
+    [:each, names] => list.flat_map (fn n -> goals_named plan n) names,
+    g => [[name, g]],
+};
+
+let goal_input g = match g {
+    [:make, i] => i,
+    [:place, _, i] => i,
+    [:effect, s] => artifact s "",
+};
+
+/// What a script's driver is told: `[mode, names, flags]`.
+let rec parse_args args acc = match args {
+    [] => acc,
+    ["-j", n, ..rest] => parse_args rest (acc.[:jobs => parse_int n]),
+    ["--profile", p, ..rest] => parse_args rest (acc.[:profile => p]),
+    ["--release", ..rest] => parse_args rest (acc.[:profile => "release"]),
+    ["-D", d, ..rest] => parse_args rest (acc.[:defines => list.append acc.[:defines] [d]]),
+    ["--test", ..rest] => parse_args rest (acc.[:mode => :test]),
+    ["--all", ..rest] => parse_args rest (acc.[:slow => true]),
+    ["--bless", ..rest] => parse_args rest (acc.[:bless => true]),
+    ["--goals", ..rest] => parse_args rest (acc.[:mode => :goals]),
+    [name, ..rest] => parse_args rest (acc.[:names => list.append acc.[:names] [name]]),
+};
+
+/// `name=value` or `name`, as an option.
+let define_pair d = match str.find "=" d {
+    i if i > 0 => [str.slice 0 i d, str.slice (i + 1) (str.byte_length d - i - 1) d],
+    _ => [d, true],
+};
+
+let show_names! plan = {
+    let line! kind name = console.print! ("  " + kind + " " + name
+                                           + (match (Plan.notes plan).[name else ()] { () => "", t => "  -- " + t }));
+    list.map (fn n -> line! "goal " n) (list.sort (map.keys (Plan.goals plan))) |> strict!
+    list.map (fn n -> line! "check" n) (list.sort (map.keys (Plan.checks plan))) |> strict!
+    0
+};
+
+let log_tail log = {
+    let lines = str.split "\n" (str.trim log);
+    str.join_str "\n" (list.map (fn l -> "      " + l) (list.drop (list.length lines - 25) lines))
+};
+
+/// Run every check whose name begins with one of `prefixes`, all of them when
+/// there are none, each one that does not depend on a failure.
+let test! ctx plan prefixes = {
+    let chosen = list.filter (fn [n, _] -> list.is_empty prefixes || list.any (fn p -> str.starts_with p n) prefixes)
+                             (list.sort_on list.head (map_pairs (Plan.checks plan)));
+    let [state, paths, failures] = build_all! ctx (list.map (fn c -> list.nth 1 c) chosen);
+    let outcomes = list.map (fn [[name, input], p] -> {
+        let failed = match input { [:artifact, s, _] => failures.[Step.id s else ()], _ => () };
+        match [p, failed] {
+            [(), ()] => { console.print! ("  skip  " + name + "  (something it needs failed)"); 1 },
+            [(), [_, log]] => { console.print! ("  FAIL  " + name + "\n" + log_tail log); 1 },
+            _ => { console.print! ("  ok    " + name); 0 },
+        }
+    }) (list.zip chosen paths);
+    strict! outcomes
+    let bad = list.sum outcomes;
+    console.print! ("\n" + to_string (list.length chosen - bad) + " passed, " + to_string bad + " failed"
+                    + ", " + to_string (list.length (State.ran state)) + " steps ran")
+    if bad == 0 { 0 } else { 1 }
+};
+
+/// Build the goals named, and place what is to be placed.
+let make_goals! ctx plan names = {
+    let wanted = match names {
+        [] => if (Plan.goals plan).[:default else ()] != () || (Plan.goals plan).["default" else ()] != () { ["default"] }
+              else { [] },
+        ns => ns,
+    };
+    let chosen = list.flat_map (fn n -> goals_named plan n) wanted;
+    let unknown = list.filter (fn [n, g] -> g == ()) chosen;
+    match [wanted, unknown] {
+        [[], _] => {
+            console.error! "build: say which goal to build; these are the ones there are:"
+            show_names! plan
+            2
+        },
+        [_, [[n, _], .._]] => {
+            console.error! ("build: there is no goal `" + n + "`; these are the ones there are:")
+            show_names! plan
+            2
+        },
+        _ => {
+            let [state, paths] = build! ctx (list.map (fn [_, g] -> goal_input g) chosen);
+            let placed = list.map (fn [[name, g], p] -> match g {
+                [:place, dest, input] => {
+                    list.map (fn [from, to] -> place_file! from to)
+                             (placements ctx state input (absolute ctx dest)) |> strict!
+                    console.print! (name + ": " + dest)
+                },
+                _ => console.print! (name + ": " + p),
+            }) (list.zip chosen paths);
+            strict! placed
+            console.error! (to_string (list.length (State.ran state)) + " steps ran, "
+                            + to_string (State.reused state) + " were already made")
+            0
+        },
+    }
+};
+
+/// A build script's `main!`: `mind` compiles a script with
+/// `let main! = build.main! plan;` added, and runs it in the project's root
+/// with the command line it was given:
+///
+///     GOAL..              build these goals (`default` when none is named)
+///     --test [PREFIX..]   run the checks whose names begin so, or all of them
+///     --bless             with --test, record what a check printed as expected
+///     --goals             say what goals and checks there are
+///     -j N, --profile P, --release, -D NAME[=VALUE]
+let main! plan_of = {
+    let o = parse_args (os.args! ()) %{ :mode => :build, :names => [], :defines => [], :jobs => 8,
+                                         :profile => "debug", :bless => false, :slow => false };
+    let options = list.fold (fn m d -> { let [k, v] = define_pair d; m.[k => v] })
+                            (%{ "bless" => o.[:bless] }) o.[:defines];
+    let ctx = Context.set_options (Context.set_profile (Context.set_jobs (context! ".") o.[:jobs]) o.[:profile])
+                                  options;
+    let code = try! {
+        let plan = settle! ctx (plan_of ctx);
+        match Plan.clashes plan {
+            [] => match o.[:mode] {
+                :goals => show_names! plan,
+                :test => test! ctx plan o.[:names],
+                _ => make_goals! ctx plan o.[:names],
+            },
+            names => {
+                console.error! ("build: the plan names these twice: " + str.join_str ", " (list.unique names))
+                2
+            },
+        }
+    } catch e {
+        match error.payload e {
+            [:step_failed, name, log] => {
+                console.error! ("build: " + name + " failed\n" + log_tail log)
+                1
+            },
+            other => { console.error! ("build: " + to_string other); 1 },
+        }
+    };
+    os.exit! code
+};
 
 when test {
     import std.test;

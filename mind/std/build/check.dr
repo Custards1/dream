@@ -1,0 +1,169 @@
+// Checks: steps whose success is the test.
+//
+// A check is kept like any step, so one that passed with these inputs is not
+// run again: `mind test` after a change to one program runs that program's
+// checks and not the rest. A check's arguments are written as
+// `build.command`'s are -- strings, inputs, `build.out_arg` -- so what it reads
+// is part of its key without being listed twice.
+//
+// A program under test is run from the project's root with its output and its
+// errors in one stream, the way a person running it sees them, and with the
+// variables a check names set over the environment.
+//
+//     build.check "e2e.fib" (check.output "fib" [vm, image] "tests/fib.expected")
+
+import std.build;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+/// An input a check reads without naming it on its command line: a directory
+/// of tests a script walks by itself. It is part of the check's key, so a
+/// change there runs the check again.
+let reads : build.Input -> :any;
+let reads input = [:reads, input];
+
+let inputs_of argv = list.flat_map (fn a -> match a {
+    s if type_of s == :string => [],
+    [:out, _] => [],
+    [:reads, i] => [i],
+    i => [i],
+}) argv;
+let described argv = list.map (fn a -> match a {
+    s if type_of s == :string => s,
+    [:reads, i] => [:reads, build.describe i],
+    i => build.describe i,
+}) argv;
+/// Arguments as an action holds them: inputs by their slots, and what a
+/// check only reads left out (see `build.slotted`).
+let slotted argv = build.slotted (list.filter (fn a -> type_of a == :string || list.head a != :reads) argv);
+let resolved job argv = build.arguments job argv;
+
+/// A check's environment, whose values may be inputs: `%{ "dream" => vm }`
+/// hands a script the path of the VM this build made.
+let env_inputs env = list.flat_map (fn [_, v] -> if type_of v == :string { [] } else { [v] }) (map_pairs env);
+let env_described env = list.map (fn [k, v] -> [k, if type_of v == :string { v } else { build.describe v }])
+                                  (list.sort_on list.head (map_pairs env));
+let env_slotted env = list.fold (fn m [k, v] -> m.[k => if type_of v == :string { v } else { [:in, build.slot v] }])
+                               %{} (map_pairs env);
+let env_resolved job env = list.fold (fn m [k, v] -> m.[k => if type_of v == :string { v } else { build.path_of job (list.nth 1 v) }])
+                                     %{} (map_pairs env);
+
+/// Run a program as a check runs it: from the root, `env` set, both streams
+/// into one file. `[code, what it printed, timed_out]`.
+let run! job env argv = {
+    let log = build.out job "output";
+    let r = try! { os.run! (list.head argv) (list.tail argv)
+                           %{ :cwd => build.root (build.Job.ctx job), :env => env, :log => log,
+                              :timeout => 600000 } }
+            catch e { %{ :code => 127, :timed_out => false, :err => to_string e } };
+    let printed = match build.read_file! log { () => r.[:err else ""], text => text };
+    [r.[:code], printed, r.[:timed_out else false]]
+};
+
+let command_line env argv =
+    str.join_str " " (list.append (list.map (fn [k, v] -> k + "=" + v) (map_pairs env)) argv) + "\n";
+
+let passed! job log = {
+    build.write_file! (build.out job "passed") ""
+    [:ok, log]
+};
+
+let succeeds! job env_given argv = {
+    let env = env_resolved job env_given;
+    let line = command_line env (resolved job argv);
+    let [code, printed, timed_out] = run! job env (resolved job argv);
+    if code == 0 { passed! job (line + printed) }
+    else { [:error, line + printed + (if timed_out { "(timed out)\n" } else { "(exit " + to_string code + ")\n" })] }
+};
+
+/// Passes when the program exits with 0.
+let succeeds : :string -> [:any] -> build.Step;
+let succeeds name argv = succeeds_with name %{} argv;
+
+/// The same, with variables set for it.
+let succeeds_with : :string -> %{ :string => :any } -> [:any] -> build.Step;
+let succeeds_with name env argv =
+    build.step "check.succeeds" name (list.append (env_inputs env) (inputs_of argv))
+               [env_described env, described argv] ["passed", "output"]
+               [succeeds_run, [env_slotted env, slotted argv]];
+
+/// The text as a person compares it: the same lines, whatever newlines it
+/// ends with.
+let trimmed text = str.trim_end text;
+
+/// The first line where two texts part, for a failure's message.
+let first_difference wanted got = {
+    let w = str.split "\n" wanted;
+    let g = str.split "\n" got;
+    let rec at i = match [list.nth i w, list.nth i g] {
+        [a, b] if a == b && i < list.length w && i < list.length g => at (i + 1),
+        _ => i,
+    };
+    let i = at 0;
+    let line xs = if i < list.length xs { list.nth i xs } else { "(nothing)" };
+    "line " + to_string (i + 1) + ":\n  expected: " + line w + "\n  printed:  " + line g + "\n"
+};
+
+let output! job env_given argv expected = {
+    let env = env_resolved job env_given;
+    let line = command_line env (resolved job argv);
+    let [code, printed, timed_out] = run! job env (resolved job argv);
+    let wanted = match build.read_file! (build.path_of job (build.slot (build.file expected))) { () => "", text => text };
+    let ctx = build.Job.ctx job;
+    if timed_out { [:error, line + printed + "(timed out)\n"] }
+    else if trimmed printed == trimmed wanted { passed! job line }
+    else if build.option ctx "bless" == true {
+        // The one step that writes into the source tree, and only when asked.
+        build.write_file! (build.root ctx + "/" + expected) (trimmed printed + "\n")
+        passed! job (line + "blessed " + expected + "\n")
+    } else {
+        [:error, line + "what it printed is not " + expected + ", from "
+                 + first_difference (trimmed wanted) (trimmed printed)]
+    }
+};
+
+/// Passes when what the program prints, errors and all, is the file
+/// `expected`. With `mind test --bless`, what it printed becomes the file.
+let output : :string -> [:any] -> :string -> build.Step;
+let output name argv expected = output_with name %{} argv expected;
+
+let output_with : :string -> %{ :string => :any } -> [:any] -> :string -> build.Step;
+let output_with name env argv expected =
+    build.step "check.output" name (list.concat [[build.file expected], env_inputs env, inputs_of argv])
+               [env_described env, described argv, expected]
+               ["passed", "output"]
+               [output_run, [env_slotted env, slotted argv, expected]];
+
+let same! job a b = {
+    let da = io.digest! (build.path_of job a);
+    let db = io.digest! (build.path_of job b);
+    if da == db { passed! job "" }
+    else { [:error, build.path_of job a + " and " + build.path_of job b + " differ\n"] }
+};
+
+// Actions as `std.build` wants them: a top-level function and plain data,
+// with inputs by their slots (see "jobs" there).
+let succeeds_run job [env, argv] = $( succeeds! job env argv );
+let output_run job [env, argv, expected] = $( output! job env argv expected );
+let same_run job [a, b] = $( same! job a b );
+
+/// Passes when two files are byte for byte the same.
+let same : :string -> build.Input -> build.Input -> build.Step;
+let same name a b =
+    build.step "check.same" name [a, b] [] ["passed"] [same_run, [build.slot a, build.slot b]];
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a failure says where the two texts part"
+            $( test.eq! "line 2:\n  expected: b\n  printed:  c\n" (first_difference "a\nb" "a\nc") ),
+        test.case "and when one of them ran out"
+            $( test.eq! "line 2:\n  expected: b\n  printed:  (nothing)\n" (first_difference "a\nb" "a") ),
+        test.case "a check reads what its arguments name"
+            $( test.eq! [build.file "t.expected", build.file "prog"]
+                        (build.Step.inputs (output "t" ["sh", build.file "prog"] "t.expected")) ),
+    ];
+}

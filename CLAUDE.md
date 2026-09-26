@@ -142,6 +142,18 @@ VM built without it is not a valid VM. LLVM is optional and gives the JIT.
 The `dreams/tests/*.sh` scripts run directly with no environment set; there is
 one left, `compile.sh`, and it needs only the VM and the seed.
 
+The same tests are being moved into the repository's `build.dr`, the
+build `mind` runs ([docs/build.md](docs/build.md), "Building this
+repository"). `just mind-test` runs its checks -- e2e programs one check per
+program per tier, the units, the bootstrap -- in parallel, and again only
+what an edit reaches; `just mind-build vm` builds the VM with
+`std.build.cc` rather than CMake. Until it covers every recipe, `just test`
+is still the whole suite. Running checks at once surfaces a pre-existing
+flake `just test` never shows: compile-time evaluation failing with
+`comp_failed ... the compile-time expression failed` in about one run in
+five when two dozen compiles run together (`dreams.contracts`, probably
+`lucid.units`). It fails the same way at the commit before `std.build`.
+
 `just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
 is **not** in `just test`, because it needs `npm install` in `editors/vscode`
 first and the rest of the suite needs nothing from outside the repository.

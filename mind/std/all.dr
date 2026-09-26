@@ -13,6 +13,9 @@ import std.build.cc.cmake;
 import std.build.cc.gnu;
 import std.build.cc.msvc;
 import std.build.cc.steps;
+import std.build.check;
+import std.build.dream;
+import std.build.probe;
 import std.cli;
 import std.codec;
 
@@ -44,7 +47,8 @@ let version = "0.1.0";
 /// The modules this build provides.
 let modules : [:string];
 let modules = ["std.agent", "std.array", "std.build", "std.build.cc", "std.build.cc.cmake", "std.build.cc.gnu",
-               "std.build.cc.msvc", "std.build.cc.steps", "std.cli", "std.codec", "std.error", "std.json", "std.list",
+               "std.build.cc.msvc", "std.build.cc.steps",
+               "std.build.check", "std.build.dream", "std.build.probe", "std.cli", "std.codec", "std.error", "std.json", "std.list",
                "std.map", "std.macros", "std.proc", "std.record", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];

@@ -1,0 +1,75 @@
+// Asking the machine: steps whose answer decides what the plan is.
+//
+// A probe is a step like any other, but never kept, because what it asks
+// about -- a program on the path, a library installed -- can change without
+// any file of the project's changing. It writes its answer as a `std.wire`
+// value, which `build.given` hands to the plan (`build.given (probe.answer_of
+// p) (fn text -> ..)`), and `answer` reads back.
+//
+// A probe's answer is `()` when the machine has no answer to give: no such
+// program, no LLVM. Deciding what that means -- build without the JIT, or
+// fail -- is the plan's business, not the probe's.
+
+import std.build;
+import std.list;
+import std.os;
+import std.str;
+import std.wire;
+
+/// The value a probe wrote, from the text `given` hands over.
+let answer : :string -> :any;
+let answer text = match wire.decode text { [:ok, v] => v, _ => () };
+
+let write_answer! job value = {
+    build.write_file! (build.out job "answer") (wire.encode value)
+    [:ok, ""]
+};
+
+let program_run job name = $( write_answer! job (match ask! name ["--version"] {
+                                                     () => (),
+                                                     said => list.head (str.split "\n" said),
+                                                 }) );
+let llvm_run job components = $( write_answer! job (llvm! components) );
+
+/// Run a program and answer what it printed, trimmed, or `()` if it could not
+/// be run or failed.
+let ask! program args = match try! { os.run! program args %{ :timeout => 30000 } } catch e { () } {
+    () => (),
+    r => if r.[:code] == 0 { str.trim r.[:out] } else { () },
+};
+
+let probe name config look =
+    build.uncached (build.step "probe" name [] config ["answer"] look);
+
+/// The step's answer file, for `build.given`.
+let answer_of : build.Step -> build.Input;
+let answer_of p = build.output p;
+
+/// A program on the path, and what it says of itself with `--version`: the
+/// first line, or `()` when there is no such program.
+let program : :string -> build.Step;
+let program name =
+    probe ("program " + name) [:program, name] [program_run, name];
+
+let llvm! components = {
+    let told! args = match ask! "llvm-config" args { () => "", text => text };
+    match ask! "llvm-config" ["--includedir"] {
+        () => (),
+        includes => %{
+            :version => told! ["--version"],
+            :includes => includes,
+            :libdir => told! ["--libdir"],
+            :libraries => list.filter (fn w -> w != "")
+                                      (list.append (str.split " " (told! (list.cons "--libs" components)))
+                                                   (str.split " " (told! ["--system-libs"]))),
+            :rtti => told! ["--has-rtti"] == "YES",
+        },
+    }
+};
+
+/// What `llvm-config` says about building against these LLVM components:
+/// `%{ :version, :includes, :libdir, :libraries, :rtti }`, or `()` when there
+/// is no LLVM.
+let llvm : [:string] -> build.Step;
+let llvm components =
+    probe "llvm" [:llvm, components] [llvm_run, components];

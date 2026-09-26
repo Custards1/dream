@@ -35,12 +35,15 @@ vm:
     cmake --build {{build_dir}} -j
 
 
-# The VM built by `std.build.cc` rather than CMake, with whichever compiler
-# `$CXX` or the platform names: what the root `build.dr` will say about it.
-# Prints where the `dream` it made is; everything lands in target/build.
-vm-cc JOBS="16": dreams
-    ./{{dreams}} -L mind mind/std/build/tests/vm.dr -o /tmp/dream-vm-cc.dream
-    ./{{dream}} /tmp/dream-vm-cc.dream {{JOBS}}
+# The repository's own build.dr, run by the `mind` in this checkout with this
+# checkout's VM and compiler: `just mind-build vm`, `just mind-test e2e`. The
+# VM is built by `std.build.cc` rather than CMake, with whichever compiler
+# `$CXX` or the platform names, and placed in build-dream/ as `just vm` does.
+mind-build *ARGS: mind
+    DREAM=$PWD/{{dream}} DREAMS=$PWD/{{image}} ./{{dream}} build/mind build {{ARGS}}
+
+mind-test *ARGS: mind
+    DREAM=$PWD/{{dream}} DREAMS=$PWD/{{image}} ./{{dream}} build/mind test {{ARGS}}
 
 # Interpreter only, to check the VM still builds without LLVM.
 vm-no-jit:

@@ -28,10 +28,48 @@ dream build/mind help
 | `mind deps` | list every package the project resolves to |
 | `mind tree` | the same, as the tree of who needs what |
 | `mind options` | every package's options, and what this build sets them to |
+| `mind goals` | what the project's `build.dr` names: its goals and its checks |
 | `mind clean` | remove `target/` |
 
 Every command but `new` looks for a `mind.toml` here or above, so they work
 from anywhere inside a project — the way `git` finds its root.
+
+## Build scripts
+
+A project with a `build.dr` is built and tested by it. `mind build [GOAL..]`
+builds the goals it names (`default` when none is named), `mind test
+[PREFIX..]` runs its checks, and `mind goals` lists both; `--profile`, `-D`
+and `-j N` are passed on, and anything after `--` too (`mind test -- --bless`
+records what a check printed as what it expects). A directory with a
+`build.dr` and no `mind.toml` is a project of its own: the root of the Dream
+repository is one.
+
+```dream
+// build.dr
+import std.build;
+import std.build.cc;
+import std.build.cc.steps;
+import std.build.check;
+import std.build.probe;
+
+let demo tc = cc.executable "demo" ["src/main.cpp"] |> cc.standard :cxx20 |> steps.artifact tc;
+
+let plan ctx =
+    build.empty
+    |> build.given (build.output (steps.toolchain (build.target_os ctx))) (fn answer -> {
+           let tc = probe.answer answer;
+           build.empty
+           |> build.goal "default" (build.place "bin/demo" (demo tc))
+           |> build.check "runs" (check.output "demo" [demo tc] "tests/demo.expected")
+       });
+```
+
+A script is a pure function from a context to a plan; `mind` compiles it with
+a `main!` added, in `target/build/script/`, again only when a file it was
+compiled from has changed. A step runs only when what it reads has changed,
+and what it makes is kept in `target/build/steps/`, so building or testing
+again after an edit runs what the edit reaches and nothing else.
+[docs/build.md](../../docs/build.md) is the design.
 
 ## Dependencies
 

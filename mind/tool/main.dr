@@ -29,6 +29,7 @@ import build;
 import config;
 import fetch;
 import manifest;
+import script;
 import util;
 
 let version = "0.1.0";
@@ -61,6 +62,7 @@ let opts = [
 
     cli.section "how to build it",
     cli.value "" "compiler" "PATH" "the compiler to run; a `.dream` is run by the VM",
+    cli.value "j" "jobs" "N" "how many steps a build script runs at once",
     cli.flag "v" "verbose" "print the compiler command before running it",
     cli.flag "h" "help" "this message",
     cli.flag "" "version" "print the version",
@@ -83,6 +85,7 @@ let command_spec = [
     cli.command "deps"  "list every package this project resolves to" [],
     cli.command "tree"  "show the dependency tree" [],
     cli.command "info"  "show what this build would run, without running it" [],
+    cli.command "goals" "the goals and checks this project's build.dr names" [],
     cli.command "options" "every package's options, and what this build sets them to" [],
     cli.command "clean" "remove target/" [],
     cli.command "help"  "this message" [],
@@ -636,6 +639,29 @@ let options_of! c =
                [:targets,  cli.all c "target"],
                [:verbose,  cli.flag_set c "verbose"]];
 
+/// What a build script is told of this command line: the profile, the
+/// defines, the job count.
+let script_flags c = list.concat [
+    (match cli.get () c "profile" {
+         () => if cli.flag_set c "release" { ["--release"] } else { [] },
+         p => ["--profile", p],
+     }),
+    list.flat_map (fn d -> ["-D", d]) (cli.all c "define"),
+    (match cli.get () c "jobs" { () => [], n => ["-j", n] }),
+];
+
+/// The root of the project here, when it has a `build.dr`: such a project is
+/// built and tested by its script. `()` otherwise.
+let script_root! here = match script.project_root! (getdir! here) {
+    [root, _] if script.has_script! root => root,
+    _ => (),
+};
+
+/// Hand the command to the project's build script, which never returns: it
+/// becomes the build. `mode` is how the script is told which command it is.
+let by_script! root c mode theirs =
+    script.run! root (options_of! c) (list.concat [mode, script_flags c, cli.rest c, theirs]);
+
 let run_command! c theirs = {
     let o = options_of! c;
     // The project is loaded inside the arm that needs one. `mind new` and
@@ -651,10 +677,20 @@ let run_command! c theirs = {
                                  [] => fail! "new needs a project name",
                                  [name, .._] => cmd_new! name,
                              },
-                  "build" => cmd_build! (project_in! here) o,
+                  "build" => match script_root! here {
+                                 () => cmd_build! (project_in! here) o,
+                                 root => by_script! root c [] theirs,
+                             },
+                  "goals" => match script_root! here {
+                                 () => fail! "goals: this project has no build.dr",
+                                 root => by_script! root c ["--goals"] theirs,
+                             },
                   "check" => cmd_check! (project_in! here) o,
                   "run"   => cmd_run! (project_in! here) o (list.append (cli.rest c) theirs),
-                  "test"  => cmd_test! (project_in! here) o (list.append (cli.rest c) theirs),
+                  "test"  => match script_root! here {
+                                 () => cmd_test! (project_in! here) o (list.append (cli.rest c) theirs),
+                                 root => by_script! root c ["--test"] theirs,
+                             },
                   "deps"  => cmd_deps! (project_in! here) o,
                   "tree"  => cmd_tree! (project_in! here) o,
                   "fetch" => cmd_fetch! (project_in! here) o,

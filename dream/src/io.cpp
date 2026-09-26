@@ -1066,6 +1066,21 @@ NativeResult io_link(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_atom(p.runtime().intern_atom("copied")));
 }
 
+/// `copy! from to` -- `to` becomes a copy of `from`, replacing it if it is
+/// there, with `from`'s permissions. Where `link!` shares a file, this makes
+/// one of `to`'s own: what a build places outside its cache is copied, so that
+/// anything which later edits it in place -- `strip`, `patchelf`, a linker
+/// writing into its old output -- cannot reach back into the cache.
+NativeResult io_copy(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0]) || !is_string(args[1])) return fail(p, "type_error", "copy! needs two paths");
+    auto from = fs_path(string_arg(args[0]));
+    auto to = fs_path(string_arg(args[1]));
+    std::error_code ec;
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) return fail_fs(p, "copy " + fs_text(from) + " to " + fs_text(to), ec);
+    return NativeResult::ok(UNIT);
+}
+
 /// `chmod! path mode` -- set the permission bits, `0o755` being `493`. On
 /// Windows only the owner's write bit means anything (it is the read-only
 /// attribute), and the rest are accepted and ignored, so a build can mark its
@@ -1178,6 +1193,7 @@ ModuleDef make_io_module() {
                          {"digest!", 1, 0b1, io_digest_file},
                          {"digest", 1, 0b1, io_digest_text},
                          {"link!", 2, 0b11, io_link},
+                         {"copy!", 2, 0b11, io_copy},
                          {"chmod!", 2, 0b11, io_chmod},
                          {"walk!", 1, 0b1, io_walk},
                          {"async", 1, 0b1, io_async},

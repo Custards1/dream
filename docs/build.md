@@ -1366,19 +1366,15 @@ they are built says is not optional.
    image with an embedded library.
 2. **VM primitives. Built**, but for `dreams --depfile`: the table under
    "Running a plan".
-3. **`std.build` core. Built, sequentially** (`mind/std/build/mod.dr`):
-   contexts, inputs, steps and their identities, keys and results, the
-   stamp cache, discovered inputs, scratch directories renamed into place,
-   `write` and `command`; and `std.build.cc.steps`, which makes a `cc` target
-   a compile step per source and a link step. `just test-build` builds a
-   library and a program through it and checks, change by change, that
-   exactly the right steps rerun, with several steps running at once. `just
-   vm-cc` builds the VM this way, JIT included, from
-   `mind/std/build/tests/vm.dr`: 21 steps in 21 s on 24 jobs against 25.6 s
-   for a clean CMake build, no warnings, 203 ms for a build with nothing to
-   do, and the result passes `dream_tests` and every e2e program. What is
-   left: workspaces, `cache = :local`, probes as steps, plans with goals and
-   checks, and `given`.
+3. **`std.build` core. Built** (`mind/std/build/mod.dr`): contexts, inputs,
+   steps and their identities, keys and results, the stamp cache,
+   discovered inputs, scratch directories renamed into place, a runner that
+   runs independent steps at once and can keep going past a failure, plans
+   with goals, checks and `given`, placing by copy and rename, `write`,
+   `command` and `glob`, and the driver a script is run by (`build.main!`).
+   An action is data, `[f, data]`, for the reason "Jobs" gives. What is left:
+   workspaces, `cache = :local`, and a plan's contributions to a package's
+   own compile (payloads, modules, defines).
 4. **The graph. Built.** Cycle detection with the loop in the message, version
    requirements and `std.version`, revision conflicts reported as such,
    three kinds of edge, and `mind.lock`. None of this needs build scripts,
@@ -1388,22 +1384,34 @@ they are built says is not optional.
    `when`, conditional dependencies, `[profile.*]`, `[build] target`, and
    `mind options`. What is left for item 6 is `ctx.options` and a script's
    `build.define`, since there are no scripts to hand them to yet.
-6. **`mind` runs scripts.** Script discovery, `[build-dependencies]`,
-   drivers, outcome reuse, folding outcomes into the compile, `--target` and
-   `-j`, and the goal and check commands (`mind build GOAL`, `mind goals`,
-   `mind test PATTERN`).
-7. **Tools.** `probe`, then `cc`, then `dream` and `check`. `cc`'s
-   vocabulary and its translations for GCC, Clang, MSVC and CMake are
-   **built** and tested (`std.build.cc`, `.gnu`, `.msvc`, `.cmake`, and `just
-   test-build`); what is left of it is the steps that run them, which need
-   item 3. `dream/tests/ffi` is rebuilt as a package whose C library is made
-   by its own `build.dr` rather than by the test script. That is the first
-   real user, and it is small.
-8. **This repository.** Stage 0 in `build.sh`, the root `build.dr` with the
-   VM built by `cc`, then the goals and the checks group by group, each
-   checked against its `just` recipe until the two agree. Then PGO, then
-   `cc.msvc` and macOS, then CMake is cut down to the embedders' file and
-   most of the `justfile` is removed.
+6. **`mind` runs scripts. Partly built** (`mind/tool/script.dr`): a
+   project's `build.dr` is compiled with the driver line added, kept until a
+   file it was read from changes (its depfile), and run in the project's
+   root for `mind build [GOAL..]`, `mind test [PREFIX..]` and `mind goals`,
+   with `--profile`, `-D` and `-j`. A directory with a `build.dr` and no
+   `mind.toml` is a project. What is left: `[build-dependencies]`, a
+   package's script contributing to its compile (outcomes, `-L KEY+=DIR`),
+   and scripts of dependencies.
+7. **Tools. Built:** `std.build.cc` with its translations for GCC, Clang,
+   MSVC and CMake and its steps (`std.build.cc.steps`), `std.build.dream`,
+   `std.build.check` and `std.build.probe` (a program, LLVM, the compiler).
+   `just test-build` builds a library and a program with each toolchain the
+   machine has, and through the runner checks change by change that exactly
+   the right steps rerun. Left: `fetch`, `files` (install), `cmake` as a
+   workspace step, and `dream/tests/ffi` rebuilt as a package whose C
+   library its own `build.dr` makes.
+8. **This repository. Begun:** `build.dr` at the root has the VM built by
+   `cc` with the JIT when the LLVM probe answers, the compiler from the seed
+   and by itself, `mind` and `lucid`, placed where the `justfile` places
+   them, and 115 checks: the VM's units, bootstrap and seed, the std,
+   compiler, `mind` and `lucid` units, the compiler's Python harnesses,
+   `e2e.sh`, and a check per e2e program under each tier and per example.
+   `just mind-test` runs them all in 20 s on 24 jobs; again with nothing
+   changed, in 0.35 s, running nothing; after an edit to one test program,
+   the four steps that read it. Left: stage 0 in `build.sh`, `install`,
+   `vm-pgo`, fuzzing, the heap-verified and no-JIT runs, `test-ffi`,
+   `test-lucid-session`, then `cc.msvc` and macOS, then CMake cut down to
+   the embedders' file and most of the `justfile` removed.
 9. **`cmake`**, when something wants to vendor a CMake project. Nothing in
    this repository does.
 10. **The single driver**, and the shared cache as a default.
