@@ -54,6 +54,25 @@ else
     echo "ok   and nothing is written for a script it does not have"; pass=$((pass + 1))
 fi
 
+# The unit cache forgets: a unit no build has used in a month is removed, one
+# in use is kept, and the directory is looked over once a day at most.
+mkdir -p "$tmp/units"
+touch "$tmp/units/walk-fresh"
+touch -d '40 days ago' "$tmp/units/walk-stale"
+MIND_UNITS="$tmp/units" run plain
+if [ -e "$tmp/units/walk-fresh" ] && [ ! -e "$tmp/units/walk-stale" ]; then
+    echo "ok   a unit unused for a month is forgotten, one in use is not"; pass=$((pass + 1))
+else
+    echo "FAIL the unit cache kept or dropped the wrong units: $(ls "$tmp/units" | tr '\n' ' ')"; fail=$((fail + 1))
+fi
+touch -d '40 days ago' "$tmp/units/walk-stale"
+MIND_UNITS="$tmp/units" run plain
+if [ -e "$tmp/units/walk-stale" ]; then
+    echo "ok   and it is looked over once a day, not at every build"; pass=$((pass + 1))
+else
+    echo "FAIL the unit cache was looked over twice in a day"; fail=$((fail + 1))
+fi
+
 mkdir -p "$tmp/p/app" "$tmp/p/lib" "$tmp/p/gen"
 printf '[package]\nname = "gen"\nversion = "1.0.0"\n' >"$tmp/p/gen/mind.toml"
 printf 'let line name = "let made_for = \\"" + name + "\\";";\n' >"$tmp/p/gen/source.dr"

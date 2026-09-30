@@ -412,9 +412,19 @@ is read back; `units.sh` asks that twice. Warm, parse went from 1.4 s to 0.47
 s, and `--time` puts the warm self-compile at 4.1 s: parse 0.47, expand 0.5,
 resolve 0.57, lower 0.8, types 0.2, share 0.4-1.2, emit 0.34.
 
-Next, in the order they would pay: a part's key narrowed from the whole
-declared state to the declarations the part's names reach, so that adding a
-function to one module does not walk every other again; and a cache that
-forgets. Every edit keeps new units and nothing removes the old ones, so
-`$MIND_HOME/units` only grows -- `mind` should drop units no build has read
-in a while.
+### A cache that forgets
+
+Every edit keeps new units, and a unit is never wrong -- it is keyed on what it
+was made from -- only never asked for again, so a cache left alone only grows.
+There is no `touch` in the VM, and a build should not need one: a unit read
+back is written again once it is a day old (`unit.refresh!`), so its
+modification time is within a day of the last build that wanted it, and `mind`
+removes the units no build has used in 30 days (`build.forget_units!`). It
+looks the directory over at most once a day, by a stamp in it, since a scan
+at every build would cost what the cache saves. Two `mind`s forgetting at once
+remove the same files, and a unit removed while a build reads it is computed
+again.
+
+Next: a part's key narrowed from the whole declared state to the declarations
+the part's names reach, so that adding a function to one module does not walk
+every other again.

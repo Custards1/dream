@@ -81,9 +81,25 @@ let recall! cache kind k = match cache {
         () => (),
         named => match file.read! (path dir kind named) {
             () => (),
-            bytes => match wire.decode bytes { [:ok, v] => v, _ => () },
+            bytes => match wire.decode bytes {
+                [:ok, v] => {
+                    refresh! (path dir kind named) bytes
+                    v
+                },
+                _ => (),
+            },
         },
     },
+};
+
+/// A unit read back is written again once it is a day old, so that its
+/// modification time says when a build last wanted it: what `mind` goes by to
+/// forget the units nothing has asked for in a month. A day, so that a unit
+/// read at every build is rewritten once a day and not once a build.
+let refresh! : :string -> :string -> :unit;
+let refresh! at bytes = match io.stat! at {
+    [_, modified, _] if vm.wall_ms! () - modified / 1000000 > 86400000 => file.replace! at bytes,
+    _ => (),
 };
 
 /// Keep `v` under `kind` and `k`. Written beside and renamed into place, so a

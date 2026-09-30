@@ -6,11 +6,13 @@
 // directories, run it. There is nothing to cache and no link step.
 import std.console;
 
+import std.file;
 import std.io;
 import std.list;
 import std.os;
 import std.str;
 import std.toml;
+import std.vm;
 import std.version;
 import std.build.Outcome;
 import std.build.Target;
@@ -1005,9 +1007,51 @@ let script_args! m o g =
 /// unit was computed from: `$MIND_UNITS`, or `units` in `mind`'s own
 /// directory, and `MIND_UNITS=off` for none.
 let units_args! () = match util.env_path! "MIND_UNITS" {
-    () => ["--units", util.join (util.mind_home! ()) "units"],
+    () => kept_units! (util.join (util.mind_home! ()) "units"),
     "off" => [],
-    dir => ["--units", dir],
+    dir => kept_units! dir,
+};
+
+let kept_units! dir = {
+    forget_units! dir
+    ["--units", dir]
+};
+
+// --- a cache that forgets ------------------------------------------------------
+//
+// Every edit makes new units and nothing makes one stale -- a unit is keyed on
+// what it was made from, so an old one is never wrong, only never asked for
+// again -- and so a unit cache left alone only grows. A unit that is read back
+// is written again when it is more than a day old (`unit.recall!` in
+// `dreams`), so a unit's modification time is within a day of the last build
+// that used it, and here the ones no build has used in `unit_days` are removed.
+// Once a day at most, by the modification time of a stamp in the cache: a
+// scan of the whole directory at every build would cost what the cache saves.
+// Two builds that forget at once remove the same files, and a unit removed
+// while a build reads it is a unit that build computes again.
+
+let unit_days = 30;
+let day_ms = 86400000;
+
+let forget_units! : :string -> :unit;
+let forget_units! dir = {
+    let now = vm.wall_ms! ();
+    let stamp = util.join dir "forgotten";
+    match io.stat! stamp {
+        [_, at, _] if now - at / 1000000 < day_ms => (),
+        _ => {
+            file.mkdir_all! dir
+            file.write! stamp ""
+            strict! (list.map (fn name -> forget_unit! (util.join dir name) now) (os.list_dir! dir))
+            ()
+        },
+    }
+};
+
+let forget_unit! path now = match io.stat! path {
+    [_, at, :file] if now - at / 1000000 > unit_days * day_ms =>
+        try! { io.remove! path } catch _ { () },
+    _ => (),
 };
 
 /// The whole command line for one build.

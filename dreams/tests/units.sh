@@ -106,6 +106,15 @@ refused "a syntax error" "shapes.dr"
 refused "the same syntax error, its parse read back" "shapes.dr"
 sed -i '/let broken/d' "$tmp/p/shapes.dr"
 same "and mended"
+# A unit read back is written again once it is a day old, which is what lets
+# `mind` tell a unit in use from one nothing asks for any more.
+for f in "$tmp/units"/*; do touch -d '2 days ago' "$f"; done
+same "a warm build over units two days old"
+if [ -n "$(find "$tmp/units" -type f -newermt '1 hour ago' | head -1)" ]; then
+    echo "ok   and the units it read were written again"; pass=$((pass + 1))
+else
+    echo "FAIL no unit read back was written again"; fail=$((fail + 1))
+fi
 if [ "$(made parse)" -gt 0 ]; then
     echo "ok   parses were kept"; pass=$((pass + 1))
 else
