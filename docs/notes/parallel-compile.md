@@ -460,3 +460,32 @@ warm 4.1 s, from 6.4 s); one added to `lower` walks thirteen (5.7 s, from
 globals are numbered in module order and every later module's numbers move.
 Numbering each module's globals from a base of its own would fix that, at
 the cost of a relocation in every consumer of a global index.
+
+### The key was quadratic in modules
+
+The part key came in with a quadratic of its own, which this repository's 67
+modules could not show: to find a module's submodules, `part_key` held every
+module's name against every prefix the part could see, for every part. On
+`scale.py`'s programs of four declarations a module, with `--units`:
+
+| modules | no cache | cold | warm | one body | one declaration |
+|---|---|---|---|---|---|
+| 400 | 2.5 s | 2.8 s | 1.8 s | 1.8 s | 1.9 s |
+| 800 | 4.6 s | 10.5 s | 8.1 s | 7.8 s | 7.8 s |
+
+A warm build of 800 modules was slower than no cache at all. `modules_under`
+now indexes every module by each dotted prefix of its name once per build,
+and a part's key reads that:
+
+| modules | no cache | cold | warm | one body | one declaration |
+|---|---|---|---|---|---|
+| 400 | 1.3 s | 1.4 s | 1.1 s | 1.0 s | 1.1 s |
+| 800 | 3.3 s | 3.7 s | 2.1 s | 2.1 s | 2.5 s |
+| 1600 | 8.2 s | 7.0 s | 4.3 s | 4.7 s | 5.0 s |
+| 3200 | 16.3 s | 15.6 s | 9.2 s | 9.4 s | 10.9 s |
+
+Linear, and what is left of a warm build at 1,600 modules is the whole-program
+work no unit holds: loading 1,600 files and reading their parses back (1.1 s),
+merging the parts (0.9 s), linking (0.9 s), sharing (0.7 s) and emitting
+(0.3 s), none of it dominated by one function. Making those per-module too is
+dynamic linking's question (docs/dynamic-linking.md), not the unit cache's.

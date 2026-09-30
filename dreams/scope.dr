@@ -2274,6 +2274,7 @@ let resolve_parts! l cache = {
     // every part another part (see "a part as a unit").
     let base = vm.share! (declared_base.[:next_global => invent_base]);
     let common = match cache { () => "", _ => common_key l base };
+    let under = match cache { () => %{}, _ => modules_under l };
     let all = pending declared;
     let numbered = list.zip (list.range 0 (list.length all)) all;
     // One part per module whose bodies it walks, in the order of the modules:
@@ -2288,7 +2289,7 @@ let resolve_parts! l cache = {
                                    (list.sort (list.map list.head (map_pairs by_module))));
     let key_of slice = match cache {
         () => "",
-        _ => part_key l base common (list.head (list.nth 1 (list.head slice))),
+        _ => part_key under base common (list.head (list.nth 1 (list.head slice))),
     };
     let running = strict! (list.map (fn slice -> walk_elsewhere! cache shared_l base (key_of slice) slice) slices);
     let walked = strict! (list.map (fn pr -> join! pr) running);
@@ -2341,15 +2342,32 @@ let common_key l base = unit.digest [
 /// module moves the parts that can see it and not the rest, as long as it
 /// moves no other module's globals: globals are numbered in module order, so
 /// one added early in the program is still seen by nearly every part.
-let part_key l base common mi = {
-    let names = list.map (fn i -> modules.module_name (modules.module_at l i)) (list.range 0 (modules.module_count l));
+let part_key : :map -> :map -> :string -> :integer -> :string;
+let part_key under base common mi = {
     let seen = reached_modules (env_at base mi) (%{ mi => true });
-    let prefixes = list.map (fn t -> names.[t] + ".") (list.filter (fn t -> type_of t == :integer) (map.keys seen));
-    let groups = list.map (fn p -> p + ".") (list.filter (fn p -> type_of p == :string) (map.keys seen));
-    let inside = list.filter (fn i -> list.any (fn pre -> str.starts_with pre (names.[i])) (prefixes + groups))
-                             (list.range 0 (list.length names));
-    let visible = list.sort (list.unique (list.filter (fn t -> type_of t == :integer) (map.keys seen) + inside));
-    unit.key ["base", common, unit.digest (list.map (fn t -> [t, env_at base t]) visible)]
+    let visible = list.fold (fn acc key -> list.fold (fn a i -> a.[i => true]) acc (under.[key else []]))
+                            seen (map.keys seen);
+    let ordered = list.sort (list.filter (fn t -> type_of t == :integer) (map.keys visible));
+    unit.key ["base", common, unit.digest (list.map (fn t -> [t, env_at base t]) ordered)]
+};
+
+/// The modules under each module and each namespace, by the module's index or
+/// the namespace's name: `std` and `std.list` lead to `std.list.sorted`, if
+/// there is one. Made once for every part's key, since asked per part it was
+/// every module's name against every prefix, for every part -- a quadratic
+/// that made a warm build of 800 modules slower than no cache at all.
+let modules_under : modules.Loader -> :map;
+let modules_under l = {
+    let count = modules.module_count l;
+    let index = list.fold (fn m i -> m.[modules.module_name (modules.module_at l i) => i]) (%{}) (list.range 0 count);
+    list.fold (fn acc i -> {
+        let parts = str.split "." (modules.module_name (modules.module_at l i));
+        let prefixes = list.map (fn n -> str.join_str "." (list.take n parts)) (list.range 1 (list.length parts));
+        list.fold (fn a pre -> {
+            let by_name = a.[pre => list_cons i (a.[pre else []])];
+            match index.[pre else ()] { () => by_name, t => by_name.[t => list_cons i (by_name.[t else []])] }
+        }) acc prefixes
+    }) (%{}) (list.range 0 count)
 };
 
 /// Every module an environment names, as `index => true`, and every namespace,

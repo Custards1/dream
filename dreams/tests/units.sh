@@ -70,6 +70,14 @@ else
 fi
 printf 'let extra = 1;\n' >>"$tmp/p/shapes.dr"
 same "a declaration added"
+# A module is seen through its submodules too: `util` names `shapes.extra.k`,
+# and a declaration put in front of `k` moves the global `util` was walked
+# against.
+printf 'mod extra { let k = 3; }\n' >>"$tmp/p/shapes.dr"
+printf 'let deep = shapes.extra.k;\n' >>"$tmp/p/util.dr"
+same "a submodule another module reaches into"
+sed -i 's/mod extra { let k = 3; }/mod extra { let before = 0; let k = 3; }/' "$tmp/p/shapes.dr"
+same "a declaration added to it"
 # A declaration walks again the parts that can see it and no others: `util`
 # and `main`, which imports it, and not `shapes` or the standard library.
 walks=$(made walk)
