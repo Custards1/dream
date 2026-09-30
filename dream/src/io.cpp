@@ -96,6 +96,8 @@ bool is_string(Value v) { return is_obj(resolve(v), ObjType::Str); }
 // program can reach a descriptor it was not given, or one it has closed.
 // ---------------------------------------------------------------------------
 
+void forget_waiter(int fd);
+
 struct Handle {
     int fd = -1;
     HandleKind kind = HandleKind::File;
@@ -186,7 +188,18 @@ public:
                 h.fd = -1;
             }
         }
-        if (to_close >= 0) sys::close(to_close);
+        if (to_close >= 0) {
+            // The close `close!` put off until this operation finished. That
+            // operation may have gone on to park its process on the
+            // descriptor -- `accept!` holds the handle until it has armed the
+            // poller -- and `close!`'s own `forget` ran before there was a
+            // waiter to release. Closing silently here left it parked for
+            // ever: a closed descriptor leaves epoll without an event. A test
+            // that stopped a listener while its accept loop was between the
+            // two hung at exit about one run in ten.
+            forget_waiter(to_close);
+            sys::close(to_close);
+        }
     }
 
     /// Every open handle, for `std.vm`.
@@ -1012,6 +1025,8 @@ NativeResult net_shutdown(Process& p, Value, Value* args, uint32_t) {
     sys::shutdown(h.fd(), SHUT_WR);
     return NativeResult::ok(UNIT);
 }
+
+void forget_waiter(int fd) { Poller::get().forget(fd); }
 
 }  // namespace
 
