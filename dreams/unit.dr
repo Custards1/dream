@@ -1,15 +1,16 @@
 // Compile units: a part of a build, kept between builds.
 //
-// A build resolves and lowers its program in parts, one per module, each in a
-// process of its own (see "resolving in parts" in `scope` and "lowering in
-// parts" in `lower`). A part is a function of a few things -- the program's
-// declarations, the module's own bodies, and for lowering the program's
-// wrappers -- and when none of them has changed since the last build its
-// answer has not either. So with a unit cache (`dreams --units DIR`) a part's
-// answer is written down under a key made of all of them, and the next build
-// that would compute the same thing reads it instead. Editing a module's
-// bodies re-walks and re-lowers that module; every other module's part is read
-// back. Everything after -- merging, checking, sharing, writing the image --
+// A build resolves, lowers and checks its program in parts, one per module,
+// each in a process of its own (see "resolving in parts" in `scope` and
+// "lowering in parts" in `lower`). A part is a function of a few things -- the
+// program's declarations and the module's own bodies, and besides those the
+// program's wrappers for lowering and its signatures for checking -- and when
+// none of them has changed since the last build its answer has not either. So
+// with a unit cache (`dreams --units DIR`) a part's answer is written down
+// under a key made of all of them, and the next build that would compute the
+// same thing reads it instead. Editing a module's bodies walks, lowers and
+// checks that module again; every other module's part is read back.
+// Everything after -- merging, settling `comp`s, sharing, writing the image --
 // runs as it always did, on the same values, so a build that read its parts
 // from the cache writes the image one that computed them writes.
 //

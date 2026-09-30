@@ -54,13 +54,19 @@ same() {
 
 same "a cold cache"
 same "a warm one"
-kept=$(ls "$tmp/units" | wc -l)
+# made KIND -- how many units of that kind the cache holds.
+made() { ls "$tmp/units" | grep -c "^$1-"; }
+walks=$(made walk); checks=$(made check)
 sed -i 's/let area w h = w \* h;/let area w h = h * w + 0;/' "$tmp/p/shapes.dr"
 same "a body edited in one module"
-if [ "$(ls "$tmp/units" | wc -l)" -lt "$((kept + 5))" ]; then
-    echo "ok   and only that module's parts were made again"; pass=$((pass + 1))
+# One module walked and checked again, and no other. Lowering is allowed
+# more: `double` is a wrapper whose literal the edit moved, and a wrapper's
+# callers are lowered against it (see `lower.reached_wrappers`).
+if [ "$(made walk)" = "$((walks + 1))" ] && [ "$(made check)" = "$((checks + 1))" ]; then
+    echo "ok   and only that module's part was walked and checked again"; pass=$((pass + 1))
 else
-    echo "FAIL an edit to one body made $(( $(ls "$tmp/units" | wc -l) - kept )) new units"; fail=$((fail + 1))
+    echo "FAIL an edit to one body made $(( $(made walk) - walks )) walks and $(( $(made check) - checks )) checks"
+    fail=$((fail + 1))
 fi
 printf 'let extra = 1;\n' >>"$tmp/p/shapes.dr"
 same "a declaration added"
@@ -68,6 +74,30 @@ sed -i 's/let name = "shapes";/let title = "shapes";\nlet name = title;/' "$tmp/
 same "a wrapper introduced where a value was"
 sed -i 's/shapes.name/shapes.title/' "$tmp/p/util.dr"
 same "a name another module uses changed"
+
+# A part's check is kept as well, and what it says of a body depends on
+# signatures written elsewhere: here a signature added to `shapes` makes a body
+# of `util` wrong without a character of `util` changing. A check read back
+# from before it would say nothing.
+printf 'let loose = shapes.double "x";\n' >>"$tmp/p/util.dr"
+same "a body no signature constrains"
+printf 'let double : :integer -> :integer;\n' >>"$tmp/p/shapes.dr"
+refused() {
+    ( cd "$tmp/p" && "$dream" "$image" -L "$root/mind" --units "$tmp/units" -o "$tmp/with.dream" main.dr >"$tmp/log1" 2>&1 )
+    s1=$?
+    ( cd "$tmp/p" && "$dream" "$image" -L "$root/mind" -o "$tmp/without.dream" main.dr >"$tmp/log2" 2>&1 )
+    s2=$?
+    if [ "$s1" != 0 ] && [ "$s2" != 0 ] && cmp -s "$tmp/log1" "$tmp/log2" && grep -q "$2" "$tmp/log1"; then
+        echo "ok   $1"; pass=$((pass + 1))
+    else
+        echo "FAIL $1: with units $s1, without $s2"
+        cat "$tmp/log1" "$tmp/log2" | head -8 | sed 's/^/    /'
+        fail=$((fail + 1))
+    fi
+}
+refused "a signature elsewhere that makes it wrong" "util.dr"
+sed -i '/let loose/d' "$tmp/p/util.dr"
+same "and the body taken away again"
 
 # The compiler itself, which is the program with the most parts there is.
 ( "$dream" "$image" -L "$root/mind" -L "$root" --units "$tmp/self" -o "$tmp/self1.dream" "$root/dreams/main.dr" >/dev/null 2>&1 &&

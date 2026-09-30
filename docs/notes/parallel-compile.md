@@ -362,8 +362,46 @@ whole resolving frame, the loader included: 1.7 GB more copied and twice the
 time, invisible to `--time` because `--time` runs serially. `!cache` and `!k`
 on `walk_elsewhere!` and `part_elsewhere!` are the fix.
 
-Next, in the order they would pay: checking kept per part (it reads the whole
-program's signatures and the settled `comp`s, so its key needs both); the
-parse kept per file; and a part's key narrowed from the whole declared state to
-the declarations the part's names reach, so that adding a function to one
-module does not walk every other again.
+### `--time` timed a pipeline no build runs
+
+It resolved, checked and lowered in one process, in its own order, and so it
+could not see a unit cache at all: a warm build and a cold one read the same.
+It now forces `compile.build!`'s stages one at a time -- in parts, from
+`--units`, with the sharing process -- and says what those cost. Two traps
+were found on the way. The first: `strict!` on a lowering made in parts
+forces its lazy `:image`, the parts shared in this process should the sharing
+process fail, which no build ever asks for. That was three seconds charged to
+`lower` that a build never spends, so the timer leaves that key out. The
+second: a clock read inside a list element is read when the list is printed,
+not where it is written, so the reading is bound first and forced as a
+statement.
+
+### Checking kept per part, and the checker built in a tenth of the time
+
+Read honestly, a warm build's largest stage was the type checker: 2.1 s of
+it, against 0.7 s for lowering. Its per-body half is now a unit like the
+others -- keyed on the part's walk and on a digest of what every body is
+checked against (`typecheck.tables`: the signatures, named types, what the
+`comp`s came to), so a signature changed in one module checks every part
+again and a body changed without one checks its own. `units.sh` has the case
+that proves the second half of the key is needed: a signature added to one
+module makes an untouched body of another wrong.
+
+That took the bodies from 0.5 s to 5 ms and the stage only to 1.7 s, because
+the rest was building the checker, which every build pays. 14% of a warm
+build's reductions were `mentions_refine`: whether a named type reaches a
+`where` through the names it mentions, walked afresh for each named type down
+every path to a depth of eight. `refined_table` builds the same answers a
+depth at a time, each depth reading the one below as a table, and building
+the checker went from 1.5 s to 0.13 s. That is a gain for every build, cached or
+not.
+
+A self-compile with the same VM, runs interleaved, old compiler against new:
+no cache 8.5 s -> 7.5 s, and a warm cache 6.5 s -> 4.9 s. Under `--time`, a
+warm build is now parse 1.4 s, expand 0.5, resolve 0.6, lower 0.7, types
+0.2, share 0.4-1.1, emit 0.35.
+
+Next, in the order they would pay: the parse kept per file, now the largest
+stage; and a part's key narrowed from the whole declared state to the
+declarations the part's names reach, so that adding a function to one module
+does not walk every other again.
