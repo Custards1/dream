@@ -1219,6 +1219,8 @@ NativeResult vm_host_members(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_open_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_call_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_close_image(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_wire_encode(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_wire_decode(Process& p, Value self, Value* args, uint32_t n);
 }  // namespace
 
 ModuleDef make_vm_module() {
@@ -1243,6 +1245,9 @@ ModuleDef make_vm_module() {
                          {"open_image!", 1, 0b1, vm_open_image},
                          {"call_image!", 4, 0b1111, vm_call_image, 0, true},
                          {"close_image!", 1, 0b1, vm_close_image},
+                         // `std.wire`'s format, done here; see "The wire format, natively".
+                         {"wire_encode", 1, 0b0, vm_wire_encode, 0, true},
+                         {"wire_decode", 1, 0b1, vm_wire_decode},
                          // measuring
                          {"now_ns!", 1, 0b1, vm_now_ns},
                          {"wall_ms!", 1, 0b1, vm_wall_ms},
@@ -2393,6 +2398,277 @@ NativeResult core_compare(Process& p, Value, Value* args, uint32_t) {
     int cmp = 0;
     if (!compare_values(p, args[0], args[1], 0, &cmp)) return NativeResult::raise(p.result);
     return NativeResult::ok(make_fixnum(cmp));
+}
+
+// --- the wire format, natively ---
+//
+// `std.wire` is written in Dream, a byte at a time, and it is exact and slow:
+// 150,000 small lists took 7.7 s to write and 70 s to read, which is a
+// language describing its own bytes through `str_le` and `str_byte`. Anything
+// that keeps a compiled program's state between runs -- a build's compile
+// units -- is that size, so the format is done here as well, byte for byte
+// the same: `std.wire.encode` and `decode` call these, and every message
+// either side writes the other reads. The Dream writer stays the definition
+// of the format, and `std.wire`'s tests hold the two to each other.
+//
+// The same rules, in the same places. A map's entries are written in the order
+// `compare` puts their keys, so equal maps are equal bytes. Anything that is
+// not data -- a function, a process -- is written as the string `to_string`
+// gives it, as `std.codec`'s `write_opaque` does. Reading never raises: a
+// value that is not one is `[:error, why]`. And an atom is only ever looked
+// up, never made, so a message cannot grow the atom table.
+
+enum : uint8_t {
+    WIRE_UNIT = 0, WIRE_FALSE = 1, WIRE_TRUE = 2, WIRE_INT = 3, WIRE_FLOAT = 4,
+    WIRE_STRING = 5, WIRE_ATOM = 6, WIRE_CHAR = 7, WIRE_LIST = 8, WIRE_ARRAY = 9,
+    WIRE_MAP = 10,
+};
+
+void wire_le(std::string* out, uint64_t v, int width) {
+    for (int i = 0; i < width; ++i) out->push_back(char((v >> (8 * i)) & 0xff));
+}
+
+void wire_bytes(std::string* out, uint8_t tag, const char* data, uint64_t len) {
+    out->push_back(char(tag));
+    wire_le(out, len, 4);
+    out->append(data, size_t(len));
+}
+
+/// Write a value that has already been forced all the way down. False when
+/// a map's keys could not be compared, which is the only way this can fail.
+bool wire_write(Process& p, Value v, std::string* out, int depth) {
+    v = resolve(v);
+    if (depth > 10000) return false;
+    if (is_unit(v)) { out->push_back(char(WIRE_UNIT)); return true; }
+    if (is_bool(v)) { out->push_back(char(v == TRUE_V ? WIRE_TRUE : WIRE_FALSE)); return true; }
+    if (is_fixnum(v)) {
+        out->push_back(char(WIRE_INT));
+        wire_le(out, uint64_t(fixnum_value(v)), 8);
+        return true;
+    }
+    if (is_char(v)) {
+        out->push_back(char(WIRE_CHAR));
+        wire_le(out, uint64_t(imm_payload(v)), 4);
+        return true;
+    }
+    if (is_atom(v)) {
+        const std::string& name = p.runtime().atom_name(uint32_t(imm_payload(v)));
+        wire_bytes(out, WIRE_ATOM, name.data(), name.size());
+        return true;
+    }
+    if (v == NIL) { out->push_back(char(WIRE_LIST)); wire_le(out, 0, 4); return true; }
+    if (is_ptr(v)) {
+        switch (as_obj(v)->type) {
+            case ObjType::Float: {
+                double d = static_cast<FloatObj*>(as_obj(v))->value;
+                char b[8];
+                std::memcpy(b, &d, 8);
+                out->push_back(char(WIRE_FLOAT));
+                out->append(b, 8);
+                return true;
+            }
+            case ObjType::Str: {
+                auto* s = static_cast<StrObj*>(as_obj(v));
+                wire_bytes(out, WIRE_STRING, s->data(), s->len);
+                return true;
+            }
+            case ObjType::Cons: {
+                // The count comes first and is not known until the spine has
+                // been walked, so a place is kept for it and filled after.
+                out->push_back(char(WIRE_LIST));
+                size_t at = out->size();
+                wire_le(out, 0, 4);
+                uint64_t n = 0;
+                for (Value cur = v; is_obj(cur, ObjType::Cons);
+                     cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+                    if (!wire_write(p, static_cast<ConsObj*>(as_obj(cur))->head, out, depth + 1)) return false;
+                    ++n;
+                }
+                for (int i = 0; i < 4; ++i) (*out)[at + i] = char((n >> (8 * i)) & 0xff);
+                return true;
+            }
+            case ObjType::Array: {
+                auto* a = static_cast<ArrayObj*>(as_obj(v));
+                out->push_back(char(WIRE_ARRAY));
+                wire_le(out, a->len, 4);
+                for (uint32_t i = 0; i < a->len; ++i) {
+                    if (!wire_write(p, static_cast<ArrayObj*>(as_obj(v))->items()[i], out, depth + 1)) return false;
+                }
+                return true;
+            }
+            case ObjType::Map: {
+                std::vector<std::pair<Value, Value>> entries;
+                map_collect(v, entries);
+                bool ok = true;
+                std::stable_sort(entries.begin(), entries.end(), [&](const auto& x, const auto& y) {
+                    int cmp = 0;
+                    if (!compare_values(p, x.first, y.first, 0, &cmp)) ok = false;
+                    return cmp < 0;
+                });
+                if (!ok) return false;
+                out->push_back(char(WIRE_MAP));
+                wire_le(out, entries.size(), 4);
+                for (auto& [k, val] : entries) {
+                    if (!wire_write(p, k, out, depth + 1) || !wire_write(p, val, out, depth + 1)) return false;
+                }
+                return true;
+            }
+            case ObjType::BigStr: {
+                auto* b = static_cast<BigStrObj*>(as_obj(v));
+                wire_bytes(out, WIRE_STRING, b->data, b->len);
+                return true;
+            }
+            default: break;
+        }
+    }
+    // Not data: its text, as `std.codec`'s `write_opaque` writes it.
+    std::string text;
+    if (!stringify(p, v, &text)) return false;
+    wire_bytes(out, WIRE_STRING, text.data(), text.size());
+    return true;
+}
+
+NativeResult vm_wire_encode(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    std::string out;
+    if (!wire_write(p, forced, &out, 0)) {
+        return type_fail(p, "wire_encode: a map's keys could not be compared, or the value nests too deep");
+    }
+    if (out.size() > UINT32_MAX) return type_fail(p, "wire_encode: the message is larger than a string can be");
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+struct WireReader {
+    Process& p;
+    const unsigned char* data;
+    uint64_t len;
+    uint64_t at = 0;
+
+    bool has(uint64_t n) const { return at + n <= len; }
+    uint64_t le(int width) {
+        uint64_t v = 0;
+        for (int i = width - 1; i >= 0; --i) v = (v << 8) | data[at + i];
+        at += width;
+        return v;
+    }
+
+    /// One value, or false for bytes that are not one.
+    bool read(Value* out, int depth) {
+        if (depth > 10000 || !has(1)) return false;
+        uint8_t tag = data[at++];
+        switch (tag) {
+            case WIRE_UNIT: *out = UNIT; return true;
+            case WIRE_FALSE: *out = make_bool(false); return true;
+            case WIRE_TRUE: *out = make_bool(true); return true;
+            case WIRE_INT: {
+                if (!has(8)) return false;
+                // A fixnum is 63 bits: the top byte is under 0x40 or at least
+                // 0xC0, and anything between is a number this runtime cannot
+                // hold, which `std.wire` refuses too.
+                uint8_t top = data[at + 7];
+                if (top >= 64 && top < 192) return false;
+                *out = make_integer(p, int64_t(le(8)));
+                return true;
+            }
+            case WIRE_FLOAT: {
+                if (!has(8)) return false;
+                double d;
+                std::memcpy(&d, data + at, 8);
+                at += 8;
+                *out = p.heap().make_float(d);
+                return true;
+            }
+            case WIRE_STRING: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                if (!has(n)) return false;
+                *out = p.heap().make_string(reinterpret_cast<const char*>(data + at), uint32_t(n));
+                at += n;
+                return true;
+            }
+            case WIRE_ATOM: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                if (!has(n)) return false;
+                uint32_t id;
+                if (!p.runtime().find_atom(std::string_view(reinterpret_cast<const char*>(data + at), n), &id)) {
+                    return false;
+                }
+                at += n;
+                *out = make_atom(id);
+                return true;
+            }
+            case WIRE_CHAR: {
+                if (!has(4)) return false;
+                uint64_t code = le(4);
+                if (code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) return false;
+                *out = make_char(uint32_t(code));
+                return true;
+            }
+            case WIRE_LIST: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                std::vector<Value> items;
+                items.reserve(size_t(std::min<uint64_t>(n, len)));
+                for (uint64_t i = 0; i < n; ++i) {
+                    Value item;
+                    if (!read(&item, depth + 1)) return false;
+                    items.push_back(item);
+                }
+                Value list = NIL;
+                for (size_t i = items.size(); i-- > 0;) list = p.heap().make_cons(items[i], list);
+                *out = list;
+                return true;
+            }
+            case WIRE_ARRAY: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                if (n > len) return false;
+                std::vector<Value> items;
+                items.reserve(size_t(n));
+                for (uint64_t i = 0; i < n; ++i) {
+                    Value item;
+                    if (!read(&item, depth + 1)) return false;
+                    items.push_back(item);
+                }
+                Value arr = p.heap().make_array(uint32_t(n));
+                for (uint64_t i = 0; i < n; ++i) static_cast<ArrayObj*>(as_obj(arr))->items()[i] = items[i];
+                *out = arr;
+                return true;
+            }
+            case WIRE_MAP: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                Value m = p.heap().make_map(0);
+                for (uint64_t i = 0; i < n; ++i) {
+                    Value k, v;
+                    if (!read(&k, depth + 1) || !read(&v, depth + 1)) return false;
+                    m = resolve(map_insert(p, m, k, v));
+                }
+                *out = m;
+                return true;
+            }
+            default: return false;
+        }
+    }
+};
+
+NativeResult vm_wire_decode(Process& p, Value, Value* args, uint32_t) {
+    Bytes b;
+    if (!string_bytes(args[0], &b)) return type_fail(p, "wire_decode needs a string");
+    WireReader r{p, reinterpret_cast<const unsigned char*>(b.data), b.len};
+    Value v;
+    const char* why = nullptr;
+    if (!r.read(&v, 0)) why = "not a wire value";
+    else if (r.at != r.len) why = "trailing bytes after a wire value";
+    Value tag = make_atom(p.runtime().intern_atom(why ? "error" : "ok"));
+    Value second = why ? p.heap().make_string(why, uint32_t(std::strlen(why))) : v;
+    Value list = p.heap().make_cons(second, NIL);
+    return NativeResult::ok(p.heap().make_cons(tag, list));
 }
 
 // --- large data ---

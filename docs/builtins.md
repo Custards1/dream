@@ -406,6 +406,8 @@ These report figures for the **calling** process.
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `share!` | `value → value` | The same value, forced all the way down and moved into the runtime's shared area. From then on a `spawn!`, `send!` or `join!` carrying it copies a pointer rather than the value. |
+| `wire_encode` | `value → string` | The value, forced all the way down, in `std.wire`'s format, byte for byte what `std.wire`'s Dream writer produces, and thousands of times faster: `std.wire.encode` is this. A map is written in the order `compare` puts its keys; what is not data is written as its `to_string`. |
+| `wire_decode` | `string → [:ok, value] \| [:error, string]` | One `std.wire` message, read whole. Never raises. Trailing bytes, a truncated field, an integer past 63 bits and an atom this program does not have are all `[:error, why]` -- an atom is looked up, never made. `std.wire.decode` is this. |
 | `shared_bytes!` | `unit → integer` | Bytes in the runtime's shared area. |
 
 Processes share nothing: a value that crosses between two is copied, which is
