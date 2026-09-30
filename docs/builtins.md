@@ -284,6 +284,9 @@ import std.io;
 | `remove!` | `path:string → unit` | Deletes a file. Raises on failure. |
 | `rename!` | `from:string → to:string → unit` | Renames or moves a file. Raises on failure. |
 | `mkdir!` | `path:string → unit` | Creates a directory. Silently succeeds if it already exists. |
+| `stat!` | `path:string → [size:integer, modified:integer, kind:atom] \| unit` | A path's stamp: its size, when it was last written in nanoseconds since the epoch (seconds' resolution on Windows), and `:file`, `:dir` or `:other`. `()` when nothing is there, which is an answer rather than a failure: a deleted input has moved as surely as a rewritten one. |
+| `digest!` | `path:string → string` | The SHA-256 of a file's contents, as 64 lowercase hex digits, read in the VM rather than a chunk at a time through the heap. Raises as `open!` does. |
+| `digest` | `data:string → string` | The SHA-256 of a string, the digest `digest!` gives the file holding the same bytes. Pure. |
 
 ### Error atoms
 

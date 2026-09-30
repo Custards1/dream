@@ -325,9 +325,9 @@ imports, so `mind` treats it as a dependency like any other.
 **File digests are cached behind a stamp**, which is git's index trick. A
 file's `(size, modified)` is kept beside its digest, and the contents are
 read only when the stamp has moved. Digesting in Dream would be the most
-expensive thing a no-op build does, so the VM does it: this needs
-`io.stat!`, `io.digest!` for a file and a pure `digest` for a string. None of
-them exist yet.
+expensive thing a no-op build does, so the VM does it: `io.stat!` gives the
+stamp, `io.digest!` the SHA-256 of a file and the pure `io.digest` that of a
+string, and the two agree on the same bytes.
 
 ## What `mind` does with it
 
@@ -677,7 +677,11 @@ they are built says is not optional.
    the header bits, the VM's check and `--any-target`, and
    `docs/bytecode-format.md`. This stands alone and is useful now, for any
    image with an embedded library.
-2. **VM primitives.** `io.stat!`, `io.digest!` and `digest`.
+2. **VM primitives. Built.** `io.stat!`, `io.digest!` and `io.digest`, which is
+   SHA-256 so that the digest pinning a fetched source is the one its
+   publisher printed. The pure one is in `std.io` rather than among the
+   builtins: it is `digest!` asked of bytes already in hand, and a builtin
+   costs an opcode.
 3. **`std.build` core.** The vocabulary, keys, the runner (sequential
    first, then concurrent), the stamp cache, outcomes, `write`, `command`,
    and `when test` blocks for each.
