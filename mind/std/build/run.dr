@@ -334,7 +334,7 @@ let build_all! ctx st steps = {
             strict! results
             fold! (fn m r -> match r {
                 [:ok, [:ok, _]] => m + 1,
-                [:ok, [:error, why]] => fail! why,
+                [:ok, [:error, why]] => fail! ("in `" + build.Context.package ctx + "`, " + why),
                 [:error, e] => fail! (to_string e),
             }) n results
         }) done (chunks jobs batch)
@@ -384,25 +384,90 @@ let outcome ctx plan mods st =
 let stamps_file : :map -> :string;
 let stamps_file ctx = build.Context.cache ctx + "/stamps";
 
-/// The driver's `main!`: `run.run! script.plan`.
+/// The stamps a run starts from: what the last run in this cache knew.
+let known_stamps! : :map -> :map;
+let known_stamps! ctx = match file.read! (stamps_file ctx) {
+    () => %{},
+    text => match wire.decode text { [:ok, m] => m, _ => %{} },
+};
+
+/// One script's plan, carried out from `known` stamps: `[outcome, stamps]`.
+let carry_out! : :map -> :map -> (:map -> :map) -> [:any];
+let carry_out! ctx known plan_of = {
+    file.mkdir_all! (build.Context.cache ctx)
+    let [plan, mods, st] = settle! ctx (State.set_stamps (State.new ()) known) (plan_of ctx);
+    let answer = outcome ctx plan mods st;
+    strict! answer
+    [answer, State.stamps st]
+};
+
+/// `carry_out!` in a process of its own. A function by itself so that the
+/// thunk `proc` spawns carries this frame -- a context, the stamps and the
+/// script's `plan` -- and not the frame of the run that started it.
+let carry_out_elsewhere! : [:any] -> [:any];
+let carry_out_elsewhere! job = {
+    let [ctx, known, plan_of] = job;
+    carry_out! ctx known plan_of
+};
+
+/// A script run by hand, or by a driver of its own: `run.run! script.plan`.
+/// With no `--context` it builds for this machine and prints what it would
+/// hand the compiler, which is how a script is debugged.
 let run! : (:map -> :map) -> :unit;
 let run! plan_of = {
     let args = os.args! ();
     let ctx = context! args;
     strict! ctx
-    file.mkdir_all! (build.Context.cache ctx)
-    let known = match file.read! (stamps_file ctx) {
-        () => %{},
-        text => match wire.decode text { [:ok, m] => m, _ => %{} },
-    };
-    let [plan, mods, st] = settle! ctx (State.set_stamps (State.new ()) known) (plan_of ctx);
-    strict! st
-    file.write! (stamps_file ctx) (wire.encode (State.stamps st))
-    let answer = outcome ctx plan mods st;
-    strict! answer
+    let [answer, stamps] = carry_out! ctx (known_stamps! ctx) plan_of;
+    file.write! (stamps_file ctx) (wire.encode stamps)
     match flag_value "--outcome" args {
         () => console.print! (to_string answer),
         f => file.write! f (wire.encode answer),
+    }
+};
+
+/// Every package's script in one program: `mind`'s driver, which is one
+/// compile and one VM however many packages have a script.
+///
+/// `--contexts FILE` is a map of key to context, and only the scripts it
+/// names are run -- the others' answers are still good, which `mind` knows
+/// and this does not need to. They run at once, each in a process of its own,
+/// sharing one cache and one stamp table, which is read before and written
+/// after rather than by each, so that two scripts cannot lose each other's
+/// stamps. `--outcomes FILE` gets a map of key to outcome.
+let run_all! : [[:any]] -> :unit;
+let run_all! scripts = {
+    let args = os.args! ();
+    let contexts = match flag_value "--contexts" args {
+        () => fail! "run_all! needs --contexts",
+        f => match file.read! f {
+            () => fail! ("cannot read the contexts " + f),
+            text => match wire.decode text {
+                [:ok, m] if list.all (fn [_, c] -> build.is_context c) (map_pairs m) => m,
+                _ => fail! ("the contexts " + f + " are not a map of build.Context"),
+            },
+        },
+    };
+    strict! contexts
+    let chosen = list.filter (fn [key, _] -> map_has contexts key) scripts;
+    match chosen {
+        [] => (),
+        [[first, _], .._] => {
+            let known = known_stamps! (contexts.[first]);
+            let results = proc.try_map! carry_out_elsewhere!
+                                        (list.map (fn [key, plan_of] -> [contexts.[key], known, plan_of]) chosen);
+            strict! results
+            let [outcomes, stamps] = list.fold (fn [found, st] [[key, _], r] -> match r {
+                [:ok, [answer, more]] => [found.[key => answer], map.merge st more],
+                [:error, e] => fail! ("the build script of `" + key + "` failed: " + to_string e),
+            }) [%{}, known] (list.zip chosen results);
+            strict! outcomes
+            file.write! (stamps_file (contexts.[first])) (wire.encode stamps)
+            match flag_value "--outcomes" args {
+                () => console.print! (to_string outcomes),
+                f => file.write! f (wire.encode outcomes),
+            }
+        },
     }
 };
 

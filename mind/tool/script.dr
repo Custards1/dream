@@ -78,14 +78,18 @@ priv let deadline_ms = 30 * 60 * 1000;
 priv let here! : :unit -> :map;
 priv let here! () = Target.make (os.platform ()) (os.arch ());
 
-/// Where step directories live: one cache for every package in the project,
-/// or for every project when `MIND_BUILD_CACHE` says where. Sharing is safe
-/// because a step's directory is named by its key and filled atomically.
+/// Where step directories live: `$MIND_BUILD_CACHE`, or `build` under
+/// `mind`'s own directory, shared by every project on the machine. Sharing is
+/// safe because a step's directory is named by its key -- everything that
+/// could change what it holds -- and is filled in a scratch directory renamed
+/// into place, so two builds asking for the same step at once cannot see half
+/// of one; and it is worth it because the same step asked for by two projects
+/// is done once.
 priv let steps_dir! : :map -> :string;
-priv let steps_dir! setting = match util.env_path! "MIND_BUILD_CACHE" {
-    () => util.absolute! (util.join (Setting.target_dir setting) "build/steps"),
-    dir => util.absolute! dir,
-};
+priv let steps_dir! setting = util.absolute! (match util.env_path! "MIND_BUILD_CACHE" {
+    () => util.join (util.mind_home! ()) "build",
+    dir => dir,
+});
 
 priv let dir_of : :map -> :map -> :string;
 priv let dir_of setting s = util.join (Setting.target_dir setting) ("build/" + Scripted.key s);
@@ -116,22 +120,77 @@ priv let unmoved! recorded = list.all (fn [p, was] -> match io.stat! p {
     [size, modified, _] => was == [size, modified],
 }) (map_pairs recorded);
 
-// --- the driver ----------------------------------------------------------------------
+// --- drivers ---------------------------------------------------------------------------
+//
+// One driver runs every script whose build dependencies are the same, which in
+// a project whose scripts use only `std` is every script it has: one compile
+// and one VM however many packages have one. Scripts with different build
+// dependencies cannot share, because each script's packages are a namespace of
+// its own -- a tool may use `json` 1.x while another uses 2.x -- and one
+// program has one namespace. So scripts are grouped by the `-L` roots they are
+// compiled with, and a group is a driver.
+//
+// Every script is a file called `build.dr`, so a driver cannot import two of
+// them by that name. Each script's package is given a name for the driver's
+// compile alone, `mind_script_N`, as an alias (`-L NAME=DIR`) and as an
+// overlay of its own directory (`-L NAME+=DIR`), which finds the script beside
+// the manifest even when the package keeps its modules in `src/`; and the
+// driver imports it `as script_N`.
 
-/// The driver's own directory holds a manifest, so that the driver is a
-/// package of its own: written anywhere under the project, it would belong to
-/// the project, and `import build` would find the project's script rather than
-/// a dependency's.
-priv let write_driver! : :string -> :unit;
-priv let write_driver! dir = {
-    file.mkdir_all! dir
-    file.write! (util.join dir "mind.toml") "[package]\nname = \"mind_build_driver\"\nversion = \"0.0.0\"\n"
-    file.write! (util.join dir "main.dr")
-                ("// Written by mind: runs this package's build script.\n"
-                 + "import std.build.run;\nimport build;\nlet main! = run.run! build.plan;\n")
+/// Scripts that can share a driver, in the order they came.
+priv let groups : [:map] -> [[:map]];
+priv let groups scripted = {
+    let by = list.fold (fn acc s -> map.update [] (fn xs -> list.append xs [s]) acc (str.join_str "\n" (Scripted.paths s)))
+                       (%{}) scripted;
+    list.map (fn k -> by.[k]) (list.unique (list.map (fn s -> str.join_str "\n" (Scripted.paths s)) scripted))
 };
 
-/// The files the driver is compiled from, from `dreams --modules`.
+/// The script as a module path inside its package: `build`, or `tools.build`
+/// for `[build] script = "tools/build.dr"`.
+priv let script_module : :map -> :string;
+priv let script_module s = {
+    // Both are absolute, and the script is inside the package, so the module
+    // path is what follows the root.
+    let from = str.byte_length (Scripted.root s) + 1;
+    let rel = str.slice from (str.byte_length (Scripted.script s) - from - 3) (Scripted.script s);
+    str.join_str "." (str.split "/" rel)
+};
+
+priv let group_dir : :map -> [:map] -> :string;
+priv let group_dir setting group =
+    util.join (Setting.target_dir setting)
+              ("build/_drivers/" + str.slice 0 16 (io.digest (str.join_str "\n" (Scripted.paths (list.head group)))));
+
+/// The driver's source. Its directory holds a manifest, so that the driver is
+/// a package of its own: written anywhere under the project without one, it
+/// would belong to the project.
+priv let write_driver! : :string -> [:map] -> :unit;
+priv let write_driver! dir group = {
+    file.mkdir_all! dir
+    file.write! (util.join dir "mind.toml") "[package]\nname = \"mind_build_driver\"\nversion = \"0.0.0\"\n"
+    let numbered = list.enumerate group;
+    file.write! (util.join dir "main.dr")
+                (str.join_str "" (list.concat [
+                    ["// Written by mind: runs these packages' build scripts.\nimport std.build.run;\n"],
+                    list.map (fn [i, s] -> "import mind_script_" + to_string i + "." + script_module s
+                                           + " as script_" + to_string i + ";\n") numbered,
+                    ["let main! = run.run_all! [\n"],
+                    list.map (fn [i, s] -> "    [\"" + Scripted.key s + "\", script_" + to_string i + ".plan],\n") numbered,
+                    ["];\n"],
+                ]))
+};
+
+/// The `-L` roots a group's driver is compiled with.
+priv let driver_roots : [:map] -> [:string];
+priv let driver_roots group =
+    list.concat [list.flat_map (fn [i, s] -> ["-L", "mind_script_" + to_string i + "=" + Scripted.root s,
+                                              "-L", "mind_script_" + to_string i + "+=" + Scripted.root s])
+                               (list.enumerate group),
+                 list.flat_map (fn p -> ["-L", p]) (Scripted.paths (list.head group))];
+
+/// The files one script is compiled from, from `dreams --modules`, which
+/// loads and does not compile: what a package's record keeps, so that editing
+/// one script runs that one again and no other.
 let sources_of : :string -> [:string];
 let sources_of listing =
     list.flat_map (fn line -> match list.filter (fn w -> not (str.is_empty w)) (str.split " " line) {
@@ -145,80 +204,102 @@ priv let compiler_args setting args = match Setting.compiler setting {
     [program, ..lead] => [program, list.append lead args],
 };
 
-/// Compile the driver for `s`, and answer `[:ok, sources]`: the stamps of
-/// every file its image was compiled from.
-priv let compile_driver! : :map -> :map -> :any;
-priv let compile_driver! setting s = {
-    let dir = dir_of setting s;
-    let driver = util.join dir "driver";
-    write_driver! driver
-    // The script's own directory first, so `import build` finds this script and
-    // not one beside some tool it builds with.
-    let roots = list.flat_map (fn p -> ["-L", p]) (list.cons (util.dirname (Scripted.script s)) (Scripted.paths s));
-    let main = util.join driver "main.dr";
-    let [program, args] = compiler_args setting (list.concat [[main], roots, ["-o", util.join dir "script.dream"]]);
+priv let script_sources! : :map -> :map -> :map;
+priv let script_sources! setting s = {
+    let [lp, largs] = compiler_args setting (list.concat [["--modules", Scripted.script s],
+                                                          list.flat_map (fn p -> ["-L", p]) (Scripted.paths s)]);
+    stamps! (sources_of (os.exec! lp largs).[:out])
+};
+
+priv let compile_driver! : :map -> :string -> [:map] -> :any;
+priv let compile_driver! setting dir group = {
+    write_driver! (util.join dir "driver") group
+    let [program, args] = compiler_args setting (list.concat [[util.join dir "driver/main.dr"], driver_roots group,
+                                                              ["-o", util.join dir "script.dream"]]);
     if Setting.verbose setting { console.error! (str.join_str " " (list.cons program args)) }
     let r = os.exec! program args;
     match r.[:code] {
-        0 => {
-            let [lp, largs] = compiler_args setting (list.concat [["--modules", main], roots]);
-            let listed = os.exec! lp largs;
-            [:ok, stamps! (sources_of listed.[:out])]
-        },
-        _ => [:error, "the build script of `" + Scripted.key s + "` does not compile:\n" + str.trim (r.[:err] + r.[:out])],
+        0 => [:ok, ()],
+        _ => [:error, "the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
+                      + " do not compile:\n" + str.trim (r.[:err] + r.[:out])],
     }
 };
 
-// --- one script ----------------------------------------------------------------------
+// --- one group ---------------------------------------------------------------------------
 
-/// Run `s`'s script, or reuse what it answered last, and answer
-/// `[:ok, outcome]` or `[:error, why]`.
-priv let run_one! : [:map] -> :any;
-priv let run_one! pair = {
-    let [setting, s] = pair;
-    let dir = dir_of setting s;
-    let record_file = util.join dir "record";
-    let ctx_bytes = wire.encode (context! setting s);
-    let ctx_digest = io.digest ctx_bytes;
-    let record = match file.read! record_file {
-        () => %{},
-        text => match wire.decode text { [:ok, r] => r, _ => %{} },
-    };
+priv let read_record! : :string -> :map;
+priv let read_record! f = match file.read! f {
+    () => %{},
+    text => match wire.decode text { [:ok, r] => r, _ => %{} },
+};
+
+/// Whether a package's last answer is still good: the same context, and
+/// nothing its script was compiled from or its run read has moved.
+priv let fresh! : :map -> :string -> :bool;
+priv let fresh! record ctx_digest = match record {
+    %{ :context => c, :sources => sources, :reads => reads } =>
+        c == ctx_digest && unmoved! sources && unmoved! reads,
+    _ => false,
+};
+
+/// Run the group's stale scripts, or none, and answer `[:ok, [[key, outcome]]]`
+/// for all of them, or `[:error, why]`.
+priv let run_group! : [:any] -> :any;
+priv let run_group! job = {
+    let [setting, group] = job;
+    let dir = group_dir setting group;
     let image = util.join dir "script.dream";
-    let fresh = match record {
-        %{ :context => c, :sources => sources, :reads => reads } =>
-            c == ctx_digest && io.exists! image && unmoved! sources && unmoved! reads,
-        _ => false,
-    };
-    match fresh {
-        true => [:ok, record.[:outcome]],
-        false => {
+    let listed = list.map (fn s -> [Scripted.key s, Scripted.script s]) group;
+    let each = list.map (fn s -> {
+        let ctx = context! setting s;
+        let record_file = util.join (dir_of setting s) "record";
+        [s, ctx, io.digest (wire.encode ctx), record_file, read_record! record_file]
+    }) group;
+    strict! each
+    let stale = list.filter (fn [_, _, digest, _, record] -> not (io.exists! image && fresh! record digest)) each;
+    match stale {
+        [] => [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each],
+        _ => {
             file.mkdir_all! dir
-            let compiled = match record.[:sources else ()] {
-                known if known != () && io.exists! image && unmoved! known => [:ok, known],
-                _ => compile_driver! setting s,
+            let driver = read_record! (util.join dir "record");
+            // A stale script whose sources moved (or were never listed) is why
+            // the driver is compiled again; one whose context or reads moved
+            // only has to be run.
+            let moved = list.filter (fn [_, _, _, _, record] -> match record.[:sources else ()] {
+                () => true,
+                sources => not (unmoved! sources),
+            }) stale;
+            let compiled = match [driver.[:scripts else ()] == listed && io.exists! image, moved] {
+                [true, []] => [:ok, ()],
+                _ => compile_driver! setting dir group,
             };
             match compiled {
                 [:error, why] => [:error, why],
-                [:ok, sources] => {
-                    let ctx_file = util.join dir "context";
-                    let out_file = util.join dir "outcome";
-                    file.write! ctx_file ctx_bytes
-                    let r = os.exec_for! (Setting.vm setting) [image, "--context", ctx_file, "--outcome", out_file] deadline_ms;
+                [:ok, _] => {
+                    file.write! (util.join dir "record") (wire.encode (%{ :scripts => listed }))
+                    let contexts = list.fold (fn m [s, ctx, _, _, _] -> m.[Scripted.key s => ctx]) (%{}) stale;
+                    let ctx_file = util.join dir "contexts";
+                    let out_file = util.join dir "outcomes";
+                    file.write! ctx_file (wire.encode contexts)
+                    let r = os.exec_for! (Setting.vm setting) [image, "--contexts", ctx_file, "--outcomes", out_file] deadline_ms;
                     match [r.[:timed_out], r.[:code]] {
-                        [true, _] => [:error, "the build script of `" + Scripted.key s + "` ran for longer than "
-                                              + to_string (deadline_ms / 60000) + " minutes"],
-                        [_, 0] => match file.read! out_file {
-                            () => [:error, "the build script of `" + Scripted.key s + "` wrote no outcome"],
-                            text => match wire.decode text {
-                                [:ok, outcome] if types.accepts Outcome.type outcome => {
-                                    file.write! record_file (wire.encode (%{ :context => ctx_digest, :sources => sources,
-                                                                            :reads => Outcome.reads outcome,
-                                                                            :outcome => outcome }))
-                                    [:ok, outcome]
-                                },
-                                _ => [:error, "the build script of `" + Scripted.key s + "` wrote an outcome that does not read"],
+                        [true, _] => [:error, "the build scripts ran for longer than " + to_string (deadline_ms / 60000) + " minutes"],
+                        [_, 0] => match wire.decode (match file.read! out_file { () => "", t => t }) {
+                            [:ok, outcomes] if list.all (fn [_, o] -> types.accepts Outcome.type o) (map_pairs outcomes) => {
+                                strict! (list.map (fn [s, _, digest, record_file, record] -> {
+                                    let sources = match list.any (fn [m, .._] -> Scripted.key m == Scripted.key s) moved {
+                                        true => script_sources! setting s,
+                                        false => record.[:sources],
+                                    };
+                                    let o = outcomes.[Scripted.key s];
+                                    file.mkdir_all! (dir_of setting s)
+                                    file.write! record_file (wire.encode (%{ :context => digest, :sources => sources,
+                                                                            :reads => Outcome.reads o, :outcome => o }))
+                                }) stale)
+                                [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, outcomes.[Scripted.key s else record.[:outcome]]])
+                                               each]
                             },
+                            _ => [:error, "the build scripts wrote outcomes that do not read"],
                         },
                         _ => [:error, str.trim (r.[:err] + r.[:out])],
                     }
@@ -228,33 +309,27 @@ priv let run_one! pair = {
     }
 };
 
-// --- all of them ----------------------------------------------------------------------
+// --- all of them --------------------------------------------------------------------------
 
-priv let chunks : :integer -> [a] -> [[a]];
-priv let rec chunks n xs = match xs {
-    [] => [],
-    _ => list.cons (list.take n xs) (chunks n (list.drop n xs)),
-};
-
-/// Every script in the build, `jobs` at a time, answering `[:ok, [[key, outcome]]]`
-/// or the first failure.
+/// Every script in the build: each group's driver at once, answering
+/// `[:ok, [[key, outcome]]]` in the order the scripts came, or the first failure.
 let run_all! : :map -> [:map] -> :any;
 let run_all! setting scripted = {
-    let jobs = if Setting.jobs setting < 1 { 1 } else { Setting.jobs setting };
-    let results = list.concat (list.map (fn group -> {
-        let rs = proc.try_map! run_one! (list.map (fn s -> [setting, s]) group);
-        strict! rs
-        list.zip (list.map Scripted.key group) rs
-    }) (chunks jobs scripted));
+    let results = proc.try_map! run_group! (list.map (fn g -> [setting, g]) (groups scripted));
     strict! results
-    // The first failure, or every outcome: `[key, [:ok, [:ok, o]]]` is a script
-    // that answered, and anything else is the reason the build stops.
-    list.fold (fn acc [key, r] -> match [acc, r] {
+    let found = list.fold (fn acc r -> match [acc, r] {
         [[:error, _], _] => acc,
-        [[:ok, done], [:ok, [:ok, outcome]]] => [:ok, list.append done [[key, outcome]]],
+        [[:ok, done], [:ok, [:ok, more]]] => [:ok, list.append done more],
         [_, [:ok, [:error, why]]] => [:error, why],
-        [_, [:error, e]] => [:error, "the build script of `" + key + "` failed: " + to_string e],
-    }) [:ok, []] results
+        [_, [:error, e]] => [:error, "the build scripts failed: " + to_string e],
+    }) [:ok, []] results;
+    match found {
+        [:ok, pairs] => {
+            let by = map.from_pairs pairs;
+            [:ok, list.map (fn s -> [Scripted.key s, by.[Scripted.key s]]) scripted]
+        },
+        failed => failed,
+    }
 };
 
 // --- into the compile -------------------------------------------------------------------

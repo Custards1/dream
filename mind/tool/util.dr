@@ -42,6 +42,18 @@ let home! () = match os.env! "HOME" {
     home => home,
 };
 
+/// `mind`'s own directory: `$MIND_HOME`, or `~/.mind`. What is kept there is
+/// shared between projects, because it is keyed by what it is -- a repository
+/// at a revision, a build step by its key -- and not by who asked.
+let mind_home! () =
+    match env_path! "MIND_HOME" {
+        () => match home! () {
+            () => ".mind",
+            h => join h ".mind",
+        },
+        h => h,
+    };
+
 /// A leading `~` means the home directory.
 ///
 /// A shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`

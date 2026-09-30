@@ -749,7 +749,7 @@ let stdlib_root! () = {
     let named = util.env_path! "MIND_STDLIB";
     if named != () { named }
     else {
-        let home = match util.env_path! "MIND_HOME" { () => util.join (home_dir! ()) ".mind", h => h };
+        let home = util.mind_home! ();
         let installed = util.join home "std";
         if io.is_dir! installed { home }
         else {
@@ -760,8 +760,6 @@ let stdlib_root! () = {
         }
     }
 };
-
-let home_dir! () = match util.home! () { () => ".", h => h };
 
 /// The nearest `name` directory at or above `from`, or `()`. Holds a library
 /// whose `std` is a package, so it is the *parent* that becomes a `-L` root.

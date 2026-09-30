@@ -157,10 +157,12 @@ this package alone. `build.given` lets a step's answer decide the rest of the
 plan, and `build.all` merges plans. docs/build.md is the whole design.
 
 Every step is cached by a key made of what it was given and the contents of
-the files it reads, under `target/build/steps` (or `$MIND_BUILD_CACHE`, to
-share one cache between projects). A build where nothing changed runs no
-script and starts no VM: it costs a `stat` per input. Scripts run at the same
-time, and so do the steps inside one, `-j` at once (default: one per core).
+the files it reads, in one cache every project on the machine shares
+(`$MIND_HOME/build`, or `$MIND_BUILD_CACHE`): the same step asked for by two
+projects is done once. A build where nothing changed runs no script and starts
+no VM: it costs a `stat` per input. Scripts whose build dependencies are the
+same are compiled into one driver and run as one program, each in a process of
+its own, and the steps inside them run `-j` at once (default: one per core).
 
 A script sees only the environment variables its manifest lists:
 
@@ -291,7 +293,7 @@ the target the compiler records, so `linux` and `os=linux` are one directory.
 | `DREAM` | the VM to run images with (default: `dream`) |
 | `MIND_STDLIB` | where the standard library lives (default: `mind`) |
 | `MIND_HOME` | where fetched packages are cached (default: `~/.mind`) |
-| `MIND_BUILD_CACHE` | one build-step cache for every project (default: each project's `target/build/steps`) |
+| `MIND_BUILD_CACHE` | where build steps are cached (default: `$MIND_HOME/build`, shared by every project) |
 
 ## Layout
 

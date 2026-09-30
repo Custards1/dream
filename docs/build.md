@@ -384,9 +384,9 @@ the packages that use them:
 Packages that do not depend on each other run their scripts at the same time.
 Outputs live under the root project's `target/`, never in a dependency's
 directory, because a fetched package is shared by every project that uses it
-and is treated as read-only. `MIND_BUILD_CACHE` points every project at one
-step cache. That is safe because a step's directory is named by its key and
-filled atomically.
+and is treated as read-only. Every project shares one step cache,
+`$MIND_HOME/build` unless `MIND_BUILD_CACHE` says otherwise. That is safe
+because a step's directory is named by its key and filled atomically.
 
 The manifest gains:
 
@@ -684,13 +684,12 @@ What keeps a build of a thousand packages fast:
   steps within a script.
 - **Work is shared by key**, across packages, and across projects with
   `MIND_BUILD_CACHE`.
-- **Next: one driver for every script.** Because a script is a
-  `Context -> Plan` function, `mind` can compile a single driver that imports
-  every package's script under its key. That is one compile and one VM
-  instead of hundreds, one scheduler with one job limit, and cross-package
-  deduplication in memory rather than through the cache. It is left for
-  later because per-package drivers are simpler to debug and already get the
-  no-op case right. It is the reason scripts have no `main!`.
+- **One driver per set of build dependencies.** Because a script is a
+  `Context -> Plan` function, `mind` compiles one driver that imports every
+  script sharing build dependencies, each under a name of its own. That is one
+  compile and one VM instead of one per package, and it is the reason scripts
+  have no `main!`. Scripts with different build dependencies cannot share a
+  program, since each is a namespace of its own; see item 8 below.
 
 What does not grow with the graph: nothing in `std.build` keeps a list it
 searches. The step table, the stamp table and the outcome are maps keyed by
@@ -742,7 +741,21 @@ they are built says is not optional.
    artifacts, and a step's key reads it through `build.keyed`, which puts each
    artifact's step shape where the step was; and `Job.paths` is keyed by
    `build.input_id`, a string, because a map compares list keys by identity.
-8. **The single driver**, and the shared cache as a default.
+8. **The single driver, and the shared cache as a default. Built.** Scripts
+   whose build dependencies are the same are one driver, one compile and one
+   VM (`run.run_all!`), each script in a process of its own and the stamp
+   table read once and written once. Scripts with different build
+   dependencies get a driver each, because each script's packages are a
+   namespace of its own and one program has one: that is why it is a driver
+   per set of build dependencies rather than one per build. Every script is a
+   `build.dr`, so a driver names each package for its own compile
+   (`-L mind_script_N=DIR` and the overlay `-L mind_script_N+=DIR`, which finds
+   the script beside the manifest when the package's modules are in `src/`)
+   and imports it `as script_N`. A package's record keeps its own script's
+   sources, from `dreams --modules` on the script, so editing one script runs
+   that one again and no other; the driver is recompiled when a stale
+   script's sources moved. Steps are cached in `$MIND_HOME/build` unless
+   `MIND_BUILD_CACHE` says otherwise.
 
 Settled:
 

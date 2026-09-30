@@ -66,6 +66,12 @@ cat >"$tmp/p/lib/greet.dr" <<'EOF'
 when tuned { let how = "tuned"; }
 when not tuned { let how = "untuned"; }
 EOF
+mkdir -p "$tmp/p/lib2/src"
+printf '[package]\nname = "lib2"\nversion = "0.1.0"\nsrc = "src"\n' >"$tmp/p/lib2/mind.toml"
+cat >"$tmp/p/lib2/build.dr" <<'EOF'
+import std.build;
+let plan ctx = build.empty |> build.module "made" (build.write "made.dr" "let word = \"shared\";");
+EOF
 cat >"$tmp/p/app/mind.toml" <<'EOF'
 [package]
 name = "app"
@@ -76,6 +82,7 @@ env = ["APP_GREETING"]
 
 [dependencies]
 lib = "../lib"
+lib2 = "../lib2"
 
 [build-dependencies]
 gen = "../gen"
@@ -96,12 +103,19 @@ cat >"$tmp/p/app/main.dr" <<'EOF'
 import std.console;
 import app.info;
 import lib.greet;
+import lib2.made;
 let main! = console.print! (info.made_for + " " + info.version + " " + greet.how + " "
-                            + info.greeting + " " + to_string (data_count ()));
+                            + info.greeting + " " + to_string (data_count ()) + " " + made.word);
 EOF
 
 APP_GREETING=hi run p/app
-check "generated modules, payloads, a tool and a dependency's define reach the compile" 0 "app 1.4.0 tuned hi 1"
+check "generated modules, payloads, a tool and a dependency's define reach the compile" 0 "app 1.4.0 tuned hi 1 shared"
+drivers=$(ls "$tmp/p/app/target/build/_drivers" | wc -l)
+if [ "$drivers" = 2 ]; then
+    echo "ok   scripts with the same build dependencies share one driver"; pass=$((pass + 1))
+else
+    echo "FAIL three scripts, two sets of build dependencies, and $drivers drivers"; fail=$((fail + 1))
+fi
 a=$(stamp "$tmp/p/app/target/build/app/record")
 l=$(stamp "$tmp/p/app/target/build/lib/record")
 
@@ -121,7 +135,7 @@ else
 fi
 
 APP_GREETING=bye run p/app
-check "a variable the manifest lists is part of the context" 0 "app 1.4.0 tuned bye 1"
+check "a variable the manifest lists is part of the context" 0 "app 1.4.0 tuned bye 1 shared"
 
 cat >"$tmp/p/lib/build.dr" <<'EOF'
 import std.build;
