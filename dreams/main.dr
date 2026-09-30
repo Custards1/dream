@@ -888,7 +888,7 @@ let configured! o = {
 /// writing the program twice.
 let read! o file =
     modules.load_shared! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
-                         (opt o :test == true);
+                         (opt o :test == true) (opt o :units);
 
 let load! o file = expansion.expand! (read! o file);
 

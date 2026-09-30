@@ -99,6 +99,19 @@ refused "a signature elsewhere that makes it wrong" "util.dr"
 sed -i '/let loose/d' "$tmp/p/util.dr"
 same "and the body taken away again"
 
+# A file's parse is kept by its text, and a parse that failed is kept as well:
+# read back, it must fail the way it did, twice over.
+printf 'let broken = (1 +;\n' >>"$tmp/p/shapes.dr"
+refused "a syntax error" "shapes.dr"
+refused "the same syntax error, its parse read back" "shapes.dr"
+sed -i '/let broken/d' "$tmp/p/shapes.dr"
+same "and mended"
+if [ "$(made parse)" -gt 0 ]; then
+    echo "ok   parses were kept"; pass=$((pass + 1))
+else
+    echo "FAIL no parse was kept"; fail=$((fail + 1))
+fi
+
 # The compiler itself, which is the program with the most parts there is.
 ( "$dream" "$image" -L "$root/mind" -L "$root" --units "$tmp/self" -o "$tmp/self1.dream" "$root/dreams/main.dr" >/dev/null 2>&1 &&
   "$dream" "$image" -L "$root/mind" -L "$root" --units "$tmp/self" -o "$tmp/self2.dream" "$root/dreams/main.dr" >/dev/null 2>&1 &&

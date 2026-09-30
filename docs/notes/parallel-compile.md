@@ -401,7 +401,20 @@ no cache 8.5 s -> 7.5 s, and a warm cache 6.5 s -> 4.9 s. Under `--time`, a
 warm build is now parse 1.4 s, expand 0.5, resolve 0.6, lower 0.7, types
 0.2, share 0.4-1.1, emit 0.35.
 
-Next, in the order they would pay: the parse kept per file, now the largest
-stage; and a part's key narrowed from the whole declared state to the
-declarations the part's names reach, so that adding a function to one module
-does not walk every other again.
+### The parse kept per file
+
+Then the parse was the largest stage, and it is the easiest unit of all:
+`parser.parse_module` reads nothing but the text, so the key is the compiler
+and the text's digest (`modules.parse_unit!`). It is kept by the process that
+parses the file ahead of the walk, so a parse read back is read on another
+worker too. A parse that failed is kept as well and fails the same way when it
+is read back; `units.sh` asks that twice. Warm, parse went from 1.4 s to 0.47
+s, and `--time` puts the warm self-compile at 4.1 s: parse 0.47, expand 0.5,
+resolve 0.57, lower 0.8, types 0.2, share 0.4-1.2, emit 0.34.
+
+Next, in the order they would pay: a part's key narrowed from the whole
+declared state to the declarations the part's names reach, so that adding a
+function to one module does not walk every other again; and a cache that
+forgets. Every edit keeps new units and nothing removes the old ones, so
+`$MIND_HOME/units` only grows -- `mind` should drop units no build has read
+in a while.

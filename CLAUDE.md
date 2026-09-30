@@ -61,7 +61,8 @@ process of its own, and `dreams --units DIR` keeps each part between builds --
 its walk and its lowering, keyed by the compiler's digest, the declared program
 and the module's bodies -- so an edit to one module walks and lowers that
 module and reads the rest back (its type check too, keyed as well on the
-program's signatures), and the image is byte for byte the one an
+program's signatures, and every file's parse, keyed on its text), and the
+image is byte for byte the one an
 uncached build writes (`dreams/tests/units.sh`). `mind` passes it on every
 build. [dreams/unit.dr](dreams/unit.dr) and "Compile units" in
 docs/notes/parallel-compile.md are the design.

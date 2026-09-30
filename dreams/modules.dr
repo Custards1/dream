@@ -35,6 +35,7 @@ import dreams.diag;
 import dreams.package;
 import dreams.parser;
 import dreams.path;
+import dreams.unit;
 
 /// Modules the VM provides natively. An `import` of one of these resolves to a
 /// runtime lookup rather than to Dream source. This must match the runtime's
@@ -791,8 +792,29 @@ let parse_elsewhere! text =
 /// The same, answering through the shared area; see `load_shared!`. A parse
 /// the area refuses -- nothing in one should hold a suspension, but if it did
 /// -- comes back `:crashed` and is parsed again in place, like any other.
-let parse_shared! text =
-    spawn! $( try! { vm.share! (parser.parse_module text) } catch e { [:crashed, e] } );
+/// The cache is strict for the reason `scope.walk_elsewhere!`'s is.
+let parse_shared! !units text =
+    spawn! $( try! { vm.share! (parse_unit! units text) } catch e { [:crashed, e] } );
+
+/// A file's parse, or the one kept for the same text (see `dreams/unit.dr`).
+/// A parse reads nothing but the text, so the text is the whole key, besides
+/// the compiler that parsed it. A parse that failed is kept too: it fails the
+/// same way the next time.
+let parse_unit! : unit.Cache -> :string -> :any;
+let parse_unit! units text = match units {
+    () => parser.parse_module text,
+    _ => {
+        let k = unit.key ["parse", io.digest text];
+        match unit.recall! units "parse" k {
+            () => {
+                let parsed = parser.parse_module text;
+                unit.keep! units "parse" k parsed
+                parsed
+            },
+            kept => kept,
+        }
+    },
+};
 
 /// Start parsing, elsewhere, every file these imports of the module `name`
 /// will load and nothing has yet.
@@ -830,7 +852,7 @@ let rec prefetch! l deps = match deps {
         let text = if wanted { text_of! l file } else { () };
         if text == () { prefetch! l rest }
         else {
-            let child = if l.[:share_parses else false] { parse_shared! text }
+            let child = if l.[:share_parses else false] { parse_shared! (l.[:units else ()]) text }
                         else { parse_elsewhere! text };
             let marked = put :prefetch ((fetched l).[file => [text, child]]) l;
             prefetch! (prefetch! marked (scanned_imports text)) rest
@@ -1074,10 +1096,13 @@ let load! file roots cfg test_mode =
 /// most of what a parse elsewhere cost the walk that joins it. Not the
 /// default, because nothing in the shared area is freed before the runtime
 /// is, and a language server loads the program again at every keystroke.
-let load_shared! : :string -> [:string] -> :any -> :bool -> Loader;
-let load_shared! file roots cfg test_mode =
-    load_root! (put :share_parses true
-                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) []))
+///
+/// `units` is where parses are kept between builds, or `()`: a one-shot
+/// compile is also the one that may be handed a unit cache.
+let load_shared! : :string -> [:string] -> :any -> :bool -> unit.Cache -> Loader;
+let load_shared! file roots cfg test_mode units =
+    load_root! (put :units units (put :share_parses true
+                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])))
                file test_mode;
 
 /// The same, reading `ov` -- a map of path to text -- instead of the disk for
