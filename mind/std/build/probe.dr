@@ -1,0 +1,64 @@
+// std.build.probe: asking the machine, as steps whose answer is data.
+//
+//     let plan ctx =
+//         build.given (probe.library ctx "sqlite3") (fn found -> match found {
+//             "yes" => build.empty |> build.define "system_sqlite",
+//             _ => build.empty |> build.payload "sqlite" (vendored ctx),
+//         });
+//
+// A probe is a step like any other, so its answer is cached by its key and
+// asked again only when something it depends on moves. What it answers is a
+// small file, read by `build.given`, and a probe never fails: "not here" is
+// an answer, and the plan decides what it means.
+//
+// A probe's key is its question and the target, not the state of the machine,
+// so an answer is kept until the question changes. That is the trade every
+// configure step makes; `mind clean` asks again.
+
+import std.build;
+import std.build.cc;
+
+/// Where `program` is on `PATH`, or `""`.
+let program : :map -> :string -> :any;
+let program ctx p =
+    build.artifact (build.step "probe" ("program " + p) [] [build.Context.target ctx, p] ["answer"]
+                               (fn job -> [build.Op.find p "answer"]))
+                   "answer";
+
+/// What `pkg-config` says -- `what` is `--cflags`, `--libs` or
+/// `--modversion` -- or `""` when it has nothing to say or is not installed.
+let pkg_config : :map -> :string -> :string -> :any;
+let pkg_config ctx what package =
+    build.artifact (build.step "probe" ("pkg-config " + what + " " + package) []
+                               [build.Context.target ctx, what, package] ["answer"]
+                               (fn job -> [build.Op.capture "pkg-config" [what, package] "answer"]))
+                   "answer";
+
+/// `"yes"` when a C program linking against `-l<name>` builds, `"no"`
+/// otherwise: the question a configure script asks of a library, asked of the
+/// same compiler `std.build.cc` would use.
+let library : :map -> :string -> :any;
+let library ctx name = {
+    let compiler = cc.compiler ctx (cc.library name []);
+    build.artifact (build.step "probe" ("library " + name) [] [build.Context.target ctx, compiler, name] ["answer"]
+                               (fn job -> [build.Op.write "probe.c" "int main(void) { return 0; }\n",
+                                           build.Op.attempt compiler ["-o", "probe", "probe.c", "-l" + name] "answer"]))
+                   "answer"
+};
+
+when test {
+    import std.list;
+    import std.test;
+
+    let here = build.Target.make :linux :x86_64;
+    let ctx = build.Context.new "p" "1" "/p" here here;
+    let step_of a = list.nth 1 a;
+
+    let tests = [
+        test.case "a probe asks one question and never fails"
+            $( test.eq! [[:find, "git", "answer"]]
+                        (build.Step.action (step_of (program ctx "git")) (build.Job.make "/d" ctx (%{}))) ),
+        test.case "two questions are two steps"
+            $( test.ne! (build.Step.shape (step_of (library ctx "z"))) (build.Step.shape (step_of (library ctx "m"))) ),
+    ];
+}

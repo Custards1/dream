@@ -1,0 +1,9 @@
+// The C library the test binds, made by the package that uses it: `cc` builds
+// it for the target and `payload` carries it in the image, where `ffi.dr`
+// finds it as `from embedded "sample"`.
+import std.build;
+import std.build.cc;
+
+let plan ctx =
+    build.empty
+    |> build.payload "sample" (cc.library "sample" ["sample.c"] |> cc.flags ["-O2"] |> cc.shared ctx);

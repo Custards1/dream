@@ -228,8 +228,43 @@ let op! dir o = try! {
             if r.[:code] == 0 { [:ok, ()] }
             else { [:error, program + " exited with " + to_string r.[:code] + "\n" + r.[:out] + r.[:err]] }
         },
+        [:find, program, name] => { file.write! (target! name) (on_path! program); [:ok, ()] },
+        [:capture, program, args, name] => {
+            let r = asked! dir program args;
+            file.write! (target! name) (if r.[:code] == 0 { r.[:out] } else { "" })
+            [:ok, ()]
+        },
+        [:attempt, program, args, name] => {
+            let r = asked! dir program args;
+            file.write! (target! name) (if r.[:code] == 0 { "yes" } else { "no" })
+            [:ok, ()]
+        },
+        [:verify, name, digest] => match io.digest! (dir + "/" + name) {
+            d if d == digest => [:ok, ()],
+            d => [:error, name + " has the SHA-256 " + d + ", and the build pins it to " + digest],
+        },
     }
 } catch e { [:error, to_string e] };
+
+/// A program run to answer a question, where not being able to run it at all
+/// is an answer too: `exec_in!` raises for a program that is not there, and a
+/// probe for a compiler that is missing should say "no", not stop the build.
+let asked! : :string -> :string -> [:string] -> :map;
+let asked! dir program args = try! { os.exec_in! dir program args 0 } catch e { %{ :code => 127, :out => "", :err => "" } };
+
+/// Where `program` is on `PATH`, or `""`. The search a shell does, written
+/// out so that it is the same on every system: `;` between directories and
+/// `.exe` on Windows.
+let on_path! : :string -> :string;
+let on_path! program = {
+    let windows = os.platform () == :windows;
+    let dirs = str.split (if windows { ";" } else { ":" }) (match os.env! "PATH" { () => "", p => p });
+    let names = if windows && not (str.ends_with ".exe" program) { [program + ".exe", program] } else { [program] };
+    let hits = list.flat_map (fn d -> list.filter (fn f -> match io.stat! f { [_, _, :file] => true, _ => false })
+                                                (list.map (fn n -> d + "/" + n) names))
+                             (list.filter (fn d -> not (str.is_empty d)) dirs);
+    match hits { [] => "", [first, .._] => first }
+};
 
 /// Make one step in a scratch directory and move it into place.
 let make! : :map -> :string -> :map -> :map -> :any;
@@ -292,7 +327,7 @@ let build_all! ctx st steps = {
     let jobs = if build.Context.jobs ctx < 1 { 1 } else { build.Context.jobs ctx };
     let run_level! done level = {
         let batch = list.map (fn s -> [ctx, key_of s, s,
-                                        map.from_pairs (list.map (fn i -> [i, where ctx st i]) (build.Step.inputs s))])
+                                        map.from_pairs (list.map (fn i -> [build.input_id i, where ctx st i]) (build.Step.inputs s))])
                              (by_level.[level]);
         fold! (fn n group -> {
             let results = proc.try_map! run_one! group;
@@ -411,6 +446,21 @@ when test {
                 strict! got
                 file.remove_all! cache
                 test.eq! [[5, 0], [0, 5], %{ "answered" => true }, "hello", "let v = 1;"] got
+            } ),
+        test.case "the questions a step can ask never fail, and verify can"
+            $( {
+                let dir = "dream-build-ops-" + to_string (os.pid! ());
+                file.mkdir_all! dir
+                let got = [op! dir (build.Op.write "f" "abc"),
+                           list.head (op! dir (build.Op.verify "f" (io.digest "abc"))),
+                           list.head (op! dir (build.Op.verify "f" (io.digest "abd"))),
+                           list.head (op! dir (build.Op.find "no-such-program-anywhere" "where")),
+                           file.read! (dir + "/where"),
+                           list.head (op! dir (build.Op.attempt "no-such-program-anywhere" [] "tried")),
+                           file.read! (dir + "/tried")];
+                strict! got
+                file.remove_all! dir
+                test.eq! [[:ok, ()], :ok, :error, :ok, "", :ok, "no"] got
             } ),
         test.case "steps at one depth never read each other"
             $( {

@@ -268,6 +268,8 @@ virtual let inputs cfg;                 // [Input]
 virtual let outputs ctx cfg;            // [:string]; may depend on the target
 virtual let run job cfg;                // the operations that make them
 virtual let version cfg = "1";          // change it to invalidate every step made before
+virtual let settings ctx cfg = ();      // what it found that the config does not say, e.g. the compiler
+virtual let label cfg = name cfg;       // what a step is called in a log
 
 /// The step this configuration describes. The key covers the tool's
 /// version, the target and the whole configuration, so changing a flag
@@ -731,9 +733,15 @@ they are built says is not optional.
    enclosing project's; and the outcome is a record in `std.build`
    (`Outcome`), because it crosses to `mind` as `std.wire` and a reader has to
    name every key it accepts.
-7. **Tools.** `cc`, `probe` and `fetch`, and `dream/tests/ffi` rebuilt as a
-   package whose C library is made by its own `build.dr` rather than by the
-   test script.
+7. **Tools. Built.** `std.build.tool` (the behavior, with `settings` and
+   `label` beside the four holes), `cc`, `probe` and `fetch`, and
+   `dream/tests/ffi` rebuilt as a package whose C library is made by its own
+   `build.dr` -- `test-ffi` now builds it with `mind`. Asking the machine
+   needed operations that answer rather than fail (`find`, `capture`,
+   `attempt`) and one that pins (`verify`). A tool's configuration may hold
+   artifacts, and a step's key reads it through `build.keyed`, which puts each
+   artifact's step shape where the step was; and `Job.paths` is keyed by
+   `build.input_id`, a string, because a map compares list keys by identity.
 8. **The single driver**, and the shared cache as a default.
 
 Settled:

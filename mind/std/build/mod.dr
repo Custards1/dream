@@ -126,9 +126,9 @@ mapping Step {
     shape
 }
 
-/// What an action receives. `paths` maps each input -- as the step was given
-/// it, normalized -- to where it is on disk, and `dir` is the step's own
-/// directory, the only place it may write.
+/// What an action receives. `paths` maps each input (by `input_id`) to where
+/// it is on disk -- `build.path` is how an action asks -- and `dir` is the
+/// step's own directory, the only place it may write.
 mapping Job { dir, ctx, paths = %{} }
 
 /// The shape of an input, as a step's shape includes it.
@@ -149,22 +149,39 @@ let step tool name inputs config outputs action = {
 
 /// What an action asks for, carried out in order by the runner, in the step's
 /// directory, stopping at the first that fails. A name is relative to that
-/// directory; `copy`'s source is a path from `Job.paths`. `exec`'s program is
-/// looked up on `PATH` as a shell would, and it runs with the step's
-/// directory as its working directory.
+/// directory; `copy`'s source is a path from `Job.paths`. A program is looked
+/// up on `PATH` as a shell would, and runs with the step's directory as its
+/// working directory.
+///
+/// The last four ask the machine a question rather than make something, and
+/// never fail -- the answer is the point, and "no" is one: `find` writes where
+/// a program is on `PATH` (or nothing), `capture` what a program printed when
+/// it succeeded (or nothing), `attempt` `yes` or `no` for whether it
+/// succeeded. `verify` fails unless the file has the SHA-256 given, which is
+/// what pins something fetched.
 union Op {
     write(name : :string, text : :string)
     copy(from : :string, name : :string)
     exec(program : :string, args : [:string])
+    find(program : :string, name : :string)
+    capture(program : :string, args : [:string], name : :string)
+    attempt(program : :string, args : [:string], name : :string)
+    verify(name : :string, digest : :string)
 }
 
 /// An output of a step, as an input to another.
 let artifact : :map -> :string -> :any;
 let artifact s name = Input.artifact s name;
 
+/// The name an input goes by in `Job.paths`. A string, because a map compares
+/// a list key by identity rather than by contents, and the same input is
+/// rebuilt as a new list wherever a bare string is turned into one.
+let input_id : :any -> :string;
+let input_id i = encode (input_shape (input i));
+
 /// Where an input is, from inside an action.
 let path : :map -> :any -> :string;
-let path job i = (Job.paths job).[input i else ()];
+let path job i = (Job.paths job).[input_id i else ()];
 
 /// Where an output goes, from inside an action.
 let out : :map -> :string -> :string;
@@ -311,6 +328,20 @@ let write name text =
     artifact (step "write" name [] [name, text] [name] (fn job -> [Op.write name text])) name;
 
 // --- keys --------------------------------------------------------------------------
+
+/// `v` with every artifact in it replaced by its step's shape: a tool's
+/// configuration as a key can read it. An artifact holds its step, and a step
+/// holds its action, which no key can say; the shape says everything about
+/// the step that could change what it makes.
+let keyed : :any -> :any;
+let rec keyed v = match v {
+    [:artifact, s, n] if type_of s == :map && map_has s :shape => [:artifact, Step.shape s, n],
+    _ => match type_of v {
+        :list => list.map keyed v,
+        :map => map.map_values keyed v,
+        _ => v,
+    },
+};
 
 /// Whether `v` is data -- something `encode` can say exactly. A function in a
 /// step's config would be keyed as nothing at all, and a change to it would

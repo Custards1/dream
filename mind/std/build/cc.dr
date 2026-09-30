@@ -1,0 +1,150 @@
+// std.build.cc: C and C++, to a shared library, an object or a program.
+//
+//     let sqlite ctx =
+//         cc.library "sqlite3" ["vendor/sqlite3.c"]
+//         |> cc.flags ["-O2"]
+//         |> cc.define "SQLITE_THREADSAFE=0"
+//         |> cc.shared ctx;
+//
+// The compiler is `$CC` (`$CXX` when a source is C++) when the manifest lets
+// the script see it (`[build] env = ["CC"]`), and otherwise `cc`, `c++`, or
+// `cl` on Windows. Which one it found is part of the key, so changing it
+// rebuilds.
+//
+// A header is not a source, and a change to one rebuilds nothing unless it is
+// named: `cc.headers` puts headers in the key without passing them to the
+// compiler. Include directories are relative to the package.
+
+import std.build;
+import std.list;
+import std.str;
+derive std.build.tool;
+
+/// What to build. `kind` is `:shared`, `:object` or `:program`.
+mapping Config {
+    kind = :shared
+    name : :string
+    sources = []
+    headers = []
+    flags : [:string] = []
+    defines : [:string] = []
+    includes : [:string] = []
+}
+
+/// A shared library called `name` from these sources: `libname.so`,
+/// `libname.dylib` or `name.dll`, as the target names it.
+let library : :string -> [:any] -> :map;
+let library n sources = Config.set_sources (Config.new n) sources;
+
+/// One object file.
+let object : :string -> [:any] -> :map;
+let object n sources = Config.set_kind (library n sources) :object;
+
+/// A program.
+let program : :string -> [:any] -> :map;
+let program n sources = Config.set_kind (library n sources) :program;
+
+let flags : [:string] -> :map -> :map;
+let flags fs c = Config.set_flags c (list.append (Config.flags c) fs);
+
+/// `NAME` or `NAME=VALUE`, as `-D` takes it.
+let define : :string -> :map -> :map;
+let define d c = Config.set_defines c (list.append (Config.defines c) [d]);
+
+let include : :string -> :map -> :map;
+let include dir c = Config.set_includes c (list.append (Config.includes c) [dir]);
+
+let headers : [:any] -> :map -> :map;
+let headers hs c = Config.set_headers c (list.append (Config.headers c) hs);
+
+/// The library, as an input to something else: a payload, usually.
+let shared : :map -> :map -> :any;
+let shared ctx c = artifact ctx c;
+
+// --- the tool ------------------------------------------------------------------------
+
+let name c = "cc";
+let label c = Config.name c;
+let inputs c = list.append (Config.sources c) (Config.headers c);
+
+let outputs ctx c = match Config.kind c {
+    :object => [build.object_name ctx (Config.name c)],
+    :program => [build.exe_name ctx (Config.name c)],
+    _ => [build.shared_name ctx (Config.name c)],
+};
+
+let is_cxx : :any -> :bool;
+let is_cxx s = match build.input s {
+    [:file, p] => list.any (fn e -> str.ends_with e p) [".cpp", ".cc", ".cxx"],
+    _ => false,
+};
+
+/// The compiler this build will run.
+let compiler : :map -> :map -> :string;
+let compiler ctx c = {
+    let cxx = list.any is_cxx (Config.sources c);
+    let env = build.Context.env ctx;
+    match env.[(if cxx { "CXX" } else { "CC" }) else ()] {
+        () => match build.Target.os (build.Context.host ctx) {
+            :windows => "cl",
+            _ => if cxx { "c++" } else { "cc" },
+        },
+        named => named,
+    }
+};
+
+let settings ctx c = compiler ctx c;
+
+let is_msvc : :string -> :bool;
+let is_msvc program = program == "cl" || str.ends_with "cl.exe" program;
+
+let run job c = {
+    let ctx = build.Job.ctx job;
+    let program = compiler ctx c;
+    let out = list.head (outputs ctx c);
+    let root = build.Context.root ctx;
+    let sources = list.map (fn s -> build.path job s) (Config.sources c);
+    let includes = list.map (fn d -> root + "/" + d) (Config.includes c);
+    let args = if is_msvc program {
+        list.concat [["/nologo"],
+                     match Config.kind c { :shared => ["/LD", "/Fe" + out], :object => ["/c", "/Fo" + out], _ => ["/Fe" + out] },
+                     list.map (fn d -> "/I" + d) includes, list.map (fn d -> "/D" + d) (Config.defines c),
+                     Config.flags c, sources]
+    } else {
+        let macos = build.Target.os (build.Context.target ctx) == :macos;
+        list.concat [match Config.kind c {
+                         :shared => [if macos { "-dynamiclib" } else { "-shared" }, "-fPIC"],
+                         :object => ["-c", "-fPIC"],
+                         _ => [],
+                     },
+                     ["-o", out], list.map (fn d -> "-I" + d) includes, list.map (fn d -> "-D" + d) (Config.defines c),
+                     Config.flags c, sources]
+    };
+    [build.Op.exec program args]
+};
+
+when test {
+    import std.test;
+
+    let here os = build.Target.make os :x86_64;
+    let ctx os = build.Context.new "p" "1" "/p" (here os) (here os);
+    let job os = build.Job.make "/d" (ctx os) (%{ build.input_id "a.c" => "/p/a.c" });
+
+    let tests = [
+        test.case "a shared library is named for the target"
+            $( test.eq! [["libz.so"], ["z.dll"]]
+                        [outputs (ctx :linux) (library "z" ["a.c"]), outputs (ctx :windows) (library "z" ["a.c"])] ),
+        test.case "the command a shared library is built with"
+            $( test.eq! [[:exec, "cc", ["-shared", "-fPIC", "-o", "libz.so", "-I/p/inc", "-DX=1", "-O2", "/p/a.c"]]]
+                        (run (job :linux) (library "z" ["a.c"] |> include "inc" |> define "X=1" |> flags ["-O2"])) ),
+        test.case "the key follows the flags and the compiler"
+            $( test.eq! [false, false]
+                        [build.Step.shape (step (ctx :linux) (library "z" ["a.c"]))
+                             == build.Step.shape (step (ctx :linux) (library "z" ["a.c"] |> flags ["-O2"])),
+                         build.Step.shape (step (ctx :linux) (library "z" ["a.c"]))
+                             == build.Step.shape (step (build.Context.set_env (ctx :linux) (%{ "CC" => "clang" }))
+                                                       (library "z" ["a.c"]))] ),
+        test.case "a C++ source picks the C++ compiler"
+            $( test.eq! "c++" (compiler (ctx :linux) (library "z" ["a.cpp"])) ),
+    ];
+}

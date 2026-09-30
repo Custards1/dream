@@ -1,0 +1,51 @@
+// std.build.tool: what a tool is.
+//
+// A tool is a module that derives this, and fills four holes: its `name`,
+// what it reads (`inputs`), what it makes (`outputs`, which may depend on the
+// target), and how (`run`, which answers the operations the runner carries
+// out). What it gets back is the step construction every tool would otherwise
+// write for itself. `std.build.cc` is one; one written next year in another
+// package is exactly as capable, which is why this is a behavior and `cc` is
+// not a special case.
+//
+//     // a tool's own module
+//     import std.build;
+//     derive std.build.tool;
+//
+//     mapping Config { name, sources = [] }
+//     let name c = "mytool";
+//     let inputs c = Config.sources c;
+//     let outputs ctx c = [Config.name c + ".out"];
+//     let run job c = [build.Op.exec "mytool" (..)];
+//
+// A tool's configuration is its own record, built with its own `|>`
+// modifiers and handed to `step` or `artifact` at the end.
+
+import std.build;
+import std.list;
+
+virtual let name cfg;
+virtual let inputs cfg;
+virtual let outputs ctx cfg;
+virtual let run job cfg;
+
+/// Change it to make every step this tool made before stale.
+virtual let version cfg = "1";
+
+/// What the tool will do that the configuration does not say -- which
+/// compiler it found, say -- so that it is part of the key.
+virtual let settings ctx cfg = ();
+
+/// What a step is called in a log. The tool's name unless it says better.
+virtual let label cfg = name cfg;
+
+/// The step this configuration describes. Its key covers the tool's version,
+/// the target, the settings and the whole configuration, so changing a flag
+/// rebuilds and changing nothing does not.
+let step ctx cfg =
+    build.step (name cfg) (label cfg) (inputs cfg)
+               [version cfg, build.Context.target ctx, settings ctx cfg, build.keyed cfg]
+               (outputs ctx cfg) (fn job -> run job cfg);
+
+/// Its first output, as an input to something else: what most callers want.
+let artifact ctx cfg = build.artifact (step ctx cfg) (list.head (outputs ctx cfg));
