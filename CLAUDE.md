@@ -58,8 +58,8 @@ docs/notes/macro-expansion.md).
 
 A parallel build resolves and lowers in **parts, one per module**, each in a
 process of its own, and `dreams --units DIR` keeps each part between builds --
-its walk and its lowering, keyed by the compiler's digest, the declared program
-and the module's bodies -- so an edit to one module walks and lowers that
+its walk and its lowering, keyed by the compiler's digest, the declarations
+the module can see and the module's bodies -- so an edit to one module walks and lowers that
 module and reads the rest back (its type check too, keyed as well on the
 program's signatures, and every file's parse, keyed on its text), and the
 image is byte for byte the one an

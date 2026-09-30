@@ -70,6 +70,16 @@ else
 fi
 printf 'let extra = 1;\n' >>"$tmp/p/shapes.dr"
 same "a declaration added"
+# A declaration walks again the parts that can see it and no others: `util`
+# and `main`, which imports it, and not `shapes` or the standard library.
+walks=$(made walk)
+printf 'let unused n = n;\n' >>"$tmp/p/util.dr"
+same "a declaration added to a module one other imports"
+if [ "$(made walk)" = "$((walks + 2))" ]; then
+    echo "ok   and only the two parts that can see it were walked again"; pass=$((pass + 1))
+else
+    echo "FAIL a declaration in util walked $(( $(made walk) - walks )) parts again, not 2"; fail=$((fail + 1))
+fi
 sed -i 's/let name = "shapes";/let title = "shapes";\nlet name = title;/' "$tmp/p/shapes.dr"
 same "a wrapper introduced where a value was"
 sed -i 's/shapes.name/shapes.title/' "$tmp/p/util.dr"

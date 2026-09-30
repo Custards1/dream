@@ -425,6 +425,38 @@ at every build would cost what the cache saves. Two `mind`s forgetting at once
 remove the same files, and a unit removed while a build reads it is computed
 again.
 
-Next: a part's key narrowed from the whole declared state to the declarations
-the part's names reach, so that adding a function to one module does not walk
-every other again.
+### A part keyed on what it can see
+
+Until here a walk's key held the whole declared program, so adding a function
+to any module walked every module again: 9 s on a self-compile, a cold build's
+cost, for the commonest edit there is. Two things in the declared state moved
+with every declaration, found by printing a digest of each field and adding one
+declaration to the last module:
+
+- **`next_global`**, where the globals a part invents (deforestation's loops)
+  are numbered from. Parts now invent from `scope.invent_base`, 2^26, and
+  `merge_parts` hands each part a `go` of `g0 - invent_base` plus the parts
+  before it -- the same offset every consumer (`opt.remap_leaf`,
+  `lower.reach_parts`) already added to a global at or past `invented_from`,
+  which is now `invent_base`. A part's walk no longer depends on how many
+  declarations there are.
+- **The environments.** A part resolves names in its own module's
+  environment and, through what that names -- an alias, an `import a.{x}`
+  selection, a namespace -- in the environments of those modules and their
+  submodules, and nowhere else. `scope.part_key` reads the module references
+  off the environment whole (`reached_modules`) and keys the part on those
+  environments only.
+
+Also out of the key: the declaring pass's diagnostics and `module_recs`, which
+a walk carries and never reads. Before trusting it, every walk read back was
+walked again and compared, over a cold build, a warm one, a declaration added
+to `main`, to `lower`, to `std.list`, a name renamed across modules, an import
+added and a declaration removed: no mismatch, and every image the image built
+without units.
+
+A declaration added to the last module now walks one part (4.3 s against a
+warm 4.1 s, from 6.4 s); one added to `lower` walks thirteen (5.7 s, from
+7.2 s). One added early -- to `std.list` -- still walks everything, because
+globals are numbered in module order and every later module's numbers move.
+Numbering each module's globals from a base of its own would fix that, at
+the cost of a relocation in every consumer of a global index.
