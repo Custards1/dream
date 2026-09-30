@@ -162,9 +162,15 @@ priv let script_module s = {
 };
 
 priv let group_dir : :map -> [:map] -> :string;
-priv let group_dir setting group =
-    util.join (Setting.target_dir setting)
-              ("build/_drivers/" + str.slice 0 16 (io.digest (str.join_str "\n" (Scripted.paths (list.head group)))));
+priv let group_dir setting group = {
+    // Named by the scripts in it as well as what they are compiled with: two
+    // runs asking for different sets of scripts -- a package's own checks,
+    // and a build of it that runs its dependencies' scripts too -- must not
+    // write one driver over the other while both are compiling it.
+    let named = list.append (Scripted.paths (list.head group))
+                            (list.map (fn s -> Scripted.key s + "=" + Scripted.script s) group);
+    util.join (Setting.target_dir setting) ("build/_drivers/" + str.slice 0 16 (io.digest (str.join_str "\n" named)))
+};
 
 /// The driver's source. Its directory holds a manifest, so that the driver is
 /// a package of its own: written anywhere under the project without one, it
@@ -172,9 +178,9 @@ priv let group_dir setting group =
 priv let write_driver! : :string -> [:map] -> :unit;
 priv let write_driver! dir group = {
     file.mkdir_all! dir
-    file.write! (util.join dir "mind.toml") "[package]\nname = \"mind_build_driver\"\nversion = \"0.0.0\"\n"
+    replace! (util.join dir "mind.toml") "[package]\nname = \"mind_build_driver\"\nversion = \"0.0.0\"\n"
     let numbered = list.enumerate group;
-    file.write! (util.join dir "main.dr")
+    replace! (util.join dir "main.dr")
                 (str.join_str "" (list.concat [
                     ["// Written by mind: runs these packages' build scripts.\nimport std.build.run;\n"],
                     list.map (fn [i, s] -> "import mind_script_" + to_string i + "." + script_module s
@@ -184,6 +190,12 @@ priv let write_driver! dir group = {
                     ["];\n"],
                 ]))
 };
+
+/// A file written whole or not at all (`std.file`'s): two runs of one group
+/// at once each write the same bytes, and neither must ever read the other's
+/// half-written file.
+priv let replace! : :string -> :string -> :unit;
+priv let replace! path text = file.replace! path text;
 
 /// The `-L` roots a group's driver is compiled with.
 priv let driver_roots : [:map] -> [:string];
@@ -219,12 +231,15 @@ priv let script_sources! setting s = {
 priv let compile_driver! : :map -> :string -> [:map] -> :any;
 priv let compile_driver! setting dir group = {
     write_driver! (util.join dir "driver") group
+    // Compiled beside the image and renamed into place, for the reason
+    // `replace!` gives: a run that finds the image there must find a whole one.
+    let scratch = util.join dir ("script.dream.tmp-" + file.scratch_suffix! ());
     let [program, args] = compiler_args setting (list.concat [[util.join dir "driver/main.dr"], driver_roots group,
-                                                              ["-o", util.join dir "script.dream"]]);
+                                                              ["-o", scratch]]);
     if Setting.verbose setting { console.error! (str.join_str " " (list.cons program args)) }
     let r = os.exec! program args;
     match r.[:code] {
-        0 => [:ok, ()],
+        0 => { io.rename! scratch (util.join dir "script.dream"); [:ok, ()] },
         _ => [:error, "the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
                       + " do not compile:\n" + str.trim (r.[:err] + r.[:out])],
     }
@@ -286,15 +301,22 @@ priv let run_group! job = {
             match compiled {
                 [:error, why] => [:error, why],
                 [:ok, _] => {
-                    file.write! (util.join dir "record") (wire.encode (%{ :scripts => listed }))
+                    replace! (util.join dir "record") (wire.encode (%{ :scripts => listed }))
                     let contexts = list.fold (fn m [s, ctx, _, _, _] -> m.[Scripted.key s => ctx]) (%{}) stale;
-                    let ctx_file = util.join dir "contexts";
-                    let out_file = util.join dir "outcomes";
+                    // This run's own: another run of the same group may be
+                    // asking for other packages at the same moment.
+                    let run_id = file.scratch_suffix! ();
+                    let ctx_file = util.join dir ("contexts-" + run_id);
+                    let out_file = util.join dir ("outcomes-" + run_id);
                     file.write! ctx_file (wire.encode contexts)
                     let r = os.exec_for! (Setting.vm setting) [image, "--contexts", ctx_file, "--outcomes", out_file] deadline_ms;
+                    let answer = file.read! out_file;
+                    strict! answer
+                    file.remove_all! ctx_file
+                    file.remove_all! out_file
                     match [r.[:timed_out], r.[:code]] {
                         [true, _] => [:error, "the build scripts ran for longer than " + to_string (deadline_ms / 60000) + " minutes"],
-                        [_, 0] => match wire.decode (match file.read! out_file { () => "", t => t }) {
+                        [_, 0] => match wire.decode (match answer { () => "", t => t }) {
                             [:ok, outcomes] if list.all (fn [_, o] -> types.accepts Outcome.type o) (map_pairs outcomes) => {
                                 strict! (list.map (fn [s, _, digest, record_file, record] -> {
                                     let sources = match list.any (fn [m, .._] -> Scripted.key m == Scripted.key s) moved {
@@ -304,7 +326,7 @@ priv let run_group! job = {
                                     let o = outcomes.[Scripted.key s];
                                     if not (Setting.testing setting) {
                                         file.mkdir_all! (dir_of setting s)
-                                        file.write! record_file (wire.encode (%{ :context => digest, :sources => sources,
+                                        replace! record_file (wire.encode (%{ :context => digest, :sources => sources,
                                                                                 :reads => Outcome.reads o, :outcome => o }))
                                     }
                                 }) stale)

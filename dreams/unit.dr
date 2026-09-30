@@ -1,0 +1,128 @@
+// Compile units: a part of a build, kept between builds.
+//
+// A build resolves and lowers its program in parts, one per module, each in a
+// process of its own (see "resolving in parts" in `scope` and "lowering in
+// parts" in `lower`). A part is a function of a few things -- the program's
+// declarations, the module's own bodies, and for lowering the program's
+// wrappers -- and when none of them has changed since the last build its
+// answer has not either. So with a unit cache (`dreams --units DIR`) a part's
+// answer is written down under a key made of all of them, and the next build
+// that would compute the same thing reads it instead. Editing a module's
+// bodies re-walks and re-lowers that module; every other module's part is read
+// back. Everything after -- merging, checking, sharing, writing the image --
+// runs as it always did, on the same values, so a build that read its parts
+// from the cache writes the image one that computed them writes.
+//
+// What is kept is what a part *added*: a walk starts from the program's
+// declared state, which every part shares and which is most of what a
+// resolution weighs, so a unit is the difference (`delta`), and reading it
+// back lays the difference over the state this build has (`restore`). That is
+// sound because the state is part of the key: a unit is only ever laid over the
+// state it was taken against.
+//
+// The key also holds the compiler's own digest (`vm.image_digest`), because
+// what a part comes to is decided by the compiler that computed it, and a
+// unit another compiler wrote means nothing to this one.
+
+import std.file;
+import std.io;
+import std.list;
+import std.map;
+import std.str;
+import std.vm;
+import std.wire;
+
+/// Where units are kept, or `()` for a build that keeps none.
+type Cache = :string | :unit;
+
+/// A digest of a value: what a key is made of. The value's `std.wire` bytes,
+/// which spell equal values alike whatever order a map was built in.
+let digest : :any -> :string;
+let digest v = io.digest (vm.wire_encode v);
+
+/// A key from several digests: the compiler first, so that no two compilers
+/// ever share one.
+let key : [:string] -> :string;
+let key parts = io.digest (str.join_str ":" (list.cons (vm.image_digest ()) parts));
+
+// --- what a part added ---------------------------------------------------------
+
+/// What `r` holds that `base` does not: for each field, nothing when it is the
+/// same, the entries `r` added or changed when both are maps, and the whole
+/// value otherwise. A walk only ever adds to a table, so a table's difference
+/// is its new entries.
+let delta : :map -> :map -> :map;
+let delta base r = list.fold (fn acc [k, v] -> match base.[k else [:absent]] {
+    same if same == v => acc,
+    old if type_of old == :map && type_of v == :map =>
+        acc.[k => [:entries, list.filter (fn [ek, ev] -> not (map_has old ek) || old.[ek] != ev) (map_pairs v)]],
+    _ => acc.[k => [:is, v]],
+}) (%{}) (map_pairs r);
+
+/// `base` with a difference laid over it: what `delta` was taken from.
+let restore : :map -> :map -> :map;
+let restore base d = list.fold (fn acc [k, change] -> match change {
+    [:entries, pairs] => acc.[k => list.fold (fn m [ek, ev] -> m.[ek => ev]) (acc.[k else %{}]) pairs],
+    [:is, v] => acc.[k => v],
+}) base (map_pairs d);
+
+// --- the cache ---------------------------------------------------------------------
+
+let path : :string -> :string -> :string -> :string;
+let path cache kind k = cache + "/" + kind + "-" + k;
+
+/// The unit kept under `kind` and `k`, or `()`. A build with no cache has no
+/// key either, and neither reads nor keeps anything.
+let recall! : Cache -> :string -> :string | :unit -> :any;
+let recall! cache kind k = match cache {
+    () => (),
+    dir => match k {
+        () => (),
+        named => match file.read! (path dir kind named) {
+            () => (),
+            bytes => match wire.decode bytes { [:ok, v] => v, _ => () },
+        },
+    },
+};
+
+/// Keep `v` under `kind` and `k`. Written beside and renamed into place, so a
+/// build reading the cache while another writes it sees a whole unit or none,
+/// and two builds writing the same unit write the same bytes.
+let keep! : Cache -> :string -> :string | :unit -> :any -> :unit;
+let keep! cache kind k v = match cache {
+    () => (),
+    dir => match k {
+        () => (),
+        named => {
+            file.mkdir_all! dir
+            file.replace! (path dir kind named) (vm.wire_encode v)
+        },
+    },
+};
+
+/// Positions made relative to the part's first, and back. A part's answer
+/// names bodies by where they stand in the whole program's queue, and a body
+/// added to an earlier module moves every later one; kept relative, a unit
+/// survives that.
+let shifted : :integer -> [[:any]] -> [[:any]];
+let shifted by pairs = list.map (fn pair -> list.cons (list.head pair + by) (list.tail pair)) pairs;
+
+when test {
+    import std.test;
+
+    let base = %{ :envs => %{ 0 => "declared" }, :refs => %{ 1 => :a }, :count => 3, :bodies => [] };
+    let walked = base.[:refs => (base.[:refs]).[2 => :b]].[:count => 5].[:bodies => [[0, :body]]].[:new => true];
+
+    let tests = [
+        test.case "a part's difference is only what it added"
+            $( test.eq! %{ :refs => [:entries, [[2, :b]]], :count => [:is, 5], :bodies => [:is, [[0, :body]]],
+                           :new => [:is, true] }
+                        (delta base walked) ),
+        test.case "laid over what it was taken from, it is the part again"
+            $( test.eq! walked (restore base (delta base walked)) ),
+        test.case "and it survives the wire"
+            $( test.eq! walked (restore base (match wire.decode (vm.wire_encode (delta base walked)) { [:ok, d] => d, _ => %{} })) ),
+        test.case "positions shift and shift back"
+            $( test.eq! [[3, :a], [5, :b, :c]] (shifted 3 (shifted (0 - 3) [[3, :a], [5, :b, :c]])) ),
+    ];
+}

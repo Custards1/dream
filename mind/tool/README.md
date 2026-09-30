@@ -336,6 +336,7 @@ the target the compiler records, so `linux` and `os=linux` are one directory.
 | `DREAM` | the VM to run images with (default: `dream`) |
 | `MIND_STDLIB` | where the standard library lives (default: `mind`) |
 | `MIND_HOME` | where fetched packages are cached (default: `~/.mind`) |
+| `MIND_UNITS` | where the compiler keeps each module's walk and lowering between builds (default: `$MIND_HOME/units`; `off` for none) |
 | `MIND_BUILD_CACHE` | where build steps are cached (default: `$MIND_HOME/build`, shared by every project) |
 
 ## Layout

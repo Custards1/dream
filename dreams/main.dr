@@ -129,7 +129,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
-    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true [];
+    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true [] (opt o :units);
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
@@ -761,6 +761,8 @@ let rec parse_args args o =
         // this, which is the point: when an image misbehaves it answers
         // whether the pass that rewrote it is why.
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
+        ["--units"] => with_opt :error "--units needs a directory" o,
+        ["--units", dir, ..rest] => parse_args rest (with_opt :units dir o),
         ["--no-types", ..rest] => parse_args rest (with_opt :no_types true o),
         ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
         ["--debug-cfg", ..rest] => parse_args rest (append_opt :defines "debug" o),
@@ -819,6 +821,8 @@ let usage! () = {
         "                           each module exports",
         "  --release                define `release`",
         "  --no-opt                 emit the arena as lowered, unshared",
+        "  --units DIR              keep each module's walk and lowering in DIR, and",
+        "                           read them back while nothing they depend on moved",
         "  --no-types               do not hold the program to its signatures",
         "  --debug-cfg              define `debug`",
         "  -q, --quiet              print only what was asked for",

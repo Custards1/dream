@@ -95,6 +95,24 @@ let copy! from to = {
     io.close! dst
 };
 
+/// A name for a scratch file no other writer is using: this OS process's id
+/// and this green process's. The first alone is not enough, since one VM runs
+/// many processes, and two of them replacing the same file at once each
+/// renamed the other's scratch file away.
+let scratch_suffix! : :unit -> :string;
+let scratch_suffix! () = {
+    to_string (os.pid! ()) + "-" + str.slice 0 12 (io.digest (to_string (self! ())))
+};
+
+/// Write `text` to `path` whole or not at all: beside it, then renamed into
+/// place, so a reader sees the old file or the new one and never half of one.
+let replace! : :string -> :string -> :unit;
+let replace! path text = {
+    let scratch = path + ".tmp-" + scratch_suffix! ();
+    write! scratch text
+    io.rename! scratch path
+};
+
 /// Remove `path` and, when it is a directory, everything under it. Nothing
 /// there is not an error: what was asked for is that it be gone.
 let remove_all! : :string -> :unit;

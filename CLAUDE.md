@@ -51,9 +51,19 @@ just bootstrap-check   # the seed still reproduces itself from this source
 The guarantee is byte equality: compiling this source with the seed produces an
 identical image, and so does the stage after that. When you change the compiler,
 run `just bootstrap` and copy `build/dreams.dream` over the seed -- or, when the
-change adds atoms to the compiler, build once more with that image and copy the
-second one, which is the fixpoint (see "`mind/std/all.dr --test` is not
-byte-stable" in docs/notes/macro-expansion.md).
+change adds atoms to the compiler, build again with each new image until one
+compiles the source into itself, and copy that one: it can take two rounds
+(see "`mind/std/all.dr --test` is not byte-stable" in
+docs/notes/macro-expansion.md).
+
+A parallel build resolves and lowers in **parts, one per module**, each in a
+process of its own, and `dreams --units DIR` keeps each part between builds --
+its walk and its lowering, keyed by the compiler's digest, the declared program
+and the module's bodies -- so an edit to one module walks and lowers that
+module and reads the rest back, and the image is byte for byte the one an
+uncached build writes (`dreams/tests/units.sh`). `mind` passes it on every
+build. [dreams/unit.dr](dreams/unit.dr) and "Compile units" in
+docs/notes/parallel-compile.md are the design.
 
 The pipeline a build runs -- resolve, lower and link, types, contracts, share,
 emit -- is written once, in [dreams/compile.dr](dreams/compile.dr):

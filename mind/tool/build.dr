@@ -998,6 +998,18 @@ let script_args! m o g =
         },
     };
 
+/// Where the compiler keeps each module's walk and lowering between builds
+/// (`dreams --units`), so a build after an edit to one module walks and lowers
+/// that module and reads the rest back. One cache for every project and every
+/// compiler, since a unit's key holds the compiler's digest and everything the
+/// unit was computed from: `$MIND_UNITS`, or `units` in `mind`'s own
+/// directory, and `MIND_UNITS=off` for none.
+let units_args! () = match util.env_path! "MIND_UNITS" {
+    () => ["--units", util.join (util.mind_home! ()) "units"],
+    "off" => [],
+    dir => ["--units", dir],
+};
+
 /// The whole command line for one build.
 ///
 /// The package's settings come before this invocation's, because the compiler
@@ -1018,6 +1030,7 @@ let compile_args! m o =
                      (list.unique (list.concat [manifest.host_modules m, dep_hosts g,
                                                 option o :hosts []])),
             setting_args m o g,
+            units_args! (),
             from_scripts,
             ["-o", output_of m o],
             manifest.compiler_flags m,

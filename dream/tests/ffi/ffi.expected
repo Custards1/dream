@@ -33,8 +33,8 @@ counter4,counter5
 <error :ffi_error argument 3 of `sort_ints`: a callback must be a pure function: C cannot wait while it performs an effect>
 -- memory
 [24, 24]
-%{:size => 24, :order => [:x, :y, :tag], :fields => %{:x => [0, :i32], :y => [8, :double], :tag => [16, :u8]}, :align => 8}
-%{:x => 3, :y => 1.5, :tag => 7}
+[[:align, 8], [:fields, [[:tag, [16, :u8]], [:x, [0, :i32]], [:y, [8, :double]]]], [:order, [:x, :y, :tag]], [:size, 24]]
+[[:tag, 7], [:x, 3], [:y, 1.5]]
 18.5
 8
 [4, "abc", "bc"]

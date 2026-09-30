@@ -35,6 +35,7 @@ import dreams.builtins;
 import dreams.diag;
 import dreams.fuse;
 import dreams.modules;
+import dreams.unit;
 
 // --- what a name in front of a dot can be ------------------------------------
 //
@@ -2255,7 +2256,7 @@ let merge_parts declared r0 base walked = {
 /// the starting state and every part are shared (`vm.share!`), so what crosses
 /// between processes is pointers; see "resolving in parts" for what the
 /// answer does and does not hold.
-let resolve_parts! l part_count = {
+let resolve_parts! l cache = {
     let declared = declare! l;
     let r0 = ((((((((resolver (envs declared))).[:imports => (s_imports declared)])).[:module_recs => (s_module_recs declared)])).[:diags => (diags declared)])).[:fuse => true];
     let seeded = list.fold (fn r e ->
@@ -2263,21 +2264,80 @@ let resolve_parts! l part_count = {
         r0 (modules.expansions l);
     let shared_l = vm.share! l;
     let base = vm.share! (walk_base shared_l declared seeded 0);
+    // What every part starts from, as a key: a part walked against other
+    // declarations is another part. Without `defs`, which is the outline of
+    // every declaration with its span, and which nothing a walk does reads --
+    // an editor and `--dump` do. With it, one character typed anywhere moved a
+    // span in the outline, and every module's part was walked again. With the
+    // modules' names, which the walk reads from the loader for a group's
+    // members. Only worked out when there is a cache to key, since it is a
+    // walk of the whole declared program.
+    let base_key = match cache {
+        () => "",
+        _ => unit.digest [map_remove base :defs,
+                          list.map (fn i -> modules.module_name (modules.module_at l i))
+                                   (list.range 0 (modules.module_count l))],
+    };
     let all = pending declared;
     let numbered = list.zip (list.range 0 (list.length all)) all;
-    // Dealt before any process starts, for the reason `lower.link_parallel!`
-    // gives.
-    let slices = strict! (list.map (fn k -> list.filter (fn np -> list.head np % part_count == k) numbered)
-                                   (list.range 0 part_count));
-    let running = strict! (list.map (fn slice -> walk_elsewhere! shared_l base slice) slices);
+    // One part per module whose bodies it walks, in the order of the modules:
+    // a module's bodies are what a change to it changes, so a part is a unit
+    // that can be kept between builds (see "a part as a unit"). Dealt before
+    // any process starts, for the reason `lower.link_parallel!` gives.
+    let by_module = list.fold (fn m np -> {
+        let mi = list.head (list.nth 1 np);
+        m.[mi => list_cons np (m.[mi else []])]
+    }) (%{}) numbered;
+    let slices = strict! (list.map (fn mi -> list.reverse (by_module.[mi]))
+                                   (list.sort (list.map list.head (map_pairs by_module))));
+    let running = strict! (list.map (fn slice -> walk_elsewhere! cache shared_l base base_key slice) slices);
     let walked = strict! (list.map (fn pr -> join! pr) running);
     merge_parts declared seeded base walked
 };
 
 /// A process walking one part. Its own function so that the suspension
 /// `spawn!` copies holds the loader, the state and the slice -- all shared, or
-/// small -- and nothing else.
-let walk_elsewhere! l base slice = spawn! $( vm.share! (walk_part l base slice) );
+/// small -- and nothing else. The cache and the key are strict for the same
+/// reason: handed in unforced, the key was a suspension of the caller's frame,
+/// and every part's process was given a copy of the whole resolution with it
+/// -- 1.7 GB more copied on a self-compile, and twice the time, with no cache
+/// at all.
+let walk_elsewhere! !cache l base !base_key slice = spawn! $( vm.share! (walk_unit! cache l base base_key slice) );
+
+// --- a part as a unit ---------------------------------------------------------------
+//
+// A part's walk is a function of the state every part starts from and of its
+// own module's bodies, so with a unit cache it is kept, as what it added to
+// that state, under a key made of both (see `dreams/unit.dr`). It is walked
+// with positions counted from its own first body, and shifted to where it
+// stands after: a body added to an earlier module moves every later one, and
+// a unit that held absolute positions would be stale for no reason.
+
+/// Walk one part, or read it back.
+let walk_unit! cache l base base_key slice = match cache {
+    () => walk_part l base slice,
+    _ => walk_kept! cache l base base_key slice,
+};
+
+let walk_kept! cache l base base_key slice = {
+    let from = list.head (list.head slice);
+    let local = unit.shifted (0 - from) slice;
+    let k = match cache { () => (), _ => unit.key ["walk", base_key, unit.digest local] };
+    let walked = match unit.recall! cache "walk" k {
+        () => {
+            let r = walk_part l base local;
+            unit.keep! cache "walk" k (unit.delta base r)
+            r
+        },
+        d => unit.restore base d,
+    };
+    (((walked.[:part_bodies => unit.shifted from (part_bodies walked)])
+        .[:part_notes => unit.shifted from (walked.[:part_notes else []])])).[:unit_key => k]
+};
+
+/// The key a part was kept under, or `()` for a build that keeps none. What
+/// lowering keys the part's lowering by, with the wrappers it lowers against.
+let unit_key r = r.[:unit_key else ()];
 
 // --- wrappers ---------------------------------------------------------------------
 //

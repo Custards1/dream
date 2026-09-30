@@ -62,6 +62,10 @@ mapping Options {
     payloads = []
     parallel = false
     payload_names = []
+    // Where parts are kept between builds (`--units DIR`, see `dreams/unit.dr`),
+    // or `()`: only a parallel build is in parts, so only one reads or keeps
+    // them.
+    units = ()
 }
 
 /// The defaults: checked, shared, no payload.
@@ -69,7 +73,7 @@ let options = Options.new ();
 
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
-let scratch = Options.make false false [] false [];
+let scratch = Options.make false false [] false [] ();
 
 // --- a build --------------------------------------------------------------------
 
@@ -108,12 +112,12 @@ let build! l o = {
     // keeps each part's name uses in the part, and lowering the arena whole
     // (`--no-opt`) asks them all of one resolution.
     let parted = parallel && Options.optimize o;
-    let r = if parted { scope.resolve_parts! l lower.part_count } else { scope.resolve! l };
+    let r = if parted { scope.resolve_parts! l (Options.units o) } else { scope.resolve! l };
     // A build that will be optimized is lowered in parts, in several processes
     // at once (`lower.link_parallel!`); one that will not keeps the arena
     // exactly as `lower` builds it, which the parts cannot, since each is
     // shared before it is merged.
-    let low = if parted { lower.link_parallel! l r } else { lower.link! l r };
+    let low = if parted { lower.link_parallel! l r (Options.units o) } else { lower.link! l r };
     let front = list.append (modules.diags l) (lower.all_diags r low);
     // One checker for the diagnostics, the contracts and both of the JIT's
     // parameter masks. Lazy, so a build without types never makes it -- and

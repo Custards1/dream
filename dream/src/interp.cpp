@@ -205,10 +205,27 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
 
     switch (oa->type) {
         case ObjType::Cons: {
-            auto* x = static_cast<ConsObj*>(oa);
-            auto* y = static_cast<ConsObj*>(ob);
-            if (!values_equal(p, x->head, y->head, raised, depth + 1) || *raised) return false;
-            return values_equal(p, x->tail, y->tail, raised, depth + 1);
+            // Down the spine in a loop, as `compare` walks it: recursing on
+            // the tail made a list deep as well as long, and two lists of a
+            // thousand elements could not be compared at all -- the depth
+            // limit is for nesting, and only the elements nest.
+            Value xa = fa, xb = fb;
+            for (;;) {
+                auto* x = static_cast<ConsObj*>(as_obj(xa));
+                auto* y = static_cast<ConsObj*>(as_obj(xb));
+                if (!values_equal(p, x->head, y->head, raised, depth + 1) || *raised) return false;
+                xa = resolve(x->tail);
+                xb = resolve(y->tail);
+                if ((!is_whnf(xa) && !force_whnf(p, xa, &xa)) ||
+                    (!is_whnf(xb) && !force_whnf(p, xb, &xb))) {
+                    *raised = true;
+                    return false;
+                }
+                if (xa == xb) return true;
+                if (!is_obj(xa, ObjType::Cons) || !is_obj(xb, ObjType::Cons)) {
+                    return values_equal(p, xa, xb, raised, depth + 1);
+                }
+            }
         }
         case ObjType::Array: {
             auto* x = static_cast<ArrayObj*>(oa);

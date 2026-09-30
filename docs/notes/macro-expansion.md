@@ -777,9 +777,13 @@ the seed compiling the new source gave one image, and that image compiling the
 source gave another, 387 bytes apart, all in that constant's `NODE` records.
 Both are deterministic, and the second is a fixpoint -- it compiles the source
 into itself, because the compiler that wrote it has the atom table it writes.
-So after a compiler change that adds atoms, **the seed is stage 3, not stage 2**:
-build with the seed, build again with what that made, check that the second
-reproduces itself, and copy that one over `dreams/bootstrap/dreams.dream`.
+So after a compiler change that adds atoms, **the seed is the fixpoint, not
+stage 2**: build with the seed, build again with what that made, and keep going
+until an image compiles the source into itself, then copy that one over
+`dreams/bootstrap/dreams.dream`. It was stage 3 here, and stage 4 when the
+compile units came in (2026-09-30): the atoms a compiler's own image holds
+decide the next image's constants, which decide its atoms, and it took one more
+round for that to settle.
 Copying stage 2 would pass the next `bootstrap-check` (which compares stage 2
 with stage 3 of the *next* run) and still leave a seed that does not reproduce
 itself, which is the guarantee the check exists for.

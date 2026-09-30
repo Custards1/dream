@@ -1,4 +1,5 @@
 #include "builtins.hpp"
+#include "sha256.hpp"
 
 #include "io.hpp"
 
@@ -1219,6 +1220,7 @@ NativeResult vm_host_members(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_open_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_call_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_close_image(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_image_digest(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_wire_encode(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_wire_decode(Process& p, Value self, Value* args, uint32_t n);
 }  // namespace
@@ -1245,6 +1247,7 @@ ModuleDef make_vm_module() {
                          {"open_image!", 1, 0b1, vm_open_image},
                          {"call_image!", 4, 0b1111, vm_call_image, 0, true},
                          {"close_image!", 1, 0b1, vm_close_image},
+                         {"image_digest", 1, 0b1, vm_image_digest},
                          // `std.wire`'s format, done here; see "The wire format, natively".
                          {"wire_encode", 1, 0b0, vm_wire_encode, 0, true},
                          {"wire_decode", 1, 0b1, vm_wire_decode},
@@ -2656,6 +2659,30 @@ struct WireReader {
         }
     }
 };
+
+/// The SHA-256 of the running image, as `io.digest` spells one: which program
+/// this is, exactly. A compiler keys what it caches between runs by it, since
+/// a unit one compiler made means nothing to another. Pure, because an image
+/// cannot change while it runs; worked out once per runtime.
+NativeResult vm_image_digest(Process& p, Value, Value*, uint32_t) {
+    static std::mutex mutex;
+    static std::unordered_map<const void*, std::string> known;
+    const Image& img = p.runtime().image();
+    std::string hex;
+    {
+        std::lock_guard<std::mutex> g(mutex);
+        auto it = known.find(&img);
+        if (it != known.end()) hex = it->second;
+    }
+    if (hex.empty()) {
+        Sha256 sha;
+        sha.update(img.bytes(), img.byte_count());
+        hex = sha.hex();
+        std::lock_guard<std::mutex> g(mutex);
+        known[&img] = hex;
+    }
+    return NativeResult::ok(p.heap().make_string(hex.data(), uint32_t(hex.size())));
+}
 
 NativeResult vm_wire_decode(Process& p, Value, Value* args, uint32_t) {
     Bytes b;

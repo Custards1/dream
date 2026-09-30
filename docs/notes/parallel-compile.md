@@ -301,3 +301,69 @@ and two cores are unchanged (10.8/10.4 s against 10.7/10.3, 6.7/6.4 against
 cross-part share, which is the end of the critical path, has twice the parts
 to merge. That is a loss on a machine anyone can measure for a gain on one
 nobody here has, so it waits for someone with eight cores to measure it.
+
+## Compile units: a module's walk and lowering, kept between builds
+
+Done 2026-09-30. `dreams --units DIR` keeps each module's part of a parallel
+build -- its walk (resolution) and its lowering -- and reads it back when
+nothing it was computed from has moved; `mind` passes it on every build
+(`$MIND_HOME/units`). On a self-compile with four cores:
+
+| | |
+|---|---|
+| no cache | 7.8 s |
+| cold cache (computes and keeps every part) | 7.9-8.8 s |
+| warm, nothing changed | 5.2-5.5 s |
+| one body edited in one module | 5.4 s |
+
+and every image equals the one an uncached build of the same source writes,
+byte for byte, which `dreams/tests/units.sh` holds after each kind of edit a
+key has to notice. What is left of the warm build is what is not cached:
+loading and expanding, declaring, the merge, checking (always run), sharing and
+emitting.
+
+How it is built, and why each piece is the way it is:
+
+- **Parts are modules.** A body used to go to part `index % 4`, which is
+  balanced and says nothing about what changed. Now each module's bodies are a
+  part, walked and lowered in a process of its own; that alone costs nothing
+  measurable (7.7 s against 7.7 s), and it makes a part a unit an edit either
+  touches or does not.
+- **Declaring stays whole.** Macros run transformers from any module, `derive`
+  specializes a base module's *syntax*, and every part's lowering reads the
+  whole program's wrappers, so a module is not compiled alone: the program is
+  loaded and declared as before, and what is kept is the per-body work, which
+  is most of a build.
+- **A walk is kept as what it added** to the state every part starts from
+  (`unit.delta`), and read back by laying that over this build's state
+  (`unit.restore`). Sound because that state is in the key -- minus `defs`,
+  the outline with every declaration's span, which no walk reads and which
+  moved every key on every keystroke -- with the modules' names, which the
+  walk reads from the loader.
+- **A lowering's key is the walk's plus the wrappers the part reaches**, closed
+  over what each wrapper stands for. Keyed on the whole table, a wrapper
+  moving anywhere re-lowered every part: a wrapper's literal keeps its span,
+  and a call site lowered from it carries the span into the image, so its
+  callers do change -- but only its callers.
+- **Positions are relative to the part.** A part names bodies by where they
+  stand in the program's queue, and a body added to an earlier module moves
+  every later one.
+- **Keys start with the compiler's digest** (`vm.image_digest`), so no unit is
+  ever read by a compiler that did not write it.
+- **It needed the wire format in C++.** A unit is a hundred thousand nodes, and
+  `std.wire` in Dream took 70 s to read one that size; `vm.wire_encode` and
+  `vm.wire_decode` write the same bytes in milliseconds.
+
+The trap it walked into, written down because it is the one CLAUDE.md warns
+about and it still cost an hour: the keys handed to each part's `spawn!` were
+unforced -- even with no cache, when they were `()` -- and a suspension carries
+its frame. Every one of the sixty-odd part processes was given a copy of the
+whole resolving frame, the loader included: 1.7 GB more copied and twice the
+time, invisible to `--time` because `--time` runs serially. `!cache` and `!k`
+on `walk_elsewhere!` and `part_elsewhere!` are the fix.
+
+Next, in the order they would pay: checking kept per part (it reads the whole
+program's signatures and the settled `comp`s, so its key needs both); the
+parse kept per file; and a part's key narrowed from the whole declared state to
+the declarations the part's names reach, so that adding a function to one
+module does not walk every other again.

@@ -18,6 +18,7 @@
 // arena into bytes. Both are their own step.
 
 import std.list;
+import std.map;
 import std.str;
 import std.macros;
 
@@ -31,6 +32,7 @@ import dreams.opt;
 import dreams.modules;
 import std.vm;
 import dreams.scope;
+import dreams.unit;
 
 // --- the lowering state -----------------------------------------------------
 //
@@ -1908,12 +1910,36 @@ let lower_part r numbered = {
 /// Its own function so that the suspension `spawn!` copies holds the
 /// resolution and the slice and nothing else; the part comes back shared, so
 /// joining it is a pointer too.
-let part_elsewhere! r slice = spawn! $( vm.share! (lower_part r slice) );
+/// The cache and the key are strict: see `scope.walk_elsewhere!` for what an
+/// unforced key carried into every part's process.
+let part_elsewhere! !cache !k r slice = spawn! $( vm.share! (lower_unit! cache k r slice) );
+
+/// Lower one part, or read it back: see "a part as a unit" in `scope`. A
+/// part's lowering is a function of its walk -- whose key covers the declared
+/// program and the part's bodies -- and of the wrappers of the whole program,
+/// which every part lowers against; `k` is made of those two. Positions are
+/// counted from the part's first body for the reason the walk's are.
+let lower_unit! cache k r slice = match [cache, slice] {
+    [(), _] => lower_part r slice,
+    [_, []] => lower_part r slice,
+    [_, [[from, .._], .._]] => {
+        let local = unit.shifted (0 - from) slice;
+        let lowered = match unit.recall! cache "lower" k {
+            () => {
+                let part = lower_part r local;
+                unit.keep! cache "lower" k part
+                part
+            },
+            kept => kept,
+        };
+        lowered.[:notes => unit.shifted from (lowered.[:notes])]
+    },
+};
 
 /// Lower the whole program in parts and link it: what `link!` does, in
 /// `part_count` processes. Each part comes back shared within itself.
-let link_parallel! : modules.Loader -> scope.Resolution -> Lowering;
-let link_parallel! ld r = {
+let link_parallel! : modules.Loader -> scope.Resolution -> :any -> Lowering;
+let link_parallel! ld r cache = {
     let rs = vm.share! r;
     // A resolution made in parts is lowered in the same parts, each against
     // the part that walked it -- which is the only one that knows what its
@@ -1934,7 +1960,19 @@ let link_parallel! ld r = {
     // Dealt before any process starts: a slice left lazy would cross into its
     // child as a suspension holding every body, and be dealt there.
     strict! work
-    let running = strict! (list.map (fn w -> part_elsewhere! (list.head w) (list.nth 1 w)) work);
+    // What a part is lowered against besides its own walk: the wrappers it
+    // reaches, as a key. Only those -- a literal in a wrapper keeps its span,
+    // which a call site lowered from it carries into the image, so a wrapper
+    // moving does change its callers; keyed on the whole table, one character
+    // typed anywhere above a wrapper re-lowered every part in the program.
+    let all_wrappers = scope.wrappers rs;
+    let key_of w = match [cache, scope.unit_key (list.head w)] {
+        [(), _] => (),
+        [_, ()] => (),
+        [_, walk] => unit.key ["lower", walk, unit.digest (reached_wrappers all_wrappers (list.head w))],
+    };
+    let running = strict! (list.map (fn w -> part_elsewhere! (if key_of w == () { () } else { cache }) (key_of w)
+                                                             (list.head w) (list.nth 1 w)) work);
     let parts = strict! (list.map (fn pr -> join! pr) running);
     let offsets = list.map (fn w -> scope.part_offsets (list.head w)) work;
     let head = link_head rs offsets parts;
@@ -1963,6 +2001,28 @@ let link_parallel! ld r = {
     // process: the parts are never laid out any other way.
     linked.[:image => patched linked (opt.optimize_parts (list.head (for_sharing rs head))
                                                           (head.[:arenas]) (scope.invented_from rs))]
+};
+
+/// The wrappers a part's names reach, and the wrappers those stand for, as
+/// `[global, wrapper]` sorted: what its lowering reads of the table.
+let reached_wrappers all r = {
+    let used = list.fold (fn m [_, meaning] -> match meaning {
+        [:global, _, _, gi] if gi != () => m.[gi => true],
+        [:member, _, _, gi] if gi != () => m.[gi => true],
+        _ => m,
+    }) (%{}) (map_pairs (scope.refs r));
+    let rec close seen todo = match todo {
+        [] => seen,
+        [gi, ..rest] => match all.[gi else ()] {
+            () => close seen rest,
+            w => {
+                let next = scope.target_global (list.head w);
+                if map_has seen gi { close seen rest }
+                else { close (seen.[gi => w]) (list.cons next rest) }
+            },
+        },
+    };
+    list.sort_on list.head (map_pairs (close (%{}) (map.keys used)))
 };
 
 /// Whether this lowering was made in parts, and so has no arena of its own:
