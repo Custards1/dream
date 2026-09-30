@@ -1463,10 +1463,7 @@ NativeResult comp_fail(Process& p, const char* kind, const std::string& message)
 /// not two that drift.
 NativeResult run_compile_time(Process& p, Runtime& rt, Scheduler& sched,
                               const std::shared_ptr<Process>& root) {
-    sched.start();
-    sched.enqueue(root);
-    bool clean = sched.wait_for_all();
-    sched.stop();
+    bool clean = sched.run(root);
 
     if (root->failed || !clean) {
         return comp_fail(p, "comp_failed", "the compile-time expression failed");

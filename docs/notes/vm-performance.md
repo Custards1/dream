@@ -512,6 +512,20 @@ by `enqueue` and decremented when a slice ends without re-enqueueing, so a
 slice that hands its process straight back increments before it decrements and
 the count never dips. The check is one load.
 
+**Later, 2026-09-30: there was another instant like it.** `eval_image!` and
+`call_image!` run a compile-time expression on a scheduler of their own, and
+`run_compile_time` still started it before enqueueing. With one worker the
+check's `idle_workers_ + 1 >= workers_.size()` always holds, so the only thing
+between it and a false deadlock was the worker's 500us wait: a starting thread
+descheduled for longer than that on a loaded machine lost the race, and the
+`comp` answered `:comp_failed the compile-time expression failed`. It never
+showed under `just test`, which runs one compile at a time; `mind test` runs
+them in parallel and hit `dreams.contracts` about one clean run in two.
+Twenty-four copies of `dreams/tests/contracts.py` at once on four cores failed
+16 times before and none in 72 after. The order is now `Scheduler::run`, and
+the command line, the embedding API and compile-time evaluation all call it,
+so there is one place to get it right rather than three.
+
 ## The tier's eager arguments can change *which* error a program raises
 
 Found 2026-09-14, confirmed against the VM as it was before any of that day's

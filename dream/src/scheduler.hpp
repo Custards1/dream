@@ -71,6 +71,23 @@ public:
     /// Returns false when nothing could run but processes were still alive.
     bool wait_for_all();
 
+    /// Run a program whose root process is primed: queue it, start the
+    /// workers, wait, stop. Answers what `wait_for_all` does.
+    ///
+    /// One method because the order is the whole of it: the command line and
+    /// the embedding API had each been fixed to get it right, and compile-time
+    /// evaluation still had it wrong. A process is counted as active by `enqueue`, so a
+    /// scheduler started first has a window in which the root is live,
+    /// nothing is active and every worker is idle -- which is the definition
+    /// the deadlock check tests, and it fires. The flag is sticky, so the run
+    /// answers "deadlocked" however it goes on. A worker waits 500us before
+    /// it asks, so the window only opens when the starting thread is
+    /// descheduled for longer than that: a loaded machine, which is why a
+    /// compile-time `comp` failed one run in several under `mind test` and
+    /// never under `just test`. Queued before the workers exist, there is no
+    /// such instant.
+    bool run(const std::shared_ptr<Process>& root);
+
     // --- process-facing operations ---
     uint64_t spawn_from(Process& parent, Value work);
     bool send(Process& sender, uint64_t target, Value message);
