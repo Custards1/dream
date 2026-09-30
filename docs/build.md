@@ -68,14 +68,19 @@ build cheap:
 - A plan is **lazy**. A payload the image does not end up using is never
   built, and neither is a branch of a `match` that did not match.
 - A script is **importable**. `mind` compiles a small driver that imports
-  the script and calls `build.run! script.plan`. Because the script has no
+  the script and calls `run.run! script.plan` (`std.build.run`). Because the script has no
   entry point of its own, one driver can later import every package's script
   at once, as one program with one scheduler, which is the scaling item
   below.
 
-Effects happen in exactly two places: inside a step's action, which the
-runner calls, and in `build.given`, which feeds the result of a step back into
-the plan (see "Decisions that need the machine").
+Effects happen in exactly one place: the runner. A step's action is pure too,
+and answers what is to be done as data -- write this text there, run this
+program with these arguments (`build.Op`) -- which the runner carries out.
+That is not a stylistic choice: a pure function cannot so much as name an
+impure one, so an action that did its own work could not be made by a pure
+script at all. `build.given` feeds the result of a step back into the plan
+through a pure function of what the step made (see "Decisions that need the
+machine").
 
 ## The vocabulary
 
@@ -98,6 +103,8 @@ mapping Context {
     env = %{}           // only the variables the manifest names in [build] env
     options = %{}       // the package's options, settled ("Options")
     dependencies = %{}  // key => version, for everything it uses
+    jobs = 1            // the runner's: how many steps at once
+    cache = "target/build/steps"  // the runner's: where step directories live
 }
 
 mapping Target {
@@ -105,6 +112,12 @@ mapping Target {
     arch                // :x86_64 | :aarch64
 }
 ```
+
+The context reaches a script as `std.wire` bytes, and `wire` answers a name
+only with an atom the program already has. So the fields' descriptions spell
+out every atom they can hold (`os : :linux | :macos | :windows | :unknown`),
+which is what makes each decodable, and the runner checks what it read with
+`build.is_context` before a script sees it.
 
 `env` holds only what the manifest lists (`[build] env = ["CC",
 "PKG_CONFIG_PATH"]`). That is what lets the runner decide whether a script's
@@ -141,7 +154,7 @@ mapping Step {
     inputs = []         // [Input]: their contents are part of the key
     config = ()         // data: everything else that changes the output
     outputs = []        // [:string]: files it makes in its own directory
-    action              // Job -> result.Of :unit :string, called by the runner
+    action              // Job -> [Op], carried out by the runner
 }
 ```
 
@@ -169,10 +182,21 @@ mapping Job {
 }
 ```
 
-with `build.path job input`, `build.out job "name"`, `build.exec! job program
-args`, which runs the program in `dir` and answers `[:error, output]` when it
-fails, and `build.log! job text`. An action is the only code in a build that
-touches the file system, and it touches only what it was handed.
+with `build.path job input` and `build.out job "name"`. What an action answers
+is a list of operations, done in order in the step's directory and stopping
+at the first that fails:
+
+```dream
+union Op {
+    write(name : :string, text : :string)
+    copy(from : :string, name : :string)
+    exec(program : :string, args : [:string])   // run in the step's directory
+}
+```
+
+An action touches only what it names, and only inside its own directory.
+`exec` runs through `os.exec_in!`, which gives the child its own working
+directory: `chdir!` is the whole VM's, and steps run at once.
 
 ### Plans
 
@@ -242,7 +266,7 @@ otherwise write for itself:
 virtual let name cfg;                   // "cc"
 virtual let inputs cfg;                 // [Input]
 virtual let outputs ctx cfg;            // [:string]; may depend on the target
-virtual let run! job cfg;               // make them
+virtual let run job cfg;                // the operations that make them
 virtual let version cfg = "1";          // change it to invalidate every step made before
 
 /// The step this configuration describes. The key covers the tool's
@@ -271,7 +295,7 @@ let shared ctx c = artifact ctx c;
 let name c = "cc";
 let inputs c = Config.sources c;
 let outputs ctx c = [build.shared_name ctx (Config.name c)];
-let run! job c = build.exec! job (compiler job) (arguments job c);
+let run job c = [build.Op.exec (compiler job) (arguments job c)];
 ```
 
 That is all a tool is. It is why `cc` does not have to be in `std` to be as
@@ -291,7 +315,7 @@ needs it:
 `std.build.command` is the escape hatch that keeps the rest honest:
 
 ```dream
-let parser = command.make "peg" "peg-gen" ["grammar.peg", "-o", command.out "parser.dr"];
+let parser = command.make "peg" "peg-gen" [command.file "grammar.peg", "-o", command.out "parser.dr"];
 build.module "parser" parser
 ```
 
@@ -304,7 +328,7 @@ imports, so `mind` treats it as a dependency like any other.
 
 ## Running a plan
 
-`build.run! plan` is the driver's `main!`. It:
+`run.run! plan` is the driver's `main!`. It:
 
 1. Reads the context `mind` wrote (`--context FILE`), or makes one for the
    host when it is run by hand. Running a script by hand is how it is
@@ -682,9 +706,12 @@ they are built says is not optional.
    publisher printed. The pure one is in `std.io` rather than among the
    builtins: it is `digest!` asked of bytes already in hand, and a builtin
    costs an opcode.
-3. **`std.build` core.** The vocabulary, keys, the runner (sequential
-   first, then concurrent), the stamp cache, outcomes, `write`, `command`,
-   and `when test` blocks for each.
+3. **`std.build` core. Built.** The vocabulary (`std.build`), keys, the
+   runner (`std.build.run`: concurrent by depth, `jobs` at a time), the stamp
+   cache, outcomes, `write`, `std.build.command`, and `std.file` beneath them,
+   each with its `when test` block. Actions answer operations rather than
+   performing them (see "Jobs"). The `std.build.tool` behavior waits for
+   item 7, which is its first user besides `command`.
 4. **The graph. Built.** Cycle detection with the loop in the message, version
    requirements and `std.version`, revision conflicts reported as such,
    three kinds of edge, and `mind.lock`. None of this needs build scripts,

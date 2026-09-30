@@ -1,5 +1,6 @@
 // Paths, files, and the small things every other module here needs.
 
+import std.file;
 import std.io;
 import std.list;
 import std.os;
@@ -156,54 +157,12 @@ let basename path = {
 };
 
 // --- files ------------------------------------------------------------------
+//
+// `std.file`'s, under the names the rest of `mind` already uses.
 
-let rec read_chunks! h acc = {
-    let chunk = io.read! h 65536;
-    if len chunk == 0 { acc } else { read_chunks! h (acc + chunk) }
-};
-
-/// The whole file, or `()` when it cannot be opened.
-let read_file! path = {
-    let opened = try! { io.open! path :read } catch e { () };
-    match opened {
-        () => (),
-        h => {
-            let text = read_chunks! h "";
-            io.close! h
-            text
-        }
-    }
-};
-
-let write_file! path text = {
-    let h = io.open! path :write;
-    let rec put! offset = {
-        let left = str.byte_length text - offset;
-        if left <= 0 { :done }
-        else {
-            // Two arguments, not one string built from both: `io.write!` is
-            // curried, so passing one leaves a function behind rather than
-            // failing here, and it fails as `offset + <function>` instead.
-            let wrote = io.write! h (str.slice offset left text);
-            put! (offset + wrote)
-        }
-    };
-    put! 0
-    io.close! h
-};
-
-/// Make `path` and every directory above it.
-let rec mkdir_p! path =
-    match path {
-        "" => :done,
-        "." => :done,
-        "/" => :done,
-        p => {
-            let parent = dirname p;
-            if parent != p { mkdir_p! parent } else { :done }
-            io.mkdir! p
-        }
-    };
+let read_file! path = file.read! path;
+let write_file! path text = file.write! path text;
+let mkdir_p! path = file.mkdir_all! path;
 
 when test {
     import std.test;

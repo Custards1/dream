@@ -369,6 +369,7 @@ The result map fields:
 | `now!` | `unit → integer` | Milliseconds since the Unix epoch, from the wall clock. It can jump, forwards or back, so it is what to stamp a log line with and never what to measure a duration with. |
 | `pid!` | `unit → integer` | The OS process ID of the running VM. |
 | `platform` | `unit → atom` | The current platform: `:linux`, `:macos`, `:windows`, or `:unknown`. |
+| `arch` | `unit → atom` | `:x86_64`, `:aarch64` or `:unknown`: the architecture the VM was built for, which is the one a program's native code has to match. |
 | `exit!` | `code:integer → never` | Terminates the entire VM immediately with the given exit code. Flushes stdio first. Never returns. |
 
 ---

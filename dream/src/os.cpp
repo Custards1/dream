@@ -586,6 +586,21 @@ NativeResult os_pid(Process& p, Value, Value*, uint32_t) {
     )));
 }
 
+/// The machine's architecture, in the names the image header's target bits
+/// use. What the VM was built for rather than what the kernel says, which is
+/// the same thing for every question a program can ask of it: this is the
+/// architecture the program's native code has to match.
+NativeResult os_arch(Process& p, Value, Value*, uint32_t) {
+#if defined(__x86_64__) || defined(_M_X64)
+    const char* name = "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    const char* name = "aarch64";
+#else
+    const char* name = "unknown";
+#endif
+    return NativeResult::ok(make_atom(p.runtime().intern_atom(name)));
+}
+
 NativeResult os_platform(Process& p, Value, Value*, uint32_t) {
 #if defined(__linux__)
     const char* name = "linux";
@@ -748,6 +763,7 @@ ModuleDef make_os_module() {
                          {"now!", 1, 0b1, os_now},
                          {"pid!", 1, 0b1, os_pid},
                          {"platform", 1, 0b1, os_platform},
+                         {"arch", 1, 0b1, os_arch},
                          {"exit!", 1, 0b1, os_exit},
                      }};
 }

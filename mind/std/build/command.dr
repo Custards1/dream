@@ -1,0 +1,73 @@
+// std.build.command: run any program as a step.
+//
+//     let parser = command.make "peg" "peg-gen" [command.file "grammar.peg", "-o", command.out "parser.dr"];
+//     build.module "parser" parser
+//
+// The arguments are one list, and what in it is an input or an output is
+// marked there: a bare string is passed as written, `command.file` and an
+// artifact are inputs (passed as their paths), and `command.out` is an output
+// (passed as its name, which is relative to the step's directory, where the
+// program runs). So a step's inputs, its outputs and its key all come from the
+// one list the program is run with, and cannot drift from it.
+
+import std.build;
+import std.list;
+
+/// An output of the command, passed to it by name.
+let out : :string -> :any;
+let out name = [:out, name];
+
+/// A file of the package, passed to the command as its path.
+let file : :string -> :any;
+let file path = build.Input.file path;
+
+let is_input : :any -> :bool;
+let is_input a = match a { [:file, _] => true, [:artifact, _, _] => true, _ => false };
+
+/// The step, for a caller that wants more than its first output.
+let step : :string -> :string -> [:any] -> :map;
+let step name program args = {
+    let inputs = list.filter is_input args;
+    let outputs = list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args;
+    // The config says where each input goes rather than what it is: the
+    // inputs are in the key already, by content, and a path would make the
+    // same command in two checkouts two different steps.
+    let placed = list.map (fn a -> match a {
+        [:out, n] => [:out, n],
+        _ if is_input a => [:in, list.index_of a inputs],
+        s => s,
+    }) args;
+    build.step "command" name inputs [program, placed] outputs
+        (fn job -> [build.Op.exec program (list.map (fn a -> match a {
+            [:out, n] => n,
+            _ if is_input a => build.path job a,
+            s => s,
+        }) args)])
+};
+
+/// Its first output, as an input to something else: what most callers want.
+let make : :string -> :string -> [:any] -> :any;
+let make name program args = {
+    let s = step name program args;
+    build.artifact s (list.head (build.Step.outputs s))
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "inputs and outputs come from the argument list"
+            $( {
+                let s = step "t" "cc" [file "a.c", "-o", out "a.o"];
+                test.eq! [[[:file, "a.c"]], ["a.o"]] [build.Step.inputs s, build.Step.outputs s]
+            } ),
+        test.case "an artifact is an input"
+            $( {
+                let made = make "g" "gen" [out "g.c"];
+                test.eq! [made] (build.Step.inputs (step "c" "cc" [made, out "g.o"]))
+            } ),
+        test.case "the key follows the program and the arguments"
+            $( test.ne! (build.Step.shape (step "t" "cc" [file "a.c", "-O2"]))
+                        (build.Step.shape (step "t" "cc" [file "a.c", "-O0"])) ),
+    ];
+}
