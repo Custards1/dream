@@ -1760,6 +1760,7 @@ waiting for a value.
 | `list_dir! path` | the names in a directory, sorted, without `.` and `..` |
 | `exec! program args` | run a child to completion → `%{ :code, :out, :err, :timed_out }` |
 | `exec_for! program args ms` | the same, killing the child after `ms` |
+| `exec_in! dir program args ms` | the same, started in `dir`; `0` for no deadline |
 | `replace! program args` | **become** `program`: this VM is gone and it takes over the process |
 | `monotonic! ()` | milliseconds from a fixed point, from a clock that never jumps |
 | `now! ()` | milliseconds since the Unix epoch, from the wall clock |

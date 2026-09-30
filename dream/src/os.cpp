@@ -121,6 +121,10 @@ struct Job {
     std::string out;
     std::string err;
     std::thread worker;
+    /// Where the child starts, or empty for this VM's own working directory.
+    /// A child's own, because `chdir!` is the whole VM's: two build steps
+    /// running at once could not each change it without breaking the other.
+    std::string dir;
 
     /// 0 means "wait as long as it takes". Anything else is a deadline after
     /// which the child is killed -- worth having because a build tool spends
@@ -245,7 +249,8 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     }
     PROCESS_INFORMATION child{};
     bool created = ready && CreateProcessW(nullptr, command.data(), nullptr, nullptr,
-        TRUE, EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &start.StartupInfo, &child);
+        TRUE, EXTENDED_STARTUPINFO_PRESENT, nullptr,
+        job->dir.empty() ? nullptr : windows::wide(job->dir).c_str(), &start.StartupInfo, &child);
     DWORD error = GetLastError();
     DeleteProcThreadAttributeList(start.lpAttributeList);
     CloseHandle(out_write); out_write = nullptr;
@@ -331,6 +336,14 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     posix_spawn_file_actions_adddup2(&actions, err_pipe[1], 2);
     posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
     posix_spawn_file_actions_addclose(&actions, err_pipe[0]);
+    if (!job->dir.empty()) {
+        // Before the program is looked up, so a relative program name is
+        // relative to `dir`, as it would be to a shell that had `cd`'d there.
+        // Every libc this VM is built against has it: glibc since 2.29, and
+        // macOS since 10.15. Nothing here falls back to `chdir!`, which would
+        // move every other process's working directory with it.
+        posix_spawn_file_actions_addchdir_np(&actions, job->dir.c_str());
+    }
 
     std::vector<char*> args;
     args.reserve(argv.size() + 1);
@@ -397,10 +410,10 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
 
 #endif
 
-NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms);
+NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir);
 
 NativeResult os_exec(Process& p, Value, Value* args, uint32_t) {
-    return os_exec_with(p, args, 0);
+    return os_exec_with(p, args, 0, UNIT);
 }
 
 /// `exec_for! program args milliseconds` -- the same, with a deadline. A child
@@ -411,10 +424,23 @@ NativeResult os_exec_for(Process& p, Value, Value* args, uint32_t) {
     if (!is_fixnum(ms) || fixnum_value(ms) < 0) {
         return fail(p, "type_error", "exec_for! needs a timeout in milliseconds");
     }
-    return os_exec_with(p, args, fixnum_value(ms));
+    return os_exec_with(p, args, fixnum_value(ms), UNIT);
 }
 
-NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms) {
+/// `exec_in! dir program args milliseconds` -- the same again, started in
+/// `dir`, with 0 for no deadline. What a build step runs things with: it
+/// owns a directory and must not have to share the VM's.
+NativeResult os_exec_in(Process& p, Value, Value* args, uint32_t) {
+    if (p.os_pending >= 0) return os_exec_with(p, args + 1, 0, UNIT);
+    if (!is_string(args[0])) return fail(p, "type_error", "exec_in! needs a directory");
+    Value ms = resolve(args[3]);
+    if (!is_fixnum(ms) || fixnum_value(ms) < 0) {
+        return fail(p, "type_error", "exec_in! needs a timeout in milliseconds, or 0 for none");
+    }
+    return os_exec_with(p, args + 1, fixnum_value(ms), args[0]);
+}
+
+NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir) {
     // Entered again after the helper thread woke us: the child has exited.
     if (p.os_pending >= 0) {
         int64_t id = p.os_pending;
@@ -464,6 +490,12 @@ NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms) {
 
     auto job = std::make_shared<Job>();
     job->timeout_ms = timeout_ms;
+    if (dir != UNIT) {
+        job->dir = string_arg(dir);
+        if (job->dir.empty() || job->dir.find('\0') != std::string::npos) {
+            return fail(p, "bad_argument", "exec_in! needs a directory");
+        }
+    }
     int64_t id = Jobs::get().add(job);
     p.os_pending = id;
 
@@ -710,6 +742,7 @@ ModuleDef make_os_module() {
                          {"list_dir!", 1, 0b1, os_list_dir},
                          {"exec!", 2, 0b01, os_exec},
                          {"exec_for!", 3, 0b101, os_exec_for},
+                         {"exec_in!", 4, 0b1011, os_exec_in},
                          {"replace!", 2, 0b01, os_replace},
                          {"monotonic!", 1, 0b1, os_monotonic},
                          {"now!", 1, 0b1, os_now},
