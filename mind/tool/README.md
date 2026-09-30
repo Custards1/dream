@@ -20,7 +20,7 @@ dream build/mind help
 | `mind new <name>` | create a project in `./<name>` |
 | `mind build` | compile to `target/<profile>/<name>.dream` |
 | `mind run [args]` | compile, then run with the arguments given |
-| `mind test` | compile with `--test` and run the result |
+| `mind test [NAME..]` | run every test at once: each package's units and its build script's checks |
 | `mind check` | compile without writing an image |
 | `mind add <source>` | add a dependency: a directory, a git URL, or a tarball |
 | `mind remove <name>` | take one out again |
@@ -171,6 +171,49 @@ A script sees only the environment variables its manifest lists:
 env = ["CC", "PKG_CONFIG_PATH"]
 script = "tools/build.dr"        # when it is not build.dr
 ```
+
+## Tests
+
+`mind test` runs every test a project has, at once, `-j` at a time: each
+package's **units** -- its `when test` blocks, compiled with `--test` and run
+-- and the **checks** its build script declares. A test is named for its
+package, and `mind test NAME` runs the ones called NAME or beginning with it
+and a dot:
+
+```
+mind test                     # everything
+mind test dreams              # one package's
+mind test dreams.contracts    # one check
+```
+
+A check is a step that passes when it succeeds, declared in `build.dr` and run
+only by `mind test`, every time:
+
+```dream
+let plan ctx =
+    build.empty
+    |> build.check "golden" (command.check ctx "golden" (command.toolchain ctx) "tests/golden.sh" []);
+```
+
+`command.check` runs a program in the package's directory, with the
+variables given laid over the environment; `command.toolchain ctx` is the VM
+and compiler this build uses (`DREAM`, `DREAMS`), for a suite that runs them.
+A library with no program of its own names the file its tests are gathered
+from, `[test] entry = "all.dr"`.
+
+A **workspace** tests several packages as one project:
+
+```toml
+[workspace]
+name = "dream"
+members = ["dreams", "lucid", "mind/std", "mind/tool"]
+
+[build]
+compiler = "build/dreams.dream"     # the members' too, unless --compiler says
+```
+
+`mind test` in it runs every member's tests and the workspace's own checks
+(its `build.dr`). The repository's own `mind.toml` is one.
 
 ### Cycles
 

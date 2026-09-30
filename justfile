@@ -211,6 +211,11 @@ vscode:
 # Everything.
 test: test-vm test-e2e test-std test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
 
+# The same suites as `test`, run at once by `mind test`: the repository is a
+# workspace, and each suite is a check. See "Testing" in CLAUDE.md.
+test-parallel: mind
+    DREAM="$PWD/{{dream}}" ./{{dream}} build/mind test
+
 test-vm: vm
     ./{{build_dir}}/bin/dream_tests
 

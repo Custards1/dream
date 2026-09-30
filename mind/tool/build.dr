@@ -12,6 +12,7 @@ import std.os;
 import std.str;
 import std.toml;
 import std.version;
+import std.build.Outcome;
 import std.build.Target;
 
 import config;
@@ -958,12 +959,33 @@ let script_target o m = match targets m o {
 };
 
 /// What every script in this build shares.
-let script_setting! m o g =
+let script_setting! m o g = {
+    // Absolute, since a check runs them from a directory of its own.
+    let placed! p = if str.contains_str "/" p { util.absolute! p } else { p };
     script.Setting.make (target_dir m)
-        (match compiler_command! (choose_compiler! m (option o :compiler ())) { [program, lead] => list.cons program lead })
-        (vm_command! ()) (profile_of o) (script_target o m) (option o :jobs 1)
+        (match compiler_command! (choose_compiler! m (option o :compiler ())) {
+             [program, lead] => list.map placed! (list.cons program lead),
+         })
+        (placed! (vm_command! ())) (profile_of o) (script_target o m) (option o :jobs 1)
         (list.fold (fn acc n -> match node_version n { () => acc, v => acc.[node_key n => v] }) (%{}) (nodes g))
-        (option o :verbose false);
+        (option o :verbose false) (option o :testing false) (option o :only [])
+};
+
+/// The package's own checks, run as `mind test` runs them -- `[:ok, [[name,
+/// [passed, ms, output]]]]`, `[:ok, []]` for a package without a script -- or
+/// why they could not be run. `:only` narrows them to the names given.
+let checks! m o =
+    match resolve! m o false {
+        [:error, why] => [:error, why],
+        [:ok, g] => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
+            [] => [:ok, []],
+            own => match script.run_all! (script_setting! m (with_option :testing true o) g) own {
+                [:error, why] => [:error, why],
+                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map_pairs (Outcome.checks outcome))],
+                [:ok, []] => [:ok, []],
+            },
+        },
+    };
 
 /// The compiler arguments this build's scripts add: none, and nothing run,
 /// when no package has a script.
@@ -987,7 +1009,7 @@ let compile_args! m o =
         [:ok, g, paths] => match script_args! m o g {
           [:error, why] => [:error, why],
           [:ok, from_scripts] => [:ok, list.concat [
-            [manifest.entry! m],
+            [match option o :entry () { () => manifest.entry! m, e => e }],
             paths,
             repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
             repeated "-I" (list.unique (list.concat [manifest.includes m, dep_includes g,

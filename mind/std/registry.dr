@@ -256,14 +256,10 @@ when test {
     ///
     /// A supervisor is asynchronous and a child registers itself once it is
     /// running, so "the name is bound" and "the name is bound to the new one"
-    /// are both moments nothing here can order. Each round trip gives the
-    /// pending work its turn, so this converges immediately in practice -- and
-    /// answering rather than waiting means a genuine disagreement fails the
-    /// case instead of hanging it.
-    priv let rec settle! reg name was tries = {
-        let p = whereis! reg name;
-        if p != was || tries <= 0 { p } else { settle! reg name was (tries - 1) }
-    };
+    /// are both moments nothing here can order, so it asks until they have
+    /// happened, for as long as `test.eventually!` allows -- by the clock, not
+    /// by a count of asks, which a loaded machine used up before the restart.
+    priv let settle! reg name was = test.eventually! (fn () -> whereis! reg name) (fn p -> p != was) test.patience;
 
     /// A registry, a body run against it, and the registry stopped again.
     ///
@@ -422,7 +418,7 @@ when test {
             $( test.true! (with_registry! (fn reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
-                   let p = settle! reg "c" () 200;
+                   let p = settle! reg "c" ();
                    supervisor.stop! sup
                    p != ()
                })) ),
@@ -430,11 +426,11 @@ when test {
             $( test.true! (with_registry! (fn reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
-                   let before = settle! reg "c" () 200;
+                   let before = settle! reg "c" ();
                    // It ends; the supervisor starts another; that one puts
                    // itself here over the entry the dead one left.
                    counter.cast! before :go_away
-                   let after = settle! reg "c" before 200;
+                   let after = settle! reg "c" before;
                    supervisor.stop! sup
                    before != () && after != () && after != before
                })) ),
@@ -442,9 +438,9 @@ when test {
             $( test.eq! 7 (with_registry! (fn reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
-                   let before = settle! reg "c" () 200;
+                   let before = settle! reg "c" ();
                    counter.cast! before :go_away
-                   settle! reg "c" before 200
+                   settle! reg "c" before
                    let got = call! reg "c" [:add, 7];
                    supervisor.stop! sup
                    got
@@ -453,7 +449,7 @@ when test {
             $( test.eq! ["c"] (with_registry! (fn reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
-                   settle! reg "c" () 200
+                   settle! reg "c" ()
                    let names = supervisor.which! sup;
                    supervisor.stop! sup
                    names

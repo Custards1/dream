@@ -2,3 +2,7 @@
 name = "mind"
 version = "0.1.0"
 src = "."
+
+[build]
+# `build.dr` here is `mind`'s own module; the build script is this one.
+script = "tests/build.dr"

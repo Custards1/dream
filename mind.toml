@@ -1,0 +1,10 @@
+# The repository, as one project for `mind test`: every package's own tests,
+# and the checks that belong to no one package (build.dr, beside this), run at
+# once. `mind test dreams` is one package's; `mind test dreams.contracts` one
+# check. `just test` is the same suite run one group at a time.
+[workspace]
+name = "dream"
+members = ["dreams", "lucid", "mind/std", "mind/tool"]
+
+[build]
+compiler = "build/dreams.dream"

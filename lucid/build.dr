@@ -1,0 +1,14 @@
+// The language server's one check beyond its units: a whole conversation with
+// it, run as a server, from the root of the repository.
+import std.build;
+import std.build.command;
+import std.file;
+import std.map;
+
+let plan : :map -> :map;
+let plan ctx = {
+    let repo = file.parent (build.Context.root ctx);
+    let chain = command.toolchain ctx;
+    let env = map.merge chain (%{ "dream" => chain.["DREAM"], "dreams" => chain.["DREAMS"], "MIND_STDLIB" => repo + "/mind" });
+    build.empty |> build.check "session" (command.check_in repo "session" env "lucid/tests/session.sh" [])
+};

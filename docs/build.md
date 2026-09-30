@@ -412,6 +412,27 @@ defines = ["release"]
 and the command line gains `--target`, `--profile`, `-D KEY:name=value` and
 `-j N`. The next two sections are the graph and the options.
 
+## Checks, and `mind test`
+
+A plan may declare **checks**: `build.check name step`. A check is a step
+that passes when its operations succeed, and it is run only by `mind test`,
+and every time -- it is a question, not something made -- after whatever it
+reads has been built. A test run's context says so (`testing`) and names the
+VM and the compiler the build uses (`vm`, `compiler`), and its outcome carries
+each check's result (`Outcome.checks`: passed, milliseconds, and what it
+printed when it failed).
+
+A suite written as a script is run with `command.check`, in the package's
+directory, or `command.check_in` somewhere else, with variables laid over the
+environment: `Op.run`, which is `os.exec_with!`. It is the one operation that
+reaches outside the step's directory, and only a check has a use for it.
+
+`mind test` runs each package's units -- its `when test` blocks, compiled
+with `--test` from `[test] entry` or its entry, and run -- and its checks, all
+at once, and names each `package.name`. A workspace (`[workspace] members`)
+does that for every member and for its own checks. A test run writes no
+record, so it never stands in for a build's answer.
+
 ## The package graph
 
 `mind` resolves one graph before anything is compiled or run, and every
@@ -756,6 +777,9 @@ they are built says is not optional.
    that one again and no other; the driver is recompiled when a stale
    script's sources moved. Steps are cached in `$MIND_HOME/build` unless
    `MIND_BUILD_CACHE` says otherwise.
+9. **Checks, workspaces and `mind test`. Built.** See "Checks, and `mind
+   test`" above. The repository is a workspace whose tests are what `just
+   test` runs.
 
 Settled:
 

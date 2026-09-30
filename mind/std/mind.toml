@@ -2,3 +2,8 @@
 name = "std"
 version = "0.1.0"
 src = "."
+
+[test]
+# A library has no program; its tests are gathered by all.dr, which imports
+# every module so that each one's `when test` block is collected.
+entry = "all.dr"

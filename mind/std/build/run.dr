@@ -122,13 +122,15 @@ let overlay modules = match map_pairs modules {
     },
 };
 
-/// Every step the plan reaches, by shape.
-let steps_of : :map -> :any -> :map;
-let steps_of plan mods = {
+/// Every step the plan reaches, by shape -- and in a test run, everything its
+/// checks read, though not the checks, which are run rather than built.
+let steps_of : :map -> :any -> :bool -> :map;
+let steps_of plan mods testing = {
     let roots = list.concat [map.values (build.Plan.payloads plan),
                              list.map (fn s -> build.artifact s "") (build.Plan.steps plan),
                              list.map (fn [i, _] -> i) (build.Plan.later plan),
-                             match mods { () => [], s => [build.artifact s ""] }];
+                             match mods { () => [], s => [build.artifact s ""] },
+                             if testing { list.flat_map build.Step.inputs (map.values (build.Plan.checks plan)) } else { [] }];
     list.fold reach (%{}) roots
 };
 
@@ -225,6 +227,11 @@ let op! dir o = try! {
         [:copy, from, name] => { file.copy! from (target! name); [:ok, ()] },
         [:exec, program, args] => {
             let r = os.exec_in! dir program args 0;
+            if r.[:code] == 0 { [:ok, ()] }
+            else { [:error, program + " exited with " + to_string r.[:code] + "\n" + r.[:out] + r.[:err]] }
+        },
+        [:run, where, env, program, args] => {
+            let r = os.exec_with! where (list.map (fn [k, v] -> k + "=" + v) (map_pairs env)) program args 0;
             if r.[:code] == 0 { [:ok, ()] }
             else { [:error, program + " exited with " + to_string r.[:code] + "\n" + r.[:out] + r.[:err]] }
         },
@@ -354,7 +361,7 @@ let rec settle! ctx st plan = {
         found => fail! (str.join_str "\n" found),
     }
     let mods = overlay (build.Plan.modules plan);
-    let steps = steps_of plan mods;
+    let steps = steps_of plan mods (build.Context.testing ctx);
     let keyed = fold! (fn acc s -> key! ctx acc s) st (map.values steps);
     let files = fold! (fn acc i -> match i { [:file, p] => digest! ctx acc p, _ => acc })
                       keyed (list.concat [map.values (build.Plan.payloads plan),
@@ -373,13 +380,58 @@ let rec settle! ctx st plan = {
     }
 };
 
+// --- checks -------------------------------------------------------------------------------
+
+/// One check, in a scratch directory of its own, removed when it passes and
+/// kept when it fails so that what it left can be looked at. A function by
+/// itself for the reason `run_one!` is.
+let check_one! : [:any] -> [:any];
+let check_one! job = {
+    let [ctx, k, s, paths] = job;
+    let dir = dir_of ctx k + ".check-" + to_string (os.pid! ());
+    file.mkdir_all! dir
+    let started = os.monotonic! ();
+    let result = fold! (fn acc o -> match acc { [:ok, _] => op! dir o, failed => failed })
+                       [:ok, ()] (build.Step.action s (build.Job.make dir ctx paths));
+    strict! result
+    let ms = os.monotonic! () - started;
+    match result {
+        [:ok, _] => { file.remove_all! dir; [true, ms, ""] },
+        [:error, why] => [false, ms, why + "\n  its work is in " + dir],
+    }
+};
+
+/// Every check in the plan, `jobs` at a time: `[results, state]`, the results
+/// by name as `Outcome.checks` keeps them.
+let run_checks! : :map -> :map -> :map -> [:any];
+let run_checks! ctx st plan = {
+    let wanted = build.Context.only ctx;
+    let named = list.filter (fn [n, _] -> list.is_empty wanted || list.contains n wanted)
+                            (list.sort_on list.head (map_pairs (build.Plan.checks plan)));
+    let keyed = fold! (fn acc [_, s] -> key! ctx acc s) st named;
+    let jobs = if build.Context.jobs ctx < 1 { 1 } else { build.Context.jobs ctx };
+    let results = fold! (fn found group -> {
+        let got = proc.try_map! check_one!
+                                (list.map (fn [_, s] -> [ctx, (State.keys keyed).[build.Step.shape s], s,
+                                                         map.from_pairs (list.map (fn i -> [build.input_id i, where ctx keyed i])
+                                                                                  (build.Step.inputs s))])
+                                          group);
+        strict! got
+        list.fold (fn m [[name, _], r] -> match r {
+            [:ok, answer] => m.[name => answer],
+            [:error, e] => m.[name => [false, 0, to_string e]],
+        }) found (list.zip group got)
+    }) (%{}) (chunks jobs named);
+    [results, keyed]
+};
+
 /// What the compile is handed.
 let outcome : :map -> :map -> :any -> :map -> :map;
 let outcome ctx plan mods st =
     build.Outcome.make (map.map_values (fn i -> where ctx st i) (build.Plan.payloads plan))
                        (match mods { () => (), s => where ctx st (build.artifact s "") })
                        (build.Plan.defines plan) (build.Plan.hosts plan) (build.Plan.target plan)
-                       (State.reads st) (State.built st) (State.reused st);
+                       (State.reads st) (State.built st) (State.reused st) (%{});
 
 let stamps_file : :map -> :string;
 let stamps_file ctx = build.Context.cache ctx + "/stamps";
@@ -396,9 +448,10 @@ let carry_out! : :map -> :map -> (:map -> :map) -> [:any];
 let carry_out! ctx known plan_of = {
     file.mkdir_all! (build.Context.cache ctx)
     let [plan, mods, st] = settle! ctx (State.set_stamps (State.new ()) known) (plan_of ctx);
-    let answer = outcome ctx plan mods st;
+    let [checks, after] = if build.Context.testing ctx { run_checks! ctx st plan } else { [%{}, st] };
+    let answer = build.Outcome.set_checks (outcome ctx plan mods after) checks;
     strict! answer
-    [answer, State.stamps st]
+    [answer, State.stamps after]
 };
 
 /// `carry_out!` in a process of its own. A function by itself so that the
@@ -526,6 +579,24 @@ when test {
                 strict! got
                 file.remove_all! dir
                 test.eq! [[:ok, ()], :ok, :error, :ok, "", :ok, "no"] got
+            } ),
+        test.case "a test run builds what its checks read, and runs each"
+            $( {
+                let cache = "dream-build-checks-" + to_string (os.pid! ());
+                let here = here! ();
+                let ctx = build.Context.set_testing (build.Context.set_cache (build.Context.new "t" "0" (os.cwd! ()) here here) cache) true;
+                let made = build.write "made.txt" "hello";
+                let holds text = build.step "check" "holds" [made] text []
+                                            (fn job -> [build.Op.copy (build.path job made) "copy",
+                                                        build.Op.verify "copy" (io.digest text)]);
+                let plan = build.empty |> build.check "passes" (holds "hello") |> build.check "fails" (holds "bye");
+                let [p, mods, st] = settle! ctx (State.new ()) plan;
+                let [results, _] = run_checks! ctx st p;
+                let got = [(results.["passes"]).[0], (results.["fails"]).[0],
+                           str.contains_str "SHA-256" (results.["fails"]).[2], State.built st];
+                strict! got
+                file.remove_all! cache
+                test.eq! [true, false, true, 1] got
             } ),
         test.case "steps at one depth never read each other"
             $( {

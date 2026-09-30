@@ -1,0 +1,24 @@
+// The repository's own checks: what belongs to no one package. Each runs a
+// suite from the root of the repository, with the VM and the compiler this
+// test run uses in the environment, under every name the suites read them by.
+import std.build;
+import std.build.command;
+import std.file;
+import std.map;
+
+let tools : :map -> %{:string => :string};
+let tools ctx = {
+    let chain = command.toolchain ctx;
+    map.merge chain (%{ "dream" => chain.["DREAM"], "dreams" => chain.["DREAMS"] })
+};
+
+let suite : :map -> :string -> :string -> :map;
+let suite ctx name program = command.check_in (build.Context.root ctx) name (tools ctx) program [];
+
+let plan : :map -> :map;
+let plan ctx =
+    build.empty
+    |> build.check "vm" (suite ctx "vm" (file.parent (build.Context.vm ctx) + "/dream_tests"))
+    |> build.check "e2e" (suite ctx "e2e" "dream/tests/e2e.sh")
+    |> build.check "examples" (suite ctx "examples" "examples/run.sh")
+    |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh");

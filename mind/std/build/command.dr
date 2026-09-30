@@ -24,26 +24,57 @@ let file path = build.Input.file path;
 let is_input : :any -> :bool;
 let is_input a = match a { [:file, _] => true, [:artifact, _, _] => true, _ => false };
 
+/// The arguments as a key reads them: where each input goes rather than what
+/// it is. The inputs are in the key already, by content, and a path would
+/// make the same command in two checkouts two different steps.
+let placed : [:any] -> [:any];
+let placed args = {
+    let inputs = list.filter is_input args;
+    list.map (fn a -> match a {
+        [:out, n] => [:out, n],
+        _ if is_input a => [:in, list.index_of a inputs],
+        s => s,
+    }) args
+};
+
 /// The step, for a caller that wants more than its first output.
 let step : :string -> :string -> [:any] -> :map;
 let step name program args = {
     let inputs = list.filter is_input args;
     let outputs = list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args;
-    // The config says where each input goes rather than what it is: the
-    // inputs are in the key already, by content, and a path would make the
-    // same command in two checkouts two different steps.
-    let placed = list.map (fn a -> match a {
-        [:out, n] => [:out, n],
-        _ if is_input a => [:in, list.index_of a inputs],
-        s => s,
-    }) args;
-    build.step "command" name inputs [program, placed] outputs
+    build.step "command" name inputs [program, placed args] outputs
         (fn job -> [build.Op.exec program (list.map (fn a -> match a {
             [:out, n] => n,
             _ if is_input a => build.path job a,
             s => s,
         }) args)])
 };
+
+/// The VM and the compiler this build uses, as the environment of a program
+/// that runs either: `DREAM` and `DREAMS`, which is what `mind` itself reads.
+/// The compiler is the last word of how it is run -- its image, when it is
+/// an image the VM runs.
+let toolchain : :map -> %{:string => :string};
+let toolchain ctx = %{ "DREAM" => build.Context.vm ctx, "DREAMS" => list.last (build.Context.compiler ctx) };
+
+/// A check that runs `program` in the package's directory, with `env` laid over
+/// the environment: what a test suite written as a script is run as. It passes
+/// when the program does. Its inputs are marked in `args` as a step's are, so
+/// what it reads is built first; a check is run every time whatever its key.
+let check : :map -> :string -> %{:string => :string} -> :string -> [:any] -> :map;
+let check ctx name env program args = check_in (build.Context.root ctx) name env program args;
+
+/// The same, run in `dir`: for a suite written to be run from somewhere other
+/// than the package, such as the root of the repository it belongs to.
+let check_in : :string -> :string -> %{:string => :string} -> :string -> [:any] -> :map;
+let check_in dir name env program args =
+    build.step "check" name (list.filter is_input args) [dir, program, env, placed args]
+               (list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args)
+               (fn job -> [build.Op.run dir env program (list.map (fn a -> match a {
+                   [:out, n] => build.out job n,
+                   _ if is_input a => build.path job a,
+                   s => s,
+               }) args)]);
 
 /// Its first output, as an input to something else: what most callers want.
 let make : :string -> :string -> [:any] -> :any;

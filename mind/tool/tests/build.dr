@@ -1,0 +1,23 @@
+// `mind`'s checks beyond its units: the graph, options and build scripts,
+// each against packages on disk and a `mind` compiled for the run. Named as
+// the script in mind/tool/mind.toml, because `build.dr` beside it is `mind`'s
+// own module.
+import std.build;
+import std.build.command;
+import std.file;
+import std.list;
+import std.map;
+
+let suite : :map -> :string -> :map;
+let suite ctx name = {
+    let repo = file.parent (file.parent (build.Context.root ctx));
+    let chain = command.toolchain ctx;
+    let env = map.merge chain (%{ "dream" => chain.["DREAM"], "dreams" => chain.["DREAMS"] });
+    command.check_in repo name env "sh"
+        ["-c", "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
+               + " && \"$dream\" \"$dreams\" -L mind/std mind/tool/main.dr -o \"$t/mind.dream\" >/dev/null"
+               + " && mind=\"$t/mind.dream\" mind/tool/tests/" + name + ".sh"]
+};
+
+let plan : :map -> :map;
+let plan ctx = list.fold (fn p name -> p |> build.check name (suite ctx name)) build.empty ["graph", "options", "scripts"];

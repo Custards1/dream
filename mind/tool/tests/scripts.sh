@@ -145,6 +145,44 @@ EOF
 run p/app
 check "a failing script says which step and what it printed" 1 "it went wrong"
 
+# test DIR ARGS -- `mind test` in DIR.
+mtest() {
+    dir=$1; shift
+    out=$(cd "$tmp/$dir" && "$dream" "$mind" test --compiler "$dreams" "$@" 2>&1)
+    status=$?
+}
+
+mkdir -p "$tmp/w/a" "$tmp/w/b"
+printf '[workspace]\nname = "w"\nmembers = ["a", "b"]\n' >"$tmp/w/mind.toml"
+printf '[package]\nname = "a"\n' >"$tmp/w/a/mind.toml"
+printf '[package]\nname = "b"\n' >"$tmp/w/b/mind.toml"
+for pkg in a b; do
+    cat >"$tmp/w/$pkg/main.dr" <<'EOF'
+import std.console;
+let main! = console.print! "main";
+when test {
+    import std.test;
+    let tests = [test.case "adds" $( test.eq! 2 (1 + 1) )];
+}
+EOF
+done
+cat >"$tmp/w/a/build.dr" <<'EOF'
+import std.build;
+import std.build.command;
+let plan ctx =
+    build.empty
+    |> build.check "fine" (command.check ctx "fine" (%{}) "sh" ["-c", "exit 0"])
+    |> build.check "broken" (command.check ctx "broken" (%{ "WHY" => "on purpose" }) "sh" ["-c", "echo broken $WHY; exit 1"]);
+EOF
+mtest w
+check "a workspace tests every member's units and checks, and says which failed" 1 "FAIL a.broken"
+check "and prints what a failing check printed" 1 "broken on purpose"
+check "and runs the rest" 1 "3 passed, 1 failed"
+mtest w a.fine
+check "a check is picked by name" 0 "1 passed, 0 failed"
+mtest w b
+check "a package is picked by its name" 0 "adds"
+
 echo
 echo "$pass script cases passed, $fail failed"
 [ "$fail" -eq 0 ]

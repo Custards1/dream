@@ -59,6 +59,13 @@ mapping Context {
     dependencies : %{:string => :string} = %{}
     jobs : :integer = 1
     cache : :string = "target/build/steps"
+    // Whether this run is `mind test`'s, which runs the plan's checks, and the
+    // VM and compiler command the build uses, for a check that runs either.
+    testing : :bool = false
+    vm : :string = "dream"
+    compiler : [:string] = []
+    // The checks a test run is asked for, by name; every one when empty.
+    only : [:string] = []
 }
 
 /// Whether `v` is a whole context, its targets included -- what the runner
@@ -153,6 +160,12 @@ let step tool name inputs config outputs action = {
 /// up on `PATH` as a shell would, and runs with the step's directory as its
 /// working directory.
 ///
+/// `run` is `exec` somewhere else, with variables of its own: for a check,
+/// which asks a question of the package where it is rather than making
+/// something in a directory of its own. It is the only operation that reaches
+/// outside the step's directory, and a step that makes something has no use
+/// for it.
+///
 /// The last four ask the machine a question rather than make something, and
 /// never fail -- the answer is the point, and "no" is one: `find` writes where
 /// a program is on `PATH` (or nothing), `capture` what a program printed when
@@ -163,6 +176,7 @@ union Op {
     write(name : :string, text : :string)
     copy(from : :string, name : :string)
     exec(program : :string, args : [:string])
+    run(dir : :string, env : %{:string => :string}, program : :string, args : [:string])
     find(program : :string, name : :string)
     capture(program : :string, args : [:string], name : :string)
     attempt(program : :string, args : [:string], name : :string)
@@ -205,10 +219,11 @@ mapping Plan {
     steps = []
     later = []
     conflicts = []
+    checks = %{}
 }
 
 let empty : :map;
-let empty = Plan.make (%{}) (%{}) (%{}) [] () [] [] [];
+let empty = Plan.make (%{}) (%{}) (%{}) [] () [] [] [] (%{});
 
 /// Embed a file in the image: `--payload NAME=PATH`.
 let payload : :string -> :any -> :map -> :map;
@@ -234,6 +249,13 @@ let host_module name p = Plan.set_hosts p (list.unique (list.append (Plan.hosts 
 /// decide. Two plans' targets meet rather than add.
 let target : :any -> :map -> :map;
 let target ts p = Plan.set_target p (meet (Plan.target p) ts);
+
+/// A check `mind test` runs: it passes when the step's operations all
+/// succeed. Only `mind test` runs checks, and it runs them every time -- a
+/// check is a question, not something made -- after building whatever they
+/// read.
+let check : :string -> :map -> :map -> :map;
+let check name s p = Plan.set_checks p (claim "check" name s (Plan.checks p));
 
 /// Make a step whether or not anything uses it.
 let also : :map -> :map -> :map;
@@ -290,12 +312,13 @@ let all plans = list.fold (fn a b ->
               (meet (Plan.target a) (Plan.target b))
               (list.append (Plan.steps a) (Plan.steps b))
               (list.append (Plan.later a) (Plan.later b))
-              (list.append (Plan.conflicts a) (Plan.conflicts b))) empty plans;
+              (list.append (Plan.conflicts a) (Plan.conflicts b))
+              (merge_table "check" (Plan.checks a) (Plan.checks b))) empty plans;
 
 /// Everything wrong with a plan, before anything is run.
 let conflicts : :map -> [:string];
 let conflicts p = list.concat [Plan.conflicts p, table_conflicts (Plan.payloads p),
-                               table_conflicts (Plan.modules p)];
+                               table_conflicts (Plan.modules p), table_conflicts (Plan.checks p)];
 
 /// What a run hands the compile, with every input resolved to a path: the
 /// payloads by name, the directory of generated modules (or `()`), the
@@ -313,6 +336,9 @@ mapping Outcome {
     reads = %{}
     built : :integer = 0
     reused : :integer = 0
+    // A test run's checks, by name: whether each passed, how long it took in
+    // milliseconds, and what it printed when it failed.
+    checks : %{:string => [:bool, :integer, :string]} = %{}
 }
 
 let is_outcome : :any -> :bool;

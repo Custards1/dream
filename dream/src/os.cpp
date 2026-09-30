@@ -125,6 +125,10 @@ struct Job {
     /// A child's own, because `chdir!` is the whole VM's: two build steps
     /// running at once could not each change it without breaking the other.
     std::string dir;
+    /// `NAME=value` for each variable the child gets in addition to -- or in
+    /// place of -- this VM's own. A child's own, like `dir`: `set_env!` is
+    /// the whole VM's, and two checks running at once each want theirs.
+    std::vector<std::string> env;
 
     /// 0 means "wait as long as it takes". Anything else is a deadline after
     /// which the child is killed -- worth having because a build tool spends
@@ -247,9 +251,35 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
         if (!command.empty()) command += L' ';
         command += windows::quote(arg);
     }
+    // The same overlay as on POSIX, as the block `CreateProcessW` takes: every
+    // `NAME=value` NUL-terminated, and one more NUL at the end. Names compare
+    // without case, as Windows compares them.
+    std::wstring block;
+    if (!job->env.empty()) {
+        auto upper_name = [](const std::wstring& kv) {
+            std::wstring n = kv.substr(0, kv.find(L'=', 1));
+            for (auto& c : n) c = towupper(c);
+            return n;
+        };
+        std::vector<std::wstring> ours;
+        for (const std::string& kv : job->env) ours.push_back(windows::wide(kv));
+        wchar_t* inherited = GetEnvironmentStringsW();
+        for (wchar_t* e = inherited; e && *e; e += wcslen(e) + 1) {
+            std::wstring entry(e);
+            bool replaced = false;
+            for (const std::wstring& kv : ours) {
+                if (upper_name(kv) == upper_name(entry)) { replaced = true; break; }
+            }
+            if (!replaced) { block += entry; block.push_back(L'\0'); }
+        }
+        if (inherited) FreeEnvironmentStringsW(inherited);
+        for (const std::wstring& kv : ours) { block += kv; block.push_back(L'\0'); }
+        block.push_back(L'\0');
+    }
     PROCESS_INFORMATION child{};
     bool created = ready && CreateProcessW(nullptr, command.data(), nullptr, nullptr,
-        TRUE, EXTENDED_STARTUPINFO_PRESENT, nullptr,
+        TRUE, EXTENDED_STARTUPINFO_PRESENT | (block.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT),
+        block.empty() ? nullptr : block.data(),
         job->dir.empty() ? nullptr : windows::wide(job->dir).c_str(), &start.StartupInfo, &child);
     DWORD error = GetLastError();
     DeleteProcThreadAttributeList(start.lpAttributeList);
@@ -353,7 +383,24 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     pid_t child = 0;
     // `posix_spawnp`, so a bare program name is found on PATH -- `git` should
     // mean what it means in a shell.
-    int rc = ::posix_spawnp(&child, args[0], &actions, nullptr, args.data(), environ);
+    // This VM's environment with the job's variables laid over it: a name the
+    // job sets is dropped from what is inherited, and the job's value added.
+    std::vector<char*> envp;
+    if (!job->env.empty()) {
+        auto name_of = [](const std::string& kv) { return kv.substr(0, kv.find('=')); };
+        for (char** e = environ; *e; ++e) {
+            std::string entry(*e);
+            bool replaced = false;
+            for (const std::string& kv : job->env) {
+                if (name_of(kv) == name_of(entry)) { replaced = true; break; }
+            }
+            if (!replaced) envp.push_back(*e);
+        }
+        for (std::string& kv : job->env) envp.push_back(kv.data());
+        envp.push_back(nullptr);
+    }
+    int rc = ::posix_spawnp(&child, args[0], &actions, nullptr, args.data(),
+                            job->env.empty() ? environ : envp.data());
     posix_spawn_file_actions_destroy(&actions);
     ::close(out_pipe[1]);
     ::close(err_pipe[1]);
@@ -410,7 +457,8 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
 
 #endif
 
-NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir);
+NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir,
+                          std::vector<std::string> env = {});
 
 NativeResult os_exec(Process& p, Value, Value* args, uint32_t) {
     return os_exec_with(p, args, 0, UNIT);
@@ -440,7 +488,31 @@ NativeResult os_exec_in(Process& p, Value, Value* args, uint32_t) {
     return os_exec_with(p, args + 1, fixnum_value(ms), args[0]);
 }
 
-NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir) {
+/// `exec_with! dir env program args milliseconds` -- `exec_in!` with variables
+/// of its own: `env` is a list of `NAME=value`, laid over this VM's
+/// environment for the child alone. What a check runs a test suite with.
+NativeResult os_exec_with_env(Process& p, Value, Value* args, uint32_t) {
+    if (p.os_pending >= 0) return os_exec_with(p, args + 2, 0, UNIT);
+    if (!is_string(args[0])) return fail(p, "type_error", "exec_with! needs a directory");
+    std::vector<std::string> env;
+    if (!read_string_list(p, args[1], &env)) {
+        if (p.park_requested) return NativeResult::block();
+        return fail(p, "type_error", "exec_with! needs a list of NAME=value strings");
+    }
+    for (const auto& kv : env) {
+        if (kv.find('=') == std::string::npos || kv.front() == '=' || kv.find('\0') != std::string::npos) {
+            return fail(p, "bad_argument", "exec_with!: `" + kv + "` is not NAME=value");
+        }
+    }
+    Value ms = resolve(args[4]);
+    if (!is_fixnum(ms) || fixnum_value(ms) < 0) {
+        return fail(p, "type_error", "exec_with! needs a timeout in milliseconds, or 0 for none");
+    }
+    return os_exec_with(p, args + 2, fixnum_value(ms), args[0], std::move(env));
+}
+
+NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir,
+                          std::vector<std::string> env) {
     // Entered again after the helper thread woke us: the child has exited.
     if (p.os_pending >= 0) {
         int64_t id = p.os_pending;
@@ -490,6 +562,7 @@ NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir
 
     auto job = std::make_shared<Job>();
     job->timeout_ms = timeout_ms;
+    job->env = std::move(env);
     if (dir != UNIT) {
         job->dir = string_arg(dir);
         if (job->dir.empty() || job->dir.find('\0') != std::string::npos) {
@@ -758,6 +831,7 @@ ModuleDef make_os_module() {
                          {"exec!", 2, 0b01, os_exec},
                          {"exec_for!", 3, 0b101, os_exec_for},
                          {"exec_in!", 4, 0b1011, os_exec_in},
+                         {"exec_with!", 5, 0b10101, os_exec_with_env},
                          {"replace!", 2, 0b01, os_replace},
                          {"monotonic!", 1, 0b1, os_monotonic},
                          {"now!", 1, 0b1, os_now},

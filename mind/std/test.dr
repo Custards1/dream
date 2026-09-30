@@ -17,6 +17,7 @@
 // the import would be a cycle. Walking lists with the primitives directly is a
 // small price for letting every module test itself.
 import std.console;
+import std.os;
 
 
 // --- cases ------------------------------------------------------------------
@@ -29,6 +30,33 @@ let case_name : Case -> :string;
 let case_name c = c.[0];
 let case_body : Case -> :any;
 let case_body c = ((list_tail c)).[0];
+
+// --- waiting ----------------------------------------------------------------
+
+/// Ask `probe!` until `done` holds of what it answers, or `ms` milliseconds
+/// have passed, and answer the last answer: for a case waiting on something
+/// another process does, such as a supervisor restarting a child.
+///
+/// Bounded by time rather than by a number of asks. How many asks fit into
+/// the moment it takes the other process to act depends on how busy the
+/// machine is, and a case that allowed two hundred passed when it ran alone
+/// and failed when the suite ran beside others. On giving up it answers what
+/// it has rather than raising, so a genuine disagreement fails the case's
+/// assertion instead of hanging it.
+let eventually! : (:unit -> a) -> (a -> :bool) -> :integer -> a;
+let eventually! probe! done ms = {
+    let deadline = os.monotonic! () + ms;
+    let rec ask! () = {
+        let got = probe! ();
+        if done got || os.monotonic! () >= deadline { got } else { ask! () }
+    };
+    ask! ()
+};
+
+/// How long a case waits for another process by default: long enough for a
+/// loaded machine, and short beside a hang.
+let patience : :integer;
+let patience = 10000;
 
 // --- assertions -------------------------------------------------------------
 //

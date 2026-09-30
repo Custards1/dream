@@ -369,13 +369,10 @@ when test {
     ///
     /// A supervisor is asynchronous and a child registers itself once it is
     /// running, so "the name is bound" and "the name is bound to the new one"
-    /// are both moments nothing here can order. Answering rather than waiting
-    /// is what makes a genuine disagreement fail the case instead of hanging
-    /// it.
-    priv let rec settle! reg name was tries = {
-        let p = registry.whereis! reg name;
-        if p != was || tries <= 0 { p } else { settle! reg name was (tries - 1) }
-    };
+    /// are both moments nothing here can order, so it asks until they have
+    /// happened, for as long as `test.eventually!` allows.
+    priv let settle! reg name was =
+        test.eventually! (fn () -> registry.whereis! reg name) (fn p -> p != was) test.patience;
 
     let tests = [
         test.case "a call goes out and an answer comes back"
@@ -484,14 +481,14 @@ when test {
                    let sup = supervisor.start! :one_for_one
                                  [registry.child! reg (store.child! "store" %{})];
                    let l = serve_via! 0 (registry.finder! reg "store");
-                   let first_pid = settle! reg "store" () 200;
+                   let first_pid = settle! reg "store" ();
                    let c = here! (port_of! l);
                    let first = call! c [:put, "a", 1];
 
                    // It ends; the supervisor starts another; that one registers
                    // itself over the entry the dead one left behind.
                    store.cast! first_pid :go_away
-                   settle! reg "store" first_pid 200
+                   settle! reg "store" first_pid
 
                    // The same connection, and a server that has never seen it.
                    // `:missing` rather than `1` is the honest answer: what

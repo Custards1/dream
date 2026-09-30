@@ -125,7 +125,24 @@ VM built without it is not a valid VM. LLVM is optional and gives the JIT.
 
 ## Testing
 
-`just test` runs everything. The groups, and what each one is actually asking:
+`just test` runs everything, one group at a time. `mind test`, from the root
+of the repository, runs the same suites at once -- the repository is a
+workspace (`mind.toml`, and `build.dr` beside it), each package's units and
+its build script's checks are tests named `package.name`, and `mind test
+dreams.contracts` runs one:
+
+```
+DREAM=$PWD/build-dream/bin/dream build-dream/bin/dream build/mind test
+```
+
+It covers every group below. What it does not yet cover is building from
+nothing (stage 0 in `build.sh`), `install` and `vm-pgo`, and what `test-all`
+adds: fuzzing, the heap-verified run and the no-JIT build. A suite a check
+runs must not write where another reads -- `compile.sh`'s `image` is where it
+*writes* the compiler it builds, and handed the compiler under test as
+`image` it overwrote the image a dozen other suites were running.
+
+The groups, and what each one is actually asking:
 
 | Recipe | Question |
 |---|---|

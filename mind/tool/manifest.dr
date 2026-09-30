@@ -31,7 +31,35 @@ let empty = make "." (%{});
 let root m = m.[:root else "."];
 let doc m = m.[:doc else (%{})];
 
-let name m = toml.get "" (doc m) "package" "name";
+/// The package's name; for a workspace that is not also a package, the
+/// workspace's (`[workspace] name`, or its directory's), which is what its
+/// own checks are named under.
+let name m = match toml.get "" (doc m) "package" "name" {
+    "" => match toml.get "" (doc m) "workspace" "name" {
+        "" => if is_workspace m { util.basename (root m) } else { "" },
+        n => n,
+    },
+    n => n,
+};
+
+/// Whether the manifest describes a package, as opposed to only a workspace.
+let is_package m = toml.get "" (doc m) "package" "name" != "";
+
+// --- workspaces ------------------------------------------------------------------------
+//
+// A workspace is a manifest that lists packages to be treated as one project
+// by `mind test`: `[workspace] members = ["dreams", "lucid"]`. It may be a
+// package too, and it may have a build script of its own, whose checks are
+// the workspace's -- what belongs to no one member, such as a repository's
+// end-to-end tests.
+
+let is_workspace m = map_has (doc m) "workspace";
+
+/// The members, as directories relative to the workspace.
+let members m = match toml.get () (doc m) "workspace" "members" {
+    () => [],
+    ms => if type_of ms == :list { ms } else { [ms] },
+};
 let version m = toml.get "0.0.0" (doc m) "package" "version";
 
 /// Where this package's modules are. What the manifest says, relative to it;
@@ -100,7 +128,12 @@ let compiler_flags m = build_list m "flags";
 
 /// Which compiler to run. `()` when the manifest does not say, and the
 /// environment or the command line decides.
-let compiler m = toml.get () (doc m) "build" "compiler";
+/// A path (anything with a `/` in it) is the manifest's, as every other path
+/// in it is; a bare name is looked up as the VM or the shell would.
+let compiler m = match toml.get () (doc m) "build" "compiler" {
+    () => (),
+    c => if str.contains_str "/" c { util.join (root m) c } else { c },
+};
 
 /// Where the built image goes. `target/[<platforms>/]<profile>/<name>.dream`
 /// unless the manifest says; `build.output_of` says why.
@@ -111,13 +144,39 @@ let output m = toml.get () (doc m) "build" "output";
 let target m = build_list m "target";
 
 /// The package's build script: `[build] script`, or `build.dr` beside the
-/// manifest when there is one, or `()`. Having none is the usual case, and
-/// then nothing about a build changes -- no script is compiled or run, and
-/// nothing is written.
+/// manifest when it is one, or `()`. Having none is the usual case, and then
+/// nothing about a build changes -- no script is compiled or run, and nothing
+/// is written.
+///
+/// A `build.dr` is a script when it declares a `plan`, which every script
+/// must. In a package whose modules sit beside its manifest a `build.dr` may
+/// just as well be an ordinary module called `build` -- `mind`'s own is -- and
+/// the name alone cannot tell the two apart; what a script has to say can.
 let script! m =
     match toml.get () (doc m) "build" "script" {
-        () => { let beside = util.join (root m) "build.dr"; if io.exists! beside { beside } else { () } },
+        () => {
+            let beside = util.join (root m) "build.dr";
+            match util.read_file! beside {
+                () => (),
+                text => if declares_plan text { beside } else { () },
+            }
+        },
         s => util.join (root m) s,
+    };
+
+/// Whether a script's text declares `plan` at the top level: a line that
+/// begins `let plan`, as every script's does.
+let declares_plan text =
+    list.any (fn line -> str.starts_with "let plan " line || str.starts_with "let plan:" line
+                         || str.starts_with "let plan :" line)
+             (str.split "\n" text);
+
+/// The file `mind test` compiles with `--test`: `[test] entry`, for a library
+/// whose tests are gathered somewhere other than its program, or the entry.
+let test_entry! m =
+    match toml.get () (doc m) "test" "entry" {
+        () => entry! m,
+        e => util.join (src! m) e,
     };
 
 /// The environment variables a build script may see, `[build] env`. Only
@@ -304,9 +363,8 @@ let load! dir = {
         text => match toml.parse text {
             [:ok, d] => {
                 let m = make dir d;
-                if str.is_empty (name m) {
-                    [:error, path + ": [package] has no `name`"]
-                } else { [:ok, m] }
+                if is_package m || is_workspace m { [:ok, m] }
+                else { [:error, path + ": [package] has no `name`"] }
             },
             [:error, why] => [:error, path + ": " + why],
             _ => [:error, path + ": could not be read"],
@@ -446,6 +504,11 @@ when test {
         test.case "version defaults"
             $( test.eq! "0.0.0" (version (of "[package]\nname = \"d\"")) ),
         test.case "version"  $( test.eq! "1.2" (version (of "[package]\nname=\"d\"\nversion=\"1.2\"")) ),
+        test.case "a build.dr is a script when it declares a plan"
+            $( test.eq! [true, true, false]
+                        [declares_plan "import std.build;\nlet plan ctx = build.empty;\n",
+                         declares_plan "let plan : build.Context -> build.Plan;\n",
+                         declares_plan "// the build tool's own graph\nlet graph! m o = ();\n"] ),
         // --- [build] ---
         test.case "defines are read as a list"
             $( test.eq! ["a", "b"] (defines (of "[build]\ndefines = [\"a\", \"b\"]")) ),
