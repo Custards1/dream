@@ -5,7 +5,8 @@ The build tool for Dream — what Cargo is to rustc.
 `mind` is itself written in Dream and compiled by `dreams`, like any other
 program in this repository. It has no compiler of its own: Dream compiles whole
 programs, so a build is *find the packages, hand them to `dreams`, run it*.
-There is no object file, no link step, and nothing to cache.
+There is no object file and no link step. What is cached is what build
+scripts make, below.
 
 ```
 just mind                 # build it to build/mind
@@ -128,6 +129,47 @@ namespace of their own: a tool may use `json` 1.x while the program uses 2.x.
 `mind deps` marks them `[build: ...]` and `mind tree` hangs them under
 `[build]`.
 
+## Build scripts
+
+A package may carry a `build.dr` beside its manifest, for what it needs made
+before it compiles and cannot write by hand: a module generated from data, a
+file to embed, a switch that depends on the machine. **It is optional.** A
+package without one builds exactly as before, and nothing is written for it.
+
+A script is a pure function from a context to a plan, written with
+`std.build`:
+
+```dream
+// build.dr
+import std.build;
+import std.build.command;
+
+let plan ctx =
+    build.empty
+    |> build.module "version" (build.write "version.dr" ("let v = \"" + build.version ctx + "\";"))
+    |> build.payload "table" (command.make "table" "gen-table" [command.file "table.csv", command.out "t.bin"])
+    |> build.define "generated";
+```
+
+`build.module` makes `<package>.version` importable, as the package's own
+module; `build.payload` embeds a file; `build.define` sets a `when` flag for
+this package alone. `build.given` lets a step's answer decide the rest of the
+plan, and `build.all` merges plans. docs/build.md is the whole design.
+
+Every step is cached by a key made of what it was given and the contents of
+the files it reads, under `target/build/steps` (or `$MIND_BUILD_CACHE`, to
+share one cache between projects). A build where nothing changed runs no
+script and starts no VM: it costs a `stat` per input. Scripts run at the same
+time, and so do the steps inside one, `-j` at once (default: one per core).
+
+A script sees only the environment variables its manifest lists:
+
+```toml
+[build]
+env = ["CC", "PKG_CONFIG_PATH"]
+script = "tools/build.dr"        # when it is not build.dr
+```
+
 ### Cycles
 
 Every kind of dependency means "must be ready first", so a loop cannot be
@@ -249,6 +291,7 @@ the target the compiler records, so `linux` and `os=linux` are one directory.
 | `DREAM` | the VM to run images with (default: `dream`) |
 | `MIND_STDLIB` | where the standard library lives (default: `mind`) |
 | `MIND_HOME` | where fetched packages are cached (default: `~/.mind`) |
+| `MIND_BUILD_CACHE` | one build-step cache for every project (default: each project's `target/build/steps`) |
 
 ## Layout
 
@@ -258,6 +301,7 @@ the target the compiler records, so `linux` and `os=linux` are one directory.
 | `manifest.dr` | reading `mind.toml`, and the line edits `add` and `remove` make |
 | `fetch.dr` | resolving a dependency to a directory, fetching if needed |
 | `build.dr` | the dependency graph, and calling the compiler |
+| `script.dr` | running packages' build scripts, and folding what they make into the compile |
 | `lock.dr` | `mind.lock`: writing it, reading it, and what counts as drift |
 | `util.dr` | paths and files |
 

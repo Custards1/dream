@@ -110,6 +110,21 @@ let output m = toml.get () (doc m) "build" "output";
 /// entry per `--target`. `any`, `linux`, `["linux", "macos"]`.
 let target m = build_list m "target";
 
+/// The package's build script: `[build] script`, or `build.dr` beside the
+/// manifest when there is one, or `()`. Having none is the usual case, and
+/// then nothing about a build changes -- no script is compiled or run, and
+/// nothing is written.
+let script! m =
+    match toml.get () (doc m) "build" "script" {
+        () => { let beside = util.join (root m) "build.dr"; if io.exists! beside { beside } else { () } },
+        s => util.join (root m) s,
+    };
+
+/// The environment variables a build script may see, `[build] env`. Only
+/// these: a variable the script cannot read cannot change its plan, which is
+/// what lets an answer be reused.
+let script_env m = build_list m "env";
+
 // --- options, configuration and profiles ----------------------------------------
 //
 // `[options]` is what this package can be built as, `[config.KEY]` is how it

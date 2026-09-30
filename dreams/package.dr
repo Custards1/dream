@@ -40,9 +40,12 @@ mapping Package {
     src = "."
     deps = []
     manifest = ""
+    overlays = []
 }
 
-let make = Package.make;
+/// A package as its manifest describes it. Overlays are never in a manifest --
+/// they are what a build adds (`-L KEY+=DIR`) -- so they start empty.
+let make n v r s d m = Package.make n v r s d m [];
 
 let name p = Package.name p;
 let version p = Package.version p;
@@ -70,18 +73,28 @@ let rec first_file! candidates =
         [c, ..rest] => if path.is_file! c { c } else { first_file! rest },
     };
 
+/// Directories searched after `src` for this package's modules: what a build
+/// script generated, given as `-L KEY+=DIR`. A generated module is the
+/// package's own -- `sqlite.version`, not `sqlite_gen.version` -- which is the
+/// whole of why this is an overlay and not a second package.
+let overlays p = Package.overlays p;
+
 /// The file for a module path inside this package, if it exists.
 ///
 /// `a.b` is `src/a/b.dr`, or `src/a/b/mod.dr` when the module has grown into a
 /// directory -- which is the point of looking for both: a module can become a
-/// directory without any of its importers changing.
+/// directory without any of its importers changing. The package's own source
+/// comes before its overlays, so a generated module never shadows a written one.
 let module_file! p segments =
     if list.is_empty segments { () }
     else {
-        let base = path.join_all (src p) segments;
-        first_file! (list.append
-            (list.map (fn ext -> path.with_extension ext base) module_extensions)
-            (list.map (fn ext -> path.with_extension ext (path.join base "mod")) module_extensions))
+        let candidates dir = {
+            let base = path.join_all dir segments;
+            list.append
+                (list.map (fn ext -> path.with_extension ext base) module_extensions)
+                (list.map (fn ext -> path.with_extension ext (path.join base "mod")) module_extensions)
+        };
+        first_file! (list.flat_map candidates (list.cons (src p) (overlays p)))
     };
 
 /// Directories that hold build output rather than source. Skipped when listing
@@ -344,15 +357,45 @@ let split_root text =
         _ => [(), text],
     };
 
+/// `KEY+=DIR`, an overlay onto the package imported as `KEY`, as
+/// `[key, dir]`; `()` for any other root.
+let split_overlay text =
+    match str.find "+=" text {
+        i if i > 0 => {
+            let n = str.slice 0 i text;
+            if is_alias_name n { [n, str.slice (i + 2) (str.byte_length text - i - 2) text] } else { () }
+        },
+        _ => (),
+    };
+
 /// The directory half of a root, for the places that use roots as plain
 /// search paths.
-let root_dir text = list.nth 1 (split_root text);
+let root_dir text = match split_overlay text {
+    [_, dir] => dir,
+    () => list.nth 1 (split_root text),
+};
+
+/// Put `dir` under the package `n` names. Applied after every root and
+/// dependency is in the set, because the key may be an alias only a
+/// dependency list introduces.
+let overlay! n dir s =
+    match (by_name s).[n else ()] {
+        () => note ("`" + n + "+=" + dir + "` overlays a package nothing is called") s,
+        i => {
+            let p = at s i;
+            let grown = list.append (list.take i (packages s))
+                                    (list.cons (Package.set_overlays p (list.append (overlays p) [dir]))
+                                               (list.drop (i + 1) (packages s)));
+            set grown (by_name s) (current_index s) (notes s)
+        },
+    };
 
 /// A root given with `-L` may be a package itself, or a directory holding
 /// several. A manifest that names no package is the second case -- and so is no
 /// manifest at all -- so both look inside. `NAME=DIR` is always one package.
 let add_from_root! spec s =
     match split_root spec {
+        _ if split_overlay spec != () => s,
         [(), dir] =>
             match manifest_at! dir {
                 () => packages_inside! dir s,
@@ -434,7 +477,8 @@ let discover! file extra_roots = {
                                  v => list.map (fn r -> path.expand_home! r) (split_roots v),
                              });
     let found = find_enclosing! (path.dirname file) empty;
-    close_deps! 0 (list.fold (fn acc r -> add_from_root! r acc) found roots)
+    let closed = close_deps! 0 (list.fold (fn acc r -> add_from_root! r acc) found roots);
+    list.fold (fn acc r -> match split_overlay r { [n, dir] => overlay! n dir acc, () => acc }) closed roots
 };
 
 // --- tests -------------------------------------------------------------------
@@ -521,7 +565,14 @@ when test {
         test.case "a path with an `=` in it is still a path"
             $( test.eq! [[(), "./a/b=c"], [(), "=x"]] [split_root "./a/b=c", split_root "=x"] ),
         test.case "the directory of a named root"
-            $( test.eq! ["d", "d"] [root_dir "n=d", root_dir "d"] ),
+            $( test.eq! ["d", "d", "d"] [root_dir "n=d", root_dir "d", root_dir "n+=d"] ),
+        test.case "an overlay names a package and a directory"
+            $( test.eq! [["gen", "/t/gen"], (), ()]
+                        [split_overlay "gen+=/t/gen", split_overlay "gen=/t", split_overlay "a/b+=c"] ),
+        test.case "an overlay goes to the package its key names"
+            $( test.eq! [[], ["/o"], 1]
+                        { let s = overlay! "b" "/o" two!;
+                          [overlays (at s 0), overlays (at s 1), list.length (notes (overlay! "nope" "/o" s))] } ),
         test.case "two names for one package keep one entry"
             $( test.eq! [0, 0, 0]
                         { let s = alias! "b_alias" 0 (alias! "a_alias" 0 two!);

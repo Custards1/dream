@@ -128,6 +128,7 @@ test-mind: build
     ./{{dreams}} -L mind/std mind/tool/main.dr -o /tmp/dream-mind-graph.dream
     dream={{dream}} mind=/tmp/dream-mind-graph.dream mind/tool/tests/graph.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/options.sh
+    dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/scripts.sh
 
 clean:
     rm -rf {{build_dir}} build-nojit build-tsan
@@ -250,7 +251,7 @@ test-dreams: build
 # file is well formed on its own -- a module in the middle of a package is not a
 # program, and following its imports would be asking something else.
 test-dreams-corpus: build
-    @for f in mind/std/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
+    @for f in mind/std/*.dr mind/std/build/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
               dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr; do \
         ./{{dreams}} --parse "$f" || exit 1; \
     done

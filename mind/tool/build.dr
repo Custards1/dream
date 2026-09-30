@@ -12,11 +12,13 @@ import std.os;
 import std.str;
 import std.toml;
 import std.version;
+import std.build.Target;
 
 import config;
 import fetch;
 import lock;
 import manifest;
+import script;
 import util;
 
 // --- the dependency graph ------------------------------------------------------
@@ -919,6 +921,63 @@ let compiler_command! chosen =
 /// `[flag, a, flag, b, ..]` -- how a repeated option is written out.
 let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
 
+// --- build scripts ----------------------------------------------------------------
+//
+// script.dr runs them; what is here is what it is told about this build. A
+// project where no package has a `build.dr` never gets past `scripted!`.
+
+/// Every package in the build with a script: the root under its own name,
+/// then each dependency under its key, with the `-L` roots its script is
+/// compiled with -- the standard library and its build dependencies.
+let scripted! m o g = {
+    let one! key dm root = match manifest.script! dm {
+        () => [],
+        file => [script.Scripted.make key (manifest.version dm) (util.absolute! root) (util.absolute! file)
+                                      (manifest.script_env dm)
+                                      ((g.[:options else (%{})]).[(if key == manifest.name m { root_key } else { key }) else (%{})])
+                                      (list.cons (stdlib_root! ())
+                                                 (match build_graph g (if key == manifest.name m { root_key } else { key }) {
+                                                      () => [],
+                                                      sub => list.map package_arg (nodes sub),
+                                                  }))],
+    };
+    list.concat (list.cons (one! (manifest.name m) m (manifest.root m))
+                           (list.map (fn n -> match node_manifest n {
+                                () => one! (node_key n) (manifest.make (node_dir n) (%{})) (node_dir n),
+                                dm => one! (node_key n) dm (node_dir n),
+                            }) (nodes g)))
+};
+
+/// A single `--target` naming one system and one architecture, as the target
+/// a script is told it is building for; `()` otherwise, and the script is
+/// told the host.
+let script_target o m = match targets m o {
+    [one] => match target_sides one {
+        [[os_name], [arch_name]] => Target.make (to_existing_atom os_name) (to_existing_atom arch_name),
+        _ => (),
+    },
+    _ => (),
+};
+
+/// What every script in this build shares.
+let script_setting! m o g =
+    script.Setting.make (target_dir m)
+        (match compiler_command! (choose_compiler! m (option o :compiler ())) { [program, lead] => list.cons program lead })
+        (vm_command! ()) (profile_of o) (script_target o m) (option o :jobs 1)
+        (list.fold (fn acc n -> match node_version n { () => acc, v => acc.[node_key n => v] }) (%{}) (nodes g))
+        (option o :verbose false);
+
+/// The compiler arguments this build's scripts add: none, and nothing run,
+/// when no package has a script.
+let script_args! m o g =
+    match scripted! m o g {
+        [] => [:ok, []],
+        found => match script.run_all! (script_setting! m o g) found {
+            [:error, why] => [:error, why],
+            [:ok, outcomes] => script.compile_args outcomes,
+        },
+    };
+
 /// The whole command line for one build.
 ///
 /// The package's settings come before this invocation's, because the compiler
@@ -927,7 +986,9 @@ let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
 let compile_args! m o =
     match search_paths! m o {
         [:error, why] => [:error, why],
-        [:ok, g, paths] => [:ok, list.concat [
+        [:ok, g, paths] => match script_args! m o g {
+          [:error, why] => [:error, why],
+          [:ok, from_scripts] => [:ok, list.concat [
             [manifest.entry! m],
             paths,
             repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
@@ -937,12 +998,14 @@ let compile_args! m o =
                      (list.unique (list.concat [manifest.host_modules m, dep_hosts g,
                                                 option o :hosts []])),
             setting_args m o g,
+            from_scripts,
             ["-o", output_of m o],
             manifest.compiler_flags m,
             manifest.profile_flags m (profile_of o),
             option o :extra [],
             option o :flags [],
-        ]],
+          ]],
+        },
     };
 
 /// What the program is compiled as: its defines, every package's options

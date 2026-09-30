@@ -340,16 +340,11 @@ let rec settle! ctx st plan = {
 
 /// What the compile is handed.
 let outcome : :map -> :map -> :any -> :map -> :map;
-let outcome ctx plan mods st = %{
-    :payloads => map.map_values (fn i -> where ctx st i) (build.Plan.payloads plan),
-    :modules => match mods { () => (), s => where ctx st (build.artifact s "") },
-    :defines => build.Plan.defines plan,
-    :hosts => build.Plan.hosts plan,
-    :target => build.Plan.target plan,
-    :reads => State.reads st,
-    :built => State.built st,
-    :reused => State.reused st,
-};
+let outcome ctx plan mods st =
+    build.Outcome.make (map.map_values (fn i -> where ctx st i) (build.Plan.payloads plan))
+                       (match mods { () => (), s => where ctx st (build.artifact s "") })
+                       (build.Plan.defines plan) (build.Plan.hosts plan) (build.Plan.target plan)
+                       (State.reads st) (State.built st) (State.reused st);
 
 let stamps_file : :map -> :string;
 let stamps_file ctx = build.Context.cache ctx + "/stamps";

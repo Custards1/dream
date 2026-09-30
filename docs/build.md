@@ -99,7 +99,7 @@ mapping Context {
     root                // :string, the package's directory
     target : Target     // where the image will run
     host : Target       // where this build is running; differs when cross-building
-    profile = :debug    // :debug | :release
+    profile = "debug"   // the profile's name: "debug", "release", or one the project declares
     env = %{}           // only the variables the manifest names in [build] env
     options = %{}       // the package's options, settled ("Options")
     dependencies = %{}  // key => version, for everything it uses
@@ -721,8 +721,16 @@ they are built says is not optional.
    `when`, conditional dependencies, `[profile.*]`, `[build] target`, and
    `mind options`. What is left for item 6 is `ctx.options` and a script's
    `build.define`, since there are no scripts to hand them to yet.
-6. **`mind` runs scripts.** Script discovery, `[build-dependencies]`, drivers, outcome
-   reuse, folding outcomes into the compile, `--target` and `-j`.
+6. **`mind` runs scripts. Built.** Script discovery (`build.dr`, or `[build]
+   script`), `[build-dependencies]`, drivers, outcome reuse (`record`: the
+   context's digest and the stamps of the script's sources and of everything
+   it read), folding outcomes into the compile, `--target` and `-j`, and
+   `mind/tool/tests/scripts.sh`. The overlay is `-L KEY+=DIR` in
+   `dreams/package.dr`. A driver is written into a directory with a manifest
+   of its own, so that `import build` finds the script it is for and not the
+   enclosing project's; and the outcome is a record in `std.build`
+   (`Outcome`), because it crosses to `mind` as `std.wire` and a reader has to
+   name every key it accepts.
 7. **Tools.** `cc`, `probe` and `fetch`, and `dream/tests/ffi` rebuilt as a
    package whose C library is made by its own `build.dr` rather than by the
    test script.

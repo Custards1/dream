@@ -24,6 +24,7 @@ import std.list;
 import std.os;
 import std.str;
 import std.toml;
+import std.vm;
 
 import build;
 import config;
@@ -61,6 +62,7 @@ let opts = [
 
     cli.section "how to build it",
     cli.value "" "compiler" "PATH" "the compiler to run; a `.dream` is run by the VM",
+    cli.value "j" "jobs" "N" "how many build steps and scripts at once (default: one per core)",
     cli.flag "v" "verbose" "print the compiler command before running it",
     cli.flag "h" "help" "this message",
     cli.flag "" "version" "print the version",
@@ -156,6 +158,11 @@ packages it depends on, however deep:
 `when vendored` in a package's code reads that package's option, and
 `when sqlite.vendored` another's. `-D sqlite:threads=off` sets one from the
 command line, and `mind options` shows them all.
+
+A package may carry a `build.dr`, a script written with `std.build` that
+says what it needs made before it compiles: generated modules, embedded files,
+defines. It is optional, its steps are cached under target/build, and a build
+where nothing changed runs none of it. `-j N` sets how much runs at once.
 
 `mind run -- ARGS` passes ARGS to the program rather than to mind.
 
@@ -621,6 +628,17 @@ let profile_of! c =
         [p, true] => if p == "release" { p } else { fail! ("--release and --profile " + p + " say two different things") },
     };
 
+/// `-j N`, or one job per worker the VM runs, which is one per core up to
+/// the scheduler's cap.
+let jobs_of! c =
+    match cli.get () c "jobs" {
+        () => (vm.scheduler! ()).[:workers else 1],
+        n => match parse_int n {
+            j if j != () && j > 0 => j,
+            _ => fail! ("-j wants a number of jobs, not `" + n + "`"),
+        },
+    };
+
 let options_of! c =
     list.fold (fn o kv -> build.with_option (list.head kv) (list.nth 1 kv) o)
               build.options
@@ -634,7 +652,8 @@ let options_of! c =
                [:sets,     sets_of c],
                [:profile,  profile_of! c],
                [:targets,  cli.all c "target"],
-               [:verbose,  cli.flag_set c "verbose"]];
+               [:verbose,  cli.flag_set c "verbose"],
+               [:jobs,     jobs_of! c]];
 
 let run_command! c theirs = {
     let o = options_of! c;

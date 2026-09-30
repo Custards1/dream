@@ -50,7 +50,10 @@ just bootstrap-check   # the seed still reproduces itself from this source
 
 The guarantee is byte equality: compiling this source with the seed produces an
 identical image, and so does the stage after that. When you change the compiler,
-run `just bootstrap` and copy `build/dreams.dream` over the seed.
+run `just bootstrap` and copy `build/dreams.dream` over the seed -- or, when the
+change adds atoms to the compiler, build once more with that image and copy the
+second one, which is the fixpoint (see "`mind/std/all.dr --test` is not
+byte-stable" in docs/notes/macro-expansion.md).
 
 The pipeline a build runs -- resolve, lower and link, types, contracts, share,
 emit -- is written once, in [dreams/compile.dr](dreams/compile.dr):
