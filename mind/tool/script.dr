@@ -1,0 +1,435 @@
+// Build scripts: what `mind` does with a package's `build.dr`.
+//
+// A script is optional, and a package without one is built exactly as it was
+// before scripts existed: nothing here is compiled, run or written for it.
+// For a package that has one, docs/build.md is the design and std.build the
+// vocabulary; this is the part that belongs to `mind`:
+//
+// 1. **Skip if nothing moved.** `target/build/<key>/record` keeps the digest
+//    of the context the script was last run with, the stamp of every file its
+//    image was compiled from, the stamp of every file the run read, and what
+//    it answered. If none has moved, the answer is reused and no VM starts:
+//    a `stat` per input is the whole cost.
+// 2. **Compile the driver** when a file it was compiled from has moved. The
+//    driver is three lines that import the script and hand its `plan` to
+//    `std.build.run`; it is compiled with the standard library and the
+//    package's `[build-dependencies]`, never its ordinary dependencies.
+// 3. **Run it** with the context, under a deadline, since a script is a
+//    program and may diverge.
+// 4. **Fold the answer into the compile**: payloads as `--payload`, generated
+//    modules as an overlay (`-L KEY+=DIR`), defines scoped to the package,
+//    host modules, and where the image can run.
+//
+// Scripts do not feed one another -- a script's context names its
+// dependencies' versions, never their outcomes -- so every package's runs at
+// the same time, up to the job count.
+//
+// This module does not import `build`, which calls it: the caller hands over
+// what a script needs to know about the graph and the compiler.
+
+import std.build.Context;
+import std.build.Outcome;
+import std.build.Target;
+import std.types;
+import std.console;
+import std.file;
+import std.io;
+import std.list;
+import std.map;
+import std.os;
+import std.proc;
+import std.str;
+import std.wire;
+
+import util;
+
+/// One package with a script, as the caller found it in the graph. `key` is
+/// the name it is imported by (the root's own name for the root), `root` its
+/// directory, absolute, and `paths` the `-L` roots its script is compiled
+/// with: the standard library and its build dependencies.
+mapping Scripted {
+    key : :string
+    version : :string
+    root : :string
+    script : :string
+    env : [:string]
+    options = %{}
+    paths : [:string] = []
+}
+
+/// What every script in one build shares: where `target/` is, how to run the
+/// compiler and the VM, what the build is for, and how much at once.
+mapping Setting {
+    target_dir : :string
+    compiler : [:string]
+    vm : :string
+    profile : :string = "debug"
+    target = ()
+    jobs : :integer = 1
+    dependencies = %{}
+    verbose : :bool = false
+    // `mind test`'s: every script runs, so that its checks do, and no record
+    // is written -- a test run's answer is not what a build should reuse.
+    testing : :bool = false
+    only : [:string] = []
+}
+
+/// How long a script may run. It is a program, and a build that waits for
+/// ever on one that diverged is worse than one that says so.
+priv let deadline_ms : :integer;
+priv let deadline_ms = 30 * 60 * 1000;
+
+priv let here! : :unit -> :map;
+priv let here! () = Target.make (os.platform ()) (os.arch ());
+
+/// Where step directories live: `$MIND_BUILD_CACHE`, or `build` under
+/// `mind`'s own directory, shared by every project on the machine. Sharing is
+/// safe because a step's directory is named by its key -- everything that
+/// could change what it holds -- and is filled in a scratch directory renamed
+/// into place, so two builds asking for the same step at once cannot see half
+/// of one; and it is worth it because the same step asked for by two projects
+/// is done once.
+priv let steps_dir! : :map -> :string;
+priv let steps_dir! setting = util.absolute! (match util.env_path! "MIND_BUILD_CACHE" {
+    () => util.join (util.mind_home! ()) "build",
+    dir => dir,
+});
+
+priv let dir_of : :map -> :map -> :string;
+priv let dir_of setting s = util.join (Setting.target_dir setting) ("build/" + Scripted.key s);
+
+/// The context a script is told, and nothing it was not meant to see: only the
+/// environment variables its manifest lists.
+priv let context! : :map -> :map -> :map;
+priv let context! setting s = {
+    let env = list.fold (fn m name -> match os.env! name { () => m, v => m.[name => v] }) (%{}) (Scripted.env s);
+    let host = here! ();
+    Context.make (Scripted.key s) (Scripted.version s) (Scripted.root s)
+                 (match Setting.target setting { () => host, t => t }) host
+                 (Setting.profile setting) env (Scripted.options s) (Setting.dependencies setting)
+                 (Setting.jobs setting) (steps_dir! setting)
+                 (Setting.testing setting) (Setting.vm setting) (Setting.compiler setting) (Setting.only setting)
+};
+
+// --- stamps ------------------------------------------------------------------------
+
+/// `[size, modified]` for each path, or `()` for one that is not there.
+priv let stamps! : [:string] -> :map;
+priv let stamps! paths = list.fold (fn m p -> m.[p => match io.stat! p { () => (), [size, modified, _] => [size, modified] }])
+                              (%{}) paths;
+
+/// Whether every path still has the stamp it had.
+priv let unmoved! : :map -> :bool;
+priv let unmoved! recorded = list.all (fn [p, was] -> match io.stat! p {
+    () => was == (),
+    [size, modified, _] => was == [size, modified],
+}) (map_pairs recorded);
+
+// --- drivers ---------------------------------------------------------------------------
+//
+// One driver runs every script whose build dependencies are the same, which in
+// a project whose scripts use only `std` is every script it has: one compile
+// and one VM however many packages have one. Scripts with different build
+// dependencies cannot share, because each script's packages are a namespace of
+// its own -- a tool may use `json` 1.x while another uses 2.x -- and one
+// program has one namespace. So scripts are grouped by the `-L` roots they are
+// compiled with, and a group is a driver.
+//
+// Every script is a file called `build.dr`, so a driver cannot import two of
+// them by that name. Each script's package is given a name for the driver's
+// compile alone, `mind_script_N`, as an alias (`-L NAME=DIR`) and as an
+// overlay of its own directory (`-L NAME+=DIR`), which finds the script beside
+// the manifest even when the package keeps its modules in `src/`; and the
+// driver imports it `as script_N`.
+
+/// Scripts that can share a driver, in the order they came.
+priv let groups : [:map] -> [[:map]];
+priv let groups scripted = {
+    let by = list.fold (fn acc s -> map.update [] (fn xs -> list.append xs [s]) acc (str.join_str "\n" (Scripted.paths s)))
+                       (%{}) scripted;
+    list.map (fn k -> by.[k]) (list.unique (list.map (fn s -> str.join_str "\n" (Scripted.paths s)) scripted))
+};
+
+/// The script as a module path inside its package: `build`, or `tools.build`
+/// for `[build] script = "tools/build.dr"`.
+priv let script_module : :map -> :string;
+priv let script_module s = {
+    // Both are absolute, and the script is inside the package, so the module
+    // path is what follows the root.
+    let from = str.byte_length (Scripted.root s) + 1;
+    let rel = str.slice from (str.byte_length (Scripted.script s) - from - 3) (Scripted.script s);
+    str.join_str "." (str.split "/" rel)
+};
+
+priv let group_dir : :map -> [:map] -> :string;
+priv let group_dir setting group = {
+    // Named by the scripts in it as well as what they are compiled with: two
+    // runs asking for different sets of scripts -- a package's own checks,
+    // and a build of it that runs its dependencies' scripts too -- must not
+    // write one driver over the other while both are compiling it.
+    let named = list.append (Scripted.paths (list.head group))
+                            (list.map (fn s -> Scripted.key s + "=" + Scripted.script s) group);
+    util.join (Setting.target_dir setting) ("build/_drivers/" + str.slice 0 16 (io.digest (str.join_str "\n" named)))
+};
+
+/// The driver's source. Its directory holds a manifest, so that the driver is
+/// a package of its own: written anywhere under the project without one, it
+/// would belong to the project.
+priv let write_driver! : :string -> [:map] -> :unit;
+priv let write_driver! dir group = {
+    file.mkdir_all! dir
+    replace! (util.join dir "mind.toml") "[package]\nname = \"mind_build_driver\"\nversion = \"0.0.0\"\n"
+    let numbered = list.enumerate group;
+    replace! (util.join dir "main.dr")
+                (str.join_str "" (list.concat [
+                    ["// Written by mind: runs these packages' build scripts.\nimport std.build.run;\n"],
+                    list.map (fn [i, s] -> "import mind_script_" + to_string i + "." + script_module s
+                                           + " as script_" + to_string i + ";\n") numbered,
+                    ["let main! = run.run_all! [\n"],
+                    list.map (fn [i, s] -> "    [\"" + Scripted.key s + "\", script_" + to_string i + ".plan],\n") numbered,
+                    ["];\n"],
+                ]))
+};
+
+/// A file written whole or not at all (`std.file`'s): two runs of one group
+/// at once each write the same bytes, and neither must ever read the other's
+/// half-written file.
+priv let replace! : :string -> :string -> :unit;
+priv let replace! path text = file.replace! path text;
+
+/// The `-L` roots a group's driver is compiled with.
+priv let driver_roots : [:map] -> [:string];
+priv let driver_roots group =
+    list.concat [list.flat_map (fn [i, s] -> ["-L", "mind_script_" + to_string i + "=" + Scripted.root s,
+                                              "-L", "mind_script_" + to_string i + "+=" + Scripted.root s])
+                               (list.enumerate group),
+                 list.flat_map (fn p -> ["-L", p]) (Scripted.paths (list.head group))];
+
+/// The files one script is compiled from, from `dreams --modules`, which
+/// loads and does not compile: what a package's record keeps, so that editing
+/// one script runs that one again and no other.
+let sources_of : :string -> [:string];
+let sources_of listing =
+    list.flat_map (fn line -> match list.filter (fn w -> not (str.is_empty w)) (str.split " " line) {
+        [_, f] if str.ends_with ".dr" f => [f],
+        _ => [],
+    }) (str.split "\n" listing);
+
+/// `[program, lead ++ args]` as the compiler is run.
+priv let compiler_args : :map -> [:string] -> [:any];
+priv let compiler_args setting args = match Setting.compiler setting {
+    [program, ..lead] => [program, list.append lead args],
+};
+
+priv let script_sources! : :map -> :map -> :map;
+priv let script_sources! setting s = {
+    let [lp, largs] = compiler_args setting (list.concat [["--modules", Scripted.script s],
+                                                          list.flat_map (fn p -> ["-L", p]) (Scripted.paths s)]);
+    stamps! (sources_of (os.exec! lp largs).[:out])
+};
+
+priv let compile_driver! : :map -> :string -> [:map] -> :any;
+priv let compile_driver! setting dir group = {
+    write_driver! (util.join dir "driver") group
+    // Compiled beside the image and renamed into place, for the reason
+    // `replace!` gives: a run that finds the image there must find a whole one.
+    let scratch = util.join dir ("script.dream.tmp-" + file.scratch_suffix! ());
+    let [program, args] = compiler_args setting (list.concat [[util.join dir "driver/main.dr"], driver_roots group,
+                                                              ["-o", scratch]]);
+    if Setting.verbose setting { console.error! (str.join_str " " (list.cons program args)) }
+    let r = os.exec! program args;
+    match r.[:code] {
+        0 => { io.rename! scratch (util.join dir "script.dream"); [:ok, ()] },
+        _ => [:error, "the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
+                      + " do not compile:\n" + str.trim (r.[:err] + r.[:out])],
+    }
+};
+
+// --- one group ---------------------------------------------------------------------------
+
+priv let read_record! : :string -> :map;
+priv let read_record! f = match file.read! f {
+    () => %{},
+    text => match wire.decode text { [:ok, r] => r, _ => %{} },
+};
+
+/// Whether a package's last answer is still good: the same context, and
+/// nothing its script was compiled from or its run read has moved.
+priv let fresh! : :map -> :string -> :bool;
+priv let fresh! record ctx_digest = match record {
+    %{ :context => c, :sources => sources, :reads => reads } =>
+        c == ctx_digest && unmoved! sources && unmoved! reads,
+    _ => false,
+};
+
+/// Run the group's stale scripts, or none, and answer `[:ok, [[key, outcome]]]`
+/// for all of them, or `[:error, why]`.
+priv let run_group! : [:any] -> :any;
+priv let run_group! job = {
+    let [setting, group] = job;
+    let dir = group_dir setting group;
+    let image = util.join dir "script.dream";
+    // What the driver was compiled from besides the scripts: the compiler,
+    // stamped, since a driver made by another compiler is another image --
+    // or, if the compiler was being rewritten when it ran, not an image.
+    let listed = [list.map (fn s -> [Scripted.key s, Scripted.script s]) group,
+                  stamps! (list.filter (fn w -> str.contains_str "/" w) (Setting.compiler setting))];
+    let each = list.map (fn s -> {
+        let ctx = context! setting s;
+        let record_file = util.join (dir_of setting s) "record";
+        [s, ctx, io.digest (wire.encode ctx), record_file, read_record! record_file]
+    }) group;
+    strict! each
+    let stale = list.filter (fn [_, _, digest, _, record] ->
+        Setting.testing setting || not (io.exists! image && fresh! record digest)) each;
+    match stale {
+        [] => [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each],
+        _ => {
+            file.mkdir_all! dir
+            let driver = read_record! (util.join dir "record");
+            // A stale script whose sources moved (or were never listed) is why
+            // the driver is compiled again; one whose context or reads moved
+            // only has to be run.
+            let moved = list.filter (fn [_, _, _, _, record] -> match record.[:sources else ()] {
+                () => true,
+                sources => not (unmoved! sources),
+            }) stale;
+            let compiled = match [driver.[:scripts else ()] == listed && io.exists! image, moved] {
+                [true, []] => [:ok, ()],
+                _ => compile_driver! setting dir group,
+            };
+            match compiled {
+                [:error, why] => [:error, why],
+                [:ok, _] => {
+                    replace! (util.join dir "record") (wire.encode (%{ :scripts => listed }))
+                    let contexts = list.fold (fn m [s, ctx, _, _, _] -> m.[Scripted.key s => ctx]) (%{}) stale;
+                    // This run's own: another run of the same group may be
+                    // asking for other packages at the same moment.
+                    let run_id = file.scratch_suffix! ();
+                    let ctx_file = util.join dir ("contexts-" + run_id);
+                    let out_file = util.join dir ("outcomes-" + run_id);
+                    file.write! ctx_file (wire.encode contexts)
+                    let r = os.exec_for! (Setting.vm setting) [image, "--contexts", ctx_file, "--outcomes", out_file] deadline_ms;
+                    let answer = file.read! out_file;
+                    strict! answer
+                    file.remove_all! ctx_file
+                    file.remove_all! out_file
+                    match [r.[:timed_out], r.[:code]] {
+                        [true, _] => [:error, "the build scripts ran for longer than " + to_string (deadline_ms / 60000) + " minutes"],
+                        [_, 0] => match wire.decode (match answer { () => "", t => t }) {
+                            [:ok, outcomes] if list.all (fn [_, o] -> types.accepts Outcome.type o) (map_pairs outcomes) => {
+                                strict! (list.map (fn [s, _, digest, record_file, record] -> {
+                                    let sources = match list.any (fn [m, .._] -> Scripted.key m == Scripted.key s) moved {
+                                        true => script_sources! setting s,
+                                        false => record.[:sources],
+                                    };
+                                    let o = outcomes.[Scripted.key s];
+                                    if not (Setting.testing setting) {
+                                        file.mkdir_all! (dir_of setting s)
+                                        replace! record_file (wire.encode (%{ :context => digest, :sources => sources,
+                                                                                :reads => Outcome.reads o, :outcome => o }))
+                                    }
+                                }) stale)
+                                [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, outcomes.[Scripted.key s else record.[:outcome]]])
+                                               each]
+                            },
+                            _ => [:error, "the build scripts wrote outcomes that do not read"],
+                        },
+                        _ => [:error, str.trim (r.[:err] + r.[:out])],
+                    }
+                },
+            }
+        },
+    }
+};
+
+// --- all of them --------------------------------------------------------------------------
+
+/// Every script in the build: each group's driver at once, answering
+/// `[:ok, [[key, outcome]]]` in the order the scripts came, or the first failure.
+let run_all! : :map -> [:map] -> :any;
+let run_all! setting scripted = {
+    let results = proc.try_map! run_group! (list.map (fn g -> [setting, g]) (groups scripted));
+    strict! results
+    let found = list.fold (fn acc r -> match [acc, r] {
+        [[:error, _], _] => acc,
+        [[:ok, done], [:ok, [:ok, more]]] => [:ok, list.append done more],
+        [_, [:ok, [:error, why]]] => [:error, why],
+        [_, [:error, e]] => [:error, "the build scripts failed: " + to_string e],
+    }) [:ok, []] results;
+    match found {
+        [:ok, pairs] => {
+            let by = map.from_pairs pairs;
+            [:ok, list.map (fn s -> [Scripted.key s, by.[Scripted.key s]]) scripted]
+        },
+        failed => failed,
+    }
+};
+
+// --- into the compile -------------------------------------------------------------------
+
+/// A setting as `-D` writes it.
+priv let shown : :any -> :string;
+priv let shown v = match type_of v { :string => v, _ => to_string v };
+
+/// A target as `--target` takes it.
+let target_arg : :map -> :string;
+let target_arg t = {
+    let name a = { let s = to_string a; str.slice 1 (str.byte_length s - 1) s };
+    "os=" + name (Target.os t) + ",arch=" + name (Target.arch t)
+};
+
+/// The compiler arguments the outcomes add, or the reason they cannot be had
+/// together: two packages embedding a payload under one name.
+let compile_args : [[:any]] -> :any;
+let compile_args outcomes = {
+    let payloads = list.flat_map (fn [key, o] -> list.map (fn [n, p] -> [n, p, key]) (map_pairs (Outcome.payloads o)))
+                                 outcomes;
+    let clash = list.filter (fn [n, _, k] -> list.any (fn [n2, _, k2] -> n2 == n && k2 != k) payloads) payloads;
+    match clash {
+        [[n, _, k], .._] => [:error, "two build scripts embed a payload called `" + n + "`, `" + k + "`'s and another's"],
+        [] => {
+            let targets = list.filter (fn t -> t != ()) (list.map (fn [_, o] -> Outcome.target o) outcomes);
+            [:ok, list.concat [
+                list.flat_map (fn [n, p, _] -> ["--payload", n + "=" + p]) payloads,
+                list.flat_map (fn [key, o] -> match Outcome.modules o {
+                    () => [],
+                    dir => ["-L", key + "+=" + dir],
+                }) outcomes,
+                list.flat_map (fn [key, o] -> list.flat_map (fn [n, v] -> match v {
+                    true => ["-D", key + ":" + n],
+                    _ => ["-D", key + ":" + n + "=" + shown v],
+                }) (map_pairs (Outcome.defines o))) outcomes,
+                list.flat_map (fn [_, o] -> list.flat_map (fn h -> ["--host-module", h]) (Outcome.hosts o)) outcomes,
+                match targets {
+                    [] => [],
+                    [first, ..rest] => list.flat_map (fn t -> ["--target", target_arg t])
+                                                     (list.fold (fn acc ts -> list.filter (fn t -> list.contains t ts) acc) first rest),
+                },
+            ]]
+        },
+    }
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "the files a driver was compiled from"
+            $( test.eq! ["/s/std/list.dr", "/p/build.dr"]
+                        (sources_of "std.list  /s/std/list.dr\nstd.build.Step  std.build.Step\nbuild   /p/build.dr\n") ),
+        test.case "outcomes become compiler arguments"
+            $( test.eq! [:ok, ["--payload", "lib=/c/lib.so", "-L", "sq+=/c/mods", "-D", "sq:fast",
+                               "--host-module", "host.gpu"]]
+                        (compile_args [["sq", %{ :payloads => %{ "lib" => "/c/lib.so" }, :modules => "/c/mods",
+                                                 :defines => %{ "fast" => true }, :hosts => ["host.gpu"] }],
+                                       ["other", %{ :defines => %{}, :payloads => %{} }]]) ),
+        test.case "a define with a value is scoped with it"
+            $( test.eq! [:ok, ["-D", "sq:n=3"]] (compile_args [["sq", %{ :defines => %{ "n" => 3 } }]]) ),
+        test.case "two packages cannot embed one name"
+            $( test.eq! :error (list.head (compile_args [["a", %{ :payloads => %{ "x" => "/1" } }],
+                                                         ["b", %{ :payloads => %{ "x" => "/2" } }]])) ),
+        test.case "a target as the compiler takes it"
+            $( test.eq! "os=linux,arch=x86_64" (target_arg (Target.make :linux :x86_64)) ),
+    ];
+}

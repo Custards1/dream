@@ -58,6 +58,7 @@
 // the original arena for comparison.
 
 import std.list;
+import std.vm;
 
 import dreams.ir;
 import dreams.builtins;
@@ -645,7 +646,19 @@ let optimize_parts img parts invented_from = optimize_parts_filled img parts inv
 /// The same, with each settled `comp` placeholder read as the part-0 node its
 /// value was lowered to: `filled` maps the function a placeholder waits on to
 /// that node.
+///
+/// The walk is the VM's (`vm.share_arenas`), and is `optimize_parts_by_hand`
+/// step for step: this is a whole-program walk a warm build cannot keep
+/// between builds, and in Dream it was a map insert and a `to_string` per node.
 let optimize_parts_filled img parts invented_from filled = {
+    let [nodes, kids, funcs] = vm.share_arenas [img.[:funcs else []], parts, invented_from, filled,
+                                                edge_map, run_map, part_base];
+    ((img.[:nodes => nodes]).[:kids => kids]).[:funcs => funcs]
+};
+
+/// The walk `vm.share_arenas` makes, as the definition of it: the tests below
+/// hold the two to each other.
+let optimize_parts_by_hand img parts invented_from filled = {
     let s0 = ((((((fresh img #[] #[]).[:parts => parts]).[:memo_leaves => true]))
                 .[:invented_from => invented_from]).[:filled => filled]);
     let walked = list.fold (fn acc f -> {
@@ -723,7 +736,36 @@ when test {
                                      ir.node :neg 0 ir.no_node ir.no_node,
                                      ir.node :neg 1 ir.no_node ir.no_node] [] [2, 3]);
 
+    /// Two parts and the linked program's own arena, with something in them
+    /// for every step of the walk: constants renamed through a part's pools, a
+    /// function and an invented global moved past the parts before, a `field`
+    /// renamed and never shared, a call with a run of arguments, a settled
+    /// `comp` placeholder read from part 0, captures, and a node two parts
+    /// both have.
+    let none = ir.no_node;
+    let pools ints strs = %{ :ints => array_of_list ints, :floats => #[], :strs => array_of_list strs, :atoms => #[] };
+    let parts = array_of_list [
+        %{ :nodes => array_of_list [[:const_int, 0, 1, none, none], [:local, 0, 2, none, none]],
+           :kids => array_of_list [4, 5] },
+        %{ :nodes => array_of_list [[:add, 0, 1, 2, none], [:const_int, 0, 0, none, none],
+                                    [:global, 0, 70, none, none], [:make_closure, 0, 1, none, none]],
+           :kids => #[], :remap => pools [3] [], :fo => 0, :go => 5 },
+        %{ :nodes => array_of_list [[:apply, 0, 1, 0, 2], [:field, 0, 4, 0, none], [:const_int, 0, 0, none, none],
+                                    [:unit, 0, 0, none, none], [:local, 0, 2, none, none],
+                                    [:add, 0, 2, 2, none], [:make_closure, 0, 1, none, none]],
+           :kids => array_of_list [2, 3], :remap => pools [3] [6], :fo => 10, :go => 7 },
+    ];
+    let parted = %{ :funcs => [%{ :body => part_base + 0 },
+                               %{ :body => 2 * part_base + 0, :n_captures => 2, :captures_off => 0 },
+                               %{ :body => 2 * part_base + 5 },
+                               %{ :body => part_base + 3 },
+                               %{ :body => none }] };
+    let filled = %{ 10 => 0 };
+
     let tests = [
+        test.case "the VM shares parts as the walk written here does"
+            $( test.eq! (optimize_parts_by_hand parted parts 60 filled)
+                        (optimize_parts_filled parted parts 60 filled) ),
         test.case "two copies of a leaf become one node"
             $( test.eq! 1 (list.length (nodes_of two_locals)) ),
         test.case "and both bodies point at it"

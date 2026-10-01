@@ -334,13 +334,27 @@ let rec sort_by before xs = {
     }
 };
 
-/// Ascending, by the runtime's total order over the flat types.
+/// Ascending, by the runtime's total order over the flat types. Stable.
+///
+/// The machine sorts (`sort_keyed`): this and `sort_on` were `sort_by`'s merge
+/// sort, which takes its list apart and builds it again at every level, and
+/// `sort_on` asked for each key at every comparison. A key is forced whole
+/// before the sort starts, where a comparison forces a key only as far as it
+/// needs to; that is the one difference, and it is one only for a key with a
+/// part that cannot be forced.
 let sort : [a] -> [a];
-let sort xs = sort_by (fn a b -> compare a b < 0) xs;
+let sort xs = {
+    let items = array_of_list xs;
+    sort_keyed (array_to_list items) items
+};
 
-/// Ascending by a key extracted from each element.
+/// Ascending by a key extracted from each element, which is asked for once
+/// per element. Stable.
 let sort_on : (a -> b) -> [a] -> [a];
-let sort_on key xs = sort_by (fn a b -> compare (key a) (key b) < 0) xs;
+let sort_on key xs = {
+    let items = array_of_list xs;
+    sort_keyed (map key (array_to_list items)) items
+};
 
 // --- conversion -------------------------------------------------------------
 

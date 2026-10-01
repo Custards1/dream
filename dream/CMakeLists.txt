@@ -151,6 +151,7 @@ set(DREAM_SOURCES
   src/builtins.cpp
   src/ffi.cpp
   src/io.cpp
+  src/sha256.cpp
   src/os.cpp
   src/scheduler.cpp
   src/runtime.cpp

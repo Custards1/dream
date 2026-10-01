@@ -1,0 +1,8 @@
+[package]
+name = "ffi_test"
+version = "0.1.0"
+entry = "ffi.dr"
+
+[build]
+# The C compiler the library is built with, when one is named.
+env = ["CC"]

@@ -1,7 +1,11 @@
 #include "builtins.hpp"
+#include "sha256.hpp"
 
 #include "io.hpp"
 
+#include <array>
+#include <unordered_map>
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -1219,6 +1223,12 @@ NativeResult vm_host_members(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_open_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_call_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_close_image(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_image_digest(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_wire_encode(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_share_arenas(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_node_section(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_index_section(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_wire_decode(Process& p, Value self, Value* args, uint32_t n);
 }  // namespace
 
 ModuleDef make_vm_module() {
@@ -1243,6 +1253,15 @@ ModuleDef make_vm_module() {
                          {"open_image!", 1, 0b1, vm_open_image},
                          {"call_image!", 4, 0b1111, vm_call_image, 0, true},
                          {"close_image!", 1, 0b1, vm_close_image},
+                         {"image_digest", 1, 0b1, vm_image_digest},
+                         // `std.wire`'s format, done here; see "The wire format, natively".
+                         {"wire_encode", 1, 0b0, vm_wire_encode, 0, true},
+                         {"wire_decode", 1, 0b1, vm_wire_decode},
+                         // `opt.optimize_parts`'s walk; see "Sharing a program's parts".
+                         {"share_arenas", 1, 0b0, vm_share_arenas, 0, true},
+                         // `emit`'s node and kid sections; see "The image's two largest sections".
+                         {"node_section", 1, 0b0, vm_node_section, 0, true},
+                         {"index_section", 1, 0b0, vm_index_section, 0, true},
                          // measuring
                          {"now_ns!", 1, 0b1, vm_now_ns},
                          {"wall_ms!", 1, 0b1, vm_wall_ms},
@@ -1463,10 +1482,7 @@ NativeResult comp_fail(Process& p, const char* kind, const std::string& message)
 /// not two that drift.
 NativeResult run_compile_time(Process& p, Runtime& rt, Scheduler& sched,
                               const std::shared_ptr<Process>& root) {
-    sched.start();
-    sched.enqueue(root);
-    bool clean = sched.wait_for_all();
-    sched.stop();
+    bool clean = sched.run(root);
 
     if (root->failed || !clean) {
         return comp_fail(p, "comp_failed", "the compile-time expression failed");
@@ -2398,6 +2414,703 @@ NativeResult core_compare(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_fixnum(cmp));
 }
 
+/// `sort_keyed keys xs` -- the elements of the array `xs`, as a list, in the
+/// order `compare` puts `keys` in, equal keys keeping their order. What
+/// `std.list.sort` and `sort_on` are: a merge sort written in Dream took apart
+/// and rebuilt its list at every level and asked for the key twice a
+/// comparison, and a compile sorts tens of thousands of things.
+///
+/// The keys are forced whole first, under a vouch, and the sort then compares
+/// values that are already forced, so it forces nothing and nothing can be
+/// collected under it. The elements are carried, never looked at: an element
+/// the Dream sort never forced is not forced here either.
+NativeResult core_sort_keyed(Process& p, Value, Value* args, uint32_t) {
+    Value keys;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &keys)) return NativeResult::raise(p.result);
+    }
+    Value xs = resolve(args[1]);
+    if (!is_obj(xs, ObjType::Array)) return type_fail(p, "sort_keyed needs a list of keys and an array");
+    auto* arr = static_cast<ArrayObj*>(as_obj(xs));
+    std::vector<Value> ks;
+    for (Value cur = resolve(keys); is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail))
+        ks.push_back(static_cast<ConsObj*>(as_obj(cur))->head);
+    if (ks.size() != arr->len) return type_fail(p, "sort_keyed needs a key for every element");
+    std::vector<uint32_t> order(ks.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    bool ok = true;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        if (!ok) return false;
+        int cmp = 0;
+        if (!compare_values(p, ks[a], ks[b], 0, &cmp)) { ok = false; return false; }
+        return cmp < 0;
+    });
+    if (!ok) return NativeResult::raise(p.result);
+    Value list = NIL;
+    for (size_t i = order.size(); i-- > 0;) list = p.heap().make_cons(arr->items()[order[i]], list);
+    return NativeResult::ok(list);
+}
+
+// --- the wire format, natively ---
+//
+// `std.wire` is written in Dream, a byte at a time, and it is exact and slow:
+// 150,000 small lists took 7.7 s to write and 70 s to read, which is a
+// language describing its own bytes through `str_le` and `str_byte`. Anything
+// that keeps a compiled program's state between runs -- a build's compile
+// units -- is that size, so the format is done here as well, byte for byte
+// the same: `std.wire.encode` and `decode` call these, and every message
+// either side writes the other reads. The Dream writer stays the definition
+// of the format, and `std.wire`'s tests hold the two to each other.
+//
+// The same rules, in the same places. A map's entries are written in the order
+// `compare` puts their keys, so equal maps are equal bytes. Anything that is
+// not data -- a function, a process -- is written as the string `to_string`
+// gives it, as `std.codec`'s `write_opaque` does. Reading never raises: a
+// value that is not one is `[:error, why]`. And an atom is only ever looked
+// up, never made, so a message cannot grow the atom table.
+
+enum : uint8_t {
+    WIRE_UNIT = 0, WIRE_FALSE = 1, WIRE_TRUE = 2, WIRE_INT = 3, WIRE_FLOAT = 4,
+    WIRE_STRING = 5, WIRE_ATOM = 6, WIRE_CHAR = 7, WIRE_LIST = 8, WIRE_ARRAY = 9,
+    WIRE_MAP = 10,
+};
+
+void wire_le(std::string* out, uint64_t v, int width) {
+    for (int i = 0; i < width; ++i) out->push_back(char((v >> (8 * i)) & 0xff));
+}
+
+void wire_bytes(std::string* out, uint8_t tag, const char* data, uint64_t len) {
+    out->push_back(char(tag));
+    wire_le(out, len, 4);
+    out->append(data, size_t(len));
+}
+
+/// Write a value that has already been forced all the way down. False when
+/// a map's keys could not be compared, which is the only way this can fail.
+bool wire_write(Process& p, Value v, std::string* out, int depth) {
+    v = resolve(v);
+    if (depth > 10000) return false;
+    if (is_unit(v)) { out->push_back(char(WIRE_UNIT)); return true; }
+    if (is_bool(v)) { out->push_back(char(v == TRUE_V ? WIRE_TRUE : WIRE_FALSE)); return true; }
+    if (is_fixnum(v)) {
+        out->push_back(char(WIRE_INT));
+        wire_le(out, uint64_t(fixnum_value(v)), 8);
+        return true;
+    }
+    if (is_char(v)) {
+        out->push_back(char(WIRE_CHAR));
+        wire_le(out, uint64_t(imm_payload(v)), 4);
+        return true;
+    }
+    if (is_atom(v)) {
+        const std::string& name = p.runtime().atom_name(uint32_t(imm_payload(v)));
+        wire_bytes(out, WIRE_ATOM, name.data(), name.size());
+        return true;
+    }
+    if (v == NIL) { out->push_back(char(WIRE_LIST)); wire_le(out, 0, 4); return true; }
+    if (is_ptr(v)) {
+        switch (as_obj(v)->type) {
+            case ObjType::Float: {
+                double d = static_cast<FloatObj*>(as_obj(v))->value;
+                char b[8];
+                std::memcpy(b, &d, 8);
+                out->push_back(char(WIRE_FLOAT));
+                out->append(b, 8);
+                return true;
+            }
+            case ObjType::Str: {
+                auto* s = static_cast<StrObj*>(as_obj(v));
+                wire_bytes(out, WIRE_STRING, s->data(), s->len);
+                return true;
+            }
+            case ObjType::Cons: {
+                // The count comes first and is not known until the spine has
+                // been walked, so a place is kept for it and filled after.
+                out->push_back(char(WIRE_LIST));
+                size_t at = out->size();
+                wire_le(out, 0, 4);
+                uint64_t n = 0;
+                for (Value cur = v; is_obj(cur, ObjType::Cons);
+                     cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+                    if (!wire_write(p, static_cast<ConsObj*>(as_obj(cur))->head, out, depth + 1)) return false;
+                    ++n;
+                }
+                for (int i = 0; i < 4; ++i) (*out)[at + i] = char((n >> (8 * i)) & 0xff);
+                return true;
+            }
+            case ObjType::Array: {
+                auto* a = static_cast<ArrayObj*>(as_obj(v));
+                out->push_back(char(WIRE_ARRAY));
+                wire_le(out, a->len, 4);
+                for (uint32_t i = 0; i < a->len; ++i) {
+                    if (!wire_write(p, static_cast<ArrayObj*>(as_obj(v))->items()[i], out, depth + 1)) return false;
+                }
+                return true;
+            }
+            case ObjType::Map: {
+                std::vector<std::pair<Value, Value>> entries;
+                map_collect(v, entries);
+                bool ok = true;
+                std::stable_sort(entries.begin(), entries.end(), [&](const auto& x, const auto& y) {
+                    int cmp = 0;
+                    if (!compare_values(p, x.first, y.first, 0, &cmp)) ok = false;
+                    return cmp < 0;
+                });
+                if (!ok) return false;
+                out->push_back(char(WIRE_MAP));
+                wire_le(out, entries.size(), 4);
+                for (auto& [k, val] : entries) {
+                    if (!wire_write(p, k, out, depth + 1) || !wire_write(p, val, out, depth + 1)) return false;
+                }
+                return true;
+            }
+            case ObjType::BigStr: {
+                auto* b = static_cast<BigStrObj*>(as_obj(v));
+                wire_bytes(out, WIRE_STRING, b->data, b->len);
+                return true;
+            }
+            default: break;
+        }
+    }
+    // Not data: its text, as `std.codec`'s `write_opaque` writes it.
+    std::string text;
+    if (!stringify(p, v, &text)) return false;
+    wire_bytes(out, WIRE_STRING, text.data(), text.size());
+    return true;
+}
+
+NativeResult vm_wire_encode(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    std::string out;
+    if (!wire_write(p, forced, &out, 0)) {
+        return type_fail(p, "wire_encode: a map's keys could not be compared, or the value nests too deep");
+    }
+    if (out.size() > UINT32_MAX) return type_fail(p, "wire_encode: the message is larger than a string can be");
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+struct WireReader {
+    Process& p;
+    const unsigned char* data;
+    uint64_t len;
+    uint64_t at = 0;
+
+    bool has(uint64_t n) const { return at + n <= len; }
+    uint64_t le(int width) {
+        uint64_t v = 0;
+        for (int i = width - 1; i >= 0; --i) v = (v << 8) | data[at + i];
+        at += width;
+        return v;
+    }
+
+    /// One value, or false for bytes that are not one.
+    bool read(Value* out, int depth) {
+        if (depth > 10000 || !has(1)) return false;
+        uint8_t tag = data[at++];
+        switch (tag) {
+            case WIRE_UNIT: *out = UNIT; return true;
+            case WIRE_FALSE: *out = make_bool(false); return true;
+            case WIRE_TRUE: *out = make_bool(true); return true;
+            case WIRE_INT: {
+                if (!has(8)) return false;
+                // A fixnum is 63 bits: the top byte is under 0x40 or at least
+                // 0xC0, and anything between is a number this runtime cannot
+                // hold, which `std.wire` refuses too.
+                uint8_t top = data[at + 7];
+                if (top >= 64 && top < 192) return false;
+                *out = make_integer(p, int64_t(le(8)));
+                return true;
+            }
+            case WIRE_FLOAT: {
+                if (!has(8)) return false;
+                double d;
+                std::memcpy(&d, data + at, 8);
+                at += 8;
+                *out = p.heap().make_float(d);
+                return true;
+            }
+            case WIRE_STRING: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                if (!has(n)) return false;
+                *out = p.heap().make_string(reinterpret_cast<const char*>(data + at), uint32_t(n));
+                at += n;
+                return true;
+            }
+            case WIRE_ATOM: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                if (!has(n)) return false;
+                uint32_t id;
+                if (!p.runtime().find_atom(std::string_view(reinterpret_cast<const char*>(data + at), n), &id)) {
+                    return false;
+                }
+                at += n;
+                *out = make_atom(id);
+                return true;
+            }
+            case WIRE_CHAR: {
+                if (!has(4)) return false;
+                uint64_t code = le(4);
+                if (code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) return false;
+                *out = make_char(uint32_t(code));
+                return true;
+            }
+            case WIRE_LIST: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                std::vector<Value> items;
+                items.reserve(size_t(std::min<uint64_t>(n, len)));
+                for (uint64_t i = 0; i < n; ++i) {
+                    Value item;
+                    if (!read(&item, depth + 1)) return false;
+                    items.push_back(item);
+                }
+                Value list = NIL;
+                for (size_t i = items.size(); i-- > 0;) list = p.heap().make_cons(items[i], list);
+                *out = list;
+                return true;
+            }
+            case WIRE_ARRAY: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                if (n > len) return false;
+                std::vector<Value> items;
+                items.reserve(size_t(n));
+                for (uint64_t i = 0; i < n; ++i) {
+                    Value item;
+                    if (!read(&item, depth + 1)) return false;
+                    items.push_back(item);
+                }
+                Value arr = p.heap().make_array(uint32_t(n));
+                for (uint64_t i = 0; i < n; ++i) static_cast<ArrayObj*>(as_obj(arr))->items()[i] = items[i];
+                *out = arr;
+                return true;
+            }
+            case WIRE_MAP: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                Value m = p.heap().make_map(0);
+                for (uint64_t i = 0; i < n; ++i) {
+                    Value k, v;
+                    if (!read(&k, depth + 1) || !read(&v, depth + 1)) return false;
+                    m = resolve(map_insert(p, m, k, v));
+                }
+                *out = m;
+                return true;
+            }
+            default: return false;
+        }
+    }
+};
+
+/// The SHA-256 of the running image, as `io.digest` spells one: which program
+/// this is, exactly. A compiler keys what it caches between runs by it, since
+/// a unit one compiler made means nothing to another. Pure, because an image
+/// cannot change while it runs; worked out once per runtime.
+NativeResult vm_image_digest(Process& p, Value, Value*, uint32_t) {
+    static std::mutex mutex;
+    static std::unordered_map<const void*, std::string> known;
+    const Image& img = p.runtime().image();
+    std::string hex;
+    {
+        std::lock_guard<std::mutex> g(mutex);
+        auto it = known.find(&img);
+        if (it != known.end()) hex = it->second;
+    }
+    if (hex.empty()) {
+        Sha256 sha;
+        sha.update(img.bytes(), img.byte_count());
+        hex = sha.hex();
+        std::lock_guard<std::mutex> g(mutex);
+        known[&img] = hex;
+    }
+    return NativeResult::ok(p.heap().make_string(hex.data(), uint32_t(hex.size())));
+}
+
+// ---------------------------------------------------------------------------
+// Sharing a program's parts into one arena
+// ---------------------------------------------------------------------------
+//
+// `opt.optimize_parts` in the compiler, done here: the last whole-program walk
+// of a build, which hash-conses every part's arena into one. The parts arrive
+// already shared within themselves, so all this does is rename -- each part's
+// constants into the program's pools, its functions and invented globals past
+// the parts before it -- and keep each node once by its whole record. Written
+// in Dream it was a map insert and a `to_string` per node, threaded through a
+// state record, and the largest stage left in a warm build of a big program.
+//
+// It is the Dream walk, step for step, and must stay so: the image it writes
+// is compared byte for byte with the one the Dream walk writes (`opt`'s tests
+// hold the two to each other on parts with every kind of node in them). The
+// opcode tables are the compiler's, handed in, so there is no second copy of
+// which operand is an edge.
+//
+// Everything is forced before the walk starts, and nothing is forced during
+// it, so the values read here stay where they are: allocation never collects.
+
+struct ShareArenas {
+    Process& p;
+    int64_t part_base = 0;
+    int64_t invented_from = 0;
+    Value filled = NIL;
+    Value none = 0, nop = 0, field = 0, unit = 0, global = 0, make_closure = 0, make_thunk = 0;
+    Value const_int = 0, const_float = 0, const_str = 0, const_atom = 0;
+    std::unordered_map<Value, std::vector<int>> edges;
+    std::unordered_map<Value, std::array<int64_t, 3>> runs;
+
+    struct Part {
+        Value nodes = NIL, kids = NIL, remap = UNIT;
+        int64_t fo = 0, go = 0;
+        Value ints = NIL, floats = NIL, strs = NIL, atoms = NIL;
+    };
+    std::vector<Part> parts;
+    size_t cur = 0;
+
+    using Node = std::array<Value, 5>;
+    std::vector<Node> out;
+    std::vector<Value> kids;
+    std::unordered_map<std::string, int64_t> seen;
+    std::unordered_map<std::string, int64_t> runs_seen;
+    std::unordered_map<int64_t, Value> memo;
+    const char* failed = nullptr;
+
+    explicit ShareArenas(Process& proc) : p(proc) {}
+
+    Value atom(const char* name) { return make_atom(p.runtime().intern_atom(name)); }
+
+    /// `c.[i else d]` for a list, an array or a map.
+    Value at(Value c, int64_t i, Value d) {
+        c = resolve(c);
+        if (i < 0) return d;
+        if (is_obj(c, ObjType::Array)) {
+            auto* a = static_cast<ArrayObj*>(as_obj(c));
+            return uint64_t(i) < a->len ? resolve(a->items()[i]) : d;
+        }
+        if (is_obj(c, ObjType::Map)) {
+            Value found;
+            return map_lookup(p, c, make_fixnum(i), &found) ? resolve(found) : d;
+        }
+        for (Value cur = c; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+            if (i-- == 0) return resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        }
+        return d;
+    }
+    Value field_of(Value m, Value key, Value d) {
+        Value found;
+        return is_obj(resolve(m), ObjType::Map) && map_lookup(p, resolve(m), key, &found) ? resolve(found) : d;
+    }
+    static int64_t num(Value v) { return fixnum_value(resolve(v)); }
+
+    bool is_node(Value v) const { return resolve(v) != none; }
+
+    Node node_at(int64_t i) {
+        Value n = at(parts[cur].nodes, i, UNIT);
+        if (n == UNIT) return Node{nop, make_fixnum(0), none, none, none};
+        Node out{};
+        for (int k = 0; k < 5; ++k) out[k] = at(n, k, none);
+        return out;
+    }
+    Value kid_at(int64_t i) { return at(parts[cur].kids, i, none); }
+
+    void key_of(const Value* vs, size_t n, std::string* key) {
+        key->clear();
+        for (size_t i = 0; i < n; ++i) {
+            Value v = resolve(vs[i]);
+            if (is_ptr(v)) {
+                std::string text;
+                if (!stringify(p, v, &text)) failed = "a node holds something that cannot be written";
+                key->push_back('\xff');
+                key->append(text);
+                key->push_back('\0');
+            } else {
+                key->append(reinterpret_cast<const char*>(&v), sizeof v);
+            }
+        }
+    }
+
+    Value keep(const Node& n) {
+        if (n[0] != field) {
+            std::string key;
+            key_of(n.data(), 5, &key);
+            auto it = seen.find(key);
+            if (it != seen.end()) return make_fixnum(it->second);
+            seen.emplace(std::move(key), int64_t(out.size()));
+        }
+        out.push_back(n);
+        return make_fixnum(int64_t(out.size()) - 1);
+    }
+
+    Value keep_run(const std::vector<Value>& run) {
+        std::string key;
+        key_of(run.data(), run.size(), &key);
+        auto it = runs_seen.find(key);
+        if (it != runs_seen.end()) return make_fixnum(it->second);
+        int64_t offset = int64_t(kids.size());
+        runs_seen.emplace(std::move(key), offset);
+        kids.insert(kids.end(), run.begin(), run.end());
+        return make_fixnum(offset);
+    }
+
+    Value remapped(Value table, Value i) {
+        Value v = at(table, num(i), 0);
+        if (v == 0) failed = "a constant is not in its part's pool";
+        return v;
+    }
+
+    Node remap_leaf(Node n) {
+        const Part& part = parts[cur];
+        if (resolve(part.remap) == UNIT) return n;
+        Value op = n[0];
+        if (op == make_closure || op == make_thunk) n[2] = make_fixnum(num(n[2]) + part.fo);
+        else if (op == unit) { if (is_node(n[2])) n[2] = make_fixnum(num(n[2]) + part.fo); }
+        else if (op == global) { if (num(n[2]) >= invented_from) n[2] = make_fixnum(num(n[2]) + part.go); }
+        else if (op == const_int) n[2] = remapped(part.ints, n[2]);
+        else if (op == const_float) n[2] = remapped(part.floats, n[2]);
+        else if (op == const_str) n[2] = remapped(part.strs, n[2]);
+        else if (op == const_atom) n[2] = remapped(part.atoms, n[2]);
+        return n;
+    }
+
+    Value rebuild(Value i) {
+        i = resolve(i);
+        if (!is_node(i) || failed) return i;
+        Node n = node_at(num(i));
+        int64_t key = num(i) + int64_t(cur) * part_base;
+        auto hit = memo.find(key);
+        if (hit != memo.end()) return hit->second;
+        bool leaf = !edges.count(n[0]) && !runs.count(n[0]);
+        Value got = leaf ? rebuild_leaf(remap_leaf(n)) : rebuild_node(n);
+        memo[key] = got;
+        return got;
+    }
+
+    Value rebuild_leaf(const Node& n) {
+        if (n[0] == unit && is_node(n[2])) {
+            Value value;
+            if (is_obj(resolve(filled), ObjType::Map) && map_lookup(p, resolve(filled), resolve(n[2]), &value)) {
+                size_t back = cur;
+                cur = 0;
+                Value got = rebuild(value);
+                cur = back;
+                return got;
+            }
+        }
+        return keep(n);
+    }
+
+    Value rebuild_node(Node n) {
+        const Part& part = parts[cur];
+        if (n[0] == field && resolve(part.remap) != UNIT) n[3] = remapped(part.strs, n[3]);
+        auto e = edges.find(n[0]);
+        if (e != edges.end()) {
+            for (int k : e->second) n[2 + k] = rebuild(n[2 + k]);
+        }
+        auto r = runs.find(n[0]);
+        if (r != runs.end()) {
+            auto [off_k, count_k, width] = r->second;
+            int64_t off = num(n[2 + off_k]);
+            int64_t many = num(n[2 + count_k]) * width;
+            std::vector<Value> run;
+            run.reserve(size_t(std::max<int64_t>(many, 0)));
+            for (int64_t j = 0; j < many; ++j) run.push_back(rebuild(kid_at(off + j)));
+            n[2 + off_k] = keep_run(run);
+        }
+        return keep(n);
+    }
+
+    Value place_captures(Value f) {
+        cur = 0;
+        int64_t off = num(field_of(f, atom("captures_off"), make_fixnum(0)));
+        int64_t many = num(field_of(f, atom("n_captures"), make_fixnum(0)));
+        if (many == 0) return make_fixnum(0);
+        std::vector<Value> run;
+        for (int64_t j = 0; j < many; ++j) run.push_back(kid_at(off + j));
+        return keep_run(run);
+    }
+};
+
+/// `[funcs, parts, invented_from, filled, edges, runs, part_base]` to
+/// `[nodes, kids, funcs]`: see "Sharing a program's parts into one arena".
+NativeResult vm_share_arenas(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    ShareArenas s(p);
+    Value in[7];
+    for (int i = 0; i < 7; ++i) in[i] = s.at(forced, i, UNIT);
+    s.invented_from = ShareArenas::num(in[2]);
+    s.filled = in[3];
+    s.part_base = ShareArenas::num(in[6]);
+    s.none = s.atom("none"); s.nop = s.atom("nop"); s.field = s.atom("field"); s.unit = s.atom("unit");
+    s.global = s.atom("global"); s.make_closure = s.atom("make_closure"); s.make_thunk = s.atom("make_thunk");
+    s.const_int = s.atom("const_int"); s.const_float = s.atom("const_float");
+    s.const_str = s.atom("const_str"); s.const_atom = s.atom("const_atom");
+    std::vector<std::pair<Value, Value>> table;
+    map_collect(resolve(in[4]), table);
+    for (auto& [op, ks] : table) {
+        std::vector<int>& into = s.edges[resolve(op)];
+        for (int k = 0; s.at(ks, k, UNIT) != UNIT; ++k) into.push_back(int(ShareArenas::num(s.at(ks, k, UNIT))));
+    }
+    table.clear();
+    map_collect(resolve(in[5]), table);
+    for (auto& [op, spec] : table) {
+        s.runs[resolve(op)] = {ShareArenas::num(s.at(spec, 0, UNIT)), ShareArenas::num(s.at(spec, 1, UNIT)),
+                               ShareArenas::num(s.at(spec, 2, UNIT))};
+    }
+    Value nodes_k = s.atom("nodes"), kids_k = s.atom("kids"), remap_k = s.atom("remap"), fo_k = s.atom("fo"), go_k = s.atom("go");
+    for (int64_t k = 0;; ++k) {
+        Value part = s.at(in[1], k, UNIT);
+        if (part == UNIT) break;
+        ShareArenas::Part pv;
+        pv.nodes = s.field_of(part, nodes_k, NIL);
+        pv.kids = s.field_of(part, kids_k, NIL);
+        pv.remap = s.field_of(part, remap_k, UNIT);
+        pv.fo = ShareArenas::num(s.field_of(part, fo_k, make_fixnum(0)));
+        pv.go = ShareArenas::num(s.field_of(part, go_k, make_fixnum(0)));
+        if (pv.remap != UNIT) {
+            pv.ints = s.field_of(pv.remap, s.atom("ints"), NIL);
+            pv.floats = s.field_of(pv.remap, s.atom("floats"), NIL);
+            pv.strs = s.field_of(pv.remap, s.atom("strs"), NIL);
+            pv.atoms = s.field_of(pv.remap, s.atom("atoms"), NIL);
+        }
+        s.parts.push_back(pv);
+    }
+    if (s.parts.empty()) s.parts.push_back(ShareArenas::Part{});
+    Value body_k = s.atom("body"), caps_k = s.atom("captures_off");
+    std::vector<Value> funcs;
+    for (Value cur = resolve(in[0]); is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        Value f = resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        Value body = s.field_of(f, body_k, s.none);
+        Value got = body;
+        if (s.is_node(body)) {
+            s.cur = size_t(ShareArenas::num(body) / s.part_base);
+            if (s.cur >= s.parts.size()) return type_fail(p, "share_arenas: a body names a part that is not there");
+            got = s.rebuild(make_fixnum(ShareArenas::num(body) % s.part_base));
+        }
+        Value caps = s.place_captures(f);
+        if (s.failed) return type_fail(p, s.failed);
+        funcs.push_back(map_insert(p, map_insert(p, f, body_k, got), caps_k, caps));
+    }
+    if (s.failed) return type_fail(p, s.failed);
+    Value nodes = NIL;
+    for (size_t i = s.out.size(); i-- > 0;) {
+        Value rec = NIL;
+        for (int k = 5; k-- > 0;) rec = p.heap().make_cons(s.out[i][k], rec);
+        nodes = p.heap().make_cons(rec, nodes);
+    }
+    Value kids = NIL;
+    for (size_t i = s.kids.size(); i-- > 0;) kids = p.heap().make_cons(s.kids[i], kids);
+    Value fl = NIL;
+    for (size_t i = funcs.size(); i-- > 0;) fl = p.heap().make_cons(funcs[i], fl);
+    Value result = p.heap().make_cons(fl, NIL);
+    result = p.heap().make_cons(kids, result);
+    result = p.heap().make_cons(nodes, result);
+    return NativeResult::ok(result);
+}
+
+// ---------------------------------------------------------------------------
+// The image's two largest sections, written here
+// ---------------------------------------------------------------------------
+//
+// `emit.node_bytes` and `emit.index` in the compiler write a node as twelve
+// bytes and a kid as four, through a function call and a `str_le` a field, and
+// an image is tens of thousands of each. These write the same bytes in one
+// call a section -- `emit`'s tests hold them to the Dream writers -- with the
+// opcode numbers the compiler's own table gives (`ir.op_codes`), handed in.
+
+namespace {
+
+/// A node index as the image stores one: the word, or all ones for `:none`.
+bool section_index(Process& p, Value v, Value none, std::string* out) {
+    v = resolve(v);
+    uint32_t w;
+    if (v == none) w = 0xFFFFFFFFu;
+    else if (is_fixnum(v)) w = uint32_t(uint64_t(fixnum_value(v)));
+    else return false;
+    (void)p;
+    for (int i = 0; i < 4; ++i) out->push_back(char((w >> (8 * i)) & 0xff));
+    return true;
+}
+
+}  // namespace
+
+/// `node_section [nodes, op_codes]` -- every node as `u8 opcode, u8 flags,
+/// u16 0, index a, index b, index c`.
+NativeResult vm_node_section(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    forced = resolve(forced);
+    if (!is_obj(forced, ObjType::Cons)) return type_fail(p, "node_section needs [nodes, op_codes]");
+    Value nodes = resolve(static_cast<ConsObj*>(as_obj(forced))->head);
+    Value rest = resolve(static_cast<ConsObj*>(as_obj(forced))->tail);
+    if (!is_obj(rest, ObjType::Cons)) return type_fail(p, "node_section needs [nodes, op_codes]");
+    Value codes = resolve(static_cast<ConsObj*>(as_obj(rest))->head);
+    Value none = make_atom(p.runtime().intern_atom("none"));
+    std::string out;
+    for (Value cur = nodes; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        Value n = resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        Value f[5];
+        Value walk = n;
+        for (int k = 0; k < 5; ++k) {
+            if (!is_obj(walk, ObjType::Cons)) return type_fail(p, "node_section: a node is [op, flags, a, b, c]");
+            f[k] = resolve(static_cast<ConsObj*>(as_obj(walk))->head);
+            walk = resolve(static_cast<ConsObj*>(as_obj(walk))->tail);
+        }
+        Value code;
+        int64_t op = map_lookup(p, codes, f[0], &code) && is_fixnum(resolve(code)) ? fixnum_value(resolve(code)) : 0;
+        if (!is_fixnum(f[1])) return type_fail(p, "node_section: a node's flags are an integer");
+        out.push_back(char(op & 0xff));
+        out.push_back(char(fixnum_value(f[1]) & 0xff));
+        out.push_back('\0');
+        out.push_back('\0');
+        for (int k = 2; k < 5; ++k) {
+            if (!section_index(p, f[k], none, &out)) return type_fail(p, "node_section: an operand is an integer or :none");
+        }
+    }
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+/// `index_section xs` -- every element as an index: the kids section.
+NativeResult vm_index_section(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    Value none = make_atom(p.runtime().intern_atom("none"));
+    std::string out;
+    for (Value cur = resolve(forced); is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        if (!section_index(p, static_cast<ConsObj*>(as_obj(cur))->head, none, &out))
+            return type_fail(p, "index_section: an index is an integer or :none");
+    }
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+NativeResult vm_wire_decode(Process& p, Value, Value* args, uint32_t) {
+    Bytes b;
+    if (!string_bytes(args[0], &b)) return type_fail(p, "wire_decode needs a string");
+    WireReader r{p, reinterpret_cast<const unsigned char*>(b.data), b.len};
+    Value v;
+    const char* why = nullptr;
+    if (!r.read(&v, 0)) why = "not a wire value";
+    else if (r.at != r.len) why = "trailing bytes after a wire value";
+    Value tag = make_atom(p.runtime().intern_atom(why ? "error" : "ok"));
+    Value second = why ? p.heap().make_string(why, uint32_t(std::strlen(why))) : v;
+    Value list = p.heap().make_cons(second, NIL);
+    return NativeResult::ok(p.heap().make_cons(tag, list));
+}
+
 // --- large data ---
 //
 // The payload region is the one part of an image the container addresses in 64
@@ -2492,6 +3205,7 @@ const BuiltinDef BUILTINS[] = {
     {"data_count", 1, 0b1, core_data_count},
     {"data_at", 1, 0b1, core_data_at},
     {"compare", 2, 0b11, core_compare},
+    {"sort_keyed", 2, 0b10, core_sort_keyed, true},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

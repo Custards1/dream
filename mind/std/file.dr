@@ -1,0 +1,149 @@
+// Whole files, and the directories they go in.
+//
+// `std.io` is handles and bytes, which is what the VM provides; this is what
+// nearly every program that touches a file actually wants from it -- all of
+// it in, all of it out, and the directories above made first. It began as
+// `mind`'s own helpers and moved here when `std.build` needed the same ones,
+// since a second copy is how two of them come to disagree.
+
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+let read_chunks! : :any -> [:string] -> :string;
+let rec read_chunks! h acc = {
+    let chunk = io.read! h 65536;
+    if len chunk == 0 { str.join_str "" (list.reverse acc) } else { read_chunks! h (list.cons chunk acc) }
+};
+
+/// The whole file, or `()` when it cannot be opened.
+let read! : :string -> :string | :unit;
+let read! path = {
+    let opened = try! { io.open! path :read } catch e { () };
+    match opened {
+        () => (),
+        h => {
+            let text = read_chunks! h [];
+            io.close! h
+            text
+        },
+    }
+};
+
+/// Replace the file with `text`, making it if it is not there.
+let write! : :string -> :string -> :unit;
+let write! path text = {
+    let h = io.open! path :write;
+    let rec put! offset = {
+        let left = str.byte_length text - offset;
+        // Two arguments, not one string built from both: `io.write!` is
+        // curried, so passing one leaves a function behind rather than
+        // failing here, and it fails as `offset + <function>` instead.
+        if left > 0 { put! (offset + io.write! h (str.slice offset left text)) }
+    };
+    put! 0
+    io.close! h
+};
+
+/// Everything before the last `/`, or "" when there is none.
+let parent : :string -> :string;
+let parent path = {
+    let rec last i best =
+        if i >= str.byte_length path { best }
+        else if str.byte i path == 47 { last (i + 1) i }
+        else { last (i + 1) best };
+    match last 0 (0 - 1) {
+        n if n <= 0 => if n == 0 { "/" } else { "" },
+        n => str.slice 0 n path,
+    }
+};
+
+/// Make `path` and every directory above it.
+let mkdir_all! : :string -> :unit;
+let rec mkdir_all! path =
+    match path {
+        "" => (),
+        "." => (),
+        "/" => (),
+        p => {
+            if not (io.is_dir! p) {
+                mkdir_all! (parent p)
+                io.mkdir! p
+            }
+        },
+    };
+
+/// Copy a file's bytes, a chunk at a time so a large one is never held whole.
+let copy! : :string -> :string -> :unit;
+let copy! from to = {
+    let src = io.open! from :read;
+    let dst = io.open! to :write;
+    let rec put! text offset = {
+        let left = str.byte_length text - offset;
+        if left > 0 { put! text (offset + io.write! dst (str.slice offset left text)) }
+    };
+    let rec pump! () = {
+        let chunk = io.read! src 65536;
+        if len chunk > 0 {
+            put! chunk 0
+            pump! ()
+        }
+    };
+    pump! ()
+    io.close! src
+    io.close! dst
+};
+
+/// A name for a scratch file no other writer is using: this OS process's id
+/// and this green process's. The first alone is not enough, since one VM runs
+/// many processes, and two of them replacing the same file at once each
+/// renamed the other's scratch file away.
+let scratch_suffix! : :unit -> :string;
+let scratch_suffix! () = {
+    to_string (os.pid! ()) + "-" + str.slice 0 12 (io.digest (to_string (self! ())))
+};
+
+/// Write `text` to `path` whole or not at all: beside it, then renamed into
+/// place, so a reader sees the old file or the new one and never half of one.
+let replace! : :string -> :string -> :unit;
+let replace! path text = {
+    let scratch = path + ".tmp-" + scratch_suffix! ();
+    write! scratch text
+    io.rename! scratch path
+};
+
+/// Remove `path` and, when it is a directory, everything under it. Nothing
+/// there is not an error: what was asked for is that it be gone.
+let remove_all! : :string -> :unit;
+let rec remove_all! path =
+    match io.stat! path {
+        () => (),
+        [_, _, :dir] => {
+            strict! (list.map (fn name -> remove_all! (path + "/" + name)) (os.list_dir! path))
+            io.remove! path
+        },
+        _ => io.remove! path,
+    };
+
+when test {
+    import std.test;
+
+    let scratch! () = "dream-file-test-" + to_string (os.pid! ());
+
+    let tests = [
+        test.case "the parent of a path"
+            $( test.eq! ["a/b", "", "/", "/a"] [parent "a/b/c", parent "c", parent "/c", parent "/a/b"] ),
+        test.case "a file written is the file read"
+            $( {
+                let d = scratch! ();
+                mkdir_all! (d + "/x/y")
+                write! (d + "/x/y/f") "hello"
+                copy! (d + "/x/y/f") (d + "/g")
+                let got = [read! (d + "/x/y/f"), read! (d + "/g"), read! (d + "/none")];
+                strict! got
+                remove_all! d
+                test.eq! [["hello", "hello", ()], ()] [got, io.stat! d]
+            } ),
+    ];
+}

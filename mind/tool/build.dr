@@ -6,17 +6,22 @@
 // directories, run it. There is nothing to cache and no link step.
 import std.console;
 
+import std.file;
 import std.io;
 import std.list;
 import std.os;
 import std.str;
 import std.toml;
+import std.vm;
 import std.version;
+import std.build.Outcome;
+import std.build.Target;
 
 import config;
 import fetch;
 import lock;
 import manifest;
+import script;
 import util;
 
 // --- the dependency graph ------------------------------------------------------
@@ -747,7 +752,7 @@ let stdlib_root! () = {
     let named = util.env_path! "MIND_STDLIB";
     if named != () { named }
     else {
-        let home = match util.env_path! "MIND_HOME" { () => util.join (home_dir! ()) ".mind", h => h };
+        let home = util.mind_home! ();
         let installed = util.join home "std";
         if io.is_dir! installed { home }
         else {
@@ -758,8 +763,6 @@ let stdlib_root! () = {
         }
     }
 };
-
-let home_dir! () = match util.home! () { () => ".", h => h };
 
 /// The nearest `name` directory at or above `from`, or `()`. Holds a library
 /// whose `std` is a package, so it is the *parent* that becomes a `-L` root.
@@ -919,6 +922,138 @@ let compiler_command! chosen =
 /// `[flag, a, flag, b, ..]` -- how a repeated option is written out.
 let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
 
+// --- build scripts ----------------------------------------------------------------
+//
+// script.dr runs them; what is here is what it is told about this build. A
+// project where no package has a `build.dr` never gets past `scripted!`.
+
+/// Every package in the build with a script: the root under its own name,
+/// then each dependency under its key, with the `-L` roots its script is
+/// compiled with -- the standard library and its build dependencies.
+let scripted! m o g = {
+    let one! key dm root = match manifest.script! dm {
+        () => [],
+        file => [script.Scripted.make key (manifest.version dm) (util.absolute! root) (util.absolute! file)
+                                      (manifest.script_env dm)
+                                      ((g.[:options else (%{})]).[(if key == manifest.name m { root_key } else { key }) else (%{})])
+                                      (list.cons (stdlib_root! ())
+                                                 (match build_graph g (if key == manifest.name m { root_key } else { key }) {
+                                                      () => [],
+                                                      sub => list.map package_arg (nodes sub),
+                                                  }))],
+    };
+    list.concat (list.cons (one! (manifest.name m) m (manifest.root m))
+                           (list.map (fn n -> match node_manifest n {
+                                () => one! (node_key n) (manifest.make (node_dir n) (%{})) (node_dir n),
+                                dm => one! (node_key n) dm (node_dir n),
+                            }) (nodes g)))
+};
+
+/// A single `--target` naming one system and one architecture, as the target
+/// a script is told it is building for; `()` otherwise, and the script is
+/// told the host.
+let script_target o m = match targets m o {
+    [one] => match target_sides one {
+        [[os_name], [arch_name]] => Target.make (to_existing_atom os_name) (to_existing_atom arch_name),
+        _ => (),
+    },
+    _ => (),
+};
+
+/// What every script in this build shares.
+let script_setting! m o g = {
+    // Absolute, since a check runs them from a directory of its own.
+    let placed! p = if str.contains_str "/" p { util.absolute! p } else { p };
+    script.Setting.make (target_dir m)
+        (match compiler_command! (choose_compiler! m (option o :compiler ())) {
+             [program, lead] => list.map placed! (list.cons program lead),
+         })
+        (placed! (vm_command! ())) (profile_of o) (script_target o m) (option o :jobs 1)
+        (list.fold (fn acc n -> match node_version n { () => acc, v => acc.[node_key n => v] }) (%{}) (nodes g))
+        (option o :verbose false) (option o :testing false) (option o :only [])
+};
+
+/// The package's own checks, run as `mind test` runs them -- `[:ok, [[name,
+/// [passed, ms, output]]]]`, `[:ok, []]` for a package without a script -- or
+/// why they could not be run. `:only` narrows them to the names given.
+let checks! m o =
+    match resolve! m o false {
+        [:error, why] => [:error, why],
+        [:ok, g] => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
+            [] => [:ok, []],
+            own => match script.run_all! (script_setting! m (with_option :testing true o) g) own {
+                [:error, why] => [:error, why],
+                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map_pairs (Outcome.checks outcome))],
+                [:ok, []] => [:ok, []],
+            },
+        },
+    };
+
+/// The compiler arguments this build's scripts add: none, and nothing run,
+/// when no package has a script.
+let script_args! m o g =
+    match scripted! m o g {
+        [] => [:ok, []],
+        found => match script.run_all! (script_setting! m o g) found {
+            [:error, why] => [:error, why],
+            [:ok, outcomes] => script.compile_args outcomes,
+        },
+    };
+
+/// Where the compiler keeps each module's walk and lowering between builds
+/// (`dreams --units`), so a build after an edit to one module walks and lowers
+/// that module and reads the rest back. One cache for every project and every
+/// compiler, since a unit's key holds the compiler's digest and everything the
+/// unit was computed from: `$MIND_UNITS`, or `units` in `mind`'s own
+/// directory, and `MIND_UNITS=off` for none.
+let units_args! () = match util.env_path! "MIND_UNITS" {
+    () => kept_units! (util.join (util.mind_home! ()) "units"),
+    "off" => [],
+    dir => kept_units! dir,
+};
+
+let kept_units! dir = {
+    forget_units! dir
+    ["--units", dir]
+};
+
+// --- a cache that forgets ------------------------------------------------------
+//
+// Every edit makes new units and nothing makes one stale -- a unit is keyed on
+// what it was made from, so an old one is never wrong, only never asked for
+// again -- and so a unit cache left alone only grows. A unit that is read back
+// is written again when it is more than a day old (`unit.recall!` in
+// `dreams`), so a unit's modification time is within a day of the last build
+// that used it, and here the ones no build has used in `unit_days` are removed.
+// Once a day at most, by the modification time of a stamp in the cache: a
+// scan of the whole directory at every build would cost what the cache saves.
+// Two builds that forget at once remove the same files, and a unit removed
+// while a build reads it is a unit that build computes again.
+
+let unit_days = 30;
+let day_ms = 86400000;
+
+let forget_units! : :string -> :unit;
+let forget_units! dir = {
+    let now = vm.wall_ms! ();
+    let stamp = util.join dir "forgotten";
+    match io.stat! stamp {
+        [_, at, _] if now - at / 1000000 < day_ms => (),
+        _ => {
+            file.mkdir_all! dir
+            file.write! stamp ""
+            strict! (list.map (fn name -> forget_unit! (util.join dir name) now) (os.list_dir! dir))
+            ()
+        },
+    }
+};
+
+let forget_unit! path now = match io.stat! path {
+    [_, at, :file] if now - at / 1000000 > unit_days * day_ms =>
+        try! { io.remove! path } catch _ { () },
+    _ => (),
+};
+
 /// The whole command line for one build.
 ///
 /// The package's settings come before this invocation's, because the compiler
@@ -927,8 +1062,10 @@ let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
 let compile_args! m o =
     match search_paths! m o {
         [:error, why] => [:error, why],
-        [:ok, g, paths] => [:ok, list.concat [
-            [manifest.entry! m],
+        [:ok, g, paths] => match script_args! m o g {
+          [:error, why] => [:error, why],
+          [:ok, from_scripts] => [:ok, list.concat [
+            [match option o :entry () { () => manifest.entry! m, e => e }],
             paths,
             repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
             repeated "-I" (list.unique (list.concat [manifest.includes m, dep_includes g,
@@ -937,12 +1074,15 @@ let compile_args! m o =
                      (list.unique (list.concat [manifest.host_modules m, dep_hosts g,
                                                 option o :hosts []])),
             setting_args m o g,
+            units_args! (),
+            from_scripts,
             ["-o", output_of m o],
             manifest.compiler_flags m,
             manifest.profile_flags m (profile_of o),
             option o :extra [],
             option o :flags [],
-        ]],
+          ]],
+        },
     };
 
 /// What the program is compiled as: its defines, every package's options

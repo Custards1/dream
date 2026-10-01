@@ -134,6 +134,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
+| `sort_keyed` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
 ### Large data
 
@@ -284,6 +285,9 @@ import std.io;
 | `remove!` | `path:string → unit` | Deletes a file. Raises on failure. |
 | `rename!` | `from:string → to:string → unit` | Renames or moves a file. Raises on failure. |
 | `mkdir!` | `path:string → unit` | Creates a directory. Silently succeeds if it already exists. |
+| `stat!` | `path:string → [size:integer, modified:integer, kind:atom] \| unit` | A path's stamp: its size, when it was last written in nanoseconds since the epoch (seconds' resolution on Windows), and `:file`, `:dir` or `:other`. `()` when nothing is there, which is an answer rather than a failure: a deleted input has moved as surely as a rewritten one. |
+| `digest!` | `path:string → string` | The SHA-256 of a file's contents, as 64 lowercase hex digits, read in the VM rather than a chunk at a time through the heap. Raises as `open!` does. |
+| `digest` | `data:string → string` | The SHA-256 of a string, the digest `digest!` gives the file holding the same bytes. Pure. |
 
 ### Error atoms
 
@@ -346,6 +350,8 @@ import std.os;
 |------|-----------|-------------|
 | `exec!` | `program:string → args:list of string → map` | Runs `program` to completion and returns a map `%{ :code, :out, :err, :timed_out }`. `program` is resolved via `PATH`. Parks the calling process — not the worker thread — while the child runs. |
 | `exec_for!` | `program:string → args:list of string → timeout_ms:integer → map` | Same as `exec!` but kills the child after `timeout_ms` milliseconds. Sets `:timed_out true` in the result map when the deadline is hit, so the caller can distinguish that from an ordinary non-zero exit code. |
+| `exec_in!` | `dir:string → program:string → args:list of string → timeout_ms:integer → map` | `exec_for!` with the child started in `dir`, and `0` for no deadline. The directory is the child's own: `chdir!` moves the whole VM's, which two concurrent build steps cannot share. A relative `program` is looked up from `dir`. |
+| `exec_with!` | `dir:string → env:list of string → program:string → args:list of string → timeout_ms:integer → map` | `exec_in!` with variables of the child's own: each `NAME=value` in `env` is laid over this VM's environment for that child alone, since `set_env!` changes the whole VM's. |
 | `replace!` | `program:string → args:list of string → never` | **Becomes** `program`: `execvp`, so this VM — image, heap and every thread — is gone and the named program takes over the process, inheriting the terminal and every open descriptor. Stdio is flushed first. It returns only by failing, raising `:not_found` when the program cannot be run. Use it to hand over to something interactive; `exec!` gives its child pipes, which is right for a compiler and useless for anything that prompts. |
 
 The result map fields:
@@ -365,6 +371,7 @@ The result map fields:
 | `now!` | `unit → integer` | Milliseconds since the Unix epoch, from the wall clock. It can jump, forwards or back, so it is what to stamp a log line with and never what to measure a duration with. |
 | `pid!` | `unit → integer` | The OS process ID of the running VM. |
 | `platform` | `unit → atom` | The current platform: `:linux`, `:macos`, `:windows`, or `:unknown`. |
+| `arch` | `unit → atom` | `:x86_64`, `:aarch64` or `:unknown`: the architecture the VM was built for, which is the one a program's native code has to match. |
 | `exit!` | `code:integer → never` | Terminates the entire VM immediately with the given exit code. Flushes stdio first. Never returns. |
 
 ---
@@ -400,6 +407,11 @@ These report figures for the **calling** process.
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `share!` | `value → value` | The same value, forced all the way down and moved into the runtime's shared area. From then on a `spawn!`, `send!` or `join!` carrying it copies a pointer rather than the value. |
+| `wire_encode` | `value → string` | The value, forced all the way down, in `std.wire`'s format, byte for byte what `std.wire`'s Dream writer produces, and thousands of times faster: `std.wire.encode` is this. A map is written in the order `compare` puts its keys; what is not data is written as its `to_string`. |
+| `wire_decode` | `string → [:ok, value] \| [:error, string]` | One `std.wire` message, read whole. Never raises. Trailing bytes, a truncated field, an integer past 63 bits and an atom this program does not have are all `[:error, why]` -- an atom is looked up, never made. `std.wire.decode` is this. |
+| `share_arenas` | `[funcs, parts, invented_from, filled, edges, runs, part_base] → [nodes, kids, funcs]` | The compiler's `opt.optimize_parts`: a program's parts, each an arena already shared within itself, hash-consed into one -- constants renamed through each part's pools, functions and invented globals moved past the parts before, a settled `comp` placeholder read from part 0. Step for step the walk `opt.optimize_parts_by_hand` writes in Dream, which `opt`'s tests hold it to; the opcode tables are the compiler's, handed in. |
+| `node_section` | `[nodes, op_codes] → string` | An image's NODE section: each node `[op, flags, a, b, c]` as `u8 opcode, u8 flags, u16 0` and three indices, `:none` as all ones, the opcode from the compiler's table. The bytes `emit.node_bytes` writes, which `emit`'s tests hold it to. |
+| `index_section` | `list → string` | An image's KIDS section: each index as a little-endian `u32`, `:none` as all ones. The bytes `emit.index` writes. |
 | `shared_bytes!` | `unit → integer` | Bytes in the runtime's shared area. |
 
 Processes share nothing: a value that crosses between two is copied, which is

@@ -21,14 +21,7 @@ import util;
 
 /// Where fetched packages are kept. Shared between projects, because a
 /// repository at a given revision is the same bytes whoever asked for it.
-let cache_root! () =
-    match util.env_path! "MIND_HOME" {
-        () => match util.home! () {
-            () => ".mind",
-            home => util.join home ".mind",
-        },
-        home => home,
-    };
+let cache_root! () = util.mind_home! ();
 
 /// A URL turned into one path segment. Not a hash: a directory you can read is
 /// worth more than one you cannot when a fetch goes wrong and you want to look.

@@ -50,7 +50,22 @@ just bootstrap-check   # the seed still reproduces itself from this source
 
 The guarantee is byte equality: compiling this source with the seed produces an
 identical image, and so does the stage after that. When you change the compiler,
-run `just bootstrap` and copy `build/dreams.dream` over the seed.
+run `just bootstrap` and copy `build/dreams.dream` over the seed -- or, when the
+change adds atoms to the compiler, build again with each new image until one
+compiles the source into itself, and copy that one: it can take two rounds
+(see "`mind/std/all.dr --test` is not byte-stable" in
+docs/notes/macro-expansion.md).
+
+A parallel build resolves and lowers in **parts, one per module**, each in a
+process of its own, and `dreams --units DIR` keeps each part between builds --
+its walk and its lowering, keyed by the compiler's digest, the declarations
+the module can see and the module's bodies -- so an edit to one module walks and lowers that
+module and reads the rest back (its type check too, keyed as well on the
+program's signatures, and every file's parse, keyed on its text), and the
+image is byte for byte the one an
+uncached build writes (`dreams/tests/units.sh`). `mind` passes it on every
+build. [dreams/unit.dr](dreams/unit.dr) and "Compile units" in
+docs/notes/parallel-compile.md are the design.
 
 The pipeline a build runs -- resolve, lower and link, types, contracts, share,
 emit -- is written once, in [dreams/compile.dr](dreams/compile.dr):
@@ -122,7 +137,24 @@ VM built without it is not a valid VM. LLVM is optional and gives the JIT.
 
 ## Testing
 
-`just test` runs everything. The groups, and what each one is actually asking:
+`just test` runs everything, one group at a time. `mind test`, from the root
+of the repository, runs the same suites at once -- the repository is a
+workspace (`mind.toml`, and `build.dr` beside it), each package's units and
+its build script's checks are tests named `package.name`, and `mind test
+dreams.contracts` runs one:
+
+```
+DREAM=$PWD/build-dream/bin/dream build-dream/bin/dream build/mind test
+```
+
+It covers every group below. What it does not yet cover is building from
+nothing (stage 0 in `build.sh`), `install` and `vm-pgo`, and what `test-all`
+adds: fuzzing, the heap-verified run and the no-JIT build. A suite a check
+runs must not write where another reads -- `compile.sh`'s `image` is where it
+*writes* the compiler it builds, and handed the compiler under test as
+`image` it overwrote the image a dozen other suites were running.
+
+The groups, and what each one is actually asking:
 
 | Recipe | Question |
 |---|---|

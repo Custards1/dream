@@ -357,6 +357,14 @@ void Scheduler::dump(const char* why) const {
     std::fflush(stderr);
 }
 
+bool Scheduler::run(const std::shared_ptr<Process>& root) {
+    enqueue(root);
+    start();
+    bool clean = wait_for_all();
+    stop();
+    return clean;
+}
+
 bool Scheduler::wait_for_all() {
     // `DREAM_STUCK_SECONDS=n` reports what every process is doing if the whole
     // system goes that long without spending a single reduction. A program

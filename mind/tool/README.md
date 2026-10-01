@@ -5,7 +5,8 @@ The build tool for Dream — what Cargo is to rustc.
 `mind` is itself written in Dream and compiled by `dreams`, like any other
 program in this repository. It has no compiler of its own: Dream compiles whole
 programs, so a build is *find the packages, hand them to `dreams`, run it*.
-There is no object file, no link step, and nothing to cache.
+There is no object file and no link step. What is cached is what build
+scripts make, below.
 
 ```
 just mind                 # build it to build/mind
@@ -19,7 +20,7 @@ dream build/mind help
 | `mind new <name>` | create a project in `./<name>` |
 | `mind build` | compile to `target/<profile>/<name>.dream` |
 | `mind run [args]` | compile, then run with the arguments given |
-| `mind test` | compile with `--test` and run the result |
+| `mind test [NAME..]` | run every test at once: each package's units and its build script's checks |
 | `mind check` | compile without writing an image |
 | `mind add <source>` | add a dependency: a directory, a git URL, or a tarball |
 | `mind remove <name>` | take one out again |
@@ -127,6 +128,92 @@ no manifest has no version, so a requirement on one is an error.
 namespace of their own: a tool may use `json` 1.x while the program uses 2.x.
 `mind deps` marks them `[build: ...]` and `mind tree` hangs them under
 `[build]`.
+
+## Build scripts
+
+A package may carry a `build.dr` beside its manifest, for what it needs made
+before it compiles and cannot write by hand: a module generated from data, a
+file to embed, a switch that depends on the machine. **It is optional.** A
+package without one builds exactly as before, and nothing is written for it.
+
+A script is a pure function from a context to a plan, written with
+`std.build`:
+
+```dream
+// build.dr
+import std.build;
+import std.build.command;
+
+let plan ctx =
+    build.empty
+    |> build.module "version" (build.write "version.dr" ("let v = \"" + build.version ctx + "\";"))
+    |> build.payload "table" (command.make "table" "gen-table" [command.file "table.csv", command.out "t.bin"])
+    |> build.define "generated";
+```
+
+`build.module` makes `<package>.version` importable, as the package's own
+module; `build.payload` embeds a file; `build.define` sets a `when` flag for
+this package alone. `build.given` lets a step's answer decide the rest of the
+plan, and `build.all` merges plans. docs/build.md is the whole design.
+
+Every step is cached by a key made of what it was given and the contents of
+the files it reads, in one cache every project on the machine shares
+(`$MIND_HOME/build`, or `$MIND_BUILD_CACHE`): the same step asked for by two
+projects is done once. A build where nothing changed runs no script and starts
+no VM: it costs a `stat` per input. Scripts whose build dependencies are the
+same are compiled into one driver and run as one program, each in a process of
+its own, and the steps inside them run `-j` at once (default: one per core).
+
+A script sees only the environment variables its manifest lists:
+
+```toml
+[build]
+env = ["CC", "PKG_CONFIG_PATH"]
+script = "tools/build.dr"        # when it is not build.dr
+```
+
+## Tests
+
+`mind test` runs every test a project has, at once, `-j` at a time: each
+package's **units** -- its `when test` blocks, compiled with `--test` and run
+-- and the **checks** its build script declares. A test is named for its
+package, and `mind test NAME` runs the ones called NAME or beginning with it
+and a dot:
+
+```
+mind test                     # everything
+mind test dreams              # one package's
+mind test dreams.contracts    # one check
+```
+
+A check is a step that passes when it succeeds, declared in `build.dr` and run
+only by `mind test`, every time:
+
+```dream
+let plan ctx =
+    build.empty
+    |> build.check "golden" (command.check ctx "golden" (command.toolchain ctx) "tests/golden.sh" []);
+```
+
+`command.check` runs a program in the package's directory, with the
+variables given laid over the environment; `command.toolchain ctx` is the VM
+and compiler this build uses (`DREAM`, `DREAMS`), for a suite that runs them.
+A library with no program of its own names the file its tests are gathered
+from, `[test] entry = "all.dr"`.
+
+A **workspace** tests several packages as one project:
+
+```toml
+[workspace]
+name = "dream"
+members = ["dreams", "lucid", "mind/std", "mind/tool"]
+
+[build]
+compiler = "build/dreams.dream"     # the members' too, unless --compiler says
+```
+
+`mind test` in it runs every member's tests and the workspace's own checks
+(its `build.dr`). The repository's own `mind.toml` is one.
 
 ### Cycles
 
@@ -249,6 +336,8 @@ the target the compiler records, so `linux` and `os=linux` are one directory.
 | `DREAM` | the VM to run images with (default: `dream`) |
 | `MIND_STDLIB` | where the standard library lives (default: `mind`) |
 | `MIND_HOME` | where fetched packages are cached (default: `~/.mind`) |
+| `MIND_UNITS` | where the compiler keeps each file's parse and each module's walk, lowering and type check between builds (default: `$MIND_HOME/units`; `off` for none). A unit no build has used in 30 days is removed, the cache being looked over at most once a day |
+| `MIND_BUILD_CACHE` | where build steps are cached (default: `$MIND_HOME/build`, shared by every project) |
 
 ## Layout
 
@@ -258,6 +347,7 @@ the target the compiler records, so `linux` and `os=linux` are one directory.
 | `manifest.dr` | reading `mind.toml`, and the line edits `add` and `remove` make |
 | `fetch.dr` | resolving a dependency to a directory, fetching if needed |
 | `build.dr` | the dependency graph, and calling the compiler |
+| `script.dr` | running packages' build scripts, and folding what they make into the compile |
 | `lock.dr` | `mind.lock`: writing it, reading it, and what counts as drift |
 | `util.dr` | paths and files |
 

@@ -22,8 +22,10 @@ import std.console;
 import std.io;
 import std.list;
 import std.os;
+import std.proc;
 import std.str;
 import std.toml;
+import std.vm;
 
 import build;
 import config;
@@ -61,6 +63,7 @@ let opts = [
 
     cli.section "how to build it",
     cli.value "" "compiler" "PATH" "the compiler to run; a `.dream` is run by the VM",
+    cli.value "j" "jobs" "N" "how many build steps and scripts at once (default: one per core)",
     cli.flag "v" "verbose" "print the compiler command before running it",
     cli.flag "h" "help" "this message",
     cli.flag "" "version" "print the version",
@@ -73,7 +76,7 @@ let command_spec = [
     cli.command "new"   "create a project in ./<name>" [],
     cli.command "build" "compile the project to target/<profile>/<name>.dream" [],
     cli.command "run"   "compile, then run it with the arguments given" [],
-    cli.command "test"  "compile with --test and run the result" [],
+    cli.command "test"  "run every test at once: units and checks; NAME narrows" [],
     cli.command "check" "compile without writing an image" [],
     cli.command "repl"  "an interactive session, with this project's packages" [],
     cli.command "add"   "add a dependency: a directory, a git URL, or a tarball" [],
@@ -156,6 +159,11 @@ packages it depends on, however deep:
 `when vendored` in a package's code reads that package's option, and
 `when sqlite.vendored` another's. `-D sqlite:threads=off` sets one from the
 command line, and `mind options` shows them all.
+
+A package may carry a `build.dr`, a script written with `std.build` that
+says what it needs made before it compiles: generated modules, embedded files,
+defines. It is optional, its steps are cached under target/build, and a build
+where nothing changed runs none of it. `-j N` sets how much runs at once.
 
 `mind run -- ARGS` passes ARGS to the program rather than to mind.
 
@@ -257,9 +265,117 @@ let cmd_run! m o args = {
     relay! (build.run_image! m o args)
 };
 
-let cmd_test! m o args = {
-    report_build! m (build.with_option :dev true (build.with_option :extra ["--test"] o)) "testing" true
-    relay! (build.run_image! m o args)
+// --- testing -------------------------------------------------------------------
+//
+// `mind test` runs every test a project has, at once: each package's units
+// (its `when test` blocks, compiled with `--test` and run) and the checks its
+// build script declares (`build.check`). In a workspace that is every
+// member's, and the workspace's own checks beside them. A test is named for
+// its package -- `dreams.units`, `dreams.contracts` -- and `mind test NAME`
+// runs those whose name is NAME or begins with it and a dot, so `mind test
+// dreams` is all of one package's.
+
+/// A test result: its name, whether it passed, how long it took and what it
+/// printed.
+group Result { name : :string, passed : :bool, ms : :integer, output : :string }
+
+/// Whether a person who asked for `asked` wants the test `name`.
+let picked : [:string] -> :string -> :bool;
+let picked asked name = list.is_empty asked || list.any (fn a -> a == name || str.starts_with (a + ".") name) asked;
+
+/// One package's units.
+let units! : :map -> :map -> [:list];
+let units! pm o = {
+    let started = os.monotonic! ();
+    let to = build.with_option :output (util.join (build.target_dir pm) ("test/" + manifest.name pm + ".dream"))
+                 (build.with_option :entry (manifest.test_entry! pm)
+                     (build.with_option :dev true (build.with_option :extra ["--test"] o)));
+    let [passed, output] = match build.compile! pm to {
+        [:error, why] => [false, why],
+        [:ok, _] => match build.run_image! pm to [] {
+            [code, out, err] => [code == 0, out + err],
+        },
+    };
+    strict! passed
+    [Result.make (manifest.name pm + ".units") passed (os.monotonic! () - started) output]
+};
+
+/// One package's checks, narrowed to the ones asked for by name.
+let checks! : :map -> :map -> [:string] -> [:list];
+let checks! pm o asked = {
+    let prefix = manifest.name pm + ".";
+    let named = list.flat_map (fn a -> if str.starts_with prefix a { [str.slice (str.byte_length prefix) (str.byte_length a - str.byte_length prefix) a] } else { [] })
+                              asked;
+    let only = if list.any (fn a -> a == manifest.name pm) asked { [] } else { named };
+    match build.checks! pm (build.with_option :only only o) {
+        [:error, why] => [Result.make (manifest.name pm + ".checks") false 0 why],
+        [:ok, results] => list.map (fn [n, [passed, ms, output]] -> Result.make (prefix + n) passed ms output) results,
+    }
+};
+
+/// A task, run in a process of its own: `[:units, manifest, options]` or
+/// `[:checks, manifest, options, asked]`.
+let test_task! : :list -> [:list];
+let test_task! t = match t {
+    [:units, pm, o] => units! pm o,
+    [:checks, pm, o, asked] => checks! pm o asked,
+};
+
+let seconds : :integer -> :string;
+let seconds ms = to_string (ms / 1000) + "." + to_string (ms % 1000 / 100) + " s";
+
+/// The packages `mind test` covers: the project, and its members when it is
+/// a workspace.
+let tested! : :map -> [:map];
+let tested! m = list.cons m (list.map (fn d -> match manifest.load! (util.join (manifest.root m) d) {
+    [:ok, pm] => pm,
+    [:error, why] => fail! ("workspace member `" + d + "`: " + why),
+}) (manifest.members m));
+
+let cmd_test! m o0 asked = {
+    let packages = tested! m;
+    // A workspace's compiler is its members' too, unless the command line
+    // named one: they are tested as one project, by one compiler.
+    let o = match [build.option o0 :compiler (), manifest.compiler m] {
+        [(), ()] => o0,
+        [(), c] => build.with_option :compiler c o0,
+        _ => o0,
+    };
+    let wants_package pm = list.is_empty asked || list.any (fn a -> a == manifest.name pm
+                                                                    || str.starts_with (manifest.name pm + ".") a) asked;
+    let tasks = list.flat_map (fn pm -> list.concat [
+        if manifest.is_package pm && picked asked (manifest.name pm + ".units") && io.exists! (manifest.test_entry! pm) {
+            [[:units, pm, o]]
+        } else { [] },
+        if wants_package pm { [[:checks, pm, o, asked]] } else { [] },
+    ]) packages;
+    let outcomes = proc.try_map! test_task! tasks;
+    strict! outcomes
+    let results = list.sort_on Result.name (list.flat_map (fn r -> match r {
+        [:ok, rs] => rs,
+        [:error, e] => [Result.make "mind" false 0 (to_string e)],
+    }) outcomes);
+    match results {
+        [] => fail! (match asked { [] => "nothing to test", _ => "no test is called " + str.join_str " or " asked }),
+        // A package's units on their own are shown whole, as `mind test` in a
+        // package with no build script always showed them.
+        [one] if str.ends_with ".units" (Result.name one) => {
+            console.write! (Result.output one)
+            if not (Result.passed one) { os.exit! 1 }
+        },
+        _ => {
+            strict! (list.map (fn r -> {
+                console.print! ((if Result.passed r { "ok   " } else { "FAIL " }) + Result.name r
+                                + "  (" + seconds (Result.ms r) + ")")
+                if not (Result.passed r) {
+                    console.print! (str.join_str "\n" (list.map (fn l -> "    " + l) (str.split "\n" (str.trim (Result.output r)))))
+                }
+            }) results)
+            let failed = list.length (list.filter (fn r -> not (Result.passed r)) results);
+            console.print! ("\n" + to_string (list.length results - failed) + " passed, " + to_string failed + " failed")
+            if failed > 0 { os.exit! 1 }
+        },
+    }
 };
 
 /// An interactive session. It replaces `mind` with the compiler rather than
@@ -621,6 +737,17 @@ let profile_of! c =
         [p, true] => if p == "release" { p } else { fail! ("--release and --profile " + p + " say two different things") },
     };
 
+/// `-j N`, or one job per worker the VM runs, which is one per core up to
+/// the scheduler's cap.
+let jobs_of! c =
+    match cli.get () c "jobs" {
+        () => (vm.scheduler! ()).[:workers else 1],
+        n => match parse_int n {
+            j if j != () && j > 0 => j,
+            _ => fail! ("-j wants a number of jobs, not `" + n + "`"),
+        },
+    };
+
 let options_of! c =
     list.fold (fn o kv -> build.with_option (list.head kv) (list.nth 1 kv) o)
               build.options
@@ -634,7 +761,8 @@ let options_of! c =
                [:sets,     sets_of c],
                [:profile,  profile_of! c],
                [:targets,  cli.all c "target"],
-               [:verbose,  cli.flag_set c "verbose"]];
+               [:verbose,  cli.flag_set c "verbose"],
+               [:jobs,     jobs_of! c]];
 
 let run_command! c theirs = {
     let o = options_of! c;
@@ -654,7 +782,7 @@ let run_command! c theirs = {
                   "build" => cmd_build! (project_in! here) o,
                   "check" => cmd_check! (project_in! here) o,
                   "run"   => cmd_run! (project_in! here) o (list.append (cli.rest c) theirs),
-                  "test"  => cmd_test! (project_in! here) o (list.append (cli.rest c) theirs),
+                  "test"  => cmd_test! (project_in! here) o (cli.rest c),
                   "deps"  => cmd_deps! (project_in! here) o,
                   "tree"  => cmd_tree! (project_in! here) o,
                   "fetch" => cmd_fetch! (project_in! here) o,

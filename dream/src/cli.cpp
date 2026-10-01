@@ -607,16 +607,7 @@ int dream_main(int argc, char** argv) {
     Value cl = root->heap().make_closure(func, 0);
     prime_apply(*root, cl, 0);
 
-    // Queued before the workers exist, not after. A process is counted as
-    // active by `enqueue`, so starting first leaves a window in which the root
-    // is live, nothing is active, and every worker is idle -- which is the
-    // definition the deadlock check tests, and it fires. The flag is sticky,
-    // so the program then runs to completion and reports a deadlock on the way
-    // out. Enqueueing first means there is no such instant.
-    sched.enqueue(root);
-    sched.start();
-    bool clean = sched.wait_for_all();
-    sched.stop();
+    bool clean = sched.run(root);
 
     int status = 0;
     if (!clean) {

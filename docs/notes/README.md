@@ -28,6 +28,7 @@ Spreading a self-compile across processes and cores, and what it does on fewer o
 - The self-compile on four cores: 8.8 s -> 5.8 s, and what 3 s would take
 - Resolving, lowering and checking in parts: 5.75 s -> 3.7 s
 - Fewer cores than the machine has: 15.6 s -> 9.1 s on one
+- Compile units: a module's walk and lowering, kept between builds
 
 ## [Compiling large programs](compiler-scaling.md)
 

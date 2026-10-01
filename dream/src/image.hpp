@@ -236,6 +236,10 @@ public:
     uint8_t target_os() const { return uint8_t(flags_ >> 8); }
     uint8_t target_arch() const { return uint8_t(flags_ >> 16); }
     uint32_t entry() const { return entry_; }
+    /// The image's own bytes, from its header on, payload included: what
+    /// `vm.image_digest` reads.
+    const uint8_t* bytes() const { return data_; }
+    size_t byte_count() const { return size_; }
 
     StringRef module_name() const { return str(module_name_); }
     StringRef source_name() const { return str(source_name_); }

@@ -35,6 +35,7 @@ import dreams.diag;
 import dreams.package;
 import dreams.parser;
 import dreams.path;
+import dreams.unit;
 
 /// Modules the VM provides natively. An `import` of one of these resolves to a
 /// runtime lookup rather than to Dream source. This must match the runtime's
@@ -377,19 +378,37 @@ let rec local_module l scope dep = {
 /// wrong owner. Nested packages are legal, so the innermost one wins: the
 /// longest source root still containing the file is its real owner.
 let canonical_name! l file fallback = {
-    let real = path.absolute! file;
-    let best = list.fold (fn found pkg -> {
-        let src = path.absolute! (package.src pkg);
-        match package.module_name src real {
+    let real = path.segments (path.drop_extension (path.absolute! file));
+    let best = list.fold (fn found root -> {
+        let [src, name] = root;
+        match package.module_name_in src real {
             () => found,
             inside => {
-                let depth = list.length (path.segments src);
+                let depth = list.length src;
                 if list.head found >= depth { found }
-                else { [depth, package.name pkg + "." + inside] }
+                else { [depth, name + "." + inside] }
             },
         }
-    }) [0 - 1, ()] (package.packages (packages l));
+    }) [0 - 1, ()] (package_roots! l);
     match list.nth 1 best { () => fallback, name => name }
+};
+
+/// Every package's source directory, absolute and taken apart, with the
+/// package's name: `[segments, name]`. Every file the loader reads is named
+/// against all of them (`canonical_name!`), and making each one absolute again
+/// for every file was most of what loading a program of many modules cost. So
+/// the root's load works them out once and the loader carries them; a loader
+/// that does not carry them works them out where it is asked.
+let package_roots! l = match l.[:package_roots else ()] {
+    () => list.map (fn pkg -> [path.segments (path.absolute! (package.src pkg)), package.name pkg])
+                   (package.packages (packages l)),
+    roots => roots,
+};
+
+let with_package_roots! l = {
+    let roots = package_roots! l;
+    strict! roots
+    l.[:package_roots => roots]
 };
 
 // --- explaining a failure ----------------------------------------------------
@@ -791,8 +810,29 @@ let parse_elsewhere! text =
 /// The same, answering through the shared area; see `load_shared!`. A parse
 /// the area refuses -- nothing in one should hold a suspension, but if it did
 /// -- comes back `:crashed` and is parsed again in place, like any other.
-let parse_shared! text =
-    spawn! $( try! { vm.share! (parser.parse_module text) } catch e { [:crashed, e] } );
+/// The cache is strict for the reason `scope.walk_elsewhere!`'s is.
+let parse_shared! !units text =
+    spawn! $( try! { vm.share! (parse_unit! units text) } catch e { [:crashed, e] } );
+
+/// A file's parse, or the one kept for the same text (see `dreams/unit.dr`).
+/// A parse reads nothing but the text, so the text is the whole key, besides
+/// the compiler that parsed it. A parse that failed is kept too: it fails the
+/// same way the next time.
+let parse_unit! : unit.Cache -> :string -> :any;
+let parse_unit! units text = match units {
+    () => parser.parse_module text,
+    _ => {
+        let k = unit.key ["parse", io.digest text];
+        match unit.recall! units "parse" k {
+            () => {
+                let parsed = parser.parse_module text;
+                unit.keep! units "parse" k parsed
+                parsed
+            },
+            kept => kept,
+        }
+    },
+};
 
 /// Start parsing, elsewhere, every file these imports of the module `name`
 /// will load and nothing has yet.
@@ -830,7 +870,7 @@ let rec prefetch! l deps = match deps {
         let text = if wanted { text_of! l file } else { () };
         if text == () { prefetch! l rest }
         else {
-            let child = if l.[:share_parses else false] { parse_shared! text }
+            let child = if l.[:share_parses else false] { parse_shared! (l.[:units else ()]) text }
                         else { parse_elsewhere! text };
             let marked = put :prefetch ((fetched l).[file => [text, child]]) l;
             prefetch! (prefetch! marked (scanned_imports text)) rest
@@ -975,7 +1015,8 @@ let add_test_runner! l = {
 /// The loader comes back even when loading failed, because it carries the
 /// source files the diagnostics point into -- an error that cannot quote its
 /// own line is much less use.
-let load_root! l file test_mode = {
+let load_root! l0 file test_mode = {
+    let l = with_package_roots! l0;
     // Name the root the way any other module in its package would be, so that a
     // module's identity does not depend on it being the entry point.
     let name = canonical_name! l file (path.stem file);
@@ -1074,10 +1115,13 @@ let load! file roots cfg test_mode =
 /// most of what a parse elsewhere cost the walk that joins it. Not the
 /// default, because nothing in the shared area is freed before the runtime
 /// is, and a language server loads the program again at every keystroke.
-let load_shared! : :string -> [:string] -> :any -> :bool -> Loader;
-let load_shared! file roots cfg test_mode =
-    load_root! (put :share_parses true
-                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) []))
+///
+/// `units` is where parses are kept between builds, or `()`: a one-shot
+/// compile is also the one that may be handed a unit cache.
+let load_shared! : :string -> [:string] -> :any -> :bool -> unit.Cache -> Loader;
+let load_shared! file roots cfg test_mode units =
+    load_root! (put :units units (put :share_parses true
+                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])))
                file test_mode;
 
 /// The same, reading `ov` -- a map of path to text -- instead of the disk for

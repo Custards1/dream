@@ -1,0 +1,66 @@
+// The compiler's checks: programs it compiled, run and compared; the seed
+// reproducing itself; and every file in the repository parsing. The suites
+// are written to be run from the root of the repository, which is where each
+// runs, with the VM and this compiler in the environment.
+import std.build;
+import std.build.command;
+import std.file;
+import std.list;
+import std.map;
+
+let repo : :map -> :string;
+let repo ctx = file.parent (build.Context.root ctx);
+
+/// The VM and the compiler under the names the suites read. `image` is not
+/// among them: `parts.sh` and `target.sh` read it as the compiler to test, and
+/// `compile.sh` as where to write the compiler it builds -- which, set for
+/// every suite, overwrote the image the others were running while they ran.
+let tools : :map -> %{:string => :string};
+let tools ctx = {
+    let chain = command.toolchain ctx;
+    map.merge chain (%{ "dream" => chain.["DREAM"], "seed" => build.Context.root ctx + "/bootstrap/dreams.dream" })
+};
+
+/// A suite run from the root of the repository, with `extra` in its
+/// environment besides the tools.
+let suite : :map -> :string -> %{:string => :string} -> :string -> [:string] -> :map;
+let suite ctx name extra program args = command.check_in (repo ctx) name (map.merge (tools ctx) extra) program args;
+
+/// The compiler under test, as the suites that take it as `image` want it.
+let under_test : :map -> %{:string => :string};
+let under_test ctx = %{ "image" => list.last (build.Context.compiler ctx) };
+
+/// A Python suite, which takes the VM and the compiler as flags.
+let python : :map -> :string -> :map;
+let python ctx name =
+    suite ctx name (%{}) "python3" ["dreams/tests/" + name + ".py", "--dream", build.Context.vm ctx,
+                              "--compiler", list.last (build.Context.compiler ctx)];
+
+/// The seed, compiling this source, makes an image that makes itself: the
+/// byte equality the bootstrap promises.
+let bootstrap : :string;
+let bootstrap = "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
+    + " && \"$dream\" \"$seed\" -L mind -L . -o \"$t/stage2.dream\" dreams/main.dr >/dev/null"
+    + " && \"$dream\" \"$t/stage2.dream\" -L mind -L . -o \"$t/stage3.dream\" dreams/main.dr >/dev/null"
+    + " && cmp \"$t/stage2.dream\" \"$t/stage3.dream\"";
+
+/// Every Dream file in the repository parses, and the parser's own tests pass.
+let corpus : :string;
+let corpus = "for f in mind/std/*.dr mind/std/build/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr"
+    + " dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr; do"
+    + " \"$dream\" \"$image\" --parse \"$f\" >/dev/null || { echo \"$f does not parse\"; exit 1; }; done"
+    + " && t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
+    + " && \"$dream\" \"$image\" dreams/ast.dr --test -L mind -L . -o \"$t/ast.dream\" >/dev/null && \"$dream\" \"$t/ast.dream\""
+    + " && \"$dream\" \"$image\" dreams/parser.dr --test -L mind -L . -o \"$t/parser.dream\" >/dev/null && \"$dream\" \"$t/parser.dream\"";
+
+let plan : :map -> :map;
+let plan ctx =
+    list.fold (fn p name -> p |> build.check name (python ctx name))
+              (build.empty
+               |> build.check "compile" (suite ctx "compile" (%{}) "dreams/tests/compile.sh" [])
+               |> build.check "parts" (suite ctx "parts" (under_test ctx) "dreams/tests/parts.sh" [])
+               |> build.check "target" (suite ctx "target" (under_test ctx) "dreams/tests/target.sh" [])
+               |> build.check "unit_cache" (suite ctx "unit_cache" (under_test ctx) "dreams/tests/units.sh" [])
+               |> build.check "bootstrap" (suite ctx "bootstrap" (%{}) "sh" ["-c", bootstrap])
+               |> build.check "corpus" (suite ctx "corpus" (under_test ctx) "sh" ["-c", corpus]))
+              ["macros", "optional_types", "static_types", "type_codegen", "contracts", "core_primitives", "modules"];

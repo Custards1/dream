@@ -129,7 +129,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
-    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true [];
+    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true [] (opt o :units);
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
@@ -430,21 +430,47 @@ let show_time! o file = {
     // a round that refuses every module before running one.
     let load = timed! (expansion.expand! (modules.with_metering (value_of read)));
     let l = value_of load;
-    let resolved = timed! (scope.resolve! l);
+    // The pipeline a build runs, which is not the one-process pipeline this
+    // used to time: a build from the command line resolves, lowers and checks
+    // in parts, reads parts back from `--units`, and shares the arena in a
+    // process that starts while lowering finishes. Timed the old way, a warm
+    // unit cache looked no faster than none. So the stages here are
+    // `compile.build!`'s, forced one at a time; `share` is what is left of the
+    // sharing process's work once lowering and checking are done with, and in
+    // parts there is no `arena` to build.
+    let co = compile_options o;
+    let parted = compile.Options.optimize co;
+    let resolved = timed! (if parted { scope.resolve_parts! l (compile.Options.units co) } else { scope.resolve! l });
     let r = value_of resolved;
+    // Lowered in parts, a lowering holds a lazy `:image` as well: the parts
+    // shared in this process, should the sharing process fail. A build never
+    // forces it, and forcing the lowering whole here would; that alone was
+    // three seconds of a warm build that no build spends. The clock is read by
+    // hand, since the lowering has to be kept whole for `share` below.
+    let before_lower = os.monotonic! ();
+    let low = if parted { lower.link_parallel! l r (compile.Options.units co) } else { lower.link! l r };
+    strict! (map_remove low :image)
+    // Read as a statement: a list element is suspended, and a clock read
+    // inside one would be read when the row is printed.
+    let lower_ms = os.monotonic! () - before_lower;
+    strict! lower_ms
+    let linked = [low, lower_ms, 0];
     let checked = timed! (if opt o :no_types == true || diag.error_count (scope.r_diags r) > 0 { [] }
-                          else { typecheck.check_program l r });
-    let linked = timed! (lower.link! l r);
-    let low = value_of linked;
-    let built = timed! (lower.image low);
-    let lowered = value_of built;
-    let shared = timed! (optimizer.optimize lowered);
+                          else { typecheck.Analysis.diags (compile.analyze_parallel! l r (lower.comp_values low) (compile.Options.units co)) });
+    let built = timed! (if parted { () } else { lower.image low });
+    let shared = timed! (if parted {
+                             match join! (lower.sharing low) {
+                                 [:crashed, _] => optimizer.optimize (lower.image low),
+                                 done => lower.patched low done,
+                             }
+                         } else { optimizer.optimize (value_of built) });
     let img = value_of shared;
+    let lowered = if parted { img } else { value_of built };
     let written = timed! (emit.to_binary img);
     let bytes = value_of written;
 
     let stages = [["parse", read], ["expand", load], ["resolve", resolved],
-                  ["types", checked], ["lower", linked], ["arena", built], ["share", shared],
+                  ["lower", linked], ["types", checked], ["arena", built], ["share", shared],
                   ["emit", written]];
     let total = list.fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
     let pad n text = str.repeat (n - str.byte_length text) " " + text;
@@ -761,6 +787,8 @@ let rec parse_args args o =
         // this, which is the point: when an image misbehaves it answers
         // whether the pass that rewrote it is why.
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
+        ["--units"] => with_opt :error "--units needs a directory" o,
+        ["--units", dir, ..rest] => parse_args rest (with_opt :units dir o),
         ["--no-types", ..rest] => parse_args rest (with_opt :no_types true o),
         ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
         ["--debug-cfg", ..rest] => parse_args rest (append_opt :defines "debug" o),
@@ -819,6 +847,8 @@ let usage! () = {
         "                           each module exports",
         "  --release                define `release`",
         "  --no-opt                 emit the arena as lowered, unshared",
+        "  --units DIR              keep each module's walk and lowering in DIR, and",
+        "                           read them back while nothing they depend on moved",
         "  --no-types               do not hold the program to its signatures",
         "  --debug-cfg              define `debug`",
         "  -q, --quiet              print only what was asked for",
@@ -858,7 +888,7 @@ let configured! o = {
 /// writing the program twice.
 let read! o file =
     modules.load_shared! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
-                         (opt o :test == true);
+                         (opt o :test == true) (opt o :units);
 
 let load! o file = expansion.expand! (read! o file);
 

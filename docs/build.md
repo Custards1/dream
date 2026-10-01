@@ -68,14 +68,19 @@ build cheap:
 - A plan is **lazy**. A payload the image does not end up using is never
   built, and neither is a branch of a `match` that did not match.
 - A script is **importable**. `mind` compiles a small driver that imports
-  the script and calls `build.run! script.plan`. Because the script has no
+  the script and calls `run.run! script.plan` (`std.build.run`). Because the script has no
   entry point of its own, one driver can later import every package's script
   at once, as one program with one scheduler, which is the scaling item
   below.
 
-Effects happen in exactly two places: inside a step's action, which the
-runner calls, and in `build.given`, which feeds the result of a step back into
-the plan (see "Decisions that need the machine").
+Effects happen in exactly one place: the runner. A step's action is pure too,
+and answers what is to be done as data -- write this text there, run this
+program with these arguments (`build.Op`) -- which the runner carries out.
+That is not a stylistic choice: a pure function cannot so much as name an
+impure one, so an action that did its own work could not be made by a pure
+script at all. `build.given` feeds the result of a step back into the plan
+through a pure function of what the step made (see "Decisions that need the
+machine").
 
 ## The vocabulary
 
@@ -94,10 +99,12 @@ mapping Context {
     root                // :string, the package's directory
     target : Target     // where the image will run
     host : Target       // where this build is running; differs when cross-building
-    profile = :debug    // :debug | :release
+    profile = "debug"   // the profile's name: "debug", "release", or one the project declares
     env = %{}           // only the variables the manifest names in [build] env
     options = %{}       // the package's options, settled ("Options")
     dependencies = %{}  // key => version, for everything it uses
+    jobs = 1            // the runner's: how many steps at once
+    cache = "target/build/steps"  // the runner's: where step directories live
 }
 
 mapping Target {
@@ -105,6 +112,12 @@ mapping Target {
     arch                // :x86_64 | :aarch64
 }
 ```
+
+The context reaches a script as `std.wire` bytes, and `wire` answers a name
+only with an atom the program already has. So the fields' descriptions spell
+out every atom they can hold (`os : :linux | :macos | :windows | :unknown`),
+which is what makes each decodable, and the runner checks what it read with
+`build.is_context` before a script sees it.
 
 `env` holds only what the manifest lists (`[build] env = ["CC",
 "PKG_CONFIG_PATH"]`). That is what lets the runner decide whether a script's
@@ -141,7 +154,7 @@ mapping Step {
     inputs = []         // [Input]: their contents are part of the key
     config = ()         // data: everything else that changes the output
     outputs = []        // [:string]: files it makes in its own directory
-    action              // Job -> result.Of :unit :string, called by the runner
+    action              // Job -> [Op], carried out by the runner
 }
 ```
 
@@ -169,10 +182,21 @@ mapping Job {
 }
 ```
 
-with `build.path job input`, `build.out job "name"`, `build.exec! job program
-args`, which runs the program in `dir` and answers `[:error, output]` when it
-fails, and `build.log! job text`. An action is the only code in a build that
-touches the file system, and it touches only what it was handed.
+with `build.path job input` and `build.out job "name"`. What an action answers
+is a list of operations, done in order in the step's directory and stopping
+at the first that fails:
+
+```dream
+union Op {
+    write(name : :string, text : :string)
+    copy(from : :string, name : :string)
+    exec(program : :string, args : [:string])   // run in the step's directory
+}
+```
+
+An action touches only what it names, and only inside its own directory.
+`exec` runs through `os.exec_in!`, which gives the child its own working
+directory: `chdir!` is the whole VM's, and steps run at once.
 
 ### Plans
 
@@ -242,8 +266,10 @@ otherwise write for itself:
 virtual let name cfg;                   // "cc"
 virtual let inputs cfg;                 // [Input]
 virtual let outputs ctx cfg;            // [:string]; may depend on the target
-virtual let run! job cfg;               // make them
+virtual let run job cfg;                // the operations that make them
 virtual let version cfg = "1";          // change it to invalidate every step made before
+virtual let settings ctx cfg = ();      // what it found that the config does not say, e.g. the compiler
+virtual let label cfg = name cfg;       // what a step is called in a log
 
 /// The step this configuration describes. The key covers the tool's
 /// version, the target and the whole configuration, so changing a flag
@@ -271,7 +297,7 @@ let shared ctx c = artifact ctx c;
 let name c = "cc";
 let inputs c = Config.sources c;
 let outputs ctx c = [build.shared_name ctx (Config.name c)];
-let run! job c = build.exec! job (compiler job) (arguments job c);
+let run job c = [build.Op.exec (compiler job) (arguments job c)];
 ```
 
 That is all a tool is. It is why `cc` does not have to be in `std` to be as
@@ -291,7 +317,7 @@ needs it:
 `std.build.command` is the escape hatch that keeps the rest honest:
 
 ```dream
-let parser = command.make "peg" "peg-gen" ["grammar.peg", "-o", command.out "parser.dr"];
+let parser = command.make "peg" "peg-gen" [command.file "grammar.peg", "-o", command.out "parser.dr"];
 build.module "parser" parser
 ```
 
@@ -304,7 +330,7 @@ imports, so `mind` treats it as a dependency like any other.
 
 ## Running a plan
 
-`build.run! plan` is the driver's `main!`. It:
+`run.run! plan` is the driver's `main!`. It:
 
 1. Reads the context `mind` wrote (`--context FILE`), or makes one for the
    host when it is run by hand. Running a script by hand is how it is
@@ -325,9 +351,9 @@ imports, so `mind` treats it as a dependency like any other.
 **File digests are cached behind a stamp**, which is git's index trick. A
 file's `(size, modified)` is kept beside its digest, and the contents are
 read only when the stamp has moved. Digesting in Dream would be the most
-expensive thing a no-op build does, so the VM does it: this needs
-`io.stat!`, `io.digest!` for a file and a pure `digest` for a string. None of
-them exist yet.
+expensive thing a no-op build does, so the VM does it: `io.stat!` gives the
+stamp, `io.digest!` the SHA-256 of a file and the pure `io.digest` that of a
+string, and the two agree on the same bytes.
 
 ## What `mind` does with it
 
@@ -358,9 +384,9 @@ the packages that use them:
 Packages that do not depend on each other run their scripts at the same time.
 Outputs live under the root project's `target/`, never in a dependency's
 directory, because a fetched package is shared by every project that uses it
-and is treated as read-only. `MIND_BUILD_CACHE` points every project at one
-step cache. That is safe because a step's directory is named by its key and
-filled atomically.
+and is treated as read-only. Every project shares one step cache,
+`$MIND_HOME/build` unless `MIND_BUILD_CACHE` says otherwise. That is safe
+because a step's directory is named by its key and filled atomically.
 
 The manifest gains:
 
@@ -385,6 +411,27 @@ defines = ["release"]
 
 and the command line gains `--target`, `--profile`, `-D KEY:name=value` and
 `-j N`. The next two sections are the graph and the options.
+
+## Checks, and `mind test`
+
+A plan may declare **checks**: `build.check name step`. A check is a step
+that passes when its operations succeed, and it is run only by `mind test`,
+and every time -- it is a question, not something made -- after whatever it
+reads has been built. A test run's context says so (`testing`) and names the
+VM and the compiler the build uses (`vm`, `compiler`), and its outcome carries
+each check's result (`Outcome.checks`: passed, milliseconds, and what it
+printed when it failed).
+
+A suite written as a script is run with `command.check`, in the package's
+directory, or `command.check_in` somewhere else, with variables laid over the
+environment: `Op.run`, which is `os.exec_with!`. It is the one operation that
+reaches outside the step's directory, and only a check has a use for it.
+
+`mind test` runs each package's units -- its `when test` blocks, compiled
+with `--test` from `[test] entry` or its entry, and run -- and its checks, all
+at once, and names each `package.name`. A workspace (`[workspace] members`)
+does that for every member and for its own checks. A test run writes no
+record, so it never stands in for a build's answer.
 
 ## The package graph
 
@@ -658,13 +705,12 @@ What keeps a build of a thousand packages fast:
   steps within a script.
 - **Work is shared by key**, across packages, and across projects with
   `MIND_BUILD_CACHE`.
-- **Next: one driver for every script.** Because a script is a
-  `Context -> Plan` function, `mind` can compile a single driver that imports
-  every package's script under its key. That is one compile and one VM
-  instead of hundreds, one scheduler with one job limit, and cross-package
-  deduplication in memory rather than through the cache. It is left for
-  later because per-package drivers are simpler to debug and already get the
-  no-op case right. It is the reason scripts have no `main!`.
+- **One driver per set of build dependencies.** Because a script is a
+  `Context -> Plan` function, `mind` compiles one driver that imports every
+  script sharing build dependencies, each under a name of its own. That is one
+  compile and one VM instead of one per package, and it is the reason scripts
+  have no `main!`. Scripts with different build dependencies cannot share a
+  program, since each is a namespace of its own; see item 8 below.
 
 What does not grow with the graph: nothing in `std.build` keeps a list it
 searches. The step table, the stamp table and the outcome are maps keyed by
@@ -677,10 +723,17 @@ they are built says is not optional.
    the header bits, the VM's check and `--any-target`, and
    `docs/bytecode-format.md`. This stands alone and is useful now, for any
    image with an embedded library.
-2. **VM primitives.** `io.stat!`, `io.digest!` and `digest`.
-3. **`std.build` core.** The vocabulary, keys, the runner (sequential
-   first, then concurrent), the stamp cache, outcomes, `write`, `command`,
-   and `when test` blocks for each.
+2. **VM primitives. Built.** `io.stat!`, `io.digest!` and `io.digest`, which is
+   SHA-256 so that the digest pinning a fetched source is the one its
+   publisher printed. The pure one is in `std.io` rather than among the
+   builtins: it is `digest!` asked of bytes already in hand, and a builtin
+   costs an opcode.
+3. **`std.build` core. Built.** The vocabulary (`std.build`), keys, the
+   runner (`std.build.run`: concurrent by depth, `jobs` at a time), the stamp
+   cache, outcomes, `write`, `std.build.command`, and `std.file` beneath them,
+   each with its `when test` block. Actions answer operations rather than
+   performing them (see "Jobs"). The `std.build.tool` behavior waits for
+   item 7, which is its first user besides `command`.
 4. **The graph. Built.** Cycle detection with the loop in the message, version
    requirements and `std.version`, revision conflicts reported as such,
    three kinds of edge, and `mind.lock`. None of this needs build scripts,
@@ -690,12 +743,43 @@ they are built says is not optional.
    `when`, conditional dependencies, `[profile.*]`, `[build] target`, and
    `mind options`. What is left for item 6 is `ctx.options` and a script's
    `build.define`, since there are no scripts to hand them to yet.
-6. **`mind` runs scripts.** Script discovery, `[build-dependencies]`, drivers, outcome
-   reuse, folding outcomes into the compile, `--target` and `-j`.
-7. **Tools.** `cc`, `probe` and `fetch`, and `dream/tests/ffi` rebuilt as a
-   package whose C library is made by its own `build.dr` rather than by the
-   test script.
-8. **The single driver**, and the shared cache as a default.
+6. **`mind` runs scripts. Built.** Script discovery (`build.dr`, or `[build]
+   script`), `[build-dependencies]`, drivers, outcome reuse (`record`: the
+   context's digest and the stamps of the script's sources and of everything
+   it read), folding outcomes into the compile, `--target` and `-j`, and
+   `mind/tool/tests/scripts.sh`. The overlay is `-L KEY+=DIR` in
+   `dreams/package.dr`. A driver is written into a directory with a manifest
+   of its own, so that `import build` finds the script it is for and not the
+   enclosing project's; and the outcome is a record in `std.build`
+   (`Outcome`), because it crosses to `mind` as `std.wire` and a reader has to
+   name every key it accepts.
+7. **Tools. Built.** `std.build.tool` (the behavior, with `settings` and
+   `label` beside the four holes), `cc`, `probe` and `fetch`, and
+   `dream/tests/ffi` rebuilt as a package whose C library is made by its own
+   `build.dr` -- `test-ffi` now builds it with `mind`. Asking the machine
+   needed operations that answer rather than fail (`find`, `capture`,
+   `attempt`) and one that pins (`verify`). A tool's configuration may hold
+   artifacts, and a step's key reads it through `build.keyed`, which puts each
+   artifact's step shape where the step was; and `Job.paths` is keyed by
+   `build.input_id`, a string, because a map compares list keys by identity.
+8. **The single driver, and the shared cache as a default. Built.** Scripts
+   whose build dependencies are the same are one driver, one compile and one
+   VM (`run.run_all!`), each script in a process of its own and the stamp
+   table read once and written once. Scripts with different build
+   dependencies get a driver each, because each script's packages are a
+   namespace of its own and one program has one: that is why it is a driver
+   per set of build dependencies rather than one per build. Every script is a
+   `build.dr`, so a driver names each package for its own compile
+   (`-L mind_script_N=DIR` and the overlay `-L mind_script_N+=DIR`, which finds
+   the script beside the manifest when the package's modules are in `src/`)
+   and imports it `as script_N`. A package's record keeps its own script's
+   sources, from `dreams --modules` on the script, so editing one script runs
+   that one again and no other; the driver is recompiled when a stale
+   script's sources moved. Steps are cached in `$MIND_HOME/build` unless
+   `MIND_BUILD_CACHE` says otherwise.
+9. **Checks, workspaces and `mind test`. Built.** See "Checks, and `mind
+   test`" above. The repository is a workspace whose tests are what `just
+   test` runs.
 
 Settled:
 

@@ -49,6 +49,7 @@ derive std.codec;
 import std.list;
 import std.result;
 import std.str;
+import std.vm;
 
 // --- the tags ----------------------------------------------------------------
 //
@@ -325,13 +326,37 @@ priv let rec read buf at = match str_byte buf at {
 /// sender and the reader disagree about the format, and carrying on would read
 /// the next message as part of this one. A stream of several messages is
 /// `frames`, which knows where each ends because the frame says so.
-let decode : :string -> result.Of :any :string;
-let decode text = match read text 0 {
+/// One message, the way the writer and reader above spell it: the definition
+/// of the format, which the VM's `wire_decode` is held to by the tests below.
+let decode_by_hand : :string -> result.Of :any :string;
+let decode_by_hand text = match read text 0 {
     () => result.error ("not a " + format_name () + " value"),
     [v, at] =>
         if at == len text { result.ok v }
         else { result.error ("trailing bytes after a " + format_name () + " value") },
 };
+
+// --- natively ----------------------------------------------------------------
+//
+// What is above is the format, written out in the language it serves, and it
+// is exact and slow: a value of 150,000 small lists took 7.7 s to write and
+// 70 s to read, because every byte is a Dream step. The VM does the same in
+// C++ (`vm.wire_encode`, `vm.wire_decode`) in milliseconds, byte for byte the
+// same, and a message is written and read that way. The tests below hold the
+// two to each other.
+
+/// A value, as one message.
+let encode : :any -> :string;
+let encode v = vm.wire_encode v;
+
+/// One message, decoded whole. Trailing bytes are a failure rather than
+/// something to ignore, because this format is fixed-width in every field --
+/// a value that ended early means the sender and the reader disagree about
+/// the format, and carrying on would read the next message as part of this
+/// one. A stream of several messages is `frames`, which knows where each ends
+/// because the frame says so.
+let decode : :string -> result.Of :any :string;
+let decode text = vm.wire_decode text;
 
 // --- tests ---------------------------------------------------------------------
 
@@ -415,6 +440,21 @@ when test {
         test.case "a name this program has no atom for"
             $( test.true! (result.is_error
                    (decode (str_concat [str_of_bytes [6], str_le 3 4, "zzq"]))) ),
+
+        // the VM's codec is this module's, byte for byte
+        test.case "the VM writes what the walk above writes"
+            $( test.eq! [] (list.filter (fn v -> encode v != encode_value v)
+                                        [(), true, 0 - 1, 4611686018427387903, 2.5, 'λ', "s", :ok, [1, [2]],
+                                         array_of_list [1, "x"], %{ :b => 1, :a => [2], "k" => %{ 3 => () } },
+                                         %{ 1.5 => :f, 'c' => :c, true => :t }, [], %{}]) ),
+        test.case "and reads what the reader above reads"
+            $( test.eq! [] (list.filter (fn v -> decode (encode_value v) != decode_by_hand (encode_value v))
+                                        [(), 7, "s", :ok, [1, [2, 3]], array_of_list [4], %{ "a" => [:b] }, 'z']) ),
+        test.case "and refuses what it refuses"
+            $( test.eq! [true, true, true, true]
+                        (list.map (fn t -> result.is_error (decode t) && result.is_error (decode_by_hand t))
+                                  ["", str_of_bytes [99], encode 1 + encode 2,
+                                   str_concat [str_of_bytes [6], str_le 3 4, "zzq"]]) ),
 
         // decode_or, from std.codec
         test.case "decode_or on a bad message" $( test.eq! :fallback (decode_or :fallback "!") ),

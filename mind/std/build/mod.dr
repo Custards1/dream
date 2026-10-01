@@ -1,0 +1,454 @@
+// std.build: what a package's `build.dr` is written in.
+//
+// A script is a pure function from a `Context` to a `Plan`: what the package
+// needs made before it can be compiled -- a C library to embed, a generated
+// module, a switch that depends on the machine -- said as data. `mind` works
+// out how, when and whether to make it. docs/build.md is the design; this
+// module is its vocabulary, and `std.build.run` is the runner that carries a
+// plan out.
+//
+// Everything here is pure, a step's action included: an action answers what
+// is to be done as data -- write this text there, run this program with these
+// arguments -- and the runner is the only thing that does it. A pure function
+// cannot so much as name an impure one, so an action that did its own work
+// could not be made by a pure script at all; and one that says what it wants
+// can only touch what it names, inside its own directory. That, and plans
+// being values, is what lets a plan be compared (a step whose key has not
+// moved is not run), scheduled (the graph is known before anything runs) and
+// left lazy (a payload nothing uses is never made).
+
+import std.io;
+import std.list;
+import std.map;
+import std.str;
+import std.types;
+
+// --- where a build runs ------------------------------------------------------------
+
+/// Where an image runs, in the names the image header's target bits use.
+///
+/// The atoms are written out here, and not only for the checker: a context
+/// reaches a script as `std.wire` bytes, and `wire` answers a name only with an
+/// atom the program already has -- it never interns what it is sent. Naming
+/// every value a field can take is what makes each one decodable.
+mapping Target {
+    os : :linux | :macos | :windows | :unknown
+    arch : :x86_64 | :aarch64 | :unknown
+}
+
+/// What a script is told, and all it may know about the world outside its own
+/// files.
+///
+/// `env` holds only the variables the manifest lists in `[build] env`: an
+/// environment variable the script cannot see cannot change its plan, which
+/// is what lets the runner reuse an answer. `jobs` and `cache` are the
+/// runner's rather than the script's -- how many steps may run at once, and
+/// the directory every step's own directory lives under -- and are here so
+/// that one file carries a run's whole configuration.
+mapping Context {
+    package : :string
+    version : :string
+    root : :string
+    target : :map
+    host : :map
+    // A string, because a project may name its own (`[profile.bench]`), and a
+    // name no program mentions would not come back through `std.wire` as an atom.
+    profile : :string = "debug"
+    env : %{:string => :string} = %{}
+    options = %{}
+    dependencies : %{:string => :string} = %{}
+    jobs : :integer = 1
+    cache : :string = "target/build/steps"
+    // Whether this run is `mind test`'s, which runs the plan's checks, and the
+    // VM and compiler command the build uses, for a check that runs either.
+    testing : :bool = false
+    vm : :string = "dream"
+    compiler : [:string] = []
+    // The checks a test run is asked for, by name; every one when empty.
+    only : [:string] = []
+}
+
+/// Whether `v` is a whole context, its targets included -- what the runner
+/// asks of one it has read, before a script sees it.
+let is_context : :any -> :bool;
+let is_context v =
+    types.accepts Context.type v
+    && types.accepts Target.type (Context.target v) && types.accepts Target.type (Context.host v);
+
+let version : :map -> :string;
+let version ctx = Context.version ctx;
+
+/// `libsqlite3.so`, `libsqlite3.dylib` or `sqlite3.dll`, for the target.
+/// Every tool needs these, so they are written once.
+let shared_name : :map -> :string -> :string;
+let shared_name ctx name = match Target.os (Context.target ctx) {
+    :windows => name + ".dll",
+    :macos => "lib" + name + ".dylib",
+    _ => "lib" + name + ".so",
+};
+
+let exe_name : :map -> :string -> :string;
+let exe_name ctx name = match Target.os (Context.target ctx) { :windows => name + ".exe", _ => name };
+
+let object_name : :map -> :string -> :string;
+let object_name ctx name = match Target.os (Context.target ctx) { :windows => name + ".obj", _ => name + ".o" };
+
+// --- inputs and steps ----------------------------------------------------------------
+
+/// A file in the package, relative to its root, or something a step makes.
+///
+/// An artifact holds the step that makes it, and that one decision is the
+/// graph: a step's inputs name the steps they come from, so the whole graph is
+/// whatever is reachable from the plan. There is no registry and no global
+/// state, and an artifact nothing reaches is never built. A bare string is
+/// accepted wherever an input is, and means a file.
+union Input {
+    file(path : :string)
+    artifact(step : :map, name : :string)
+}
+
+/// A bare string made into the input it means.
+let input : :any -> :any;
+let input i = match type_of i { :string => Input.file i, _ => i };
+
+/// One piece of work.
+///
+/// `config` is data -- everything that changes what the step makes, other
+/// than its inputs' contents -- and `action` is what makes it: a pure function
+/// from a `Job` to the operations the runner is to carry out (`Op`). `shape` is the digest of everything about the step a
+/// pure function can see: the tool, the config, the outputs, and the shapes of
+/// the steps its artifacts come from. It is computed once, when the step is
+/// made, and read lazily, so a graph where many steps share one input costs
+/// one digest per step and not one per path to it. The runner's key is the
+/// shape with the contents of the files folded in, which only an effect can
+/// read. The name is in neither: two packages asking for the same thing by
+/// different names share the work.
+mapping Step {
+    tool
+    name
+    inputs = []
+    config = ()
+    outputs = []
+    action
+    shape
+}
+
+/// What an action receives. `paths` maps each input (by `input_id`) to where
+/// it is on disk -- `build.path` is how an action asks -- and `dir` is the
+/// step's own directory, the only place it may write.
+mapping Job { dir, ctx, paths = %{} }
+
+/// The shape of an input, as a step's shape includes it.
+priv let input_shape : :any -> :any;
+priv let input_shape i = match i {
+    [:file, p] => [:file, p],
+    [:artifact, s, n] => [:artifact, Step.shape s, n],
+};
+
+/// A step. The constructor every tool ends in, because it is the one that
+/// works out the shape.
+let step : :string -> :string -> [:any] -> :any -> [:string] -> :any -> :map;
+let step tool name inputs config outputs action = {
+    let ins = list.map input inputs;
+    Step.make tool name ins config outputs action
+        (io.digest (encode [tool, config, outputs, list.map input_shape ins]))
+};
+
+/// What an action asks for, carried out in order by the runner, in the step's
+/// directory, stopping at the first that fails. A name is relative to that
+/// directory; `copy`'s source is a path from `Job.paths`. A program is looked
+/// up on `PATH` as a shell would, and runs with the step's directory as its
+/// working directory.
+///
+/// `run` is `exec` somewhere else, with variables of its own: for a check,
+/// which asks a question of the package where it is rather than making
+/// something in a directory of its own. It is the only operation that reaches
+/// outside the step's directory, and a step that makes something has no use
+/// for it.
+///
+/// The last four ask the machine a question rather than make something, and
+/// never fail -- the answer is the point, and "no" is one: `find` writes where
+/// a program is on `PATH` (or nothing), `capture` what a program printed when
+/// it succeeded (or nothing), `attempt` `yes` or `no` for whether it
+/// succeeded. `verify` fails unless the file has the SHA-256 given, which is
+/// what pins something fetched.
+union Op {
+    write(name : :string, text : :string)
+    copy(from : :string, name : :string)
+    exec(program : :string, args : [:string])
+    run(dir : :string, env : %{:string => :string}, program : :string, args : [:string])
+    find(program : :string, name : :string)
+    capture(program : :string, args : [:string], name : :string)
+    attempt(program : :string, args : [:string], name : :string)
+    verify(name : :string, digest : :string)
+}
+
+/// An output of a step, as an input to another.
+let artifact : :map -> :string -> :any;
+let artifact s name = Input.artifact s name;
+
+/// The name an input goes by in `Job.paths`. A string, because a map compares
+/// a list key by identity rather than by contents, and the same input is
+/// rebuilt as a new list wherever a bare string is turned into one.
+let input_id : :any -> :string;
+let input_id i = encode (input_shape (input i));
+
+/// Where an input is, from inside an action.
+let path : :map -> :any -> :string;
+let path job i = (Job.paths job).[input_id i else ()];
+
+/// Where an output goes, from inside an action.
+let out : :map -> :string -> :string;
+let out job name = Job.dir job + "/" + name;
+
+// --- plans ------------------------------------------------------------------------------
+
+/// What a package contributes to its own compile.
+///
+/// Every contribution takes the plan last, so they chain with `|>`. `later` is
+/// `given`'s: `[input, f]` pairs the runner resolves once the input is built.
+/// `conflicts` is what merging found -- two payloads or two modules under one
+/// name -- kept rather than raised, because building a plan is pure; the
+/// runner reports them before it runs anything.
+mapping Plan {
+    payloads = %{}
+    modules = %{}
+    defines = %{}
+    hosts = []
+    target = ()
+    steps = []
+    later = []
+    conflicts = []
+    checks = %{}
+}
+
+let empty : :map;
+let empty = Plan.make (%{}) (%{}) (%{}) [] () [] [] [] (%{});
+
+/// Embed a file in the image: `--payload NAME=PATH`.
+let payload : :string -> :any -> :map -> :map;
+let payload name i p = Plan.set_payloads p (claim "payload" name (input i) (Plan.payloads p));
+
+/// A generated module, imported as `<package>.<name>`.
+let module : :string -> :any -> :map -> :map;
+let module name i p = Plan.set_modules p (claim "module" name (input i) (Plan.modules p));
+
+/// A `when` flag, scoped to the package.
+let define : :string -> :map -> :map;
+let define name p = Plan.set_defines p ((Plan.defines p).[name => true]);
+
+/// A `when` setting with a value.
+let set : :string -> :any -> :map -> :map;
+let set name value p = Plan.set_defines p ((Plan.defines p).[name => value]);
+
+/// A host module the package needs at run time.
+let host_module : :string -> :map -> :map;
+let host_module name p = Plan.set_hosts p (list.unique (list.append (Plan.hosts p) [name]));
+
+/// Where the result can run: a list of targets, or `()` to let the compiler
+/// decide. Two plans' targets meet rather than add.
+let target : :any -> :map -> :map;
+let target ts p = Plan.set_target p (meet (Plan.target p) ts);
+
+/// A check `mind test` runs: it passes when the step's operations all
+/// succeed. Only `mind test` runs checks, and it runs them every time -- a
+/// check is a question, not something made -- after building whatever they
+/// read.
+let check : :string -> :map -> :map -> :map;
+let check name s p = Plan.set_checks p (claim "check" name s (Plan.checks p));
+
+/// Make a step whether or not anything uses it.
+let also : :map -> :map -> :map;
+let also s p = Plan.set_steps p (list.append (Plan.steps p) [s]);
+
+/// Once `i` is built, read it as a string and merge in `f` of it. `f` is pure,
+/// so the effect is still only in the step that made `i`.
+let given : :any -> (:string -> :map) -> :map;
+let given i f = Plan.set_later empty [[input i, f]];
+
+/// The table with `name => value` in it. A name already given to something
+/// else is marked as a conflict in the table itself, which is where
+/// `conflicts` finds it: the plan stays a value, and nothing raises.
+priv let claim : :string -> :string -> :any -> :map -> :map;
+priv let claim kind name value table = match table.[name else ()] {
+    () => table.[name => value],
+    old if old == value => table,
+    _ => table.[name => [:conflict, kind, name]],
+};
+
+priv let meet : :any -> :any -> :any;
+priv let meet a b = match [a, b] {
+    [(), _] => b,
+    [_, ()] => a,
+    _ => list.filter (fn t -> list.contains t b) a,
+};
+
+/// Two tables merged, a name in both recorded as a conflict unless both say
+/// the same thing.
+priv let merge_table : :string -> :map -> :map -> :map;
+priv let merge_table kind a b =
+    map.fold (fn acc k v -> match acc.[k else ()] {
+        () => acc.[k => v],
+        old if old == v => acc,
+        _ => acc.[k => [:conflict, kind, k]],
+    }) a b;
+
+/// The conflicts a table holds, as messages.
+priv let table_conflicts : :map -> [:string];
+priv let table_conflicts t =
+    list.flat_map (fn pair -> match list.nth 1 pair {
+        [:conflict, kind, name] => ["two " + kind + "s are called `" + name + "`"],
+        _ => [],
+    }) (map_pairs t);
+
+/// Several plans as one. Merging is a union, and a name two of them give
+/// different things to is a conflict rather than one silently winning.
+let all : [:map] -> :map;
+let all plans = list.fold (fn a b ->
+    Plan.make (merge_table "payload" (Plan.payloads a) (Plan.payloads b))
+              (merge_table "module" (Plan.modules a) (Plan.modules b))
+              (map.merge (Plan.defines a) (Plan.defines b))
+              (list.unique (list.append (Plan.hosts a) (Plan.hosts b)))
+              (meet (Plan.target a) (Plan.target b))
+              (list.append (Plan.steps a) (Plan.steps b))
+              (list.append (Plan.later a) (Plan.later b))
+              (list.append (Plan.conflicts a) (Plan.conflicts b))
+              (merge_table "check" (Plan.checks a) (Plan.checks b))) empty plans;
+
+/// Everything wrong with a plan, before anything is run.
+let conflicts : :map -> [:string];
+let conflicts p = list.concat [Plan.conflicts p, table_conflicts (Plan.payloads p),
+                               table_conflicts (Plan.modules p), table_conflicts (Plan.checks p)];
+
+/// What a run hands the compile, with every input resolved to a path: the
+/// payloads by name, the directory of generated modules (or `()`), the
+/// defines, host modules and targets, the stamp of every file the plan read
+/// (by which `mind` tells whether it has to run the script again), and how
+/// many steps were built and reused. Declared here, and not only built by the
+/// runner, because it crosses from one program to another as `std.wire`, and
+/// a reader has to name every key it accepts.
+mapping Outcome {
+    payloads : %{:string => :string} = %{}
+    modules = ()
+    defines = %{}
+    hosts : [:string] = []
+    target = ()
+    reads = %{}
+    built : :integer = 0
+    reused : :integer = 0
+    // A test run's checks, by name: whether each passed, how long it took in
+    // milliseconds, and what it printed when it failed.
+    checks : %{:string => [:bool, :integer, :string]} = %{}
+}
+
+let is_outcome : :any -> :bool;
+let is_outcome v = types.accepts Outcome.type v;
+
+// --- steps every build has ---------------------------------------------------------
+
+/// A step that writes `text` to `name`, keyed on the text itself. Generating a
+/// module is ordinary Dream code handed to this: the text is pure and lazy,
+/// and the step is only run when the text has changed.
+let write : :string -> :string -> :any;
+let write name text =
+    artifact (step "write" name [] [name, text] [name] (fn job -> [Op.write name text])) name;
+
+// --- keys --------------------------------------------------------------------------
+
+/// `v` with every artifact in it replaced by its step's shape: a tool's
+/// configuration as a key can read it. An artifact holds its step, and a step
+/// holds its action, which no key can say; the shape says everything about
+/// the step that could change what it makes.
+let keyed : :any -> :any;
+let rec keyed v = match v {
+    [:artifact, s, n] if type_of s == :map && map_has s :shape => [:artifact, Step.shape s, n],
+    _ => match type_of v {
+        :list => list.map keyed v,
+        :map => map.map_values keyed v,
+        _ => v,
+    },
+};
+
+/// Whether `v` is data -- something `encode` can say exactly. A function in a
+/// step's config would be keyed as nothing at all, and a change to it would
+/// never rebuild anything, so the runner refuses one instead.
+let is_data : :any -> :bool;
+let rec is_data v = match type_of v {
+    :pure_fn => false,
+    :impure_fn => false,
+    :process => false,
+    :module => false,
+    :error => false,
+    :list => list.all is_data v,
+    :array => list.all is_data (array_to_list v),
+    :map => list.all (fn pair -> is_data (list.head pair) && is_data (list.nth 1 pair)) (map_pairs v),
+    _ => true,
+};
+
+/// A canonical spelling of a piece of data: two values encode alike exactly
+/// when they are equal, whatever order a map was built in. Every piece says
+/// what kind it is and how long it is, so no two values can run into each
+/// other's text. What a key is a digest of.
+let encode : :any -> :string;
+let rec encode v = match type_of v {
+    :string => "s" + to_string (str.byte_length v) + ":" + v,
+    :bigstr => "s" + to_string (str.byte_length v) + ":" + v,
+    :integer => "i" + to_string v + ";",
+    :float => "f" + to_string v + ";",
+    :char => "c" + to_string (char_code v) + ";",
+    :atom => "a" + to_string v + ";",
+    :bool => if v { "T" } else { "F" },
+    :unit => "U",
+    :list => "[" + str.join_str "" (list.map encode v) + "]",
+    :array => "#[" + str.join_str "" (list.map encode (array_to_list v)) + "]",
+    :map => "{" + str.join_str "" (list.map (fn pair -> encode (list.head pair) + encode (list.nth 1 pair))
+                                            (list.sort_on list.head (map_pairs v))) + "}",
+    other => "?" + to_string other + ";",
+};
+
+when test {
+    import std.test;
+
+    let ctx os = Context.new "p" "1.0" "/p" (Target.make os :x86_64) (Target.make :linux :x86_64);
+    let noop job = [];
+    let leaf = step "t" "leaf" ["a.c"] [1] ["a.o"] noop;
+
+    let tests = [
+        test.case "a name for the target's shared library"
+            $( test.eq! ["libz.so", "libz.dylib", "z.dll"]
+                        (list.map (fn os -> shared_name (ctx os) "z") [:linux, :macos, :windows]) ),
+        test.case "a bare string is a file"
+            $( test.eq! [[:file, "a.c"], [:artifact, leaf, "a.o"]]
+                        [input "a.c", input (artifact leaf "a.o")] ),
+        test.case "encoding does not depend on the order a map was built in"
+            $( test.eq! (encode (%{ :a => 1, "b" => [2, 3] })) (encode ((%{ "b" => [2, 3] }).[:a => 1])) ),
+        test.case "encoding tells a string from the text of another value"
+            $( test.eq! 4 (list.length (list.unique (list.map encode ["1", 1, '1', ["1"]]))) ),
+        test.case "a function is not data"
+            $( test.eq! [true, false, false] [is_data [1, %{ :a => "b" }], is_data noop, is_data [noop]] ),
+        test.case "the shape ignores the name and follows the config"
+            $( test.eq! [true, false]
+                        [Step.shape (step "t" "x" ["a.c"] [1] ["a.o"] noop) == Step.shape leaf,
+                         Step.shape (step "t" "x" ["a.c"] [2] ["a.o"] noop) == Step.shape leaf] ),
+        test.case "the shape follows the step an artifact comes from"
+            $( test.ne! (Step.shape (step "u" "y" [artifact leaf "a.o"] () [] noop))
+                        (Step.shape (step "u" "y" [artifact (step "t" "leaf" ["b.c"] [1] ["a.o"] noop) "a.o"] () [] noop)) ),
+        test.case "contributions chain"
+            $( test.eq! [["x"], %{ "f" => true, "n" => 3 }, ["h"]]
+                        {
+                            let p = empty |> payload "x" "x.bin" |> define "f" |> set "n" 3 |> host_module "h";
+                            [map.keys (Plan.payloads p), Plan.defines p, Plan.hosts p]
+                        } ),
+        test.case "two payloads under one name are a conflict"
+            $( test.eq! ["two payloads are called `x`"]
+                        (conflicts (all [empty |> payload "x" "a", empty |> payload "x" "b"])) ),
+        test.case "the same payload twice is not"
+            $( test.eq! [] (conflicts (all [empty |> payload "x" "a", empty |> payload "x" "a"])) ),
+        test.case "targets meet"
+            $( test.eq! [[:linux], ()]
+                        [Plan.target (all [empty |> target [:linux, :macos], empty |> target [:linux]]),
+                         Plan.target empty] ),
+        test.case "writing is keyed on the text"
+            $( test.ne! (Step.shape (list.nth 1 (write "v.dr" "a"))) (Step.shape (list.nth 1 (write "v.dr" "b"))) ),
+    ];
+}

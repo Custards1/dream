@@ -301,3 +301,256 @@ and two cores are unchanged (10.8/10.4 s against 10.7/10.3, 6.7/6.4 against
 cross-part share, which is the end of the critical path, has twice the parts
 to merge. That is a loss on a machine anyone can measure for a gain on one
 nobody here has, so it waits for someone with eight cores to measure it.
+
+## Compile units: a module's walk and lowering, kept between builds
+
+Done 2026-09-30. `dreams --units DIR` keeps each module's part of a parallel
+build -- its walk (resolution) and its lowering -- and reads it back when
+nothing it was computed from has moved; `mind` passes it on every build
+(`$MIND_HOME/units`). On a self-compile with four cores:
+
+| | |
+|---|---|
+| no cache | 7.8 s |
+| cold cache (computes and keeps every part) | 7.9-8.8 s |
+| warm, nothing changed | 5.2-5.5 s |
+| one body edited in one module | 5.4 s |
+
+and every image equals the one an uncached build of the same source writes,
+byte for byte, which `dreams/tests/units.sh` holds after each kind of edit a
+key has to notice. What is left of the warm build is what is not cached:
+loading and expanding, declaring, the merge, checking (always run), sharing and
+emitting.
+
+How it is built, and why each piece is the way it is:
+
+- **Parts are modules.** A body used to go to part `index % 4`, which is
+  balanced and says nothing about what changed. Now each module's bodies are a
+  part, walked and lowered in a process of its own; that alone costs nothing
+  measurable (7.7 s against 7.7 s), and it makes a part a unit an edit either
+  touches or does not.
+- **Declaring stays whole.** Macros run transformers from any module, `derive`
+  specializes a base module's *syntax*, and every part's lowering reads the
+  whole program's wrappers, so a module is not compiled alone: the program is
+  loaded and declared as before, and what is kept is the per-body work, which
+  is most of a build.
+- **A walk is kept as what it added** to the state every part starts from
+  (`unit.delta`), and read back by laying that over this build's state
+  (`unit.restore`). Sound because that state is in the key -- minus `defs`,
+  the outline with every declaration's span, which no walk reads and which
+  moved every key on every keystroke -- with the modules' names, which the
+  walk reads from the loader.
+- **A lowering's key is the walk's plus the wrappers the part reaches**, closed
+  over what each wrapper stands for. Keyed on the whole table, a wrapper
+  moving anywhere re-lowered every part: a wrapper's literal keeps its span,
+  and a call site lowered from it carries the span into the image, so its
+  callers do change -- but only its callers.
+- **Positions are relative to the part.** A part names bodies by where they
+  stand in the program's queue, and a body added to an earlier module moves
+  every later one.
+- **Keys start with the compiler's digest** (`vm.image_digest`), so no unit is
+  ever read by a compiler that did not write it.
+- **It needed the wire format in C++.** A unit is a hundred thousand nodes, and
+  `std.wire` in Dream took 70 s to read one that size; `vm.wire_encode` and
+  `vm.wire_decode` write the same bytes in milliseconds.
+
+The trap it walked into, written down because it is the one CLAUDE.md warns
+about and it still cost an hour: the keys handed to each part's `spawn!` were
+unforced -- even with no cache, when they were `()` -- and a suspension carries
+its frame. Every one of the sixty-odd part processes was given a copy of the
+whole resolving frame, the loader included: 1.7 GB more copied and twice the
+time, invisible to `--time` because `--time` runs serially. `!cache` and `!k`
+on `walk_elsewhere!` and `part_elsewhere!` are the fix.
+
+### `--time` timed a pipeline no build runs
+
+It resolved, checked and lowered in one process, in its own order, and so it
+could not see a unit cache at all: a warm build and a cold one read the same.
+It now forces `compile.build!`'s stages one at a time -- in parts, from
+`--units`, with the sharing process -- and says what those cost. Two traps
+were found on the way. The first: `strict!` on a lowering made in parts
+forces its lazy `:image`, the parts shared in this process should the sharing
+process fail, which no build ever asks for. That was three seconds charged to
+`lower` that a build never spends, so the timer leaves that key out. The
+second: a clock read inside a list element is read when the list is printed,
+not where it is written, so the reading is bound first and forced as a
+statement.
+
+### Checking kept per part, and the checker built in a tenth of the time
+
+Read honestly, a warm build's largest stage was the type checker: 2.1 s of
+it, against 0.7 s for lowering. Its per-body half is now a unit like the
+others -- keyed on the part's walk and on a digest of what every body is
+checked against (`typecheck.tables`: the signatures, named types, what the
+`comp`s came to), so a signature changed in one module checks every part
+again and a body changed without one checks its own. `units.sh` has the case
+that proves the second half of the key is needed: a signature added to one
+module makes an untouched body of another wrong.
+
+That took the bodies from 0.5 s to 5 ms and the stage only to 1.7 s, because
+the rest was building the checker, which every build pays. 14% of a warm
+build's reductions were `mentions_refine`: whether a named type reaches a
+`where` through the names it mentions, walked afresh for each named type down
+every path to a depth of eight. `refined_table` builds the same answers a
+depth at a time, each depth reading the one below as a table, and building
+the checker went from 1.5 s to 0.13 s. That is a gain for every build, cached or
+not.
+
+A self-compile with the same VM, runs interleaved, old compiler against new:
+no cache 8.5 s -> 7.5 s, and a warm cache 6.5 s -> 4.9 s. Under `--time`, a
+warm build is now parse 1.4 s, expand 0.5, resolve 0.6, lower 0.7, types
+0.2, share 0.4-1.1, emit 0.35.
+
+### The parse kept per file
+
+Then the parse was the largest stage, and it is the easiest unit of all:
+`parser.parse_module` reads nothing but the text, so the key is the compiler
+and the text's digest (`modules.parse_unit!`). It is kept by the process that
+parses the file ahead of the walk, so a parse read back is read on another
+worker too. A parse that failed is kept as well and fails the same way when it
+is read back; `units.sh` asks that twice. Warm, parse went from 1.4 s to 0.47
+s, and `--time` puts the warm self-compile at 4.1 s: parse 0.47, expand 0.5,
+resolve 0.57, lower 0.8, types 0.2, share 0.4-1.2, emit 0.34.
+
+### A cache that forgets
+
+Every edit keeps new units, and a unit is never wrong -- it is keyed on what it
+was made from -- only never asked for again, so a cache left alone only grows.
+There is no `touch` in the VM, and a build should not need one: a unit read
+back is written again once it is a day old (`unit.refresh!`), so its
+modification time is within a day of the last build that wanted it, and `mind`
+removes the units no build has used in 30 days (`build.forget_units!`). It
+looks the directory over at most once a day, by a stamp in it, since a scan
+at every build would cost what the cache saves. Two `mind`s forgetting at once
+remove the same files, and a unit removed while a build reads it is computed
+again.
+
+### A part keyed on what it can see
+
+Until here a walk's key held the whole declared program, so adding a function
+to any module walked every module again: 9 s on a self-compile, a cold build's
+cost, for the commonest edit there is. Two things in the declared state moved
+with every declaration, found by printing a digest of each field and adding one
+declaration to the last module:
+
+- **`next_global`**, where the globals a part invents (deforestation's loops)
+  are numbered from. Parts now invent from `scope.invent_base`, 2^26, and
+  `merge_parts` hands each part a `go` of `g0 - invent_base` plus the parts
+  before it -- the same offset every consumer (`opt.remap_leaf`,
+  `lower.reach_parts`) already added to a global at or past `invented_from`,
+  which is now `invent_base`. A part's walk no longer depends on how many
+  declarations there are.
+- **The environments.** A part resolves names in its own module's
+  environment and, through what that names -- an alias, an `import a.{x}`
+  selection, a namespace -- in the environments of those modules and their
+  submodules, and nowhere else. `scope.part_key` reads the module references
+  off the environment whole (`reached_modules`) and keys the part on those
+  environments only.
+
+Also out of the key: the declaring pass's diagnostics and `module_recs`, which
+a walk carries and never reads. Before trusting it, every walk read back was
+walked again and compared, over a cold build, a warm one, a declaration added
+to `main`, to `lower`, to `std.list`, a name renamed across modules, an import
+added and a declaration removed: no mismatch, and every image the image built
+without units.
+
+A declaration added to the last module now walks one part (4.3 s against a
+warm 4.1 s, from 6.4 s); one added to `lower` walks thirteen (5.7 s, from
+7.2 s). One added early -- to `std.list` -- still walks everything, because
+globals are numbered in module order and every later module's numbers move.
+Numbering each module's globals from a base of its own would fix that, at
+the cost of a relocation in every consumer of a global index.
+
+### The key was quadratic in modules
+
+The part key came in with a quadratic of its own, which this repository's 67
+modules could not show: to find a module's submodules, `part_key` held every
+module's name against every prefix the part could see, for every part. On
+`scale.py`'s programs of four declarations a module, with `--units`:
+
+| modules | no cache | cold | warm | one body | one declaration |
+|---|---|---|---|---|---|
+| 400 | 2.5 s | 2.8 s | 1.8 s | 1.8 s | 1.9 s |
+| 800 | 4.6 s | 10.5 s | 8.1 s | 7.8 s | 7.8 s |
+
+A warm build of 800 modules was slower than no cache at all. `modules_under`
+now indexes every module by each dotted prefix of its name once per build,
+and a part's key reads that:
+
+| modules | no cache | cold | warm | one body | one declaration |
+|---|---|---|---|---|---|
+| 400 | 1.3 s | 1.4 s | 1.1 s | 1.0 s | 1.1 s |
+| 800 | 3.3 s | 3.7 s | 2.1 s | 2.1 s | 2.5 s |
+| 1600 | 8.2 s | 7.0 s | 4.3 s | 4.7 s | 5.0 s |
+| 3200 | 16.3 s | 15.6 s | 9.2 s | 9.4 s | 10.9 s |
+
+Linear, and what is left of a warm build at 1,600 modules is the whole-program
+work no unit holds: loading 1,600 files and reading their parses back (1.1 s),
+merging the parts (0.9 s), linking (0.9 s), sharing (0.7 s) and emitting
+(0.3 s), none of it dominated by one function. Making those per-module too is
+dynamic linking's question (docs/dynamic-linking.md), not the unit cache's.
+
+### The whole-program stages, taken down
+
+Then those, one at a time, on the same 1,600-module program, warm:
+
+- **Loading** was path arithmetic. `path.dr` found an extension and a
+  directory a character at a time (`last_index` hops between occurrences with
+  `str_find` now), and `canonical_name!` made every package's source absolute
+  again for every file it named -- three normalisations per package per file.
+  The loader carries the packages' roots, worked out once. 25.4M reductions
+  became 13.8M.
+- **Three loops over the parts read parts by index from lists** --
+  `link_head`, `link_parallel!`'s notes and `merge_parts` -- each a walk to
+  the part, so each loop quadratic in modules. Arrays.
+- **Every part's lowering key was worked out by the process that starts the
+  parts**, one after another before any began. Each part works out its own.
+- **Sharing the parts** is a whole-program walk no unit holds: rename each
+  part's constants, functions and invented globals, and keep each node once by
+  its record. In Dream it was a map insert and a `to_string` per node,
+  threaded through a state record. `vm.share_arenas` is the same walk in the
+  VM -- the Dream walk stays as `optimize_parts_by_hand`, and the compiler it
+  built and the compiler `vm.share_arenas` built compile this repository into
+  the same bytes. 650 ms became one that finishes while the checker is still
+  running.
+- **`patched` turned the shared arena back into tables** to fill in the
+  `comp` placeholders, and flattened it again: fifty thousand map writes for a
+  build with no `comp` at all. Settling writes nothing it does not append or
+  overwrite, so it writes into empty tables counting from the arena's end
+  now, laid over the arena's lists afterwards.
+
+- **Sorting** was `std.list`'s merge sort in Dream, and `sort_on` asked for
+  each key at every comparison. The `sort_keyed` builtin sorts an array by
+  keys forced once each, in `compare`'s order, stably; `sort` and `sort_on`
+  are it.
+- **The node and kid sections** were a function call and a `str_le` a
+  field, tens of thousands of times. `vm.node_section` and
+  `vm.index_section` write the same bytes, a section a call, and `emit`'s
+  first tests hold them to the Dream writers.
+
+Each native came with its Dream walk kept as the definition and a test
+between the two, and with the check that a compiler built either way compiles
+this repository and the 1,600-module program into the same bytes.
+
+Two things measured and not kept. Sharing only part of the resolution with
+the lowering and checking processes saved nothing a real build could see.
+Working each walk's key out in its own process, as lowering's is, saved
+nothing either: the 285 ms that spawning the walks takes is the walks
+themselves, already spread across the cores, not the keys. That attempt also
+found the trap again: a key's parts handed in lazily carried the unshared
+loader into all 1,600 processes, and the machine killed the build for memory.
+
+Old compiler on the old tree against new on the new, same VM, three
+interleaved runs, the least of each:
+
+| | no cache | warm |
+|---|---|---|
+| the compiler, before | 3.77 s | 2.23 s |
+| the compiler, after | 3.18 s | 1.30 s |
+| 1,600 modules, before | 5.39 s | 4.33 s |
+| 1,600 modules, after | 3.74 s | 2.34 s |
+
+What a warm build of 1,600 modules is now made of, by a timeline put on a real
+build: loading 0.7 s, declaring 0.18 s, reading the walks back 0.3 s, merging
+them 0.2 s, lowering 0.55 s, checking 0.2 s, writing 0.3 s. Reductions went from
+90M to 45M, and nothing left is more than a twentieth of them.

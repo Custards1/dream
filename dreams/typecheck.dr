@@ -2209,25 +2209,39 @@ let contract k expected why span d h ds =
 /// the names it mentions. Worked out once per type, when the checker is built,
 /// so that a program without a refinement -- which is nearly every program --
 /// pays one lookup per checked literal and never builds a datum.
-let rec mentions_refine k mi desc n =
+///
+/// `below` answers the same question one name shallower, for every named type:
+/// a name is followed by looking it up there rather than by walking into its
+/// description. Walked, a type that mentions others that mention others went
+/// down every path to the same types again, to a depth of eight, for every
+/// named type in the program -- a seventh of a warm build's reductions spent
+/// giving the same few answers. `refined_table` builds the tables a depth at a
+/// time, and the answers are the walk's, depth limit and all.
+let rec mentions_refine k mi desc n below =
     if n <= 0 { false }
     else {
         match desc {
             [:list, [[:atom, "refine", _], .._], _] => true,
-            [:list, parts, _] => list.any (fn x -> mentions_refine k mi x n) parts,
-            [:map, kvs, _] => list.any (fn kv -> mentions_refine k mi (list.nth 1 kv) n) kvs,
+            [:list, parts, _] => list.any (fn x -> mentions_refine k mi x n below) parts,
+            [:map, kvs, _] => list.any (fn kv -> mentions_refine k mi (list.nth 1 kv) n below) kvs,
             [:name, nm, _] => match type_ref k mi nm {
                 () => false,
-                gi => match (Checker.named k).[gi else ()] {
-                    [mi2, _, d2, _] => mentions_refine k mi2 d2 (n - 1),
-                    _ => false,
-                },
+                gi => below.[gi else false],
             },
             [:field, _, _, _] => refines k (eval_type k (in_module mi) desc) (n - 1),
-            [:apply, head, args, _] => list.any (fn x -> mentions_refine k mi x n) (list_cons head args),
+            [:apply, head, args, _] => list.any (fn x -> mentions_refine k mi x n below) (list_cons head args),
             _ => false,
         }
     };
+
+/// Every named type that mentions a refinement within `depth` names, as
+/// `gi => true`: depth one reads nothing below it, and each depth after reads
+/// the one before.
+let refined_table k named depth =
+    list.fold (fn below n -> list.fold (fn acc kv -> {
+        let [mi, _, desc, _] = list.nth 1 kv;
+        if mentions_refine k mi desc n below { acc.[list.nth 0 kv => true] } else { acc }
+    }) %{} (map_pairs named)) %{} (list.range 1 (depth + 1));
 
 /// Whether a checker type could put a predicate between a value and itself.
 let rec refines k t n =
@@ -2389,10 +2403,7 @@ let checker l r = {
         let [owner, t, _] = list.nth 1 kv;
         unknown_types k0 (in_module owner) t (modules.module_source (modules.module_at l owner)) d
     }) ds (map_pairs sigs);
-    let refined = list.fold (fn acc kv -> {
-        let [mi, _, desc, _] = list.nth 1 kv;
-        if mentions_refine k0 mi desc 8 { acc.[list.nth 0 kv => true] } else { acc }
-    }) %{} (map_pairs named);
+    let refined = refined_table k0 named 8;
     let k1 = Checker.set_refined (Checker.set_sigs (Checker.set_uses k0 uses) evaluated) refined;
     [Checker.set_heads k1 (heads_of k0 l), unknown]
 };
@@ -2453,6 +2464,18 @@ let prepared l r comps = {
     let [k0, ds0] = checker l r;
     [with_comp_globals r (Checker.set_comps k0 comps), ds0]
 };
+
+/// What every body is checked against besides its own module's names: the
+/// signatures, the named types, what the `comp`s came to and what the checker
+/// worked out from them. A part's check is kept between builds under its walk's
+/// key and this (`compile.check_unit!`), so a signature changed in one module
+/// checks every part again -- any of them may call what it describes -- and a
+/// body changed without one checks only its own part. The loader and the
+/// resolution are left out: what a check reads of them is the part's names,
+/// which the walk's key already covers.
+let tables : Checker -> [:any];
+let tables k = [Checker.named k, Checker.sigs k, Checker.uses k, Checker.comps k,
+                Checker.refined k, Checker.heads k];
 
 /// The checker, asking `r` what a name means. A resolution made in parts knows
 /// the names of the bodies it walked and no others (see "resolving in parts" in

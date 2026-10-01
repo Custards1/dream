@@ -205,11 +205,25 @@ let start_child! sup c = {
     p
 };
 
+/// Start the child called `name` and record it as running.
+///
+/// The child is started here, before it is recorded. Handed to `map.put` as
+/// an argument, the start was a suspension stored in the table -- a map's
+/// values are lazy -- and nothing forced it unless somebody happened to read
+/// that child's pid. The first start did, by forcing the whole state; a
+/// `restart!` of a child that had already ended did not, so the child was
+/// listed as running and never ran, and a watcher waiting to hear it go down
+/// waited for ever. It showed only when the machine was busy enough for the
+/// first child's death to reach the supervisor before the restart did.
 let start_named! : :process -> State -> :string -> State;
 let start_named! sup s name =
     match child_named s name {
         () => s,
-        c => with_running (map.put (s_running s) name (start_child! sup c)) s,
+        c => {
+            let p = start_child! sup c;
+            strict! p
+            with_running (map.put (s_running s) name p) s
+        },
     };
 
 /// Ask a child to stop, and wait until it has.
@@ -430,14 +444,9 @@ when test {
     /// A supervisor is asynchronous, and there is no primitive that waits for
     /// it to have noticed something: the child's death and the supervisor's
     /// reading of it are two moments, sent by two different processes, and
-    /// nothing orders them. Each round trip through the mailbox gives the
-    /// pending report its turn, so this converges immediately in practice --
-    /// and answers whatever it has when it runs out of patience, so a genuine
-    /// disagreement still fails the case rather than hanging it.
-    let rec settle! sup want tries = {
-        let names = which! sup;
-        if names == want || tries <= 0 { names } else { settle! sup want (tries - 1) }
-    };
+    /// nothing orders them, so it asks until they agree, for as long as
+    /// `test.eventually!` allows.
+    let settle! sup want = test.eventually! (fn () -> which! sup) (fn names -> names == want) test.patience;
 
     let tests = [
         test.case "a supervisor starts its children"
@@ -466,7 +475,7 @@ when test {
                               [child_with "once" quitter! :temporary] default_limits;
                 // It ends on its own; the supervisor drops it rather than
                 // starting it again.
-                let names = settle! sup [] 100;
+                let names = settle! sup [];
                 stop! sup
                 test.eq! [] names
             } ),

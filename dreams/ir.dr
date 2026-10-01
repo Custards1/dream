@@ -139,7 +139,7 @@ priv let nth = list.nth;
 // `check_expr` before that, and `check_expr` was not the problem.)
 // The tables depend only on the bytecode vocabulary, so build them into the
 // compiler image. Destructuring makes each column's meaning explicit.
-priv let op_codes = comp fold (fn m [op, code, _] -> m.[op => code]) %{} ops;
+let op_codes = comp fold (fn m [op, code, _] -> m.[op => code]) %{} ops;
 priv let op_names = comp fold (fn m [op, _, name] -> m.[op => name]) %{} ops;
 priv let op_of_codes = comp fold (fn m [op, code, _] -> m.[code => op]) %{} ops;
 

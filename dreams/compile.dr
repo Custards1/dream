@@ -34,6 +34,7 @@ import dreams.opt as optimizer;
 import dreams.scope;
 import dreams.typecheck;
 import dreams.contract;
+import dreams.unit;
 import std.vm;
 
 // --- what to compile it as ------------------------------------------------------
@@ -62,6 +63,10 @@ mapping Options {
     payloads = []
     parallel = false
     payload_names = []
+    // Where parts are kept between builds (`--units DIR`, see `dreams/unit.dr`),
+    // or `()`: only a parallel build is in parts, so only one reads or keeps
+    // them.
+    units = ()
 }
 
 /// The defaults: checked, shared, no payload.
@@ -69,7 +74,7 @@ let options = Options.new ();
 
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
-let scratch = Options.make false false [] false [];
+let scratch = Options.make false false [] false [] ();
 
 // --- a build --------------------------------------------------------------------
 
@@ -108,12 +113,12 @@ let build! l o = {
     // keeps each part's name uses in the part, and lowering the arena whole
     // (`--no-opt`) asks them all of one resolution.
     let parted = parallel && Options.optimize o;
-    let r = if parted { scope.resolve_parts! l lower.part_count } else { scope.resolve! l };
+    let r = if parted { scope.resolve_parts! l (Options.units o) } else { scope.resolve! l };
     // A build that will be optimized is lowered in parts, in several processes
     // at once (`lower.link_parallel!`); one that will not keeps the arena
     // exactly as `lower` builds it, which the parts cannot, since each is
     // shared before it is merged.
-    let low = if parted { lower.link_parallel! l r } else { lower.link! l r };
+    let low = if parted { lower.link_parallel! l r (Options.units o) } else { lower.link! l r };
     let front = list.append (modules.diags l) (lower.all_diags r low);
     // One checker for the diagnostics, the contracts and both of the JIT's
     // parameter masks. Lazy, so a build without types never makes it -- and
@@ -134,7 +139,7 @@ let build! l o = {
                     }
                 };
     let known = if parallel && Options.types o && diag.error_count front == 0 {
-                    analyze_parallel! l r (lower.comp_values low)
+                    analyze_parallel! l r (lower.comp_values low) (Options.units o)
                 } else { facts };
     let checked = type_diags! (Options.types o) known low front;
     let all = list.append front checked;
@@ -166,30 +171,61 @@ let share_elsewhere! p = {
 /// at once: the same answer `typecheck.analyze` gives, in about a quarter of
 /// the time. The checker is built here, once, and shared, so each process is
 /// handed a pointer to it; each answers what its bodies said, against their
-/// positions, and `typecheck.concluded` lays them back in order.
-let analyze_parallel! l r comps = {
+/// positions, and `typecheck.concluded` lays them back in order. With a unit
+/// cache, a part resolved in parts is checked once for a given walk and given
+/// checker tables, and read back after (`check_unit!`).
+let analyze_parallel! l r comps cache = {
     let kd = vm.share! (typecheck.prepared l r comps);
     let k = list.head kd;
+    let tables = match cache { () => (), _ => unit.digest (typecheck.tables k) };
+    strict! tables
+    let key_of pr = match tables {
+        () => (),
+        digest => match scope.unit_key pr { () => (), walk => unit.key ["check", walk, digest] },
+    };
     let work = match scope.parts r {
         () => {
             let all = scope.bodies r;
             let numbered = list.zip (list.range 0 (list.length all)) all;
-            list.map (fn j -> [k, list.filter (fn nb -> list.head nb % lower.part_count == j) numbered])
+            list.map (fn j -> [k, list.filter (fn nb -> list.head nb % lower.part_count == j) numbered, ()])
                      (list.range 0 lower.part_count)
         },
-        walked => list.map (fn pr -> [typecheck.with_resolution k pr, scope.part_bodies pr]) walked,
+        walked => list.map (fn pr -> [typecheck.with_resolution k pr, scope.part_bodies pr, key_of pr]) walked,
     };
     strict! work
-    let running = strict! (list.map (fn w -> check_elsewhere! (list.head w) (list.nth 1 w)) work);
+    let running = strict! (list.map (fn w -> check_elsewhere! (match list.nth 2 w { () => (), _ => cache })
+                                                              (list.nth 2 w) (list.head w) (list.nth 1 w)) work);
     let said = list.concat (strict! (list.map (fn pr -> join! pr) running));
     let ordered = list.map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said);
     strict! (typecheck.concluded k r (list.nth 1 kd) ordered)
 };
 
 /// A process checking some bodies against a shared checker. Its own function
-/// for the reason `share_elsewhere!` is.
-let check_elsewhere! k slice =
-    spawn! $( vm.share! (list.map (fn nb -> [list.head nb, typecheck.check_decl k (list.nth 1 nb) []]) slice) );
+/// for the reason `share_elsewhere!` is, and its cache and key strict for the
+/// reason `lower.part_elsewhere!`'s are.
+let check_elsewhere! !cache !key k slice = spawn! $( vm.share! (check_unit! cache key k slice) );
+
+/// What some bodies said, or what they said the last time they were checked
+/// against the same walk and the same tables. Kept with positions counted from
+/// the part's first body, as a walk is, so a body added to an earlier module
+/// does not make every later part's check a stranger.
+let check_unit! cache key k slice = match [cache, slice] {
+    [(), _] => check_bodies k slice,
+    [_, []] => check_bodies k slice,
+    [_, [[from, .._], .._]] => {
+        let said = match unit.recall! cache "check" key {
+            () => {
+                let fresh = check_bodies k (unit.shifted (0 - from) slice);
+                unit.keep! cache "check" key fresh
+                fresh
+            },
+            kept => kept,
+        };
+        unit.shifted from said
+    },
+};
+
+let check_bodies k slice = list.map (fn nb -> [list.head nb, typecheck.check_decl k (list.nth 1 nb) []]) slice;
 
 /// What a program's signatures and contracts say is wrong with it, given what
 /// the earlier stages said. Nothing, when they already found an error or the

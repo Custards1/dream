@@ -26,6 +26,7 @@
 // then every body is checked against the finished environments.
 
 import std.list;
+import std.map;
 import std.vm;
 import std.str;
 import std.macros;
@@ -35,6 +36,7 @@ import dreams.builtins;
 import dreams.diag;
 import dreams.fuse;
 import dreams.modules;
+import dreams.unit;
 
 // --- what a name in front of a dot can be ------------------------------------
 //
@@ -2214,15 +2216,20 @@ let walk_part l base numbered = {
 let merge_parts declared r0 base walked = {
     let f0 = func_count base;
     let g0 = next_global base;
+    // A part numbered what it invented from `invent_base`; its `go` takes
+    // those to where they stand after the declarations and the parts before.
     let counted = list.fold (fn acc r -> {
         let [fo, go, out] = acc;
-        [fo + func_count r - f0, go + next_global r - g0, list_cons [fo, go] out]
+        [fo + func_count r - f0, go + next_global r - invent_base, list_cons [fo, g0 - invent_base + go] out]
     }) [0, 0, []] walked;
-    let offsets = list.reverse (list.nth 2 counted);
-    let told = list.map (fn k -> (walked.[k]).[:part_offsets => offsets.[k]])
-                        (list.range 0 (list.length walked));
+    // Arrays where a part is read by its index in a loop over the parts, as
+    // in `lower.link_head`: read from a list, each is a walk to the part.
+    let offsets = array_of_list (list.reverse (list.nth 2 counted));
+    let told = list.map (fn kr -> (list.nth 1 kr).[:part_offsets => offsets.[list.head kr]])
+                        (list.zip (list.range 0 (list.length walked)) walked);
+    let ta = array_of_list told;
     let funcs = list.fold (fn m k -> {
-        let r = told.[k];
+        let r = ta.[k];
         let fo = list.head (offsets.[k]);
         list.fold (fn m2 i -> m2.[i + fo => func_at r i]) m (list.range f0 (func_count r))
     }) (func_map base) (list.range 0 (list.length told));
@@ -2232,14 +2239,14 @@ let merge_parts declared r0 base walked = {
     };
     let placed = list.sort_on (fn pb -> list.head pb) (list.concat (list.map (fn k -> {
         let fo = list.head (offsets.[k]);
-        list.map (fn pb -> moved_body pb fo) (part_bodies (told.[k]))
+        list.map (fn pb -> moved_body pb fo) (part_bodies (ta.[k]))
     }) (list.range 0 (list.length told))));
     let candidates = list.sort_on (fn pc -> list.head pc) (list.concat (list.map (fn r ->
         list.zip (list.map (fn pb -> list.head pb) (part_bodies r)) (r.[:part_candidates else []])) told));
     let invented = list.concat (list.map (fn k -> {
         let [fo, go] = offsets.[k];
         list.map (fn g -> [list.nth 0 g + go, list.nth 1 g, list.nth 2 g, list.nth 3 g + fo])
-                 (fused (told.[k]))
+                 (fused (ta.[k]))
     }) (list.range 0 (list.length told)));
     let notes = list.sort_on (fn n -> list.head n) (list.concat (list.map (fn r -> r.[:part_notes else []]) told));
     let bs = list.map (fn pb -> list.nth 1 pb) placed;
@@ -2247,7 +2254,7 @@ let merge_parts declared r0 base walked = {
     let numbered = (base.[:funcs => funcs]).[:func_count => f0 + list.head counted];
     let queued = (numbered.[:bodies => list.reverse bs]).[:next_global => g0 + list.nth 1 counted];
     let whole = (((queued.[:fused => list.reverse invented]).[:diags => list.append (r_diags base) said])
-                    .[:parts => told]).[:invented_from => g0];
+                    .[:parts => told]).[:invented_from => invent_base];
     finish_walk declared r0 state whole bs (list.map (fn pc -> list.nth 1 pc) candidates)
 };
 
@@ -2255,29 +2262,153 @@ let merge_parts declared r0 base walked = {
 /// the starting state and every part are shared (`vm.share!`), so what crosses
 /// between processes is pointers; see "resolving in parts" for what the
 /// answer does and does not hold.
-let resolve_parts! l part_count = {
+let resolve_parts! l cache = {
     let declared = declare! l;
     let r0 = ((((((((resolver (envs declared))).[:imports => (s_imports declared)])).[:module_recs => (s_module_recs declared)])).[:diags => (diags declared)])).[:fuse => true];
     let seeded = list.fold (fn r e ->
         r.[:refs => (((refs r)).[(ref_key (list.nth 0 e) (list.nth 1 e) (list.nth 2 e)) => (list.nth 3 e)])])
         r0 (modules.expansions l);
     let shared_l = vm.share! l;
-    let base = vm.share! (walk_base shared_l declared seeded 0);
+    let declared_base = walk_base shared_l declared seeded 0;
+    // Every part invents its globals from `invent_base` rather than from where
+    // the declarations left off, and `merge_parts` moves them to where they
+    // belong, as it moves each part's functions. The number of declarations
+    // is then nothing a part's walk depends on, so adding one does not make
+    // every part another part (see "a part as a unit").
+    let base = vm.share! (declared_base.[:next_global => invent_base]);
+    let common = match cache { () => "", _ => common_key l base };
+    let under = match cache { () => %{}, _ => modules_under l };
     let all = pending declared;
     let numbered = list.zip (list.range 0 (list.length all)) all;
-    // Dealt before any process starts, for the reason `lower.link_parallel!`
-    // gives.
-    let slices = strict! (list.map (fn k -> list.filter (fn np -> list.head np % part_count == k) numbered)
-                                   (list.range 0 part_count));
-    let running = strict! (list.map (fn slice -> walk_elsewhere! shared_l base slice) slices);
+    // One part per module whose bodies it walks, in the order of the modules:
+    // a module's bodies are what a change to it changes, so a part is a unit
+    // that can be kept between builds (see "a part as a unit"). Dealt before
+    // any process starts, for the reason `lower.link_parallel!` gives.
+    let by_module = list.fold (fn m np -> {
+        let mi = list.head (list.nth 1 np);
+        m.[mi => list_cons np (m.[mi else []])]
+    }) (%{}) numbered;
+    let slices = strict! (list.map (fn mi -> list.reverse (by_module.[mi]))
+                                   (list.sort (list.map list.head (map_pairs by_module))));
+    let key_of slice = match cache {
+        () => "",
+        _ => part_key under base common (list.head (list.nth 1 (list.head slice))),
+    };
+    let running = strict! (list.map (fn slice -> walk_elsewhere! cache shared_l base (key_of slice) slice) slices);
     let walked = strict! (list.map (fn pr -> join! pr) running);
-    merge_parts declared seeded base walked
+    merge_parts declared seeded declared_base walked
 };
 
 /// A process walking one part. Its own function so that the suspension
 /// `spawn!` copies holds the loader, the state and the slice -- all shared, or
-/// small -- and nothing else.
-let walk_elsewhere! l base slice = spawn! $( vm.share! (walk_part l base slice) );
+/// small -- and nothing else. The cache and the key are strict for the same
+/// reason: handed in unforced, the key was a suspension of the caller's frame,
+/// and every part's process was given a copy of the whole resolution with it
+/// -- 1.7 GB more copied on a self-compile, and twice the time, with no cache
+/// at all.
+let walk_elsewhere! !cache l base !base_key slice = spawn! $( vm.share! (walk_unit! cache l base base_key slice) );
+
+// --- a part as a unit ---------------------------------------------------------------
+//
+// A part's walk is a function of the state every part starts from and of its
+// own module's bodies, so with a unit cache it is kept, as what it added to
+// that state, under a key made of both (see `dreams/unit.dr`). It is walked
+// with positions counted from its own first body, and shifted to where it
+// stands after: a body added to an earlier module moves every later one, and
+// a unit that held absolute positions would be stale for no reason. The key
+// holds only the part of that state the part can read (`part_key`): the
+// environments of the modules its own can name, and not the number of globals
+// declared, since the globals it invents are numbered from `invent_base`.
+
+/// Where a part walked in parts numbers the globals it invents. Past any
+/// program's declarations by far, so that nothing at or above it is a declared
+/// global, and small enough to stay a fixnum through every offset added to it.
+let invent_base = 67108864;
+
+/// What every part's key holds: the state every part starts from, less what no
+/// walk reads, and less the environments, which a part's key holds only as many
+/// of as it can see (`part_key`). Less `defs`, the outline of every declaration
+/// with its span -- one character typed anywhere moved a span in it. Less the
+/// declaring pass's diagnostics and `module_recs`, which the walk carries and
+/// never reads. With the modules' names, which the walk reads from the loader
+/// for a group's members.
+let common_key l base = unit.digest [
+    list.fold (fn b k -> map_remove b k) base [:defs, :envs, :diags, :module_recs],
+    list.map (fn i -> modules.module_name (modules.module_at l i)) (list.range 0 (modules.module_count l)),
+];
+
+/// A part's key: what every part shares, and the environments of the modules
+/// the part's own module can reach. A name is resolved in the module's own
+/// environment, and through it -- an alias, an `import a.{x}` selection, a
+/// namespace -- in the environment of a module it names, or of one of that
+/// module's submodules; no walk reads any other. So a declaration added to a
+/// module moves the parts that can see it and not the rest, as long as it
+/// moves no other module's globals: globals are numbered in module order, so
+/// one added early in the program is still seen by nearly every part.
+let part_key : :map -> :map -> :string -> :integer -> :string;
+let part_key under base common mi = {
+    let seen = reached_modules (env_at base mi) (%{ mi => true });
+    let visible = list.fold (fn acc key -> list.fold (fn a i -> a.[i => true]) acc (under.[key else []]))
+                            seen (map.keys seen);
+    let ordered = list.sort (list.filter (fn t -> type_of t == :integer) (map.keys visible));
+    unit.key ["base", common, unit.digest (list.map (fn t -> [t, env_at base t]) ordered)]
+};
+
+/// The modules under each module and each namespace, by the module's index or
+/// the namespace's name: `std` and `std.list` lead to `std.list.sorted`, if
+/// there is one. Made once for every part's key, since asked per part it was
+/// every module's name against every prefix, for every part -- a quadratic
+/// that made a warm build of 800 modules slower than no cache at all.
+let modules_under : modules.Loader -> :map;
+let modules_under l = {
+    let count = modules.module_count l;
+    let index = list.fold (fn m i -> m.[modules.module_name (modules.module_at l i) => i]) (%{}) (list.range 0 count);
+    list.fold (fn acc i -> {
+        let parts = str.split "." (modules.module_name (modules.module_at l i));
+        let prefixes = list.map (fn n -> str.join_str "." (list.take n parts)) (list.range 1 (list.length parts));
+        list.fold (fn a pre -> {
+            let by_name = a.[pre => list_cons i (a.[pre else []])];
+            match index.[pre else ()] { () => by_name, t => by_name.[t => list_cons i (by_name.[t else []])] }
+        }) acc prefixes
+    }) (%{}) (list.range 0 count)
+};
+
+/// Every module an environment names, as `index => true`, and every namespace,
+/// as `prefix => true`: read off the environment whole, so that no way of
+/// naming a module is missed.
+let rec reached_modules v acc = match v {
+    [:dream, t] if type_of t == :integer => acc.[t => true],
+    [:group, p] if type_of p == :string => acc.[p => true],
+    xs if type_of xs == :list => list.fold (fn a x -> reached_modules x a) acc xs,
+    m if type_of m == :map => list.fold (fn a kv -> reached_modules (list.nth 1 kv) a) acc (map_pairs m),
+    _ => acc,
+};
+
+/// Walk one part, or read it back.
+let walk_unit! cache l base base_key slice = match cache {
+    () => walk_part l base slice,
+    _ => walk_kept! cache l base base_key slice,
+};
+
+let walk_kept! cache l base base_key slice = {
+    let from = list.head (list.head slice);
+    let local = unit.shifted (0 - from) slice;
+    let k = match cache { () => (), _ => unit.key ["walk", base_key, unit.digest local] };
+    let walked = match unit.recall! cache "walk" k {
+        () => {
+            let r = walk_part l base local;
+            unit.keep! cache "walk" k (unit.delta base r)
+            r
+        },
+        d => unit.restore base d,
+    };
+    (((walked.[:part_bodies => unit.shifted from (part_bodies walked)])
+        .[:part_notes => unit.shifted from (walked.[:part_notes else []])])).[:unit_key => k]
+};
+
+/// The key a part was kept under, or `()` for a build that keeps none. What
+/// lowering keys the part's lowering by, with the wrappers it lowers against.
+let unit_key r = r.[:unit_key else ()];
 
 // --- wrappers ---------------------------------------------------------------------
 //

@@ -18,6 +18,7 @@
 #include "interp.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
+#include "sha256.hpp"
 
 #if defined(__linux__) && !defined(DREAM_PORTABLE_POLLER)
 #define DREAM_HAVE_EPOLL 1
@@ -94,6 +95,8 @@ bool is_string(Value v) { return is_obj(resolve(v), ObjType::Str); }
 // handed out for the same number. That is the whole safety argument: no Dream
 // program can reach a descriptor it was not given, or one it has closed.
 // ---------------------------------------------------------------------------
+
+void forget_waiter(int fd);
 
 struct Handle {
     int fd = -1;
@@ -185,7 +188,18 @@ public:
                 h.fd = -1;
             }
         }
-        if (to_close >= 0) sys::close(to_close);
+        if (to_close >= 0) {
+            // The close `close!` put off until this operation finished. That
+            // operation may have gone on to park its process on the
+            // descriptor -- `accept!` holds the handle until it has armed the
+            // poller -- and `close!`'s own `forget` ran before there was a
+            // waiter to release. Closing silently here left it parked for
+            // ever: a closed descriptor leaves epoll without an event. A test
+            // that stopped a listener while its accept loop was between the
+            // two hung at exit about one run in ten.
+            forget_waiter(to_close);
+            sys::close(to_close);
+        }
     }
 
     /// Every open handle, for `std.vm`.
@@ -705,6 +719,92 @@ NativeResult io_is_dir(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_bool(S_ISDIR(st.st_mode)));
 }
 
+// --- stamps and digests -------------------------------------------------------
+//
+// What a build cache is made of. A file's stamp -- its size and when it was
+// last written -- is kept beside the digest of its contents, and the contents
+// are read again only when the stamp has moved: git's index trick, and what
+// lets a build where nothing changed cost a `stat` per input. Digesting is
+// done here rather than in Dream because it is the one part of a no-op build
+// that would otherwise read every byte of every input.
+
+/// When a file was last written, in nanoseconds since the epoch. Windows keeps
+/// seconds in `_stat64`, which is coarser but still a stamp: a file rewritten
+/// within the second at the same size is read again only if something else
+/// moved, the same risk git's index accepts on filesystems with coarse times.
+int64_t modified_ns(const sys::FileStat& st) {
+#if defined(_WIN32)
+    return int64_t(st.st_mtime) * 1000000000;
+#elif defined(__APPLE__)
+    return int64_t(st.st_mtimespec.tv_sec) * 1000000000 + st.st_mtimespec.tv_nsec;
+#else
+    return int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+#endif
+}
+
+/// `[size, modified, kind]`, or `()` when nothing is there.
+///
+/// Nothing being there is an answer rather than a raise, because it is the
+/// question a stamp check most often asks: an input that has been deleted has
+/// moved as surely as one that has been rewritten. A list rather than a map
+/// because it is a stamp, compared whole far more often than it is read.
+NativeResult io_stat(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "stat! needs a path");
+    std::string path = string_arg(args[0]);
+    sys::FileStat st{};
+    if (sys::stat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return NativeResult::ok(UNIT);
+        return fail_errno(p, "stat " + path, errno);
+    }
+    const char* kind = S_ISDIR(st.st_mode) ? "dir" : S_ISREG(st.st_mode) ? "file" : "other";
+    Value k = make_atom(p.runtime().intern_atom(kind));
+    Value list = p.heap().make_cons(k, NIL);
+    list = p.heap().make_cons(make_integer(p, modified_ns(st)), list);
+    list = p.heap().make_cons(make_integer(p, int64_t(st.st_size)), list);
+    return NativeResult::ok(list);
+}
+
+Value hex_string(Process& p, const std::string& hex) {
+    return p.heap().make_string(hex.data(), uint32_t(hex.size()));
+}
+
+/// The SHA-256 of a file's contents, as 64 hex digits. It reads the file here
+/// rather than handing it to Dream a chunk at a time, which is the point: a
+/// megabyte of input is one call and no allocation on the Dream heap.
+NativeResult io_digest_file(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "digest! needs a path");
+    std::string path = string_arg(args[0]);
+    int fd = sys::open(path.c_str(), O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return fail_errno(p, "digest " + path, errno);
+    Sha256 sha;
+    std::vector<char> buf(1 << 16);
+    for (;;) {
+        sys::Count got = sys::read(fd, buf.data(), buf.size());
+        if (got == 0) break;
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            sys::close(fd);
+            return fail_errno(p, "digest " + path, e);
+        }
+        sha.update(buf.data(), size_t(got));
+    }
+    sys::close(fd);
+    return NativeResult::ok(hex_string(p, sha.hex()));
+}
+
+/// The SHA-256 of a string, the same digest `digest!` gives the file holding
+/// it. Pure, and in `std.io` rather than among the builtins because it is the
+/// same question as `digest!` asked of bytes already in hand, and a builtin
+/// would cost an opcode for something no inner loop calls.
+NativeResult io_digest(Process& p, Value, Value* args, uint32_t) {
+    Bytes b;
+    if (!string_bytes(args[0], &b)) return fail(p, "type_error", "digest needs a string");
+    Sha256 sha;
+    sha.update(b.data, size_t(b.len));
+    return NativeResult::ok(hex_string(p, sha.hex()));
+}
+
 NativeResult io_remove(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "remove! needs a path");
     std::string path = string_arg(args[0]);
@@ -926,6 +1026,8 @@ NativeResult net_shutdown(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(UNIT);
 }
 
+void forget_waiter(int fd) { Poller::get().forget(fd); }
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1072,9 @@ ModuleDef make_io_module() {
                          {"remove!", 1, 0b1, io_remove},
                          {"rename!", 2, 0b11, io_rename},
                          {"mkdir!", 1, 0b1, io_mkdir},
+                         {"stat!", 1, 0b1, io_stat},
+                         {"digest!", 1, 0b1, io_digest_file},
+                         {"digest", 1, 0b1, io_digest},
                          {"async", 1, 0b1, io_async},
                      }};
 }

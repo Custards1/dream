@@ -130,13 +130,23 @@ let callbacks! u = {
 
 let compare! a b = { console.print! "never"; a - b };
 
+/// A map as its pairs in key order, all the way down. A map prints in the order
+/// its keys hash, and an atom hashes by its index in the image, which moves
+/// whenever the compiler numbers the image differently; what is being tested
+/// is the layout, not the order a map happens to print in.
+let ordered v = match type_of v {
+    :map => list.map (fn [k, x] -> [k, ordered x]) (list.sort_on list.head (map_pairs v)),
+    :list => list.map ordered v,
+    _ => v,
+};
+
 let memory! u = {
     section! "memory"
     console.print! [sample.point_size (), sample.Point.size]
-    console.print! sample.Point.layout
+    console.print! (ordered sample.Point.layout)
     let b = sample.Point.new! ();
     sample.fill! b 3 1.5
-    console.print! (sample.Point.read! b)
+    console.print! (ordered (sample.Point.read! b))
     sample.Point.write! b %{ :x => 10 }
     console.print! (sample.point_sum b)
     console.print! (sample.Point.offset :y)
