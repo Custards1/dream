@@ -117,6 +117,36 @@ let main! = {
     console.print! ((col * 2.0) @ tall2 == tensor.host (col * 2.0) @ tall2)
     console.print! (tall @ (col + 1.0) == tall @ tensor.host (col + 1.0))
 
+    // A reshape copies nothing, an outer product is a product, and a dot
+    // product of deferred vectors is a fused multiply and sum.
+    let flat = tensor.reshape [6000] m;
+    console.print! (tensor.reshape [100, 60] m @ u == tensor.host (tensor.reshape [100, 60] m) @ u)
+    console.print! (flat * 2.0 == tensor.reshape [6000] (m * 2.0))
+    let a1 = tensor.random 15 [100];
+    let b1 = tensor.random 16 [80];
+    console.print! (tensor.relu (tensor.outer a1 b1 - 0.25) == tensor.relu (tensor.host (tensor.outer a1 b1) - 0.25))
+    console.print! (tensor.at (tensor.outer a1 b1) [7, 9] == tensor.at a1 [7] * tensor.at b1 [9])
+    console.print! (near (tensor.dot (flat * 2.0) flat) (tensor.dot (tensor.host (flat * 2.0)) (tensor.host flat)))
+    console.print! (near ((flat - 1.0) @ (flat + 1.0)) (tensor.host (flat - 1.0) @ tensor.host (flat + 1.0)))
+
+    // Sums along an axis run the operand's program as they sum. Each answer
+    // adds along the axis in order, so it is exactly the plain sum written
+    // out one float at a time.
+    let along0 = tensor.sum_axis 0 (m * 2.0 + n);
+    let along1 = tensor.sum_axis 1 (m * 2.0 + n);
+    console.print! (along0 == tensor.sum_axis 0 (tensor.host (m * 2.0 + n)))
+    console.print! (tensor.at along0 [37] == list.fold (fn acc i -> acc + (tensor.at m [i, 37] * 2.0 + tensor.at n [i, 37])) 0.0 (list.range 0 60))
+    console.print! (tensor.at along1 [41] == list.fold (fn acc j -> acc + (tensor.at m [41, j] * 2.0 + tensor.at n [41, j])) 0.0 (list.range 0 100))
+    let cube = tensor.reshape [6, 10, 100] (m - n);
+    console.print! (tensor.at (tensor.sum_axis 1 cube) [4, 77] == list.fold (fn acc j -> acc + (tensor.at m [40 + j, 77] - tensor.at n [40 + j, 77])) 0.0 (list.range 0 10))
+    console.print! (tensor.sum_axis 1 (w @ x) == tensor.sum_axis 1 (tensor.host (w @ x)))
+
+    // A reduction of a product folds each tile as it is finished.
+    console.print! (near (tensor.sum (w @ x)) (tensor.sum (tensor.host (w @ x))))
+    console.print! (tensor.maximum (tensor.relu (big @ wide - 70.0)) == tensor.maximum (tensor.relu (tensor.host (big @ wide) - 70.0)))
+    console.print! (tensor.minimum (tall @ col) == tensor.minimum (tensor.host (tall @ col)))
+    console.print! (near (tensor.mean (w @ x + 1.0)) (tensor.mean (tensor.host (w @ x) + 1.0)))
+
     // Products and moves read the numbers of a deferred operand.
     console.print! (near (tensor.sum ((m + 0.0) @ tensor.transpose n)) (tensor.sum (m @ tensor.transpose n)))
     console.print! (tensor.to_list (tensor.reshape [6000] (m * 1.0)) == tensor.to_list (tensor.reshape [6000] m))

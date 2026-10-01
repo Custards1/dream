@@ -278,7 +278,8 @@ product as it is finished, or in the product kernel itself on the GPU. A
 transpose defers too, and is read where it lies: by a chain, or by a
 product's strides (`a @ tensor.transpose b` copies nothing). A chain feeding
 a product on the host is computed as the product packs it. A reduction of
-such a chain never stores it. Nothing about
+such a chain never stores it, and neither do `sum_axis` and `dot`. A reshape
+copies nothing. Nothing about
 this is visible except the speed: a deferred tensor has its type and shape,
 and shape errors are raised where they always were. `strict!` computes one,
 which is what timing or `vm.share!` wants.

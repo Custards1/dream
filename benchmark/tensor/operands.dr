@@ -33,5 +33,24 @@ let main! = {
     best! "a @ transpose b, stepped" (fn () -> a @ strict! (tensor.transpose b));
     best! "a @ transpose b, strided" (fn () -> a @ tensor.transpose b);
     best! "transpose a @ b, stepped" (fn () -> strict! (tensor.transpose a) @ b);
-    best! "transpose a @ b, strided" (fn () -> tensor.transpose a @ b)
+    best! "transpose a @ b, strided" (fn () -> tensor.transpose a @ b);
+    best! "sum_axis 0, stepped" (fn () -> tensor.sum_axis 0 (strict! (m * 2.0 + n)));
+    best! "sum_axis 0, fused  " (fn () -> tensor.sum_axis 0 (m * 2.0 + n));
+    best! "sum_axis 1, stepped" (fn () -> tensor.sum_axis 1 (strict! (m * 2.0 + n)));
+    best! "sum_axis 1, fused  " (fn () -> tensor.sum_axis 1 (m * 2.0 + n));
+    let flat = tensor.reshape [4000000] m;
+    best! "dot of a chain, stepped" (fn () -> tensor.dot (strict! (flat * 2.0)) flat);
+    best! "dot of a chain, fused  " (fn () -> tensor.dot (flat * 2.0) flat);
+    let wide = tensor.random 7 [4096, 64];
+    let tall = tensor.random 8 [64, 4096];
+    best! "sum of product, stepped" (fn () -> tensor.sum (strict! (wide @ tall)));
+    best! "sum of product, folded " (fn () -> tensor.sum (wide @ tall));
+    if tensor.gpu_available () {
+        let gx = tensor.gpu (tensor.random 9 [1024, 256]);
+        let gw = tensor.gpu (tensor.random 10 [256, 256]);
+        best! "gpu chain into product, stepped" (fn () -> tensor.host (strict! ((gx - 0.5) * 2.0) @ gw));
+        best! "gpu chain into product, fused  " (fn () -> tensor.host ((gx - 0.5) * 2.0 @ gw));
+        best! "gpu sum_axis, before (round trip)" (fn () -> tensor.gpu (tensor.sum_axis 0 (tensor.host (tensor.gpu m * 2.0))));
+        best! "gpu sum_axis, fused             " (fn () -> tensor.host (tensor.sum_axis 0 (tensor.gpu m * 2.0)))
+    } else { () }
 };

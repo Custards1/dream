@@ -7,10 +7,14 @@
 // (gpu.cpp). Which backend runs is decided by where the operands are, never by
 // the operation: a program moves a tensor to the GPU with `tensor.gpu` and
 // everything it then does to it -- `+`, `@`, `tensor.sum` -- runs there, and
-// `tensor.host` brings an answer back. An operation the GPU has no kernel for
-// still works on a GPU tensor; it reads the numbers back, runs on the host, and
-// puts the answer on the GPU, so a program is never wrong for having moved,
-// only slower than it could be.
+// `tensor.host` brings an answer back. Every operation has a GPU form; what
+// reads numbers back to the host is only what answers in host terms -- a
+// number, a list, a printed string, `==`.
+//
+// Elementwise work, products, transposes and reductions do not compute where
+// they are called: they record a program and compute it, fused, when
+// something reads the numbers. "fusion" below is the mechanism, and
+// docs/notes/tensors.md the measurements.
 //
 // Nothing here forces anything but the arguments of `std.tensor` functions
 // that take lists. The operators reach this from `arith`, which holds its
@@ -236,17 +240,6 @@ bool upload(Process& p, const Shape& s, const double* data, int dtype, Value* ou
     }
     *out = wrap_gpu(p, s, dtype, b);
     return true;
-}
-
-/// A host answer computed for a GPU operand, put back where the operand was.
-/// This is the fallback that keeps every operation correct on the GPU.
-bool place_like(Process& p, const TensorObj* like, Value host, Value* out) {
-    if (!on_gpu(like)) {
-        *out = host;
-        return true;
-    }
-    auto* t = static_cast<TensorObj*>(as_obj(host));
-    return upload(p, shape_of(t), t->data(), like->dtype, out);
 }
 
 // --- reading Dream data into a tensor ----------------------------------------------
@@ -802,15 +795,23 @@ const double* run_block(const FuseProgram& prog, TensorObj* const* inputs, const
 /// Run `body(begin, end)` over `[0, n)`, split across threads when `n` is
 /// large enough that the threads pay for themselves. Elementwise work is
 /// bound by memory, not arithmetic, so the line is higher than the product's.
+///
+/// `work` is how many numbers the whole range touches, when that is not `n`
+/// -- a sum along an axis does `n` outputs' worth of `len` each -- and
+/// `align` the granule a chunk is a multiple of.
 template <class Body>
-void parallel_range(size_t n, Body body) {
-    const size_t threads = n < (size_t(1) << 18) ? 1 : std::min<size_t>(tensor_threads(), n >> 16);
+void parallel_range(size_t n, Body body, size_t work = 0, size_t align = kFuseBlock) {
+    if (work == 0) work = n;
+    const size_t threads = work < (size_t(1) << 18)
+                               ? 1
+                               : std::min<size_t>({size_t(tensor_threads()), work >> 16,
+                                                   (n + align - 1) / align});
     if (threads <= 1) {
         body(size_t(0), n, size_t(0));
         return;
     }
     size_t chunk = (n + threads - 1) / threads;
-    chunk = (chunk + kFuseBlock - 1) / kFuseBlock * kFuseBlock;
+    chunk = (chunk + align - 1) / align * align;
     std::vector<std::thread> pool;
     size_t index = 1;
     for (size_t b = chunk; b < n; b += chunk, ++index)
@@ -914,6 +915,11 @@ struct OperandPlan {
     Program prog;
     FuseProgram view{};
     size_t cols = 0;
+    // A deferred operand on the GPU: its program and buffers, for the
+    // generated product kernel to compute as it loads.
+    gpu::Buffer* ins[kFuseMaxInputs];
+    size_t counts[kFuseMaxInputs], rows[kFuseMaxInputs];
+    gpu::OperandProgram on_device{};
 };
 
 /// `len` numbers of a deferred operand's row `row` from column `col`. Called
@@ -943,6 +949,14 @@ void plan_operand(TensorObj* t, size_t cols, OperandPlan& plan) {
         return;
     }
     append(plan.prog, from_obj(t));
+    if (!plan.prog.product_a && plan.prog.ncode == 1 && plan.prog.code[0] == FUSE_LOAD) {
+        // A reshape of a computed tensor: its numbers are the operand's, in
+        // the operand's order.
+        TensorObj* src = plan.prog.inputs[0];
+        if (on_gpu(src)) plan.device = gpu::Operand{buffer_of(src), cols, 1};
+        else plan.host = plain_operand(src->data(), cols);
+        return;
+    }
     if (is_transpose(plan.prog)) {
         // Element (i, j) of the transpose of an R x C source is the source's
         // (j, i): one step along a row of the transpose is a whole row of the
@@ -955,6 +969,13 @@ void plan_operand(TensorObj* t, size_t cols, OperandPlan& plan) {
     }
     plan.view = plan.prog.view();
     plan.cols = cols;
+    if (t->device == TENSOR_GPU) {
+        buffers_of(plan.prog, plan.ins, plan.counts, plan.rows);
+        plan.on_device = gpu::OperandProgram{plan.view, plan.ins, plan.counts, plan.rows,
+                                             plan.prog.consts};
+        plan.device = gpu::Operand{nullptr, 0, 0, &plan.on_device};
+        return;
+    }
     plan.host = GemmOperand{nullptr, 0, 0, operand_segment, &plan, 0};
 }
 
@@ -988,7 +1009,10 @@ bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device
         std::string why;
         bool ok;
         if (prog.product_a) {
-            ok = bare_product
+            // The fixed product kernel reads buffers; an operand that is a
+            // program needs a generated one, even with nothing after it.
+            const bool computed_operand = pa.device.program || pb.device.program;
+            ok = bare_product && !computed_operand
                      ? gpu::matmul(dtype, pa.device, pb.device, b, g.M, g.K, g.N, &why)
                      : gpu::fused_matmul(dtype, view, pa.device, pb.device, g.M, g.K, g.N, ins,
                                          counts, rows, prog.consts, b, &why);
@@ -1145,8 +1169,9 @@ bool map_unary(Process& p, int fn, TensorObj* x, Value* out) {
 /// The sum, minimum or maximum of every number `x` stands for. A deferred `x`
 /// is reduced as it is computed, block by block, and never stored.
 bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
-    // A product is computed, epilogue and all, and then folded: the fold has
-    // no tile of its own to ride along with.
+    // A product is computed, epilogue and all, and kept, and then folded.
+    // Folding each tile as the product finishes it was measured and not kept:
+    // see "Finishing fusion" in docs/notes/tensors.md.
     if (pending_product(x) && !settle(p, &x, err)) return false;
     Program prog;
     append(prog, from_obj(x));
@@ -1169,13 +1194,105 @@ bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
     return true;
 }
 
+/// The sums along an axis on the host, the operand's program computed as it
+/// is summed and never stored. `out` is `outer x inner` and zeroed; source
+/// position `(o * len + a) * inner + i` adds into `out[o * inner + i]`, in the
+/// order of `a`, which is what makes the answer the same at any thread count.
+///
+/// Two ways through, by the width of what follows the axis. A wide one adds a
+/// segment of a row per step along the axis, the threads dividing the
+/// outputs. A narrow one -- the last axis, `inner` 1 -- scans each output's
+/// whole contiguous range once, a block at a time, the threads dividing the
+/// rows; adding segments of one number would be a block evaluation per
+/// number.
+void sum_axis_host(const FuseProgram& prog, TensorObj* const* inputs, const double* consts,
+                   double* out, size_t outer, size_t len, size_t inner) {
+    const size_t work = outer * len * inner;
+    if (inner >= kFuseBlock) {
+        parallel_range(outer * inner, [&](size_t begin, size_t end, size_t) {
+            Scratch scratch(std::max(prog.depth, 1u));
+            std::vector<double> block(kFuseBlock);
+            for (size_t u = begin; u < end;) {
+                const size_t o = u / inner, i0 = u % inner;
+                const size_t piece = std::min(end - u, inner - i0);
+                double* acc = out + u;
+                for (size_t a = 0; a < len; ++a) {
+                    const size_t base = (o * len + a) * inner + i0;
+                    for (size_t done = 0; done < piece; done += kFuseBlock) {
+                        const size_t l = std::min(kFuseBlock, piece - done);
+                        const double* r = run_block(prog, inputs, consts, nullptr, base + done, l,
+                                                    scratch, block.data());
+                        for (size_t j = 0; j < l; ++j) acc[done + j] += r[j];
+                    }
+                }
+                u += piece;
+            }
+        }, work);
+        return;
+    }
+    parallel_range(outer, [&](size_t begin, size_t end, size_t) {
+        Scratch scratch(std::max(prog.depth, 1u));
+        std::vector<double> block(kFuseBlock);
+        for (size_t o = begin; o < end; ++o) {
+            double* acc = out + o * inner;
+            const size_t start = o * len * inner, stop = start + len * inner;
+            for (size_t base = start; base < stop; base += kFuseBlock) {
+                const size_t l = std::min(kFuseBlock, stop - base);
+                const double* r = run_block(prog, inputs, consts, nullptr, base, l, scratch,
+                                            block.data());
+                for (size_t j = 0; j < l; ++j) acc[(base - start + j) % inner] += r[j];
+            }
+        }
+    }, work, 1);
+}
+
+/// `t` summed along `axis` (of a tensor of two or more axes), which drops out
+/// of the shape. Fused: the program of a deferred `t` runs as it is summed,
+/// on the host or in a generated GPU kernel, and nothing but the sums is
+/// stored. A product is computed first, as for any reduction.
+bool sum_axis(Process& p, TensorObj* t, uint32_t axis, Value* out) {
+    if (pending_product(t) && !settle(p, &t, out)) return false;
+    Program prog;
+    append(prog, from_obj(t));
+    const FuseProgram view = prog.view();
+    Shape s;
+    size_t outer = 1, inner = 1;
+    for (uint32_t i = 0; i < t->rank; ++i) {
+        if (i < axis) outer *= t->dims[i];
+        if (i > axis) inner *= t->dims[i];
+        if (i != axis) s.dims[s.rank++] = t->dims[i];
+    }
+    s.count = uint64_t(outer) * inner;
+    const size_t len = t->dims[axis];
+    if (on_gpu(t)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, t->dtype, out);
+        if (!b) return false;
+        gpu::Buffer* ins[kFuseMaxInputs];
+        size_t counts[kFuseMaxInputs], rows[kFuseMaxInputs];
+        buffers_of(prog, ins, counts, rows);
+        std::string why;
+        if (!gpu::fused_axis(t->dtype, view, ins, counts, rows, prog.consts, outer, len, inner, b,
+                             &why)) {
+            gpu::release(b);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, s, t->dtype, b);
+        return true;
+    }
+    double* data;
+    if (!new_host(p, s, out, &data)) return false;
+    std::fill(data, data + s.count, 0.0);
+    sum_axis_host(view, prog.inputs, prog.consts, data, outer, len, inner);
+    return true;
+}
+
 // --- products ----------------------------------------------------------------------
 
-/// An operand of a deferred product, as the product will read it: computed if
-/// it is a product itself (a product's own operand is computed, not fused),
-/// and on the GPU unless it is a bare transpose, which the device kernels read
-/// by strides. Anything else deferred on the host stays deferred and is
-/// computed into the product's panels as they are packed.
+/// An operand of a deferred product, as the product will read it: computed
+/// if it is a product itself (a product's own operand is computed, not fused).
+/// Anything else deferred stays deferred, and is read where it lies or
+/// computed as the product loads it -- into the host product's panels as they
+/// are packed, or into the GPU product kernel's tiles.
 bool product_operand(Process& p, TensorObj** t, Value* err) {
     TensorObj* x = *t;
     if (TensorObj* done = computed_of(x)) {
@@ -1183,11 +1300,6 @@ bool product_operand(Process& p, TensorObj** t, Value* err) {
         return true;
     }
     if (pending_product(x)) return settle(p, t, err);
-    if (on_gpu(x)) {
-        Program prog;
-        append(prog, from_obj(x));
-        if (!is_transpose(prog)) return settle(p, t, err);
-    }
     return true;
 }
 
@@ -1227,6 +1339,23 @@ bool matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
         Program prog;
         prog.product(a, b);
         *out = defer(p, prog, s, a->device, a->dtype);
+        return true;
+    }
+
+    // The dot product is the sum of the elementwise product: deferred and
+    // folded as it is computed, so that a chain on either side is never
+    // stored, and on the GPU one fused reduction rather than a product kernel
+    // with a single column of work. Two computed vectors on the host keep the
+    // dot kernel, which allocates nothing at all.
+    if (scalar && (on_gpu(a) || !computed_of(a) || !computed_of(b))) {
+        Value prod;
+        if (!tensor_arith(p, Op::Mul, from_obj(a), from_obj(b), &prod)) {
+            *out = prod;
+            return false;
+        }
+        double r;
+        if (!reduce(p, KRED_SUM, tensor_of(prod), &r, out)) return false;
+        *out = p.heap().make_float(r);
         return true;
     }
 
@@ -1305,6 +1434,48 @@ bool transpose(Process& p, TensorObj* x, Value* out) {
     }
     tensor_kernels().transpose(x->data(), data, R, C);
     *out = t;
+    return true;
+}
+
+/// The same numbers in shape `s`, of the same size. Nothing is copied that
+/// does not have to be:
+///
+/// - A deferred tensor whose inputs are all as long as it is reads each of
+///   them at exactly the position it writes, so its program means the same
+///   under any shape of the same size, and it stays deferred, reshaped. One
+///   with a broadcast input does not -- a row repeated down a matrix is not a
+///   row repeated down a vector -- and is computed first.
+/// - On the GPU the buffer is shared, which is free: neither tensor can
+///   change it.
+/// - A large computed tensor on the host answers a deferred `[LOAD k]` in the
+///   new shape: a chain reads it where it lies, and a product reads it by
+///   strides (`plan_operand`). Only a small one is copied.
+bool reshape(Process& p, TensorObj* t, const Shape& s, Value* out) {
+    if (!computed_of(t)) {
+        Program prog;
+        append(prog, from_obj(t));
+        bool flat = true;
+        for (unsigned i = 0; i < prog.ninputs; ++i) flat = flat && prog.inputs[i]->count == t->count;
+        if (flat) {
+            *out = defer(p, prog, s, t->device, t->dtype);
+            return true;
+        }
+    }
+    if (!settle(p, &t, out)) return false;
+    if (on_gpu(t)) {
+        gpu::retain(buffer_of(t));
+        *out = wrap_gpu(p, s, t->dtype, buffer_of(t));
+        return true;
+    }
+    if (s.count >= kFuseMin) {
+        Program prog;
+        prog.emit(FUSE_LOAD, prog.input(t));
+        *out = defer(p, prog, s, t->device, t->dtype);
+        return true;
+    }
+    double* data;
+    if (!new_host(p, s, out, &data)) return false;
+    std::memcpy(data, t->data(), size_t(t->count) * sizeof(double));
     return true;
 }
 
@@ -1510,27 +1681,8 @@ NativeResult t_reshape(Process& p, Value, Value* args, uint32_t) {
                  shape_text(shape_of(t)) + ") to shape " + shape_text(s));
         return raised(err);
     }
-    // A deferred tensor whose inputs are all as long as it is reads each of
-    // them at exactly the position it writes, so its program means the same
-    // under any shape of the same size: it stays deferred, reshaped. One with
-    // a broadcast input does not -- a row repeated down a matrix is not a row
-    // repeated down a vector -- and is computed first.
-    if (!computed_of(t)) {
-        Program prog;
-        append(prog, from_obj(t));
-        bool flat = true;
-        for (unsigned i = 0; i < prog.ninputs; ++i) flat = flat && prog.inputs[i]->count == t->count;
-        if (flat) return NativeResult::ok(defer(p, prog, s, t->device, t->dtype));
-    }
-    if (!settle(p, &t, &err)) return raised(err);
-    if (on_gpu(t)) {
-        gpu::retain(buffer_of(t));
-        return NativeResult::ok(wrap_gpu(p, s, t->dtype, buffer_of(t)));
-    }
-    double* data;
     Value out;
-    if (!new_host(p, s, &out, &data)) return raised(out);
-    std::memcpy(data, t->data(), size_t(t->count) * sizeof(double));
+    if (!reshape(p, t, s, &out)) return raised(out);
     return NativeResult::ok(out);
 }
 
@@ -1609,8 +1761,8 @@ NativeResult t_dot(Process& p, Value callee, Value* args, uint32_t argc) {
 /// `outer a b`: every product `a[i] * b[j]`, as a matrix. A product with an
 /// inner length of one, which is what lets the GPU do it with the same kernel.
 NativeResult t_outer(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(a, 0);
-    DREAM_ARG(b, 1);
+    DREAM_SHAPE_ARG(a, 0);
+    DREAM_SHAPE_ARG(b, 1);
     Value err;
     if (a->rank != 1 || b->rank != 1) {
         fail(p, &err, "shape_error", "`outer` takes two vectors");
@@ -1618,27 +1770,17 @@ NativeResult t_outer(Process& p, Value, Value* args, uint32_t) {
     }
     if (!same_device(p, a, b, "`outer`", &err)) return raised(err);
     const uint32_t M = a->dims[0], N = b->dims[0];
-    const Shape s = shape2(M, N);
-    if (s.count > kMaxElements) {
+    if (uint64_t(M) * N > kMaxElements) {
         fail(p, &err, "out_of_memory", "an outer product this large is larger than 4 GiB");
         return raised(err);
     }
-    if (on_gpu(a)) {
-        gpu::Buffer* c = gpu_alloc(p, s.count, a->dtype, &err);
-        if (!c) return raised(err);
-        std::string why;
-        if (!gpu::matmul(a->dtype, gpu::Operand{buffer_of(a), 1, 1}, gpu::Operand{buffer_of(b), N, 1},
-                         c, M, 1, N, &why)) {
-            gpu::release(c);
-            gpu_fail(p, &err, why);
-            return raised(err);
-        }
-        return NativeResult::ok(wrap_gpu(p, s, a->dtype, c));
-    }
-    double* data;
-    Value out;
-    if (!new_host(p, s, &out, &data)) return raised(out);
-    host_gemm(plain_operand(a->data(), 1), plain_operand(b->data(), N), data, M, 1, N);
+    // A column times a row: an ordinary product with an inner length of one,
+    // so that it defers, and what is done to it next fuses into it, as after
+    // any other `@`.
+    Value col, row, out;
+    if (!reshape(p, a, shape2(M, 1), &col)) return raised(col);
+    if (!reshape(p, b, shape2(1, N), &row)) return raised(row);
+    if (!matmul(p, tensor_of(col), tensor_of(row), &out)) return raised(out);
     return NativeResult::ok(out);
 }
 
@@ -1678,7 +1820,7 @@ NativeResult t_norm(Process& p, Value, Value* args, uint32_t) {
 /// arithmetic, on the GPU too (see the head of this file).
 NativeResult t_sum_axis(Process& p, Value, Value* args, uint32_t) {
     Value ax = resolve(args[0]);
-    DREAM_ARG(t, 1);
+    DREAM_SHAPE_ARG(t, 1);
     Value err;
     if (!is_fixnum(ax) || fixnum_value(ax) < 0 || fixnum_value(ax) >= int64_t(t->rank)) {
         fail(p, &err, "shape_error",
@@ -1691,30 +1833,8 @@ NativeResult t_sum_axis(Process& p, Value, Value* args, uint32_t) {
         if (!reduce(p, KRED_SUM, t, &r, &err)) return raised(err);
         return NativeResult::ok(p.heap().make_float(r));
     }
-    const uint32_t axis = uint32_t(fixnum_value(ax));
-    std::vector<double> scratch;
-    const double* src;
-    if (!host_view(p, t, scratch, &src, &err)) return raised(err);
-    Shape s;
-    size_t outer = 1, inner = 1;
-    for (uint32_t i = 0; i < t->rank; ++i) {
-        if (i < axis) outer *= t->dims[i];
-        if (i > axis) inner *= t->dims[i];
-        if (i != axis) s.dims[s.rank++] = t->dims[i];
-    }
-    s.count = uint64_t(outer) * inner;
-    const size_t len = t->dims[axis];
-    double* data;
     Value out;
-    if (!new_host(p, s, &out, &data)) return raised(out);
-    std::fill(data, data + s.count, 0.0);
-    for (size_t o = 0; o < outer; ++o)
-        for (size_t a = 0; a < len; ++a) {
-            const double* row = src + (o * len + a) * inner;
-            double* acc = data + o * inner;
-            for (size_t i = 0; i < inner; ++i) acc[i] += row[i];
-        }
-    if (!place_like(p, t, out, &out)) return raised(out);
+    if (!sum_axis(p, t, uint32_t(fixnum_value(ax)), &out)) return raised(out);
     return NativeResult::ok(out);
 }
 

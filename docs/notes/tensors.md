@@ -469,13 +469,83 @@ kernel plus a pass, even single-threaded, because the chain's pass and the
 temporary go with it. On four threads it also runs in parallel, where the
 blocked kernel does not.
 
-### What fusion does not do yet
+### Finishing fusion
 
-- **`sum_axis`** computes its operand first.
-- **Generated packing on the GPU.** A chain feeding a GPU product is computed
-  into memory first.
+The last operations that computed their operand first, and what each does
+now:
+
+- **Reshape copies nothing.** A large computed tensor on the host reshapes to
+  a deferred `[LOAD k]`, which a chain reads in place and a product reads by
+  strides. A deferred tensor stays deferred, as before; on the GPU the buffer
+  is shared, as before. Only a small host tensor is copied.
+- **An outer product is a product.** `tensor.outer a b` is the column `a` times
+  the row `b`, two free reshapes and an ordinary deferred `@`. A chain after
+  it fuses as after any product, and a chain before it is computed as it
+  packs.
+- **`dot` of anything deferred is a fused multiply and sum.** The elementwise
+  product is deferred and folded as it is computed, on either device. Two
+  computed host vectors keep the dot kernel, which allocates nothing.
+- **`sum_axis` runs the operand's program as it sums.** On the host there are
+  two traversals, by the width of what follows the axis. A wide one adds a
+  segment of a row per step along the axis. A narrow one (the last axis)
+  scans each output's contiguous range once; adding segments of one number
+  would be a block evaluation per number. Either adds along the axis in
+  order, so the answer is the plain sum written out one float at a time, the
+  same at any thread count. On the GPU it is a generated `axis` kernel, one
+  work-item per answer. Before, a GPU `sum_axis` read the operand back, summed
+  on the host and uploaded the answer.
+- **A chain feeding a GPU product is computed as the kernel loads it.** An
+  operand that is a deferred program gets its own value function (`va`, `vb`)
+  in the generated product kernel, prefixed so that three programs share one
+  parameter list. Its elements are computed straight into the tile of local
+  memory the kernel was copying into.
+
+With `sum_axis` fused on the GPU, nothing falls back to the host any more.
+The only reads back are of things that answer in host terms: a number, a
+list, a printed string, `==`.
+
+Measured against `strict!` on the operand (4 threads; 1 thread in brackets):
+
+| | stepped | fused |
+|---|---|---|
+| `sum_axis 0 (m * 2 + n)`, 2000 x 2000 | 6 ms (14) | 5 ms (8) |
+| `sum_axis 1 (m * 2 + n)` | 8 ms (24) | 6 ms (17) |
+| `dot (flat * 2) flat`, 4M | 4 ms (12) | 1 ms (5) |
+| GPU `sum_axis 0`, against the old round trip | 39 ms | 13 ms |
+| GPU `(x - 0.5) * 2 @ w` (POCL) | 25 ms | 25 ms |
+
+POCL computes the "GPU" on these same cores, so a chain computed into the
+tile shows nothing there; on a GPU it saves a kernel launch and a write and
+read of the operand.
+
+**Measured and not kept: folding a reduction into the product.** `tensor.sum
+(w @ x)` folded each tile as the product finished it, with the partials
+combined in tile order so the answer stayed the same at any thread count. On
+one thread it was 4–20% *slower* in every run (184 → 198 ms, 210 → 257,
+187 → 195, 189 → 200 for a 4096 x 64 by 64 x 4096 product). On four threads it
+was noise both ways (84 → 67, 67 → 80, 98 → 63). What it saved was one read
+pass over C, which costs almost nothing beside the product. What it cost was
+reading each finished tile while the packed panel of B is still needed for
+the next block of rows, evicting it. An elementwise epilogue pays the same
+eviction but saves a whole write pass and a read, which is why that one is
+kept and this one is not. A reduction of a product computes the product,
+keeps it, and folds it.
+
+`tensor_fusion.dr` checks each of these exactly where the arithmetic is the
+same: free reshapes in chains and products, outer products with an epilogue,
+`sum_axis` along every kind of axis against the sum written out in Dream,
+and `sum_axis` of a product. Dot products and sums are checked to a
+tolerance, since their summation order changes. `tensor_gpu.dr` checks chains
+into GPU products on either side and in the one-column kernel, the GPU
+`sum_axis` on both axes, outer products and fused dots.
+
+### What is left
+
 - **A product as an operand of another product.** `(a @ b) @ c` computes the
-  inner product, as it must.
+  inner product, as it must: the outer product reads each of its elements K
+  times.
+- **Elementwise work across the two devices.** A host tensor and a GPU tensor
+  in one operation is still an error (`:device_error`), by design.
 
 ## Considered: a server process that owns the tensors and mutates them
 

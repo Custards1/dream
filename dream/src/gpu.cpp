@@ -179,7 +179,7 @@ struct Program {
 /// product with more than one column, `mv` for one with exactly one.
 struct Fused {
     cl_program program = nullptr;
-    cl_kernel map = nullptr, reduce = nullptr, mm = nullptr, mv = nullptr;
+    cl_kernel map = nullptr, reduce = nullptr, axis = nullptr, mm = nullptr, mv = nullptr;
 };
 
 struct Device {
@@ -603,36 +603,44 @@ bool transpose(int dtype, Buffer* in, Buffer* out, size_t rows, size_t cols, std
 
 namespace {
 
-/// The OpenCL source for a fused program: a `value` function computing one
-/// element from the inputs and constants, and the two kernels around it. The
-/// constants are arguments, so that `x * 0.5` and `x * 0.25` are one kernel
-/// and a loop that changes a scalar every iteration builds nothing new.
-std::string fused_source(int dtype, const FuseProgram& prog) {
-    std::string params, args;
+/// One value function of a generated kernel: its source, the parameters it
+/// adds to a kernel's list, and the arguments that pass them on.
+struct ValueFn {
+    std::string text, params, args;
+};
+
+/// `name(i, n, ..)`: the value of `prog` at position `i` of an answer of `n`,
+/// with its inputs and constants named with `pre` so that several programs
+/// can share one kernel's parameter list. A program that starts from a product
+/// takes the product's element as `p`.
+ValueFn value_function(const FuseProgram& prog, const std::string& name, const std::string& pre,
+                       bool product) {
+    ValueFn f;
     for (unsigned k = 0; k < prog.ninputs; ++k) {
-        const std::string i = std::to_string(k);
-        params += ", __global const T* in" + i + ", ulong n" + i + ", ulong r" + i;
-        args += ", in" + i + ", n" + i + ", r" + i;
+        const std::string i = pre + std::to_string(k);
+        f.params += ", __global const T* in" + i + ", ulong n" + i + ", ulong r" + i;
+        f.args += ", in" + i + ", n" + i + ", r" + i;
     }
     for (unsigned k = 0; k < prog.nconsts; ++k) {
-        params += ", T c" + std::to_string(k);
-        args += ", c" + std::to_string(k);
+        f.params += ", T c" + pre + std::to_string(k);
+        f.args += ", c" + pre + std::to_string(k);
     }
-    std::string loads;
     // Each input is loaded the way the program reads it -- as it lies, as
     // its transpose, or both -- once, at the top.
+    std::string loads;
     std::vector<bool> plain(prog.ninputs, false), turned(prog.ninputs, false);
     for (unsigned i = 0; i < prog.ncode; ++i) {
         if (prog.code[2 * i] == FUSE_LOAD) plain[prog.code[2 * i + 1]] = true;
         if (prog.code[2 * i] == FUSE_LOADT) turned[prog.code[2 * i + 1]] = true;
     }
     for (unsigned k = 0; k < prog.ninputs; ++k) {
-        const std::string i = std::to_string(k);
-        if (plain[k]) loads += "    T x" + i + " = in" + i + "[n" + i + " == n ? i : i % n" + i + "];\n";
+        const std::string i = std::to_string(k), q = pre + i;
+        if (plain[k])
+            loads += "    T x" + i + " = in" + q + "[n" + q + " == n ? i : i % n" + q + "];\n";
         if (turned[k])
-            loads += "    ulong o" + i + " = i % n" + i + ";\n"
-                     "    T xt" + i + " = in" + i + "[(o" + i + " % r" + i + ") * (n" + i + " / r" + i +
-                     ") + o" + i + " / r" + i + "];\n";
+            loads += "    ulong o" + i + " = i % n" + q + ";\n"
+                     "    T xt" + i + " = in" + q + "[(o" + i + " % r" + q + ") * (n" + q + " / r" + q +
+                     ") + o" + i + " / r" + q + "];\n";
     }
     std::vector<std::string> stack;
     static const char* const binops[] = {" + ", " - ", " * ", " / "};
@@ -642,7 +650,7 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
         const unsigned op = prog.code[2 * i], arg = prog.code[2 * i + 1];
         switch (op) {
             case FUSE_LOAD: stack.push_back("x" + std::to_string(arg)); break;
-            case FUSE_CONST: stack.push_back("c" + std::to_string(arg)); break;
+            case FUSE_CONST: stack.push_back("c" + pre + std::to_string(arg)); break;
             case FUSE_PRODUCT: stack.push_back("p"); break;
             case FUSE_LOADT: stack.push_back("xt" + std::to_string(arg)); break;
             case FUSE_BIN: {
@@ -655,15 +663,52 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
             default: stack.back() = std::string(fns[arg]) + "(" + stack.back() + ")"; break;
         }
     }
-    std::string src = std::string("// ") + (dtype == F32 ? "f32" : "f64") + "\n" + kFusedPrelude;
+    f.text = "inline T " + name + "(ulong i, ulong n" + (product ? ", T p" : "") + f.params +
+             ") {\n" + loads + "    return " + stack.back() + ";\n}\n";
+    return f;
+}
+
+/// The OpenCL source for a fused program: a `value` function computing one
+/// element from the inputs and constants, and the kernels around it. The
+/// constants are arguments, so that `x * 0.5` and `x * 0.25` are one kernel
+/// and a loop that changes a scalar every iteration builds nothing new.
+///
+/// A program that starts from a product gets the product kernels instead,
+/// and an operand of that product that is itself a deferred program (`pa`,
+/// `pb`) is computed by its own value function as the product loads it --
+/// into the tile of local memory the kernel was going to copy it into, so a
+/// chain feeding the product is never stored.
+std::string fused_source(int dtype, const FuseProgram& prog, const FuseProgram* pa,
+                         const FuseProgram* pb) {
     bool product = false;
     for (unsigned i = 0; i < prog.ncode; ++i) product = product || prog.code[2 * i] == FUSE_PRODUCT;
+    const ValueFn v = value_function(prog, "value", "", product);
+    std::string src = std::string("// ") + (dtype == F32 ? "f32" : "f64") + "\n" + kFusedPrelude +
+                      v.text;
     if (product) {
-        // The product's element arrives as `p`; everything else is as for an
-        // elementwise program. The kernels are `kSource`'s, with the store
-        // replaced by the program applied to what would have been stored.
-        src += "inline T value(ulong i, ulong n, T p" + params + ") {\n" + loads + "    return " +
-               stack.back() + ";\n}\n";
+        std::string params = v.params, args = v.args;
+        std::string load_a = "A[row * ars + (t + lc) * acs]";
+        std::string load_b = "B[(t + lr) * brs + col * bcs]";
+        std::string load_ma = "A[i * ars + k * acs]", load_x = "x[k * xrs]";
+        if (pa) {
+            const ValueFn f = value_function(*pa, "va", "a", false);
+            src += f.text;
+            params += f.params;
+            args += f.args;
+            load_a = "va((ulong)row * K + (t + lc), (ulong)M * K" + f.args + ")";
+            load_ma = "va((ulong)i * K + k, (ulong)M * K" + f.args + ")";
+        }
+        if (pb) {
+            const ValueFn f = value_function(*pb, "vb", "b", false);
+            src += f.text;
+            params += f.params;
+            args += f.args;
+            load_b = "vb((ulong)(t + lr) * N + col, (ulong)K * N" + f.args + ")";
+            load_x = "vb((ulong)k, (ulong)K" + f.args + ")";
+        }
+        // The kernels are `kSource`'s, with the loads of a computed operand
+        // replaced by its value function and the store replaced by the
+        // program applied to what would have been stored.
         src += "__kernel void mm(__global const T* A, ulong ars, ulong acs, __global const T* B,\n"
                "                 ulong brs, ulong bcs, __global T* C,\n"
                "                 int M, int K, int N, ulong n" + params + ") {\n"
@@ -673,27 +718,27 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
                "    int lc = get_local_id(0), lr = get_local_id(1);\n"
                "    T acc = (T)0;\n"
                "    for (int t = 0; t < K; t += TS) {\n"
-               "        As[lr][lc] = (row < M && t + lc < K) ? A[row * ars + (t + lc) * acs] : (T)0;\n"
-               "        Bs[lr][lc] = (t + lr < K && col < N) ? B[(t + lr) * brs + col * bcs] : (T)0;\n"
+               "        As[lr][lc] = (row < M && t + lc < K) ? " + load_a + " : (T)0;\n"
+               "        Bs[lr][lc] = (t + lr < K && col < N) ? " + load_b + " : (T)0;\n"
                "        barrier(CLK_LOCAL_MEM_FENCE);\n"
                "        for (int k = 0; k < TS; ++k) acc += As[lr][k] * Bs[k][lc];\n"
                "        barrier(CLK_LOCAL_MEM_FENCE);\n"
                "    }\n"
                "    if (row < M && col < N) {\n"
                "        ulong i = (ulong)row * N + col;\n"
-               "        C[i] = value(i, n, acc" + args + ");\n"
+               "        C[i] = value(i, n, acc" + v.args + ");\n"
                "    }\n}\n";
         src += "__kernel void mv(__global const T* A, ulong ars, ulong acs, __global const T* x,\n"
                "                 ulong xrs, __global T* y, int M, int K, ulong n" + params + ") {\n"
                "    int i = get_global_id(0);\n"
                "    if (i >= M) return;\n"
                "    T acc = (T)0;\n"
-               "    for (int k = 0; k < K; ++k) acc += A[i * ars + k * acs] * x[k * xrs];\n"
-               "    y[i] = value((ulong)i, n, acc" + args + ");\n}\n";
+               "    for (int k = 0; k < K; ++k) acc += " + load_ma + " * " + load_x + ";\n"
+               "    y[i] = value((ulong)i, n, acc" + v.args + ");\n}\n";
         return src;
     }
-    src += "inline T value(ulong i, ulong n" + params + ") {\n" + loads + "    return " +
-           stack.back() + ";\n}\n";
+    const std::string& params = v.params;
+    const std::string& args = v.args;
     src += "__kernel void map(__global T* out, ulong n" + params + ") {\n"
            "    ulong i = get_global_id(0);\n"
            "    if (i < n) out[i] = value(i, n" + args + ");\n}\n";
@@ -710,13 +755,24 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
            "        barrier(CLK_LOCAL_MEM_FENCE);\n"
            "    }\n"
            "    if (lid == 0) partial[get_group_id(0)] = scratch[0];\n}\n";
+    // A sum along an axis: one work-item per answer, adding the values along
+    // the axis in order.
+    src += "__kernel void axis(__global T* out, ulong outer, ulong len, ulong inner, ulong n" +
+           params + ") {\n"
+           "    ulong g = get_global_id(0);\n"
+           "    if (g >= outer * inner) return;\n"
+           "    ulong o = g / inner, i = g % inner;\n"
+           "    T acc = (T)0;\n"
+           "    for (ulong a = 0; a < len; ++a) acc += value((o * len + a) * inner + i, n" + args + ");\n"
+           "    out[g] = acc;\n}\n";
     return src;
 }
 
 /// The kernels for a program, built the first time it is asked for. Called
 /// under the device's lock, which is what guards the cache.
-Fused* fused_kernels(Device& d, int dtype, const FuseProgram& prog, std::string* why) {
-    std::string src = fused_source(dtype, prog);
+Fused* fused_kernels(Device& d, int dtype, const FuseProgram& prog, std::string* why,
+                     const FuseProgram* pa = nullptr, const FuseProgram* pb = nullptr) {
+    std::string src = fused_source(dtype, prog, pa, pb);
     auto it = d.fused.find(src);
     if (it != d.fused.end()) return &it->second;
     Fused f;
@@ -725,7 +781,8 @@ Fused* fused_kernels(Device& d, int dtype, const FuseProgram& prog, std::string*
     const bool product = src.find("__kernel void mm(") != std::string::npos;
     if (product ? !kernel(d, f.program, "mm", &f.mm, why) || !kernel(d, f.program, "mv", &f.mv, why)
                 : !kernel(d, f.program, "map", &f.map, why) ||
-                      !kernel(d, f.program, "reduce", &f.reduce, why))
+                      !kernel(d, f.program, "reduce", &f.reduce, why) ||
+                      !kernel(d, f.program, "axis", &f.axis, why))
         return nullptr;
     return &d.fused.emplace(std::move(src), f).first->second;
 }
@@ -762,25 +819,51 @@ bool fused_matmul(int dtype, const FuseProgram& prog, Operand a, Operand b, size
     if (!d) return false;
     if (!program_for(*d, dtype, err)) return false;
     std::lock_guard<std::mutex> g(d->lock);
-    Fused* f = fused_kernels(*d, dtype, prog, err);
+    Fused* f = fused_kernels(*d, dtype, prog, err, a.program ? &a.program->prog : nullptr,
+                             b.program ? &b.program->prog : nullptr);
     if (!f) return false;
     const cl_ulong n = cl_ulong(M) * N;
+    // An operand computed by its own program has no buffer; the kernel's
+    // parameter for one is still there and never read, so any buffer fills it.
+    cl_mem amem = a.buf ? a.buf->mem : out->mem;
+    cl_mem bmem = b.buf ? b.buf->mem : out->mem;
+    auto bind_all = [&](Launch& l) {
+        bind_program(l, dtype, prog, ins, counts, rows, consts);
+        for (const OperandProgram* op : {a.program, b.program})
+            if (op) bind_program(l, dtype, op->prog, op->ins, op->counts, op->rows, op->consts);
+    };
     if (N == 1) {
         size_t global = round_up(M, 64);
         Launch l{*d, f->mv};
-        l.arg(a.buf->mem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs)).arg(b.buf->mem)
-            .arg(cl_ulong(b.rs)).arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(n);
-        bind_program(l, dtype, prog, ins, counts, rows, consts);
+        l.arg(amem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs)).arg(bmem).arg(cl_ulong(b.rs))
+            .arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(n);
+        bind_all(l);
         return l.run(1, &global, nullptr, err);
     }
     size_t global[2] = {round_up(N, d->tile), round_up(M, d->tile)};
     size_t group[2] = {d->tile, d->tile};
     Launch l{*d, f->mm};
-    l.arg(a.buf->mem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs)).arg(b.buf->mem)
-        .arg(cl_ulong(b.rs)).arg(cl_ulong(b.cs)).arg(out->mem).arg(cl_int(M)).arg(cl_int(K))
-        .arg(cl_int(N)).arg(n);
-    bind_program(l, dtype, prog, ins, counts, rows, consts);
+    l.arg(amem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs)).arg(bmem).arg(cl_ulong(b.rs))
+        .arg(cl_ulong(b.cs)).arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(cl_int(N)).arg(n);
+    bind_all(l);
     return l.run(2, global, group, err);
+}
+
+bool fused_axis(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
+                const size_t* rows, const double* consts, size_t outer, size_t len, size_t inner,
+                Buffer* out, std::string* err) {
+    Device* d = ready(err);
+    if (!d) return false;
+    if (!program_for(*d, dtype, err)) return false;
+    std::lock_guard<std::mutex> g(d->lock);
+    Fused* f = fused_kernels(*d, dtype, prog, err);
+    if (!f) return false;
+    size_t global = round_up(outer * inner, 64);
+    Launch l{*d, f->axis};
+    l.arg(out->mem).arg(cl_ulong(outer)).arg(cl_ulong(len)).arg(cl_ulong(inner))
+        .arg(cl_ulong(outer * len * inner));
+    bind_program(l, dtype, prog, ins, counts, rows, consts);
+    return l.run(1, &global, nullptr, err);
 }
 
 bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins,

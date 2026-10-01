@@ -50,11 +50,24 @@ Buffer* alloc(size_t bytes, std::string* err);
 void retain(Buffer* b);
 void release(Buffer* b);
 
+/// A deferred operand of a product on the device: its program, with the
+/// inputs and constants it reads, computed per element as the product loads
+/// it. Only `fused_matmul` takes one.
+struct OperandProgram {
+    FuseProgram prog;
+    Buffer* const* ins;
+    const size_t* counts;
+    const size_t* rows;
+    const double* consts;
+};
+
 /// One operand of a product on the device: element `(i, j)` is
-/// `buf[i * rs + j * cs]`, so that a transpose is read by strides, not copied.
+/// `buf[i * rs + j * cs]`, so that a transpose is read by strides, not copied
+/// -- or, when `program` is set, that program's value at `i * width + j`.
 struct Operand {
     Buffer* buf;
     size_t rs, cs;
+    const OperandProgram* program = nullptr;
 };
 
 /// Host doubles into a device buffer of `dtype`, converting on the way.
@@ -65,6 +78,12 @@ bool download(Buffer* src, int dtype, double* dst, size_t n, std::string* err);
 /// `n` elements from `src` at element `offset` into the start of `dst`.
 bool copy(Buffer* src, int dtype, size_t offset, Buffer* dst, size_t n, std::string* err);
 
+/// The sums of a fused program's values along an axis: the program's answer
+/// is `outer x len x inner`, and `out[o * inner + i]` is the sum over `a` of
+/// position `(o * len + a) * inner + i`.
+bool fused_axis(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
+                const size_t* rows, const double* consts, size_t outer, size_t len, size_t inner,
+                Buffer* out, std::string* err);
 /// A fused elementwise program (`FuseProgram`, tensor_kernels.hpp) computed
 /// into `out`: one kernel, generated from the program the first time it is
 /// met and cached. `ins[k]` holds `counts[k]` elements, read at `i % count`.
