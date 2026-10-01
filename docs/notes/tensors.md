@@ -415,14 +415,67 @@ Two versions were measured and not kept:
 The first touch of memory the process has never had is still paid once: the
 first 32 MB tensor costs about 45 ms. Warm up before measuring.
 
+### Transposes, and chains into a product
+
+Two passes remained that nothing needed. A transpose was copied before
+anything read it, and a chain feeding a product (`(x - mean) / sd @ w`) was
+computed into memory before the product packed it into panels, which is a
+copy anyway. One mechanism removes both: the product reads its operands
+through a descriptor rather than a pointer.
+
+- **A transpose defers.** `tensor.transpose t` on a large tensor answers a
+  deferred `[LOADT k]`, an instruction that reads an R x C input as its
+  C x R transpose at any position. A chain reads it in place, gathering with
+  counters rather than a division per element. A transpose of it is `t`
+  itself. Computing it alone is the blocked transpose kernel, which moves a
+  cache line at a time both ways.
+- **A `GemmOperand`** is either a pointer with row and column strides, or a
+  callback that writes a row segment. The packers read through it: row by
+  row, or down columns when the columns are contiguous.
+  - A computed matrix is strides `(width, 1)`.
+  - A transpose is strides `(1, width of its source)`, read with nothing
+    copied, which is how a BLAS takes `'T'`.
+  - Any other deferred tensor on the host is a callback, `operand_segment`,
+    which runs its program for exactly the row segment the packer asks for,
+    straight into the buffer it packs from. A chain feeding a product is
+    computed once per packing of its panel and never stored. The thin
+    products (one row, one column) read through the same descriptor.
+- **The GPU's product kernels take strides**, fixed and generated alike, so
+  a transpose on the GPU is read in place too. A chain feeding a GPU product
+  is still computed first: generated packing is the next step there.
+- **Operands that cannot be read in place are computed first.** A product's
+  own operand that is itself a pending product, and on the GPU anything
+  deferred but a transpose.
+
+The VM unit test checks the product with B read by strides and A by callback
+against the triple loop, exactly. `tensor_fusion.dr` checks transposes read by
+a chain, by a product on either side, through the thin paths, and inside a
+chain feeding a product with an epilogue, all exactly against the operands
+computed first. `tensor_gpu.dr` checks the strided device kernels against the
+host.
+
+Measured against `strict!` on the operand, which computes it first:
+
+| | 4 threads | 1 thread |
+|---|---|---|
+| `tensor.transpose m + n`, 2000 x 2000 | 26 → 9 ms | 25 → 21 ms |
+| `(x - 0.5) * 2.0 @ w`, 4096 x 1024 by 1024 x 64 | 17 → 10 ms | 47 → 39 ms |
+| `a @ tensor.transpose b`, 1024 x 1024 | 48 → 35 ms | 107 → 104 ms |
+| `tensor.transpose a @ b`, 1024 x 1024 | 40 → 32 ms | 110 → 96 ms |
+
+The gather was the risk: reading a transpose element by element walks a
+column of its source, a cache line per element. It still beats the blocked
+kernel plus a pass, even single-threaded, because the chain's pass and the
+temporary go with it. On four threads it also runs in parallel, where the
+blocked kernel does not.
+
 ### What fusion does not do yet
 
-- **Operations that are not elementwise.** `sum_axis` and `transpose` compute
-  their operand first. A transpose could be a strided load in the program.
+- **`sum_axis`** computes its operand first.
+- **Generated packing on the GPU.** A chain feeding a GPU product is computed
+  into memory first.
 - **A product as an operand of another product.** `(a @ b) @ c` computes the
-  inner product, which it must; but an elementwise chain *before* a product
-  (`(x * 2.0) @ w`) is computed into memory rather than applied as the
-  product's panels are packed.
+  inner product, as it must.
 
 ## Considered: a server process that owns the tensors and mutates them
 

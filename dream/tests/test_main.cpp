@@ -799,18 +799,42 @@ static void test_tensor_kernels() {
             std::vector<double> A(M * K), B(K * N), C(M * N, -1.0);
             for (size_t i = 0; i < A.size(); ++i) A[i] = double(i % 7) - 3.0;
             for (size_t i = 0; i < B.size(); ++i) B[i] = double(i % 5) * 0.5 - 1.0;
-            k->gemm(A.data(), B.data(), C.data(), M, K, N, nullptr);
-            double worst = 0;
-            for (size_t i = 0; i < M; ++i)
-                for (size_t j = 0; j < N; ++j) {
-                    double want = 0;
-                    for (size_t p = 0; p < K; ++p) want += A[i * K + p] * B[p * N + j];
-                    worst = std::max(worst, std::abs(C[i * N + j] - want));
-                }
-            // Small integers and halves: every product and partial sum is
-            // exact, so any reordering the kernel does still gives the same
-            // number.
-            CHECK_EQ(worst, 0.0);
+            // The same product with its operands read three ways: as stored;
+            // B as the transpose of its own transpose, by strides; and A
+            // computed a segment at a time by a callback. Every way must give
+            // the textbook answer.
+            std::vector<double> Bt(N * K);
+            for (size_t p = 0; p < K; ++p)
+                for (size_t j = 0; j < N; ++j) Bt[j * K + p] = B[p * N + j];
+            struct Rows {
+                const std::vector<double>* a;
+                size_t K;
+            } rows{&A, K};
+            auto segment = [](void* ctx, size_t row, size_t col, size_t len, double* out) {
+                auto* r = static_cast<Rows*>(ctx);
+                for (size_t l = 0; l < len; ++l) out[l] = (*r->a)[row * r->K + col + l];
+            };
+            const GemmOperand plainA{A.data(), K, 1, nullptr, nullptr, 0};
+            const GemmOperand plainB{B.data(), N, 1, nullptr, nullptr, 0};
+            const GemmOperand turnedB{Bt.data(), 1, K, nullptr, nullptr, 0};
+            const GemmOperand computedA{nullptr, 0, 0, segment, &rows, 0};
+            const GemmOperand* as[] = {&plainA, &plainA, &computedA};
+            const GemmOperand* bs[] = {&plainB, &turnedB, &plainB};
+            for (int way = 0; way < 3; ++way) {
+                std::fill(C.begin(), C.end(), -1.0);
+                k->gemm(*as[way], *bs[way], C.data(), M, K, N, nullptr);
+                double worst = 0;
+                for (size_t i = 0; i < M; ++i)
+                    for (size_t j = 0; j < N; ++j) {
+                        double want = 0;
+                        for (size_t p = 0; p < K; ++p) want += A[i * K + p] * B[p * N + j];
+                        worst = std::max(worst, std::abs(C[i * N + j] - want));
+                    }
+                // Small integers and halves: every product and partial sum is
+                // exact, so any reordering the kernel does still gives the
+                // same number.
+                CHECK_EQ(worst, 0.0);
+            }
         }
         double x[19], y[19], out[19];
         for (int i = 0; i < 19; ++i) {

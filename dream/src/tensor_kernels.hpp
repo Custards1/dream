@@ -32,6 +32,9 @@ enum KernelReduce : int { KRED_SUM = 0, KRED_MIN, KRED_MAX };
 ///   FUSE_CONST k  push constant k
 ///   FUSE_BIN op   pop y, pop x, push `x op y` (`KOP_*`)
 ///   FUSE_UN fn    pop x, push `fn x` (`KFN_*`)
+///   FUSE_LOADT k  push input k -- an R x C matrix -- read as its C x R
+///                 transpose, at `i % (R * C)`: what `tensor.transpose`
+///                 defers to, so that a transpose is read where it lies
 ///   FUSE_PRODUCT  push the matrix product the program starts from, at `i`
 ///                 (see `TensorExpr::product_a`); at most one per program,
 ///                 and only where the answer is exactly as long as the product
@@ -39,7 +42,7 @@ enum KernelReduce : int { KRED_SUM = 0, KRED_MIN, KRED_MAX };
 /// The limits keep a program small enough that the CPU's evaluator keeps its
 /// whole stack in L1, and that a GPU kernel built from it has a short argument
 /// list. A chain that would pass one is computed and starts a new program.
-enum FuseCode : uint8_t { FUSE_LOAD = 0, FUSE_CONST, FUSE_BIN, FUSE_UN, FUSE_PRODUCT };
+enum FuseCode : uint8_t { FUSE_LOAD = 0, FUSE_CONST, FUSE_BIN, FUSE_UN, FUSE_PRODUCT, FUSE_LOADT };
 constexpr unsigned kFuseMaxInputs = 8, kFuseMaxConsts = 16, kFuseMaxCode = 64,
                    kFuseMaxDepth = 12;
 
@@ -59,6 +62,22 @@ struct GemmEpilogue {
     size_t row_base;
 };
 
+/// One operand of the matrix product, as the product reads it. Element
+/// `(i, j)` is `data[(i + row0) * rs + j * cs]` -- a matrix as it is stored
+/// (`rs` its width, `cs` 1), or one read as its transpose (`rs` 1, `cs` the
+/// stored width), with nothing copied either way. When `segment` is set it is
+/// instead whatever `segment` writes for `len` elements of row `i + row0`
+/// from column `j`: a deferred tensor computed straight into the panel the
+/// product was about to copy it into. `row0` is how a band of rows on its
+/// own thread is told where it starts.
+struct GemmOperand {
+    const double* data;
+    size_t rs, cs;
+    void (*segment)(void* ctx, size_t row, size_t col, size_t len, double* out);
+    void* ctx;
+    size_t row0;
+};
+
 struct TensorKernels {
     /// `out[i] = x[i] op y[i]` over `n` elements.
     void (*binary)(int op, const double* x, const double* y, double* out, size_t n);
@@ -68,10 +87,10 @@ struct TensorKernels {
     double (*dot)(const double* a, const double* b, size_t n);
     /// `n` must be at least 1.
     double (*reduce)(int op, const double* x, size_t n);
-    /// `C = A x B`, row-major, `C` overwritten, and `epi` (when there is one)
-    /// told as each tile of C is finished.
-    void (*gemm)(const double* A, const double* B, double* C, size_t M, size_t K, size_t N,
-                 const GemmEpilogue* epi);
+    /// `C = A x B`, `C` row-major and overwritten, and `epi` (when there is
+    /// one) told as each tile of C is finished.
+    void (*gemm)(const GemmOperand& A, const GemmOperand& B, double* C, size_t M, size_t K,
+                 size_t N, const GemmEpilogue* epi);
     void (*transpose)(const double* in, double* out, size_t rows, size_t cols);
 };
 

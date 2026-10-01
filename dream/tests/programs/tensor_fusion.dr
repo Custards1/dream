@@ -87,6 +87,36 @@ let main! = {
     console.print! (near (tensor.sum (w @ x * 2.0)) (tensor.sum (tensor.host (w @ x)) * 2.0))
     console.print! (tensor.at (tall @ col + 1.0) [4999] == tensor.at (tensor.host (tall @ col)) [4999] + 1.0)
 
+    // A transpose is deferred: a chain reads it where it lies, a product reads
+    // it by strides, and a transpose of it is what it was taken of.
+    let mt = tensor.transpose m;
+    let u = tensor.random 12 [60];
+    console.print! (list.all (fn k -> {
+        let i = k * 7 % 100;
+        let j = k * 13 % 60;
+        tensor.at (mt * 2.0 + tensor.transpose n + u) [i, j] ==
+            tensor.at m [j, i] * 2.0 + tensor.at n [j, i] + tensor.at u [j]
+    }) (list.range 0 200))
+    console.print! (tensor.transpose mt == m)
+    console.print! (mt == tensor.host mt)
+    console.print! (near (tensor.sum mt) (tensor.sum m))
+
+    // Operands of a product are read where they lie when they can be, and a
+    // chain feeding a product is computed into the product's own panels. The
+    // product reads the same numbers either way, so the answers are equal.
+    let wt = tensor.random 13 [150, 300] - 0.5;
+    console.print! (w @ tensor.transpose wt == tensor.host w @ tensor.host (tensor.transpose wt))
+    console.print! (tensor.transpose w @ w == tensor.host (tensor.transpose w) @ tensor.host w)
+    console.print! ((w * 2.0 - 1.0) @ x == tensor.host (w * 2.0 - 1.0) @ x)
+    console.print! (w @ tensor.relu (x + 0.25) == w @ tensor.host (tensor.relu (x + 0.25)))
+    console.print! ((tensor.transpose wt * 0.5 + 1.0) @ wt == tensor.host (tensor.transpose wt * 0.5 + 1.0) @ wt)
+    console.print! (tensor.relu ((w - 0.1) @ (x * 3.0) + bias) ==
+                    tensor.relu (tensor.host (tensor.host (w - 0.1) @ tensor.host (x * 3.0)) + bias))
+    let tall2 = tensor.random 14 [30, 5000];
+    console.print! (tensor.transpose tall2 @ col == tensor.host (tensor.transpose tall2) @ col)
+    console.print! ((col * 2.0) @ tall2 == tensor.host (col * 2.0) @ tall2)
+    console.print! (tall @ (col + 1.0) == tall @ tensor.host (col + 1.0))
+
     // Products and moves read the numbers of a deferred operand.
     console.print! (near (tensor.sum ((m + 0.0) @ tensor.transpose n)) (tensor.sum (m @ tensor.transpose n)))
     console.print! (tensor.to_list (tensor.reshape [6000] (m * 1.0)) == tensor.to_list (tensor.reshape [6000] m))

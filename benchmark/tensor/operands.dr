@@ -1,0 +1,37 @@
+// What reading a product's operands in place is worth: transposes read by
+// strides or by a chain, and a chain computed as the product packs it,
+// against `strict!` on the operand, which computes it into memory first.
+//
+//     dream build/dreams.dream -L mind benchmark/tensor/operands.dr -o /tmp/to.dream
+//     dream /tmp/to.dream
+import std.console;
+import std.list;
+import std.os;
+import std.tensor;
+
+let best! name thunk = {
+    let rec go! k !least = if k == 0 { least } else {
+        let before = os.monotonic! ();
+        let r = strict! (thunk ());
+        let ms = os.monotonic! () - before;
+        go! (k - 1) (if least < 0 || ms < least { ms } else { least })
+    };
+    console.print! (name + ": " + to_string (go! 7 (0 - 1)) + " ms")
+};
+
+let main! = {
+    let m = tensor.random 1 [2000, 2000];
+    let n = tensor.random 2 [2000, 2000];
+    best! "transpose + chain, stepped" (fn () -> strict! (tensor.transpose m) + n);
+    best! "transpose + chain, fused  " (fn () -> tensor.transpose m + n);
+    let x = tensor.random 3 [4096, 1024];
+    let w = tensor.random 4 [1024, 64];
+    best! "chain into product, stepped" (fn () -> strict! ((x - 0.5) * 2.0) @ w);
+    best! "chain into product, fused  " (fn () -> (x - 0.5) * 2.0 @ w);
+    let a = tensor.random 5 [1024, 1024];
+    let b = tensor.random 6 [1024, 1024];
+    best! "a @ transpose b, stepped" (fn () -> a @ strict! (tensor.transpose b));
+    best! "a @ transpose b, strided" (fn () -> a @ tensor.transpose b);
+    best! "transpose a @ b, stepped" (fn () -> strict! (tensor.transpose a) @ b);
+    best! "transpose a @ b, strided" (fn () -> tensor.transpose a @ b)
+};

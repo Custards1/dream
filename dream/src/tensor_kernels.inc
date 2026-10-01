@@ -158,31 +158,69 @@ inline vec loadv(const double* p) {
 }
 inline void storev(double* p, vec v) { std::memcpy(p, &v, sizeof v); }
 
-/// B's `kc x nc` block as panels of NR columns, each `kc x NR` and contiguous,
-/// the last padded with zeros.
-void pack_b(const double* B, Z ldb, Z kc, Z nc, double* Bp) {
-    for (Z j = 0; j < nc; j += NR) {
-        const Z w = std::min(NR, nc - j);
-        double* d = Bp + (j / NR) * kc * NR;
-        for (Z k = 0; k < kc; ++k, d += NR) {
-            const double* src = B + k * ldb + j;
-            Z l = 0;
-            for (; l < w; ++l) d[l] = src[l];
-            for (; l < NR; ++l) d[l] = 0;
+/// Row `i` of `op` from column `j`, `len` long: a pointer into the operand's
+/// own numbers when they lie in a row, otherwise gathered or computed into
+/// `tmp`.
+inline const double* row_of(const GemmOperand& op, Z i, Z j, Z len, double* tmp) {
+    if (op.segment) {
+        op.segment(op.ctx, i + op.row0, j, len, tmp);
+        return tmp;
+    }
+    const double* at = op.data + (i + op.row0) * op.rs + j * op.cs;
+    if (op.cs == 1) return at;
+    for (Z l = 0; l < len; ++l) tmp[l] = at[l * op.cs];
+    return tmp;
+}
+
+/// Whether `op`'s columns lie contiguously: a transposed operand, which is
+/// read down its columns rather than gathered across its rows.
+inline bool by_column(const GemmOperand& op) { return !op.segment && op.rs == 1 && op.cs != 1; }
+
+/// B's `kc x nc` block from `(pc, jc)` as panels of NR columns, each
+/// `kc x NR` and contiguous, the last padded with zeros.
+void pack_b(const GemmOperand& B, Z pc, Z jc, Z kc, Z nc, double* Bp, double* tmp) {
+    if (by_column(B)) {
+        for (Z j = 0; j < nc; ++j) {
+            const double* col = B.data + (pc + B.row0) + (jc + j) * B.cs;
+            double* d = Bp + (j / NR) * kc * NR + j % NR;
+            for (Z k = 0; k < kc; ++k) d[k * NR] = col[k];
         }
+    } else {
+        for (Z k = 0; k < kc; ++k) {
+            const double* src = row_of(B, pc + k, jc, nc, tmp);
+            for (Z j = 0; j < nc; j += NR) {
+                const Z w = std::min(NR, nc - j);
+                double* d = Bp + (j / NR) * kc * NR + k * NR;
+                for (Z l = 0; l < w; ++l) d[l] = src[j + l];
+            }
+        }
+    }
+    if (const Z w = nc % NR) {
+        double* d = Bp + (nc / NR) * kc * NR;
+        for (Z k = 0; k < kc; ++k)
+            for (Z l = w; l < NR; ++l) d[k * NR + l] = 0;
     }
 }
 
-/// A's `mc x kc` block as slivers of MR rows, each stored column by column.
-void pack_a(const double* A, Z lda, Z mc, Z kc, double* Ap) {
-    for (Z i = 0; i < mc; i += MR) {
-        const Z h = std::min(MR, mc - i);
-        double* d = Ap + (i / MR) * kc * MR;
-        for (Z k = 0; k < kc; ++k, d += MR) {
-            Z r = 0;
-            for (; r < h; ++r) d[r] = A[(i + r) * lda + k];
-            for (; r < MR; ++r) d[r] = 0;
+/// A's `mc x kc` block from `(ic, pc)` as slivers of MR rows, each stored
+/// column by column, the last padded with zeros.
+void pack_a(const GemmOperand& A, Z ic, Z pc, Z mc, Z kc, double* Ap, double* tmp) {
+    if (by_column(A)) {
+        for (Z k = 0; k < kc; ++k) {
+            const double* col = A.data + (ic + A.row0) + (pc + k) * A.cs;
+            for (Z i = 0; i < mc; ++i) Ap[(i / MR) * kc * MR + k * MR + i % MR] = col[i];
         }
+    } else {
+        for (Z i = 0; i < mc; ++i) {
+            const double* src = row_of(A, ic + i, pc, kc, tmp);
+            double* d = Ap + (i / MR) * kc * MR + i % MR;
+            for (Z k = 0; k < kc; ++k) d[k * MR] = src[k];
+        }
+    }
+    if (const Z h = mc % MR) {
+        double* d = Ap + (mc / MR) * kc * MR;
+        for (Z k = 0; k < kc; ++k)
+            for (Z r = h; r < MR; ++r) d[k * MR + r] = 0;
     }
 }
 
@@ -226,9 +264,14 @@ inline void micro(Z kc, const double* __restrict a, const double* __restrict b, 
 /// just computed will not be touched again, and it is as hot in cache as it
 /// will ever be -- which is the whole of what fusing into a product is for. A
 /// thin product hands over everything at the end, having touched it once.
-void gemm(const double* A, const double* B, double* C, Z M, Z K, Z N, const GemmEpilogue* epi) {
+void gemm(const GemmOperand& A, const GemmOperand& B, double* C, Z M, Z K, Z N,
+          const GemmEpilogue* epi) {
     if (N == 1) {
-        for (Z i = 0; i < M; ++i) C[i] = dot(A + i * K, B, K);
+        // B is one column: read it once into a vector, then a dot product
+        // per row of A.
+        std::vector<double> col(K), row(K);
+        for (Z k = 0; k < K; ++k) col[k] = *row_of(B, k, 0, 1, &row[0]);
+        for (Z i = 0; i < M; ++i) C[i] = dot(row_of(A, i, 0, K, row.data()), col.data(), K);
         if (epi) epi->fn(epi->ctx, epi->row_base, epi->row_base + M, 0, 1);
         return;
     }
@@ -236,24 +279,26 @@ void gemm(const double* A, const double* B, double* C, Z M, Z K, Z N, const Gemm
     if (M == 1) {
         // A row vector times a matrix: a sum of B's rows, each scaled, which
         // reads B once and in order.
+        std::vector<double> arow(K), brow(N);
+        const double* a = row_of(A, 0, 0, K, arow.data());
         for (Z k = 0; k < K; ++k) {
-            const double a = A[k];
-            const double* __restrict b = B + k * N;
+            const double ak = a[k];
+            const double* __restrict b = row_of(B, k, 0, N, brow.data());
             double* __restrict c = C;
-            for (Z j = 0; j < N; ++j) c[j] += a * b[j];
+            for (Z j = 0; j < N; ++j) c[j] += ak * b[j];
         }
         if (epi) epi->fn(epi->ctx, epi->row_base, epi->row_base + 1, 0, N);
         return;
     }
-    std::vector<double> Bp(KC * (NC + NR)), Ap((MC + MR) * KC);
+    std::vector<double> Bp(KC * (NC + NR)), Ap((MC + MR) * KC), tmp(std::max(NC, KC));
     for (Z jc = 0; jc < N; jc += NC) {
         const Z nc = std::min(NC, N - jc);
         for (Z pc = 0; pc < K; pc += KC) {
             const Z kc = std::min(KC, K - pc);
-            pack_b(B + pc * N + jc, N, kc, nc, Bp.data());
+            pack_b(B, pc, jc, kc, nc, Bp.data(), tmp.data());
             for (Z ic = 0; ic < M; ic += MC) {
                 const Z mc = std::min(MC, M - ic);
-                pack_a(A + ic * K + pc, K, mc, kc, Ap.data());
+                pack_a(A, ic, pc, mc, kc, Ap.data(), tmp.data());
                 for (Z jr = 0; jr < nc; jr += NR)
                     for (Z ir = 0; ir < mc; ir += MR)
                         micro(kc, Ap.data() + (ir / MR) * kc * MR, Bp.data() + (jr / NR) * kc * NR,

@@ -50,6 +50,13 @@ Buffer* alloc(size_t bytes, std::string* err);
 void retain(Buffer* b);
 void release(Buffer* b);
 
+/// One operand of a product on the device: element `(i, j)` is
+/// `buf[i * rs + j * cs]`, so that a transpose is read by strides, not copied.
+struct Operand {
+    Buffer* buf;
+    size_t rs, cs;
+};
+
 /// Host doubles into a device buffer of `dtype`, converting on the way.
 bool upload(Buffer* dst, int dtype, const double* src, size_t n, std::string* err);
 /// A device buffer of `dtype` back into host doubles. Waits for every queued
@@ -61,22 +68,25 @@ bool copy(Buffer* src, int dtype, size_t offset, Buffer* dst, size_t n, std::str
 /// A fused elementwise program (`FuseProgram`, tensor_kernels.hpp) computed
 /// into `out`: one kernel, generated from the program the first time it is
 /// met and cached. `ins[k]` holds `counts[k]` elements, read at `i % count`.
+///
+/// `rows[k]` is input k's rows when it is a matrix, which a `FUSE_LOADT`
+/// needs to read it as its transpose.
 bool fused(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
-           const double* consts, Buffer* out, size_t n, std::string* err);
+           const size_t* rows, const double* consts, Buffer* out, size_t n, std::string* err);
 /// The same program's sum, minimum or maximum (`KRED_*`) over `n >= 1`
 /// elements, folded on the device and finished on the host in double
 /// precision, with the elements never stored.
 bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins,
-                  const size_t* counts, const double* consts, size_t n, double* out,
-                  std::string* err);
+                  const size_t* counts, const size_t* rows, const double* consts, size_t n,
+                  double* out, std::string* err);
 /// `C = A x B` with a fused program applied to each element of C as it is
 /// stored: the program starts from `FUSE_PRODUCT`, which is that element. One
 /// kernel for `relu (w @ x + b)`, generated and cached as `fused`'s are.
-bool fused_matmul(int dtype, const FuseProgram& prog, Buffer* a, Buffer* b, size_t M, size_t K,
-                  size_t N, Buffer* const* ins, const size_t* counts, const double* consts,
-                  Buffer* out, std::string* err);
-/// `C = A x B`, row-major, M x K by K x N.
-bool matmul(int dtype, Buffer* a, Buffer* b, Buffer* c, size_t M, size_t K, size_t N,
+bool fused_matmul(int dtype, const FuseProgram& prog, Operand a, Operand b, size_t M, size_t K,
+                  size_t N, Buffer* const* ins, const size_t* counts, const size_t* rows,
+                  const double* consts, Buffer* out, std::string* err);
+/// `C = A x B`, M x K by K x N, C row-major.
+bool matmul(int dtype, Operand a, Operand b, Buffer* c, size_t M, size_t K, size_t N,
             std::string* err);
 bool transpose(int dtype, Buffer* in, Buffer* out, size_t rows, size_t cols, std::string* err);
 

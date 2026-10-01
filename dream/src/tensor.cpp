@@ -443,12 +443,17 @@ unsigned tensor_threads() {
     return n;
 }
 
+/// A computed matrix as a product reads it: `cols` wide, stored row by row.
+GemmOperand plain_operand(const double* data, size_t cols) {
+    return GemmOperand{data, cols, 1, nullptr, nullptr, 0};
+}
+
 /// `C = A x B`, and `epi` (with `row_base` ignored) told of each finished
 /// tile of C in whole-matrix rows. The tiles of different bands are disjoint,
 /// so an epilogue that writes only its own tile may run on every band's
 /// thread at once.
-void host_gemm(const double* A, const double* B, double* C, size_t M, size_t K, size_t N,
-               const GemmEpilogue* epi = nullptr) {
+void host_gemm(const GemmOperand& A, const GemmOperand& B, double* C, size_t M, size_t K,
+               size_t N, const GemmEpilogue* epi = nullptr) {
     const TensorKernels& k = tensor_kernels();
     const double work = 2.0 * double(M) * double(K) * double(N);
     size_t threads = work < 3e7 ? 1 : std::min<size_t>(tensor_threads(), M / 32);
@@ -460,10 +465,12 @@ void host_gemm(const double* A, const double* B, double* C, size_t M, size_t K, 
     // partial tile that another band would have filled.
     size_t band = (M + threads - 1) / threads;
     band = (band + 5) / 6 * 6;
-    auto run = [&k, A, B, C, K, N, epi](size_t m0, size_t rows) {
+    auto run = [&k, &A, &B, C, K, N, epi](size_t m0, size_t rows) {
         GemmEpilogue here;
         if (epi) here = GemmEpilogue{epi->fn, epi->ctx, m0};
-        k.gemm(A + m0 * K, B, C + m0 * N, rows, K, N, epi ? &here : nullptr);
+        GemmOperand band = A;
+        band.row0 += m0;
+        k.gemm(band, B, C + m0 * N, rows, K, N, epi ? &here : nullptr);
     };
     std::vector<std::thread> pool;
     for (size_t m0 = band; m0 < M; m0 += band) pool.emplace_back(run, m0, std::min(band, M - m0));
@@ -600,7 +607,9 @@ struct Program {
         unsigned sp = 0, most = 0;
         for (unsigned i = 0; i < ncode; ++i) {
             switch (code[2 * i]) {
-                case FUSE_LOAD: case FUSE_CONST: case FUSE_PRODUCT: most = std::max(most, ++sp); break;
+                case FUSE_LOAD: case FUSE_LOADT: case FUSE_CONST: case FUSE_PRODUCT:
+                    most = std::max(most, ++sp);
+                    break;
                 case FUSE_BIN: --sp; break;
                 default: break;
             }
@@ -636,6 +645,7 @@ void append(Program& prog, Value v) {
         unsigned arg = c[2 * i + 1];
         switch (c[2 * i]) {
             case FUSE_LOAD:
+            case FUSE_LOADT:
                 arg = prog.input(static_cast<TensorObj*>(as_obj(e->inputs()[arg])));
                 break;
             case FUSE_CONST: arg = prog.constant(e->consts()[arg]); break;
@@ -681,6 +691,9 @@ struct Slot {
 struct Scratch {
     std::vector<double> mem;
     explicit Scratch(unsigned depth) : mem(size_t(depth) * 2 * kFuseBlock) {}
+    void ensure(unsigned depth) {
+        if (mem.size() < size_t(depth) * 2 * kFuseBlock) mem.resize(size_t(depth) * 2 * kFuseBlock);
+    }
     double* at(unsigned pos, unsigned which) { return mem.data() + (pos * 2 + which) * kFuseBlock; }
 };
 
@@ -703,6 +716,26 @@ const double* run_block(const FuseProgram& prog, TensorObj* const* inputs, const
         const bool last = direct && i + 1 == prog.ncode;
         switch (op) {
             case FUSE_PRODUCT: stack[sp++] = Slot{product + base, 0, false}; break;
+            case FUSE_LOADT: {
+                // An R x C input read as its C x R transpose: answer position
+                // `o` is row `o / R`, column `o % R` of the transpose, which
+                // is `in[(o % R) * C + o / R]`. Walked with counters rather
+                // than a division per element.
+                const TensorObj* in = inputs[arg];
+                const size_t R = in->dims[0], C = in->dims[1], m = R * C;
+                const double* src = in->data();
+                double* buf = scratch.at(sp, 0);
+                size_t o = base % m, r = o % R, c = o / R;
+                for (size_t j = 0; j < len; ++j) {
+                    buf[j] = src[r * C + c];
+                    if (++r == R) {
+                        r = 0;
+                        if (++c == C) c = 0;
+                    }
+                }
+                stack[sp++] = Slot{buf, 0, false};
+                break;
+            }
             case FUSE_LOAD: {
                 const TensorObj* in = inputs[arg];
                 const size_t m = size_t(in->count);
@@ -859,12 +892,70 @@ double reduce_host(int op, const FuseProgram& prog, TensorObj* const* inputs,
     return r;
 }
 
-gpu::Buffer* const* buffers_of(const Program& prog, gpu::Buffer** out, size_t* counts) {
+/// The device buffers a program reads, with each one's length and, for a
+/// matrix, its rows (which a transposed load needs).
+void buffers_of(const Program& prog, gpu::Buffer** out, size_t* counts, size_t* rows) {
     for (unsigned i = 0; i < prog.ninputs; ++i) {
-        out[i] = buffer_of(prog.inputs[i]);
-        counts[i] = size_t(prog.inputs[i]->count);
+        const TensorObj* t = prog.inputs[i];
+        out[i] = buffer_of(t);
+        counts[i] = size_t(t->count);
+        rows[i] = t->rank == 2 ? t->dims[0] : size_t(t->count);
     }
-    return out;
+}
+
+/// How a product reads one of its operands, worked out once per product and
+/// kept alive for the length of it. A computed tensor is read where it lies; a
+/// transpose (`[LOADT k]`) is read where its source lies, by strides; any
+/// other deferred tensor is computed a row segment at a time, straight into
+/// the panel the product packs (`operand_segment`), and never stored.
+struct OperandPlan {
+    GemmOperand host{};
+    gpu::Operand device{};
+    Program prog;
+    FuseProgram view{};
+    size_t cols = 0;
+};
+
+/// `len` numbers of a deferred operand's row `row` from column `col`. Called
+/// by the product's threads at once, so the scratch is each thread's own.
+void operand_segment(void* ctx, size_t row, size_t col, size_t len, double* out) {
+    auto* plan = static_cast<OperandPlan*>(ctx);
+    thread_local Scratch scratch(1);
+    scratch.ensure(std::max(plan->view.depth, 1u));
+    const size_t base = row * plan->cols + col;
+    for (size_t done = 0; done < len; done += kFuseBlock) {
+        const size_t n = std::min(kFuseBlock, len - done);
+        const double* r = run_block(plan->view, plan->prog.inputs, plan->prog.consts, nullptr,
+                                    base + done, n, scratch, out + done);
+        if (r != out + done) std::memcpy(out + done, r, n * sizeof(double));
+    }
+}
+
+bool is_transpose(const Program& prog) {
+    return !prog.product_a && prog.ncode == 1 && prog.code[0] == FUSE_LOADT;
+}
+
+/// The plan for operand `t`, which the product sees as `cols` wide.
+void plan_operand(TensorObj* t, size_t cols, OperandPlan& plan) {
+    if (TensorObj* done = computed_of(t)) {
+        if (on_gpu(done)) plan.device = gpu::Operand{buffer_of(done), cols, 1};
+        else plan.host = plain_operand(done->data(), cols);
+        return;
+    }
+    append(plan.prog, from_obj(t));
+    if (is_transpose(plan.prog)) {
+        // Element (i, j) of the transpose of an R x C source is the source's
+        // (j, i): one step along a row of the transpose is a whole row of the
+        // source.
+        TensorObj* src = plan.prog.inputs[0];
+        const size_t C = src->dims[1];
+        if (on_gpu(src)) plan.device = gpu::Operand{buffer_of(src), 1, C};
+        else plan.host = GemmOperand{src->data(), 1, C, nullptr, nullptr, 0};
+        return;
+    }
+    plan.view = plan.prog.view();
+    plan.cols = cols;
+    plan.host = GemmOperand{nullptr, 0, 0, operand_segment, &plan, 0};
 }
 
 /// Compute a program into a new tensor of shape `s` where its inputs are.
@@ -878,24 +969,34 @@ bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device
                  Value* out) {
     const FuseProgram view = prog.view();
     const bool bare_product = prog.product_a && prog.ncode == 1;
+    // A bare transpose is the blocked transpose kernel, which moves memory a
+    // cache line at a time both ways rather than gathering a column at a time.
+    const bool bare_transpose = is_transpose(prog);
+    OperandPlan pa, pb;
+    Gemm g{};
+    if (prog.product_a) {
+        g = gemm_of(prog.product_a, prog.product_b);
+        plan_operand(prog.product_a, g.K, pa);
+        plan_operand(prog.product_b, g.N, pb);
+    }
     if (device == TENSOR_GPU) {
         gpu::Buffer* b = gpu_alloc(p, s.count, dtype, out);
         if (!b) return false;
         gpu::Buffer* ins[kFuseMaxInputs];
-        size_t counts[kFuseMaxInputs];
-        buffers_of(prog, ins, counts);
+        size_t counts[kFuseMaxInputs], rows[kFuseMaxInputs];
+        buffers_of(prog, ins, counts, rows);
         std::string why;
         bool ok;
         if (prog.product_a) {
-            const Gemm g = gemm_of(prog.product_a, prog.product_b);
             ok = bare_product
-                     ? gpu::matmul(dtype, buffer_of(prog.product_a), buffer_of(prog.product_b), b,
-                                   g.M, g.K, g.N, &why)
-                     : gpu::fused_matmul(dtype, view, buffer_of(prog.product_a),
-                                         buffer_of(prog.product_b), g.M, g.K, g.N, ins, counts,
-                                         prog.consts, b, &why);
+                     ? gpu::matmul(dtype, pa.device, pb.device, b, g.M, g.K, g.N, &why)
+                     : gpu::fused_matmul(dtype, view, pa.device, pb.device, g.M, g.K, g.N, ins,
+                                         counts, rows, prog.consts, b, &why);
+        } else if (bare_transpose) {
+            ok = gpu::transpose(dtype, ins[0], b, prog.inputs[0]->dims[0], prog.inputs[0]->dims[1],
+                                &why);
         } else {
-            ok = gpu::fused(dtype, view, ins, counts, prog.consts, b, size_t(s.count), &why);
+            ok = gpu::fused(dtype, view, ins, counts, rows, prog.consts, b, size_t(s.count), &why);
         }
         if (!ok) {
             gpu::release(b);
@@ -911,11 +1012,12 @@ bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device
         return false;
     }
     if (prog.product_a) {
-        const Gemm g = gemm_of(prog.product_a, prog.product_b);
         EpilogueRun run{&view, prog.inputs, prog.consts, data, g.N};
         GemmEpilogue epi{epilogue_tile, &run, 0};
-        host_gemm(prog.product_a->data(), prog.product_b->data(), data, g.M, g.K, g.N,
-                  bare_product ? nullptr : &epi);
+        host_gemm(pa.host, pb.host, data, g.M, g.K, g.N, bare_product ? nullptr : &epi);
+    } else if (bare_transpose) {
+        const TensorObj* src = prog.inputs[0];
+        tensor_kernels().transpose(src->data(), data, src->dims[0], src->dims[1]);
     } else {
         run_host(view, prog.inputs, prog.consts, data, size_t(s.count));
     }
@@ -1052,10 +1154,10 @@ bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
     const size_t n = size_t(x->count);
     if (x->device == TENSOR_GPU) {
         gpu::Buffer* ins[kFuseMaxInputs];
-        size_t counts[kFuseMaxInputs];
-        buffers_of(prog, ins, counts);
+        size_t counts[kFuseMaxInputs], rows[kFuseMaxInputs];
+        buffers_of(prog, ins, counts, rows);
         std::string why;
-        if (!gpu::fused_reduce(op, x->dtype, view, ins, counts, prog.consts, n, out, &why))
+        if (!gpu::fused_reduce(op, x->dtype, view, ins, counts, rows, prog.consts, n, out, &why))
             return gpu_fail(p, err, why);
         return true;
     }
@@ -1068,6 +1170,26 @@ bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
 }
 
 // --- products ----------------------------------------------------------------------
+
+/// An operand of a deferred product, as the product will read it: computed if
+/// it is a product itself (a product's own operand is computed, not fused),
+/// and on the GPU unless it is a bare transpose, which the device kernels read
+/// by strides. Anything else deferred on the host stays deferred and is
+/// computed into the product's panels as they are packed.
+bool product_operand(Process& p, TensorObj** t, Value* err) {
+    TensorObj* x = *t;
+    if (TensorObj* done = computed_of(x)) {
+        *t = done;
+        return true;
+    }
+    if (pending_product(x)) return settle(p, t, err);
+    if (on_gpu(x)) {
+        Program prog;
+        append(prog, from_obj(x));
+        if (!is_transpose(prog)) return settle(p, t, err);
+    }
+    return true;
+}
 
 /// `a @ b`. Two vectors give their dot product, a number; a matrix and a
 /// vector, in either order, a vector; two matrices a matrix.
@@ -1095,20 +1217,26 @@ bool matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
     const bool scalar = a->rank == 1 && b->rank == 1;
 
     // A product large enough to be worth it is deferred like elementwise work,
-    // so that what is done to it next can be fused into it. The dot product
-    // of two vectors answers a number, which nothing fuses with.
+    // so that what is done to it next can be fused into it -- and its
+    // operands are kept as they are wherever the product can read them in
+    // place (`plan_operand`), so that what was done to them before is fused
+    // into it too. The dot product of two vectors answers a number, which
+    // nothing fuses with.
     if (!scalar && (on_gpu(a) || s.count >= kFuseMin)) {
+        if (!product_operand(p, &a, out) || !product_operand(p, &b, out)) return false;
         Program prog;
         prog.product(a, b);
         *out = defer(p, prog, s, a->device, a->dtype);
         return true;
     }
 
+    if (!settle(p, &a, out) || !settle(p, &b, out)) return false;
     if (on_gpu(a)) {
         gpu::Buffer* c = gpu_alloc(p, s.count, a->dtype, out);
         if (!c) return false;
         std::string why;
-        if (!gpu::matmul(a->dtype, buffer_of(a), buffer_of(b), c, M, K, N, &why)) {
+        if (!gpu::matmul(a->dtype, gpu::Operand{buffer_of(a), K, 1}, gpu::Operand{buffer_of(b), N, 1},
+                         c, M, K, N, &why)) {
             gpu::release(c);
             return gpu_fail(p, out, why);
         }
@@ -1133,11 +1261,14 @@ bool matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
         *out = t;
         return false;
     }
-    host_gemm(a->data(), b->data(), data, M, K, N);
+    host_gemm(plain_operand(a->data(), K), plain_operand(b->data(), N), data, M, K, N);
     *out = t;
     return true;
 }
 
+/// A matrix transposed. Deferred where anything is: a `[LOADT k]` program,
+/// which an elementwise chain reads in place, a product reads by strides, and
+/// which on its own is the blocked transpose kernel (`run_program`).
 bool transpose(Process& p, TensorObj* x, Value* out) {
     if (x->rank == 1) {
         *out = from_obj(x);
@@ -1147,17 +1278,23 @@ bool transpose(Process& p, TensorObj* x, Value* out) {
         return fail(p, out, "shape_error",
                     "`transpose` takes a vector or a matrix, not shape " +
                         shape_text(shape_of(x)));
+    if (!computed_of(x)) {
+        // The transpose of a transpose is what it was taken of.
+        Program prog;
+        append(prog, from_obj(x));
+        if (is_transpose(prog)) {
+            *out = from_obj(prog.inputs[0]);
+            return true;
+        }
+        if (!settle(p, &x, out)) return false;
+    }
+    x = computed_of(x);
     const size_t R = x->dims[0], C = x->dims[1];
     const Shape s = shape2(uint32_t(C), uint32_t(R));
-    if (on_gpu(x)) {
-        gpu::Buffer* b = gpu_alloc(p, s.count, x->dtype, out);
-        if (!b) return false;
-        std::string why;
-        if (!gpu::transpose(x->dtype, buffer_of(x), b, R, C, &why)) {
-            gpu::release(b);
-            return gpu_fail(p, out, why);
-        }
-        *out = wrap_gpu(p, s, x->dtype, b);
+    if (on_gpu(x) || s.count >= kFuseMin) {
+        Program prog;
+        prog.emit(FUSE_LOADT, prog.input(x));
+        *out = defer(p, prog, s, x->device, x->dtype);
         return true;
     }
     double* data;
@@ -1398,7 +1535,7 @@ NativeResult t_reshape(Process& p, Value, Value* args, uint32_t) {
 }
 
 NativeResult t_transpose(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     Value out;
     if (!transpose(p, t, &out)) return raised(out);
     return NativeResult::ok(out);
@@ -1447,16 +1584,16 @@ NativeResult t_at(Process& p, Value, Value* args, uint32_t) {
 }
 
 NativeResult t_matmul(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(a, 0);
-    DREAM_ARG(b, 1);
+    DREAM_SHAPE_ARG(a, 0);
+    DREAM_SHAPE_ARG(b, 1);
     Value out;
     if (!matmul(p, a, b, &out)) return raised(out);
     return NativeResult::ok(out);
 }
 
 NativeResult t_dot(Process& p, Value callee, Value* args, uint32_t argc) {
-    DREAM_ARG(a, 0);
-    DREAM_ARG(b, 1);
+    DREAM_SHAPE_ARG(a, 0);
+    DREAM_SHAPE_ARG(b, 1);
     if (a->rank != 1 || b->rank != 1) {
         Value err;
         fail(p, &err, "shape_error",
@@ -1490,7 +1627,8 @@ NativeResult t_outer(Process& p, Value, Value* args, uint32_t) {
         gpu::Buffer* c = gpu_alloc(p, s.count, a->dtype, &err);
         if (!c) return raised(err);
         std::string why;
-        if (!gpu::matmul(a->dtype, buffer_of(a), buffer_of(b), c, M, 1, N, &why)) {
+        if (!gpu::matmul(a->dtype, gpu::Operand{buffer_of(a), 1, 1}, gpu::Operand{buffer_of(b), N, 1},
+                         c, M, 1, N, &why)) {
             gpu::release(c);
             gpu_fail(p, &err, why);
             return raised(err);
@@ -1500,7 +1638,7 @@ NativeResult t_outer(Process& p, Value, Value* args, uint32_t) {
     double* data;
     Value out;
     if (!new_host(p, s, &out, &data)) return raised(out);
-    host_gemm(a->data(), b->data(), data, M, 1, N);
+    host_gemm(plain_operand(a->data(), 1), plain_operand(b->data(), N), data, M, 1, N);
     return NativeResult::ok(out);
 }
 

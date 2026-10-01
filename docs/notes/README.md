@@ -91,6 +91,7 @@ Packed numeric arrays, `@`, and the GPU: what made the product fast, and what it
 - Fusion
 - Fusing into the product
 - Measuring a fresh tensor, and the pool for large blocks
+- Transposes, and chains into a product
 - Considered: a server process that owns the tensors and mutates them
 - What is not done yet
 

@@ -112,16 +112,19 @@ const char* const kSource = R"CL(
 // stepping along K a tile at a time through local memory, so every element of
 // A and B is read from global memory once per tile rather than once per
 // product term.
-__kernel void matmul(__global const T* A, __global const T* B, __global T* C,
-                     int M, int K, int N) {
+//
+// Each operand is read through strides, `A[i * ars + k * acs]`: a matrix as it
+// is stored, or one read as its transpose with nothing copied.
+__kernel void matmul(__global const T* A, ulong ars, ulong acs, __global const T* B, ulong brs,
+                     ulong bcs, __global T* C, int M, int K, int N) {
     __local T As[TS][TS];
     __local T Bs[TS][TS];
     int col = get_global_id(0), row = get_global_id(1);
     int lc = get_local_id(0), lr = get_local_id(1);
     T acc = (T)0;
     for (int t = 0; t < K; t += TS) {
-        As[lr][lc] = (row < M && t + lc < K) ? A[row * K + t + lc] : (T)0;
-        Bs[lr][lc] = (t + lr < K && col < N) ? B[(t + lr) * N + col] : (T)0;
+        As[lr][lc] = (row < M && t + lc < K) ? A[row * ars + (t + lc) * acs] : (T)0;
+        Bs[lr][lc] = (t + lr < K && col < N) ? B[(t + lr) * brs + col * bcs] : (T)0;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (int k = 0; k < TS; ++k) acc += As[lr][k] * Bs[k][lc];
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -131,12 +134,12 @@ __kernel void matmul(__global const T* A, __global const T* B, __global T* C,
 
 // A product with one column: one work-item per row, a dot product each. The
 // tiled kernel would run sixteen work-items per row and throw fifteen away.
-__kernel void matvec(__global const T* A, __global const T* x, __global T* y, int M, int K) {
+__kernel void matvec(__global const T* A, ulong ars, ulong acs, __global const T* x, ulong xrs,
+                     __global T* y, int M, int K) {
     int i = get_global_id(0);
     if (i >= M) return;
-    __global const T* a = A + (ulong)i * K;
     T acc = (T)0;
-    for (int k = 0; k < K; ++k) acc += a[k] * x[k];
+    for (int k = 0; k < K; ++k) acc += A[i * ars + k * acs] * x[k * xrs];
     y[i] = acc;
 }
 
@@ -562,7 +565,7 @@ struct Launch {
 
 }  // namespace
 
-bool matmul(int dtype, Buffer* a, Buffer* b, Buffer* c, size_t M, size_t K, size_t N,
+bool matmul(int dtype, Operand a, Operand b, Buffer* c, size_t M, size_t K, size_t N,
             std::string* err) {
     Device* d = ready(err);
     if (!d) return false;
@@ -572,13 +575,17 @@ bool matmul(int dtype, Buffer* a, Buffer* b, Buffer* c, size_t M, size_t K, size
     if (N == 1) {
         size_t global = round_up(M, 64);
         return Launch{*d, p->matvec}
-            .arg(a->mem).arg(b->mem).arg(c->mem).arg(cl_int(M)).arg(cl_int(K))
+            .arg(a.buf->mem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs))
+            .arg(b.buf->mem).arg(cl_ulong(b.rs))
+            .arg(c->mem).arg(cl_int(M)).arg(cl_int(K))
             .run(1, &global, nullptr, err);
     }
     size_t global[2] = {round_up(N, d->tile), round_up(M, d->tile)};
     size_t group[2] = {d->tile, d->tile};
     return Launch{*d, p->matmul}
-        .arg(a->mem).arg(b->mem).arg(c->mem).arg(cl_int(M)).arg(cl_int(K)).arg(cl_int(N))
+        .arg(a.buf->mem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs))
+        .arg(b.buf->mem).arg(cl_ulong(b.rs)).arg(cl_ulong(b.cs))
+        .arg(c->mem).arg(cl_int(M)).arg(cl_int(K)).arg(cl_int(N))
         .run(2, global, group, err);
 }
 
@@ -604,17 +611,28 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
     std::string params, args;
     for (unsigned k = 0; k < prog.ninputs; ++k) {
         const std::string i = std::to_string(k);
-        params += ", __global const T* in" + i + ", ulong n" + i;
-        args += ", in" + i + ", n" + i;
+        params += ", __global const T* in" + i + ", ulong n" + i + ", ulong r" + i;
+        args += ", in" + i + ", n" + i + ", r" + i;
     }
     for (unsigned k = 0; k < prog.nconsts; ++k) {
         params += ", T c" + std::to_string(k);
         args += ", c" + std::to_string(k);
     }
     std::string loads;
+    // Each input is loaded the way the program reads it -- as it lies, as
+    // its transpose, or both -- once, at the top.
+    std::vector<bool> plain(prog.ninputs, false), turned(prog.ninputs, false);
+    for (unsigned i = 0; i < prog.ncode; ++i) {
+        if (prog.code[2 * i] == FUSE_LOAD) plain[prog.code[2 * i + 1]] = true;
+        if (prog.code[2 * i] == FUSE_LOADT) turned[prog.code[2 * i + 1]] = true;
+    }
     for (unsigned k = 0; k < prog.ninputs; ++k) {
         const std::string i = std::to_string(k);
-        loads += "    T x" + i + " = in" + i + "[n" + i + " == n ? i : i % n" + i + "];\n";
+        if (plain[k]) loads += "    T x" + i + " = in" + i + "[n" + i + " == n ? i : i % n" + i + "];\n";
+        if (turned[k])
+            loads += "    ulong o" + i + " = i % n" + i + ";\n"
+                     "    T xt" + i + " = in" + i + "[(o" + i + " % r" + i + ") * (n" + i + " / r" + i +
+                     ") + o" + i + " / r" + i + "];\n";
     }
     std::vector<std::string> stack;
     static const char* const binops[] = {" + ", " - ", " * ", " / "};
@@ -626,6 +644,7 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
             case FUSE_LOAD: stack.push_back("x" + std::to_string(arg)); break;
             case FUSE_CONST: stack.push_back("c" + std::to_string(arg)); break;
             case FUSE_PRODUCT: stack.push_back("p"); break;
+            case FUSE_LOADT: stack.push_back("xt" + std::to_string(arg)); break;
             case FUSE_BIN: {
                 std::string y = stack.back();
                 stack.pop_back();
@@ -645,7 +664,8 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
         // replaced by the program applied to what would have been stored.
         src += "inline T value(ulong i, ulong n, T p" + params + ") {\n" + loads + "    return " +
                stack.back() + ";\n}\n";
-        src += "__kernel void mm(__global const T* A, __global const T* B, __global T* C,\n"
+        src += "__kernel void mm(__global const T* A, ulong ars, ulong acs, __global const T* B,\n"
+               "                 ulong brs, ulong bcs, __global T* C,\n"
                "                 int M, int K, int N, ulong n" + params + ") {\n"
                "    __local T As[TS][TS];\n"
                "    __local T Bs[TS][TS];\n"
@@ -653,8 +673,8 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
                "    int lc = get_local_id(0), lr = get_local_id(1);\n"
                "    T acc = (T)0;\n"
                "    for (int t = 0; t < K; t += TS) {\n"
-               "        As[lr][lc] = (row < M && t + lc < K) ? A[row * K + t + lc] : (T)0;\n"
-               "        Bs[lr][lc] = (t + lr < K && col < N) ? B[(t + lr) * N + col] : (T)0;\n"
+               "        As[lr][lc] = (row < M && t + lc < K) ? A[row * ars + (t + lc) * acs] : (T)0;\n"
+               "        Bs[lr][lc] = (t + lr < K && col < N) ? B[(t + lr) * brs + col * bcs] : (T)0;\n"
                "        barrier(CLK_LOCAL_MEM_FENCE);\n"
                "        for (int k = 0; k < TS; ++k) acc += As[lr][k] * Bs[k][lc];\n"
                "        barrier(CLK_LOCAL_MEM_FENCE);\n"
@@ -663,13 +683,12 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
                "        ulong i = (ulong)row * N + col;\n"
                "        C[i] = value(i, n, acc" + args + ");\n"
                "    }\n}\n";
-        src += "__kernel void mv(__global const T* A, __global const T* x, __global T* y,\n"
-               "                 int M, int K, ulong n" + params + ") {\n"
+        src += "__kernel void mv(__global const T* A, ulong ars, ulong acs, __global const T* x,\n"
+               "                 ulong xrs, __global T* y, int M, int K, ulong n" + params + ") {\n"
                "    int i = get_global_id(0);\n"
                "    if (i >= M) return;\n"
-               "    __global const T* a = A + (ulong)i * K;\n"
                "    T acc = (T)0;\n"
-               "    for (int k = 0; k < K; ++k) acc += a[k] * x[k];\n"
+               "    for (int k = 0; k < K; ++k) acc += A[i * ars + k * acs] * x[k * xrs];\n"
                "    y[i] = value((ulong)i, n, acc" + args + ");\n}\n";
         return src;
     }
@@ -713,15 +732,16 @@ Fused* fused_kernels(Device& d, int dtype, const FuseProgram& prog, std::string*
 
 /// The inputs and constants every fused kernel takes after its own arguments.
 void bind_program(Launch& l, int dtype, const FuseProgram& prog, Buffer* const* ins,
-                  const size_t* counts, const double* consts) {
-    for (unsigned k = 0; k < prog.ninputs; ++k) l.arg(ins[k]->mem).arg(cl_ulong(counts[k]));
+                  const size_t* counts, const size_t* rows, const double* consts) {
+    for (unsigned k = 0; k < prog.ninputs; ++k)
+        l.arg(ins[k]->mem).arg(cl_ulong(counts[k])).arg(cl_ulong(rows[k]));
     for (unsigned k = 0; k < prog.nconsts; ++k) l.scalar(dtype, consts[k]);
 }
 
 }  // namespace
 
 bool fused(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
-           const double* consts, Buffer* out, size_t n, std::string* err) {
+           const size_t* rows, const double* consts, Buffer* out, size_t n, std::string* err) {
     Device* d = ready(err);
     if (!d) return false;
     if (!program_for(*d, dtype, err)) return false;
@@ -731,13 +751,13 @@ bool fused(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t*
     size_t global = round_up(n, 64);
     Launch l{*d, f->map};
     l.arg(out->mem).arg(cl_ulong(n));
-    bind_program(l, dtype, prog, ins, counts, consts);
+    bind_program(l, dtype, prog, ins, counts, rows, consts);
     return l.run(1, &global, nullptr, err);
 }
 
-bool fused_matmul(int dtype, const FuseProgram& prog, Buffer* a, Buffer* b, size_t M, size_t K,
-                  size_t N, Buffer* const* ins, const size_t* counts, const double* consts,
-                  Buffer* out, std::string* err) {
+bool fused_matmul(int dtype, const FuseProgram& prog, Operand a, Operand b, size_t M, size_t K,
+                  size_t N, Buffer* const* ins, const size_t* counts, const size_t* rows,
+                  const double* consts, Buffer* out, std::string* err) {
     Device* d = ready(err);
     if (!d) return false;
     if (!program_for(*d, dtype, err)) return false;
@@ -748,21 +768,24 @@ bool fused_matmul(int dtype, const FuseProgram& prog, Buffer* a, Buffer* b, size
     if (N == 1) {
         size_t global = round_up(M, 64);
         Launch l{*d, f->mv};
-        l.arg(a->mem).arg(b->mem).arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(n);
-        bind_program(l, dtype, prog, ins, counts, consts);
+        l.arg(a.buf->mem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs)).arg(b.buf->mem)
+            .arg(cl_ulong(b.rs)).arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(n);
+        bind_program(l, dtype, prog, ins, counts, rows, consts);
         return l.run(1, &global, nullptr, err);
     }
     size_t global[2] = {round_up(N, d->tile), round_up(M, d->tile)};
     size_t group[2] = {d->tile, d->tile};
     Launch l{*d, f->mm};
-    l.arg(a->mem).arg(b->mem).arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(cl_int(N)).arg(n);
-    bind_program(l, dtype, prog, ins, counts, consts);
+    l.arg(a.buf->mem).arg(cl_ulong(a.rs)).arg(cl_ulong(a.cs)).arg(b.buf->mem)
+        .arg(cl_ulong(b.rs)).arg(cl_ulong(b.cs)).arg(out->mem).arg(cl_int(M)).arg(cl_int(K))
+        .arg(cl_int(N)).arg(n);
+    bind_program(l, dtype, prog, ins, counts, rows, consts);
     return l.run(2, global, group, err);
 }
 
 bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins,
-                  const size_t* counts, const double* consts, size_t n, double* out,
-                  std::string* err) {
+                  const size_t* counts, const size_t* rows, const double* consts, size_t n,
+                  double* out, std::string* err) {
     Device* d = ready(err);
     if (!d) return false;
     if (!program_for(*d, dtype, err)) return false;
@@ -780,7 +803,7 @@ bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins
             size_t global = groups * d->group, group = d->group;
             Launch l{*d, f->reduce};
             l.arg(partial->mem).local(group * w).arg(cl_int(op)).arg(cl_ulong(n));
-            bind_program(l, dtype, prog, ins, counts, consts);
+            bind_program(l, dtype, prog, ins, counts, rows, consts);
             ok = l.run(1, &global, &group, err);
         }
     }
