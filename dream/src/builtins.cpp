@@ -1226,6 +1226,8 @@ NativeResult vm_close_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_image_digest(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_wire_encode(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_share_arenas(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_node_section(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_index_section(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_wire_decode(Process& p, Value self, Value* args, uint32_t n);
 }  // namespace
 
@@ -1257,6 +1259,9 @@ ModuleDef make_vm_module() {
                          {"wire_decode", 1, 0b1, vm_wire_decode},
                          // `opt.optimize_parts`'s walk; see "Sharing a program's parts".
                          {"share_arenas", 1, 0b0, vm_share_arenas, 0, true},
+                         // `emit`'s node and kid sections; see "The image's two largest sections".
+                         {"node_section", 1, 0b0, vm_node_section, 0, true},
+                         {"index_section", 1, 0b0, vm_index_section, 0, true},
                          // measuring
                          {"now_ns!", 1, 0b1, vm_now_ns},
                          {"wall_ms!", 1, 0b1, vm_wall_ms},
@@ -3009,6 +3014,87 @@ NativeResult vm_share_arenas(Process& p, Value, Value* args, uint32_t) {
     result = p.heap().make_cons(kids, result);
     result = p.heap().make_cons(nodes, result);
     return NativeResult::ok(result);
+}
+
+// ---------------------------------------------------------------------------
+// The image's two largest sections, written here
+// ---------------------------------------------------------------------------
+//
+// `emit.node_bytes` and `emit.index` in the compiler write a node as twelve
+// bytes and a kid as four, through a function call and a `str_le` a field, and
+// an image is tens of thousands of each. These write the same bytes in one
+// call a section -- `emit`'s tests hold them to the Dream writers -- with the
+// opcode numbers the compiler's own table gives (`ir.op_codes`), handed in.
+
+namespace {
+
+/// A node index as the image stores one: the word, or all ones for `:none`.
+bool section_index(Process& p, Value v, Value none, std::string* out) {
+    v = resolve(v);
+    uint32_t w;
+    if (v == none) w = 0xFFFFFFFFu;
+    else if (is_fixnum(v)) w = uint32_t(uint64_t(fixnum_value(v)));
+    else return false;
+    (void)p;
+    for (int i = 0; i < 4; ++i) out->push_back(char((w >> (8 * i)) & 0xff));
+    return true;
+}
+
+}  // namespace
+
+/// `node_section [nodes, op_codes]` -- every node as `u8 opcode, u8 flags,
+/// u16 0, index a, index b, index c`.
+NativeResult vm_node_section(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    forced = resolve(forced);
+    if (!is_obj(forced, ObjType::Cons)) return type_fail(p, "node_section needs [nodes, op_codes]");
+    Value nodes = resolve(static_cast<ConsObj*>(as_obj(forced))->head);
+    Value rest = resolve(static_cast<ConsObj*>(as_obj(forced))->tail);
+    if (!is_obj(rest, ObjType::Cons)) return type_fail(p, "node_section needs [nodes, op_codes]");
+    Value codes = resolve(static_cast<ConsObj*>(as_obj(rest))->head);
+    Value none = make_atom(p.runtime().intern_atom("none"));
+    std::string out;
+    for (Value cur = nodes; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        Value n = resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        Value f[5];
+        Value walk = n;
+        for (int k = 0; k < 5; ++k) {
+            if (!is_obj(walk, ObjType::Cons)) return type_fail(p, "node_section: a node is [op, flags, a, b, c]");
+            f[k] = resolve(static_cast<ConsObj*>(as_obj(walk))->head);
+            walk = resolve(static_cast<ConsObj*>(as_obj(walk))->tail);
+        }
+        Value code;
+        int64_t op = map_lookup(p, codes, f[0], &code) && is_fixnum(resolve(code)) ? fixnum_value(resolve(code)) : 0;
+        if (!is_fixnum(f[1])) return type_fail(p, "node_section: a node's flags are an integer");
+        out.push_back(char(op & 0xff));
+        out.push_back(char(fixnum_value(f[1]) & 0xff));
+        out.push_back('\0');
+        out.push_back('\0');
+        for (int k = 2; k < 5; ++k) {
+            if (!section_index(p, f[k], none, &out)) return type_fail(p, "node_section: an operand is an integer or :none");
+        }
+    }
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+/// `index_section xs` -- every element as an index: the kids section.
+NativeResult vm_index_section(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    Value none = make_atom(p.runtime().intern_atom("none"));
+    std::string out;
+    for (Value cur = resolve(forced); is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        if (!section_index(p, static_cast<ConsObj*>(as_obj(cur))->head, none, &out))
+            return type_fail(p, "index_section: an index is an integer or :none");
+    }
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
 }
 
 NativeResult vm_wire_decode(Process& p, Value, Value* args, uint32_t) {

@@ -30,6 +30,7 @@
 
 import std.list;
 import std.str;
+import std.vm;
 
 import dreams.ir;
 
@@ -172,6 +173,13 @@ let node_bytes [op, flags, a, b, c] =
         index c,
     ];
 
+/// The node and kid sections, which are most of an image: the VM writes them
+/// (`vm.node_section`, `vm.index_section`), the same bytes `node_bytes` and
+/// `index` write -- the tests below hold them to it -- in one call a section
+/// rather than a call and a `str_le` a field.
+let node_section nodes = vm.node_section [nodes, ir.op_codes];
+let kids_section kids = vm.index_section kids;
+
 let func_bytes f =
     str.concat_all [
         u32 (f.[:name else 0]),
@@ -298,8 +306,8 @@ let sections_of img = {
      section t_kstr (string_table strs) (list.length strs),
      section t_sblb blob (str.byte_length blob),
      section t_katm (concat_map (fn v -> u32 v) (img.[:atoms else []])) (list.length (img.[:atoms else []])),
-     section t_node (concat_map (fn n -> node_bytes n) (img.[:nodes else []])) (list.length (img.[:nodes else []])),
-     section t_kids (concat_map (fn k -> index k) (img.[:kids else []])) (list.length (img.[:kids else []])),
+     section t_node (node_section (img.[:nodes else []])) (list.length (img.[:nodes else []])),
+     section t_kids (kids_section (img.[:kids else []])) (list.length (img.[:kids else []])),
      section t_func (concat_map (fn f -> func_bytes f) (img.[:funcs else []])) (list.length (img.[:funcs else []])),
      section t_glbl (concat_map (fn g -> global_bytes g) (img.[:globals else []])) (list.length (img.[:globals else []])),
      section t_impt (concat_map (fn i -> import_bytes i) (img.[:imports else []])) (list.length (img.[:imports else []])),
@@ -396,3 +404,21 @@ let with_entry bytes fi = str.concat_all [
     index fi,
     str.slice (entry_offset + 4) (str.byte_length bytes) bytes,
 ];
+
+when test {
+    import std.test;
+
+    let none = ir.no_node;
+    let nodes = [[:apply, 3, 1, 0, 2], [:local, 0, 7, none, none], [:const_int, 0, 4294967294, none, none],
+                 [:if, 1, 0, 1, 2], [:not_an_opcode, 255, none, none, none]];
+    let kids = [0, 1, none, 4294967294, 3];
+
+    let tests = [
+        test.case "the VM writes nodes as node_bytes does"
+            $( test.eq! (concat_map (fn n -> node_bytes n) nodes) (node_section nodes) ),
+        test.case "and kids as index does"
+            $( test.eq! (concat_map (fn k -> index k) kids) (kids_section kids) ),
+        test.case "nothing is nothing"
+            $( test.eq! ["", ""] [node_section [], kids_section []] ),
+    ];
+}
