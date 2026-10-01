@@ -134,6 +134,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 | Name | Signature | Description |
 |------|-----------|-------------|
 | `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
+| `sort_keyed` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
 ### Large data
 

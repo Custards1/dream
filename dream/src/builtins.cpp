@@ -2409,6 +2409,44 @@ NativeResult core_compare(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_fixnum(cmp));
 }
 
+/// `sort_keyed keys xs` -- the elements of the array `xs`, as a list, in the
+/// order `compare` puts `keys` in, equal keys keeping their order. What
+/// `std.list.sort` and `sort_on` are: a merge sort written in Dream took apart
+/// and rebuilt its list at every level and asked for the key twice a
+/// comparison, and a compile sorts tens of thousands of things.
+///
+/// The keys are forced whole first, under a vouch, and the sort then compares
+/// values that are already forced, so it forces nothing and nothing can be
+/// collected under it. The elements are carried, never looked at: an element
+/// the Dream sort never forced is not forced here either.
+NativeResult core_sort_keyed(Process& p, Value, Value* args, uint32_t) {
+    Value keys;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &keys)) return NativeResult::raise(p.result);
+    }
+    Value xs = resolve(args[1]);
+    if (!is_obj(xs, ObjType::Array)) return type_fail(p, "sort_keyed needs a list of keys and an array");
+    auto* arr = static_cast<ArrayObj*>(as_obj(xs));
+    std::vector<Value> ks;
+    for (Value cur = resolve(keys); is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail))
+        ks.push_back(static_cast<ConsObj*>(as_obj(cur))->head);
+    if (ks.size() != arr->len) return type_fail(p, "sort_keyed needs a key for every element");
+    std::vector<uint32_t> order(ks.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    bool ok = true;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        if (!ok) return false;
+        int cmp = 0;
+        if (!compare_values(p, ks[a], ks[b], 0, &cmp)) { ok = false; return false; }
+        return cmp < 0;
+    });
+    if (!ok) return NativeResult::raise(p.result);
+    Value list = NIL;
+    for (size_t i = order.size(); i-- > 0;) list = p.heap().make_cons(arr->items()[order[i]], list);
+    return NativeResult::ok(list);
+}
+
 // --- the wire format, natively ---
 //
 // `std.wire` is written in Dream, a byte at a time, and it is exact and slow:
@@ -3081,6 +3119,7 @@ const BuiltinDef BUILTINS[] = {
     {"data_count", 1, 0b1, core_data_count},
     {"data_at", 1, 0b1, core_data_at},
     {"compare", 2, 0b11, core_compare},
+    {"sort_keyed", 2, 0b10, core_sort_keyed, true},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

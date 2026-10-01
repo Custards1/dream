@@ -1110,6 +1110,7 @@ static void test_builtin_table_matches_compiler() {
                               "data_count",
                               "data_at",
                               "compare",
+                              "sort_keyed",
     };
     const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
     CHECK_EQ(builtin_count(), n);

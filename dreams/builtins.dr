@@ -67,6 +67,7 @@ let names = [
     "data_count",
     "data_at",
     "compare",
+    "sort_keyed",
 
 ];
 
@@ -146,6 +147,7 @@ let signatures = %{
     "data_count" => "unit -> integer",
     "data_at" => "integer -> bigstr",
     "compare" => "a -> b -> integer",
+    "sort_keyed" => "keys:list -> array -> list",
 
 };
 
