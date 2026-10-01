@@ -89,6 +89,8 @@ Packed numeric arrays, `@`, and the GPU: what made the product fast, and what it
 - The GPU
 - Releasing device memory
 - Fusion
+- Fusing into the product
+- Measuring a fresh tensor
 - Considered: a server process that owns the tensors and mutates them
 - What is not done yet
 

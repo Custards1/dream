@@ -69,6 +69,12 @@ bool fused(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t*
 bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins,
                   const size_t* counts, const double* consts, size_t n, double* out,
                   std::string* err);
+/// `C = A x B` with a fused program applied to each element of C as it is
+/// stored: the program starts from `FUSE_PRODUCT`, which is that element. One
+/// kernel for `relu (w @ x + b)`, generated and cached as `fused`'s are.
+bool fused_matmul(int dtype, const FuseProgram& prog, Buffer* a, Buffer* b, size_t M, size_t K,
+                  size_t N, Buffer* const* ins, const size_t* counts, const double* consts,
+                  Buffer* out, std::string* err);
 /// `C = A x B`, row-major, M x K by K x N.
 bool matmul(int dtype, Buffer* a, Buffer* b, Buffer* c, size_t M, size_t K, size_t N,
             std::string* err);

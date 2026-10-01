@@ -43,6 +43,15 @@ let main! = {
     console.print! ("agree: " + to_string (fused a b == stepped! a b));
     let s = best! "step by step" (fn () -> stepped! a b);
     let f = best! "fused       " (fn () -> fused a b);
+    // A layer whose product is cheap beside the size of its answer -- a
+    // 4096 x 64 by 64 x 4096 product makes 128 MB from 2 GFLOP -- is where
+    // the pass after the product costs most, and where fusing it into the
+    // product's tiles saves most.
+    let w = tensor.random 3 [4096, 64];
+    let x = tensor.random 4 [64, 4096];
+    let bias = tensor.random 5 [4096];
+    let layer_s = best! "layer, product then chain" (fn () -> tensor.relu (strict! (w @ x) + bias));
+    let layer_f = best! "layer, fused into product " (fn () -> tensor.relu (w @ x + bias));
     let sum_s = best! "sum, stepped" (fn () -> tensor.sum (strict! (a * b)));
     let sum_f = best! "sum, fused  " (fn () -> tensor.sum (a * b));
     if tensor.gpu_available () {
@@ -50,6 +59,11 @@ let main! = {
         let gb = tensor.gpu b;
         let gs = best! "gpu, stepped" (fn () -> tensor.host (stepped! ga gb));
         let gf = best! "gpu, fused  " (fn () -> tensor.host (fused ga gb));
+        let gw = tensor.gpu (tensor.random 3 [1024, 64]);
+        let gx = tensor.gpu (tensor.random 4 [64, 1024]);
+        let gbias = tensor.gpu (tensor.random 5 [1024]);
+        let gl_s = best! "gpu layer, stepped" (fn () -> tensor.host (tensor.relu (strict! (gw @ gx) + gbias)));
+        let gl_f = best! "gpu layer, fused  " (fn () -> tensor.host (tensor.relu (gw @ gx + gbias)));
         ()
     } else { () }
 };

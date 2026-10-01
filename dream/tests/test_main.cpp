@@ -772,7 +772,7 @@ static void test_tensor_kernels() {
             std::vector<double> A(M * K), B(K * N), C(M * N, -1.0);
             for (size_t i = 0; i < A.size(); ++i) A[i] = double(i % 7) - 3.0;
             for (size_t i = 0; i < B.size(); ++i) B[i] = double(i % 5) * 0.5 - 1.0;
-            k->gemm(A.data(), B.data(), C.data(), M, K, N);
+            k->gemm(A.data(), B.data(), C.data(), M, K, N, nullptr);
             double worst = 0;
             for (size_t i = 0; i < M; ++i)
                 for (size_t j = 0; j < N; ++j) {

@@ -170,9 +170,13 @@ struct Program {
 /// The two kernels generated for one fused program: the elementwise one, and
 /// the reduction that computes the same values and folds them instead of
 /// storing them.
+///
+/// A program that starts from a product gets the product kernels instead,
+/// with the program applied to each element as it is stored: `mm` for a
+/// product with more than one column, `mv` for one with exactly one.
 struct Fused {
     cl_program program = nullptr;
-    cl_kernel map = nullptr, reduce = nullptr;
+    cl_kernel map = nullptr, reduce = nullptr, mm = nullptr, mv = nullptr;
 };
 
 struct Device {
@@ -621,6 +625,7 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
         switch (op) {
             case FUSE_LOAD: stack.push_back("x" + std::to_string(arg)); break;
             case FUSE_CONST: stack.push_back("c" + std::to_string(arg)); break;
+            case FUSE_PRODUCT: stack.push_back("p"); break;
             case FUSE_BIN: {
                 std::string y = stack.back();
                 stack.pop_back();
@@ -632,6 +637,42 @@ std::string fused_source(int dtype, const FuseProgram& prog) {
         }
     }
     std::string src = std::string("// ") + (dtype == F32 ? "f32" : "f64") + "\n" + kFusedPrelude;
+    bool product = false;
+    for (unsigned i = 0; i < prog.ncode; ++i) product = product || prog.code[2 * i] == FUSE_PRODUCT;
+    if (product) {
+        // The product's element arrives as `p`; everything else is as for an
+        // elementwise program. The kernels are `kSource`'s, with the store
+        // replaced by the program applied to what would have been stored.
+        src += "inline T value(ulong i, ulong n, T p" + params + ") {\n" + loads + "    return " +
+               stack.back() + ";\n}\n";
+        src += "__kernel void mm(__global const T* A, __global const T* B, __global T* C,\n"
+               "                 int M, int K, int N, ulong n" + params + ") {\n"
+               "    __local T As[TS][TS];\n"
+               "    __local T Bs[TS][TS];\n"
+               "    int col = get_global_id(0), row = get_global_id(1);\n"
+               "    int lc = get_local_id(0), lr = get_local_id(1);\n"
+               "    T acc = (T)0;\n"
+               "    for (int t = 0; t < K; t += TS) {\n"
+               "        As[lr][lc] = (row < M && t + lc < K) ? A[row * K + t + lc] : (T)0;\n"
+               "        Bs[lr][lc] = (t + lr < K && col < N) ? B[(t + lr) * N + col] : (T)0;\n"
+               "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+               "        for (int k = 0; k < TS; ++k) acc += As[lr][k] * Bs[k][lc];\n"
+               "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+               "    }\n"
+               "    if (row < M && col < N) {\n"
+               "        ulong i = (ulong)row * N + col;\n"
+               "        C[i] = value(i, n, acc" + args + ");\n"
+               "    }\n}\n";
+        src += "__kernel void mv(__global const T* A, __global const T* x, __global T* y,\n"
+               "                 int M, int K, ulong n" + params + ") {\n"
+               "    int i = get_global_id(0);\n"
+               "    if (i >= M) return;\n"
+               "    __global const T* a = A + (ulong)i * K;\n"
+               "    T acc = (T)0;\n"
+               "    for (int k = 0; k < K; ++k) acc += a[k] * x[k];\n"
+               "    y[i] = value((ulong)i, n, acc" + args + ");\n}\n";
+        return src;
+    }
     src += "inline T value(ulong i, ulong n" + params + ") {\n" + loads + "    return " +
            stack.back() + ";\n}\n";
     src += "__kernel void map(__global T* out, ulong n" + params + ") {\n"
@@ -661,8 +702,11 @@ Fused* fused_kernels(Device& d, int dtype, const FuseProgram& prog, std::string*
     if (it != d.fused.end()) return &it->second;
     Fused f;
     f.program = compile(d, src, options_for(d, dtype), why);
-    if (!f.program || !kernel(d, f.program, "map", &f.map, why) ||
-        !kernel(d, f.program, "reduce", &f.reduce, why))
+    if (!f.program) return nullptr;
+    const bool product = src.find("__kernel void mm(") != std::string::npos;
+    if (product ? !kernel(d, f.program, "mm", &f.mm, why) || !kernel(d, f.program, "mv", &f.mv, why)
+                : !kernel(d, f.program, "map", &f.map, why) ||
+                      !kernel(d, f.program, "reduce", &f.reduce, why))
         return nullptr;
     return &d.fused.emplace(std::move(src), f).first->second;
 }
@@ -689,6 +733,31 @@ bool fused(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t*
     l.arg(out->mem).arg(cl_ulong(n));
     bind_program(l, dtype, prog, ins, counts, consts);
     return l.run(1, &global, nullptr, err);
+}
+
+bool fused_matmul(int dtype, const FuseProgram& prog, Buffer* a, Buffer* b, size_t M, size_t K,
+                  size_t N, Buffer* const* ins, const size_t* counts, const double* consts,
+                  Buffer* out, std::string* err) {
+    Device* d = ready(err);
+    if (!d) return false;
+    if (!program_for(*d, dtype, err)) return false;
+    std::lock_guard<std::mutex> g(d->lock);
+    Fused* f = fused_kernels(*d, dtype, prog, err);
+    if (!f) return false;
+    const cl_ulong n = cl_ulong(M) * N;
+    if (N == 1) {
+        size_t global = round_up(M, 64);
+        Launch l{*d, f->mv};
+        l.arg(a->mem).arg(b->mem).arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(n);
+        bind_program(l, dtype, prog, ins, counts, consts);
+        return l.run(1, &global, nullptr, err);
+    }
+    size_t global[2] = {round_up(N, d->tile), round_up(M, d->tile)};
+    size_t group[2] = {d->tile, d->tile};
+    Launch l{*d, f->mm};
+    l.arg(a->mem).arg(b->mem).arg(out->mem).arg(cl_int(M)).arg(cl_int(K)).arg(cl_int(N)).arg(n);
+    bind_program(l, dtype, prog, ins, counts, consts);
+    return l.run(2, global, group, err);
 }
 
 bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins,

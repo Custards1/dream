@@ -63,6 +63,30 @@ let main! = {
     let there = join! (spawn! $( tensor.sum e ));
     console.print! (near there (tensor.sum e))
 
+    // Fused into a product: the chain after `@` runs as each tile of the
+    // product is finished. `tensor.host` computes the product on its own
+    // first, and the two must agree exactly -- the product's arithmetic is the
+    // same either way, and so is the chain's.
+    let w = tensor.random 4 [200, 300] - 0.5;
+    let x = tensor.random 5 [300, 150] - 0.5;
+    let bias = tensor.random 6 [150];
+    console.print! (tensor.relu (w @ x + bias) == tensor.relu (tensor.host (w @ x) + bias))
+    let big = tensor.random 7 [400, 300];
+    let wide = tensor.random 8 [300, 400];
+    console.print! (tensor.sigmoid (big @ wide) * 2.0 == tensor.sigmoid (tensor.host (big @ wide)) * 2.0)
+    let tall = tensor.random 9 [5000, 30];
+    let col = tensor.random 10 [30];
+    console.print! (tensor.tanh (tall @ col - 1.0) == tensor.tanh (tensor.host (tall @ col) - 1.0))
+    console.print! (col @ tensor.transpose tall + 3.0 == tensor.host (col @ tensor.transpose tall) + 3.0)
+    let h = w @ x;
+    console.print! (h * h + h == tensor.host h * tensor.host h + tensor.host h)
+    console.print! (w @ x + w @ x == tensor.host (w @ x) * 2.0)
+    console.print! ((w @ x) * 0.0 + tensor.random 11 [150] == tensor.reshape [200, 150] (tensor.random 11 [150] + tensor.zeros [200, 150]))
+    console.print! (tensor.reshape [30000] (w @ x + 1.0) == tensor.reshape [30000] (tensor.host (w @ x) + 1.0))
+    console.print! (tensor.shape (tensor.reshape [150, 200] (w @ x + bias)) == [150, 200])
+    console.print! (near (tensor.sum (w @ x * 2.0)) (tensor.sum (tensor.host (w @ x)) * 2.0))
+    console.print! (tensor.at (tall @ col + 1.0) [4999] == tensor.at (tensor.host (tall @ col)) [4999] + 1.0)
+
     // Products and moves read the numbers of a deferred operand.
     console.print! (near (tensor.sum ((m + 0.0) @ tensor.transpose n)) (tensor.sum (m @ tensor.transpose n)))
     console.print! (tensor.to_list (tensor.reshape [6000] (m * 1.0)) == tensor.to_list (tensor.reshape [6000] m))

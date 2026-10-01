@@ -1130,6 +1130,8 @@ void Heap::scan_object(GcCtx& c, Obj* o) {
             if (!tensor_deferred(t)) break;
             TensorExpr* e = tensor_expr(t);
             forward(&e->result);
+            forward(&e->product_a);
+            forward(&e->product_b);
             for (uint32_t i = 0; i < e->ninputs; ++i) forward(&e->inputs()[i]);
             break;
         }
@@ -2175,6 +2177,8 @@ struct VerifyWalk {
                             return;
                         }
                         push(e->result, v);
+                        push(e->product_a, v);
+                        push(e->product_b, v);
                         for (uint32_t i = 0; i < e->ninputs; ++i) push(e->inputs()[i], v);
                         break;
                     }
@@ -2358,6 +2362,12 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
                     for (uint32_t i = 0; i < e->ninputs; ++i) {
                         Value in = copy_value(dest, e->inputs()[i], seen);
                         tensor_expr(static_cast<TensorObj*>(as_obj(t)))->inputs()[i] = in;
+                    }
+                    if (e->product_a != NIL_SLOT) {
+                        Value pa = copy_value(dest, e->product_a, seen);
+                        Value pb = copy_value(dest, e->product_b, seen);
+                        tensor_expr(static_cast<TensorObj*>(as_obj(t)))->product_a = pa;
+                        tensor_expr(static_cast<TensorObj*>(as_obj(t)))->product_b = pb;
                     }
                     return t;
                 }

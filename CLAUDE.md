@@ -350,7 +350,9 @@ The lessons that keep coming back:
   build against -- and everything done to it then runs there; `tensor.host`
   brings it back. Elementwise work on a large tensor is *deferred*: it
   records a program (`TensorExpr`) and whatever reads the numbers runs the
-  chain fused, in one pass or one generated GPU kernel. A GPU tensor holds device memory the heap counts as
+  chain fused, in one pass or one generated GPU kernel -- and a large `@`
+  defers too, so the chain after it runs inside the product (an epilogue on
+  each finished tile, or in the generated product kernel). A GPU tensor holds device memory the heap counts as
   collection pressure and frees when it dies (`Heap::reap_external`). The CPU
   kernels are compiled twice, baseline and AVX2, and picked at start-up.
   [docs/notes/tensors.md](docs/notes/tensors.md) is the design and the

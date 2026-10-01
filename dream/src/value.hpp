@@ -387,8 +387,17 @@ static_assert(sizeof(TensorObj) % 16 == 0, "a tensor's data starts on a 16-byte 
 /// a chain is one flat program and never a tree of deferred objects.
 constexpr uint8_t TENSOR_DEFERRED = 1;
 
+///
+/// A program may also begin from a matrix product (`FUSE_PRODUCT`): `a @ b` on
+/// large operands defers too, holding its two operands in `product_a` and
+/// `product_b`, so that `relu (w @ x + b)` computes the elementwise part as
+/// each band of the product is finished -- in cache, or in the product kernel
+/// itself on a GPU -- rather than in a pass over the whole product afterwards.
+/// Both are `NIL_SLOT` when the program has no product.
 struct TensorExpr {
     Value result;  // NIL_SLOT until computed
+    Value product_a;
+    Value product_b;
     uint16_t ninputs;
     uint16_t nconsts;
     uint16_t ncode;  // instructions, two bytes each

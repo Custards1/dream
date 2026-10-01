@@ -301,13 +301,88 @@ deferred operand, chains past the program limits, a deferred tensor sent to
 another process, and every reduction. It also passes under the heap verifier
 with parallel and concurrent collection.
 
+### Fusing into the product
+
+`relu (w @ x + b)` was a product that wrote its answer, then one fused pass
+over that answer for the `+ b` and `relu`. When the product is cheap beside
+its answer -- the wide, shallow layers of a network -- that second pass is a
+large share of the cost. Now the chain runs inside the product:
+
+- **`a @ b` defers.** A large product (4096 numbers or more, or any on the
+  GPU, but never the dot product of two vectors) answers a deferred tensor
+  whose program is one new instruction, `FUSE_PRODUCT`. The two operands are
+  kept in `TensorExpr::product_a` and `product_b`, which the collector traces
+  and a send copies. Building `w @ x + b` from it appends to that program like
+  any other.
+- **At most one product per program, as long as the answer.** The chain is
+  run on each finished piece of the product, which only works if the answer
+  and the product are the same numbers in the same places. A second, different
+  product in one program, or a product shorter than the answer (`v + w @ x`
+  with `v` a matrix and the product a row repeated down it), makes `build`
+  compute that operand first. The same product twice (`h * h + h`) is one
+  product.
+- **CPU: as each tile is finished.** The blocked kernel calls a
+  `GemmEpilogue` when a `96 x 2048` block of C has had its last panel of K
+  added in. That is the moment the block will not be touched again and is
+  hottest in cache, and `epilogue_tile` runs the program over it in place,
+  one row at a time. Rows are contiguous, and the program indexes by position
+  in the whole answer, so a row is just a range. Bands on separate threads
+  report their own tiles; tiles are disjoint, so epilogues run in parallel.
+  Calling the kernel once per small band of rows instead looked simpler and
+  was rejected on arithmetic: every call repacks B, which at 2048 x 2048 is
+  gigabytes of copying to save a 64 MB pass.
+- **GPU: in the store.** A program with a product generates the tiled product
+  kernel (and the one-column `matvec`) with the store
+  `C[i] = value(i, n, acc, ..)`. That makes `relu (w @ x + b)` one kernel,
+  cached by its source like every fused kernel.
+- **In-place care.** The epilogue rewrites C where it lies, so the last
+  instruction may not write its block directly while its operands still point
+  into it. `run_block` writes to scratch and the caller copies over.
+- **Reductions compute products first.** `tensor.sum (w @ x)` computes the
+  product with its epilogue, then folds. The fold has no tile to ride along
+  with.
+
+Measured on a 4096 x 64 by 64 x 4096 layer, `relu (w @ x + bias)`, against
+the product computed first (`strict!`) and the chain fused after it:
+
+| | product, then chain | fused into product |
+|---|---|---|
+| 4 threads | 93 ms | 76 ms |
+| 1 thread | 279 ms | 212 ms |
+| GPU (POCL), 1024 x 64 by 64 x 1024 | 28 ms | 27 ms |
+
+POCL runs the GPU kernels on the same four cores, so its number says the path
+works, not what a GPU would gain; there the saving is a kernel launch and a
+full read and write of C.
+
+**Reshape stays deferred** when no input is broadcast. Each input is then
+read at exactly the position the program writes, so the program means the
+same under any shape of the same size, product included.
+
+`tensor_fusion.dr` checks every fused product exactly against the product
+computed first. It covers matrix by matrix (one thread and banded across
+threads), the one-row and one-column shapes, a product used twice, two
+products, a product too short for the answer, reshape and reduction.
+`tensor_gpu.dr` checks the generated product kernels against the host.
+
+### Measuring a fresh tensor
+
+One trap seen while measuring this. The first result written into freshly
+mapped memory pays its page faults: about 40 ms for 32 MB here, against
+8–10 ms once a major collection has freed earlier blocks for reuse. Whether a
+benchmark's runs start on fresh or reused memory decides which of the two it
+reports, every run of a process alike. Warm up, and compare processes in the
+same state. Large tensors are born in old space and freed only by a major; a
+pool for them would remove the faults, and is not built.
+
 ### What fusion does not do yet
 
-- **Fusing into the product.** In `relu (w @ x + b)` the product writes its
-  answer, and one fused pass then adds and applies `relu`. That is two passes
-  where a GEMM epilogue would make one.
-- **Operations that are not elementwise.** `sum_axis`, `transpose` and
-  reshaping compute their operand first.
+- **Operations that are not elementwise.** `sum_axis` and `transpose` compute
+  their operand first. A transpose could be a strided load in the program.
+- **A product as an operand of another product.** `(a @ b) @ c` computes the
+  inner product, which it must; but an elementwise chain *before* a product
+  (`(x * 2.0) @ w`) is computed into memory rather than applied as the
+  product's panels are packed.
 
 ## Considered: a server process that owns the tensors and mutates them
 

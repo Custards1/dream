@@ -220,9 +220,16 @@ inline void micro(Z kc, const double* __restrict a, const double* __restrict b, 
 /// `C = A x B` for row-major `A` (M x K) and `B` (K x N), `C` (M x N)
 /// overwritten. Thin products go to the loops that suit them: packing a panel
 /// to multiply it by one column is all overhead.
-void gemm(const double* A, const double* B, double* C, Z M, Z K, Z N) {
+///
+/// `epi` sees each block of C the moment it is final. In the blocked loop that
+/// is the last panel of K: once `pc` has reached the end, the `mc x nc` block
+/// just computed will not be touched again, and it is as hot in cache as it
+/// will ever be -- which is the whole of what fusing into a product is for. A
+/// thin product hands over everything at the end, having touched it once.
+void gemm(const double* A, const double* B, double* C, Z M, Z K, Z N, const GemmEpilogue* epi) {
     if (N == 1) {
         for (Z i = 0; i < M; ++i) C[i] = dot(A + i * K, B, K);
+        if (epi) epi->fn(epi->ctx, epi->row_base, epi->row_base + M, 0, 1);
         return;
     }
     std::memset(C, 0, M * N * sizeof(double));
@@ -235,6 +242,7 @@ void gemm(const double* A, const double* B, double* C, Z M, Z K, Z N) {
             double* __restrict c = C;
             for (Z j = 0; j < N; ++j) c[j] += a * b[j];
         }
+        if (epi) epi->fn(epi->ctx, epi->row_base, epi->row_base + 1, 0, N);
         return;
     }
     std::vector<double> Bp(KC * (NC + NR)), Ap((MC + MR) * KC);
@@ -251,6 +259,8 @@ void gemm(const double* A, const double* B, double* C, Z M, Z K, Z N) {
                         micro(kc, Ap.data() + (ir / MR) * kc * MR, Bp.data() + (jr / NR) * kc * NR,
                               C + (ic + ir) * N + jc + jr, N, std::min(MR, mc - ir),
                               std::min(NR, nc - jr));
+                if (epi && pc + kc == K)
+                    epi->fn(epi->ctx, epi->row_base + ic, epi->row_base + ic + mc, jc, jc + nc);
             }
         }
     }

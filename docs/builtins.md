@@ -272,7 +272,10 @@ on lists already joins them.
 the GPU), the elementwise operators and functions do not compute at once. They
 record the work, and whatever reads the numbers runs the whole chain in one
 pass: `tensor.relu (a * 2.0 + b) * 0.5` is one pass over memory, or one GPU
-kernel, not four. A reduction of such a chain never stores it. Nothing about
+kernel, not four. A product defers too, so the chain after it runs inside it:
+`tensor.relu (w @ x + b)` applies `+ b` and `relu` to each block of the
+product as it is finished, or in the product kernel itself on the GPU. A
+reduction of such a chain never stores it. Nothing about
 this is visible except the speed: a deferred tensor has its type and shape,
 and shape errors are raised where they always were. `strict!` computes one,
 which is what timing or `vm.share!` wants.

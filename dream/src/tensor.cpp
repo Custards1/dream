@@ -443,26 +443,31 @@ unsigned tensor_threads() {
     return n;
 }
 
-void host_gemm(const double* A, const double* B, double* C, size_t M, size_t K, size_t N) {
+/// `C = A x B`, and `epi` (with `row_base` ignored) told of each finished
+/// tile of C in whole-matrix rows. The tiles of different bands are disjoint,
+/// so an epilogue that writes only its own tile may run on every band's
+/// thread at once.
+void host_gemm(const double* A, const double* B, double* C, size_t M, size_t K, size_t N,
+               const GemmEpilogue* epi = nullptr) {
     const TensorKernels& k = tensor_kernels();
     const double work = 2.0 * double(M) * double(K) * double(N);
     size_t threads = work < 3e7 ? 1 : std::min<size_t>(tensor_threads(), M / 32);
     if (threads <= 1) {
-        k.gemm(A, B, C, M, K, N);
+        k.gemm(A, B, C, M, K, N, epi);
         return;
     }
     // Bands in multiples of the kernel's six rows, so no band ends in a
     // partial tile that another band would have filled.
     size_t band = (M + threads - 1) / threads;
     band = (band + 5) / 6 * 6;
+    auto run = [&k, A, B, C, K, N, epi](size_t m0, size_t rows) {
+        GemmEpilogue here;
+        if (epi) here = GemmEpilogue{epi->fn, epi->ctx, m0};
+        k.gemm(A + m0 * K, B, C + m0 * N, rows, K, N, epi ? &here : nullptr);
+    };
     std::vector<std::thread> pool;
-    for (size_t m0 = band; m0 < M; m0 += band) {
-        const size_t rows = std::min(band, M - m0);
-        pool.emplace_back([&k, A, B, C, m0, rows, K, N] {
-            k.gemm(A + m0 * K, B, C + m0 * N, rows, K, N);
-        });
-    }
-    k.gemm(A, B, C, std::min(band, M), K, N);
+    for (size_t m0 = band; m0 < M; m0 += band) pool.emplace_back(run, m0, std::min(band, M - m0));
+    run(0, std::min(band, M));
     for (auto& t : pool) t.join();
 }
 
@@ -547,8 +552,14 @@ struct Program {
     double consts[kFuseMaxConsts];
     uint8_t code[kFuseMaxCode * 2];
     unsigned ninputs = 0, nconsts = 0, ncode = 0;
+    /// The matrix product the program starts from (`FUSE_PRODUCT`), or none.
+    TensorObj* product_a = nullptr;
+    TensorObj* product_b = nullptr;
     /// Past one of the limits. The caller computes an operand and starts over.
     bool overflow = false;
+    /// Two different products met in one program. Only one can be the
+    /// product the program is fused into; the caller computes the other.
+    bool second_product = false;
 
     void emit(uint8_t op, unsigned arg) {
         if (ncode == kFuseMaxCode) {
@@ -579,11 +590,17 @@ struct Program {
         consts[nconsts] = c;
         return nconsts++;
     }
+    void product(TensorObj* a, TensorObj* b) {
+        if (product_a && (product_a != a || product_b != b)) second_product = true;
+        product_a = a;
+        product_b = b;
+        emit(FUSE_PRODUCT, 0);
+    }
     unsigned depth() const {
         unsigned sp = 0, most = 0;
         for (unsigned i = 0; i < ncode; ++i) {
             switch (code[2 * i]) {
-                case FUSE_LOAD: case FUSE_CONST: most = std::max(most, ++sp); break;
+                case FUSE_LOAD: case FUSE_CONST: case FUSE_PRODUCT: most = std::max(most, ++sp); break;
                 case FUSE_BIN: --sp; break;
                 default: break;
             }
@@ -622,10 +639,24 @@ void append(Program& prog, Value v) {
                 arg = prog.input(static_cast<TensorObj*>(as_obj(e->inputs()[arg])));
                 break;
             case FUSE_CONST: arg = prog.constant(e->consts()[arg]); break;
+            case FUSE_PRODUCT:
+                prog.product(static_cast<TensorObj*>(as_obj(e->product_a)),
+                             static_cast<TensorObj*>(as_obj(e->product_b)));
+                continue;
             default: break;
         }
         prog.emit(c[2 * i], arg);
     }
+}
+
+/// The shape of `a @ b` as matrices: a vector on the left is a row, on the
+/// right a column.
+struct Gemm {
+    size_t M, K, N;
+};
+Gemm gemm_of(const TensorObj* a, const TensorObj* b) {
+    return Gemm{a->rank == 2 ? a->dims[0] : 1u, a->rank == 2 ? a->dims[1] : a->dims[0],
+                b->rank == 2 ? b->dims[1] : 1u};
 }
 
 /// The program's value at the numbers `[base, base + len)` of an answer of
@@ -655,15 +686,23 @@ struct Scratch {
 
 /// One block. Answers the pointer the block's numbers are at: `out` when the
 /// last instruction could write there, otherwise a scratch buffer.
+///
+/// `product` is the whole computed product a `FUSE_PRODUCT` reads, or null.
+/// An epilogue computes in place -- `out` is the product's own block -- and
+/// then the last instruction must not write `out` directly, since its operands
+/// may still point into it; the caller copies the answer over afterwards.
 const double* run_block(const FuseProgram& prog, TensorObj* const* inputs, const double* consts,
-                        size_t base, size_t len, Scratch& scratch, double* out) {
+                        const double* product, size_t base, size_t len, Scratch& scratch,
+                        double* out) {
     const TensorKernels& k = tensor_kernels();
+    const bool direct = !(product && out == product + base);
     Slot stack[kFuseMaxDepth];
     unsigned sp = 0;
     for (unsigned i = 0; i < prog.ncode; ++i) {
         const unsigned op = prog.code[2 * i], arg = prog.code[2 * i + 1];
-        const bool last = i + 1 == prog.ncode;
+        const bool last = direct && i + 1 == prog.ncode;
         switch (op) {
+            case FUSE_PRODUCT: stack[sp++] = Slot{product + base, 0, false}; break;
             case FUSE_LOAD: {
                 const TensorObj* in = inputs[arg];
                 const size_t m = size_t(in->count);
@@ -753,10 +792,37 @@ void run_host(const FuseProgram& prog, TensorObj* const* inputs, const double* c
         Scratch scratch(std::max(prog.depth, 1u));
         for (size_t base = begin; base < end; base += kFuseBlock) {
             const size_t len = std::min(kFuseBlock, end - base);
-            const double* r = run_block(prog, inputs, consts, base, len, scratch, out + base);
+            const double* r = run_block(prog, inputs, consts, nullptr, base, len, scratch, out + base);
             if (r != out + base) std::memcpy(out + base, r, len * sizeof(double));
         }
     });
+}
+
+/// What the product's epilogue needs: the program, and the whole C it rewrites
+/// in place, tile by tile, as the product finishes them.
+struct EpilogueRun {
+    const FuseProgram* prog;
+    TensorObj* const* inputs;
+    const double* consts;
+    double* C;
+    size_t N;
+};
+
+/// Run the program over one finished tile of C, a row at a time -- a tile is
+/// not contiguous, but each of its rows is, and the program indexes by the
+/// position in the whole answer, so a row is just a range.
+void epilogue_tile(void* ctx, size_t row0, size_t row1, size_t col0, size_t col1) {
+    auto* e = static_cast<EpilogueRun*>(ctx);
+    Scratch scratch(std::max(e->prog->depth, 1u));
+    for (size_t r = row0; r < row1; ++r) {
+        const size_t end = r * e->N + col1;
+        for (size_t base = r * e->N + col0; base < end; base += kFuseBlock) {
+            const size_t len = std::min(kFuseBlock, end - base);
+            double* out = e->C + base;
+            const double* got = run_block(*e->prog, e->inputs, e->consts, e->C, base, len, scratch, out);
+            if (got != out) std::memcpy(out, got, len * sizeof(double));
+        }
+    }
 }
 
 /// The program's sum, minimum or maximum, block by block, with nothing stored.
@@ -780,7 +846,7 @@ double reduce_host(int op, const FuseProgram& prog, TensorObj* const* inputs,
         double acc = 0;
         for (size_t base = begin; base < end; base += kFuseBlock) {
             const size_t len = std::min(kFuseBlock, end - base);
-            const double* r = run_block(prog, inputs, consts, base, len, scratch, block.data());
+            const double* r = run_block(prog, inputs, consts, nullptr, base, len, scratch, block.data());
             const double part = k.reduce(op, r, len);
             acc = base == begin ? part : combine(acc, part);
         }
@@ -802,9 +868,16 @@ gpu::Buffer* const* buffers_of(const Program& prog, gpu::Buffer** out, size_t* c
 }
 
 /// Compute a program into a new tensor of shape `s` where its inputs are.
+///
+/// A program that starts from a product is the product with an epilogue: the
+/// blocked kernel computes C, and the rest of the program rewrites each tile
+/// of it as the kernel finishes the tile (`epilogue_tile`), or, on a GPU, as
+/// the generated product kernel stores each element. A program that is the
+/// product and nothing more has no epilogue to run.
 bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device, uint8_t dtype,
                  Value* out) {
     const FuseProgram view = prog.view();
+    const bool bare_product = prog.product_a && prog.ncode == 1;
     if (device == TENSOR_GPU) {
         gpu::Buffer* b = gpu_alloc(p, s.count, dtype, out);
         if (!b) return false;
@@ -812,7 +885,19 @@ bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device
         size_t counts[kFuseMaxInputs];
         buffers_of(prog, ins, counts);
         std::string why;
-        if (!gpu::fused(dtype, view, ins, counts, prog.consts, b, size_t(s.count), &why)) {
+        bool ok;
+        if (prog.product_a) {
+            const Gemm g = gemm_of(prog.product_a, prog.product_b);
+            ok = bare_product
+                     ? gpu::matmul(dtype, buffer_of(prog.product_a), buffer_of(prog.product_b), b,
+                                   g.M, g.K, g.N, &why)
+                     : gpu::fused_matmul(dtype, view, buffer_of(prog.product_a),
+                                         buffer_of(prog.product_b), g.M, g.K, g.N, ins, counts,
+                                         prog.consts, b, &why);
+        } else {
+            ok = gpu::fused(dtype, view, ins, counts, prog.consts, b, size_t(s.count), &why);
+        }
+        if (!ok) {
             gpu::release(b);
             return gpu_fail(p, out, why);
         }
@@ -825,7 +910,15 @@ bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device
         *out = t;
         return false;
     }
-    run_host(view, prog.inputs, prog.consts, data, size_t(s.count));
+    if (prog.product_a) {
+        const Gemm g = gemm_of(prog.product_a, prog.product_b);
+        EpilogueRun run{&view, prog.inputs, prog.consts, data, g.N};
+        GemmEpilogue epi{epilogue_tile, &run, 0};
+        host_gemm(prog.product_a->data(), prog.product_b->data(), data, g.M, g.K, g.N,
+                  bare_product ? nullptr : &epi);
+    } else {
+        run_host(view, prog.inputs, prog.consts, data, size_t(s.count));
+    }
     *out = t;
     return true;
 }
@@ -837,6 +930,10 @@ Value defer(Process& p, const Program& prog, const Shape& s, uint8_t device, uin
     TensorExpr* e = tensor_expr(static_cast<TensorObj*>(as_obj(v)));
     e->depth = uint16_t(prog.depth());
     for (unsigned i = 0; i < prog.ninputs; ++i) e->inputs()[i] = from_obj(prog.inputs[i]);
+    if (prog.product_a) {
+        e->product_a = from_obj(prog.product_a);
+        e->product_b = from_obj(prog.product_b);
+    }
     std::memcpy(e->consts(), prog.consts, prog.nconsts * sizeof(double));
     std::memcpy(e->code(), prog.code, prog.ncode * 2);
     return v;
@@ -862,34 +959,64 @@ bool settle(Process& p, TensorObj** t, Value* err) {
     value_slot_store(&e->result, r);
     p.heap().remember_if_old(x, r);
     for (unsigned i = 0; i < e->ninputs; ++i) value_slot_store(&e->inputs()[i], UNIT);
+    if (e->product_a != NIL_SLOT) {
+        value_slot_store(&e->product_a, UNIT);
+        value_slot_store(&e->product_b, UNIT);
+    }
     *t = static_cast<TensorObj*>(as_obj(r));
     return true;
 }
 
+/// Whether `t` is a deferred tensor not yet computed whose program starts
+/// from a product.
+bool pending_product(TensorObj* t) {
+    return t && !computed_of(t) && tensor_expr(t)->product_a != NIL_SLOT;
+}
+
 /// The program for `instr` applied to `operands` (one for a function, two for
-/// an operator), each a tensor or a number.
+/// an operator), each a tensor or a number, for an answer of `count` numbers.
 bool build(Process& p, const Value* operands, unsigned n, uint8_t instr, uint8_t arg,
-           Program* prog, Value* err) {
+           uint64_t count, Program* prog, Value* err) {
     Value ops[2] = {operands[0], n > 1 ? operands[1] : UNIT};
-    // A program past a limit is a chain long enough that one more pass over
-    // memory is nothing beside it: compute the longer operand and go on with
-    // its answer. Two rounds at most -- with both operands computed the
-    // program is two loads and an operation.
+    // When the program will not do, one operand is computed and the program
+    // built again from its answer:
+    //
+    // - Past a limit, the chain is long enough that one more pass over memory
+    //   is nothing beside it, so the longer operand.
+    // - With two different products, or a product shorter than the answer
+    //   (`v + w @ x` where `v` is a matrix and the product a row, repeated
+    //   down it), the operand holding the product. A product is fused by
+    //   running the program as each tile of it is finished, which needs the
+    //   answer and the product to be the same numbers in the same places.
+    //
+    // A few rounds at most: with both operands computed the program is two
+    // loads and an operation.
     for (int round = 0;; ++round) {
         *prog = Program{};
         for (unsigned i = 0; i < n; ++i) append(*prog, ops[i]);
         prog->emit(instr, arg);
-        if (!prog->overflow && prog->depth() <= kFuseMaxDepth) return true;
+        bool product_fits = true;
+        if (prog->product_a) {
+            const Gemm g = gemm_of(prog->product_a, prog->product_b);
+            product_fits = !prog->second_product && uint64_t(g.M) * g.N == count;
+        }
+        if (!prog->overflow && product_fits && prog->depth() <= kFuseMaxDepth) return true;
         unsigned pick = n;
-        uint16_t longest = 0;
-        for (unsigned i = 0; i < n; ++i) {
-            TensorObj* t = tensor_of(ops[i]);
-            if (t && !computed_of(t) && tensor_expr(t)->ncode >= longest) {
-                longest = tensor_expr(t)->ncode;
-                pick = i;
+        if (!product_fits) {
+            for (unsigned i = 0; i < n; ++i)
+                if (pending_product(tensor_of(ops[i]))) pick = i;
+        } else {
+            uint16_t longest = 0;
+            for (unsigned i = 0; i < n; ++i) {
+                TensorObj* t = tensor_of(ops[i]);
+                if (t && !computed_of(t) && tensor_expr(t)->ncode >= longest) {
+                    longest = tensor_expr(t)->ncode;
+                    pick = i;
+                }
             }
         }
-        if (pick == n || round > 2) return fail(p, err, "shape_error", "a tensor expression too large to compute");
+        if (pick == n || round > 3)
+            return fail(p, err, "shape_error", "a tensor expression too large to compute");
         TensorObj* t = tensor_of(ops[pick]);
         if (!settle(p, &t, err)) return false;
         ops[pick] = from_obj(t);
@@ -901,7 +1028,7 @@ bool build(Process& p, const Value* operands, unsigned n, uint8_t instr, uint8_t
 bool elementwise(Process& p, const Value* operands, unsigned n, uint8_t instr, uint8_t arg,
                  const Shape& s, const TensorObj* like, Value* out) {
     Program prog;
-    if (!build(p, operands, n, instr, arg, &prog, out)) return false;
+    if (!build(p, operands, n, instr, arg, s.count, &prog, out)) return false;
     if (like->device == TENSOR_HOST && s.count < kFuseMin)
         return run_program(p, prog, s, like->device, like->dtype, out);
     *out = defer(p, prog, s, like->device, like->dtype);
@@ -916,6 +1043,9 @@ bool map_unary(Process& p, int fn, TensorObj* x, Value* out) {
 /// The sum, minimum or maximum of every number `x` stands for. A deferred `x`
 /// is reduced as it is computed, block by block, and never stored.
 bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
+    // A product is computed, epilogue and all, and then folded: the fold has
+    // no tile of its own to ride along with.
+    if (pending_product(x) && !settle(p, &x, err)) return false;
     Program prog;
     append(prog, from_obj(x));
     const FuseProgram view = prog.view();
@@ -963,6 +1093,16 @@ bool matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
     else if (b->rank == 2) s = shape1(uint32_t(N));
     else s = shape1(1);  // two vectors: answered as a number below
     const bool scalar = a->rank == 1 && b->rank == 1;
+
+    // A product large enough to be worth it is deferred like elementwise work,
+    // so that what is done to it next can be fused into it. The dot product
+    // of two vectors answers a number, which nothing fuses with.
+    if (!scalar && (on_gpu(a) || s.count >= kFuseMin)) {
+        Program prog;
+        prog.product(a, b);
+        *out = defer(p, prog, s, a->device, a->dtype);
+        return true;
+    }
 
     if (on_gpu(a)) {
         gpu::Buffer* c = gpu_alloc(p, s.count, a->dtype, out);
@@ -1226,13 +1366,26 @@ NativeResult t_reshape(Process& p, Value, Value* args, uint32_t) {
     Shape s;
     Value err;
     if (!read_shape(p, args[0], &s, &err)) return raised(err);
-    DREAM_ARG(t, 1);
+    DREAM_SHAPE_ARG(t, 1);
     if (s.count != t->count) {
         fail(p, &err, "shape_error",
              "cannot reshape " + std::to_string(t->count) + " numbers (shape " +
                  shape_text(shape_of(t)) + ") to shape " + shape_text(s));
         return raised(err);
     }
+    // A deferred tensor whose inputs are all as long as it is reads each of
+    // them at exactly the position it writes, so its program means the same
+    // under any shape of the same size: it stays deferred, reshaped. One with
+    // a broadcast input does not -- a row repeated down a matrix is not a row
+    // repeated down a vector -- and is computed first.
+    if (!computed_of(t)) {
+        Program prog;
+        append(prog, from_obj(t));
+        bool flat = true;
+        for (unsigned i = 0; i < prog.ninputs; ++i) flat = flat && prog.inputs[i]->count == t->count;
+        if (flat) return NativeResult::ok(defer(p, prog, s, t->device, t->dtype));
+    }
+    if (!settle(p, &t, &err)) return raised(err);
     if (on_gpu(t)) {
         gpu::retain(buffer_of(t));
         return NativeResult::ok(wrap_gpu(p, s, t->dtype, buffer_of(t)));
