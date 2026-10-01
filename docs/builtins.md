@@ -268,6 +268,15 @@ nested lists and arrays of numbers, converted on the way in, so
 `[1, 2, 3] @ [4, 5, 6]` is `32`. The operators `+ - * / %` do not, because `+`
 on lists already joins them.
 
+**Fusion.** On a large tensor (a few thousand numbers or more, and always on
+the GPU), the elementwise operators and functions do not compute at once. They
+record the work, and whatever reads the numbers runs the whole chain in one
+pass: `tensor.relu (a * 2.0 + b) * 0.5` is one pass over memory, or one GPU
+kernel, not four. A reduction of such a chain never stores it. Nothing about
+this is visible except the speed: a deferred tensor has its type and shape,
+and shape errors are raised where they always were. `strict!` computes one,
+which is what timing or `vm.share!` wants.
+
 **Where it runs.** An operation runs where its operands are. The CPU kernels
 are blocked and vectorized (AVX2 and FMA where the CPU has them, chosen at
 start-up), and a large product is split across threads (capped by

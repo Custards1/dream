@@ -26,6 +26,11 @@ inline bool is_tensor(Value v) { return is_obj(v, ObjType::Tensor); }
 /// False with the error in `*out` when it raises.
 bool tensor_arith(Process& p, Op op, Value a, Value b, Value* out);
 
+/// Compute a deferred tensor (see `TensorExpr`) and keep the answer in it;
+/// what `strict!` does to a tensor. False with the error when the device
+/// refused.
+bool tensor_force(Process& p, Value t, Value* err);
+
 /// `==` between two tensors: the same shape and the same numbers.
 bool tensor_equal(Process& p, Value a, Value b, bool* raised);
 /// `compare` between two tensors: by shape, then element by element.

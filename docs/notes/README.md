@@ -88,6 +88,7 @@ Packed numeric arrays, `@`, and the GPU: what made the product fast, and what it
 - The matrix product
 - The GPU
 - Releasing device memory
+- Fusion
 - Considered: a server process that owns the tensors and mutates them
 - What is not done yet
 

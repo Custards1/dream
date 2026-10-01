@@ -1,0 +1,75 @@
+// Fused elementwise arithmetic on tensors large enough to be deferred.
+//
+// Past a few thousand numbers, `+ - * / %` and the elementwise functions do
+// not compute: they record a program, and whatever reads the numbers runs the
+// whole chain in one pass. Every check here compares a fused answer with the
+// same arithmetic done one element at a time on plain floats -- the same
+// operations in the same order, so the answers must be equal exactly, not
+// nearly.
+import std.console;
+import std.list;
+import std.tensor;
+
+let m = tensor.random 1 [60, 100] - 0.5;
+let n = tensor.random 2 [60, 100];
+let v = tensor.random 3 [100];
+
+/// `fused` at `[i, j]` is `scalar` of the inputs at `[i, j]` (and `v` at `j`),
+/// for a spread of positions across the whole tensor.
+let agrees : :tensor -> (:float -> :float -> :float -> :float) -> :bool;
+let agrees fused scalar = list.all (fn k -> {
+    let i = k * 7 % 60;
+    let j = k * 13 % 100;
+    tensor.at fused [i, j] == scalar (tensor.at m [i, j]) (tensor.at n [i, j]) (tensor.at v [j])
+}) (list.range 0 200);
+
+let relu : :float -> :float;
+let relu x = if x > 0.0 { x } else { 0.0 };
+
+/// `x * 0.5 + 1.0`, `k` times: a chain far past what one program holds, so it
+/// is computed in pieces as it grows.
+let halve : :integer -> :tensor -> :tensor;
+let rec halve k !x = if k == 0 { x } else { halve (k - 1) (x * 0.5 + 1.0) };
+
+let halve_f : :integer -> :float -> :float;
+let rec halve_f k !x = if k == 0 { x } else { halve_f (k - 1) (x * 0.5 + 1.0) };
+
+let main! = {
+    console.print! (agrees (m * 2.0 + n - 1.0) (fn a b c -> a * 2.0 + b - 1.0))
+    console.print! (agrees (tensor.relu (m * n + v)) (fn a b c -> relu (a * b + c)))
+    console.print! (agrees ((v + 1.0) * m - n / 4.0) (fn a b c -> (c + 1.0) * a - b / 4.0))
+    console.print! (agrees (m * m * m) (fn a b c -> a * a * a))
+    console.print! (agrees (1.0 - tensor.exp (0.0 - n)) (fn a b c -> 1.0 - math_exp (0.0 - b)))
+    console.print! (agrees (halve 100 m) (fn a b c -> halve_f 100 a))
+
+    // A deferred tensor is computed once and then read as numbers.
+    let d = m * 3.0 + n;
+    console.print! (d.[5].[7] == tensor.at m [5, 7] * 3.0 + tensor.at n [5, 7])
+    console.print! (tensor.at d [59, 99] == tensor.at m [59, 99] * 3.0 + tensor.at n [59, 99])
+    console.print! (d == strict! (m * 3.0 + n))
+    console.print! (tensor.shape d == [60, 100])
+    console.print! (len d == 60)
+
+    // Reductions of a deferred tensor, computed without storing it.
+    let near = fn a b -> a - b < 1.0e-9 && b - a < 1.0e-9;
+    console.print! (near (tensor.sum (m * n)) (tensor.reshape [6000] m @ tensor.reshape [6000] n))
+    console.print! (near (tensor.norm m) (math_sqrt (tensor.reshape [6000] m @ tensor.reshape [6000] m)))
+    console.print! (tensor.maximum (tensor.relu m) == tensor.maximum m)
+    console.print! (tensor.minimum (tensor.relu m) == 0.0)
+    console.print! (near (tensor.mean (n * 0.0 + 2.0)) 2.0)
+
+    // A deferred tensor sent to another process is computed there.
+    let e = m - n;
+    let there = join! (spawn! $( tensor.sum e ));
+    console.print! (near there (tensor.sum e))
+
+    // Products and moves read the numbers of a deferred operand.
+    console.print! (near (tensor.sum ((m + 0.0) @ tensor.transpose n)) (tensor.sum (m @ tensor.transpose n)))
+    console.print! (tensor.to_list (tensor.reshape [6000] (m * 1.0)) == tensor.to_list (tensor.reshape [6000] m))
+};
+
+let math_exp : :float -> :float;
+let math_exp x = tensor.at (tensor.exp (tensor.of_list [x])) [0];
+
+let math_sqrt : :float -> :float;
+let math_sqrt x = tensor.at (tensor.sqrt (tensor.of_list [x])) [0];

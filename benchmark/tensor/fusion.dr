@@ -1,0 +1,55 @@
+// What fusion is worth: one elementwise chain, written plainly (fused into a
+// single pass) and with `strict!` after every step (one pass and one
+// temporary per operation, which is what it cost before fusion).
+//
+//     dream build/dreams.dream -L mind benchmark/tensor/fusion.dr -o /tmp/tf.dream
+//     dream /tmp/tf.dream [N]
+import std.console;
+import std.list;
+import std.os;
+import std.str;
+import std.tensor;
+
+let fused : :tensor -> :tensor -> :tensor;
+let fused a b = tensor.relu (a * 2.0 + b - 1.0) * 0.5;
+
+let stepped! a b = {
+    let x = strict! (a * 2.0);
+    let y = strict! (x + b);
+    let z = strict! (y - 1.0);
+    let r = strict! (tensor.relu z);
+    strict! (r * 0.5)
+};
+
+/// The best of five runs, in milliseconds.
+let best! name thunk = {
+    let rec go! k !least = if k == 0 { least } else {
+        let before = os.monotonic! ();
+        let r = strict! (thunk ());
+        let ms = os.monotonic! () - before;
+        go! (k - 1) (if least < 0 || ms < least { ms } else { least })
+    };
+    let ms = go! 5 (0 - 1);
+    console.print! (name + ": " + to_string ms + " ms");
+    ms
+};
+
+let main! = {
+    let args = os.args! ();
+    let n = if args == [] { 4000000 } else { parse_int (list.head args) };
+    let a = tensor.random 1 [n];
+    let b = tensor.random 2 [n];
+    console.print! ("n = " + to_string n + " (" + to_string (n * 8 / 1000000) + " MB a tensor)");
+    console.print! ("agree: " + to_string (fused a b == stepped! a b));
+    let s = best! "step by step" (fn () -> stepped! a b);
+    let f = best! "fused       " (fn () -> fused a b);
+    let sum_s = best! "sum, stepped" (fn () -> tensor.sum (strict! (a * b)));
+    let sum_f = best! "sum, fused  " (fn () -> tensor.sum (a * b));
+    if tensor.gpu_available () {
+        let ga = tensor.gpu a;
+        let gb = tensor.gpu b;
+        let gs = best! "gpu, stepped" (fn () -> tensor.host (stepped! ga gb));
+        let gf = best! "gpu, fused  " (fn () -> tensor.host (fused ga gb));
+        ()
+    } else { () }
+};

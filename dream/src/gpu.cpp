@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -94,58 +95,18 @@ struct Api {
 
 // --- the kernels ---------------------------------------------------------------
 //
-// One source, built once per element type with `T` defined to it. The
-// operation codes are tensor_kernels.hpp's, so the host and the device agree on
-// what `op == 3` means. Every constant is written `(T)n`: a bare `1.0` is a
-// double, and a device without doubles refuses the whole program over it.
+// The fixed kernels -- the products and transpose -- are one source, built
+// once per element type with `T` defined to it. Elementwise work and
+// reductions are not here: each fused program gets kernels generated for it
+// (`fused_source`), whose operation codes are tensor_kernels.hpp's, so the
+// host and the device agree on what `op == 3` means. Every constant is written
+// `(T)n`: a bare `1.0` is a double, and a device without doubles refuses the
+// whole program over it.
 
 const char* const kSource = R"CL(
 #ifdef FP64
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #endif
-
-inline T apply(int op, T a, T b) {
-    switch (op) {
-        case 0: return a + b;
-        case 1: return a - b;
-        case 2: return a * b;
-        case 3: return a / b;
-        default: return fmod(a, b);
-    }
-}
-
-__kernel void binary(int op, __global const T* x, ulong nx, __global const T* y, ulong ny,
-                     __global T* out, ulong n) {
-    ulong i = get_global_id(0);
-    if (i >= n) return;
-    out[i] = apply(op, x[nx == n ? i : i % nx], y[ny == n ? i : i % ny]);
-}
-
-__kernel void scalar(int op, __global const T* x, T s, int left, __global T* out, ulong n) {
-    ulong i = get_global_id(0);
-    if (i >= n) return;
-    out[i] = left ? apply(op, s, x[i]) : apply(op, x[i], s);
-}
-
-__kernel void unary(int fn, __global const T* x, __global T* out, ulong n) {
-    ulong i = get_global_id(0);
-    if (i >= n) return;
-    T a = x[i];
-    T r;
-    switch (fn) {
-        case 0: r = -a; break;
-        case 1: r = sqrt(a); break;
-        case 2: r = exp(a); break;
-        case 3: r = log(a); break;
-        case 4: r = fabs(a); break;
-        case 5: r = tanh(a); break;
-        case 6: r = sin(a); break;
-        case 7: r = cos(a); break;
-        case 8: r = a > (T)0 ? a : (T)0; break;
-        default: r = (T)1 / ((T)1 + exp(-a)); break;
-    }
-    out[i] = r;
-}
 
 // The textbook tiled product: each work-group computes a TS x TS tile of C,
 // stepping along K a tile at a time through local memory, so every element of
@@ -184,33 +145,34 @@ __kernel void transpose(__global const T* in, __global T* out, int R, int C) {
     if (i < R && j < C) out[(ulong)j * R + i] = in[(ulong)i * C + j];
 }
 
-inline T combine(int op, T a, T b) {
-    return op == 0 ? a + b : (op == 1 ? fmin(a, b) : fmax(a, b));
-}
+)CL";
 
-// Each work-group folds a stride of the input and then its own scratch; the
-// host finishes the partials, in double precision.
-__kernel void reduce(int op, __global const T* x, ulong n, __global T* partial,
-                     __local T* scratch) {
-    ulong gid = get_global_id(0), gsz = get_global_size(0);
-    uint lid = get_local_id(0), lsz = get_local_size(0);
-    T acc = op == 0 ? (T)0 : x[0];
-    for (ulong i = gid; i < n; i += gsz) acc = combine(op, acc, x[i]);
-    scratch[lid] = acc;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (uint s = lsz / 2; s > 0; s >>= 1) {
-        if (lid < s) scratch[lid] = combine(op, scratch[lid], scratch[lid + s]);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (lid == 0) partial[get_group_id(0)] = scratch[0];
+// What every generated elementwise kernel starts with: the operations a
+// program's instructions name, as functions, so that a nested `relu` is a call
+// and not its operand written out twice at every level.
+const char* const kFusedPrelude = R"CL(
+#ifdef FP64
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#endif
+inline T relu_(T a) { return a > (T)0 ? a : (T)0; }
+inline T sigmoid_(T a) { return (T)1 / ((T)1 + exp(-a)); }
+inline T combine_(int op, T a, T b) {
+    return op == 0 ? a + b : (op == 1 ? fmin(a, b) : fmax(a, b));
 }
 )CL";
 
-/// The kernels built for one element type.
+/// The fixed kernels, built for one element type.
 struct Program {
     cl_program program = nullptr;
-    cl_kernel binary = nullptr, scalar = nullptr, unary = nullptr, matmul = nullptr,
-              matvec = nullptr, transpose = nullptr, reduce = nullptr;
+    cl_kernel matmul = nullptr, matvec = nullptr, transpose = nullptr;
+};
+
+/// The two kernels generated for one fused program: the elementwise one, and
+/// the reduction that computes the same values and folds them instead of
+/// storing them.
+struct Fused {
+    cl_program program = nullptr;
+    cl_kernel map = nullptr, reduce = nullptr;
 };
 
 struct Device {
@@ -219,6 +181,10 @@ struct Device {
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
     Program programs[2];  // by Dtype
+    /// Fused kernels by their source, which names the dtype. A program is
+    /// built the first time it is met, and a loop meets the same one every
+    /// iteration -- its constants are arguments, not part of the source.
+    std::unordered_map<std::string, Fused> fused;
     bool f64 = false;
     size_t tile = 16;
     size_t group = 64;    // the reduction's work-group size, a power of two
@@ -332,37 +298,46 @@ bool pick_device(Device& d, std::string* why) {
     return false;
 }
 
-bool build(Device& d, Program& prog, const std::string& options, std::string* why) {
+/// Compile `source` with `options`, saying what went wrong in `why`.
+cl_program compile(Device& d, const std::string& source, const std::string& options,
+                   std::string* why) {
     cl_int err = 0;
-    const char* src = kSource;
-    prog.program = d.cl.CreateProgramWithSource(d.context, 1, &src, nullptr, &err);
+    const char* src = source.c_str();
+    cl_program program = d.cl.CreateProgramWithSource(d.context, 1, &src, nullptr, &err);
     if (err != CL_SUCCESS) {
         *why = cl_failure("clCreateProgramWithSource", err);
-        return false;
+        return nullptr;
     }
-    err = d.cl.BuildProgram(prog.program, 1, &d.device, options.c_str(), nullptr, nullptr);
+    err = d.cl.BuildProgram(program, 1, &d.device, options.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
         size_t len = 0;
-        d.cl.GetProgramBuildInfo(prog.program, d.device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
+        d.cl.GetProgramBuildInfo(program, d.device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
         std::string log(len, '\0');
-        d.cl.GetProgramBuildInfo(prog.program, d.device, CL_PROGRAM_BUILD_LOG, len, log.data(),
+        d.cl.GetProgramBuildInfo(program, d.device, CL_PROGRAM_BUILD_LOG, len, log.data(),
                                  nullptr);
         *why = "the GPU kernels did not build: " + log;
-        return false;
+        return nullptr;
     }
-    struct Named { cl_kernel* k; const char* name; } kernels[] = {
-        {&prog.binary, "binary"}, {&prog.scalar, "scalar"}, {&prog.unary, "unary"},
-        {&prog.matmul, "matmul"}, {&prog.matvec, "matvec"}, {&prog.transpose, "transpose"},
-        {&prog.reduce, "reduce"},
-    };
-    for (auto& k : kernels) {
-        *k.k = d.cl.CreateKernel(prog.program, k.name, &err);
-        if (err != CL_SUCCESS) {
-            *why = cl_failure(k.name, err);
-            return false;
-        }
-    }
-    return true;
+    return program;
+}
+
+bool kernel(Device& d, cl_program program, const char* name, cl_kernel* out, std::string* why) {
+    cl_int err = 0;
+    *out = d.cl.CreateKernel(program, name, &err);
+    if (err != CL_SUCCESS) *why = cl_failure(name, err);
+    return err == CL_SUCCESS;
+}
+
+std::string options_for(const Device& d, int dtype) {
+    return std::string(dtype == F32 ? "-DT=float" : "-DT=double -DFP64") +
+           " -DTS=" + std::to_string(d.tile);
+}
+
+bool build(Device& d, Program& prog, int dtype, std::string* why) {
+    prog.program = compile(d, kSource, options_for(d, dtype), why);
+    return prog.program && kernel(d, prog.program, "matmul", &prog.matmul, why) &&
+           kernel(d, prog.program, "matvec", &prog.matvec, why) &&
+           kernel(d, prog.program, "transpose", &prog.transpose, why);
 }
 
 void init(Device& d) {
@@ -399,12 +374,11 @@ void init(Device& d) {
         d.why = cl_failure("clCreateCommandQueue", err);
         return;
     }
-    const std::string ts = " -DTS=" + std::to_string(d.tile);
-    if (!build(d, d.programs[F32], "-DT=float" + ts, &why)) {
+    if (!build(d, d.programs[F32], F32, &why)) {
         d.why = why;
         return;
     }
-    if (d.f64 && !build(d, d.programs[F64], "-DT=double -DFP64" + ts, &why)) d.f64 = false;
+    if (d.f64 && !build(d, d.programs[F64], F64, &why)) d.f64 = false;
 }
 
 Device* ready(std::string* err) {
@@ -584,46 +558,6 @@ struct Launch {
 
 }  // namespace
 
-bool binary(int op, int dtype, Buffer* x, size_t nx, Buffer* y, size_t ny, Buffer* out, size_t n,
-            std::string* err) {
-    Device* d = ready(err);
-    if (!d) return false;
-    Program* p = program_for(*d, dtype, err);
-    if (!p) return false;
-    std::lock_guard<std::mutex> g(d->lock);
-    size_t global = round_up(n, 64);
-    return Launch{*d, p->binary}
-        .arg(cl_int(op)).arg(x->mem).arg(cl_ulong(nx)).arg(y->mem).arg(cl_ulong(ny))
-        .arg(out->mem).arg(cl_ulong(n))
-        .run(1, &global, nullptr, err);
-}
-
-bool scalar(int op, int dtype, Buffer* x, double s, bool scalar_left, Buffer* out, size_t n,
-            std::string* err) {
-    Device* d = ready(err);
-    if (!d) return false;
-    Program* p = program_for(*d, dtype, err);
-    if (!p) return false;
-    std::lock_guard<std::mutex> g(d->lock);
-    size_t global = round_up(n, 64);
-    return Launch{*d, p->scalar}
-        .arg(cl_int(op)).arg(x->mem).scalar(dtype, s).arg(cl_int(scalar_left ? 1 : 0))
-        .arg(out->mem).arg(cl_ulong(n))
-        .run(1, &global, nullptr, err);
-}
-
-bool unary(int fn, int dtype, Buffer* x, Buffer* out, size_t n, std::string* err) {
-    Device* d = ready(err);
-    if (!d) return false;
-    Program* p = program_for(*d, dtype, err);
-    if (!p) return false;
-    std::lock_guard<std::mutex> g(d->lock);
-    size_t global = round_up(n, 64);
-    return Launch{*d, p->unary}
-        .arg(cl_int(fn)).arg(x->mem).arg(out->mem).arg(cl_ulong(n))
-        .run(1, &global, nullptr, err);
-}
-
 bool matmul(int dtype, Buffer* a, Buffer* b, Buffer* c, size_t M, size_t K, size_t N,
             std::string* err) {
     Device* d = ready(err);
@@ -656,11 +590,113 @@ bool transpose(int dtype, Buffer* in, Buffer* out, size_t rows, size_t cols, std
         .run(2, global, nullptr, err);
 }
 
-bool reduce(int op, int dtype, Buffer* x, size_t n, double* out, std::string* err) {
+namespace {
+
+/// The OpenCL source for a fused program: a `value` function computing one
+/// element from the inputs and constants, and the two kernels around it. The
+/// constants are arguments, so that `x * 0.5` and `x * 0.25` are one kernel
+/// and a loop that changes a scalar every iteration builds nothing new.
+std::string fused_source(int dtype, const FuseProgram& prog) {
+    std::string params, args;
+    for (unsigned k = 0; k < prog.ninputs; ++k) {
+        const std::string i = std::to_string(k);
+        params += ", __global const T* in" + i + ", ulong n" + i;
+        args += ", in" + i + ", n" + i;
+    }
+    for (unsigned k = 0; k < prog.nconsts; ++k) {
+        params += ", T c" + std::to_string(k);
+        args += ", c" + std::to_string(k);
+    }
+    std::string loads;
+    for (unsigned k = 0; k < prog.ninputs; ++k) {
+        const std::string i = std::to_string(k);
+        loads += "    T x" + i + " = in" + i + "[n" + i + " == n ? i : i % n" + i + "];\n";
+    }
+    std::vector<std::string> stack;
+    static const char* const binops[] = {" + ", " - ", " * ", " / "};
+    static const char* const fns[] = {"-", "sqrt", "exp", "log", "fabs", "tanh",
+                                      "sin", "cos", "relu_", "sigmoid_"};
+    for (unsigned i = 0; i < prog.ncode; ++i) {
+        const unsigned op = prog.code[2 * i], arg = prog.code[2 * i + 1];
+        switch (op) {
+            case FUSE_LOAD: stack.push_back("x" + std::to_string(arg)); break;
+            case FUSE_CONST: stack.push_back("c" + std::to_string(arg)); break;
+            case FUSE_BIN: {
+                std::string y = stack.back();
+                stack.pop_back();
+                std::string& x = stack.back();
+                x = arg == KOP_MOD ? "fmod(" + x + ", " + y + ")" : "(" + x + binops[arg] + y + ")";
+                break;
+            }
+            default: stack.back() = std::string(fns[arg]) + "(" + stack.back() + ")"; break;
+        }
+    }
+    std::string src = std::string("// ") + (dtype == F32 ? "f32" : "f64") + "\n" + kFusedPrelude;
+    src += "inline T value(ulong i, ulong n" + params + ") {\n" + loads + "    return " +
+           stack.back() + ";\n}\n";
+    src += "__kernel void map(__global T* out, ulong n" + params + ") {\n"
+           "    ulong i = get_global_id(0);\n"
+           "    if (i < n) out[i] = value(i, n" + args + ");\n}\n";
+    src += "__kernel void reduce(__global T* partial, __local T* scratch, int op, ulong n" +
+           params + ") {\n"
+           "    ulong gid = get_global_id(0), gsz = get_global_size(0);\n"
+           "    uint lid = get_local_id(0), lsz = get_local_size(0);\n"
+           "    T acc = op == 0 ? (T)0 : value(0, n" + args + ");\n"
+           "    for (ulong i = gid; i < n; i += gsz) acc = combine_(op, acc, value(i, n" + args + "));\n"
+           "    scratch[lid] = acc;\n"
+           "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+           "    for (uint s = lsz / 2; s > 0; s >>= 1) {\n"
+           "        if (lid < s) scratch[lid] = combine_(op, scratch[lid], scratch[lid + s]);\n"
+           "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+           "    }\n"
+           "    if (lid == 0) partial[get_group_id(0)] = scratch[0];\n}\n";
+    return src;
+}
+
+/// The kernels for a program, built the first time it is asked for. Called
+/// under the device's lock, which is what guards the cache.
+Fused* fused_kernels(Device& d, int dtype, const FuseProgram& prog, std::string* why) {
+    std::string src = fused_source(dtype, prog);
+    auto it = d.fused.find(src);
+    if (it != d.fused.end()) return &it->second;
+    Fused f;
+    f.program = compile(d, src, options_for(d, dtype), why);
+    if (!f.program || !kernel(d, f.program, "map", &f.map, why) ||
+        !kernel(d, f.program, "reduce", &f.reduce, why))
+        return nullptr;
+    return &d.fused.emplace(std::move(src), f).first->second;
+}
+
+/// The inputs and constants every fused kernel takes after its own arguments.
+void bind_program(Launch& l, int dtype, const FuseProgram& prog, Buffer* const* ins,
+                  const size_t* counts, const double* consts) {
+    for (unsigned k = 0; k < prog.ninputs; ++k) l.arg(ins[k]->mem).arg(cl_ulong(counts[k]));
+    for (unsigned k = 0; k < prog.nconsts; ++k) l.scalar(dtype, consts[k]);
+}
+
+}  // namespace
+
+bool fused(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
+           const double* consts, Buffer* out, size_t n, std::string* err) {
     Device* d = ready(err);
     if (!d) return false;
-    Program* p = program_for(*d, dtype, err);
-    if (!p) return false;
+    if (!program_for(*d, dtype, err)) return false;
+    std::lock_guard<std::mutex> g(d->lock);
+    Fused* f = fused_kernels(*d, dtype, prog, err);
+    if (!f) return false;
+    size_t global = round_up(n, 64);
+    Launch l{*d, f->map};
+    l.arg(out->mem).arg(cl_ulong(n));
+    bind_program(l, dtype, prog, ins, counts, consts);
+    return l.run(1, &global, nullptr, err);
+}
+
+bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins,
+                  const size_t* counts, const double* consts, size_t n, double* out,
+                  std::string* err) {
+    Device* d = ready(err);
+    if (!d) return false;
+    if (!program_for(*d, dtype, err)) return false;
     // Enough groups to fill a GPU, few enough that the host's share is nothing.
     const size_t groups = std::min<size_t>(256, (n + d->group - 1) / d->group);
     const size_t w = dtype_size(dtype);
@@ -669,11 +705,15 @@ bool reduce(int op, int dtype, Buffer* x, size_t n, double* out, std::string* er
     bool ok;
     {
         std::lock_guard<std::mutex> g(d->lock);
-        size_t global = groups * d->group, group = d->group;
-        ok = Launch{*d, p->reduce}
-                 .arg(cl_int(op)).arg(x->mem).arg(cl_ulong(n)).arg(partial->mem)
-                 .local(group * w)
-                 .run(1, &global, &group, err);
+        Fused* f = fused_kernels(*d, dtype, prog, err);
+        ok = f != nullptr;
+        if (ok) {
+            size_t global = groups * d->group, group = d->group;
+            Launch l{*d, f->reduce};
+            l.arg(partial->mem).local(group * w).arg(cl_int(op)).arg(cl_ulong(n));
+            bind_program(l, dtype, prog, ins, counts, consts);
+            ok = l.run(1, &global, &group, err);
+        }
     }
     std::vector<double> parts(groups);
     if (ok) ok = download(partial, dtype, parts.data(), groups, err);

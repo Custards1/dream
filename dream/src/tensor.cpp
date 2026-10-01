@@ -144,6 +144,9 @@ gpu::Buffer* buffer_of(const TensorObj* t) {
 }
 
 bool is_number(Value v) { return is_fixnum(v) || is_obj(v, ObjType::Float); }
+
+/// A deferred tensor computed, or a computed one as it is. See "fusion" below.
+bool settle(Process& p, TensorObj** t, Value* err);
 double number_of(Value v) {
     return is_fixnum(v) ? double(fixnum_value(v)) : static_cast<FloatObj*>(as_obj(v))->value;
 }
@@ -210,8 +213,9 @@ bool download(Process& p, const TensorObj* t, std::vector<double>& out, Value* e
 
 /// Any tensor's numbers, as a pointer to host memory: its own for a host
 /// tensor, `scratch` filled from the device for a GPU one.
-bool host_view(Process& p, const TensorObj* t, std::vector<double>& scratch, const double** data,
+bool host_view(Process& p, TensorObj* t, std::vector<double>& scratch, const double** data,
                Value* err) {
+    if (!settle(p, &t, err)) return false;
     if (!on_gpu(t)) {
         *data = t->data();
         return true;
@@ -518,21 +522,301 @@ bool same_device(Process& p, const TensorObj* a, const TensorObj* b, const char*
     return true;
 }
 
-bool tensor_tensor(Process& p, Op op, TensorObj* x, TensorObj* y, Value* out) {
-    Shape sx = shape_of(x), sy = shape_of(y), s;
-    if (!broadcast(p, op, sx, sy, &s, out)) return false;
-    if (!same_device(p, x, y, (std::string("`") + op_text(op) + "`").c_str(), out)) return false;
-    const int kop = kernel_op(op);
-    if (on_gpu(x)) {
-        gpu::Buffer* b = gpu_alloc(p, s.count, x->dtype, out);
+// --- fusion ------------------------------------------------------------------------
+//
+// The elementwise operators and functions do not compute. They record a
+// program (`TensorExpr`, value.hpp) and answer a deferred tensor of the right
+// shape; whatever needs the numbers computes the whole chain at once. Shapes
+// and devices are checked as the program is built, so every error that
+// depends on them is raised where it always was. What is deferred is only the
+// arithmetic, and arithmetic cannot fail.
+//
+// A tensor smaller than `kFuseMin` is computed on the spot: fusing saves
+// passes over memory, and a few thousand doubles are already in cache, where
+// the object that records the program would cost more than the pass it saves.
+// On the GPU everything is deferred, because there the saving is kernel
+// launches, and a launch costs the same however small the tensor.
+
+constexpr uint64_t kFuseMin = 4096;
+
+/// A program being built: a `TensorExpr` before it is stored or run. Its
+/// inputs are computed tensors, held by pointer -- nothing can move them while
+/// a native or an operator is running, because nothing collects.
+struct Program {
+    TensorObj* inputs[kFuseMaxInputs];
+    double consts[kFuseMaxConsts];
+    uint8_t code[kFuseMaxCode * 2];
+    unsigned ninputs = 0, nconsts = 0, ncode = 0;
+    /// Past one of the limits. The caller computes an operand and starts over.
+    bool overflow = false;
+
+    void emit(uint8_t op, unsigned arg) {
+        if (ncode == kFuseMaxCode) {
+            overflow = true;
+            return;
+        }
+        code[2 * ncode] = op;
+        code[2 * ncode + 1] = uint8_t(arg);
+        ++ncode;
+    }
+    unsigned input(TensorObj* t) {
+        for (unsigned i = 0; i < ninputs; ++i)
+            if (inputs[i] == t) return i;
+        if (ninputs == kFuseMaxInputs) {
+            overflow = true;
+            return 0;
+        }
+        inputs[ninputs] = t;
+        return ninputs++;
+    }
+    unsigned constant(double c) {
+        for (unsigned i = 0; i < nconsts; ++i)
+            if (std::memcmp(&consts[i], &c, sizeof c) == 0) return i;
+        if (nconsts == kFuseMaxConsts) {
+            overflow = true;
+            return 0;
+        }
+        consts[nconsts] = c;
+        return nconsts++;
+    }
+    unsigned depth() const {
+        unsigned sp = 0, most = 0;
+        for (unsigned i = 0; i < ncode; ++i) {
+            switch (code[2 * i]) {
+                case FUSE_LOAD: case FUSE_CONST: most = std::max(most, ++sp); break;
+                case FUSE_BIN: --sp; break;
+                default: break;
+            }
+        }
+        return most;
+    }
+    FuseProgram view() const { return FuseProgram{code, ncode, ninputs, nconsts, depth()}; }
+};
+
+TensorObj* computed_of(TensorObj* t) {
+    if (!tensor_deferred(t)) return t;
+    Value r = tensor_expr(t)->result;
+    return r == NIL_SLOT ? nullptr : static_cast<TensorObj*>(as_obj(r));
+}
+
+/// Append what `v` computes: a computed tensor is a load, a number a
+/// constant, and a deferred tensor its whole program, so that a chain is one
+/// flat program however it was built.
+void append(Program& prog, Value v) {
+    v = resolve(v);
+    if (is_number(v)) {
+        prog.emit(FUSE_CONST, prog.constant(number_of(v)));
+        return;
+    }
+    auto* t = static_cast<TensorObj*>(as_obj(v));
+    if (TensorObj* done = computed_of(t)) {
+        prog.emit(FUSE_LOAD, prog.input(done));
+        return;
+    }
+    TensorExpr* e = tensor_expr(t);
+    const uint8_t* c = e->code();
+    for (unsigned i = 0; i < e->ncode; ++i) {
+        unsigned arg = c[2 * i + 1];
+        switch (c[2 * i]) {
+            case FUSE_LOAD:
+                arg = prog.input(static_cast<TensorObj*>(as_obj(e->inputs()[arg])));
+                break;
+            case FUSE_CONST: arg = prog.constant(e->consts()[arg]); break;
+            default: break;
+        }
+        prog.emit(c[2 * i], arg);
+    }
+}
+
+/// The program's value at the numbers `[base, base + len)` of an answer of
+/// `n`, a block at a time small enough that every stack slot stays in L1.
+///
+/// The stack holds pointers, not copies: a load of an input as long as the
+/// answer points straight into it, a constant is carried as a scalar and meets
+/// a vector through the scalar kernel, and only a broadcast load or an
+/// operation's result fills a buffer. Each stack position has two buffers so
+/// that an operation never writes the buffer it is reading -- the kernels take
+/// `__restrict` pointers, and an aliased one would be undefined. The last
+/// instruction writes the caller's memory directly when it can.
+constexpr size_t kFuseBlock = 256;
+
+struct Slot {
+    const double* p;
+    double s;
+    bool scalar;
+};
+
+/// Scratch for one thread of evaluation: two blocks per stack position.
+struct Scratch {
+    std::vector<double> mem;
+    explicit Scratch(unsigned depth) : mem(size_t(depth) * 2 * kFuseBlock) {}
+    double* at(unsigned pos, unsigned which) { return mem.data() + (pos * 2 + which) * kFuseBlock; }
+};
+
+/// One block. Answers the pointer the block's numbers are at: `out` when the
+/// last instruction could write there, otherwise a scratch buffer.
+const double* run_block(const FuseProgram& prog, TensorObj* const* inputs, const double* consts,
+                        size_t base, size_t len, Scratch& scratch, double* out) {
+    const TensorKernels& k = tensor_kernels();
+    Slot stack[kFuseMaxDepth];
+    unsigned sp = 0;
+    for (unsigned i = 0; i < prog.ncode; ++i) {
+        const unsigned op = prog.code[2 * i], arg = prog.code[2 * i + 1];
+        const bool last = i + 1 == prog.ncode;
+        switch (op) {
+            case FUSE_LOAD: {
+                const TensorObj* in = inputs[arg];
+                const size_t m = size_t(in->count);
+                // Within the input's first `m` numbers -- all of it for an
+                // input as long as the answer -- index `i` is `i % m`.
+                if (base + len <= m) {
+                    stack[sp++] = Slot{in->data() + base, 0, false};
+                    break;
+                }
+                // A broadcast input: its numbers repeat every `m`, so copy
+                // the block in runs that wrap at the end of the input.
+                double* buf = scratch.at(sp, 0);
+                size_t at = base % m;
+                for (size_t done = 0; done < len;) {
+                    size_t run = std::min(len - done, m - at);
+                    std::memcpy(buf + done, in->data() + at, run * sizeof(double));
+                    done += run;
+                    at = 0;
+                }
+                stack[sp++] = Slot{buf, 0, false};
+                break;
+            }
+            case FUSE_CONST: stack[sp++] = Slot{nullptr, consts[arg], true}; break;
+            case FUSE_BIN: {
+                Slot y = stack[--sp];
+                Slot x = stack[sp - 1];
+                if (x.scalar && y.scalar) {
+                    double a = x.s, b = y.s, r;
+                    k.scalar(int(arg), &a, b, false, &r, 1);
+                    stack[sp - 1] = Slot{nullptr, r, true};
+                    break;
+                }
+                double* dst = last ? out : scratch.at(sp - 1, scratch.at(sp - 1, 0) == x.p ? 1 : 0);
+                if (x.scalar) k.scalar(int(arg), y.p, x.s, true, dst, len);
+                else if (y.scalar) k.scalar(int(arg), x.p, y.s, false, dst, len);
+                else k.binary(int(arg), x.p, y.p, dst, len);
+                stack[sp - 1] = Slot{dst, 0, false};
+                break;
+            }
+            default: {  // FUSE_UN
+                Slot x = stack[sp - 1];
+                if (x.scalar) {
+                    double r;
+                    k.unary(int(arg), &x.s, &r, 1);
+                    stack[sp - 1] = Slot{nullptr, r, true};
+                    break;
+                }
+                double* dst = last ? out : scratch.at(sp - 1, scratch.at(sp - 1, 0) == x.p ? 1 : 0);
+                k.unary(int(arg), x.p, dst, len);
+                stack[sp - 1] = Slot{dst, 0, false};
+                break;
+            }
+        }
+    }
+    // A program whose answer is a scalar or a bare load cannot have written
+    // `out`; a constant fills it.
+    if (stack[0].scalar) {
+        std::fill(out, out + len, stack[0].s);
+        return out;
+    }
+    return stack[0].p;
+}
+
+/// Run `body(begin, end)` over `[0, n)`, split across threads when `n` is
+/// large enough that the threads pay for themselves. Elementwise work is
+/// bound by memory, not arithmetic, so the line is higher than the product's.
+template <class Body>
+void parallel_range(size_t n, Body body) {
+    const size_t threads = n < (size_t(1) << 18) ? 1 : std::min<size_t>(tensor_threads(), n >> 16);
+    if (threads <= 1) {
+        body(size_t(0), n, size_t(0));
+        return;
+    }
+    size_t chunk = (n + threads - 1) / threads;
+    chunk = (chunk + kFuseBlock - 1) / kFuseBlock * kFuseBlock;
+    std::vector<std::thread> pool;
+    size_t index = 1;
+    for (size_t b = chunk; b < n; b += chunk, ++index)
+        pool.emplace_back([&body, b, chunk, n, index] { body(b, std::min(n, b + chunk), index); });
+    body(size_t(0), std::min(n, chunk), size_t(0));
+    for (auto& t : pool) t.join();
+}
+
+void run_host(const FuseProgram& prog, TensorObj* const* inputs, const double* consts,
+              double* out, size_t n) {
+    parallel_range(n, [&](size_t begin, size_t end, size_t) {
+        Scratch scratch(std::max(prog.depth, 1u));
+        for (size_t base = begin; base < end; base += kFuseBlock) {
+            const size_t len = std::min(kFuseBlock, end - base);
+            const double* r = run_block(prog, inputs, consts, base, len, scratch, out + base);
+            if (r != out + base) std::memcpy(out + base, r, len * sizeof(double));
+        }
+    });
+}
+
+/// The program's sum, minimum or maximum, block by block, with nothing stored.
+double reduce_host(int op, const FuseProgram& prog, TensorObj* const* inputs,
+                   const double* consts, size_t n) {
+    const TensorKernels& k = tensor_kernels();
+    auto combine = [op](double a, double b) {
+        switch (op) {
+            case KRED_SUM: return a + b;
+            case KRED_MIN: return b < a ? b : a;
+            default: return b > a ? b : a;
+        }
+    };
+    // One partial per chunk `parallel_range` makes, each from a non-empty
+    // range; `seen` marks the ones that ran.
+    std::vector<double> partial(tensor_threads() + 1);
+    std::vector<char> seen(partial.size(), 0);
+    parallel_range(n, [&](size_t begin, size_t end, size_t index) {
+        Scratch scratch(std::max(prog.depth, 1u));
+        std::vector<double> block(kFuseBlock);
+        double acc = 0;
+        for (size_t base = begin; base < end; base += kFuseBlock) {
+            const size_t len = std::min(kFuseBlock, end - base);
+            const double* r = run_block(prog, inputs, consts, base, len, scratch, block.data());
+            const double part = k.reduce(op, r, len);
+            acc = base == begin ? part : combine(acc, part);
+        }
+        partial[index] = acc;
+        seen[index] = 1;
+    });
+    double r = partial[0];
+    for (size_t i = 1; i < partial.size(); ++i)
+        if (seen[i]) r = combine(r, partial[i]);
+    return r;
+}
+
+gpu::Buffer* const* buffers_of(const Program& prog, gpu::Buffer** out, size_t* counts) {
+    for (unsigned i = 0; i < prog.ninputs; ++i) {
+        out[i] = buffer_of(prog.inputs[i]);
+        counts[i] = size_t(prog.inputs[i]->count);
+    }
+    return out;
+}
+
+/// Compute a program into a new tensor of shape `s` where its inputs are.
+bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device, uint8_t dtype,
+                 Value* out) {
+    const FuseProgram view = prog.view();
+    if (device == TENSOR_GPU) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, dtype, out);
         if (!b) return false;
+        gpu::Buffer* ins[kFuseMaxInputs];
+        size_t counts[kFuseMaxInputs];
+        buffers_of(prog, ins, counts);
         std::string why;
-        if (!gpu::binary(kop, x->dtype, buffer_of(x), size_t(sx.count), buffer_of(y),
-                         size_t(sy.count), b, size_t(s.count), &why)) {
+        if (!gpu::fused(dtype, view, ins, counts, prog.consts, b, size_t(s.count), &why)) {
             gpu::release(b);
             return gpu_fail(p, out, why);
         }
-        *out = wrap_gpu(p, s, x->dtype, b);
+        *out = wrap_gpu(p, s, dtype, b);
         return true;
     }
     double* data;
@@ -541,65 +825,115 @@ bool tensor_tensor(Process& p, Op op, TensorObj* x, TensorObj* y, Value* out) {
         *out = t;
         return false;
     }
-    const TensorKernels& k = tensor_kernels();
-    const size_t n = size_t(s.count), nx = size_t(sx.count), ny = size_t(sy.count);
-    if (nx == n && ny == n) {
-        k.binary(kop, x->data(), y->data(), data, n);
-    } else if (ny < n) {
-        for (size_t r = 0; r < n; r += ny) k.binary(kop, x->data() + r, y->data(), data + r, ny);
-    } else {
-        for (size_t r = 0; r < n; r += nx) k.binary(kop, x->data(), y->data() + r, data + r, nx);
-    }
+    run_host(view, prog.inputs, prog.consts, data, size_t(s.count));
     *out = t;
     return true;
 }
 
-bool tensor_scalar(Process& p, Op op, TensorObj* x, double s, bool scalar_left, Value* out) {
-    const Shape sx = shape_of(x);
-    const int kop = kernel_op(op);
-    if (on_gpu(x)) {
-        gpu::Buffer* b = gpu_alloc(p, sx.count, x->dtype, out);
-        if (!b) return false;
-        std::string why;
-        if (!gpu::scalar(kop, x->dtype, buffer_of(x), s, scalar_left, b, size_t(sx.count), &why)) {
-            gpu::release(b);
-            return gpu_fail(p, out, why);
-        }
-        *out = wrap_gpu(p, sx, x->dtype, b);
+/// Store a program as a deferred tensor of shape `s`.
+Value defer(Process& p, const Program& prog, const Shape& s, uint8_t device, uint8_t dtype) {
+    Value v = p.heap().make_deferred_tensor(s.rank, s.dims, s.count, dtype, device, prog.ninputs,
+                                            prog.nconsts, prog.ncode);
+    TensorExpr* e = tensor_expr(static_cast<TensorObj*>(as_obj(v)));
+    e->depth = uint16_t(prog.depth());
+    for (unsigned i = 0; i < prog.ninputs; ++i) e->inputs()[i] = from_obj(prog.inputs[i]);
+    std::memcpy(e->consts(), prog.consts, prog.nconsts * sizeof(double));
+    std::memcpy(e->code(), prog.code, prog.ncode * 2);
+    return v;
+}
+
+/// The tensor with its numbers in hand: itself, or the answer a deferred one
+/// stands for -- computed now, kept in its `result`, and its inputs let go,
+/// so that the next read finds the answer and the inputs can die.
+bool settle(Process& p, TensorObj** t, Value* err) {
+    TensorObj* x = *t;
+    if (TensorObj* done = computed_of(x)) {
+        *t = done;
         return true;
     }
-    double* data;
-    Value t;
-    if (!new_host(p, sx, &t, &data)) {
-        *out = t;
+    Program prog;
+    append(prog, from_obj(x));
+    Value r;
+    if (!run_program(p, prog, shape_of(x), x->device, x->dtype, &r)) {
+        *err = r;
         return false;
     }
-    tensor_kernels().scalar(kop, x->data(), s, scalar_left, data, size_t(sx.count));
-    *out = t;
+    TensorExpr* e = tensor_expr(x);
+    value_slot_store(&e->result, r);
+    p.heap().remember_if_old(x, r);
+    for (unsigned i = 0; i < e->ninputs; ++i) value_slot_store(&e->inputs()[i], UNIT);
+    *t = static_cast<TensorObj*>(as_obj(r));
+    return true;
+}
+
+/// The program for `instr` applied to `operands` (one for a function, two for
+/// an operator), each a tensor or a number.
+bool build(Process& p, const Value* operands, unsigned n, uint8_t instr, uint8_t arg,
+           Program* prog, Value* err) {
+    Value ops[2] = {operands[0], n > 1 ? operands[1] : UNIT};
+    // A program past a limit is a chain long enough that one more pass over
+    // memory is nothing beside it: compute the longer operand and go on with
+    // its answer. Two rounds at most -- with both operands computed the
+    // program is two loads and an operation.
+    for (int round = 0;; ++round) {
+        *prog = Program{};
+        for (unsigned i = 0; i < n; ++i) append(*prog, ops[i]);
+        prog->emit(instr, arg);
+        if (!prog->overflow && prog->depth() <= kFuseMaxDepth) return true;
+        unsigned pick = n;
+        uint16_t longest = 0;
+        for (unsigned i = 0; i < n; ++i) {
+            TensorObj* t = tensor_of(ops[i]);
+            if (t && !computed_of(t) && tensor_expr(t)->ncode >= longest) {
+                longest = tensor_expr(t)->ncode;
+                pick = i;
+            }
+        }
+        if (pick == n || round > 2) return fail(p, err, "shape_error", "a tensor expression too large to compute");
+        TensorObj* t = tensor_of(ops[pick]);
+        if (!settle(p, &t, err)) return false;
+        ops[pick] = from_obj(t);
+    }
+}
+
+/// `instr arg` over `operands`, to an answer of shape `s` where `like` is:
+/// deferred, or computed now when it is small and on the host.
+bool elementwise(Process& p, const Value* operands, unsigned n, uint8_t instr, uint8_t arg,
+                 const Shape& s, const TensorObj* like, Value* out) {
+    Program prog;
+    if (!build(p, operands, n, instr, arg, &prog, out)) return false;
+    if (like->device == TENSOR_HOST && s.count < kFuseMin)
+        return run_program(p, prog, s, like->device, like->dtype, out);
+    *out = defer(p, prog, s, like->device, like->dtype);
     return true;
 }
 
 bool map_unary(Process& p, int fn, TensorObj* x, Value* out) {
-    const Shape s = shape_of(x);
-    if (on_gpu(x)) {
-        gpu::Buffer* b = gpu_alloc(p, s.count, x->dtype, out);
-        if (!b) return false;
+    Value v = from_obj(x);
+    return elementwise(p, &v, 1, FUSE_UN, uint8_t(fn), shape_of(x), x, out);
+}
+
+/// The sum, minimum or maximum of every number `x` stands for. A deferred `x`
+/// is reduced as it is computed, block by block, and never stored.
+bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
+    Program prog;
+    append(prog, from_obj(x));
+    const FuseProgram view = prog.view();
+    const size_t n = size_t(x->count);
+    if (x->device == TENSOR_GPU) {
+        gpu::Buffer* ins[kFuseMaxInputs];
+        size_t counts[kFuseMaxInputs];
+        buffers_of(prog, ins, counts);
         std::string why;
-        if (!gpu::unary(fn, x->dtype, buffer_of(x), b, size_t(s.count), &why)) {
-            gpu::release(b);
-            return gpu_fail(p, out, why);
-        }
-        *out = wrap_gpu(p, s, x->dtype, b);
+        if (!gpu::fused_reduce(op, x->dtype, view, ins, counts, prog.consts, n, out, &why))
+            return gpu_fail(p, err, why);
         return true;
     }
-    double* data;
-    Value t;
-    if (!new_host(p, s, &t, &data)) {
-        *out = t;
-        return false;
+    if (TensorObj* done = computed_of(x)) {
+        *out = tensor_kernels().reduce(op, done->data(), n);
+        return true;
     }
-    tensor_kernels().unary(fn, x->data(), data, size_t(s.count));
-    *out = t;
+    *out = reduce_host(op, view, prog.inputs, prog.consts, n);
     return true;
 }
 
@@ -697,17 +1031,6 @@ bool transpose(Process& p, TensorObj* x, Value* out) {
     return true;
 }
 
-bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
-    if (on_gpu(x)) {
-        std::string why;
-        if (!gpu::reduce(op, x->dtype, buffer_of(x), size_t(x->count), out, &why))
-            return gpu_fail(p, err, why);
-        return true;
-    }
-    *out = tensor_kernels().reduce(op, x->data(), size_t(x->count));
-    return true;
-}
-
 // --- rendering -----------------------------------------------------------------------
 
 /// The shortest decimal that reads back as the same number -- the same rule a
@@ -737,12 +1060,22 @@ void render_axis(const double*& data, const Shape& s, uint32_t depth, bool f32, 
 
 NativeResult raised(Value err) { return NativeResult::raise(err); }
 
-/// The tensor argument `i`, made from lists if it is not one already.
-#define DREAM_ARG(name, i)                                             \
+/// The tensor argument `i`, made from lists if it is not one already, as it
+/// stands: deferred if it is. For what reads only the shape, and for what
+/// fuses with the program a deferred tensor carries.
+#define DREAM_SHAPE_ARG(name, i)                                       \
     TensorObj* name = nullptr;                                         \
     do {                                                               \
         Value dream_err_;                                              \
         if (!coerce(p, args[i], &name, &dream_err_)) return raised(dream_err_); \
+    } while (0)
+
+/// The same, with its numbers computed: what everything else takes.
+#define DREAM_ARG(name, i)                                             \
+    DREAM_SHAPE_ARG(name, i);                                          \
+    do {                                                               \
+        Value dream_err_;                                              \
+        if (!settle(p, &name, &dream_err_)) return raised(dream_err_); \
     } while (0)
 
 NativeResult t_of_list(Process& p, Value, Value* args, uint32_t) {
@@ -860,29 +1193,29 @@ NativeResult t_random(Process& p, Value, Value* args, uint32_t) {
 }
 
 NativeResult t_shape(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     Value list = NIL;
     for (uint32_t i = t->rank; i-- > 0;) list = p.heap().make_cons(make_fixnum(t->dims[i]), list);
     return NativeResult::ok(list);
 }
 
 NativeResult t_rank(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     return NativeResult::ok(make_fixnum(t->rank));
 }
 
 NativeResult t_size(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     return NativeResult::ok(make_integer(p, int64_t(t->count)));
 }
 
 NativeResult t_device(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     return NativeResult::ok(make_atom(p.runtime().intern_atom(on_gpu(t) ? "gpu" : "host")));
 }
 
 NativeResult t_dtype(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     return NativeResult::ok(
         make_atom(p.runtime().intern_atom(on_gpu(t) && t->dtype == gpu::F32 ? "f32" : "f64")));
 }
@@ -1021,7 +1354,7 @@ NativeResult t_outer(Process& p, Value, Value* args, uint32_t) {
 /// `sum`, `minimum` and `maximum`, by the native's `user` field.
 NativeResult t_reduce(Process& p, Value callee, Value* args, uint32_t) {
     const int op = int(static_cast<NativeObj*>(as_obj(callee))->user);
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     double r;
     Value err;
     if (!reduce(p, op, t, &r, &err)) return raised(err);
@@ -1029,7 +1362,7 @@ NativeResult t_reduce(Process& p, Value callee, Value* args, uint32_t) {
 }
 
 NativeResult t_mean(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     double r;
     Value err;
     if (!reduce(p, KRED_SUM, t, &r, &err)) return raised(err);
@@ -1039,16 +1372,13 @@ NativeResult t_mean(Process& p, Value, Value* args, uint32_t) {
 /// The Euclidean length of all the numbers: the square root of the sum of
 /// their squares.
 NativeResult t_norm(Process& p, Value, Value* args, uint32_t) {
-    DREAM_ARG(t, 0);
-    Value err;
+    DREAM_SHAPE_ARG(t, 0);
+    // `t * t` deferred and summed as it is computed: one pass, nothing stored,
+    // and the same on either device.
+    Value sq, err;
+    if (!tensor_arith(p, Op::Mul, from_obj(t), from_obj(t), &sq)) return raised(sq);
     double r;
-    if (on_gpu(t)) {
-        Value sq;
-        if (!tensor_tensor(p, Op::Mul, t, t, &sq)) return raised(sq);
-        if (!reduce(p, KRED_SUM, static_cast<TensorObj*>(as_obj(sq)), &r, &err)) return raised(err);
-    } else {
-        r = tensor_kernels().dot(t->data(), t->data(), size_t(t->count));
-    }
+    if (!reduce(p, KRED_SUM, static_cast<TensorObj*>(as_obj(sq)), &r, &err)) return raised(err);
     return NativeResult::ok(p.heap().make_float(std::sqrt(r)));
 }
 
@@ -1100,7 +1430,7 @@ NativeResult t_sum_axis(Process& p, Value, Value* args, uint32_t) {
 /// `sqrt`, `exp`, `relu` and the rest, by the native's `user` field.
 NativeResult t_unary(Process& p, Value callee, Value* args, uint32_t) {
     const int fn = int(static_cast<NativeObj*>(as_obj(callee))->user);
-    DREAM_ARG(t, 0);
+    DREAM_SHAPE_ARG(t, 0);
     Value out;
     if (!map_unary(p, fn, t, &out)) return raised(out);
     return NativeResult::ok(out);
@@ -1174,12 +1504,31 @@ bool tensor_arith(Process& p, Op op, Value a, Value b, Value* out) {
     b = resolve(b);
     TensorObj* x = tensor_of(a);
     TensorObj* y = tensor_of(b);
-    if (x && y) return tensor_tensor(p, op, x, y, out);
-    if (x && is_number(b)) return tensor_scalar(p, op, x, number_of(b), false, out);
-    if (y && is_number(a)) return tensor_scalar(p, op, y, number_of(a), true, out);
-    return type_fail(p, out, std::string("cannot apply `") + op_text(op) + "` to " +
-                                 describe(p, a) + " and " + describe(p, b) +
-                                 ": a tensor combines with a tensor or a number");
+    Shape s;
+    const TensorObj* like;
+    if (x && y) {
+        if (!broadcast(p, op, shape_of(x), shape_of(y), &s, out)) return false;
+        if (!same_device(p, x, y, (std::string("`") + op_text(op) + "`").c_str(), out))
+            return false;
+        like = x;
+    } else if (x && is_number(b)) {
+        s = shape_of(x);
+        like = x;
+    } else if (y && is_number(a)) {
+        s = shape_of(y);
+        like = y;
+    } else {
+        return type_fail(p, out, std::string("cannot apply `") + op_text(op) + "` to " +
+                                     describe(p, a) + " and " + describe(p, b) +
+                                     ": a tensor combines with a tensor or a number");
+    }
+    const Value operands[2] = {a, b};
+    return elementwise(p, operands, 2, FUSE_BIN, uint8_t(kernel_op(op)), s, like, out);
+}
+
+bool tensor_force(Process& p, Value v, Value* err) {
+    TensorObj* t = tensor_of(v);
+    return settle(p, &t, err);
 }
 
 bool tensor_equal(Process& p, Value a, Value b, bool* raised) {
@@ -1257,6 +1606,7 @@ bool tensor_render(Process& p, Value v, std::string* out) {
 int tensor_index(Process& p, Value v, int64_t i, Value* out) {
     TensorObj* t = tensor_of(v);
     if (i < 0 || i >= int64_t(t->dims[0])) return 2;
+    if (!settle(p, &t, out)) return 0;
     if (t->rank == 1) {
         if (!on_gpu(t)) {
             *out = p.heap().make_float(t->data()[i]);

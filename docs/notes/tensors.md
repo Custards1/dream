@@ -209,6 +209,106 @@ marker every 32 launches and waits for the one before it. The device always
 has a full window queued, but what is in flight is bounded. **8 GB to
 669 MB**, most of which is POCL itself and the deliberately bounded window.
 
+## Fusion
+
+`relu (w @ x + b) * 0.5` used to run four elementwise passes after the
+product. Each pass read and wrote the whole tensor, and each but the last made
+a temporary as large as the answer. For a tensor larger than cache that is
+four trips through memory where one would do; on a GPU it is four kernel
+launches where one would do. Fusion makes it one.
+
+### Deferring
+
+The elementwise operators and functions do not compute any more. They record
+what they would have done and answer a **deferred tensor**: a `TensorObj` with
+`TENSOR_DEFERRED` set, whose payload is a `TensorExpr` (value.hpp) rather than
+numbers. That is a tiny stack program (load an input, push a constant, a binary
+operator, a function), the inputs it loads, and a slot for the answer.
+
+- **Same type, same shape.** `type_of`, `len`, `tensor.shape` and the type
+  checker cannot tell a deferred tensor from a computed one, and none of them
+  computes anything.
+- **Programs are flat.** Building `x op y` from a deferred `x` copies `x`'s
+  instructions into the new program instead of pointing at `x`. A chain is
+  always one program over computed tensors, never a tree of deferred objects.
+- **Errors stay where they were.** Shapes and devices are checked while the
+  program is built, so `:shape_error` and `:device_error` are raised at the
+  same point as before. The arithmetic is the only thing deferred, and it
+  cannot fail. A GPU running out of memory is the one error that now arrives
+  where the numbers are read.
+- **Reading computes, once.** A product, an index, printing, `==`, a move to
+  or from the GPU, or `strict!` computes the program. The answer goes into
+  the `result` slot (with the write barrier, since the object may be old by
+  then) and the inputs are dropped, so they can die. Every later read finds
+  the answer.
+- **Reductions never store.** `tensor.sum`, `mean`, `minimum`, `maximum` and
+  `norm` evaluate a deferred program and fold it as they go.
+  `tensor.norm t` is `t * t`, deferred, summed.
+- **Long chains split.** A program has at most 64 instructions, 8 inputs, 16
+  constants and a stack of 12. A chain that would pass one computes its
+  longer operand and starts again from the answer. A loop such as
+  `acc = acc * 0.5 + 1.0` therefore runs eight iterations per pass.
+- **Small tensors don't defer.** Below 4096 numbers on the host the answer is
+  computed at once: those are already in cache, and recording the program
+  would cost more than the pass it saves. On the GPU everything defers,
+  because there the saving is launches, and a launch costs the same however
+  small the tensor.
+
+### Running a program
+
+**CPU.** The program runs over 256-number blocks, so every stack slot stays in
+L1. The stack holds pointers, not copies:
+
+- an input as long as the answer is read where it lies;
+- a constant is carried as a scalar and meets a vector through the scalar
+  kernel;
+- only a broadcast input or an operation's result fills a buffer;
+- the last instruction writes the answer's memory directly.
+
+Each stack position has two buffers, so an operation never writes the buffer
+it reads. The kernels take `__restrict` pointers, and an aliased one would be
+undefined. Every block is the existing vectorized kernels (AVX2 where the CPU
+has it). A range past 256K numbers is split across threads, which elementwise
+work did not have before.
+
+**GPU.** The program becomes OpenCL source: a `value(i)` function whose body is
+the program as one expression, with a `map` kernel and a `reduce` kernel around
+it. Constants are kernel arguments rather than literals, so `x * 0.5` and
+`x * 0.25` share a kernel, and a loop that changes a scalar every iteration
+builds nothing new. Built kernels are cached by their source. `relu` and
+`sigmoid` are helper functions, so nesting them does not write the operand out
+twice at every level. This replaced the separate elementwise, scalar, unary
+and reduction kernels.
+
+### Measured
+
+A five-step chain over 32 MB tensors, with `strict!` after every step as the
+unfused baseline in the same binary (`benchmark/tensor/fusion.dr`):
+
+| | stepped | fused | |
+|---|---|---|---|
+| `relu (a * 2 + b - 1) * 0.5`, 4 threads | 32 ms | 10 ms | 3.2x |
+| the same, 1 thread | 81 ms | 22 ms | 3.7x |
+| `sum (a * b)`, 4 threads | 5 ms | 1 ms | 5x |
+| the chain on the GPU (POCL), with the copy back | 14 ms | 10 ms | 1.4x |
+
+The thousand-step GPU loop under "Releasing device memory" now runs as about
+125 kernels instead of 2000. Its peak fell from 669 MB to 510 MB.
+
+`tensor_fusion.dr` in the e2e suite checks fused answers exactly against the
+same arithmetic done one float at a time. It covers broadcasting through a
+deferred operand, chains past the program limits, a deferred tensor sent to
+another process, and every reduction. It also passes under the heap verifier
+with parallel and concurrent collection.
+
+### What fusion does not do yet
+
+- **Fusing into the product.** In `relu (w @ x + b)` the product writes its
+  answer, and one fused pass then adds and applies `relu`. That is two passes
+  where a GEMM epilogue would make one.
+- **Operations that are not elementwise.** `sum_axis`, `transpose` and
+  reshaping compute their operand first.
+
 ## Considered: a server process that owns the tensors and mutates them
 
 The question was whether tensor operations should run in a VM process (or
@@ -227,14 +327,11 @@ by the caller. It is part of the runtime rather than a Dream process, so
 handles never go through message copying.
 
 What mutation would actually buy is fewer allocations in a chain like
-`a * 2.0 + b`. That is better had by fusion (one kernel for the whole
-expression) than by exposing mutation; see below.
+`a * 2.0 + b`. Fusion (above) gives that, without exposing mutation.
 
 ## What is not done yet
 
-- **Fusion.** `relu (w @ x + b)` runs three kernels and makes two temporaries.
-  The tree is visible at the call, so a fused elementwise kernel is the next
-  large win, on both backends.
+- **Fusing into the product** -- see "What fusion does not do yet".
 - **Float32 on the host.** Twice the vector throughput, and the type a model
   is stored in. `dtype` is already in the header.
 - **Batched products.** `@` refuses more than two axes.
@@ -242,7 +339,6 @@ expression) than by exposing mutation; see below.
   from cuBLAS. Register tiling (each work-item computing a 4 x 4 or 8 x 8
   block) is the known next step. A CUDA or Metal backend would sit behind the
   same `gpu::` functions.
-- **Elementwise work in parallel on the CPU.** Only the product is threaded.
 - **Sending a host tensor without copying it.** A large one could be
   reference-counted the way BEAM shares large binaries.
 - **The wire format** (`std.remote`) and compile-time values (`comp`) do not

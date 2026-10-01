@@ -2955,6 +2955,19 @@ bool force_deep(Process& p, Value v, Value* out) {
             p.stack.pop_back();
             return true;
         }
+        case ObjType::Tensor: {
+            // A deferred tensor's numbers are computed here, and kept in it:
+            // `strict!` on a tensor means the arithmetic has been done, which
+            // is what a program timing it or sharing it is asking for.
+            Value err;
+            if (!tensor_force(p, head, &err)) {
+                p.result = err;
+                *out = err;
+                return false;
+            }
+            *out = head;
+            return true;
+        }
         default:
             *out = head;
             return true;

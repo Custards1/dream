@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace dream {
 
@@ -21,6 +22,28 @@ enum KernelFn : int {
 
 /// Reductions to one number.
 enum KernelReduce : int { KRED_SUM = 0, KRED_MIN, KRED_MAX };
+
+/// A fused elementwise program (see `TensorExpr` in value.hpp): two bytes an
+/// instruction, an opcode and its argument, run on a stack.
+///
+///   FUSE_LOAD k   push input k, read at `i % count` -- equal shapes and every
+///                 broadcast a tensor allows, since an input's shape is always
+///                 a trailing part of the answer's
+///   FUSE_CONST k  push constant k
+///   FUSE_BIN op   pop y, pop x, push `x op y` (`KOP_*`)
+///   FUSE_UN fn    pop x, push `fn x` (`KFN_*`)
+///
+/// The limits keep a program small enough that the CPU's evaluator keeps its
+/// whole stack in L1, and that a GPU kernel built from it has a short argument
+/// list. A chain that would pass one is computed and starts a new program.
+enum FuseCode : uint8_t { FUSE_LOAD = 0, FUSE_CONST, FUSE_BIN, FUSE_UN };
+constexpr unsigned kFuseMaxInputs = 8, kFuseMaxConsts = 16, kFuseMaxCode = 64,
+                   kFuseMaxDepth = 12;
+
+struct FuseProgram {
+    const uint8_t* code;
+    unsigned ncode, ninputs, nconsts, depth;
+};
 
 struct TensorKernels {
     /// `out[i] = x[i] op y[i]` over `n` elements.

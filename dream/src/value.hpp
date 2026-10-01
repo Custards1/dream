@@ -363,6 +363,49 @@ struct TensorObj : Obj {
 };
 static_assert(sizeof(TensorObj) % 16 == 0, "a tensor's data starts on a 16-byte boundary");
 
+/// A tensor that has not been computed yet: elementwise work, recorded.
+///
+/// `a * 2.0 + b` on large tensors used to make two passes over memory and one
+/// temporary as large as the answer; `relu (w @ x + b)` three and two. None of
+/// that work is visible to the program until something reads the numbers, so
+/// the elementwise operators and functions record what they would have done
+/// instead -- a small stack program over the tensors they were given -- and
+/// whatever finally needs the numbers (a product, an index, printing, a move
+/// to or from the GPU, `strict!`) runs the whole chain in one pass. That is
+/// fusion; docs/notes/tensors.md, "Fusion", has the measurements.
+///
+/// A deferred tensor is a `TensorObj` with `TENSOR_DEFERRED` set: the same type
+/// and the same shape as the tensor it stands for, so `type_of`, `len` and
+/// `tensor.shape` never compute anything. Its payload is a `TensorExpr`
+/// instead of numbers, and unlike a computed tensor it holds references --
+/// the inputs, and the answer once there is one -- which the collector traces.
+/// Computing it stores the answer in `result` and lets the inputs go; every
+/// later read finds the answer there.
+///
+/// The inputs are always computed tensors. Building `x op y` from a deferred
+/// `x` copies `x`'s program into the new one rather than pointing at `x`, so
+/// a chain is one flat program and never a tree of deferred objects.
+constexpr uint8_t TENSOR_DEFERRED = 1;
+
+struct TensorExpr {
+    Value result;  // NIL_SLOT until computed
+    uint16_t ninputs;
+    uint16_t nconsts;
+    uint16_t ncode;  // instructions, two bytes each
+    uint16_t depth;  // the stack the program needs
+    Value* inputs() { return reinterpret_cast<Value*>(this + 1); }
+    double* consts() { return reinterpret_cast<double*>(inputs() + ninputs); }
+    uint8_t* code() { return reinterpret_cast<uint8_t*>(consts() + nconsts); }
+    /// What a payload of this shape occupies, after the tensor's header.
+    static size_t bytes_for(size_t ninputs, size_t nconsts, size_t ncode) {
+        return sizeof(TensorExpr) + ninputs * sizeof(Value) + nconsts * sizeof(double) +
+               ((ncode * 2 + 7) & ~size_t(7));
+    }
+};
+
+inline bool tensor_deferred(const TensorObj* t) { return (t->flags & TENSOR_DEFERRED) != 0; }
+inline TensorExpr* tensor_expr(TensorObj* t) { return reinterpret_cast<TensorExpr*>(t->data()); }
+
 /// The bytes a tensor's numbers occupy wherever they live.
 inline size_t tensor_data_bytes(const TensorObj* t) {
     return size_t(t->count) * (t->dtype == TENSOR_F32 ? sizeof(float) : sizeof(double));

@@ -137,6 +137,11 @@ public:
     /// collector finds the object dead; see `reap_external`.
     Value make_external_tensor(uint32_t rank, const uint32_t* dims, uint64_t count,
                                uint8_t dtype, uint8_t device, void* handle);
+    /// A deferred tensor (`TensorExpr`) with room for a program of this size,
+    /// its inputs empty and its result unset, for the caller to fill.
+    Value make_deferred_tensor(uint32_t rank, const uint32_t* dims, uint64_t count,
+                               uint8_t dtype, uint8_t device, uint32_t ninputs,
+                               uint32_t nconsts, uint32_t ncode);
     Value make_module(uint32_t import_index, Value name);
 
     /// True when the process should collect at its next safepoint: old space

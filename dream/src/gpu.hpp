@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <string>
 
+#include "tensor_kernels.hpp"
+
 namespace dream::gpu {
 
 /// A block of device memory, reference counted. A GPU tensor holds one
@@ -56,19 +58,20 @@ bool download(Buffer* src, int dtype, double* dst, size_t n, std::string* err);
 /// `n` elements from `src` at element `offset` into the start of `dst`.
 bool copy(Buffer* src, int dtype, size_t offset, Buffer* dst, size_t n, std::string* err);
 
-/// `out[i] = x[i % nx] op y[i % ny]`: equal shapes, and every broadcast a
-/// tensor allows (a trailing shape repeated), in one kernel.
-bool binary(int op, int dtype, Buffer* x, size_t nx, Buffer* y, size_t ny, Buffer* out, size_t n,
-            std::string* err);
-bool scalar(int op, int dtype, Buffer* x, double s, bool scalar_left, Buffer* out, size_t n,
-            std::string* err);
-bool unary(int fn, int dtype, Buffer* x, Buffer* out, size_t n, std::string* err);
+/// A fused elementwise program (`FuseProgram`, tensor_kernels.hpp) computed
+/// into `out`: one kernel, generated from the program the first time it is
+/// met and cached. `ins[k]` holds `counts[k]` elements, read at `i % count`.
+bool fused(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
+           const double* consts, Buffer* out, size_t n, std::string* err);
+/// The same program's sum, minimum or maximum (`KRED_*`) over `n >= 1`
+/// elements, folded on the device and finished on the host in double
+/// precision, with the elements never stored.
+bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins,
+                  const size_t* counts, const double* consts, size_t n, double* out,
+                  std::string* err);
 /// `C = A x B`, row-major, M x K by K x N.
 bool matmul(int dtype, Buffer* a, Buffer* b, Buffer* c, size_t M, size_t K, size_t N,
             std::string* err);
 bool transpose(int dtype, Buffer* in, Buffer* out, size_t rows, size_t cols, std::string* err);
-/// Sum, minimum or maximum (`KRED_*`) of `n >= 1` elements, finished on the
-/// host in double precision.
-bool reduce(int op, int dtype, Buffer* x, size_t n, double* out, std::string* err);
 
 }  // namespace dream::gpu

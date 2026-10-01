@@ -33,13 +33,18 @@ inline void set_free_next(Obj* o, Obj* next) {
 }
 
 /// True for the object kinds whose payload holds no references -- Float, Str,
-/// Pid, BigStr and Tensor carry only raw bytes, a host id, or a pointer into the
+/// Pid and BigStr carry only raw bytes, a host id, or a pointer into the
 /// image, which is not heap memory and is never collected. Marking one is a
 /// no-op, so the collector need not put it on the worklist; the mark bit alone
 /// keeps it.
+///
+/// A tensor is not on the list although a computed one is only numbers: a
+/// deferred one holds its inputs (see `TensorExpr`), and the flag that says
+/// which is in the payload, not the type. Scanning a computed tensor finds
+/// nothing and costs a worklist slot.
 inline bool is_atom_object(ObjType t) {
     return t == ObjType::Float || t == ObjType::Str || t == ObjType::Pid ||
-           t == ObjType::BigStr || t == ObjType::Tensor;
+           t == ObjType::BigStr;
 }
 
 /// Allocation rounds every object up to one of these sizes, and every chunk in
@@ -502,6 +507,26 @@ Value Heap::make_external_tensor(uint32_t rank, const uint32_t* dims, uint64_t c
     std::memcpy(t->data(), &handle, sizeof handle);
     external_.push_back(t);
     external_bytes_ += tensor_data_bytes(t);
+    return from_obj(t);
+}
+
+Value Heap::make_deferred_tensor(uint32_t rank, const uint32_t* dims, uint64_t count,
+                                 uint8_t dtype, uint8_t device, uint32_t ninputs,
+                                 uint32_t nconsts, uint32_t ncode) {
+    // Cleared, not bare: the inputs are references, and until the caller has
+    // written them the collector must read them as empty slots.
+    auto* t = static_cast<TensorObj*>(
+        alloc(ObjType::Tensor, sizeof(TensorObj) - sizeof(Obj) +
+                                   TensorExpr::bytes_for(ninputs, nconsts, ncode)));
+    init_tensor(t, rank, dims, count);
+    t->dtype = dtype;
+    t->device = device;
+    t->flags = TENSOR_DEFERRED;
+    TensorExpr* e = tensor_expr(t);
+    e->result = NIL_SLOT;
+    e->ninputs = uint16_t(ninputs);
+    e->nconsts = uint16_t(nconsts);
+    e->ncode = uint16_t(ncode);
     return from_obj(t);
 }
 
@@ -1098,6 +1123,14 @@ void Heap::scan_object(GcCtx& c, Obj* o) {
         case ObjType::Indirect: {
             auto* ind = static_cast<IndirectObj*>(o);
             forward(&ind->target);
+            break;
+        }
+        case ObjType::Tensor: {
+            auto* t = static_cast<TensorObj*>(o);
+            if (!tensor_deferred(t)) break;
+            TensorExpr* e = tensor_expr(t);
+            forward(&e->result);
+            for (uint32_t i = 0; i < e->ninputs; ++i) forward(&e->inputs()[i]);
             break;
         }
         case ObjType::Pap: {
@@ -2133,6 +2166,18 @@ struct VerifyWalk {
                 }
                 case ObjType::Tensor: {
                     auto* t = static_cast<TensorObj*>(o);
+                    if (tensor_deferred(t)) {
+                        TensorExpr* e = tensor_expr(t);
+                        if (t->bytes < sizeof(TensorObj) +
+                                           TensorExpr::bytes_for(e->ninputs, e->nconsts, e->ncode)) {
+                            problem("deferred tensor at " + addr(o) +
+                                    " is smaller than its program");
+                            return;
+                        }
+                        push(e->result, v);
+                        for (uint32_t i = 0; i < e->ninputs; ++i) push(e->inputs()[i], v);
+                        break;
+                    }
                     uint64_t count = 1;
                     for (uint32_t i = 0; i < t->rank; ++i) count *= t->dims[i];
                     const size_t payload = t->device == TENSOR_HOST
@@ -2290,6 +2335,33 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
             return dest.make_pid(static_cast<PidObj*>(o)->id);
         case ObjType::Tensor: {
             auto* src = static_cast<TensorObj*>(o);
+            if (tensor_deferred(src)) {
+                // Computed already: what crosses is the answer.
+                TensorExpr* e = tensor_expr(src);
+                if (e->result != NIL_SLOT) return copy_value(dest, e->result, seen);
+                // Not yet: the program crosses with copies of its inputs, and
+                // the receiver computes it if it ever reads it. The shared
+                // area has nobody to do that, so it is asked for the answer.
+                if constexpr (to_shared) {
+                    dest.refuse("unevaluated tensor (`strict!` computes it)");
+                    return UNIT;
+                } else {
+                    Value t = dest.make_deferred_tensor(src->rank, src->dims, src->count,
+                                                        src->dtype, src->device, e->ninputs,
+                                                        e->nconsts, e->ncode);
+                    seen.emplace(v, t);
+                    auto* to = static_cast<TensorObj*>(as_obj(t));
+                    TensorExpr* d = tensor_expr(to);
+                    d->depth = e->depth;
+                    std::memcpy(d->consts(), e->consts(),
+                                e->nconsts * sizeof(double) + e->ncode * 2);
+                    for (uint32_t i = 0; i < e->ninputs; ++i) {
+                        Value in = copy_value(dest, e->inputs()[i], seen);
+                        tensor_expr(static_cast<TensorObj*>(as_obj(t)))->inputs()[i] = in;
+                    }
+                    return t;
+                }
+            }
             if (src->device != TENSOR_HOST) {
                 // A GPU tensor crosses as its handle: both processes then hold
                 // a reference to the one device buffer, which is immutable like
