@@ -1,0 +1,264 @@
+// Where the server is and who to be when talking to it.
+//
+// A configuration is a `mapping`, so it is a map with defaults: a program
+// writes only the fields that differ, `%{ :database => "app" }` is a whole
+// configuration, and the accessors fill in the rest. It can also be written
+// the two ways every PostgreSQL tool reads one -- a URL,
+//
+//     postgres://ada:secret@db.internal:5432/app?application_name=worker
+//
+// or libpq's keyword form, `host=db.internal dbname=app user=ada` -- and read
+// from the environment variables libpq reads, so a program configured for
+// `psql` is configured for this.
+//
+// **What is not here is TLS.** The VM's sockets are plain TCP, so a
+// configuration that *requires* encryption (`sslmode=require` and stricter) is
+// refused rather than quietly connected in the clear; `prefer` and `allow`,
+// which libpq would also settle for plain text on, are accepted. A Unix-domain
+// socket (a `host` beginning with `/`) is refused for the same reason: the VM
+// does not open one.
+
+import std.list;
+import std.map;
+import std.os;
+import std.str;
+import pg.bytes;
+import pg.errors;
+
+mapping Config {
+    host : :string = "127.0.0.1"
+    port : :integer = 5432
+    user : :string = "postgres"
+    password : :string | :unit = ()
+    /// The database to connect to; the server takes the user's name for `()`.
+    database : :string | :unit = ()
+    application_name : :string = "dream"
+    /// Run-time parameters sent at startup: `search_path`, `statement_timeout`,
+    /// `TimeZone` and anything else `SET` would take, as strings.
+    settings : %{:string => :string} = %{}
+    /// The program's own decoders, by type OID, consulted before the built-in
+    /// ones; see `pg.value`.
+    decoders : :map = %{}
+}
+
+/// A configuration, from whatever a program gave: a map of fields (missing
+/// ones defaulted), or a URL or keyword string. A string that says nothing
+/// sensible raises `:bad_config`.
+let resolve! : :any -> :map;
+let resolve! target = match type_of target {
+    :string => match parse target {
+        [:ok, c] => c,
+        [:error, why] => errors.fail! :bad_config why,
+    },
+    :map => target,
+    _ => errors.fail! :bad_config ("a configuration is a map or a connection string, not " + to_string target),
+};
+
+/// A URL (`postgres://` or `postgresql://`) or a keyword string, as a
+/// configuration: `[:ok, config]` or `[:error, why]`.
+let parse : :string -> [:ok, :map] | [:error, :string];
+let parse text =
+    if str.starts_with "postgres://" text || str.starts_with "postgresql://" text { parse_url text }
+    else { from_pairs (keyword_pairs text) };
+
+// --- URLs ------------------------------------------------------------------------
+
+priv let parse_url : :string -> [:ok, :map] | [:error, :string];
+priv let parse_url text = {
+    let rest = str_slice text (str_find text "://" 0 + 3) (len text);
+    let query_at = str_find rest "?" 0;
+    let main = if query_at < 0 { rest } else { str_slice rest 0 query_at };
+    let query = if query_at < 0 { "" } else { str_slice rest (query_at + 1) (len rest) };
+    let at = last_index "@" main;
+    let userinfo = if at < 0 { "" } else { str_slice main 0 at };
+    let location = if at < 0 { main } else { str_slice main (at + 1) (len main) };
+    let slash = str_find location "/" 0;
+    let hostport = if slash < 0 { location } else { str_slice location 0 slash };
+    let database = if slash < 0 { "" } else { str_slice location (slash + 1) (len location) };
+    let colon = str_find userinfo ":" 0;
+    let user = if colon < 0 { userinfo } else { str_slice userinfo 0 colon };
+    let password = if colon < 0 { () } else { str_slice userinfo (colon + 1) (len userinfo) };
+    let [host, port] = split_hostport hostport;
+    let pairs = [["host", host], ["port", port], ["user", user], ["dbname", database]]
+                + (if password == () { [] } else { [["password", password]] })
+                + list.map (fn kv -> match str.split "=" kv {
+                                [k] => [decode_percent k, ""],
+                                [k, ..vs] => [decode_percent k, decode_percent (str.join_str "=" vs)],
+                                _ => ["", ""],
+                            })
+                           (list.filter (fn kv -> kv != "") (str.split "&" query));
+    from_pairs (list.map (fn [k, v] -> [k, decode_percent v]) (list.filter (fn [k, v] -> v != "") pairs))
+};
+
+/// `host:port`, `host`, or `[v6]:port`.
+priv let split_hostport : :string -> [:string, :string];
+priv let split_hostport hp =
+    if str.starts_with "[" hp {
+        let close = str_find hp "]" 0;
+        [str_slice hp 1 (close - 1), str_slice hp (close + 2) (len hp)]
+    } else {
+        let colon = str_find hp ":" 0;
+        if colon < 0 { [hp, ""] } else { [str_slice hp 0 colon, str_slice hp (colon + 1) (len hp)] }
+    };
+
+priv let last_index : :string -> :string -> :integer;
+priv let last_index needle s = last_from needle s (str_find s needle 0) (-1);
+
+priv let last_from : :string -> :string -> :integer -> :integer -> :integer;
+priv let rec last_from needle s at found =
+    if at < 0 { found } else { last_from needle s (str_find s needle (at + 1)) at };
+
+/// `%40` as `@`, and `+` left alone: a connection URL is not a form.
+let decode_percent : :string -> :string;
+let decode_percent s = {
+    let at = str_find s "%" 0;
+    if at < 0 { s }
+    else {
+        match bytes.hex_decode (str_slice s (at + 1) 2) {
+            () => str_slice s 0 (at + 1) + decode_percent (str_slice s (at + 1) (len s)),
+            b => str_slice s 0 at + b + decode_percent (str_slice s (at + 3) (len s)),
+        }
+    }
+};
+
+// --- keyword strings ---------------------------------------------------------------
+
+/// `host=x port=5432 password='with space'`: pairs separated by whitespace,
+/// a value quoted with `'` when it has spaces, `\` escaping inside.
+priv let keyword_pairs : :string -> [[:string, :string]];
+priv let keyword_pairs text = keywords_from text 0 [];
+
+priv let keywords_from : :string -> :integer -> [[:string, :string]] -> [[:string, :string]];
+priv let rec keywords_from text at acc = {
+    let start = str_span text at " \t\r\n";
+    if start >= len text { list.reverse acc }
+    else {
+        let eq = str_upto text start "= \t";
+        let key = str_slice text start (eq - start);
+        let vstart = str_span text (str_span text eq " \t" + 1) " \t";
+        if str_byte text vstart == 39 {
+            let [value, next] = quoted_value text (vstart + 1) [];
+            keywords_from text next (list_cons [key, value] acc)
+        } else {
+            let vend = str_upto text vstart " \t\r\n";
+            keywords_from text vend (list_cons [key, str_slice text vstart (vend - vstart)] acc)
+        }
+    }
+};
+
+priv let quoted_value : :string -> :integer -> [:string] -> [:any];
+priv let rec quoted_value text at pieces = {
+    let stop = str_upto text at "'\\";
+    let piece = str_slice text at (stop - at);
+    match str_byte text stop {
+        92 => quoted_value text (stop + 2) (list_cons (str_slice text (stop + 1) 1) (list_cons piece pieces)),
+        _ => [str_concat (list.reverse (list_cons piece pieces)), stop + 1],
+    }
+};
+
+// --- from pairs to a configuration ---------------------------------------------------
+
+/// Pairs in libpq's vocabulary, as a configuration. A key libpq knows and this
+/// does not use is ignored; any other is a run-time parameter.
+priv let from_pairs : [[:string, :string]] -> [:ok, :map] | [:error, :string];
+priv let from_pairs pairs = list.fold (fn acc [k, v] -> match acc {
+    [:ok, c] => apply c k v,
+    failed => failed,
+}) [:ok, %{}] pairs;
+
+priv let ignored : %{:string => :bool};
+priv let ignored = map.set_of ["connect_timeout", "client_encoding", "target_session_attrs",
+                               "gssencmode", "sslcert", "sslkey", "sslrootcert", "sslcrl", "passfile",
+                               "channel_binding", "fallback_application_name", "keepalives"];
+
+priv let apply : :map -> :string -> :string -> [:ok, :map] | [:error, :string];
+priv let apply c k v = match k {
+    "host" if str.starts_with "/" v => [:error, "a Unix-domain socket (" + v + ") cannot be opened by this VM; use a TCP host"],
+    "host" => [:ok, Config.set_host c v],
+    "hostaddr" => [:ok, Config.set_host c v],
+    "port" => match parse_int v {
+        n if type_of n == :integer && n > 0 && n < 65536 => [:ok, Config.set_port c n],
+        _ => [:error, "`" + v + "` is not a port"],
+    },
+    "user" => [:ok, Config.set_user c v],
+    "password" => [:ok, Config.set_password c v],
+    "dbname" => [:ok, Config.set_database c v],
+    "database" => [:ok, Config.set_database c v],
+    "application_name" => [:ok, Config.set_application_name c v],
+    "sslmode" if list.contains v ["require", "verify-ca", "verify-full"] =>
+        [:error, "sslmode=" + v + " asks for TLS, which this client does not speak; refusing rather than connecting in the clear"],
+    "sslmode" => [:ok, c],
+    "options" => [:ok, c],
+    _ if map_has ignored k => [:ok, c],
+    _ => [:ok, Config.set_settings c ((Config.settings c).[k => v])],
+};
+
+// --- the environment ---------------------------------------------------------------
+
+/// What libpq's environment says: `DATABASE_URL` if it is set, then `PGHOST`,
+/// `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` and `PGAPPNAME` over it.
+let from_env! : :unit -> :map;
+let from_env! u = {
+    let base = match os.env! "DATABASE_URL" {
+        () => %{},
+        url => resolve! url,
+    };
+    let vars = [["PGHOST", "host"], ["PGPORT", "port"], ["PGUSER", "user"], ["PGPASSWORD", "password"],
+                ["PGDATABASE", "dbname"], ["PGAPPNAME", "application_name"]];
+    let pairs = strict! (list.filter (fn [k, v] -> v != ())
+                                     (list.map (fn [var, k] -> [k, os.env! var]) vars));
+    match list.fold (fn acc [k, v] -> match acc { [:ok, c] => apply c k v, failed => failed }) [:ok, base] pairs {
+        [:ok, c] => c,
+        [:error, why] => errors.fail! :bad_config why,
+    }
+};
+
+/// A configuration as a URL with the password left out, for a log line.
+let describe : :map -> :string;
+let describe c =
+    "postgres://" + Config.user c + "@" + Config.host c + ":" + to_string (Config.port c)
+    + "/" + (match Config.database c { () => "", d => d });
+
+/// The startup parameters a connection sends: who, where, and the settings.
+let startup_parameters : :map -> [[:string, :string]];
+let startup_parameters c =
+    [["user", Config.user c]]
+    + (match Config.database c { () => [], d => [["database", d]] })
+    + [["application_name", Config.application_name c], ["client_encoding", "UTF8"]]
+    + map_pairs (Config.settings c);
+
+when test {
+    import std.test;
+
+    let ok : [:ok, :map] | [:error, :string] -> :map;
+    let ok r = match r { [:ok, c] => c, _ => %{ :failed => r } };
+
+    let tests = [
+        test.case "an empty configuration is every default"
+            $( test.eq! ["127.0.0.1", 5432, "postgres", (), (), "dream"]
+                        [Config.host %{}, Config.port %{}, Config.user %{}, Config.password %{},
+                         Config.database %{}, Config.application_name %{}] ),
+        test.case "a whole URL"
+            $( test.eq! %{ :host => "db.internal", :port => 6543, :user => "ada", :password => "p@ss:w/rd",
+                           :database => "app", :application_name => "worker",
+                           :settings => %{ "search_path" => "s1,public" } }
+                        (ok (parse "postgresql://ada:p%40ss%3Aw%2Frd@db.internal:6543/app?application_name=worker&search_path=s1%2Cpublic")) ),
+        test.case "a URL with less in it"
+            $( test.eq! [%{ :host => "localhost" }, %{ :host => "::1", :port => 5433, :user => "me" }]
+                        [ok (parse "postgres://localhost"), ok (parse "postgres://me@[::1]:5433")] ),
+        test.case "a keyword string, with quoting"
+            $( test.eq! %{ :host => "h", :database => "d", :password => "it's a secret", :user => "u" }
+                        (ok (parse "host=h dbname=d  password='it\\'s a secret' user = u")) ),
+        test.case "what is refused, and why"
+            $( test.eq! [:error, :error, :error, :ok]
+                        (list.map (fn t -> list.head (parse t))
+                                  ["postgres://h/d?sslmode=require", "host=/var/run/postgresql",
+                                   "postgres://h:99999/d", "postgres://h/d?sslmode=prefer"]) ),
+        test.case "the parameters a startup sends"
+            $( test.eq! [["user", "ada"], ["database", "app"], ["application_name", "dream"],
+                         ["client_encoding", "UTF8"], ["TimeZone", "UTC"]]
+                        (startup_parameters %{ :user => "ada", :database => "app", :settings => %{ "TimeZone" => "UTC" } }) ),
+        test.case "described without its password"
+            $( test.eq! "postgres://ada@h:5432/app" (describe %{ :user => "ada", :password => "x", :host => "h", :database => "app" }) ),
+    ];
+}

@@ -17,6 +17,7 @@ Dont forget about strict parameters, use them when needed
 | `mind/std/` | The standard library. | Dream |
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
+| `pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [pg/README.md](pg/README.md). | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
 | `docs/` | `language-spec.md`, `builtins.md`, `ffi.md`, `gc.md`, `bytecode-format.md`. | — |
@@ -170,6 +171,7 @@ The groups, and what each one is actually asking:
 | `test-bootstrap` | The seed still reproduces itself byte for byte |
 | `test-lucid` | The language server's units: positions, framing, URIs, completion context |
 | `test-lucid-session` | One whole LSP conversation, against a running server |
+| `test-pg` | The PostgreSQL client's units, the SQL the compiler must refuse, and a live throwaway cluster (skipped without PostgreSQL) |
 
 The `dreams/tests/*.sh` scripts run directly with no environment set; there is
 one left, `compile.sh`, and it needs only the VM and the seed.

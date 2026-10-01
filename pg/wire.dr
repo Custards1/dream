@@ -1,0 +1,342 @@
+// The PostgreSQL frontend/backend protocol, version 3.0, as values.
+//
+// Everything here is pure: a message to send is built as the bytes that go on
+// the wire, and a message received is decoded from its type byte and body into
+// a `Message`. Reading and writing a socket is `pg.db`'s business, which is
+// what lets every byte of the protocol be tested without a server.
+//
+// **A frame is a type byte, a 32-bit length that counts itself, and a body.**
+// The one exception is the first thing a client sends -- the startup message,
+// and the cancel request that stands in for it on a second connection -- which
+// has no type byte, because at that point nothing has been agreed.
+//
+// **What arrives is a `union`**, so a `match` over it is checked for the
+// variants it forgets, and a message the protocol grows later arrives as
+// `unknown` rather than being mistaken for one this module knows. The variants
+// are the protocol's own names, lowercased.
+//
+// **The extended query protocol is the one that matters.** A query with
+// parameters is five messages -- Parse, Bind, Describe, Execute, Sync -- and
+// they are built separately so that `pg.db` can write them in one go: the
+// server answers all five in one round trip, which is what makes a parameter
+// cost nothing over a literal.
+
+import std.list;
+import std.map;
+import pg.bytes;
+
+// --- messages from the server --------------------------------------------------
+
+/// One column of a result, as `RowDescription` says it.
+///
+/// `key` is what a row map is keyed by: the column's name as an atom when the
+/// program has ever written that atom, and as the string otherwise. Atoms are
+/// never made from text that arrives on a socket -- a table that only grows is
+/// a leak with a server at the other end -- but a name the program mentions is
+/// already one, so `row.[:email]` works for every column the program can ask
+/// about by atom, and a `mapping` whose fields are the columns reads a row as
+/// it is. See `to_existing_atom` in docs/builtins.md.
+mapping Column {
+    name : :string
+    key
+    table : :integer = 0
+    attribute : :integer = 0
+    oid : :integer = 25
+    size : :integer = -1
+    modifier : :integer = -1
+    format : :integer = 0
+}
+
+/// The key a column named `name` is read by.
+let column_key : :string -> :any;
+let column_key name = match to_existing_atom name { () => name, a => a };
+
+/// A whole message from the server.
+union Message {
+    authentication(code : :integer, data : :string)
+    parameter_status(name : :string, value : :string)
+    backend_key(pid : :integer, secret : :integer)
+    ready(status : :atom)
+    row_description(columns : [:any])
+    data_row(fields : [:any])
+    command_complete(tag : :string)
+    error_response(fields : :map)
+    notice_response(fields : :map)
+    notification(pid : :integer, channel : :string, payload : :string)
+    parameter_description(oids : [:integer])
+    copy_in_response(format : :integer, columns : [:integer])
+    copy_out_response(format : :integer, columns : [:integer])
+    copy_data(data : :string)
+    negotiate_version(minor : :integer, unknown : [:string])
+    unknown(code : :integer, body : :string)
+    parse_complete
+    bind_complete
+    close_complete
+    no_data
+    portal_suspended
+    empty_query
+    copy_done
+}
+
+/// The message with type byte `kind` and body `body`.
+let decode : :integer -> :string -> Message;
+let decode kind body = match kind {
+    82 => Message.authentication (bytes.i32_at body 0) (str_slice body 4 (len body - 4)),  // R
+    83 => {                                                                                  // S
+        let [name, next] = bytes.cstr_at body 0;
+        Message.parameter_status name (list.head (bytes.cstr_at body next))
+    },
+    75 => Message.backend_key (bytes.i32_at body 0) (bytes.i32_at body 4),                  // K
+    90 => Message.ready (status_of (str_byte body 0)),                                      // Z
+    84 => Message.row_description (columns_of body),                                        // T
+    68 => Message.data_row (fields_of body),                                                // D
+    67 => Message.command_complete (list.head (bytes.cstr_at body 0)),                      // C
+    69 => Message.error_response (notice_fields body),                                      // E
+    78 => Message.notice_response (notice_fields body),                                     // N
+    65 => {                                                                                 // A
+        let [channel, next] = bytes.cstr_at body 4;
+        Message.notification (bytes.i32_at body 0) channel (list.head (bytes.cstr_at body next))
+    },
+    116 => Message.parameter_description                                                    // t
+               (list.map (fn i -> bytes.u32_at body (2 + 4 * i)) (list.range 0 (bytes.u16_at body 0))),
+    71 => Message.copy_in_response (str_byte body 0) (copy_formats body),                   // G
+    72 => Message.copy_out_response (str_byte body 0) (copy_formats body),                  // H
+    100 => Message.copy_data body,                                                          // d
+    99 => Message.copy_done,                                                                // c
+    118 => Message.negotiate_version (bytes.i32_at body 0) [],                              // v
+    49 => Message.parse_complete,                                                           // 1
+    50 => Message.bind_complete,                                                            // 2
+    51 => Message.close_complete,                                                           // 3
+    110 => Message.no_data,                                                                 // n
+    115 => Message.portal_suspended,                                                        // s
+    73 => Message.empty_query,                                                              // I
+    _ => Message.unknown kind body,
+};
+
+/// What `ReadyForQuery` says the session is in: outside a transaction, inside
+/// one, or inside one that has failed and will refuse everything but a
+/// rollback.
+let status_of : :integer -> :atom;
+let status_of b = match b {
+    73 => :idle,           // I
+    84 => :transaction,    // T
+    69 => :failed,         // E
+    _ => :unknown,
+};
+
+priv let columns_of : :string -> [:any];
+priv let columns_of body = columns_from body 2 (bytes.u16_at body 0) [];
+
+priv let columns_from : :string -> :integer -> :integer -> [:any] -> [:any];
+priv let rec columns_from body at n acc =
+    if n <= 0 { list.reverse acc }
+    else {
+        let [name, i] = bytes.cstr_at body at;
+        let column = Column.make name (column_key name) (bytes.u32_at body i) (bytes.i16_at body (i + 4))
+                                 (bytes.u32_at body (i + 6)) (bytes.i16_at body (i + 10))
+                                 (bytes.i32_at body (i + 12)) (bytes.i16_at body (i + 16));
+        columns_from body (i + 18) (n - 1) (list_cons column acc)
+    };
+
+/// A row's fields as the text the server sent, `()` for a NULL. Decoding them
+/// into values is `pg.value`'s, and is done only for the rows that are read.
+priv let fields_of : :string -> [:any];
+priv let fields_of body = fields_from body 2 (bytes.u16_at body 0) [];
+
+priv let fields_from : :string -> :integer -> :integer -> [:any] -> [:any];
+priv let rec fields_from body !at n acc =
+    if n <= 0 { list.reverse acc }
+    else {
+        let size = bytes.i32_at body at;
+        if size < 0 { fields_from body (at + 4) (n - 1) (list_cons () acc) }
+        else { fields_from body (at + 4 + size) (n - 1) (list_cons (str_slice body (at + 4) size) acc) }
+    };
+
+priv let copy_formats : :string -> [:integer];
+priv let copy_formats body =
+    list.map (fn i -> bytes.i16_at body (3 + 2 * i)) (list.range 0 (bytes.u16_at body 1));
+
+/// The fields of an error or a notice, keyed by what they mean. The protocol
+/// names each by one byte; the atoms are the names its documentation uses.
+priv let field_names : %{:integer => :atom};
+priv let field_names = %{
+    83 => :severity_local,     // S
+    86 => :severity,           // V
+    67 => :code,               // C
+    77 => :message,            // M
+    68 => :detail,             // D
+    72 => :hint,               // H
+    80 => :position,           // P
+    112 => :internal_position, // p
+    113 => :internal_query,    // q
+    87 => :where,              // W
+    115 => :schema,            // s
+    116 => :table,             // t
+    99 => :column,             // c
+    100 => :data_type,         // d
+    110 => :constraint,        // n
+    70 => :file,               // F
+    76 => :line,               // L
+    82 => :routine,            // R
+};
+
+priv let notice_fields : :string -> :map;
+priv let notice_fields body = notice_from body 0 %{};
+
+priv let notice_from : :string -> :integer -> :map -> :map;
+priv let rec notice_from body at acc = {
+    let code = str_byte body at;
+    if code <= 0 { acc }
+    else {
+        let [text, next] = bytes.cstr_at body (at + 1);
+        let key = field_names.[code else str_of_bytes [code]];
+        notice_from body next (strict_put acc key text)
+    }
+};
+
+priv let strict_put : :map -> :any -> :string -> :map;
+priv let strict_put !m k !v = m.[k => v];
+
+// --- messages to the server ----------------------------------------------------
+
+/// A typed frame: the type character, the length, the body.
+let frame : :string -> :string -> :string;
+let frame kind body = kind + bytes.be32 (len body + 4) + body;
+
+/// The protocol version, 3.0, as the startup message spells it.
+let protocol_version : :integer;
+let protocol_version = 196608;
+
+/// The first message: who is connecting, to what, with which settings. `params`
+/// are name/value pairs; `user` must be among them.
+let startup : [[:string, :string]] -> :string;
+let startup params = {
+    let body = bytes.be32 protocol_version
+               + str_concat (list.map (fn [k, v] -> bytes.cstr k + bytes.cstr v) params) + "\0";
+    bytes.be32 (len body + 4) + body
+};
+
+/// A request, on a connection of its own, that the server stop what the
+/// session `pid` is doing.
+let cancel_request : :integer -> :integer -> :string;
+let cancel_request pid secret =
+    bytes.be32 16 + bytes.be32 80877102 + bytes.be32 pid + bytes.be32 secret;
+
+let password : :string -> :string;
+let password text = frame "p" (bytes.cstr text);
+
+let sasl_initial : :string -> :string -> :string;
+let sasl_initial mechanism data = frame "p" (bytes.cstr mechanism + bytes.be32 (len data) + data);
+
+let sasl_response : :string -> :string;
+let sasl_response data = frame "p" data;
+
+/// A query in the simple protocol: no parameters, any number of statements.
+let query : :string -> :string;
+let query sql = frame "Q" (bytes.cstr sql);
+
+/// Parse `sql` into the statement `name` ("" for the unnamed one). `oids` gives
+/// a type to each parameter; a 0, or a parameter it does not reach, is left to
+/// the server to infer from where the parameter is used.
+let parse : :string -> :string -> [:integer] -> :string;
+let parse name sql oids =
+    frame "P" (bytes.cstr name + bytes.cstr sql + bytes.be16 (len oids)
+               + str_concat (list.map bytes.be32 oids));
+
+/// Bind `values` to the statement `stmt`, making the portal `portal`. Every
+/// value goes as text -- a string, or `()` for NULL -- and every column comes
+/// back as text: `pg.value` is the one place either is spelled.
+let bind : :string -> :string -> [:any] -> :string;
+let bind portal stmt values =
+    frame "B" (bytes.cstr portal + bytes.cstr stmt + bytes.be16 0 + bytes.be16 (len values)
+               + str_concat (list.map bound values) + bytes.be16 0);
+
+priv let bound : :any -> :string;
+priv let bound v = match v {
+    () => bytes.be32 (-1),
+    text => bytes.be32 (len text) + text,
+};
+
+/// Describe a statement (`"S"`) or a portal (`"P"`).
+let describe : :string -> :string -> :string;
+let describe kind name = frame "D" (kind + bytes.cstr name);
+
+/// Run a portal, for up to `max_rows` rows; 0 means all of them.
+let execute : :string -> :integer -> :string;
+let execute portal max_rows = frame "E" (bytes.cstr portal + bytes.be32 max_rows);
+
+/// Close a statement (`"S"`) or a portal (`"P"`).
+let close : :string -> :string -> :string;
+let close kind name = frame "C" (kind + bytes.cstr name);
+
+let sync : :string;
+let sync = frame "S" "";
+
+let flush : :string;
+let flush = frame "H" "";
+
+let terminate : :string;
+let terminate = frame "X" "";
+
+let copy_data : :string -> :string;
+let copy_data data = frame "d" data;
+
+let copy_done : :string;
+let copy_done = frame "c" "";
+
+let copy_fail : :string -> :string;
+let copy_fail reason = frame "f" (bytes.cstr reason);
+
+when test {
+    import std.test;
+
+    /// A frame back into its type and body, the way the reader takes one apart.
+    let unframe : :string -> [:integer, :string];
+    let unframe f = [str_byte f 0, str_slice f 5 (bytes.u32_at f 1 - 4)];
+
+    let columns_in : Message -> [:any];
+    let columns_in m = match m { [:row_description, cs] => cs, _ => [] };
+
+    let tests = [
+        test.case "a frame's length counts itself and not its type"
+            $( test.eq! ["Q", 13, "select 1\0"]
+                        [str_slice (query "select 1") 0 1, bytes.u32_at (query "select 1") 1,
+                         str_slice (query "select 1") 5 9] ),
+        test.case "startup is length, version, then terminated pairs"
+            $( test.eq! [4 + 4 + 5 + 3 + 1, protocol_version, "user\0me\0\0"]
+                        [bytes.u32_at (startup [["user", "me"]]) 0,
+                         bytes.u32_at (startup [["user", "me"]]) 4,
+                         str_slice (startup [["user", "me"]]) 8 10] ),
+        test.case "a NULL parameter is a length of -1 and no bytes"
+            $( test.eq! (str_of_bytes [0, 0, 0, 0, 0, 2, 0, 0, 0, 1] + "7" + bytes.be32 (-1) + bytes.be16 0)
+                        (list.nth 1 (unframe (bind "" "" ["7", ()]))) ),
+        test.case "ready, by what the status byte says"
+            $( test.eq! [[:ready, :idle], [:ready, :failed]]
+                        [decode 90 "I", decode 90 "E"] ),
+        test.case "a data row keeps NULL apart from the empty string"
+            $( test.eq! [:data_row, ["1", (), ""]]
+                        (decode 68 (bytes.be16 3 + bytes.be32 1 + "1" + bytes.be32 (-1) + bytes.be32 0)) ),
+        test.case "a row description, column by column"
+            $( test.eq! [["id", 23, 4, 16384, 1], ["no such atom here", 25, -1, 0, 0]]
+                        (list.map (fn c -> [Column.name c, Column.oid c, Column.size c,
+                                            Column.table c, Column.attribute c])
+                                  (columns_in (decode 84 (bytes.be16 2
+                                      + bytes.cstr "id" + bytes.be32 16384 + bytes.be16 1
+                                      + bytes.be32 23 + bytes.be16 4 + bytes.be32 (-1) + bytes.be16 0
+                                      + bytes.cstr "no such atom here" + bytes.be32 0 + bytes.be16 0
+                                      + bytes.be32 25 + bytes.be16 (-1) + bytes.be32 (-1) + bytes.be16 0)))) ),
+        test.case "a column is keyed by atom when the program knows the name"
+            $( test.eq! [:id, "no such atom here"] [column_key "id", column_key "no such atom here"] ),
+        test.case "an error's fields, by name"
+            $( test.eq! %{ :severity => "ERROR", :code => "42P01", :message => "nope" }
+                        (match decode 69 "VERROR\0C42P01\0Mnope\0\0" {
+                             [:error_response, fields] => fields,
+                             _ => %{},
+                         }) ),
+        test.case "a notification"
+            $( test.eq! [:notification, 7, "jobs", "go"]
+                        (decode 65 (bytes.be32 7 + "jobs\0go\0")) ),
+        test.case "a message nobody knows is kept, not guessed at"
+            $( test.eq! [:unknown, 33, "x"] (decode 33 "x") ),
+    ];
+}
