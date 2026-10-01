@@ -3317,8 +3317,15 @@ Emitter::JV Emitter::float_arith(Op op, JV a, JV bv) {
     // Not a number in hand. `arith` decides, and either raises -- which is
     // what all but always happens, with the error the interpreter would have
     // given -- or answers a number, because an operation with a float on one
-    // side of it has no third case. So the answer comes back as a double and
-    // the caller never learns there were two paths.
+    // side of it has no third case among numbers. So the answer comes back as
+    // a double and the caller never learns there were two paths.
+    //
+    // The one value that is not a number and still combines with a float is
+    // a tensor: `2.0 * t` is a tensor, and there is no register here for it.
+    // The helper says so with a 2 and the call goes back to the interpreter
+    // (`JIT_BAIL`), which is sound for the reason every bail is -- a compiled
+    // body is pure and has written nothing but registers. `Ty::Float` stays
+    // what it was: a claim about every value this can produce *here*.
     b_.SetInsertPoint(slow_bb);
     llvm::Value* out = entry_alloca(dbl_);
     llvm::Value* err = entry_alloca(i64_);
@@ -3327,7 +3334,15 @@ Emitter::JV Emitter::float_arith(Op op, JV a, JV bv) {
     llvm::Value* slowv = b_.CreateLoad(dbl_, out);
     auto* slow_end = b_.GetInsertBlock();
     auto* raise_bb = bb("fbin.raise");
-    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), join_bb, raise_bb);
+    auto* other_bb = bb("fbin.other");
+    auto* bail_bb = bb("fbin.bail");
+    b_.CreateCondBr(b_.CreateICmpEQ(ok, i32c(1)), join_bb, other_bb);
+
+    b_.SetInsertPoint(other_bb);
+    b_.CreateCondBr(b_.CreateICmpEQ(ok, i32c(2)), bail_bb, raise_bb);
+
+    b_.SetInsertPoint(bail_bb);
+    emit_bail();
 
     b_.SetInsertPoint(raise_bb);
     emit_raise(b_.CreateLoad(i64_, err));
@@ -3482,7 +3497,8 @@ Emitter::JV Emitter::type_test(const Node& n) {
         ObjType kind = n.b == DREAM_TYPE_FLOAT ? ObjType::Float :
                        n.b == DREAM_TYPE_STRING ? ObjType::Str :
                        n.b == DREAM_TYPE_LIST ? ObjType::Cons :
-                       n.b == DREAM_TYPE_ARRAY ? ObjType::Array : ObjType::Map;
+                       n.b == DREAM_TYPE_ARRAY ? ObjType::Array :
+                       n.b == DREAM_TYPE_TENSOR ? ObjType::Tensor : ObjType::Map;
         llvm::Value* matches = b_.CreateICmpEQ(header, llvm::ConstantInt::get(i8_, uint8_t(kind)));
         if (n.b == DREAM_TYPE_MAP)
             matches = b_.CreateOr(matches, b_.CreateICmpEQ(

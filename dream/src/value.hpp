@@ -110,6 +110,7 @@ enum class ObjType : uint8_t {
     ErrorBox,
     Pid,
     Native,    // a host function registered through the C API
+    Tensor,    // packed numbers with a shape; see TensorObj
     Count
 };
 
@@ -320,6 +321,52 @@ struct NativeObj : Obj {
     /// distinct Dream functions.
     uint64_t user;
 };
+
+/// A tensor: numbers packed flat, with a shape. The value the numeric
+/// operators (`+ - * / %` elementwise, `@` for products) and `std.tensor` work
+/// on, and the reason they can be fast at all.
+///
+/// An array of floats is an array of *pointers* to float boxes: every element
+/// is a separate object, sixteen bytes and a cache miss away from its
+/// neighbour, and every arithmetic result is another allocation. Nothing a
+/// vector unit does well can be done to that. This holds the doubles
+/// themselves, contiguous and row-major, so a kernel reads them the way a C
+/// program would and the compiler can vectorize the loop.
+///
+/// It is a value like any other -- immutable once built, copied between heaps
+/// when it is sent -- and holds no references, so the collector treats it as a
+/// leaf (a string, to it). One past `kMaxClassSize` is born in old space and
+/// never moved, which is what keeps a large one from being copied by every
+/// minor collection.
+///
+/// `dtype` and `device` are the two doors left open. Only `F64` on the host
+/// exists today; a `F32` buffer, or one that lives in a GPU's memory with
+/// `data` replaced by a handle, would be told apart here. See
+/// docs/notes/tensors.md.
+///
+/// The shape is held inline, up to `TENSOR_MAX_RANK` axes, so that the data
+/// starts at a fixed offset. `dims` past `rank` are zero.
+constexpr uint32_t TENSOR_MAX_RANK = 6;
+enum TensorDtype : uint8_t { TENSOR_F64 = 0, TENSOR_F32 = 1 };
+enum TensorDevice : uint8_t { TENSOR_HOST = 0 };
+
+struct TensorObj : Obj {
+    uint8_t dtype;
+    uint8_t rank;
+    uint8_t device;
+    uint8_t flags;
+    uint32_t pad;
+    uint64_t count;  // the product of the dims
+    uint32_t dims[TENSOR_MAX_RANK];
+    double* data() { return reinterpret_cast<double*>(this + 1); }
+    const double* data() const { return reinterpret_cast<const double*>(this + 1); }
+};
+static_assert(sizeof(TensorObj) % 16 == 0, "a tensor's data starts on a 16-byte boundary");
+
+/// The bytes a tensor's numbers occupy wherever they live.
+inline size_t tensor_data_bytes(const TensorObj* t) {
+    return size_t(t->count) * (t->dtype == TENSOR_F32 ? sizeof(float) : sizeof(double));
+}
 
 // ---------------------------------------------------------------------------
 // Following indirections

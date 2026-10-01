@@ -336,6 +336,7 @@ let operators = [
     ["{", :lbrace], ["}", :rbrace],
     ["<", :lt], [">", :gt], ["=", :eq],
     ["+", :plus], ["-", :minus], ["*", :star], ["/", :slash], ["%", :percent],
+    ["@", :at],
     [".", :dot], [",", :comma], [";", :semi], [":", :colon], ["|", :bar],
 ];
 
@@ -370,6 +371,7 @@ let operator_at s i = {
     else if a == 43 { [:plus, 1] }
     else if a == 42 { [:star, 1] }
     else if a == 47 { [:slash, 1] }
+    else if a == 64 { [:at, 1] }
     else if a == 46 { if b == 46 { [:dot_dot, 2] } else { [:dot, 1] } }
     else if a == 61 { if b == 61 { [:eq_eq, 2] }
                       else if b == 62 { [:fat_arrow, 2] }

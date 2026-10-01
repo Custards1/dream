@@ -60,6 +60,20 @@ let pipe_e lhs rhs span = [:pipe, lhs, rhs, span];
 let unary_e op e span      = [:unary, op, e, span];
 let binary_e op l r span   = [:binary, op, l, r, span];
 
+/// `a @ b` -- the matrix product, or the dot product of two vectors. Not a
+/// `:binary` node: it is the builtin `tensor_matmul` applied to both sides,
+/// written that way here so that nothing after the parser -- scope, types,
+/// lowering, the optimizer -- has an operator to learn. Every arithmetic
+/// operator is an opcode because a loop of them has to be a loop of machine
+/// instructions; this one does a matrix of work per call, and a call is free
+/// beside that.
+///
+/// The name takes the span of the `@` itself, not of the whole expression.
+/// A name is known by where it is written -- resolution and the language
+/// server both key on it -- and the whole expression starts where `l` does,
+/// so a name given that span was resolved as `l`.
+let matmul_e l r at span = apply_e (name_e "tensor_matmul" at) [l, r] span;
+
 /// `else` is optional; a missing one is `()`.
 let if_e cond then_e else_e span = [:if, cond, then_e, else_e, span];
 
@@ -106,6 +120,7 @@ let binops = [
     [:or_or, :or], [:and_and, :and],
     [:eq_eq, :eq], [:bang_eq, :ne], [:lt, :lt], [:le, :le], [:gt, :gt], [:ge, :ge],
     [:plus, :add], [:minus, :sub], [:star, :mul], [:slash, :div], [:percent, :mod],
+    [:at, :matmul],
 ];
 
 /// Loosest to tightest, matching the table in the language reference. `|>` is
@@ -117,7 +132,7 @@ let precedence op =
         :and => 1,
         :eq  => 2, :ne => 2, :lt => 2, :le => 2, :gt => 2, :ge => 2,
         :add => 3, :sub => 3,
-        :mul => 4, :div => 4, :mod => 4,
+        :mul => 4, :div => 4, :mod => 4, :matmul => 4,
         _    => 0 - 1,
     };
 
@@ -136,7 +151,7 @@ let infix_of token_kind =
         :gt      => :gt,  :ge      => :ge,
         :plus    => :add, :minus   => :sub,
         :star    => :mul, :slash   => :div,
-        :percent => :mod,
+        :percent => :mod, :at      => :matmul,
         _ => (),
     };
 

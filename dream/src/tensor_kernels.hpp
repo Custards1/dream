@@ -1,0 +1,49 @@
+// The table of CPU kernels a tensor operation runs, and the codes they take.
+//
+// Two copies of the table exist, one per instruction set (see the head of
+// tensor_kernels.inc); `tensor_kernels()` picks between them once.
+
+#pragma once
+
+#include <cstddef>
+
+namespace dream {
+
+/// Binary operations, in the order `+ - * / %` -- shared with the GPU's
+/// kernels, which switch on the same numbers.
+enum KernelOp : int { KOP_ADD = 0, KOP_SUB, KOP_MUL, KOP_DIV, KOP_MOD };
+
+/// Elementwise functions of one argument.
+enum KernelFn : int {
+    KFN_NEG = 0, KFN_SQRT, KFN_EXP, KFN_LOG, KFN_ABS, KFN_TANH, KFN_SIN, KFN_COS,
+    KFN_RELU, KFN_SIGMOID,
+};
+
+/// Reductions to one number.
+enum KernelReduce : int { KRED_SUM = 0, KRED_MIN, KRED_MAX };
+
+struct TensorKernels {
+    /// `out[i] = x[i] op y[i]` over `n` elements.
+    void (*binary)(int op, const double* x, const double* y, double* out, size_t n);
+    /// `out[i] = x[i] op s`, or `s op x[i]` when `scalar_left`.
+    void (*scalar)(int op, const double* x, double s, bool scalar_left, double* out, size_t n);
+    void (*unary)(int fn, const double* x, double* out, size_t n);
+    double (*dot)(const double* a, const double* b, size_t n);
+    /// `n` must be at least 1.
+    double (*reduce)(int op, const double* x, size_t n);
+    /// `C = A x B`, row-major, `C` overwritten.
+    void (*gemm)(const double* A, const double* B, double* C, size_t M, size_t K, size_t N);
+    void (*transpose)(const double* in, double* out, size_t rows, size_t cols);
+};
+
+namespace kernels_base { extern const TensorKernels kernels; }
+#if defined(DREAM_TENSOR_AVX2)
+namespace kernels_avx2 { extern const TensorKernels kernels; }
+#endif
+
+/// The fastest table this CPU can run, chosen on the first call.
+const TensorKernels& tensor_kernels();
+/// Its name, for `tensor.backend`: "avx2" or "baseline".
+const char* tensor_kernels_name();
+
+}  // namespace dream

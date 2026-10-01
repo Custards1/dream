@@ -33,13 +33,13 @@ inline void set_free_next(Obj* o, Obj* next) {
 }
 
 /// True for the object kinds whose payload holds no references -- Float, Str,
-/// Pid and BigStr carry only raw bytes, a host id, or a pointer into the
+/// Pid, BigStr and Tensor carry only raw bytes, a host id, or a pointer into the
 /// image, which is not heap memory and is never collected. Marking one is a
 /// no-op, so the collector need not put it on the worklist; the mark bit alone
 /// keeps it.
 inline bool is_atom_object(ObjType t) {
     return t == ObjType::Float || t == ObjType::Str || t == ObjType::Pid ||
-           t == ObjType::BigStr;
+           t == ObjType::BigStr || t == ObjType::Tensor;
 }
 
 /// Allocation rounds every object up to one of these sizes, and every chunk in
@@ -469,6 +469,72 @@ Value Heap::make_error(Value kind, Value payload) {
     return from_obj(o);
 }
 
+namespace {
+/// The header of a tensor, written the same way whichever area holds it.
+void init_tensor(TensorObj* t, uint32_t rank, const uint32_t* dims, uint64_t count) {
+    t->dtype = TENSOR_F64;
+    t->rank = uint8_t(rank);
+    t->device = TENSOR_HOST;
+    t->flags = 0;
+    t->pad = 0;
+    t->count = count;
+    for (uint32_t i = 0; i < TENSOR_MAX_RANK; ++i) t->dims[i] = i < rank ? dims[i] : 0;
+}
+}  // namespace
+
+Value Heap::make_tensor(uint32_t rank, const uint32_t* dims, uint64_t count) {
+    // Bare: the data is about to be written whole, and clearing megabytes the
+    // caller overwrites is the waste `alloc_bare` exists to avoid. Nothing here
+    // is a reference, so an unwritten element is never mistaken for one.
+    auto* t = static_cast<TensorObj*>(alloc_bare(
+        ObjType::Tensor, sizeof(TensorObj) - sizeof(Obj) + size_t(count) * sizeof(double)));
+    init_tensor(t, rank, dims, count);
+    return from_obj(t);
+}
+
+Value Heap::make_external_tensor(uint32_t rank, const uint32_t* dims, uint64_t count,
+                                 uint8_t dtype, uint8_t device, void* handle) {
+    auto* t = static_cast<TensorObj*>(
+        alloc_bare(ObjType::Tensor, sizeof(TensorObj) - sizeof(Obj) + sizeof(void*)));
+    init_tensor(t, rank, dims, count);
+    t->dtype = dtype;
+    t->device = device;
+    std::memcpy(t->data(), &handle, sizeof handle);
+    external_.push_back(t);
+    external_bytes_ += tensor_data_bytes(t);
+    return from_obj(t);
+}
+
+void Heap::reap_external(bool full) {
+    size_t keep = 0;
+    const size_t before = external_bytes_;
+    auto drop = [&](Obj* o) {
+        external_bytes_ -= tensor_data_bytes(static_cast<TensorObj*>(o));
+        release_external(o);
+    };
+    for (Obj* o : external_) {
+        const uint8_t gc = o->gc;
+        if (gc == GC_FORWARDED) {
+            // Promoted: the copy is the object now, and the stub is about to
+            // be nursery space again.
+            external_[keep++] = as_obj(forward_target(o));
+        } else if (gc & GC_YOUNG) {
+            // Young and not copied out: nothing reached it.
+            drop(o);
+        } else if (!full || (gc & GC_MARK)) {
+            external_[keep++] = o;
+        } else {
+            drop(o);
+        }
+    }
+    external_.resize(keep);
+    // A minor that was called for external memory and freed less than half of
+    // it found the memory held by old objects, which only a major can judge.
+    // A major settles the question either way.
+    external_major_ = !full && before >= external_trigger_ && external_bytes_ * 2 > before;
+    external_trigger_ = std::max(external_bytes_ * 2, external_bytes_ + kExternalSlack);
+}
+
 Value Heap::make_pid(uint64_t id) {
     auto* o = static_cast<PidObj*>(alloc_bare(ObjType::Pid, sizeof(uint64_t)));
     o->id = id;
@@ -732,6 +798,8 @@ Heap::~Heap() {
         marking_ = false;
         GcPool::instance().join();
     }
+    // The process is gone, so everything it held outside the heap goes too.
+    for (Obj* o : external_) release_external(o);
     free_blocks(blocks_);
     for (Block* b : nursery_) free_block(b);
 }
@@ -1379,6 +1447,7 @@ void Heap::major_collect(RootSource& roots) {
     full_trace_ = true;
     if (!trace_in_parallel(roots, /*minor=*/false)) trace_alone(roots, /*minor=*/false);
     full_trace_ = false;
+    reap_external(true);
     const uint64_t marked = now_nanos();
 
     // Sweep. Every old block's chunk headers tile the block, so one walk over
@@ -1433,6 +1502,7 @@ void Heap::minor_collect(RootSource& roots) {
     // the promoted one, so when the worklist drains, everything reachable is
     // in old space and the nursery is empty by construction.
     if (!trace_in_parallel(roots, /*minor=*/true)) trace_alone(roots, /*minor=*/true);
+    reap_external(false);
 
     // Every nursery block is now dead space; reset them all and rewind to the
     // first, so the next bump allocation refills the blocks we already have.
@@ -1621,6 +1691,7 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     full_trace_ = true;
     if (!trace_in_parallel(roots, /*minor=*/true)) trace_alone(roots, /*minor=*/true);
     full_trace_ = false;
+    reap_external(true);
     if (!sweep_in_parallel()) sweep();
     free_nursery();
     remembered_.clear();
@@ -2060,6 +2131,19 @@ struct VerifyWalk {
                     }
                     break;
                 }
+                case ObjType::Tensor: {
+                    auto* t = static_cast<TensorObj*>(o);
+                    uint64_t count = 1;
+                    for (uint32_t i = 0; i < t->rank; ++i) count *= t->dims[i];
+                    const size_t payload = t->device == TENSOR_HOST
+                                               ? t->count * sizeof(double) : sizeof(void*);
+                    if (t->rank == 0 || t->rank > TENSOR_MAX_RANK || count != t->count ||
+                        t->bytes < sizeof(TensorObj) + payload) {
+                        problem("tensor at " + addr(o) + " has a shape its size does not hold");
+                        return;
+                    }
+                    break;
+                }
                 case ObjType::BigStr: {
                     // Its bytes are not in the heap, so there is nothing here
                     // to measure against its length -- only that it points
@@ -2204,6 +2288,30 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
         }
         case ObjType::Pid:
             return dest.make_pid(static_cast<PidObj*>(o)->id);
+        case ObjType::Tensor: {
+            auto* src = static_cast<TensorObj*>(o);
+            if (src->device != TENSOR_HOST) {
+                // A GPU tensor crosses as its handle: both processes then hold
+                // a reference to the one device buffer, which is immutable like
+                // every other value. The shared area has no collector to
+                // release a reference, so it cannot hold one.
+                if constexpr (to_shared) {
+                    dest.refuse("GPU tensor");
+                    return UNIT;
+                } else {
+                    retain_external(src);
+                    return dest.make_external_tensor(src->rank, src->dims, src->count,
+                                                     src->dtype, src->device,
+                                                     tensor_handle(src));
+                }
+            }
+            // The numbers cross by copy, as a string's bytes do. A tensor
+            // sent to another process is one memcpy, not one box per element.
+            Value t = dest.make_tensor(src->rank, src->dims, src->count);
+            std::memcpy(static_cast<TensorObj*>(as_obj(t))->data(), src->data(),
+                        size_t(src->count) * sizeof(double));
+            return t;
+        }
         case ObjType::Cons: {
             // The spine is walked in a loop rather than by recursing on the
             // tail, so a long list costs no C++ stack: a hundred thousand
@@ -2485,6 +2593,13 @@ Value SharedArea::make_bigstr(const char* data, uint64_t len) {
     o->hash = bytes_hash(Bytes{data, len});
     o->data = data;
     return from_obj(o);
+}
+
+Value SharedArea::make_tensor(uint32_t rank, const uint32_t* dims, uint64_t count) {
+    auto* t = static_cast<TensorObj*>(alloc(
+        ObjType::Tensor, sizeof(TensorObj) - sizeof(Obj) + size_t(count) * sizeof(double)));
+    init_tensor(t, rank, dims, count);
+    return from_obj(t);
 }
 
 Value SharedArea::make_pid(uint64_t id) {

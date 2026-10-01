@@ -59,6 +59,13 @@ constexpr uint8_t GC_SHARED = 64;
 
 class Heap;
 
+/// What a tensor that lives outside the heap holds, and how its reference is
+/// taken and given back. Implemented in tensor.cpp, which knows what a GPU
+/// buffer is; the heap only knows that some objects hold one.
+void* tensor_handle(const TensorObj* t);
+void retain_external(Obj* o);
+void release_external(Obj* o);
+
 /// Supplies the roots for a collection. Implemented by Process.
 struct RootSource {
     virtual ~RootSource() = default;
@@ -120,6 +127,16 @@ public:
     Value make_pap(Value fn, uint32_t nargs);
     Value make_error(Value kind, Value payload);
     Value make_pid(uint64_t id);
+    /// A tensor of the given shape, its data uninitialised: the caller fills
+    /// every element. `dims` holds `rank` axes; `count` is their product, which
+    /// the caller has already checked fits (see `tensor_bytes_ok`).
+    Value make_tensor(uint32_t rank, const uint32_t* dims, uint64_t count);
+    /// A tensor whose numbers live somewhere else -- a GPU's memory -- named by
+    /// `handle`, of which the new object takes ownership of one reference. The
+    /// heap keeps a list of such objects and releases the handle when the
+    /// collector finds the object dead; see `reap_external`.
+    Value make_external_tensor(uint32_t rank, const uint32_t* dims, uint64_t count,
+                               uint8_t dtype, uint8_t device, void* handle);
     Value make_module(uint32_t import_index, Value name);
 
     /// True when the process should collect at its next safepoint: old space
@@ -170,10 +187,17 @@ public:
     /// the compile does not notice, because its minors promote about a
     /// quarter.
     bool major_due() const {
-        if (old_bytes() >= gc_threshold_) return true;
+        if (old_bytes() >= gc_threshold_ || external_major_) return true;
         return !minor_pays_ && allocated_ >= gc_threshold_;
     }
-    bool minor_due() const { return nursery_bytes_ >= nursery_hi_; }
+    /// The nursery is full -- or the memory held *outside* the heap has grown
+    /// past its trigger. A GPU tensor is fifty-six bytes of heap and megabytes
+    /// of device memory, so a loop making them fills the device long before it
+    /// fills the nursery; without the second clause nothing would ever collect
+    /// and nothing would ever be released. See `reap_external`.
+    bool minor_due() const {
+        return nursery_bytes_ >= nursery_hi_ || external_bytes_ >= external_trigger_;
+    }
 
     /// Full collection: promote every reachable young object and mark-sweep
     /// old space. Safe only at an interpreter safepoint.
@@ -184,6 +208,9 @@ public:
     /// nursery into old space, leaving it empty. The trace starts from the
     /// roots and the remembered set; old space is neither marked nor swept.
     void minor_collect(RootSource& roots);
+
+    /// How many objects this heap holds that own something outside it.
+    size_t external_count() const { return external_.size(); }
 
     /// Phase 2's step 3: a major whose *marking* overlaps the mutator.
     ///
@@ -344,6 +371,28 @@ public:
     static bool verify_after_gc();
 
 private:
+    /// Objects that hold a reference to something the heap does not own -- a
+    /// GPU buffer -- and so must say when they die. Nothing else in this
+    /// language needs a finalizer, which is why this is a list beside the
+    /// heap and not a bit on every object: the collector looks at these and at
+    /// nothing else when it asks what to release.
+    std::vector<Obj*> external_;
+    /// What `external_` holds outside the heap, in bytes, and the level that
+    /// asks for a collection: twice what survived the last one, and never less
+    /// than `kExternalSlack` above it.
+    size_t external_bytes_ = 0;
+    size_t external_trigger_ = kExternalSlack;
+    /// A minor collection freed too little of it: what is held is old, and only
+    /// a major can tell whether it is still reached.
+    bool external_major_ = false;
+    static constexpr size_t kExternalSlack = size_t(64) << 20;
+    /// Release what the dead among `external_` hold, and follow the living to
+    /// where a minor moved them. Called once the trace is complete and before
+    /// the nursery is emptied or old space swept, which is the one moment both
+    /// "was it reached" and "where is it now" can be read off the headers.
+    /// `full` says old objects were marked, so an unmarked one is dead.
+    void reap_external(bool full);
+
     struct Block {
         Block* next;
         size_t size;
@@ -676,6 +725,7 @@ public:
     Value make_string(const char* data, uint32_t len);
     Value make_bigstr(const char* data, uint64_t len);
     Value make_pid(uint64_t id);
+    Value make_tensor(uint32_t rank, const uint32_t* dims, uint64_t count);
     Value make_cons(Value head, Value tail);
     Value make_array(uint32_t len);
     Value make_map_branch(uint32_t nslots);

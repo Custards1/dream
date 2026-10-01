@@ -45,7 +45,9 @@ dream::Value dream_rt_float(dream::Process* p, double d);
 /// the double path in `arith` and nothing else. So the result unboxes, and the
 /// caller stays in doubles rather than having to rejoin two representations.
 ///
-/// Returns 1 with the double in `*out`, or 0 with the error in `*err`.
+/// Returns 1 with the double in `*out`, 0 with the error in `*err`, or 2
+/// when the answer is not a number at all -- a tensor scaled by a float --
+/// which the caller cannot hold and hands back to the interpreter.
 int dream_rt_arith_f(dream::Process* p, int32_t op, dream::Value a, dream::Value b, double* out,
                      dream::Value* err);
 

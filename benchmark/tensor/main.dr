@@ -1,0 +1,66 @@
+// A matrix product three ways: written in Dream over arrays, with `@` on the
+// CPU, and with `@` on the GPU. Prints milliseconds and GFLOP/s for each, and
+// checks the three agree.
+//
+//     dream build/dreams.dream -L mind benchmark/tensor/main.dr -o /tmp/tb.dream
+//     dream /tmp/tb.dream [N]
+//
+// The Dream version is the best a program can do without tensors: the
+// matrices as arrays of arrays of floats, a strict accumulator, indexing
+// rather than walking. It is here to say what `@` is worth, not as a straw
+// man -- every float it touches is a box, and that is the point.
+import std.array;
+import std.console;
+import std.list;
+import std.os;
+import std.str;
+import std.tensor;
+
+/// `#[#[..]]`, the same numbers as `t`.
+let nested : :tensor -> #[#[:float]];
+let nested t = array.of_list (list.map array.of_list (tensor.to_list t));
+
+let naive : #[#[:float]] -> #[#[:float]] -> #[#[:float]];
+let naive a b = {
+    let n = len a;
+    let k = len b;
+    let m = len (b.[0]);
+    let rec cell row j p !acc = if p == k { acc } else { cell row j (p + 1) (acc + row.[p] * b.[p].[j]) };
+    array.build n (fn i -> { let row = a.[i]; array.build m (fn j -> cell row j 0 0.0) })
+};
+
+let gflops : :integer -> :integer -> :string;
+let gflops n ms = if ms <= 0 { "-" } else { to_string (to_int (2.0 * to_float n * to_float n * to_float n / to_float ms / 1.0e4) / 100.0) };
+
+let timed! name n thunk = {
+    let before = os.monotonic! ();
+    let r = strict! (thunk ());
+    let ms = os.monotonic! () - before;
+    console.print! (name + ": " + to_string ms + " ms, " + gflops n ms + " GFLOP/s");
+    r
+};
+
+let main! = {
+    let args = os.args! ();
+    let n = if args == [] { 256 } else { parse_int (list.head args) };
+    let a = tensor.random 1 [n, n];
+    let b = tensor.random 2 [n, n];
+    console.print! ("n = " + to_string n + ", cpu kernels: " + tensor.cpu_kernels ());
+    let small = n <= 512;
+    let na = nested a;
+    let nb = nested b;
+    let slow = if small { timed! "dream arrays " n (fn () -> naive na nb) } else { () };
+    let fast = timed! "tensor @ cpu " n (fn () -> a @ b);
+    if small {
+        let diff = tensor.maximum (tensor.abs (tensor.of_list slow - fast));
+        console.print! ("  agree: " + to_string (diff < 1.0e-9))
+    } else { () };
+    if tensor.gpu_available () {
+        let ga = tensor.gpu a;
+        let gb = tensor.gpu b;
+        let warm = tensor.host (ga @ gb);
+        let g = timed! "tensor @ gpu " n (fn () -> tensor.host (ga @ gb));
+        console.print! ("  on " + tensor.gpu_name () + ", agree: " +
+                        to_string (tensor.maximum (tensor.abs (g - fast)) < 1.0e-3 * to_float n))
+    } else { console.print! "no GPU" }
+};

@@ -15,6 +15,7 @@
 #include <stdexcept>
 
 #include "interp.hpp"
+#include "tensor.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
 
@@ -532,6 +533,7 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
             out->append(buf);
             return true;
         }
+        case ObjType::Tensor: return tensor_render(p, w, out);
         default: out->append("<value>"); return true;
     }
 }
@@ -672,7 +674,7 @@ NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
         }
         if (impure) t = DREAM_TYPE_IMPURE_FN;
     }
-    if (unsigned(t) > unsigned(DREAM_TYPE_BIGSTR)) t = DREAM_TYPE_UNKNOWN;
+    if (unsigned(t) > unsigned(DREAM_TYPE_TENSOR)) t = DREAM_TYPE_UNKNOWN;
     return NativeResult::ok(make_atom(wk.types[t]));
 }
 
@@ -706,6 +708,8 @@ NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
         n = static_cast<ArrayObj*>(as_obj(v))->len;
     } else if (is_obj(v, ObjType::Map)) {
         n = static_cast<MapObj*>(as_obj(v))->count;
+    } else if (is_obj(v, ObjType::Tensor)) {
+        n = tensor_len(v);
     } else if (is_obj(v, ObjType::Cons)) {
         Value cur = v;
         for (;;) {
@@ -2324,7 +2328,8 @@ int compare_rank(Value v) {
     if (is_unit(v)) return 5;
     if (v == NIL || is_obj(v, ObjType::Cons)) return 6;
     if (is_obj(v, ObjType::Array)) return 7;
-    return 8;
+    if (is_obj(v, ObjType::Tensor)) return 8;
+    return 9;
 }
 
 bool compare_values(Process& p, Value a, Value b, int depth, int* out) {
@@ -2404,6 +2409,7 @@ bool compare_values(Process& p, Value a, Value b, int depth, int* out) {
             *out = order(x->len, y->len);
             return true;
         }
+        case 8: return tensor_compare(p, a, b, out);
         default: *out = 0; return true;
     }
 }
@@ -3206,6 +3212,7 @@ const BuiltinDef BUILTINS[] = {
     {"data_at", 1, 0b1, core_data_at},
     {"compare", 2, 0b11, core_compare},
     {"sort_keyed", 2, 0b10, core_sort_keyed, true},
+    {"tensor_matmul", 2, 0b11, tensor_matmul_builtin},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

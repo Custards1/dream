@@ -214,7 +214,7 @@
         },
         {
           "name": "keyword.operator.arithmetic.dream",
-          "match": "\\+|-|\\*|/|%"
+          "match": "\\+|-|\\*|/|%|@"
         },
         {
           "name": "keyword.operator.assignment.dream",

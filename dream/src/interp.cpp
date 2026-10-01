@@ -2,6 +2,7 @@
 #include <cstdlib>
 
 #include "interp.hpp"
+#include "tensor.hpp"
 
 #include <cinttypes>
 #include <cmath>
@@ -235,6 +236,8 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
         }
         case ObjType::Pid:
             return static_cast<PidObj*>(oa)->id == static_cast<PidObj*>(ob)->id;
+        case ObjType::Tensor:
+            return tensor_equal(p, fa, fb, raised);
         case ObjType::Map: {
             auto* x = static_cast<MapObj*>(oa);
             auto* y = static_cast<MapObj*>(ob);
@@ -880,6 +883,14 @@ bool concat_lists(Process& p, Value a, Value b, Value* out) {
 bool arith(Process& p, Op op, Value a, Value b, Value* out) {
     const auto& wk = well_known(p.runtime());
 
+    // Elementwise, and the reason this is a VM operation at all: `a * b` on
+    // two tensors is one pass over packed numbers. Only reached once the
+    // fixnum fast paths have declined, so asking costs ordinary arithmetic
+    // nothing.
+    if (is_obj(a, ObjType::Tensor) || is_obj(b, ObjType::Tensor)) {
+        return tensor_arith(p, op, a, b, out);
+    }
+
     if (op == Op::Add && is_listish(a) && is_listish(b)) {
         return concat_lists(p, a, b, out);
     }
@@ -1353,6 +1364,20 @@ void container_get(Process& p, uint32_t at, Value container, Value key, Value fr
                                 "the map has no key " + describe(p, key)));
         return;
     }
+    if (is_obj(container, ObjType::Tensor) && is_fixnum(key)) {
+        Value got;
+        switch (tensor_index(p, container, fixnum_value(key), &got)) {
+            case 1: ret(p, got); return;
+            case 0: do_raise(p, got); return;
+            default: break;
+        }
+        if (get_fallback(p, at, frame)) return;
+        do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                "index " + std::to_string(fixnum_value(key)) +
+                                    " is outside a tensor of length " +
+                                    std::to_string(tensor_len(container))));
+        return;
+    }
     if (!is_sequence(container)) {
         do_raise(p, type_error(p, "`.[ ]` reads a map, an array or a list, not " +
                                       describe(p, container)));
@@ -1630,6 +1655,14 @@ void finish_unary(Process& p, Op op, Value v, uint32_t type, uint32_t invert) {
         if (is_fixnum(v)) { ret(p, make_integer(p, -fixnum_value(v))); return; }
         if (is_obj(v, ObjType::Float)) {
             ret(p, p.heap().make_float(-static_cast<FloatObj*>(as_obj(v))->value));
+            return;
+        }
+        if (is_obj(v, ObjType::Tensor)) {
+            // As `0 - t`, because that is what compiled code makes of a
+            // negation it cannot do in registers, and the two tiers must
+            // print the same numbers.
+            Value r;
+            if (tensor_arith(p, Op::Sub, make_fixnum(0), v, &r)) ret(p, r); else do_raise(p, r);
             return;
         }
         do_raise(p, type_error(p, "cannot negate " + describe(p, v)));

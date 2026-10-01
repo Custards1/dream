@@ -1,0 +1,1359 @@
+// Tensors: the operators, `@`, and `std.tensor`.
+//
+// The arrangement is a thin layer of checking over two backends. Every
+// operation here reads its operands' shapes, decides the shape of the answer
+// (or raises `:shape_error` naming both), allocates it, and hands raw pointers
+// to the CPU kernels (tensor_kernels.inc) or buffer handles to the GPU's
+// (gpu.cpp). Which backend runs is decided by where the operands are, never by
+// the operation: a program moves a tensor to the GPU with `tensor.gpu` and
+// everything it then does to it -- `+`, `@`, `tensor.sum` -- runs there, and
+// `tensor.host` brings an answer back. An operation the GPU has no kernel for
+// still works on a GPU tensor; it reads the numbers back, runs on the host, and
+// puts the answer on the GPU, so a program is never wrong for having moved,
+// only slower than it could be.
+//
+// Nothing here forces anything but the arguments of `std.tensor` functions
+// that take lists. The operators reach this from `arith`, which holds its
+// operands in C++ locals (and JIT-compiled code, in registers): nothing below
+// may collect, and nothing does -- `alloc` never collects, and the one walk
+// that forces, `from_nested`, is a native's, which the machine never collects
+// underneath.
+
+#include "tensor.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <thread>
+#include <vector>
+
+#include "builtins.hpp"
+#include "gpu.hpp"
+#include "heap.hpp"
+#include "interp.hpp"
+#include "process.hpp"
+#include "tensor_kernels.hpp"
+
+namespace dream {
+
+// --- the CPU kernel table --------------------------------------------------------
+
+const TensorKernels& tensor_kernels() {
+    static const TensorKernels* chosen = [] {
+#if defined(DREAM_TENSOR_AVX2)
+        __builtin_cpu_init();
+        if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
+            return &kernels_avx2::kernels;
+#endif
+        return &kernels_base::kernels;
+    }();
+    return *chosen;
+}
+
+const char* tensor_kernels_name() {
+#if defined(DREAM_TENSOR_AVX2)
+    if (&tensor_kernels() == &kernels_avx2::kernels) return "avx2";
+#endif
+    return "baseline";
+}
+
+// --- what the heap needs ---------------------------------------------------------
+
+void* tensor_handle(const TensorObj* t) {
+    void* h;
+    std::memcpy(&h, t->data(), sizeof h);
+    return h;
+}
+
+void retain_external(Obj* o) {
+    gpu::retain(static_cast<gpu::Buffer*>(tensor_handle(static_cast<TensorObj*>(o))));
+}
+
+void release_external(Obj* o) {
+    gpu::release(static_cast<gpu::Buffer*>(tensor_handle(static_cast<TensorObj*>(o))));
+}
+
+namespace {
+
+constexpr uint8_t TENSOR_GPU = 1;
+
+/// The most elements one tensor can hold: its whole size must fit the
+/// header's 32-bit byte count, which is 4 GiB of doubles less the header.
+constexpr uint64_t kMaxElements =
+    (uint64_t(std::numeric_limits<uint32_t>::max()) - sizeof(TensorObj) - 64) / sizeof(double);
+
+struct Shape {
+    uint32_t rank = 0;
+    uint32_t dims[TENSOR_MAX_RANK] = {};
+    uint64_t count = 0;
+};
+
+Shape shape_of(const TensorObj* t) {
+    Shape s;
+    s.rank = t->rank;
+    for (uint32_t i = 0; i < t->rank; ++i) s.dims[i] = t->dims[i];
+    s.count = t->count;
+    return s;
+}
+
+Shape shape2(uint32_t a, uint32_t b) {
+    Shape s;
+    s.rank = 2;
+    s.dims[0] = a;
+    s.dims[1] = b;
+    s.count = uint64_t(a) * b;
+    return s;
+}
+
+Shape shape1(uint32_t a) {
+    Shape s;
+    s.rank = 1;
+    s.dims[0] = a;
+    s.count = a;
+    return s;
+}
+
+std::string shape_text(const Shape& s) {
+    std::string out = "[";
+    for (uint32_t i = 0; i < s.rank; ++i) {
+        if (i) out += ", ";
+        out += std::to_string(s.dims[i]);
+    }
+    return out + "]";
+}
+
+bool same_shape(const Shape& a, const Shape& b) {
+    if (a.rank != b.rank) return false;
+    for (uint32_t i = 0; i < a.rank; ++i)
+        if (a.dims[i] != b.dims[i]) return false;
+    return true;
+}
+
+TensorObj* tensor_of(Value v) {
+    v = resolve(v);
+    return is_tensor(v) ? static_cast<TensorObj*>(as_obj(v)) : nullptr;
+}
+
+bool on_gpu(const TensorObj* t) { return t->device == TENSOR_GPU; }
+gpu::Buffer* buffer_of(const TensorObj* t) {
+    return static_cast<gpu::Buffer*>(tensor_handle(t));
+}
+
+bool is_number(Value v) { return is_fixnum(v) || is_obj(v, ObjType::Float); }
+double number_of(Value v) {
+    return is_fixnum(v) ? double(fixnum_value(v)) : static_cast<FloatObj*>(as_obj(v))->value;
+}
+
+// --- raising -----------------------------------------------------------------------
+//
+// Every helper below that can fail answers false and leaves the error value
+// in `*err`, which is the shape `arith` already has. The natives turn that into
+// `NativeResult::raise`.
+
+Value error_of(Process& p, const char* kind, const std::string& message) {
+    return raise_error(p, p.runtime().intern_atom(kind), message);
+}
+
+bool fail(Process& p, Value* err, const char* kind, const std::string& message) {
+    *err = error_of(p, kind, message);
+    return false;
+}
+
+bool type_fail(Process& p, Value* err, const std::string& message) {
+    *err = raise_error(p, well_known(p.runtime()).type_error, message);
+    return false;
+}
+
+bool gpu_fail(Process& p, Value* err, const std::string& message) {
+    return fail(p, err, "gpu_error", message);
+}
+
+// --- making tensors ----------------------------------------------------------------
+
+/// A host tensor of shape `s`, its numbers for the caller to write.
+bool new_host(Process& p, const Shape& s, Value* out, double** data) {
+    if (s.count > kMaxElements)
+        return fail(p, out, "out_of_memory",
+                    "a tensor of shape " + shape_text(s) + " is larger than 4 GiB");
+    Value v = p.heap().make_tensor(s.rank, s.dims, s.count);
+    *data = static_cast<TensorObj*>(as_obj(v))->data();
+    *out = v;
+    return true;
+}
+
+/// A GPU tensor of shape `s` around a buffer the caller has already made and
+/// filled (or enqueued the filling of); the tensor takes the reference.
+Value wrap_gpu(Process& p, const Shape& s, int dtype, gpu::Buffer* b) {
+    return p.heap().make_external_tensor(s.rank, s.dims, s.count, uint8_t(dtype), TENSOR_GPU, b);
+}
+
+/// A fresh, unfilled device buffer for `count` elements of `dtype`.
+gpu::Buffer* gpu_alloc(Process& p, uint64_t count, int dtype, Value* err) {
+    std::string why;
+    gpu::Buffer* b = gpu::alloc(size_t(count) * gpu::dtype_size(dtype), &why);
+    if (!b) gpu_fail(p, err, why);
+    return b;
+}
+
+/// A GPU tensor's numbers, read back into `out`.
+bool download(Process& p, const TensorObj* t, std::vector<double>& out, Value* err) {
+    out.resize(size_t(t->count));
+    std::string why;
+    if (!gpu::download(buffer_of(t), t->dtype, out.data(), out.size(), &why))
+        return gpu_fail(p, err, why);
+    return true;
+}
+
+/// Any tensor's numbers, as a pointer to host memory: its own for a host
+/// tensor, `scratch` filled from the device for a GPU one.
+bool host_view(Process& p, const TensorObj* t, std::vector<double>& scratch, const double** data,
+               Value* err) {
+    if (!on_gpu(t)) {
+        *data = t->data();
+        return true;
+    }
+    if (!download(p, t, scratch, err)) return false;
+    *data = scratch.data();
+    return true;
+}
+
+/// Host numbers onto the GPU as a tensor of `dtype`.
+bool upload(Process& p, const Shape& s, const double* data, int dtype, Value* out) {
+    gpu::Buffer* b = gpu_alloc(p, s.count, dtype, out);
+    if (!b) return false;
+    std::string why;
+    if (!gpu::upload(b, dtype, data, size_t(s.count), &why)) {
+        gpu::release(b);
+        return gpu_fail(p, out, why);
+    }
+    *out = wrap_gpu(p, s, dtype, b);
+    return true;
+}
+
+/// A host answer computed for a GPU operand, put back where the operand was.
+/// This is the fallback that keeps every operation correct on the GPU.
+bool place_like(Process& p, const TensorObj* like, Value host, Value* out) {
+    if (!on_gpu(like)) {
+        *out = host;
+        return true;
+    }
+    auto* t = static_cast<TensorObj*>(as_obj(host));
+    return upload(p, shape_of(t), t->data(), like->dtype, out);
+}
+
+// --- reading Dream data into a tensor ----------------------------------------------
+
+/// The elements of a list or an array, forcing a list's spine. False with
+/// `*is_seq` false when `v` is neither; false with an error when a force raised.
+bool items_of(Process& p, Value v, std::vector<Value>& items, bool* is_seq, Value* err) {
+    items.clear();
+    *is_seq = true;
+    v = resolve(v);
+    if (is_obj(v, ObjType::Array)) {
+        auto* a = static_cast<ArrayObj*>(as_obj(v));
+        items.assign(a->items(), a->items() + a->len);
+        return true;
+    }
+    if (!is_nil(v) && !is_obj(v, ObjType::Cons)) {
+        *is_seq = false;
+        return false;
+    }
+    Value cur = v;
+    for (;;) {
+        Value w;
+        if (!force_whnf(p, cur, &w)) {
+            *err = p.result;
+            return false;
+        }
+        if (!is_obj(w, ObjType::Cons)) break;
+        auto* c = static_cast<ConsObj*>(as_obj(w));
+        items.push_back(c->head);
+        cur = c->tail;
+    }
+    return true;
+}
+
+/// Fill `out` from nested lists or arrays of numbers whose shape is `s`,
+/// checking that every level has the length the first element at that depth
+/// had. Forcing allocates but never collects here (this is a native's work),
+/// so the values gathered into `items` stay where they are.
+bool fill_nested(Process& p, Value v, const Shape& s, uint32_t depth, double*& out, Value* err) {
+    Value w;
+    if (!force_whnf(p, v, &w)) {
+        *err = p.result;
+        return false;
+    }
+    if (depth == s.rank) {
+        if (!is_number(w))
+            return type_fail(p, err, "a tensor holds numbers, not " + describe(p, w));
+        *out++ = number_of(w);
+        return true;
+    }
+    std::vector<Value> items;
+    bool is_seq;
+    if (!items_of(p, w, items, &is_seq, err)) {
+        if (is_seq) return false;
+        return fail(p, err, "shape_error",
+                    "the rows of a tensor must all have the same shape " + shape_text(s) +
+                        ", but one has " + describe(p, w) + " where a list was expected");
+    }
+    if (items.size() != s.dims[depth])
+        return fail(p, err, "shape_error",
+                    "the rows of a tensor must all have the same length: expected " +
+                        std::to_string(s.dims[depth]) + " at depth " + std::to_string(depth) +
+                        ", found " + std::to_string(items.size()));
+    for (Value item : items)
+        if (!fill_nested(p, item, s, depth + 1, out, err)) return false;
+    return true;
+}
+
+/// A host tensor from nested lists or arrays of numbers. The shape is read off
+/// the first element at each depth and every other element is held to it.
+bool from_nested(Process& p, Value v, Value* out) {
+    Shape s;
+    Value cur = v;
+    std::vector<Value> items;
+    for (;;) {
+        Value w;
+        if (!force_whnf(p, cur, &w)) {
+            *out = p.result;
+            return false;
+        }
+        if (is_number(w)) break;
+        bool is_seq;
+        if (!items_of(p, w, items, &is_seq, out)) {
+            if (is_seq) return false;
+            return type_fail(p, out, "a tensor is made from lists or arrays of numbers, not " +
+                                         describe(p, w));
+        }
+        if (items.empty())
+            return fail(p, out, "shape_error", "a tensor cannot be empty");
+        if (s.rank == TENSOR_MAX_RANK)
+            return fail(p, out, "shape_error",
+                        "a tensor has at most " + std::to_string(TENSOR_MAX_RANK) + " axes");
+        if (items.size() > std::numeric_limits<uint32_t>::max())
+            return fail(p, out, "shape_error", "an axis this long does not fit a tensor");
+        s.dims[s.rank++] = uint32_t(items.size());
+        cur = items[0];
+    }
+    if (s.rank == 0)
+        return type_fail(p, out, "a tensor is made from a list or an array of numbers, not a "
+                                 "single number");
+    s.count = 1;
+    for (uint32_t i = 0; i < s.rank; ++i) {
+        s.count *= s.dims[i];
+        if (s.count > kMaxElements)
+            return fail(p, out, "out_of_memory", "a tensor this large is larger than 4 GiB");
+    }
+    double* data;
+    Value t;
+    if (!new_host(p, s, &t, &data)) {
+        *out = t;
+        return false;
+    }
+    if (!fill_nested(p, v, s, 0, data, out)) return false;
+    *out = t;
+    return true;
+}
+
+/// A tensor, or lists and arrays that make one. What every `std.tensor`
+/// function and `@` accept, so that `tensor.dot [1, 2] [3, 4]` needs no
+/// conversion written out. The operators do *not* take lists -- `+` already
+/// means something for two of them.
+bool coerce(Process& p, Value v, TensorObj** t, Value* err) {
+    Value w;
+    if (!force_whnf(p, v, &w)) {
+        *err = p.result;
+        return false;
+    }
+    if (is_tensor(w)) {
+        *t = static_cast<TensorObj*>(as_obj(w));
+        return true;
+    }
+    Value made;
+    if (!from_nested(p, w, &made)) {
+        *err = made;
+        return false;
+    }
+    *t = static_cast<TensorObj*>(as_obj(made));
+    return true;
+}
+
+/// A shape written as a list or an array of positive integers.
+bool read_shape(Process& p, Value v, Shape* s, Value* err) {
+    std::vector<Value> items;
+    bool is_seq;
+    if (!items_of(p, v, items, &is_seq, err)) {
+        if (is_seq) return false;
+        return type_fail(p, err, "a shape is a list of integers, not " + describe(p, v));
+    }
+    if (items.empty() || items.size() > TENSOR_MAX_RANK)
+        return fail(p, err, "shape_error",
+                    "a shape has between 1 and " + std::to_string(TENSOR_MAX_RANK) + " axes");
+    s->rank = uint32_t(items.size());
+    s->count = 1;
+    for (uint32_t i = 0; i < s->rank; ++i) {
+        Value w;
+        if (!force_whnf(p, items[i], &w)) {
+            *err = p.result;
+            return false;
+        }
+        if (!is_fixnum(w) || fixnum_value(w) < 1 ||
+            fixnum_value(w) > int64_t(std::numeric_limits<uint32_t>::max()))
+            return fail(p, err, "shape_error",
+                        "an axis's length is a positive integer, not " + describe(p, w));
+        s->dims[i] = uint32_t(fixnum_value(w));
+        s->count *= s->dims[i];
+        if (s->count > kMaxElements)
+            return fail(p, err, "out_of_memory", "a tensor of that shape is larger than 4 GiB");
+    }
+    return true;
+}
+
+// --- the CPU's matrix product, in parallel when it is worth it -------------------
+//
+// Rows of C are independent, so a large product is split into bands of rows,
+// one thread each, every thread running the whole blocked kernel on its band
+// (and packing B for itself -- K x N against a band's M x K x N, which is
+// nothing once a band is a few dozen rows). The threads are made for the call
+// and joined before it returns: the product is a pure function of its inputs,
+// and nothing the scheduler does can see it was parallel.
+//
+// Below about thirty million operations the threads cost more than they save.
+// `DREAM_TENSOR_THREADS` caps them; 1 turns this off.
+
+unsigned tensor_threads() {
+    static const unsigned n = [] {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 1;
+        if (const char* e = std::getenv("DREAM_TENSOR_THREADS")) {
+            long v = std::strtol(e, nullptr, 10);
+            if (v >= 1) return std::min<unsigned>(hw, unsigned(v));
+        }
+        return std::min<unsigned>(hw, 16);
+    }();
+    return n;
+}
+
+void host_gemm(const double* A, const double* B, double* C, size_t M, size_t K, size_t N) {
+    const TensorKernels& k = tensor_kernels();
+    const double work = 2.0 * double(M) * double(K) * double(N);
+    size_t threads = work < 3e7 ? 1 : std::min<size_t>(tensor_threads(), M / 32);
+    if (threads <= 1) {
+        k.gemm(A, B, C, M, K, N);
+        return;
+    }
+    // Bands in multiples of the kernel's six rows, so no band ends in a
+    // partial tile that another band would have filled.
+    size_t band = (M + threads - 1) / threads;
+    band = (band + 5) / 6 * 6;
+    std::vector<std::thread> pool;
+    for (size_t m0 = band; m0 < M; m0 += band) {
+        const size_t rows = std::min(band, M - m0);
+        pool.emplace_back([&k, A, B, C, m0, rows, K, N] {
+            k.gemm(A + m0 * K, B, C + m0 * N, rows, K, N);
+        });
+    }
+    k.gemm(A, B, C, std::min(band, M), K, N);
+    for (auto& t : pool) t.join();
+}
+
+// --- elementwise ---------------------------------------------------------------------
+
+int kernel_op(Op op) {
+    switch (op) {
+        case Op::Add: return KOP_ADD;
+        case Op::Sub: return KOP_SUB;
+        case Op::Mul: return KOP_MUL;
+        case Op::Div: return KOP_DIV;
+        default: return KOP_MOD;
+    }
+}
+
+const char* op_text(Op op) {
+    switch (op) {
+        case Op::Add: return "+";
+        case Op::Sub: return "-";
+        case Op::Mul: return "*";
+        case Op::Div: return "/";
+        default: return "%";
+    }
+}
+
+/// The shape of `a op b`. Equal shapes, or one whose shape is the trailing
+/// part of the other's -- a row added to every row of a matrix -- which is
+/// numpy's broadcasting without its stretching of length-one axes.
+bool broadcast(Process& p, Op op, const Shape& a, const Shape& b, Shape* out, Value* err) {
+    if (same_shape(a, b)) {
+        *out = a;
+        return true;
+    }
+    const Shape& big = a.rank >= b.rank ? a : b;
+    const Shape& small = a.rank >= b.rank ? b : a;
+    bool suffix = small.rank < big.rank;
+    for (uint32_t i = 0; suffix && i < small.rank; ++i)
+        suffix = small.dims[i] == big.dims[big.rank - small.rank + i];
+    if (!suffix)
+        return fail(p, err, "shape_error",
+                    std::string("cannot apply `") + op_text(op) + "` to tensors of shape " +
+                        shape_text(a) + " and " + shape_text(b));
+    *out = big;
+    return true;
+}
+
+bool same_device(Process& p, const TensorObj* a, const TensorObj* b, const char* what,
+                 Value* err) {
+    if (a->device != b->device)
+        return fail(p, err, "device_error",
+                    std::string(what) + " needs both tensors in one place, but one is on the GPU "
+                    "and the other is not: move one with `tensor.gpu` or `tensor.host`");
+    if (on_gpu(a) && a->dtype != b->dtype)
+        return fail(p, err, "device_error",
+                    std::string(what) + " needs both GPU tensors to hold the same type: one is "
+                    "float32 (`tensor.gpu`) and the other float64 (`tensor.gpu64`)");
+    return true;
+}
+
+bool tensor_tensor(Process& p, Op op, TensorObj* x, TensorObj* y, Value* out) {
+    Shape sx = shape_of(x), sy = shape_of(y), s;
+    if (!broadcast(p, op, sx, sy, &s, out)) return false;
+    if (!same_device(p, x, y, (std::string("`") + op_text(op) + "`").c_str(), out)) return false;
+    const int kop = kernel_op(op);
+    if (on_gpu(x)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, x->dtype, out);
+        if (!b) return false;
+        std::string why;
+        if (!gpu::binary(kop, x->dtype, buffer_of(x), size_t(sx.count), buffer_of(y),
+                         size_t(sy.count), b, size_t(s.count), &why)) {
+            gpu::release(b);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, s, x->dtype, b);
+        return true;
+    }
+    double* data;
+    Value t;
+    if (!new_host(p, s, &t, &data)) {
+        *out = t;
+        return false;
+    }
+    const TensorKernels& k = tensor_kernels();
+    const size_t n = size_t(s.count), nx = size_t(sx.count), ny = size_t(sy.count);
+    if (nx == n && ny == n) {
+        k.binary(kop, x->data(), y->data(), data, n);
+    } else if (ny < n) {
+        for (size_t r = 0; r < n; r += ny) k.binary(kop, x->data() + r, y->data(), data + r, ny);
+    } else {
+        for (size_t r = 0; r < n; r += nx) k.binary(kop, x->data(), y->data() + r, data + r, nx);
+    }
+    *out = t;
+    return true;
+}
+
+bool tensor_scalar(Process& p, Op op, TensorObj* x, double s, bool scalar_left, Value* out) {
+    const Shape sx = shape_of(x);
+    const int kop = kernel_op(op);
+    if (on_gpu(x)) {
+        gpu::Buffer* b = gpu_alloc(p, sx.count, x->dtype, out);
+        if (!b) return false;
+        std::string why;
+        if (!gpu::scalar(kop, x->dtype, buffer_of(x), s, scalar_left, b, size_t(sx.count), &why)) {
+            gpu::release(b);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, sx, x->dtype, b);
+        return true;
+    }
+    double* data;
+    Value t;
+    if (!new_host(p, sx, &t, &data)) {
+        *out = t;
+        return false;
+    }
+    tensor_kernels().scalar(kop, x->data(), s, scalar_left, data, size_t(sx.count));
+    *out = t;
+    return true;
+}
+
+bool map_unary(Process& p, int fn, TensorObj* x, Value* out) {
+    const Shape s = shape_of(x);
+    if (on_gpu(x)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, x->dtype, out);
+        if (!b) return false;
+        std::string why;
+        if (!gpu::unary(fn, x->dtype, buffer_of(x), b, size_t(s.count), &why)) {
+            gpu::release(b);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, s, x->dtype, b);
+        return true;
+    }
+    double* data;
+    Value t;
+    if (!new_host(p, s, &t, &data)) {
+        *out = t;
+        return false;
+    }
+    tensor_kernels().unary(fn, x->data(), data, size_t(s.count));
+    *out = t;
+    return true;
+}
+
+// --- products ----------------------------------------------------------------------
+
+/// `a @ b`. Two vectors give their dot product, a number; a matrix and a
+/// vector, in either order, a vector; two matrices a matrix.
+bool matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
+    if (a->rank > 2 || b->rank > 2)
+        return fail(p, out, "shape_error",
+                    "`@` multiplies vectors and matrices, not tensors of shape " +
+                        shape_text(shape_of(a)) + " and " + shape_text(shape_of(b)));
+    if (!same_device(p, a, b, "`@`", out)) return false;
+    // As matrices: a vector on the left is a row, on the right a column.
+    const size_t M = a->rank == 2 ? a->dims[0] : 1;
+    const size_t K = a->rank == 2 ? a->dims[1] : a->dims[0];
+    const size_t Kb = b->dims[0];
+    const size_t N = b->rank == 2 ? b->dims[1] : 1;
+    if (K != Kb)
+        return fail(p, out, "shape_error",
+                    "`@` needs the inner lengths to agree, but they are " + std::to_string(K) +
+                        " and " + std::to_string(Kb) + " (shapes " + shape_text(shape_of(a)) +
+                        " and " + shape_text(shape_of(b)) + ")");
+    Shape s;
+    if (a->rank == 2 && b->rank == 2) s = shape2(uint32_t(M), uint32_t(N));
+    else if (a->rank == 2) s = shape1(uint32_t(M));
+    else if (b->rank == 2) s = shape1(uint32_t(N));
+    else s = shape1(1);  // two vectors: answered as a number below
+    const bool scalar = a->rank == 1 && b->rank == 1;
+
+    if (on_gpu(a)) {
+        gpu::Buffer* c = gpu_alloc(p, s.count, a->dtype, out);
+        if (!c) return false;
+        std::string why;
+        if (!gpu::matmul(a->dtype, buffer_of(a), buffer_of(b), c, M, K, N, &why)) {
+            gpu::release(c);
+            return gpu_fail(p, out, why);
+        }
+        if (scalar) {
+            double d = 0;
+            bool ok = gpu::download(c, a->dtype, &d, 1, &why);
+            gpu::release(c);
+            if (!ok) return gpu_fail(p, out, why);
+            *out = p.heap().make_float(d);
+            return true;
+        }
+        *out = wrap_gpu(p, s, a->dtype, c);
+        return true;
+    }
+    if (scalar) {
+        *out = p.heap().make_float(tensor_kernels().dot(a->data(), b->data(), K));
+        return true;
+    }
+    double* data;
+    Value t;
+    if (!new_host(p, s, &t, &data)) {
+        *out = t;
+        return false;
+    }
+    host_gemm(a->data(), b->data(), data, M, K, N);
+    *out = t;
+    return true;
+}
+
+bool transpose(Process& p, TensorObj* x, Value* out) {
+    if (x->rank == 1) {
+        *out = from_obj(x);
+        return true;
+    }
+    if (x->rank != 2)
+        return fail(p, out, "shape_error",
+                    "`transpose` takes a vector or a matrix, not shape " +
+                        shape_text(shape_of(x)));
+    const size_t R = x->dims[0], C = x->dims[1];
+    const Shape s = shape2(uint32_t(C), uint32_t(R));
+    if (on_gpu(x)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, x->dtype, out);
+        if (!b) return false;
+        std::string why;
+        if (!gpu::transpose(x->dtype, buffer_of(x), b, R, C, &why)) {
+            gpu::release(b);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, s, x->dtype, b);
+        return true;
+    }
+    double* data;
+    Value t;
+    if (!new_host(p, s, &t, &data)) {
+        *out = t;
+        return false;
+    }
+    tensor_kernels().transpose(x->data(), data, R, C);
+    *out = t;
+    return true;
+}
+
+bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
+    if (on_gpu(x)) {
+        std::string why;
+        if (!gpu::reduce(op, x->dtype, buffer_of(x), size_t(x->count), out, &why))
+            return gpu_fail(p, err, why);
+        return true;
+    }
+    *out = tensor_kernels().reduce(op, x->data(), size_t(x->count));
+    return true;
+}
+
+// --- rendering -----------------------------------------------------------------------
+
+/// The shortest decimal that reads back as the same number -- the same rule a
+/// float prints by, applied at the precision the tensor holds, so a float32 0.1
+/// prints as 0.1 and not as the double it widens to.
+void render_number(double d, bool f32, std::string* out) {
+    char buf[40];
+    for (int prec = 1; prec <= 17; ++prec) {
+        std::snprintf(buf, sizeof buf, "%.*g", prec, d);
+        double back = std::strtod(buf, nullptr);
+        if (f32 ? float(back) == float(d) : back == d) break;
+    }
+    out->append(buf);
+}
+
+void render_axis(const double*& data, const Shape& s, uint32_t depth, bool f32, std::string* out) {
+    out->push_back('[');
+    for (uint32_t i = 0; i < s.dims[depth]; ++i) {
+        if (i) out->append(", ");
+        if (depth + 1 == s.rank) render_number(*data++, f32, out);
+        else render_axis(data, s, depth + 1, f32, out);
+    }
+    out->push_back(']');
+}
+
+// --- the natives -------------------------------------------------------------------
+
+NativeResult raised(Value err) { return NativeResult::raise(err); }
+
+/// The tensor argument `i`, made from lists if it is not one already.
+#define DREAM_ARG(name, i)                                             \
+    TensorObj* name = nullptr;                                         \
+    do {                                                               \
+        Value dream_err_;                                              \
+        if (!coerce(p, args[i], &name, &dream_err_)) return raised(dream_err_); \
+    } while (0)
+
+NativeResult t_of_list(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    return NativeResult::ok(from_obj(t));
+}
+
+/// Nested lists of floats, the inverse of `of_list`.
+NativeResult t_to_list(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    std::vector<double> scratch;
+    const double* data;
+    Value err;
+    if (!host_view(p, t, scratch, &data, &err)) return raised(err);
+    const Shape s = shape_of(t);
+    // Built innermost first and back to front, one level of lists at a time:
+    // `level` holds the lists of the current depth in order.
+    std::vector<Value> level(size_t(s.count));
+    for (size_t i = 0; i < level.size(); ++i) level[i] = p.heap().make_float(data[i]);
+    for (uint32_t d = s.rank; d-- > 0;) {
+        const size_t width = s.dims[d];
+        std::vector<Value> up(level.size() / width);
+        for (size_t g = 0; g < up.size(); ++g) {
+            Value list = NIL;
+            for (size_t i = width; i-- > 0;) list = p.heap().make_cons(level[g * width + i], list);
+            up[g] = list;
+        }
+        level.swap(up);
+    }
+    return NativeResult::ok(level[0]);
+}
+
+NativeResult filled(Process& p, Value shape, double x) {
+    Shape s;
+    Value t;
+    if (!read_shape(p, shape, &s, &t)) return raised(t);
+    double* data;
+    if (!new_host(p, s, &t, &data)) return raised(t);
+    std::fill(data, data + s.count, x);
+    return NativeResult::ok(t);
+}
+
+NativeResult t_zeros(Process& p, Value, Value* args, uint32_t) { return filled(p, args[0], 0.0); }
+NativeResult t_ones(Process& p, Value, Value* args, uint32_t) { return filled(p, args[0], 1.0); }
+
+NativeResult t_fill(Process& p, Value, Value* args, uint32_t) {
+    Value x = resolve(args[1]);
+    if (!is_number(x)) {
+        Value err;
+        type_fail(p, &err, "`fill` fills with a number, not " + describe(p, x));
+        return raised(err);
+    }
+    return filled(p, args[0], number_of(x));
+}
+
+/// A positive integer argument, for `identity` and `range`.
+bool length_arg(Process& p, Value v, const char* what, uint32_t* n, Value* err) {
+    v = resolve(v);
+    if (!is_fixnum(v) || fixnum_value(v) < 1 || uint64_t(fixnum_value(v)) > kMaxElements)
+        return fail(p, err, "shape_error",
+                    std::string("`") + what + "` takes a positive length, not " + describe(p, v));
+    *n = uint32_t(fixnum_value(v));
+    return true;
+}
+
+NativeResult t_identity(Process& p, Value, Value* args, uint32_t) {
+    uint32_t n;
+    Value t;
+    if (!length_arg(p, args[0], "identity", &n, &t)) return raised(t);
+    if (uint64_t(n) * n > kMaxElements) {
+        fail(p, &t, "out_of_memory", "an identity matrix this large is larger than 4 GiB");
+        return raised(t);
+    }
+    double* data;
+    if (!new_host(p, shape2(n, n), &t, &data)) return raised(t);
+    std::fill(data, data + size_t(n) * n, 0.0);
+    for (size_t i = 0; i < n; ++i) data[i * n + i] = 1.0;
+    return NativeResult::ok(t);
+}
+
+NativeResult t_range(Process& p, Value, Value* args, uint32_t) {
+    uint32_t n;
+    Value t;
+    if (!length_arg(p, args[0], "range", &n, &t)) return raised(t);
+    double* data;
+    if (!new_host(p, shape1(n), &t, &data)) return raised(t);
+    for (size_t i = 0; i < n; ++i) data[i] = double(i);
+    return NativeResult::ok(t);
+}
+
+/// Uniform numbers in [0, 1), the same ones for the same seed on every
+/// machine: splitmix64, whose top 53 bits make the double. A pure function of
+/// its arguments, as everything in the language that is not spelled with a `!`.
+NativeResult t_random(Process& p, Value, Value* args, uint32_t) {
+    Value seed = resolve(args[0]);
+    if (!is_fixnum(seed)) {
+        Value err;
+        type_fail(p, &err, "`random` takes an integer seed, not " + describe(p, seed));
+        return raised(err);
+    }
+    Shape s;
+    Value t;
+    if (!read_shape(p, args[1], &s, &t)) return raised(t);
+    double* data;
+    if (!new_host(p, s, &t, &data)) return raised(t);
+    uint64_t x = uint64_t(fixnum_value(seed));
+    for (uint64_t i = 0; i < s.count; ++i) {
+        uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        data[i] = double(z >> 11) * (1.0 / 9007199254740992.0);
+    }
+    return NativeResult::ok(t);
+}
+
+NativeResult t_shape(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    Value list = NIL;
+    for (uint32_t i = t->rank; i-- > 0;) list = p.heap().make_cons(make_fixnum(t->dims[i]), list);
+    return NativeResult::ok(list);
+}
+
+NativeResult t_rank(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    return NativeResult::ok(make_fixnum(t->rank));
+}
+
+NativeResult t_size(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    return NativeResult::ok(make_integer(p, int64_t(t->count)));
+}
+
+NativeResult t_device(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    return NativeResult::ok(make_atom(p.runtime().intern_atom(on_gpu(t) ? "gpu" : "host")));
+}
+
+NativeResult t_dtype(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    return NativeResult::ok(
+        make_atom(p.runtime().intern_atom(on_gpu(t) && t->dtype == gpu::F32 ? "f32" : "f64")));
+}
+
+/// The same numbers in a new shape with the same count. On the GPU the buffer
+/// itself is shared, which is free: neither tensor can change it.
+NativeResult t_reshape(Process& p, Value, Value* args, uint32_t) {
+    Shape s;
+    Value err;
+    if (!read_shape(p, args[0], &s, &err)) return raised(err);
+    DREAM_ARG(t, 1);
+    if (s.count != t->count) {
+        fail(p, &err, "shape_error",
+             "cannot reshape " + std::to_string(t->count) + " numbers (shape " +
+                 shape_text(shape_of(t)) + ") to shape " + shape_text(s));
+        return raised(err);
+    }
+    if (on_gpu(t)) {
+        gpu::retain(buffer_of(t));
+        return NativeResult::ok(wrap_gpu(p, s, t->dtype, buffer_of(t)));
+    }
+    double* data;
+    Value out;
+    if (!new_host(p, s, &out, &data)) return raised(out);
+    std::memcpy(data, t->data(), size_t(t->count) * sizeof(double));
+    return NativeResult::ok(out);
+}
+
+NativeResult t_transpose(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    Value out;
+    if (!transpose(p, t, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// One element, by a list of indices, one per axis.
+NativeResult t_at(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    std::vector<Value> items;
+    bool is_seq;
+    Value err;
+    if (!items_of(p, args[1], items, &is_seq, &err)) {
+        if (!is_seq) type_fail(p, &err, "`at` takes a list of indices");
+        return raised(err);
+    }
+    if (items.size() != t->rank) {
+        fail(p, &err, "shape_error",
+             "`at` needs one index per axis: " + std::to_string(t->rank) + ", not " +
+                 std::to_string(items.size()));
+        return raised(err);
+    }
+    uint64_t offset = 0;
+    for (uint32_t i = 0; i < t->rank; ++i) {
+        Value w;
+        if (!force_whnf(p, items[i], &w)) return raised(p.result);
+        if (!is_fixnum(w) || fixnum_value(w) < 0 || fixnum_value(w) >= int64_t(t->dims[i])) {
+            err = raise_error(p, well_known(p.runtime()).out_of_bounds,
+                              "index " + describe(p, w) + " is outside axis " + std::to_string(i) +
+                                  " of length " + std::to_string(t->dims[i]));
+            return raised(err);
+        }
+        offset = offset * t->dims[i] + uint64_t(fixnum_value(w));
+    }
+    if (!on_gpu(t)) return NativeResult::ok(p.heap().make_float(t->data()[offset]));
+    std::string why;
+    gpu::Buffer* one = gpu::alloc(gpu::dtype_size(t->dtype), &why);
+    double d = 0;
+    bool ok = one && gpu::copy(buffer_of(t), t->dtype, size_t(offset), one, 1, &why) &&
+              gpu::download(one, t->dtype, &d, 1, &why);
+    if (one) gpu::release(one);
+    if (!ok) {
+        gpu_fail(p, &err, why);
+        return raised(err);
+    }
+    return NativeResult::ok(p.heap().make_float(d));
+}
+
+NativeResult t_matmul(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(a, 0);
+    DREAM_ARG(b, 1);
+    Value out;
+    if (!matmul(p, a, b, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+NativeResult t_dot(Process& p, Value callee, Value* args, uint32_t argc) {
+    DREAM_ARG(a, 0);
+    DREAM_ARG(b, 1);
+    if (a->rank != 1 || b->rank != 1) {
+        Value err;
+        fail(p, &err, "shape_error",
+             "`dot` takes two vectors, not shapes " + shape_text(shape_of(a)) + " and " +
+                 shape_text(shape_of(b)) + "; `@` multiplies matrices");
+        return raised(err);
+    }
+    Value out;
+    if (!matmul(p, a, b, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// `outer a b`: every product `a[i] * b[j]`, as a matrix. A product with an
+/// inner length of one, which is what lets the GPU do it with the same kernel.
+NativeResult t_outer(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(a, 0);
+    DREAM_ARG(b, 1);
+    Value err;
+    if (a->rank != 1 || b->rank != 1) {
+        fail(p, &err, "shape_error", "`outer` takes two vectors");
+        return raised(err);
+    }
+    if (!same_device(p, a, b, "`outer`", &err)) return raised(err);
+    const uint32_t M = a->dims[0], N = b->dims[0];
+    const Shape s = shape2(M, N);
+    if (s.count > kMaxElements) {
+        fail(p, &err, "out_of_memory", "an outer product this large is larger than 4 GiB");
+        return raised(err);
+    }
+    if (on_gpu(a)) {
+        gpu::Buffer* c = gpu_alloc(p, s.count, a->dtype, &err);
+        if (!c) return raised(err);
+        std::string why;
+        if (!gpu::matmul(a->dtype, buffer_of(a), buffer_of(b), c, M, 1, N, &why)) {
+            gpu::release(c);
+            gpu_fail(p, &err, why);
+            return raised(err);
+        }
+        return NativeResult::ok(wrap_gpu(p, s, a->dtype, c));
+    }
+    double* data;
+    Value out;
+    if (!new_host(p, s, &out, &data)) return raised(out);
+    host_gemm(a->data(), b->data(), data, M, 1, N);
+    return NativeResult::ok(out);
+}
+
+/// `sum`, `minimum` and `maximum`, by the native's `user` field.
+NativeResult t_reduce(Process& p, Value callee, Value* args, uint32_t) {
+    const int op = int(static_cast<NativeObj*>(as_obj(callee))->user);
+    DREAM_ARG(t, 0);
+    double r;
+    Value err;
+    if (!reduce(p, op, t, &r, &err)) return raised(err);
+    return NativeResult::ok(p.heap().make_float(r));
+}
+
+NativeResult t_mean(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    double r;
+    Value err;
+    if (!reduce(p, KRED_SUM, t, &r, &err)) return raised(err);
+    return NativeResult::ok(p.heap().make_float(r / double(t->count)));
+}
+
+/// The Euclidean length of all the numbers: the square root of the sum of
+/// their squares.
+NativeResult t_norm(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    Value err;
+    double r;
+    if (on_gpu(t)) {
+        Value sq;
+        if (!tensor_tensor(p, Op::Mul, t, t, &sq)) return raised(sq);
+        if (!reduce(p, KRED_SUM, static_cast<TensorObj*>(as_obj(sq)), &r, &err)) return raised(err);
+    } else {
+        r = tensor_kernels().dot(t->data(), t->data(), size_t(t->count));
+    }
+    return NativeResult::ok(p.heap().make_float(std::sqrt(r)));
+}
+
+/// The sums along one axis, which drops out of the shape: `sum_axis 0` of a
+/// matrix is the sum of its rows, `sum_axis 1` the sum of each row. Host
+/// arithmetic, on the GPU too (see the head of this file).
+NativeResult t_sum_axis(Process& p, Value, Value* args, uint32_t) {
+    Value ax = resolve(args[0]);
+    DREAM_ARG(t, 1);
+    Value err;
+    if (!is_fixnum(ax) || fixnum_value(ax) < 0 || fixnum_value(ax) >= int64_t(t->rank)) {
+        fail(p, &err, "shape_error",
+             "`sum_axis` takes an axis of shape " + shape_text(shape_of(t)) + ", not " +
+                 describe(p, ax));
+        return raised(err);
+    }
+    if (t->rank == 1) {
+        double r;
+        if (!reduce(p, KRED_SUM, t, &r, &err)) return raised(err);
+        return NativeResult::ok(p.heap().make_float(r));
+    }
+    const uint32_t axis = uint32_t(fixnum_value(ax));
+    std::vector<double> scratch;
+    const double* src;
+    if (!host_view(p, t, scratch, &src, &err)) return raised(err);
+    Shape s;
+    size_t outer = 1, inner = 1;
+    for (uint32_t i = 0; i < t->rank; ++i) {
+        if (i < axis) outer *= t->dims[i];
+        if (i > axis) inner *= t->dims[i];
+        if (i != axis) s.dims[s.rank++] = t->dims[i];
+    }
+    s.count = uint64_t(outer) * inner;
+    const size_t len = t->dims[axis];
+    double* data;
+    Value out;
+    if (!new_host(p, s, &out, &data)) return raised(out);
+    std::fill(data, data + s.count, 0.0);
+    for (size_t o = 0; o < outer; ++o)
+        for (size_t a = 0; a < len; ++a) {
+            const double* row = src + (o * len + a) * inner;
+            double* acc = data + o * inner;
+            for (size_t i = 0; i < inner; ++i) acc[i] += row[i];
+        }
+    if (!place_like(p, t, out, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// `sqrt`, `exp`, `relu` and the rest, by the native's `user` field.
+NativeResult t_unary(Process& p, Value callee, Value* args, uint32_t) {
+    const int fn = int(static_cast<NativeObj*>(as_obj(callee))->user);
+    DREAM_ARG(t, 0);
+    Value out;
+    if (!map_unary(p, fn, t, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// Onto the GPU, as float32 (`user` 1) or float64 (`user` 0). A tensor that
+/// is already there in that type is answered as it is.
+NativeResult t_gpu(Process& p, Value callee, Value* args, uint32_t) {
+    const int dtype = int(static_cast<NativeObj*>(as_obj(callee))->user);
+    DREAM_ARG(t, 0);
+    Value err;
+    std::string why;
+    if (!gpu::available(&why)) {
+        fail(p, &err, "no_gpu", "no GPU is available: " + why);
+        return raised(err);
+    }
+    if (dtype == gpu::F64 && !gpu::has_f64()) {
+        fail(p, &err, "no_gpu",
+             "this GPU (" + gpu::device_name() + ") has no double precision; `tensor.gpu` "
+             "moves a tensor as float32");
+        return raised(err);
+    }
+    if (on_gpu(t) && t->dtype == dtype) return NativeResult::ok(from_obj(t));
+    std::vector<double> scratch;
+    const double* data;
+    if (!host_view(p, t, scratch, &data, &err)) return raised(err);
+    Value out;
+    if (!upload(p, shape_of(t), data, dtype, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+NativeResult t_host(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    if (!on_gpu(t)) return NativeResult::ok(from_obj(t));
+    double* data;
+    Value out;
+    if (!new_host(p, shape_of(t), &out, &data)) return raised(out);
+    std::string why;
+    if (!gpu::download(buffer_of(t), t->dtype, data, size_t(t->count), &why)) {
+        gpu_fail(p, &out, why);
+        return raised(out);
+    }
+    return NativeResult::ok(out);
+}
+
+NativeResult t_gpu_available(Process& p, Value, Value*, uint32_t) {
+    std::string why;
+    return NativeResult::ok(make_bool(gpu::available(&why)));
+}
+
+/// The GPU's name, or `()` when there is none.
+NativeResult t_gpu_name(Process& p, Value, Value*, uint32_t) {
+    std::string why;
+    if (!gpu::available(&why)) return NativeResult::ok(UNIT);
+    std::string name = gpu::device_name();
+    return NativeResult::ok(p.heap().make_string(name.data(), uint32_t(name.size())));
+}
+
+/// Which CPU kernels this machine runs: "avx2" or "baseline".
+NativeResult t_cpu_kernels(Process& p, Value, Value*, uint32_t) {
+    const char* name = tensor_kernels_name();
+    return NativeResult::ok(p.heap().make_string(name, uint32_t(std::strlen(name))));
+}
+
+}  // namespace
+
+// --- what the rest of the VM calls -----------------------------------------------
+
+bool tensor_arith(Process& p, Op op, Value a, Value b, Value* out) {
+    a = resolve(a);
+    b = resolve(b);
+    TensorObj* x = tensor_of(a);
+    TensorObj* y = tensor_of(b);
+    if (x && y) return tensor_tensor(p, op, x, y, out);
+    if (x && is_number(b)) return tensor_scalar(p, op, x, number_of(b), false, out);
+    if (y && is_number(a)) return tensor_scalar(p, op, y, number_of(a), true, out);
+    return type_fail(p, out, std::string("cannot apply `") + op_text(op) + "` to " +
+                                 describe(p, a) + " and " + describe(p, b) +
+                                 ": a tensor combines with a tensor or a number");
+}
+
+bool tensor_equal(Process& p, Value a, Value b, bool* raised) {
+    TensorObj* x = tensor_of(a);
+    TensorObj* y = tensor_of(b);
+    if (!same_shape(shape_of(x), shape_of(y))) return false;
+    std::vector<double> sx, sy;
+    const double* dx;
+    const double* dy;
+    Value err;
+    if (!host_view(p, x, sx, &dx, &err) || !host_view(p, y, sy, &dy, &err)) {
+        p.result = err;
+        *raised = true;
+        return false;
+    }
+    for (uint64_t i = 0; i < x->count; ++i)
+        if (dx[i] != dy[i]) return false;
+    return true;
+}
+
+bool tensor_compare(Process& p, Value a, Value b, int* out) {
+    TensorObj* x = tensor_of(a);
+    TensorObj* y = tensor_of(b);
+    auto order = [](auto u, auto v) { return u < v ? -1 : (u > v ? 1 : 0); };
+    if (x->rank != y->rank) {
+        *out = order(x->rank, y->rank);
+        return true;
+    }
+    for (uint32_t i = 0; i < x->rank; ++i)
+        if (x->dims[i] != y->dims[i]) {
+            *out = order(x->dims[i], y->dims[i]);
+            return true;
+        }
+    std::vector<double> sx, sy;
+    const double* dx;
+    const double* dy;
+    Value err;
+    if (!host_view(p, x, sx, &dx, &err) || !host_view(p, y, sy, &dy, &err)) {
+        p.result = err;
+        return false;
+    }
+    for (uint64_t i = 0; i < x->count; ++i)
+        if (dx[i] != dy[i]) {
+            *out = order(dx[i], dy[i]);
+            return true;
+        }
+    *out = 0;
+    return true;
+}
+
+bool tensor_render(Process& p, Value v, std::string* out) {
+    TensorObj* t = tensor_of(v);
+    const Shape s = shape_of(t);
+    const bool f32 = on_gpu(t) && t->dtype == gpu::F32;
+    out->append(on_gpu(t) ? (f32 ? "gpu tensor" : "gpu64 tensor") : "tensor");
+    // A printed tensor is for reading. Past a thousand numbers nobody reads
+    // them, and rendering a large one would build a string of megabytes to
+    // say so.
+    if (s.count > 1000) {
+        out->append(" of shape ");
+        out->append(shape_text(s));
+        return true;
+    }
+    std::vector<double> scratch;
+    const double* data;
+    Value err;
+    if (!host_view(p, t, scratch, &data, &err)) {
+        p.result = err;
+        return false;
+    }
+    render_axis(data, s, 0, f32, out);
+    return true;
+}
+
+int tensor_index(Process& p, Value v, int64_t i, Value* out) {
+    TensorObj* t = tensor_of(v);
+    if (i < 0 || i >= int64_t(t->dims[0])) return 2;
+    if (t->rank == 1) {
+        if (!on_gpu(t)) {
+            *out = p.heap().make_float(t->data()[i]);
+            return 1;
+        }
+        std::string why;
+        gpu::Buffer* one = gpu::alloc(gpu::dtype_size(t->dtype), &why);
+        double d = 0;
+        bool ok = one && gpu::copy(buffer_of(t), t->dtype, size_t(i), one, 1, &why) &&
+                  gpu::download(one, t->dtype, &d, 1, &why);
+        if (one) gpu::release(one);
+        if (!ok) {
+            gpu_fail(p, out, why);
+            return 0;
+        }
+        *out = p.heap().make_float(d);
+        return 1;
+    }
+    // A row: everything after the first axis, copied out.
+    Shape s;
+    s.rank = t->rank - 1;
+    s.count = 1;
+    for (uint32_t d = 1; d < t->rank; ++d) {
+        s.dims[d - 1] = t->dims[d];
+        s.count *= t->dims[d];
+    }
+    if (on_gpu(t)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, t->dtype, out);
+        if (!b) return 0;
+        std::string why;
+        if (!gpu::copy(buffer_of(t), t->dtype, size_t(uint64_t(i) * s.count), b, size_t(s.count),
+                       &why)) {
+            gpu::release(b);
+            gpu_fail(p, out, why);
+            return 0;
+        }
+        *out = wrap_gpu(p, s, t->dtype, b);
+        return 1;
+    }
+    double* data;
+    if (!new_host(p, s, out, &data)) return 0;
+    std::memcpy(data, t->data() + uint64_t(i) * s.count, size_t(s.count) * sizeof(double));
+    return 1;
+}
+
+NativeResult tensor_matmul_builtin(Process& p, Value, Value* args, uint32_t) {
+    return t_matmul(p, UNIT, args, 2);
+}
+
+ModuleDef make_tensor_module() {
+    // Arguments are forced to weak head normal form before each call (bit i of
+    // the mask is argument i); a list argument's elements are forced as they
+    // are read.
+    return ModuleDef{
+        "std.tensor",
+        {
+            {"of_list", 1, 0b1, t_of_list},
+            {"to_list", 1, 0b1, t_to_list},
+            {"zeros", 1, 0b1, t_zeros},
+            {"ones", 1, 0b1, t_ones},
+            {"fill", 2, 0b11, t_fill},
+            {"identity", 1, 0b1, t_identity},
+            {"range", 1, 0b1, t_range},
+            {"random", 2, 0b11, t_random},
+            {"shape", 1, 0b1, t_shape},
+            {"rank", 1, 0b1, t_rank},
+            {"size", 1, 0b1, t_size},
+            {"device", 1, 0b1, t_device},
+            {"dtype", 1, 0b1, t_dtype},
+            {"reshape", 2, 0b11, t_reshape},
+            {"transpose", 1, 0b1, t_transpose},
+            {"at", 2, 0b11, t_at},
+            {"matmul", 2, 0b11, t_matmul},
+            {"dot", 2, 0b11, t_dot},
+            {"outer", 2, 0b11, t_outer},
+            {"sum", 1, 0b1, t_reduce, KRED_SUM},
+            {"minimum", 1, 0b1, t_reduce, KRED_MIN},
+            {"maximum", 1, 0b1, t_reduce, KRED_MAX},
+            {"mean", 1, 0b1, t_mean},
+            {"norm", 1, 0b1, t_norm},
+            {"sum_axis", 2, 0b11, t_sum_axis},
+            {"sqrt", 1, 0b1, t_unary, KFN_SQRT},
+            {"exp", 1, 0b1, t_unary, KFN_EXP},
+            {"log", 1, 0b1, t_unary, KFN_LOG},
+            {"abs", 1, 0b1, t_unary, KFN_ABS},
+            {"tanh", 1, 0b1, t_unary, KFN_TANH},
+            {"sin", 1, 0b1, t_unary, KFN_SIN},
+            {"cos", 1, 0b1, t_unary, KFN_COS},
+            {"relu", 1, 0b1, t_unary, KFN_RELU},
+            {"sigmoid", 1, 0b1, t_unary, KFN_SIGMOID},
+            {"gpu", 1, 0b1, t_gpu, gpu::F32},
+            {"gpu64", 1, 0b1, t_gpu, gpu::F64},
+            {"host", 1, 0b1, t_host},
+            {"gpu_available", 1, 0b1, t_gpu_available},
+            {"gpu_name", 1, 0b1, t_gpu_name},
+            {"cpu_kernels", 1, 0b1, t_cpu_kernels},
+        }};
+}
+
+}  // namespace dream
