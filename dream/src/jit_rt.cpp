@@ -10,6 +10,7 @@
 
 #include "builtins.hpp"
 #include "interp.hpp"
+#include "tensor.hpp"
 #include "process.hpp"
 #include "runtime.hpp"
 
@@ -77,14 +78,13 @@ int dream_rt_arith_f(Process* p, int32_t op, Value a, Value b, double* out, Valu
         *err = r;
         return 0;
     }
-    // An operation with a float on one side of it answers a float or raises;
-    // there is no third case, and the header says why. Checked rather than
-    // assumed, because the assumption is about `arith` and this file is not.
-    if (!number_as_double(r, out)) {
-        *err = raise_error(*p, well_known(p->runtime()).type_error,
-                           "arithmetic on a float did not answer a number");
-        return 0;
-    }
+    // An operation with a float on one side of it answers a float or raises
+    // -- unless the other side is a tensor, where `2.0 * t` is a tensor. The
+    // compiled code holds that answer in a register typed double and cannot
+    // take anything else, so it gives the call back to the interpreter (2,
+    // which it turns into `JIT_BAIL`). The body is pure, so running it again
+    // from its frame is the answer it would have given.
+    if (!number_as_double(r, out)) return 2;
     return 1;
 }
 
@@ -305,8 +305,21 @@ int dream_rt_get(Process* p, Value c, Value k, int32_t has_default, Value* out) 
                            "the map has no key " + describe(*p, k));
         return 0;
     }
+    if (is_obj(c, ObjType::Tensor) && is_fixnum(k)) {
+        switch (tensor_index(*p, c, fixnum_value(k), out)) {
+            case 1: return 1;
+            case 0: return 0;
+            default: break;
+        }
+        if (has_default) return 2;
+        *out = rt_out_of_bounds(*p, "index " + std::to_string(fixnum_value(k)) +
+                                        " is outside a tensor of length " +
+                                        std::to_string(tensor_len(c)));
+        return 0;
+    }
     if (!is_sequence_value(c)) {
-        *out = rt_type_error(*p, "`.[ ]` reads a map, an array or a list, not " + describe(*p, c));
+        *out = rt_type_error(*p, "`.[ ]` reads a map, an array or a list, not " +
+                                     describe(*p, c));
         return 0;
     }
     if (!is_fixnum(k)) {

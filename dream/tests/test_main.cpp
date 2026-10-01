@@ -1,6 +1,8 @@
 // Unit tests for the VM's building blocks. End-to-end behaviour is covered by
 // tests/e2e.sh, which compiles real Dream programs and checks their output.
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -13,6 +15,7 @@
 #include "image.hpp"
 #include "process.hpp"
 #include "runtime.hpp"
+#include "tensor_kernels.hpp"
 #include "value.hpp"
 
 using namespace dream;
@@ -735,6 +738,122 @@ static void test_cross_heap_copy() {
     static_cast<ConsObj*>(as_obj(x))->tail = x;
     Value cx = Heap::copy_between(b, x);
     CHECK_EQ(static_cast<ConsObj*>(as_obj(cx))->tail, cx);
+
+    // A tensor crosses as its numbers, in one piece, with its shape.
+    const uint32_t dims[2] = {2, 3};
+    Value t = a.make_tensor(2, dims, 6);
+    for (int i = 0; i < 6; ++i) static_cast<TensorObj*>(as_obj(t))->data()[i] = i * 1.5;
+    Value ct = Heap::copy_between(b, t);
+    auto* tc = static_cast<TensorObj*>(as_obj(ct));
+    CHECK(ct != t);
+    CHECK_EQ(tc->rank, 2u);
+    CHECK_EQ(tc->dims[1], 3u);
+    CHECK_EQ(tc->count, 6u);
+    CHECK_EQ(tc->data()[5], 7.5);
+}
+
+/// A dead big object's block is kept and handed to the next big object that
+/// fits, and what nothing reuses goes back to the system a collection later.
+static void test_big_block_pool() {
+    std::printf("big blocks are pooled\n");
+    Heap h(8192);
+    VectorRoots roots;
+    const uint32_t dims[1] = {1u << 20};  // 8 MB, far past the largest class
+    Obj* first = as_obj(h.make_tensor(1, dims, dims[0]));
+    h.collect(roots);
+    CHECK(h.bytes_pooled() >= size_t(dims[0]) * sizeof(double));
+    // Unreached, so swept and pooled: the next one of the same size is it.
+    Obj* second = as_obj(h.make_tensor(1, dims, dims[0]));
+    CHECK_EQ(second, first);
+    CHECK_EQ(h.bytes_pooled(), size_t(0));
+    // A little larger still fits the same block.
+    roots.values = {};
+    h.collect(roots);
+    const uint32_t more[1] = {dims[0] + 1000};
+    CHECK_EQ(as_obj(h.make_tensor(1, more, more[0])), first);
+    // Nothing reuses what this collection retires, so the next one gives it
+    // back.
+    h.collect(roots);
+    CHECK(h.bytes_pooled() > 0);
+    h.collect(roots);
+    CHECK_EQ(h.bytes_pooled(), size_t(0));
+}
+
+/// The matrix product against the textbook triple loop, at sizes chosen to
+/// land on every edge of the blocking: tiles of 6 x 8 cut short in each
+/// direction, a K past one 256-wide panel, the one-row and one-column shapes
+/// that take their own paths. Both instruction-set tables, where the machine
+/// can run the second, because a CPU without AVX2 runs only the first.
+static void test_tensor_kernels() {
+    std::printf("tensor kernels\n");
+    std::vector<const TensorKernels*> tables = {&kernels_base::kernels};
+#if defined(DREAM_TENSOR_AVX2)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
+        tables.push_back(&kernels_avx2::kernels);
+#endif
+    const size_t shapes[][3] = {{1, 1, 1}, {1, 7, 9}, {5, 3, 1}, {6, 8, 8},  {7, 9, 17},
+                                {13, 300, 11}, {97, 31, 100}, {2, 513, 3}};
+    for (const TensorKernels* k : tables) {
+        for (auto& s : shapes) {
+            const size_t M = s[0], K = s[1], N = s[2];
+            std::vector<double> A(M * K), B(K * N), C(M * N, -1.0);
+            for (size_t i = 0; i < A.size(); ++i) A[i] = double(i % 7) - 3.0;
+            for (size_t i = 0; i < B.size(); ++i) B[i] = double(i % 5) * 0.5 - 1.0;
+            // The same product with its operands read three ways: as stored;
+            // B as the transpose of its own transpose, by strides; and A
+            // computed a segment at a time by a callback. Every way must give
+            // the textbook answer.
+            std::vector<double> Bt(N * K);
+            for (size_t p = 0; p < K; ++p)
+                for (size_t j = 0; j < N; ++j) Bt[j * K + p] = B[p * N + j];
+            struct Rows {
+                const std::vector<double>* a;
+                size_t K;
+            } rows{&A, K};
+            auto segment = [](void* ctx, size_t row, size_t col, size_t len, double* out) {
+                auto* r = static_cast<Rows*>(ctx);
+                for (size_t l = 0; l < len; ++l) out[l] = (*r->a)[row * r->K + col + l];
+            };
+            const GemmOperand plainA{A.data(), K, 1, nullptr, nullptr, 0};
+            const GemmOperand plainB{B.data(), N, 1, nullptr, nullptr, 0};
+            const GemmOperand turnedB{Bt.data(), 1, K, nullptr, nullptr, 0};
+            const GemmOperand computedA{nullptr, 0, 0, segment, &rows, 0};
+            const GemmOperand* as[] = {&plainA, &plainA, &computedA};
+            const GemmOperand* bs[] = {&plainB, &turnedB, &plainB};
+            for (int way = 0; way < 3; ++way) {
+                std::fill(C.begin(), C.end(), -1.0);
+                k->gemm(*as[way], *bs[way], C.data(), M, K, N, nullptr);
+                double worst = 0;
+                for (size_t i = 0; i < M; ++i)
+                    for (size_t j = 0; j < N; ++j) {
+                        double want = 0;
+                        for (size_t p = 0; p < K; ++p) want += A[i * K + p] * B[p * N + j];
+                        worst = std::max(worst, std::abs(C[i * N + j] - want));
+                    }
+                // Small integers and halves: every product and partial sum is
+                // exact, so any reordering the kernel does still gives the
+                // same number.
+                CHECK_EQ(worst, 0.0);
+            }
+        }
+        double x[19], y[19], out[19];
+        for (int i = 0; i < 19; ++i) {
+            x[i] = i;
+            y[i] = 19 - i;
+        }
+        CHECK_EQ(k->dot(x, y, 19), 1140.0);
+        CHECK_EQ(k->reduce(KRED_SUM, x, 19), 171.0);
+        CHECK_EQ(k->reduce(KRED_MAX, y, 19), 19.0);
+        CHECK_EQ(k->reduce(KRED_MIN, y, 19), 1.0);
+        k->binary(KOP_SUB, x, y, out, 19);
+        CHECK_EQ(out[18], -1.0 * (19 - 18) + 18.0);
+        k->scalar(KOP_DIV, x, 2.0, true, out, 19);
+        CHECK_EQ(out[4], 0.5);
+        double t[6] = {1, 2, 3, 4, 5, 6}, tt[6];
+        k->transpose(t, tt, 2, 3);
+        CHECK_EQ(tt[1], 4.0);
+        CHECK_EQ(tt[4], 3.0);
+    }
 }
 
 static void test_image_rejects_bad_input() {
@@ -1111,6 +1230,7 @@ static void test_builtin_table_matches_compiler() {
                               "data_at",
                               "compare",
                               "sort_keyed",
+                              "tensor_matmul",
     };
     const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
     CHECK_EQ(builtin_count(), n);
@@ -1239,6 +1359,8 @@ int main() {
     test_shared_area();
     test_heap_verifier_follows_every_object_kind();
     test_cross_heap_copy();
+    test_big_block_pool();
+    test_tensor_kernels();
     test_image_rejects_bad_input();
     test_integer_hints();
     test_type_test_nodes();

@@ -78,6 +78,24 @@ How `lucid` answers an editor, and which tree answers which question.
 - A record is a declaration before it is a module
 - A host module's members come from the host
 
+## [Tensors](tensors.md)
+
+Packed numeric arrays, `@`, and the GPU: what made the product fast, and what it took to free device memory.
+
+- Why a new kind of value
+- Operators, and why `@` is a builtin
+- The JIT's float invariant, and the bail that keeps it
+- The matrix product
+- The GPU
+- Releasing device memory
+- Fusion
+- Fusing into the product
+- Measuring a fresh tensor, and the pool for large blocks
+- Transposes, and chains into a product
+- Finishing fusion
+- Considered: a server process that owns the tensors and mutates them
+- What is not done yet
+
 ## [Large data in an image](large-data.md)
 
 The payload: data past the 4 GiB line, reached as views rather than copies.

@@ -1,0 +1,56 @@
+// What reading a product's operands in place is worth: transposes read by
+// strides or by a chain, and a chain computed as the product packs it,
+// against `strict!` on the operand, which computes it into memory first.
+//
+//     dream build/dreams.dream -L mind benchmark/tensor/operands.dr -o /tmp/to.dream
+//     dream /tmp/to.dream
+import std.console;
+import std.list;
+import std.os;
+import std.tensor;
+
+let best! name thunk = {
+    let rec go! k !least = if k == 0 { least } else {
+        let before = os.monotonic! ();
+        let r = strict! (thunk ());
+        let ms = os.monotonic! () - before;
+        go! (k - 1) (if least < 0 || ms < least { ms } else { least })
+    };
+    console.print! (name + ": " + to_string (go! 7 (0 - 1)) + " ms")
+};
+
+let main! = {
+    let m = tensor.random 1 [2000, 2000];
+    let n = tensor.random 2 [2000, 2000];
+    best! "transpose + chain, stepped" (fn () -> strict! (tensor.transpose m) + n);
+    best! "transpose + chain, fused  " (fn () -> tensor.transpose m + n);
+    let x = tensor.random 3 [4096, 1024];
+    let w = tensor.random 4 [1024, 64];
+    best! "chain into product, stepped" (fn () -> strict! ((x - 0.5) * 2.0) @ w);
+    best! "chain into product, fused  " (fn () -> (x - 0.5) * 2.0 @ w);
+    let a = tensor.random 5 [1024, 1024];
+    let b = tensor.random 6 [1024, 1024];
+    best! "a @ transpose b, stepped" (fn () -> a @ strict! (tensor.transpose b));
+    best! "a @ transpose b, strided" (fn () -> a @ tensor.transpose b);
+    best! "transpose a @ b, stepped" (fn () -> strict! (tensor.transpose a) @ b);
+    best! "transpose a @ b, strided" (fn () -> tensor.transpose a @ b);
+    best! "sum_axis 0, stepped" (fn () -> tensor.sum_axis 0 (strict! (m * 2.0 + n)));
+    best! "sum_axis 0, fused  " (fn () -> tensor.sum_axis 0 (m * 2.0 + n));
+    best! "sum_axis 1, stepped" (fn () -> tensor.sum_axis 1 (strict! (m * 2.0 + n)));
+    best! "sum_axis 1, fused  " (fn () -> tensor.sum_axis 1 (m * 2.0 + n));
+    let flat = tensor.reshape [4000000] m;
+    best! "dot of a chain, stepped" (fn () -> tensor.dot (strict! (flat * 2.0)) flat);
+    best! "dot of a chain, fused  " (fn () -> tensor.dot (flat * 2.0) flat);
+    let wide = tensor.random 7 [4096, 64];
+    let tall = tensor.random 8 [64, 4096];
+    best! "sum of product, stepped" (fn () -> tensor.sum (strict! (wide @ tall)));
+    best! "sum of product, folded " (fn () -> tensor.sum (wide @ tall));
+    if tensor.gpu_available () {
+        let gx = tensor.gpu (tensor.random 9 [1024, 256]);
+        let gw = tensor.gpu (tensor.random 10 [256, 256]);
+        best! "gpu chain into product, stepped" (fn () -> tensor.host (strict! ((gx - 0.5) * 2.0) @ gw));
+        best! "gpu chain into product, fused  " (fn () -> tensor.host ((gx - 0.5) * 2.0 @ gw));
+        best! "gpu sum_axis, before (round trip)" (fn () -> tensor.gpu (tensor.sum_axis 0 (tensor.host (tensor.gpu m * 2.0))));
+        best! "gpu sum_axis, fused             " (fn () -> tensor.host (tensor.sum_axis 0 (tensor.gpu m * 2.0)))
+    } else { () }
+};

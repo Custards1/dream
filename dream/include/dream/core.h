@@ -58,7 +58,10 @@ typedef enum dream_type {
      * than the 4 GiB the rest of the container can address. Appended after
      * DREAM_TYPE_UNKNOWN rather than filed beside DREAM_TYPE_STRING, because
      * every value here is already compiled into somebody's embedder. */
-    DREAM_TYPE_BIGSTR
+    DREAM_TYPE_BIGSTR,
+    /* Packed numbers with a shape: what the numeric operators and std.tensor
+     * work on. Appended for the same reason DREAM_TYPE_BIGSTR was. */
+    DREAM_TYPE_TENSOR
 } dream_type;
 
 /* `thread` was the original spelling in the language spec and is kept as an

@@ -199,10 +199,12 @@ let rec binary_tail c level lhs ts = {
     else {
         match parse_binary c (ast.precedence op + 1) (list.tail ts) {
             [:error, m, s] => err m s,
-            [:ok, rhs, rest] =>
-                binary_tail c level
-                            (ast.binary_e op lhs rhs (ast.span_to (ast.span lhs) (ast.span rhs)))
-                            rest,
+            [:ok, rhs, rest] => {
+                let sp = ast.span_to (ast.span lhs) (ast.span rhs);
+                let e = if op == :matmul { ast.matmul_e lhs rhs (peek_span ts) sp }
+                        else { ast.binary_e op lhs rhs sp };
+                binary_tail c level e rest
+            },
         }
     }
 };
@@ -917,7 +919,7 @@ priv let primitive_atoms = [
     "any", "never",
     "integer", "float", "char", "bool", "unit", "string", "atom",
     "list", "array", "map", "module", "error", "process",
-    "pure_fn", "impure_fn", "bigstr",
+    "pure_fn", "impure_fn", "bigstr", "tensor",
 ];
 
 priv let primitive_atom_set = comp set_of primitive_atoms;

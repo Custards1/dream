@@ -10,6 +10,7 @@
 #include <sstream>
 
 #include "builtins.hpp"
+#include "tensor.hpp"
 #include "jit.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
@@ -40,9 +41,9 @@ Runtime::Runtime(bool owns_host_services)
     static const char* const kTypeNames[] = {
         "integer", "float",  "char",   "bool",   "unit",    "string",
         "atom",    "list",   "array",  "map",    "pure_fn", "impure_fn",
-        "module",  "error",  "process", "unknown", "bigstr",
+        "module",  "error",  "process", "unknown", "bigstr",  "tensor",
     };
-    static_assert(std::size(kTypeNames) == DREAM_TYPE_BIGSTR + 1,
+    static_assert(std::size(kTypeNames) == DREAM_TYPE_TENSOR + 1,
                   "every surface type needs a name");
     for (size_t i = 0; i < std::size(kTypeNames); ++i) {
         wk_->types[i] = intern_atom(kTypeNames[i]);
@@ -50,6 +51,7 @@ Runtime::Runtime(bool owns_host_services)
 
     register_module(make_console_module());
     register_module(make_math_module());
+    register_module(make_tensor_module());
     register_module(make_vm_module());
     register_module(make_ffi_module());
     register_module(make_io_module());

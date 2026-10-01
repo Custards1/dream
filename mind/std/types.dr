@@ -124,7 +124,7 @@ let record_with required optional_fields =
 let primitive : :atom -> :bool;
 let primitive kind = list.contains kind
     [:integer, :float, :string, :bool, :char, :atom, :unit,
-     :list, :array, :map, :pure_fn, :impure_fn, :process, :error, :module, :bigstr];
+     :list, :array, :map, :pure_fn, :impure_fn, :process, :error, :module, :bigstr, :tensor];
 
 // --- membership ---------------------------------------------------------------
 

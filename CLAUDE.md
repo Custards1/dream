@@ -343,6 +343,22 @@ The lessons that keep coming back:
   `Shape` holding its description. A `match` on one must handle every
   variant. Lists back it; an array opt-in, as `struct` is to `group`, is
   planned and not built.
+- `import std.tensor` gives **tensors**: packed numbers with a shape
+  (`TensorObj`), on which `+ - * / %` are elementwise and `a @ b` is the
+  matrix product (the parser writes it as the builtin `tensor_matmul`).
+  `tensor.gpu t` moves one to the GPU -- OpenCL, `dlopen`ed, so nothing to
+  build against -- and everything done to it then runs there; `tensor.host`
+  brings it back. Elementwise work on a large tensor is *deferred*: it
+  records a program (`TensorExpr`) and whatever reads the numbers runs the
+  chain fused, in one pass or one generated GPU kernel -- and a large `@`
+  defers too, so the chain after it runs inside the product (an epilogue on
+  each finished tile, or in the generated product kernel). A transpose is a
+  deferred strided read, and a product reads its operands through
+  `GemmOperand` -- strides, or a chain computed as it packs. A GPU tensor holds device memory the heap counts as
+  collection pressure and frees when it dies (`Heap::reap_external`). The CPU
+  kernels are compiled twice, baseline and AVX2, and picked at start-up.
+  [docs/notes/tensors.md](docs/notes/tensors.md) is the design and the
+  measurements.
 - `foreign lib from "libx.so" { resource Db = db_close; open! : :cstr -> out Db -> :int = db_open }`
   declares a C library: each line a C signature in the type grammar, which the
   loader (`syntax.foreign_decl`) binds through `std.ffi` *and* signs with its

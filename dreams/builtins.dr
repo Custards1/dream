@@ -68,6 +68,7 @@ let names = [
     "data_at",
     "compare",
     "sort_keyed",
+    "tensor_matmul",  // what `a @ b` is written as; see `ast.matmul_e`
 
 ];
 
@@ -148,6 +149,7 @@ let signatures = %{
     "data_at" => "integer -> bigstr",
     "compare" => "a -> b -> integer",
     "sort_keyed" => "keys:list -> array -> list",
+    "tensor_matmul" => "tensor|list|array -> tensor|list|array -> tensor|float",
 
 };
 

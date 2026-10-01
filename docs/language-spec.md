@@ -405,6 +405,7 @@ for the caller to opt into.
 | `list` | `[a, b, c]` — a cons chain, lazy in head *and* tail |
 | `array` | `#[a, b, c]` — flat, constant-time indexing |
 | `map` | `%{ k => v }` — keys forced, values lazy |
+| `tensor` | packed numbers with a shape, on the host or a GPU — see `std.tensor` |
 | `error` | a raised kind and payload, caught by `try!` |
 | `process` | a green process (`thread` is an accepted alias) |
 | `atom` | an interned name, `:like_this`; compares by identity |
@@ -478,7 +479,7 @@ value wants is usually decided by how it is read rather than by what it holds:
 | 1 | `&&` | left |
 | 2 | `==` `!=` `<` `<=` `>` `>=` | left |
 | 3 | `+` `-` | left |
-| 4 | `*` `/` `%` | left |
+| 4 | `*` `/` `%` `@` | left |
 | 5 | unary `-`, `not` | prefix |
 | 6 | `comp`, `comp!` | prefix |
 | tightest | **application** `f a b`, then postfix `.field` | left |
@@ -527,6 +528,13 @@ it is why `console.print!` puts its label first.
 - two numbers — arithmetic
 - two strings — concatenation
 - two lists — concatenation, **without forcing the elements**
+
+`+ - * / %` on a **tensor** are elementwise: with another tensor of the same
+shape (or one whose shape is the trailing part of its own, which repeats), or
+with a number on either side. `a @ b` is the matrix product of two tensors, or
+of nested lists and arrays read as them, and binds like `*`. It is the builtin
+`tensor_matmul` applied to both sides, so a local of that name shadows it.
+`std.tensor` has the rest, including moving a tensor to the GPU.
 
 Integer arithmetic that overflows a fixnum falls through to `float` rather than
 wrapping silently. `/` and `%` by an integer zero raise `:divide_by_zero`.

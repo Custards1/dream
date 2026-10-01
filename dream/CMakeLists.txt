@@ -156,7 +156,24 @@ set(DREAM_SOURCES
   src/scheduler.cpp
   src/runtime.cpp
   src/capi.cpp
+  src/tensor.cpp
+  src/tensor_kernels.cpp
+  src/gpu.cpp
 )
+
+# The tensor kernels a second time, for CPUs with AVX2 and FMA, chosen at run
+# time by `tensor_kernels()`. A second translation unit rather than
+# `target_clones` because the matrix product's inner kernel has to be inlined
+# into its loops to be fast, and GCC will not inline across instruction sets --
+# the head of src/tensor_kernels.inc has the measurement. Only where the
+# compiler can target x86-64 with GCC-style flags; elsewhere the baseline table
+# is the only one.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND NOT MSVC)
+  list(APPEND DREAM_SOURCES src/tensor_kernels_avx2.cpp)
+  set_source_files_properties(src/tensor_kernels_avx2.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx2;-mfma")
+  set(DREAM_TENSOR_AVX2 ON)
+endif()
 
 if(DREAM_HAVE_LLVM)
   list(APPEND DREAM_SOURCES src/jit.cpp src/jit_rt.cpp)
@@ -174,6 +191,10 @@ set_target_properties(dream PROPERTIES
 target_include_directories(dream
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if(DREAM_TENSOR_AVX2)
+  target_compile_definitions(dream PRIVATE DREAM_TENSOR_AVX2=1)
+endif()
 
 if(DREAM_PORTABLE_POLLER)
   target_compile_definitions(dream PRIVATE DREAM_PORTABLE_POLLER=1)
@@ -318,6 +339,9 @@ if(DREAM_BUILD_TESTS)
   add_executable(dream_tests tests/test_main.cpp)
   target_link_libraries(dream_tests PRIVATE dream)
   target_include_directories(dream_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  if(DREAM_TENSOR_AVX2)
+    target_compile_definitions(dream_tests PRIVATE DREAM_TENSOR_AVX2=1)
+  endif()
   add_test(NAME dream_tests COMMAND dream_tests)
 
   if(UNIX)

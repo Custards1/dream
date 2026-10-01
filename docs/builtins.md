@@ -21,9 +21,9 @@ These are resolved by the compiler without any import. They can be shadowed by a
 | `self!` | `unit → process` | Returns the current process's handle. |
 | `raise!` | `value → never` | Raises `value` as an error. If `value` is already an error box it is re-raised as-is; otherwise it is wrapped in one. Never returns. |
 | `type_assert` | `bool → description → value → value` | Contract primitive used by `std.types.check`. Forces only the decision; returns the original value for `true`, otherwise raises `:type_error` with the description as payload. |
-| `type_of` | `value → atom` | Returns an atom naming the type of its argument: `:integer`, `:float`, `:char`, `:bool`, `:unit`, `:string`, `:atom`, `:list`, `:array`, `:map`, `:module`, `:error`, `:process`, `:pure_fn`, `:impure_fn`, or `:bigstr` (a view into the image's payload — see [Large data](#large-data) below; deliberately *not* `:string`, so that no code path written for a string is handed one). |
+| `type_of` | `value → atom` | Returns an atom naming the type of its argument: `:integer`, `:float`, `:char`, `:bool`, `:unit`, `:string`, `:atom`, `:list`, `:array`, `:map`, `:module`, `:error`, `:process`, `:pure_fn`, `:impure_fn`, `:tensor`, or `:bigstr` (a view into the image's payload — see [Large data](#large-data) below; deliberately *not* `:string`, so that no code path written for a string is handed one). |
 | `to_string` | `value → string` | Renders any value as a human-readable string. Lists print as `[a, b, c]`, arrays as `#[a, b, c]`, maps as `%{:k => v}`, strings are quoted, chars as `'c'`. Raises `:type_error` on a bigstr, which by definition may not fit in a string; one nested inside a larger value renders as `<big string, N bytes>` rather than losing the rest of the structure. |
-| `len` | `list\|array\|map\|string\|bigstr → integer` | Returns the number of elements (list), slots (array), entries (map), or bytes (string or bigstr). Raises `:type_error` for anything else. For lists, walks the entire spine. |
+| `len` | `list\|array\|map\|string\|bigstr\|tensor → integer` | Returns the number of elements (list), slots (array), entries (map), bytes (string or bigstr), or the length of a tensor's first axis. Raises `:type_error` for anything else. For lists, walks the entire spine. |
 | `strict!` | `value → value` | Forces `value` all the way to normal form (deeply, not just to weak head normal form), then returns it unchanged. Use this when laziness would defer an effect — `list.map (fn x -> spawn! ..) xs` builds thunks; `strict! (list.map ...)` runs the spawns immediately. |
 
 ### Pattern-match internals
@@ -133,7 +133,8 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
+| `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays, tensors. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Tensors compare by shape, then element by element. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
+| `tensor_matmul` | `tensor\|list\|array → tensor\|list\|array → tensor\|float` | What `a @ b` is written as. See [`std.tensor`](#stdtensor). |
 | `sort_keyed` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
 ### Large data
@@ -230,6 +231,90 @@ import std.math;
 | `sqrt` | `number → float` | Square root. |
 | `abs` | `integer\|float → integer\|float` | Absolute value. Returns the same type as the input. |
 | `floor` | `integer\|float → integer` | Rounds down to the nearest integer. |
+
+---
+
+## `std.tensor`
+
+```dream
+import std.tensor;
+
+let a = tensor.of_list [[1, 2], [3, 4]];
+let b = tensor.random 1 [2, 2];
+a @ b                       // matrix product
+a * b + 1.0                 // elementwise, and with a number
+tensor.relu (a @ b - 0.5)   // elementwise functions
+let g = tensor.gpu a;       // the same operations, now on the GPU
+tensor.host (g @ g)         // and back
+```
+
+A tensor is packed numbers with a shape: up to six axes, row-major. On the
+host the numbers are doubles; on the GPU, float32 (`tensor.gpu`) or float64
+(`tensor.gpu64`). It is a value: nothing changes one, and every operation
+answers a new tensor. `type_of` answers `:tensor`, and `:tensor` is a type in
+signatures. [docs/notes/tensors.md](notes/tensors.md) is the design.
+
+**Operators.** `+ - * / %` are elementwise between two tensors, or between a
+tensor and a number on either side. The shapes must be equal, or one must be
+the trailing part of the other, which repeats it (a vector added to every row
+of a matrix). Unary `-` negates. `a @ b` is the matrix product: matrix by
+matrix, matrix by vector, vector by matrix, or vector by vector, which is the
+dot product and answers a float. `@` binds like `*`. `t.[i]` is an element of
+a vector, or a copy of row `i` of anything larger; `len t` is the length of the
+first axis. `==` compares shapes and numbers.
+
+**Lists in, tensors out.** Every function here and `@` take a tensor *or*
+nested lists and arrays of numbers, converted on the way in, so
+`[1, 2, 3] @ [4, 5, 6]` is `32`. The operators `+ - * / %` do not, because `+`
+on lists already joins them.
+
+**Fusion.** On a large tensor (a few thousand numbers or more, and always on
+the GPU), the elementwise operators and functions do not compute at once. They
+record the work, and whatever reads the numbers runs the whole chain in one
+pass: `tensor.relu (a * 2.0 + b) * 0.5` is one pass over memory, or one GPU
+kernel, not four. A product defers too, so the chain after it runs inside it:
+`tensor.relu (w @ x + b)` applies `+ b` and `relu` to each block of the
+product as it is finished, or in the product kernel itself on the GPU. A
+transpose defers too, and is read where it lies: by a chain, or by a
+product's strides (`a @ tensor.transpose b` copies nothing). A chain feeding
+a product on the host is computed as the product packs it. A reduction of
+such a chain never stores it, and neither do `sum_axis` and `dot`. A reshape
+copies nothing. Nothing about
+this is visible except the speed: a deferred tensor has its type and shape,
+and shape errors are raised where they always were. `strict!` computes one,
+which is what timing or `vm.share!` wants.
+
+**Where it runs.** An operation runs where its operands are. The CPU kernels
+are blocked and vectorized (AVX2 and FMA where the CPU has them, chosen at
+start-up), and a large product is split across threads (capped by
+`DREAM_TENSOR_THREADS`). The GPU is reached through OpenCL, loaded at run time
+(`DREAM_OPENCL_LIB` names the library), and its operations are queued and
+return at once; only reading a result back waits. A GPU tensor that dies has
+its device memory freed by the collector. Combining a host tensor with a GPU
+tensor raises `:device_error`.
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `of_list xs` | `nested lists/arrays → tensor` | A host tensor. The shape is read off the nesting, and every row must match it. |
+| `to_list t` | `tensor → nested lists` | The numbers as nested lists of floats. |
+| `zeros shape` · `ones shape` | `[integer] → tensor` | Filled with 0 or 1. |
+| `fill shape x` | `[integer] → number → tensor` | Filled with `x`. |
+| `identity n` | `integer → tensor` | The `n x n` identity matrix. |
+| `range n` | `integer → tensor` | `[0, 1, .., n - 1]`. |
+| `random seed shape` | `integer → [integer] → tensor` | Uniform in `[0, 1)`, the same for the same seed on every machine. |
+| `shape t` · `rank t` · `size t` | `tensor → ..` | The axes' lengths, how many, and how many numbers in all. |
+| `device t` · `dtype t` | `tensor → atom` | `:host` or `:gpu`; `:f64` or `:f32`. |
+| `reshape shape t` | `[integer] → tensor → tensor` | The same numbers in a new shape of the same size. Free on the GPU. |
+| `transpose t` | `tensor → tensor` | A matrix transposed; a vector unchanged. |
+| `at t indices` | `tensor → [integer] → float` | One element, one index per axis. |
+| `matmul a b` · `dot a b` · `outer a b` | `tensor → tensor → ..` | `a @ b`; `@` of two vectors only; every `a[i] * b[j]`. |
+| `sum` · `mean` · `minimum` · `maximum` · `norm` | `tensor → float` | Over every number. `norm` is the Euclidean length. |
+| `sum_axis axis t` | `integer → tensor → tensor` | Sums along one axis, which drops out of the shape. |
+| `sqrt` · `exp` · `log` · `abs` · `tanh` · `sin` · `cos` · `relu` · `sigmoid` | `tensor → tensor` | Elementwise. |
+| `gpu t` · `gpu64 t` | `tensor → tensor` | Onto the GPU as float32 or float64. Raises `:no_gpu` naming what is missing. |
+| `host t` | `tensor → tensor` | Back onto the host. |
+| `gpu_available ()` · `gpu_name ()` | `unit → ..` | Whether a GPU can be used, and its name (or `()`). |
+| `cpu_kernels ()` | `unit → string` | `"avx2"` or `"baseline"`: which CPU kernels this machine runs. |
 
 ---
 
@@ -1257,6 +1342,10 @@ These atoms are raised by the built-in operations. A `match` on the error kind o
 | `:no_such_member` | `module.name` where `name` is not exported |
 | `:match_error` | A `match` with no arm that matched |
 | `:out_of_bounds` | Array index outside the valid range |
+| `:shape_error` | Tensors whose shapes do not fit the operation |
+| `:device_error` | A host tensor and a GPU tensor in one operation |
+| `:no_gpu` | `tensor.gpu` where no GPU can be used |
+| `:gpu_error` | The GPU refused an operation (out of device memory, say) |
 | `:loop` | A thunk that depends on itself |
 | `:stack_overflow` | Recursion exceeded the process's stack limit |
 | `:out_of_memory` | Process heap exceeded its allocation limit |

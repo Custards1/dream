@@ -80,7 +80,7 @@ let primitives = %{
     "string" => :string, "bool" => :bool, "char" => :char, "atom" => :atom,
     "unit" => :unit, "list" => :list, "array" => :array, "map" => :map,
     "pure_fn" => :pure_fn, "impure_fn" => :impure_fn, "process" => :process,
-    "error" => :error, "module" => :module, "bigstr" => :bigstr,
+    "error" => :error, "module" => :module, "bigstr" => :bigstr, "tensor" => :tensor,
 };
 
 let lit kind v = [:lit, kind, v];
@@ -727,7 +727,7 @@ let rec infer k h e ds = match e {
     [:unary, :not, x, _] => [:bool, check k h x :bool "the operand of `not`" ds],
     [:unary, _, x, sp] => {
         let [t, ds1] = infer k h x ds;
-        numeric k h t x "the operand of `-`" ds1
+        if op_kind k t == :tensor { [:tensor, ds1] } else { numeric k h t x "the operand of `-`" ds1 }
     },
     [:binary, op, l, r, sp] => infer_binary k h op l r sp ds,
     [:if, c, t, el, _] => {
@@ -902,6 +902,7 @@ let one_kind k m = match m {
     :float => :float,
     :string => :string,
     :list => :list,
+    :tensor => :tensor,
     [:list_of, _] => :list,
     [:tuple, _] => :list,
     [:named, _, _, _] => one_kind k (peel k m 8),
@@ -973,6 +974,24 @@ let infer_binary k h op l r sp ds = match op {
 let arith k h what l r ds = {
     let [lt, ds1] = infer k h l ds;
     let [rt, ds2] = infer k h r ds1;
+    if tensor_arith k lt rt { [:tensor, ds2] } else { numeric_arith k h what lt rt l r ds2 }
+};
+
+/// Whether `l op r` is elementwise arithmetic on a tensor: a tensor with a
+/// tensor or a number, in either order. The shapes are the runtime's to check;
+/// a type says only that a value is a tensor.
+///
+/// A side nothing is known about (`()`) is accepted, and the answer is still a
+/// tensor: whatever it turns out to be, a tensor combined with it is a tensor
+/// or a raise, which is all a type here promises.
+let tensor_arith : :any -> :any -> :any -> :bool;
+let tensor_arith k lt rt = match [op_kind k lt, op_kind k rt] {
+    [:tensor, b] => b == () || b == :tensor || numeric_kind b,
+    [a, :tensor] => a == () || numeric_kind a,
+    _ => false,
+};
+
+let numeric_arith k h what lt rt l r ds2 = {
     let [a, ds3] = numeric k h lt l ("the left of " + what) ds2;
     let [b, ds4] = numeric k h rt r ("the right of " + what) ds3;
     match [a, b] {
@@ -986,6 +1005,7 @@ let arith k h what l r ds = {
 };
 
 let add k h lt rt l r sp ds = match [op_kind k lt, op_kind k rt] {
+    _ if tensor_arith k lt rt => [:tensor, ds],
     [(), _] => [:any, ds],
     [_, ()] => [:any, ds],
     [a, b] if numeric_kind a && numeric_kind b => [number_type (if a == b { a } else { :number }), ds],
@@ -995,7 +1015,7 @@ let add k h lt rt l r sp ds = match [op_kind k lt, op_kind k rt] {
         _ => [[:list_of, union_of [list_element k lt, list_element k rt]], ds],
     },
     _ if from_literals lt && from_literals rt => [:any, ds],
-    _ => [:any, bad h sp ("`+` adds two numbers, joins two strings or joins two lists, "
+    _ => [:any, bad h sp ("`+` adds two numbers, joins two strings or joins two lists, or works on a tensor, "
                          + "but this is `" + show lt + "` and `" + show rt + "`") ds],
 };
 
@@ -1037,7 +1057,7 @@ let not_a_function t = match t {
     [:record, _] => true, [:map_of, _, _] => true,
     :integer => true, :float => true, :string => true, :bool => true,
     :char => true, :atom => true, :unit => true, :list => true, :array => true,
-    :map => true, :process => true, :error => true, :bigstr => true,
+    :map => true, :process => true, :error => true, :bigstr => true, :tensor => true,
     _ => false,
 };
 
