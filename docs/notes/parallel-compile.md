@@ -519,5 +519,38 @@ Then those, one at a time, on the same 1,600-module program, warm:
   overwrite, so it writes into empty tables counting from the arena's end
   now, laid over the arena's lists afterwards.
 
-`--time`, warm, 1,600 modules: 3.95 s became 2.8 s -- parse 0.7, resolve 0.8,
-lower 0.6, types 0.24, share 0.005, emit 0.3.
+- **Sorting** was `std.list`'s merge sort in Dream, and `sort_on` asked for
+  each key at every comparison. The `sort_keyed` builtin sorts an array by
+  keys forced once each, in `compare`'s order, stably; `sort` and `sort_on`
+  are it.
+- **The node and kid sections** were a function call and a `str_le` a
+  field, tens of thousands of times. `vm.node_section` and
+  `vm.index_section` write the same bytes, a section a call, and `emit`'s
+  first tests hold them to the Dream writers.
+
+Each native came with its Dream walk kept as the definition and a test
+between the two, and with the check that a compiler built either way compiles
+this repository and the 1,600-module program into the same bytes.
+
+Two things measured and not kept. Sharing only part of the resolution with
+the lowering and checking processes saved nothing a real build could see.
+Working each walk's key out in its own process, as lowering's is, saved
+nothing either: the 285 ms that spawning the walks takes is the walks
+themselves, already spread across the cores, not the keys. That attempt also
+found the trap again: a key's parts handed in lazily carried the unshared
+loader into all 1,600 processes, and the machine killed the build for memory.
+
+Old compiler on the old tree against new on the new, same VM, three
+interleaved runs, the least of each:
+
+| | no cache | warm |
+|---|---|---|
+| the compiler, before | 3.77 s | 2.23 s |
+| the compiler, after | 3.18 s | 1.30 s |
+| 1,600 modules, before | 5.39 s | 4.33 s |
+| 1,600 modules, after | 3.74 s | 2.34 s |
+
+What a warm build of 1,600 modules is now made of, by a timeline put on a real
+build: loading 0.7 s, declaring 0.18 s, reading the walks back 0.3 s, merging
+them 0.2 s, lowering 0.55 s, checking 0.2 s, writing 0.3 s. Reductions went from
+90M to 45M, and nothing left is more than a twentieth of them.
