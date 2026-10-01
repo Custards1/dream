@@ -489,3 +489,35 @@ work no unit holds: loading 1,600 files and reading their parses back (1.1 s),
 merging the parts (0.9 s), linking (0.9 s), sharing (0.7 s) and emitting
 (0.3 s), none of it dominated by one function. Making those per-module too is
 dynamic linking's question (docs/dynamic-linking.md), not the unit cache's.
+
+### The whole-program stages, taken down
+
+Then those, one at a time, on the same 1,600-module program, warm:
+
+- **Loading** was path arithmetic. `path.dr` found an extension and a
+  directory a character at a time (`last_index` hops between occurrences with
+  `str_find` now), and `canonical_name!` made every package's source absolute
+  again for every file it named -- three normalisations per package per file.
+  The loader carries the packages' roots, worked out once. 25.4M reductions
+  became 13.8M.
+- **Three loops over the parts read parts by index from lists** --
+  `link_head`, `link_parallel!`'s notes and `merge_parts` -- each a walk to
+  the part, so each loop quadratic in modules. Arrays.
+- **Every part's lowering key was worked out by the process that starts the
+  parts**, one after another before any began. Each part works out its own.
+- **Sharing the parts** is a whole-program walk no unit holds: rename each
+  part's constants, functions and invented globals, and keep each node once by
+  its record. In Dream it was a map insert and a `to_string` per node,
+  threaded through a state record. `vm.share_arenas` is the same walk in the
+  VM -- the Dream walk stays as `optimize_parts_by_hand`, and the compiler it
+  built and the compiler `vm.share_arenas` built compile this repository into
+  the same bytes. 650 ms became one that finishes while the checker is still
+  running.
+- **`patched` turned the shared arena back into tables** to fill in the
+  `comp` placeholders, and flattened it again: fifty thousand map writes for a
+  build with no `comp` at all. Settling writes nothing it does not append or
+  overwrite, so it writes into empty tables counting from the arena's end
+  now, laid over the arena's lists afterwards.
+
+`--time`, warm, 1,600 modules: 3.95 s became 2.8 s -- parse 0.7, resolve 0.8,
+lower 0.6, types 0.24, share 0.005, emit 0.3.

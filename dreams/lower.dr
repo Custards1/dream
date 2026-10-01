@@ -2062,12 +2062,22 @@ let share_parts_elsewhere! work =
 /// is lowered again into the shared image, which interns nothing new -- this
 /// lowering already did -- and the placeholder is overwritten, as
 /// `settle_comp!` does in the arena it settles.
+///
+/// The patching is done on empty tables that count from where the shared arena
+/// ends: settling a `comp` appends its value's nodes and overwrites one
+/// placeholder, and reads nothing already there. So what it wrote is laid over
+/// the arena's lists afterwards (`overlaid`) rather than the whole arena being
+/// turned into tables to be written and flattened back -- which was most of
+/// the time a warm build of a large program spent after sharing, and all of it
+/// for a build with no `comp` in it.
 let patched l img = {
     let p = prog l;
     let nodes = img.[:nodes else []];
     let kids = img.[:kids else []];
-    let tables = ((((((p.[:nodes => ir.fill_kids %{} 0 nodes]).[:node_count => list.length nodes])
-                    .[:kids => ir.fill_kids %{} 0 kids]).[:kid_count => list.length kids]))
+    let n_nodes = list.length nodes;
+    let n_kids = list.length kids;
+    let tables = ((((((p.[:nodes => %{}]).[:node_count => n_nodes])
+                    .[:kids => %{}]).[:kid_count => n_kids]))
                     .[:funcs => img.[:funcs else []]]);
     let placed = list.head (list.fold_strict (fn acc n -> {
         let [m, i] = acc;
@@ -2090,8 +2100,20 @@ let patched l img = {
             },
         }
     }) (set_prog tables l) (pending_comp l);
-    ir.finish (prog filled)
+    let q = prog filled;
+    ((ir.finish_rest q).[:nodes => overlaid nodes (ir.nodes q) n_nodes (ir.node_count q) (ir.leaf :nop)])
+        .[:kids => overlaid kids (ir.kids q) n_kids (ir.kid_count q) ir.no_node]
 };
+
+/// `xs`, the first `n` entries of an arena, with what a table wrote over them
+/// and after them, up to `count`: the arena `ir.finish` would have flattened
+/// from one table holding both.
+let overlaid xs written n count fill =
+    if len written == 0 { xs }
+    else {
+        list.append (list.map (fn ix -> written.[list.head ix else list.nth 1 ix]) (list.zip (list.range 0 n) xs))
+                    (list.map (fn i -> written.[i else fill]) (list.range n count))
+    };
 
 // --- running what was lowered in parts ----------------------------------------
 //

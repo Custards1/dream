@@ -3,6 +3,9 @@
 
 #include "io.hpp"
 
+#include <array>
+#include <unordered_map>
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -1222,6 +1225,7 @@ NativeResult vm_call_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_close_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_image_digest(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_wire_encode(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_share_arenas(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_wire_decode(Process& p, Value self, Value* args, uint32_t n);
 }  // namespace
 
@@ -1251,6 +1255,8 @@ ModuleDef make_vm_module() {
                          // `std.wire`'s format, done here; see "The wire format, natively".
                          {"wire_encode", 1, 0b0, vm_wire_encode, 0, true},
                          {"wire_decode", 1, 0b1, vm_wire_decode},
+                         // `opt.optimize_parts`'s walk; see "Sharing a program's parts".
+                         {"share_arenas", 1, 0b0, vm_share_arenas, 0, true},
                          // measuring
                          {"now_ns!", 1, 0b1, vm_now_ns},
                          {"wall_ms!", 1, 0b1, vm_wall_ms},
@@ -2682,6 +2688,289 @@ NativeResult vm_image_digest(Process& p, Value, Value*, uint32_t) {
         known[&img] = hex;
     }
     return NativeResult::ok(p.heap().make_string(hex.data(), uint32_t(hex.size())));
+}
+
+// ---------------------------------------------------------------------------
+// Sharing a program's parts into one arena
+// ---------------------------------------------------------------------------
+//
+// `opt.optimize_parts` in the compiler, done here: the last whole-program walk
+// of a build, which hash-conses every part's arena into one. The parts arrive
+// already shared within themselves, so all this does is rename -- each part's
+// constants into the program's pools, its functions and invented globals past
+// the parts before it -- and keep each node once by its whole record. Written
+// in Dream it was a map insert and a `to_string` per node, threaded through a
+// state record, and the largest stage left in a warm build of a big program.
+//
+// It is the Dream walk, step for step, and must stay so: the image it writes
+// is compared byte for byte with the one the Dream walk writes (`opt`'s tests
+// hold the two to each other on parts with every kind of node in them). The
+// opcode tables are the compiler's, handed in, so there is no second copy of
+// which operand is an edge.
+//
+// Everything is forced before the walk starts, and nothing is forced during
+// it, so the values read here stay where they are: allocation never collects.
+
+struct ShareArenas {
+    Process& p;
+    int64_t part_base = 0;
+    int64_t invented_from = 0;
+    Value filled = NIL;
+    Value none = 0, nop = 0, field = 0, unit = 0, global = 0, make_closure = 0, make_thunk = 0;
+    Value const_int = 0, const_float = 0, const_str = 0, const_atom = 0;
+    std::unordered_map<Value, std::vector<int>> edges;
+    std::unordered_map<Value, std::array<int64_t, 3>> runs;
+
+    struct Part {
+        Value nodes = NIL, kids = NIL, remap = UNIT;
+        int64_t fo = 0, go = 0;
+        Value ints = NIL, floats = NIL, strs = NIL, atoms = NIL;
+    };
+    std::vector<Part> parts;
+    size_t cur = 0;
+
+    using Node = std::array<Value, 5>;
+    std::vector<Node> out;
+    std::vector<Value> kids;
+    std::unordered_map<std::string, int64_t> seen;
+    std::unordered_map<std::string, int64_t> runs_seen;
+    std::unordered_map<int64_t, Value> memo;
+    const char* failed = nullptr;
+
+    explicit ShareArenas(Process& proc) : p(proc) {}
+
+    Value atom(const char* name) { return make_atom(p.runtime().intern_atom(name)); }
+
+    /// `c.[i else d]` for a list, an array or a map.
+    Value at(Value c, int64_t i, Value d) {
+        c = resolve(c);
+        if (i < 0) return d;
+        if (is_obj(c, ObjType::Array)) {
+            auto* a = static_cast<ArrayObj*>(as_obj(c));
+            return uint64_t(i) < a->len ? resolve(a->items()[i]) : d;
+        }
+        if (is_obj(c, ObjType::Map)) {
+            Value found;
+            return map_lookup(p, c, make_fixnum(i), &found) ? resolve(found) : d;
+        }
+        for (Value cur = c; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+            if (i-- == 0) return resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        }
+        return d;
+    }
+    Value field_of(Value m, Value key, Value d) {
+        Value found;
+        return is_obj(resolve(m), ObjType::Map) && map_lookup(p, resolve(m), key, &found) ? resolve(found) : d;
+    }
+    static int64_t num(Value v) { return fixnum_value(resolve(v)); }
+
+    bool is_node(Value v) const { return resolve(v) != none; }
+
+    Node node_at(int64_t i) {
+        Value n = at(parts[cur].nodes, i, UNIT);
+        if (n == UNIT) return Node{nop, make_fixnum(0), none, none, none};
+        Node out{};
+        for (int k = 0; k < 5; ++k) out[k] = at(n, k, none);
+        return out;
+    }
+    Value kid_at(int64_t i) { return at(parts[cur].kids, i, none); }
+
+    void key_of(const Value* vs, size_t n, std::string* key) {
+        key->clear();
+        for (size_t i = 0; i < n; ++i) {
+            Value v = resolve(vs[i]);
+            if (is_ptr(v)) {
+                std::string text;
+                if (!stringify(p, v, &text)) failed = "a node holds something that cannot be written";
+                key->push_back('\xff');
+                key->append(text);
+                key->push_back('\0');
+            } else {
+                key->append(reinterpret_cast<const char*>(&v), sizeof v);
+            }
+        }
+    }
+
+    Value keep(const Node& n) {
+        if (n[0] != field) {
+            std::string key;
+            key_of(n.data(), 5, &key);
+            auto it = seen.find(key);
+            if (it != seen.end()) return make_fixnum(it->second);
+            seen.emplace(std::move(key), int64_t(out.size()));
+        }
+        out.push_back(n);
+        return make_fixnum(int64_t(out.size()) - 1);
+    }
+
+    Value keep_run(const std::vector<Value>& run) {
+        std::string key;
+        key_of(run.data(), run.size(), &key);
+        auto it = runs_seen.find(key);
+        if (it != runs_seen.end()) return make_fixnum(it->second);
+        int64_t offset = int64_t(kids.size());
+        runs_seen.emplace(std::move(key), offset);
+        kids.insert(kids.end(), run.begin(), run.end());
+        return make_fixnum(offset);
+    }
+
+    Value remapped(Value table, Value i) {
+        Value v = at(table, num(i), 0);
+        if (v == 0) failed = "a constant is not in its part's pool";
+        return v;
+    }
+
+    Node remap_leaf(Node n) {
+        const Part& part = parts[cur];
+        if (resolve(part.remap) == UNIT) return n;
+        Value op = n[0];
+        if (op == make_closure || op == make_thunk) n[2] = make_fixnum(num(n[2]) + part.fo);
+        else if (op == unit) { if (is_node(n[2])) n[2] = make_fixnum(num(n[2]) + part.fo); }
+        else if (op == global) { if (num(n[2]) >= invented_from) n[2] = make_fixnum(num(n[2]) + part.go); }
+        else if (op == const_int) n[2] = remapped(part.ints, n[2]);
+        else if (op == const_float) n[2] = remapped(part.floats, n[2]);
+        else if (op == const_str) n[2] = remapped(part.strs, n[2]);
+        else if (op == const_atom) n[2] = remapped(part.atoms, n[2]);
+        return n;
+    }
+
+    Value rebuild(Value i) {
+        i = resolve(i);
+        if (!is_node(i) || failed) return i;
+        Node n = node_at(num(i));
+        int64_t key = num(i) + int64_t(cur) * part_base;
+        auto hit = memo.find(key);
+        if (hit != memo.end()) return hit->second;
+        bool leaf = !edges.count(n[0]) && !runs.count(n[0]);
+        Value got = leaf ? rebuild_leaf(remap_leaf(n)) : rebuild_node(n);
+        memo[key] = got;
+        return got;
+    }
+
+    Value rebuild_leaf(const Node& n) {
+        if (n[0] == unit && is_node(n[2])) {
+            Value value;
+            if (is_obj(resolve(filled), ObjType::Map) && map_lookup(p, resolve(filled), resolve(n[2]), &value)) {
+                size_t back = cur;
+                cur = 0;
+                Value got = rebuild(value);
+                cur = back;
+                return got;
+            }
+        }
+        return keep(n);
+    }
+
+    Value rebuild_node(Node n) {
+        const Part& part = parts[cur];
+        if (n[0] == field && resolve(part.remap) != UNIT) n[3] = remapped(part.strs, n[3]);
+        auto e = edges.find(n[0]);
+        if (e != edges.end()) {
+            for (int k : e->second) n[2 + k] = rebuild(n[2 + k]);
+        }
+        auto r = runs.find(n[0]);
+        if (r != runs.end()) {
+            auto [off_k, count_k, width] = r->second;
+            int64_t off = num(n[2 + off_k]);
+            int64_t many = num(n[2 + count_k]) * width;
+            std::vector<Value> run;
+            run.reserve(size_t(std::max<int64_t>(many, 0)));
+            for (int64_t j = 0; j < many; ++j) run.push_back(rebuild(kid_at(off + j)));
+            n[2 + off_k] = keep_run(run);
+        }
+        return keep(n);
+    }
+
+    Value place_captures(Value f) {
+        cur = 0;
+        int64_t off = num(field_of(f, atom("captures_off"), make_fixnum(0)));
+        int64_t many = num(field_of(f, atom("n_captures"), make_fixnum(0)));
+        if (many == 0) return make_fixnum(0);
+        std::vector<Value> run;
+        for (int64_t j = 0; j < many; ++j) run.push_back(kid_at(off + j));
+        return keep_run(run);
+    }
+};
+
+/// `[funcs, parts, invented_from, filled, edges, runs, part_base]` to
+/// `[nodes, kids, funcs]`: see "Sharing a program's parts into one arena".
+NativeResult vm_share_arenas(Process& p, Value, Value* args, uint32_t) {
+    Value forced;
+    {
+        VouchesForGc vouch(p);
+        if (!force_deep(p, args[0], &forced)) return NativeResult::raise(p.result);
+    }
+    ShareArenas s(p);
+    Value in[7];
+    for (int i = 0; i < 7; ++i) in[i] = s.at(forced, i, UNIT);
+    s.invented_from = ShareArenas::num(in[2]);
+    s.filled = in[3];
+    s.part_base = ShareArenas::num(in[6]);
+    s.none = s.atom("none"); s.nop = s.atom("nop"); s.field = s.atom("field"); s.unit = s.atom("unit");
+    s.global = s.atom("global"); s.make_closure = s.atom("make_closure"); s.make_thunk = s.atom("make_thunk");
+    s.const_int = s.atom("const_int"); s.const_float = s.atom("const_float");
+    s.const_str = s.atom("const_str"); s.const_atom = s.atom("const_atom");
+    std::vector<std::pair<Value, Value>> table;
+    map_collect(resolve(in[4]), table);
+    for (auto& [op, ks] : table) {
+        std::vector<int>& into = s.edges[resolve(op)];
+        for (int k = 0; s.at(ks, k, UNIT) != UNIT; ++k) into.push_back(int(ShareArenas::num(s.at(ks, k, UNIT))));
+    }
+    table.clear();
+    map_collect(resolve(in[5]), table);
+    for (auto& [op, spec] : table) {
+        s.runs[resolve(op)] = {ShareArenas::num(s.at(spec, 0, UNIT)), ShareArenas::num(s.at(spec, 1, UNIT)),
+                               ShareArenas::num(s.at(spec, 2, UNIT))};
+    }
+    Value nodes_k = s.atom("nodes"), kids_k = s.atom("kids"), remap_k = s.atom("remap"), fo_k = s.atom("fo"), go_k = s.atom("go");
+    for (int64_t k = 0;; ++k) {
+        Value part = s.at(in[1], k, UNIT);
+        if (part == UNIT) break;
+        ShareArenas::Part pv;
+        pv.nodes = s.field_of(part, nodes_k, NIL);
+        pv.kids = s.field_of(part, kids_k, NIL);
+        pv.remap = s.field_of(part, remap_k, UNIT);
+        pv.fo = ShareArenas::num(s.field_of(part, fo_k, make_fixnum(0)));
+        pv.go = ShareArenas::num(s.field_of(part, go_k, make_fixnum(0)));
+        if (pv.remap != UNIT) {
+            pv.ints = s.field_of(pv.remap, s.atom("ints"), NIL);
+            pv.floats = s.field_of(pv.remap, s.atom("floats"), NIL);
+            pv.strs = s.field_of(pv.remap, s.atom("strs"), NIL);
+            pv.atoms = s.field_of(pv.remap, s.atom("atoms"), NIL);
+        }
+        s.parts.push_back(pv);
+    }
+    if (s.parts.empty()) s.parts.push_back(ShareArenas::Part{});
+    Value body_k = s.atom("body"), caps_k = s.atom("captures_off");
+    std::vector<Value> funcs;
+    for (Value cur = resolve(in[0]); is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        Value f = resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        Value body = s.field_of(f, body_k, s.none);
+        Value got = body;
+        if (s.is_node(body)) {
+            s.cur = size_t(ShareArenas::num(body) / s.part_base);
+            if (s.cur >= s.parts.size()) return type_fail(p, "share_arenas: a body names a part that is not there");
+            got = s.rebuild(make_fixnum(ShareArenas::num(body) % s.part_base));
+        }
+        Value caps = s.place_captures(f);
+        if (s.failed) return type_fail(p, s.failed);
+        funcs.push_back(map_insert(p, map_insert(p, f, body_k, got), caps_k, caps));
+    }
+    if (s.failed) return type_fail(p, s.failed);
+    Value nodes = NIL;
+    for (size_t i = s.out.size(); i-- > 0;) {
+        Value rec = NIL;
+        for (int k = 5; k-- > 0;) rec = p.heap().make_cons(s.out[i][k], rec);
+        nodes = p.heap().make_cons(rec, nodes);
+    }
+    Value kids = NIL;
+    for (size_t i = s.kids.size(); i-- > 0;) kids = p.heap().make_cons(s.kids[i], kids);
+    Value fl = NIL;
+    for (size_t i = funcs.size(); i-- > 0;) fl = p.heap().make_cons(funcs[i], fl);
+    Value result = p.heap().make_cons(fl, NIL);
+    result = p.heap().make_cons(kids, result);
+    result = p.heap().make_cons(nodes, result);
+    return NativeResult::ok(result);
 }
 
 NativeResult vm_wire_decode(Process& p, Value, Value* args, uint32_t) {

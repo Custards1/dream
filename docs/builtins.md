@@ -408,6 +408,7 @@ These report figures for the **calling** process.
 | `share!` | `value → value` | The same value, forced all the way down and moved into the runtime's shared area. From then on a `spawn!`, `send!` or `join!` carrying it copies a pointer rather than the value. |
 | `wire_encode` | `value → string` | The value, forced all the way down, in `std.wire`'s format, byte for byte what `std.wire`'s Dream writer produces, and thousands of times faster: `std.wire.encode` is this. A map is written in the order `compare` puts its keys; what is not data is written as its `to_string`. |
 | `wire_decode` | `string → [:ok, value] \| [:error, string]` | One `std.wire` message, read whole. Never raises. Trailing bytes, a truncated field, an integer past 63 bits and an atom this program does not have are all `[:error, why]` -- an atom is looked up, never made. `std.wire.decode` is this. |
+| `share_arenas` | `[funcs, parts, invented_from, filled, edges, runs, part_base] → [nodes, kids, funcs]` | The compiler's `opt.optimize_parts`: a program's parts, each an arena already shared within itself, hash-consed into one -- constants renamed through each part's pools, functions and invented globals moved past the parts before, a settled `comp` placeholder read from part 0. Step for step the walk `opt.optimize_parts_by_hand` writes in Dream, which `opt`'s tests hold it to; the opcode tables are the compiler's, handed in. |
 | `shared_bytes!` | `unit → integer` | Bytes in the runtime's shared area. |
 
 Processes share nothing: a value that crosses between two is copied, which is
