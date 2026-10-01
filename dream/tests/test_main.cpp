@@ -752,6 +752,33 @@ static void test_cross_heap_copy() {
     CHECK_EQ(tc->data()[5], 7.5);
 }
 
+/// A dead big object's block is kept and handed to the next big object that
+/// fits, and what nothing reuses goes back to the system a collection later.
+static void test_big_block_pool() {
+    std::printf("big blocks are pooled\n");
+    Heap h(8192);
+    VectorRoots roots;
+    const uint32_t dims[1] = {1u << 20};  // 8 MB, far past the largest class
+    Obj* first = as_obj(h.make_tensor(1, dims, dims[0]));
+    h.collect(roots);
+    CHECK(h.bytes_pooled() >= size_t(dims[0]) * sizeof(double));
+    // Unreached, so swept and pooled: the next one of the same size is it.
+    Obj* second = as_obj(h.make_tensor(1, dims, dims[0]));
+    CHECK_EQ(second, first);
+    CHECK_EQ(h.bytes_pooled(), size_t(0));
+    // A little larger still fits the same block.
+    roots.values = {};
+    h.collect(roots);
+    const uint32_t more[1] = {dims[0] + 1000};
+    CHECK_EQ(as_obj(h.make_tensor(1, more, more[0])), first);
+    // Nothing reuses what this collection retires, so the next one gives it
+    // back.
+    h.collect(roots);
+    CHECK(h.bytes_pooled() > 0);
+    h.collect(roots);
+    CHECK_EQ(h.bytes_pooled(), size_t(0));
+}
+
 /// The matrix product against the textbook triple loop, at sizes chosen to
 /// land on every edge of the blocking: tiles of 6 x 8 cut short in each
 /// direction, a K past one 256-wide panel, the one-row and one-column shapes
@@ -1308,6 +1335,7 @@ int main() {
     test_shared_area();
     test_heap_verifier_follows_every_object_kind();
     test_cross_heap_copy();
+    test_big_block_pool();
     test_tensor_kernels();
     test_image_rejects_bad_input();
     test_integer_hints();

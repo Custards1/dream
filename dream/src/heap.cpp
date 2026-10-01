@@ -188,6 +188,30 @@ void Heap::free_block(Block* b) {
     std::free(b);
 }
 
+void Heap::retire_big(Block* b) {
+    big_pool_.push_back(PooledBlock{b->data, b->size, sweeps_});
+    big_pool_bytes_ += b->size;
+    std::free(b);
+}
+
+void Heap::trim_big_pool() {
+    const size_t cap = std::max(kBigPoolFloor, live_after_gc_);
+    size_t keep = 0;
+    for (size_t i = 0; i < big_pool_.size(); ++i) {
+        PooledBlock& pb = big_pool_[i];
+        // Oldest first, so what goes over the cap is what has waited longest.
+        const bool stale = pb.sweep < sweeps_;
+        if (stale || big_pool_bytes_ > cap) {
+            big_pool_bytes_ -= pb.size;
+            block_bytes_ -= pb.size;
+            std::free(pb.data);
+        } else {
+            big_pool_[keep++] = pb;
+        }
+    }
+    big_pool_.resize(keep);
+}
+
 void Heap::free_blocks(Block* b) {
     while (b) {
         Block* next = b->next;
@@ -242,11 +266,46 @@ Obj* Heap::carve(size_t sz) {
     return o;
 }
 
+namespace {
+/// The size a big block is made in: `sz` rounded up to one of eight steps
+/// per doubling, at most 12.5% over what was asked for. Classes rather than
+/// exact sizes so that a pooled block fits the next object of nearly the same
+/// size, and only eight per doubling so that it is never much too big.
+size_t big_size_class(size_t sz) {
+    size_t top = size_t(1) << (63 - __builtin_clzll(uint64_t(sz)));
+    size_t step = top >= 8 ? top / 8 : 1;
+    return (sz + step - 1) / step * step;
+}
+}  // namespace
+
 Obj* Heap::carve_big(size_t sz) {
     // Anything past the top class gets a block to itself: a run of even a few
     // percent slack is one large object's worth of waste, and big objects are
     // rare enough that dedicating a block never fragments anything smaller.
-    Block* b = new_block(sz);
+    // A pooled block of the same class is taken first; see `big_pool_`.
+    const size_t cls = big_size_class(sz);
+    Block* b = nullptr;
+    // Best fit among the pooled blocks no more than half as large again as
+    // the class: a loop's sizes vary, and an exact match missed whenever they
+    // did -- the pool then held memory the program could not use while it
+    // asked the system for more.
+    size_t best = big_pool_.size();
+    for (size_t i = 0; i < big_pool_.size(); ++i) {
+        const size_t have = big_pool_[i].size;
+        if (have >= cls && have <= cls + cls / 2 &&
+            (best == big_pool_.size() || have < big_pool_[best].size))
+            best = i;
+    }
+    if (best != big_pool_.size()) {
+        b = static_cast<Block*>(std::malloc(sizeof(Block)));
+        if (!b) throw std::bad_alloc();
+        b->data = big_pool_[best].data;
+        b->size = big_pool_[best].size;
+        b->dead = false;
+        big_pool_bytes_ -= b->size;
+        big_pool_.erase(big_pool_.begin() + ptrdiff_t(best));
+    }
+    if (!b) b = new_block(cls);
     b->big = true;
     b->used = sz;
     b->next = blocks_;
@@ -827,6 +886,7 @@ Heap::~Heap() {
     for (Obj* o : external_) release_external(o);
     free_blocks(blocks_);
     for (Block* b : nursery_) free_block(b);
+    for (PooledBlock& pb : big_pool_) std::free(pb.data);
 }
 
 /// How much work makes the handshake worth it. Waking a pool of threads and
@@ -1839,6 +1899,7 @@ void Heap::note_live_by_type(size_t live, const uint64_t* by_type) {
 }
 
 void Heap::sweep() {
+    ++sweeps_;
     Obj* head[kHeapClassCount] = {};
     Obj* tail[kHeapClassCount] = {};
     size_t live = 0;
@@ -1851,7 +1912,7 @@ void Heap::sweep() {
             if (prev) prev->next = next;
             else blocks_ = next;
             if (carve_block_ == b) carve_block_ = nullptr;
-            free_block(b);
+            retire_big(b);
         } else {
             prev = b;
         }
@@ -1866,6 +1927,7 @@ void Heap::sweep() {
     note_live_by_type(live, by_type);
     last_kinds_ = gc_trace() ? live_kinds_line(by_type, live) : std::string();
     allocated_ = live;
+    trim_big_pool();
 }
 
 bool Heap::sweep_in_parallel() {
@@ -1883,6 +1945,7 @@ bool Heap::sweep_in_parallel() {
     for (Block* b = blocks_; b; b = b->next) round.blocks.push_back(b);
     round_ = &round;
 
+    ++sweeps_;
     bool ran = pool.run(pool.capacity(), [&](unsigned index, unsigned) {
         GcCtx& c = round.ctxs[index];
         for (;;) {
@@ -1906,7 +1969,7 @@ bool Heap::sweep_in_parallel() {
     Block* tail = nullptr;
     for (Block* b : round.blocks) {
         if (b->dead) {
-            free_block(b);
+            retire_big(b);
             continue;
         }
         b->next = nullptr;
@@ -1923,6 +1986,7 @@ bool Heap::sweep_in_parallel() {
     note_live_by_type(live, by_type);
     last_kinds_ = gc_trace() ? live_kinds_line(by_type, live) : std::string();
     allocated_ = live;
+    trim_big_pool();
     ++parallel_collections_;
     return true;
 }

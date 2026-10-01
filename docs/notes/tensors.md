@@ -365,15 +365,55 @@ threads), the one-row and one-column shapes, a product used twice, two
 products, a product too short for the answer, reshape and reduction.
 `tensor_gpu.dr` checks the generated product kernels against the host.
 
-### Measuring a fresh tensor
+### Measuring a fresh tensor, and the pool for large blocks
 
-One trap seen while measuring this. The first result written into freshly
-mapped memory pays its page faults: about 40 ms for 32 MB here, against
-8–10 ms once a major collection has freed earlier blocks for reuse. Whether a
-benchmark's runs start on fresh or reused memory decides which of the two it
-reports, every run of a process alike. Warm up, and compare processes in the
-same state. Large tensors are born in old space and freed only by a major; a
-pool for them would remove the faults, and is not built.
+A large object has a block of its own. When it died, the sweep handed the
+block straight back with `free`, and glibc serves anything this large with
+`mmap` and returns it with `munmap`. Every new 32 MB tensor was therefore
+fresh pages, and its first write paid 8192 page faults: about 40 ms against
+8 ms of arithmetic. Whether a run landed on fresh or reused memory decided
+which number it reported. The same benchmark gave 8 ms in one process and
+50 ms in the next, every run of a process alike.
+
+**The pool** (`Heap::big_pool_`) keeps a dead big block's memory, already
+faulted in, for the next big object:
+
+- Blocks are made in size classes, eight per doubling, so a block is never
+  more than 12.5% larger than it was asked to be.
+- A new big object takes the *best fit* among pooled blocks no more than half
+  as large again as its class.
+- What one sweep retires and nothing reuses before the next sweep is handed
+  back then. The pool never holds more than the larger of 64 MB and the live
+  heap.
+- Pooled bytes stay in the heap's held total, since they are held from the
+  system.
+
+Measured, interleaved, the same binary with and without the pool:
+
+| | without | with |
+|---|---|---|
+| a 32 MB chain, six times in a process (ms) | 55 11 10 11 10 18 | 51 9 9 11 9 14 |
+| 300 tensors of five sizes, 8–40 MB, none kept | 2.77–2.99 s | 2.23–2.90 s |
+| the same loop's peak memory | 382 MB | 358 MB |
+
+Two versions were measured and not kept:
+
+- **Exact size classes.** A block went only to an object of its own class.
+  On the loop of five sizes this was 1–15% *slower* than no pool at all, run
+  after run. glibc's own heap already reuses freed memory for any size up to
+  its mmap threshold (32 MB once it has adapted), by splitting and
+  coalescing. An exact-class pool missed whenever sizes varied, and took
+  fresh memory while it held the old.
+- **Huge pages.** Big blocks of 2 MB or more were allocated 2 MB-aligned and
+  marked `MADV_HUGEPAGE`, to make a first touch one fault per 2 MB instead of
+  one per 4 KB. Most runs improved slightly (5–7 ms steady). One stalled
+  instead: 376 ms for the first write and about 65 ms for every one after,
+  which is the kernel compacting memory synchronously on fault under the
+  `madvise` defrag setting. A tenfold worst case is not worth a few
+  milliseconds.
+
+The first touch of memory the process has never had is still paid once: the
+first 32 MB tensor costs about 45 ms. Warm up before measuring.
 
 ### What fusion does not do yet
 

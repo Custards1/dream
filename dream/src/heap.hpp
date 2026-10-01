@@ -328,6 +328,8 @@ public:
     /// free lists, and the blocks a sweep emptied but cannot hand back because
     /// something else in them is still alive.
     size_t bytes_peak_held() const { return peak_block_bytes_; }
+    /// Bytes of dead big blocks kept for reuse (`big_pool_`).
+    size_t bytes_pooled() const { return big_pool_bytes_; }
     /// What was *allocated* at the moment the heap held the most -- objects
     /// that existed, live or merely not yet proven dead. Reported beside the
     /// held figure because the gap between the two is the collector's own
@@ -437,6 +439,12 @@ private:
     Obj* carve(size_t sz);
     /// An entire block dedicated to one large object.
     Obj* carve_big(size_t sz);
+    /// A dead big object's block, kept for the next big object of its size
+    /// class rather than handed back to the system. See `big_pool_`.
+    void retire_big(Block* b);
+    /// After a sweep: hand back what the last sweep retired and nothing has
+    /// reused since, and anything past the pool's cap.
+    void trim_big_pool();
     /// Bump-allocate `sz` bytes from the nursery blocks.
     Obj* alloc_nursery(uint32_t sz);
     /// Add a block to the nursery and allocate from it. The cold half of
@@ -573,6 +581,33 @@ private:
     size_t peak_live_ = 0;
     /// Bytes currently malloc'd for blocks, and the most there have ever been.
     size_t block_bytes_ = 0;
+    /// Big blocks whose objects died, kept to be reused.
+    ///
+    /// A large object -- a tensor of a few million numbers -- has a block to
+    /// itself, and handing that block back to `free` when the object dies
+    /// returns it to the system: glibc serves anything this large with `mmap`
+    /// and gives it back with `munmap`. The next one is then fresh pages, and
+    /// the first write to each page faults. A loop that makes a 32 MB tensor
+    /// per iteration measured 40 ms an iteration in faults against 8 ms for the
+    /// work, whenever it was not lucky enough to land on reused memory.
+    ///
+    /// So a dead big block keeps its memory, filed by size class
+    /// (`big_size_class`, eight classes per doubling, so a loop's tensors of
+    /// one shape always match), and the next big object of that class takes
+    /// the most recently retired one, whose pages are warmest. What one sweep
+    /// retires and the program does not reuse before the next is handed back
+    /// then, and the pool never holds more than the larger of
+    /// `kBigPoolFloor` and the live heap. Pooled bytes still count in
+    /// `block_bytes_`: they are held from the system, which is what that says.
+    struct PooledBlock {
+        uint8_t* data;
+        size_t size;
+        uint64_t sweep;
+    };
+    std::vector<PooledBlock> big_pool_;
+    size_t big_pool_bytes_ = 0;
+    uint64_t sweeps_ = 0;
+    static constexpr size_t kBigPoolFloor = size_t(64) << 20;
     /// Bytes handed out, by object kind. Where a program's garbage actually
     /// comes from -- a lazy language's answer is usually "thunks and frames",
     /// and knowing the share is what says whether a strictness analysis would
