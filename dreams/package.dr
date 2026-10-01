@@ -110,13 +110,24 @@ let is_noise dir = {
 let module_name base file =
     match path.relative_to base (path.drop_extension file) {
         () => (),
-        segs =>
-            if list.is_empty segs { () }
-            else if list.last segs == "mod" && list.length segs > 1 {
-                str.join_str "." (list.take (list.length segs - 1) segs)
-            }
-            else { str.join_str "." segs },
+        segs => dotted_inside segs,
     };
+
+/// The same, for a file and a directory already taken apart into the segments
+/// of their normal absolute forms: what the loader asks of every file it
+/// reads, against every package, with the packages' halves worked out once.
+let module_name_in : [:string] -> [:string] -> :string | :unit;
+let module_name_in base_segs file_segs = match path.strip_prefix_segs base_segs file_segs {
+    () => (),
+    segs => dotted_inside segs,
+};
+
+let dotted_inside segs =
+    if list.is_empty segs { () }
+    else if list.last segs == "mod" && list.length segs > 1 {
+        str.join_str "." (list.take (list.length segs - 1) segs)
+    }
+    else { str.join_str "." segs };
 
 let rec collect_modules! base dir acc =
     list.fold (fn found entry ->

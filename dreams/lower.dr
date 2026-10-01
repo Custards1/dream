@@ -1910,9 +1910,25 @@ let lower_part r numbered = {
 /// Its own function so that the suspension `spawn!` copies holds the
 /// resolution and the slice and nothing else; the part comes back shared, so
 /// joining it is a pointer too.
-/// The cache and the key are strict: see `scope.walk_elsewhere!` for what an
-/// unforced key carried into every part's process.
-let part_elsewhere! !cache !k r slice = spawn! $( vm.share! (lower_unit! cache k r slice) );
+/// The cache is strict: see `scope.walk_elsewhere!` for what an unforced
+/// argument carried into every part's process.
+let part_elsewhere! !cache r slice = spawn! $( vm.share! (lower_unit! cache (lowering_key cache r) r slice) );
+
+/// What a part is lowered against besides its own walk: the wrappers it
+/// reaches, as a key. Only those -- a literal in a wrapper keeps its span,
+/// which a call site lowered from it carries into the image, so a wrapper
+/// moving does change its callers; keyed on the whole table, one character
+/// typed anywhere above a wrapper re-lowered every part in the program.
+/// Worked out in the part's own process: worked out in the one that starts
+/// them, it was every part's key one after another before any part began.
+let lowering_key : unit.Cache -> scope.Resolution -> :string | :unit;
+let lowering_key cache r = match cache {
+    () => (),
+    _ => match scope.unit_key r {
+        () => (),
+        walk => unit.key ["lower", walk, unit.digest (reached_wrappers (scope.wrappers r) r)],
+    },
+};
 
 /// Lower one part, or read it back: see "a part as a unit" in `scope`. A
 /// part's lowering is a function of its walk -- whose key covers the declared
@@ -1960,19 +1976,7 @@ let link_parallel! ld r cache = {
     // Dealt before any process starts: a slice left lazy would cross into its
     // child as a suspension holding every body, and be dealt there.
     strict! work
-    // What a part is lowered against besides its own walk: the wrappers it
-    // reaches, as a key. Only those -- a literal in a wrapper keeps its span,
-    // which a call site lowered from it carries into the image, so a wrapper
-    // moving does change its callers; keyed on the whole table, one character
-    // typed anywhere above a wrapper re-lowered every part in the program.
-    let all_wrappers = scope.wrappers rs;
-    let key_of w = match [cache, scope.unit_key (list.head w)] {
-        [(), _] => (),
-        [_, ()] => (),
-        [_, walk] => unit.key ["lower", walk, unit.digest (reached_wrappers all_wrappers (list.head w))],
-    };
-    let running = strict! (list.map (fn w -> part_elsewhere! (if key_of w == () { () } else { cache }) (key_of w)
-                                                             (list.head w) (list.nth 1 w)) work);
+    let running = strict! (list.map (fn w -> part_elsewhere! cache (list.head w) (list.nth 1 w)) work);
     let parts = strict! (list.map (fn pr -> join! pr) running);
     let offsets = list.map (fn w -> scope.part_offsets (list.head w)) work;
     let head = link_head rs offsets parts;
@@ -1981,15 +1985,17 @@ let link_parallel! ld r cache = {
     let sharing = share_parts_elsewhere! (vm.share! (for_sharing rs head));
     // What each body said, back in the order of the bodies, with a waiting
     // expression's function moved as the part's functions were.
+    let oa = array_of_list offsets;
+    let pa = array_of_list parts;
     let notes = list.sort_on (fn note -> list.head note) (list.concat (list.map (fn k -> {
-        let fo = list.head (offsets.[k]);
+        let fo = list.head (oa.[k]);
         list.map (fn note -> {
             let [position, said, waiting] = note;
             [position, said, list.map (fn one -> {
                 let [_, fi, src, span] = one;
                 [ir.no_node, fi + fo, src, span]
             }) waiting]
-        }) ((parts.[k]).[:notes])
+        }) ((pa.[k]).[:notes])
     }) (list.range 0 (list.length parts))));
     let said = list.concat (list.map (fn note -> list.nth 1 note) notes);
     let waiting = list.concat (list.map (fn note -> list.nth 2 note) notes);
@@ -2261,6 +2267,11 @@ let intern_atom_at strs si p = {
 /// against where its body lies in the parts, and the parts as
 /// `opt.optimize_parts` reads them: `%{ :prog, :base, :arenas }`.
 let link_head r offsets parts = {
+    // Arrays, since each is read by a part's index in a loop over the parts:
+    // a list read that way is a walk to the part, every time, and the loop
+    // quadratic in the number of modules.
+    let pa = array_of_list parts;
+    let oa = array_of_list offsets;
     // The constant pools, part by part, and each part's table from its own
     // indices to the program's.
     let pooled = list.fold (fn acc part -> {
@@ -2272,16 +2283,16 @@ let link_head r offsets parts = {
         [p4, list_cons %{ :ints => ints, :floats => floats, :strs => strs, :atoms => atoms }
                        (list.nth 1 acc)]
     }) [ir.program, []] parts;
-    let remaps = list.reverse (list.nth 1 pooled);
+    let ra = array_of_list (list.reverse (list.nth 1 pooled));
     // Every function's body, as the part it is in and its node there -- part
     // k is `k + 1` here, part 0 being this lowering's own arena -- and under
     // the function's index in the whole program: a part numbers its functions
     // from where the declarations left off, and is moved past the parts before
     // it (see "resolving in parts" in `scope`).
     let bodies = list.fold (fn m k -> {
-        let fo = list.head (offsets.[k]);
+        let fo = list.head (oa.[k]);
         list.fold (fn m2 fb -> m2.[list.head fb + fo => ((k + 1) * opt.part_base + list.nth 1 fb)])
-                  m ((parts.[k]).[:bodies])
+                  m ((pa.[k]).[:bodies])
     }) %{} (list.range 0 (list.length parts));
     let base = set_res r (lowering r (list.head pooled) 0);
     let fs = link_funcs r bodies base;
@@ -2290,10 +2301,10 @@ let link_head r offsets parts = {
     let p = ((((prog (list.head is)).[:funcs => (list.nth 1 fs)]).[:globals => (list.nth 1 gs)]))
                 .[:imports => (list.nth 1 is)];
     let arenas = array_of_list (list_cons %{ :nodes => ir.nodes p, :kids => ir.kids p }
-        (list.map (fn k -> %{ :nodes => array_of_list ((parts.[k]).[:nodes]),
-                              :kids => array_of_list ((parts.[k]).[:kids]),
-                              :remap => remaps.[k],
-                              :fo => list.head (offsets.[k]), :go => list.nth 1 (offsets.[k]) })
+        (list.map (fn k -> %{ :nodes => array_of_list ((pa.[k]).[:nodes]),
+                              :kids => array_of_list ((pa.[k]).[:kids]),
+                              :remap => ra.[k],
+                              :fo => list.head (oa.[k]), :go => list.nth 1 (oa.[k]) })
                   (list.range 0 (list.length parts))));
     %{ :prog => p, :base => base, :arenas => arenas }
 };

@@ -74,11 +74,7 @@ let of_segments absolute segs = {
 let dirname original = {
     let p = slashes original;
     let anchor = root p;
-    let rec last_slash i best =
-        if i >= str.byte_length p { best }
-        else if str.slice i 1 p == separator { last_slash (i + 1) i }
-        else { last_slash (i + 1) best };
-    let at = last_slash 0 (0 - 1);
+    let at = last_index separator p 0 (0 - 1);
     match at {
         _ if at < 0 => ".",
         _ if at < str.byte_length anchor => anchor,
@@ -120,18 +116,24 @@ let rec join_all base parts =
 // The dot has to be in the last segment to count: `../lib` has no extension,
 // and treating `.` and `..` as one is how a path walk loses a directory.
 
-let rec last_dot p i best =
-    if i >= str.byte_length p { best }
-    else if str.slice i 1 p == separator { last_dot p (i + 1) (0 - 1) }
-    else if str.slice i 1 p == "." { last_dot p (i + 1) i }
-    else { last_dot p (i + 1) best };
+/// Where `needle` last occurs in `p` at or after `from`, or `-1`. It hops from
+/// one occurrence to the next with `str_find`, which the machine does, rather
+/// than reading a character at a time: loading a program asks this of every
+/// path it tries, and the character walk it replaces was a tenth of a warm
+/// build's loading.
+let last_index : :string -> :string -> :integer -> :integer -> :integer;
+let rec last_index needle p from best = match str_find p needle from {
+    at if at < 0 => best,
+    at => last_index needle p (at + 1) at,
+};
 
 /// The dot's offset, or `-1`. A leading dot names a hidden file rather than
-/// starting an extension, so `.gitignore` has none.
+/// starting an extension, so `.gitignore` has none, and a dot before the last
+/// separator is in a directory's name, not the file's.
 let dot_at original = {
     let p = slashes original;
-    let at = last_dot p 0 (0 - 1);
-    let base_at = str.byte_length p - str.byte_length (basename p);
+    let base_at = last_index separator p 0 (0 - 1) + 1;
+    let at = last_index "." p base_at (0 - 1);
     if at <= base_at { 0 - 1 } else { at }
 };
 

@@ -2222,11 +2222,14 @@ let merge_parts declared r0 base walked = {
         let [fo, go, out] = acc;
         [fo + func_count r - f0, go + next_global r - invent_base, list_cons [fo, g0 - invent_base + go] out]
     }) [0, 0, []] walked;
-    let offsets = list.reverse (list.nth 2 counted);
-    let told = list.map (fn k -> (walked.[k]).[:part_offsets => offsets.[k]])
-                        (list.range 0 (list.length walked));
+    // Arrays where a part is read by its index in a loop over the parts, as
+    // in `lower.link_head`: read from a list, each is a walk to the part.
+    let offsets = array_of_list (list.reverse (list.nth 2 counted));
+    let told = list.map (fn kr -> (list.nth 1 kr).[:part_offsets => offsets.[list.head kr]])
+                        (list.zip (list.range 0 (list.length walked)) walked);
+    let ta = array_of_list told;
     let funcs = list.fold (fn m k -> {
-        let r = told.[k];
+        let r = ta.[k];
         let fo = list.head (offsets.[k]);
         list.fold (fn m2 i -> m2.[i + fo => func_at r i]) m (list.range f0 (func_count r))
     }) (func_map base) (list.range 0 (list.length told));
@@ -2236,14 +2239,14 @@ let merge_parts declared r0 base walked = {
     };
     let placed = list.sort_on (fn pb -> list.head pb) (list.concat (list.map (fn k -> {
         let fo = list.head (offsets.[k]);
-        list.map (fn pb -> moved_body pb fo) (part_bodies (told.[k]))
+        list.map (fn pb -> moved_body pb fo) (part_bodies (ta.[k]))
     }) (list.range 0 (list.length told))));
     let candidates = list.sort_on (fn pc -> list.head pc) (list.concat (list.map (fn r ->
         list.zip (list.map (fn pb -> list.head pb) (part_bodies r)) (r.[:part_candidates else []])) told));
     let invented = list.concat (list.map (fn k -> {
         let [fo, go] = offsets.[k];
         list.map (fn g -> [list.nth 0 g + go, list.nth 1 g, list.nth 2 g, list.nth 3 g + fo])
-                 (fused (told.[k]))
+                 (fused (ta.[k]))
     }) (list.range 0 (list.length told)));
     let notes = list.sort_on (fn n -> list.head n) (list.concat (list.map (fn r -> r.[:part_notes else []]) told));
     let bs = list.map (fn pb -> list.nth 1 pb) placed;
