@@ -435,15 +435,20 @@ Options, all optional except as noted:
 | `:verify` | Client: check the server's certificate (default `true`). Server: require a client certificate and check it against `:ca` (default `false`). |
 | `:check_name` | Client: whether checking includes `:host` (default `true`). `false` checks the chain alone — libpq's `verify-ca`. |
 | `:ca` | PEM certificates to trust **instead of** the system's store. Exclusive rather than additional, so a program that names its roots trusts the same thing on every machine. |
+| `:crl` | PEM certificate revocation lists. A certificate one of them lists is refused as `:certificate_revoked`, on either side. |
 | `:identity` | This side's certificate, chain and key, as the bytes of a **PKCS#12** bundle — the one format every backend imports. Required for a server. |
 | `:password` | The PKCS#12 bundle's password. |
 | `:alpn` | Protocol names to offer (client) or accept (server), in preference order. |
 
-TLS 1.2 is the oldest version either side will speak. Revocation is not checked, by any backend. On Windows SChannel does its cryptography outside the process, so a PKCS#12 identity's key is imported into the user's key store for the life of the VM and deleted when it exits.
+TLS 1.2 is the oldest version either side will speak.
+
+**Revocation** is checked from what the handshake already has, never fetched: the lists given as `:crl`, and an OCSP response the server staples (OpenSSL's client asks for one; SChannel consults whatever Windows has cached, a staple included). A certificate one of them says is revoked is refused; a certificate nothing speaks for is accepted, because its status is unknown rather than bad — and because a download in the middle of a handshake would hold a worker for as long as a remote server took.
+
+On Windows SChannel does its cryptography outside the process, so a PKCS#12 identity's key is imported into the user's key store for the life of the VM and deleted when it exits. Each such key is also written down in `%LOCALAPPDATA%\dream\tls-keys`, and a VM that was killed before it could delete its keys has them deleted by the next VM to import an identity.
 
 ### Error atoms
 
-`:certificate_untrusted` · `:certificate_expired` · `:hostname_mismatch` · `:handshake_failed` · `:tls_config` (an unreadable `:ca` or `:identity`, a wrong password) · `:tls_error` · `:bad_argument` · `:wrong_kind` · `:io_closed`
+`:certificate_untrusted` · `:certificate_expired` · `:certificate_revoked` · `:hostname_mismatch` · `:handshake_failed` · `:tls_config` (an unreadable `:ca`, `:crl` or `:identity`, a wrong password) · `:tls_error` · `:bad_argument` · `:wrong_kind` · `:io_closed`
 
 ---
 

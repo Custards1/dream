@@ -142,6 +142,8 @@ let refusals! u = {
         [server_identity! (), %{ :host => "localhost" }, :certificate_untrusted],
         [server_identity! (), %{ :host => "example.com", :ca => fixture! "ca.pem" }, :hostname_mismatch],
         [%{ :identity => fixture! "expired.p12", :password => "dream" }, trusting! (), :certificate_expired],
+        [%{ :identity => fixture! "revoked.p12", :password => "dream" }, (trusting! ()).[:crl => fixture! "ca.crl"],
+         :certificate_revoked],
     ];
     test.eq! (list.map (fn c -> [list.nth 2 c, true]) cases)
              (strict! (list.map (fn [server_opts, client_opts, _] -> refused! server_opts client_opts) cases))
@@ -303,7 +305,7 @@ let main! = test.main_of! [
     ["std.tls", [
         test.case "a round trip, ALPN, and a clean end" $( round_trip! () ),
         test.case "a server named by its address" $( by_address! () ),
-        test.case "untrusted, unknown, misnamed and expired certificates" $( refusals! () ),
+        test.case "untrusted, unknown, misnamed, expired and revoked certificates" $( refusals! () ),
         test.case "verification turned off" $( unchecked! () ),
         test.case "the chain checked and not the name" $( chain_only! () ),
         test.case "mutual TLS" $( mutual! () ),

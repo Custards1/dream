@@ -1512,6 +1512,35 @@ static void test_tls_engines() {
         }
     }
 
+    // Revocation from a list: what it names is refused, what it does not is
+    // accepted, and without the list the revoked certificate's status is
+    // unknown and it goes through, as tls.hpp says it must on every backend.
+    {
+        tls::Config client = tls_client_config();
+        client.crl_pem = tls_fixtures::ca_crl();
+        tls::Config revoked = tls_server_config();
+        revoked.identity_p12 = tls_fixtures::revoked_p12();
+        TlsPair t = tls_pair(client, revoked);
+        CHECK(t.client && t.server);
+        if (t.client && t.server) {
+            tls_shake(t);
+            if (t.client->failure().kind != "certificate_revoked") {
+                std::printf("  revoked: got %s (%s)\n", t.client->failure().kind.c_str(),
+                            t.client->failure().message.c_str());
+            }
+            CHECK_EQ(t.client->failure().kind, std::string("certificate_revoked"));
+        }
+        TlsPair good = tls_pair(client, tls_server_config());
+        CHECK(good.client && good.server && tls_shake(good) && good.client_status == tls::Status::Ok);
+        TlsPair unlisted = tls_pair(tls_client_config(), revoked);
+        CHECK(unlisted.client && unlisted.server && tls_shake(unlisted) && unlisted.client_status == tls::Status::Ok);
+        tls::Failure why;
+        tls::Config bad = tls_client_config();
+        bad.crl_pem = "no lists here";
+        CHECK(!tls::make_engine(bad, &why));
+        CHECK_EQ(why.kind, std::string("tls_config"));
+    }
+
     // Mutual TLS: the server sees who the client is.
     {
         tls::Config server = tls_server_config();

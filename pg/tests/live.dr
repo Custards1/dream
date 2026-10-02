@@ -457,6 +457,10 @@ let tls_modes! u = {
     test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_root_cert => roots }) ())
     test.eq! encrypted (over_tls! ("postgresql://u_ssl:sslpass@localhost:" + to_string (port! ())
                                    + "/app?sslmode=verify-full&sslrootcert=" + roots) ())
+    // Revocation lists that do not list the server's certificate.
+    test.eq! encrypted (over_tls! ("postgresql://u_ssl:sslpass@localhost:" + to_string (port! ())
+                                   + "/app?sslmode=verify-full&sslrootcert=" + roots
+                                   + "&sslcrl=" + certs! () + "/ca.crl") ())
     // `prefer`, the default, encrypts when it can; `disable` never does.
     test.eq! encrypted (over_tls! (as! "postgres" ()) ())
     test.eq! [false, ()] (over_tls! (secured! "postgres" () %{ :ssl_mode => :disable }) ())
@@ -474,6 +478,11 @@ let tls_refusals! u = {
     test.eq! :bad_config
              (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_ca,
                                                                       :ssl_root_cert => "/no/such/file.pem" })))
+    // A revocation list that is not one.
+    test.eq! :tls_config
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full,
+                                                                      :ssl_root_cert => certs! () + "/ca.pem",
+                                                                      :ssl_crl_pem => "not a list" })))
 };
 
 let pooled_tls! : :unit -> :any;

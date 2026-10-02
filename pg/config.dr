@@ -20,6 +20,9 @@
 // `sslrootcert=system`. A client certificate is `sslidentity`, a PKCS#12 file,
 // with `sslpassword`: PKCS#12 rather than libpq's PEM `sslcert` and `sslkey`,
 // because it is the one format every VM's TLS library can import (std.tls).
+// `sslcrl` is a PEM file of revocation lists; libpq's `sslcrldir`, a
+// directory OpenSSL hashes, has no meaning to the other libraries and is
+// ignored.
 //
 // A Unix-domain socket (a `host` beginning with `/`) is refused: the VM does
 // not open one.
@@ -51,6 +54,9 @@ mapping Config {
     /// Roots to trust, as PEM text, or a file of them; neither is the system's.
     ssl_ca : :string | :unit = ()
     ssl_root_cert : :string | :unit = ()
+    /// Revocation lists, as PEM text, or a file of them.
+    ssl_crl_pem : :string | :unit = ()
+    ssl_crl : :string | :unit = ()
     /// A client certificate and key: a PKCS#12 file, and its password.
     ssl_identity : :string | :unit = ()
     ssl_password : :string = ""
@@ -193,7 +199,7 @@ priv let from_pairs pairs = list.fold (fn acc [k, v] -> match acc {
 
 priv let ignored : %{:string => :bool};
 priv let ignored = map.set_of ["connect_timeout", "client_encoding", "target_session_attrs",
-                               "gssencmode", "sslcrl", "sslcrldir", "sslcompression", "passfile",
+                               "gssencmode", "sslcrldir", "sslcompression", "passfile",
                                "sslnegotiation", "ssl_min_protocol_version", "ssl_max_protocol_version",
                                "channel_binding", "fallback_application_name", "keepalives"];
 
@@ -217,6 +223,7 @@ priv let apply c k v = match k {
     },
     "sslrootcert" if v == "system" => [:ok, c],
     "sslrootcert" => [:ok, Config.set_ssl_root_cert c v],
+    "sslcrl" => [:ok, Config.set_ssl_crl c v],
     "sslidentity" => [:ok, Config.set_ssl_identity c v],
     "sslpassword" => [:ok, Config.set_ssl_password c v],
     "sslcert" => [:error, "a client certificate is `sslidentity`, a PKCS#12 file -- the format every platform's TLS can"
@@ -289,13 +296,14 @@ when test {
                                   ["postgres://h/d?sslmode=sometimes", "host=/var/run/postgresql",
                                    "postgres://h:99999/d", "host=h sslcert=c.pem", "postgres://h/d?sslmode=prefer"]) ),
         test.case "TLS, in libpq's words"
-            $( test.eq! [:prefer, :verify_full, "/etc/ca.pem", "/me.p12", "pw", :disable]
+            $( test.eq! [:prefer, :verify_full, "/etc/ca.pem", "/me.p12", "pw", :disable, "/etc/ca.crl"]
                         [Config.ssl_mode %{},
                          Config.ssl_mode (ok (parse "postgres://h/d?sslmode=verify-full&sslrootcert=/etc/ca.pem")),
                          Config.ssl_root_cert (ok (parse "postgres://h/d?sslmode=verify-full&sslrootcert=/etc/ca.pem")),
                          Config.ssl_identity (ok (parse "host=h sslidentity=/me.p12 sslpassword=pw")),
                          Config.ssl_password (ok (parse "host=h sslidentity=/me.p12 sslpassword=pw")),
-                         Config.ssl_mode (ok (parse "host=h sslmode=disable"))] ),
+                         Config.ssl_mode (ok (parse "host=h sslmode=disable")),
+                         Config.ssl_crl (ok (parse "host=h sslcrl=/etc/ca.crl sslcrldir=/etc/crls"))] ),
         test.case "the parameters a startup sends"
             $( test.eq! [["user", "ada"], ["database", "app"], ["application_name", "dream"],
                          ["client_encoding", "UTF8"], ["TimeZone", "UTC"]]

@@ -1343,6 +1343,8 @@ std::string read_config(Process& p, Value options, tls::Config* c) {
     if (bad) return "`:host` is a string";
     string_option(p, map, "ca", &c->ca_pem, &bad);
     if (bad) return "`:ca` is a string of PEM certificates";
+    string_option(p, map, "crl", &c->crl_pem, &bad);
+    if (bad) return "`:crl` is a string of PEM revocation lists";
     string_option(p, map, "identity", &c->identity_p12, &bad);
     if (bad) return "`:identity` is a string holding a PKCS#12 bundle";
     string_option(p, map, "password", &c->identity_password, &bad);

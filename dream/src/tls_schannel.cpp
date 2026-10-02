@@ -23,7 +23,11 @@
 // certificate) has to go into the user's key store. The import is kept for
 // the life of the VM -- one per distinct bundle, shared by every connection
 // that uses it -- and the key is deleted from the store when the VM exits.
-// A VM that is killed leaves it behind; that is the cost of Windows' design.
+// A VM that is killed cannot do that, so each key is also written down, in
+// `%LOCALAPPDATA%\dream\tls-keys`, under the name of the process that made
+// it; the first import in any later VM deletes the keys of processes that
+// are gone, and their entries with them. A key outlives a killed VM only
+// until the next VM to use an identity.
 //
 // TLS 1.3 needs `SCH_CREDENTIALS`, which Windows understands from 10 1809;
 // on anything older the credentials fall back to `SCHANNEL_CRED` and TLS 1.2.
@@ -43,7 +47,10 @@
 #include <security.h>
 #include <sspi.h>
 
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cwchar>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -52,6 +59,9 @@
 // HTTP client this file has no other use for.
 #ifndef SECURITY_FLAG_IGNORE_UNKNOWN_CA
 #define SECURITY_FLAG_IGNORE_UNKNOWN_CA 0x00000100
+#endif
+#ifndef SECURITY_FLAG_IGNORE_REVOCATION
+#define SECURITY_FLAG_IGNORE_REVOCATION 0x00000080
 #endif
 #ifndef SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
 #define SECURITY_FLAG_IGNORE_CERT_DATE_INVALID 0x00002000
@@ -82,11 +92,176 @@ HCERTSTORE pem_store(const std::string& pem, int* count) {
     return store;
 }
 
-/// A PKCS#12 bundle imported: the store it went into and the certificate
-/// whose private key came with it.
+/// The revocation lists in a PEM text, in a store of their own.
+HCERTSTORE crl_store(const std::string& pem, int* count) {
+    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, nullptr);
+    *count = 0;
+    if (!store) return nullptr;
+    for (const std::string& der : pem_blocks(pem, "X509 CRL")) {
+        if (CertAddEncodedCRLToStore(store, X509_ASN_ENCODING, reinterpret_cast<const BYTE*>(der.data()),
+                                     DWORD(der.size()), CERT_STORE_ADD_ALWAYS, nullptr)) {
+            ++*count;
+        }
+    }
+    return store;
+}
+
+/// Delete a persisted key, named as CERT_KEY_PROV_INFO_PROP_ID names it: by
+/// provider and container, CNG when the provider type is 0 and CryptoAPI
+/// otherwise.
+void delete_key(const std::wstring& provider, const std::wstring& container, DWORD type, DWORD flags) {
+    if (type == 0) {
+        NCRYPT_PROV_HANDLE prov = 0;
+        if (NCryptOpenStorageProvider(&prov, provider.c_str(), 0) != ERROR_SUCCESS) return;
+        NCRYPT_KEY_HANDLE key = 0;
+        if (NCryptOpenKey(prov, &key, container.c_str(), 0, flags & NCRYPT_MACHINE_KEY_FLAG) == ERROR_SUCCESS) {
+            NCryptDeleteKey(key, 0);  // frees the handle too
+        }
+        NCryptFreeObject(prov);
+    } else {
+        HCRYPTPROV prov = 0;
+        CryptAcquireContextW(&prov, container.c_str(), provider.c_str(), type,
+                             CRYPT_DELETEKEYSET | (flags & CRYPT_MACHINE_KEYSET));
+    }
+}
+
+// --- the journal of persisted keys --------------------------------------------
+//
+// One file per key, named `PID-START-N.key` -- the process, when it started
+// (so a pid Windows has since handed to someone else is not mistaken for the
+// owner), and a counter -- holding four lines: the provider type, the flags,
+// the provider and the container, as UTF-8.
+
+/// The journal's directory, made if it is not there; empty if it cannot be.
+std::wstring journal_dir() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
+    std::wstring base;
+    if (n > 0 && n < MAX_PATH) {
+        base.assign(buf, n);
+    } else {
+        n = GetTempPathW(MAX_PATH, buf);
+        if (n == 0 || n >= MAX_PATH) return {};
+        base.assign(buf, n);
+    }
+    if (base.back() != L'\\' && base.back() != L'/') base += L'\\';
+    std::wstring dir = base + L"dream";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir += L"\\tls-keys";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    DWORD attrs = GetFileAttributesW(dir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return {};
+    return dir;
+}
+
+/// When a process started, as a FILETIME's 64 bits; 0 for a process that has
+/// exited or cannot be asked.
+unsigned long long started(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    DWORD code = 0;
+    unsigned long long t = 0;
+    if (GetProcessTimes(h, &created, &exited, &kernel, &user) && GetExitCodeProcess(h, &code)
+        && code == STILL_ACTIVE) {
+        t = (static_cast<unsigned long long>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    }
+    CloseHandle(h);
+    return t;
+}
+
+bool read_file(const std::wstring& path, std::string* out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char buf[4096];
+    DWORD got = 0;
+    out->clear();
+    while (ReadFile(h, buf, sizeof buf, &got, nullptr) && got > 0) out->append(buf, got);
+    CloseHandle(h);
+    return true;
+}
+
+bool write_file(const std::wstring& path, const std::string& text) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    bool ok = WriteFile(h, text.data(), DWORD(text.size()), &put, nullptr) && put == text.size();
+    CloseHandle(h);
+    return ok;
+}
+
+/// Delete the keys, and the entries, of every process in the journal that is
+/// no longer running. Once per VM, at its first import.
+void sweep_journal(const std::wstring& dir) {
+    WIN32_FIND_DATAW found;
+    HANDLE find = FindFirstFileW((dir + L"\\*.key").c_str(), &found);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        unsigned long pid = 0;
+        unsigned long long start = 0;
+        if (std::swscanf(found.cFileName, L"%lu-%llu-", &pid, &start) != 2) continue;
+        if (start != 0 && started(DWORD(pid)) == start) continue;  // its owner is alive
+        std::wstring path = dir + L"\\" + found.cFileName;
+        std::string text;
+        if (!read_file(path, &text)) continue;
+        std::vector<std::string> lines;
+        size_t at = 0;
+        for (size_t nl; (nl = text.find('\n', at)) != std::string::npos; at = nl + 1) {
+            lines.push_back(text.substr(at, nl - at));
+        }
+        if (lines.size() == 4) {
+            delete_key(windows::wide(lines[2]), windows::wide(lines[3]), DWORD(std::strtoul(lines[0].c_str(), nullptr, 10)),
+                       DWORD(std::strtoul(lines[1].c_str(), nullptr, 10)));
+        }
+        DeleteFileW(path.c_str());
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+}
+
+/// The journal, swept of the dead the first time it is asked for -- which is
+/// before this VM's first import, so that nothing it imports is mistaken for
+/// a dead process's key that happens to share a container's name.
+const std::wstring& journal() {
+    static const std::wstring dir = [] {
+        std::wstring d = journal_dir();
+        if (!d.empty()) sweep_journal(d);
+        return d;
+    }();
+    return dir;
+}
+
+/// Write down a key this VM persisted; answers the entry's path, or empty
+/// when there is nowhere to write it (the key is still deleted at exit).
+std::wstring journal_key(const CRYPT_KEY_PROV_INFO& info) {
+    const std::wstring& dir = journal();
+    if (dir.empty()) return {};
+    static std::atomic<unsigned> counter{0};
+    DWORD pid = GetCurrentProcessId();
+    wchar_t name[96];
+    std::swprintf(name, 96, L"\\%lu-%llu-%u.key", static_cast<unsigned long>(pid), started(pid), counter++);
+    std::wstring path = dir + name;
+    std::string text = std::to_string(info.dwProvType) + "\n" + std::to_string(info.dwFlags) + "\n"
+                       + windows::utf8(info.pwszProvName ? info.pwszProvName : L"") + "\n"
+                       + windows::utf8(info.pwszContainerName ? info.pwszContainerName : L"") + "\n";
+    return write_file(path, text) ? path : std::wstring{};
+}
+
+/// The key provider property of a certificate, in a buffer of its own.
+std::vector<BYTE> key_prov_info(PCCERT_CONTEXT cert) {
+    DWORD size = 0;
+    if (!CertGetCertificateContextProperty(cert, CERT_KEY_PROV_INFO_PROP_ID, nullptr, &size)) return {};
+    std::vector<BYTE> buf(size);
+    if (!CertGetCertificateContextProperty(cert, CERT_KEY_PROV_INFO_PROP_ID, buf.data(), &size)) return {};
+    return buf;
+}
+
+/// A PKCS#12 bundle imported: the store it went into, the certificate whose
+/// private key came with it, and the journal entry for that key.
 struct Identity {
     HCERTSTORE store = nullptr;
     PCCERT_CONTEXT cert = nullptr;
+    std::wstring journal;
 
     ~Identity() {
         if (cert) {
@@ -94,29 +269,16 @@ struct Identity {
             CertFreeCertificateContext(cert);
         }
         if (store) CertCloseStore(store, 0);
+        if (!journal.empty()) DeleteFileW(journal.c_str());
     }
 
     /// Delete the key the import persisted. See the head of this file.
     void forget_key() {
-        DWORD size = 0;
-        if (!CertGetCertificateContextProperty(cert, CERT_KEY_PROV_INFO_PROP_ID, nullptr, &size)) return;
-        std::vector<BYTE> buf(size);
-        if (!CertGetCertificateContextProperty(cert, CERT_KEY_PROV_INFO_PROP_ID, buf.data(), &size)) return;
+        std::vector<BYTE> buf = key_prov_info(cert);
+        if (buf.empty()) return;
         auto* info = reinterpret_cast<CRYPT_KEY_PROV_INFO*>(buf.data());
-        if (info->dwProvType == 0) {
-            NCRYPT_PROV_HANDLE prov = 0;
-            if (NCryptOpenStorageProvider(&prov, info->pwszProvName, 0) != ERROR_SUCCESS) return;
-            NCRYPT_KEY_HANDLE key = 0;
-            if (NCryptOpenKey(prov, &key, info->pwszContainerName, 0, info->dwFlags & NCRYPT_MACHINE_KEY_FLAG)
-                == ERROR_SUCCESS) {
-                NCryptDeleteKey(key, 0);  // frees the handle too
-            }
-            NCryptFreeObject(prov);
-        } else {
-            HCRYPTPROV prov = 0;
-            CryptAcquireContextW(&prov, info->pwszContainerName, info->pwszProvName, info->dwProvType,
-                                 CRYPT_DELETEKEYSET | (info->dwFlags & CRYPT_MACHINE_KEYSET));
-        }
+        delete_key(info->pwszProvName ? info->pwszProvName : L"",
+                   info->pwszContainerName ? info->pwszContainerName : L"", info->dwProvType, info->dwFlags);
     }
 };
 
@@ -127,6 +289,7 @@ std::shared_ptr<Identity> import_identity(const std::string& p12, const std::str
         return nullptr;
     }
     std::wstring wpassword = windows::wide(password);
+    journal();
     auto id = std::make_shared<Identity>();
     id->store = PFXImportCertStore(&blob, wpassword.c_str(), CRYPT_USER_KEYSET);
     if (!id->store) {
@@ -135,13 +298,14 @@ std::shared_ptr<Identity> import_identity(const std::string& p12, const std::str
     }
     // The certificate whose key came with it, found by the key's provider
     // property rather than CERT_FIND_HAS_PRIVATE_KEY, which is Windows 8's.
+    // That key is the one written down; a bundle carries one.
     PCCERT_CONTEXT c = nullptr;
     while ((c = CertEnumCertificatesInStore(id->store, c)) != nullptr) {
-        DWORD size = 0;
-        if (CertGetCertificateContextProperty(c, CERT_KEY_PROV_INFO_PROP_ID, nullptr, &size)) {
+        std::vector<BYTE> info = key_prov_info(c);
+        if (info.empty()) continue;
+        if (!id->cert) {
             id->cert = CertDuplicateCertificateContext(c);
-            CertFreeCertificateContext(c);
-            break;
+            id->journal = journal_key(*reinterpret_cast<CRYPT_KEY_PROV_INFO*>(info.data()));
         }
     }
     if (!id->cert) {
@@ -276,6 +440,14 @@ public:
                 return false;
             }
         }
+        if (!config.crl_pem.empty()) {
+            int count = 0;
+            crl_ = crl_store(config.crl_pem, &count);
+            if (count == 0) {
+                *why = {"tls_config", "`crl` holds no PEM certificate revocation list"};
+                return false;
+            }
+        }
         if (server_ && verify_ && !ca_) verify_ = false;  // nothing to check a client against
         creds_ = credentials(config, why);
         if (!creds_) return false;
@@ -303,6 +475,7 @@ public:
     ~SChannelEngine() override {
         if (have_ctx_) DeleteSecurityContext(&ctx_);
         if (ca_) CertCloseStore(ca_, 0);
+        if (crl_) CertCloseStore(crl_, 0);
     }
 
     void feed(const char* data, size_t len) override { in_.append(data, len); }
@@ -584,6 +757,7 @@ private:
         HCERTSTORE pool = CertOpenStore(CERT_STORE_PROV_COLLECTION, 0, 0, 0, nullptr);
         if (cert->hCertStore) CertAddStoreToCollection(pool, cert->hCertStore, 0, 0);
         if (ca_) CertAddStoreToCollection(pool, ca_, 0, 0);
+        if (crl_) CertAddStoreToCollection(pool, crl_, 0, 0);
 
         LPSTR usage = const_cast<LPSTR>(server_ ? szOID_PKIX_KP_CLIENT_AUTH : szOID_PKIX_KP_SERVER_AUTH);
         CERT_CHAIN_PARA para{};
@@ -592,7 +766,11 @@ private:
         para.RequestedUsage.Usage.cUsageIdentifier = 1;
         para.RequestedUsage.Usage.rgpszUsageIdentifier = &usage;
         PCCERT_CHAIN_CONTEXT chain = nullptr;
-        BOOL built = CertGetCertificateChain(nullptr, cert, nullptr, pool, &para, 0, nullptr, &chain);
+        // Revocation from what is already here -- the lists given as `crl`, a
+        // stapled OCSP response SChannel cached, the system's own cache -- and
+        // never from the network, as tls.hpp says.
+        DWORD flags = CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY;
+        BOOL built = CertGetCertificateChain(nullptr, cert, nullptr, pool, &para, flags, nullptr, &chain);
         CertCloseStore(pool, 0);
         if (!built || !chain || chain->cChain == 0) {
             if (chain) CertFreeCertificateChain(chain);
@@ -600,8 +778,8 @@ private:
         }
 
         DWORD errors = chain->TrustStatus.dwErrorStatus;
-        // Revocation is not checked, by any backend: there is no saying here
-        // whether the network would let the lists be fetched.
+        // A certificate nothing here speaks for is accepted: revoked is an
+        // answer, and "no list to ask" is not one.
         errors &= ~DWORD(CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION);
         bool trusted_root = true;
         if (ca_) {
@@ -618,6 +796,8 @@ private:
         Status result = Status::Ok;
         if (!trusted_root) {
             result = fail("certificate_untrusted", "the certificate does not chain to a trusted root");
+        } else if (errors & CERT_TRUST_IS_REVOKED) {
+            result = fail("certificate_revoked", "the certificate has been revoked");
         } else if (errors & CERT_TRUST_IS_NOT_TIME_VALID) {
             result = fail("certificate_expired", "the certificate is outside its validity period");
         } else if (errors != 0) {
@@ -632,9 +812,9 @@ private:
     }
 
     /// The server's name, by the SSL policy for a name and by the certificate's
-    /// address entries for an address. Trust and time were judged already, so
-    /// the policy is told to ignore them and can only say something about the
-    /// name.
+    /// address entries for an address. Trust, time and revocation were judged
+    /// already, so the policy is told to ignore them and can only say something
+    /// about the name.
     Status check_name(PCCERT_CHAIN_CONTEXT chain) {
         PCCERT_CONTEXT leaf = chain->rgpChain[0]->rgpElement[0]->pCertContext;
         std::string ip = address_bytes(host_);
@@ -645,10 +825,12 @@ private:
         SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl{};
         ssl.cbSize = sizeof ssl;
         ssl.dwAuthType = AUTHTYPE_SERVER;
-        ssl.fdwChecks = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        ssl.fdwChecks = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                        | SECURITY_FLAG_IGNORE_REVOCATION;
         ssl.pwszServerName = whost_.data();
         CERT_CHAIN_POLICY_PARA policy{};
         policy.cbSize = sizeof policy;
+        policy.dwFlags = CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS;
         policy.pvExtraPolicyPara = &ssl;
         CERT_CHAIN_POLICY_STATUS status{};
         status.cbSize = sizeof status;
@@ -668,6 +850,7 @@ private:
     std::string host_;
     std::wstring whost_;
     HCERTSTORE ca_ = nullptr;
+    HCERTSTORE crl_ = nullptr;
     std::shared_ptr<Credentials> creds_;
     std::string alpn_;
     CtxtHandle ctx_{};

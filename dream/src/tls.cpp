@@ -37,9 +37,11 @@ std::string base64_decode(const std::string& text, size_t from, size_t to) {
 
 }  // namespace
 
-std::vector<std::string> pem_certificates(const std::string& pem) {
-    static const std::string begin = "-----BEGIN CERTIFICATE-----";
-    static const std::string end = "-----END CERTIFICATE-----";
+std::vector<std::string> pem_certificates(const std::string& pem) { return pem_blocks(pem, "CERTIFICATE"); }
+
+std::vector<std::string> pem_blocks(const std::string& pem, const std::string& label) {
+    const std::string begin = "-----BEGIN " + label + "-----";
+    const std::string end = "-----END " + label + "-----";
     std::vector<std::string> out;
     size_t at = 0;
     for (;;) {

@@ -51,6 +51,14 @@ struct Config {
     /// can give it, and it is what makes a program's trust the same on every
     /// machine it runs on.
     std::string ca_pem;
+    /// PEM certificate revocation lists. A certificate one of them lists is
+    /// refused. Revocation is also learned from an OCSP response the server
+    /// staples -- OpenSSL's client asks for one, and SChannel's chain check
+    /// reads whatever Windows has cached, a staple included. Neither is fetched: with no list
+    /// and no staple a certificate's status is unknown and it is accepted --
+    /// what SChannel does without the network, and what keeps a handshake
+    /// from blocking a worker on a download.
+    std::string crl_pem;
     /// A PKCS#12 bundle: this side's certificate, its chain, and its private
     /// key. Required for a server; a client offers it when asked. PKCS#12
     /// rather than PEM because it is the format all the backends can import.
@@ -72,8 +80,8 @@ enum class Status {
 
 /// Why something failed. `kind` is the atom a Dream program matches on.
 struct Failure {
-    /// `certificate_untrusted`, `certificate_expired`, `hostname_mismatch`,
-    /// `handshake_failed`, `tls_config` or `tls_error`.
+    /// `certificate_untrusted`, `certificate_expired`, `certificate_revoked`,
+    /// `hostname_mismatch`, `handshake_failed`, `tls_config` or `tls_error`.
     std::string kind;
     std::string message;
 };
@@ -128,5 +136,7 @@ std::string backend();
 /// The DER bytes of each certificate in a PEM text, in order. Shared by the
 /// backends whose library does not read PEM itself.
 std::vector<std::string> pem_certificates(const std::string& pem);
+/// The same for each block labelled `label` -- "X509 CRL" for revocation lists.
+std::vector<std::string> pem_blocks(const std::string& pem, const std::string& label);
 
 }  // namespace dream::tls

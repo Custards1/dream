@@ -82,9 +82,11 @@ closing behave identically; the options are the ones every backend honours
 of the same few kinds. What legitimately differs is the system's own trust
 store, consulted when a program gives no `:ca` -- a program that names its
 roots trusts the same thing everywhere. The version and cipher `tls.info!`
-reports are each library's spelling. On Windows a PKCS#12 identity's key is
-imported into the user's key store for the life of the VM, because SChannel
-works outside the process.
+reports are each library's spelling, and a revocation list given as `:crl`
+is honoured by both. On Windows a PKCS#12 identity's key is imported into the
+user's key store for the life of the VM, because SChannel works outside the
+process; each key is written down in `%LOCALAPPDATA%\dream\tls-keys`, so one
+a killed VM left behind is deleted by the next VM to import an identity.
 
 ## Verification
 

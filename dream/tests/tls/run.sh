@@ -43,6 +43,7 @@ fi
 # A program that is one side of a conversation with OpenSSL.
 cat >"$tmp/peer.dr" <<DR
 import std.console;
+import std.error;
 import std.file;
 import std.io;
 import std.net;
@@ -57,6 +58,15 @@ let main! = match os.args! () {
         streams.write_all! sock "hello from dream\n"
         console.print! (io.read! sock 4096)
         io.close! sock
+    },
+    ["probe", port, dir] => {
+        let outcome = try! {
+            let sock = net.connect! "127.0.0.1" (match parse_int port { () => 0, n => n });
+            tls.connect! sock %{ :host => "localhost", :ca => file.read! (dir + "/ca.pem") }
+            io.close! sock
+            :ok
+        } catch e { error.kind e };
+        console.print! (to_string outcome)
     },
     ["server", dir] => {
         let listener = net.listen! 0;
@@ -95,6 +105,21 @@ for version in -tls1_2 -tls1_3; do
     got=$(echo "from s_client" | timeout 20 openssl s_client "$version" -connect "127.0.0.1:$port" \
             -CAfile "$here/ca.pem" -servername localhost -verify_return_error -quiet 2>/dev/null)
     check "openssl s_client $version, dream server" "dream heard: from s_client" "$got"
+done
+
+# Stapled OCSP: s_server hands over a fixed response with its certificate, and
+# the VM must refuse the one that says "revoked" and accept the one that says
+# "good". The VM never fetches a response itself, so a staple is the only way
+# one reaches it.
+for case in "revoked :certificate_revoked" "server :ok"; do
+    set -- $case
+    port=$(free_port)
+    openssl s_server -accept "$port" -cert "$here/$1.pem" -key "$here/$1.key" -status_file "$here/$1.ocsp" \
+        -quiet -naccept 1 -www >"$tmp/s_server.log" 2>&1 &
+    pids="$pids $!"
+    sleep 0.5
+    got=$(timeout 20 "$dream" "$tmp/peer.dream" probe "$port" "$here" 2>&1 | head -1)
+    check "a stapled OCSP response for the $1 certificate" "$2" "$got"
 done
 
 echo "tls interop: $pass passed, $fail failed"

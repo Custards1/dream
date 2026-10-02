@@ -276,11 +276,13 @@ is not given (libpq's `sslrootcert=system`). In a `Config` map they are
 `:ssl_root_cert` (a path) or `:ssl_ca` (the PEM text itself), with the mode as
 an atom: `%{ :ssl_mode => :verify_full, :ssl_root_cert => "/etc/ca.pem" }`. A
 client certificate is `sslidentity`, a **PKCS#12** file, and `sslpassword`.
+Revocation lists are `sslcrl`, a PEM file (`:ssl_crl`, or `:ssl_crl_pem` for
+the text); a certificate one of them lists fails as `:certificate_revoked`.
 libpq's PEM `sslcert` and `sslkey` are refused with that advice, because PKCS#12
 is the one format every platform's TLS library imports; `openssl pkcs12
 -export` converts. A certificate that fails a check is reported by what was
 wrong -- `:certificate_untrusted`, `:certificate_expired`,
-`:hostname_mismatch` -- and `db.tls_info! conn` says what a connection
+`:certificate_revoked`, `:hostname_mismatch` -- and `db.tls_info! conn` says what a connection
 negotiated, or `()` for plain text.
 
 ## Limits

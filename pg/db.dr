@@ -190,8 +190,16 @@ priv let tls_options! c mode = {
         :require if ca != () => %{ :verify => true, :check_name => false },
         _ => %{ :verify => false },
     };
+    let crl = match config.Config.ssl_crl_pem c {
+        () => match config.Config.ssl_crl c {
+            () => (),
+            path => read_file! path "sslcrl",
+        },
+        text => text,
+    };
     let rooted = if ca == () { checks } else { checks.[:ca => ca] };
-    let named = rooted.[:host => config.Config.host c];
+    let listed = if crl == () { rooted } else { rooted.[:crl => crl] };
+    let named = listed.[:host => config.Config.host c];
     match config.Config.ssl_identity c {
         () => named,
         path => named.[:identity => read_file! path "sslidentity"].[:password => config.Config.ssl_password c],
