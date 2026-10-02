@@ -1,8 +1,9 @@
 # pg — PostgreSQL for Dream
 
 A PostgreSQL client written in Dream: the version 3 wire protocol over the VM's
-own sockets, with nothing to link against. It logs in with SCRAM-SHA-256, MD5
-or a cleartext password, and supports parameterized queries, transactions,
+own sockets, with nothing to link against. It encrypts with the VM's
+`std.tls`, logs in with SCRAM-SHA-256, MD5 or a cleartext password, and
+supports parameterized queries, transactions,
 savepoints, prepared statements, streaming, COPY, LISTEN/NOTIFY, cancellation
 and a connection pool.
 
@@ -227,7 +228,9 @@ For server errors, the condition is the SQLSTATE's name (an unlisted code gets
 its class's name). The payload also holds the server's fields: `:code`,
 `:message`, `:detail`, `:hint`, `:constraint`, `:table`, and others.
 Client-side failures use `:connection_failure`, `:no_rows`, `:too_many_rows`,
-`:bad_config` and `:unsupported_authentication`. `errors.is_retryable` and
+`:bad_config`, `:unsupported_authentication`, `:ssl_refused`, and the TLS
+kinds (`:certificate_untrusted`, `:certificate_expired`, `:hostname_mismatch`,
+`:handshake_failed`). `errors.is_retryable` and
 `errors.is_connection_lost` answer the two common questions, and
 `errors.describe` formats an error as one line.
 
@@ -256,12 +259,33 @@ libpq keyword string such as `host=h dbname=d`. `config.from_env!` reads
 recognize, such as `search_path`, `statement_timeout` or `TimeZone`, is sent to
 the server at startup.
 
+## TLS
+
+`sslmode` means what it means to libpq:
+
+| `sslmode` | Encrypted | Checked |
+|---|---|---|
+| `disable`, `allow` | no | — |
+| `prefer` (the default) | when the server offers it | nothing |
+| `require` | yes, or the connection fails with `:ssl_refused` | nothing, unless roots are given (then as `verify-ca`) |
+| `verify-ca` | yes | the certificate chains to a trusted root |
+| `verify-full` | yes | that, and it names the host |
+
+The trusted roots are `sslrootcert`, a PEM file, or the system's store when it
+is not given (libpq's `sslrootcert=system`). In a `Config` map they are
+`:ssl_root_cert` (a path) or `:ssl_ca` (the PEM text itself), with the mode as
+an atom: `%{ :ssl_mode => :verify_full, :ssl_root_cert => "/etc/ca.pem" }`. A
+client certificate is `sslidentity`, a **PKCS#12** file, and `sslpassword`.
+libpq's PEM `sslcert` and `sslkey` are refused with that advice, because PKCS#12
+is the one format every platform's TLS library imports; `openssl pkcs12
+-export` converts. A certificate that fails a check is reported by what was
+wrong -- `:certificate_untrusted`, `:certificate_expired`,
+`:hostname_mismatch` -- and `db.tls_info! conn` says what a connection
+negotiated, or `()` for plain text.
+
 ## Limits
 
-- **No TLS.** The VM's sockets are plain TCP. `sslmode=require` and stricter
-  settings are refused rather than connecting without encryption. Use a
-  trusted network, an SSH tunnel, or a TLS proxy.
-- **No Unix-domain sockets**, for the same reason.
+- **No Unix-domain sockets.** The VM does not open them.
 - **No Kerberos, GSSAPI or SSPI.**
 - SCRAM passwords are not SASLprep-normalized. That only matters for passwords
   with unusual Unicode characters.

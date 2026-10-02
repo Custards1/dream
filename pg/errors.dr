@@ -8,7 +8,9 @@
 // there under the names its protocol documentation gives them (`:message`,
 // `:detail`, `:hint`, `:constraint`, `:table`, ..). For a failure on this side
 // of the socket it is one of the conditions below, `:connection_failure` and
-// `:no_rows` among them.
+// `:no_rows` among them -- or, for a TLS handshake that failed, the kind
+// `std.tls` raised (`:certificate_untrusted`, `:hostname_mismatch`, ..), so a
+// certificate problem is told apart from a server that is not there.
 //
 //     try! { db.exec! conn (sql.insert "users" user) }
 //     catch e {
