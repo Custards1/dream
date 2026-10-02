@@ -265,6 +265,7 @@ public:
     bool init(const Config& config, Failure* why) {
         server_ = config.server;
         verify_ = config.verify;
+        check_name_ = config.check_name;
         host_ = config.host;
         whost_ = windows::wide(config.host);
         if (!config.ca_pem.empty()) {
@@ -578,7 +579,7 @@ private:
             char hex[16];
             std::snprintf(hex, sizeof hex, "0x%08lx", static_cast<unsigned long>(errors));
             result = fail("certificate_untrusted", std::string("the certificate is not trusted (chain status ") + hex + ")");
-        } else if (!server_ && !host_.empty()) {
+        } else if (!server_ && check_name_ && !host_.empty()) {
             result = check_name(chain);
         }
         CertFreeCertificateChain(chain);
@@ -618,6 +619,7 @@ private:
 
     bool server_ = false;
     bool verify_ = true;
+    bool check_name_ = true;
     std::string host_;
     std::wstring whost_;
     HCERTSTORE ca_ = nullptr;

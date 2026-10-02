@@ -48,6 +48,7 @@
 // connection should be closed: the exchange stopped somewhere in the middle.
 
 import std.error;
+import std.file;
 import std.io;
 import std.list;
 import std.map;
@@ -55,6 +56,7 @@ import std.net;
 import std.os;
 import std.str;
 import std.streams;
+import std.tls;
 import std.types;
 import pg.bytes;
 import pg.config;
@@ -122,6 +124,7 @@ let connect! target = {
                catch e { raise! (errors.caused :connection_failure ("cannot reach " + config.describe c) e) };
     let conn = Conn.make sock 0 0 %{} c;
     try! {
+        secure! sock c
         write! conn (wire.startup (config.startup_parameters c))
         authenticate! conn
         settle! conn %{} 0 0
@@ -130,6 +133,84 @@ let connect! target = {
         raise! (lost e)
     }
 };
+
+// --- TLS -----------------------------------------------------------------------------
+//
+// PostgreSQL starts every connection in plain text and upgrades it on request:
+// the client sends an SSLRequest, eight bytes where the startup message would
+// be, and the server answers one byte, `S` to go ahead or `N` to decline.
+// After an `S` the same socket is handed to `tls.connect!`, which makes it
+// speak TLS in place, and everything after -- the startup, the login, every
+// query -- goes through it without this module doing anything differently.
+// `sslmode` decides whether to ask, what a refusal means, and what is checked.
+
+/// What the server sends back for an SSLRequest, and what that means for `mode`.
+priv let secure! : :integer -> :map -> :atom;
+priv let secure! sock c = match config.Config.ssl_mode c {
+    :disable => :plain,
+    :allow => :plain,
+    mode => {
+        streams.write_all! sock (bytes.be32 8 + bytes.be32 80877103)
+        match io.read! sock 1 {
+            "S" => {
+                let options = tls_options! c mode;
+                try! { tls.connect! sock options } catch e {
+                    raise! (errors.caused (error.kind e) ("TLS with " + config.Config.host c + ": "
+                                                         + error.message e) e)
+                }
+                :tls
+            },
+            "N" if mode == :prefer => :plain,
+            "N" => errors.fail! :ssl_refused
+                       ("sslmode=" + to_string mode + " needs TLS, and " + config.Config.host c + " does not offer it"),
+            "" => errors.fail! :connection_failure "the server closed the connection when asked about TLS",
+            other => errors.fail! :protocol_violation ("the server answered an SSLRequest with " + to_string other),
+        }
+    },
+};
+
+/// What `tls.connect!` is told: how much to check, against which roots, and
+/// with which certificate of this side's own.
+///
+/// `prefer` and `require` check nothing, as libpq's do not -- they defend
+/// against a listener and not against an impostor -- except that `require`
+/// with roots given is `verify-ca`, as libpq's is.
+priv let tls_options! : :map -> :atom -> :map;
+priv let tls_options! c mode = {
+    let ca = match config.Config.ssl_ca c {
+        () => match config.Config.ssl_root_cert c {
+            () => (),
+            path => read_file! path "sslrootcert",
+        },
+        text => text,
+    };
+    let checks = match mode {
+        :verify_full => %{ :verify => true, :check_name => true },
+        :verify_ca => %{ :verify => true, :check_name => false },
+        :require if ca != () => %{ :verify => true, :check_name => false },
+        _ => %{ :verify => false },
+    };
+    let rooted = if ca == () { checks } else { checks.[:ca => ca] };
+    let named = rooted.[:host => config.Config.host c];
+    match config.Config.ssl_identity c {
+        () => named,
+        path => named.[:identity => read_file! path "sslidentity"].[:password => config.Config.ssl_password c],
+    }
+};
+
+priv let read_file! : :string -> :string -> :string;
+priv let read_file! path what = {
+    let text = try! { file.read! path } catch e { () };
+    match text {
+        () => errors.fail! :bad_config ("cannot read " + what + " " + path),
+        found => found,
+    }
+};
+
+/// Whether a connection's traffic is encrypted, and how: `std.tls`'s
+/// `%{ :version, :cipher, :alpn, :peer }`, or `()` for plain text.
+let tls_info! : Conn -> :any;
+let tls_info! conn = tls.info! (Conn.socket conn);
 
 /// Leave politely, then close the socket. Closing a connection twice, or one
 /// the server already dropped, is not an error.

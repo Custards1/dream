@@ -209,7 +209,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-std test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-pg
+test: test-vm test-e2e test-std test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
 
 # The same suites as `test`, run at once by `mind test`: the repository is a
 # workspace, and each suite is a check. See "Testing" in CLAUDE.md.
@@ -305,6 +305,11 @@ test-bootstrap: bootstrap-check
 test-std: build
     ./{{dreams}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
     ./{{dream}} /tmp/dream-std-tests.dream
+
+# std.tls: a server and its clients in one VM, and the VM against OpenSSL's
+# own client and server in both directions.
+test-tls: build
+    dream={{dream}} dreams={{image}} dream/tests/tls/run.sh
 
 # The PostgreSQL client: its units, the SQL the compiler must refuse, and the
 # whole library against a throwaway cluster -- which skips itself where there

@@ -43,6 +43,9 @@ struct Config {
     /// Client: check the server's certificate chain and name. Server: require
     /// a client certificate and check it against `ca_pem`.
     bool verify = true;
+    /// Client: whether checking includes `host`. Off is a chain that must be
+    /// trusted for a server that may be any name -- libpq's `verify-ca`.
+    bool check_name = true;
     /// PEM certificates to trust *instead of* the system's store. Exclusive
     /// rather than additional, because that is the one meaning every backend
     /// can give it, and it is what makes a program's trust the same on every

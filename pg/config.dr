@@ -11,12 +11,18 @@
 // from the environment variables libpq reads, so a program configured for
 // `psql` is configured for this.
 //
-// **What is not here is TLS.** The VM's sockets are plain TCP, so a
-// configuration that *requires* encryption (`sslmode=require` and stricter) is
-// refused rather than quietly connected in the clear; `prefer` and `allow`,
-// which libpq would also settle for plain text on, are accepted. A Unix-domain
-// socket (a `host` beginning with `/`) is refused for the same reason: the VM
-// does not open one.
+// **TLS is `sslmode`, with libpq's meanings** (see `pg.db`): `disable` and
+// `allow` speak plain text, `prefer` -- the default, as in libpq -- encrypts
+// when the server will and does not check whom it is talking to, `require`
+// insists on encryption, `verify-ca` also checks the certificate chains to a
+// trusted root, and `verify-full` that it names the host. The roots are
+// `sslrootcert` (a PEM file), or the system's when it is not given -- libpq's
+// `sslrootcert=system`. A client certificate is `sslidentity`, a PKCS#12 file,
+// with `sslpassword`: PKCS#12 rather than libpq's PEM `sslcert` and `sslkey`,
+// because it is the one format every VM's TLS library can import (std.tls).
+//
+// A Unix-domain socket (a `host` beginning with `/`) is refused: the VM does
+// not open one.
 
 import std.list;
 import std.map;
@@ -39,7 +45,26 @@ mapping Config {
     /// The program's own decoders, by type OID, consulted before the built-in
     /// ones; see `pg.value`.
     decoders : :map = %{}
+    /// libpq's `sslmode`, as an atom: `:disable`, `:allow`, `:prefer`,
+    /// `:require`, `:verify_ca` or `:verify_full`.
+    ssl_mode : :disable | :allow | :prefer | :require | :verify_ca | :verify_full = :prefer
+    /// Roots to trust, as PEM text, or a file of them; neither is the system's.
+    ssl_ca : :string | :unit = ()
+    ssl_root_cert : :string | :unit = ()
+    /// A client certificate and key: a PKCS#12 file, and its password.
+    ssl_identity : :string | :unit = ()
+    ssl_password : :string = ""
 }
+
+/// How much TLS a connection insists on; see the head of this file.
+type SslMode = :disable | :allow | :prefer | :require | :verify_ca | :verify_full;
+
+/// `sslmode`'s spellings, as the atoms `ssl_mode` holds.
+let ssl_modes : %{:string => SslMode};
+let ssl_modes = %{
+    "disable" => :disable, "allow" => :allow, "prefer" => :prefer,
+    "require" => :require, "verify-ca" => :verify_ca, "verify-full" => :verify_full,
+};
 
 /// A configuration, from whatever a program gave: a map of fields (missing
 /// ones defaulted), or a URL or keyword string. A string that says nothing
@@ -168,7 +193,8 @@ priv let from_pairs pairs = list.fold (fn acc [k, v] -> match acc {
 
 priv let ignored : %{:string => :bool};
 priv let ignored = map.set_of ["connect_timeout", "client_encoding", "target_session_attrs",
-                               "gssencmode", "sslcert", "sslkey", "sslrootcert", "sslcrl", "passfile",
+                               "gssencmode", "sslcrl", "sslcrldir", "sslcompression", "passfile",
+                               "sslnegotiation", "ssl_min_protocol_version", "ssl_max_protocol_version",
                                "channel_binding", "fallback_application_name", "keepalives"];
 
 priv let apply : :map -> :string -> :string -> [:ok, :map] | [:error, :string];
@@ -185,9 +211,17 @@ priv let apply c k v = match k {
     "dbname" => [:ok, Config.set_database c v],
     "database" => [:ok, Config.set_database c v],
     "application_name" => [:ok, Config.set_application_name c v],
-    "sslmode" if list.contains v ["require", "verify-ca", "verify-full"] =>
-        [:error, "sslmode=" + v + " asks for TLS, which this client does not speak; refusing rather than connecting in the clear"],
-    "sslmode" => [:ok, c],
+    "sslmode" => match ssl_modes.[v else ()] {
+        () => [:error, "`" + v + "` is not an sslmode; it is one of disable, allow, prefer, require, verify-ca, verify-full"],
+        mode => [:ok, Config.set_ssl_mode c mode],
+    },
+    "sslrootcert" if v == "system" => [:ok, c],
+    "sslrootcert" => [:ok, Config.set_ssl_root_cert c v],
+    "sslidentity" => [:ok, Config.set_ssl_identity c v],
+    "sslpassword" => [:ok, Config.set_ssl_password c v],
+    "sslcert" => [:error, "a client certificate is `sslidentity`, a PKCS#12 file -- the format every platform's TLS can"
+                          + " import -- rather than `sslcert` and `sslkey`; `openssl pkcs12 -export` makes one"],
+    "sslkey" => [:error, "a client key goes with its certificate in `sslidentity`, a PKCS#12 file"],
     "options" => [:ok, c],
     _ if map_has ignored k => [:ok, c],
     _ => [:ok, Config.set_settings c ((Config.settings c).[k => v])],
@@ -250,10 +284,18 @@ when test {
             $( test.eq! %{ :host => "h", :database => "d", :password => "it's a secret", :user => "u" }
                         (ok (parse "host=h dbname=d  password='it\\'s a secret' user = u")) ),
         test.case "what is refused, and why"
-            $( test.eq! [:error, :error, :error, :ok]
+            $( test.eq! [:error, :error, :error, :error, :ok]
                         (list.map (fn t -> list.head (parse t))
-                                  ["postgres://h/d?sslmode=require", "host=/var/run/postgresql",
-                                   "postgres://h:99999/d", "postgres://h/d?sslmode=prefer"]) ),
+                                  ["postgres://h/d?sslmode=sometimes", "host=/var/run/postgresql",
+                                   "postgres://h:99999/d", "host=h sslcert=c.pem", "postgres://h/d?sslmode=prefer"]) ),
+        test.case "TLS, in libpq's words"
+            $( test.eq! [:prefer, :verify_full, "/etc/ca.pem", "/me.p12", "pw", :disable]
+                        [Config.ssl_mode %{},
+                         Config.ssl_mode (ok (parse "postgres://h/d?sslmode=verify-full&sslrootcert=/etc/ca.pem")),
+                         Config.ssl_root_cert (ok (parse "postgres://h/d?sslmode=verify-full&sslrootcert=/etc/ca.pem")),
+                         Config.ssl_identity (ok (parse "host=h sslidentity=/me.p12 sslpassword=pw")),
+                         Config.ssl_password (ok (parse "host=h sslidentity=/me.p12 sslpassword=pw")),
+                         Config.ssl_mode (ok (parse "host=h sslmode=disable"))] ),
         test.case "the parameters a startup sends"
             $( test.eq! [["user", "ada"], ["database", "app"], ["application_name", "dream"],
                          ["client_encoding", "UTF8"], ["TimeZone", "UTC"]]

@@ -384,25 +384,44 @@ public:
 
     /// Wait for `fd` to become readable (or writable) on behalf of `pid`.
     ///
+    /// A descriptor has waiters in each direction, because a socket is
+    /// full-duplex -- one process may be parked reading it while another is
+    /// parked writing to it, and each must be woken by its own readiness --
+    /// and several in one direction, because several processes may accept on
+    /// one listener. Readiness wakes everyone waiting in that direction; the
+    /// ones that lose the race for it find the operation would block again
+    /// and arm again. It used to be one waiter per descriptor, and a second
+    /// replaced the first, which was then never woken: a hang that needed two
+    /// processes parked at once, so a large loopback buffer on Linux hid it
+    /// and a small one on macOS did not.
+    ///
     /// Returns false when this build cannot wait, so the caller can fall back
     /// to a blocking call rather than parking a process nothing will wake.
     bool arm(int fd, bool writable, uint64_t pid, Scheduler* sched) {
 #if DREAM_HAVE_EPOLL
         if (epoll_fd_ < 0) return false;
+        uint32_t events;
+        bool added;
         {
             std::lock_guard<std::mutex> g(mutex_);
-            waiters_[fd] = Waiter{pid, sched};
-        }
-        epoll_event ev{};
-        ev.events = uint32_t((writable ? EPOLLOUT : EPOLLIN) | EPOLLONESHOT | EPOLLERR | EPOLLHUP);
-        ev.data.fd = fd;
-        // MOD first: the descriptor is usually already in the set from an
-        // earlier wait, and ADD would fail with EEXIST.
-        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-            if (errno != ENOENT || ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
-                std::lock_guard<std::mutex> g(mutex_);
-                waiters_.erase(fd);
-                return false;
+            auto [it, fresh] = waiters_.try_emplace(fd);
+            added = fresh;
+            std::vector<Waiter>& side = writable ? it->second.writers : it->second.readers;
+            side.push_back(Waiter{pid, sched});
+            events = interest(it->second);
+            // Made under the lock, so that two processes arming one descriptor
+            // in opposite directions cannot leave it registered for only one.
+            epoll_event ev{};
+            ev.events = events;
+            ev.data.fd = fd;
+            // MOD first: the descriptor is usually already in the set from an
+            // earlier wait, and ADD would fail with EEXIST.
+            if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
+                if (errno != ENOENT || ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+                    side.pop_back();
+                    if (added) waiters_.erase(it);
+                    return false;
+                }
             }
         }
         sched->note_io_wait(true);
@@ -410,68 +429,74 @@ public:
         return true;
 #else
         std::lock_guard<std::mutex> g(mutex_);
-        if (!running_ || waiters_.count(fd)) return false;
+        if (!running_) return false;
         sched->note_io_wait(true);
-        waiters_[fd] = Waiter{pid, sched, writable};
+        (writable ? waiters_[fd].writers : waiters_[fd].readers).push_back(Waiter{pid, sched});
         changed_.notify_all();
         return true;
 #endif
     }
 
-    /// The process parked on `fd`, or 0 if none is.
+    /// A process parked on `fd`, or 0 if none is.
     uint64_t waiter_of(int fd) {
         std::lock_guard<std::mutex> g(mutex_);
         auto it = waiters_.find(fd);
-        return it == waiters_.end() ? 0 : it->second.pid;
+        if (it == waiters_.end()) return 0;
+        if (!it->second.readers.empty()) return it->second.readers.front().pid;
+        return it->second.writers.empty() ? 0 : it->second.writers.front().pid;
     }
 
     /// Stop watching `fd`, because it is being closed.
     void forget(int fd) {
-#if DREAM_HAVE_EPOLL
-        if (epoll_fd_ < 0) return;
-        Waiter w{};
-        bool had = false;
+        Waiters w{};
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = waiters_.find(fd);
             if (it != waiters_.end()) {
                 w = it->second;
-                had = true;
                 waiters_.erase(it);
             }
+#if DREAM_HAVE_EPOLL
+            if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+#endif
         }
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         // Whoever was waiting must be released, or closing a socket out from
         // under a reader would park that reader for ever. It wakes, retries,
         // and gets the "closed" error the retry produces.
-        if (had && w.sched) {
-            // Wake before releasing the IO-waiter count; see `run_child` in
-            // os.cpp for why the other order invents a deadlock.
-            w.sched->wake(w.pid);
-            w.sched->note_io_wait(false);
-        }
-#else
-        Waiter w{};
-        {
-            std::lock_guard<std::mutex> g(mutex_);
-            auto it = waiters_.find(fd);
-            if (it == waiters_.end()) return;
-            w = it->second;
-            waiters_.erase(it);
-        }
-        w.sched->wake(w.pid);
-        w.sched->note_io_wait(false);
-#endif
+        release(w.readers);
+        release(w.writers);
     }
 
 private:
     struct Waiter {
         uint64_t pid = 0;
         Scheduler* sched = nullptr;
-        bool writable = false;
+    };
+    /// Who is parked on one descriptor, in each direction.
+    struct Waiters {
+        std::vector<Waiter> readers;
+        std::vector<Waiter> writers;
     };
 
+    /// Wake waiters and stop counting them. Wake before releasing the
+    /// IO-waiter count; see `run_child` in os.cpp for why the other order
+    /// invents a deadlock.
+    static void release(const std::vector<Waiter>& ws) {
+        for (const Waiter& w : ws) {
+            w.sched->wake(w.pid);
+            w.sched->note_io_wait(false);
+        }
+    }
+
 #if DREAM_HAVE_EPOLL
+    /// The events to ask for: one-shot, in the directions someone waits in.
+    static uint32_t interest(const Waiters& w) {
+        uint32_t e = EPOLLONESHOT | EPOLLERR | EPOLLHUP;
+        if (!w.readers.empty()) e |= EPOLLIN;
+        if (!w.writers.empty()) e |= EPOLLOUT;
+        return e;
+    }
+
     void loop() {
         std::vector<epoll_event> events(64);
         while (running_.load(std::memory_order_relaxed)) {
@@ -487,20 +512,29 @@ private:
                     [[maybe_unused]] sys::Count r = sys::read(wake_fd_, &drain, sizeof drain);
                     continue;
                 }
-                Waiter w{};
+                uint32_t got = events[i].events;
+                bool failed = (got & (EPOLLERR | EPOLLHUP)) != 0;
+                std::vector<Waiter> readers, writers;
                 {
                     std::lock_guard<std::mutex> g(mutex_);
                     auto it = waiters_.find(fd);
                     if (it == waiters_.end()) continue;
-                    w = it->second;
-                    waiters_.erase(it);
+                    if (failed || (got & EPOLLIN)) readers.swap(it->second.readers);
+                    if (failed || (got & EPOLLOUT)) writers.swap(it->second.writers);
+                    if (it->second.readers.empty() && it->second.writers.empty()) {
+                        waiters_.erase(it);
+                    } else {
+                        // One-shot disarmed the descriptor; whoever is still
+                        // waiting in the other direction needs it armed again.
+                        epoll_event ev{};
+                        ev.events = interest(it->second);
+                        ev.data.fd = fd;
+                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+                    }
                 }
-                if (w.sched) {
-                    IOTRACE("ready fd=%d -> wake pid=%llu", fd, (unsigned long long)w.pid);
-                    // Wake first, then release the count; see `run_child`.
-                    w.sched->wake(w.pid);
-                    w.sched->note_io_wait(false);
-                }
+                IOTRACE("ready fd=%d -> wake %zu readers, %zu writers", fd, readers.size(), writers.size());
+                release(readers);
+                release(writers);
             }
         }
     }
@@ -511,11 +545,17 @@ private:
         std::unique_lock<std::mutex> lock(mutex_);
         while (running_) {
             for (auto it = waiters_.begin(); it != waiters_.end();) {
-                if (!sys::ready(it->first, it->second.writable)) { ++it; continue; }
-                Waiter w = it->second;
-                it = waiters_.erase(it);
-                w.sched->wake(w.pid);
-                w.sched->note_io_wait(false);
+                Waiters& w = it->second;
+                if (!w.readers.empty() && sys::ready(it->first, false)) {
+                    release(w.readers);
+                    w.readers.clear();
+                }
+                if (!w.writers.empty() && sys::ready(it->first, true)) {
+                    release(w.writers);
+                    w.writers.clear();
+                }
+                if (w.readers.empty() && w.writers.empty()) it = waiters_.erase(it);
+                else ++it;
             }
             changed_.wait_for(lock, std::chrono::milliseconds(5));
         }
@@ -527,7 +567,7 @@ private:
     int wake_fd_ = -1;
     std::thread thread_;
     std::mutex mutex_;
-    std::unordered_map<int, Waiter> waiters_;
+    std::unordered_map<int, Waiters> waiters_;
 };
 
 /// Park `p` until `fd` is ready. The caller returns the result unchanged.
@@ -1304,6 +1344,10 @@ std::string read_config(Process& p, Value options, tls::Config* c) {
         if (!is_bool(v)) return "`:verify` is true or false";
         c->verify = truthy(v);
     }
+    if (option(p, map, "check_name", &v)) {
+        if (!is_bool(v)) return "`:check_name` is true or false";
+        c->check_name = truthy(v);
+    }
     if (option(p, map, "alpn", &v)) {
         Value cur = v;
         for (;;) {
@@ -1340,10 +1384,10 @@ NativeResult tls_handshake(Process& p, Value* args, bool server) {
         config.verify = !server;
         std::string bad = read_config(p, args[1], &config);
         if (!bad.empty()) return fail(p, "bad_argument", bad);
-        if (!server && config.verify && config.host.empty()) {
+        if (!server && config.verify && config.check_name && config.host.empty()) {
             return fail(p, "bad_argument",
                         "a client that verifies needs `:host`, the name the certificate must carry; "
-                        "`:verify => false` is how to say it should not check");
+                        "`:check_name => false` checks the chain alone, and `:verify => false` nothing");
         }
         if (server && config.identity_p12.empty()) {
             return fail(p, "bad_argument", "a server needs `:identity`, a PKCS#12 bundle of its certificate and key");

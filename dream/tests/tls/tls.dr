@@ -167,6 +167,23 @@ let unchecked! u = {
     join! server
 };
 
+/// The chain checked and the name not: what libpq calls `verify-ca`.
+let chain_only! : :unit -> :any;
+let chain_only! u = {
+    let [server, port] = server! (server_identity! ()) echo!;
+    let sock = net.connect! "127.0.0.1" port;
+    tls.connect! sock %{ :host => "example.com", :ca => fixture! "ca.pem", :check_name => false }
+    streams.write_all! sock "chain"
+    test.eq! "echo: chain" (exactly! sock 11 [])
+    io.close! sock
+    join! server
+    let [_, refused] = refused! (server_identity! ())
+                                %{ :host => "localhost", :ca => fixture! "other_ca.pem", :check_name => false };
+    test.true! refused
+    test.eq! [:certificate_untrusted, true]
+             (refused! (server_identity! ()) %{ :ca => fixture! "other_ca.pem", :check_name => false })
+};
+
 let mutual! : :unit -> :any;
 let mutual! u = {
     let wants_client = (server_identity! ()).[:ca => fixture! "ca.pem"].[:verify => true];
@@ -288,6 +305,7 @@ let main! = test.main_of! [
         test.case "a server named by its address" $( by_address! () ),
         test.case "untrusted, unknown, misnamed and expired certificates" $( refusals! () ),
         test.case "verification turned off" $( unchecked! () ),
+        test.case "the chain checked and not the name" $( chain_only! () ),
         test.case "mutual TLS" $( mutual! () ),
         test.case "configurations that cannot work" $( bad_config! () ),
         test.case "megabytes both ways at once" $( bulk! () ),

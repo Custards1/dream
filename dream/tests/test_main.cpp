@@ -788,11 +788,7 @@ static void test_big_block_pool() {
 /// can run the second, because a CPU without AVX2 runs only the first.
 static void test_tensor_kernels() {
     std::printf("tensor kernels\n");
-    std::vector<const TensorKernels*> tables = {&kernels_base::kernels};
-#if defined(DREAM_TENSOR_AVX2)
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
-        tables.push_back(&kernels_avx2::kernels);
-#endif
+    std::vector<const TensorKernels*> tables = tensor_kernel_tables();
     const size_t shapes[][3] = {{1, 1, 1}, {1, 7, 9}, {5, 3, 1}, {6, 8, 8},  {7, 9, 17},
                                 {13, 300, 11}, {97, 31, 100}, {2, 513, 3}};
     for (const TensorKernels* k : tables) {
@@ -1491,6 +1487,23 @@ static void test_tls_engines() {
         client.verify = false;
         TlsPair t = tls_pair(client, tls_server_config());
         CHECK(t.client && t.server && tls_shake(t) && t.client_status == tls::Status::Ok);
+    }
+
+    // The chain alone: a trusted certificate for another name is accepted,
+    // an untrusted one is not.
+    {
+        tls::Config client = tls_client_config();
+        client.host = "example.com";
+        client.check_name = false;
+        TlsPair t = tls_pair(client, tls_server_config());
+        CHECK(t.client && t.server && tls_shake(t) && t.client_status == tls::Status::Ok);
+        client.ca_pem = tls_fixtures::other_ca_pem();
+        TlsPair u = tls_pair(client, tls_server_config());
+        CHECK(u.client && u.server);
+        if (u.client && u.server) {
+            tls_shake(u);
+            CHECK_EQ(u.client->failure().kind, std::string("certificate_untrusted"));
+        }
     }
 
     // Mutual TLS: the server sees who the client is.

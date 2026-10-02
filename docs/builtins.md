@@ -405,6 +405,48 @@ import std.net;
 
 ---
 
+## `std.tls`
+
+TLS on a socket. A connected stream handle is upgraded **in place**: `connect!` and `accept!` answer the same handle, and from then on `io.read!`, `io.write!`, `io.close!` and `net.shutdown!` on it carry plaintext through the session — so everything written over sockets (`std.streams`, `std.remote`, a program's own reader) works over TLS unchanged. Upgrading a connection that has already spoken plain text is how PostgreSQL's SSLRequest and SMTP's STARTTLS work, and is why there is no separate `dial`.
+
+The library is the platform's and invisible to Dream: OpenSSL 3 on Linux and macOS, SChannel on Windows. The same program behaves the same on each: the options are what every backend can honour, and a failure is one of the kinds below whatever the library called it. Every blocking step — the handshake, a read waiting for a record, a write waiting for the socket — parks the process, not the worker. See `dream/src/tls.hpp` for the design.
+
+```dream
+import std.net;
+import std.tls;
+
+let sock = net.connect! "example.com" 443;
+tls.connect! sock %{ :host => "example.com", :alpn => ["http/1.1"] }
+io.write! sock "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+```
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `connect!` | `socket → options:map → socket` | The client's handshake. Raises the kind of failure below when the server cannot be trusted. |
+| `accept!` | `socket → options:map → socket` | The server's handshake, on a socket from `net.accept!`. |
+| `info!` | `socket → map\|unit` | `%{ :version, :cipher, :alpn, :peer }` for a TLS socket — `:peer` the subject of the other side's certificate, `:alpn` the protocol chosen, either `()` when there is none — and `()` for a plain one. Version and cipher are spelled by the library. |
+| `backend` | `unit → string` | The TLS library this VM was built with, and its version. |
+
+Options, all optional except as noted:
+
+| Key | Meaning |
+|-----|---------|
+| `:host` | The name (or address) the server's certificate must carry, also sent as SNI. **Required** for a client that verifies. |
+| `:verify` | Client: check the server's certificate (default `true`). Server: require a client certificate and check it against `:ca` (default `false`). |
+| `:check_name` | Client: whether checking includes `:host` (default `true`). `false` checks the chain alone — libpq's `verify-ca`. |
+| `:ca` | PEM certificates to trust **instead of** the system's store. Exclusive rather than additional, so a program that names its roots trusts the same thing on every machine. |
+| `:identity` | This side's certificate, chain and key, as the bytes of a **PKCS#12** bundle — the one format every backend imports. Required for a server. |
+| `:password` | The PKCS#12 bundle's password. |
+| `:alpn` | Protocol names to offer (client) or accept (server), in preference order. |
+
+TLS 1.2 is the oldest version either side will speak. Revocation is not checked, by any backend. On Windows SChannel does its cryptography outside the process, so a PKCS#12 identity's key is imported into the user's key store for the life of the VM and deleted when it exits.
+
+### Error atoms
+
+`:certificate_untrusted` · `:certificate_expired` · `:hostname_mismatch` · `:handshake_failed` · `:tls_config` (an unreadable `:ca` or `:identity`, a wrong password) · `:tls_error` · `:bad_argument` · `:wrong_kind` · `:io_closed`
+
+---
+
 ## `std.os`
 
 Operating system interface: arguments, environment, filesystem traversal, subprocesses.

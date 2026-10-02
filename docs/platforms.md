@@ -52,7 +52,10 @@ Platform-specific work remains platform-specific:
 
 Use a C++20 compiler and CMake 3.20 or newer. GCC, Clang, and MSVC are supported
 by the build configuration. libffi is required -- `std.ffi` is part of every
-VM -- and LLVM is optional. Start with the interpreter to avoid LLVM:
+VM -- and so is TLS for `std.tls`: OpenSSL 3 on Linux and macOS (`libssl-dev`,
+or Homebrew's `openssl@3`, which CMake finds by itself), and on Windows
+SChannel, which is part of the system and needs nothing installed. LLVM is
+optional. Start with the interpreter to avoid LLVM:
 
 ```text
 cmake -S . -B build -DDREAM_ENABLE_JIT=OFF
@@ -65,8 +68,23 @@ Visual Studio puts it in `build/bin/Release/dream.exe`. Keep the Windows VM DLL
 beside the executable. Enable LLVM with `DREAM_ENABLE_JIT`; without it the
 build produces an interpreter. Without libffi the configure stops: point
 `DREAM_FFI_INCLUDE` and `DREAM_FFI_LIB` at an unusual install, or on Windows use
-vcpkg's `libffi` through its toolchain file. On Windows, use libraries built for
-the same compiler ABI.
+vcpkg's `libffi` through its toolchain file. Without OpenSSL the configure stops
+too; `-DOPENSSL_ROOT_DIR` points it at an unusual install. On Windows, use
+libraries built for the same compiler ABI.
+
+### TLS on each platform
+
+`std.tls` is one interface over two libraries, and a program cannot tell which
+it got: OpenSSL on Linux and macOS, SChannel on Windows. Each is driven from
+memory by the same socket code in the VM, so parking, non-blocking IO and
+closing behave identically; the options are the ones every backend honours
+(an identity is a PKCS#12 bundle, trusted roots are PEM); and a failure is one
+of the same few kinds. What legitimately differs is the system's own trust
+store, consulted when a program gives no `:ca` -- a program that names its
+roots trusts the same thing everywhere. The version and cipher `tls.info!`
+reports are each library's spelling. On Windows a PKCS#12 identity's key is
+imported into the user's key store for the life of the VM, because SChannel
+works outside the process.
 
 ## Verification
 

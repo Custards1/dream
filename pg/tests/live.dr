@@ -8,7 +8,9 @@
 // connection and vanish with it.
 
 import std.console;
+import std.file;
 import std.list;
+import std.map;
 import std.os;
 import std.proc;
 import std.str;
@@ -48,7 +50,7 @@ let login! user password = {
     :ok
 };
 
-let refused! : :map -> :unit -> :any;
+let refused! : :any -> :unit -> :any;
 let refused! target u = db.connect! target;
 
 let wrong_password! : :unit -> :any;
@@ -419,6 +421,72 @@ let bad_pool! u = {
     :ok
 };
 
+// --- TLS ----------------------------------------------------------------------------
+//
+// The cluster runs with `ssl=on` and the VM's own test certificate, which names
+// `localhost` and 127.0.0.1; `u_ssl` may only connect encrypted.
+
+let certs! : :unit -> :string;
+let certs! u = match os.env! "PG_TEST_CERTS" {
+    () => "dream/tests/tls",
+    d => d,
+};
+
+let secured! : :string -> :string | :unit -> :map -> :map;
+let secured! user password extra = map.merge (as! user password) extra;
+
+/// Whether the server says this session is encrypted, and whom the client
+/// was told it was talking to.
+let over_tls! : :any -> :unit -> [:any, :any];
+let over_tls! target u = {
+    let conn = db.connect! target;
+    let encrypted = db.scalar! conn "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+    let info = db.tls_info! conn;
+    db.close! conn
+    [encrypted, if info == () { () } else { info.[:peer] }]
+};
+
+let tls_modes! : :unit -> :any;
+let tls_modes! u = {
+    let roots = certs! () + "/ca.pem";
+    let encrypted = [true, "CN=localhost"];
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :require }) ())
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_ca, :ssl_root_cert => roots }) ())
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_root_cert => roots,
+                                                                  :host => "localhost" }) ())
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_root_cert => roots }) ())
+    test.eq! encrypted (over_tls! ("postgresql://u_ssl:sslpass@localhost:" + to_string (port! ())
+                                   + "/app?sslmode=verify-full&sslrootcert=" + roots) ())
+    // `prefer`, the default, encrypts when it can; `disable` never does.
+    test.eq! encrypted (over_tls! (as! "postgres" ()) ())
+    test.eq! [false, ()] (over_tls! (secured! "postgres" () %{ :ssl_mode => :disable }) ())
+};
+
+let tls_refusals! : :unit -> :any;
+let tls_refusals! u = {
+    // A user the server only lets in over TLS, asked for without it.
+    test.eq! :invalid_authorization_specification
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :disable })))
+    // Roots that did not sign the server's certificate.
+    let other = file.read! (certs! () + "/other_ca.pem");
+    test.eq! :certificate_untrusted
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_ca => other })))
+    test.eq! :bad_config
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_ca,
+                                                                      :ssl_root_cert => "/no/such/file.pem" })))
+};
+
+let pooled_tls! : :unit -> :any;
+let pooled_tls! u = {
+    let p = pool.start! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full,
+                                                        :ssl_root_cert => certs! () + "/ca.pem" }) 2;
+    let answers = proc.map! (pooled_work! p) (list.range 1 5);
+    test.eq! [10, 20, 30, 40] answers
+    test.eq! true (pool.scalar! p "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+    pool.stop! p
+    :ok
+};
+
 let main! = test.main_of! [
     ["pg live: logging in", [
         test.case "trust" $( login! "postgres" () ),
@@ -449,6 +517,11 @@ let main! = test.main_of! [
         test.case "LISTEN and NOTIFY" $( notifications! () ),
         test.case "a subscription process" $( subscription! () ),
         test.case "cancelling a running statement" $( cancelling! () ),
+    ]],
+    ["pg live: TLS", [
+        test.case "every sslmode that encrypts, and the two that may not" $( tls_modes! () ),
+        test.case "what TLS refuses" $( tls_refusals! () ),
+        test.case "a pool of encrypted connections" $( pooled_tls! () ),
     ]],
     ["pg live: pool", [
         test.case "many processes, few connections" $( pooling! () ),

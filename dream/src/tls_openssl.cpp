@@ -200,10 +200,12 @@ public:
             X509_VERIFY_PARAM* param = SSL_get0_param(ssl_);
             // An address is checked against the certificate's IP entries and
             // is never sent as SNI, which is for names only.
-            if (X509_VERIFY_PARAM_set1_ip_asc(param, config.host.c_str()) != 1) {
-                ERR_clear_error();
+            bool address = X509_VERIFY_PARAM_set1_ip_asc(param, config.host.c_str()) == 1;
+            ERR_clear_error();
+            if (address && !config.check_name) X509_VERIFY_PARAM_set1_ip(param, nullptr, 0);
+            if (!address) {
                 SSL_set_tlsext_host_name(ssl_, config.host.c_str());
-                if (SSL_set1_host(ssl_, config.host.c_str()) != 1) {
+                if (config.check_name && SSL_set1_host(ssl_, config.host.c_str()) != 1) {
                     *why = {"tls_config", "`" + config.host + "` is not a host name"};
                     return false;
                 }

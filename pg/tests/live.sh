@@ -67,7 +67,16 @@ trap cleanup EXIT
 run_as_owner "$bin/initdb" -D "$tmp/data" -A trust -U postgres >"$tmp/initdb.log" 2>&1 || {
     echo "pg live: initdb failed"; sed 's/^/    /' "$tmp/initdb.log" | tail -5; exit 1; }
 
+# TLS, with the VM's own test certificate (dream/tests/tls): `u_ssl` may only
+# connect encrypted, and everyone else may connect either way.
+cp dream/tests/tls/server.pem "$tmp/data/server.crt"
+cp dream/tests/tls/server.key "$tmp/data/server.key"
+chmod 600 "$tmp/data/server.key"
+[ -n "$as_owner" ] && chown postgres "$tmp/data/server.crt" "$tmp/data/server.key"
+
 cat >"$tmp/data/pg_hba.conf" <<HBA
+hostssl   all u_ssl 127.0.0.1/32 scram-sha-256
+hostnossl all u_ssl 127.0.0.1/32 reject
 host all u_md5   127.0.0.1/32 md5
 host all u_scram 127.0.0.1/32 scram-sha-256
 host all u_clear 127.0.0.1/32 password
@@ -76,16 +85,16 @@ local all all trust
 HBA
 
 run_as_owner "$bin/pg_ctl" -D "$tmp/data" -l "$tmp/server.log" -w \
-    -o "-p $port -k $tmp -c listen_addresses=127.0.0.1 -c fsync=off" start >/dev/null 2>&1 || {
+    -o "-p $port -k $tmp -c listen_addresses=127.0.0.1 -c fsync=off -c ssl=on" start >/dev/null 2>&1 || {
     echo "pg live: the server did not start"; sed 's/^/    /' "$tmp/server.log" | tail -5; exit 1; }
 
 "$psql" -q -h 127.0.0.1 -p "$port" -U postgres -d postgres \
     -c "SET password_encryption = 'md5'; CREATE USER u_md5 PASSWORD 'md5pass';" \
-    -c "SET password_encryption = 'scram-sha-256'; CREATE USER u_scram PASSWORD 'scrampass'; CREATE USER u_clear PASSWORD 'clearpass';" \
+    -c "SET password_encryption = 'scram-sha-256'; CREATE USER u_scram PASSWORD 'scrampass'; CREATE USER u_clear PASSWORD 'clearpass'; CREATE USER u_ssl PASSWORD 'sslpass';" \
     -c "CREATE DATABASE app;" >"$tmp/setup.log" 2>&1 || {
     echo "pg live: could not set the cluster up"; sed 's/^/    /' "$tmp/setup.log"; exit 1; }
 
 "$dream" "$dreams" pg/tests/live.dr -L mind -L . -o "$tmp/live.dream" >"$tmp/build.log" 2>&1 || {
     echo "pg live: the suite did not compile"; sed 's/^/    /' "$tmp/build.log" | head -10; exit 1; }
 
-PG_TEST_PORT=$port timeout 300 "$dream" "$tmp/live.dream"
+PG_TEST_PORT=$port PG_TEST_CERTS=$PWD/dream/tests/tls timeout 300 "$dream" "$tmp/live.dream"

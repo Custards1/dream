@@ -164,6 +164,7 @@ The groups, and what each one is actually asking:
 | `test-examples` | Every example, output compared against what is recorded beside it |
 | `test-std` | The standard library's `when test` blocks |
 | `test-ffi` | `std.ffi`/`std.foreign` against a C library built from `dream/tests/ffi` |
+| `test-tls` | `std.tls`: a server and clients in one VM, and against OpenSSL's `s_server`/`s_client` |
 | `test-mind` | `mind`'s path handling, manifests, dependency specs |
 | `test-dreams` | Every `when test` block `dreams/main.dr` reaches |
 | `test-dreams-corpus` | Every `.dr` file in the repository parses |
@@ -369,6 +370,15 @@ The lessons that keep coming back:
   the process ends; `foreign.run! server (fn () -> ..)` does work in a library
   server that owns what is made through it. `foreign` is contextual -- still
   the name of `std.foreign`. [docs/ffi.md](docs/ffi.md).
+- `import std.tls` gives **TLS** on a socket, upgraded in place:
+  `tls.connect! sock %{ :host => h }` answers the same handle, and `io.read!`
+  and `io.write!` on it then carry plaintext. The VM drives a TLS library
+  from memory -- OpenSSL on Linux and macOS, linked at build time and as
+  required as libffi; SChannel on Windows -- and the socket side (parking,
+  non-blocking IO, close) is io.cpp's, written once. An identity is PKCS#12
+  and roots are PEM because those are what every backend imports.
+  [dream/src/tls.hpp](dream/src/tls.hpp) is the design, and
+  `dream/tests/tls` the fixtures, which portable.py runs on all three OSes.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

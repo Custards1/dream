@@ -21,4 +21,5 @@ let plan ctx =
     |> build.check "vm" (suite ctx "vm" (file.parent (build.Context.vm ctx) + "/dream_tests"))
     |> build.check "e2e" (suite ctx "e2e" "dream/tests/e2e.sh")
     |> build.check "examples" (suite ctx "examples" "examples/run.sh")
-    |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh");
+    |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh")
+    |> build.check "tls" (suite ctx "tls" "dream/tests/tls/run.sh");
