@@ -371,10 +371,16 @@ public:
                 return fail("tls_error", "cannot decrypt a record: " + status_text(s));
             }
             // The plaintext and what is left over both point into `in_`, so
-            // they are copied out before it changes.
+            // they are copied out before it changes. Plaintext only from a
+            // record that had some: a close_notify answers SEC_I_CONTEXT_EXPIRED
+            // and leaves the alert's own bytes in a DATA buffer, which are not
+            // the application's.
             std::string extra;
+            bool has_data = s == SEC_E_OK || s == SEC_I_RENEGOTIATE;
             for (SecBuffer& x : b) {
-                if (x.BufferType == SECBUFFER_DATA && x.cbBuffer) plain_.append(static_cast<char*>(x.pvBuffer), x.cbBuffer);
+                if (has_data && x.BufferType == SECBUFFER_DATA && x.cbBuffer) {
+                    plain_.append(static_cast<char*>(x.pvBuffer), x.cbBuffer);
+                }
                 if (x.BufferType == SECBUFFER_EXTRA && x.cbBuffer) {
                     extra.assign(in_.data() + (in_.size() - x.cbBuffer), x.cbBuffer);
                 }
