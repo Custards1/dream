@@ -1451,7 +1451,13 @@ static void test_tls_engines() {
             t.server->feed(bye.data(), bye.size());
             char buf[16];
             size_t n = 0;
-            CHECK(t.server->read(buf, sizeof buf, &n) == tls::Status::Closed);
+            tls::Status at_close = t.server->read(buf, sizeof buf, &n);
+            if (at_close != tls::Status::Closed) {
+                std::printf("  close_notify: %zu bytes sent, %s, server read answered %d (%s)\n", bye.size(),
+                            t.client->info().version.c_str(), int(at_close),
+                            t.server->failure().message.c_str());
+            }
+            CHECK(at_close == tls::Status::Closed);
         }
     }
 

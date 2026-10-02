@@ -353,7 +353,10 @@ public:
                 if (s == SEC_E_OK) renegotiating_ = false;
                 continue;
             }
-            if (in_.empty()) return eof_ ? Status::Closed : Status::WantRead;
+            if (in_.empty()) {
+                if (!eof_ && last_decrypt_ != SEC_E_OK) failure_.message = "the last record decrypted as " + status_text(last_decrypt_);
+                return eof_ ? Status::Closed : Status::WantRead;
+            }
             SecBuffer b[4] = {
                 {ULONG(in_.size()), SECBUFFER_DATA, in_.data()},
                 {0, SECBUFFER_EMPTY, nullptr},
@@ -363,6 +366,7 @@ public:
             SecBufferDesc desc{SECBUFFER_VERSION, 4, b};
             SECURITY_STATUS s = DecryptMessage(&ctx_, &desc, 0, nullptr);
             if (s == SEC_E_INCOMPLETE_MESSAGE) return eof_ ? Status::Closed : Status::WantRead;
+            last_decrypt_ = s;
             if (s != SEC_E_OK && s != SEC_I_RENEGOTIATE && s != SEC_I_CONTEXT_EXPIRED) {
                 return fail("tls_error", "cannot decrypt a record: " + status_text(s));
             }
@@ -414,9 +418,14 @@ public:
         DWORD type = SCHANNEL_SHUTDOWN;
         SecBuffer b{sizeof type, SECBUFFER_TOKEN, &type};
         SecBufferDesc desc{SECBUFFER_VERSION, 1, &b};
-        if (ApplyControlToken(&ctx_, &desc) != SEC_E_OK) return;
+        SECURITY_STATUS s = ApplyControlToken(&ctx_, &desc);
+        if (s != SEC_E_OK) {
+            failure_.message = "SCHANNEL_SHUTDOWN: " + status_text(s);
+            return;
+        }
         in_.clear();
-        step(false);  // the close_notify, into `out_`
+        s = step(false);  // the close_notify, into `out_`
+        if (s != SEC_E_OK) failure_.message = "after SCHANNEL_SHUTDOWN: " + status_text(s);
         done_ = false;
     }
 
@@ -639,6 +648,7 @@ private:
     bool eof_ = false;
     bool closed_ = false;
     bool renegotiating_ = false;
+    SECURITY_STATUS last_decrypt_ = SEC_E_OK;
     SecPkgContext_StreamSizes sizes_{};
     std::string in_;
     std::string out_;
