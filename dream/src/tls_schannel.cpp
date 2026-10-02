@@ -333,7 +333,13 @@ public:
                 return fail("handshake_failed", "SChannel did not report its record sizes");
             }
             Status checked = check_peer();
-            if (checked != Status::Ok) return checked;
+            if (checked != Status::Ok) {
+                // SChannel thinks the handshake succeeded -- the check was
+                // ours, made after it -- so the peer has to be told, or it
+                // waits for a conversation that is never coming.
+                alert(failure_.kind);
+                return checked;
+            }
             done_ = true;
             return Status::Ok;
         }
@@ -537,6 +543,22 @@ private:
             default:
                 return fail("handshake_failed", status_text(s));
         }
+    }
+
+    /// Send the fatal alert that says why the handshake is over, as OpenSSL
+    /// does for a check it makes itself.
+    void alert(const std::string& kind) {
+        DWORD number = kind == "certificate_expired"   ? TLS1_ALERT_CERTIFICATE_EXPIRED
+                       : kind == "certificate_revoked" ? TLS1_ALERT_CERTIFICATE_REVOKED
+                       : kind == "hostname_mismatch"   ? TLS1_ALERT_BAD_CERTIFICATE
+                       : kind == "certificate_untrusted" ? TLS1_ALERT_UNKNOWN_CA
+                                                         : TLS1_ALERT_ACCESS_DENIED;
+        SCHANNEL_ALERT_TOKEN token{SCHANNEL_ALERT, TLS1_ALERT_FATAL, number};
+        SecBuffer b{sizeof token, SECBUFFER_TOKEN, &token};
+        SecBufferDesc desc{SECBUFFER_VERSION, 1, &b};
+        if (ApplyControlToken(&ctx_, &desc) != SEC_E_OK) return;
+        in_.clear();
+        step(false);  // the alert record, into `out_`
     }
 
     /// The certificate the peer presented, checked as tls.hpp says: chained to

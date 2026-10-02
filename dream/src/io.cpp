@@ -655,12 +655,20 @@ Pump pull_tls(TlsSession& s, int fd, int* err) {
 /// Raise what the engine said went wrong, and remember it: a session that has
 /// failed refuses everything after, rather than handing on whatever state the
 /// library was left in.
+///
+/// The peer is told twice over: the alert the engine made, if it made one, and
+/// then the end of this side's stream. A TLS session that has failed sends
+/// nothing more, and a peer that is not told so -- a server whose client
+/// refused its certificate after a handshake the server saw succeed -- waits
+/// for ever on a read. Only the sending half is shut, so whatever the peer
+/// says back can still be read, and the handle stays the program's to close.
 NativeResult tls_failed(Process& p, TlsSession& s, int fd) {
     s.state = TlsSession::State::Failed;
     s.failure = s.engine->failure();
     int ignored = 0;
     s.out += s.engine->take_output();  // the alert, if there is one
     flush_tls(s, fd, &ignored);
+    sys::shutdown(fd, SHUT_WR);
     return fail(p, s.failure.kind.c_str(), s.failure.message);
 }
 

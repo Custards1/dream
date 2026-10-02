@@ -21,7 +21,13 @@ def run(command, **kwargs):
         command = [args.wine, command[0], *[
             "Z:" + str(x) if isinstance(x, Path) and x.is_absolute() else x
             for x in command[1:]]]
-    result = subprocess.run([str(x) for x in command], capture_output=True, timeout=180, **kwargs)
+    try:
+        result = subprocess.run([str(x) for x in command], capture_output=True, timeout=180, **kwargs)
+    except subprocess.TimeoutExpired as e:
+        # What it printed before it stopped is where it stopped.
+        out = (e.stdout or b"").decode(errors="replace")
+        err = (e.stderr or b"").decode(errors="replace")
+        raise RuntimeError(f"{command}: timed out\n--- stdout ---\n{out}\n--- stderr ---\n{err}") from None
     if result.returncode:
         raise RuntimeError(f"{command}: exit {result.returncode}\n{result.stderr.decode(errors='replace')}")
     return result.stdout.replace(b"\r\n", b"\n")
