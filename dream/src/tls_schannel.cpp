@@ -766,9 +766,10 @@ private:
         para.RequestedUsage.Usage.cUsageIdentifier = 1;
         para.RequestedUsage.Usage.rgpszUsageIdentifier = &usage;
         PCCERT_CHAIN_CONTEXT chain = nullptr;
-        // Revocation from what is already here -- the lists given as `crl`, a
-        // stapled OCSP response SChannel cached, the system's own cache -- and
-        // never from the network, as tls.hpp says.
+        // Revocation from what Windows already has -- a stapled OCSP response
+        // SChannel cached, the system's own cache -- and never from the
+        // network, as tls.hpp says. The lists given as `crl` are read by
+        // `listed`.
         DWORD flags = CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY;
         BOOL built = CertGetCertificateChain(nullptr, cert, nullptr, pool, &para, flags, nullptr, &chain);
         CertCloseStore(pool, 0);
@@ -796,7 +797,7 @@ private:
         Status result = Status::Ok;
         if (!trusted_root) {
             result = fail("certificate_untrusted", "the certificate does not chain to a trusted root");
-        } else if (errors & CERT_TRUST_IS_REVOKED) {
+        } else if ((errors & CERT_TRUST_IS_REVOKED) || listed(chain->rgpChain[0])) {
             result = fail("certificate_revoked", "the certificate has been revoked");
         } else if (errors & CERT_TRUST_IS_NOT_TIME_VALID) {
             result = fail("certificate_expired", "the certificate is outside its validity period");
@@ -809,6 +810,40 @@ private:
         }
         CertFreeCertificateChain(chain);
         return result;
+    }
+
+    /// Whether one of the `crl` lists names a certificate of the chain, each
+    /// list read only for the certificates its issuer signed and only when
+    /// that issuer's signature on it holds. Done here rather than left to the
+    /// chain engine, whose revocation provider may or may not look for lists
+    /// in the stores it is handed -- Wine's does, Windows' did not -- and a
+    /// list that is honoured on one machine and not another is worse than
+    /// none.
+    bool listed(const CERT_SIMPLE_CHAIN* simple) {
+        if (!crl_) return false;
+        for (DWORD i = 0; i + 1 < simple->cElement; ++i) {
+            PCCERT_CONTEXT cert = simple->rgpElement[i]->pCertContext;
+            PCCERT_CONTEXT issuer = simple->rgpElement[i + 1]->pCertContext;
+            PCCRL_CONTEXT crl = nullptr;
+            while ((crl = CertEnumCRLsInStore(crl_, crl)) != nullptr) {
+                if (!CertCompareCertificateName(X509_ASN_ENCODING, &crl->pCrlInfo->Issuer,
+                                                &cert->pCertInfo->Issuer)) {
+                    continue;
+                }
+                if (!CryptVerifyCertificateSignatureEx(0, X509_ASN_ENCODING, CRYPT_VERIFY_CERT_SIGN_SUBJECT_CRL,
+                                                       const_cast<CRL_CONTEXT*>(crl),
+                                                       CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT,
+                                                       const_cast<CERT_CONTEXT*>(issuer), 0, nullptr)) {
+                    continue;
+                }
+                PCRL_ENTRY entry = nullptr;
+                if (CertFindCertificateInCRL(cert, crl, 0, nullptr, &entry) && entry) {
+                    CertFreeCRLContext(crl);
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// The server's name, by the SSL policy for a name and by the certificate's
