@@ -56,6 +56,7 @@ Runtime::Runtime(bool owns_host_services)
     register_module(make_ffi_module());
     register_module(make_io_module());
     register_module(make_net_module());
+    register_module(make_tls_module());
     register_module(make_os_module());
     // The poller thread has to exist before any process can wait on a
     // descriptor, and it costs nothing when nothing does IO.
