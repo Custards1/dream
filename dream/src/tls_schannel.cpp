@@ -459,6 +459,13 @@ private:
         };
         ULONG in_count = (first && !alpn_.empty()) ? 3 : 2;
         SecBufferDesc in_desc{SECBUFFER_VERSION, in_count, in};
+        // With nothing to hand over -- the call after SCHANNEL_SHUTDOWN, which
+        // only has a close_notify to give back -- a client passes no input at
+        // all, as Microsoft's shutdown sequence does, and a server one empty
+        // buffer, since AcceptSecurityContext requires a descriptor.
+        SecBuffer nothing{0, SECBUFFER_EMPTY, nullptr};
+        SecBufferDesc empty_desc{SECBUFFER_VERSION, 1, &nothing};
+        bool no_input = !first && in_.empty();
         SecBufferDesc alpn_only{SECBUFFER_VERSION, 1, &in[2]};
         SecBuffer out[2] = {{0, SECBUFFER_TOKEN, nullptr}, {0, SECBUFFER_ALERT, nullptr}};
         SecBufferDesc out_desc{SECBUFFER_VERSION, 2, out};
@@ -468,15 +475,16 @@ private:
             ULONG flags = ASC_REQ_SEQUENCE_DETECT | ASC_REQ_REPLAY_DETECT | ASC_REQ_CONFIDENTIALITY
                           | ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_STREAM | ASC_REQ_EXTENDED_ERROR;
             if (verify_) flags |= ASC_REQ_MUTUAL_AUTH;
-            s = AcceptSecurityContext(&creds_->handle, first ? nullptr : &ctx_, &in_desc, flags, 0, &ctx_,
-                                      &out_desc, &attrs, nullptr);
+            s = AcceptSecurityContext(&creds_->handle, first ? nullptr : &ctx_, no_input ? &empty_desc : &in_desc,
+                                      flags, 0, &ctx_, &out_desc, &attrs, nullptr);
         } else {
             ULONG flags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY
                           | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_EXTENDED_ERROR
                           | ISC_REQ_MANUAL_CRED_VALIDATION;
             if (creds_->identity) flags |= ISC_REQ_USE_SUPPLIED_CREDS;
             SEC_WCHAR* target = whost_.empty() ? nullptr : whost_.data();
-            SecBufferDesc* input = first ? (alpn_.empty() ? nullptr : &alpn_only) : &in_desc;
+            SecBufferDesc* input = first ? (alpn_.empty() ? nullptr : &alpn_only)
+                                         : (no_input ? nullptr : &in_desc);
             s = InitializeSecurityContextW(&creds_->handle, first ? nullptr : &ctx_, target, flags, 0, 0, input,
                                            0, &ctx_, &out_desc, &attrs, nullptr);
         }

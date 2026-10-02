@@ -1548,6 +1548,10 @@ static void test_tls_engines() {
 }
 
 int main() {
+    // Unbuffered, so that a test that crashes the process still leaves the
+    // name of the section it was in: under CI stdout is a pipe, and a pipe is
+    // block-buffered, so a crash used to take every line with it.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_arithmetic_boundaries();
     test_value_tagging();
     test_heap_alloc();
