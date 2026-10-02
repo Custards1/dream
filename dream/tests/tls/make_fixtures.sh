@@ -18,10 +18,12 @@ cd "$(dirname "$0")"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-ec() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null; }
+# RSA rather than EC: it is the key every SChannel and every crypt32 imports,
+# Wine's included, which is where the Windows backend can be run off Windows.
+key() { openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$1" 2>/dev/null; }
 
 authority() {  # key cert cn
-    ec "$1"
+    key "$1"
     openssl req -x509 -key "$1" -out "$2" -days 36500 -subj "/CN=$3" \
         -addext "basicConstraints=critical,CA:TRUE" \
         -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
@@ -52,18 +54,18 @@ copy_extensions = none
 commonName = supplied
 [server]
 basicConstraints = critical,CA:FALSE
-keyUsage = critical,digitalSignature
+keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:localhost,IP:127.0.0.1
 [client]
 basicConstraints = critical,CA:FALSE
-keyUsage = critical,digitalSignature
+keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = clientAuth
 subjectAltName = DNS:client.test
 CNF
 
 leaf() {  # name cn section start end
-    ec "$work/$1.key"
+    key "$work/$1.key"
     openssl req -new -key "$work/$1.key" -subj "/CN=$2" -out "$work/$1.csr" 2>/dev/null
     openssl ca -batch -config "$work/ca.cnf" -extensions "$3" -startdate "$4" -enddate "$5" \
         -in "$work/$1.csr" -out "$work/$1.pem" -notext 2>/dev/null

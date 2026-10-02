@@ -62,6 +62,10 @@ if args.mode == "compile":
     run([vm, compiler, "-L", ROOT / "mind", "-L", ROOT, ROOT / "dream/tests/portable_paths.dr",
          "-o", images / "paths.dream"])
     cases.append(dict(name="paths", sha256=digest(images / "paths.dream"), expected="true\n" * 7))
+    # std.tls through whichever library this platform's VM was built with:
+    # OpenSSL on Linux and macOS, SChannel on Windows. One image, one output.
+    run([vm, compiler, "-L", ROOT / "mind", ROOT / "dream/tests/tls/tls.dr", "-o", images / "tls.dream"])
+    cases.append(dict(name="tls", sha256=digest(images / "tls.dream")))
     run([vm, compiler, "-L", ROOT / "mind", "-L", ROOT, ROOT / "dreams/main.dr",
          "-o", images / "dreams.dream"])
     cases.append(dict(name="dreams", sha256=digest(images / "dreams.dream")))
@@ -78,6 +82,9 @@ else:
                 run([vm, image, "-L", ROOT / "mind", ROOT / "dream/tests/programs/bytes.dr", "-o", output])
                 expected = (ROOT / "dream/tests/programs/bytes.expected").read_bytes().replace(b"\r\n", b"\n")
                 assert run([vm, output]).rstrip(b"\n") == expected.rstrip(b"\n")
+            elif case["name"] == "tls":
+                got = run([vm, image, ROOT / "dream/tests/tls"])
+                assert got.rstrip(b"\n").endswith(b"all tests passed"), got.decode(errors="replace")
             elif case["name"] == "portable":
                 got = run([vm, "--workers", "1", image, vm, image, Path(scratch) / "bytes ü.dat"])
                 platform = 'windows' if args.wine or os.name == 'nt' else ('macos' if sys.platform == 'darwin' else 'linux')
