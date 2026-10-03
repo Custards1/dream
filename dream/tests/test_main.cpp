@@ -189,6 +189,66 @@ static void test_gc_handles_cycles() {
     CHECK_EQ(static_cast<ConsObj*>(as_obj(rb))->tail, ra);
 }
 
+/// A block that the sweep finds mostly dead is emptied by the next major: its
+/// survivors are copied into the holes of other blocks and the block is handed
+/// back. What has to come through is everything a promotion has to keep --
+/// values, sharing, the references between the survivors -- and the roots have
+/// to name the copies.
+static void test_major_evacuates_sparse_blocks() {
+    std::printf("a major evacuates sparse blocks\n");
+    Heap h(4096);
+    VectorRoots roots;
+
+    // A chain of kept cells with nineteen others between each pair of them,
+    // every one rooted, so a first collection tenures them all densely.
+    const int n = 4000;
+    Value prev_kept = NIL;
+    for (int i = 0; i < n; ++i) {
+        if (i % 20 == 0) {
+            prev_kept = h.make_cons(h.make_float(double(i)), prev_kept);
+            roots.values.push_back(prev_kept);
+        } else {
+            roots.values.push_back(h.make_cons(h.make_float(double(i)), NIL));
+        }
+    }
+    h.collect(roots);
+    CHECK_EQ(h.blocks_evacuated(), uint64_t(0));
+
+    // Drop all but the kept cells, and root the newest of them twice: one
+    // object reached two ways must still be one object after it moves.
+    std::vector<Value> kept;
+    for (int i = 0; i < n; i += 20) kept.push_back(roots.values[size_t(i)]);
+    roots.values = kept;
+    roots.values.push_back(kept.back());
+    std::vector<Value> addresses = roots.values;
+
+    // The first of these sweeps finds the blocks sparse and chooses them; the
+    // second empties them.
+    h.collect(roots);
+    h.collect(roots);
+    CHECK(h.blocks_evacuated() > 0);
+    CHECK(h.bytes_evacuated() > 0);
+
+    size_t moved = 0;
+    for (size_t k = 0; k < kept.size(); ++k) {
+        if (roots.values[k] != addresses[k]) ++moved;
+        // The chain still runs from each kept cell to every one before it.
+        Value cur = roots.values[k];
+        for (size_t j = k + 1; j-- > 0;) {
+            CHECK(is_obj(cur, ObjType::Cons));
+            auto* c = static_cast<ConsObj*>(as_obj(cur));
+            CHECK_EQ(static_cast<FloatObj*>(as_obj(c->head))->value, double(j * 20));
+            cur = c->tail;
+            // A cell's tail is the cell kept before it, which is rooted too.
+            if (j > 0) CHECK_EQ(cur, roots.values[j - 1]);
+        }
+        CHECK(is_nil(cur));
+    }
+    CHECK(moved > 0);
+    CHECK_EQ(roots.values.back(), roots.values[kept.size() - 1]);
+    CHECK_EQ(h.verify(roots), std::string());
+}
+
 static void test_minor_collection_promotes_reachable() {
     std::printf("minor collection promotes the reachable young\n");
     Heap h(4096);
@@ -1594,6 +1654,7 @@ int main() {
     test_gc_preserves_sharing();
     test_gc_collapses_indirections();
     test_gc_handles_cycles();
+    test_major_evacuates_sparse_blocks();
     test_minor_collection_promotes_reachable();
     test_minor_collection_leaves_old_space_alone();
     test_write_barrier_keeps_old_to_young();

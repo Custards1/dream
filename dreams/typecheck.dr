@@ -973,10 +973,28 @@ let infer_binary k h op l r sp ds = match op {
     :mul => arith k h "`*`" l r ds,
     :div => arith k h "`/`" l r ds,
     :mod => arith k h "`%`" l r ds,
+    :cons => {
+        let [ht, ds1] = infer k h l ds;
+        let [tt, ds2] = infer k h r ds1;
+        [cons_type k ht tt, ds2]
+    },
     _ => {
         let ds1 = list.nth 1 (infer k h l ds);
         [:bool, list.nth 1 (infer k h r ds1)]
     },
+};
+
+/// What `x :: xs` is, from what the two sides are. A list known cell by cell
+/// stays known that way, one cell longer -- `[]` is a tuple of nothing, so
+/// `1 :: 2 :: []` is the tuple a literal `[1, 2]` would be -- and a list known
+/// only by its element widens the element to take the head in. A tail that is
+/// not known to be a list says nothing, and answers `:any`: it is reported
+/// nowhere, because consing onto it is a raise only when forced, and that is
+/// not a mismatch the checker can see.
+let cons_type k ht tt = match peel k tt 8 {
+    [:tuple, ts] => [:tuple, list.cons ht ts],
+    [:list_of, e] => [:list_of, union_of [widen ht, e]],
+    _ => :any,
 };
 
 let arith k h what l r ds = {

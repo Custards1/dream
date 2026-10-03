@@ -49,9 +49,18 @@ uint64_t key_hash(Value v) {
         return h ? h : 1;
     }
     uint64_t h = v;
-    if (is_ptr(v) && as_obj(v)->type == ObjType::Float) {
-        double d = static_cast<FloatObj*>(as_obj(v))->value;
-        std::memcpy(&h, &d, 8);
+    if (is_ptr(v)) {
+        Obj* o = as_obj(v);
+        if (o->type == ObjType::Float) {
+            double d = static_cast<FloatObj*>(o)->value;
+            std::memcpy(&h, &d, 8);
+        } else if (o->type == ObjType::Pid) {
+            // Compared by the process it names, so hashed by it too: two
+            // boxes of one pid are one key.
+            h = static_cast<PidObj*>(o)->id;
+        } else {
+            h = identity_hash(o);
+        }
     }
     h ^= h >> 33;
     h *= 0xff51afd7ed558ccdull;

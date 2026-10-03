@@ -348,9 +348,12 @@ fuzz ITERATIONS="400": build
 # `DREAM_GC_PAR_MIN=0` divides every collection across the helper threads
 # however small it is, and `DREAM_GC_CONCURRENT=1` hands every major's marking
 # to them too, so the verifier sees the single-threaded collector, the parallel
-# collector and the overlapping mark on the same small programs.
+# collector and the overlapping mark on the same small programs. The second run
+# adds `DREAM_GC_EVACUATE=all`, which empties every block at every major, so
+# that programs this small move nearly every old object they have.
 test-heap: build
     DREAM_VERIFY_HEAP=1 DREAM_GC_PAR_MIN=0 DREAM_GC_CONCURRENT=1 dream/tests/e2e.sh
+    DREAM_VERIFY_HEAP=1 DREAM_GC_PAR_MIN=0 DREAM_GC_CONCURRENT=1 DREAM_GC_EVACUATE=all dream/tests/e2e.sh
 
 # Data races, on the concurrency-heavy programs -- and on the collector, which
 # is the other thing here that runs on several threads. `DREAM_GC_PAR_MIN=0`
@@ -364,7 +367,7 @@ test-races:
       -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
       -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
     cmake --build build-tsan -j
-    DREAM_GC_PAR_MIN=0 DREAM_GC_CONCURRENT=1 dream=build-tsan/bin/dream dream/tests/e2e.sh
+    DREAM_GC_PAR_MIN=0 DREAM_GC_CONCURRENT=1 DREAM_GC_EVACUATE=all dream=build-tsan/bin/dream dream/tests/e2e.sh
 
 # The slow, thorough set. What to run before believing a change is safe.
 test-all: test fuzz test-heap vm-no-jit

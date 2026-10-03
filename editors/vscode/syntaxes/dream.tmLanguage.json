@@ -13,6 +13,9 @@
       "include": "#char"
     },
     {
+      "include": "#cons"
+    },
+    {
       "include": "#atom"
     },
     {
@@ -73,6 +76,11 @@
     "char": {
       "name": "string.quoted.single.dream",
       "match": "'(\\\\(u\\{[0-9A-Fa-f]+\\}|.)|[^'\\\\])'"
+    },
+    "cons": {
+      "comment": "`x :: xs`. Before atoms, because the lexer reads `::ok` as `::` and then `ok`, not as a colon and the atom `:ok`.",
+      "name": "keyword.operator.cons.dream",
+      "match": "::"
     },
     "atom": {
       "comment": "An atom is a colon and a name: :ok, :error, :not_a_function.",

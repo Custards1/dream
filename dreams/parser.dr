@@ -179,8 +179,9 @@ let rec pipe_tail c lhs ts =
         }
     };
 
-/// Precedence climbing. Every infix operator is left-associative, which is why
-/// the right side is parsed at one level tighter.
+/// Precedence climbing. Every infix operator but `::` is left-associative,
+/// which is why the right side is parsed at one level tighter; `::` parses its
+/// right side at its own level, so the next `::` joins the right (`ast.right_assoc`).
 let rec parse_binary c level ts =
     match parse_unary c ts {
         [:error, m, s] => err m s,
@@ -198,7 +199,8 @@ let rec binary_tail c level lhs ts = {
     if op == () { ok lhs ts }
     else if ast.precedence op < level { ok lhs ts }
     else {
-        match parse_binary c (ast.precedence op + 1) (list.tail ts) {
+        let tighter = if ast.right_assoc op { ast.precedence op } else { ast.precedence op + 1 };
+        match parse_binary c tighter (list.tail ts) {
             [:error, m, s] => err m s,
             [:ok, rhs, rest] => {
                 let sp = ast.span_to (ast.span lhs) (ast.span rhs);
@@ -2582,8 +2584,14 @@ when test {
             $( test.eq! "(binary or (name a) (binary and (name b) (name c)))" (shape "a || b && c") ),
         test.case "comparison is looser than arithmetic"
             $( test.eq! "(binary lt (binary add (name a) (int 1)) (name b))" (shape "a + 1 < b") ),
-        test.case "every operator is left-associative"
+        test.case "every operator but :: is left-associative"
             $( test.eq! "(binary sub (binary sub (int 1) (int 2)) (int 3))" (shape "1 - 2 - 3") ),
+        test.case ":: groups to the right"
+            $( test.eq! "(binary cons (int 1) (binary cons (int 2) (list )))" (shape "1 :: 2 :: []") ),
+        test.case ":: is looser than arithmetic"
+            $( test.eq! "(binary cons (binary sub (name n) (int 1)) (name rest))" (shape "n - 1 :: rest") ),
+        test.case ":: is tighter than comparison"
+            $( test.eq! "(binary eq (binary cons (name x) (name xs)) (name ys))" (shape "x :: xs == ys") ),
         test.case "the pipe is looser than everything"
             $( test.eq! "(pipe (binary add (name x) (int 1)) (apply (name f) (name a)))"
                         (shape "x + 1 |> f a") ),

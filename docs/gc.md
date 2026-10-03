@@ -19,9 +19,10 @@ The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp
 - [x] A nested force collects when the frames below it have vouched for their
       locals, which is what took peak RSS from 859 MB to 511 MB (2026-09-12).
       See "Collecting underneath a native".
-- [ ] Later -- moving (copying or compacting) collection. This is now the
-      whole of what is left: 182 MB live sits in 386 MB of blocks, and no
-      threshold reaches a hole.
+- [x] A major evacuates the old blocks its last sweep found sparse, and hands
+      back the ones it found empty (2026-10-03). See "Evacuating sparse
+      blocks" -- including why it bought less than this list expected.
+- [ ] Later -- full compaction. Nothing measured asks for it yet.
 
 ## The collector today
 
@@ -157,10 +158,11 @@ The heap is **generational**: two generations inside one process heap, a
   milliseconds the process spent stopped in each kind, because a stall you
   cannot measure has not been diagnosed yet.
 
-Nothing in old space ever moves, which is what makes collection safe at an
-interpreter safepoint with no native-stack scanning: nothing the interpreter
-holds in a C++ local ever moves (`alloc` never collects, and a major collection
-moves nothing at all). `DREAM_VERIFY_HEAP=1` re-traces the whole graph after
+Old space moves only when a major evacuates a sparse block (see "Evacuating
+sparse blocks"), and it is safe at an interpreter safepoint with no
+native-stack scanning for the reason promotion always was: `alloc` never
+collects, and whatever can collect underneath a native has vouched that its
+locals survive a move. `DREAM_VERIFY_HEAP=1` re-traces the whole graph after
 every collection and aborts on the first inconsistency; after a minor the walk
 additionally requires that no reachable object is still young. (That switch
 used to be compiled out unless the build defined `DREAM_DEBUG` or
@@ -437,10 +439,120 @@ free lists that can neither merge nor move.
 
 That is fragmentation, and the only real answer to it is a collector that
 moves old objects: compaction, or the opportunistic evacuation of sparse
-blocks. Which is what "Later -- moving collections" below is about, and the
-vouching rule above is most of what it needs, because "every frame between here
-and `run_process` has vouched" is exactly the precondition for moving an
-object a C++ frame might be holding.
+blocks. The second is built -- "Evacuating sparse blocks", next -- and the
+first thing it found is that the numbers in this section no longer describe
+the compiler.
+
+## Evacuating sparse blocks
+
+Built 2026-10-03. A major empties the old blocks the sweep before it found
+mostly dead: their survivors are copied into the holes of the rest, and the
+blocks go back to the system whole. A block the sweep finds *entirely* dead
+goes back at once.
+
+**The mechanism is promotion, done to old objects.** Three steps, each at a
+moment the collector already had:
+
+1. *The sweep chooses.* A block whose survivors fill less than a quarter of it
+   (`DREAM_GC_EVACUATE`, in percent) is marked `evacuate`, up to a budget of an
+   eighth of old space in live bytes, so the copying a major owes is bounded
+   by a fraction of what its own trace touched. A block with most of its tail
+   still unused is new rather than fragmented, and is left for the carve to
+   fill. The free lists are rebuilt from nothing at every sweep -- the only way
+   to leave a chosen block's holes off them -- and `carve` never takes a
+   chosen block's tail, so nothing new lands in it while it waits.
+2. *The next major copies, once its trace is over.* Every marked object in a
+   chosen block is copied with its header and payload exactly as promotion
+   copies a young one, `aux` and the cached hash included, and leaves a
+   `GC_FORWARDED` stub behind. The copy is carved from the rebuilt lists, so it
+   lands in somebody else's hole, and it is born marked, so the sweep keeps it.
+   The roots are then pointed at the copies (`forward` in `fixing_roots_`
+   mode), and so is `external_`.
+3. *The sweep rewrites the rest.* It already visits every live object; after
+   an evacuation it also points each one's references at the copies
+   (`fix_refs`), through the same field list the trace uses (`for_each_slot`,
+   which is now the only copy of it). The chosen blocks are taken off the list
+   first, so no thread sweeps a stub, and freed last, once nothing can still be
+   reading one.
+
+Doing it after the trace rather than during it is what lets the concurrent
+mark use it unchanged: a helper may have marked an object in a chosen block
+and scanned the objects that point at it before the finalize, so an object
+moved *during* the finalize's trace would leave those references behind. Moved
+after it, every reference is either a root or inside a live object, and the
+sweep reaches all of the second kind.
+
+**Why moving is safe, which is the part that had to be checked rather than
+built.** Promotion has always moved objects, so anything that held a young
+object across a collection was already broken; the question was only what
+holds an *old* one on the strength of "old space never moves". The audit:
+
+- The interpreter's safepoints keep nothing in C++ locals, and a nested force
+  may collect only under natives that vouched -- `strict!`, `vm.share!`,
+  `vm.call_image!` and the three string natives -- each of which re-reads
+  everything from `p.stack` after a force. `force_deep` does too, and says so
+  at length. A large object, which a native might hold as a buffer, never
+  moves: big blocks are never chosen.
+- JIT-compiled code embeds only immediates (atoms, fixnums, booleans), never
+  an object's address -- compiled code is shared between processes, so it
+  could not.
+- The C API already promises a value only until the next run or allocation.
+- The `std::unordered_map<Value, ...>` tables in `share_arenas` live inside one
+  native that forces nothing.
+
+**And one thing that was not safe, and had not been for promotion either.** A
+map hashed a key it compares by identity -- a list, an array, a closure -- by
+its *address*. Promotion moves every young object, so a list used as a key was
+found before a minor collection and missing after it, and a map sent to
+another process with its keys filed its leaves under hashes its copied keys
+could not reproduce. An identity hash is kept in the header now, in the
+fifteen bits of `aux` that `AUX_DEEP_FORCED` did not use (`identity_hash`):
+assigned the first time anything asks, carried by every copy the collector
+makes, and carried across `copy_between`. A shared object without one is
+hashed by its address, which is stable there. Fifteen bits is not unique and
+need not be -- equality is still identity, and a collision is a longer leaf
+chain. A pid is hashed by the process it names, since that is how it compares.
+`dream/tests/programs/identity_keys.dr` is the regression test; on the VM
+before it, every lookup in it misses.
+
+**What it bought, and why that is less than this file predicted.** The case for
+it was the 182 MB-in-386 MB figure above, which was measured on 2026-09-12. The
+self-compile has changed shape since: it resolves, lowers and checks in parts,
+one process each, and the map-pinning fix took most of its live set away. Its
+largest heap at any major now holds 33 MB, its live sets fill their blocks, and
+evacuation has nothing to do there -- images byte-identical, no change in time
+or memory that survives a second run.
+
+Where a single heap does get large -- a generated program of 6,400
+declarations in one module (`dreams/tests/scale.py`) -- peak RSS went
+**2,500 MB -> 2,350 MB**, three interleaved runs each on one binary
+(`DREAM_GC_EVACUATE=0` against the default), with wall time unchanged at
+6.5-6.7 s. Almost none of that is evacuation. The trace shows majors that
+found 19 MB live in 496 MB of blocks and 43 MB in 531 MB, after a phase whose
+data died all at once, and before this change every one of those emptied
+blocks stayed held: a sweep could put an empty block's chunks on the free
+lists, but nothing handed the block back. Freeing empty blocks alone
+(`DREAM_GC_EVACUATE=1`, which chooses almost nothing to move) measured the same
+2.2-2.3 GB as evacuating at 25% or 50%, and the whole compile moved one to two
+and a half megabytes. Sparse-but-live blocks turned out to be rare in the
+compiler as it now is; dead ones were the waste.
+
+So the threshold is not a tuned number: nothing measured tells 25% from 50%,
+and the default is the one that copies least. The machinery is worth keeping
+for the workload it was built for and that nobody has measured here yet -- a
+long-lived process whose live set is churned rather than dropped, which is what
+`lucid` is -- and because it is a clean A/B switch away from the collector
+that never moved anything.
+
+| Variable | What it does |
+|---|---|
+| `DREAM_GC_EVACUATE` | The share of a block, in percent, below which its survivors are moved out (default 25). `0` turns evacuation off, and with it the rebuilt lists and the freeing of empty blocks -- the old collector exactly. `all` empties every block at every major, which is useless for memory and is how `test-heap` and `test-races` get small programs to move nearly every old object they have. |
+
+`--stats` does not report it yet; `DREAM_GC_TRACE=1` puts what each major
+moved, from how many blocks, and how many the sweep chose next on its line.
+The tests: `test_major_evacuates_sparse_blocks` in the VM's units, and the
+e2e programs under the verifier with `DREAM_GC_EVACUATE=all`, serially and
+with every collection parallel and every mark concurrent.
 
 ## Why generational, why parallel, why concurrent
 
@@ -569,15 +681,13 @@ involved: the mutator's *own* store sites had to use the atomic spelling too.
 
 ## Later -- moving collections
 
-Nothing about the language demands immutability of address. The roots are
-precise and collection only starts at safepoints, so a *copying young* GC --
-nursery as a pair of semispaces -- is a plausible endgame now that generations
-exist and their promotion path is proved correct. A fully compacting old
-space is a bigger ask: it turns every raw `Value` held across a safepoint
-into a hazard, which today is safe only because nothing in old space moves.
-The "alloc never collects" rule keeps such pointers out of harm's way during a
-call; the implication, that a moving collector must mark or scan before any
-C++ local escapes, is what `--verify` will be asked to test first.
+Nothing about the language demands immutability of address, and evacuation
+(above) has now shown it: old objects move, and the audit of who might have
+been relying on them not to found only the identity hash. A fully compacting
+old space would be the same machinery applied to every block rather than the
+sparse ones -- the safety argument does not change -- and the reason it is not
+built is the one evacuation's measurements give: what the compiler wastes now
+is empty blocks, not half-full ones.
 
 ## Where we are
 
@@ -699,9 +809,11 @@ C++ local escapes, is what `--verify` will be asked to test first.
   written down under "Collecting underneath a native", with the numbers:
   collecting more often, and a bigger nursery. Neither helps, and both cost.
 
-- **Next:** moving collections -- the design for which is written down under
-  "Later" below, and which is now the only lever left on memory. The 47%
-  occupancy of old space at the end of a self-compile is the number to beat.
+- **Done:** evacuating sparse blocks, and freeing empty ones, at every major
+  (2026-10-03). Peak RSS on a 6,400-declaration program 2,500 MB -> 2,350 MB,
+  nearly all of it from the empty blocks; nothing measurable on the
+  self-compile, whose heaps are small now. On the way, map keys compared by
+  identity stopped being hashed by address. See "Evacuating sparse blocks".
 
 The VM-side Phase 1 work sits alongside compiler work done in the same session:
 a `dreams` bug in lowered guarded match arms (a guarded arm's failing pattern

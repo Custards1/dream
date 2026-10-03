@@ -481,13 +481,21 @@ value wants is usually decided by how it is read rather than by what it holds:
 | 0 | `\|\|` | left |
 | 1 | `&&` | left |
 | 2 | `==` `!=` `<` `<=` `>` `>=` | left |
-| 3 | `+` `-` | left |
-| 4 | `*` `/` `%` `@` | left |
-| 5 | unary `-`, `not` | prefix |
-| 6 | `comp`, `comp!` | prefix |
+| 3 | `::` | **right** |
+| 4 | `+` `-` | left |
+| 5 | `*` `/` `%` `@` | left |
+| 6 | unary `-`, `not` | prefix |
+| 7 | `comp`, `comp!` | prefix |
 | tightest | **application** `f a b`, then postfix `.field` | left |
 
-Every infix operator is left-associative. The single most important
+`x :: xs` is the list with `x` in front of `xs` -- the cell `list.cons x xs`
+makes, compiled to the same `cons` operator, so the tail is lazy. It is the one
+operator that groups to the right, because a list is built from its end:
+`1 :: 2 :: []` is `[1, 2]`. Below `+`, so `n - 1 :: rest` puts the difference
+at the front; above the comparisons, so `x :: xs == ys` compares lists. It is an
+expression only: a pattern still takes a list apart as `[x, ..rest]`.
+
+Every other infix operator is left-associative. The single most important
 consequence: **application binds tighter than everything**, so
 
 ```dream

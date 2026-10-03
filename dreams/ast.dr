@@ -119,6 +119,7 @@ let span e = list.last e;
 let binops = [
     [:or_or, :or], [:and_and, :and],
     [:eq_eq, :eq], [:bang_eq, :ne], [:lt, :lt], [:le, :le], [:gt, :gt], [:ge, :ge],
+    [:colon_colon, :cons],
     [:plus, :add], [:minus, :sub], [:star, :mul], [:slash, :div], [:percent, :mod],
     [:at, :matmul],
 ];
@@ -131,10 +132,18 @@ let precedence op =
         :or  => 0,
         :and => 1,
         :eq  => 2, :ne => 2, :lt => 2, :le => 2, :gt => 2, :ge => 2,
-        :add => 3, :sub => 3,
-        :mul => 4, :div => 4, :mod => 4, :matmul => 4,
+        :cons => 3,
+        :add => 4, :sub => 4,
+        :mul => 5, :div => 5, :mod => 5, :matmul => 5,
         _    => 0 - 1,
     };
+
+/// `x :: xs` is the one operator that groups to the right, because a list is
+/// built from its end: `1 :: 2 :: []` is `1 :: (2 :: [])`, and the left-handed
+/// reading would cons a list onto a number. It sits below `+` so that
+/// `n - 1 :: rest` puts the difference at the front, and above the comparisons
+/// so that `x :: xs == ys` compares the lists.
+let right_assoc op = op == :cons;
 
 /// The operator a token kind stands for, or `()` when it is not one.
 ///
@@ -152,6 +161,7 @@ let infix_of token_kind =
         :plus    => :add, :minus   => :sub,
         :star    => :mul, :slash   => :div,
         :percent => :mod, :at      => :matmul,
+        :colon_colon => :cons,
         _ => (),
     };
 
@@ -343,8 +353,8 @@ when test {
             $( test.eq! [:add, :eq, ()]
                         [infix_of :plus, infix_of :eq_eq, infix_of :ident] ),
         test.case "binary precedence follows the parser ladder"
-            $( test.eq! [0, 1, 2, 3, 4, -1]
-                        [precedence :or, precedence :and, precedence :eq,
+            $( test.eq! [0, 1, 2, 3, 4, 5, -1]
+                        [precedence :or, precedence :and, precedence :eq, precedence :cons,
                          precedence :add, precedence :mul, precedence :unknown] ),
         test.case "a declaration records recursion and parameters"
             $( test.eq! [:let, "go", [["n", [4, 5]]], [:name, "n", [8, 9]], true, [0, 9]]

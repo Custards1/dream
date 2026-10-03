@@ -517,6 +517,9 @@ let rec lower_expr e l =
             binary op (list.nth 1 a) ir.no_node (list.head a)
         },
 
+        // Every binary operator is the arena's operator of the same name, and
+        // that includes `x :: xs`: `:cons` is the cell the `list.cons` builtin
+        // is rewritten into by `opt`, written here directly.
         [:binary, op, lhs, rhs, _] => {
             let a = lower_expr lhs l;
             let b = lower_expr rhs (list.head a);

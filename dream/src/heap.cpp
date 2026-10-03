@@ -175,6 +175,7 @@ Heap::Block* Heap::new_block(size_t bytes, bool exact) {
     b->used = 0;
     b->big = false;
     b->dead = false;
+    b->evacuate = false;
     block_bytes_ += size;
     if (block_bytes_ > peak_block_bytes_) {
         peak_block_bytes_ = block_bytes_;
@@ -254,11 +255,13 @@ Obj* Heap::carve(size_t sz) {
     // orphaned the day the big object dies and its whole block is handed back.
     // The carve is why collection can never run here: the block's tail belongs
     // to no object yet, but the caller may hold raw pointers that a collection
-    // would have to treat as roots or lose.
+    // would have to treat as roots or lose. A block waiting to be evacuated is
+    // not a target either: whatever went into it would only be copied out
+    // again, and its tail is about to be handed back with the rest of it.
     Block* b = carve_block_;
-    if (b && (b->big || b->used + sz > b->size)) b = nullptr;
+    if (b && (b->big || b->evacuate || b->used + sz > b->size)) b = nullptr;
     for (Block* c = blocks_; b == nullptr && c; c = c->next) {
-        if (!c->big && c->used + sz <= c->size) b = c;
+        if (!c->big && !c->evacuate && c->used + sz <= c->size) b = c;
     }
     if (!b) {
         b = new_block(sz);
@@ -306,6 +309,7 @@ Obj* Heap::carve_big(size_t sz) {
         b->data = pb.data;
         b->size = pb.size;
         b->dead = false;
+        b->evacuate = false;
         big_pool_bytes_ -= b->size;
     }
     // Exactly the class, not the heap's minimum block. That minimum is for
@@ -1186,105 +1190,129 @@ Obj* Heap::promote(GcCtx& c, Obj* o) {
     return copy;
 }
 
-template <bool Par, bool Con>
-void Heap::scan_object(GcCtx& c, Obj* o) {
-    // Each reference is either forwarded (the copying collector: promote a
-    // young one, mark an old one, fold an indirection) or, when `Con`, merely
-    // marked -- the concurrent mark's whole scan. Everything else is shared,
-    // which is why the switch below is the same list of fields either way.
-    auto forward = [&](Value* slot) {
-        if constexpr (Con)
-            mark_ref(c, read_slot<Par>(slot));
-        else
-            forward_in<Par, Con>(c, slot);
-    };
-    switch (read_type<Par>(o)) {
+namespace {
+
+/// Every reference an object holds, handed to `visit` as a slot to read and
+/// perhaps rewrite. Written once for everything that walks an object's fields:
+/// the trace, which promotes and marks through them, and the sweep after an
+/// evacuation, which points them at where their targets went. Two copies of
+/// this list would be two places to forget a field, and a forgotten field is a
+/// reference the collector frees or leaves pointing at a block it handed back.
+///
+/// `type` is passed in rather than read here because the concurrent mark has to
+/// read it atomically and nobody else does.
+template <class F>
+inline void for_each_slot(Obj* o, ObjType type, F&& visit) {
+    switch (type) {
         case ObjType::Cons: {
             auto* x = static_cast<ConsObj*>(o);
-            forward(&x->head);
-            forward(&x->tail);
+            visit(&x->head);
+            visit(&x->tail);
             break;
         }
         case ObjType::Array: {
             auto* a = static_cast<ArrayObj*>(o);
-            for (uint32_t i = 0; i < a->len; ++i) forward(&a->items()[i]);
+            for (uint32_t i = 0; i < a->len; ++i) visit(&a->items()[i]);
             break;
         }
         case ObjType::Map: {
             auto* m = static_cast<MapObj*>(o);
             uint32_t n = map_bit_count(m->bitmap);
-            for (uint32_t i = 0; i < n; ++i) forward(&m->slots()[i]);
+            for (uint32_t i = 0; i < n; ++i) visit(&m->slots()[i]);
             break;
         }
         case ObjType::MapLeaf: {
             auto* l = static_cast<MapLeafObj*>(o);
-            forward(&l->key);
-            forward(&l->value);
-            forward(&l->next);
+            visit(&l->key);
+            visit(&l->value);
+            visit(&l->next);
             break;
         }
         case ObjType::Closure: {
             auto* x = static_cast<ClosureObj*>(o);
-            for (uint32_t i = 0; i < x->ncaps; ++i) forward(&x->caps()[i]);
+            for (uint32_t i = 0; i < x->ncaps; ++i) visit(&x->caps()[i]);
             break;
         }
         case ObjType::Thunk:
         case ObjType::Blackhole: {
             auto* t = static_cast<ThunkObj*>(o);
-            forward(&t->frame);
+            visit(&t->frame);
             break;
         }
         case ObjType::Indirect: {
             auto* ind = static_cast<IndirectObj*>(o);
-            forward(&ind->target);
+            visit(&ind->target);
             break;
         }
         case ObjType::Tensor: {
             auto* t = static_cast<TensorObj*>(o);
             if (!tensor_deferred(t)) break;
             TensorExpr* e = tensor_expr(t);
-            forward(&e->result);
-            forward(&e->product_a);
-            forward(&e->product_b);
-            for (uint32_t i = 0; i < e->ninputs; ++i) forward(&e->inputs()[i]);
+            visit(&e->result);
+            visit(&e->product_a);
+            visit(&e->product_b);
+            for (uint32_t i = 0; i < e->ninputs; ++i) visit(&e->inputs()[i]);
             break;
         }
         case ObjType::Pap: {
             auto* p = static_cast<PapObj*>(o);
-            forward(&p->fn);
-            for (uint32_t i = 0; i < p->nargs; ++i) forward(&p->args()[i]);
+            visit(&p->fn);
+            for (uint32_t i = 0; i < p->nargs; ++i) visit(&p->args()[i]);
             break;
         }
         case ObjType::Frame: {
             auto* f = static_cast<FrameObj*>(o);
-            forward(&f->closure);
-            for (uint32_t i = 0; i < f->nslots; ++i) forward(&f->slots()[i]);
+            visit(&f->closure);
+            for (uint32_t i = 0; i < f->nslots; ++i) visit(&f->slots()[i]);
             break;
         }
         case ObjType::ErrorBox: {
             auto* e = static_cast<ErrorObj*>(o);
-            forward(&e->kind);
-            forward(&e->payload);
+            visit(&e->kind);
+            visit(&e->payload);
             break;
         }
         case ObjType::Module: {
-            forward(&static_cast<ModuleObj*>(o)->name);
+            visit(&static_cast<ModuleObj*>(o)->name);
             break;
         }
         case ObjType::Native: {
-            forward(&static_cast<NativeObj*>(o)->name);
+            visit(&static_cast<NativeObj*>(o)->name);
             break;
         }
-        // Float, Str and Pid hold no references.
+        // Float, Str, Pid, BigStr and BigInt hold no references.
         default:
             break;
     }
+}
+
+}  // namespace
+
+template <bool Par, bool Con>
+void Heap::scan_object(GcCtx& c, Obj* o) {
+    // Each reference is either forwarded (the copying collector: promote a
+    // young one, mark an old one, fold an indirection) or, when `Con`, merely
+    // marked -- the concurrent mark's whole scan.
+    for_each_slot(o, read_type<Par>(o), [&](Value* slot) {
+        if constexpr (Con)
+            mark_ref(c, read_slot<Par>(slot));
+        else
+            forward_in<Par, Con>(c, slot);
+    });
 }
 
 void Heap::forward(Value* slot) {
     // While verifying, `forward` records roots instead of marking them.
     if (recording_) {
         recording_->push_back(*slot);
+        return;
+    }
+    // After an evacuation, the roots are pointed at the copies and nothing
+    // else is done: the trace is over, and the sweep that follows does the
+    // same for every reference inside the heap.
+    if (fixing_roots_) {
+        Value v = *slot;
+        if (is_ptr(v) && as_obj(v)->gc == GC_FORWARDED) *slot = forward_target(as_obj(v));
         return;
     }
     if (parallel_)
@@ -1597,6 +1625,10 @@ void Heap::major_collect(RootSource& roots) {
     if (!trace_in_parallel(roots, /*minor=*/false)) trace_alone(roots, /*minor=*/false);
     full_trace_ = false;
     reap_external(true);
+    // Everything alive is marked now, and that is all evacuation needs: the
+    // blocks the last sweep chose are emptied into the holes of the rest,
+    // and the sweep below rewrites the references as it passes them.
+    evacuate(roots);
     const uint64_t marked = now_nanos();
 
     // Sweep. Every old block's chunk headers tile the block, so one walk over
@@ -1633,9 +1665,11 @@ void Heap::major_collect(RootSource& roots) {
     major_nanos_ += now_nanos() - started;
     if (gc_trace())
         std::fprintf(stderr,
-                     "; major: %zu live, %zu held, %.2f ms mark, %.2f ms sweep%s\n",
+                     "; major: %zu live, %zu held, %.2f ms mark, %.2f ms sweep,"
+                     " %zu evacuated from %zu blocks, %zu chosen%s\n",
                      live_after_gc_, block_bytes_, double(marked - started) / 1e6,
-                     double(now_nanos() - marked) / 1e6, last_kinds_.c_str());
+                     double(now_nanos() - marked) / 1e6, last_evacuated_,
+                     last_evacuated_blocks_, evacuate_pending_, last_kinds_.c_str());
     verify_collect(roots, false);
 }
 
@@ -1841,6 +1875,9 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     if (!trace_in_parallel(roots, /*minor=*/true)) trace_alone(roots, /*minor=*/true);
     full_trace_ = false;
     reap_external(true);
+    // The helpers are joined and the last of the graph has been traced, so
+    // this is the same moment as a stopped major's: see `major_collect`.
+    evacuate(roots);
     if (!sweep_in_parallel()) sweep();
     free_nursery();
     remembered_.clear();
@@ -1861,9 +1898,11 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     if (gc_trace())
         std::fprintf(stderr,
                      "; concurrent major: %zu live, %zu held, "
-                     "%.2f ms overlap + %.2f ms stop%s\n",
+                     "%.2f ms overlap + %.2f ms stop,"
+                     " %zu evacuated from %zu blocks, %zu chosen%s\n",
                      live_after_gc_, block_bytes_, double(overlap_ns) / 1e6,
-                     double(final_ns) / 1e6, last_kinds_.c_str());
+                     double(final_ns) / 1e6, last_evacuated_, last_evacuated_blocks_,
+                     evacuate_pending_, last_kinds_.c_str());
     verify_collect(roots, false);
 }
 
@@ -1871,7 +1910,71 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
 // Sweeping
 // ---------------------------------------------------------------------------
 
+/// Whether a major empties the blocks its sweep finds mostly dead, and how dead
+/// "mostly" is: a block is chosen when what survives in it is under this share
+/// of its size. `DREAM_GC_EVACUATE=0` turns evacuation off -- and with it the
+/// rebuilt free lists and the freeing of empty blocks, so that the switch is a
+/// clean A/B against the collector that never moved an old object -- and a
+/// number from 1 to 99 sets the share in percent. `all` evacuates every block
+/// that is not empty, at every major, whatever it holds -- which is useless for
+/// memory and is how the tests get a small program to move nearly every old
+/// object it has, every time (`just test-heap`).
+///
+/// A quarter is not a tuned number. Nothing measured so far tells 25 from 50
+/// apart -- sparse blocks turned out to be rare, and nearly all of what the
+/// switch buys is the freeing of empty ones -- so the default is the one that
+/// copies least. "Evacuating sparse blocks" in docs/gc.md has the numbers.
+static unsigned evacuate_below_percent() {
+    static const unsigned pct = [] {
+        if (const char* v = std::getenv("DREAM_GC_EVACUATE")) {
+            if (std::strcmp(v, "all") == 0) return 100u;
+            long n = std::atol(v);
+            if (n <= 0) return 0u;
+            if (n < 100) return unsigned(n);
+        }
+        return 25u;
+    }();
+    return pct;
+}
+
+void Heap::fix_refs(Obj* o) {
+    for_each_slot(o, o->type, [](Value* slot) {
+        Value v = *slot;
+        if (!is_ptr(v)) return;
+        // Another sweep thread may be clearing this target's mark at the same
+        // moment, so the byte is read as an atomic; the one bit asked about
+        // here is never set or cleared by anybody during a sweep. A stub's
+        // payload is read plainly because nothing writes it: an evacuated
+        // block is off the list, and no thread sweeps it.
+        Obj* t = as_obj(v);
+        if (std::atomic_ref<uint8_t>(t->gc).load(std::memory_order_relaxed) == GC_FORWARDED)
+            *slot = forward_target(t);
+    });
+}
+
+bool Heap::choose_to_evacuate(const Block* b, size_t live_here) {
+    const unsigned pct = evacuate_below_percent();
+    if (b->big) return false;
+    if (pct >= 100) return true;
+    // A block whose tail is still mostly unused is not fragmented, it is new:
+    // the carve will fill it.
+    if (b->used * 2 < b->size) return false;
+    if (live_here * 100 >= size_t(pct) * b->size) return false;
+    const size_t before = evacuate_chosen_.fetch_add(live_here, std::memory_order_relaxed);
+    if (before + live_here <= evacuate_budget_) return true;
+    evacuate_chosen_.fetch_sub(live_here, std::memory_order_relaxed);
+    return false;
+}
+
 void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live, uint64_t* by_type) {
+    // Every store this sweep makes to a header is atomic, relaxed, because
+    // after an evacuation another sweep thread reads headers it does not own:
+    // `fix_refs` asks each reference's target whether it is a stub. On the
+    // machines this runs on that is the same instruction as a plain store.
+    auto set_gc = [](Obj* o, uint8_t g) {
+        std::atomic_ref<uint8_t>(o->gc).store(g, std::memory_order_relaxed);
+    };
+    const bool fixing = fixing_refs_;
     if (b->big) {
         // A dedicated block carries exactly one big object. It never joins
         // a size class (its size is past the table), so the choice is
@@ -1879,7 +1982,8 @@ void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live, uint64_t*
         // carved into it, so freeing it cannot strand a live chunk.
         Obj* o = reinterpret_cast<Obj*>(b->data);
         if (o->gc & GC_MARK) {
-            o->gc &= ~GC_MARK;
+            if (fixing) fix_refs(o);
+            set_gc(o, o->gc & ~GC_MARK);
             live += o->bytes;
             by_type[size_t(o->type) & 31] += o->bytes;
             ++by_type[32 + (size_t(o->type) & 31)];
@@ -1889,8 +1993,21 @@ void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live, uint64_t*
         return;
     }
 
+    // What the chains looked like before this block, so that a block chosen
+    // to be evacuated -- or found empty -- can take back what it put on them.
+    // Its chunks are then on no list at all, which is the point: nothing may
+    // be allocated into a block that is about to be handed back.
+    const bool moving = evacuate_below_percent() != 0;
+    Obj* head_before[kHeapClassCount];
+    Obj* tail_before[kHeapClassCount];
+    if (moving) {
+        std::memcpy(head_before, head, sizeof head_before);
+        std::memcpy(tail_before, tail, sizeof tail_before);
+    }
+
     // A shared block: its chunks tile it exactly, so one walk sees every
     // object and always ends precisely at `used`.
+    size_t here = 0;
     size_t pos = 0;
     while (pos < b->used) {
         auto* o = reinterpret_cast<Obj*>(b->data + pos);
@@ -1899,23 +2016,119 @@ void Heap::sweep_block(Block* b, Obj** head, Obj** tail, size_t& live, uint64_t*
         if (o->gc & GC_MARK) {
             // Tenured objects keep their generation bit; only the cycle's
             // mark is cleared.
-            o->gc &= ~GC_MARK;
-            live += sz;
+            if (fixing) fix_refs(o);
+            set_gc(o, o->gc & ~GC_MARK);
+            here += sz;
             by_type[size_t(o->type) & 31] += sz;
             ++by_type[32 + (size_t(o->type) & 31)];
-        } else if (o->gc & GC_FREE) {
+        } else if ((o->gc & GC_FREE) && !moving) {
             // Alive on a list from an earlier cycle, untouched since. The
             // free bit is what keeps us from pushing it a second time; it
             // still points off its list head. Leave the header alone.
         } else {
-            o->gc = GC_FREE;
+            // Dead, or free from an earlier cycle. When blocks can be chosen
+            // for evacuation the lists are rebuilt from nothing at every sweep
+            // -- the only way to leave a chosen block's holes off them -- so a
+            // chunk that was already free is threaded again with the rest.
+            set_gc(o, GC_FREE);
             size_t i = class_index(sz);
             set_free_next(o, head[i]);
             if (!head[i]) tail[i] = o;
             head[i] = o;
         }
     }
+    live += here;
+    if (!moving) return;
+    // An empty block goes back now; a sparse one waits to be emptied by the
+    // next major. Either way its chunks come off the lists again.
+    if (here == 0 || choose_to_evacuate(b, here)) {
+        std::memcpy(head, head_before, sizeof head_before);
+        std::memcpy(tail, tail_before, sizeof tail_before);
+        if (here == 0) b->dead = true;
+        else b->evacuate = true;
+    }
 }
+
+void Heap::evacuate(RootSource& roots) {
+    last_evacuated_ = 0;
+    last_evacuated_blocks_ = 0;
+    if (!evacuate_pending_) return;
+    // Every marked object in a chosen block is copied, exactly as promotion
+    // copies a young one: header and payload as they were, `aux` and the
+    // cached hash with them, and a stub left behind whose first payload word
+    // names the copy. The copy is carved from the free lists, which the last
+    // sweep rebuilt without the chosen blocks' holes, so it lands in a hole
+    // somewhere else -- which is the whole of what this is for. It is born
+    // marked, so the sweep keeps it.
+    //
+    // A new block the carve adds goes on the front of the list, behind this
+    // walk, so the walk never meets it.
+    size_t moved = 0;
+    size_t blocks = 0;
+    for (Block* b = blocks_; b; b = b->next) {
+        if (!b->evacuate) continue;
+        ++blocks;
+        for (size_t pos = 0; pos < b->used;) {
+            auto* o = reinterpret_cast<Obj*>(b->data + pos);
+            const uint32_t sz = o->bytes;
+            pos += sz;
+            if (!(o->gc & GC_MARK)) continue;
+            Obj* copy = carve(sz);
+            copy->type = o->type;
+            copy->aux = o->aux;
+            copy->bytes = sz;
+            copy->gc = GC_OLD | GC_MARK;
+            std::memcpy(copy + 1, o + 1, size_t(sz) - sizeof(Obj));
+            *reinterpret_cast<Value*>(o + 1) = from_obj(copy);
+            o->gc = GC_FORWARDED;
+            moved += sz;
+        }
+    }
+    // What lives outside the heap is named by its object, and the object may
+    // be one that moved. `reap_external` has already run, so every entry here
+    // is alive.
+    for (Obj*& o : external_) {
+        if (o->gc == GC_FORWARDED) o = as_obj(forward_target(o));
+    }
+    // The roots are the only references outside the heap, and the sweep
+    // rewrites every one inside it.
+    fixing_roots_ = true;
+    roots.visit_roots(*this);
+    fixing_roots_ = false;
+    fixing_refs_ = true;
+    evacuated_bytes_ += moved;
+    evacuated_blocks_ += blocks;
+    last_evacuated_ = moved;
+    last_evacuated_blocks_ = blocks;
+}
+
+std::vector<Heap::Block*> Heap::detach_evacuated() {
+    std::vector<Block*> gone;
+    if (!evacuate_pending_) return gone;
+    Block** link = &blocks_;
+    while (Block* b = *link) {
+        if (b->evacuate) {
+            *link = b->next;
+            gone.push_back(b);
+        } else {
+            link = &b->next;
+        }
+    }
+    if (carve_block_ && carve_block_->evacuate) carve_block_ = nullptr;
+    evacuate_pending_ = 0;
+    return gone;
+}
+
+void Heap::free_evacuated(std::vector<Block*>& gone) {
+    for (Block* b : gone) free_block(b);
+    gone.clear();
+    fixing_refs_ = false;
+}
+
+/// What a sweep may choose to evacuate before the next major, in live bytes.
+/// An eighth of what old space holds now bounds the copying the next major
+/// does to a fraction of what its own trace already touched.
+static size_t evacuate_budget_for(size_t old_bytes) { return old_bytes / 8; }
 
 /// The kinds that make up a live set, largest first, as ` map 55% list 16%`.
 ///
@@ -1954,6 +2167,9 @@ void Heap::note_live_by_type(size_t live, const uint64_t* by_type) {
 
 void Heap::sweep() {
     ++sweeps_;
+    std::vector<Block*> gone = detach_evacuated();
+    evacuate_budget_ = evacuate_budget_for(allocated_);
+    evacuate_chosen_.store(0, std::memory_order_relaxed);
     Obj* head[kHeapClassCount] = {};
     Obj* tail[kHeapClassCount] = {};
     size_t live = 0;
@@ -1966,15 +2182,21 @@ void Heap::sweep() {
             if (prev) prev->next = next;
             else blocks_ = next;
             if (carve_block_ == b) carve_block_ = nullptr;
-            retire_big(b);
+            if (b->big) retire_big(b);
+            else free_block(b);
         } else {
+            if (b->evacuate) ++evacuate_pending_;
             prev = b;
         }
         b = next;
     }
+    // The chunks the sweep found are every free chunk there is when the lists
+    // are rebuilt, so the old lists go first.
+    if (evacuate_below_percent() != 0) free_lists_.fill(nullptr);
     merge_free_lists(head, tail);
+    free_evacuated(gone);
     Block* cb = blocks_;
-    while (cb && cb->big) cb = cb->next;
+    while (cb && (cb->big || cb->evacuate)) cb = cb->next;
     carve_block_ = cb;
     live_after_gc_ = live;
     if (live > peak_live_) peak_live_ = live;
@@ -1996,6 +2218,9 @@ bool Heap::sweep_in_parallel() {
     // afterwards rather than where it is found.
     GcRound round;
     round.ctxs.resize(pool.capacity());
+    std::vector<Block*> gone = detach_evacuated();
+    evacuate_budget_ = evacuate_budget_for(allocated_);
+    evacuate_chosen_.store(0, std::memory_order_relaxed);
     for (Block* b = blocks_; b; b = b->next) round.blocks.push_back(b);
     round_ = &round;
 
@@ -2009,10 +2234,22 @@ bool Heap::sweep_in_parallel() {
         }
     });
     round_ = nullptr;
-    if (!ran) return false;
+    if (!ran) {
+        // Nothing was swept, so nothing was chosen and the stubs are still
+        // owed their rewrite: put the detached blocks back for the serial
+        // sweep the caller falls back on.
+        for (Block* b : gone) {
+            b->next = blocks_;
+            blocks_ = b;
+            ++evacuate_pending_;
+        }
+        --sweeps_;
+        return false;
+    }
 
     size_t live = 0;
     uint64_t by_type[64] = {};
+    if (evacuate_below_percent() != 0) free_lists_.fill(nullptr);
     for (GcCtx& c : round.ctxs) {
         merge_free_lists(c.free_head, c.free_tail);
         live += c.live;
@@ -2023,17 +2260,20 @@ bool Heap::sweep_in_parallel() {
     Block* tail = nullptr;
     for (Block* b : round.blocks) {
         if (b->dead) {
-            retire_big(b);
+            if (b->big) retire_big(b);
+            else free_block(b);
             continue;
         }
+        if (b->evacuate) ++evacuate_pending_;
         b->next = nullptr;
         if (tail) tail->next = b;
         else head = b;
         tail = b;
     }
     blocks_ = head;
+    free_evacuated(gone);
     Block* cb = blocks_;
-    while (cb && cb->big) cb = cb->next;
+    while (cb && (cb->big || cb->evacuate)) cb = cb->next;
     carve_block_ = cb;
     live_after_gc_ = live;
     if (live > peak_live_) peak_live_ = live;
@@ -2447,8 +2687,21 @@ private:
 Value copy_suspension(Heap& dest, Value v, CopySeen& seen);
 
 template <class Dest>
+Value copy_object(Dest& dest, Value v, CopySeen& seen);
+
+/// A copy keeps the identity hash of what it copies (see `AUX_IDENTITY`): a
+/// map crosses with the hashes its leaves were filed under, so a key that
+/// crossed with it has to answer the same one. `copy_object` makes the copy;
+/// this is the entry every recursion goes through, so every object it makes is
+/// stamped -- except the cells of a list's spine, which the loop there makes
+/// itself and stamps as it goes.
+inline void carry_identity(Value from, Value to) {
+    if (!is_ptr(to)) return;
+    if (uint16_t id = as_obj(from)->aux & AUX_IDENTITY) as_obj(to)->aux |= id;
+}
+
+template <class Dest>
 Value copy_value(Dest& dest, Value v, CopySeen& seen) {
-    constexpr bool to_shared = std::is_same_v<Dest, SharedArea>;
     if (!is_ptr(v)) return v;
     v = resolve(v);
     if (!is_ptr(v)) return v;
@@ -2456,6 +2709,14 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
 
     if (auto* it = seen.find(v)) return it->second;
 
+    Value out = copy_object(dest, v, seen);
+    carry_identity(v, out);
+    return out;
+}
+
+template <class Dest>
+Value copy_object(Dest& dest, Value v, CopySeen& seen) {
+    constexpr bool to_shared = std::is_same_v<Dest, SharedArea>;
     Obj* o = as_obj(v);
     switch (o->type) {
         case ObjType::Float:
@@ -2548,6 +2809,7 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
                 Value next = resolve(src->tail);
                 if (is_ptr(next) && as_obj(next)->type == ObjType::Cons && !seen.find(next)) {
                     Value fresh = dest.make_cons(UNIT, NIL);
+                    carry_identity(next, fresh);
                     seen.emplace(next, fresh);
                     static_cast<ConsObj*>(as_obj(cell))->tail = fresh;
                     cell = fresh;

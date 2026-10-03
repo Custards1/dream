@@ -602,7 +602,7 @@ let rec expression e = match e {
     [:apply, f, args, sp] => expression f && sequence expression args && is_span sp,
     [:pipe, l, r, sp] => expression l && expression r && is_span sp,
     [:unary, op, x, sp] => list.contains op [:neg, :not] && expression x && is_span sp,
-    [:binary, op, l, r, sp] => list.contains op [:add, :sub, :mul, :div, :mod,
+    [:binary, op, l, r, sp] => list.contains op [:add, :sub, :mul, :div, :mod, :cons,
         :eq, :ne, :lt, :le, :gt, :ge, :and, :or] && expression l && expression r && is_span sp,
     [:if, c, t, f, sp] => expression c && expression t && optional expression f && is_span sp,
     [:block, xs, sp] => sequence statement xs && is_span sp,

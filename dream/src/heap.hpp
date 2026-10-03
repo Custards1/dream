@@ -9,10 +9,13 @@
 //
 // The heap is generational: fresh objects bump-allocate in the nursery, and a
 // minor collection promotes everything still reachable into old space by
-// copying. Old space is a non-moving mark-sweep, which is why collection is
-// safe at an interpreter safepoint with no native-stack scanning. Nothing the
-// interpreter holds in a C++ local ever moves: `alloc` never collects, and a
-// major collection moves nothing at all.
+// copying. Old space is a mark-sweep that moves only what it chooses to: a
+// major collection evacuates the few blocks its last sweep found mostly empty,
+// copying their survivors into the holes of the rest and handing the blocks
+// back whole (see "Evacuating sparse blocks" in docs/gc.md). Collection is
+// still safe at an interpreter safepoint with no native-stack scanning, for the
+// reason promotion always was: `alloc` never collects, and what can collect
+// underneath a native is exactly what has vouched that its locals survive one.
 //
 // The design this implements is written down in docs/gc.md ("Phase 1").
 
@@ -302,6 +305,10 @@ public:
     uint64_t parallel_rounds() const { return parallel_collections_; }
     /// Bytes of nursery space copied into old space by promotion.
     uint64_t bytes_promoted() const { return promoted_bytes_; }
+    /// Bytes of old space copied out of sparse blocks by evacuation, and the
+    /// blocks that were handed back for it.
+    uint64_t bytes_evacuated() const { return evacuated_bytes_; }
+    uint64_t blocks_evacuated() const { return evacuated_blocks_; }
     /// Nanoseconds this process spent stopped in a collection, split by kind.
     /// Wall time, not CPU time: what a collection costs is what the process
     /// could not do while it ran, and a parallel collector's whole claim is
@@ -426,6 +433,11 @@ private:
         /// because in a parallel sweep the thread that finds a dead block is
         /// not the one that owns the list.
         bool dead;
+        /// Chosen by the last sweep to be emptied by the next major: its live
+        /// share was small enough that copying it out is cheaper than holding
+        /// the rest. None of its holes are on a free list and nothing is carved
+        /// from its tail, so nothing new lands in it while it waits.
+        bool evacuate;
     };
 
     /// One collector thread's private state for the length of one collection.
@@ -548,6 +560,23 @@ private:
     /// what survives. Shared by the serial sweep and the parallel one, which
     /// differ only in whose chains they fill and who rebuilds the block list.
     void sweep_block(Block* b, Obj** head, Obj** tail, size_t& live, uint64_t* by_type);
+
+    /// Move every marked object out of the blocks the last sweep chose, leave a
+    /// forwarding stub behind, and point the roots and `external_` at the
+    /// copies. Called once a major's trace is complete and before its sweep,
+    /// which rewrites the references inside the heap as it passes them.
+    void evacuate(RootSource& roots);
+    /// Take the blocks `evacuate` emptied off the block list, so that no sweep
+    /// walks them; the sweep frees them once it has finished reading their
+    /// stubs.
+    std::vector<Block*> detach_evacuated();
+    void free_evacuated(std::vector<Block*>& gone);
+    /// Whether a block the sweep just walked should be evacuated by the next
+    /// major, given the bytes it found alive there. Claims the bytes from the
+    /// cycle's budget when it says yes.
+    bool choose_to_evacuate(const Block* b, size_t live_here);
+    /// Rewrite every reference in `o` that names an evacuated object.
+    static void fix_refs(Obj* o);
     void note_live_by_type(size_t live, const uint64_t* by_type);
     static std::string live_kinds_line(const uint64_t* by_type, size_t live);
     /// What the last major's sweep found, for its trace line. Built only
@@ -651,6 +680,20 @@ private:
     uint64_t major_collections_ = 0;
     uint64_t minor_collections_ = 0;
     uint64_t promoted_bytes_ = 0;
+    uint64_t evacuated_bytes_ = 0;
+    uint64_t evacuated_blocks_ = 0;
+    /// Blocks chosen for the next major to empty, and whether the sweep running
+    /// now has stubs to rewrite references through.
+    size_t evacuate_pending_ = 0;
+    bool fixing_refs_ = false;
+    /// What the sweep running now may still choose to evacuate, in live bytes,
+    /// and how much it has chosen. Atomic because the parallel sweep's threads
+    /// choose as they go.
+    size_t evacuate_budget_ = 0;
+    std::atomic<size_t> evacuate_chosen_{0};
+    /// What the last evacuation moved, for the trace line.
+    size_t last_evacuated_ = 0;
+    size_t last_evacuated_blocks_ = 0;
     uint64_t parallel_collections_ = 0;
     uint64_t minor_nanos_ = 0;
     uint64_t major_nanos_ = 0;
@@ -677,6 +720,9 @@ private:
 
     /// Non-null while verifying: `forward` records roots rather than marking.
     std::vector<Value>* recording_ = nullptr;
+    /// True while `evacuate` hands the roots their objects' new addresses:
+    /// `forward` then rewrites a slot naming a stub and does nothing else.
+    bool fixing_roots_ = false;
 
     /// Note a store into a marked object during a concurrent mark: the object
     /// goes on the re-walk list (`mark_log_`, drained by the finalize) and on
@@ -732,6 +778,25 @@ inline size_t object_size(const Obj* o) { return o->bytes; }
 inline bool is_shared_obj(const Obj* o) {
     return std::atomic_ref<uint8_t>(const_cast<Obj*>(o)->gc).load(std::memory_order_relaxed) &
            GC_SHARED;
+}
+
+/// The hash a map gives a key it compares by identity. See `AUX_IDENTITY`.
+///
+/// Assigned the first time anything asks, by the process that owns the object
+/// -- only the owner ever writes a header, and `aux` is not a byte a collector
+/// thread reads -- and kept from then on. An object in the shared area cannot
+/// be written by anybody, but it cannot move either, so one with no identity of
+/// its own is hashed by its address, which is as stable there as the bits are
+/// everywhere else. The numbers come from a counter per thread mixed into
+/// fifteen bits; nothing needs them to differ between threads, only to spread.
+inline uint64_t identity_hash(Obj* o) {
+    if (uint16_t id = o->aux & AUX_IDENTITY) return id;
+    if (is_shared_obj(o)) return reinterpret_cast<uint64_t>(o);
+    thread_local uint32_t next = 0;
+    uint32_t mixed = ++next * 0x9e3779b9u;
+    uint16_t id = uint16_t(((mixed >> 17) % 0x7fffu + 1) << 1);
+    o->aux |= id;
+    return id;
 }
 
 /// Values every process of a runtime can read and none of them owns.

@@ -139,6 +139,20 @@ struct Obj {
 /// so it survives a collection. A host that reaches in and replaces a field of
 /// an object it did not just make must clear it.
 constexpr uint16_t AUX_DEEP_FORCED = 1;
+
+/// The rest of `aux`: an object's identity hash, or zero when nothing has asked
+/// for one yet.
+///
+/// A map compares a list, an array, a closure -- anything but the flat kinds --
+/// by identity, and hashed it by its address. An address is not an identity:
+/// promotion copies every young object somewhere else, so a list used as a key
+/// was found before a minor collection and missing after it, and the copy a
+/// message makes had the same problem across processes. So the identity is
+/// kept in the header instead, which travels with every copy the collector
+/// makes and which `copy_between` carries across. Fifteen bits is not unique,
+/// and need not be: equality is still by identity, and a collision costs a
+/// longer leaf chain, not a wrong answer. See `identity_hash`.
+constexpr uint16_t AUX_IDENTITY = 0xfffe;
 static_assert(sizeof(Obj) == 8, "object headers must stay one word");
 
 inline Obj* as_obj(Value v) { return reinterpret_cast<Obj*>(v); }
