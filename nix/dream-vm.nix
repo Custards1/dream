@@ -19,6 +19,11 @@
 , doCheck ? true
 }:
 
+let
+  # Linked into libdream, so the VM this builds needs neither libffi.so nor
+  # libLLVM.so at run time: see DREAM_LINK_DEPS in dream/CMakeLists.txt.
+  libffiStatic = import ./libffi-static.nix { inherit libffi; };
+in
 stdenv.mkDerivation {
   pname = "dream-vm";
   version = "0.1.0";
@@ -43,12 +48,16 @@ stdenv.mkDerivation {
   nativeBuildInputs = [ cmake pkg-config ]
     ++ lib.optional withJit llvmPackages_21.llvm.dev;
 
-  buildInputs = [ libffi openssl ]
+  buildInputs = [ libffiStatic openssl ]
     ++ lib.optional withJit zlib;   # LLVM links against it
 
   cmakeFlags = [
     "-DDREAM_ENABLE_JIT=${if withJit then "ON" else "OFF"}"
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+    # STATIC rather than the default PREFER_STATIC: a package that quietly
+    # fell back on the shared libraries would be the build this exists to avoid.
+    "-DDREAM_LINK_DEPS=STATIC"
+    "-DDREAM_FFI_LIB=${libffiStatic.out}/lib/libffi.a"
   ];
 
   inherit doCheck;
@@ -63,11 +72,9 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "The Dream virtual machine: lazy graph reduction, green processes, an LLVM JIT";
+    description = "The Dream virtual machine";
     longDescription = ''
-      A lazy graph-reduction interpreter written as an explicit state machine,
-      BEAM-style green processes with isolated heaps and copied messages, and
-      an optional LLVM JIT for the strict numeric spine of hot functions.
+      A lazy graph-reduction interpreter/compiler written as an explicit state machine,
       Installs the `dream` binary, `libdream`, and the C embedding headers.
     '';
     homepage = "https://github.com/Custards1/dream";
