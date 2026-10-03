@@ -1324,6 +1324,64 @@ relying on any of this:
 
 ---
 
+### `std.sql`
+
+```dream
+import std.sql;
+import std.sql.sqlite;
+```
+
+SQL for whichever database is on the other end. A statement is built as a
+value and rendered only when the dialect is known: the same query is `$1` and
+`"name"` for Postgres, `?` and `` `name` `` for MySQL. Dialects are maps, so a
+database not listed here is `sql.extend` away. The module's head comment is the
+design.
+
+```dream
+let db = sqlite.open! "notes.db";
+sql.query! db (sql.select ["name", sql.alias (sql.count "id") "n"]
+    |> sql.from "users" |> sql.where (sql.gt "age" 18)
+    |> sql.group_by ["name"] |> sql.order_by [sql.desc "n"] |> sql.limit 10)
+sql.query! db (sql.q "select * from users where id = ? and ?" [7, sql.eq "active" true])
+```
+
+A string means one of three things, depending on where it is written: SQL text
+(`raw`, `concat`, a whole statement), a column (the left of a comparison, a
+select list, `order_by`), or a value (the right of a comparison, a hole in `q`,
+an argument to `call`). A fragment is a fragment in all three places, and a
+query used inside another is a parenthesized subquery.
+
+| Name | Description |
+|------|-------------|
+| `raw` · `param` · `literal` · `ident` · `col` | The pieces: text, a bound value, a value written into the text, a quoted name, a qualified name (`"t.c"`). |
+| `q text args` | SQL with `?` holes, each filled by a value (as a parameter) or a fragment/query (as SQL). `??` is a literal `?`. |
+| `concat` · `join sep` · `parens` | Put fragments together. |
+| `per_dialect f` | A fragment written differently for each dialect. |
+| `eq` · `ne` · `lt` · `le` · `gt` · `ge` · `like` · `ilike` · `op sym` | Comparisons; `eq c ()` is `IS NULL`. |
+| `in_list` · `not_in` · `in_query` · `between` · `exists` · `is_null` · `is_not_null` | More conditions. An empty `IN` is false. |
+| `all_of` · `any_of` · `negate` | Combine conditions, each parenthesized. |
+| `call` · `count` · `count_all` · `sum` · `avg` · `min` · `max` · `alias` · `asc` · `desc` · `case_when` | Expressions. |
+| `select` · `from` · `join_on` · `left_join` · `right_join` · `full_join` · `cross_join` · `where` · `group_by` · `having` · `order_by` · `limit` · `offset` · `distinct` · `with_cte` · `with_recursive` | Queries, chained with `\|>`. |
+| `union_all` · `union_distinct` · `intersect` · `except` | Compound queries. |
+| `insert_into` · `values` · `values_list` · `values_in` · `insert_select` · `on_conflict_nothing` · `on_conflict_update` · `excluded` · `returning` · `update` · `set` · `delete_from` | Writing. `values` takes a map, and atom keys are allowed, so a record's `to_map` can be inserted as it is. |
+| `create_table` · `column` · `not_null` · `unique` · `primary_key` · `auto_increment` · `default` · `references` · `check` · `primary_key_on` · `unique_on` · `foreign_key` · `check_that` · `drop_table` · `create_index` · `unique_index` · `drop_index` · `add_column` · `if_not_exists` · `if_exists` | Schema. A type is an atom the dialect knows (`:integer`, `:text`, `:bool`, ..), `[:varchar, 80]`, or a string written as given. |
+| `ansi` · `sqlite` · `postgres` · `mysql` · `mssql` · `extend` | Dialects. |
+| `render d x` · `inline d x` | `%{ :text, :params, :problems }` for a dialect, or the text with values written in. |
+| `exec! c x` · `query! c x` · `run! c x` · `first!` · `one!` · `scalar!` · `column!` · `query_as! description` | Run a statement: its effect, rows as maps by column name, the raw outcome, or one piece of it. |
+| `exec_many! c xs` | Many statements; a run of the same text is prepared once. |
+| `script! c text` · `transaction! c f` · `using! c f` · `close! c` · `traced f c` | Scripts, transactions (nested ones are savepoints), scoped connections, and a hook that sees each statement. |
+| `migrate! c migrations` | Apply `[id, name, statements]` migrations the database has not seen, each in its own transaction. |
+| `fail!` · `is_sql_error` · `error_code` | A database's refusal: kind `:sql_error`, with a code that is `:unique`, `:foreign_key`, `:not_null`, `:check`, `:constraint`, `:busy`, ... wherever the driver can say so. |
+| `connection d state effects` · `no_rows` | For writing a driver: the effects are `:run`, and optionally `:run_many`, `:script` and `:close`. |
+
+`std.sql.sqlite` is the driver this library carries. It binds the system's
+libsqlite3 through `std.foreign`, and the library is found the way the platform's
+loader finds one (on Nix, `nix-shell` puts it on `LD_LIBRARY_PATH`).
+`sqlite.open! path`, `sqlite.memory! ()`, and `sqlite.open_with! path
+%{ :readonly, :busy_timeout, :foreign_keys, :place }`, where `:place` may be a
+`foreign.start!` server to own the database. `sqlite.available! ()` says
+whether the library can be loaded at all.
+
 ### `std.all`
 
 ```dream

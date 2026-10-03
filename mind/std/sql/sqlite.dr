@@ -1,0 +1,512 @@
+// SQLite, as a `std.sql` connection.
+//
+//     import std.sql;
+//     import std.sql.sqlite;
+//
+//     let db = sqlite.open! "notes.db";
+//     sql.exec! db (sql.insert_into "notes" |> sql.values %{ "body" => "hi" })
+//     sql.query! db (sql.select [] |> sql.from "notes")
+//     sql.close! db
+//
+// The library is the system's (`libsqlite3.so.0`, or what `foreign.shared_library`
+// says it is called elsewhere), found the way the platform's loader finds one --
+// so on a system that keeps it somewhere unusual, `LD_LIBRARY_PATH` is how to
+// say where.
+//
+// A database handle is owned by the process that opened it, as every
+// `std.foreign` resource is, and a statement is owned by its database: closing
+// the database finalizes whatever was still open on it. A connection opened
+// with `:place` set to a `foreign.start!` server lives in that server instead,
+// and every call on it is a message there -- which is how a database is shared
+// between processes, one statement at a time, with no lock.
+//
+// What SQLite stores and what comes back: an integer, a float, text, a blob
+// (`[:blob, bytes]`), or NULL. A bool is stored as 1 or 0 and read back as
+// that integer, because SQLite has no booleans to give back. Text is read up
+// to its first NUL byte; text that holds one should be stored as a blob.
+
+import std.foreign;
+import std.list;
+import std.sql;
+
+foreign sqlite3 from (foreign.shared_library "sqlite3" "0") {
+    resource Db = sqlite3_close_v2
+    resource Stmt = sqlite3_finalize
+
+    open! : :cstr -> out (Db | ()) -> :int -> :ptr -> :int = sqlite3_open_v2
+    errmsg! : Db -> :cstr = sqlite3_errmsg
+    extended_errcode! : Db -> :int = sqlite3_extended_errcode
+    busy_timeout! : Db -> :int -> :int = sqlite3_busy_timeout
+    exec! : Db -> :cstr -> :ptr -> :ptr -> :ptr -> :int = sqlite3_exec
+    changes! : Db -> :int = sqlite3_changes
+    last_insert_rowid! : Db -> :i64 = sqlite3_last_insert_rowid
+
+    prepare! : Db -> :bytes -> :int -> out (Stmt | ()) -> :ptr -> :int = sqlite3_prepare_v2
+    step! : Stmt -> :int = sqlite3_step
+    reset! : Stmt -> :int = sqlite3_reset
+    clear_bindings! : Stmt -> :int = sqlite3_clear_bindings
+    readonly! : Stmt -> :int = sqlite3_stmt_readonly
+
+    bind_null! : Stmt -> :int -> :int = sqlite3_bind_null
+    bind_int64! : Stmt -> :int -> :i64 -> :int = sqlite3_bind_int64
+    bind_double! : Stmt -> :int -> :double -> :int = sqlite3_bind_double
+    bind_text! : Stmt -> :int -> :bytes -> :int -> :ptr -> :int = sqlite3_bind_text
+    bind_blob! : Stmt -> :int -> :bytes -> :int -> :ptr -> :int = sqlite3_bind_blob
+
+    column_count! : Stmt -> :int = sqlite3_column_count
+    column_name! : Stmt -> :int -> :cstr = sqlite3_column_name
+    column_type! : Stmt -> :int -> :int = sqlite3_column_type
+    column_int64! : Stmt -> :int -> :i64 = sqlite3_column_int64
+    column_double! : Stmt -> :int -> :double = sqlite3_column_double
+    column_text! : Stmt -> :int -> :cstr | () = sqlite3_column_text
+    column_blob! : Stmt -> :int -> :ptr = sqlite3_column_blob
+    column_bytes! : Stmt -> :int -> :int = sqlite3_column_bytes
+
+    libversion : :void -> :cstr = sqlite3_libversion
+}
+
+/// A blob comes back as a bare pointer and a length, and Dream reads no memory
+/// it was not told the size of. So the bytes are copied into a buffer of that
+/// length first, which it was.
+foreign libc {
+    copy! : :buffer -> :ptr -> :size -> :ptr = memcpy
+}
+
+// --- opening ------------------------------------------------------------------
+
+/// How a database is opened. Every key may be left out:
+///
+///   :readonly       open it for reading only (false)
+///   :busy_timeout   how long to wait on a lock held elsewhere, in ms (5000)
+///   :foreign_keys   enforce `REFERENCES` -- SQLite does not unless asked (true)
+///   :place          `foreign.here`, or a `foreign.start!` server to own it
+type Options = %{ :atom => :any };
+
+/// The database at `path`, made if there is none. A `file:` URI is taken too.
+let open! : :string -> sql.Connection;
+let open! path = open_with! path %{};
+
+/// A database in memory, gone when it is closed.
+let memory! : :unit -> sql.Connection;
+let memory! u = open_with! ":memory:" %{};
+
+let open_with! : :string -> Options -> sql.Connection;
+let open_with! path options = {
+    let place = options.[:place else foreign.here];
+    let flags = (if options.[:readonly else false] { open_readonly } else { open_readwrite + open_create }) + open_uri;
+    let db = foreign.run! place (fn () -> open_here! path flags options);
+    sql.connection sql.sqlite %{ :db => db, :place => place }
+                   %{ :run => run!, :run_many => run_many!, :script => script!, :close => close! }
+};
+
+priv let open_readonly : :integer;
+priv let open_readonly = 1;
+priv let open_readwrite : :integer;
+priv let open_readwrite = 2;
+priv let open_create : :integer;
+priv let open_create = 4;
+priv let open_uri : :integer;
+priv let open_uri = 64;
+
+priv let open_here! : :string -> :integer -> Options -> sqlite3.Db;
+priv let open_here! path flags options = {
+    let [rc, opened] = sqlite3.open! path flags ();
+    match opened {
+        () => sql.fail! "out of memory" (code_of rc) path,
+        db => {
+            if rc != 0 {
+                // SQLite hands back a handle even when it could not open the
+                // file, so that the reason can be read from it; it still has
+                // to be closed.
+                let message = sqlite3.errmsg! db;
+                strict! message
+                foreign.release! db
+                sql.fail! message (code_of rc) path
+            } else { () }
+            sqlite3.busy_timeout! db options.[:busy_timeout else 5000]
+            if options.[:foreign_keys else true] { exec_here! db "PRAGMA foreign_keys = ON" } else { () }
+            db
+        },
+    }
+};
+
+/// The version of the library, as it says it: `"3.45.1"`.
+let version : :unit -> :string;
+let version u = sqlite3.libversion ();
+
+/// Whether the library can be loaded here at all.
+let available! : :unit -> :bool;
+let available! u = try! {
+    let v = sqlite3.libversion ();
+    strict! v
+    true
+} catch e { false };
+
+// --- the driver ---------------------------------------------------------------
+//
+// Each effect is a function of the connection's state, run where the database
+// lives. What is read from a statement is forced as it is read: a value left
+// suspended would be read later, after the statement had stepped on or been
+// finalized.
+
+priv let run! : :map -> :string -> [sql.Value] -> sql.Outcome;
+priv let run! state text params = {
+    let db = state.[:db];
+    foreign.run! state.[:place] (fn () -> run_here! db text params)
+};
+
+priv let run_here! : sqlite3.Db -> :string -> [sql.Value] -> sql.Outcome;
+priv let run_here! db text params = {
+    let [rc, st] = sqlite3.prepare! db text (len text) ();
+    if rc != 0 { fail_db! db text } else { () }
+    match st {
+        // Text with no statement in it -- a comment, or nothing -- prepares to
+        // NULL, and there is nothing to run.
+        () => sql.no_rows 0 (),
+        _ => foreign.using! st (fn st -> execute! db st text params),
+    }
+};
+
+priv let execute! : sqlite3.Db -> sqlite3.Stmt -> :string -> [sql.Value] -> sql.Outcome;
+priv let execute! db st text params = {
+    bind_all! db st text 1 params
+    let n = sqlite3.column_count! st;
+    let names = column_names! st 0 n [];
+    let rows = step_rows! db st text n [];
+    // `changes` and the last row's id belong to the last statement that
+    // wrote, which is not this one if this one only read.
+    let wrote = sqlite3.readonly! st == 0;
+    let changes = if wrote { sqlite3.changes! db } else { 0 };
+    let last_id = if wrote { sqlite3.last_insert_rowid! db } else { () };
+    strict! changes
+    strict! last_id
+    %{ :columns => names, :rows => rows, :changes => changes, :last_id => last_id }
+};
+
+/// Cons, forcing the head.
+priv let keep : a -> [a] -> [a];
+priv let keep !x xs = list.cons x xs;
+
+priv let column_names! : sqlite3.Stmt -> :integer -> :integer -> [:string] -> [:string];
+priv let rec column_names! st !i n !acc =
+    if i >= n { list.reverse acc }
+    else {
+        let name = sqlite3.column_name! st i;
+        column_names! st (i + 1) n (keep name acc)
+    };
+
+priv let step_rows! : sqlite3.Db -> sqlite3.Stmt -> :string -> :integer -> [[sql.Value]] -> [[sql.Value]];
+priv let rec step_rows! db st text n !acc = {
+    let rc = sqlite3.step! st;
+    match rc {
+        100 => {
+            let row = read_row! st 0 n [];
+            step_rows! db st text n (keep row acc)
+        },
+        101 => list.reverse acc,
+        _ => fail_db! db text,
+    }
+};
+
+priv let read_row! : sqlite3.Stmt -> :integer -> :integer -> [sql.Value] -> [sql.Value];
+priv let rec read_row! st !i n !acc =
+    if i >= n { list.reverse acc }
+    else {
+        let v = column_value! st i;
+        read_row! st (i + 1) n (keep v acc)
+    };
+
+priv let column_value! : sqlite3.Stmt -> :integer -> sql.Value;
+priv let column_value! st i = {
+    let kind = sqlite3.column_type! st i;
+    let v = match kind {
+        1 => sqlite3.column_int64! st i,
+        2 => sqlite3.column_double! st i,
+        3 => sqlite3.column_text! st i,
+        4 => blob_bytes! st i,
+        _ => (),
+    };
+    strict! v
+    v
+};
+
+priv let blob_bytes! : sqlite3.Stmt -> :integer -> sql.Value;
+priv let blob_bytes! st i = {
+    // The pointer first and then the length, the order SQLite asks for: the
+    // length is only settled once the value is in the form being read.
+    let p = sqlite3.column_blob! st i;
+    let n = sqlite3.column_bytes! st i;
+    strict! p
+    strict! n
+    if n == 0 { sql.blob "" }
+    else {
+        let b = foreign.buffer! n;
+        libc.copy! b p n
+        let bytes = foreign.read! b 0 n;
+        strict! bytes
+        foreign.release! b
+        sql.blob bytes
+    }
+};
+
+/// `SQLITE_TRANSIENT`: SQLite copies what it is given before the call returns,
+/// so a Dream string may move afterwards.
+priv let transient : :integer;
+priv let transient = 0 - 1;
+
+priv let bind_all! : sqlite3.Db -> sqlite3.Stmt -> :string -> :integer -> [sql.Value] -> :unit;
+priv let rec bind_all! db st text !i params = match params {
+    [] => (),
+    [v, ..rest] => {
+        let rc = bind_one! st i v;
+        if rc != 0 { fail_db! db text } else { () }
+        bind_all! db st text (i + 1) rest
+    },
+};
+
+priv let bind_one! : sqlite3.Stmt -> :integer -> sql.Value -> :integer;
+priv let bind_one! st i v = match v {
+    () => sqlite3.bind_null! st i,
+    true => sqlite3.bind_int64! st i 1,
+    false => sqlite3.bind_int64! st i 0,
+    [:blob, bytes] => sqlite3.bind_blob! st i bytes (len bytes) transient,
+    _ => match type_of v {
+        :integer => sqlite3.bind_int64! st i v,
+        :float => sqlite3.bind_double! st i v,
+        _ => sqlite3.bind_text! st i v (len v) transient,
+    },
+};
+
+priv let run_many! : :map -> :string -> [[sql.Value]] -> :integer;
+priv let run_many! state text param_lists = {
+    let db = state.[:db];
+    foreign.run! state.[:place] (fn () -> many_here! db text param_lists)
+};
+
+/// One statement prepared once, and reset and bound again for each row.
+priv let many_here! : sqlite3.Db -> :string -> [[sql.Value]] -> :integer;
+priv let many_here! db text param_lists = {
+    let [rc, st] = sqlite3.prepare! db text (len text) ();
+    if rc != 0 { fail_db! db text } else { () }
+    match st {
+        () => 0,
+        _ => foreign.using! st (fn st -> each_row! db st text (sqlite3.readonly! st == 0) param_lists 0),
+    }
+};
+
+priv let each_row! : sqlite3.Db -> sqlite3.Stmt -> :string -> :bool -> [[sql.Value]] -> :integer -> :integer;
+priv let rec each_row! db st text wrote params !total = match params {
+    [] => total,
+    [ps, ..rest] => {
+        sqlite3.reset! st
+        sqlite3.clear_bindings! st
+        bind_all! db st text 1 ps
+        drain! db st text
+        let changed = if wrote { sqlite3.changes! db } else { 0 };
+        each_row! db st text wrote rest (total + changed)
+    },
+};
+
+priv let drain! : sqlite3.Db -> sqlite3.Stmt -> :string -> :unit;
+priv let rec drain! db st text = {
+    let rc = sqlite3.step! st;
+    match rc {
+        100 => drain! db st text,
+        101 => (),
+        _ => fail_db! db text,
+    }
+};
+
+priv let script! : :map -> :string -> :unit;
+priv let script! state text = {
+    let db = state.[:db];
+    foreign.run! state.[:place] (fn () -> exec_here! db text)
+};
+
+priv let exec_here! : sqlite3.Db -> :string -> :unit;
+priv let exec_here! db text = {
+    let rc = sqlite3.exec! db text () () ();
+    if rc != 0 { fail_db! db text } else { () }
+};
+
+priv let close! : :map -> :unit;
+priv let close! state = {
+    let db = state.[:db];
+    foreign.run! state.[:place] (fn () -> foreign.release! db)
+};
+
+// --- errors -------------------------------------------------------------------
+
+priv let fail_db! : sqlite3.Db -> :string -> :never;
+priv let fail_db! db text = {
+    let message = sqlite3.errmsg! db;
+    let code = sqlite3.extended_errcode! db;
+    strict! message
+    strict! code
+    sql.fail! message (code_of code) text
+};
+
+/// SQLite's extended result codes, in the words `std.sql.fail!` lists, so that
+/// a program can catch a duplicate key without knowing it was SQLite that
+/// refused it. A code with no word stays the number.
+priv let code_of : :integer -> :any;
+priv let code_of code = match code {
+    2067 => :unique,
+    1555 => :unique,
+    787 => :foreign_key,
+    1299 => :not_null,
+    275 => :check,
+    _ => match code % 256 {
+        19 => :constraint,
+        5 => :busy,
+        6 => :locked,
+        8 => :readonly,
+        14 => :cantopen,
+        _ => code,
+    },
+};
+
+when test {
+    import std.console;
+    import std.error;
+    import std.str;
+    import std.test;
+
+    /// `f` against a fresh database in memory, or nothing where the library
+    /// cannot be loaded -- `test-std` runs on machines that have no SQLite,
+    /// and says so rather than failing.
+    let with_db! : (sql.Connection -> :any) -> :any;
+    let with_db! f = if available! () { sql.using! (memory! ()) f } else { :ok };
+
+    let kind_of! : (:unit -> :any) -> :any;
+    let kind_of! work = try! {
+        let v = work ();
+        strict! v
+        :no_error
+    } catch e { if sql.is_sql_error e { sql.error_code e } else { error.kind e } };
+
+    let schema = sql.create_table "people" [
+        sql.column "id" :integer |> sql.auto_increment,
+        sql.column "name" :text |> sql.not_null |> sql.unique,
+        sql.column "age" :integer,
+        sql.column "photo" :blob,
+        sql.column "score" :float |> sql.default 1.5,
+    ];
+
+    let people = [
+        %{ :name => "ada", :age => 36, :photo => sql.blob (str.of_bytes [0, 1, 255]) },
+        %{ :name => "bob", :age => 17 },
+        %{ :name => "cy", :age => (), :photo => sql.blob "" },
+    ];
+
+    let seeded! db = {
+        sql.exec! db schema
+        sql.exec_many! db (list.map (fn p -> sql.insert_into "people" |> sql.values p) people)
+        db
+    };
+
+    let tests = [
+        test.case "the library" $( {
+            if available! () { () }
+            else { console.print! "  (no libsqlite3 here: the std.sql.sqlite tests are skipped)" }
+            :ok
+        } ),
+        test.case "values come back as they went in" $( with_db! (fn db -> test.eq!
+            [[1, "x", 2.5, (), [:blob, "a\0b"]]]
+            (sql.run! db (sql.q "select ?, ?, ?, ?, ?" [1, "x", 2.5, (), sql.blob "a\0b"])).[:rows]) ),
+        test.case "a row is a map by column name" $( with_db! (fn db -> test.eq!
+            [%{ "a" => 1, "b" => "two" }] (sql.query! db (sql.raw "select 1 as a, 'two' as b"))) ),
+        test.case "inserts in one prepared statement" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! 3 (sql.scalar! db (sql.select [sql.count_all] |> sql.from "people"))
+        }) ),
+        test.case "a default is filled" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! [1.5, 1.5, 1.5] (sql.column! db (sql.select ["score"] |> sql.from "people"))
+        }) ),
+        test.case "blobs, empty and not" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! [[:blob, (str.of_bytes [0, 1, 255])], (), [:blob, ""]]
+                     (sql.column! db (sql.select ["photo"] |> sql.from "people" |> sql.order_by ["id"]))
+        }) ),
+        test.case "a query with every clause" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! [%{ "name" => "ada" }]
+                     (sql.query! db (sql.select ["name"] |> sql.from "people"
+                                     |> sql.where (sql.ge "age" 18) |> sql.where (sql.like "name" "a%")
+                                     |> sql.order_by [sql.desc "age"] |> sql.limit 5))
+        }) ),
+        test.case "returning" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! [%{ "id" => 4, "name" => "dee" }]
+                     (sql.query! db (sql.insert_into "people" |> sql.values %{ "name" => "dee" }
+                                     |> sql.returning ["id", "name"]))
+        }) ),
+        test.case "an update counts what it changed" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! 2 (sql.exec! db (sql.update "people" |> sql.set %{ "age" => sql.q "age + 1" [] }
+                                      |> sql.where (sql.is_not_null "age"))).[:changes]
+        }) ),
+        test.case "an upsert" $( with_db! (fn db -> {
+            seeded! db
+            sql.exec! db (sql.insert_into "people" |> sql.values %{ "name" => "bob", "age" => 50 }
+                          |> sql.on_conflict_update ["name"] ["age"])
+            test.eq! 50 (sql.scalar! db (sql.select ["age"] |> sql.from "people" |> sql.where (sql.eq "name" "bob")))
+        }) ),
+        test.case "a duplicate is a :unique error" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! :unique (kind_of! (fn () -> sql.exec! db (sql.insert_into "people" |> sql.values %{ "name" => "ada" })))
+        }) ),
+        test.case "bad SQL is an :sql_error" $( with_db! (fn db ->
+            test.true! (kind_of! (fn () -> sql.query! db "selec 1") != :no_error)) ),
+        test.case "a transaction that raises leaves nothing" $( with_db! (fn db -> {
+            seeded! db
+            kind_of! (fn () -> sql.transaction! db (fn tx -> {
+                sql.exec! tx (sql.delete_from "people")
+                raise! :changed_my_mind
+            }))
+            test.eq! 3 (sql.scalar! db (sql.select [sql.count_all] |> sql.from "people"))
+        }) ),
+        test.case "a nested transaction is a savepoint" $( with_db! (fn db -> {
+            seeded! db
+            sql.transaction! db (fn tx -> {
+                sql.exec! tx (sql.delete_from "people" |> sql.where (sql.eq "name" "ada"))
+                kind_of! (fn () -> sql.transaction! tx (fn inner -> {
+                    sql.exec! inner (sql.delete_from "people")
+                    raise! :no
+                }))
+            })
+            test.eq! ["bob", "cy"] (sql.column! db (sql.select ["name"] |> sql.from "people" |> sql.order_by ["name"]))
+        }) ),
+        test.case "one! wants one" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! :not_one (kind_of! (fn () -> sql.one! db (sql.select [] |> sql.from "people")))
+        }) ),
+        test.case "migrations run once" $( with_db! (fn db -> {
+            let ms = [
+                [2, "add", sql.insert_into "t" |> sql.values %{ "x" => 1 }],
+                [1, "make", [sql.create_table "t" [sql.column "x" :integer]]],
+            ];
+            let first = sql.migrate! db ms;
+            let again = sql.migrate! db ms;
+            test.eq! [[1, 2], [], 1] [first, again, sql.scalar! db (sql.select [sql.count_all] |> sql.from "t")]
+        }) ),
+        test.case "a script runs every statement" $( with_db! (fn db -> {
+            sql.script! db "create table a (x); insert into a values (1); insert into a values (2);"
+            test.eq! 3 (sql.scalar! db (sql.select [sql.sum "x"] |> sql.from "a"))
+        }) ),
+        test.case "an empty statement is nothing" $( with_db! (fn db ->
+            test.eq! [] (sql.query! db "-- nothing")) ),
+        test.case "a database in a server" $( {
+            if available! () {
+                let server = foreign.start! ();
+                let db = open_with! ":memory:" %{ :place => server };
+                sql.script! db "create table s (x); insert into s values (7);"
+                let seven = sql.scalar! db (sql.raw "select x from s");
+                sql.close! db
+                foreign.stop! server
+                test.eq! 7 seven
+            } else { :ok }
+        } ),
+    ];
+}

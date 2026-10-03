@@ -41,6 +41,8 @@ import std.remote;
 import std.result;
 import std.seq;
 import std.server;
+import std.sql;
+import std.sql.sqlite;
 import std.str;
 import std.streams;
 import std.supervisor;
@@ -61,7 +63,7 @@ let modules = ["std.agent", "std.array", "std.atom", "std.build", "std.build.cc"
                "std.build.run", "std.build.tool", "std.char", "std.cli",
                "std.codec", "std.error", "std.file", "std.json", "std.list",
                "std.map", "std.macros", "std.num", "std.payload", "std.proc", "std.record", "std.registry", "std.remote",
-               "std.result", "std.seq", "std.server", "std.str", "std.streams",
+               "std.result", "std.seq", "std.server", "std.sql", "std.sql.sqlite", "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];
 
 // --- the tests std.record cannot hold ----------------------------------------

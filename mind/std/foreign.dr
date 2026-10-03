@@ -49,6 +49,7 @@
 
 import std.ffi;
 import std.list;
+import std.os;
 
 // --- the vocabulary ------------------------------------------------------------
 
@@ -127,6 +128,21 @@ let taken destructor = [:cstr, destructor];
 let library : :string -> Library;
 let library path = path;
 
+/// A library installed on the system, by the name its loader knows it by on
+/// the platform this is running on: `shared_library "sqlite3" "0"` is
+/// `libsqlite3.so.0` on Linux, `libsqlite3.0.dylib` on macOS and `sqlite3.dll`
+/// on Windows. The version is the soname's, and `""` leaves it off.
+///
+/// This lives here rather than with the library that wants it because a
+/// `foreign` declaration's `from (..)` is compiled inside the module the
+/// declaration makes, which sees `std.ffi` and `std.foreign` and nothing else.
+let shared_library : :string -> :string -> Library;
+let shared_library name version = match os.platform () {
+    :windows => name + ".dll",
+    :macos => if version == "" { "lib" + name + ".dylib" } else { "lib" + name + "." + version + ".dylib" },
+    _ => if version == "" { "lib" + name + ".so" } else { "lib" + name + ".so." + version },
+};
+
 /// The running program, and everything linked into it.
 let this_program : Library = ();
 
@@ -166,7 +182,7 @@ let owned! u = ffi.owned! u;
 /// The answer is forced all the way down before the release: a lazy answer
 /// that read through `h` would otherwise be forced later, against a handle
 /// that is gone. So `f` should answer data, not an infinite structure.
-let using! : Handle :string -> (Handle :string -> a) -> a;
+let using! : Handle t -> (Handle t -> a) -> a;
 let using! h f = {
     let answer = try! { strict! (f h) } catch e {
         release_if_alive! h
@@ -177,7 +193,7 @@ let using! h f = {
 };
 
 /// `f` may have released `h` itself, or released its parent.
-priv let release_if_alive! : Handle :string -> :unit;
+priv let release_if_alive! : Handle t -> :unit;
 priv let release_if_alive! h = if ffi.alive! h { ffi.release! h } else { () };
 
 // --- memory -------------------------------------------------------------------------
