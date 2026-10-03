@@ -95,6 +95,19 @@ else
   missing=1
 fi
 
+# Nor is TLS: `std.tls` is part of the VM, and on Linux and macOS it is
+# OpenSSL 3. (Windows uses SChannel, and does not run this script.)
+if pkg-config --exists 'openssl >= 3' 2>/dev/null || \
+   compgen -G "/nix/store/*openssl-3*-dev/include/openssl/ssl.h" >/dev/null || \
+   compgen -G "/usr/include/openssl/ssl.h" >/dev/null || \
+   compgen -G "/usr/local/include/openssl/ssl.h" >/dev/null || \
+   { command -v brew >/dev/null && [[ -d "$(brew --prefix openssl@3 2>/dev/null)/include" ]]; }; then
+  ok "OpenSSL found"
+else
+  printf '    %smissing: OpenSSL 3  (std.tls, a required part of the VM: libssl-dev, openssl@3)%s\n' "$RED" "$RESET"
+  missing=1
+fi
+
 [[ $missing -eq 0 ]] || die "install the tools above and run this again"
 
 # The optional piece. Report it now rather than letting CMake bury the news.

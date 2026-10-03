@@ -1,0 +1,379 @@
+// Values: what a Dream value is to PostgreSQL, and what a column is to Dream.
+//
+// Everything crosses as **text**, the format every PostgreSQL type has and the
+// one its documentation specifies. The binary formats are faster for a few
+// types and undocumented for the rest, and a client that sent binary would
+// need a second encoder for each type it met. Text is one spelling per type,
+// written here once.
+//
+// **Going in**, a parameter's spelling is decided by its Dream kind:
+//
+//   | Dream                 | PostgreSQL                                   |
+//   |-----------------------|----------------------------------------------|
+//   | `()`                  | NULL                                         |
+//   | integer, float        | the number                                   |
+//   | bool                  | `t` / `f`                                    |
+//   | string, char          | the text                                     |
+//   | atom                  | its name, so `:active` fills an enum column  |
+//   | list, array           | an array literal, `{1,2,NULL}`, nested       |
+//   | map                   | JSON, through `std.json`                     |
+//   | `typed oid text`      | exactly that text, declared as that type     |
+//
+// and, but for one kind, is sent with no declared type, so the server infers
+// one from where the parameter is used -- `$1` compared with a `date` column is
+// a `date`, and `'2024-01-01'` reads as one. Where it cannot, write the cast in
+// SQL (`$1::jsonb`) or wrap the value: `json`, `jsonb` and `bytea` below do
+// that.
+//
+// **The kind is the integer, which goes as `int8`.** A number with no type is
+// the case inference gets wrong: `generate_series($1, $2)` and
+// `coalesce($1, 0)` have several candidates and the server will not pick one,
+// and `jsonb_build_object('n', $1)` has no type to infer from at all. `int8`
+// compares with, and assigns to, every integer and numeric column, so being
+// definite costs nothing where inference would have worked. A float is left
+// untyped on purpose: as `float8` it would turn a comparison with a `numeric`
+// column into a floating-point one.
+//
+// **Coming out**, a column's type OID decides its value:
+//
+//   | PostgreSQL                            | Dream                       |
+//   |---------------------------------------|-----------------------------|
+//   | NULL                                  | `()`                        |
+//   | `int2`, `int4`, `int8`, `oid`         | integer                     |
+//   | `float4`, `float8`                    | float                       |
+//   | `numeric`                             | integer when it is one, text otherwise |
+//   | `bool`                                | bool                        |
+//   | `json`, `jsonb`                       | the parsed value            |
+//   | `bytea`                               | the raw bytes, as a string  |
+//   | arrays of any of these                | lists, nested               |
+//   | everything else                       | the text the server sent    |
+//
+// **`numeric` is exact and Dream has no decimal**, so a numeric that is a whole
+// number small enough for an integer is one, and any other is left as the text
+// PostgreSQL wrote rather than rounded into a float. `sum(int4)` is a numeric,
+// which is why the first half matters; `avg` is one too, and `avg(x)::float8`
+// is how to ask for a float. An `int8` past what a fixnum holds is kept as text
+// for the same reason. Dates, times and intervals are text in ISO 8601, which
+// sorts and compares as it should and which every format library reads.
+//
+// A program that wants another decoding for some type says so with
+// `Config.decoders`: a map from OID to a function of the text.
+
+import std.json as js;
+import std.list;
+import std.map;
+import std.str;
+import pg.bytes;
+import std.array;
+import std.num;
+
+// --- type OIDs ----------------------------------------------------------------
+//
+// The built-in ones, fixed since PostgreSQL 7 and listed in `pg_type.dat`.
+
+mod oid {
+    let bool : :integer;
+    let bool = 16;
+    let bytea : :integer;
+    let bytea = 17;
+    let char : :integer;
+    let char = 18;
+    let name : :integer;
+    let name = 19;
+    let int8 : :integer;
+    let int8 = 20;
+    let int2 : :integer;
+    let int2 = 21;
+    let int4 : :integer;
+    let int4 = 23;
+    let text : :integer;
+    let text = 25;
+    let oid : :integer;
+    let oid = 26;
+    let json : :integer;
+    let json = 114;
+    let float4 : :integer;
+    let float4 = 700;
+    let float8 : :integer;
+    let float8 = 701;
+    let varchar : :integer;
+    let varchar = 1043;
+    let date : :integer;
+    let date = 1082;
+    let timestamp : :integer;
+    let timestamp = 1114;
+    let timestamptz : :integer;
+    let timestamptz = 1184;
+    let numeric : :integer;
+    let numeric = 1700;
+    let uuid : :integer;
+    let uuid = 2950;
+    let void : :integer;
+    let void = 2278;
+    let jsonb : :integer;
+    let jsonb = 3802;
+}
+
+/// The element type of each built-in array type.
+let element_of : %{:integer => :integer};
+let element_of = %{
+    1000 => 16, 1001 => 17, 1002 => 18, 1003 => 19, 1005 => 21, 1007 => 23,
+    1009 => 25, 1014 => 1042, 1015 => 1043, 1016 => 20, 1021 => 700, 1022 => 701,
+    1028 => 26, 1182 => 1082, 1183 => 1083, 1115 => 1114, 1185 => 1184,
+    1231 => 1700, 199 => 114, 3807 => 3802, 2951 => 2950, 1270 => 1266, 1187 => 1186,
+};
+
+// --- going in ---------------------------------------------------------------------
+
+/// A value that says what type it is, for a parameter the server cannot infer.
+/// An array whose first element is this atom, which no other parameter is.
+let typed : :integer -> :any -> #[:any];
+let typed type_oid text = #[:pg_typed, type_oid, text];
+
+/// A value to go in as `json`, whatever its Dream kind -- a list included,
+/// which would otherwise be an array.
+let json : :any -> #[:any];
+let json v = typed oid.json (js.write v);
+
+let jsonb : :any -> #[:any];
+let jsonb v = typed oid.jsonb (js.write v);
+
+/// Bytes to go in as `bytea`, rather than as text that must be valid UTF-8.
+let bytea : :string -> #[:any];
+let bytea raw = typed oid.bytea ("\\x" + bytes.hex_encode raw);
+
+let is_typed : :any -> :bool;
+let is_typed v = type_of v == :array && len v == 3 && v.[0] == :pg_typed;
+
+/// The type a parameter declares: its OID for a `typed` one, `int8` for an
+/// integer, and 0 -- "infer it" -- for everything else.
+let oid_of : :any -> :integer;
+let oid_of v = match type_of v {
+    :integer => oid.int8,
+    _ => if is_typed v { v.[1] } else { 0 },
+};
+
+/// A parameter as the text that goes on the wire, or `()` for NULL.
+let encode : :any -> :any;
+let encode v = match type_of v {
+    :unit => (),
+    :string => v,
+    :integer => to_string v,
+    :float => float_text v,
+    :bool => if v { "t" } else { "f" },
+    :char => str.of_chars [v],
+    :atom => atom_name v,
+    :list => array_literal v,
+    :array => if is_typed v { v.[2] } else { array_literal (array.to_list v) },
+    :map => js.write v,
+    _ => to_string v,
+};
+
+/// A float as PostgreSQL reads one. `to_string` spells the three that are not
+/// numbers in C's way, which `float8in` does not take.
+priv let float_text : :float -> :string;
+priv let float_text x = match to_string x {
+    "nan" => "NaN",
+    "-nan" => "NaN",
+    "inf" => "Infinity",
+    "-inf" => "-Infinity",
+    text => text,
+};
+
+/// An atom's name, without the colon `to_string` puts in front.
+let atom_name : :atom -> :string;
+let atom_name a = { let t = to_string a; str.slice 1 (len t - 1) t };
+
+/// A list as an array literal: `{1,"two",NULL,{3,4}}`. Every element that is
+/// not a number, a bool or a nested list is quoted, which is always correct --
+/// the server unquotes before it parses -- where leaving one bare would be
+/// wrong for any text holding a comma, a brace, a space or the word NULL.
+let array_literal : [:any] -> :string;
+let array_literal items = "{" + str.join_str "," (list.map array_element items) + "}";
+
+priv let array_element : :any -> :string;
+priv let array_element v = match type_of v {
+    :unit => "NULL",
+    :integer => to_string v,
+    :float => float_text v,
+    :bool => if v { "t" } else { "f" },
+    :list => array_literal v,
+    :array => if is_typed v { quote_element v.[2] } else { array_literal (array.to_list v) },
+    _ => quote_element (encode v),
+};
+
+priv let quote_element : :string -> :string;
+priv let quote_element text =
+    "\"" + str.concat_all (list.map escape_element (str.chars text)) + "\"";
+
+priv let escape_element : :char -> :string;
+priv let escape_element c = match c {
+    '"' => "\\\"",
+    '\\' => "\\\\",
+    _ => str.of_chars [c],
+};
+
+// --- coming out --------------------------------------------------------------------
+
+/// The column's text, as the value its type says it is. `decoders` is the
+/// program's own map from OID to function, consulted first.
+let decode : %{:integer => :any} -> :integer -> :any -> :any;
+let decode decoders type_oid text = match text {
+    () => (),
+    t => match decoders.[type_oid else ()] {
+        () => decode_builtin decoders type_oid t,
+        custom => custom t,
+    },
+};
+
+priv let decode_builtin : %{:integer => :any} -> :integer -> :string -> :any;
+priv let decode_builtin decoders type_oid text = match type_oid {
+    16 => text == "t",
+    20 => exact_integer text,
+    21 => num.parse_int text,
+    23 => num.parse_int text,
+    26 => num.parse_int text,
+    700 => float_of text,
+    701 => float_of text,
+    1700 => exact_integer text,
+    114 => json_of text,
+    3802 => json_of text,
+    17 => bytea_of text,
+    2278 => (),
+    _ => match element_of.[type_oid else ()] {
+        () => text,
+        element => parse_array (decode decoders element) text,
+    },
+};
+
+/// An integer when the text is one that fits, and the text otherwise. A
+/// number too big for a fixnum parses as a float, which is exactly the silent
+/// rounding this refuses -- so the answer must be an integer, not merely a
+/// number.
+let exact_integer : :string -> :any;
+let exact_integer text = match num.parse_int text {
+    n if type_of n == :integer => n,
+    _ => text,
+};
+
+priv let float_of : :string -> :any;
+priv let float_of text = match num.parse_float text {
+    () => text,
+    x => x,
+};
+
+priv let json_of : :string -> :any;
+priv let json_of text = match js.parse text {
+    [:ok, v] => v,
+    _ => text,
+};
+
+/// `bytea`'s hex output, `\x` and two digits a byte. The older escape format
+/// is only produced when a server is told to, and is left as text.
+priv let bytea_of : :string -> :any;
+priv let bytea_of text =
+    if str.starts_with "\\x" text {
+        match bytes.hex_decode (str.slice 2 (len text - 2) text) {
+            () => text,
+            raw => raw,
+        }
+    } else { text };
+
+// --- array literals ---------------------------------------------------------------
+//
+// `{1,2,NULL}`, `{"a b","c\"d"}`, `{{1,2},{3,4}}`, and an optional dimension
+// prefix -- `[0:1]={7,8}` -- that this skips, since a list starts at zero
+// whatever bounds it was declared with. The parser threads a byte offset
+// through the text rather than taking it apart into characters; see "A string
+// is a sequence of bytes with two costs" in docs/language-spec.md.
+
+/// The array `text` spells, each element through `element`.
+let parse_array : (:any -> :any) -> :string -> :any;
+let parse_array element text = {
+    let start = if str.starts_with "[" text { str.find_from 0 "=" text + 1 } else { 0 };
+    if str.byte start text != 123 { text }                                // {
+    else { list.head (array_from element text (start + 1) []) }
+};
+
+/// The rest of an array whose `{` has been read: `[items, next]`.
+priv let array_from : (:any -> :any) -> :string -> :integer -> [:any] -> [:any];
+priv let rec array_from element text at acc = match str.byte at text {
+    125 => [list.reverse acc, at + 1],                                     // }
+    44 => array_from element text (at + 1) acc,                             // ,
+    -1 => [list.reverse acc, at],
+    123 => {                                                                // {
+        let [inner, next] = array_from element text (at + 1) [];
+        array_from element text next (list.cons inner acc)
+    },
+    34 => {                                                                 // "
+        let [raw, next] = quoted_from text (at + 1) [];
+        array_from element text next (list.cons (element raw) acc)
+    },
+    _ => {
+        let stop = str.upto ",}" at text;
+        let raw = str.slice at (stop - at) text;
+        let item = if str.lower raw == "null" { () } else { element raw };
+        array_from element text stop (list.cons item acc)
+    },
+};
+
+/// A quoted element whose `"` has been read: its text unescaped, and the
+/// offset after the closing quote.
+priv let quoted_from : :string -> :integer -> [:string] -> [:any];
+priv let rec quoted_from text at pieces = {
+    let stop = str.upto "\"\\" at text;
+    let piece = str.slice at (stop - at) text;
+    match str.byte stop text {
+        92 => quoted_from text (stop + 2) (list.cons (str.slice (stop + 1) 1 text) (list.cons piece pieces)),
+        _ => [str.concat_all (list.reverse (list.cons piece pieces)), stop + 1],
+    }
+};
+
+when test {
+    import std.test;
+
+    let none : %{:integer => :any};
+    let none = %{};
+
+    let tests = [
+        test.case "parameters by kind"
+            $( test.eq! [(), "7", "1.5", "t", "x", "c", "active", "{1,\"a,b\",NULL}", "{\"k\":1}"]
+                        (list.map encode [(), 7, 1.5, true, "x", 'c', :active, [1, "a,b", ()], %{ "k" => 1 }]) ),
+        test.case "a float that is not a number is spelled as PostgreSQL spells it"
+            $( test.eq! ["NaN", "Infinity", "-Infinity"]
+                        (list.map encode [0.0 / 0.0, 1.0 / 0.0, -1.0 / 0.0]) ),
+        test.case "nested arrays, and the quoting an element needs"
+            $( test.eq! "{{1,2},{\"say \\\"hi\\\"\",\"back\\\\slash\"}}"
+                        (encode [[1, 2], ["say \"hi\"", "back\\slash"]]) ),
+        test.case "a typed value declares its type and is sent as written"
+            $( test.eq! [114, "[1,2]", 17, "\\x00ff", 0, 20, 0]
+                        [oid_of (json [1, 2]), encode (json [1, 2]),
+                         oid_of (bytea (str.of_bytes [0, 255])), encode (bytea (str.of_bytes [0, 255])),
+                         oid_of [1, 2], oid_of 7, oid_of 7.5] ),
+        test.case "columns by type"
+            $( test.eq! [true, false, 42, -7, 2.5, "hello", (), ()]
+                        [decode none 16 "t", decode none 16 "f", decode none 23 "42", decode none 20 "-7",
+                         decode none 701 "2.5", decode none 25 "hello", decode none 23 (), decode none 2278 ""] ),
+        test.case "numeric is an integer only when nothing is lost"
+            $( test.eq! [6, "2.5000000000000000", "123456789012345678901234567890", 4611686018427387903,
+                         "9223372036854775807"]
+                        [decode none 1700 "6", decode none 1700 "2.5000000000000000",
+                         decode none 1700 "123456789012345678901234567890",
+                         decode none 20 "4611686018427387903", decode none 20 "9223372036854775807"] ),
+        test.case "json and bytea"
+            $( test.eq! [%{ "a" => [1, true] }, str.of_bytes [0, 255, 65]]
+                        [decode none 3802 "{\"a\": [1, true]}", decode none 17 "\\x00ff41"] ),
+        test.case "arrays, nested, quoted and with NULLs"
+            $( test.eq! [[1, 2, ()], [["a b", "c\"d"], ["", "NULL"]], [7, 8], []]
+                        [decode none 1007 "{1,2,NULL}",
+                         decode none 1009 "{{\"a b\",\"c\\\"d\"},{\"\",\"NULL\"}}",
+                         decode none 1007 "[0:1]={7,8}", decode none 1007 "{}"] ),
+        test.case "a program's own decoder wins"
+            $( test.eq! ["<2024-01-02>", ["<x>", "<y>"]]
+                        [decode %{ 1082 => fn t -> "<" + t + ">" } 1082 "2024-01-02",
+                         decode %{ 25 => fn t -> "<" + t + ">" } 1009 "{x,y}"] ),
+        test.case "what goes in comes back out"
+            $( test.eq! [[1, (), 3], ["a,b", "{", "\\"]]
+                        [decode none 1007 (encode [1, (), 3]), decode none 1009 (encode ["a,b", "{", "\\"])] ),
+    ];
+}

@@ -138,6 +138,38 @@ endif()
 message(STATUS "Dream: FFI enabled (${DREAM_FFI_LIB})")
 
 # ---------------------------------------------------------------------------
+# TLS, for std.tls
+#
+# Required, for the reason libffi is: `std.tls` is part of what a VM is, and a
+# program that speaks TLS must run on every VM, so there is no build without
+# it. The library is the platform's choice and invisible to Dream: OpenSSL 3
+# on Linux and macOS, linked here; SChannel on Windows, which is part of the
+# system. See src/tls.hpp.
+# ---------------------------------------------------------------------------
+if(WIN32)
+  set(DREAM_TLS_SOURCE src/tls_schannel.cpp)
+  message(STATUS "Dream: TLS through SChannel")
+else()
+  if(APPLE AND NOT OPENSSL_ROOT_DIR)
+    # Homebrew's OpenSSL is keg-only, so it is not on the default search path.
+    execute_process(COMMAND brew --prefix openssl@3
+                    OUTPUT_VARIABLE DREAM_BREW_OPENSSL
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(DREAM_BREW_OPENSSL)
+      set(OPENSSL_ROOT_DIR "${DREAM_BREW_OPENSSL}")
+    endif()
+  endif()
+  find_package(OpenSSL 3.0)
+  if(NOT OPENSSL_FOUND)
+    message(FATAL_ERROR "Dream: OpenSSL 3 not found. std.tls is a required part of the VM; "
+                        "install OpenSSL's development files (libssl-dev, openssl@3), or "
+                        "point -DOPENSSL_ROOT_DIR=<prefix> at them.")
+  endif()
+  set(DREAM_TLS_SOURCE src/tls_openssl.cpp)
+  message(STATUS "Dream: TLS through OpenSSL ${OPENSSL_VERSION}")
+endif()
+
+# ---------------------------------------------------------------------------
 # The VM library
 # ---------------------------------------------------------------------------
 set(DREAM_SOURCES
@@ -159,6 +191,8 @@ set(DREAM_SOURCES
   src/tensor.cpp
   src/tensor_kernels.cpp
   src/gpu.cpp
+  src/tls.cpp
+  ${DREAM_TLS_SOURCE}
 )
 
 # The tensor kernels a second time, for CPUs with AVX2 and FMA, chosen at run
@@ -220,7 +254,9 @@ else()
 endif()
 if(WIN32)
   target_compile_definitions(dream PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
-  target_link_libraries(dream PRIVATE ws2_32)
+  target_link_libraries(dream PRIVATE ws2_32 secur32 crypt32 ncrypt)
+else()
+  target_link_libraries(dream PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -338,7 +374,7 @@ if(DREAM_BUILD_TESTS)
   enable_testing()
   add_executable(dream_tests tests/test_main.cpp)
   target_link_libraries(dream_tests PRIVATE dream)
-  target_include_directories(dream_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_include_directories(dream_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   if(DREAM_TENSOR_AVX2)
     target_compile_definitions(dream_tests PRIVATE DREAM_TENSOR_AVX2=1)
   endif()

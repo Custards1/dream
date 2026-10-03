@@ -1,0 +1,540 @@
+// The library against a running server: every exchange `pg.db` and `pg.pool`
+// make, checked end to end.
+//
+// `live.sh` starts a throwaway cluster, makes the users each login method
+// needs, and runs this with `PG_TEST_PORT` set. Each case runs in a process of
+// its own (`std.test`) and opens its own connection, so a case that breaks one
+// breaks nothing else; tables a case makes are `TEMP`, which belong to its
+// connection and vanish with it.
+
+import std.console;
+import std.file;
+import std.list;
+import std.map;
+import std.os;
+import std.proc;
+import std.str;
+import std.test;
+import std.types;
+import pg.config;
+import pg.db;
+import pg.errors;
+import pg.pool;
+import pg.sql;
+import pg.value;
+import std.num;
+
+let port! : :unit -> :integer;
+let port! u = match num.parse_int (os.env! "PG_TEST_PORT") {
+    n if type_of n == :integer => n,
+    _ => 5432,
+};
+
+let as! : :string -> :string | :unit -> :map;
+let as! user password = %{ :host => "127.0.0.1", :port => port! (), :user => user,
+                           :password => password, :database => "app" };
+
+let admin! : :unit -> :any;
+let admin! u = db.connect! (as! "postgres" ());
+
+/// The condition `body!` raised, or `:none`.
+let condition_of! : (:unit -> :any) -> :any;
+let condition_of! body! = try! { strict! (body! ()); :none } catch e { errors.condition e };
+
+// --- logging in -------------------------------------------------------------------
+
+let login! : :string -> :string | :unit -> :any;
+let login! user password = {
+    let conn = db.connect! (as! user password);
+    test.eq! user (db.scalar! conn "SELECT current_user")
+    db.close! conn
+    :ok
+};
+
+let refused! : :any -> :unit -> :any;
+let refused! target u = db.connect! target;
+
+let wrong_password! : :unit -> :any;
+let wrong_password! u = {
+    test.eq! :invalid_password (condition_of! (refused! (as! "u_scram" "nope")))
+    test.eq! :invalid_password (condition_of! (refused! (as! "u_md5" "nope")))
+    test.eq! :invalid_password (condition_of! (refused! (as! "u_scram" ())))
+};
+
+let nowhere! : :unit -> :any;
+let nowhere! u = {
+    test.eq! :invalid_catalog_name (condition_of! (refused! (as! "postgres" ()).[:database => "no_such_db"]))
+    test.eq! :connection_failure (condition_of! (refused! %{ :host => "127.0.0.1", :port => 1 }))
+};
+
+let url! : :unit -> :any;
+let url! u = {
+    let conn = db.connect! ("postgresql://u_scram:scrampass@127.0.0.1:" + to_string (port! ())
+                            + "/app?application_name=live%20test&search_path=pg_catalog");
+    test.eq! ["live test", "pg_catalog"]
+             (list.head (db.query! conn "SELECT current_setting('application_name'), current_setting('search_path')").[:tuples])
+    test.true! (db.server_version conn >= 100000)
+    test.true! (db.ping! conn)
+    db.close! conn
+    test.false! (db.ping! conn)
+};
+
+// --- values -----------------------------------------------------------------------
+
+let round_trip! : :unit -> :any;
+let round_trip! u = {
+    let conn = admin! ();
+    let i = 42;
+    let big = 4611686018427387000;
+    let f = 2.5;
+    let t = "héllo, \"world\"\n\t\\";
+    let b = str.of_bytes [0, 1, 255, 39, 92];
+    let ints = [1, (), 3];
+    let words = ["a,b", "{x}", "NULL", "", "q\"uote"];
+    let doc = %{ "k" => [1, true, ()] };
+    let row = db.one! conn (expand sql.query
+        "SELECT {i}::int4 AS i, {big}::int8 AS big, {f}::float8 AS f, {t}::text AS t,
+                {ints}::int4[] AS ints, {words}::text[] AS words,
+                {doc}::jsonb AS doc, true AS yes, NULL::text AS nothing,
+                12.50::numeric AS price, 10::numeric AS whole,
+                '2024-02-29'::date AS day, 'NaN'::float8 AS nan");
+    test.eq! [42, 4611686018427387000, 2.5, t, words, doc, true, (), "12.50", 10, "2024-02-29"]
+             [row.[:i], row.[:big], row.[:f], row.[:t], row.[:words], row.[:doc],
+              row.[:yes], row.[:nothing], row.[:price], row.[:whole], row.[:day]]
+    test.eq! [1, (), 3] row.[:ints]
+    test.true! (str.contains_str "nan" (to_string row.[:nan]))
+    // Bytes go in as `bytea`: as text, a NUL would be refused as invalid UTF-8.
+    let raw = value.bytea b;
+    test.eq! b (db.scalar! conn (expand sql.query "SELECT {raw}"))
+    let typed = value.jsonb [1, 2];
+    test.eq! [1, 2] (db.scalar! conn (expand sql.query "SELECT {typed}"))
+    db.close! conn
+};
+
+/// A program that names a column as an atom reads rows keyed by it, and a
+/// `mapping` whose fields are the columns reads a row as it is.
+mapping Person {
+    id : :integer
+    name : :string
+    email : :string | :unit = ()
+    greeting self = "hello, " + name self
+}
+
+let records! : :unit -> :any;
+let records! u = {
+    let conn = admin! ();
+    db.script! conn (expand sql.script "CREATE TEMP TABLE person (id int PRIMARY KEY, name text NOT NULL, email text);")
+    test.eq! 2 (db.exec! conn (sql.insert_all "person" [Person.make 1 "ada" "ada@example.com", Person.new 2 "bob"]))
+    let people = db.query_as! Person.type conn "SELECT * FROM person ORDER BY id";
+    test.eq! ["hello, ada", "hello, bob"] (list.map Person.greeting people)
+    test.eq! [:id, :name, :email] (list.map (fn c -> c.[:key]) (db.query! conn "SELECT * FROM person").[:columns])
+    test.raises! $( strict! (db.query_as! Person.type conn "SELECT 'x' AS id, 'y' AS name") )
+    db.close! conn
+};
+
+let decoders! : :unit -> :any;
+let decoders! u = {
+    let conn = db.connect! (as! "postgres" ()).[:decoders => %{ 1082 => fn d -> str.split "-" d }];
+    test.eq! [["2024", "02", "29"], ["2025", "01", "01"]]
+             (db.column! conn "SELECT unnest(ARRAY['2024-02-29'::date, '2025-01-01'])")
+    db.close! conn
+};
+
+// --- the macro and the builders -------------------------------------------------------
+
+let templates! : :unit -> :any;
+let templates! u = {
+    let conn = admin! ();
+    let lo = 3;
+    let hi = 5;
+    let range = expand sql.fragment "generate_series({lo}, {hi}) AS n";
+    let evens = expand sql.fragment "n % 2 = 0";
+    test.eq! [4] (db.column! conn (expand sql.query "SELECT n FROM {..range} WHERE {..evens} AND n > {lo}"))
+    test.eq! [12] (db.column! conn (expand sql.query ["SELECT ", lo * hi - 3, "::int + 0"]))
+    // Braces inside a string constant are the string's.
+    test.eq! [[1, 2]] (db.column! conn (expand sql.query "SELECT '{1,2}'::int[] WHERE {lo} = 3"))
+    let ids = [3, 5];
+    test.eq! [3, 5] (db.column! conn (expand sql.query "SELECT n FROM generate_series(1, 9) n WHERE n = ANY({ids}::int[]) ORDER BY n"))
+    test.eq! [2, 3] (db.column! conn (sql.text_with "SELECT n FROM generate_series($1::int, $2::int) n" [2, 3]))
+    db.close! conn
+};
+
+let builders! : :unit -> :any;
+let builders! u = {
+    let conn = admin! ();
+    db.script! conn "CREATE TEMP TABLE item (id serial PRIMARY KEY, label text, qty int DEFAULT 0)"
+    let made = db.one! conn (sql.returning [:id, :label] (sql.insert "item" %{ :label => "nut", :qty => 3 }));
+    test.eq! "nut" made.[:label]
+    test.eq! 1 (db.exec! conn (sql.update "item" %{ :qty => 9 } %{ :id => made.[:id] }))
+    test.eq! [9] (db.column! conn (sql.select "item" [:qty] %{ :label => "nut" }))
+    test.eq! 0 (db.exec! conn (sql.delete "item" %{ :label => () }))
+    test.eq! 1 (db.exec! conn (sql.delete "item" (sql.or [sql.eq :label "nut", sql.eq :label "bolt"])))
+    db.close! conn
+};
+
+// --- failures ---------------------------------------------------------------------------
+
+let no_table! : :any -> :unit -> :any;
+let no_table! conn u = db.rows! conn "SELECT * FROM no_such_table";
+
+let duplicate! : :any -> :unit -> :any;
+let duplicate! conn u = db.exec! conn "INSERT INTO uniq VALUES (1)";
+
+let nonsense! : :any -> :unit -> :any;
+let nonsense! conn u = db.rows! conn (sql.raw "SELECT FROM WHERE");
+
+let failures! : :unit -> :any;
+let failures! u = {
+    let conn = admin! ();
+    test.eq! :undefined_table (condition_of! (no_table! conn))
+    // The connection is still good after a failed statement.
+    test.eq! 1 (db.scalar! conn "SELECT 1")
+    db.script! conn "CREATE TEMP TABLE uniq (id int CONSTRAINT uniq_id UNIQUE); INSERT INTO uniq VALUES (1);"
+    let e = try! { duplicate! conn (); () } catch e { e };
+    test.eq! [:unique_violation, "23505", "uniq_id"] [errors.condition e, errors.code e, errors.constraint e]
+    test.true! (str.contains_str "already exists" (errors.detail e))
+    test.eq! :syntax_error (condition_of! (nonsense! conn))
+    test.eq! 1 (db.scalar! conn "SELECT 1")
+    db.close! conn
+};
+
+let cardinality! : :unit -> :any;
+let cardinality! u = {
+    let conn = admin! ();
+    test.eq! :no_rows (condition_of! (one_of! conn "SELECT 1 WHERE false"))
+    test.eq! :too_many_rows (condition_of! (one_of! conn "SELECT generate_series(1, 2)"))
+    test.eq! [(), 7] [db.first! conn "SELECT 1 WHERE false", (db.first! conn "SELECT 7 AS n").[:n]]
+    test.eq! () (db.scalar! conn "SELECT 1 WHERE false")
+    db.close! conn
+};
+
+let one_of! : :any -> :string -> :unit -> :any;
+let one_of! conn q u = db.one! conn q;
+
+// --- several statements, notices ------------------------------------------------------------
+
+let scripts! : :unit -> :any;
+let scripts! u = {
+    let conn = admin! ();
+    let results = db.script! conn (expand sql.script "
+        CREATE TEMP TABLE s (n int);
+        INSERT INTO s SELECT generate_series(1, 4);
+        SELECT sum(n) AS total FROM s;
+        DO $$ BEGIN RAISE NOTICE 'hello from %', 'plpgsql'; END $$;
+    ");
+    test.eq! ["CREATE TABLE", "INSERT 0 4", "SELECT 1", "DO"] (list.map (fn r -> r.[:command]) results)
+    test.eq! [(), 4, 1, ()] (list.map (fn r -> r.[:count]) results)
+    test.eq! 10 (list.head (list.nth 2 results).[:rows]).[:total]
+    test.eq! ["hello from plpgsql"] (list.map (fn n -> n.[:message]) (list.last results).[:notices])
+    db.close! conn
+};
+
+// --- transactions ---------------------------------------------------------------------------
+
+let add! : :integer -> :any -> :integer;
+let add! n conn = db.exec! conn (expand sql.query "INSERT INTO tx VALUES ({n})");
+
+let add_then_fail! : :integer -> :any -> :integer;
+let add_then_fail! n conn = {
+    add! n conn
+    errors.fail! :deliberate "and now it goes wrong"
+};
+
+let nested! : :any -> :integer;
+let nested! conn = {
+    add! 10 conn
+    try! { db.savepoint! conn (add_then_fail! 11) } catch e { 0 }
+    db.savepoint! conn (add! 12)
+};
+
+let make_table! : :any -> :integer;
+let make_table! conn = db.exec! conn "CREATE TABLE read_only_test (x int)";
+
+let transactions! : :unit -> :any;
+let transactions! u = {
+    let conn = admin! ();
+    db.script! conn "CREATE TEMP TABLE tx (n int)"
+    test.eq! 1 (db.transaction! conn (add! 1))
+    test.eq! :deliberate (try! { db.transaction! conn (add_then_fail! 2) } catch e { errors.condition e })
+    test.eq! 1 (db.scalar! conn "SELECT count(*) FROM tx")
+    test.eq! 1 (db.transaction! conn nested!)
+    test.eq! [1, 10, 12] (db.column! conn "SELECT n FROM tx ORDER BY n")
+    test.eq! 1 (db.serializable! conn 3 (add! 20))
+    // A TEMP table may be written in a read-only transaction; a real one may not.
+    test.eq! :read_only_sql_transaction
+             (try! { db.transaction_with! conn %{ :read_only => true } make_table! } catch e { errors.condition e })
+    // Nothing is left open.
+    test.eq! "idle" (to_string_status (db.query! conn "SELECT 1").[:status])
+    db.close! conn
+};
+
+let to_string_status : :atom -> :string;
+let to_string_status s = value.atom_name s;
+
+// --- prepared statements, streaming --------------------------------------------------------
+
+let prepared! : :unit -> :any;
+let prepared! u = {
+    let conn = admin! ();
+    let p = db.prepare! conn "twice" "SELECT $1::int * 2 AS doubled";
+    test.eq! [23] p.[:parameters]
+    test.eq! [[6], [8]] [(db.execute! conn p [3]).[:tuples].[0], (db.execute! conn p [4]).[:tuples].[0]]
+    db.deallocate! conn p
+    test.eq! :invalid_sql_statement_name (condition_of! (run_prepared! conn p))
+    db.close! conn
+};
+
+let run_prepared! : :any -> :any -> :unit -> :any;
+let run_prepared! conn p u = db.execute! conn p [1];
+
+let seen! : :process -> :map -> :any;
+let seen! to row = send! to row.[:n];
+
+let streaming! : :unit -> :any;
+let streaming! u = {
+    let conn = admin! ();
+    let q = "SELECT generate_series(1, 10) AS n";
+    test.eq! 55 (db.fold! conn q 3 (fn acc row -> acc + row.[:n]) 0)
+    test.eq! 10 (db.each! conn q 4 (seen! (self! ())))
+    test.eq! [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] (strict! (list.map (fn i -> recv! ()) (list.range 0 10)))
+    test.eq! :division_by_zero (condition_of! (fold_badly! conn))
+    test.eq! 1 (db.scalar! conn "SELECT 1")
+    db.close! conn
+};
+
+let fold_badly! : :any -> :unit -> :any;
+let fold_badly! conn u = db.fold! conn "SELECT 1 / (5 - n) FROM generate_series(1, 9) n" 2 (fn a r -> a + 1) 0;
+
+// --- COPY ------------------------------------------------------------------------------------
+
+let copying! : :unit -> :any;
+let copying! u = {
+    let conn = admin! ();
+    db.script! conn "CREATE TEMP TABLE c (id int, note text, tags text[])"
+    let rows = list.map (fn i -> [i, if i % 3 == 0 { () } else { "line\t" + to_string i + "\nnext\\" }, ["a", "b c"]])
+                        (list.range 0 2500);
+    test.eq! 2500 (db.copy_in! conn "c" [:id, :note, :tags] rows)
+    test.eq! 2500 (db.scalar! conn "SELECT count(*) FROM c")
+    test.eq! ["line\t1\nnext\\", ["a", "b c"]] (list.tail (list.head (db.query! conn "SELECT * FROM c WHERE id = 1").[:tuples]))
+    let out = db.copy_out! conn "COPY (SELECT id, note FROM c WHERE id < 4 ORDER BY id) TO STDOUT";
+    test.eq! [["0", ()], ["1", "line\t1\nnext\\"], ["2", "line\t2\nnext\\"], ["3", ()]] out
+    test.eq! :undefined_table (condition_of! (copy_nowhere! conn))
+    test.eq! 1 (db.scalar! conn "SELECT 1")
+    db.close! conn
+};
+
+let copy_nowhere! : :any -> :unit -> :any;
+let copy_nowhere! conn u = db.copy_in! conn "no_such_table" [:a] [[1]];
+
+// --- LISTEN / NOTIFY, cancel --------------------------------------------------------------------
+
+let notifications! : :unit -> :any;
+let notifications! u = {
+    let listener = admin! ();
+    let talker = admin! ();
+    db.listen! listener "jobs"
+    db.notify! talker "jobs" "first"
+    let n = db.next_notification! listener;
+    test.eq! ["jobs", "first", true] [n.[:channel], n.[:payload], n.[:pid] != db.Conn.pid listener]
+    // One that arrives during a query comes back with the query's result.
+    db.notify! talker "jobs" "second"
+    db.scalar! talker "SELECT pg_sleep(0.1)"
+    test.eq! ["second"] (list.map (fn x -> x.[:payload]) (db.query! listener "SELECT 1").[:notifications])
+    db.close! listener
+    db.close! talker
+};
+
+let subscription! : :unit -> :any;
+let subscription! u = {
+    let sub = db.subscribe! (as! "postgres" ()) ["events"] (self! ());
+    let talker = admin! ();
+    db.notify! talker "events" "a"
+    db.notify! talker "events" "b"
+    let got = strict! (list.map (fn i -> recv! ()) [0, 1]);
+    test.eq! [["events", "a"], ["events", "b"]] (list.map (fn [_, n] -> [n.[:channel], n.[:payload]]) got)
+    test.eq! :stopped (db.stop_listening! sub)
+    db.close! talker
+};
+
+let sleeper! : :any -> :any;
+let sleeper! conn = try! { db.scalar! conn "SELECT pg_sleep(10)"; :finished } catch e { errors.condition e };
+
+let pause! : :unit -> :unit;
+let pause! u = {
+    let c = admin! ();
+    db.scalar! c "SELECT pg_sleep(0.3)"
+    db.close! c
+};
+
+let cancelling! : :unit -> :any;
+let cancelling! u = {
+    let conn = admin! ();
+    let started = os.monotonic! ();
+    let worker = spawn! $( sleeper! conn );
+    pause! ()
+    test.true! (db.cancel! conn)
+    test.eq! :query_canceled (join! worker)
+    test.true! (os.monotonic! () - started < 5000)
+    test.eq! 1 (db.scalar! conn "SELECT 1")
+    db.close! conn
+};
+
+// --- the pool --------------------------------------------------------------------------------
+
+let pooled_work! : :process -> :integer -> :integer;
+let pooled_work! p i = pool.scalar! p (expand sql.query "SELECT {i}::int * 10 FROM pg_sleep(0.05)");
+
+let pooled_fail! : :any -> :integer;
+let pooled_fail! conn = {
+    db.exec! conn "BEGIN"
+    db.exec! conn "CREATE TEMP TABLE half_done (x int)"
+    errors.fail! :deliberate "leaving a transaction open"
+};
+
+let pooling! : :unit -> :any;
+let pooling! u = {
+    let p = pool.start! (as! "u_scram" "scrampass") 3;
+    let answers = proc.map! (pooled_work! p) (list.range 1 13);
+    test.eq! (list.map (fn i -> i * 10) (list.range 1 13)) answers
+    let s = pool.stats! p;
+    test.eq! [3, 3, 3, 0] [s.[:size], s.[:open], s.[:idle], s.[:waiting]]
+    // A body that fails mid-transaction leaves nothing behind.
+    test.eq! :deliberate (try! { pool.with! p pooled_fail! } catch e { errors.condition e })
+    test.eq! "idle" (to_string_status (pool.query! p "SELECT 1").[:status])
+    test.eq! 3 (pool.stats! p).[:idle]
+    test.eq! 3 (pool.drain! p)
+    test.eq! 1 (pool.scalar! p "SELECT 1")
+    test.eq! [1, 1] (let_stats! p)
+    pool.stop! p
+    :ok
+};
+
+let let_stats! : :process -> [:integer];
+let let_stats! p = { let s = pool.stats! p; [s.[:open], s.[:idle]] };
+
+let bad_pool! : :unit -> :any;
+let bad_pool! u = {
+    let p = pool.start! %{ :host => "127.0.0.1", :port => 1 } 1;
+    test.eq! :connection_failure (try! { pool.scalar! p "SELECT 1" } catch e { errors.condition e })
+    // The failed open gave its place back.
+    test.eq! 0 (pool.stats! p).[:open]
+    pool.stop! p
+    :ok
+};
+
+// --- TLS ----------------------------------------------------------------------------
+//
+// The cluster runs with `ssl=on` and the VM's own test certificate, which names
+// `localhost` and 127.0.0.1; `u_ssl` may only connect encrypted.
+
+let certs! : :unit -> :string;
+let certs! u = match os.env! "PG_TEST_CERTS" {
+    () => "dream/tests/tls",
+    d => d,
+};
+
+let secured! : :string -> :string | :unit -> :map -> :map;
+let secured! user password extra = map.merge (as! user password) extra;
+
+/// Whether the server says this session is encrypted, and whom the client
+/// was told it was talking to.
+let over_tls! : :any -> :unit -> [:any, :any];
+let over_tls! target u = {
+    let conn = db.connect! target;
+    let encrypted = db.scalar! conn "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+    let info = db.tls_info! conn;
+    db.close! conn
+    [encrypted, if info == () { () } else { info.[:peer] }]
+};
+
+let tls_modes! : :unit -> :any;
+let tls_modes! u = {
+    let roots = certs! () + "/ca.pem";
+    let encrypted = [true, "CN=localhost"];
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :require }) ())
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_ca, :ssl_root_cert => roots }) ())
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_root_cert => roots,
+                                                                  :host => "localhost" }) ())
+    test.eq! encrypted (over_tls! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_root_cert => roots }) ())
+    test.eq! encrypted (over_tls! ("postgresql://u_ssl:sslpass@localhost:" + to_string (port! ())
+                                   + "/app?sslmode=verify-full&sslrootcert=" + roots) ())
+    // Revocation lists that do not list the server's certificate.
+    test.eq! encrypted (over_tls! ("postgresql://u_ssl:sslpass@localhost:" + to_string (port! ())
+                                   + "/app?sslmode=verify-full&sslrootcert=" + roots
+                                   + "&sslcrl=" + certs! () + "/ca.crl") ())
+    // `prefer`, the default, encrypts when it can; `disable` never does.
+    test.eq! encrypted (over_tls! (as! "postgres" ()) ())
+    test.eq! [false, ()] (over_tls! (secured! "postgres" () %{ :ssl_mode => :disable }) ())
+};
+
+let tls_refusals! : :unit -> :any;
+let tls_refusals! u = {
+    // A user the server only lets in over TLS, asked for without it.
+    test.eq! :invalid_authorization_specification
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :disable })))
+    // Roots that did not sign the server's certificate.
+    let other = file.read! (certs! () + "/other_ca.pem");
+    test.eq! :certificate_untrusted
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_ca => other })))
+    test.eq! :bad_config
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_ca,
+                                                                      :ssl_root_cert => "/no/such/file.pem" })))
+    // A revocation list that is not one.
+    test.eq! :tls_config
+             (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full,
+                                                                      :ssl_root_cert => certs! () + "/ca.pem",
+                                                                      :ssl_crl_pem => "not a list" })))
+};
+
+let pooled_tls! : :unit -> :any;
+let pooled_tls! u = {
+    let p = pool.start! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full,
+                                                        :ssl_root_cert => certs! () + "/ca.pem" }) 2;
+    let answers = proc.map! (pooled_work! p) (list.range 1 5);
+    test.eq! [10, 20, 30, 40] answers
+    test.eq! true (pool.scalar! p "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+    pool.stop! p
+    :ok
+};
+
+let main! = test.main_of! [
+    ["pg live: logging in", [
+        test.case "trust" $( login! "postgres" () ),
+        test.case "cleartext password" $( login! "u_clear" "clearpass" ),
+        test.case "md5" $( login! "u_md5" "md5pass" ),
+        test.case "SCRAM-SHA-256" $( login! "u_scram" "scrampass" ),
+        test.case "a wrong or missing password" $( wrong_password! () ),
+        test.case "no such database, and no server at all" $( nowhere! () ),
+        test.case "a URL, its settings, ping" $( url! () ),
+    ]],
+    ["pg live: values", [
+        test.case "every kind, there and back" $( round_trip! () ),
+        test.case "rows as records" $( records! () ),
+        test.case "a program's own decoders" $( decoders! () ),
+    ]],
+    ["pg live: statements", [
+        test.case "templates, splices and lists" $( templates! () ),
+        test.case "insert, update, select, delete from data" $( builders! () ),
+        test.case "failures, by condition, and the connection survives" $( failures! () ),
+        test.case "one, first, scalar" $( cardinality! () ),
+        test.case "a script and its notices" $( scripts! () ),
+    ]],
+    ["pg live: sessions", [
+        test.case "transactions and savepoints" $( transactions! () ),
+        test.case "prepared statements" $( prepared! () ),
+        test.case "streaming a portal" $( streaming! () ),
+        test.case "COPY in and out" $( copying! () ),
+        test.case "LISTEN and NOTIFY" $( notifications! () ),
+        test.case "a subscription process" $( subscription! () ),
+        test.case "cancelling a running statement" $( cancelling! () ),
+    ]],
+    ["pg live: TLS", [
+        test.case "every sslmode that encrypts, and the two that may not" $( tls_modes! () ),
+        test.case "what TLS refuses" $( tls_refusals! () ),
+        test.case "a pool of encrypted connections" $( pooled_tls! () ),
+    ]],
+    ["pg live: pool", [
+        test.case "many processes, few connections" $( pooling! () ),
+        test.case "a pool that cannot connect" $( bad_pool! () ),
+    ]],
+];

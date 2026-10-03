@@ -1,7 +1,7 @@
 # The virtual machine: C++, built by CMake.
 #
 # libffi is required: `std.ffi` is part of every VM, and one that cannot call C
-# is not a valid build. LLVM is optional. It is on by default here because
+# is not a valid build. So is OpenSSL, for `std.tls`. LLVM is optional. It is on by default here because
 # without it you lose the JIT tier -- but `withJit = false` is a real
 # configuration the VM supports, and the tests run under it.
 #
@@ -13,6 +13,7 @@
 , pkg-config
 , llvmPackages_21
 , libffi
+, openssl
 , zlib
 , withJit ? true
 , doCheck ? true
@@ -42,7 +43,7 @@ stdenv.mkDerivation {
   nativeBuildInputs = [ cmake pkg-config ]
     ++ lib.optional withJit llvmPackages_21.llvm.dev;
 
-  buildInputs = [ libffi ]
+  buildInputs = [ libffi openssl ]
     ++ lib.optional withJit zlib;   # LLVM links against it
 
   cmakeFlags = [

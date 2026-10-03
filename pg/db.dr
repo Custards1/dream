@@ -1,0 +1,1026 @@
+// A connection to PostgreSQL, and everything done over one.
+//
+//     import pg.db;
+//     import pg.sql;
+//
+//     let main! = {
+//         let conn = db.connect! "postgres://ada@localhost/app";
+//         let id = 7;
+//         let user = db.one! conn (expand sql.query "SELECT name, email FROM users WHERE id = {id}");
+//         console.print! user.[:name]
+//         db.close! conn
+//     };
+//
+// **A connection is a value**, not a process: the socket, what the server said
+// about itself at startup, and the configuration. Nothing about it changes as
+// it is used -- the server keeps the session's state (its transaction, its
+// prepared statements, what it is listening to) and says how things stand at
+// the end of every exchange -- so there is nothing on this side to keep in step,
+// and a connection can be handed to another process like any other value.
+// What it cannot be is *used* by two processes at once: an exchange is a
+// conversation, and two interleaved are nonsense to the server. `pg.pool` is
+// how several processes share connections.
+//
+// **That a connection holds no buffer is a decision**, and it is the same one
+// `std.remote` makes: every read takes exactly the bytes of the message being
+// read -- a five-byte header, then the body it announces -- so nothing that
+// belongs to the next message is ever held, and there is nothing to carry
+// from one call to the next. It costs two reads per message where a buffer
+// would cost one per few hundred, which a profile would show on a result of a
+// million rows and nowhere else.
+//
+// **A query is one round trip.** It goes out in the extended protocol as Parse,
+// Bind, Describe, Execute and Sync written together, and everything the server
+// says back is read until it is ready again. A failure arrives in the middle
+// of that and is held until the server is ready, so the connection is always
+// left at a message boundary and fit to use: a statement that fails is an
+// error for the caller, never a broken connection. The values go beside the
+// text, never in it; see `pg.sql`.
+//
+// **A result is decoded only as far as it is read.** The rows arrive as text
+// and stay that way until something asks for a row, at which point that row's
+// columns are decoded by type (`pg.value`). A program that counts rows never
+// decodes one.
+//
+// **Every failure is `:postgres`**, with a `:condition` to branch on; see
+// `pg.errors`. A socket that fails underneath an exchange is reported as
+// `:connection_failure`, carrying the socket's own error as `:cause`, and that
+// connection should be closed: the exchange stopped somewhere in the middle.
+
+import std.error;
+import std.file;
+import std.io;
+import std.list;
+import std.map;
+import std.net;
+import std.os;
+import std.str;
+import std.streams;
+import std.tls;
+import std.types;
+import pg.bytes;
+import pg.config;
+import pg.crypto;
+import pg.errors;
+import pg.sql;
+import pg.value;
+import pg.wire;
+import std.num;
+
+/// An open connection.
+mapping Conn {
+    socket : :integer
+    pid : :integer = 0
+    secret : :integer = 0
+    /// What the server reported at startup: `server_version`, `TimeZone`,
+    /// `integer_datetimes` and the rest of `ParameterStatus`.
+    parameters : %{:string => :string} = %{}
+    config : :map = %{}
+}
+
+/// What a statement answered.
+///
+/// `rows` are maps from column key to value (see `pg.wire.Column` for what a
+/// key is), and `tuples` the same values positionally, which is what a result
+/// with two columns of the same name needs. Both are decoded as they are read.
+/// `count` is what the command tag says it did -- rows inserted, updated,
+/// deleted or selected -- or `()` for a command that does not count.
+mapping Result {
+    columns : [:any] = []
+    tuples : [[:any]] = []
+    rows : [:map] = []
+    command : :string = ""
+    count : :integer | :unit = ()
+    status : :atom = :idle
+    notices : [:map] = []
+    notifications : [:any] = []
+    copy : [:string] = []
+}
+
+/// A notification, from `LISTEN`.
+mapping Notification {
+    channel : :string
+    payload : :string = ""
+    pid : :integer = 0
+}
+
+/// A statement prepared on the server, by name, for `execute!`.
+mapping Prepared {
+    name : :string
+    text : :string
+    parameters : [:integer] = []
+    columns : [:any] = []
+}
+
+// --- connecting ------------------------------------------------------------------
+
+/// Connect and log in. `target` is a configuration map, a URL or a keyword
+/// string; see `pg.config`. Raises `:connection_failure` when the server
+/// cannot be reached, and the server's own condition -- `:invalid_password`,
+/// `:invalid_catalog_name` -- when it refuses.
+let connect! : :any -> Conn;
+let connect! target = {
+    let c = config.resolve! target;
+    let sock = try! { net.connect! (config.Config.host c) (config.Config.port c) }
+               catch e { raise! (errors.caused :connection_failure ("cannot reach " + config.describe c) e) };
+    let conn = Conn.make sock 0 0 %{} c;
+    try! {
+        secure! sock c
+        write! conn (wire.startup (config.startup_parameters c))
+        authenticate! conn
+        settle! conn %{} 0 0
+    } catch e {
+        quietly_close! sock
+        raise! (lost e)
+    }
+};
+
+// --- TLS -----------------------------------------------------------------------------
+//
+// PostgreSQL starts every connection in plain text and upgrades it on request:
+// the client sends an SSLRequest, eight bytes where the startup message would
+// be, and the server answers one byte, `S` to go ahead or `N` to decline.
+// After an `S` the same socket is handed to `tls.connect!`, which makes it
+// speak TLS in place, and everything after -- the startup, the login, every
+// query -- goes through it without this module doing anything differently.
+// `sslmode` decides whether to ask, what a refusal means, and what is checked.
+
+/// What the server sends back for an SSLRequest, and what that means for `mode`.
+priv let secure! : :integer -> :map -> :atom;
+priv let secure! sock c = match config.Config.ssl_mode c {
+    :disable => :plain,
+    :allow => :plain,
+    mode => {
+        streams.write_all! sock (bytes.be32 8 + bytes.be32 80877103)
+        match io.read! sock 1 {
+            "S" => {
+                let options = tls_options! c mode;
+                try! { tls.connect! sock options } catch e {
+                    raise! (errors.caused (error.kind e) ("TLS with " + config.Config.host c + ": "
+                                                         + error.message e) e)
+                }
+                :tls
+            },
+            "N" if mode == :prefer => :plain,
+            "N" => errors.fail! :ssl_refused
+                       ("sslmode=" + to_string mode + " needs TLS, and " + config.Config.host c + " does not offer it"),
+            "" => errors.fail! :connection_failure "the server closed the connection when asked about TLS",
+            other => errors.fail! :protocol_violation ("the server answered an SSLRequest with " + to_string other),
+        }
+    },
+};
+
+/// What `tls.connect!` is told: how much to check, against which roots, and
+/// with which certificate of this side's own.
+///
+/// `prefer` and `require` check nothing, as libpq's do not -- they defend
+/// against a listener and not against an impostor -- except that `require`
+/// with roots given is `verify-ca`, as libpq's is.
+priv let tls_options! : :map -> :atom -> :map;
+priv let tls_options! c mode = {
+    let ca = match config.Config.ssl_ca c {
+        () => match config.Config.ssl_root_cert c {
+            () => (),
+            path => read_file! path "sslrootcert",
+        },
+        text => text,
+    };
+    let checks = match mode {
+        :verify_full => %{ :verify => true, :check_name => true },
+        :verify_ca => %{ :verify => true, :check_name => false },
+        :require if ca != () => %{ :verify => true, :check_name => false },
+        _ => %{ :verify => false },
+    };
+    let crl = match config.Config.ssl_crl_pem c {
+        () => match config.Config.ssl_crl c {
+            () => (),
+            path => read_file! path "sslcrl",
+        },
+        text => text,
+    };
+    let rooted = if ca == () { checks } else { checks.[:ca => ca] };
+    let listed = if crl == () { rooted } else { rooted.[:crl => crl] };
+    let named = listed.[:host => config.Config.host c];
+    match config.Config.ssl_identity c {
+        () => named,
+        path => named.[:identity => read_file! path "sslidentity"].[:password => config.Config.ssl_password c],
+    }
+};
+
+priv let read_file! : :string -> :string -> :string;
+priv let read_file! path what = {
+    let text = try! { file.read! path } catch e { () };
+    match text {
+        () => errors.fail! :bad_config ("cannot read " + what + " " + path),
+        found => found,
+    }
+};
+
+/// Whether a connection's traffic is encrypted, and how: `std.tls`'s
+/// `%{ :version, :cipher, :alpn, :peer }`, or `()` for plain text.
+let tls_info! : Conn -> :any;
+let tls_info! conn = tls.info! (Conn.socket conn);
+
+/// Leave politely, then close the socket. Closing a connection twice, or one
+/// the server already dropped, is not an error.
+let close! : Conn -> :unit;
+let close! conn = {
+    try! { io.write! (Conn.socket conn) wire.terminate } catch e { 0 }
+    quietly_close! (Conn.socket conn)
+};
+
+priv let quietly_close! : :integer -> :unit;
+priv let quietly_close! sock = try! { io.close! sock } catch e { () };
+
+/// Whether the socket is still open on this side. A server that went away is
+/// only found out by talking to it; `ping!` does that.
+let is_open! : Conn -> :bool;
+let is_open! conn = io.is_open! (Conn.socket conn);
+
+/// One of the server's startup parameters, or `()`.
+let parameter : :string -> Conn -> :any;
+let parameter name conn = (Conn.parameters conn).[name else ()];
+
+/// The server's version as `server_version_num` spells it: 160004 for 16.4,
+/// 90624 for 9.6.24. It is worked out from `server_version`, which every
+/// server reports at startup, where `server_version_num` is not reported.
+let server_version : Conn -> :integer;
+let server_version conn = match parameter "server_version" conn {
+    () => 0,
+    text => version_number text,
+};
+
+let version_number : :string -> :integer;
+let version_number text = {
+    let numeric = str.slice 0 (str.span "0123456789." 0 text) text;
+    let parts = list.map (fn p -> match num.parse_int p { n if type_of n == :integer => n, _ => 0 })
+                         (str.split "." numeric);
+    match parts {
+        [major, minor, .._] if major >= 10 => major * 10000 + minor,
+        [major] if major >= 10 => major * 10000,
+        [major, minor, patch, .._] => major * 10000 + minor * 100 + patch,
+        [major, minor] => major * 10000 + minor * 100,
+        _ => 0,
+    }
+};
+
+/// The configuration a connection was made with, for opening another like it.
+let config_of : Conn -> :map;
+let config_of conn = Conn.config conn;
+
+// --- authentication ----------------------------------------------------------------
+
+/// Answer whatever the server asks until it says the login succeeded.
+priv let authenticate! : Conn -> :unit;
+priv let rec authenticate! conn = match receive! conn {
+    [:authentication, 0, _] => (),
+    [:authentication, 3, _] => {
+        write! conn (wire.password (password! conn))
+        authenticate! conn
+    },
+    [:authentication, 5, salt] => {
+        let c = Conn.config conn;
+        let inner = crypto.md5_hex (password! conn + config.Config.user c);
+        write! conn (wire.password ("md5" + crypto.md5_hex (inner + salt)))
+        authenticate! conn
+    },
+    [:authentication, 10, data] => {
+        let mechanisms = list.filter (fn m -> m != "") (str.split "\0" data);
+        if list.contains "SCRAM-SHA-256" mechanisms { scram! conn }
+        else {
+            errors.fail! :unsupported_authentication
+                ("the server offers " + str.join_str ", " mechanisms + "; this client speaks SCRAM-SHA-256")
+        }
+        authenticate! conn
+    },
+    [:authentication, code, _] =>
+        errors.fail! :unsupported_authentication
+            ("the server asks for authentication method " + to_string code
+             + " (Kerberos, GSSAPI or SSPI), which this client does not speak"),
+    [:error_response, fields] => raise! (errors.server fields),
+    [:negotiate_version, _, _] => authenticate! conn,
+    [:notice_response, _] => authenticate! conn,
+    other => unexpected! "logging in" other,
+};
+
+priv let password! : Conn -> :string;
+priv let password! conn = match config.Config.password (Conn.config conn) {
+    () => errors.fail! :invalid_password "the server asks for a password, and the configuration has none",
+    p => p,
+};
+
+/// SCRAM-SHA-256: two messages each way, and the server proves it knew the
+/// password too before the login is believed.
+priv let scram! : Conn -> :unit;
+priv let scram! conn = {
+    let nonce = nonce! ();
+    let [bare, first] = crypto.scram_first nonce;
+    write! conn (wire.sasl_initial "SCRAM-SHA-256" first)
+    let server_first = sasl_step! conn 11;
+    match crypto.scram_final (password! conn) nonce bare server_first {
+        [:error, why] => errors.fail! :protocol_violation ("SCRAM: " + why),
+        [:ok, [final, signature]] => {
+            write! conn (wire.sasl_response final)
+            if crypto.scram_verified signature (sasl_step! conn 12) { () }
+            else { errors.fail! :invalid_authorization_specification "SCRAM: the server could not prove it knows the password" }
+        },
+    }
+};
+
+priv let sasl_step! : Conn -> :integer -> :string;
+priv let sasl_step! conn code = match receive! conn {
+    [:authentication, c, data] if c == code => data,
+    [:error_response, fields] => raise! (errors.server fields),
+    other => unexpected! "during SCRAM" other,
+};
+
+/// Eighteen random bytes as base64, which has no comma in its alphabet and so
+/// can stand in a SCRAM attribute as it is. From the kernel where there is
+/// one; from the clock and the pid, hashed, where there is not -- a nonce must
+/// not repeat, and it need not be secret.
+priv let nonce! : :unit -> :string;
+priv let nonce! u = {
+    let raw = try! {
+        let h = io.open! "/dev/urandom" :read;
+        let got = io.read! h 18;
+        io.close! h
+        got
+    } catch e { "" };
+    let seed = if len raw == 18 { raw }
+               else { str.slice 0 18 (crypto.sha256 (to_string (os.now! ()) + ":" + to_string (os.pid! ())
+                                                + ":" + to_string (os.monotonic! ()))) };
+    bytes.base64_encode seed
+};
+
+/// After the login: the server's parameters and the key to cancel with, up to
+/// the first time it says it is ready.
+priv let settle! : Conn -> :map -> :integer -> :integer -> Conn;
+priv let rec settle! conn params pid secret = match receive! conn {
+    [:parameter_status, name, v] => settle! conn (params.[name => v]) pid secret,
+    [:backend_key, p, s] => settle! conn params p s,
+    [:notice_response, _] => settle! conn params pid secret,
+    [:error_response, fields] => raise! (errors.server fields),
+    [:ready, _] => Conn.make (Conn.socket conn) pid secret params (Conn.config conn),
+    other => unexpected! "starting up" other,
+};
+
+// --- the socket -------------------------------------------------------------------
+
+priv let write! : Conn -> :string -> :atom;
+priv let write! conn data = streams.write_all! (Conn.socket conn) data;
+
+/// Up to `n` bytes, stopping early only at end of stream. As `std.remote`'s,
+/// and for its reason: a read answers what has arrived, not what was asked.
+priv let exactly! : :integer -> :integer -> [:string] -> :string;
+priv let rec exactly! sock n acc =
+    if n <= 0 { str.concat_all (list.reverse acc) }
+    else {
+        let chunk = io.read! sock n;
+        if len chunk == 0 { str.concat_all (list.reverse acc) }
+        else { exactly! sock (n - len chunk) (list.cons chunk acc) }
+    };
+
+/// The next message from the server.
+priv let receive! : Conn -> :any;
+priv let receive! conn = {
+    let sock = Conn.socket conn;
+    let header = exactly! sock 5 [];
+    if len header < 5 { errors.fail! :connection_failure "the server closed the connection" }
+    else {
+        let size = bytes.u32_at header 1 - 4;
+        let body = if size > 0 { exactly! sock size [] } else { "" };
+        if len body < size { errors.fail! :connection_failure "the server closed the connection mid-message" }
+        else { wire.decode (str.byte 0 header) body }
+    }
+};
+
+/// A failure of the socket, in this library's terms. One of ours passes
+/// through as it is.
+priv let lost : :any -> :any;
+priv let lost e =
+    if errors.is_postgres e { e }
+    else { errors.caused :connection_failure ("the connection failed: " + error.describe e) e };
+
+priv let unexpected! : :string -> :any -> :never;
+priv let unexpected! doing message =
+    errors.fail! :protocol_violation ("unexpected " + to_string message + " while " + doing);
+
+/// Send `data` and collect the answer, with a socket that fails underneath
+/// either reported as a lost connection.
+priv let exchange! : Conn -> :string -> Pending -> [:map];
+priv let exchange! conn data p = try! {
+    write! conn data
+    collect! conn p
+} catch e { raise! (lost e) };
+
+// --- collecting what the server says ------------------------------------------------
+//
+// One collector serves every exchange. It reads until the server is ready,
+// closing a result at each command it completes, and answers the results in
+// order -- one for a query, one per statement for a script. A failure is held
+// until the server is ready, and raised then, so the connection is always left
+// where the next exchange can begin.
+
+group Pending {
+    columns
+    raw
+    copy
+    notices
+    notifications
+    failure
+    done
+}
+
+priv let pending : [:any] -> Pending;
+priv let pending columns = Pending.make columns [] [] [] [] () [];
+
+priv let collect! : Conn -> Pending -> [:map];
+priv let rec collect! conn !p = match receive! conn {
+    [:row_description, cols] => collect! conn (Pending.set_columns p cols),
+    [:data_row, fields] => collect! conn (with_row p fields),
+    [:command_complete, tag] => collect! conn (closed conn p tag),
+    :empty_query => collect! conn (closed conn p ""),
+    [:copy_data, data] => collect! conn (with_copy p data),
+    [:copy_out_response, _, _] => collect! conn p,
+    :copy_done => collect! conn p,
+    [:copy_in_response, _, _] => {
+        write! conn (wire.copy_fail "COPY FROM STDIN goes through db.copy_in!, which has rows to send")
+        collect! conn p
+    },
+    [:error_response, fields] => collect! conn (with_failure p (errors.server fields)),
+    [:notice_response, fields] => collect! conn (with_notice p fields),
+    [:notification, pid, channel, payload] =>
+        collect! conn (with_notification p (Notification.make channel payload pid)),
+    [:ready, status] => finish! conn p status,
+    _ => collect! conn p,
+};
+
+priv let with_row : Pending -> [:any] -> Pending;
+priv let with_row p fields = forced Pending.set_raw p (strict_cons fields (Pending.raw p));
+
+priv let with_copy : Pending -> :string -> Pending;
+priv let with_copy p data = forced Pending.set_copy p (strict_cons data (Pending.copy p));
+
+priv let with_notice : Pending -> :map -> Pending;
+priv let with_notice p fields = forced Pending.set_notices p (strict_cons fields (Pending.notices p));
+
+priv let with_notification : Pending -> :map -> Pending;
+priv let with_notification p n = forced Pending.set_notifications p (strict_cons n (Pending.notifications p));
+
+/// A setter whose value is forced first. A change stores what it is given as
+/// it is given, so without this a list grown a row at a time is a chain of
+/// suspended conses, each holding the one before, that only unwinds -- one
+/// frame per row -- when the result is finally read.
+priv let forced : (Pending -> :any -> Pending) -> Pending -> :any -> Pending;
+priv let forced set p !v = set p v;
+
+/// The first failure is the one that is raised; a later one is about the
+/// first.
+priv let with_failure : Pending -> :any -> Pending;
+priv let with_failure p e = if Pending.failure p == () { Pending.set_failure p e } else { p };
+
+/// A cons whose tail is already a value, so a list built a message at a time is
+/// a list and not a tower of suspended conses.
+priv let strict_cons : :any -> [:any] -> [:any];
+priv let strict_cons x !xs = list.cons x xs;
+
+/// A command finished: its result joins the done ones, and the next starts
+/// empty.
+priv let closed : Conn -> Pending -> :string -> Pending;
+priv let closed conn p tag = {
+    let columns = Pending.columns p;
+    let decoders = config.Config.decoders (Conn.config conn);
+    let tuples = list.map (decode_tuple decoders columns) (list.reverse (Pending.raw p));
+    let r = %{
+        :columns => columns,
+        :tuples => tuples,
+        :rows => list.map (row_of columns) tuples,
+        :command => tag,
+        :count => count_of tag,
+        :copy => list.reverse (Pending.copy p),
+    };
+    Pending.make [] [] [] (Pending.notices p) (Pending.notifications p) (Pending.failure p)
+                 (strict_cons r (Pending.done p))
+};
+
+priv let finish! : Conn -> Pending -> :atom -> [:map];
+priv let finish! conn p status = match Pending.failure p {
+    () => {
+        let notices = list.reverse (Pending.notices p);
+        let notes = list.reverse (Pending.notifications p);
+        list.map (fn r -> r.[:status => status].[:notices => notices].[:notifications => notes])
+                 (list.reverse (Pending.done p))
+    },
+    e => raise! e,
+};
+
+priv let decode_tuple : :map -> [:any] -> [:any] -> [:any];
+priv let decode_tuple decoders columns fields =
+    list.map (fn [c, f] -> value.decode decoders (wire.Column.oid c) f) (list.zip columns fields);
+
+priv let row_of : [:any] -> [:any] -> :map;
+priv let row_of columns tuple =
+    list.fold_strict (fn m [c, v] -> m.[wire.Column.key c => v]) %{} (list.zip columns tuple);
+
+/// The count at the end of a command tag: `INSERT 0 5` is 5, `UPDATE 2` is 2,
+/// `CREATE TABLE` is `()`.
+let count_of : :string -> :integer | :unit;
+let count_of tag = match num.parse_int (list.last (str.split " " tag)) {
+    n if type_of n == :integer => n,
+    _ => (),
+};
+
+// --- querying ------------------------------------------------------------------------
+
+/// Run one statement and answer everything it said: a `Result`.
+///
+/// `q` is a fragment -- from `expand sql.query`, or built with `pg.sql` -- or
+/// a string with no parameters, which the compiler checks is one well-formed
+/// statement wherever it is written as a literal.
+let query! : Conn -> sql.Query -> :map;
+let query! conn q = {
+    let [text, vs] = sql.render q;
+    only (exchange! conn (wire.parse "" text (list.map value.oid_of vs)
+                          + wire.bind "" "" (list.map value.encode vs)
+                          + wire.describe "P" "" + wire.execute "" 0 + wire.sync)
+                    (pending []))
+};
+
+priv let only : [:map] -> :map;
+priv let only results = match results {
+    [] => %{},
+    [r, .._] => r,
+};
+
+/// The rows, as maps.
+let rows! : Conn -> sql.Query -> [:map];
+let rows! conn q = Result.rows (query! conn q);
+
+/// The one row a statement answers. None raises `:no_rows`, and more than one
+/// `:too_many_rows`, because a caller who says "one" has said something about
+/// the data that has turned out to be false.
+let one! : Conn -> sql.Query -> :map;
+let one! conn q = match rows! conn q {
+    [row] => row,
+    [] => errors.fail! :no_rows ("expected one row and there were none: " + sql.describe q),
+    _ => errors.fail! :too_many_rows ("expected one row and there were several: " + sql.describe q),
+};
+
+/// The first row, or `()` when there is none.
+let first! : Conn -> sql.Query -> :any;
+let first! conn q = match rows! conn q {
+    [] => (),
+    [row, .._] => row,
+};
+
+/// The first column of the first row, or `()` when there are no rows:
+/// `db.scalar! conn "SELECT count(*) FROM users"`.
+let scalar! : Conn -> sql.Query -> :any;
+let scalar! conn q = match Result.tuples (query! conn q) {
+    [] => (),
+    [[v, .._], .._] => v,
+    _ => (),
+};
+
+/// The first column of every row.
+let column! : Conn -> sql.Query -> [:any];
+let column! conn q = list.map (fn t -> list.head t) (Result.tuples (query! conn q));
+
+/// Run a statement for what it does, and answer how many rows it did it to.
+let exec! : Conn -> sql.Query -> :integer;
+let exec! conn q = counted (query! conn q);
+
+/// The rows, each checked against `description` -- a type, a `mapping`'s
+/// `.type`, a union -- so a program that says what a row is finds out at the
+/// query when it is wrong, rather than at the field.
+let query_as! : :any -> Conn -> sql.Query -> [:map];
+let query_as! description conn q = types.check_each description (rows! conn q);
+
+/// Several statements in one string, in the simple protocol: no parameters,
+/// and a result for each. What a migration is run with.
+let script! : Conn -> sql.Script -> [:map];
+let script! conn text = exchange! conn (wire.query text) (pending []);
+
+/// Whether the server answers. An empty query is the cheapest exchange there
+/// is: one message each way.
+let ping! : Conn -> :bool;
+let ping! conn = try! {
+    exchange! conn (wire.query "") (pending [])
+    true
+} catch e { false };
+
+// --- streaming --------------------------------------------------------------------
+//
+// A result too large to hold is read a batch at a time from a portal: Execute
+// asks for `batch` rows and the server stops after them with PortalSuspended,
+// and the next Execute picks up where it left off. Nothing is synced until the
+// rows run out, so the portal lives exactly as long as the walk -- no cursor to
+// declare, no transaction to open. A failure part-way still syncs, so the
+// connection is left as good as a failed `query!` leaves it.
+
+/// Fold `f` over the rows, `batch` at a time, holding only one batch.
+let fold! : Conn -> sql.Query -> :integer -> (a -> :map -> a) -> a -> a;
+let fold! conn q batch f init = stream! conn q batch (fold_step! f) init;
+
+/// Run `handle!` on each row, `batch` at a time, and answer how many rows there
+/// were. `handle!` is given the row.
+let each! : Conn -> sql.Query -> :integer -> (:map -> :any) -> :integer;
+let each! conn q batch handle! = stream! conn q batch (each_step! handle!) 0;
+
+priv let fold_step! : (a -> :map -> a) -> a -> [:map] -> a;
+priv let fold_step! f acc rows = list.fold_strict f acc rows;
+
+priv let each_step! : (:map -> :any) -> :integer -> [:map] -> :integer;
+priv let rec each_step! handle! !n rows = match rows {
+    [] => n,
+    [row, ..rest] => {
+        handle! row
+        each_step! handle! (n + 1) rest
+    },
+};
+
+/// The walk itself: `step!` is given the accumulator and each batch's rows, in
+/// order, and answers the next accumulator.
+priv let stream! : Conn -> sql.Query -> :integer -> (a -> [:map] -> a) -> a -> a;
+priv let stream! conn q batch step! init = {
+    let [text, vs] = sql.render q;
+    try! {
+        write! conn (wire.parse "" text (list.map value.oid_of vs)
+                     + wire.bind "" "" (list.map value.encode vs)
+                     + wire.describe "P" "" + wire.execute "" batch + wire.flush)
+        portal! conn batch step! init [] [] ()
+    } catch e { raise! (lost e) }
+};
+
+priv let portal! : Conn -> :integer -> (a -> [:map] -> a) -> a -> [:any] -> [:any] -> :any -> a;
+priv let rec portal! conn batch step! !acc columns raw failure = match receive! conn {
+    [:row_description, cols] => portal! conn batch step! acc cols raw failure,
+    [:data_row, fields] => portal! conn batch step! acc columns (strict_cons fields raw) failure,
+    :portal_suspended => {
+        let next = step! acc (batch_rows conn columns raw);
+        write! conn (wire.execute "" batch + wire.flush)
+        portal! conn batch step! next columns [] failure
+    },
+    [:command_complete, _] => {
+        let next = step! acc (batch_rows conn columns raw);
+        write! conn wire.sync
+        portal! conn batch step! next columns [] failure
+    },
+    [:error_response, fields] => {
+        write! conn wire.sync
+        portal! conn batch step! acc columns [] (errors.server fields)
+    },
+    [:ready, _] => if failure == () { acc } else { raise! failure },
+    _ => portal! conn batch step! acc columns raw failure,
+};
+
+priv let batch_rows : Conn -> [:any] -> [:any] -> [:map];
+priv let batch_rows conn columns raw = {
+    let decoders = config.Config.decoders (Conn.config conn);
+    list.map (fn fields -> row_of columns (decode_tuple decoders columns fields)) (list.reverse raw)
+};
+
+// --- transactions ------------------------------------------------------------------
+
+/// `[:ok, body! arg]`, computed all the way down before this answers, or
+/// `[:error, e]` for what it raised.
+///
+/// The value is bound and forced as statements, not written into the list:
+/// `[:ok, strict! (body! arg)]` is a list holding a suspension, so the work it
+/// names would happen whenever the list was read -- after a COMMIT, outside
+/// the `try!` -- which is the trap "A reply, a message or a list element is
+/// suspended unless forced" in CLAUDE.md describes.
+let attempt! : (a -> b) -> a -> [:ok, b] | [:error, :any];
+let attempt! body! arg = try! {
+    let v = body! arg;
+    strict! v
+    [:ok, v]
+} catch e { [:error, e] };
+//
+// `body!` is what runs inside, given the connection: a lambda written in an
+// impure function -- `db.transaction! conn (fn c -> db.exec! c ..)` -- or,
+// for work with a name, an impure function with the connection as its last
+// parameter, applied to the rest: `db.transaction! conn (transfer! a b 100)`
+// with `let transfer! from to amount conn = ..`.
+//
+// What `body!` answers is forced before COMMIT, all the way down. A lazy answer
+// would otherwise be computed after the transaction had ended -- its queries
+// run outside it, or against a connection already handed back.
+
+/// Run `body!` in a transaction: COMMIT if it answers, ROLLBACK and raise again
+/// if it raises.
+let transaction! : Conn -> (Conn -> a) -> a;
+let transaction! conn body! = transaction_with! conn %{} body!;
+
+/// The same, with the transaction's characteristics:
+/// `%{ :isolation => :serializable, :read_only => true, :deferrable => true }`.
+/// The isolation is `:read_committed`, `:repeatable_read` or `:serializable`.
+let transaction_with! : Conn -> :map -> (Conn -> a) -> a;
+let transaction_with! conn options body! = {
+    exec! conn (sql.raw (begin_statement options))
+    match attempt! body! conn {
+        [:ok, v] => {
+            exec! conn "COMMIT"
+            v
+        },
+        [:error, e] => {
+            rollback! conn
+            raise! e
+        },
+    }
+};
+
+/// ROLLBACK, unless the connection is gone -- in which case so is the
+/// transaction, and the failure worth reporting is the one that ended it.
+priv let rollback! : Conn -> :unit;
+priv let rollback! conn = try! { exec! conn "ROLLBACK"; () } catch e { () };
+
+let begin_statement : :map -> :string;
+let begin_statement options = str.join_str " " (list.filter (fn s -> s != "") [
+    "BEGIN",
+    match options.[:isolation else ()] {
+        () => "",
+        :read_committed => "ISOLATION LEVEL READ COMMITTED",
+        :repeatable_read => "ISOLATION LEVEL REPEATABLE READ",
+        :serializable => "ISOLATION LEVEL SERIALIZABLE",
+        other => "ISOLATION LEVEL " + str.upper (value.atom_name other),
+    },
+    match options.[:read_only else ()] { true => "READ ONLY", false => "READ WRITE", _ => "" },
+    match options.[:deferrable else ()] { true => "DEFERRABLE", false => "NOT DEFERRABLE", _ => "" },
+]);
+
+/// A serializable transaction, run again while it fails in the way PostgreSQL
+/// says to retry -- a serialization failure or a deadlock -- up to `attempts`
+/// times in all. Any other failure, or the last retryable one, is raised.
+let serializable! : Conn -> :integer -> (Conn -> a) -> a;
+let rec serializable! conn attempts body! = {
+    match attempt! (transaction_with! conn %{ :isolation => :serializable }) body! {
+        [:ok, v] => v,
+        [:error, e] if attempts > 1 && errors.is_retryable e => serializable! conn (attempts - 1) body!,
+        [:error, e] => raise! e,
+    }
+};
+
+/// Run `body!` inside a savepoint, within a transaction already open: if it
+/// raises, what it did is undone and the transaction carries on -- the error is
+/// raised again for the caller to decide about. Savepoints nest.
+let savepoint! : Conn -> (Conn -> a) -> a;
+let savepoint! conn body! = {
+    exec! conn "SAVEPOINT dream_savepoint"
+    match attempt! body! conn {
+        [:ok, v] => {
+            exec! conn "RELEASE SAVEPOINT dream_savepoint"
+            v
+        },
+        [:error, e] => {
+            try! {
+                exec! conn "ROLLBACK TO SAVEPOINT dream_savepoint"
+                exec! conn "RELEASE SAVEPOINT dream_savepoint"
+            } catch ignored { 0 }
+            raise! e
+        },
+    }
+};
+
+// --- prepared statements ----------------------------------------------------------------
+
+/// Parse `text` once, on the server, as the statement `name`. What the server
+/// infers about its parameters and columns comes back with it.
+let prepare! : Conn -> :string -> :string -> Prepared;
+let prepare! conn name text = {
+    try! {
+        write! conn (wire.parse name text [] + wire.describe "S" name + wire.sync)
+        described! conn (Prepared.new name text) ()
+    } catch e { raise! (lost e) }
+};
+
+priv let described! : Conn -> Prepared -> :any -> Prepared;
+priv let rec described! conn p failure = match receive! conn {
+    [:parameter_description, oids] => described! conn (Prepared.set_parameters p oids) failure,
+    [:row_description, cols] => described! conn (Prepared.set_columns p cols) failure,
+    [:error_response, fields] => described! conn p (if failure == () { errors.server fields } else { failure }),
+    [:ready, _] => if failure == () { p } else { raise! failure },
+    _ => described! conn p failure,
+};
+
+/// Run a prepared statement with `vs` for its parameters, in order.
+let execute! : Conn -> Prepared -> [:any] -> :map;
+let execute! conn p vs = {
+    only (exchange! conn (wire.bind "" (Prepared.name p) (list.map value.encode vs) + wire.execute "" 0 + wire.sync)
+                    (pending (Prepared.columns p)))
+};
+
+/// Forget a prepared statement on the server.
+let deallocate! : Conn -> Prepared -> :unit;
+let deallocate! conn p = {
+    exchange! conn (wire.close "S" (Prepared.name p) + wire.sync) (pending [])
+    ()
+};
+
+// --- COPY ---------------------------------------------------------------------------
+//
+// The fastest way in and out of a table, in COPY's text format: a line a row,
+// a tab between columns, `\N` for NULL, and backslash escapes for the four
+// characters that would otherwise end a field or a line.
+
+/// Copy `rows` -- lists of values, in the order of `columns` -- into `table`,
+/// and answer how many went in. Values are spelled as parameters are; see
+/// `pg.value`.
+let copy_in! : Conn -> :any -> [:any] -> [[:any]] -> :integer;
+let copy_in! conn table columns rows = {
+    let target = sql.text (sql.concat [sql.qualified (str.split "." (to_string_name table)), sql.raw " ("
+                                       , sql.join ", " (list.map sql.ident columns), sql.raw ")"]);
+    let outcome = try! {
+        write! conn (wire.query ("COPY " + target + " FROM STDIN"))
+        match copy_ready! conn () {
+            () => {
+                send_rows! conn rows
+                write! conn wire.copy_done
+                let n = counted (only (collect! conn (pending [])));
+                [:ok, n]
+            },
+            e => [:error, e],
+        }
+    } catch e { raise! (lost e) };
+    match outcome {
+        [:ok, n] => n,
+        [:error, e] => raise! e,
+    }
+};
+
+priv let counted : :map -> :integer;
+priv let counted r = match Result.count r {
+    () => 0,
+    n => n,
+};
+
+priv let to_string_name : :any -> :string;
+priv let to_string_name t = if type_of t == :atom { value.atom_name t } else { to_string t };
+
+/// Read until the server is ready to be sent rows. A failure -- no such table
+/// -- arrives instead, and is read to the end and answered.
+priv let copy_ready! : Conn -> :any -> :any;
+priv let rec copy_ready! conn failure = match receive! conn {
+    [:copy_in_response, _, _] => (),
+    [:error_response, fields] => copy_ready! conn (errors.server fields),
+    [:ready, _] => if failure == () { errors.client :protocol_violation "the server did not start a COPY" } else { failure },
+    _ => copy_ready! conn failure,
+};
+
+/// A thousand rows to a message: big enough that framing is noise, small
+/// enough that no one message is a large allocation.
+priv let send_rows! : Conn -> [[:any]] -> :unit;
+priv let rec send_rows! conn rows = match rows {
+    [] => (),
+    _ => {
+        write! conn (wire.copy_data (str.concat_all (list.map copy_line (list.take 1000 rows))))
+        send_rows! conn (list.drop 1000 rows)
+    },
+};
+
+/// A row as one line of COPY text.
+let copy_line : [:any] -> :string;
+let copy_line row = str.join_str "\t" (list.map copy_field row) + "\n";
+
+priv let copy_field : :any -> :string;
+priv let copy_field v = match value.encode v {
+    () => "\\N",
+    text => copy_escape text,
+};
+
+priv let copy_escape : :string -> :string;
+priv let copy_escape text =
+    if str.upto "\\\t\n\r" 0 text >= len text { text }
+    else { str.concat_all (list.map escape_char (str.chars text)) };
+
+priv let escape_char : :char -> :string;
+priv let escape_char c = match c {
+    '\\' => "\\\\",
+    '\t' => "\\t",
+    '\n' => "\\n",
+    '\r' => "\\r",
+    _ => str.of_chars [c],
+};
+
+/// Copy out what `statement` -- a `COPY .. TO STDOUT` -- writes, each row as a
+/// list of its fields' text, `()` for NULL.
+let copy_out! : Conn -> sql.Statement -> [[:any]];
+let copy_out! conn statement = list.map copy_fields (Result.copy (only (script! conn statement)));
+
+/// One line of COPY text as its fields.
+let copy_fields : :string -> [:any];
+let copy_fields line = {
+    let body = if str.ends_with "\n" line { str.slice 0 (len line - 1) line } else { line };
+    list.map (fn f -> if f == "\\N" { () } else { copy_unescape f }) (str.split "\t" body)
+};
+
+priv let copy_unescape : :string -> :string;
+priv let copy_unescape f = {
+    let at = str.find_from 0 "\\" f;
+    if at < 0 { f }
+    else {
+        let c = str.slice (at + 1) 1 f;
+        let plain = match c { "t" => "\t", "n" => "\n", "r" => "\r", "b" => "\u{8}", "f" => "\u{c}", "v" => "\u{b}", other => other };
+        str.slice 0 at f + plain + copy_unescape (str.slice (at + 2) (len f) f)
+    }
+};
+
+// --- LISTEN and NOTIFY -----------------------------------------------------------------
+
+let listen! : Conn -> :string -> :unit;
+let listen! conn channel = { exec! conn (sql.raw ("LISTEN " + sql.quote_ident channel)); () };
+
+let unlisten! : Conn -> :string -> :unit;
+let unlisten! conn channel = { exec! conn (sql.raw ("UNLISTEN " + sql.quote_ident channel)); () };
+
+/// Tell every connection listening on `channel`. The payload is a value, so it
+/// needs no quoting.
+let notify! : Conn -> :string -> :string -> :unit;
+let notify! conn channel payload = {
+    exec! conn (sql.concat [sql.raw "SELECT pg_notify(", sql.param channel, sql.raw ", ", sql.param payload, sql.raw ")"])
+    ()
+};
+
+/// Wait for the next notification on a connection that is listening. It parks
+/// this process, not a worker, until one arrives.
+let next_notification! : Conn -> Notification;
+let rec next_notification! conn = match receive! conn {
+    [:notification, pid, channel, payload] => Notification.make channel payload pid,
+    [:error_response, fields] => raise! (errors.server fields),
+    _ => next_notification! conn,
+};
+
+/// A connection of its own, listening on `channels`, and a process that sends
+/// each notification to `to` as `[:pg_notification, notification]`. Stop it
+/// with `stop_listening!`.
+///
+/// `to` is strict, and that is not a detail: an argument arrives suspended, and
+/// `self! ()` left suspended would be asked for the first time inside the
+/// forwarding process -- which would then send every notification to itself.
+let subscribe! : :any -> [:string] -> :process -> :map;
+let subscribe! target channels !to = {
+    let conn = connect! target;
+    strict! (list.map (fn ch -> listen! conn ch) channels)
+    // Bound before the map is built: a map's values are lazy, and a spawn
+    // left in one would not happen until something read it.
+    let process = forwarder! conn to;
+    %{ :connection => conn, :process => process }
+};
+
+/// The spawn is in a function of its own so the suspension carries only what
+/// it needs; see "A suspension carries its frame" in CLAUDE.md.
+priv let forwarder! : Conn -> :process -> :process;
+priv let forwarder! conn !to = spawn! $( forward! conn to );
+
+priv let forward! : Conn -> :process -> :atom;
+priv let rec forward! conn to = {
+    match attempt! next_notification! conn {
+        [:ok, n] => {
+            send! to [:pg_notification, n]
+            forward! conn to
+        },
+        _ => :stopped,
+    }
+};
+
+/// Stop a subscription: close its connection, which ends its process.
+let stop_listening! : :map -> :atom;
+let stop_listening! subscription = {
+    close! subscription.[:connection]
+    try! { join! subscription.[:process] } catch e { :stopped }
+};
+
+// --- cancelling ------------------------------------------------------------------------
+
+/// Ask the server to stop whatever `conn` is running. It goes over a connection
+/// of its own, since the one doing the work is busy; the statement it stops
+/// fails with `:query_canceled`. Answers whether the request was delivered,
+/// which is all the protocol says -- the server may have finished first.
+let cancel! : Conn -> :bool;
+let cancel! conn = try! {
+    let c = Conn.config conn;
+    let sock = net.connect! (config.Config.host c) (config.Config.port c);
+    streams.write_all! sock (wire.cancel_request (Conn.pid conn) (Conn.secret conn))
+    io.read! sock 1
+    quietly_close! sock
+    true
+} catch e { false };
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a command tag's count"
+            $( test.eq! [5, 2, 10, ()] (list.map count_of ["INSERT 0 5", "UPDATE 2", "SELECT 10", "CREATE TABLE"]) ),
+        test.case "a version string as a number"
+            $( test.eq! [160013, 170000, 90624, 0]
+                        (list.map version_number ["16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)", "17beta1", "9.6.24", "x"]) ),
+        test.case "BEGIN with characteristics"
+            $( test.eq! ["BEGIN", "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE"]
+                        [begin_statement %{},
+                         begin_statement %{ :isolation => :serializable, :read_only => true, :deferrable => true }] ),
+        test.case "COPY text, both ways"
+            $( test.eq! ["1\t\\N\ta\\tb\\\\c\\nd\n", [["1", (), "a\tb\\c\nd"]]]
+                        [copy_line [1, (), "a\tb\\c\nd"], [copy_fields (copy_line [1, (), "a\tb\\c\nd"])]] ),
+    ];
+}

@@ -1,0 +1,246 @@
+// What goes wrong, as something a program can branch on.
+//
+// Everything this library raises has one kind, `:postgres`, so one `catch`
+// with one test sees all of it. The payload is a map, and the key that matters
+// is `:condition`: an atom naming what happened. For a failure the server
+// reported it is the SQLSTATE's condition name from PostgreSQL's Appendix A --
+// `:unique_violation` for 23505 -- and the rest of the server's fields are
+// there under the names its protocol documentation gives them (`:message`,
+// `:detail`, `:hint`, `:constraint`, `:table`, ..). For a failure on this side
+// of the socket it is one of the conditions below, `:connection_failure` and
+// `:no_rows` among them -- or, for a TLS handshake that failed, the kind
+// `std.tls` raised (`:certificate_untrusted`, `:hostname_mismatch`, ..), so a
+// certificate problem is told apart from a server that is not there.
+//
+//     try! { db.exec! conn (sql.insert "users" user) }
+//     catch e {
+//         if errors.is :unique_violation e { 0 } else { error.rethrow! e }
+//     }
+//
+// **A code nobody named still means something.** The first two characters of
+// a SQLSTATE are its class, and every class has a name, so a code this table
+// does not list still arrives with a condition -- the class's -- rather than
+// with nothing.
+//
+// The module is `errors` rather than `error` so that a program can import it
+// beside `std.error` without renaming either.
+
+import std.list;
+import std.map;
+import std.str;
+import std.error;
+
+/// The kind of everything this library raises.
+let kind : :atom;
+let kind = :postgres;
+
+/// The SQLSTATEs a program is most likely to handle, by name.
+priv let conditions : %{:string => :atom};
+priv let conditions = %{
+    "00000" => :successful_completion,
+    "08000" => :connection_exception,
+    "08003" => :connection_does_not_exist,
+    "08006" => :connection_failure,
+    "08P01" => :protocol_violation,
+    "0A000" => :feature_not_supported,
+    "21000" => :cardinality_violation,
+    "22001" => :string_data_right_truncation,
+    "22003" => :numeric_value_out_of_range,
+    "22004" => :null_value_not_allowed,
+    "22007" => :invalid_datetime_format,
+    "22008" => :datetime_field_overflow,
+    "22012" => :division_by_zero,
+    "22023" => :invalid_parameter_value,
+    "22P02" => :invalid_text_representation,
+    "23000" => :integrity_constraint_violation,
+    "23502" => :not_null_violation,
+    "23503" => :foreign_key_violation,
+    "23505" => :unique_violation,
+    "23514" => :check_violation,
+    "23P01" => :exclusion_violation,
+    "25001" => :active_sql_transaction,
+    "25006" => :read_only_sql_transaction,
+    "25P01" => :no_active_sql_transaction,
+    "25P02" => :in_failed_sql_transaction,
+    "26000" => :invalid_sql_statement_name,
+    "28000" => :invalid_authorization_specification,
+    "28P01" => :invalid_password,
+    "2BP01" => :dependent_objects_still_exist,
+    "3D000" => :invalid_catalog_name,
+    "3F000" => :invalid_schema_name,
+    "40001" => :serialization_failure,
+    "40002" => :transaction_integrity_constraint_violation,
+    "40P01" => :deadlock_detected,
+    "42501" => :insufficient_privilege,
+    "42601" => :syntax_error,
+    "42703" => :undefined_column,
+    "42704" => :undefined_object,
+    "42710" => :duplicate_object,
+    "42804" => :datatype_mismatch,
+    "42846" => :cannot_coerce,
+    "42883" => :undefined_function,
+    "42P01" => :undefined_table,
+    "42P02" => :undefined_parameter,
+    "42P04" => :duplicate_database,
+    "42P07" => :duplicate_table,
+    "53300" => :too_many_connections,
+    "55P03" => :lock_not_available,
+    "57014" => :query_canceled,
+    "57P01" => :admin_shutdown,
+    "P0001" => :raise_exception,
+    "P0002" => :no_data_found,
+};
+
+/// Each SQLSTATE class, for the codes `conditions` does not name.
+priv let classes : %{:string => :atom};
+priv let classes = %{
+    "01" => :warning,
+    "02" => :no_data,
+    "08" => :connection_exception,
+    "0A" => :feature_not_supported,
+    "21" => :cardinality_violation,
+    "22" => :data_exception,
+    "23" => :integrity_constraint_violation,
+    "25" => :invalid_transaction_state,
+    "26" => :invalid_sql_statement_name,
+    "28" => :invalid_authorization_specification,
+    "2B" => :dependent_privilege_descriptors_still_exist,
+    "3D" => :invalid_catalog_name,
+    "3F" => :invalid_schema_name,
+    "40" => :transaction_rollback,
+    "42" => :syntax_error_or_access_rule_violation,
+    "53" => :insufficient_resources,
+    "54" => :program_limit_exceeded,
+    "55" => :object_not_in_prerequisite_state,
+    "57" => :operator_intervention,
+    "58" => :system_error,
+    "P0" => :plpgsql_error,
+    "XX" => :internal_error,
+};
+
+/// The condition a SQLSTATE names: its own, its class's, or `:unknown`.
+let condition_of : :string -> :atom;
+let condition_of code = match conditions.[code else ()] {
+    () => classes.[str.slice 0 2 code else :unknown],
+    c => c,
+};
+
+/// The payload for what the server sent, its fields as `pg.wire` named them
+/// and the condition added.
+let of_server : :map -> :map;
+let of_server fields = fields.[:condition => condition_of fields.[:code else ""]];
+
+/// An error from what the server sent.
+let server : :map -> :error;
+let server fields = boxed (of_server fields);
+
+/// An error from this side: a condition and a sentence.
+let client : :atom -> :string -> :error;
+let client condition message = boxed %{ :condition => condition, :message => message };
+
+/// The same, with what caused it kept under `:cause`.
+let caused : :atom -> :string -> :any -> :error;
+let caused condition message cause =
+    boxed %{ :condition => condition, :message => message, :cause => cause };
+
+/// The payload is forced before it is boxed. An error keeps whatever it is
+/// given, a suspension included, and `.[ ]` on a payload read back out of one
+/// is handed the suspension rather than the map.
+priv let boxed : :map -> :error;
+priv let boxed !payload = error.new kind payload;
+
+/// Raise one from this side.
+let fail! : :atom -> :string -> :never;
+let fail! condition message = raise! (client condition message);
+
+// --- reading one ----------------------------------------------------------------
+
+/// Whether `e` is something this library raised.
+let is_postgres : :any -> :bool;
+let is_postgres e = error.kind e == kind;
+
+/// One of the fields, or `()`.
+let field : :atom -> :any -> :any;
+let field key e = if is_postgres e { (error.payload e).[key else ()] } else { () };
+
+/// The condition, or `()` for an error this library did not raise.
+let condition : :any -> :any;
+let condition e = field :condition e;
+
+/// Whether `e` is this library's, with this condition.
+let is : :atom -> :any -> :bool;
+let is c e = condition e == c;
+
+let code : :any -> :any;
+let code e = field :code e;
+
+let message : :any -> :any;
+let message e = field :message e;
+
+let detail : :any -> :any;
+let detail e = field :detail e;
+
+let hint : :any -> :any;
+let hint e = field :hint e;
+
+let constraint : :any -> :any;
+let constraint e = field :constraint e;
+
+/// Whether running the same transaction again could succeed: the two failures
+/// PostgreSQL documents as "retry the transaction".
+let is_retryable : :any -> :bool;
+let is_retryable e = is :serialization_failure e || is :deadlock_detected e;
+
+/// Whether the connection itself is gone, as opposed to a statement having
+/// failed on a connection that is still good. A pool asks this before it
+/// takes a connection back.
+let is_connection_lost : :any -> :bool;
+let is_connection_lost e = list.contains (condition e)
+    [:connection_failure, :connection_exception, :connection_does_not_exist,
+     :protocol_violation, :admin_shutdown];
+
+/// The line to print: severity, code, condition, message, then whatever the
+/// server added.
+let describe : :any -> :string;
+let describe e =
+    if not (is_postgres e) { to_string e }
+    else {
+        let p = error.payload e;
+        let head = str.join_str " " (list.filter (fn s -> s != "")
+            [p.[:severity else ""], p.[:code else ""], name_of p.[:condition else :unknown] + ":"]);
+        let tail = list.filter (fn s -> s != "")
+            [labelled "detail" p.[:detail else ()], labelled "hint" p.[:hint else ()],
+             labelled "cause" (match p.[:cause else ()] { () => (), c => to_string c })];
+        str.join_str "\n  " (list.cons (head + " " + p.[:message else ""]) tail)
+    };
+
+priv let name_of : :atom -> :string;
+priv let name_of a = { let t = to_string a; str.slice 1 (len t - 1) t };
+
+priv let labelled : :string -> :any -> :string;
+priv let labelled label v = match v { () => "", text => label + ": " + to_string text };
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a code is its condition, or its class's"
+            $( test.eq! [:unique_violation, :integrity_constraint_violation, :unknown]
+                        [condition_of "23505", condition_of "23999", condition_of "ZZ000"] ),
+        test.case "a server error carries its fields and its condition"
+            $( test.eq! [true, :undefined_table, "42P01", "relation \"x\" does not exist"]
+                        [is :undefined_table (server %{ :code => "42P01", :message => "relation \"x\" does not exist" }),
+                         condition (server %{ :code => "42P01" }), code (server %{ :code => "42P01" }),
+                         message (server %{ :code => "42P01", :message => "relation \"x\" does not exist" })] ),
+        test.case "an error that is not ours has no condition"
+            $( test.eq! [(), false] [condition (error.new :other 1), is :unique_violation 7] ),
+        test.case "what can be retried, and what lost the connection"
+            $( test.eq! [true, false, true]
+                        [is_retryable (server %{ :code => "40001" }), is_retryable (server %{ :code => "23505" }),
+                         is_connection_lost (client :connection_failure "gone")] ),
+        test.case "described for a person"
+            $( test.eq! "ERROR 23505 unique_violation: duplicate key\n  detail: Key (id)=(1) already exists."
+                        (describe (server %{ :severity => "ERROR", :code => "23505", :message => "duplicate key",
+                                             :detail => "Key (id)=(1) already exists." })) ),
+    ];
+}

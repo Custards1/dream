@@ -2,9 +2,9 @@
 #
 #   nix-shell        then ./build.sh
 #
-# libffi is required (`std.ffi` is part of every VM). LLVM is optional; it is
-# here because with it you get the JIT, and a build without it is the unusual
-# case rather than the default.
+# libffi and OpenSSL are required (`std.ffi` and `std.tls` are part of every
+# VM). LLVM is optional; it is here because with it you get the JIT, and a
+# build without it is the unusual case rather than the default.
 { pkgs ? import <nixpkgs> { } }:
 
 pkgs.mkShell {
@@ -23,6 +23,7 @@ pkgs.mkShell {
 
   buildInputs = with pkgs; [
     libffi                     # std.ffi, required
+    openssl                    # std.tls, required
     zlib                       # LLVM links against it
     sqlite                     # std.sql.sqlite, loaded when a program opens a database
   ];

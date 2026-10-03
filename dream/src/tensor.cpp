@@ -58,6 +58,14 @@ const TensorKernels& tensor_kernels() {
     return *chosen;
 }
 
+std::vector<const TensorKernels*> tensor_kernel_tables() {
+    std::vector<const TensorKernels*> tables = {&kernels_base::kernels};
+#if defined(DREAM_TENSOR_AVX2)
+    if (&tensor_kernels() == &kernels_avx2::kernels) tables.push_back(&kernels_avx2::kernels);
+#endif
+    return tables;
+}
+
 const char* tensor_kernels_name() {
 #if defined(DREAM_TENSOR_AVX2)
     if (&tensor_kernels() == &kernels_avx2::kernels) return "avx2";

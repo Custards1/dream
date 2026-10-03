@@ -6,7 +6,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libffi-dev
+      - run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
       - run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF
       - run: cmake --build build --parallel 2
       - run: python3 dream/tests/portable.py compile --vm build/bin/dream --images portable-images
@@ -30,10 +30,12 @@ jobs:
       # libffi is required on every platform: `std.ffi` is part of the VM.
       # Windows takes it from vcpkg, whose toolchain also copies the DLL
       # beside the executables; Homebrew's is keg-only and has to be named.
+      # So is OpenSSL, for `std.tls`, on Linux and macOS (CMake finds
+      # Homebrew's itself); Windows' TLS is SChannel, which is the system's.
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libffi-dev
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
       - if: runner.os == 'macOS'
-        run: brew install libffi
+        run: brew install libffi openssl@3
       - if: runner.os == 'Windows'
         run: vcpkg install libffi:x64-windows
       - if: runner.os == 'Linux'

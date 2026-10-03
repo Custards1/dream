@@ -64,5 +64,6 @@ std::vector<IoHandleInfo> io_snapshot();
 
 ModuleDef make_io_module();
 ModuleDef make_net_module();
+ModuleDef make_tls_module();
 
 }  // namespace dream

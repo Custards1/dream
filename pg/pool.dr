@@ -1,0 +1,243 @@
+// A pool: connections shared by many processes, one process at a time each.
+//
+//     let pool = pool.start! "postgres://app@db/app" 10;
+//     let users = pool.rows! pool "SELECT * FROM users";
+//     pool.with! pool (archive! cutoff)          // let archive! cutoff conn = ..
+//
+// **The pool is a server** (`std.server`), and what it serves is permission.
+// Its state is the idle connections, how many are open, and who is waiting;
+// checking a connection out is a call, and handing one back is a cast. The
+// connection itself is a value (see `pg.db`), so the process that checks one
+// out uses it directly -- no query passes through the pool's mailbox, and the
+// pool is never the bottleneck it would be if it ran them.
+//
+// **Opening happens in the caller.** When nothing is idle and there is room,
+// the pool answers "open one" and counts it as open; the caller connects. A
+// server that connected on a caller's behalf would make every other caller
+// wait for the TCP handshake and the login, and a server that cannot be
+// reached would stall the pool rather than the one process that asked.
+//
+// **What comes back is judged before it is kept.** A body that answered hands
+// its connection back as it is. One that raised may have left a transaction
+// open, so the connection is rolled back first, and one whose connection was
+// lost -- or whose rollback fails -- is closed and forgotten, which frees its
+// place for the next caller to open afresh. So a connection in the pool is
+// always idle and always usable, whatever the code that last held it did.
+//
+// When every connection is out, a caller waits, in order, for one to come
+// back. There is no timeout -- `std.server` has none -- so a pool whose
+// connections are all held by work that never ends is a pool that waits.
+
+import std.list;
+import std.server;
+import pg.config;
+import pg.db;
+import pg.errors;
+
+mod keeper {
+    derive std.server;
+    import std.list;
+    import pg.db;
+
+    mapping State {
+        config : :map
+        size : :integer
+        idle : [:any] = []
+        open : :integer = 0
+        waiting : [:any] = []
+    }
+
+    let init! : :any -> :any;
+    let init! args = args;
+
+    let handle_call! : :any -> :any -> :any -> :any;
+    let handle_call! request from state = match request {
+        :checkout => match State.idle state {
+            [conn, ..rest] => reply [:conn, conn] (State.set_idle state rest),
+            [] if State.open state < State.size state =>
+                reply [:open, State.config state] (State.set_open state (State.open state + 1)),
+            [] => noreply (State.set_waiting state (State.waiting state + [from])),
+        },
+        :stats => reply %{ :size => State.size state, :open => State.open state,
+                           :idle => len (State.idle state), :waiting => len (State.waiting state) } state,
+        :drain => reply (State.idle state) (State.set_open (State.set_idle state []) (State.open state - len (State.idle state))),
+        _ => reply [:error, :unknown_request] state,
+    };
+
+    /// A connection back, or the news that one is gone. Either is handed
+    /// straight to the longest waiter when there is one: a connection as it
+    /// is, and a lost one as permission to open its replacement.
+    let handle_cast! : :any -> :any -> :any;
+    let handle_cast! message state = match [message, State.waiting state] {
+        [[:checkin, conn], [first, ..rest]] => {
+            reply_to! first [:conn, conn]
+            noreply (State.set_waiting state rest)
+        },
+        [[:checkin, conn], []] => noreply (State.set_idle state (list.cons conn (State.idle state))),
+        [:lost, [first, ..rest]] => {
+            reply_to! first [:open, State.config state]
+            noreply (State.set_waiting state rest)
+        },
+        [:lost, []] => noreply (State.set_open state (State.open state - 1)),
+        _ => noreply state,
+    };
+
+    let terminate! : :any -> :any -> :any;
+    let terminate! reason state = strict! (list.map (fn c -> db.close! c) (State.idle state));
+
+    let server_name : :any -> :string;
+    let server_name u = "pg.pool";
+}
+
+/// Start a pool of at most `size` connections to `target` -- a configuration
+/// map, a URL or a keyword string. Nothing is opened until it is wanted, and a
+/// bad configuration is reported here rather than at the first query.
+let start! : :any -> :integer -> :process;
+let start! target size = keeper.start! (keeper.State.new (config.resolve! target) size);
+
+/// The pool as a `std.supervisor` child, named `name`.
+let child! : :string -> :any -> :integer -> :any;
+let child! name target size = keeper.child! name (keeper.State.new (config.resolve! target) size);
+
+/// Close the idle connections and stop. Connections still checked out are
+/// their holders' to close; handing one back to a stopped pool loses it.
+let stop! : :process -> :any;
+let stop! pool = keeper.stop! pool;
+
+/// `%{ :size, :open, :idle, :waiting }`.
+let stats! : :process -> :map;
+let stats! pool = keeper.call! pool :stats;
+
+/// Close every idle connection now, keeping the pool. What a program does
+/// after the server restarted, so the next caller opens a fresh connection
+/// rather than finding out the old ones are dead.
+let drain! : :process -> :integer;
+let drain! pool = {
+    let idle = keeper.call! pool :drain;
+    strict! (list.map (fn c -> db.close! c) idle)
+    len idle
+};
+
+/// A connection of the pool's, for the caller's exclusive use until it hands
+/// it back with `checkin!`. `with!` is the way that cannot forget to.
+let checkout! : :process -> :any;
+let checkout! pool = match keeper.call! pool :checkout {
+    [:conn, conn] => conn,
+    [:open, target] => {
+        match db.attempt! db.connect! target {
+            [:ok, conn] => conn,
+            [:error, e] => {
+                keeper.cast! pool :lost
+                raise! e
+            },
+        }
+    },
+};
+
+let checkin! : :process -> :any -> :any;
+let checkin! pool conn = keeper.cast! pool [:checkin, conn];
+
+/// Give up a connection that is no longer fit to share.
+let discard! : :process -> :any -> :any;
+let discard! pool conn = {
+    db.close! conn
+    keeper.cast! pool :lost
+};
+
+/// Run `body!` with a connection of the pool's, and hand it back however
+/// `body!` ends. `body!` is given the connection, as for `db.transaction!`,
+/// and its answer is forced before the connection goes back, for the reason
+/// given there.
+let with! : :process -> (:any -> a) -> a;
+let with! pool body! = {
+    let conn = checkout! pool;
+    match db.attempt! body! conn {
+        [:ok, v] => {
+            checkin! pool conn
+            v
+        },
+        [:error, e] => {
+            settle! pool conn e
+            raise! e
+        },
+    }
+};
+
+/// After a failure: back to the pool rolled back, or out of it.
+priv let settle! : :process -> :any -> :any -> :any;
+priv let settle! pool conn e =
+    if errors.is_connection_lost e { discard! pool conn }
+    else {
+        let clean = try! { db.exec! conn "ROLLBACK"; true } catch ignored { false };
+        if clean { checkin! pool conn } else { discard! pool conn }
+    };
+
+// --- one statement, borrowed for -----------------------------------------------------
+//
+// The everyday case is one statement, and these are `pg.db`'s functions of the
+// same names with the connection borrowed around them.
+
+let query! : :process -> :any -> :map;
+let query! pool q = with! pool (on_query! q);
+
+let rows! : :process -> :any -> [:map];
+let rows! pool q = with! pool (on_rows! q);
+
+let one! : :process -> :any -> :map;
+let one! pool q = with! pool (on_one! q);
+
+let first! : :process -> :any -> :any;
+let first! pool q = with! pool (on_first! q);
+
+let scalar! : :process -> :any -> :any;
+let scalar! pool q = with! pool (on_scalar! q);
+
+let exec! : :process -> :any -> :integer;
+let exec! pool q = with! pool (on_exec! q);
+
+/// A transaction on a borrowed connection; see `db.transaction!`.
+let transaction! : :process -> (:any -> a) -> a;
+let transaction! pool body! = with! pool (on_transaction! body!);
+
+priv let on_query! : :any -> :any -> :map;
+priv let on_query! q conn = db.query! conn q;
+priv let on_rows! : :any -> :any -> [:map];
+priv let on_rows! q conn = db.rows! conn q;
+priv let on_one! : :any -> :any -> :map;
+priv let on_one! q conn = db.one! conn q;
+priv let on_first! : :any -> :any -> :any;
+priv let on_first! q conn = db.first! conn q;
+priv let on_scalar! : :any -> :any -> :any;
+priv let on_scalar! q conn = db.scalar! conn q;
+priv let on_exec! : :any -> :any -> :integer;
+priv let on_exec! q conn = db.exec! conn q;
+priv let on_transaction! : (:any -> a) -> :any -> a;
+priv let on_transaction! body! conn = db.transaction! conn body!;
+
+when test {
+    import std.test;
+
+    let full : :any;
+    let full = keeper.State.make %{} 2 [] 2 [];
+
+    let tests = [
+        test.case "an idle connection is handed out first"
+            $( test.eq! [[:conn, :a], [:b]]
+                        (match keeper.answer! :checkout (keeper.State.make %{} 2 [:a, :b] 2 []) {
+                             [v, s] => [v, keeper.State.idle s],
+                         }) ),
+        test.case "with room and nothing idle, the caller is told to open one"
+            $( test.eq! [[:open, %{ :host => "h" }], 1]
+                        (match keeper.answer! :checkout (keeper.State.new %{ :host => "h" } 2) {
+                             [v, s] => [v, keeper.State.open s],
+                         }) ),
+        test.case "a full pool keeps the caller waiting"
+            $( test.eq! [(), 2, 2] (match keeper.answer! :checkout full {
+                   [v, s] => [v, keeper.State.open s, keeper.State.size s],
+               }) ),
+        test.case "a lost connection frees its place"
+            $( test.eq! 1 (match keeper.handle_cast! :lost full { [:noreply, s] => keeper.State.open s, _ => -1 }) ),
+        test.case "a connection back with nobody waiting is idle"
+            $( test.eq! [:c] (match keeper.handle_cast! [:checkin, :c] full { [:noreply, s] => keeper.State.idle s, _ => [] }) ),
+    ];
+}

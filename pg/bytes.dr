@@ -1,0 +1,256 @@
+// Bytes: the arithmetic a binary protocol is written in.
+//
+// A Dream string is a sequence of bytes, and that is all a frame on the wire
+// is, so this module works on strings throughout -- there is no second byte
+// type to convert to and from. What it adds is what the runtime does not have:
+// integers in network order (the runtime's own `str_le` is little-endian), the
+// two text spellings of bytes a PostgreSQL conversation uses (hex for `bytea`,
+// base64 for SCRAM), and exclusive-or.
+//
+// **There are no bitwise operators in Dream**, and exclusive-or is the one
+// operation a password exchange cannot do without. So it is a table: sixteen
+// by sixteen answers for a pair of nibbles, built once, and a byte is two
+// lookups. That is cheap enough for SCRAM's four thousand rounds of HMAC and
+// needs nothing from the VM. `pg.crypto` builds AND and OR the same way for
+// MD5, which is the other place a bit is ever looked at.
+
+import std.list;
+import std.str;
+import std.array;
+
+// --- integers in network order ----------------------------------------------
+//
+// PostgreSQL writes every length, count and code big-endian. Each of these
+// takes a value already in range; a negative one is written as its two's
+// complement, which is how the protocol spells -1 for a NULL column.
+
+let two_32 : :integer;
+let two_32 = 4294967296;
+
+/// `n` as `width` bytes, most significant first.
+let be : :integer -> :integer -> :string;
+let be width n = {
+    let modulus = if width >= 8 { 0 } else { pow256 width };
+    let u = if n < 0 && modulus > 0 { n + modulus } else { n };
+    str.of_bytes (list.reverse (le_bytes width u))
+};
+
+priv let pow256 : :integer -> :integer;
+priv let rec pow256 n = if n <= 0 { 1 } else { 256 * pow256 (n - 1) };
+
+priv let le_bytes : :integer -> :integer -> [:integer];
+priv let rec le_bytes width n =
+    if width <= 0 { [] } else { list.cons (n % 256) (le_bytes (width - 1) (n / 256)) };
+
+let be16 : :integer -> :string;
+let be16 n = be 2 n;
+
+let be32 : :integer -> :string;
+let be32 n = be 4 n;
+
+/// The unsigned 16-bit integer at byte `at`.
+let u16_at : :string -> :integer -> :integer;
+let u16_at s at = str.byte at s * 256 + str.byte (at + 1) s;
+
+/// The signed 16-bit integer at byte `at`.
+let i16_at : :string -> :integer -> :integer;
+let i16_at s at = { let u = u16_at s at; if u >= 32768 { u - 65536 } else { u } };
+
+/// The unsigned 32-bit integer at byte `at`.
+let u32_at : :string -> :integer -> :integer;
+let u32_at s at =
+    ((str.byte at s * 256 + str.byte (at + 1) s) * 256 + str.byte (at + 2) s) * 256
+    + str.byte (at + 3) s;
+
+/// The signed 32-bit integer at byte `at`, which is how the protocol writes a
+/// length that may be -1.
+let i32_at : :string -> :integer -> :integer;
+let i32_at s at = { let u = u32_at s at; if u >= 2147483648 { u - two_32 } else { u } };
+
+// --- C strings ----------------------------------------------------------------
+
+/// `s` terminated, as every name and value in the protocol is.
+let cstr : :string -> :string;
+let cstr s = s + "\0";
+
+/// The terminated string starting at `at`, and the offset after its terminator:
+/// `[text, next]`. A string with no terminator runs to the end, which is how a
+/// truncated message is read without raising here -- the caller has the length
+/// and can tell.
+let cstr_at : :string -> :integer -> [:string, :integer];
+let cstr_at s at = {
+    let stop = str.find_from at "\0" s;
+    let end = if stop < 0 { len s } else { stop };
+    [str.slice at (end - at) s, end + 1]
+};
+
+/// Every byte of `s`, as integers.
+let to_list : :string -> [:integer];
+let to_list s = list.map (fn i -> str.byte i s) (list.range 0 (len s));
+
+// --- hex ----------------------------------------------------------------------
+
+priv let hex_digits : :string;
+priv let hex_digits = "0123456789abcdef";
+
+/// The value of one hex digit, or -1.
+let hex_value : :integer -> :integer;
+let hex_value b = match b {
+    b if b >= 48 && b <= 57 => b - 48,
+    b if b >= 97 && b <= 102 => b - 87,
+    b if b >= 65 && b <= 70 => b - 55,
+    _ => -1,
+};
+
+/// Two lowercase hex digits per byte.
+let hex_encode : :string -> :string;
+let hex_encode s = str.concat_all (list.map hex_byte (to_list s));
+
+priv let hex_byte : :integer -> :string;
+priv let hex_byte b = str.slice (b / 16) 1 hex_digits + str.slice (b % 16) 1 hex_digits;
+
+/// The bytes a run of hex digits spells, or `()` when they spell nothing: an
+/// odd count or a character that is not a digit.
+let hex_decode : :string -> :string | :unit;
+let hex_decode s =
+    if len s % 2 != 0 { () }
+    else {
+        let bytes = list.map (fn i -> pair_value (str.byte (2 * i) s) (str.byte (2 * i + 1) s))
+                             (list.range 0 (len s / 2));
+        if list.any (fn b -> b < 0) bytes { () } else { str.of_bytes bytes }
+    };
+
+priv let pair_value : :integer -> :integer -> :integer;
+priv let pair_value hi lo = {
+    let h = hex_value hi;
+    let l = hex_value lo;
+    if h < 0 || l < 0 { -1 } else { h * 16 + l }
+};
+
+// --- base64 -------------------------------------------------------------------
+//
+// The standard alphabet with padding, RFC 4648 section 4, which is what SCRAM
+// exchanges its nonces, salts and proofs in.
+
+priv let alphabet : :string;
+priv let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+priv let sextet : :integer -> :string;
+priv let sextet n = str.slice n 1 alphabet;
+
+let base64_encode : :string -> :string;
+let base64_encode s = str.concat_all (base64_groups (to_list s));
+
+priv let base64_groups : [:integer] -> [:string];
+priv let rec base64_groups bytes = match bytes {
+    [] => [],
+    [a] => [sextet (a / 4) + sextet (a % 4 * 16) + "=="],
+    [a, b] => [sextet (a / 4) + sextet (a % 4 * 16 + b / 16) + sextet (b % 16 * 4) + "="],
+    [a, b, c, ..rest] =>
+        list.cons (sextet (a / 4) + sextet (a % 4 * 16 + b / 16)
+                   + sextet (b % 16 * 4 + c / 64) + sextet (c % 64))
+                  (base64_groups rest),
+};
+
+/// The value of one base64 character, -2 for padding, or -1.
+priv let base64_value : :integer -> :integer;
+priv let base64_value c = match c {
+    c if c >= 65 && c <= 90 => c - 65,
+    c if c >= 97 && c <= 122 => c - 71,
+    c if c >= 48 && c <= 57 => c + 4,
+    43 => 62,
+    47 => 63,
+    61 => -2,
+    _ => -1,
+};
+
+/// The bytes `s` spells, or `()` for text that is not base64.
+let base64_decode : :string -> :string | :unit;
+let base64_decode s =
+    if len s % 4 != 0 { () }
+    else {
+        let values = list.map (fn i -> base64_value (str.byte i s)) (list.range 0 (len s));
+        match base64_bytes values [] {
+            () => (),
+            bytes => str.of_bytes bytes,
+        }
+    };
+
+/// Four sextets at a time into three bytes, padding only at the end.
+priv let base64_bytes : [:integer] -> [[:integer]] -> [:integer] | :unit;
+priv let rec base64_bytes values acc = match values {
+    [] => list.concat (list.reverse acc),
+    [a, b, -2, -2] if a >= 0 && b >= 0 =>
+        list.concat (list.reverse (list.cons [a * 4 + b / 16] acc)),
+    [a, b, c, -2] if a >= 0 && b >= 0 && c >= 0 =>
+        list.concat (list.reverse (list.cons [a * 4 + b / 16, b % 16 * 16 + c / 4] acc)),
+    [a, b, c, d, ..rest] if a >= 0 && b >= 0 && c >= 0 && d >= 0 =>
+        base64_bytes rest (list.cons [a * 4 + b / 16, b % 16 * 16 + c / 4, c % 4 * 64 + d] acc),
+    _ => (),
+};
+
+// --- exclusive-or ---------------------------------------------------------------
+
+/// A nibble operation as a table: entry `a * 16 + b` is `a op b`. Built from
+/// the bits once, which is the only place a bit is ever examined one at a time.
+let nibble_table : (:integer -> :integer -> :integer) -> #[:integer];
+let nibble_table bit_op =
+    array.of_list (list.map (fn i -> nibble_by_bits bit_op (i / 16) (i % 16)) (list.range 0 256));
+
+priv let nibble_by_bits : (:integer -> :integer -> :integer) -> :integer -> :integer -> :integer;
+priv let nibble_by_bits bit_op a b =
+    list.fold_strict (fn acc k -> acc + bit_op (a / pow2 k % 2) (b / pow2 k % 2) * pow2 k) 0 [0, 1, 2, 3];
+
+priv let pow2 : :integer -> :integer;
+priv let rec pow2 k = if k <= 0 { 1 } else { 2 * pow2 (k - 1) };
+
+let xor_nibbles : #[:integer];
+let xor_nibbles = nibble_table (fn x y -> if x == y { 0 } else { 1 });
+
+/// One byte exclusive-or another.
+let xor8 : :integer -> :integer -> :integer;
+let xor8 a b =
+    xor_nibbles.[a / 16 * 16 + b / 16] * 16 + xor_nibbles.[a % 16 * 16 + b % 16];
+
+/// Two strings of the same length, exclusive-or'd byte by byte. The shorter
+/// one decides the length when they differ.
+let xor : :string -> :string -> :string;
+let xor a b = str.of_bytes (xor_lists (to_list a) (to_list b));
+
+/// The same, on byte lists, which is what a loop that xors many times keeps
+/// its accumulator as rather than building a string each round.
+let xor_lists : [:integer] -> [:integer] -> [:integer];
+let rec xor_lists xs ys = match [xs, ys] {
+    [[x, ..xr], [y, ..yr]] => list.cons (xor8 x y) (xor_lists xr yr),
+    _ => [],
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "network order, both ways"
+            $( test.eq! [[0, 0, 1, 2], 258, [255, 255, 255, 255], -1, 65535, -2]
+                        [to_list (be32 258), u32_at (be32 258) 0, to_list (be32 (-1)),
+                         i32_at (be32 (-1)) 0, u16_at (be16 (-1)) 0, i16_at (be16 (-2)) 0] ),
+        test.case "a C string and where the next field starts"
+            $( test.eq! [["user", 5], ["", 6], ["x", 8]]
+                        [cstr_at "user\0\0x" 0, cstr_at "user\0\0x" 5, cstr_at "user\0\0x" 6] ),
+        test.case "hex round trip, and what is not hex"
+            $( test.eq! ["00ff41", str.of_bytes [0, 255, 65], (), ()]
+                        [hex_encode (str.of_bytes [0, 255, 65]), hex_decode "00FF41",
+                         hex_decode "abc", hex_decode "zz"] ),
+        test.case "base64 against RFC 4648's vectors"
+            $( test.eq! ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"]
+                        (list.map base64_encode ["", "f", "fo", "foo", "foob", "fooba", "foobar"]) ),
+        test.case "base64 decodes what it encodes, and refuses the rest"
+            $( test.eq! ["foobar", "fo", str.of_bytes [0, 255, 128], (), ()]
+                        [base64_decode "Zm9vYmFy", base64_decode "Zm8=",
+                         base64_decode (base64_encode (str.of_bytes [0, 255, 128])),
+                         base64_decode "Zm9", base64_decode "Zm=v"] ),
+        test.case "exclusive-or by table"
+            $( test.eq! [0, 255, 0x5c, 0x6a, str.of_bytes [3, 0]]
+                        [xor8 7 7, xor8 0 255, xor8 0 0x5c, xor8 0x36 0x5c,
+                         xor (str.of_bytes [1, 2]) (str.of_bytes [2, 2])] ),
+    ];
+}

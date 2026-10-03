@@ -16,6 +16,8 @@
 #include "process.hpp"
 #include "runtime.hpp"
 #include "tensor_kernels.hpp"
+#include "tls.hpp"
+#include "tls/tls_fixtures.hpp"
 #include "value.hpp"
 
 using namespace dream;
@@ -786,11 +788,7 @@ static void test_big_block_pool() {
 /// can run the second, because a CPU without AVX2 runs only the first.
 static void test_tensor_kernels() {
     std::printf("tensor kernels\n");
-    std::vector<const TensorKernels*> tables = {&kernels_base::kernels};
-#if defined(DREAM_TENSOR_AVX2)
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
-        tables.push_back(&kernels_avx2::kernels);
-#endif
+    std::vector<const TensorKernels*> tables = tensor_kernel_tables();
     const size_t shapes[][3] = {{1, 1, 1}, {1, 7, 9}, {5, 3, 1}, {6, 8, 8},  {7, 9, 17},
                                 {13, 300, 11}, {97, 31, 100}, {2, 513, 3}};
     for (const TensorKernels* k : tables) {
@@ -1339,7 +1337,256 @@ static void test_arithmetic_boundaries() {
     CHECK_EQ(result, int64_t(21));
 }
 
+
+// --- TLS --------------------------------------------------------------------
+//
+// The engine is driven from memory, so two of them can talk to each other with
+// nothing between but this loop: what one writes the other is fed. That tests
+// the backend this VM was built with -- OpenSSL here, SChannel on Windows -- on
+// its own, with no socket and no scheduler to blame when it fails.
+
+struct TlsPair {
+    std::unique_ptr<tls::Engine> client;
+    std::unique_ptr<tls::Engine> server;
+    tls::Status client_status = tls::Status::WantRead;
+    tls::Status server_status = tls::Status::WantRead;
+};
+
+static tls::Config tls_server_config() {
+    tls::Config c;
+    c.server = true;
+    c.verify = false;
+    c.identity_p12 = tls_fixtures::server_p12();
+    c.identity_password = tls_fixtures::password;
+    return c;
+}
+
+static tls::Config tls_client_config() {
+    tls::Config c;
+    c.host = "localhost";
+    c.ca_pem = tls_fixtures::ca_pem();
+    return c;
+}
+
+/// Run both handshakes until each has finished or failed, passing records
+/// across. Answers false when they stopped making progress.
+static bool tls_shake(TlsPair& t) {
+    for (int round = 0; round < 50; ++round) {
+        if (t.client_status == tls::Status::WantRead) t.client_status = t.client->handshake();
+        std::string to_server = t.client->take_output();
+        t.server->feed(to_server.data(), to_server.size());
+        if (t.server_status == tls::Status::WantRead) t.server_status = t.server->handshake();
+        std::string to_client = t.server->take_output();
+        t.client->feed(to_client.data(), to_client.size());
+        bool client_done = t.client_status != tls::Status::WantRead;
+        bool server_done = t.server_status != tls::Status::WantRead;
+        if (client_done && server_done && to_server.empty() && to_client.empty()) return true;
+        // One side failed and said so; the other is waiting for what will not come.
+        if ((t.client_status == tls::Status::Error || t.server_status == tls::Status::Error)
+            && to_server.empty() && to_client.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static TlsPair tls_pair(const tls::Config& client, const tls::Config& server) {
+    TlsPair t;
+    tls::Failure why;
+    t.client = tls::make_engine(client, &why);
+    if (!t.client) std::printf("  client engine: %s %s\n", why.kind.c_str(), why.message.c_str());
+    t.server = tls::make_engine(server, &why);
+    if (!t.server) std::printf("  server engine: %s %s\n", why.kind.c_str(), why.message.c_str());
+    return t;
+}
+
+/// Plaintext sent one way: written by `from`, fed across, read by `to`.
+static std::string tls_send(tls::Engine& from, tls::Engine& to, const std::string& text) {
+    if (from.write(text.data(), text.size()) != tls::Status::Ok) return "<write failed>";
+    std::string records = from.take_output();
+    to.feed(records.data(), records.size());
+    std::string got;
+    char buf[4096];
+    for (;;) {
+        size_t n = 0;
+        tls::Status st = to.read(buf, sizeof buf, &n);
+        // A read may answer with records of its own (a TLS 1.3 ticket's
+        // acknowledgement, say); they go back the other way.
+        std::string back = to.take_output();
+        from.feed(back.data(), back.size());
+        if (st != tls::Status::Ok) break;
+        got.append(buf, n);
+    }
+    return got;
+}
+
+static void test_tls_engines() {
+    std::printf("tls engines (%s)\n", tls::backend().c_str());
+
+    // A whole conversation, both ways, and the server's name checked.
+    {
+        tls::Config server = tls_server_config();
+        server.alpn = {"dream/1", "http/1.1"};
+        tls::Config client = tls_client_config();
+        client.alpn = {"dream/1"};
+        TlsPair t = tls_pair(client, server);
+        CHECK(t.client && t.server);
+        if (t.client && t.server) {
+            CHECK(tls_shake(t));
+            CHECK(t.client_status == tls::Status::Ok);
+            CHECK(t.server_status == tls::Status::Ok);
+            CHECK_EQ(t.client->info().alpn, std::string("dream/1"));
+            CHECK_EQ(t.server->info().alpn, std::string("dream/1"));
+            CHECK_EQ(t.client->info().peer, std::string("CN=localhost"));
+            CHECK(!t.client->info().version.empty());
+            CHECK_EQ(tls_send(*t.client, *t.server, "hello, server"), std::string("hello, server"));
+            CHECK_EQ(tls_send(*t.server, *t.client, "hello, client"), std::string("hello, client"));
+            std::string big(200000, 'x');
+            for (size_t i = 0; i < big.size(); ++i) big[i] = char('a' + i % 26);
+            CHECK(tls_send(*t.client, *t.server, big) == big);
+
+            // A clean close reads as the end of the stream on the other side.
+            t.client->close();
+            std::string bye = t.client->take_output();
+            t.server->feed(bye.data(), bye.size());
+            char buf[16];
+            size_t n = 0;
+            tls::Status at_close = t.server->read(buf, sizeof buf, &n);
+            if (at_close != tls::Status::Closed) {
+                std::printf("  close_notify: %zu bytes sent, %s, server read answered %d (%s)\n", bye.size(),
+                            t.client->info().version.c_str(), int(at_close),
+                            t.server->failure().message.c_str());
+            }
+            CHECK(at_close == tls::Status::Closed);
+        }
+    }
+
+    // Each way verification fails is reported as what it is.
+    struct Refusal { const char* what; std::string ca; std::string host; std::string identity; const char* kind; };
+    std::vector<Refusal> refusals = {
+        {"untrusted", tls_fixtures::other_ca_pem(), "localhost", tls_fixtures::server_p12(), "certificate_untrusted"},
+        {"misnamed", tls_fixtures::ca_pem(), "example.com", tls_fixtures::server_p12(), "hostname_mismatch"},
+        {"expired", tls_fixtures::ca_pem(), "localhost", tls_fixtures::expired_p12(), "certificate_expired"},
+    };
+    for (const Refusal& r : refusals) {
+        tls::Config client = tls_client_config();
+        client.ca_pem = r.ca;
+        client.host = r.host;
+        tls::Config server = tls_server_config();
+        server.identity_p12 = r.identity;
+        TlsPair t = tls_pair(client, server);
+        CHECK(t.client && t.server);
+        if (!t.client || !t.server) continue;
+        tls_shake(t);
+        CHECK(t.client_status == tls::Status::Error);
+        if (t.client->failure().kind != r.kind) {
+            std::printf("  %s: got %s (%s)\n", r.what, t.client->failure().kind.c_str(),
+                        t.client->failure().message.c_str());
+        }
+        CHECK_EQ(t.client->failure().kind, std::string(r.kind));
+    }
+
+    // Verification off accepts what it would have refused.
+    {
+        tls::Config client = tls_client_config();
+        client.ca_pem = tls_fixtures::other_ca_pem();
+        client.verify = false;
+        TlsPair t = tls_pair(client, tls_server_config());
+        CHECK(t.client && t.server && tls_shake(t) && t.client_status == tls::Status::Ok);
+    }
+
+    // The chain alone: a trusted certificate for another name is accepted,
+    // an untrusted one is not.
+    {
+        tls::Config client = tls_client_config();
+        client.host = "example.com";
+        client.check_name = false;
+        TlsPair t = tls_pair(client, tls_server_config());
+        CHECK(t.client && t.server && tls_shake(t) && t.client_status == tls::Status::Ok);
+        client.ca_pem = tls_fixtures::other_ca_pem();
+        TlsPair u = tls_pair(client, tls_server_config());
+        CHECK(u.client && u.server);
+        if (u.client && u.server) {
+            tls_shake(u);
+            CHECK_EQ(u.client->failure().kind, std::string("certificate_untrusted"));
+        }
+    }
+
+    // Revocation from a list: what it names is refused, what it does not is
+    // accepted, and without the list the revoked certificate's status is
+    // unknown and it goes through, as tls.hpp says it must on every backend.
+    {
+        tls::Config client = tls_client_config();
+        client.crl_pem = tls_fixtures::ca_crl();
+        tls::Config revoked = tls_server_config();
+        revoked.identity_p12 = tls_fixtures::revoked_p12();
+        TlsPair t = tls_pair(client, revoked);
+        CHECK(t.client && t.server);
+        if (t.client && t.server) {
+            tls_shake(t);
+            if (t.client->failure().kind != "certificate_revoked") {
+                std::printf("  revoked: got %s (%s)\n", t.client->failure().kind.c_str(),
+                            t.client->failure().message.c_str());
+            }
+            CHECK_EQ(t.client->failure().kind, std::string("certificate_revoked"));
+        }
+        TlsPair good = tls_pair(client, tls_server_config());
+        CHECK(good.client && good.server && tls_shake(good) && good.client_status == tls::Status::Ok);
+        TlsPair unlisted = tls_pair(tls_client_config(), revoked);
+        CHECK(unlisted.client && unlisted.server && tls_shake(unlisted) && unlisted.client_status == tls::Status::Ok);
+        tls::Failure why;
+        tls::Config bad = tls_client_config();
+        bad.crl_pem = "no lists here";
+        CHECK(!tls::make_engine(bad, &why));
+        CHECK_EQ(why.kind, std::string("tls_config"));
+    }
+
+    // Mutual TLS: the server sees who the client is.
+    {
+        tls::Config server = tls_server_config();
+        server.ca_pem = tls_fixtures::ca_pem();
+        server.verify = true;
+        tls::Config client = tls_client_config();
+        client.identity_p12 = tls_fixtures::client_p12();
+        client.identity_password = tls_fixtures::password;
+        TlsPair t = tls_pair(client, server);
+        CHECK(t.client && t.server);
+        if (t.client && t.server) {
+            CHECK(tls_shake(t));
+            CHECK(t.client_status == tls::Status::Ok);
+            CHECK(t.server_status == tls::Status::Ok);
+            CHECK_EQ(t.server->info().peer, std::string("CN=Dream Test Client"));
+            CHECK_EQ(tls_send(*t.client, *t.server, "it is me"), std::string("it is me"));
+        }
+    }
+
+    // What cannot be used is refused before any handshake.
+    {
+        tls::Failure why;
+        tls::Config c = tls_server_config();
+        c.identity_password = "wrong";
+        CHECK(!tls::make_engine(c, &why));
+        CHECK_EQ(why.kind, std::string("tls_config"));
+        tls::Config d = tls_client_config();
+        d.ca_pem = "no certificates here";
+        why = {};
+        CHECK(!tls::make_engine(d, &why));
+        CHECK_EQ(why.kind, std::string("tls_config"));
+    }
+
+    // The PEM reader the backends without one share.
+    {
+        std::vector<std::string> certs = tls::pem_certificates(tls_fixtures::ca_pem() + tls_fixtures::other_ca_pem());
+        CHECK_EQ(certs.size(), size_t(2));
+        CHECK(!certs.empty() && certs[0].size() > 100 && uint8_t(certs[0][0]) == 0x30);  // a DER SEQUENCE
+    }
+}
+
 int main() {
+    // Unbuffered, so that a test that crashes the process still leaves the
+    // name of the section it was in: under CI stdout is a pipe, and a pipe is
+    // block-buffered, so a crash used to take every line with it.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_arithmetic_boundaries();
     test_value_tagging();
     test_heap_alloc();
@@ -1369,6 +1616,7 @@ int main() {
     test_atom_interning();
     test_builtin_table_matches_compiler();
     test_maps();
+    test_tls_engines();
 
     std::printf("\n%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

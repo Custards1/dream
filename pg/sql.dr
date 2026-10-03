@@ -1,0 +1,812 @@
+// SQL, the Dream way: text and values kept apart from the moment they meet.
+//
+// The one rule of talking to a database safely is that a value is never
+// spliced into the text of a statement. PostgreSQL makes that easy -- a
+// statement says `$1`, and the value travels beside it -- and a client makes it
+// hard again the moment building a statement means counting dollars by hand.
+// So nothing here counts. A statement is a **fragment**: a list of pieces of
+// trusted SQL text and of values, and only `render` numbers the values, once,
+// when the whole statement is known. Fragments nest and concatenate freely,
+// and a value can never be mistaken for text, because it was never text.
+//
+//     let by_email email = expand sql.query "SELECT id, name FROM users WHERE email = {email}";
+//     // [:sql, ["SELECT id, name FROM users WHERE email = ", [:param, email]]]
+//
+// **`expand sql.query` is the way in.** It reads a string literal at compile
+// time, finds each `{name}` -- outside quotes, comments and dollar-quoted
+// bodies, so `'{1,2}'` stays an array literal -- and makes it a parameter,
+// resolved where the macro was written. It costs nothing at run time beyond
+// building the list. And because it runs while compiling, it also *checks*:
+// an unterminated string, a stray parenthesis, a second statement, a `$1`
+// written by hand, a first word that begins no SQL statement -- each is a
+// compile error at the `expand`, not a round trip to the server at three in
+// the morning. `{..where}` splices a fragment built elsewhere. A placeholder is
+// a name or a dotted path to a module member; anything more is a list:
+//
+//     expand sql.query ["SELECT * FROM t WHERE a = ", a + 1, " AND b = ", f x]
+//
+// where the string literals are SQL and everything else is a value.
+//
+// **A plain string is a statement with no parameters**, and that is checked
+// too, by a refinement. `db.query!` takes a `Query`, which is a fragment or a
+// `Statement`, and a `Statement` is `:string where` it passes the same lint --
+// so `db.query! conn "SELEC 1"` is rejected by the compiler in every program
+// that writes it, with nothing for the program to opt into. See "Compile-time
+// contracts" in docs/language-spec.md, which is the mechanism.
+//
+// **What the lint knows is the lexical shape of SQL**, not its grammar: that a
+// quote ends, that parentheses balance, that a statement starts with a word
+// that can start one. Whether a column exists is the server's to say. What it
+// catches is the class of mistake that is cheapest to make and most annoying
+// to find out about late.
+//
+// The builders below the macro -- `insert`, `update`, `select`, `where` and
+// friends -- write the statements that are always the same shape from data, so
+// a `mapping` record can go into a table as it is.
+
+import std.list;
+import std.map;
+import std.str;
+import pg.value;
+import std.num;
+
+// --- what a fragment is --------------------------------------------------------
+
+/// A piece of a statement: trusted SQL text, a value, or another fragment.
+type Part = :string | [:param, :any] | [:splice, :any];
+
+/// A statement, or a piece of one, with its values beside its text.
+type Fragment = [:sql, [Part]];
+
+/// A statement with no parameters, written as a string: one statement that
+/// passes `problem`.
+type Statement = :string where fn s -> problem s == ();
+
+/// Several statements, for the simple protocol (`db.script!`).
+type Script = :string where fn s -> script_problem s == ();
+
+/// What a query is given: a fragment, or a string that needs no values.
+type Query = Fragment | Statement;
+
+/// SQL text, trusted as it is: no placeholders, no checks. Everything else in
+/// this module is built from this and `param`, and it is the one function that
+/// can make a mistake with a value -- it is for text the program wrote.
+let raw : :string -> Fragment;
+let raw text = [:sql, [text]];
+
+/// One value, as a parameter.
+let param : :any -> Fragment;
+let param v = [:sql, [[:param, v]]];
+
+/// A query as a fragment, whichever it was given as.
+let of : Query -> Fragment;
+let of q = match type_of q {
+    :string => raw q,
+    _ => q,
+};
+
+/// The parts of a fragment.
+let parts : Fragment -> [Part];
+let parts f = f.[1];
+
+/// Several fragments, one after another.
+let concat : [Fragment] -> Fragment;
+let concat fragments = [:sql, list.map (fn f -> [:splice, f]) fragments];
+
+/// Several fragments with `separator` between each.
+let join : :string -> [Fragment] -> Fragment;
+let join separator fragments = match fragments {
+    [] => raw "",
+    [first, ..rest] =>
+        [:sql, list.cons [:splice, first]
+                         (list.flat_map (fn f -> [separator, [:splice, f]]) rest)],
+};
+
+/// Values as a list of parameters, `$1, $2, $3`, for `IN (..)` and `VALUES`.
+///
+/// An empty list renders as nothing, which makes `IN ()` -- a syntax error. A
+/// list that can be empty is better compared as an array: `= ANY({ids})`.
+let params : [:any] -> Fragment;
+let params vs = join ", " (list.map param vs);
+
+// --- rendering -------------------------------------------------------------------
+
+/// The statement's text with its parameters numbered, and the values in that
+/// order: `[text, values]`. A fragment spliced in that is not one raises
+/// `:type_error` here, which is the first moment it can be told.
+let render : Query -> [:string, [:any]];
+let render q = {
+    let flat = flatten (parts (of q)) [];
+    number flat 1 [] []
+};
+
+priv let flatten : [Part] -> [:any] -> [:any];
+priv let rec flatten ps !acc = match ps {
+    [] => acc,
+    [p, ..rest] => flatten rest (match p {
+        [:splice, f] => flatten (parts (spliced f)) acc,
+        other => list.cons other acc,
+    }),
+};
+
+/// A spliced value must be a fragment: a string in its place would be text
+/// arriving where a value was meant, which is the one thing this module is
+/// for preventing.
+priv let spliced : :any -> Fragment;
+priv let spliced f = type_assert (is_fragment f) "a fragment (build text with sql.raw)" f;
+
+let is_fragment : :any -> :bool;
+let is_fragment f = type_of f == :list && not (list.is_empty f) && f.[0] == :sql;
+
+/// `flat` is reversed, so this walks it back to front and conses each piece
+/// on, which leaves `text` and `values` in order without reversing either.
+/// The numbers are assigned from the end, which is why they start from the
+/// count of values and go down.
+priv let number : [:any] -> :integer -> [:string] -> [:any] -> [:string, [:any]];
+priv let number flat start text values = {
+    let count = list.count (fn p -> type_of p != :string) flat;
+    number_from flat (count + start - 1) text values
+};
+
+priv let number_from : [:any] -> :integer -> [:string] -> [:any] -> [:string, [:any]];
+priv let rec number_from flat !n text values = match flat {
+    [] => [str.concat_all text, values],
+    [p, ..rest] => match type_of p {
+        :string => number_from rest n (list.cons p text) values,
+        _ => number_from rest (n - 1) (list.cons ("$" + to_string n) text) (list.cons p.[1] values),
+    },
+};
+
+/// The text alone, with numbered placeholders: what the server will be sent.
+let text : Query -> :string;
+let text q = list.head (render q);
+
+/// The values alone, in placeholder order.
+let values : Query -> [:any];
+let values q = list.nth 1 (render q);
+
+/// A statement as a person reads one in a log: the text, and the values after
+/// it. Not SQL -- nothing here ever writes a value into SQL.
+let describe : Query -> :string;
+let describe q = {
+    let [t, vs] = render q;
+    if list.is_empty vs { t } else { t + "  -- " + to_string vs }
+};
+
+// --- names -----------------------------------------------------------------------
+
+/// A name as a quoted identifier: `"order"`, `"user ""quoted"""`. An atom is
+/// its name, so a map key goes in as the column it names.
+let ident : :any -> Fragment;
+let ident name = raw (quote_ident name);
+
+/// `"schema"."table"`, from its parts.
+let qualified : [:any] -> Fragment;
+let qualified names = raw (str.join_str "." (list.map quote_ident names));
+
+let quote_ident : :any -> :string;
+let quote_ident name = {
+    let text = if type_of name == :atom { value.atom_name name } else { to_string name };
+    "\"" + str.join_str "\"\"" (str.split "\"" text) + "\""
+};
+
+/// A table name as written: a string with a dot in it is a schema and a
+/// table, and is quoted part by part.
+priv let table_name : :any -> Fragment;
+priv let table_name t = match type_of t {
+    :list => if is_fragment t { t } else { qualified t },
+    :string => qualified (str.split "." t),
+    _ => ident t,
+};
+
+// --- conditions -------------------------------------------------------------------
+
+/// `"column" = $n`, or `"column" IS NULL` for `()`, since `= NULL` is never
+/// true.
+let eq : :any -> :any -> Fragment;
+let eq column v = match v {
+    () => concat [ident column, raw " IS NULL"],
+    _ => concat [ident column, raw " = ", param v],
+};
+
+/// Conditions joined by AND, each parenthesised. None is `TRUE`.
+let and : [Fragment] -> Fragment;
+let and conditions = match conditions {
+    [] => raw "TRUE",
+    [one] => one,
+    many => join " AND " (list.map parenthesised many),
+};
+
+/// Conditions joined by OR. None is `FALSE`.
+let or : [Fragment] -> Fragment;
+let or conditions = match conditions {
+    [] => raw "FALSE",
+    [one] => one,
+    many => join " OR " (list.map parenthesised many),
+};
+
+let negate : Fragment -> Fragment;
+let negate condition = concat [raw "NOT ", parenthesised condition];
+
+priv let parenthesised : Fragment -> Fragment;
+priv let parenthesised f = concat [raw "(", f, raw ")"];
+
+/// What a `where` can be given: a map of column to value, compared for
+/// equality; one fragment; or a list of fragments, all of which must hold.
+type Conditions = :map | Fragment | [Fragment];
+
+let condition : Conditions -> Fragment;
+let condition c = match type_of c {
+    :map => and (list.map (fn [k, v] -> eq k v) (map.pairs c)),
+    _ => if c.[0 else ()] == :sql { c } else { and c },
+};
+
+/// ` WHERE ..`, or nothing for no conditions at all.
+let where : Conditions -> Fragment;
+let where c =
+    if c == %{} || c == [] { raw "" } else { concat [raw " WHERE ", condition c] };
+
+// --- statements from data ----------------------------------------------------------
+//
+// A row is a map from column to value -- which is exactly what a `mapping`
+// record is, so `sql.insert "users" (User.new "ada@example.com")` is a whole
+// insert. Columns come from the map's keys, an atom by its name.
+
+/// `INSERT INTO table ("a", "b") VALUES ($1, $2)`.
+let insert : :any -> :map -> Fragment;
+let insert table row = insert_all table [row];
+
+/// One `INSERT` of many rows. The columns are the first row's.
+///
+/// **`()` is `DEFAULT` here**, and so is a column a row does not have: the
+/// column's default, which for a column without one is NULL. That is what
+/// lets a record go in as it is -- a `mapping` whose `id` defaults to `()`
+/// inserts with the `serial` filling it in, rather than with an explicit NULL
+/// the column refuses. An `update` is different: there `()` is NULL, because
+/// setting a column to nothing is what it says.
+let insert_all : :any -> [:map] -> Fragment;
+let insert_all table rows = {
+    let columns = map.keys (list.head rows);
+    concat [raw "INSERT INTO ", table_name table,
+            raw " (", join ", " (list.map ident columns), raw ") VALUES ",
+            join ", " (list.map (fn row -> concat [raw "(", join ", " (list.map (fn c -> inserted row.[c else ()]) columns), raw ")"])
+                                rows)]
+};
+
+priv let inserted : :any -> Fragment;
+priv let inserted v = match v {
+    () => raw "DEFAULT",
+    _ => param v,
+};
+
+/// `UPDATE table SET "a" = $1 .. WHERE ..`.
+let update : :any -> :map -> Conditions -> Fragment;
+let update table changes conditions =
+    concat [raw "UPDATE ", table_name table, raw " SET ",
+            join ", " (list.map (fn [k, v] -> concat [ident k, raw " = ", param v]) (map.pairs changes)),
+            where conditions];
+
+/// `DELETE FROM table WHERE ..`.
+let delete : :any -> Conditions -> Fragment;
+let delete table conditions = concat [raw "DELETE FROM ", table_name table, where conditions];
+
+/// `SELECT "a", "b" FROM table WHERE ..`; no columns is `*`.
+let select : :any -> [:any] -> Conditions -> Fragment;
+let select table columns conditions =
+    concat [raw "SELECT ", (if list.is_empty columns { raw "*" } else { join ", " (list.map ident columns) }),
+            raw " FROM ", table_name table, where conditions];
+
+/// ` RETURNING "a", "b"`, appended; no columns is `*`.
+let returning : [:any] -> Fragment -> Fragment;
+let returning columns statement =
+    concat [statement, raw " RETURNING ",
+            (if list.is_empty columns { raw "*" } else { join ", " (list.map ident columns) })];
+
+/// A statement written with `$1`, `$2` .. and the values they stand for, as a
+/// fragment -- so text from elsewhere composes with everything above. A `$n`
+/// past the end of `vs` is NULL.
+let text_with : :string -> [:any] -> Fragment;
+let text_with sql vs = [:sql, list.map (fn t -> match t {
+    [:positional, n] => [:param, vs.[n - 1 else ()]],
+    other => token_text other,
+}) (scan sql false)];
+
+// --- the lexer ---------------------------------------------------------------------
+//
+// Just enough of PostgreSQL's lexical structure to know where code is and
+// where it is not: string constants (with `E''` escapes and `''` doubling),
+// quoted identifiers, dollar-quoted bodies, line and nested block comments,
+// and the punctuation a lint asks about. A token is
+//
+//   [:code, text]          anything else, verbatim
+//   [:literal, text]       a quoted string, identifier, body or comment
+//   [:open] [:close] [:semicolon]
+//   [:positional, n]       `$n`
+//   [:placeholder, text]   `{text}`, when braces are asked for
+//   [:error, message]
+//
+// and joining every token's text gives back what was scanned, so a fragment
+// built from tokens says exactly what was written.
+
+priv let specials : :string;
+priv let specials = "'\"-/$();{}";
+
+/// `text` as tokens. `braces` says whether `{..}` is a placeholder (the macro's
+/// templates) or code.
+let scan : :string -> :bool -> [:any];
+let scan text braces = list.reverse (scan_from text braces 0 []);
+
+priv let scan_from : :string -> :bool -> :integer -> [:any] -> [:any];
+priv let rec scan_from text braces !at acc = {
+    let stop = str.upto specials at text;
+    let before = if stop > at { list.cons [:code, str.slice at (stop - at) text] acc } else { acc };
+    let next = str.byte (stop + 1) text;
+    match str.byte stop text {
+        -1 => before,
+        39 => {                                                               // '
+            let escapes = stop > 0 && is_e (str.byte (stop - 1) text)
+                          && not (stop > 1 && is_ident (str.byte (stop - 2) text));
+            let end = quote_end text (stop + 1) 39 escapes;
+            if end < 0 { list.cons [:error, "a string constant is never closed"] before }
+            else { scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before) }
+        },
+        34 => {                                                               // "
+            let end = quote_end text (stop + 1) 34 false;
+            if end < 0 { list.cons [:error, "a quoted identifier is never closed"] before }
+            else { scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before) }
+        },
+        45 if next == 45 => {                                                 // --
+            let end = str.upto "\n" stop text;
+            scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before)
+        },
+        47 if next == 42 => {                                                 // /*
+            let end = comment_end text (stop + 2) 1;
+            if end < 0 { list.cons [:error, "a /* comment is never closed"] before }
+            else { scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before) }
+        },
+        36 if is_digit next && not (stop > 0 && is_ident (str.byte (stop - 1) text)) => {   // $1
+            let end = str.span "0123456789" (stop + 1) text;
+            let n = match num.parse_int (str.slice (stop + 1) (end - stop - 1) text) { () => 0, k => k };
+            scan_from text braces end (list.cons [:positional, n] before)
+        },
+        36 if not (stop > 0 && is_ident (str.byte (stop - 1) text)) => match dollar_tag text stop {
+            () => scan_from text braces (stop + 1) (list.cons [:code, "$"] before),
+            tag => {
+                let close = str.find_from (stop + len tag) tag text;
+                if close < 0 { list.cons [:error, "a dollar-quoted " + tag + " body is never closed"] before }
+                else {
+                    let end = close + len tag;
+                    scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before)
+                }
+            },
+        },
+        40 => scan_from text braces (stop + 1) (list.cons [:open] before),     // (
+        41 => scan_from text braces (stop + 1) (list.cons [:close] before),    // )
+        59 => scan_from text braces (stop + 1) (list.cons [:semicolon] before), // ;
+        123 if braces => {                                                     // {
+            let close = str.find_from stop "}" text;
+            if close < 0 { list.cons [:error, "a `{` is never closed with `}`"] before }
+            else {
+                scan_from text braces (close + 1)
+                          (list.cons [:placeholder, str.trim (str.slice (stop + 1) (close - stop - 1) text)] before)
+            }
+        },
+        125 if braces => list.cons [:error, "a `}` with no `{` before it"] before,
+        b => scan_from text braces (stop + 1) (list.cons [:code, str.of_bytes [b]] before),
+    }
+};
+
+priv let is_digit : :integer -> :bool;
+priv let is_digit b = b >= 48 && b <= 57;
+
+priv let is_e : :integer -> :bool;
+priv let is_e b = b == 69 || b == 101;
+
+priv let is_ident_start : :integer -> :bool;
+priv let is_ident_start b = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128;
+
+priv let is_ident : :integer -> :bool;
+priv let is_ident b = is_ident_start b || is_digit b || b == 36;
+
+/// Past the closing quote of a string or identifier whose opening quote is
+/// just before `at`, or -1. A doubled quote is one quote; in an `E''` string a
+/// backslash escapes whatever follows it.
+priv let quote_end : :string -> :integer -> :integer -> :bool -> :integer;
+priv let rec quote_end text at q escapes = {
+    let stop = str.upto (if escapes { str.of_bytes [q, 92] } else { str.of_bytes [q] }) at text;
+    match str.byte stop text {
+        -1 => -1,
+        92 => quote_end text (stop + 2) q escapes,
+        _ if str.byte (stop + 1) text == q => quote_end text (stop + 2) q escapes,
+        _ => stop + 1,
+    }
+};
+
+/// Past the end of a block comment whose `/*` is before `at`. PostgreSQL's
+/// comments nest, so `depth` counts.
+priv let comment_end : :string -> :integer -> :integer -> :integer;
+priv let rec comment_end text at depth = {
+    let stop = str.upto "*/" at text;
+    let next = str.byte (stop + 1) text;
+    match str.byte stop text {
+        -1 => -1,
+        42 if next == 47 => if depth == 1 { stop + 2 } else { comment_end text (stop + 2) (depth - 1) },
+        47 if next == 42 => comment_end text (stop + 2) (depth + 1),
+        _ => comment_end text (stop + 1) depth,
+    }
+};
+
+/// The `$tag$` opening a dollar-quoted body at `at`, or `()` when the `$` there
+/// opens nothing.
+priv let dollar_tag : :string -> :integer -> :any;
+priv let dollar_tag text at = {
+    let first = str.byte (at + 1) text;
+    if first == 36 { "$$" }
+    else if not (is_ident_start first) { () }
+    else {
+        let end = tag_end text (at + 2);
+        if str.byte end text == 36 { str.slice at (end - at + 1) text } else { () }
+    }
+};
+
+priv let tag_end : :string -> :integer -> :integer;
+priv let rec tag_end text !at = {
+    let b = str.byte at text;
+    if is_ident_start b || is_digit b { tag_end text (at + 1) } else { at }
+};
+
+/// A token's text, as it was written.
+let token_text : :any -> :string;
+let token_text t = match t {
+    [:code, s] => s,
+    [:literal, s] => s,
+    [:open] => "(",
+    [:close] => ")",
+    [:semicolon] => ";",
+    [:positional, n] => "$" + to_string n,
+    [:placeholder, s] => "{" + s + "}",
+    _ => "",
+};
+
+// --- the lint ---------------------------------------------------------------------
+
+/// The words a statement can begin with.
+priv let commands : %{:string => :bool};
+priv let commands = map.set_of [
+    "ABORT", "ALTER", "ANALYZE", "ANALYSE", "BEGIN", "CALL", "CHECKPOINT", "CLOSE", "CLUSTER",
+    "COMMENT", "COMMIT", "COPY", "CREATE", "DEALLOCATE", "DECLARE", "DELETE", "DISCARD", "DO",
+    "DROP", "END", "EXECUTE", "EXPLAIN", "FETCH", "GRANT", "IMPORT", "INSERT", "LISTEN", "LOAD",
+    "LOCK", "MERGE", "MOVE", "NOTIFY", "PREPARE", "REASSIGN", "REFRESH", "REINDEX", "RELEASE",
+    "RESET", "REVOKE", "ROLLBACK", "SAVEPOINT", "SECURITY", "SELECT", "SET", "SHOW", "START",
+    "TABLE", "TRUNCATE", "UNLISTEN", "UPDATE", "VACUUM", "VALUES", "WITH",
+];
+
+/// What is wrong with `tokens` as SQL, or `()`.
+///
+/// `several` allows more than one statement; `positional` allows `$n`, which a
+/// fragment from `text_with` has and a template must not. A placeholder or a
+/// splice is a value wherever it appears, and only a splice can hide text --
+/// so where there is one, the parentheses and the first word are not judged,
+/// since the fragment it stands for may hold either.
+let lint : [:any] -> :bool -> :bool -> :any;
+let lint tokens several positional = lint_as true tokens several positional;
+
+/// The same, for a piece of a statement when `whole` is false: only what is
+/// wrong whatever the piece is joined to -- a quote or comment left open, a
+/// stray `$n` -- since a piece may well begin mid-clause or open a parenthesis
+/// that the statement around it closes.
+let lint_as : :bool -> [:any] -> :bool -> :bool -> :any;
+let lint_as whole tokens several positional = {
+    let errors = list.filter (fn t -> t.[0] == :error) tokens;
+    let splices = list.any (fn t -> t.[0] == :placeholder && str.starts_with ".." t.[1]) tokens;
+    let positionals = list.filter (fn t -> t.[0] == :positional) tokens;
+    let code = list.filter (fn t -> not (t.[0] == :code && str.trim t.[1] == "") && not (is_comment t)) tokens;
+    match [errors, code] {
+        [[[:error, message], .._], _] => message,
+        [_, []] if whole => "the statement is empty",
+        _ if not positional && not (list.is_empty positionals) =>
+            "`$" + to_string (list.head positionals).[1] + "` is a numbered parameter, but there are no values to number;"
+            + " write `{name}` in `sql.query`, or build the statement with `sql.text_with`",
+        _ if splices || not whole => (),
+        _ => match balance code 0 {
+            () => statements code several,
+            message => message,
+        },
+    }
+};
+
+priv let is_comment : :any -> :bool;
+priv let is_comment t = match t {
+    [:literal, s] => str.starts_with "--" s || str.starts_with "/*" s,
+    _ => false,
+};
+
+/// Whether the parentheses close, in order.
+priv let balance : [:any] -> :integer -> :any;
+priv let rec balance tokens !depth = match tokens {
+    [] => if depth == 0 { () } else { "a `(` is never closed" },
+    [[:open], ..rest] => balance rest (depth + 1),
+    [[:close], ..rest] => if depth == 0 { "a `)` closes nothing" } else { balance rest (depth - 1) },
+    [_, ..rest] => balance rest depth,
+};
+
+/// The statements between the semicolons: each must begin with a command, and
+/// unless `several` there must be only one, though it may end with `;`.
+priv let statements : [:any] -> :bool -> :any;
+priv let statements code several = {
+    let pieces = list.filter (fn p -> not (list.is_empty p)) (split_statements code [] []);
+    match pieces {
+        [] => "the statement is empty",
+        [_, _, .._] if not several =>
+            "this is " + to_string (len pieces) + " statements, and a query is one;"
+            + " several in one string go through `db.script!`",
+        _ => match list.filter (fn p -> p != ()) (list.map first_word_problem pieces) {
+            [] => (),
+            [message, .._] => message,
+        },
+    }
+};
+
+priv let split_statements : [:any] -> [:any] -> [[:any]] -> [[:any]];
+priv let rec split_statements tokens current acc = match tokens {
+    [] => list.reverse (list.cons (list.reverse current) acc),
+    [[:semicolon], ..rest] => split_statements rest [] (list.cons (list.reverse current) acc),
+    [t, ..rest] => split_statements rest (list.cons t current) acc,
+};
+
+priv let first_word_problem : [:any] -> :any;
+priv let first_word_problem statement = match statement {
+    [[:open], .._] => (),
+    [[:code, text], .._] => {
+        let trimmed = str.trim_start text;
+        let word = str.upper (str.slice 0 (str.upto " \t\r\n,*" 0 trimmed) trimmed);
+        if map.has commands word { () }
+        else { "`" + str.slice 0 (str.upto " \t\r\n" 0 trimmed) trimmed + "` does not begin an SQL statement" }
+    },
+    [[:placeholder, _], .._] => "a statement cannot begin with a value",
+    _ => "a statement must begin with a command such as SELECT",
+};
+
+/// What is wrong with `text` as one statement with no parameters, or `()`.
+let problem : :string -> :any;
+let problem text = lint (scan text false) false false;
+
+/// What is wrong with `text` as a script of statements, or `()`.
+let script_problem : :string -> :any;
+let script_problem text = lint (scan text false) true false;
+
+// --- the macro -----------------------------------------------------------------------
+
+priv type Syntax = :any;
+
+priv let span : [:integer, :integer];
+priv let span = [0, 0];
+
+priv let str_s : :string -> Syntax;
+priv let str_s s = [:str, s, span];
+
+priv let list_s : [Syntax] -> Syntax;
+priv let list_s items = [:list, items, span];
+
+priv let atom_s : :string -> Syntax;
+priv let atom_s name = [:atom, name, span];
+
+priv let tagged : :string -> Syntax -> Syntax;
+priv let tagged tag e = list_s [atom_s tag, e];
+
+priv let invalid : :string -> [:error, :string];
+priv let invalid message = [:error, "sql.query: " + message];
+
+/// `expand sql.query "SELECT .. {name} .."`, or a list of SQL strings and
+/// values: a fragment whose placeholders are the values the names hold where
+/// the macro was written. Checked as SQL while compiling; see the top of this
+/// file.
+macro query template = match template {
+    [:str, text, _] => from_template text,
+    [:list, items, _] => from_items items,
+    _ => invalid "expects a string literal, or a list of SQL string literals and values",
+};
+
+/// A piece of a statement, for splicing into one with `{..name}`: the same
+/// placeholders, checked only for what is wrong wherever the piece goes.
+///
+///     let recent = expand sql.fragment "created_at > now() - {age}::interval";
+///     expand sql.query "SELECT * FROM events WHERE {..recent} ORDER BY id"
+macro fragment template = match template {
+    [:str, text, _] => {
+        let tokens = scan text true;
+        match lint_as false tokens false false {
+            () => assemble (list.map template_part tokens),
+            message => invalid message,
+        }
+    },
+    _ => invalid "sql.fragment expects a string literal",
+};
+
+/// The same, for a script of several statements: `{..}` placeholders, the
+/// simple protocol's freedom with semicolons, and no values -- the simple
+/// protocol has nowhere to put them -- so it is for splicing fragments and
+/// for checking a migration at compile time.
+macro script template = match template {
+    [:str, text, _] => match lint (scan text false) true false {
+        () => str_s text,
+        message => invalid message,
+    },
+    _ => invalid "sql.script expects a string literal",
+};
+
+priv let from_template : :string -> Syntax;
+priv let from_template text = {
+    let tokens = scan text true;
+    match lint tokens false false {
+        () => assemble (list.map template_part tokens),
+        message => invalid message,
+    }
+};
+
+/// A token as the syntax of a part: text, a parameter, a splice, or the
+/// complaint a placeholder that names nothing deserves.
+priv let template_part : :any -> :any;
+priv let template_part t = match t {
+    [:placeholder, inner] if str.starts_with ".." inner => match path (str.trim (str.slice 2 (len inner - 2) inner)) {
+        () => [:error, "`{" + inner + "}` must splice a name, like `{..where}`"],
+        e => [:splice_s, e],
+    },
+    [:placeholder, inner] => match path inner {
+        () => [:error, "`{" + inner + "}` must name a value, like `{id}` or `{config.limit}`;"
+                       + " for anything else, give sql.query a list"],
+        e => [:param_s, e],
+    },
+    other => token_text other,
+};
+
+/// A placeholder's name as syntax: `x`, or `m.x.y` for a module member.
+priv let path : :string -> :any;
+priv let path text = {
+    let segments = str.split "." text;
+    if text == "" || not (list.all is_name segments) { () }
+    else {
+        list.fold (fn e seg -> [:field, e, seg, span])
+                  [:name, list.head segments, span] (list.tail segments)
+    }
+};
+
+priv let is_name : :string -> :bool;
+priv let is_name s =
+    len s > 0 && is_ident_start (str.byte 0 s) && str.span name_bytes 0 s == len s;
+
+priv let name_bytes : :string;
+priv let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_!";
+
+/// The syntax of `[:sql, [parts]]` from the parts, with adjacent text merged.
+priv let assemble : [:any] -> Syntax;
+priv let assemble pieces = match list.filter (fn p -> type_of p == :list && p.[0] == :error) pieces {
+    [[:error, message], .._] => invalid message,
+    _ => tagged "sql" (list_s (list.map part_syntax (merge_text pieces [] ""))),
+};
+
+priv let merge_text : [:any] -> [:any] -> :string -> [:any];
+priv let rec merge_text pieces acc pending = match pieces {
+    [] => list.reverse (if pending == "" { acc } else { list.cons pending acc }),
+    [p, ..rest] => match type_of p {
+        :string => merge_text rest acc (pending + p),
+        _ => merge_text rest (list.cons p (if pending == "" { acc } else { list.cons pending acc })) "",
+    },
+};
+
+priv let part_syntax : :any -> Syntax;
+priv let part_syntax p = match p {
+    [:param_s, e] => tagged "param" e,
+    [:splice_s, e] => tagged "splice" e,
+    text => str_s text,
+};
+
+/// The list form: string literals are SQL, scanned for placeholders too, and
+/// any other expression is a value. The literals are linted together, with a
+/// placeholder standing in for each value.
+priv let from_items : [Syntax] -> Syntax;
+priv let from_items items = {
+    let tokens = list.flat_map (fn item -> match item {
+        [:str, text, _] => scan text true,
+        e => [[:value, e]],
+    }) items;
+    let as_lint = list.map (fn t -> match t { [:value, _] => [:placeholder, "value"], other => other }) tokens;
+    match lint as_lint false false {
+        () => assemble (list.map (fn t -> match t {
+            [:value, e] => [:param_s, e],
+            other => template_part other,
+        }) tokens),
+        message => invalid message,
+    }
+};
+
+when test {
+    import std.test;
+
+    let kinds : [:any] -> [:atom];
+    let kinds ts = list.map (fn t -> t.[0]) ts;
+
+    let tests = [
+        test.case "a fragment renders its values as numbered parameters"
+            $( test.eq! ["SELECT * FROM t WHERE a = $1 AND b = $2", [1, "x"]]
+                        (render [:sql, ["SELECT * FROM t WHERE a = ", [:param, 1], " AND b = ", [:param, "x"]]]) ),
+        test.case "fragments nest, and are numbered across the nesting"
+            $( test.eq! ["SELECT $1, ($2), $3", [1, 2, 3]]
+                        (render (concat [raw "SELECT ", param 1, raw ", (", param 2, raw "), ", param 3])) ),
+        test.case "a plain string is a statement with no values"
+            $( test.eq! ["SELECT 1", []] (render "SELECT 1") ),
+        test.case "splicing text where a fragment belongs is refused"
+            $( test.raises! $( render [:sql, ["SELECT ", [:splice, "1; DROP TABLE t"]]] ) ),
+        test.case "identifiers are quoted, quotes doubled"
+            $( test.eq! ["\"order\"", "\"a\"\"b\"", "\"public\".\"users\""]
+                        [text (ident :order), text (ident "a\"b"), text (qualified ["public", "users"])] ),
+        test.case "equality, and NULL"
+            $( test.eq! [["\"id\" = $1", [5]], ["\"gone\" IS NULL", []]]
+                        [render (eq :id 5), render (eq :gone ())] ),
+        test.case "conditions from a map, a fragment or a list"
+            $( test.eq! ["", " WHERE \"a\" = $1", " WHERE (x > $1) AND (y < $2)", " WHERE TRUE"]
+                        [text (where %{}), text (where %{ :a => 1 }),
+                         text (where [concat [raw "x > ", param 1], concat [raw "y < ", param 2]]),
+                         text (where (and []))] ),
+        test.case "an insert from a map"
+            $( test.eq! ["INSERT INTO \"app\".\"users\" (\"name\") VALUES ($1)", ["ada"]]
+                        (render (insert "app.users" %{ :name => "ada" })) ),
+        test.case "many rows in one insert, DEFAULT for what a row lacks"
+            $( test.eq! ["INSERT INTO \"t\" (\"a\") VALUES ($1), (DEFAULT)", [1]]
+                        (render (insert_all "t" [%{ :a => 1 }, %{ :b => 2 }])) ),
+        test.case "in an insert, nothing is DEFAULT"
+            $( test.eq! ["INSERT INTO \"t\" (\"id\") VALUES (DEFAULT)", []]
+                        (render (insert "t" %{ :id => () })) ),
+        test.case "update, delete, select, returning"
+            $( test.eq! ["UPDATE \"t\" SET \"a\" = $1 WHERE \"id\" = $2",
+                         "DELETE FROM \"t\" WHERE \"id\" = $1",
+                         "SELECT \"a\", \"b\" FROM \"t\"",
+                         "SELECT * FROM \"t\" WHERE \"id\" = $1 RETURNING *"]
+                        [text (update "t" %{ :a => 1 } %{ :id => 2 }), text (delete "t" %{ :id => 2 }),
+                         text (select "t" [:a, :b] %{}), text (returning [] (select "t" [] %{ :id => 1 }))] ),
+        test.case "values as a list of parameters"
+            $( test.eq! ["IN ($1, $2, $3)", [1, 2, 3]] (render (concat [raw "IN (", params [1, 2, 3], raw ")"])) ),
+        test.case "numbered text becomes a fragment, and renumbers when it composes"
+            $( test.eq! ["SELECT $1 WHERE x = $2 AND y = $3", [0, "a", ()]]
+                        (render (concat [raw "SELECT ", param 0, text_with " WHERE x = $1 AND y = $2" ["a"]])) ),
+        test.case "the lexer knows quotes, comments and dollar bodies"
+            $( test.eq! [:code, :literal, :code, :literal, :code, :literal, :code, :positional]
+                        (kinds (scan "a '{x}' b /* c /* d */ e */ f $q$ $1 ) $q$ g $1" false)) ),
+        test.case "E strings escape, plain strings double"
+            $( test.eq! [[[:code, "E"], [:literal, "'it\\'s'"], [:code, " x"]], [[:literal, "'it''s'"]]]
+                        [scan "E'it\\'s' x" false, scan "'it''s'" false] ),
+        test.case "a $ inside a name is part of it"
+            $( test.eq! [[:code, :code, :code], "a$1"]
+                        [kinds (scan "a$1" false), str.concat_all (list.map token_text (scan "a$1" false))] ),
+        test.case "what the lint accepts"
+            $( test.eq! [(), (), (), (), ()]
+                        [problem "SELECT 1", problem "  select (1);  ", problem "WITH x AS (SELECT 1) SELECT * FROM x",
+                         problem "-- why\nINSERT INTO t VALUES ('a;b', $$ ; $$)",
+                         script_problem "CREATE TABLE t (a int); INSERT INTO t VALUES (1);"] ),
+        test.case "what the lint refuses"
+            $( test.eq! ["a string constant is never closed", "a `(` is never closed",
+                         "a `)` closes nothing", "`SELEC` does not begin an SQL statement",
+                         "the statement is empty"]
+                        [problem "SELECT 'oops", problem "SELECT (1", problem "SELECT 1)",
+                         problem "SELEC 1", problem " -- nothing\n"] ),
+        test.case "one statement, and no numbered parameters without values"
+            $( test.true! (problem "SELECT 1; SELECT 2" != () && problem "SELECT $1" != ()) ),
+        test.case "a template's placeholders become its parameters"
+            $( test.eq! ["SELECT * FROM t WHERE a = $1 AND b @> '{1,2}'", [7]]
+                        (render [:sql, list.map (fn p -> match p {
+                            [:param_s, [:name, "a", _]] => [:param, 7],
+                            other => other,
+                        }) (list.map template_part (scan "SELECT * FROM t WHERE a = {a} AND b @> '{1,2}'" true))]) ),
+        test.case "a piece of a statement is checked only for what is wrong anywhere"
+            $( test.eq! [(), (), "a string constant is never closed", (), "the statement is empty"]
+                        [lint_as false (scan "n % 2 = 0 AND (" true) false false,
+                         lint_as false (scan "" true) false false,
+                         lint_as false (scan "name = 'x" true) false false,
+                         lint (scan "SELECT * FROM t WHERE {..w}" true) false false,
+                         lint (scan "" true) false false] ),
+        test.case "a placeholder that names nothing is a complaint"
+            $( test.eq! [:error, :error, :param_s, :splice_s]
+                        (list.map (fn p -> p.[0]) (list.map template_part
+                            [[:placeholder, "a + 1"], [:placeholder, ""], [:placeholder, "m.x"], [:placeholder, "..w"]])) ),
+    ];
+}

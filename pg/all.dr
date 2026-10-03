@@ -1,0 +1,12 @@
+// Every module in the library, so that `--test` collects each one's tests and
+// a module that no longer compiles fails the build rather than being skipped.
+
+import pg.bytes;
+import pg.config;
+import pg.crypto;
+import pg.db;
+import pg.errors;
+import pg.pool;
+import pg.sql;
+import pg.value;
+import pg.wire;
