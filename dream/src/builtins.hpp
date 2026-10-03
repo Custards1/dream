@@ -64,7 +64,6 @@ void map_collect(Value node, std::vector<std::pair<Value, Value>>& out);
 bool map_lookup(Process& p, Value map, Value key, Value* out);
 
 /// Modules this runtime provides to `import`.
-ModuleDef make_console_module();
 ModuleDef make_math_module();
 ModuleDef make_vm_module();
 ModuleDef make_ffi_module();

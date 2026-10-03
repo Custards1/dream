@@ -1344,7 +1344,7 @@ let rec arm_guard_and_body c pat ts = {
 // --- patterns ---------------------------------------------------------------
 
 let rec parse_pattern c ts =
-    match parse_pattern_atom c ts {
+    match parse_cons_pattern c ts {
         [:error, m, s] => err m s,
         [:ok, p, rest] =>
             // `p as name` binds the whole value as well as its parts.
@@ -1357,6 +1357,23 @@ let rec parse_pattern c ts =
                     ok (ast.as_p p (peek_value after) (peek_span after)
                                  (ast.span_to (ast.span p) (peek_span after)))
                        (list.tail after)
+                }
+            },
+    };
+
+/// `::` associates right and binds tighter than `as`. Parentheses allow an
+/// alias or another pattern on either side without forcing the list's tail.
+let rec parse_cons_pattern c ts =
+    match parse_pattern_atom c ts {
+        [:error, m, s] => err m s,
+        [:ok, head, rest] =>
+            if not (at rest :colon_colon) { ok head rest }
+            else {
+                let operator_span = peek_span rest;
+                match parse_cons_pattern c (list.tail rest) {
+                    [:error, m, s] => err m s,
+                    [:ok, tail, after] => ok (ast.cons_p head tail operator_span
+                        (ast.span_to (ast.span head) (ast.span tail))) after,
                 }
             },
     };
@@ -2692,6 +2709,19 @@ when test {
         test.case "a list pattern with a rest"
             $( test.eq! "(match (name v) [[x ..rest] (name x)])"
                         (shape "match v { [x, ..rest] => x }") ),
+        test.case "macro syntax validates both sides and the operator span of cons"
+            $( test.eq! [true, false]
+                [syntax.pattern (ast.cons_p (ast.bind_p "h" [0, 1]) (ast.wildcard_p [5, 6]) [2, 4] [0, 6]),
+                 syntax.pattern [:cons_p, [:bind, "h", [0, 1]], [:wildcard, [5, 6]], (), [0, 6]]] ),
+        test.case "cons patterns associate to the right"
+            $( test.eq! "(match (name v) [(a :: (b :: rest)) (name rest)])"
+                        (shape "match v { a :: b :: rest => rest }") ),
+        test.case "an alias outside cons binds the whole list"
+            $( test.eq! "(match (name v) [((h :: t) as all) (name all)])"
+                        (shape "match v { h :: t as all => all }") ),
+        test.case "parentheses allow an alias of the tail"
+            $( test.eq! "(match (name v) [(h :: (t as rest)) (name rest)])"
+                        (shape "match v { h :: (t as rest) => rest }") ),
         test.case "an unnamed rest"
             $( test.eq! "(match (name v) [[x ..] (name x)])" (shape "match v { [x, ..] => x }") ),
         test.case "an empty list pattern"

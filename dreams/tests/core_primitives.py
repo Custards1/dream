@@ -53,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix='dream-primitives-') as directory:
         f'let probe_{name} ' + ' '.join('xyz'[:arity]) + f' = {spelled(name)} ' + ' '.join('xyz'[:arity]) + ';'
         for name, arity in primitives) + '\nlet main! = console.print! 0;\n')
     image = temp / 'matrix.dream'
-    run(vm, compiler, str(src), '-o', str(image))
+    run(vm, compiler, '-L', str(root / 'mind'), str(src), '-o', str(image))
     data = image.read_bytes()
     offset, length = section(data, b'NODE')
     nodes = list(struct.iter_unpack('<BBHIII', data[offset:offset + length]))

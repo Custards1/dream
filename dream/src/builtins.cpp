@@ -859,35 +859,10 @@ NativeResult bi_match_key(Process& p, Value, Value* args, uint32_t) {
 // External linkage, because `builtin_def` is inline in the header now -- see
 // the note there. The entries stay next to the functions they name.
 // ---------------------------------------------------------------------------
-// std.console
+// std.math
 // ---------------------------------------------------------------------------
 
 namespace {
-
-NativeResult write_values(Process& p, Value* args, uint32_t argc, bool newline, std::FILE* out) {
-    std::string text;
-    for (uint32_t i = 0; i < argc; ++i) {
-        if (!stringify(p, args[i], &text)) return NativeResult::raise(p.result);
-    }
-    if (newline) text.push_back('\n');
-    // One write, so interleaved output from concurrent processes stays legible.
-    std::fwrite(text.data(), 1, text.size(), out);
-    std::fflush(out);
-    return NativeResult::ok(UNIT);
-}
-
-NativeResult con_print(Process& p, Value, Value* args, uint32_t argc) {
-    return write_values(p, args, argc, true, stdout);
-}
-NativeResult con_write(Process& p, Value, Value* args, uint32_t argc) {
-    return write_values(p, args, argc, false, stdout);
-}
-NativeResult con_line(Process& p, Value, Value* args, uint32_t argc) {
-    return write_values(p, args, argc, true, stdout);
-}
-NativeResult con_error(Process& p, Value, Value* args, uint32_t argc) {
-    return write_values(p, args, argc, true, stderr);
-}
 
 NativeResult math_sqrt(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
@@ -1298,35 +1273,6 @@ ModuleDef make_vm_module() {
                          {"allocated!", 1, 0b1, vm_allocated},
                          {"peak_bytes!", 1, 0b1, vm_peak_bytes},
                          {"stats!", 1, 0b1, vm_stats},
-                     }};
-}
-
-ModuleDef make_console_module() {
-    // One argument each. `print!`, `line!` and `error!` add a newline;
-    // `write!` does not.
-    //
-    // These used to be variadic, printing every argument in turn. It read
-    // well -- `print! "x = " x " y = " y` -- but a variadic function can never
-    // be passed too many arguments, so nothing was ever an error and a stray
-    // value on the end of a line was silently printed instead of being the
-    // thing the line evaluated to:
-    //
-    //     if n < 0 { 1 } else { console.print! total 0 }   // prints "...0"
-    //
-    // That block means to answer `0`. Variadic makes it print `0` and answer
-    // unit, and no arity check can ever catch it. With one argument the same
-    // line is `(print! total) 0`, which raises `:not_a_function` -- loudly,
-    // where the mistake is.
-    //
-    // Several values are joined by the caller, which is what `+` is for.
-    // `to_string` is the identity on a string, so it is always safe to reach
-    // for: `print! ("x = " + to_string x)`.
-    return ModuleDef{"std.console",
-                     {
-                         {"print!", 1, 0b1, con_print},
-                         {"write!", 1, 0b1, con_write},
-                         {"line!", 1, 0b1, con_line},
-                         {"error!", 1, 0b1, con_error},
                      }};
 }
 

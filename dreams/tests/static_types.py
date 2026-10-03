@@ -329,15 +329,17 @@ let main! = {
 };
 ''', ':type_error\n:not_a_function\n:type_error\n')
 
-    # `--no-types` skips checking and signature hints. Executable sections
-    # stay identical; the typed image additionally records integer parameters.
-    typed = prelude + '''
-let add : :integer -> :integer -> :integer;
+    # A signature changes no node. Against the same program without it, every
+    # section is identical but the hints: the typed image records that `add`
+    # takes integers. The signature is written last, so leaving it out moves
+    # no span.
+    untyped = prelude + '''
 let add x y = x + y;
 let main! = console.print! (add 1 2);
 '''
+    typed = untyped + 'let add : :integer -> :integer -> :integer;\n'
     assert compile_source(typed, out='a.dream').returncode == 0
-    assert compile_source(typed, '--no-types', out='b.dream').returncode == 0
+    assert compile_source(untyped, out='b.dream').returncode == 0
     def sections(path):
         data = path.read_bytes()
         count, = struct.unpack_from('<I', data, 28)
@@ -359,11 +361,12 @@ let main! = console.print! (add 1 2);
         return with_types[b'SBLB'][1][offset:offset + length]
 
     assert any(function_name(fi) == b'add' and mask == 3 for fi, _, mask in records)
-    assert b'ITYP' not in without_types
+    # `std.console` is Dream, so the untyped program has hints of its own --
+    # for `std`'s signatures -- and the typed one has those and `add`'s.
+    entries, plain_hints = without_types.pop(b'ITYP', (0, b''))
+    assert set(struct.iter_unpack('<IIQ', plain_hints)) < set(records)
     assert with_types == without_types
-    broken = prelude + 'let n : :string = 5; let main! = console.print! n;'
-    assert compile_source(broken, '--no-types').returncode == 0
-    count += 2
+    count += 1
 
     # --- records with typed fields -----------------------------------------------
     failure(prelude + '''

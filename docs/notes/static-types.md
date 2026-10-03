@@ -95,10 +95,11 @@ field apart with a nested pattern, counts as handling. A false report here
 teaches people to write `_ =>` everywhere, which is worse than no check.
 
 **Bootstrap order.** The seed must parse a signature before `std` may contain
-one, because the compiler imports `std`. Changing the checker so that it
-accepts something the seed's checker rejects needs one build with `--no-types`
-first: build the new compiler with the seed and `--no-types`, let *that*
-compile the source twice, compare, and copy it over the seed.
+one, because the compiler imports `std`. There is no way to switch the
+checker off (`--no-types` was removed on 2026-10-03), so the compiler's own
+source must also satisfy the seed's checker: a change that makes the checker
+accept something the seed rejects lands in two steps -- the checker first,
+reseeded, and only then the source that relies on it.
 
 ## Compile-time contracts: a refinement run against a value the compiler has
 

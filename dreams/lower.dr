@@ -1013,6 +1013,16 @@ let rec pattern_test p subject binds l =
             let cmp = eq_const subject (list.nth 1 k) (list.head k);
             [list.head cmp, list.nth 1 cmp, binds]
         },
+        [:cons_p, head, tail, _, _] => {
+            let cell = call_builtin "_match_is_cons" [subject] l;
+            let h = call_builtin "_match_head" [subject] (list.head cell);
+            let first = pattern_test head (list.nth 1 h) binds (list.head h);
+            let first_test = bool_and (list.nth 1 cell) (list.nth 1 first) (list.head first);
+            let t = call_builtin "_match_tail" [subject] (list.head first_test);
+            let rest = pattern_test tail (list.nth 1 t) (list.nth 2 first) (list.head t);
+            let both = bool_and (list.nth 1 first_test) (list.nth 1 rest) (list.head rest);
+            [list.head both, list.nth 1 both, list.nth 2 rest]
+        },
         [:list_p, items, rest, _]     => list_test items rest subject binds l,
         [:array_p, items, rest, span] => array_test items rest subject binds span l,
         [:map_p, pairs, span] => map_test pairs subject binds span l,
@@ -1171,6 +1181,16 @@ let rec extract p subject want binds l =
         [:as_p, inner, _, name_span, _] =>
             extract inner subject want
                     (if want name_span { list.append binds [[name_span, subject]] } else { binds }) l,
+        [:cons_p, head, tail, _, _] => {
+            let first = if wants want head {
+                let h = call_builtin "_match_head" [subject] l;
+                extract head (list.nth 1 h) want binds (list.head h)
+            } else { [l, binds] };
+            if wants want tail {
+                let t = call_builtin "_match_tail" [subject] (list.head first);
+                extract tail (list.nth 1 t) want (list.nth 1 first) (list.head t)
+            } else { first }
+        },
         [:list_p, items, rest, _] => extract_list items rest subject want binds l,
         [:array_p, items, _, _] =>
             list.fold (fn acc pair ->

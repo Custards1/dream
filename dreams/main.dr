@@ -88,8 +88,7 @@ let tokenize! file src = {
                 },
         };
     let n = put! (lexer.tokens src) 0;
-    // The `0` needs its own statement: `console.print!` is variadic, so on the
-    // same line it would be one more thing to print rather than the answer.
+    // The exit status is a separate statement after printing the count.
     if n < 0 { 1 }
     else {
         console.print! ((to_string n) + " tokens")
@@ -131,7 +130,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
-    compile.Options.make (opt o :no_types != true) (opt o :no_opt != true) [] true [] (opt o :units);
+    compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units);
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
@@ -506,7 +505,7 @@ let show_time! o file = {
     let lower_ms = os.monotonic! () - before_lower;
     strict! lower_ms
     let linked = [low, lower_ms, 0];
-    let checked = timed! (if opt o :no_types == true || diag.error_count (scope.r_diags r) > 0 { [] }
+    let checked = timed! (if diag.error_count (scope.r_diags r) > 0 { [] }
                           else { typecheck.Analysis.diags (compile.analyze_parallel! l r (lower.comp_values low) (compile.Options.units co)) });
     let built = timed! (if parted { () } else { lower.image low });
     let shared = timed! (if parted {
@@ -842,7 +841,6 @@ let rec parse_args args o =
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
         ["--units"] => with_opt :error "--units needs a directory" o,
         ["--units", dir, ..rest] => parse_args rest (with_opt :units dir o),
-        ["--no-types", ..rest] => parse_args rest (with_opt :no_types true o),
         ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
         ["--debug-cfg", ..rest] => parse_args rest (append_opt :defines "debug" o),
         ["-q", ..rest] => parse_args rest (with_opt :quiet true o),
@@ -903,7 +901,6 @@ let usage! () = {
         "  --no-opt                 emit the arena as lowered, unshared",
         "  --units DIR              keep each module's walk and lowering in DIR, and",
         "                           read them back while nothing they depend on moved",
-        "  --no-types               do not hold the program to its signatures",
         "  --debug-cfg              define `debug`",
         "  -q, --quiet              print only what was asked for",
     ] |> strict!

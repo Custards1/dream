@@ -50,7 +50,6 @@ Runtime::Runtime(bool owns_host_services)
         wk_->types[i] = intern_atom(kTypeNames[i]);
     }
 
-    register_module(make_console_module());
     register_module(make_math_module());
     register_module(make_tensor_module());
     register_module(make_vm_module());

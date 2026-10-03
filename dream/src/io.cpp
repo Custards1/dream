@@ -937,6 +937,18 @@ NativeResult io_kind(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_atom(p.runtime().intern_atom(name)));
 }
 
+NativeResult io_is_terminal(Process& p, Value, Value* args, uint32_t) {
+    Held h;
+    if (!h.open(args[0])) return fail(p, "io_closed", "this handle is closed");
+    return NativeResult::ok(make_bool(sys::is_terminal(h.fd())));
+}
+
+NativeResult io_enable_ansi(Process& p, Value, Value* args, uint32_t) {
+    Held h;
+    if (!h.open(args[0])) return fail(p, "io_closed", "this handle is closed");
+    return NativeResult::ok(make_bool(sys::enable_ansi(h.fd())));
+}
+
 NativeResult io_is_open(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_fixnum(v)) return NativeResult::ok(make_bool(false));
@@ -1662,6 +1674,8 @@ ModuleDef make_io_module() {
                          {"size!", 1, 0b1, io_size},
                          {"kind!", 1, 0b1, io_kind},
                          {"is_open!", 1, 0b1, io_is_open},
+                         {"is_terminal!", 1, 0b1, io_is_terminal},
+                         {"enable_ansi!", 1, 0b1, io_enable_ansi},
                          {"stdin!", 1, 0b1, io_stdin},
                          {"stdout!", 1, 0b1, io_stdout},
                          {"stderr!", 1, 0b1, io_stderr},

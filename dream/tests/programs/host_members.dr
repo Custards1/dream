@@ -25,7 +25,7 @@ let main! = {
 
     console.print! (list.contains "sqrt" (names "std.math"))
     console.print! (arity "std.math" "sqrt")
-    console.print! (list.contains "print!" (names "std.console"))
+    console.print! (list.contains "write!" (names "std.io"))
     console.print! (list.contains "host_members" (names "std.vm"))
 
     // Every entry is a name and an arity, and the order is the module's own.

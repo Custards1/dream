@@ -1,0 +1,253 @@
+// Console policy in Dream; std.io supplies handles and byte operations.
+// Output functions finish their write and return unit. They never close a
+// caller's handle, and I/O errors are propagated to the caller.
+import std.io;
+import std.os;
+import std.list;
+import std.str;
+import std.streams;
+import std.error;
+import std.num;
+
+/// Concatenate rendered values. Strings are used as-is, including Unicode.
+let text : [:any] -> :string;
+let text values = str.concat_all (list.map to_string values);
+
+let write_to! : :any -> :any -> :unit;
+let write_to! handle value = { streams.write_all! handle (to_string value); () };
+let print_to! : :any -> :any -> :unit;
+let print_to! handle value = write_to! handle (to_string value + "\n");
+let write! : :any -> :unit;
+let write! value = write_to! (io.stdout! ()) value;
+let print! : :any -> :unit;
+let print! value = print_to! (io.stdout! ()) value;
+let line! : :any -> :unit;
+let line! value = print! value;
+let error! : :any -> :unit;
+let error! value = print_to! (io.stderr! ()) value;
+let error_write! : :any -> :unit;
+let error_write! value = write_to! (io.stderr! ()) value;
+
+// --- formatting -------------------------------------------------------------
+
+/// `{}` consumes one value; `{{` and `}}` write literal braces. Malformed
+/// templates and missing/extra values are errors, never silently discarded.
+let format : :string -> [:any] -> [:ok, :string] | [:error, :string];
+let format template values = {
+    let size = str.byte_length template;
+    let rec walk !at !start remaining !pieces =
+        if at >= size {
+            if not (list.is_empty remaining) { [:error, "too many format values"] }
+            else { [:ok, str.concat_all (list.reverse (list.cons (str.slice start (at - start) template) pieces))] }
+        } else {
+            let c = str.byte at template;
+            let next = str.byte (at + 1) template;
+            if c == 123 || c == 125 {
+                let before = list.cons (str.slice start (at - start) template) pieces;
+                if next == c { walk (at + 2) (at + 2) remaining (list.cons (str.slice at 1 template) before) }
+                else if c == 123 && next == 125 {
+                    match remaining {
+                        [] => [:error, "not enough format values"],
+                        [value, ..rest] => walk (at + 2) (at + 2) rest (list.cons (to_string value) before),
+                    }
+                } else { [:error, "unmatched format brace at byte " + to_string at] }
+            } else { walk (at + 1) start remaining pieces }
+        };
+    walk 0 0 values []
+};
+
+let format! : :string -> [:any] -> :string;
+let format! template values = match format template values {
+    [:ok, rendered] => rendered,
+    [:error, why] => error.raise_as! :bad_argument why,
+};
+let printf! : :string -> [:any] -> :unit;
+let printf! template values = print! (format! template values);
+let writef! : :string -> [:any] -> :unit;
+let writef! template values = write! (format! template values);
+let errorf! : :string -> [:any] -> :unit;
+let errorf! template values = error! (format! template values);
+
+// --- input ------------------------------------------------------------------
+
+/// A complete line, without LF or CRLF, or `()` at EOF. An empty line is "".
+/// Read exactly through the newline so another caller can read the next line.
+/// The limit counts bytes before LF; it bounds memory even on untrusted input.
+let read_line_from! : :integer -> :any -> :string | :unit;
+let read_line_from! limit handle = {
+    if limit <= 0 { error.raise_as! :bad_argument "line limit must be positive" }
+    let rec read! !size !pieces = match io.read! handle 1 {
+        "" => if size == 0 { () } else { str.concat_all (list.reverse pieces) },
+        "\n" => {
+            let line = str.concat_all (list.reverse pieces);
+            if str.ends_with "\r" line { str.slice 0 (str.byte_length line - 1) line } else { line }
+        },
+        byte => {
+            if size >= limit { error.raise_as! :line_too_long ("line exceeds " + to_string limit + " bytes") }
+            read! (size + 1) (list.cons byte pieces)
+        },
+    };
+    read! 0 []
+};
+
+/// Prompt sessions can use files or pipes in tests. Handles remain owned by
+/// the caller. Prompts go to stderr by default, leaving stdout for results.
+mapping Session {
+    input : :any
+    output : :any
+    max_line : :integer = 1048576
+}
+let session! : :unit -> Session;
+let session! () = Session.new (io.stdin! ()) (io.stderr! ());
+let read_line! : :unit -> :string | :unit;
+let read_line! () = read_line_from! 1048576 (io.stdin! ());
+let prompt_with! : Session -> :any -> :string | :unit;
+let prompt_with! session question = {
+    write_to! (Session.output session) question
+    read_line_from! (Session.max_line session) (Session.input session)
+};
+let prompt! : :any -> :string | :unit;
+let prompt! question = prompt_with! (session! ()) question;
+
+/// The parser returns [:ok, value] or [:error, help]. Invalid input is retried;
+/// EOF always returns (), never the default or an implicit confirmation.
+let ask_with! : Session -> :any -> (:string -> [:ok, a] | [:error, :string]) -> a | :unit;
+let rec ask_with! session question parse = match prompt_with! session question {
+    () => (),
+    line => match parse line {
+        [:ok, value] => value,
+        [:error, help] => {
+            print_to! (Session.output session) help
+            ask_with! session question parse
+        },
+    },
+};
+let ask! : :any -> (:string -> [:ok, a] | [:error, :string]) -> a | :unit;
+let ask! question parse = ask_with! (session! ()) question parse;
+
+let confirmation : :bool -> :string -> [:ok, :bool] | [:error, :string];
+let confirmation default line = match str.lower (str.trim line) {
+    "" => [:ok, default],
+    "y" => [:ok, true], "yes" => [:ok, true],
+    "n" => [:ok, false], "no" => [:ok, false],
+    _ => [:error, "Please answer yes or no."],
+};
+let confirm_with! : Session -> :any -> :bool -> :bool | :unit;
+let confirm_with! session question default =
+    ask_with! session (to_string question + (if default { " [Y/n] " } else { " [y/N] " })) (confirmation default);
+let confirm! : :any -> :bool -> :bool | :unit;
+let confirm! question default = confirm_with! (session! ()) question default;
+
+let integer : :string -> [:ok, :integer] | [:error, :string];
+let integer line = match num.parse_int (str.trim line) {
+    () => [:error, "Please enter an integer."],
+    n => [:ok, n],
+};
+let prompt_int! : :any -> :integer | :unit;
+let prompt_int! question = ask! question integer;
+
+// --- color ------------------------------------------------------------------
+
+type ColorMode = :auto | :always | :off;
+type Style = :bold | :dim | :italic | :underline | :black | :red | :green
+           | :yellow | :blue | :magenta | :cyan | :white;
+let style_code : Style -> :string;
+let style_code style = match style {
+    :bold => "1", :dim => "2", :italic => "3", :underline => "4",
+    :black => "30", :red => "31", :green => "32", :yellow => "33",
+    :blue => "34", :magenta => "35", :cyan => "36", :white => "37",
+};
+
+/// Explicit ANSI text. Use paint! for destination-aware coloring. Restore the
+/// outer style after a nested style's reset, and always reset at the end.
+let style : [Style] -> :any -> :string;
+let style styles value = {
+    let plain = to_string value;
+    if list.is_empty styles || str.is_empty plain { plain }
+    else {
+        let start = "\u{1b}[" + str.join_str ";" (list.map style_code styles) + "m";
+        start + str.join_str ("\u{1b}[0m" + start) (str.split "\u{1b}[0m" plain) + "\u{1b}[0m"
+    }
+};
+
+/// Explicit modes win. Auto respects NO_COLOR and TERM=dumb, and emits ANSI
+/// only to a terminal supporting it. Pipes and files stay plain by default.
+let color_enabled! : ColorMode -> :any -> :bool;
+let color_enabled! mode handle = match mode {
+    :always => true,
+    :off => false,
+    :auto => {
+        let no_color = os.env! "NO_COLOR";
+        if (no_color != () && no_color != "") || os.env! "TERM" == "dumb" { false }
+        else { io.enable_ansi! handle }
+    },
+};
+let paint! : ColorMode -> :any -> [Style] -> :any -> :string;
+let paint! mode handle styles value =
+    if color_enabled! mode handle { style styles value } else { to_string value };
+let styled! : [Style] -> :any -> :unit;
+let styled! styles value = {
+    let out = io.stdout! ();
+    print_to! out (paint! :auto out styles value)
+};
+
+// --- logging ----------------------------------------------------------------
+
+type Level = :debug | :info | :warn | :error | :off;
+let level_rank : Level -> :integer;
+let level_rank level = match level { :debug => 0, :info => 1, :warn => 2, :error => 3, :off => 4 };
+let level_name : Level -> :string;
+let level_name level = match level { :debug => "DEBUG", :info => "INFO", :warn => "WARN", :error => "ERROR", :off => "OFF" };
+let level_style : Level -> [Style];
+let level_style level = match level { :debug => [:dim], :info => [:cyan], :warn => [:yellow], :error => [:red, :bold], :off => [] };
+
+mapping Logger {
+    output : :any
+    minimum : :debug | :info | :warn | :error | :off = :info
+    color : :auto | :always | :off = :auto
+    prefix : :string = ""
+}
+let logger! : :unit -> Logger;
+let logger! () = Logger.new (io.stderr! ());
+
+/// Suppressed values stay lazy. Every line of a multiline message gets its
+/// label; a single assembled write keeps short concurrent messages together.
+let log_with! : Logger -> Level -> :any -> :unit;
+let log_with! logger level value = {
+    if level != :off && level_rank level >= level_rank (Logger.minimum logger) {
+        let out = Logger.output logger;
+        let label = paint! (Logger.color logger) out (level_style level) ("[" + level_name level + "]");
+        let prefix = if str.is_empty (Logger.prefix logger) { "" } else { Logger.prefix logger + ": " };
+        let lines = list.map (fn line -> label + " " + prefix + line) (str.split "\n" (to_string value));
+        print_to! out (str.join_str "\n" lines)
+    }
+};
+let log! : Level -> :any -> :unit;
+let log! level value = log_with! (logger! ()) level value;
+let info! : :any -> :unit;
+let info! value = log! :info value;
+let warn! : :any -> :unit;
+let warn! value = log! :warn value;
+let logf! : Level -> :string -> [:any] -> :unit;
+let logf! level template values = log! level (format! template values);
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "format values, escapes, Unicode, and empty templates"
+            $( test.eq! [[:ok, "{雪}: 42"], [:ok, ""], [:ok, "[] () true"]]
+                        [format "{{{}}}: {}" ["雪", 42], format "" [], format "{} {} {}" [[], (), true]] ),
+        test.case "format errors keep missing and extra values visible"
+            $( test.eq! [[:error, "not enough format values"], [:error, "too many format values"],
+                         [:error, "unmatched format brace at byte 0"]]
+                        [format "{}" [], format "" [1], format "{" []] ),
+        test.case "confirmation normalizes text and honors the empty-line default"
+            $( test.eq! [[:ok, true], [:ok, false], [:ok, true], [:error, "Please answer yes or no."]]
+                        [confirmation false " YES ", confirmation true "n", confirmation true "", confirmation false "maybe"] ),
+        test.case "nested styles restore their outer style"
+            $( test.eq! "\u{1b}[31ma\u{1b}[1mb\u{1b}[0m\u{1b}[31mc\u{1b}[0m"
+                        (style [:red] ("a" + style [:bold] "b" + "c")) ),
+        test.case "plain styles and rendered pieces"
+            $( test.eq! ["42", "", "x=42"] [style [] 42, style [:bold] "", text ["x=", 42]] ),
+    ];
+}

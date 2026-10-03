@@ -11,7 +11,7 @@
 // lookup at run time.
 //
 // A module path that has no file behind it is assumed to be provided by the
-// host -- `std.console` is C++ in the VM, not Dream. Those are listed
+// host -- `std.io` is C++ in the VM, not Dream. Those are listed
 // explicitly so a typo in an import is an error rather than a mystery at run
 // time.
 //
@@ -47,7 +47,7 @@ import std.map;
 /// compilable. It is deliberately not a wildcard: naming the module is what
 /// keeps a typo in an import an error rather than a mystery later.
 let native_modules =
-    ["std.console", "std.crypto", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.tls", "std.vm"];
+    ["std.crypto", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.tls", "std.vm"];
 
 let is_native p = list.contains p native_modules;
 
@@ -1029,11 +1029,7 @@ let add_test_runner! l = {
         (list.range 0 (module_count l));
     let src =
         if list.is_empty suites {
-            // Still a valid program: it reports that there was nothing to run,
-            // which is more use than an image with no entry point. One string,
-            // not two: `console.print!` is variadic, so a second argument would
-            // be a second thing printed, and generated code should not depend on
-            // that to read correctly.
+            // Still a valid program: report that there was nothing to run.
             "import std.console;\n"
             + "let main! = { console.print! \"no tests found "
             + "(a module exports tests by defining `tests`)\" };\n"
@@ -1221,7 +1217,7 @@ when test {
             $( test.eq! [["std", "list"], ["list"]]
                         [dotted_segments "std.list", dotted_segments "list"] ),
         test.case "the host's own modules are known by name"
-            $( test.eq! [true, false] [is_native "std.console", is_native "std.nope"] ),
+            $( test.eq! [true, false, false] [is_native "std.io", is_native "std.console", is_native "std.nope"] ),
 
         // --- `when`, resolved as the file is read ---
         test.case "a when that holds contributes its items"
@@ -1261,9 +1257,9 @@ when test {
             $( test.eq! 1 (list.length (expand_items on
                    (items_of "when test { when test { let a = 1; } }"))) ),
         test.case "an import inside a when that is off is never followed"
-            $( test.eq! [] (natives (from_text! config.empty "when test { import std.console; }")) ),
+            $( test.eq! [] (natives (from_text! config.empty "when test { import std.io; }")) ),
         test.case "an import inside a when that holds is"
-            $( test.eq! ["std.console"] (natives (from_text! on "when test { import std.console; }")) ),
+            $( test.eq! ["std.io"] (natives (from_text! on "when test { import std.io; }")) ),
 
         // --- what a module depends on ---
         test.case "imports and derives are both dependencies"
@@ -1282,12 +1278,12 @@ when test {
         test.case "a file with no conditions records none"
             $( test.eq! [] (reads (from_text! on "let a = 1;")) ),
         test.case "a host module is recorded rather than searched for"
-            $( test.eq! [["std.console"], ["t"]]
-                        { let l = from_text! on "import std.console;";
+            $( test.eq! [["std.io"], ["t"]]
+                        { let l = from_text! on "import std.io;";
                           [natives l, names l] } ),
         test.case "the same host module twice is recorded once"
-            $( test.eq! ["std.console"]
-                        (natives (from_text! on "import std.console;\nimport std.console;")) ),
+            $( test.eq! ["std.io"]
+                        (natives (from_text! on "import std.io;\nimport std.io;")) ),
         test.case "a parse error is a diagnostic, not a raise"
             $( test.eq! 1 (list.length (diags (from_text! on "let = ;"))) ),
         test.case "a module that failed to parse is not recorded"
@@ -1308,14 +1304,14 @@ when test {
                                   (module_items (module_at (from_text! on "mod inner { let a = 1; }")
                                                            1))) ),
         test.case "a mod's own imports are followed"
-            $( test.eq! ["std.console"]
-                        (natives (from_text! on "mod inner { import std.console; }")) ),
+            $( test.eq! ["std.io"]
+                        (natives (from_text! on "mod inner { import std.io; }")) ),
         test.case "two mods of one name is an error, not a silent replacement"
             $( test.eq! 1 (list.length (diags (from_text! on
                    "mod a { let x = 1; }\nmod a { let y = 2; }"))) ),
         test.case "a when inside a mod is resolved as a file's would be"
             $( test.eq! [] (natives (from_text! config.empty
-                   "mod inner { when test { import std.console; } }")) ),
+                   "mod inner { when test { import std.io; } }")) ),
 
         // --- the module a name is already loaded under ---
         test.case "a sibling is found by walking outwards"

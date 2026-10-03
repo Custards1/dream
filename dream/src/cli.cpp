@@ -568,6 +568,24 @@ int dream_main(int argc, char** argv) {
                 return 0;
             }
         }
+        // The root module's global of that name first: it is the program's own
+        // function. A bare name is shared with every module the program links
+        // in -- `std` has its own `atom`, `rev` and `integer` -- so the first
+        // function or global of that name in the image is whichever module
+        // happened to be laid out earlier.
+        const Image& img = rt.image();
+        const std::string root = img.module_name().str();
+        for (uint32_t m = 0; m < img.module_count(); ++m) {
+            const ModuleRec& mr = img.module(m);
+            if (!img.str(mr.name).equals(root.c_str())) continue;
+            for (uint32_t k = 0; k < mr.globals_count; ++k) {
+                const GlobalRec& gr = img.global(mr.globals_start + k);
+                if (gr.kind == GLOBAL_FUNCTION && img.str(gr.name).equals(dump_jit_fn.c_str())) {
+                    std::fputs(jit_owner->dump_ir(gr.target).c_str(), stdout);
+                    return 0;
+                }
+            }
+        }
         for (uint32_t i = 0; i < rt.image().func_count(); ++i) {
             if (rt.image().str(rt.image().func(i).name).equals(dump_jit_fn.c_str())) {
                 std::fputs(jit_owner->dump_ir(i).c_str(), stdout);

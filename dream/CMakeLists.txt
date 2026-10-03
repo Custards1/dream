@@ -33,6 +33,8 @@ option(DREAM_BUILD_TESTS "Build the VM test suite" ON)
 # Override either way with -DDREAM_LLVM_CONFIG=<path> or -DLLVM_DIR=<cmakedir>.
 # ---------------------------------------------------------------------------
 set(DREAM_HAVE_LLVM OFF)
+set(DREAM_LLVM_STATIC OFF)
+set(DREAM_LLVM_RTTI "NO")
 
 # ---------------------------------------------------------------------------
 # How LLVM and libffi are linked
@@ -181,6 +183,7 @@ if(DREAM_ENABLE_JIT)
         if(DREAM_LLVM_STATIC_RC EQUAL 0 AND DREAM_LLVM_LIBS_RAW)
           execute_process(
             COMMAND ${DREAM_LLVM_CONFIG} --link-static --system-libs
+            RESULT_VARIABLE DREAM_LLVM_SYSTEM_RC
             OUTPUT_VARIABLE DREAM_LLVM_SYSLIBS_RAW
             OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_QUIET)
@@ -197,6 +200,10 @@ if(DREAM_ENABLE_JIT)
           # still be printed and acted on, and PREFER_STATIC takes the shared
           # library that satisfies the same dependencies from its own
           # DT_NEEDED rather than from the command line.
+          if(NOT DREAM_LLVM_SYSTEM_RC EQUAL 0)
+            list(APPEND DREAM_LLVM_SYSLIB_MISSING "llvm-config --system-libs failed")
+          endif()
+
           if(DREAM_LLVM_SYSLIB_MISSING)
             string(REPLACE ";" " " DREAM_LLVM_SYSLIB_MISSING_TEXT
                            "${DREAM_LLVM_SYSLIB_MISSING}")
@@ -229,16 +236,21 @@ if(DREAM_ENABLE_JIT)
 
       if(NOT DREAM_LLVM_STATIC)
         execute_process(
-          COMMAND ${DREAM_LLVM_CONFIG} --libs ${DREAM_LLVM_COMPONENTS}
+          COMMAND ${DREAM_LLVM_CONFIG} --link-shared --libs ${DREAM_LLVM_COMPONENTS}
+          RESULT_VARIABLE DREAM_LLVM_SHARED_RC
           OUTPUT_VARIABLE DREAM_LLVM_LIBS_RAW
           OUTPUT_STRIP_TRAILING_WHITESPACE
           ERROR_QUIET)
 
         execute_process(
-          COMMAND ${DREAM_LLVM_CONFIG} --system-libs
+          COMMAND ${DREAM_LLVM_CONFIG} --link-shared --system-libs
           OUTPUT_VARIABLE DREAM_LLVM_SYSLIBS_RAW
           OUTPUT_STRIP_TRAILING_WHITESPACE
           ERROR_QUIET)
+
+        if(NOT DREAM_LLVM_SHARED_RC EQUAL 0 OR NOT DREAM_LLVM_LIBS_RAW)
+          message(FATAL_ERROR "Dream: llvm-config cannot supply shared LLVM libraries; choose STATIC or install shared LLVM")
+        endif()
 
         # Usually an empty list, since libLLVM.so records its own DT_NEEDED.
         # Whatever is on it is filtered by the same rule for the same reason: an
@@ -286,10 +298,32 @@ if(DREAM_ENABLE_JIT)
     find_package(LLVM CONFIG QUIET)
 
     if(LLVM_FOUND)
-      # The package names the component libraries, which are archives in
-      # a default LLVM build -- static or not is the package's choice here.
-      llvm_map_components_to_libnames(
-        DREAM_LLVM_LIBS ${DREAM_LLVM_COMPONENTS})
+      if(DREAM_LINK_DEPS STREQUAL "SHARED")
+        if(NOT TARGET LLVM)
+          message(FATAL_ERROR "Dream: LLVM_DIR has no shared LLVM target; use llvm-config or another LLVM installation")
+        endif()
+        get_target_property(DREAM_LLVM_TARGET_TYPE LLVM TYPE)
+        if(NOT DREAM_LLVM_TARGET_TYPE STREQUAL "SHARED_LIBRARY")
+          message(FATAL_ERROR "Dream: LLVM_DIR's LLVM target is not a shared library")
+        endif()
+        set(DREAM_LLVM_LIBS LLVM)
+      else()
+        llvm_map_components_to_libnames(DREAM_LLVM_LIBS ${DREAM_LLVM_COMPONENTS})
+        set(DREAM_LLVM_STATIC ON)
+        foreach(component IN LISTS DREAM_LLVM_LIBS)
+          if(TARGET ${component})
+            get_target_property(component_type ${component} TYPE)
+            if(NOT component_type STREQUAL "STATIC_LIBRARY")
+              set(DREAM_LLVM_STATIC OFF)
+            endif()
+          else()
+            set(DREAM_LLVM_STATIC OFF)
+          endif()
+        endforeach()
+        if(DREAM_LINK_DEPS STREQUAL "STATIC" AND NOT DREAM_LLVM_STATIC)
+          message(FATAL_ERROR "Dream: LLVM_DIR does not supply static component targets")
+        endif()
+      endif()
 
       set(DREAM_LLVM_INCLUDEDIR ${LLVM_INCLUDE_DIRS})
       set(DREAM_LLVM_LIBDIR ${LLVM_LIBRARY_DIRS})
@@ -374,8 +408,15 @@ function(dream_ffi_archive_works archive include_dir result_var)
 [=[
 cmake_minimum_required(VERSION 3.20)
 project(dream_ffi_probe C)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_library(dream_ffi_probe SHARED probe.c)
+if(WIN32)
+  target_compile_definitions(dream_ffi_probe PRIVATE FFI_STATIC_BUILD)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_options(dream_ffi_probe PRIVATE "-Wl,-z,defs")
+endif()
 
 target_include_directories(
   dream_ffi_probe
@@ -451,7 +492,7 @@ set(DREAM_FFI_STATIC OFF)
 # ---------------------------------------------------------------------------
 if(DREAM_FFI_LIB_EXPLICIT)
 
-  if(DREAM_FFI_LIB MATCHES "\\.a$"
+  if((DREAM_FFI_LIB MATCHES "\\.a$" OR DREAM_FFI_LIB MATCHES "\\.lib$")
      AND NOT DREAM_FFI_LIB MATCHES "\\.dll\\.a$")
 
     if(NOT DREAM_FFI_INCLUDE)
@@ -535,6 +576,9 @@ else()
       list(REMOVE_DUPLICATES DREAM_FFI_STATIC_CANDIDATES)
 
       foreach(candidate IN LISTS DREAM_FFI_STATIC_CANDIDATES)
+        if(NOT candidate MATCHES "\\.(a|lib)$" OR candidate MATCHES "\\.dll\\.a$")
+          continue()
+        endif()
         if(NOT DREAM_FFI_INCLUDE)
           break()
         endif()

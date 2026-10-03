@@ -219,17 +219,18 @@ let main! = console.print! (try! { connect (len (os.args! ()) - 5) } catch e { "
     # --- the image ------------------------------------------------------------------------
     #
     # Contracts are run on a copy of the program and thrown away: an image with
-    # contracts that hold is byte-identical to the same program compiled with
-    # the types switched off. (A string, because a signature over integers or
-    # floats does add something to an image -- the JIT's parameter hints.)
+    # contracts that hold is byte-identical to the same program with the
+    # signature left out. (A string, because a signature over integers or
+    # floats does add something to an image -- the JIT's parameter hints.) The
+    # signature is written last, so that leaving it out moves no span.
     source = '''import std.console;
 type Name = :string where fn s -> len s > 0;
-let greet : Name -> :string;
 let greet n = "hi " + n;
 let main! = { console.print! (greet "ada") console.print! (greet "bo") };
 '''
-    assert compile_source(source, out='typed.dream').returncode == 0
-    assert compile_source(source, '--no-types', out='untyped.dream').returncode == 0
+    signature = 'let greet : Name -> :string;\n'
+    assert compile_source(source + signature, out='typed.dream').returncode == 0
+    assert compile_source(source, out='untyped.dream').returncode == 0
     assert (temp / 'typed.dream').read_bytes() == (temp / 'untyped.dream').read_bytes()
     count += 1
 

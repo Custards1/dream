@@ -19,6 +19,7 @@
 // against the one that is gone does not link.
 
 import std.build;
+import std.build.cc;
 import std.build.cc.steps;
 import std.list;
 import std.str;
@@ -61,27 +62,51 @@ let answer text = match wire.decode text { [:ok, v] => v, _ => () };
 let llvm_answer : [:string] -> :string;
 let llvm_answer said = match list.map str.trim said {
     ["", .._] => wire.encode (),
-    [includes, version, libdir, libs, system, rtti] => wire.encode (%{
+    [includes, version, libdir, libs, system, rtti] if not (str.is_empty libs) => wire.encode (%{
         :version => version,
         :includes => includes,
         :libdir => libdir,
         :libraries => list.filter (fn w -> not (str.is_empty w)) (list.append (str.split " " libs) (str.split " " system)),
         :rtti => rtti == "YES",
     }),
+    _ => wire.encode (),
 };
 
-/// What `llvm-config` says about building against these LLVM components:
-/// `%{ :version, :includes, :libdir, :libraries, :rtti }` once read with
-/// `answer`, or `()` when there is no LLVM.
-let llvm : [:string] -> :any;
-let llvm components = {
-    let asks = [["--includedir"], ["--version"], ["--libdir"], list.cons "--libs" components, ["--system-libs"],
-                ["--has-rtti"]];
+/// LLVM discovery with an explicit linkage request. `--libfiles` preserves
+/// archive paths, including on installations outside the compiler's search path.
+/// Keep `llvm`'s shared-library behavior for existing callers.
+let llvm_link : :string -> :string -> [:string] -> :any;
+let llvm_link program linkage components = {
+    let asks = [["--includedir"], ["--version"], ["--libdir"],
+                list.concat [[linkage, "--libfiles"], components], [linkage, "--system-libs"], ["--has-rtti"]];
     let names = list.map (fn i -> "said" + to_string i) (list.range 0 (list.length asks));
-    build.artifact (build.uncached (build.step "probe" "llvm" [] [:llvm, components] ["answer"] (fn job ->
-        list.append (list.map (fn [n, args] -> build.Op.capture "llvm-config" args n) (list.zip names asks))
-                    [build.Op.transform names "answer" llvm_answer])))
+    build.artifact (build.uncached (build.step "probe" "llvm" [] [:llvm, program, linkage, components] ["answer"] (fn job ->
+        list.concat [list.map (fn [n, args] -> build.Op.capture program args n) (list.zip names asks),
+                     [build.Op.attempt program [linkage, "--system-libs"] "system_ok",
+                      build.Op.transform (list.append names ["system_ok"]) "answer" (fn said ->
+                        if list.last said != "yes" { wire.encode () } else { llvm_answer (list.take 6 said) })]])))
                    "answer"
+};
+
+let llvm : [:string] -> :any;
+let llvm components = llvm_link "llvm-config" "--link-shared" components;
+
+/// Prove a dependency can participate in a shared-library link with the
+/// selected compiler. References in `source` force archive members to be
+/// extracted; linking an empty program would not test PIC or the ABI.
+let shared_link : cc.Toolchain -> :string -> [:string] -> [:string] -> :any;
+let shared_link tc source cflags libs = {
+    let windows = cc.Toolchain.os tc == :windows;
+    let args = match cc.Toolchain.family tc {
+        :msvc => list.concat [["/nologo", "/LD", "probe.cpp"], cflags, ["/link"], libs, ["/OUT:probe.dll"]],
+        _ => list.concat [(if windows { [] } else { ["-fPIC"] }), cflags,
+                           ["probe.cpp", (if cc.Toolchain.os tc == :macos { "-dynamiclib" } else { "-shared" })],
+                           (if cc.Toolchain.os tc == :linux { ["-Wl,-z,defs"] } else { [] }),
+                           libs, ["-o", "probe.so"]],
+    };
+    build.artifact (build.uncached (build.step "probe" "shared dependency" [] [tc, source, cflags, libs] ["answer"]
+        (fn job -> [build.Op.write "probe.cpp" source,
+                    build.Op.attempt (cc.Toolchain.cxx tc) args "answer"]))) "answer"
 };
 
 when test {
@@ -100,6 +125,11 @@ when test {
                                 :libraries => ["-lLLVM-21", "-lz"], :rtti => false }]
                         [answer (llvm_answer ["", "", "", "", "", ""]),
                          answer (llvm_answer ["/i\n", "21.1.8", "/l", "-lLLVM-21", "-lz", "NO"])] ),
+        test.case "LLVM headers without linkable libraries are not an LLVM answer"
+            $( test.eq! () (answer (llvm_answer ["/i", "21.1.8", "/l", "", "-lz", "YES"])) ),
+        test.case "static and shared LLVM questions have different keys"
+            $( test.ne! (build.Step.shape (step_of (llvm_link "llvm-config" "--link-static" ["core"])))
+                        (build.Step.shape (step_of (llvm_link "llvm-config" "--link-shared" ["core"]))) ),
         test.case "two questions are two steps"
             $( test.ne! (build.Step.shape (step_of (library ctx "z"))) (build.Step.shape (step_of (library ctx "m"))) ),
     ];

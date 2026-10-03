@@ -311,6 +311,7 @@ let literal_p e span    = [:literal, e, span];
 /// `[x, ..rest] as whole` the list, its rest and the whole `as` all begin at
 /// the `[`, so `rest` and `whole` were given one slot, and `whole` came out
 /// holding the rest.
+let cons_p head tail operator_span span = [:cons_p, head, tail, operator_span, span];
 let list_p items rest span  = [:list_p, items, rest, span];
 let array_p items rest span = [:array_p, items, rest, span];
 let map_p pairs span        = [:map_p, pairs, span];
@@ -519,6 +520,7 @@ let rec show_pattern p =
         [:wildcard, _]      => "_",
         [:bind, n, _]       => n,
         [:literal, e, _]    => show e,
+        [:cons_p, head, tail, _, _] => "(" + show_pattern head + " :: " + show_pattern tail + ")",
         [:list_p, items, rest, _]  => "[" + show_items items rest + "]",
         [:array_p, items, rest, _] => "#[" + show_items items rest + "]",
         [:map_p, pairs, _]  =>

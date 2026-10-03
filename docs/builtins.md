@@ -216,26 +216,36 @@ let main! = {
 
 ## `std.console`
 
-Output to stdout and stderr. All members are **variadic** — they accept any number of arguments, force each, and render them in sequence with no separator.
+Implemented in Dream over `std.io`. Existing `print!`, `write!`, `line!` and
+`error!` calls take one value, render it with `to_string`, and return unit.
+Writes complete before returning; I/O failures propagate.
 
 ```dream
 import std.console;
+console.printf! "{} scored {}" ["Ada", 42]
+let name = console.prompt! "Name? ";
+console.warn! "Using the default configuration"
 ```
 
-| Name | Description |
-|------|-------------|
-| `print! ..` | Writes all arguments to stdout, then a newline. |
-| `write! ..` | Writes all arguments to stdout, without a trailing newline. |
-| `line! ..` | Alias for `print!`. |
-| `error! ..` | Writes all arguments to stderr, then a newline. |
+| Function | Behavior |
+|---|---|
+| `print! value`, `line! value` | stdout, with a newline |
+| `write! value` | stdout, without a newline |
+| `error! value`, `error_write! value` | stderr, with/without a newline |
+| `print_to! handle value`, `write_to! handle value` | caller-supplied output |
+| `text values` | concatenate rendered values |
+| `format template values` | `[:ok, text]` or `[:error, message]`; `{}`, `{{`, `}}` |
+| `format! template values` | formatted text, or `:bad_argument` |
+| `printf!`, `writef!`, `errorf!` | formatted output |
+| `read_line! ()`, `prompt! question` | a line, or `()` at EOF |
+| `confirm! question default` | yes/no with retry; `()` at EOF |
+| `prompt_int! question`, `ask! question parser` | validated input with retry |
+| `styled! styles value` | terminal-aware styled stdout line |
+| `log! level value`, `info! value`, `warn! value` | labeled stderr logging |
+| `logf! level template values` | formatted logging |
 
-Because these are variadic, they are **never partially applied** — `console.print! "x = "` prints immediately, it does not return a function waiting for a second argument.
-
-```dream
-console.print! "hello, world"
-console.print! "x = " x ", y = " y
-x |> console.print! "x = "   // still one application, prints immediately
-```
+See [Console](console.md) for stream injection, line limits, colors and logger
+configuration. Prompts use stderr by default so stdout can carry program results.
 
 ---
 
@@ -1141,7 +1151,7 @@ of the suite, and its failure arrives at the runner as an ordinary value
 through `join!` rather than as something that has already unwound the runner's
 own stack.
 
-`std.test` imports only `std.console` — never `std.list`.
+`std.test` depends only on native I/O and OS operations, avoiding cycles with the modules it tests.
 A module's own tests import this framework, so anything the framework depended
 on could not have tests of its own; the import would be a cycle. Walking lists
 with the primitives directly is the price of letting every module test itself.
