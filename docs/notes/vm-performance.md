@@ -848,6 +848,8 @@ this section, "pre-fusion" is after the JIT work and before deforestation,
 | `bytescan` | 59 ms | 144 ms | **0.41x** | 3.06x | -- | -- | -- |
 | `strbuild` | 68 ms | 0.9 ms | 75x | 76x | 70x | 82x | 72x |
 
+*(2026-10-03: `strbuild` is 32 ms and 37x since "Building ahead" below.)*
+
 Six of the seven are ahead of CPython, and the seventh is a different algorithm
 on each side. Read the six with the noise floor in mind: everything but
 `bytescan` moved by less than the 3% that "Two things that will lie to you" says
@@ -1080,6 +1082,85 @@ the VM waited for ever on a finished program -- every worker idle, nothing left
 to say so. Once in a few hundred runs on a loaded machine; the full e2e suite
 under a watchdog that took `gdb` backtraces is what caught it, in an `--no-jit`
 run. `Scheduler::notify_done` is the fix.
+
+## Building ahead: a producer makes a run of cells a call
+
+Done 2026-10-03. After "List and map code in the JIT" every list *consumer* ran
+compiled and allocated nothing, and every *producer* still ran one cell per
+call. `replicate n x = .. cons x (replicate (n - 1) x)` suspends its tail
+because the program says to, so each cell cost a cell, a thunk, the frame the
+thunk reads and a trip through the interpreter to force it: `strbuild` was
+116 bytes and a call for 24 bytes of data, and it was the one row of the
+CPython table nothing had moved.
+
+The tail can be evaluated early wherever nobody could tell, and in a pure body
+the only ways to tell are an error, a loop that never ends, and work or memory
+nobody asked for. So a compiled `cons h (f ..)` answer takes the loop's
+back-edge instead of suspending `f ..`, and every iteration after the first
+runs *ahead*: it may do inline arithmetic, tests and reads on values in hand,
+and build, and nothing else. Every helper call, raise, bail and yield is behind
+`ahead_guard`, which leaves the run with its last tail suspended -- a thunk of
+the whole body against a frame of the slots, which is what the interpreter's
+thunk of the call would have run one `Apply` later. A run is at most
+`kBuildAhead` (64) cells and one slice. "Building ahead" in
+[dream/src/jit.cpp](../../dream/src/jit.cpp) is the design;
+`dream/tests/programs/jit_ahead.dr` holds it to the interpreter on each way it
+could show -- an error twenty cells past the reader, a condition that stops
+being a bool, a producer that spins for ever past cell fifty.
+
+What made it a small change is that the abort is never a new kind of state.
+The first iteration is the call the interpreter made, and runs as it always
+did; an iteration ahead that gives up leaves exactly the suspension a
+step-at-a-time producer would have left. The run length barely matters past
+16 (`strbuild` 54 ms at 2, 37 at 16, 34 at 64, 32 at 4096).
+
+The tail of a cell already in hand is now built in place in a lazy position
+too -- a load that cannot raise -- which is what lets `map f (tail xs)` keep
+going over a list that is already built. Without it, `map` stopped every step:
+its next argument was a suspension the next iteration would force at once,
+and a step whose strict argument is still suspended ends the run rather than
+aborting a moment later.
+
+| | before | after |
+|---|---|---|
+| `strbuild` (benchmark) | 45 ms, 46 MB | **32 ms, 22 MB** |
+| `map (*2) (map (+1) (replicate 400000 1))` | 200 ms | **98 ms** |
+| self-compile | 1.70 s | 1.70 s, byte-identical image |
+
+`strbuild`'s 22 MB is its cells, counted twice because the list is live while
+`_str_concat` walks it; 13 ms of its 32 is collecting them. What is left in the
+map chain is the program's own laziness: `f x` is still suspended per cell,
+with the frame it reads.
+
+**One difference between the tiers this found, and it was not this change's.**
+A non-bool condition compiled raised "`if` needs a bool" where the interpreter
+says "`if` needs a bool, got integer 5"; `and`, `or` and `not` the same. An
+error from an aborted run comes from the interpreter, so the test showed the
+two messages side by side. `dream_rt_type_error_got` gives the compiled tier
+the interpreter's words.
+
+## Reusing the frame of a self tail call: measured, and not built
+
+Asked 2026-10-03 as the cheap first step at the 40% of a compile that is
+frames, needing no escape analysis: when the interpreter makes a saturated self
+call in tail position and nothing captured the caller's frame -- no thunk was
+made against it -- write the arguments into it and go round again, instead of
+allocating the callee's. Counted before building, with a probe that marked a
+frame whenever `make_thunk` was handed it:
+
+| self-compile | JIT on | `--no-jit` |
+|---|---|---|
+| saturated calls of a closure (each a frame) | 14.68M | 16.45M |
+| ... a self call in tail position | 1.12M | 1.85M |
+| ... whose frame nothing had captured | **73.8K** | **73.8K** |
+
+Half a percent of the frames, so not built. The reason is the same as the
+reason frames are 40% in the first place: an argument is suspended against
+the caller's frame unless `thunk_for` can compute it on the spot, so the call
+that is about to replace a frame has almost always just captured it. A `let`
+does the same. The tail calls a frame could be reused for are the strict
+numeric loops, and those are the ones the JIT already takes with no frame at
+all -- which is why JIT on and off leave the same 73.8K.
 
 ## A JIT that can allocate -- the plan
 

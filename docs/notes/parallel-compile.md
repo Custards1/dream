@@ -114,6 +114,11 @@ nothing else, so it runs in four processes (`lower.link_parallel!`, used by
   `link_parallel!` for the resolution and the parts. The REPL builds with
   `compile.scratch`, which is not optimized and so lowers whole, and `lucid`
   never builds at all -- both would leak a program's worth per request.
+- **What is still copied is not worth sharing.** Measured 2026-10-03 by timing
+  `Heap::copy_between`, which every `spawn!`, `send!` and `join!` goes through:
+  a self-compile makes 492 cross-heap copies, 10.8 MB and **12 ms** in all,
+  across every worker, against a 1.7 s build. The large values already travel
+  by pointer; what is left is replies and small arguments.
 - **Deal the bodies round-robin.** Contiguous slices of equal source were a
   third apart in nodes -- a byte of `typecheck.dr` lowers to three times what a
   byte of `lexer.dr` does -- and the slowest slice is the stage. Dealt one at a

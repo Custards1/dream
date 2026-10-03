@@ -160,6 +160,11 @@ Value dream_rt_type_error(Process* p, const char* message) {
     return raise_error(*p, well_known(p->runtime()).type_error, message);
 }
 
+Value dream_rt_type_error_got(Process* p, const char* message, Value v) {
+    return raise_error(*p, well_known(p->runtime()).type_error,
+                       std::string(message) + ", got " + describe(*p, v));
+}
+
 int64_t* dream_rt_reduction_slot(Process* p) { return &p->reductions; }
 
 Value* dream_rt_frame_slots(Value frame) {
@@ -474,6 +479,18 @@ int dream_rt_set(Process* p, Value c, Value k, Value v, Value* out) {
 }
 
 Value dream_rt_cons(Process* p, Value head, Value tail) { return p->heap().make_cons(head, tail); }
+
+Value dream_rt_cons_after(Process* p, Value last, Value head) {
+    Value cell = p->heap().make_cons(head, NIL);
+    if (last != 0) dream_rt_set_tail(p, last, cell);
+    return cell;
+}
+
+void dream_rt_set_tail(Process* p, Value cell, Value tail) {
+    auto* c = static_cast<ConsObj*>(as_obj(cell));
+    c->tail = tail;
+    p->heap().remember_if_old(c, tail);
+}
 
 Value dream_rt_make_list(Process* p, uint32_t n, const Value* items) {
     Value list = NIL;

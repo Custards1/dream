@@ -1,0 +1,165 @@
+// Warnings about programs that are correct and will still go wrong.
+//
+// The one here is the trap the notes keep finding: an accumulator nobody
+// forces.
+//
+//     let rec total i n acc = if i > n { acc } else { total (i + 1) n (acc + i) };
+//
+// Dream is lazy, so each call hands `acc + i` on suspended, holding the last
+// call's `acc`, which is itself suspended. Nothing in the loop looks at it, so
+// a million-step loop builds a million-link chain, and forcing the answer
+// walks it -- far enough to run the machine out of depth. `list.fold_strict`
+// exists because of it, `bytescan` grew a guard because of it, and the cure is
+// one character: `!acc` forces the argument as each call starts.
+//
+// A strictness analysis could find these and more, and was measured worthless
+// for what it was built for (see "NOT a strictness analysis" in
+// docs/notes/vm-performance.md). This is the narrow case instead, read off the
+// syntax: a parameter whose every use either grows it by `+`, `-` or `*` in a
+// call of the function itself, hands it back unchanged to the same position,
+// or *is* the function's answer. A parameter used any other way -- tested,
+// passed to anything else, rebound, named in a lambda -- is left alone,
+// because that use may be what forces it. So the warning is never wrong about
+// the chain; it only misses the ones it cannot see.
+
+import std.list;
+import dreams.ast;
+
+/// What a walk over one parameter's uses has found: whether a call grows it,
+/// and whether anything else touches it. `other` is what clears it.
+group Uses { grows = false, other = false }
+
+let no_uses = Uses.new;
+let grown u = Uses.set_grows true u;
+let touched u = Uses.set_other true u;
+
+/// The operators that build a chain when their result is handed on unforced.
+/// `/` and `%` are left out: a loop does not usually accumulate through them,
+/// and either can raise, which is a reason the program might want it lazy.
+let grows_through : :atom -> :bool;
+let grows_through op = op == :add || op == :sub || op == :mul;
+
+/// A saturated call of the function itself: `f a b` for an `f` of two
+/// parameters. Partial applications and calls through a pipe are not counted.
+let self_args f k e = match e {
+    [:apply, [:name, g, _], args, _] if g == f && list.length args == k => args,
+    _ => (),
+};
+
+/// Every use of `n` anywhere in `e` is "something else", except inside a call
+/// of the function itself, which `call_uses` reads argument by argument.
+///
+/// The walk is over the tree as lists rather than node by node, so that it
+/// cannot miss a form: any string equal to `n` that is not a plain `[:name, n,
+/// _]` -- a binder, a pattern, a field, a parameter of a lambda -- counts as
+/// touching it, which is the conservative answer.
+let rec uses f k i n e u =
+    if Uses.other u { u }
+    else { match e {
+        [:name, m, _] => if m == n { touched u } else { u },
+        _ => match self_args f k e {
+            () => match type_of e {
+                :list => list.fold (fn acc x -> uses f k i n x acc) u e,
+                :string => if e == n { touched u } else { u },
+                _ => u,
+            },
+            args => call_uses f k i n args 0 u,
+        },
+    } };
+
+let rec call_uses f k i n args j u =
+    match args {
+        [] => u,
+        [a, ..rest] =>
+            call_uses f k i n rest (j + 1) (if j == i { step_uses f k i n a u } else { uses f k i n a u }),
+    };
+
+/// The argument in the parameter's own position: handed back as it is, grown
+/// by an operator, or anything else.
+let step_uses f k i n a u =
+    match a {
+        [:name, m, _] if m == n => u,
+        [:binary, op, [:name, m, _], r, _] if m == n && grows_through op => uses f k i n r (grown u),
+        [:binary, op, l, [:name, m, _], _] if m == n && op != :sub && grows_through op =>
+            uses f k i n l (grown u),
+        _ => uses f k i n a u,
+    };
+
+/// Uses in answer position, where the parameter being the answer is not a use
+/// at all: the caller gets the chain and forces it, and that is the overflow.
+let rec answer_uses f k i n e u =
+    match e {
+        [:name, m, _] if m == n => u,
+        [:if, c, t, el, _] => answer_uses f k i n el (answer_uses f k i n t (uses f k i n c u)),
+        [:block, stmts, _] if not (list.is_empty stmts) => {
+            let last = list.last stmts;
+            let before = list.fold (fn acc s -> uses f k i n s acc) u (list.take (list.length stmts - 1) stmts);
+            match last {
+                [:let, _, _, _, _, _] => uses f k i n last before,
+                [:let_p, _, _, _] => uses f k i n last before,
+                _ => answer_uses f k i n last before,
+            }
+        },
+        [:match, s, arms, _] =>
+            list.fold (fn acc arm -> match arm {
+                           [pattern, guard, body, _] =>
+                               answer_uses f k i n body (uses f k i n guard (uses f k i n pattern acc)),
+                           _ => uses f k i n arm acc,
+                       })
+                      (uses f k i n s u) arms,
+        _ => uses f k i n e u,
+    };
+
+/// The parameters of `let f ps = body` that are accumulators nothing forces,
+/// as `[name, span]`. Strict parameters, patterns and `()` are never named.
+let lazy_accumulators : :string -> [:any] -> :any -> [:any];
+let lazy_accumulators f ps body = {
+    let k = list.length ps;
+    list.concat (list.map (fn i -> {
+        let p = list.nth i ps;
+        let n = ast.param_name p;
+        if type_of n != :string || ast.param_strict p || ast.param_pattern p != () { [] }
+        else {
+            let u = answer_uses f k i n body no_uses;
+            if Uses.grows u && not (Uses.other u) { [[n, list.nth 1 p]] } else { [] }
+        }
+    }) (list.range 0 k))
+};
+
+when test {
+    import std.test;
+    import dreams.parser;
+
+    /// The names `lazy_accumulators` reports for the first declaration of `src`.
+    let flagged src = match parser.parse_module src {
+        [:ok, [[:let, f, ps, body, _, _], .._], _] =>
+            list.map (fn p -> list.head p) (lazy_accumulators f ps body),
+        other => other,
+    };
+
+    let tests = [
+        test.case "an accumulator grown by + and only answered is flagged"
+            $( test.eq! ["acc"] (flagged "let rec t i n acc = if i > n { acc } else { t (i + 1) n (acc + i) };") ),
+        test.case "the counter beside it is tested, so only the accumulator is"
+            $( test.eq! ["acc"] (flagged "let rec t i n acc = if i > n { acc } else { t (i + 1) n (acc * 2) };") ),
+        test.case "a strict accumulator is not flagged"
+            $( test.eq! [] (flagged "let rec t i n !acc = if i > n { acc } else { t (i + 1) n (acc + i) };") ),
+        test.case "an accumulator the body looks at is forced every step"
+            $( test.eq! [] (flagged "let rec t i n acc = if i > n || acc < 0 { acc } else { t (i + 1) n (acc + i) };") ),
+        test.case "one passed to anything else may be forced there"
+            $( test.eq! [] (flagged "let rec t i n acc = if i > n { g acc } else { t (i + 1) n (acc + i) };") ),
+        test.case "subtracting from it grows it; subtracting it does not"
+            $( test.eq! [["a"], []]
+                        [flagged "let rec t i a = if i == 0 { a } else { t (i - 1) (a - i) };",
+                         flagged "let rec t i a = if i == 0 { a } else { t (i - 1) (i - a) };"] ),
+        test.case "an accumulator built by a cons is a list, not a chain"
+            $( test.eq! [] (flagged "let rec t i n acc = if i > n { acc } else { t (i + 1) n (list.cons i acc) };") ),
+        test.case "a name rebound in the body is not the parameter"
+            $( test.eq! [] (flagged "let rec t i acc = if i == 0 { acc } else { let acc = 1; t (i - 1) (acc + 1) };") ),
+        test.case "the answer through a match and a block still counts as the answer"
+            $( test.eq! ["acc"]
+                        (flagged "let rec t xs acc = match xs { [] => { acc }, [x, ..rest] => t rest (acc + x) };") ),
+        test.case "an accumulator handed back unchanged is carried, not grown"
+            $( test.eq! [] (flagged "let rec t i acc = if i == 0 { acc } else { t (i - 1) acc };") ),
+    ];
+}

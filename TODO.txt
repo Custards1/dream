@@ -1,0 +1,42 @@
+ 2. Let the JIT allocate, widening it first. The plan in vm-performance.md is good, and its own correction about order is the important part: widen the tier first so that de-pinning has a workload to be judged by. strbuild (75x behind CPython) is the obvious target, along with list-building recursions and map-building folds. Right now compiled code can only handle numbers.
+
+  3. Cut the frame cost in the interpreter. Frames are 40% of everything a compile allocates. The JIT already removes frames for the functions it takes. For the rest, a cheap first step needs no escape analysis: when the interpreter makes a self tail call and nothing captured the old frame (no thunk or closure made in it), it could reuse that frame in place. This is worth a measurement before anything bigger.
+  4. Compile JIT functions in the background. About 10 ms per compiled function is most of mapfilter's time. The notes rule out the optimisation level as the cause, so the remaining fix is to compile on a helper thread and keep interpreting until the code is ready. Short programs would stop paying that cost while the work is in progress.
+  5. Sharing large immutable values between processes. send! deep-copies everything. That is the right default, but large data that never changes (a parsed std, a unit's declarations in a parallel build) could live in a shared region that can't be modified, the way payload views already work. I'd measure how much the parallel compile spends copying before committing to this.
+
+  Language
+
+  6. A warning for an accumulator that isn't strict. The same trap comes up again and again: fold_strict, the bytescan guard, "three million suspended additions". The notes showed that a full strictness analysis isn't worth it for allocation, but a narrow check would still help with this crash. The case: a self-recursive function passes a parameter back to itself through +, - or a cons, and the parameter isn't marked !. That covers most of these crashes, costs almost nothing, and the fix it suggests is one character.
+  7. Write the error-propagation step once. std.result and macros.with_ok exist, but a chain of fallible steps is still expand macros.with_ok ... nested by hand. A let? binding (or ? after an expression) that short-circuits on [:error, _] inside a block would make the "errors are values" convention cheap to follow. That convention is the right one for pure code here, since raising is an effect. This could start as a macro and become syntax only if it proves its worth.
+  8. Generic calls through virtual/derive. At the moment derive is specialised at compile time, and a generic caller has to pass the operations in by hand. One option that fits Dream is to let a record carry the module it was derived for, so shape.area x can dispatch on it. That would be opt-in and paid for only by records that ask. It is a real design decision, and leaving it out entirely is a defensible answer.
+  9. Use signatures for integer hints in the JIT. This is next according to your memory notes, and it's cheap given that float hints are already done. With integer hints, a signature becomes a reason to write types and not just documentation.
+
+
+
+
+_______________________________________________________
+
+
+
+
+
+
+2. JIT allocation — done (build-ahead). A compiled function whose answer is cons h (f ..) now builds up to 64 cells per call instead of one.
+- How: after the first cell, each next step may only do inline work: arithmetic and tests on values in hand, reading cells, building. Anything that could raise, run code, force a suspension or yield stops the run. The rest of the list is then left suspended, exactly as before.
+- Results:
+  - strbuild went from 45 ms to 32 ms, allocating 22 MB instead of 46 MB.
+  - A map chain over replicate got about 2x faster (200 → 98 ms). That needed one extra change: taking the tail of a cell already in hand is now a plain read rather than a suspension.
+  - Self-compile time is unchanged (1.70 s) and the image is byte-identical.
+- New test: jit_ahead.dr checks the interpreter and JIT agree when there's an error, a non-bool condition or an infinite loop past the point the reader stops.
+- Older JIT bug, also fixed: for a non-bool if/and/or/not, compiled code said "if needs a bool" where the interpreter says "…, got integer 5". It now matches.
+- DREAM_JIT_AHEAD=0 turns build-ahead off for comparison.
+
+3. Frame reuse — measured, not built. In a self-compile only 73.8K of 14.7M frames (0.5%) are self tail calls that nothing captured. Arguments and lets almost always capture the frame. Written up in docs/notes/vm-performance.md.
+
+4. Background JIT compile was already done on 2026-09-25.
+
+5. Sharing between processes was already done on 2026-09-25 (vm.share!). What is still copied in a self-compile is 492 copies, 10.8 MB and 12 ms in total, under 1% of the build. Noted in parallel-compile.md.
+
+6. Non-strict accumulator warning — unfinished. dreams/lint.dr holds the check and its unit tests, but it has never compiled or run. I backed out the hook in scope.dr so the compiler still builds. To finish: compile lint.dr, re-add the scope.dr hook, run just test-dreams, check std produces no warnings, and rebuild the seed.
+
+7–9 were not started.

@@ -70,6 +70,9 @@ int dream_rt_number_double(dream::Process* p, dream::Value v, double* out);
 /// Raise a type error with a fixed message, for the shapes compiled code
 /// rejects inline (a non-bool condition, say).
 dream::Value dream_rt_type_error(dream::Process* p, const char* message);
+/// The same with what was found instead, described as the interpreter
+/// describes it: `message, got <v>`. The two tiers raise the same words.
+dream::Value dream_rt_type_error_got(dream::Process* p, const char* message, dream::Value v);
 
 /// The address of the process's reduction counter, fetched once on entry so
 /// the loop back-edge can decrement it without a call.
@@ -139,6 +142,13 @@ dream::Value dream_rt_peek(dream::Value c, dream::Value k);
 
 /// A list cell, an array, a list literal. None of them can raise.
 dream::Value dream_rt_cons(dream::Process* p, dream::Value head, dream::Value tail);
+/// A cell whose tail is not known yet, linked in after `last` when there is
+/// one (`last` zero means none), and the cell's tail filled in later. What a
+/// loop building a list front to back is made of; see "Building ahead" in
+/// jit.cpp. Neither can raise, and both keep the write barrier, because
+/// `last` is a cell compiled code made but the collector may already own.
+dream::Value dream_rt_cons_after(dream::Process* p, dream::Value last, dream::Value head);
+void dream_rt_set_tail(dream::Process* p, dream::Value cell, dream::Value tail);
 dream::Value dream_rt_make_list(dream::Process* p, uint32_t n, const dream::Value* items);
 dream::Value dream_rt_make_array(dream::Process* p, uint32_t n, const dream::Value* items);
 

@@ -179,6 +179,23 @@ constexpr uint32_t kMaxBindDuplication = 8;
 /// binding computed once" -- so this bounds the size of the compiled body.
 constexpr uint32_t kMaxMemoCode = 64;
 
+/// How many cells one compiled call of a list builder makes before it suspends
+/// the rest. See "Building ahead". A bound on work and memory nobody may ever
+/// ask for -- `take 1 (replicate n x)` pays for this many cells -- and on how
+/// long a compiled call runs before the interpreter sees it again; large
+/// enough that the suspension, the frame and the trip through the interpreter
+/// it replaces are paid once a run rather than once a cell.
+constexpr int64_t kBuildAhead = 64;
+
+/// `DREAM_JIT_AHEAD=0` turns building ahead off, for measuring it.
+bool build_ahead_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("DREAM_JIT_AHEAD");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
 // ---------------------------------------------------------------------------
 // Representation
 //
@@ -532,6 +549,18 @@ bool cheap_lazy(const Image& img, const std::vector<uint32_t>& binds, uint32_t a
     }
 }
 
+/// The head and tail of a cell `n` builds: the opcode, or a saturated call of
+/// the builtin it is the opcode of, which is what an image `opt` has not
+/// rewritten still holds. `{NO_NODE, NO_NODE}` for anything else.
+std::pair<uint32_t, uint32_t> cons_parts(const Image& img, const Node& n) {
+    if (Op(n.op) == Op::Cons) return {n.a, n.b};
+    if (Op(n.op) != Op::Apply || n.c != 2) return {NO_NODE, NO_NODE};
+    const Node& callee = img.node(n.a);
+    if (Op(callee.op) != Op::Builtin || callee.a >= builtin_count()) return {NO_NODE, NO_NODE};
+    if (std::strcmp(builtin_def(callee.a).name, "_list_cons") != 0) return {NO_NODE, NO_NODE};
+    return {img.kid(n.b), img.kid(n.b + 1)};
+}
+
 // ---------------------------------------------------------------------------
 // Analysis
 // ---------------------------------------------------------------------------
@@ -610,6 +639,10 @@ struct Analysis {
     bool accumulate = false;
     std::unordered_set<uint32_t> steps;
     std::unordered_set<uint32_t> let_steps;
+    /// Answers of the shape `cons h (f ..)`, a cell whose tail is a call of
+    /// this function: the list is built ahead of whoever reads it, a run of
+    /// cells a call. See "Building ahead".
+    std::unordered_set<uint32_t> cons_steps;
 };
 
 /// How many arguments a call handed to the machine may have. The helper takes
@@ -783,6 +816,14 @@ public:
                     a.force_first.clear();
                 }
             }
+        }
+        // Only the loop shape builds ahead: the run lives in its registers and
+        // is handed back from its one frame. A float slot would want the
+        // peeled first iteration as well, and nothing that builds a list has
+        // asked for one yet.
+        if (!recurses_ && !a.accumulate && !a.float_slots && peer_depth_ == 0 &&
+            build_ahead_enabled()) {
+            find_cons_steps(f_.body, 0, a.cons_steps);
         }
         if (peer_depth_ > 0) {
             // The two variants a peer may be emitted as, typed by the slots
@@ -1423,6 +1464,42 @@ private:
     /// `tail` is whether `idx` is in result position -- its value is the
     /// body's -- which is what recognises the two shapes of recursion that are
     /// compiled as a loop after all. See "Recursion that is a loop" below.
+    /// Every answer of the body that is `cons h (f ..)` with `f` this
+    /// function, saturated. The walk is the one `collect_calls` makes of the
+    /// answer positions.
+    void find_cons_steps(uint32_t idx, int depth, std::unordered_set<uint32_t>& out) const {
+        if (depth > 256) return;
+        const Node& n = img_.node(idx);
+        switch (Op(n.op)) {
+            case Op::If: {
+                const int k = constant_condition(img_, n);
+                if (k >= 0) {
+                    const uint32_t arm = k ? n.b : n.c;
+                    if (arm != NO_NODE) find_cons_steps(arm, depth + 1, out);
+                    return;
+                }
+                find_cons_steps(n.b, depth + 1, out);
+                if (n.c != NO_NODE) find_cons_steps(n.c, depth + 1, out);
+                return;
+            }
+            case Op::Block: {
+                if (n.b == 0) return;
+                const uint32_t last = img_.kid(n.a + n.b - 1);
+                if (Op(img_.node(last).op) != Op::Bind) find_cons_steps(last, depth + 1, out);
+                return;
+            }
+            case Op::SwitchAtom: case Op::SwitchHead:
+                for (uint32_t i = 1; i < n.c; i += 2) find_cons_steps(img_.kid(n.b + i), depth + 1, out);
+                find_cons_steps(img_.kid(n.b + n.c - 1), depth + 1, out);
+                return;
+            default: {
+                const uint32_t tail = cons_parts(img_, n).second;
+                if (tail != NO_NODE && is_self_call(img_.node(tail))) out.insert(idx);
+                return;
+            }
+        }
+    }
+
     void collect_calls(uint32_t idx, int depth, bool tail = false) {
         if (depth > 256) return;
         const Node& n = img_.node(idx);
@@ -1853,7 +1930,7 @@ public:
           force_first_(a.force_first), binds_(a.binds), peel_first_(a.peel),
           ret_dbl_(preset && a.ret_dbl), eager_(a.eager), bind_inline_(a.bind_inline),
           bind_memo_(a.bind_memo), accumulate_(a.accumulate), steps_(a.steps),
-          let_steps_(a.let_steps),
+          let_steps_(a.let_steps), cons_steps_(a.cons_steps),
           kinds_(a.kinds), nested_calls_(a.nested_calls), peers_(peers),
           preset_(preset), b_(ctx) {}
 
@@ -1912,6 +1989,19 @@ private:
     void bump_pending();
     /// Hand the answer back, finishing the accumulation when there is one.
     void emit_return(JV r);
+    // --- building ahead ------------------------------------------------------
+    /// `cons h (f ..)` as the answer: a cell, and the call's iteration next.
+    JV cons_step(uint32_t idx);
+    /// Leave for `ahead_abort_` when a run of cells is being built. Written
+    /// before anything an iteration ahead may not do.
+    void ahead_guard();
+    /// What `ahead_guard` leaves for: the rest of the list, suspended.
+    void emit_ahead_abort();
+    /// A helper call that may run code, raise or block, behind `ahead_guard`.
+    llvm::CallInst* guarded(llvm::FunctionCallee callee, llvm::ArrayRef<llvm::Value*> args) {
+        ahead_guard();
+        return b_.CreateCall(callee, args);
+    }
     /// The arguments of a self call, evaluated or lazy as the analysis said.
     bool self_args(const Node& n, std::vector<JV>* args);
     JV apply(uint32_t idx, const Node& n);
@@ -2029,6 +2119,8 @@ private:
     /// Emit the raise path: store the error and return with JIT_RAISED.
     void emit_raise(llvm::Value* error);
     void emit_type_error(const char* message);
+    /// A type error naming what was found, in the interpreter's words.
+    void emit_type_error(const char* message, llvm::Value* got);
 
     llvm::Value* i64(uint64_t v) { return llvm::ConstantInt::get(i64_, v); }
     llvm::Value* i32c(int v) { return llvm::ConstantInt::get(i32_, v); }
@@ -2078,6 +2170,15 @@ private:
     const bool accumulate_;
     const std::unordered_set<uint32_t> steps_;
     const std::unordered_set<uint32_t> let_steps_;
+    /// See `Analysis::cons_steps`.
+    const std::unordered_set<uint32_t> cons_steps_;
+    /// The run being built ahead: its first cell and its last, zero until the
+    /// first cell is made, and how many more it may have. Null unless the
+    /// body has a `cons_step`. See "Building ahead".
+    llvm::Value* ahead_first_ = nullptr;
+    llvm::Value* ahead_last_ = nullptr;
+    llvm::Value* ahead_left_ = nullptr;
+    llvm::BasicBlock* ahead_abort_ = nullptr;
     /// The accumulation: the sum of the left sides so far (`acc_`), the least
     /// and greatest it has been before each addition (`minp_`, `maxp_`), how
     /// many levels the interpreter would have pending (`pend_`), and whether
@@ -2157,7 +2258,8 @@ private:
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
         rt_frame_slots_, rt_native_, rt_builtin_, rt_switch_head_,
         rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_literal_str_,
-        rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_;
+        rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_,
+        rt_cons_after_, rt_set_tail_, rt_type_error_got_;
     /// The adopt arm of the `snapshot` being written, joined at its end.
     llvm::BasicBlock* pending_adopt_ = nullptr;
 };
@@ -2211,6 +2313,8 @@ void Emitter::declare_helpers() {
         "dream_rt_number_double", llvm::FunctionType::get(i32_, {ptr_, i64_, ptr_}, false));
     rt_type_error_ = mod_.getOrInsertFunction(
         "dream_rt_type_error", llvm::FunctionType::get(i64_, {ptr_, ptr_}, false));
+    rt_type_error_got_ = mod_.getOrInsertFunction(
+        "dream_rt_type_error_got", llvm::FunctionType::get(i64_, {ptr_, ptr_, i64_}, false));
     rt_reduction_slot_ = mod_.getOrInsertFunction(
         "dream_rt_reduction_slot", llvm::FunctionType::get(ptr_, {ptr_}, false));
     rt_frame_slots_ = mod_.getOrInsertFunction(
@@ -2234,6 +2338,11 @@ void Emitter::declare_helpers() {
         "dream_rt_peek", llvm::FunctionType::get(i64_, {i64_, i64_}, false));
     rt_cons_ = mod_.getOrInsertFunction(
         "dream_rt_cons", llvm::FunctionType::get(i64_, {ptr_, i64_, i64_}, false));
+    rt_cons_after_ = mod_.getOrInsertFunction(
+        "dream_rt_cons_after", llvm::FunctionType::get(i64_, {ptr_, i64_, i64_}, false));
+    rt_set_tail_ = mod_.getOrInsertFunction(
+        "dream_rt_set_tail",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i64_, i64_}, false));
     rt_make_list_ = mod_.getOrInsertFunction(
         "dream_rt_make_list", llvm::FunctionType::get(i64_, {ptr_, i32_, ptr_}, false));
     rt_make_array_ = mod_.getOrInsertFunction(
@@ -2299,6 +2408,14 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
     make_iteration_state();
     fresh_ = b_.CreateAlloca(i1_, nullptr, "fresh");
     b_.CreateStore(b_.getTrue(), fresh_);
+    if (!cons_steps_.empty() && !peel_first_) {
+        ahead_first_ = b_.CreateAlloca(i64_, nullptr, "ahead.first");
+        ahead_last_ = b_.CreateAlloca(i64_, nullptr, "ahead.last");
+        ahead_left_ = b_.CreateAlloca(i64_, nullptr, "ahead.left");
+        b_.CreateStore(i64(0), ahead_first_);
+        b_.CreateStore(i64(0), ahead_last_);
+        b_.CreateStore(i64(kBuildAhead), ahead_left_);
+    }
     if (accumulate_) {
         i128_ = llvm::Type::getInt128Ty(ctx_);
         auto zero = llvm::ConstantInt::get(i128_, 0);
@@ -2387,6 +2504,11 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
     } else if (!b_.GetInsertBlock()->getTerminator()) {
         // Every path ended in a tail call; nothing falls through here.
         b_.CreateUnreachable();
+    }
+    if (ahead_abort_) emit_ahead_abort();
+    if (failed_) {
+        fn_->eraseFromParent();
+        return nullptr;
     }
 
     finish_bind_table();
@@ -2538,6 +2660,7 @@ llvm::Function* Emitter::emit_entry(const std::string& name, llvm::Function* bod
 }
 
 void Emitter::emit_raise(llvm::Value* error) {
+    ahead_guard();
     b_.CreateStore(i32c(JIT_RAISED), status_);
     b_.CreateRet(error);
 }
@@ -2547,7 +2670,13 @@ void Emitter::emit_type_error(const char* message) {
     emit_raise(b_.CreateCall(rt_type_error_, {proc_, msg}));
 }
 
+void Emitter::emit_type_error(const char* message, llvm::Value* got) {
+    llvm::Value* msg = b_.CreateGlobalString(message);
+    emit_raise(b_.CreateCall(rt_type_error_got_, {proc_, msg, got}));
+}
+
 void Emitter::emit_bail() {
+    ahead_guard();
     // Nothing has happened yet: no reduction spent, no slot written, no effect.
     // So the interpreter can simply run the call, which is what it would have
     // done had this function never been compiled.
@@ -2583,6 +2712,7 @@ llvm::Value* Emitter::force(llvm::Value* v) {
     b_.CreateCondBr(suspended, need, done);
 
     b_.SetInsertPoint(need);
+    ahead_guard();
     llvm::Value* out = entry_alloca(i64_, "forced");
     llvm::Value* ok = b_.CreateCall(rt_force_, {proc_, v, out});
     llvm::Value* forced = b_.CreateLoad(i64_, out);
@@ -3011,6 +3141,39 @@ Emitter::JV Emitter::lazy(uint32_t idx) {
             phi->addIncoming(th, slow_end);
             return tag(phi);
         }
+        case Op::ListTail: {
+            // The tail of a cell already in hand is a load, and cannot raise;
+            // it is handed over as it stands, suspension or not. Anything else
+            // -- an operand still suspended, the empty list -- is the
+            // suspension it would have been. This is what lets `map f (tail
+            // xs)` build ahead over a list that is already built.
+            if (!cheap_lazy(img_, binds_, f_.arity, n.a, 0)) return tag(suspend(idx));
+            llvm::Value* x = lazy(n.a).v;
+            if (failed_) return none();
+            auto* obj = bb("lazy.tail.obj");
+            auto* cell = bb("lazy.tail.cell");
+            auto* miss = bb("lazy.tail.miss");
+            auto* done = bb("lazy.tail.done");
+            b_.CreateCondBr(is_heap_ptr(x), obj, miss);
+            b_.SetInsertPoint(obj);
+            llvm::Value* type = b_.CreateLoad(i8_, b_.CreateIntToPtr(x, ptr_));
+            b_.CreateCondBr(
+                b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Cons))), cell,
+                miss);
+            b_.SetInsertPoint(cell);
+            llvm::Value* tail =
+                b_.CreateLoad(i64_, b_.CreateIntToPtr(b_.CreateAdd(x, i64(16)), ptr_));
+            b_.CreateBr(done);
+            b_.SetInsertPoint(miss);
+            llvm::Value* th = suspend(idx);
+            auto* miss_end = b_.GetInsertBlock();
+            b_.CreateBr(done);
+            b_.SetInsertPoint(done);
+            auto* phi = b_.CreatePHI(i64_, 2);
+            phi->addIncoming(tail, cell);
+            phi->addIncoming(th, miss_end);
+            return tag(phi);
+        }
         case Op::Get: {
             // `thunk_for`'s read: an element of an array or of the part of a
             // list already built, found without forcing anything. `dream_rt_peek`
@@ -3139,7 +3302,7 @@ Emitter::JV Emitter::get(const Node& n) {
     b_.SetInsertPoint(slow);
     llvm::Value* out = entry_alloca(i64_, "got");
     llvm::Value* st =
-        b_.CreateCall(rt_get_, {proc_, c, k, i32c(n.c != NO_NODE ? 1 : 0), out});
+        guarded(rt_get_, {proc_, c, k, i32c(n.c != NO_NODE ? 1 : 0), out});
     llvm::Value* slowv = b_.CreateLoad(i64_, out);
     auto* slow_end = b_.GetInsertBlock();
     auto* raise_bb = bb("get.raise");
@@ -3193,7 +3356,7 @@ Emitter::JV Emitter::set(const Node& n) {
     JV vv = lazy(n.c);
     if (failed_) return none();
     llvm::Value* out = entry_alloca(i64_, "set");
-    llvm::Value* ok = b_.CreateCall(rt_set_, {proc_, c, k, vv.v, out});
+    llvm::Value* ok = guarded(rt_set_, {proc_, c, k, vv.v, out});
     llvm::Value* r = b_.CreateLoad(i64_, out);
     auto* cont = bb("set.ok");
     auto* raise_bb = bb("set.raise");
@@ -3260,7 +3423,7 @@ llvm::Value* Emitter::as_double(JV v, const char* message) {
 
     b_.SetInsertPoint(other);
     llvm::Value* slot = entry_alloca(dbl_);
-    llvm::Value* ok = b_.CreateCall(rt_number_double_, {proc_, v.v, slot});
+    llvm::Value* ok = guarded(rt_number_double_, {proc_, v.v, slot});
     auto* big = bb("num.big");
     auto* bad = bb("num.bad");
     b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), big, bad);
@@ -3282,7 +3445,7 @@ llvm::Value* Emitter::as_double(JV v, const char* message) {
 /// refuses an infinity or a NaN, which has no integer to be.
 Emitter::JV Emitter::int_of_double(llvm::Value* d) {
     llvm::Value* out = entry_alloca(i64_);
-    llvm::Value* ok = b_.CreateCall(rt_int_of_double_, {proc_, d, out});
+    llvm::Value* ok = guarded(rt_int_of_double_, {proc_, d, out});
     llvm::Value* v = b_.CreateLoad(i64_, out);
     auto* cont = bb("int.ok");
     auto* raise_bb = bb("int.raise");
@@ -3369,7 +3532,7 @@ Emitter::JV Emitter::float_arith(Op op, JV a, JV bv) {
     llvm::Value* out = entry_alloca(dbl_);
     llvm::Value* err = entry_alloca(i64_);
     llvm::Value* ok =
-        b_.CreateCall(rt_arith_f_, {proc_, i32c(int(op)), box(a), box(bv), out, err});
+        guarded(rt_arith_f_, {proc_, i32c(int(op)), box(a), box(bv), out, err});
     llvm::Value* slowv = b_.CreateLoad(dbl_, out);
     auto* slow_end = b_.GetInsertBlock();
     auto* raise_bb = bb("fbin.raise");
@@ -3406,7 +3569,7 @@ Emitter::JV Emitter::float_order(Op op, JV a, JV bv) {
 
     b_.SetInsertPoint(slow_bb);
     llvm::Value* out = entry_alloca(i64_);
-    llvm::Value* ok = b_.CreateCall(rt_compare_, {proc_, i32c(int(op)), box(a), box(bv), out});
+    llvm::Value* ok = guarded(rt_compare_, {proc_, i32c(int(op)), box(a), box(bv), out});
     llvm::Value* slowv = b_.CreateLoad(i64_, out);
     auto* slow_end = b_.GetInsertBlock();
     auto* raise_bb = bb("fcmp.raise");
@@ -3428,6 +3591,7 @@ Emitter::JV Emitter::float_order(Op op, JV a, JV bv) {
 
 Emitter::JV Emitter::node(uint32_t idx, bool tail) {
     if (failed_) return none();
+    if (tail && ahead_first_ && cons_steps_.count(idx)) return cons_step(idx);
     const Node& n = img_.node(idx);
     switch (Op(n.op)) {
         case Op::ConstInt: {
@@ -3600,7 +3764,7 @@ Emitter::JV Emitter::switch_node(const Node& n, bool tail) {
     llvm::Value* key = box(subject);
     if (Op(n.op) == Op::SwitchHead) {
         auto* out = entry_alloca(i64_);
-        auto* ok = b_.CreateCall(rt_switch_head_, {proc_, key, out});
+        auto* ok = guarded(rt_switch_head_, {proc_, key, out});
         key = b_.CreateLoad(i64_, out);
         auto* ready = bb("switch.head");
         auto* raised = bb("switch.raise");
@@ -3670,7 +3834,7 @@ Emitter::JV Emitter::conditional(const Node& n, bool tail) {
     b_.CreateCondBr(b_.CreateOr(is_true, is_false), pick, bad_bb);
 
     b_.SetInsertPoint(bad_bb);
-    emit_type_error("`if` needs a bool");
+    emit_type_error("`if` needs a bool", c);
 
     b_.SetInsertPoint(pick);
     b_.CreateCondBr(is_true, then_bb, else_bb);
@@ -3737,7 +3901,7 @@ Emitter::JV Emitter::logic(const Node& n) {
     b_.CreateCondBr(b_.CreateOr(is_true, is_false), pick, bad_bb);
 
     b_.SetInsertPoint(bad_bb);
-    emit_type_error(is_and ? "`and` needs a bool" : "`or` needs a bool");
+    emit_type_error(is_and ? "`and` needs a bool" : "`or` needs a bool", l);
 
     b_.SetInsertPoint(pick);
     // `and` continues on true, `or` continues on false.
@@ -3775,7 +3939,7 @@ Emitter::JV Emitter::unary(const Node& n) {
         llvm::Value* is_false = b_.CreateICmpEQ(v, i64(FALSE_V));
         b_.CreateCondBr(b_.CreateOr(is_true, is_false), ok_bb, bad_bb);
         b_.SetInsertPoint(bad_bb);
-        emit_type_error("`not` needs a bool");
+        emit_type_error("`not` needs a bool", v);
         b_.SetInsertPoint(ok_bb);
         return tag(b_.CreateSelect(is_true, i64(FALSE_V), i64(TRUE_V)));
     }
@@ -3806,7 +3970,7 @@ Emitter::JV Emitter::unary(const Node& n) {
 
     b_.SetInsertPoint(slow_bb);
     llvm::Value* out = entry_alloca(i64_);
-    llvm::Value* ok = b_.CreateCall(
+    llvm::Value* ok = guarded(
         rt_arith_, {proc_, i32c(int(Op::Sub)), i64(make_fixnum(0)), v, out});
     llvm::Value* slowv = b_.CreateLoad(i64_, out);
     auto* slow_end = b_.GetInsertBlock();
@@ -3965,7 +4129,7 @@ Emitter::JV Emitter::binary(const Node& n) {
     b_.SetInsertPoint(slow_bb);
     auto* out = entry_alloca(i64_);
     llvm::FunctionCallee helper = is_cmp ? rt_compare_ : rt_arith_;
-    llvm::Value* ok = b_.CreateCall(helper, {proc_, i32c(int(op)), a, bb_, out});
+    llvm::Value* ok = guarded(helper, {proc_, i32c(int(op)), a, bb_, out});
     llvm::Value* slowv = b_.CreateLoad(i64_, out);
     auto* slow_end = b_.GetInsertBlock();
     auto* raise_bb = bb("bin.raise");
@@ -4027,7 +4191,7 @@ Emitter::JV Emitter::closure_call(const Node& n) {
     if (failed_) return none();
     spend_reduction();
     llvm::Value* out = entry_alloca(i64_, "applied");
-    llvm::Value* st = b_.CreateCall(rt_apply_, {proc_, f, i32c(int(n.c)), items, out});
+    llvm::Value* st = guarded(rt_apply_, {proc_, f, i32c(int(n.c)), items, out});
     llvm::Value* v = b_.CreateLoad(i64_, out);
     auto* cont = bb("apply.ok");
     auto* raise_bb = bb("apply.raise");
@@ -4182,7 +4346,7 @@ Emitter::JV Emitter::call_peer_variant(llvm::Function* fn, SlotSet dbl_slots, bo
         call.push_back(dbl ? args[i].v : box(args[i]));
     }
     call.push_back(status_);
-    return take_call_status(b_.CreateCall(fn, call), "peer", ret_dbl);
+    return take_call_status(guarded(fn, call), "peer", ret_dbl);
 }
 
 /// One of the numeric natives, made rather than called.
@@ -4259,7 +4423,7 @@ Emitter::JV Emitter::native_call(KnownNative which, const Node& n) {
                                   : which == KnownNative::Floor ? rt_floor_
                                                                 : rt_to_int_;
     auto* out = entry_alloca(i64_);
-    llvm::Value* ok = b_.CreateCall(helper, {proc_, x.v, out});
+    llvm::Value* ok = guarded(helper, {proc_, x.v, out});
     llvm::Value* v = b_.CreateLoad(i64_, out);
     auto* cont = bb("native.ok");
     auto* raise_bb = bb("native.raise");
@@ -4309,7 +4473,7 @@ Emitter::JV Emitter::host_call(const NativeSite& site, const Node& n) {
     auto* out = entry_alloca(i64_);
     call.push_back(out);
 
-    llvm::Value* ok = b_.CreateCall(site.builtin ? rt_builtin_ : rt_native_, call);
+    llvm::Value* ok = guarded(site.builtin ? rt_builtin_ : rt_native_, call);
     llvm::Value* v = b_.CreateLoad(i64_, out);
     auto* cont = bb("host.ok");
     auto* raise_bb = bb("host.raise");
@@ -4482,6 +4646,23 @@ Emitter::JV Emitter::let_step(const Node& n) {
 }
 
 void Emitter::emit_return(JV r) {
+    if (ahead_first_) {
+        // The end of a run: the answer is the last cell's tail, and the first
+        // cell is the answer. With no run, it is the answer as it stands.
+        llvm::Value* v = box(r);
+        llvm::Value* first = b_.CreateLoad(i64_, ahead_first_);
+        auto* plain = bb("ret.plain");
+        auto* run = bb("ret.run");
+        b_.CreateCondBr(b_.CreateICmpEQ(first, i64(0)), plain, run);
+        b_.SetInsertPoint(plain);
+        b_.CreateStore(i32c(JIT_OK), status_);
+        b_.CreateRet(v);
+        b_.SetInsertPoint(run);
+        b_.CreateCall(rt_set_tail_, {proc_, b_.CreateLoad(i64_, ahead_last_), v});
+        b_.CreateStore(i32c(JIT_OK), status_);
+        b_.CreateRet(first);
+        return;
+    }
     if (!accumulate_) {
         b_.CreateStore(i32c(JIT_OK), status_);
         b_.CreateRet(box(r));
@@ -4520,6 +4701,119 @@ void Emitter::emit_return(JV r) {
     emit_bail();
 }
 
+// ---------------------------------------------------------------------------
+// Building ahead
+//
+// `replicate n x = if n <= 0 { [] } else { cons x (replicate (n - 1) x) }` is
+// the shape of every list producer, and the interpreter runs it one cell at a
+// time: the tail is a suspension of the next call, so each cell costs a cell,
+// a thunk, a frame for the thunk to read and a trip through the interpreter to
+// force it -- 116 bytes and a call, for 24 bytes of data. Compiling the body
+// made each trip cheaper and kept all four.
+//
+// The tail could be evaluated now instead, and for most producers nothing
+// would show: the body is pure, so evaluating it early is invisible *unless it
+// raises, diverges or does unbounded work* -- and a list nobody reads past its
+// first cell is exactly where an eager tail would do all three. So the loop
+// evaluates it speculatively, and gives up the moment it cannot be sure:
+//
+//   * The first iteration -- the call the interpreter actually made -- runs as
+//     it always did. When its answer is `cons h (f args)`, it makes the cell
+//     with no tail yet and, instead of suspending `f args`, takes the loop's
+//     back-edge with `args` as the slots: in lazy positions, built or
+//     suspended exactly as the interpreter's `Apply` would hand them over.
+//   * Every iteration after that is *ahead*, and an iteration ahead may only
+//     do what cannot be observed: inline arithmetic and tests on values in
+//     hand, reads of cells and arrays, building. Before everything else --
+//     every helper call, since any of them may raise, run code, force a
+//     suspension or block; every raise; a bail; a yield -- `ahead_guard`
+//     leaves for `ahead_abort_` instead, which makes the last cell's tail a
+//     suspension of the *whole body* against a frame of the current slots.
+//     That is what the interpreter's thunk of the call would have evaluated,
+//     one `Apply` later, and the run so far is the answer. Nothing the
+//     iteration did is lost but registers.
+//   * A run ends at `kBuildAhead` cells, or when the slice runs out, by
+//     suspending the call exactly as before; and an iteration whose answer is
+//     not a cell ends it by becoming the last cell's tail.
+//
+// A strict parameter is one the next iteration will force at once, so a step
+// whose argument there is still a suspension would only abort. The run stops
+// at that step instead, which costs what a step always cost.
+// ---------------------------------------------------------------------------
+
+void Emitter::ahead_guard() {
+    if (!ahead_first_) return;
+    if (!ahead_abort_) ahead_abort_ = bb("ahead.abort");
+    auto* cont = bb("ahead.ok");
+    b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i64_, ahead_first_), i64(0)), ahead_abort_,
+                    cont);
+    b_.SetInsertPoint(cont);
+}
+
+void Emitter::emit_ahead_abort() {
+    b_.SetInsertPoint(ahead_abort_);
+    llvm::Value* rest = suspend(f_.body);
+    b_.CreateCall(rt_set_tail_, {proc_, b_.CreateLoad(i64_, ahead_last_), rest});
+    b_.CreateStore(i32c(JIT_OK), status_);
+    b_.CreateRet(b_.CreateLoad(i64_, ahead_first_));
+}
+
+Emitter::JV Emitter::cons_step(uint32_t idx) {
+    const auto [head, call] = cons_parts(img_, img_.node(idx));
+    const Node& c = img_.node(call);
+    llvm::Value* h = lazy(head).v;
+    if (failed_) return none();
+    std::vector<llvm::Value*> args(c.c);
+    for (uint32_t i = 0; i < c.c; ++i) {
+        args[i] = lazy(img_.kid(c.b + i)).v;
+        if (failed_) return none();
+    }
+    llvm::Value* cell =
+        b_.CreateCall(rt_cons_after_, {proc_, b_.CreateLoad(i64_, ahead_last_), h});
+    llvm::Value* first = b_.CreateLoad(i64_, ahead_first_);
+    b_.CreateStore(b_.CreateSelect(b_.CreateICmpEQ(first, i64(0)), cell, first), ahead_first_);
+    b_.CreateStore(cell, ahead_last_);
+    llvm::Value* left = b_.CreateSub(b_.CreateLoad(i64_, ahead_left_), i64(1));
+    b_.CreateStore(left, ahead_left_);
+    llvm::Value* go = b_.CreateAnd(b_.CreateICmpSGT(left, i64(0)),
+                                   b_.CreateICmpSGT(spend_reduction(), i64(0)));
+    for (uint32_t i = 0; i < c.c && i < 64; ++i) {
+        if (!((eager_ >> i) & 1)) continue;
+        // Settled: what `force` lets through without a call.
+        llvm::Value* v = args[i];
+        auto* test = b_.GetInsertBlock();
+        auto* obj = bb("ahead.obj");
+        auto* next = bb("ahead.arg");
+        b_.CreateCondBr(is_heap_ptr(v), obj, next);
+        b_.SetInsertPoint(obj);
+        llvm::Value* type = b_.CreateLoad(i8_, b_.CreateIntToPtr(v, ptr_));
+        llvm::Value* rel =
+            b_.CreateSub(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Thunk)));
+        llvm::Value* settled = b_.CreateICmpUGT(rel, llvm::ConstantInt::get(i8_, 2));
+        auto* obj_end = b_.GetInsertBlock();
+        b_.CreateBr(next);
+        b_.SetInsertPoint(next);
+        auto* phi = b_.CreatePHI(i1_, 2);
+        phi->addIncoming(b_.getTrue(), test);
+        phi->addIncoming(settled, obj_end);
+        go = b_.CreateAnd(go, phi);
+    }
+    auto* iterate = bb("ahead.iterate");
+    auto* stop = bb("ahead.stop");
+    b_.CreateCondBr(go, iterate, stop);
+
+    b_.SetInsertPoint(stop);
+    b_.CreateCall(rt_set_tail_, {proc_, cell, suspend(call)});
+    b_.CreateStore(i32c(JIT_OK), status_);
+    b_.CreateRet(b_.CreateLoad(i64_, ahead_first_));
+
+    b_.SetInsertPoint(iterate);
+    for (uint32_t i = 0; i < c.c; ++i) b_.CreateStore(args[i], slots_[i]);
+    if (fresh_) b_.CreateStore(b_.getFalse(), fresh_);
+    b_.CreateBr(loop_header_);
+    return none();
+}
+
 llvm::Value* Emitter::spend_reduction() {
     llvm::Value* left = b_.CreateLoad(i64_, reduction_slot_);
     llvm::Value* next = b_.CreateSub(left, i64(1));
@@ -4545,6 +4839,7 @@ void Emitter::emit_yield() {
     // Only the parameters in the recursive shape: the slots past them are
     // never read there. A slot a `let` bound holds nothing worth carrying: the
     // interpreter resumes at the top of the body and runs the `let` again.
+    ahead_guard();
     const uint32_t n = recurses_ ? f_.arity : f_.slots;
     llvm::Value* vals = entry_alloca(i64_, "yield.vals", std::max(1u, n));
     for (uint32_t i = 0; i < n; ++i) {
@@ -4811,6 +5106,7 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_floor", reinterpret_cast<void*>(&dream_rt_floor));
     add("dream_rt_int_of_double", reinterpret_cast<void*>(&dream_rt_int_of_double));
     add("dream_rt_type_error", reinterpret_cast<void*>(&dream_rt_type_error));
+    add("dream_rt_type_error_got", reinterpret_cast<void*>(&dream_rt_type_error_got));
     add("dream_rt_reduction_slot", reinterpret_cast<void*>(&dream_rt_reduction_slot));
     add("dream_rt_frame_slots", reinterpret_cast<void*>(&dream_rt_frame_slots));
     add("dream_rt_native", reinterpret_cast<void*>(&dream_rt_native));
@@ -4819,6 +5115,8 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_set", reinterpret_cast<void*>(&dream_rt_set));
     add("dream_rt_peek", reinterpret_cast<void*>(&dream_rt_peek));
     add("dream_rt_cons", reinterpret_cast<void*>(&dream_rt_cons));
+    add("dream_rt_cons_after", reinterpret_cast<void*>(&dream_rt_cons_after));
+    add("dream_rt_set_tail", reinterpret_cast<void*>(&dream_rt_set_tail));
     add("dream_rt_make_list", reinterpret_cast<void*>(&dream_rt_make_list));
     add("dream_rt_make_array", reinterpret_cast<void*>(&dream_rt_make_array));
     add("dream_rt_literal_str", reinterpret_cast<void*>(&dream_rt_literal_str));
