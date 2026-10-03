@@ -10,12 +10,12 @@
 // `[:ok, value]` or `[:error, message]` instead, and `parse_or` is the form for
 // when a default is more useful than a diagnosis.
 //
-// | JSON      | Dream                                    |
-// |-----------|------------------------------------------|
-// | object    | map, with string keys                    |
+// | JSON      | Dream                                     |
+// |-----------|------------------------------------------ |
+// | object    | map, with string keys                     |
 // | array     | list                                      |
 // | string    | string                                    |
-// | number    | integer when it has no `.`/`e`, else float |
+// | number    | integer when it has no `.`/`e`, else float|
 // | true/false| bool                                      |
 // | null      | `()`                                      |
 //
