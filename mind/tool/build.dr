@@ -970,7 +970,7 @@ let script_setting! m o g = {
          })
         (placed! (vm_command! ())) (profile_of o) (script_target o m) (option o :jobs 1)
         (list.fold (fn acc n -> match node_version n { () => acc, v => acc.[node_key n => v] }) (%{}) (nodes g))
-        (option o :verbose false) (option o :testing false) (option o :only [])
+        (option o :verbose false) (option o :testing false) (option o :only []) (option o :goals [])
 };
 
 /// The package's own checks, run as `mind test` runs them -- `[:ok, [[name,
@@ -984,6 +984,21 @@ let checks! m o =
             own => match script.run_all! (script_setting! m (with_option :testing true o) g) own {
                 [:error, why] => [:error, why],
                 [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map_pairs (Outcome.checks outcome))],
+                [:ok, []] => [:ok, []],
+            },
+        },
+    };
+
+/// The goals named, made by the package's own script -- `[:ok, [[name,
+/// path]]]`, each where its result is -- or why they could not be.
+let goals! m o names =
+    match resolve! m o false {
+        [:error, why] => [:error, why],
+        [:ok, g] => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
+            [] => [:error, "`" + manifest.name m + "` has no build script, so it has no goals"],
+            own => match script.run_all! (script_setting! m (with_option :goals names o) g) own {
+                [:error, why] => [:error, why],
+                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map_pairs (Outcome.goals outcome))],
                 [:ok, []] => [:ok, []],
             },
         },

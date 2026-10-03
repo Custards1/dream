@@ -1,10 +1,39 @@
-// The repository's own checks: what belongs to no one package. Each runs a
-// suite from the root of the repository, with the VM and the compiler this
-// test run uses in the environment, under every name the suites read them by.
+// The repository's own build script: what belongs to no one package.
+//
+// Its checks are what `mind test` runs beside every member's units: suites
+// written to be run from the root of the repository, with the VM and the
+// compiler this test run uses in the environment, under every name the suites
+// read them by.
+//
+// Its goals build the repository from source, which nothing else in the
+// workspace does:
+//
+//     mind build vm        build-dream/bin/dream, and its library beside it
+//     mind build dreams    build/dreams.dream, the compiler, from the seed
+//     mind build seed      the compiler rebuilt by itself, over the seed
+//     mind build default   vm, dreams, mind and lucid
+//
+// Each goal puts what it makes where the `justfile` always has, so every
+// script and note that names `build-dream/bin/dream` or `build/dreams.dream`
+// stays right. The VM is built object by object with `std.build.cc` and
+// whichever compiler `$CXX` or the platform names, not with CMake, and the
+// compiler is compiled by the VM this build made, so `mind build dreams`
+// after an edit to one file of the VM recompiles that file, relinks, and
+// builds the compiler again with what it made. This is docs/build.md,
+// "Building this repository".
+
 import std.build;
+import std.build.cc;
+import std.build.cc.steps;
 import std.build.command;
+import std.build.dream;
+import std.build.probe;
 import std.file;
+import std.list;
 import std.map;
+import std.str;
+
+// --- checks ------------------------------------------------------------------------
 
 let tools : :map -> %{:string => :string};
 let tools ctx = {
@@ -15,10 +44,163 @@ let tools ctx = {
 let suite : :map -> :string -> :string -> :map;
 let suite ctx name program = command.check_in (build.Context.root ctx) name (tools ctx) program [];
 
-let plan : :map -> :map;
-let plan ctx =
+/// `std.build.cc` against the compilers themselves, and the runner rebuilding
+/// what changed and nothing else (`just test-build`).
+let std_build : :string;
+let std_build = "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
+    + " && for p in toolchains incremental; do"
+    + " \"$dream\" \"$dreams\" -L mind mind/std/build/tests/$p.dr -o \"$t/$p.dream\" >/dev/null"
+    + " && \"$dream\" \"$t/$p.dream\" || exit 1; done";
+
+let checks : :map -> :map;
+let checks ctx =
     build.empty
     |> build.check "vm" (suite ctx "vm" (file.parent (build.Context.vm ctx) + "/dream_tests"))
+    |> build.check "std_build" (command.check_in (build.Context.root ctx) "std_build" (tools ctx) "sh" ["-c", std_build])
     |> build.check "e2e" (suite ctx "e2e" "dream/tests/e2e.sh")
     |> build.check "examples" (suite ctx "examples" "examples/run.sh")
     |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh");
+
+// --- the VM -------------------------------------------------------------------------
+
+let vm_sources : [:string];
+let vm_sources = list.map (fn s -> "dream/src/" + s + ".cpp")
+                          ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "ffi",
+                           "io", "sha256", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
+                           "jit_rt"];
+
+/// GCC's inliner ceilings: dream/CMakeLists.txt says why at length. The
+/// reduction loop is one enormous function, past which GCC will not inline
+/// anything, however small.
+let inliner : [:string];
+let inliner = ["--param", "large-function-growth=400", "--param", "large-function-insns=10000",
+               "--param", "inline-unit-growth=120", "--param", "max-inline-insns-auto=120",
+               "--param", "max-inline-insns-single=800"];
+
+/// The tensor kernels a second time, for CPUs with AVX2 and FMA, chosen at run
+/// time: on x86-64, with a compiler that takes GCC's flags. CMakeLists.txt and
+/// the head of src/tensor_kernels.inc say why it is a translation unit of its
+/// own.
+let avx2 : :map -> cc.Toolchain -> cc.Target -> cc.Target;
+let avx2 ctx tc t = match [build.Target.arch (build.Context.target ctx), cc.Toolchain.family tc] {
+    [:x86_64, :gnu] => t |> cc.source_with "dream/src/tensor_kernels_avx2.cpp" [cc.Setting.flags_for :gnu ["-mavx2", "-mfma"]]
+                         |> cc.define "DREAM_TENSOR_AVX2",
+    _ => t,
+};
+
+/// `jit.cpp` when LLVM answered and the JIT was not turned off (`-D jit=off`),
+/// the stub otherwise.
+let jit : :map -> :any -> cc.Target -> cc.Target;
+let jit ctx llvm t = match [build.option ctx "jit", llvm] {
+    ["off", _] => cc.source "dream/src/jit_stub.cpp" t,
+    [_, ()] => cc.source "dream/src/jit_stub.cpp" t,
+    [_, l] =>
+        t |> cc.source_with "dream/src/jit.cpp" (if l.[:rtti] { [] } else { [cc.Setting.rtti false] })
+          |> cc.define "DREAM_HAVE_LLVM"
+          |> cc.define "__STDC_CONSTANT_MACROS" |> cc.define "__STDC_FORMAT_MACROS" |> cc.define "__STDC_LIMIT_MACROS"
+          // `-isystem`, so LLVM's headers are not held to this build's warnings.
+          |> cc.flags_for :gnu ["-isystem", l.[:includes]]
+          |> cc.flags_for :msvc ["/external:I" + l.[:includes], "/external:W0"]
+          |> cc.set (cc.Setting.library_dir l.[:libdir])
+          |> cc.link_flags_for :gnu l.[:libraries],
+};
+
+let optimized : :map -> cc.Target -> cc.Target;
+let optimized ctx t = match build.profile ctx {
+    "debug" => t |> cc.optimize 3 |> cc.debug_info true,
+    _ => t |> cc.optimize 3,
+};
+
+/// libffi as `pkg-config` describes it, or the compiler's own search paths
+/// when it has nothing to say: a system with libffi installed where the
+/// compiler looks needs no flags at all. Nix keeps the headers where it does
+/// not look, and `nix-shell -p pkg-config libffi` is the answer there.
+let ffi : [:string] -> cc.Target -> cc.Target;
+let ffi [cflags, libs] t = {
+    let words text = list.filter (fn w -> not (str.is_empty w)) (str.split " " (str.trim text));
+    match words libs {
+        [] => t |> cc.system "ffi",
+        found => t |> cc.flags_for :gnu (words cflags) |> cc.link_flags_for :gnu found,
+    }
+};
+
+let libdream : :map -> cc.Toolchain -> :any -> [:string] -> cc.Target;
+let libdream ctx tc llvm libffi =
+    cc.shared "dream" vm_sources
+    |> cc.standard :cxx20
+    |> optimized ctx
+    |> cc.warnings :extra
+    |> cc.flags_for :gnu ["-Wno-unused-parameter", "-fno-semantic-interposition", "-fno-plt"]
+    |> cc.flags_for :gcc inliner
+    |> cc.flags_for :msvc ["/permissive-", "/utf-8", "/wd4100"]
+    |> cc.define_for :msvc "_CRT_SECURE_NO_WARNINGS"
+    |> cc.public_include "dream/include"
+    |> cc.include "dream/src"
+    |> cc.threads
+    |> ffi libffi
+    |> cc.system_for :linux "dl"
+    |> cc.system_for :windows "ws2_32"
+    |> cc.export_all
+    |> avx2 ctx tc
+    |> jit ctx llvm;
+
+let native : :map -> :string -> :string -> cc.Target -> cc.Target;
+let native ctx name source lib =
+    cc.executable name [source]
+    |> cc.standard :cxx20
+    |> optimized ctx
+    |> cc.warnings :extra
+    |> cc.flags_for :gnu ["-Wno-unused-parameter"]
+    |> cc.include "dream/src"
+    |> cc.use lib;
+
+// --- Dream programs ------------------------------------------------------------------
+
+/// The compiler, compiled by `compiler` and run on `vm`.
+let dreams_by : :any -> :any -> :any;
+let dreams_by vm compiler = dream.program "dreams" "dreams/main.dr" compiler vm |> dream.paths ["mind", "."];
+
+let goals : :map -> cc.Toolchain -> :any -> [:string] -> :map;
+let goals ctx tc llvm libffi = {
+    let lib = libdream ctx tc llvm libffi;
+    let cli = native ctx "dream" "dream/src/cli.cpp" lib;
+    let vm = steps.artifact tc cli;
+    let dreams = dream.artifact (dreams_by vm (build.file "dreams/bootstrap/dreams.dream"));
+    let stage3 = dream.artifact (dreams_by vm dreams);
+    build.empty
+    |> build.goal "vm" (build.place "build-dream" (build.artifact (steps.link_step tc cli) ""))
+    |> build.note "vm" "the VM, and its library beside it, in build-dream/"
+    |> build.goal "vm-tests" (build.place "build-dream/bin/dream_tests"
+                                          (steps.artifact tc (native ctx "dream_tests" "dream/tests/test_main.cpp" lib)))
+    |> build.goal "dreams" (build.place "build/dreams.dream" dreams)
+    |> build.note "dreams" "the compiler, built by the seed"
+    |> build.goal "seed" (build.place "dreams/bootstrap/dreams.dream" stage3)
+    |> build.note "seed" "the compiler built by itself, over the checked-in seed"
+    |> build.goal "mind" (build.place "build/mind" (dream.artifact (dream.program "mind" "mind/tool/main.dr" dreams vm
+                                                                     |> dream.paths ["mind/std"] |> dream.flags ["--shebang"])))
+    |> build.goal "lucid" (build.place "build/lucid.dream"
+                                       (dream.artifact (dream.program "lucid" "lucid/main.dr" dreams vm |> dream.paths ["mind", "."])))
+    |> build.goal "default" (build.each ["vm", "dreams", "mind", "lucid"])
+};
+
+let llvm_parts : [:string];
+let llvm_parts = ["core", "orcjit", "native", "support", "target", "analysis", "passes", "ipo",
+                  "instcombine", "scalaropts", "transformutils"];
+
+/// A probe asked again every build. `probe.pkg_config` keeps its answer until
+/// the question changes, and a first build on a machine without `pkg-config`
+/// would keep "nothing" for good.
+let asked_again : :any -> :any;
+let asked_again a = match a { [:artifact, s, n] => build.artifact (build.uncached s) n };
+
+/// The questions that come before the goals: which compiler, whether there is
+/// an LLVM, and where libffi is. Everything else follows from the answers.
+let plan : :map -> :map;
+let plan ctx = build.all [
+    checks ctx,
+    steps.with_toolchain ctx (fn tc ->
+        build.given (probe.llvm llvm_parts) (fn llvm ->
+        build.given (asked_again (probe.pkg_config ctx "--cflags" "libffi")) (fn cflags ->
+        build.given (asked_again (probe.pkg_config ctx "--libs" "libffi")) (fn libs ->
+            goals ctx tc (probe.answer llvm) [cflags, libs])))),
+];

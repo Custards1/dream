@@ -59,41 +59,21 @@ let parent path = {
     }
 };
 
+// The three walks below are natives (`std.io`): each is one call where the
+// same walk in Dream is a recursion over `list_dir!` or a read and a write per
+// chunk, and a build does all three for every step it runs.
+
 /// Make `path` and every directory above it.
 let mkdir_all! : :string -> :unit;
-let rec mkdir_all! path =
-    match path {
-        "" => (),
-        "." => (),
-        "/" => (),
-        p => {
-            if not (io.is_dir! p) {
-                mkdir_all! (parent p)
-                io.mkdir! p
-            }
-        },
-    };
-
-/// Copy a file's bytes, a chunk at a time so a large one is never held whole.
-let copy! : :string -> :string -> :unit;
-let copy! from to = {
-    let src = io.open! from :read;
-    let dst = io.open! to :write;
-    let rec put! text offset = {
-        let left = str.byte_length text - offset;
-        if left > 0 { put! text (offset + io.write! dst (str.slice offset left text)) }
-    };
-    let rec pump! () = {
-        let chunk = io.read! src 65536;
-        if len chunk > 0 {
-            put! chunk 0
-            pump! ()
-        }
-    };
-    pump! ()
-    io.close! src
-    io.close! dst
+let mkdir_all! path = match path {
+    "" => (),
+    p => io.mkdir_all! p,
 };
+
+/// Copy a file, replacing `to` if it is there. The copy is a file of its own,
+/// with `from`'s permissions: changing one never changes the other.
+let copy! : :string -> :string -> :unit;
+let copy! from to = io.copy! from to;
 
 /// A name for a scratch file no other writer is using: this OS process's id
 /// and this green process's. The first alone is not enough, since one VM runs
@@ -116,15 +96,17 @@ let replace! path text = {
 /// Remove `path` and, when it is a directory, everything under it. Nothing
 /// there is not an error: what was asked for is that it be gone.
 let remove_all! : :string -> :unit;
-let rec remove_all! path =
-    match io.stat! path {
-        () => (),
-        [_, _, :dir] => {
-            strict! (list.map (fn name -> remove_all! (path + "/" + name)) (os.list_dir! path))
-            io.remove! path
-        },
-        _ => io.remove! path,
-    };
+let remove_all! path = {
+    io.remove_all! path
+    ()
+};
+
+/// Every file under `dir`, relative to it, sorted; `[]` when it is not there.
+let walk! : :string -> [:string];
+let walk! dir = match io.stat! dir {
+    [_, _, :dir] => io.walk! dir,
+    _ => [],
+};
 
 when test {
     import std.test;

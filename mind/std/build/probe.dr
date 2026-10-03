@@ -13,10 +13,16 @@
 //
 // A probe's key is its question and the target, not the state of the machine,
 // so an answer is kept until the question changes. That is the trade every
-// configure step makes; `mind clean` asks again.
+// configure step makes; `mind clean` asks again. `llvm` is the exception: an
+// answer that is a library's whole configuration is asked every build, since
+// installing another LLVM changes no file of the project's, and a build made
+// against the one that is gone does not link.
 
 import std.build;
-import std.build.cc;
+import std.build.cc.steps;
+import std.list;
+import std.str;
+import std.wire;
 
 /// Where `program` is on `PATH`, or `""`.
 let program : :map -> :string -> :any;
@@ -39,15 +45,46 @@ let pkg_config ctx what package =
 /// same compiler `std.build.cc` would use.
 let library : :map -> :string -> :any;
 let library ctx name = {
-    let compiler = cc.compiler ctx (cc.library name []);
+    let compiler = list.head (steps.compilers ctx);
     build.artifact (build.step "probe" ("library " + name) [] [build.Context.target ctx, compiler, name] ["answer"]
                                (fn job -> [build.Op.write "probe.c" "int main(void) { return 0; }\n",
                                            build.Op.attempt compiler ["-o", "probe", "probe.c", "-l" + name] "answer"]))
                    "answer"
 };
 
+/// What a probe answered as a value rather than text, for one whose answer is
+/// a record (`llvm`); `()` for no answer.
+let answer : :string -> :any;
+let answer text = match wire.decode text { [:ok, v] => v, _ => () };
+
+/// `llvm-config`'s answers, as one record.
+let llvm_answer : [:string] -> :string;
+let llvm_answer said = match list.map str.trim said {
+    ["", .._] => wire.encode (),
+    [includes, version, libdir, libs, system, rtti] => wire.encode (%{
+        :version => version,
+        :includes => includes,
+        :libdir => libdir,
+        :libraries => list.filter (fn w -> not (str.is_empty w)) (list.append (str.split " " libs) (str.split " " system)),
+        :rtti => rtti == "YES",
+    }),
+};
+
+/// What `llvm-config` says about building against these LLVM components:
+/// `%{ :version, :includes, :libdir, :libraries, :rtti }` once read with
+/// `answer`, or `()` when there is no LLVM.
+let llvm : [:string] -> :any;
+let llvm components = {
+    let asks = [["--includedir"], ["--version"], ["--libdir"], list.cons "--libs" components, ["--system-libs"],
+                ["--has-rtti"]];
+    let names = list.map (fn i -> "said" + to_string i) (list.range 0 (list.length asks));
+    build.artifact (build.uncached (build.step "probe" "llvm" [] [:llvm, components] ["answer"] (fn job ->
+        list.append (list.map (fn [n, args] -> build.Op.capture "llvm-config" args n) (list.zip names asks))
+                    [build.Op.transform names "answer" llvm_answer])))
+                   "answer"
+};
+
 when test {
-    import std.list;
     import std.test;
 
     let here = build.Target.make :linux :x86_64;
@@ -58,6 +95,11 @@ when test {
         test.case "a probe asks one question and never fails"
             $( test.eq! [[:find, "git", "answer"]]
                         (build.Step.action (step_of (program ctx "git")) (build.Job.make "/d" ctx (%{}))) ),
+        test.case "llvm's answers are one record, or none"
+            $( test.eq! [(), %{ :version => "21.1.8", :includes => "/i", :libdir => "/l",
+                                :libraries => ["-lLLVM-21", "-lz"], :rtti => false }]
+                        [answer (llvm_answer ["", "", "", "", "", ""]),
+                         answer (llvm_answer ["/i\n", "21.1.8", "/l", "-lLLVM-21", "-lz", "NO"])] ),
         test.case "two questions are two steps"
             $( test.ne! (build.Step.shape (step_of (library ctx "z"))) (build.Step.shape (step_of (library ctx "m"))) ),
     ];

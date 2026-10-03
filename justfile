@@ -209,15 +209,34 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-std test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
+test: test-vm test-e2e test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
 
 # The same suites as `test`, run at once by `mind test`: the repository is a
 # workspace, and each suite is a check. See "Testing" in CLAUDE.md.
 test-parallel: mind
     DREAM="$PWD/{{dream}}" ./{{dream}} build/mind test
 
+# The repository's goals, made by its own build.dr through the `mind` in this
+# checkout: `just mind-build vm`, `just mind-build default`. The VM is built by
+# `std.build.cc` rather than CMake, with whichever compiler `$CXX` or the
+# platform names, and placed in build-dream/ as `just vm` does.
+mind-build *ARGS: mind
+    DREAM="$PWD/{{dream}}" ./{{dream}} build/mind build {{ARGS}}
+
 test-vm: vm
     ./{{build_dir}}/bin/dream_tests
+
+# `std.build.cc` put to the compilers themselves: one description of a C++
+# library and a program, built with GCC, with Clang, and through the
+# `CMakeLists.txt` `std.build.cc.cmake` writes for it, each result run. A
+# toolchain the machine does not have is skipped and says so. Then the same
+# kind of build through `std.build`'s runner, changed a piece at a time, to
+# check that each change reruns what depends on it and nothing else.
+test-build: build
+    ./{{dreams}} -L mind mind/std/build/tests/toolchains.dr -o /tmp/dream-toolchains.dream
+    ./{{dream}} /tmp/dream-toolchains.dream
+    ./{{dreams}} -L mind mind/std/build/tests/incremental.dr -o /tmp/dream-incremental.dream
+    ./{{dream}} /tmp/dream-incremental.dream
 
 # Real programs, run under both the interpreter and the JIT, which must agree.
 test-e2e: build

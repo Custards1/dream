@@ -72,6 +72,10 @@ mapping Setting {
     // is written -- a test run's answer is not what a build should reuse.
     testing : :bool = false
     only : [:string] = []
+    // `mind build GOAL..`'s: the goals asked for, which run like a test run
+    // does -- every time, and leaving no record -- because a goal is asked
+    // for by a person and its answer is where it put things.
+    goals : [:string] = []
 }
 
 /// How long a script may run. It is a program, and a build that waits for
@@ -109,7 +113,13 @@ priv let context! setting s = {
                  (Setting.profile setting) env (Scripted.options s) (Setting.dependencies setting)
                  (Setting.jobs setting) (steps_dir! setting)
                  (Setting.testing setting) (Setting.vm setting) (Setting.compiler setting) (Setting.only setting)
+                 (Setting.goals setting)
 };
+
+/// Whether this run is one a person asked a question of -- checks, or goals --
+/// which runs every script asked for and keeps no record.
+priv let asking : :map -> :bool;
+priv let asking setting = Setting.testing setting || not (list.is_empty (Setting.goals setting));
 
 // --- stamps ------------------------------------------------------------------------
 
@@ -281,7 +291,7 @@ priv let run_group! job = {
     }) group;
     strict! each
     let stale = list.filter (fn [_, _, digest, _, record] ->
-        Setting.testing setting || not (io.exists! image && fresh! record digest)) each;
+        asking setting || not (io.exists! image && fresh! record digest)) each;
     match stale {
         [] => [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each],
         _ => {
@@ -324,7 +334,7 @@ priv let run_group! job = {
                                         false => record.[:sources],
                                     };
                                     let o = outcomes.[Scripted.key s];
-                                    if not (Setting.testing setting) {
+                                    if not (asking setting) {
                                         file.mkdir_all! (dir_of setting s)
                                         replace! record_file (wire.encode (%{ :context => digest, :sources => sources,
                                                                                 :reads => Outcome.reads o, :outcome => o }))

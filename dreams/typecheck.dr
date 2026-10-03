@@ -388,17 +388,23 @@ let module_type k target = match env_of k target {
     e => if scope.has_global e "type" { typed_global k (scope.global_index e "type") } else { () },
 };
 
+/// `mod.Name`: the type a member of another module denotes, or `()`. A module
+/// is asked first, for the reason `type_ref` gives: `cc.Setting` for a
+/// `union Setting` in `cc` is the module the union became, and the global of
+/// the same name beside it holds a run-time description this pass cannot read.
 let member_type k r_ref field = match r_ref {
     [:dream, target] => match env_of k target {
         () => (),
-        e =>
-            if scope.has_global e field { typed_global k (scope.global_index e field) }
-            else {
-                match scope.alias_of e field {
-                    [:dream, inner] => module_type k inner,
-                    _ => (),
-                }
-            },
+        e => {
+            let as_module = match scope.alias_of e field {
+                [:dream, inner] => module_type k inner,
+                _ => (),
+            };
+            match as_module {
+                () => if scope.has_global e field { typed_global k (scope.global_index e field) } else { () },
+                t => t,
+            }
+        },
     },
     _ => (),
 };

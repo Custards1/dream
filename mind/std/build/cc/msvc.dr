@@ -1,0 +1,218 @@
+// MSVC: `std.build.cc`'s settings as `cl.exe`, `link.exe` and `lib.exe` take
+// them, and `clang-cl`, which takes the same.
+//
+// Three things are different enough from GCC to need more than a translation.
+//
+// - **Headers come back on stdout.** `cl /showIncludes` prints a line per
+//   header rather than writing a depfile, and prefixes it in the language
+//   Visual Studio was installed in. The probe learns the prefix by compiling
+//   one file (docs/build.md, "One script, every compiler"), and `headers`
+//   below takes it apart.
+// - **Nothing is exported from a DLL unless asked.** `export_all` is done as
+//   CMake does it: the objects' external symbols, listed by `dumpbin
+//   /symbols`, become a `.def` file (`def_file`) that the link is handed.
+// - **Debug information goes in the object** (`/Z7`), since `/Zi` shares one
+//   `.pdb` between every compile and objects here are made concurrently.
+
+import std.build.cc;
+import std.list;
+import std.str;
+
+let value_text v = match v { () => "", s if type_of s == :string => s, x => to_string x };
+
+/// The flags one setting adds when compiling a source in `lang`.
+let compile_flags : cc.Toolchain -> :atom -> cc.Setting -> [:string];
+let compile_flags tc lang s = match s {
+    [:standard, l] if cc.standard_is_for lang l => match [lang, cc.standard_version l] {
+        [:cxx, "23"] => ["/std:c++latest"],
+        [:cxx, v] => ["/std:c++" + v],
+        [_, v] => ["/std:c" + v],
+    },
+    [:optimize, 0] => ["/Od"],
+    [:optimize, :size] => ["/O1"],
+    [:optimize, _] => ["/O2"],
+    [:debug_info, true] => ["/Z7"],
+    [:warnings, :none] => ["/W0"],
+    [:warnings, :default] => ["/W3"],
+    [:warnings, _] => ["/W4"],
+    [:warnings_as_errors, true] => ["/WX"],
+    [:define, n, ()] => ["/D" + n],
+    [:define, n, v] => ["/D" + n + "=" + value_text v],
+    [:include, d] => ["/I" + d],
+    [:rtti, false] if lang == :cxx => ["/GR-"],
+    [:sanitize, :address] => ["/fsanitize=address"],
+    [:flags_for, sel, fs] if cc.applies sel tc => fs,
+    [:define_for, sel, n] if cc.applies sel tc => ["/D" + n],
+    _ => [],
+};
+
+/// The flags one setting adds to a link.
+let link_flags : cc.Toolchain -> cc.Setting -> [:string];
+let link_flags tc s = match s {
+    [:debug_info, true] => ["/DEBUG"],
+    [:sanitize, :address] => ["/INFERASANLIBS"],
+    [:system, l] => [l + ".lib"],
+    [:system_for, os, l] if os == cc.Toolchain.os tc => [l + ".lib"],
+    [:library_dir, d] => ["/LIBPATH:" + d],
+    [:link_file, p] => [p],
+    [:link_flags_for, sel, fs] if cc.applies sel tc => fs,
+    _ => [],
+};
+
+/// What MSVC cannot do with these settings, said before anything runs.
+let problems : cc.Toolchain -> [cc.Setting] -> [:string];
+let problems tc settings =
+    list.flat_map (fn s -> match s {
+        [:sanitize, k] if k != :none && k != :address =>
+            ["MSVC has only the address sanitizer, not " + to_string k],
+        _ => [],
+    }) settings;
+
+/// The command that compiles one source of `t` into `object`. The headers it
+/// read are in what it prints (`headers`), since `cl` writes no depfile.
+let compile : cc.Toolchain -> cc.Target -> [:any] -> :string -> [:string];
+let compile tc t [path, own] object = {
+    let lang = cc.language path;
+    list.concat [[cc.Toolchain.cxx tc, "/nologo", "/showIncludes"],
+                 (if lang == :cxx { ["/EHsc"] } else { [] }),
+                 list.flat_map (compile_flags tc lang) (cc.settings_for t own),
+                 ["/c", path, "/Fo" + object]]
+};
+
+/// `cl /showIncludes` output, taken apart: the headers it names, and every
+/// other line, which is the compiler's own output and is shown as it is.
+/// The first line `cl` prints is the name of the file it compiled, which says
+/// nothing, and is dropped.
+let headers : :string -> :string -> [[:string], :string];
+let headers prefix output = {
+    let lines = str.split "\n" output;
+    let [found, rest] = list.fold (fn [hs, others] raw -> {
+        let line = if str.ends_with "\r" raw { str.slice 0 (str.byte_length raw - 1) raw } else { raw };
+        if str.starts_with prefix line {
+            let n = str.byte_length prefix;
+            [list.cons (str.trim (str.slice n (str.byte_length line - n) line)) hs, others]
+        } else { [hs, list.cons line others] }
+    }) [[], []] lines;
+    let shown = match list.reverse rest {
+        [first, ..more] if str.ends_with ".c" first || str.ends_with ".cpp" first
+                           || str.ends_with ".cc" first || str.ends_with ".cxx" first => more,
+        all => all,
+    };
+    [list.reverse found, str.trim (str.join_str "\n" shown)]
+};
+
+/// Where the `.def` for a DLL goes: beside it, by the same name.
+let def_path : :string -> :string;
+let def_path out = if str.ends_with ".dll" out { str.slice 0 (str.byte_length out - 4) out + ".def" } else { out + ".def" };
+
+/// The commands that make `out` from `objects`. `libraries` are the import
+/// libraries of the DLLs it uses. A DLL that exports everything is handed
+/// the `.def` made beside it (`def_file`).
+let link : cc.Toolchain -> cc.Target -> [:string] -> [:string] -> :string -> [[:string]];
+let link tc t objects libraries out = match cc.kind t {
+    :static => [list.concat [[cc.Toolchain.archiver tc, "/nologo", "/OUT:" + out], objects]],
+    k => [list.concat [[cc.Toolchain.linker tc, "/nologo"],
+                       (if k == :shared {
+                            list.append ["/DLL", "/IMPLIB:" + str.slice 0 (str.byte_length out - 4) out + ".lib"]
+                                        (if list.contains cc.Setting.export_all (cc.settings t)
+                                         { ["/DEF:" + def_path out] } else { [] })
+                        } else { [] }),
+                       objects, libraries,
+                       list.flat_map (link_flags tc) (cc.link_settings t),
+                       ["/OUT:" + out]]],
+};
+
+// --- exporting everything ------------------------------------------------------
+
+/// What `dumpbin /symbols` needs to be asked, for the objects of a DLL.
+let symbols_command : [:string] -> [:string];
+let symbols_command objects = list.append ["dumpbin.exe", "/nologo", "/symbols"] objects;
+
+/// Names the compiler made for itself, which a DLL must not export: string
+/// literals, floating constants, and the runtime's own.
+let private_symbol : :string -> :bool;
+let private_symbol name =
+    list.any (fn p -> str.starts_with p name)
+             ["??_C@", "__real@", "__xmm@", "__ymm@", "__imp_", "_load_config_used", "__guard", "_tls_", "$"];
+
+/// A `.def` exporting every external symbol an object defines, from
+/// `dumpbin /symbols` output. A defined symbol is in a section (`SECTn`,
+/// where an undefined one says `UNDEF`); a function's type is `()`, and
+/// anything else is data and exported as `DATA`.
+///
+///     00F 00000000 SECT4  notype ()    External     | ?run@@YAHXZ (int __cdecl run(void))
+///     010 00000000 SECT5  notype       External     | ?count@@3HA (int count)
+let def_file : :string -> :string -> :string;
+let def_file library dumped = {
+    let entries = list.flat_map (fn raw -> {
+        let line = str.trim raw;
+        match str.split "|" line {
+            [left, right] if str.contains_str " SECT" left && str.contains_str "External" left => {
+                let symbol = list.head (str.split " " (str.trim right));
+                if symbol == "" || private_symbol symbol { [] }
+                else if str.contains_str "()" left { ["    " + symbol] }
+                else { ["    " + symbol + " DATA"] }
+            },
+            _ => [],
+        }
+    }) (str.split "\n" dumped);
+    str.join_str "\n" (list.concat [["LIBRARY " + library, "EXPORTS"], list.unique entries, [""]])
+};
+
+when test {
+    import std.test;
+
+    let tc = cc.msvc;
+    let vm = cc.shared "dream" ["src/interp.cpp"]
+             |> cc.standard :cxx20
+             |> cc.optimize 3
+             |> cc.debug_info true
+             |> cc.warnings :extra
+             |> cc.public_include "include"
+             |> cc.threads
+             |> cc.flags_for :gcc ["--param", "x=1"]
+             |> cc.flags_for :msvc ["/permissive-", "/utf-8"]
+             |> cc.define_for :msvc "_CRT_SECURE_NO_WARNINGS"
+             |> cc.system_for :windows "ws2_32"
+             |> cc.export_all;
+
+    let tests = [
+        test.case "the same target as GCC compiles it, in MSVC's words"
+            $( test.eq! ["cl.exe", "/nologo", "/showIncludes", "/EHsc", "/std:c++20", "/O2", "/Z7", "/W4",
+                         "/permissive-", "/utf-8", "/D_CRT_SECURE_NO_WARNINGS", "/Iinclude",
+                         "/c", "src/interp.cpp", "/Fosrc#interp.cpp.obj"]
+                        (compile tc vm (list.head (cc.sources vm)) "src#interp.cpp.obj") ),
+        test.case "a C source gets no C++ exception model"
+            $( test.eq! ["cl.exe", "/nologo", "/showIncludes", "/std:c11", "/c", "a.c", "/Foa.obj"]
+                        (compile tc (cc.static "a" ["a.c"] |> cc.standard :c11 |> cc.standard :cxx20)
+                                 ["a.c", []] "a.obj") ),
+        test.case "a DLL leaves an import library and exports through its .def"
+            $( test.eq! [["link.exe", "/nologo", "/DLL", "/IMPLIB:lib/dream.lib", "/DEF:lib/dream.def",
+                          "a.obj", "/DEBUG", "ws2_32.lib", "/OUT:lib/dream.dll"]]
+                        (link tc vm ["a.obj"] [] "lib/dream.dll") ),
+        test.case "an executable links the import library of what it uses"
+            $( test.eq! [["link.exe", "/nologo", "c.obj", "lib/dream.lib", "ws2_32.lib", "/OUT:bin/dream.exe"]]
+                        (link tc (cc.executable "dream" ["cli.cpp"] |> cc.use vm) ["c.obj"] ["lib/dream.lib"]
+                              "bin/dream.exe") ),
+        test.case "a static library is made by lib.exe"
+            $( test.eq! [["lib.exe", "/nologo", "/OUT:x.lib", "a.obj"]]
+                        (link tc (cc.static "x" []) ["a.obj"] [] "x.lib") ),
+        test.case "headers are taken out of what cl prints, whatever its language"
+            $( test.eq! [["C:\\inc\\a.h", "C:\\inc\\b.h"], "src\\x.cpp(3): warning C4100: unused"]
+                        (headers "Remarque : inclusion du fichier :"
+                                 "x.cpp\r\nRemarque : inclusion du fichier : C:\\inc\\a.h\r\nsrc\\x.cpp(3): warning C4100: unused\r\nRemarque : inclusion du fichier :  C:\\inc\\b.h\r\n") ),
+        test.case "a .def exports what the objects define, functions and data"
+            $( test.eq! "LIBRARY dream\nEXPORTS\n    ?run@@YAHXZ\n    ?count@@3HA DATA\n"
+                        (def_file "dream" (str.join_str "\n" [
+                            "00F 00000000 SECT4  notype ()    External     | ?run@@YAHXZ (int __cdecl run(void))",
+                            "010 00000000 SECT5  notype       External     | ?count@@3HA (int count)",
+                            "011 00000000 UNDEF  notype ()    External     | ?other@@YAXXZ (void __cdecl other(void))",
+                            "012 00000000 SECT6  notype       Static       | $SG1234",
+                            "013 00000000 SECT7  notype       External     | ??_C@_05ABC@hello@",
+                            "014 00000000 SECT4  notype ()    External     | ?run@@YAHXZ (int __cdecl run(void))"])) ),
+        test.case "what MSVC cannot do is said before anything runs"
+            $( test.eq! [1, 0]
+                        [list.length (problems tc [cc.Setting.sanitize :thread]),
+                         list.length (problems tc [cc.Setting.sanitize :address])] ),
+    ];
+}

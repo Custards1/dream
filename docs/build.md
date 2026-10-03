@@ -105,6 +105,10 @@ mapping Context {
     dependencies = %{}  // key => version, for everything it uses
     jobs = 1            // the runner's: how many steps at once
     cache = "target/build/steps"  // the runner's: where step directories live
+    testing = false     // `mind test`'s run, which runs the plan's checks
+    vm, compiler        // the VM and the compiler command the build uses
+    only = []           // the checks a test run is asked for; every one when empty
+    goals = []          // the goals `mind build GOAL..` asked for
 }
 
 mapping Target {
@@ -134,11 +138,15 @@ alongside it. Every tool needs these, so they are written once, here.
 ```dream
 union Input {
     file(path : :string)                    // in the package, relative to its root
+    tree(dir : :string, suffix : :string)   // every file under dir ending in suffix
     artifact(step : Step, name : :string)   // something a step makes
 }
 ```
 
-A bare string is accepted wherever an `Input` is and means `file`. An
+A bare string is accepted wherever an `Input` is and means `file`. A `tree`
+is for what a step walks by itself, such as a directory of tests a script
+runs: every file in it is part of the key, so adding one changes the key as
+surely as editing one. An
 artifact **holds the step that makes it**. That one decision is what makes
 the graph: a step's inputs name the steps they come from, so the whole graph
 is whatever is reachable from the plan. There is no registry and no global
@@ -155,20 +163,60 @@ mapping Step {
     config = ()         // data: everything else that changes the output
     outputs = []        // [:string]: files it makes in its own directory
     action              // Job -> [Op], carried out by the runner
+    discovers = false   // it names what it read in deps.d ("Discovered inputs")
+    cache = :shared     // :shared, or :never for one run every time it is asked for
+    timeout = 0         // milliseconds, 0 for none: a step is a program and may diverge
 }
 ```
 
 A step's **key** is a digest of `tool`, `config` and its inputs, where a
 file contributes the digest of its contents and an artifact contributes its
-step's key. The name is not in the key, so two packages that ask for the same
-thing by different names share the work. Keys are what the cache is indexed
-by and what `build.given` waits on.
+step's **result**: its key, and for a step that discovers its inputs, the
+digests of what it read. The name is not in the key, so two packages that ask
+for the same thing by different names share the work. Keys are what the cache
+is indexed by and what `build.given` waits on. `build.discovering`,
+`build.uncached` and `build.within ms` set the last three, which say how a
+step is run and are in neither the key nor the shape.
+
+A step run every time (`cache = :never`) declares nothing it reads, so its
+key never moves. What reads it is keyed on what it wrote instead: an answer
+that changed has to reach the steps that read it.
 
 A step writes only into **its own directory**, which the runner makes, and
 declares what it will write there. It never picks an output path. Two steps
 therefore cannot collide, a half-finished step leaves nothing where a
 finished one is expected (it runs in a scratch directory that is renamed into
 place), and one cache can be shared by concurrent builds.
+
+### Discovered inputs
+
+Some steps cannot say what they read until they have read it. A C file's
+headers are the familiar case. A Dream program is the same: `dreams main.dr`
+reads whatever `main.dr` imports, and the list changes whenever an `import`
+does. Declaring these by hand is the thing everyone gets wrong, and a `tree`
+over the whole source directory is right but rebuilds too much.
+
+A step with `discovers = true` names the files it read in a **depfile**,
+`deps.d` in its directory: `cc` asks the compiler for one (`-MD`, or
+`/showIncludes` from MSVC, turned into one), and `std.build.dream` asks
+`dreams --depfile`. The runner keeps the list, with each file's digest, in
+the step's record. The step is current when its key matches **and** every
+file on the list still has the digest it had, which costs a `stat` per file
+while the stamps hold. This is ninja's `deps`, and it is the only way a no-op
+build of a C++ program costs a `stat` per header rather than a compile per
+file.
+
+The key still comes from the declared inputs alone, since the discovered
+ones are not known until the step has run. One record is kept per key, and a
+run with other reads replaces it. That is why a step downstream is keyed on
+the **result** and not the key: an object whose header changed is compiled
+again under the same key, and the program linked from it must see a different
+input or it would not be relinked. It is also why keys are worked out as steps
+become ready rather than all at once beforehand. The tests that pin this are
+`std.build.run`'s own, with a step that copies its source and names a header,
+and `mind/std/build/tests/incremental.dr`, which builds a library and a
+program with the machine's compiler and changes a header only the program
+includes.
 
 ### Jobs
 
@@ -190,13 +238,41 @@ at the first that fails:
 union Op {
     write(name : :string, text : :string)
     copy(from : :string, name : :string)
+    link(from : :string, name : :string)        // a copy sharing the bytes
     exec(program : :string, args : [:string])   // run in the step's directory
+    run(dir, env, program, args)                // run elsewhere, with variables of its own
+    run_to(dir, env, program, args, name)       // and keep everything it printed in `name`
+    observe(dir, env, program, args, name)      // the same, whatever it exits with
+    find(program, name)                         // where it is on PATH, or ""
+    capture(program, args, name)                // what it printed when it succeeded, or ""
+    attempt(program, args, name)                // "yes" or "no"
+    list(dir, suffix, name)                     // the files under dir, one to a line
+    verify(name, digest)                        // fail unless the SHA-256 is this
+    transform(from : [:string], name, f)        // f of some files' texts, written as another
+    expect(name, path, bless)                   // fail unless name holds what path does
+    same(a, b)                                  // fail unless the two are byte for byte one
+    empty(name, why)                            // fail, showing it, unless name is empty
 }
 ```
 
 An action touches only what it names, and only inside its own directory.
 `exec` runs through `os.exec_in!`, which gives the child its own working
-directory: `chdir!` is the whole VM's, and steps run at once.
+directory: `chdir!` is the whole VM's, and steps run at once. `run` is
+`os.exec_with!`, which lays variables over the environment for the child
+alone, and `run_to` and `observe` are `os.exec_joined!`, which writes the
+child's errors in among its output as a terminal shows them -- what a check
+comparing a program's output against a recorded file needs. The questions
+(`find` to `list`) never fail, since "no" is an answer. `transform` takes a
+pure function, which is how a tool turns what a program printed into what it
+needs without an effect of its own: MSVC's `/showIncludes` into a depfile,
+`dumpbin`'s listing into a `.def`, six answers of `llvm-config` into one
+record. The runner makes the directory each declared output goes in before
+the action runs.
+
+The action is called in the runner, and what it answers is forced all the way
+down before it crosses into the step's process. A suspension carries its
+frame, and an action's frame holds the step's inputs, each of which holds the
+step it comes from: the whole graph upstream, copied for every step run.
 
 ### Plans
 
@@ -212,6 +288,9 @@ mapping Plan {
     target = ()         // () lets the compiler decide; else [Target]
     steps = []          // made for their own sake, e.g. a file beside the image
     later = []          // build.given, below
+    checks = %{}        // name => Step, run by `mind test`
+    goals = %{}         // name => Goal, made by `mind build NAME`
+    notes = %{}         // name => a line saying what a goal or check is for
 }
 ```
 
@@ -224,6 +303,8 @@ mapping Plan {
 | `build.host_module name` | a host module the package needs |
 | `build.target targets` | where the result can run |
 | `build.also step` | make it whether or not anything uses it |
+| `build.check name step` | a check `mind test` runs ("Checks, and `mind test`") |
+| `build.goal name goal`, `build.note name text` | something to ask for by name ("Goals") |
 | `build.all [plans]` | several plans, merged |
 
 Merging is a union. Two payloads or two modules under one name are reported
@@ -250,7 +331,9 @@ let plan ctx =
 ```
 
 `build.given input f` waits for the input to be built, reads it as a string,
-and merges `f`'s plan in, which may itself contain further `given`s. `f` is
+and merges `f`'s plan in, which may itself contain further `given`s.
+`build.given_files dir suffix f` is the same for what a directory holds: `f`
+is handed the paths, from a listing that runs every time. `f` is
 pure, so the effect is still only in the step. The runner resolves `given`s
 in waves, and a plan with none is a single graph known up front, which is the
 common case and the fast one.
@@ -281,26 +364,27 @@ let artifact ctx cfg = build.artifact (step ctx cfg) (list.head (outputs ctx cfg
 ```
 
 A tool's configuration is its own record, built with its own `|>`
-modifiers, and handed to `step` or `artifact` at the end. The C tool:
+modifiers, and handed to `step` or `artifact` at the end. A parser
+generator:
 
 ```dream
-// mind/std/build/cc.dr
+// a package's own tool
 import std.build;
 derive std.build.tool;
 
-mapping Config { kind = :shared, name, sources = [], flags = [], defines = [], includes = [] }
+mapping Config { grammar : :string, module = "parser", flags = [] }
 
-let library name sources = Config.make :shared name sources [] [] [];
+let grammar g = Config.new g;
 let flags fs c = Config.set_flags c (list.append (Config.flags c) fs);
-let shared ctx c = artifact ctx c;
 
-let name c = "cc";
-let inputs c = Config.sources c;
-let outputs ctx c = [build.shared_name ctx (Config.name c)];
-let run job c = [build.Op.exec (compiler job) (arguments job c)];
+let name c = "peg";
+let inputs c = [Config.grammar c];
+let outputs ctx c = [Config.module c + ".dr"];
+let run job c = [build.Op.exec "peg-gen" (list.concat [Config.flags c, [build.path job (Config.grammar c)],
+                                                       ["-o", Config.module c + ".dr"]])];
 ```
 
-That is all a tool is. It is why `cc` does not have to be in `std` to be as
+That is all a one-step tool is. It is why `cc` does not have to be in `std` to be as
 good as one that is, and why the `derive` contract is checked: a tool that
 forgets `outputs` is a compile error in the tool, not a mystery in a build.
 
@@ -309,10 +393,16 @@ needs it:
 
 | | |
 |-|-|
-| `std.build.cc` | C and C++ to shared libraries and objects; `$CC`, `cl.exe` on Windows |
+| `std.build.cc` | C and C++, object by object, with GCC, Clang or MSVC ("Native code") |
 | `std.build.command` | any program: arguments are strings, inputs and `command.out "name"` |
-| `std.build.probe` | ask the machine: a library, `pkg-config`, a program on the path |
+| `std.build.check` | checks that declare what they read, kept like any step |
+| `std.build.dream` | Dream programs, by a compiler that may be something the build made |
+| `std.build.probe` | ask the machine: a library, `pkg-config`, a program on the path, LLVM |
 | `std.build.fetch` | a URL pinned by digest; for vendored sources too large to check in |
+
+`cc` and `dream` do not derive `std.build.tool`: each makes a graph of steps
+rather than one -- a compile per source and a link, a compiler compiling the
+compiler -- and is plain functions over `build.step`.
 
 `std.build.command` is the escape hatch that keeps the rest honest:
 
@@ -328,6 +418,84 @@ Tools from packages are listed under `[build-dependencies]` and are compiled
 into the script and not into the program. A tool is only code the script
 imports, so `mind` treats it as a dependency like any other.
 
+## Native code: `std.build.cc`
+
+`cc` builds C and C++ with **the machine's own compiler**, whichever that is,
+from one description:
+
+```dream
+let lib = cc.shared "demo" ["src/demo.cpp"]
+          |> cc.standard :cxx20 |> cc.optimize 2 |> cc.warnings :extra
+          |> cc.public_include "include" |> cc.threads
+          |> cc.flags_for :msvc ["/permissive-"];
+let app = cc.executable "demo" ["src/main.cpp"] |> cc.use lib;
+
+let plan ctx = steps.with_toolchain ctx (fn tc ->
+    build.empty |> build.payload "demo" (steps.artifact tc app));
+```
+
+A target is data in a vocabulary of settings (`cc.Setting`: a standard, an
+optimization level, a define, an include directory, `rtti`, a sanitizer,
+`threads`, `export_all`, a system library, ..), with a modifier for each that
+takes the target last. A setting is in `settings` (this target's sources),
+`public` (this target and everything that uses it) or a single source's own
+(`cc.source_with "jit.cpp" [cc.Setting.rtti false]`). `cc.use x` brings what
+it takes to use `x`: its public settings, and its output to link.
+
+Each family translates the vocabulary: `std.build.cc.gnu` for GCC and Clang,
+`std.build.cc.msvc` for `cl.exe` and `clang-cl`, and `std.build.cc.cmake`,
+which writes a `CMakeLists.txt` for the same targets (`cmake.export`). What
+is about one compiler says which -- `cc.flags_for :gcc [..]`, `:clang`,
+`:gnu` for both, `:msvc` -- and a toolchain of another family leaves it out.
+None of the translation runs anything, so all of it is tested on any machine,
+and `mind/std/build/tests/toolchains.dr` builds one library and program with
+GCC, with Clang and through CMake and runs each.
+
+What differs between compilers is `cc`'s problem, not the script's:
+
+| What differs | Who deals with it |
+|---|---|
+| flag spelling (`-O3`, `/O2`) | the family's translation of `cc.optimize 3` |
+| file names (`libx.so`, `x.dll` + `x.lib`, `x.o`, `x.obj`) | `cc.file_name`, `cc.import_name`, `cc.object_name` |
+| exporting from a DLL | `cc.export_all`: for MSVC, `dumpbin /symbols` and a `transform` write a `.def`, as CMake's `WINDOWS_EXPORT_ALL_SYMBOLS` does |
+| finding a shared library at run time | a run path for GNU; on Windows the DLL goes in `bin/` beside the program |
+| headers read | `-MD -MF` for GNU; `/showIncludes` for MSVC, taken apart into a depfile |
+| system libraries | `cc.system "ws2_32"` is `-lws2_32` or `ws2_32.lib` |
+
+**The toolchain is a probe's answer.** `steps.with_toolchain ctx f` asks the
+C++ compiler what it is -- `$CXX` and `$CC` when the manifest lets the script
+see them (`[build] env = ["CC", "CXX"]`), `c++`, `clang++` or `cl.exe`
+otherwise -- and hands `f` a `cc.Toolchain` naming the family and the version
+it printed. The toolchain is in every compile step's key, so a new compiler
+under the same name rebuilds everything and nothing else does.
+
+`steps.artifact tc target` is the target's file, and behind it:
+
+- **one step per source file**, keyed on the toolchain, the settings that
+  reach that one file and its contents, discovering its headers. A header
+  changed recompiles what includes it and no others, and two targets that
+  compile a file alike share the object.
+- **one step to link**, laid out as it will be installed: `lib/libx.so`,
+  `bin/x`, and a program carries the shared libraries it uses (`lib/`, with a
+  run path of `$ORIGIN/../lib`; `bin/` on Windows). Every artifact runs where
+  it lies, and a placed one runs where it is placed.
+
+The compiler runs in the package's directory, so the paths a script writes
+mean what they say there, and writes into the step's.
+
+## Dream programs: `std.build.dream`
+
+```dream
+let stage2 = dream.program "dreams" "dreams/main.dr" seed vm |> dream.paths ["mind", "."];
+let stage3 = dream.program "dreams" "dreams/main.dr" (dream.artifact stage2) vm |> dream.paths ["mind", "."];
+```
+
+The compiler is an **input**, so it may be an artifact, and compiling the
+compiler with what it just built is a second program. So is the VM that runs
+an image compiler. A program's modules are discovered inputs, from `dreams
+--depfile`, so editing a module rebuilds exactly the images that import it.
+`dream.no_warnings` fails a compile that printed one, as the examples want.
+
 ## Running a plan
 
 `run.run! plan` is the driver's `main!`. It:
@@ -337,12 +505,16 @@ imports, so `mind` treats it as a dependency like any other.
    debugged.
 2. Evaluates `plan ctx`, collects every step reachable from it, and takes
    each once by key.
-3. Runs the graph. A step whose inputs are ready runs in a process of its
-   own, up to `ctx.jobs` at once. As the note on `spawn!` in CLAUDE.md warns,
-   the thunk handed to `spawn!` is made in a small function so that it does
-   not carry the runner's frame.
-4. Skips a step whose directory already holds a record of its key. It runs
-   anything else in a scratch directory, then renames that into place.
+3. Runs the graph. A step starts as soon as everything it reads is made, in
+   a process of its own, up to `ctx.jobs` at once, and is keyed then. As the
+   note on `spawn!` in CLAUDE.md warns, the thunk handed to `spawn!` is made in
+   a small function and carries only the step's forced operations, not the
+   runner's frame or the step. A build stops starting steps at its first
+   failure and raises it once what is running has finished; a test run keeps
+   going and reports each check.
+4. Skips a step whose directory holds a record of its key whose discovered
+   reads still hold. It runs anything else in a scratch directory, then
+   renames that into place.
 5. Resolves `given`s once their inputs are built, and goes back to 2 with
    the merged plan.
 6. Writes the **outcome**: what the plan contributes, with every input
@@ -432,6 +604,28 @@ with `--test` from `[test] entry` or its entry, and run -- and its checks, all
 at once, and names each `package.name`. A workspace (`[workspace] members`)
 does that for every member and for its own checks. A test run writes no
 record, so it never stands in for a build's answer.
+
+## Goals
+
+A plan may name what there is to ask for: `build.goal name goal`, with a
+line about it from `build.note`. A goal is
+
+| | |
+|-|-|
+| `build.make input` | build it, and say where it is |
+| `build.place path input` | build it and put it at `path` in the package -- a whole step's outputs beneath it for `artifact s ""` |
+| `build.each [names]` | several goals under one name |
+| `build.effect step` | run a step every time it is asked for |
+
+`mind build GOAL..` runs the package's script with the goals in its context
+(`goals`), and the outcome says where each one is (`Outcome.goals`). A run
+asked for goals runs every time and writes no record, as a test run does. A
+goal is only built when it is asked for: a plan with goals costs nothing more
+to a compile or a test. `build.place` is the one way a build writes outside
+its cache, and it never writes into the file it replaces -- a copy beside it,
+renamed over it -- so a VM running the old image keeps the pages it had. A
+name the plan does not have is answered with the goals it does, and their
+notes.
 
 ## The package graph
 
@@ -729,7 +923,8 @@ they are built says is not optional.
    builtins: it is `digest!` asked of bytes already in hand, and a builtin
    costs an opcode.
 3. **`std.build` core. Built.** The vocabulary (`std.build`), keys, the
-   runner (`std.build.run`: concurrent by depth, `jobs` at a time), the stamp
+   runner (`std.build.run`: each step as soon as its inputs are made, `jobs`
+   at a time), the stamp
    cache, outcomes, `write`, `std.build.command`, and `std.file` beneath them,
    each with its `when test` block. Actions answer operations rather than
    performing them (see "Jobs"). The `std.build.tool` behavior waits for
@@ -780,6 +975,47 @@ they are built says is not optional.
 9. **Checks, workspaces and `mind test`. Built.** See "Checks, and `mind
    test`" above. The repository is a workspace whose tests are what `just
    test` runs.
+10. **Discovered inputs, goals and native code. Built.** Two lines of work
+   on this design met here, and this is what the second added to the first:
+   `discovers`, records of what a step read, and keying on a step's result
+   ("Discovered inputs"), with `dreams --depfile`; a scheduler that starts each
+   step when its inputs are made and keys it then, where the first ran by
+   depth and keyed everything beforehand, which discovered inputs cannot do;
+   `tree` inputs, `given_files`, `cache`, `timeout`; goals and `mind build
+   GOAL`; `std.build.cc` as targets in a vocabulary of settings, translated by
+   `cc.gnu`, `cc.msvc` and `cc.cmake`, built object by object
+   (`cc.steps`); `std.build.check`, `std.build.dream`, `probe.llvm`; the
+   operations those needed (`link`, `run_to`, `observe`, `list`, `transform`,
+   `expect`, `same`, `empty`); and the file natives under `std.file`
+   (`mkdir_all!`, `remove_all!`, `copy!`, `link!`, `chmod!`, `walk!`) and
+   `os.exec_joined!`. The repository's `build.dr` builds the VM, the compiler,
+   `mind` and `lucid` as goals (`mind build default`).
+
+Open:
+
+- **MSVC's environment.** `cl.exe` needs the `INCLUDE`, `LIB` and `PATH`
+  `vcvarsall.bat` sets up. The plan is a probe that finds Visual Studio with
+  `vswhere`, captures that environment once, and runs each step with it; until
+  then a build with MSVC is run from a developer prompt. The MSVC translation
+  is tested on its own and has not been run against `cl.exe`.
+- **Long command lines.** A response file (`@args`) when a line would pass
+  Windows' 32K limit.
+- **Profile-guided builds** as artifacts (`cc.profile_generate`, a training
+  step, `cc.profile_use`), which would make `vm-pgo` a goal. The flags that
+  make a profile survive objects compiled in scratch directories were
+  measured with GCC 15: `-fprofile-prefix-path`, `-fprofile-dir`, and objects
+  named by their source (`dream#src#interp.cpp.o`), which `cc` already does.
+- **Step workspaces**: a directory kept between runs, named by a step's
+  identity, for a program that is incremental by itself (`cmake --build`).
+  That is what driving another project's CMake build wants; `cc.cmake` today
+  only writes the `CMakeLists.txt`.
+- **A step's output shown when it succeeds.** A compile's warnings are seen
+  only when it fails; the build is meant to be warning-free, and a log kept
+  beside each step would let `mind` say so.
+- **The repository's checks, per program.** `e2e` and `examples` are each one
+  suite. A check per program and tier, kept by key, would rerun only what an
+  edit reaches; `std.build.check` can say it, and what holds it back is the
+  rest of what `e2e.sh` checks (the JIT's IR, shebang and payload images).
 
 Settled:
 
@@ -790,5 +1026,11 @@ Settled:
   alternative, a separate package per script, would have put
   `sqlite_gen.version` where `sqlite.version` was meant.
 - **`cc` lives in `std`**, because embedding a C library is a documented
-  feature and `dream/tests/ffi` needs a C compiler. The `derive` contract
-  means a third-party tool is exactly as capable.
+  feature and `dream/tests/ffi` needs a C compiler. It is plain functions
+  over `build.step` rather than a `std.build.tool`, because it makes a graph
+  rather than a step, which a third-party tool can do the same way.
+- **Actions answer operations** rather than performing them. The other line
+  of work had an action answer a suspended call to an impure function, which
+  a pure script may make; operations won because they are data -- a step's
+  work can be shown, compared and moved to a worker without the frame it was
+  written in -- and everything the other needed fitted in a few more of them.
