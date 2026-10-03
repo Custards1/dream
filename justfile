@@ -334,10 +334,10 @@ test-tls: build
 # whole library against a throwaway cluster -- which skips itself where there
 # is no PostgreSQL to make one with.
 test-pg: build
-    ./{{dreams}} pg/all.dr --test -L mind -L . -o /tmp/dream-pg-tests.dream
+    ./{{dreams}} mind/std/sql/pg/all.dr --test -L mind -L . -o /tmp/dream-pg-tests.dream
     ./{{dream}} /tmp/dream-pg-tests.dream
-    dream={{dream}} dreams={{image}} pg/tests/contracts.sh
-    dream={{dream}} dreams={{image}} pg/tests/live.sh
+    dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/contracts.sh
+    dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/live.sh
 
 # Malformed images must be rejected, never crashed on.
 fuzz ITERATIONS="400": build

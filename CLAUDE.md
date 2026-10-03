@@ -17,7 +17,7 @@ Dont forget about strict parameters, use them when needed
 | `mind/std/` | The standard library. | Dream |
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
-| `pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [pg/README.md](pg/README.md). | Dream |
+| `mind/std/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/sql/pg/README.md](mind/std/sql/pg/README.md). | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
 | `docs/` | `language-spec.md`, `builtins.md`, `ffi.md`, `gc.md`, `bytecode-format.md`. | — |

@@ -4,7 +4,7 @@
 # check. `just test` is the same suite run one group at a time.
 [workspace]
 name = "dream"
-members = ["dreams", "lucid", "mind/std", "mind/tool", "pg"]
+members = ["dreams", "lucid", "mind/std", "mind/tool"]
 
 [build]
 compiler = "build/dreams.dream"

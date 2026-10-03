@@ -47,7 +47,7 @@
 import std.list;
 import std.map;
 import std.str;
-import pg.value;
+import std.sql.pg.value;
 import std.sql.lint as checked;
 
 // --- what a fragment is --------------------------------------------------------
@@ -311,7 +311,7 @@ let text_with sql vs = [:sql, list.map (fn t -> match t {
     other => token_text other,
 }) (scan sql false)];
 
-// Shared lexical checks; keep these names for existing pg.sql callers.
+// Shared lexical checks; keep these names for existing std.sql.pg.sql callers.
 let scan : :string -> :bool -> [:any];
 let scan text braces = checked.scan text braces;
 let token_text : :any -> :string;

@@ -1432,12 +1432,12 @@ Other parameter positions still bind `()` as NULL. `sql.blob bytes` distinguishe
 binary data from text. PostgreSQL additionally accepts lists as arrays, maps as
 JSON, and atoms as their names; each dialect validates parameter kinds.
 
-`pg.driver` connects PostgreSQL to this API: `driver.open! target` takes a
-`pg.config` map, URL or keyword string, and `driver.wrap! conn` adapts an existing
-`pg.db` connection. It preserves SQLSTATE as `:state` and the original error as
+`std.sql.pg.driver` connects PostgreSQL to this API: `driver.open! target` takes a
+`std.sql.pg.config` map, URL or keyword string, and `driver.wrap! conn` adapts an existing
+`std.sql.pg.db` connection. It preserves SQLSTATE as `:state` and the original error as
 `:cause`, returns `bytea` as blobs, streams through portals, and prepares each
 run of equal SQL once for `exec_many!`. Use `RETURNING` for generated keys;
-PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../pg/README.md).
+PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../mind/std/sql/pg/README.md).
 
 `std.sql.sqlite` is the SQLite driver. It binds the system's
 libsqlite3 through `std.foreign`, and the library is found the way the platform's

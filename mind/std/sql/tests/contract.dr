@@ -1,0 +1,134 @@
+// One application-level contract, run against both SQLite and PostgreSQL.
+import std.error;
+import std.json as json_codec;
+import std.list;
+import std.proc;
+import std.sql;
+import std.sql.pool;
+import std.test;
+
+let prepared! : (:unit -> sql.Connection) -> :any;
+let prepared! open! = sql.using! (open! ()) (fn c -> {
+    sql.exec! c "CREATE TEMP TABLE contract_prepared (id bigint PRIMARY KEY, body text)"
+    let insert = sql.statement! c (sql.q "INSERT INTO contract_prepared VALUES (?, ?)" [(), ()]);
+    sql.using_statement! insert (fn st -> {
+        test.eq! 1 (sql.execute! st [1, "one"]).[:changes]
+        let select = sql.statement! c (sql.q "SELECT body FROM contract_prepared WHERE id = ?" [()]);
+        sql.using_statement! select (fn read -> {
+            test.eq! [["one"]] (sql.execute! read [1]).[:rows]
+            test.eq! 1 (sql.execute! st [2, "two"]).[:changes]
+            test.eq! [["two"]] (sql.execute! read [2]).[:rows]
+        })
+        let wrong = try! { sql.execute! st [3] } catch e { e };
+        test.eq! :parameters (sql.error_code wrong)
+        let failed = try! { sql.execute! st [1, "duplicate"] } catch e { e };
+        test.eq! :unique (sql.error_code failed)
+        test.eq! 1 (sql.execute! st [3, ()]).[:changes]
+    })
+    test.eq! ["one", "two", ()] (sql.column! c "SELECT body FROM contract_prepared ORDER BY id")
+    let e = try! { sql.using_statement! (sql.statement! c (sql.q "SELECT ?" [1])) (fn st -> raise! (error.new :callback_failure "keep me")) } catch e { e };
+    test.eq! :callback_failure (error.kind e)
+    test.true! (sql.ping! c)
+});
+
+let bulk! : (:unit -> sql.Connection) -> :any;
+let bulk! open! = sql.using! (open! ()) (fn c -> {
+    sql.exec! c "CREATE TEMP TABLE contract_bulk (id bigint PRIMARY KEY, body text DEFAULT 'default', bytes bytea)"
+    test.eq! 3 (sql.copy_in! c "contract_bulk" ["id", "body", "bytes"]
+        [[1, "tabs\tand\nlines\\", sql.blob "a\0b"], [2, (), sql.blob ""], [3, "NULL", ()]])
+    test.eq! [[1, "tabs\tand\nlines\\", sql.blob "a\0b"], [2, (), sql.blob ""], [3, "NULL", ()]]
+        (sql.copy_out! c "SELECT id, body, bytes FROM contract_bulk ORDER BY id")
+    test.eq! 0 (sql.copy_in! c "contract_bulk" ["id"] [])
+    let wrong = try! { sql.copy_in! c "contract_bulk" ["id", "body"] [[4]] } catch e { e };
+    test.eq! :parameters (sql.error_code wrong)
+    let failed = try! { sql.copy_in! c "contract_bulk" ["id"] [[4], [1]] } catch e { e };
+    test.eq! :unique (sql.error_code failed)
+    test.eq! 3 (sql.scalar! c "SELECT count(*) FROM contract_bulk")
+    // A failure within an existing transaction rolls back only the bulk work.
+    sql.transaction! c (fn tx -> {
+        let failed = try! { sql.copy_in! tx "contract_bulk" ["id"] [[5], [1]] } catch e { e };
+        test.eq! :unique (sql.error_code failed)
+        sql.exec! tx "INSERT INTO contract_bulk (id) VALUES (6)"
+    })
+    test.eq! [1, 2, 3, 6] (sql.column! c "SELECT id FROM contract_bulk ORDER BY id")
+});
+
+let scripts! : (:unit -> sql.Connection) -> :any;
+let scripts! open! = sql.using! (open! ()) (fn c -> {
+    let results = sql.script_results! c "CREATE TEMP TABLE contract_script (id bigint); INSERT INTO contract_script VALUES (1); SELECT id, 'a;b' AS text FROM contract_script; SELECT 2 AS other;";
+    test.eq! 4 (len results)
+    test.eq! 1 results.[1].[:changes]
+    test.eq! [[1, "a;b"]] results.[2].[:rows]
+    test.eq! [[2]] results.[3].[:rows]
+    test.eq! ["id", "text"] results.[2].[:columns]
+    test.eq! ["id", "text"] (list.map (fn m -> m.[:name]) results.[2].[:metadata])
+    test.true! (sql.supports c :prepare_statement)
+    test.eq! (sql.dialect_name (sql.dialect_of c)) (sql.info! c).[:dialect]
+    test.true! (sql.ping! c)
+    let data = [1, true, %{ "x" => "y" }];
+    let got = sql.scalar! c (sql.q "SELECT ?" [sql.json data]);
+    test.eq! data (if type_of got == :string { json_codec.parse_or () got } else { got })
+});
+
+let pooling! : (:unit -> sql.Connection) -> :any;
+let pooling! open! = {
+    let p = pool.start! open! 2;
+    let results = proc.map! (fn n -> pool.with! p (fn c -> sql.scalar! c (sql.q "SELECT ?" [n]))) (list.range 0 16);
+    test.eq! (list.range 0 16) results
+    test.true! ((pool.stats! p).[:workers] <= 2)
+    pool.drain! p
+    test.eq! 42 (pool.scalar! p "SELECT 42")
+    pool.stop! p
+    // One worker makes session-local state observable on the next borrow.
+    let p = pool.start! open! 1;
+    pool.exec! p "CREATE TEMP TABLE contract_pool (id bigint)"
+    pool.with! p (fn c -> {
+        sql.exec! c "BEGIN"
+        sql.exec! c "INSERT INTO contract_pool VALUES (1)"
+        ()
+    })
+    test.eq! 0 (pool.scalar! p "SELECT count(*) FROM contract_pool")
+    let e = try! { pool.with! p (fn c -> {
+        sql.exec! c "BEGIN"
+        sql.exec! c "INSERT INTO contract_pool VALUES (2)"
+        raise! (error.new :pool_callback "original")
+    }) } catch e { e };
+    test.eq! :pool_callback (error.kind e)
+    test.eq! 0 (pool.scalar! p "SELECT count(*) FROM contract_pool")
+    pool.transaction! p (fn c -> sql.exec! c "INSERT INTO contract_pool VALUES (3)")
+    test.eq! 1 (pool.scalar! p "SELECT count(*) FROM contract_pool")
+    pool.stop! p
+    let bad = pool.start! (fn () -> sql.fail! "cannot open" :connection_lost "") 1;
+    let first = try! { pool.scalar! bad "SELECT 1" } catch e { e };
+    let second = try! { pool.scalar! bad "SELECT 1" } catch e { e };
+    test.true! (sql.is_connection_lost first && sql.is_connection_lost second)
+    pool.stop! bad
+};
+
+let cleanup! : (:unit -> sql.Connection) -> :any;
+let cleanup! open! = sql.using! (open! ()) (fn c -> {
+    sql.exec! c "CREATE TEMP TABLE contract_parent (id bigint PRIMARY KEY)"
+    sql.exec! c "CREATE TEMP TABLE contract_child (id bigint REFERENCES contract_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+    let commit_error = try! { sql.transaction! c (fn tx -> {
+        sql.exec! tx "INSERT INTO contract_child VALUES (99)"
+        :answered
+    }) } catch e { e };
+    test.eq! :foreign_key (sql.error_code commit_error)
+    test.eq! 0 (sql.scalar! c "SELECT count(*) FROM contract_child")
+    test.eq! 42 (sql.transaction! c (fn tx -> sql.scalar! tx "SELECT 42"))
+    let outcome = sql.using! (open! ()) (fn other -> sql.run! other "SELECT 7 AS seven");
+    test.eq! [[7]] outcome.[:rows]
+    // A failed cleanup must not replace the callback's error.
+    let broken = c.[:close => fn state -> raise! (error.new :cleanup_failure ())];
+    let original = try! { sql.using! broken (fn ignored -> raise! (error.new :body_failure ())) } catch e { e };
+    test.eq! :body_failure (error.kind original)
+});
+
+let tests : (:unit -> sql.Connection) -> [:any];
+let tests open! = [
+    test.case "commit failure rolls back and cleanup preserves the original error" $( cleanup! open! ),
+    test.case "reusable statements coexist, recover and release" $( prepared! open! ),
+    test.case "bulk rows preserve values and roll back atomically" $( bulk! open! ),
+    test.case "script results, metadata, JSON and inspection" $( scripts! open! ),
+    test.case "bounded owner-safe pools, rollback and failed opens" $( pooling! open! ),
+];

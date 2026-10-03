@@ -4,7 +4,8 @@ import std.list;
 import std.sql;
 import std.str;
 import std.test;
-import pg.driver;
+import std.sql.pg.driver;
+import std.sql.pg;
 
 mapping Item { id : :integer, body : :string }
 
@@ -108,8 +109,35 @@ let errors! target = {
     ()
 };
 
+let optional! : :any -> :unit;
+let optional! target = {
+    let c = pg.open! target;
+    let other = pg.open! target;
+    test.true! (sql.supports c :cancel && sql.supports c :listen)
+    sql.listen! c "standard_events"
+    sql.notify! other "standard_events" "hello"
+    let note = sql.next_notification! c;
+    test.eq! ["standard_events", "hello"] [note.[:channel], note.[:payload]]
+    sql.unlisten! c "standard_events"
+    let sub = sql.subscribe! (fn () -> pg.open! target) ["standard_events"] (self! ());
+    sql.notify! other "standard_events" "forwarded"
+    let message = recv! ();
+    test.eq! [:sql_notification, "forwarded"] [message.[0], message.[1].[:payload]]
+    test.eq! :stopped (sql.stop_listening! sub)
+    let work = spawn! $( try! { sql.scalar! c "SELECT pg_sleep(10)"; :finished } catch e { sql.error_code e } );
+    sql.scalar! other "SELECT pg_sleep(0.3)"
+    test.true! (sql.cancel! c)
+    test.eq! :canceled (join! work)
+    test.true! (sql.ping! c)
+    let result = sql.run! c (sql.raw "DO $$ BEGIN RAISE NOTICE 'shared notice'; END $$");
+    test.eq! "shared notice" result.[:notices].[0].[:message]
+    sql.close! c
+    sql.close! other
+};
+
 let tests : :any -> [:any];
 let tests target = [
+    test.case "shared cancellation, notifications, subscriptions and notices" $( optional! target ),
     test.case "open failures, constraint codes and a closed connection" $( errors! target ),
     test.case "shared queries, defaults, NULL, blobs, arrays, JSON and row records" $( values! target ),
     test.case "prepare once, count changes, and recover from a failed batch" $( many! target ),

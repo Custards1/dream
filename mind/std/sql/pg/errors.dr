@@ -125,7 +125,7 @@ let condition_of code = match conditions.[code else ()] {
     c => c,
 };
 
-/// The payload for what the server sent, its fields as `pg.wire` named them
+/// The payload for what the server sent, its fields as `std.sql.pg.wire` named them
 /// and the condition added.
 let of_server : :map -> :map;
 let of_server fields = fields.[:condition => condition_of fields.[:code else ""]];

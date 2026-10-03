@@ -22,12 +22,12 @@
 //
 // What SQLite stores and what comes back: an integer, a float, text, a blob
 // (`[:blob, bytes]`), or NULL. A bool is stored as 1 or 0 and read back as
-// that integer, because SQLite has no booleans to give back. Text is read up
-// to its first NUL byte; text that holds one should be stored as a blob.
+// that integer, because SQLite has no booleans to give back. Text and blobs preserve embedded NUL bytes.
 
 import std.foreign;
 import std.list;
 import std.sql;
+import std.sql.lint;
 import std.str;
 
 foreign sqlite3 from (foreign.shared_library "sqlite3" "0") {
@@ -39,6 +39,9 @@ foreign sqlite3 from (foreign.shared_library "sqlite3" "0") {
     extended_errcode! : Db -> :int = sqlite3_extended_errcode
     busy_timeout! : Db -> :int -> :int = sqlite3_busy_timeout
     exec! : Db -> :cstr -> :ptr -> :ptr -> :ptr -> :int = sqlite3_exec
+    autocommit! : Db -> :int = sqlite3_get_autocommit
+    complete! : :cstr -> :int = sqlite3_complete
+    total_changes! : Db -> :int = sqlite3_total_changes
     changes! : Db -> :int = sqlite3_changes
     last_insert_rowid! : Db -> :i64 = sqlite3_last_insert_rowid
 
@@ -56,6 +59,8 @@ foreign sqlite3 from (foreign.shared_library "sqlite3" "0") {
 
     column_count! : Stmt -> :int = sqlite3_column_count
     column_name! : Stmt -> :int -> :cstr = sqlite3_column_name
+    column_decltype! : Stmt -> :int -> :cstr | () = sqlite3_column_decltype
+    column_text_bytes! : Stmt -> :int -> :ptr = sqlite3_column_text
     column_type! : Stmt -> :int -> :int = sqlite3_column_type
     column_int64! : Stmt -> :int -> :i64 = sqlite3_column_int64
     column_double! : Stmt -> :int -> :double = sqlite3_column_double
@@ -96,7 +101,10 @@ let open_with! path options = {
     let place = options.[:place else foreign.here];
     let flags = (if options.[:readonly else false] { open_readonly } else { open_readwrite + open_create }) + open_uri;
     let db = foreign.run! place (fn () -> open_here! path flags options);
-    let effects = %{ :run => run!, :run_many => run_many!, :script => script!, :close => close! };
+    let effects = %{ :run => run!, :run_many => run_many!, :script => script!, :close => close!,
+        :prepare_statement => prepare_statement!, :execute_statement => execute_statement!,
+        :deallocate_statement => deallocate_statement!, :script_results => script_results!,
+        :reset => reset!, :info => info! };
     // Rows are streamed only where the database is: a fold handed to a server
     // would run its handler in the server, which is not where a program
     // expects its own code to run. Elsewhere `sql.fold!` reads the whole
@@ -178,15 +186,19 @@ priv let execute! db st text params = {
     bind_all! db st text 1 params
     let n = sqlite3.column_count! st;
     let names = column_names! st 0 n [];
+    let metadata = metadata! st 0 n [];
+    let before = sqlite3.total_changes! db;
     let rows = step_rows! db st text n [];
     // `changes` and the last row's id belong to the last statement that
     // wrote, which is not this one if this one only read.
     let wrote = sqlite3.readonly! st == 0;
-    let changes = if wrote { sqlite3.changes! db } else { 0 };
+    let changes = if wrote && sqlite3.total_changes! db != before { sqlite3.changes! db } else { 0 };
     let last_id = if wrote { sqlite3.last_insert_rowid! db } else { () };
     strict! changes
     strict! last_id
-    %{ :columns => names, :rows => rows, :changes => changes, :last_id => last_id }
+    %{ :columns => names, :rows => rows, :changes => changes, :last_id => last_id,
+       :metadata => metadata, :command => (), :status => if sqlite3.autocommit! db == 1 { :idle } else { :transaction },
+       :notices => [], :notifications => [] }
 };
 
 /// Cons, forcing the head.
@@ -228,7 +240,7 @@ priv let column_value! st i = {
     let v = match kind {
         1 => sqlite3.column_int64! st i,
         2 => sqlite3.column_double! st i,
-        3 => sqlite3.column_text! st i,
+        3 => text_bytes! st i,
         4 => blob_bytes! st i,
         _ => (),
     };
@@ -271,7 +283,9 @@ priv let rec bind_all! db st text !i params = match params {
 };
 
 priv let bind_one! : sqlite3.Stmt -> :integer -> sql.Value -> :integer;
-priv let bind_one! st i v = match v {
+priv let rec bind_one! st i v = match v {
+    [:json, text] => sqlite3.bind_text! st i text (len text) transient,
+    [:native_value, :sqlite, raw] => bind_one! st i raw,
     () => sqlite3.bind_null! st i,
     true => sqlite3.bind_int64! st i 1,
     false => sqlite3.bind_int64! st i 0,
@@ -375,6 +389,80 @@ priv let close! : :map -> :unit;
 priv let close! state = {
     let db = state.[:db];
     foreign.run! state.[:place] (fn () -> foreign.release! db)
+};
+
+// --- reusable statements, scripts and session state ----------------------------
+
+priv let prepare_statement! : :map -> :string -> [:any] -> :map;
+priv let prepare_statement! state text params = foreign.run! state.[:place] (fn () -> {
+    let [rc, st] = sqlite3.prepare! state.[:db] text (len text) ();
+    if rc != 0 { fail_db! state.[:db] text } else { () }
+    if st == () { sql.fail! "cannot prepare an empty statement" :parameters text } else { () }
+    %{ :stmt => st, :text => text }
+});
+
+priv let execute_statement! : :map -> :map -> [:any] -> sql.Outcome;
+priv let execute_statement! state prepared params = foreign.run! state.[:place] (fn () -> {
+    let st = prepared.[:stmt];
+    sqlite3.reset! st
+    sqlite3.clear_bindings! st
+    execute! state.[:db] st prepared.[:text] params
+});
+
+priv let deallocate_statement! : :map -> :map -> :unit;
+priv let deallocate_statement! state prepared = foreign.run! state.[:place] (fn () -> foreign.release! prepared.[:stmt]);
+
+priv let script_results! : :map -> :string -> [sql.Outcome];
+priv let script_results! state text = foreign.run! state.[:place]
+    (fn () -> script_parts! state.[:db] (lint.scan text false) "" []);
+
+// sqlite3_complete understands CREATE TRIGGER bodies; lexical semicolons
+// alone do not. No splitting inside quotes, comments or trigger BEGIN/END.
+priv let script_parts! : sqlite3.Db -> [:any] -> :string -> [sql.Outcome] -> [sql.Outcome];
+priv let rec script_parts! db tokens pending !results = match tokens {
+    [] => if str.trim pending == "" || lint.problem pending == "the statement is empty" { list.reverse results }
+          else { let result = run_here! db pending []; strict! result; list.reverse (list.cons result results) },
+    [token, ..rest] => {
+        let text = pending + lint.token_text token;
+        if token == [:semicolon] && sqlite3.complete! text == 1 {
+            let result = run_here! db text [];
+            strict! result
+            script_parts! db rest "" (list.cons result results)
+        } else { script_parts! db rest text results }
+    },
+};
+
+priv let reset! : :map -> :unit;
+priv let reset! state = foreign.run! state.[:place] (fn () -> {
+    if sqlite3.autocommit! state.[:db] == 0 { exec_here! state.[:db] "ROLLBACK" } else { () }
+});
+
+priv let info! : :map -> :map;
+priv let info! state = %{ :server_version => version () };
+
+priv let metadata! : sqlite3.Stmt -> :integer -> :integer -> [:map] -> [:map];
+priv let rec metadata! st i n !acc = if i >= n { list.reverse acc } else {
+    let name = sqlite3.column_name! st i;
+    let declared = sqlite3.column_decltype! st i;
+    let column = %{ :name => name, :native_type => declared };
+    strict! column
+    metadata! st (i + 1) n (list.cons column acc)
+};
+
+priv let text_bytes! : sqlite3.Stmt -> :integer -> :string;
+priv let text_bytes! st i = {
+    let pointer = sqlite3.column_text_bytes! st i;
+    let n = sqlite3.column_bytes! st i;
+    strict! pointer
+    if n == 0 { "" } else {
+        let buffer = foreign.buffer! n;
+        foreign.using! buffer (fn buffer -> {
+            libc.copy! buffer pointer n
+            let bytes = foreign.read! buffer 0 n;
+            strict! bytes
+            bytes
+        })
+    }
 };
 
 // --- errors -------------------------------------------------------------------

@@ -11,7 +11,7 @@
 // from the environment variables libpq reads, so a program configured for
 // `psql` is configured for this.
 //
-// **TLS is `sslmode`, with libpq's meanings** (see `pg.db`): `disable` and
+// **TLS is `sslmode`, with libpq's meanings** (see `std.sql.pg.db`): `disable` and
 // `allow` speak plain text, `prefer` -- the default, as in libpq -- encrypts
 // when the server will and does not check whom it is talking to, `require`
 // insists on encryption, `verify-ca` also checks the certificate chains to a
@@ -31,8 +31,8 @@ import std.list;
 import std.map;
 import std.os;
 import std.str;
-import pg.bytes;
-import pg.errors;
+import std.sql.pg.bytes;
+import std.sql.pg.errors;
 import std.num;
 
 mapping Config {
@@ -47,7 +47,7 @@ mapping Config {
     /// `TimeZone` and anything else `SET` would take, as strings.
     settings : %{:string => :string} = %{}
     /// The program's own decoders, by type OID, consulted before the built-in
-    /// ones; see `pg.value`.
+    /// ones; see `std.sql.pg.value`.
     decoders : :map = %{}
     /// libpq's `sslmode`, as an atom: `:disable`, `:allow`, `:prefer`,
     /// `:require`, `:verify_ca` or `:verify_full`.

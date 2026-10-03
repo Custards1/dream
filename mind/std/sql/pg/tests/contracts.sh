@@ -1,7 +1,7 @@
 #!/bin/sh
 # What the compiler refuses: malformed SQL, written where a program writes SQL.
 #
-# `pg.sql` checks a statement twice over at compile time -- the `sql.query`
+# `std.sql.pg.sql` checks a statement twice over at compile time -- the `sql.query`
 # macro lints its template while it expands, and a plain string handed to
 # `db.query!` meets the `Statement` refinement, whose predicate the compiler
 # runs on the literal. Neither can be tested from inside a program, because a
@@ -25,8 +25,8 @@ fail=0
 # compile BODY -- the diagnostics of a program whose one function is BODY.
 compile() {
     cat >"$tmp/case.dr" <<DR
-import pg.db;
-import pg.sql;
+import std.sql.pg.db;
+import std.sql.pg.sql;
 import std.sql as shared;
 let run! conn a = $1;
 let main! = ();

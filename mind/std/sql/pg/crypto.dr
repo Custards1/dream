@@ -15,7 +15,7 @@
 //
 // **MD5 is written here**, because nothing else provides it and some servers
 // still store `md5` passwords. It needs AND, OR and NOT on 32-bit words, which
-// are tables of nibbles as `pg.bytes` builds exclusive-or. It is slow by the
+// are tables of nibbles as `std.sql.pg.bytes` builds exclusive-or. It is slow by the
 // standards of C and that does not matter: a login hashes two short strings.
 //
 // What is not here is `SASLprep`, the Unicode normalisation SCRAM asks a
@@ -28,7 +28,7 @@
 import std.io;
 import std.list;
 import std.str;
-import pg.bytes;
+import std.sql.pg.bytes;
 import std.array;
 import std.num;
 

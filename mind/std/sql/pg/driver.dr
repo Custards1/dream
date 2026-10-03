@@ -1,16 +1,16 @@
 // PostgreSQL as a std.sql.Connection. A wrapped connection has the same owner
-// and lifetime as the original pg.db connection; use it serially.
+// and lifetime as the original std.sql.pg.db connection; use it serially.
 import std.error;
 import std.list;
 import std.map;
 import std.sql;
 import std.str;
-import pg.db;
-import pg.errors;
-import pg.value;
-import pg.wire;
+import std.sql.pg.db;
+import std.sql.pg.errors;
+import std.sql.pg.value;
+import std.sql.pg.wire;
 
-/// Connect using pg.config's map, URL or keyword string.
+/// Connect using std.sql.pg.config's map, URL or keyword string.
 let open! : :any -> sql.Connection;
 let open! target = try! {
     let conn = db.connect! target;
@@ -23,12 +23,21 @@ let open! target = try! {
 let wrap! : db.Conn -> sql.Connection;
 let wrap! conn = sql.connection sql.postgres conn %{
     :run => run!, :run_many => many!, :script => script!, :fold => fold!, :close => close!,
+    :prepare_statement => prepare_statement!, :execute_statement => execute_statement!,
+    :deallocate_statement => deallocate_statement!, :script_results => script_results!,
+    :copy_in => copy_in!, :cancel => cancel!, :info => info!, :reset => reset!,
+    :listen => listen!, :unlisten => unlisten!, :notify => notify!, :next_notification => next_notification!,
 };
 
 priv let parameter : :any -> :any;
-priv let parameter v = match v { [:blob, bytes] => value.bytea bytes, _ => v };
+priv let parameter v = match v {
+    [:blob, bytes] => value.bytea bytes,
+    [:json, text] => value.typed value.oid.json text,
+    [:native_value, :postgres, v] => v,
+    _ => v,
+};
 
-// Keep pg.db's decoding contract intact. Only this adapter tags bytea, using
+// Keep std.sql.pg.db's decoding contract intact. Only this adapter tags bytea, using
 // the column OID, including bytea nested in arrays. NULL stays NULL.
 priv let cell : :integer -> :any -> :any;
 priv let cell oid v = match v {
@@ -57,6 +66,10 @@ priv let outcome result = %{
     :rows => tuples (db.Result.columns result) (db.Result.tuples result),
     :changes => changed result,
     :last_id => (),
+    :metadata => list.map (fn col -> %{ :name => wire.Column.name col, :native_type => wire.Column.oid col,
+        :table => wire.Column.table col, :attribute => wire.Column.attribute col }) (db.Result.columns result),
+    :command => db.Result.command result, :status => db.Result.status result,
+    :notices => db.Result.notices result, :notifications => db.Result.notifications result,
 };
 
 priv let run! : db.Conn -> :string -> [:any] -> sql.Outcome;
@@ -103,6 +116,56 @@ priv let fold! conn text params batch step! init = try! {
 
 priv let close! : db.Conn -> :unit;
 priv let close! conn = try! { db.close! conn } catch e { fail! "" e };
+
+// Named prepared handles coexist on one connection. A fresh process identity
+// supplies a unique protocol name; no mutable counter or user-name collision.
+priv let prepare_statement! : db.Conn -> :string -> [:any] -> db.Prepared;
+priv let prepare_statement! conn text params = try! {
+    let token = spawn! $( () );
+    join! token
+    db.prepare_types! conn ("dream_sql_" + to_string token) text (list.map (fn v -> value.oid_of (parameter v)) params)
+} catch e { fail! text e };
+
+priv let execute_statement! : db.Conn -> db.Prepared -> [:any] -> sql.Outcome;
+priv let execute_statement! conn prepared params = try! {
+    let result = db.execute! conn prepared (list.map parameter params);
+    strict! result
+    outcome result
+} catch e { fail! (db.Prepared.text prepared) e };
+
+priv let deallocate_statement! : db.Conn -> db.Prepared -> :unit;
+priv let deallocate_statement! conn prepared = try! { db.deallocate! conn prepared } catch e { fail! (db.Prepared.text prepared) e };
+
+priv let script_results! : db.Conn -> :string -> [sql.Outcome];
+priv let script_results! conn text = try! {
+    let results = db.script! conn text;
+    strict! results
+    list.map outcome results
+} catch e { fail! text e };
+
+priv let copy_in! : db.Conn -> :string -> [:string] -> [[:any]] -> :integer;
+priv let copy_in! conn table columns rows = try! {
+    db.copy_in! conn table columns (list.map (list.map parameter) rows)
+} catch e { fail! "COPY FROM STDIN" e };
+
+priv let cancel! : db.Conn -> :bool;
+priv let cancel! conn = db.cancel! conn;
+
+priv let info! : db.Conn -> :map;
+priv let info! conn = %{ :server_version => db.server_version conn, :parameters => db.Conn.parameters conn,
+                        :tls => db.tls_info! conn };
+
+priv let reset! : db.Conn -> :unit;
+priv let reset! conn = try! { db.script! conn "ROLLBACK; UNLISTEN *"; () } catch e { fail! "ROLLBACK; UNLISTEN *" e };
+
+priv let listen! : db.Conn -> :string -> :unit;
+priv let listen! conn channel = try! { db.listen! conn channel } catch e { fail! "LISTEN" e };
+priv let unlisten! : db.Conn -> :string -> :unit;
+priv let unlisten! conn channel = try! { db.unlisten! conn channel } catch e { fail! "UNLISTEN" e };
+priv let notify! : db.Conn -> :string -> :string -> :unit;
+priv let notify! conn channel payload = try! { db.notify! conn channel payload } catch e { fail! "NOTIFY" e };
+priv let next_notification! : db.Conn -> :map;
+priv let next_notification! conn = try! { db.next_notification! conn } catch e { fail! "notification" e };
 
 /// A PostgreSQL refusal in std.sql's vocabulary, retaining all server fields.
 /// Exceptions from application callbacks pass through unchanged.

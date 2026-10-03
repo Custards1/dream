@@ -11,7 +11,7 @@
 // operation a password exchange cannot do without. So it is a table: sixteen
 // by sixteen answers for a pair of nibbles, built once, and a byte is two
 // lookups. That is cheap enough for SCRAM's four thousand rounds of HMAC and
-// needs nothing from the VM. `pg.crypto` builds AND and OR the same way for
+// needs nothing from the VM. `std.sql.pg.crypto` builds AND and OR the same way for
 // MD5, which is the other place a bit is ever looked at.
 
 import std.list;

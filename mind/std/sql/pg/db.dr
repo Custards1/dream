@@ -1,7 +1,7 @@
 // A connection to PostgreSQL, and everything done over one.
 //
-//     import pg.db;
-//     import pg.sql;
+//     import std.sql.pg.db;
+//     import std.sql.pg.sql;
 //
 //     let main! = {
 //         let conn = db.connect! "postgres://ada@localhost/app";
@@ -18,7 +18,7 @@
 // the end of every exchange -- so there is nothing on this side to keep in step,
 // and a connection can be handed to another process like any other value.
 // What it cannot be is *used* by two processes at once: an exchange is a
-// conversation, and two interleaved are nonsense to the server. `pg.pool` is
+// conversation, and two interleaved are nonsense to the server. `std.sql.pg.pool` is
 // how several processes share connections.
 //
 // **That a connection holds no buffer is a decision**, and it is the same one
@@ -35,15 +35,15 @@
 // of that and is held until the server is ready, so the connection is always
 // left at a message boundary and fit to use: a statement that fails is an
 // error for the caller, never a broken connection. The values go beside the
-// text, never in it; see `pg.sql`.
+// text, never in it; see `std.sql.pg.sql`.
 //
 // **A result is decoded only as far as it is read.** The rows arrive as text
 // and stay that way until something asks for a row, at which point that row's
-// columns are decoded by type (`pg.value`). A program that counts rows never
+// columns are decoded by type (`std.sql.pg.value`). A program that counts rows never
 // decodes one.
 //
 // **Every failure is `:postgres`**, with a `:condition` to branch on; see
-// `pg.errors`. A socket that fails underneath an exchange is reported as
+// `std.sql.pg.errors`. A socket that fails underneath an exchange is reported as
 // `:connection_failure`, carrying the socket's own error as `:cause`, and that
 // connection should be closed: the exchange stopped somewhere in the middle.
 
@@ -58,13 +58,13 @@ import std.str;
 import std.streams;
 import std.tls;
 import std.types;
-import pg.bytes;
-import pg.config;
-import pg.crypto;
-import pg.errors;
-import pg.sql;
-import pg.value;
-import pg.wire;
+import std.sql.pg.bytes;
+import std.sql.pg.config;
+import std.sql.pg.crypto;
+import std.sql.pg.errors;
+import std.sql.pg.sql;
+import std.sql.pg.value;
+import std.sql.pg.wire;
 import std.num;
 
 /// An open connection.
@@ -80,7 +80,7 @@ mapping Conn {
 
 /// What a statement answered.
 ///
-/// `rows` are maps from column key to value (see `pg.wire.Column` for what a
+/// `rows` are maps from column key to value (see `std.sql.pg.wire.Column` for what a
 /// key is), and `tuples` the same values positionally, which is what a result
 /// with two columns of the same name needs. Both are decoded as they are read.
 /// `count` is what the command tag says it did -- rows inserted, updated,
@@ -115,7 +115,7 @@ mapping Prepared {
 // --- connecting ------------------------------------------------------------------
 
 /// Connect and log in. `target` is a configuration map, a URL or a keyword
-/// string; see `pg.config`. Raises `:connection_failure` when the server
+/// string; see `std.sql.pg.config`. Raises `:connection_failure` when the server
 /// cannot be reached, and the server's own condition -- `:invalid_password`,
 /// `:invalid_catalog_name` -- when it refuses.
 let connect! : :any -> Conn;
@@ -534,7 +534,7 @@ let count_of tag = match num.parse_int (list.last (str.split " " tag)) {
 
 /// Run one statement and answer everything it said: a `Result`.
 ///
-/// `q` is a fragment -- from `expand sql.query`, or built with `pg.sql` -- or
+/// `q` is a fragment -- from `expand sql.query`, or built with `std.sql.pg.sql` -- or
 /// a string with no parameters, which the compiler checks is one well-formed
 /// statement wherever it is written as a literal.
 let query! : Conn -> sql.Query -> :map;
@@ -854,7 +854,7 @@ let deallocate! conn p = {
 
 /// Copy `rows` -- lists of values, in the order of `columns` -- into `table`,
 /// and answer how many went in. Values are spelled as parameters are; see
-/// `pg.value`.
+/// `std.sql.pg.value`.
 let copy_in! : Conn -> :any -> [:any] -> [[:any]] -> :integer;
 let copy_in! conn table columns rows = {
     let target = sql.text (sql.concat [sql.qualified (str.split "." (to_string_name table)), sql.raw " ("

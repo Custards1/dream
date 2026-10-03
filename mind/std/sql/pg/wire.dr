@@ -2,7 +2,7 @@
 //
 // Everything here is pure: a message to send is built as the bytes that go on
 // the wire, and a message received is decoded from its type byte and body into
-// a `Message`. Reading and writing a socket is `pg.db`'s business, which is
+// a `Message`. Reading and writing a socket is `std.sql.pg.db`'s business, which is
 // what lets every byte of the protocol be tested without a server.
 //
 // **A frame is a type byte, a 32-bit length that counts itself, and a body.**
@@ -17,13 +17,13 @@
 //
 // **The extended query protocol is the one that matters.** A query with
 // parameters is five messages -- Parse, Bind, Describe, Execute, Sync -- and
-// they are built separately so that `pg.db` can write them in one go: the
+// they are built separately so that `std.sql.pg.db` can write them in one go: the
 // server answers all five in one round trip, which is what makes a parameter
 // cost nothing over a literal.
 
 import std.list;
 import std.map;
-import pg.bytes;
+import std.sql.pg.bytes;
 import std.atom;
 import std.str;
 
@@ -141,7 +141,7 @@ priv let rec columns_from body at n acc =
     };
 
 /// A row's fields as the text the server sent, `()` for a NULL. Decoding them
-/// into values is `pg.value`'s, and is done only for the rows that are read.
+/// into values is `std.sql.pg.value`'s, and is done only for the rows that are read.
 priv let fields_of : :string -> [:any];
 priv let fields_of body = fields_from body 2 (bytes.u16_at body 0) [];
 
@@ -247,7 +247,7 @@ let parse name sql oids =
 
 /// Bind `values` to the statement `stmt`, making the portal `portal`. Every
 /// value goes as text -- a string, or `()` for NULL -- and every column comes
-/// back as text: `pg.value` is the one place either is spelled.
+/// back as text: `std.sql.pg.value` is the one place either is spelled.
 let bind : :string -> :string -> [:any] -> :string;
 let bind portal stmt values =
     frame "B" (bytes.cstr portal + bytes.cstr stmt + bytes.be16 0 + bytes.be16 (len values)

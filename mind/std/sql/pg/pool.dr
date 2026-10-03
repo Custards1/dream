@@ -7,7 +7,7 @@
 // **The pool is a server** (`std.server`), and what it serves is permission.
 // Its state is the idle connections, how many are open, and who is waiting;
 // checking a connection out is a call, and handing one back is a cast. The
-// connection itself is a value (see `pg.db`), so the process that checks one
+// connection itself is a value (see `std.sql.pg.db`), so the process that checks one
 // out uses it directly -- no query passes through the pool's mailbox, and the
 // pool is never the bottleneck it would be if it ran them.
 //
@@ -30,14 +30,14 @@
 
 import std.list;
 import std.server;
-import pg.config;
-import pg.db;
-import pg.errors;
+import std.sql.pg.config;
+import std.sql.pg.db;
+import std.sql.pg.errors;
 
 mod keeper {
     derive std.server;
     import std.list;
-    import pg.db;
+    import std.sql.pg.db;
 
     mapping State {
         config : :map
@@ -86,7 +86,7 @@ mod keeper {
     let terminate! reason state = strict! (list.map (fn c -> db.close! c) (State.idle state));
 
     let server_name : :any -> :string;
-    let server_name u = "pg.pool";
+    let server_name u = "std.sql.pg.pool";
 }
 
 /// Start a pool of at most `size` connections to `target` -- a configuration
@@ -174,7 +174,7 @@ priv let settle! pool conn e =
 
 // --- one statement, borrowed for -----------------------------------------------------
 //
-// The everyday case is one statement, and these are `pg.db`'s functions of the
+// The everyday case is one statement, and these are `std.sql.pg.db`'s functions of the
 // same names with the connection borrowed around them.
 
 let query! : :process -> :any -> :map;

@@ -1,4 +1,4 @@
-// The library against a running server: every exchange `pg.db` and `pg.pool`
+// The library against a running server: every exchange `std.sql.pg.db` and `std.sql.pg.pool`
 // make, checked end to end.
 //
 // `live.sh` starts a throwaway cluster, makes the users each login method
@@ -16,13 +16,15 @@ import std.proc;
 import std.str;
 import std.test;
 import std.types;
-import pg.config;
-import pg.db;
-import pg.errors;
-import pg.pool;
-import pg.sql;
-import pg.value;
-import pg.tests.standard;
+import std.sql.pg.config;
+import std.sql.pg.db;
+import std.sql.pg.errors;
+import std.sql.pg.pool;
+import std.sql.pg.sql;
+import std.sql.pg.value;
+import std.sql.pg.tests.standard;
+import std.sql.pg;
+import std.sql.tests.contract;
 import std.num;
 
 let port! : :unit -> :integer;
@@ -499,6 +501,7 @@ let pooled_tls! u = {
 };
 
 let main! = test.main_of! [
+    ["std.sql contract: PostgreSQL", contract.tests (fn () -> pg.open! (as! "postgres" ()))],
     ["pg live: std.sql", standard.tests (as! "postgres" ())],
     ["pg live: logging in", [
         test.case "trust" $( login! "postgres" () ),

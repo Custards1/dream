@@ -1,6 +1,6 @@
 // A small task list against PostgreSQL: the library as a program would use it.
 //
-//     dreams pg/examples/tasks.dr -L mind -L . -o tasks.dream
+//     dreams mind/std/sql/pg/examples/tasks.dr -L mind -L . -o tasks.dream
 //     DATABASE_URL=postgres://me@localhost/app dream tasks.dream
 //
 // Configured from the environment, the way `psql` is: `DATABASE_URL`, or the
@@ -8,10 +8,10 @@
 
 import std.console;
 import std.list;
-import pg.config;
-import pg.db;
-import pg.errors;
-import pg.sql;
+import std.sql.pg.config;
+import std.sql.pg.db;
+import std.sql.pg.errors;
+import std.sql.pg.sql;
 
 /// A row of `task`, as a record. Its fields are the table's columns, so a row
 /// read back is one of these as it stands, and one made here inserts as it is.

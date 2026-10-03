@@ -49,7 +49,7 @@
 // run one many times, run a script, close. Everything else (`query!`,
 // `one!`, `scalar!`, `transaction!`, `migrate!`) is written here once, in
 // terms of those, so a driver is small and every driver gets all of it.
-// `std.sql.sqlite` and `pg.driver` supply these effects.
+// `std.sql.sqlite` and `std.sql.pg` supply these effects.
 //
 // | SQL                | Dream                                     |
 // |--------------------|-------------------------------------------|
@@ -66,11 +66,11 @@
 // converting. Atoms are never made from what a database sends: writing
 // `:email` anywhere in the program is what makes that column read by atom.
 //
-// `std.sql.sqlite` and `pg.driver` are the drivers there are.
+// `std.sql.sqlite` and `std.sql.pg` are the drivers there are.
 
 import std.atom;
 import std.error;
-import std.json;
+import std.json as json_codec;
 import std.list;
 import std.map;
 import std.str;
@@ -82,11 +82,22 @@ import std.sql.lint;
 /// Parameter values; the dialect checks which kinds it accepts on render.
 /// A blob is tagged [:blob, bytes], because a string is bytes either way.
 /// PostgreSQL also accepts lists as arrays, maps as JSON, and atoms as names.
-type Value = :unit | :integer | :float | :string | :bool | :list | :map | :atom;
+type Value = :unit | :integer | :float | :string | :bool | :list | :map | :atom | :array | :char;
 
 /// Bytes, to be stored as a blob rather than as text.
 let blob : :string -> Value;
 let blob bytes = [:blob, bytes];
+
+/// Explicit JSON, including arrays and scalars that would otherwise become
+/// SQL arrays or ordinary parameters. SQLite stores JSON text; PostgreSQL
+/// binds a JSON value. Reading SQLite JSON text remains explicit.
+let json : :any -> Value;
+let json v = [:json, json_codec.write v];
+
+/// A deliberate backend-specific parameter (for example a PostgreSQL OID
+/// wrapper). Rendering refuses it when used with another backend.
+let native_value : :atom -> :any -> Value;
+let native_value backend v = [:native_value, backend, v];
 
 /// Whether `v` is something every database can store, and if not, why not --
 /// `()` for a value that is fine. Checked as a statement is rendered, so a map
@@ -99,6 +110,8 @@ let value_problem v = value_problem_in ansi v;
 /// JSON and an atom as its name, because its driver knows how to send them.
 let value_problem_in : Dialect -> :any -> :any;
 let value_problem_in d v = match v {
+    [:json, text] => if type_of text == :string { () } else { "JSON holds encoded text" },
+    [:native_value, backend, _] => if dialect_name d == backend { () } else { "native value belongs to " + to_string backend },
     [:blob, b] => if type_of b == :string { () } else { "a blob holds a string of bytes" },
     _ => match type_of v {
         :unit => (), :integer => (), :float => (), :string => (), :bool => (),
@@ -199,20 +212,29 @@ let parens x = frag ["(", sql_of x, ")"];
 ///
 ///     sql.q "select * from t where a = ? and b in ?" [1, sql.q "(select b from u)" []]
 let q : :string -> [:any] -> Sql;
-let q text args = frag (fill text 0 args []);
+let q text args = frag (fill_tokens (lint.scan text false) args []);
 
-priv let fill : :string -> :integer -> [:any] -> [:any] -> [:any];
-priv let rec fill text !from args !acc = {
+// Only code tokens have holes: quoted strings, identifiers and comments are
+// copied verbatim. Extra values are a mistake, just like missing values.
+priv let fill_tokens : [:any] -> [:any] -> [:any] -> [:any];
+priv let rec fill_tokens tokens args !acc = match tokens {
+    [] => list.reverse (if list.is_empty args { acc } else { list.cons [:unsupported, "`q` has more arguments than holes"] acc }),
+    [[:code, text], ..rest] => fill_code text 0 rest args acc,
+    [[:error, message], .._] => list.reverse (list.cons [:unsupported, message] acc),
+    [t, ..rest] => fill_tokens rest args (list.cons (lint.token_text t) acc),
+};
+
+priv let fill_code : :string -> :integer -> [:any] -> [:any] -> [:any] -> [:any];
+priv let rec fill_code text from tokens args !acc = {
     let at = str.find_from from "?" text;
-    if at < 0 {
-        list.reverse (list.cons (str.slice from (len text - from) text) acc)
-    } else if at + 1 < len text && str.slice (at + 1) 1 text == "?" {
-        fill text (at + 2) args (list.cons (str.slice from (at + 1 - from) text) acc)
+    if at < 0 { fill_tokens tokens args (list.cons (str.slice from (len text - from) text) acc) }
+    else if str.slice (at + 1) 1 text == "?" {
+        fill_code text (at + 2) tokens args (list.cons (str.slice from (at + 1 - from) text) acc)
     } else {
         let before = list.cons (str.slice from (at - from) text) acc;
         match args {
-            [] => list.reverse (list.cons [:unsupported, "`q` has more holes than arguments: " + text] before),
-            [arg, ..rest] => fill text (at + 1) rest (list.cons (expr_of arg) before),
+            [] => list.reverse (list.cons [:unsupported, "`q` has more holes than arguments"] before),
+            [arg, ..rest] => fill_code text (at + 1) tokens rest (list.cons (expr_of arg) before),
         }
     }
 };
@@ -259,10 +281,11 @@ let problem text = lint.problem text;
 /// SQL written with numbered parameters (`$1`, `$2`, ..) and the values they
 /// stand for, as a fragment -- so SQL from elsewhere composes with everything
 /// here and is renumbered, or made `?`, for the dialect it is run against. A
-/// `$n` past the end of `values` is NULL.
+/// A missing or nonpositive parameter index is rejected on render.
 let positional : :string -> [:any] -> Sql;
 let positional text values = frag (list.map (fn t -> match t {
-    [:positional, n] => [:value, values.[n - 1 else ()]],
+    [:positional, n] => if n > 0 && n <= len values { [:value, values.[n - 1]] }
+                        else { [:unsupported, "numbered parameter has no value: $" + to_string n] },
     other => lint.token_text other,
 }) (lint.scan text false));
 
@@ -879,6 +902,8 @@ priv let push !s xs = list.cons s xs;
 /// A value as the dialect writes it in SQL text.
 let literal_text : Dialect -> :any -> :string;
 let literal_text d v = match v {
+    [:json, text] => literal_text d text,
+    [:native_value, _, _] => "<native parameter>",
     () => "NULL",
     true => d.[:true],
     false => d.[:false],
@@ -902,7 +927,7 @@ let literal_text d v = match v {
         :array => literal_text d (list.of_array v),
         :map => {
             let json_of = d.[:json];
-            json_of (json.write v)
+            json_of (json_codec.write v)
         },
         _ => to_string v,
     },
@@ -1530,6 +1555,9 @@ let describe_error e =
 let prepare! : Connection -> Runnable -> Rendered;
 let prepare! c x = {
     let st = render c.[:dialect] x;
+    if type_of x == :string {
+        match lint.problem x { () => (), message => fail! message :syntax x }
+    } else { () }
     match st.[:problems] {
         [] => (),
         problems => fail! (str.join_str "; " problems) :unsupported st.[:text],
@@ -1549,7 +1577,9 @@ let run! : Connection -> Runnable -> Outcome;
 let run! c x = {
     let st = prepare! c x;
     let go! = c.[:run];
-    go! c.[:state] st.[:text] st.[:params]
+    let outcome = go! c.[:state] st.[:text] st.[:params];
+    strict! outcome
+    outcome
 };
 
 /// Run a statement for its effect: `%{ :changes, :last_id }`.
@@ -1561,7 +1591,7 @@ let exec! c x = {
 
 /// The rows of a query, each a map from column name to value.
 let query! : Connection -> Runnable -> [Row];
-let query! c x = rows_of (run! c x);
+let query! c x = { let outcome = run! c x; rows_of outcome };
 
 /// An outcome's rows, as maps.
 let rows_of : Outcome -> [Row];
@@ -1578,7 +1608,7 @@ let column_key : :string -> :any;
 let column_key name = match atom.existing name { () => name, a => a };
 
 /// The rows of a query, each checked against `description` (`std.types`):
-/// `sql.query_as! db (types.record %{ "id" => :integer }) q`.
+/// `sql.query_as! (types.record %{ "id" => :integer }) db q`.
 let query_as! : :any -> Connection -> Runnable -> [Row];
 let query_as! description c x = list.map (fn row -> types.check description row) (query! c x);
 
@@ -1651,10 +1681,7 @@ priv let rec run_each! c text params !total = match params {
 /// Many statements in one string, with no parameters: a schema file.
 let script! : Connection -> Script -> :unit;
 let script! c text = match c.[:script else ()] {
-    () => {
-        exec! c text
-        ()
-    },
+    () => { script_results! c text; () },
     f => {
         let go! = f;
         go! c.[:state] text
@@ -1695,12 +1722,19 @@ let transaction_with! c options work = {
         } catch ignored { () }
         raise! e
     };
-    if depth == 0 { exec! c d.[:commit] }
-    else {
-        match d.[:release else ()] {
-            () => (),
-            release => exec! c (call_with release point),
+    try! {
+        if depth == 0 { exec! c d.[:commit] }
+        else {
+            match d.[:release else ()] {
+                () => (),
+                release => exec! c (call_with release point),
+            }
         }
+    } catch e {
+        try! {
+            if depth == 0 { exec! c d.[:rollback] } else { exec! c (call_with d.[:rollback_to] point) }
+        } catch ignored { () }
+        raise! e
     }
     answer
 };
@@ -1737,7 +1771,7 @@ let serializable! c attempts work = retrying! c attempts %{ :isolation => :seria
 // that offers `:fold` -- state -> text -> params -> batch -> step -> init --
 // and calls `step acc columns rows` with each batch, in order; one that cannot
 // is given the whole result as one batch, which is the same answer at a cost
-// in memory. `pg.driver` reads through a portal; `std.sql.sqlite` steps.
+// in memory. `std.sql.pg` reads through a portal; `std.sql.sqlite` steps.
 
 /// Fold `f` over the rows of `x`, `batch` at a time, holding one batch.
 let fold! : Connection -> Runnable -> :integer -> (a -> Row -> a) -> a -> a;
@@ -1792,6 +1826,186 @@ let using! c work = {
     };
     close! c
     answer
+};
+
+// --- driver capabilities and session operations --------------------------------
+
+/// Optional native operations this connection actually implements. Portable
+/// bulk insertion and ping work even without native acceleration.
+let capabilities : Connection -> [:atom];
+let capabilities c = list.filter (fn key -> map.has c key)
+    [:fold, :run_many, :prepare_statement, :script, :script_results, :copy_in,
+     :cancel, :listen, :unlisten, :notify, :next_notification, :info, :reset];
+
+let supports : Connection -> :atom -> :bool;
+let supports c feature = list.contains feature (capabilities c);
+
+priv let require! : Connection -> :atom -> :any;
+priv let require! c feature = match c.[feature else ()] {
+    () => fail! (to_string (dialect_name (dialect_of c)) + " does not support " + to_string feature) :unsupported "",
+    operation => operation,
+};
+
+/// Check the connection with a round trip. False includes connection errors.
+let ping! : Connection -> :bool;
+let ping! c = try! { scalar! c "SELECT 1" == 1 } catch e { false };
+
+/// Driver-specific facts alongside the portable :dialect and :capabilities.
+let info! : Connection -> :map;
+let info! c = {
+    let extra = match c.[:info else ()] { () => %{}, f => { let get! = f; get! c.[:state] } };
+    map.merge extra %{ :dialect => dialect_name (dialect_of c), :capabilities => capabilities c }
+};
+
+/// Roll back an abandoned transaction and clear driver session subscriptions.
+/// Pools require this hook; a failed reset means the connection is discarded.
+/// Temporary objects and deliberate session settings are not reset.
+let reset! : Connection -> :unit;
+let reset! c = { let reset_session! = require! c :reset; reset_session! c.[:state] };
+
+/// Ask the database to cancel work from another process. True means the
+/// request was delivered, not that it won the race with statement completion.
+let cancel! : Connection -> :bool;
+let cancel! c = { let cancel_query! = require! c :cancel; cancel_query! c.[:state] };
+
+/// Every statement's outcome, in order. Unlike script!, results are retained.
+/// Splitting scripts is a driver's job: procedure and trigger bodies can
+/// contain semicolons which are not statement boundaries.
+let script_results! : Connection -> Script -> [Outcome];
+let script_results! c text = {
+    let run_script! = require! c :script_results;
+    run_script! c.[:state] text
+};
+
+// --- reusable prepared statements ---------------------------------------------
+
+type Prepared = %{ :atom => :any };
+
+/// Prepare a fragment or builder once. Its parameter positions form the
+/// template; execute! replaces all of them with the supplied values.
+/// Example: statement! c (q "INSERT INTO t (id, name) VALUES (?, ?)" [(), ()]).
+/// Initial values may supply native parameter type hints; use casts where a
+/// database cannot infer a parameter's type. The handle belongs to c.
+let statement! : Connection -> Runnable -> Prepared;
+let statement! c template = {
+    let rendered = prepare! c template;
+    let open_statement! = require! c :prepare_statement;
+    let handle = open_statement! c.[:state] rendered.[:text] rendered.[:params];
+    strict! handle
+    %{ :connection => c, :handle => handle, :text => rendered.[:text], :arity => len rendered.[:params] }
+};
+
+/// Execute a prepared handle, returning the same Outcome as run!.
+let execute! : Prepared -> [:any] -> Outcome;
+let execute! statement params = {
+    let c = statement.[:connection];
+    let text = statement.[:text];
+    if len params != statement.[:arity] { fail! "wrong number of prepared statement parameters" :parameters text } else { () }
+    validate_params! c params text
+    match c.[:trace else ()] {
+        () => (),
+        f => { let trace! = f; trace! %{ :text => text, :params => params, :problems => [] } },
+    }
+    let execute_statement! = require! c :execute_statement;
+    let result = execute_statement! c.[:state] statement.[:handle] params;
+    strict! result
+    result
+};
+
+priv let validate_params! : Connection -> [:any] -> :string -> :unit;
+priv let validate_params! c params text = {
+    let problems = list.filter (fn p -> p != ()) (list.map (value_problem_in (dialect_of c)) params);
+    if list.is_empty problems { () } else { fail! (str.join_str "; " problems) :parameters text }
+};
+
+let deallocate! : Prepared -> :unit;
+let deallocate! statement = {
+    let c = statement.[:connection];
+    let release_statement! = require! c :deallocate_statement;
+    release_statement! c.[:state] statement.[:handle]
+};
+
+/// Force the callback result before releasing the handle. Cleanup never
+/// replaces a callback's original error.
+let using_statement! : Prepared -> (Prepared -> a) -> a;
+let using_statement! statement work! = {
+    let answer = try! { strict! (work! statement) } catch e {
+        try! { deallocate! statement } catch ignored { () }
+        raise! e
+    };
+    deallocate! statement
+    answer
+};
+
+// --- bulk rows -----------------------------------------------------------------
+
+/// Insert positional rows atomically. PostgreSQL uses COPY; other drivers
+/// use a prepared batch. () always means NULL here, never DEFAULT. An empty
+/// input is a no-op. Column names must be nonempty and unique.
+let copy_in! : Connection -> :string -> [:string] -> [[:any]] -> :integer;
+let copy_in! c table columns rows = {
+    if list.is_empty columns || len (list.unique columns) != len columns {
+        fail! "bulk insertion needs distinct column names" :parameters ""
+    } else { () }
+    strict! (list.map (fn row -> {
+        if len row != len columns { fail! "bulk row width does not match its columns" :parameters "" } else { () }
+        validate_params! c row ""
+    }) rows)
+    if list.is_empty rows { 0 } else {
+        transaction! c (fn tx -> match tx.[:copy_in else ()] {
+            () => exec_many! tx (list.map (fn row -> insert_into table |> values_in columns [list.map param row]) rows),
+            f => { let copy_rows! = f; copy_rows! tx.[:state] table columns rows },
+        })
+    }
+};
+
+/// Export typed positional rows from a SELECT or builder. For exports larger
+/// than memory, fold! and each! stream without collecting the whole result.
+let copy_out! : Connection -> Runnable -> [[:any]];
+let copy_out! c query = { let result = run! c query; result.[:rows] };
+
+// --- notifications (optional) --------------------------------------------------
+// These are explicit capabilities, not emulated with polling tables. Use a
+// dedicated connection when waiting, and another connection for query work.
+let listen! : Connection -> :string -> :unit;
+let listen! c channel = { let listen_channel! = require! c :listen; listen_channel! c.[:state] channel };
+let unlisten! : Connection -> :string -> :unit;
+let unlisten! c channel = { let unlisten_channel! = require! c :unlisten; unlisten_channel! c.[:state] channel };
+let notify! : Connection -> :string -> :string -> :unit;
+let notify! c channel payload = { let send_notification! = require! c :notify; send_notification! c.[:state] channel payload };
+let next_notification! : Connection -> :map;
+let next_notification! c = { let receive_notification! = require! c :next_notification; receive_notification! c.[:state] };
+
+/// Open a dedicated notification connection and forward notifications as
+/// [:sql_notification, notification] to target. Supported by notification
+/// drivers whose connections can be closed from the subscribing process.
+let subscribe! : (:unit -> Connection) -> [:string] -> :process -> :map;
+let subscribe! open! channels !target = {
+    let c = open! ();
+    strict! c
+    try! {
+        require! c :next_notification
+        strict! (list.map (fn channel -> listen! c channel) channels)
+    } catch e { try! { close! c } catch ignored { () }; raise! e }
+    let process = notification_process! c target;
+    %{ :connection => c, :process => process }
+};
+
+priv let notification_process! : Connection -> :process -> :process;
+priv let notification_process! c !target = spawn! $( forward_notifications! c target );
+priv let forward_notifications! : Connection -> :process -> :atom;
+priv let rec forward_notifications! c target = {
+    let next = try! { let n = next_notification! c; strict! n; [:ok, n] } catch e { [:error, e] };
+    match next {
+        [:ok, n] => { send! target [:sql_notification, n]; forward_notifications! c target },
+        [:error, _] => :stopped,
+    }
+};
+
+let stop_listening! : :map -> :atom;
+let stop_listening! subscription = {
+    try! { close! subscription.[:connection] } catch ignored { () }
+    try! { join! subscription.[:process] } catch e { :stopped }
 };
 
 // --- migrations ---------------------------------------------------------------
@@ -2019,11 +2233,17 @@ when test {
                          inline postgres (param (unseen %{ "a" => 1 })), inline postgres (param (unseen :on))] ),
         test.case "and sqlite does not"
             $( test.eq! 1 (list.length (render sqlite (param (unseen [1, 2]))).[:problems]) ),
+        test.case "q leaves quoted question marks alone and rejects arity mistakes" $( {
+            let st = lite (q "SELECT '?', ? -- ?" [7]);
+            test.eq! ["SELECT '?', ? -- ?", [7], []] [st.[:text], st.[:params], st.[:problems]]
+            test.true! (not (list.is_empty (lite (q "SELECT 1" [7])).[:problems]))
+            test.true! (not (list.is_empty (lite (positional "SELECT $2" [7])).[:problems]))
+        } ),
         test.case "numbered SQL is renumbered for the dialect"
             $( test.eq! [["SELECT ? WHERE x = ? AND y = ?", [0, "a", ()]], "SELECT $1 WHERE x = $2 AND y = $3"]
-                        [match lite (concat ["SELECT ", param 0, positional " WHERE x = $1 AND y = $2" ["a"]]) {
+                        [match lite (concat ["SELECT ", param 0, positional " WHERE x = $1 AND y = $2" ["a", ()]]) {
                              st => [st.[:text], st.[:params]] },
-                         text_of postgres (concat ["SELECT ", param 0, positional " WHERE x = $1 AND y = $2" ["a"]])] ),
+                         text_of postgres (concat ["SELECT ", param 0, positional " WHERE x = $1 AND y = $2" ["a", ()]])] ),
         test.case "a value piece is a parameter, or a fragment spliced"
             $( test.eq! ["a = ? AND \"b\" = ?", [1, 2]]
                         (match lite [:sql, ["a = ", [:value, 1], " AND ", [:value, eq "b" 2]]] { st => [st.[:text], st.[:params]] }) ),

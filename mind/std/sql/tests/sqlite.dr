@@ -1,0 +1,23 @@
+import std.sql;
+import std.sql.sqlite;
+import std.error;
+import std.sql.tests.contract;
+import std.test;
+let main! = test.main_of! [
+    ["std.sql contract: SQLite", contract.tests sqlite.memory!],
+    ["std.sql SQLite capabilities", [
+        test.case "unsupported features fail explicitly" $( sql.using! (sqlite.memory! ()) (fn c -> {
+            test.false! (sql.supports c :cancel)
+            test.false! (sql.supports c :listen)
+            let canceled = try! { sql.cancel! c } catch e { e };
+            let listening = try! { sql.listen! c "channel" } catch e { e };
+            test.eq! [:unsupported, :unsupported] [sql.error_code canceled, sql.error_code listening]
+        }) ),
+        test.case "text preserves NUL and script results preserve trigger bodies" $( sql.using! (sqlite.memory! ()) (fn c -> {
+            test.eq! "a\0b" (sql.scalar! c (sql.q "SELECT ?" ["a\0b"]))
+            let results = sql.script_results! c "CREATE TABLE t (id); CREATE TABLE audit (id); CREATE TRIGGER t_insert AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); INSERT INTO audit VALUES (NEW.id + 1); END; INSERT INTO t VALUES (4); SELECT id FROM audit ORDER BY id;";
+            test.eq! [[4], [5]] results.[4].[:rows]
+            test.eq! 0 (sql.run! c "CREATE TABLE empty_table (id)").[:changes]
+        }) ),
+    ]],
+];

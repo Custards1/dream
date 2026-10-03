@@ -4,7 +4,7 @@
 #
 # The cluster listens on 127.0.0.1 at a free port, and its pg_hba.conf gives
 # each login method a user of its own -- `u_md5`, `u_scram`, `u_clear` -- so
-# every way `pg.db` can authenticate is exercised against the server's own
+# every way `std.sql.pg.db` can authenticate is exercised against the server's own
 # implementation of it. `live.dr` is the suite.
 #
 # PostgreSQL is not a dependency of this repository, so a machine without it
@@ -94,7 +94,7 @@ run_as_owner "$bin/pg_ctl" -D "$tmp/data" -l "$tmp/server.log" -w \
     -c "CREATE DATABASE app;" >"$tmp/setup.log" 2>&1 || {
     echo "pg live: could not set the cluster up"; sed 's/^/    /' "$tmp/setup.log"; exit 1; }
 
-"$dream" "$dreams" pg/tests/live.dr -L mind -L . -o "$tmp/live.dream" >"$tmp/build.log" 2>&1 || {
+"$dream" "$dreams" mind/std/sql/pg/tests/live.dr -L mind -L . -o "$tmp/live.dream" >"$tmp/build.log" 2>&1 || {
     echo "pg live: the suite did not compile"; sed 's/^/    /' "$tmp/build.log" | head -10; exit 1; }
 
 PG_TEST_PORT=$port PG_TEST_CERTS=$PWD/dream/tests/tls timeout 300 "$dream" "$tmp/live.dream"

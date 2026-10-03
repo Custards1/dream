@@ -15,8 +15,8 @@ directly.
 ```dream
 import std.console;
 import std.list;
-import pg.db;
-import pg.sql;
+import std.sql.pg.db;
+import std.sql.pg.sql;
 
 mapping User { id : :integer, name : :string, email : :string | :unit = () }
 
@@ -41,22 +41,22 @@ The modules:
 
 | Module | What it is |
 |---|---|
-| `pg.driver` | PostgreSQL as a `std.sql.Connection`, with shared builders, transactions, migrations and errors. |
-| `pg.db` | A connection and everything done over one. |
-| `pg.sql` | Statements as fragments, the `sql.query` macro, and statement builders. |
-| `pg.pool` | A pool of connections shared by processes (a `std.server`). |
-| `pg.errors` | Failures as conditions you can match on (`:unique_violation`, ...). |
-| `pg.config` | `Config`, read from URLs, keyword strings and `PG*` variables. |
-| `pg.value` | Converting between Dream values and PostgreSQL text. |
-| `pg.wire`, `pg.crypto`, `pg.bytes` | The protocol, SCRAM/MD5, and byte arithmetic. |
+| `std.sql.pg.driver` | PostgreSQL as a `std.sql.Connection`, with shared builders, transactions, migrations and errors. |
+| `std.sql.pg.db` | A connection and everything done over one. |
+| `std.sql.pg.sql` | Statements as fragments, the `sql.query` macro, and statement builders. |
+| `std.sql.pg.pool` | A pool of connections shared by processes (a `std.server`). |
+| `std.sql.pg.errors` | Failures as conditions you can match on (`:unique_violation`, ...). |
+| `std.sql.pg.config` | `Config`, read from URLs, keyword strings and `PG*` variables. |
+| `std.sql.pg.value` | Converting between Dream values and PostgreSQL text. |
+| `std.sql.pg.wire`, `std.sql.pg.crypto`, `std.sql.pg.bytes` | The protocol, SCRAM/MD5, and byte arithmetic. |
 
 ## Using `std.sql`
 
-For the shared SQL API, import `std.sql` and `pg.driver`:
+For the shared SQL API, import `std.sql` and `std.sql.pg.driver`:
 
 ```dream
 import std.sql;
-import pg.driver;
+import std.sql.pg.driver;
 
 let main! = sql.using! (driver.open! "postgres://ada@localhost/app") (fn conn -> {
     let min_id = 10;
@@ -82,12 +82,12 @@ callback, so its non-database effects may happen more than once.
 
 Rows retain atom keys for names the program already uses, so mapping records
 read them directly. The shared API tags `bytea` as `sql.blob bytes` (including
-bytea array elements); `pg.db` continues to return raw bytes. Send blobs with
+bytea array elements); `std.sql.pg.db` continues to return raw bytes. Send blobs with
 `sql.blob`; lists become PostgreSQL arrays, maps become JSON, and atoms become
 their names. In shared insert builders, `()` requests the column default and
 `sql.null` requests NULL. Use `sql.positional text values` to adapt `$1`-style
 SQL. PostgreSQL reports no `:last_id`; request generated keys with `RETURNING`.
-Custom `pg.config` decoders still apply; bytea decoders used through the adapter
+Custom `std.sql.pg.config` decoders still apply; bytea decoders used through the adapter
 must return bytes for it to tag as blobs.
 
 Driver errors have kind `:sql_error`. `sql.error_code` uses shared names such
@@ -97,9 +97,9 @@ and the original PostgreSQL error (`:cause`) remain available. Application
 callback exceptions pass through unchanged.
 
 Both APIs now use `std.sql.lint` for lexical checking. Plain string literal
-statements and templates with invalid SQL are compile errors. `pg.sql` keeps
+statements and templates with invalid SQL are compile errors. `std.sql.pg.sql` keeps
 its existing fragment representation; use shared builders and macros with
-`std.sql`, and PostgreSQL builders and macros with `pg.db`.
+`std.sql`, and PostgreSQL builders and macros with `std.sql.pg.db`.
 
 ## Writing statements
 
@@ -188,8 +188,8 @@ fragment, which can then be combined with others.
 
 ## Running them
 
-| `pg.driver` | PostgreSQL as a `std.sql.Connection`, with shared builders, transactions, migrations and errors. |
-| `pg.db` | Returns |
+| `std.sql.pg.driver` | PostgreSQL as a `std.sql.Connection`, with shared builders, transactions, migrations and errors. |
+| `std.sql.pg.db` | Returns |
 |---|---|
 | `query! conn q` | a `Result`: `rows`, `tuples`, `columns`, `command`, `count`, `status`, `notices`, `notifications` |
 | `rows! conn q` | the rows, as maps |
