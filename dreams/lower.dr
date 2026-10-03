@@ -150,10 +150,24 @@ let slot_at span l =
 
 // --- constants ----------------------------------------------------------------
 
-let const_int v l = {
-    let [program, index] = ir.intern_int v (prog l);
-    emit (ir.node :const_int index ir.no_node ir.no_node) (set_prog program l)
-};
+/// An integer constant: a `KINT` entry when it is a fixnum, which is every
+/// integer a program is likely to write.
+///
+/// One that is not -- a literal past 2^62, or a compile-time value that grew
+/// into a bignum -- has no `i64` to be, so it is written as its digits and read
+/// back by `_parse_int` where it is used. That keeps the image format what it
+/// was, at the price of a parse each time the expression is evaluated, which a
+/// literal at the top of a definition pays once. The lower bound is spelled as
+/// arithmetic because it was written before a seed that could read it as a
+/// literal existed.
+let const_int v l =
+    if v > 4611686018427387903 || v < 0 - 4611686018427387903 - 1 {
+        let [l1, digits] = const_str (to_string v) l;
+        call_builtin "_parse_int" [digits] l1
+    } else {
+        let [program, index] = ir.intern_int v (prog l);
+        emit (ir.node :const_int index ir.no_node ir.no_node) (set_prog program l)
+    };
 
 let const_float v l = {
     let [program, index] = ir.intern_float v (prog l);

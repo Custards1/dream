@@ -224,9 +224,9 @@ Values are decoded by column type:
 
 | PostgreSQL | Dream |
 |---|---|
-| integers, `oid` | integer (an `int8` too large for a fixnum stays text) |
+| integers, `oid` | integer |
 | `float4`, `float8` | float |
-| `numeric` | integer if it is a whole number that fits, otherwise its exact text |
+| `numeric` | integer if it is a whole number, of any size; otherwise its exact text |
 | `bool` | bool |
 | `json`, `jsonb` | the parsed value |
 | `bytea` | its bytes, as a string |

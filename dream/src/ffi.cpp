@@ -60,6 +60,7 @@
 #include <thread>
 #include <vector>
 
+#include "bigint.hpp"
 #include "builtins.hpp"
 #include "interp.hpp"
 #include "process.hpp"
@@ -798,6 +799,18 @@ bool need_int(Value v, int64_t* out, Err* e) {
         *out = fixnum_value(v);
         return true;
     }
+    // A bignum is in range when it is a 64-bit integer of either signedness:
+    // an unsigned one past 2^63 crosses as its bit pattern, which is what a
+    // `uint64_t` parameter reads back.
+    if (bigint::is_big(v)) {
+        uint64_t u;
+        if (bigint::to_int64(v, out)) return true;
+        if (bigint::to_uint64(v, &u)) {
+            *out = int64_t(u);
+            return true;
+        }
+        return say(e, "an integer wider than 64 bits");
+    }
     if (is_obj(v, ObjType::Float)) {
         *out = int64_t(static_cast<FloatObj*>(as_obj(v))->value);
         return true;
@@ -810,8 +823,8 @@ bool need_float(Value v, double* out, Err* e) {
         *out = static_cast<FloatObj*>(as_obj(v))->value;
         return true;
     }
-    if (is_fixnum(v)) {
-        *out = double(fixnum_value(v));
+    if (bigint::is_integer(v)) {
+        *out = bigint::to_double(v);
         return true;
     }
     return say(e, "expected a number");
@@ -857,7 +870,7 @@ Value load_scalar(Process& p, Kind k, const void* where) {
         case K_I32: { int32_t x; std::memcpy(&x, where, 4); return make_fixnum(x); }
         case K_U32: { uint32_t x; std::memcpy(&x, where, 4); return make_fixnum(x); }
         case K_I64: { int64_t x; std::memcpy(&x, where, 8); return make_integer(p, x); }
-        case K_U64: { uint64_t x; std::memcpy(&x, where, 8); return make_integer(p, int64_t(x)); }
+        case K_U64: { uint64_t x; std::memcpy(&x, where, 8); return bigint::from_uint64(p.heap(), x); }
         case K_F32: { float x; std::memcpy(&x, where, 4); return p.heap().make_float(x); }
         case K_F64: { double x; std::memcpy(&x, where, 8); return p.heap().make_float(x); }
         case K_PTR: {

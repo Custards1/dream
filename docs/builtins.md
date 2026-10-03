@@ -477,6 +477,38 @@ On Windows SChannel does its cryptography outside the process, so a PKCS#12 iden
 
 ---
 
+## `std.crypto`
+
+Hashes, MACs, key derivation and randomness, done by the machine. Dream has no bitwise operators, so any of these written in Dream is thousands of reductions per block; here each is one call. Everything is **bytes in, bytes out**: a digest, a MAC or a derived key is a string of raw bytes, ready to be the next step's key or salt, and `hex`/`base64` spell one for printing. The hashes are written out in the VM (`dream/src/digest.cpp`), not taken from the TLS library, so they are the same on every platform.
+
+Where the algorithm is a parameter it is an atom: `:md5`, `:sha1`, `:sha256`, `:sha384` or `:sha512`. Anything else raises `:type_error`.
+
+```dream
+import std.crypto;
+
+crypto.hex (crypto.sha256 "abc")               // "ba7816bf..."
+crypto.hmac :sha256 key message                // 32 raw bytes
+crypto.pbkdf2 :sha256 password salt 600000 32  // a 32-byte key
+crypto.equal expected_mac given_mac            // constant time
+```
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `md5`, `sha1`, `sha256`, `sha384`, `sha512` | `string → string` | The digest, as raw bytes (16, 20, 32, 48, 64). |
+| `digest` | `alg → string → string` | The same, with the hash chosen by the caller. |
+| `hmac` | `alg → key → message → string` | HMAC (RFC 2104). |
+| `pbkdf2` | `alg → password → salt → iterations → length → string` | PBKDF2 with HMAC (RFC 8018). The key's padding is hashed once, so each round costs two compressions. |
+| `hkdf` | `alg → key → salt → info → length → string` | HKDF extract-and-expand (RFC 5869). An empty salt is the RFC's default. |
+| `equal` | `string → string → bool` | Whether two strings hold the same bytes, in time that depends only on their lengths — for checking a MAC. |
+| `xor` | `string → string → string` | Two strings of one length, exclusive-or'd byte by byte. |
+| `hex`, `unhex` | `string → string`, `string → string\|unit` | Lowercase hex, and back (either case); `()` for text that is not hex. |
+| `base64`, `unbase64` | `string → string`, `string → string\|unit` | Padded RFC 4648 base64, and back; `()` for text that is not. |
+| `random_bytes!` | `integer → string` | That many bytes from the operating system's generator (`getrandom`, `arc4random_buf`, `BCryptGenRandom`), up to 2^24. |
+
+A native runs to completion on its worker, so an expensive `pbkdf2` holds that worker for as long as it takes; the iteration count is the caller's choice.
+
+---
+
 ## `std.os`
 
 Operating system interface: arguments, environment, filesystem traversal, subprocesses.

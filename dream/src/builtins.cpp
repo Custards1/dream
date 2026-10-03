@@ -1,5 +1,5 @@
 #include "builtins.hpp"
-#include "sha256.hpp"
+#include "digest.hpp"
 
 #include "io.hpp"
 
@@ -14,6 +14,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "bigint.hpp"
 #include "interp.hpp"
 #include "tensor.hpp"
 #include "process.hpp"
@@ -42,6 +43,10 @@ uint64_t key_hash(Value v) {
     if (is_ptr(v) && as_obj(v)->type == ObjType::Str) {
         string_bytes(v, &bytes);
         return bytes_hash(bytes);
+    }
+    if (is_ptr(v) && as_obj(v)->type == ObjType::BigInt) {
+        uint64_t h = bigint::hash(static_cast<BigIntObj*>(as_obj(v)));
+        return h ? h : 1;
     }
     uint64_t h = v;
     if (is_ptr(v) && as_obj(v)->type == ObjType::Float) {
@@ -74,6 +79,9 @@ bool key_equal(Value a, Value b) {
     }
     if (x->type == ObjType::Pid) {
         return static_cast<PidObj*>(x)->id == static_cast<PidObj*>(y)->id;
+    }
+    if (x->type == ObjType::BigInt) {
+        return bigint::equal(static_cast<BigIntObj*>(x), static_cast<BigIntObj*>(y));
     }
     return false;
 }
@@ -415,6 +423,9 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
     if (!is_ptr(w)) { out->append("<value>"); return true; }
 
     switch (as_obj(w)->type) {
+        case ObjType::BigInt:
+            bigint::append_decimal(w, out);
+            return true;
         case ObjType::Float: {
             double d = static_cast<FloatObj*>(as_obj(w))->value;
             char buf[40];
@@ -871,11 +882,12 @@ NativeResult con_error(Process& p, Value, Value* args, uint32_t argc) {
 
 NativeResult math_sqrt(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
-    double d = is_fixnum(v) ? double(fixnum_value(v))
-                            : (is_obj(v, ObjType::Float)
-                                   ? static_cast<FloatObj*>(as_obj(v))->value
-                                   : NAN);
-    if (std::isnan(d) && !is_obj(v, ObjType::Float)) {
+    double d;
+    if (is_obj(v, ObjType::Float)) {
+        d = static_cast<FloatObj*>(as_obj(v))->value;
+    } else if (bigint::is_integer(v)) {
+        d = bigint::to_double(v);
+    } else {
         return NativeResult::raise(
             raise_error(p, well_known(p.runtime()).type_error, "sqrt needs a number"));
     }
@@ -888,6 +900,7 @@ NativeResult math_abs(Process& p, Value, Value* args, uint32_t) {
         int64_t n = fixnum_value(v);
         return NativeResult::ok(make_integer(p, n < 0 ? -n : n));
     }
+    if (bigint::is_big(v)) return NativeResult::ok(bigint::abs(p.heap(), v));
     if (is_obj(v, ObjType::Float)) {
         return NativeResult::ok(
             p.heap().make_float(std::fabs(static_cast<FloatObj*>(as_obj(v))->value)));
@@ -898,10 +911,14 @@ NativeResult math_abs(Process& p, Value, Value* args, uint32_t) {
 
 NativeResult math_floor(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
-    if (is_fixnum(v)) return NativeResult::ok(v);
+    if (bigint::is_integer(v)) return NativeResult::ok(v);
     if (is_obj(v, ObjType::Float)) {
-        return NativeResult::ok(
-            make_integer(p, int64_t(std::floor(static_cast<FloatObj*>(as_obj(v))->value))));
+        Value r = UNIT;
+        if (!bigint::from_double(p.heap(), std::floor(static_cast<FloatObj*>(as_obj(v))->value), &r)) {
+            return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error,
+                                                   "floor of an infinity or a NaN is not an integer"));
+        }
+        return NativeResult::ok(r);
     }
     return NativeResult::raise(
         raise_error(p, well_known(p.runtime()).type_error, "floor needs a number"));
@@ -1408,6 +1425,11 @@ bool import_across(Process& dest, Runtime& src_rt, Value v, Value* out, int dept
         case ObjType::Float:
             *out = dest.heap().make_float(static_cast<FloatObj*>(as_obj(v))->value);
             return true;
+        case ObjType::BigInt: {
+            auto* b = static_cast<BigIntObj*>(as_obj(v));
+            *out = dest.heap().make_bigint(b->limbs(), b->len, b->neg != 0);
+            return true;
+        }
         case ObjType::Str: {
             auto* s = static_cast<StrObj*>(as_obj(v));
             *out = dest.heap().make_string(s->data(), s->len);
@@ -2065,14 +2087,22 @@ NativeResult core_str_byte(Process& p, Value, Value* args, uint32_t) {
 NativeResult core_str_le(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     Value n = resolve(args[1]);
-    if (!is_fixnum(v) || !is_fixnum(n)) {
+    if (!bigint::is_integer(v) || !is_fixnum(n)) {
         return type_fail(p, "str_le needs an integer and a width");
     }
     int64_t width = fixnum_value(n);
-    if (width < 0 || width > 8) {
+    if (width < 0 || width > (int64_t(1) << 30)) {
         return NativeResult::raise(raise_error(
             p, well_known(p.runtime()).type_error,
-            "str_le writes between zero and eight bytes, not " + std::to_string(width)));
+            "str_le cannot write " + std::to_string(width) + " bytes"));
+    }
+    // Wider than a word, or a bignum: the two's complement at that width,
+    // sign extended or cut, which is the same rule the word case follows.
+    if (width > 8 || bigint::is_big(v)) {
+        Value s = p.heap().make_string(nullptr, uint32_t(width));
+        bigint::to_le_bytes(v, size_t(width),
+                            reinterpret_cast<uint8_t*>(static_cast<StrObj*>(as_obj(s))->data()));
+        return NativeResult::ok(s);
     }
     // Through `uint64_t` so that a negative value is its two's complement and
     // the shift is defined.
@@ -2112,8 +2142,8 @@ NativeResult core_char_of_code(Process& p, Value, Value* args, uint32_t) {
 
 NativeResult core_to_float(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
-    if (is_fixnum(v)) return NativeResult::ok(p.heap().make_float(double(fixnum_value(v))));
     if (is_obj(v, ObjType::Float)) return NativeResult::ok(v);
+    if (bigint::is_integer(v)) return NativeResult::ok(p.heap().make_float(bigint::to_double(v)));
     return type_fail(p, "to_float needs a number");
 }
 
@@ -2126,8 +2156,8 @@ NativeResult core_to_float(Process& p, Value, Value* args, uint32_t) {
 NativeResult core_float_bytes(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     double d;
-    if (is_fixnum(v)) d = double(fixnum_value(v));
-    else if (is_obj(v, ObjType::Float)) d = static_cast<FloatObj*>(as_obj(v))->value;
+    if (is_obj(v, ObjType::Float)) d = static_cast<FloatObj*>(as_obj(v))->value;
+    else if (bigint::is_integer(v)) d = bigint::to_double(v);
     else return type_fail(p, "float_bytes needs a number");
     unsigned char b[8];
     std::memcpy(b, &d, 8);
@@ -2147,12 +2177,17 @@ NativeResult core_float_of_bytes(Process& p, Value, Value* args, uint32_t) {
 
 NativeResult core_to_int(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
-    if (is_fixnum(v)) return NativeResult::ok(v);
+    if (bigint::is_integer(v)) return NativeResult::ok(v);
     if (is_obj(v, ObjType::Float)) {
         double d = static_cast<FloatObj*>(as_obj(v))->value;
         // Truncates toward zero, like C. `math.floor` is there for the other
-        // rounding, so this one does not have to guess.
-        return NativeResult::ok(make_integer(p, int64_t(d)));
+        // rounding, so this one does not have to guess. Exactly, however large:
+        // a double past 2^62 is an integer already, and its bignum is it.
+        Value r = UNIT;
+        if (!bigint::from_double(p.heap(), d, &r)) {
+            return type_fail(p, "to_int of an infinity or a NaN is not an integer");
+        }
+        return NativeResult::ok(r);
     }
     return type_fail(p, "to_int needs a number");
 }
@@ -2160,18 +2195,17 @@ NativeResult core_to_int(Process& p, Value, Value* args, uint32_t) {
 NativeResult core_parse_int(Process& p, Value, Value* args, uint32_t) {
     StrObj* s = as_string(args[0]);
     if (!s) return type_fail(p, "parse_int needs a string");
-    std::string text(s->data(), s->len);
-    size_t used = 0;
-    long long v = 0;
-    try {
-        v = std::stoll(text, &used, 10);
-    } catch (...) {
-        return NativeResult::ok(UNIT);
-    }
-    // The whole string has to be a number, or "12abc" would parse as 12.
-    while (used < text.size() && std::isspace(uint8_t(text[used]))) ++used;
-    if (used != text.size()) return NativeResult::ok(UNIT);
-    return NativeResult::ok(make_integer(p, int64_t(v)));
+    // Space either side, a sign, and digits -- the whole of the rest, or
+    // "12abc" would parse as 12. However many digits: past eighteen the answer
+    // is a bignum, which is also how a literal too big for a fixnum is built
+    // (`const_int` in dreams/lower.dr).
+    const char* d = s->data();
+    size_t lo = 0, hi = s->len;
+    while (lo < hi && std::isspace(uint8_t(d[lo]))) ++lo;
+    while (hi > lo && std::isspace(uint8_t(d[hi - 1]))) --hi;
+    Value v = UNIT;
+    if (!bigint::parse(p.heap(), d + lo, hi - lo, &v)) return NativeResult::ok(UNIT);
+    return NativeResult::ok(v);
 }
 
 /// `to_existing_atom` -- the atom of this name, if there already is one.
@@ -2320,7 +2354,7 @@ NativeResult core_map_pairs(Process& p, Value, Value* args, uint32_t) {
 /// The force is not vouched (see "VouchesForGc"), so a collection it wants
 /// waits for the machine, and holding `Obj*` across it is safe.
 int compare_rank(Value v) {
-    if (is_fixnum(v) || is_obj(v, ObjType::Float)) return 0;
+    if (is_fixnum(v) || is_obj(v, ObjType::Float) || is_obj(v, ObjType::BigInt)) return 0;
     if (is_char(v)) return 1;
     if (is_bool(v)) return 2;
     if (is_atom(v)) return 3;
@@ -2351,12 +2385,14 @@ bool compare_values(Process& p, Value a, Value b, int depth, int* out) {
     auto order = [](auto x, auto y) { return x < y ? -1 : (x > y ? 1 : 0); };
     switch (ra) {
         case 0: {
-            if (is_fixnum(a) && is_fixnum(b)) {
-                *out = order(fixnum_value(a), fixnum_value(b));
+            if (bigint::is_integer(a) && bigint::is_integer(b)) {
+                *out = bigint::compare(a, b);
             } else {
-                double x = is_fixnum(a) ? double(fixnum_value(a)) : static_cast<FloatObj*>(as_obj(a))->value;
-                double y = is_fixnum(b) ? double(fixnum_value(b)) : static_cast<FloatObj*>(as_obj(b))->value;
-                *out = order(x, y);
+                auto as_double = [](Value v) {
+                    return is_obj(v, ObjType::Float) ? static_cast<FloatObj*>(as_obj(v))->value
+                                                     : bigint::to_double(v);
+                };
+                *out = order(as_double(a), as_double(b));
             }
             return true;
         }
@@ -2479,7 +2515,7 @@ NativeResult core_sort_keyed(Process& p, Value, Value* args, uint32_t) {
 enum : uint8_t {
     WIRE_UNIT = 0, WIRE_FALSE = 1, WIRE_TRUE = 2, WIRE_INT = 3, WIRE_FLOAT = 4,
     WIRE_STRING = 5, WIRE_ATOM = 6, WIRE_CHAR = 7, WIRE_LIST = 8, WIRE_ARRAY = 9,
-    WIRE_MAP = 10,
+    WIRE_MAP = 10, WIRE_BIGINT = 11,
 };
 
 void wire_le(std::string* out, uint64_t v, int width) {
@@ -2502,6 +2538,23 @@ bool wire_write(Process& p, Value v, std::string* out, int depth) {
     if (is_fixnum(v)) {
         out->push_back(char(WIRE_INT));
         wire_le(out, uint64_t(fixnum_value(v)), 8);
+        return true;
+    }
+    if (bigint::is_big(v)) {
+        // Eight bytes when it fits in them, as every integer did before there
+        // were bignums; past 64 bits, as many as its two's complement needs.
+        int64_t small;
+        if (bigint::to_int64(v, &small)) {
+            out->push_back(char(WIRE_INT));
+            wire_le(out, uint64_t(small), 8);
+            return true;
+        }
+        const size_t n = bigint::le_width(v);
+        out->push_back(char(WIRE_BIGINT));
+        wire_le(out, n, 4);
+        const size_t at = out->size();
+        out->resize(at + n);
+        bigint::to_le_bytes(v, n, reinterpret_cast<uint8_t*>(&(*out)[at]));
         return true;
     }
     if (is_char(v)) {
@@ -2624,12 +2677,15 @@ struct WireReader {
             case WIRE_TRUE: *out = make_bool(true); return true;
             case WIRE_INT: {
                 if (!has(8)) return false;
-                // A fixnum is 63 bits: the top byte is under 0x40 or at least
-                // 0xC0, and anything between is a number this runtime cannot
-                // hold, which `std.wire` refuses too.
-                uint8_t top = data[at + 7];
-                if (top >= 64 && top < 192) return false;
                 *out = make_integer(p, int64_t(le(8)));
+                return true;
+            }
+            case WIRE_BIGINT: {
+                if (!has(4)) return false;
+                uint64_t n = le(4);
+                if (!has(n)) return false;
+                *out = bigint::from_le_bytes(p.heap(), data + at, size_t(n));
+                at += n;
                 return true;
             }
             case WIRE_FLOAT: {
@@ -2802,8 +2858,8 @@ struct ShareArenas {
             Value found;
             return map_lookup(p, c, make_fixnum(i), &found) ? resolve(found) : d;
         }
-        for (Value cur = c; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
-            if (i-- == 0) return resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        for (Value cell = c; is_obj(cell, ObjType::Cons); cell = resolve(static_cast<ConsObj*>(as_obj(cell))->tail)) {
+            if (i-- == 0) return resolve(static_cast<ConsObj*>(as_obj(cell))->head);
         }
         return d;
     }
@@ -2818,9 +2874,9 @@ struct ShareArenas {
     Node node_at(int64_t i) {
         Value n = at(parts[cur].nodes, i, UNIT);
         if (n == UNIT) return Node{nop, make_fixnum(0), none, none, none};
-        Node out{};
-        for (int k = 0; k < 5; ++k) out[k] = at(n, k, none);
-        return out;
+        Node node{};
+        for (int k = 0; k < 5; ++k) node[k] = at(n, k, none);
+        return node;
     }
     Value kid_at(int64_t i) { return at(parts[cur].kids, i, none); }
 

@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <map>
 #include <vector>
 
 #include "value.hpp"
@@ -127,6 +128,12 @@ public:
     Value make_pap(Value fn, uint32_t nargs);
     Value make_error(Value kind, Value payload);
     Value make_pid(uint64_t id);
+    /// A bignum with room for `limbs` limbs, uninitialised: the caller writes
+    /// them and sets `len` and `neg`. See `bigint::finish`.
+    BigIntObj* alloc_bigint(uint32_t limbs);
+    /// A copy of a bignum's limbs, sign and all. Not canonicalised: the source
+    /// already is.
+    Value make_bigint(const uint64_t* limbs, uint32_t len, bool neg);
     /// A tensor of the given shape, its data uninitialised: the caller fills
     /// every element. `dims` holds `rank` axes; `count` is their product, which
     /// the caller has already checked fits (see `tensor_bytes_ok`).
@@ -379,8 +386,9 @@ public:
 
 private:
     /// Objects that hold a reference to something the heap does not own -- a
-    /// GPU buffer -- and so must say when they die. Nothing else in this
-    /// language needs a finalizer, which is why this is a list beside the
+    /// GPU buffer, a large bignum's limbs -- and so must say when they die.
+    /// Nothing else in this language needs a finalizer, which is why this is a
+    /// list beside the
     /// heap and not a bit on every object: the collector looks at these and at
     /// nothing else when it asks what to release.
     std::vector<Obj*> external_;
@@ -399,6 +407,10 @@ private:
     /// "was it reached" and "where is it now" can be read off the headers.
     /// `full` says old objects were marked, so an unmarked one is dead.
     void reap_external(bool full);
+    /// What one of `external_` holds outside the heap, and letting it go:
+    /// a tensor's GPU buffer, or a bignum's limbs.
+    static size_t external_size(Obj* o);
+    static void drop_external(Obj* o);
 
     struct Block {
         Block* next;
@@ -426,7 +438,9 @@ private:
     /// that guards the free lists while several threads carve from them.
     struct GcRound;
 
-    Block* new_block(size_t bytes);
+    /// A block of at least `bytes`, and at least the heap's minimum block
+    /// unless `exact` -- which a dedicated big-object block is.
+    Block* new_block(size_t bytes, bool exact = false);
     void free_block(Block* b);
     void free_blocks(Block* b);
     /// Free every nursery block: after a major collection every reachable
@@ -599,12 +613,19 @@ private:
     /// then, and the pool never holds more than the larger of
     /// `kBigPoolFloor` and the live heap. Pooled bytes still count in
     /// `block_bytes_`: they are held from the system, which is what that says.
+    ///
+    /// Filed by block size, each size's blocks in the order they were retired,
+    /// so taking one is a `lower_bound` and a `pop_back`. It was one flat list
+    /// searched end to end, which was right for tensors -- a handful at a time
+    /// -- and wrong for a loop of bignums past the top class, which retires a
+    /// thousand per sweep and then searched all of them, and erased from the
+    /// middle, at every allocation.
     struct PooledBlock {
         uint8_t* data;
         size_t size;
         uint64_t sweep;
     };
-    std::vector<PooledBlock> big_pool_;
+    std::map<size_t, std::vector<PooledBlock>> big_pool_;
     size_t big_pool_bytes_ = 0;
     uint64_t sweeps_ = 0;
     static constexpr size_t kBigPoolFloor = size_t(64) << 20;
@@ -765,6 +786,7 @@ public:
     Value make_string(const char* data, uint32_t len);
     Value make_bigstr(const char* data, uint64_t len);
     Value make_pid(uint64_t id);
+    Value make_bigint(const uint64_t* limbs, uint32_t len, bool neg);
     Value make_tensor(uint32_t rank, const uint32_t* dims, uint64_t count);
     Value make_cons(Value head, Value tail);
     Value make_array(uint32_t len);

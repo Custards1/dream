@@ -82,8 +82,8 @@ let main! = {
 
     // A float among the integers: the sum is the interpreter's float sum.
     console.print! (total [1, 2, 0.5, 4])
-    // One suffix sum leaves the fixnum range though the total does not: the
-    // interpreter's answer is a float, so the loop's must be too.
+    // One suffix sum leaves the fixnum range though the total does not: it is
+    // a bignum on the way and a fixnum again at the end, in either tier.
     console.print! (total [0 - 2305843009213693952, 2305843009213693952, 2305843009213693952])
     console.print! (total [2305843009213693952, 2305843009213693952, 0 - 2305843009213693952])
     // An element that cannot be added: the same error, from the same place.

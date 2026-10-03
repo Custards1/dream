@@ -49,7 +49,11 @@ The heap is **generational**: two generations inside one process heap, a
   `gc` byte alongside `GC_MARK` and `GC_FREE`. Large objects (past the top of
   the class table, 4 KiB) allocate straight into old space and tenure
   immediately: they are rare, often long-lived, and copying one once to "save"
-  the next copy is a bad swap.
+  the next copy is a bad swap. A dedicated block is exactly its size class, not the
+  heap's 64 KiB minimum. A bignum that would be large is not a large object at
+  all: its limbs live outside the heap and its header is young, so a minor
+  collection frees it (see "The first version was 6x slower on `fib`" in
+  [notes/bignums.md](notes/bignums.md)).
 - **How big the nursery is.** Not chosen -- *earned*. A nursery is a bet that
   most objects die young, and its size is how long they are given to do it: too
   small and a collection promotes objects that were about to die anyway, which

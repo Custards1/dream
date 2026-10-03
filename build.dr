@@ -69,7 +69,7 @@ let checks ctx =
 let vm_sources : [:string];
 let vm_sources = list.map (fn s -> "dream/src/" + s + ".cpp")
                           ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "ffi",
-                           "io", "sha256", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
+                           "io", "digest", "crypto", "bigint", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
                            "jit_rt", "tls"];
 
 /// GCC's inliner ceilings: dream/CMakeLists.txt says why at length. The
@@ -162,6 +162,7 @@ let libdream ctx tc llvm libffi openssl =
     |> tls tc openssl
     |> cc.system_for :linux "dl"
     |> cc.system_for :windows "ws2_32"
+    |> cc.system_for :windows "bcrypt"
     |> cc.export_all
     |> avx2 ctx tc
     |> jit ctx llvm;

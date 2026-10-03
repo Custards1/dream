@@ -35,6 +35,7 @@
 #include <thread>
 #include <vector>
 
+#include "bigint.hpp"
 #include "builtins.hpp"
 #include "gpu.hpp"
 #include "heap.hpp"
@@ -155,12 +156,15 @@ gpu::Buffer* buffer_of(const TensorObj* t) {
     return static_cast<gpu::Buffer*>(tensor_handle(t));
 }
 
-bool is_number(Value v) { return is_fixnum(v) || is_obj(v, ObjType::Float); }
+bool is_number(Value v) {
+    return is_fixnum(v) || is_obj(v, ObjType::Float) || is_obj(v, ObjType::BigInt);
+}
 
 /// A deferred tensor computed, or a computed one as it is. See "fusion" below.
 bool settle(Process& p, TensorObj** t, Value* err);
 double number_of(Value v) {
-    return is_fixnum(v) ? double(fixnum_value(v)) : static_cast<FloatObj*>(as_obj(v))->value;
+    if (is_obj(v, ObjType::Float)) return static_cast<FloatObj*>(as_obj(v))->value;
+    return bigint::to_double(v);
 }
 
 // --- raising -----------------------------------------------------------------------

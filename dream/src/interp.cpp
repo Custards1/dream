@@ -3,6 +3,7 @@
 
 #include "interp.hpp"
 #include "tensor.hpp"
+#include "bigint.hpp"
 
 #include <cinttypes>
 #include <cmath>
@@ -77,9 +78,13 @@ inline void push_retry(Process& p, ContKind k, uint32_t a, uint32_t b, uint32_t 
 // Numbers
 // ---------------------------------------------------------------------------
 
-inline bool is_number(Value v) { return is_fixnum(v) || is_obj(v, ObjType::Float); }
+inline bool is_number(Value v) {
+    return is_fixnum(v) || is_obj(v, ObjType::Float) || is_obj(v, ObjType::BigInt);
+}
 inline double to_double(Value v) {
-    return is_fixnum(v) ? double(fixnum_value(v)) : static_cast<FloatObj*>(as_obj(v))->value;
+    if (is_fixnum(v)) return double(fixnum_value(v));
+    if (is_obj(v, ObjType::Float)) return static_cast<FloatObj*>(as_obj(v))->value;
+    return bigint::to_double(v);
 }
 
 }  // namespace
@@ -98,9 +103,7 @@ Value make_native(Process& p, NativeFn fn, Value name, uint32_t arity,
 
 Value make_integer(Process& p, int64_t v) {
     if (fixnum_fits(v)) return make_fixnum(v);
-    // Beyond 63 bits we fall back to a float rather than growing a bignum
-    // type; the compiler only ever emits values that fit.
-    return p.heap().make_float(double(v));
+    return bigint::from_int64(p.heap(), v);
 }
 
 Value raise_error(Process& p, uint32_t kind_atom, const std::string& message) {
@@ -188,6 +191,12 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
 
     if (is_number(fa) && is_number(fb)) {
         if (is_fixnum(fa) && is_fixnum(fb)) return fa == fb;
+        // Both canonical, so a fixnum and a bignum are never the same integer.
+        if (bigint::is_integer(fa) && bigint::is_integer(fb)) {
+            return bigint::is_big(fa) && bigint::is_big(fb) &&
+                   bigint::equal(static_cast<BigIntObj*>(as_obj(fa)),
+                                 static_cast<BigIntObj*>(as_obj(fb)));
+        }
         return to_double(fa) == to_double(fb);
     }
     if (!is_ptr(fa) || !is_ptr(fb)) return false;
@@ -924,34 +933,54 @@ bool arith(Process& p, Op op, Value a, Value b, Value* out) {
         return false;
     }
 
-    if (is_fixnum(a) && is_fixnum(b)) {
-        int64_t x = fixnum_value(a), y = fixnum_value(b), r = 0;
-        bool overflow = false;
+    if (bigint::is_integer(a) && bigint::is_integer(b)) {
+        if (is_fixnum(a) && is_fixnum(b)) {
+            int64_t x = fixnum_value(a), y = fixnum_value(b), r = 0;
+            bool overflow = false;
+            switch (op) {
+                case Op::Add: overflow = add_overflow(x, y, &r); break;
+                case Op::Sub: overflow = sub_overflow(x, y, &r); break;
+                case Op::Mul: overflow = mul_overflow(x, y, &r); break;
+                case Op::Div:
+                    if (y == 0) {
+                        *out = raise_error(p, wk.divide_by_zero, "division by zero");
+                        return false;
+                    }
+                    r = x / y;
+                    break;
+                case Op::Mod:
+                    if (y == 0) {
+                        *out = raise_error(p, wk.divide_by_zero, "remainder by zero");
+                        return false;
+                    }
+                    r = x % y;
+                    break;
+                default: break;
+            }
+            if (!overflow && fixnum_fits(r)) {
+                *out = make_fixnum(r);
+                return true;
+            }
+        }
+        // Past 63 bits, or a bignum already: exact, and a fixnum again as soon
+        // as the answer fits. This is where an overflow used to become a
+        // float, and the only way into bigint.cpp from arithmetic.
+        Heap& h = p.heap();
         switch (op) {
-            case Op::Add: overflow = add_overflow(x, y, &r); break;
-            case Op::Sub: overflow = sub_overflow(x, y, &r); break;
-            case Op::Mul: overflow = mul_overflow(x, y, &r); break;
+            case Op::Add: *out = bigint::add(h, a, b); return true;
+            case Op::Sub: *out = bigint::sub(h, a, b); return true;
+            case Op::Mul: *out = bigint::mul(h, a, b); return true;
             case Op::Div:
-                if (y == 0) {
-                    *out = raise_error(p, wk.divide_by_zero, "division by zero");
-                    return false;
-                }
-                r = x / y;
-                break;
             case Op::Mod:
-                if (y == 0) {
-                    *out = raise_error(p, wk.divide_by_zero, "remainder by zero");
+                if (b == make_fixnum(0)) {
+                    *out = raise_error(p, wk.divide_by_zero,
+                                       op == Op::Div ? "division by zero" : "remainder by zero");
                     return false;
                 }
-                r = x % y;
-                break;
+                *out = op == Op::Div ? bigint::quot(h, a, b) : bigint::rem(h, a, b);
+                return true;
             default: break;
         }
-        if (!overflow && fixnum_fits(r)) {
-            *out = make_fixnum(r);
-            return true;
-        }
-        // Fall through to double on overflow rather than silently wrapping.
     }
 
     double x = to_double(a), y = to_double(b), r = 0;
@@ -987,9 +1016,8 @@ bool compare(Process& p, Op op, Value a, Value b, Value* out) {
 
     int cmp;
     if (is_number(a) && is_number(b)) {
-        if (is_fixnum(a) && is_fixnum(b)) {
-            int64_t x = fixnum_value(a), y = fixnum_value(b);
-            cmp = x < y ? -1 : (x > y ? 1 : 0);
+        if (bigint::is_integer(a) && bigint::is_integer(b)) {
+            cmp = bigint::compare(a, b);
         } else {
             double x = to_double(a), y = to_double(b);
             cmp = x < y ? -1 : (x > y ? 1 : 0);
@@ -1653,6 +1681,7 @@ void finish_unary(Process& p, Op op, Value v, uint32_t type, uint32_t invert) {
     }
     if (op == Op::Neg) {
         if (is_fixnum(v)) { ret(p, make_integer(p, -fixnum_value(v))); return; }
+        if (bigint::is_big(v)) { ret(p, bigint::negate(p.heap(), v)); return; }
         if (is_obj(v, ObjType::Float)) {
             ret(p, p.heap().make_float(-static_cast<FloatObj*>(as_obj(v))->value));
             return;

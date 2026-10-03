@@ -34,8 +34,8 @@ inline void set_free_next(Obj* o, Obj* next) {
 }
 
 /// True for the object kinds whose payload holds no references -- Float, Str,
-/// Pid and BigStr carry only raw bytes, a host id, or a pointer into the
-/// image, which is not heap memory and is never collected. Marking one is a
+/// Pid, BigInt and BigStr carry only raw bytes, a host id, or a pointer into
+/// the image, which is not heap memory and is never collected. Marking one is a
 /// no-op, so the collector need not put it on the worklist; the mark bit alone
 /// keeps it.
 ///
@@ -45,7 +45,7 @@ inline void set_free_next(Obj* o, Obj* next) {
 /// nothing and costs a worklist slot.
 inline bool is_atom_object(ObjType t) {
     return t == ObjType::Float || t == ObjType::Str || t == ObjType::Pid ||
-           t == ObjType::BigStr;
+           t == ObjType::BigStr || t == ObjType::BigInt;
 }
 
 /// Allocation rounds every object up to one of these sizes, and every chunk in
@@ -161,8 +161,8 @@ Heap::Heap(size_t initial_bytes)
     nursery_.push_back(new_block(initial_bytes));
 }
 
-Heap::Block* Heap::new_block(size_t bytes) {
-    size_t size = bytes < initial_bytes_ ? initial_bytes_ : bytes;
+Heap::Block* Heap::new_block(size_t bytes, bool exact) {
+    size_t size = bytes < initial_bytes_ && !exact ? initial_bytes_ : bytes;
     auto* b = static_cast<Block*>(std::malloc(sizeof(Block)));
     if (!b) throw std::bad_alloc();
     b->data = static_cast<uint8_t*>(std::malloc(size));
@@ -190,27 +190,32 @@ void Heap::free_block(Block* b) {
 }
 
 void Heap::retire_big(Block* b) {
-    big_pool_.push_back(PooledBlock{b->data, b->size, sweeps_});
+    big_pool_[b->size].push_back(PooledBlock{b->data, b->size, sweeps_});
     big_pool_bytes_ += b->size;
     std::free(b);
 }
 
 void Heap::trim_big_pool() {
     const size_t cap = std::max(kBigPoolFloor, live_after_gc_);
-    size_t keep = 0;
-    for (size_t i = 0; i < big_pool_.size(); ++i) {
-        PooledBlock& pb = big_pool_[i];
-        // Oldest first, so what goes over the cap is what has waited longest.
-        const bool stale = pb.sweep < sweeps_;
-        if (stale || big_pool_bytes_ > cap) {
-            big_pool_bytes_ -= pb.size;
-            block_bytes_ -= pb.size;
-            std::free(pb.data);
-        } else {
-            big_pool_[keep++] = pb;
+    for (auto it = big_pool_.begin(); it != big_pool_.end();) {
+        std::vector<PooledBlock>& same = it->second;
+        size_t keep = 0;
+        for (size_t i = 0; i < same.size(); ++i) {
+            PooledBlock& pb = same[i];
+            // Oldest first within a size, so what goes over the cap is what
+            // has waited longest there.
+            const bool stale = pb.sweep < sweeps_;
+            if (stale || big_pool_bytes_ > cap) {
+                big_pool_bytes_ -= pb.size;
+                block_bytes_ -= pb.size;
+                std::free(pb.data);
+            } else {
+                same[keep++] = pb;
+            }
         }
+        same.resize(keep);
+        it = same.empty() ? big_pool_.erase(it) : std::next(it);
     }
-    big_pool_.resize(keep);
 }
 
 void Heap::free_blocks(Block* b) {
@@ -289,24 +294,27 @@ Obj* Heap::carve_big(size_t sz) {
     // Best fit among the pooled blocks no more than half as large again as
     // the class: a loop's sizes vary, and an exact match missed whenever they
     // did -- the pool then held memory the program could not use while it
-    // asked the system for more.
-    size_t best = big_pool_.size();
-    for (size_t i = 0; i < big_pool_.size(); ++i) {
-        const size_t have = big_pool_[i].size;
-        if (have >= cls && have <= cls + cls / 2 &&
-            (best == big_pool_.size() || have < big_pool_[best].size))
-            best = i;
-    }
-    if (best != big_pool_.size()) {
+    // asked the system for more. Of that size, the block retired last, whose
+    // pages are the warmest.
+    auto fit = big_pool_.lower_bound(cls);
+    if (fit != big_pool_.end() && fit->first <= cls + cls / 2) {
         b = static_cast<Block*>(std::malloc(sizeof(Block)));
         if (!b) throw std::bad_alloc();
-        b->data = big_pool_[best].data;
-        b->size = big_pool_[best].size;
+        const PooledBlock pb = fit->second.back();
+        fit->second.pop_back();
+        if (fit->second.empty()) big_pool_.erase(fit);
+        b->data = pb.data;
+        b->size = pb.size;
         b->dead = false;
         big_pool_bytes_ -= b->size;
-        big_pool_.erase(big_pool_.begin() + ptrdiff_t(best));
     }
-    if (!b) b = new_block(cls);
+    // Exactly the class, not the heap's minimum block. That minimum is for
+    // shared blocks, which many objects carve; a dedicated block holds one
+    // object and nothing is ever cut from its tail, so rounding a 5 KiB
+    // object up to a 64 KiB block was 59 KiB of nothing -- held until the
+    // object died. A loop of bignums past the top class made one per step,
+    // and held a gigabyte from the OS for 85 MB of numbers.
+    if (!b) b = new_block(cls, true);
     b->big = true;
     b->used = sz;
     b->next = blocks_;
@@ -427,6 +435,36 @@ Obj* Heap::alloc(ObjType type, size_t extra) {
 Value Heap::make_float(double v) {
     auto* o = static_cast<FloatObj*>(alloc_bare(ObjType::Float, sizeof(double)));
     o->value = v;
+    return from_obj(o);
+}
+
+BigIntObj* Heap::alloc_bigint(uint32_t limbs) {
+    // Inline while the object fits a size class: a young chunk like any other.
+    if (align_up(sizeof(BigIntObj) + size_t(limbs) * 8) <= kMaxClassSize) {
+        auto* o = static_cast<BigIntObj*>(alloc_bare(ObjType::BigInt, 8 + size_t(limbs) * 8));
+        o->external = 0;
+        o->pad = 0;
+        return o;
+    }
+    // Past it, a young header and limbs of their own; see `BigIntObj`. The
+    // header goes on `external_`, so the collector says when they die.
+    auto* data = static_cast<uint64_t*>(std::malloc(size_t(limbs) * 8));
+    if (!data) throw std::bad_alloc();
+    auto* o = static_cast<BigIntObj*>(alloc_bare(ObjType::BigInt, 8 + 16));
+    o->external = 1;
+    o->pad = 0;
+    o->external_limbs() = data;
+    o->external_capacity() = limbs;
+    external_.push_back(o);
+    external_bytes_ += size_t(limbs) * 8;
+    return o;
+}
+
+Value Heap::make_bigint(const uint64_t* limbs, uint32_t len, bool neg) {
+    BigIntObj* o = alloc_bigint(len);
+    o->len = len;
+    o->neg = neg ? 1 : 0;
+    std::memcpy(o->limbs(), limbs, size_t(len) * 8);
     return from_obj(o);
 }
 
@@ -590,12 +628,25 @@ Value Heap::make_deferred_tensor(uint32_t rank, const uint32_t* dims, uint64_t c
     return from_obj(t);
 }
 
+size_t Heap::external_size(Obj* o) {
+    if (o->type == ObjType::BigInt) return size_t(static_cast<BigIntObj*>(o)->external_capacity()) * 8;
+    return tensor_data_bytes(static_cast<TensorObj*>(o));
+}
+
+void Heap::drop_external(Obj* o) {
+    if (o->type == ObjType::BigInt) {
+        std::free(static_cast<BigIntObj*>(o)->external_limbs());
+        return;
+    }
+    release_external(o);
+}
+
 void Heap::reap_external(bool full) {
     size_t keep = 0;
     const size_t before = external_bytes_;
     auto drop = [&](Obj* o) {
-        external_bytes_ -= tensor_data_bytes(static_cast<TensorObj*>(o));
-        release_external(o);
+        external_bytes_ -= external_size(o);
+        drop_external(o);
     };
     for (Obj* o : external_) {
         const uint8_t gc = o->gc;
@@ -884,10 +935,12 @@ Heap::~Heap() {
         GcPool::instance().join();
     }
     // The process is gone, so everything it held outside the heap goes too.
-    for (Obj* o : external_) release_external(o);
+    for (Obj* o : external_) drop_external(o);
     free_blocks(blocks_);
     for (Block* b : nursery_) free_block(b);
-    for (PooledBlock& pb : big_pool_) std::free(pb.data);
+    for (auto& [size, same] : big_pool_) {
+        for (PooledBlock& pb : same) std::free(pb.data);
+    }
 }
 
 /// How much work makes the handshake worth it. Waking a pool of threads and
@@ -2231,6 +2284,23 @@ struct VerifyWalk {
                     }
                     break;
                 }
+                case ObjType::BigInt: {
+                    // Canonical as well as in bounds: a top limb of zero is a
+                    // bignum some operation forgot to trim, and equality would
+                    // then call it different from the same number trimmed.
+                    auto* b = static_cast<BigIntObj*>(o);
+                    const size_t room = b->external ? size_t(b->external_capacity()) * 8
+                                                    : b->bytes - sizeof(BigIntObj);
+                    if (b->len == 0 || room < size_t(b->len) * 8) {
+                        problem("bignum at " + addr(o) + " is shorter than its length claims");
+                        return;
+                    }
+                    if (b->limbs()[b->len - 1] == 0) {
+                        problem("bignum at " + addr(o) + " is not trimmed");
+                        return;
+                    }
+                    break;
+                }
                 case ObjType::Tensor: {
                     auto* t = static_cast<TensorObj*>(o);
                     if (tensor_deferred(t)) {
@@ -2402,6 +2472,10 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
         }
         case ObjType::Pid:
             return dest.make_pid(static_cast<PidObj*>(o)->id);
+        case ObjType::BigInt: {
+            auto* b = static_cast<BigIntObj*>(o);
+            return dest.make_bigint(b->limbs(), b->len, b->neg != 0);
+        }
         case ObjType::Tensor: {
             auto* src = static_cast<TensorObj*>(o);
             if (tensor_deferred(src)) {
@@ -2719,6 +2793,14 @@ Obj* SharedArea::alloc(ObjType type, size_t extra) {
 Value SharedArea::make_float(double v) {
     auto* o = static_cast<FloatObj*>(alloc(ObjType::Float, sizeof(double)));
     o->value = v;
+    return from_obj(o);
+}
+
+Value SharedArea::make_bigint(const uint64_t* limbs, uint32_t len, bool neg) {
+    auto* o = static_cast<BigIntObj*>(alloc(ObjType::BigInt, 8 + size_t(len) * 8));
+    o->len = len;
+    o->neg = neg ? 1 : 0;
+    std::memcpy(o->limbs(), limbs, size_t(len) * 8);
     return from_obj(o);
 }
 

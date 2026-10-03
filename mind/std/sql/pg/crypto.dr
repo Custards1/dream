@@ -6,17 +6,10 @@
 // asks for by default and the only one that does not let the server, or anyone
 // listening, learn something that can log in as you.
 //
-// **SHA-256 is the VM's** (`io.digest`, a pure function in `std.io`), because a
-// hash written in Dream would be a hash computed one bit at a time with no
-// bitwise operators. Everything SCRAM is built from -- HMAC, PBKDF2 -- is a
-// composition of SHA-256 calls and exclusive-or, so the only loop that runs
-// here is PBKDF2's four thousand rounds, each two native digests and a
-// thirty-two byte xor.
-//
-// **MD5 is written here**, because nothing else provides it and some servers
-// still store `md5` passwords. It needs AND, OR and NOT on 32-bit words, which
-// are tables of nibbles as `std.sql.pg.bytes` builds exclusive-or. It is slow by the
-// standards of C and that does not matter: a login hashes two short strings.
+// **Every primitive is the VM's** (`std.crypto`). This module used to write
+// MD5 over nibble tables and PBKDF2 as four thousand rounds of Dream around
+// two native digests; both are now one call each, and what is left here is
+// the part that is PostgreSQL's: which digest of what, and the SCRAM messages.
 //
 // What is not here is `SASLprep`, the Unicode normalisation SCRAM asks a
 // password to go through first. PostgreSQL itself skips it for any password
@@ -25,175 +18,28 @@
 // itself -- is exactly right, and a server built with the same assumption
 // (libpq's) agrees.
 
-import std.io;
+import std.crypto;
 import std.list;
 import std.str;
-import std.sql.pg.bytes;
-import std.array;
 import std.num;
-
-// --- SHA-256, HMAC, PBKDF2 ------------------------------------------------------
 
 /// The SHA-256 of `s`, as 32 raw bytes.
 let sha256 : :string -> :string;
-let sha256 s = match bytes.hex_decode (io.digest s) { () => "", raw => raw };
-
-priv let block : :integer;
-priv let block = 64;
-
-/// A key padded to one block and xor'd with `pad`, as HMAC wants it.
-priv let padded : :integer -> :string -> :string;
-priv let padded pad key = {
-    let k = if len key > block { sha256 key } else { key };
-    let fill = list.replicate (block - len k) 0;
-    str.of_bytes (list.map (fn b -> bytes.xor8 b pad) (bytes.to_list k + fill))
-};
+let sha256 s = crypto.sha256 s;
 
 /// HMAC-SHA-256 (RFC 2104) of `message` under `key`, as raw bytes.
 let hmac_sha256 : :string -> :string -> :string;
-let hmac_sha256 key message = hmac_padded (padded 0x36 key) (padded 0x5c key) message;
-
-/// The same with the two padded keys already made, which is what a loop that
-/// signs under one key thousands of times wants: the padding is the same every
-/// time.
-priv let hmac_padded : :string -> :string -> :string -> :string;
-priv let hmac_padded inner outer message = sha256 (outer + sha256 (inner + message));
+let hmac_sha256 key message = crypto.hmac :sha256 key message;
 
 /// PBKDF2 with HMAC-SHA-256 (RFC 8018), one block: the 32 bytes SCRAM calls
 /// `SaltedPassword`.
-///
-/// The accumulator is a string, and that is what keeps it from becoming four
-/// thousand suspended xors: `!acc` forces it, and forcing a string built by
-/// `str_of_bytes` forces every byte that went into it. A list would be forced
-/// only as far as its first cell.
 let pbkdf2_sha256 : :string -> :string -> :integer -> :string;
-let pbkdf2_sha256 password salt iterations = {
-    let inner = padded 0x36 password;
-    let outer = padded 0x5c password;
-    let first = hmac_padded inner outer (salt + bytes.be32 1);
-    pbkdf2_rounds inner outer first first (iterations - 1)
-};
-
-priv let pbkdf2_rounds : :string -> :string -> :string -> :string -> :integer -> :string;
-priv let rec pbkdf2_rounds inner outer previous !acc n =
-    if n <= 0 { acc }
-    else {
-        let next = hmac_padded inner outer previous;
-        pbkdf2_rounds inner outer next (bytes.xor acc next) (n - 1)
-    };
-
-// --- MD5 ----------------------------------------------------------------------
-//
-// RFC 1321, written over integers that stand for 32-bit words. Every value is
-// kept in [0, 2^32), and the largest intermediate -- a word shifted left by 23
-// for a rotation -- is under 2^55, comfortably inside a fixnum.
-
-priv let modulus : :integer;
-priv let modulus = 4294967296;
-
-priv let and_nibbles : #[:integer];
-priv let and_nibbles = bytes.nibble_table (fn x y -> x * y);
-
-priv let or_nibbles : #[:integer];
-priv let or_nibbles = bytes.nibble_table (fn x y -> if x + y > 0 { 1 } else { 0 });
-
-/// A nibble table applied across the eight nibbles of two words.
-priv let word_op : #[:integer] -> :integer -> :integer -> :integer;
-priv let word_op table a b = nibbles table a b 1 0 8;
-
-priv let nibbles : #[:integer] -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
-priv let rec nibbles table !a !b !place !acc n =
-    if n == 0 { acc }
-    else { nibbles table (a / 16) (b / 16) (place * 16)
-                   (acc + table.[a % 16 * 16 + b % 16] * place) (n - 1) };
-
-priv let and32 : :integer -> :integer -> :integer;
-priv let and32 a b = word_op and_nibbles a b;
-priv let or32 : :integer -> :integer -> :integer;
-priv let or32 a b = word_op or_nibbles a b;
-priv let xor32 : :integer -> :integer -> :integer;
-priv let xor32 a b = word_op bytes.xor_nibbles a b;
-priv let not32 : :integer -> :integer;
-priv let not32 a = modulus - 1 - a;
-
-priv let rotl32 : :integer -> :integer -> :integer;
-priv let rotl32 x s = {
-    let p = pow2 s;
-    x * p % modulus + x / (modulus / p)
-};
-
-priv let pow2 : :integer -> :integer;
-priv let rec pow2 k = if k <= 0 { 1 } else { 2 * pow2 (k - 1) };
-
-priv let shifts : #[:integer];
-priv let shifts = array.of_list (list.concat (list.map (fn r -> list.concat (list.replicate 4 r))
-    [[7, 12, 17, 22], [5, 9, 14, 20], [4, 11, 16, 23], [6, 10, 15, 21]]));
-
-/// `floor(abs(sin(i + 1)) * 2^32)`, as RFC 1321 tabulates it.
-priv let sines : #[:integer];
-priv let sines = #[
-    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
-];
-
-/// The message, padded to a whole number of 64-byte blocks with its length in
-/// bits at the end, little-endian.
-priv let md5_padded : :string -> :string;
-priv let md5_padded s = {
-    let n = len s;
-    let zeros = (55 - n % 64 + 64) % 64;
-    s + str.of_bytes (list.cons 128 (list.replicate zeros 0)) + str.of_int_le 8 (n * 8)
-};
-
-/// The sixteen little-endian words of the block at byte `at`.
-priv let words_at : :string -> :integer -> #[:integer];
-priv let words_at s at = array.of_list (list.map (fn i -> le32_at s (at + 4 * i)) (list.range 0 16));
-
-priv let le32_at : :string -> :integer -> :integer;
-priv let le32_at s at =
-    ((str.byte (at + 3) s * 256 + str.byte (at + 2) s) * 256 + str.byte (at + 1) s) * 256
-    + str.byte at s;
-
-/// One of the 64 steps: the mixing function and the word it reads for step `i`.
-priv let mix : :integer -> :integer -> :integer -> :integer -> [:integer, :integer];
-priv let mix i b c d = match i / 16 {
-    0 => [or32 (and32 b c) (and32 (not32 b) d), i],
-    1 => [or32 (and32 d b) (and32 (not32 d) c), (5 * i + 1) % 16],
-    2 => [xor32 (xor32 b c) d, (3 * i + 5) % 16],
-    _ => [xor32 c (or32 b (not32 d)), 7 * i % 16],
-};
-
-priv let md5_steps : #[:integer] -> :integer -> :integer -> :integer -> :integer -> :integer -> [:integer];
-priv let rec md5_steps words !i !a !b !c !d =
-    if i == 64 { [a, b, c, d] }
-    else {
-        let [f, g] = mix i b c d;
-        let sum = (f + a + sines.[i] + words.[g]) % modulus;
-        md5_steps words (i + 1) d ((b + rotl32 sum shifts.[i]) % modulus) b c
-    };
-
-priv let md5_blocks : :string -> :integer -> :integer -> :integer -> :integer -> :integer -> [:integer];
-priv let rec md5_blocks s at !a !b !c !d =
-    if at >= len s { [a, b, c, d] }
-    else {
-        let [a2, b2, c2, d2] = md5_steps (words_at s at) 0 a b c d;
-        md5_blocks s (at + 64)
-            ((a + a2) % modulus) ((b + b2) % modulus) ((c + c2) % modulus) ((d + d2) % modulus)
-    };
+let pbkdf2_sha256 password salt iterations = crypto.pbkdf2 :sha256 password salt iterations 32;
 
 /// The MD5 of `s`, as 32 lowercase hex digits -- the spelling PostgreSQL's
 /// `md5` authentication exchanges.
 let md5_hex : :string -> :string;
-let md5_hex s = {
-    let state = md5_blocks (md5_padded s) 0 0x67452301 0xefcdab89 0x98badcfe 0x10325476;
-    bytes.hex_encode (str.concat_all (list.map (fn w -> str.of_int_le 4 w) state))
-};
+let md5_hex s = crypto.hex (crypto.md5 s);
 
 // --- SCRAM-SHA-256 ----------------------------------------------------------------
 //
@@ -202,6 +48,11 @@ let md5_hex s = {
 // the client's first message, because the server takes the user from the
 // startup message and ignores this one. The two halves are pure, so the whole
 // exchange is tested against the RFC's own transcript.
+
+/// Eighteen random bytes as base64, which has no comma in its alphabet and so
+/// can stand in a SCRAM attribute as it is.
+let scram_nonce! : :unit -> :string;
+let scram_nonce! u = crypto.base64 (crypto.random_bytes! 18);
 
 /// The client's first message for `nonce`: `[bare, whole]`. The bare part is
 /// signed later, so it is kept.
@@ -225,7 +76,7 @@ let scram_final : :string -> :string -> :string -> :string -> [:ok, [:string, :s
 let scram_final password client_nonce client_bare server_first = {
     let attrs = scram_attributes server_first;
     let nonce = attrs.["r" else ""];
-    let salt = bytes.base64_decode attrs.["s" else ""];
+    let salt = crypto.unbase64 attrs.["s" else ""];
     let rounds = num.parse_int attrs.["i" else ""];
     if not (str.starts_with client_nonce nonce) || len nonce <= len client_nonce {
         [:error, "the server's nonce does not extend the client's"]
@@ -238,10 +89,10 @@ let scram_final password client_nonce client_bare server_first = {
                     let client_key = hmac_sha256 salted "Client Key";
                     let without_proof = "c=biws,r=" + nonce;
                     let auth = client_bare + "," + server_first + "," + without_proof;
-                    let proof = bytes.xor client_key (hmac_sha256 (sha256 client_key) auth);
+                    let proof = crypto.xor client_key (hmac_sha256 (sha256 client_key) auth);
                     let server_signature = hmac_sha256 (hmac_sha256 salted "Server Key") auth;
-                    [:ok, [without_proof + ",p=" + bytes.base64_encode proof,
-                           bytes.base64_encode server_signature]]
+                    [:ok, [without_proof + ",p=" + crypto.base64 proof,
+                           crypto.base64 server_signature]]
                 },
                 _ => [:error, "the server's iteration count is not a positive integer"],
             },
@@ -260,19 +111,19 @@ when test {
     let tests = [
         test.case "SHA-256 is the VM's, as bytes"
             $( test.eq! "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-                        (bytes.hex_encode (sha256 "abc")) ),
+                        (crypto.hex (sha256 "abc")) ),
         test.case "HMAC-SHA-256 against RFC 4231's second case"
             $( test.eq! "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-                        (bytes.hex_encode (hmac_sha256 "Jefe" "what do ya want for nothing?")) ),
+                        (crypto.hex (hmac_sha256 "Jefe" "what do ya want for nothing?")) ),
         test.case "HMAC with a key longer than a block hashes it first"
             $( test.eq! "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-                        (bytes.hex_encode (hmac_sha256 (str.repeat 131 (str.of_bytes [0xaa]))
+                        (crypto.hex (hmac_sha256 (str.repeat 131 (str.of_bytes [0xaa]))
                                      "Test Using Larger Than Block-Size Key - Hash Key First")) ),
         test.case "PBKDF2-HMAC-SHA-256, one round and many"
             $( test.eq! ["120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
                          "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"]
-                        [bytes.hex_encode (pbkdf2_sha256 "password" "salt" 1),
-                         bytes.hex_encode (pbkdf2_sha256 "password" "salt" 4096)] ),
+                        [crypto.hex (pbkdf2_sha256 "password" "salt" 1),
+                         crypto.hex (pbkdf2_sha256 "password" "salt" 4096)] ),
         test.case "MD5 against RFC 1321's suite"
             $( test.eq! ["d41d8cd98f00b204e9800998ecf8427e", "0cc175b9c0f1b6a831c399e269772661",
                          "900150983cd24fb0d6963f7d28e17f72", "f96b697d7cb7938d525a2f31aaf161d0",

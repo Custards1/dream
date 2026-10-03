@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 
+#include "bigint.hpp"
 #include "builtins.hpp"
 #include "interp.hpp"
 #include "tensor.hpp"
@@ -57,14 +58,15 @@ Value dream_rt_float(Process* p, double d) { return p->heap().make_float(d); }
 
 namespace {
 /// The double a number in hand stands for. Only ever asked of a value `arith`
-/// has just answered with, which is a fixnum or a float box and nothing else.
+/// has just answered with an operand that was a float, which makes the answer
+/// a float box, or a tensor, which is the one thing this declines.
 inline bool number_as_double(Value v, double* out) {
-    if (is_fixnum(v)) {
-        *out = double(fixnum_value(v));
-        return true;
-    }
     if (is_obj(v, ObjType::Float)) {
         *out = static_cast<FloatObj*>(as_obj(v))->value;
+        return true;
+    }
+    if (bigint::is_integer(v)) {
+        *out = bigint::to_double(v);
         return true;
     }
     return false;
@@ -89,26 +91,33 @@ int dream_rt_arith_f(Process* p, int32_t op, Value a, Value b, double* out, Valu
 }
 
 int dream_rt_to_int(Process* p, Value v, Value* out) {
-    if (is_fixnum(v)) {
+    if (bigint::is_integer(v)) {
         *out = v;
         return 1;
     }
     if (is_obj(v, ObjType::Float)) {
-        *out = make_integer(*p, int64_t(static_cast<FloatObj*>(as_obj(v))->value));
-        return 1;
+        if (bigint::from_double(p->heap(), static_cast<FloatObj*>(as_obj(v))->value, out)) return 1;
+        *out = raise_error(*p, well_known(p->runtime()).type_error,
+                           "to_int of an infinity or a NaN is not an integer");
+        return 0;
     }
     *out = raise_error(*p, well_known(p->runtime()).type_error, "to_int needs a number");
     return 0;
 }
 
 int dream_rt_floor(Process* p, Value v, Value* out) {
-    if (is_fixnum(v)) {
+    if (bigint::is_integer(v)) {
         *out = v;
         return 1;
     }
     if (is_obj(v, ObjType::Float)) {
-        *out = make_integer(*p, int64_t(std::floor(static_cast<FloatObj*>(as_obj(v))->value)));
-        return 1;
+        if (bigint::from_double(p->heap(), std::floor(static_cast<FloatObj*>(as_obj(v))->value),
+                                out)) {
+            return 1;
+        }
+        *out = raise_error(*p, well_known(p->runtime()).type_error,
+                           "floor of an infinity or a NaN is not an integer");
+        return 0;
     }
     *out = raise_error(*p, well_known(p->runtime()).type_error, "floor needs a number");
     return 0;
@@ -120,6 +129,10 @@ int dream_rt_abs(Process* p, Value v, Value* out) {
         *out = make_integer(*p, n < 0 ? -n : n);
         return 1;
     }
+    if (bigint::is_big(v)) {
+        *out = bigint::abs(p->heap(), v);
+        return 1;
+    }
     if (is_obj(v, ObjType::Float)) {
         *out = p->heap().make_float(std::fabs(static_cast<FloatObj*>(as_obj(v))->value));
         return 1;
@@ -128,7 +141,20 @@ int dream_rt_abs(Process* p, Value v, Value* out) {
     return 0;
 }
 
-Value dream_rt_int_of_double(Process* p, double d) { return make_integer(*p, int64_t(d)); }
+int dream_rt_int_of_double(Process* p, double d, Value* out) {
+    if (bigint::from_double(p->heap(), d, out)) return 1;
+    *out = raise_error(*p, well_known(p->runtime()).type_error,
+                       "an infinity or a NaN is not an integer");
+    return 0;
+}
+
+int dream_rt_number_double(Process* p, Value v, double* out) {
+    if (bigint::is_big(v)) {
+        *out = bigint::to_double(v);
+        return 1;
+    }
+    return 0;
+}
 
 Value dream_rt_type_error(Process* p, const char* message) {
     return raise_error(*p, well_known(p->runtime()).type_error, message);

@@ -249,9 +249,9 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     if (!InitializeProcThreadAttributeList(start.lpAttributeList, 1, 0, &bytes)) {
         job->error = windows::error(); cleanup(); finish(); return;
     }
-    HANDLE inherited[] = {input, out_write, err_write};
+    HANDLE handles[] = {input, out_write, err_write};
     bool ready = UpdateProcThreadAttribute(start.lpAttributeList, 0,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles,
         (job->joined ? 2 : 3) * sizeof(HANDLE), nullptr, nullptr);
     std::wstring command;
     for (const auto& arg : argv) {

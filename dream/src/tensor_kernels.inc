@@ -252,17 +252,28 @@ void pack_a(const GemmOperand& A, Z ic, Z pc, Z mc, Z kc, double* Ap, double* tm
 /// C's `h x w` tile (at most MR x NR) plus the product of an A sliver and a B
 /// panel. A full tile is written straight from the registers; an edge tile
 /// goes through a scratch copy so that nothing past C's edge is touched.
+// GCC's unroll hint, which Clang reads too. MSVC has no such pragma and warns
+// about one it does not know (C4068), so there it is nothing.
+#ifndef DREAM_UNROLL
+#if defined(__GNUC__) || defined(__clang__)
+#define DREAM_PRAGMA(x) _Pragma(#x)
+#define DREAM_UNROLL(n) DREAM_PRAGMA(GCC unroll n)
+#else
+#define DREAM_UNROLL(n)
+#endif
+#endif
+
 inline void micro(Z kc, const double* __restrict a, const double* __restrict b, double* C,
                   Z ldc, Z h, Z w) {
     vec c[MR][NV] = {};
     for (Z k = 0; k < kc; ++k, a += MR, b += NR) {
         vec bv[NV];
-#pragma GCC unroll 4
+DREAM_UNROLL(4)
         for (Z v = 0; v < NV; ++v) bv[v] = loadv(b + v * VW);
-#pragma GCC unroll 8
+DREAM_UNROLL(8)
         for (Z r = 0; r < MR; ++r) {
             const vec ar = vec{} + a[r];
-#pragma GCC unroll 4
+DREAM_UNROLL(4)
             for (Z v = 0; v < NV; ++v) c[r][v] += ar * bv[v];
         }
     }

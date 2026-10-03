@@ -59,9 +59,13 @@ int dream_rt_to_int(dream::Process* p, dream::Value v, dream::Value* out);
 int dream_rt_floor(dream::Process* p, dream::Value v, dream::Value* out);
 int dream_rt_abs(dream::Process* p, dream::Value v, dream::Value* out);
 
-/// `make_integer` of a double already in a register: the tail of `to_int` and
-/// of `math.floor` when compiled code has the number unboxed. Cannot raise.
-dream::Value dream_rt_int_of_double(dream::Process* p, double d);
+/// The integer a double already in a register truncates to: the tail of
+/// `to_int` and of `math.floor` when compiled code has the number unboxed. A
+/// bignum past 2^62; an error for an infinity or a NaN, with 0 answered.
+int dream_rt_int_of_double(dream::Process* p, double d, dream::Value* out);
+/// The double a tagged number stands for, where compiled code met something
+/// that was neither a fixnum nor a float box: a bignum, or an error.
+int dream_rt_number_double(dream::Process* p, dream::Value v, double* out);
 
 /// Raise a type error with a fixed message, for the shapes compiled code
 /// rejects inline (a non-bool condition, say).

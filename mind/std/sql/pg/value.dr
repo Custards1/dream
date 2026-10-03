@@ -49,11 +49,11 @@
 //   | everything else                       | the text the server sent    |
 //
 // **`numeric` is exact and Dream has no decimal**, so a numeric that is a whole
-// number small enough for an integer is one, and any other is left as the text
-// PostgreSQL wrote rather than rounded into a float. `sum(int4)` is a numeric,
-// which is why the first half matters; `avg` is one too, and `avg(x)::float8`
-// is how to ask for a float. An `int8` past what a fixnum holds is kept as text
-// for the same reason. Dates, times and intervals are text in ISO 8601, which
+// number is an integer -- of any size, since Dream's integers have none -- and
+// any other is left as the text PostgreSQL wrote rather than rounded into a
+// float. `sum(int4)` is a numeric, which is why the first half matters; `avg`
+// is one too, and `avg(x)::float8` is how to ask for a float. Dates, times and
+// intervals are text in ISO 8601, which
 // sorts and compares as it should and which every format library reads.
 //
 // A program that wants another decoding for some type says so with
@@ -246,10 +246,8 @@ priv let decode_builtin decoders type_oid text = match type_oid {
     },
 };
 
-/// An integer when the text is one that fits, and the text otherwise. A
-/// number too big for a fixnum parses as a float, which is exactly the silent
-/// rounding this refuses -- so the answer must be an integer, not merely a
-/// number.
+/// An integer when the text is a whole number, and the text otherwise -- a
+/// `numeric` with a fraction, which no Dream number holds exactly.
 let exact_integer : :string -> :any;
 let exact_integer text = match num.parse_int text {
     n if type_of n == :integer => n,
@@ -355,8 +353,8 @@ when test {
                         [decode none 16 "t", decode none 16 "f", decode none 23 "42", decode none 20 "-7",
                          decode none 701 "2.5", decode none 25 "hello", decode none 23 (), decode none 2278 ""] ),
         test.case "numeric is an integer only when nothing is lost"
-            $( test.eq! [6, "2.5000000000000000", "123456789012345678901234567890", 4611686018427387903,
-                         "9223372036854775807"]
+            $( test.eq! [6, "2.5000000000000000", 123456789012345678901234567890, 4611686018427387903,
+                         9223372036854775807]
                         [decode none 1700 "6", decode none 1700 "2.5000000000000000",
                          decode none 1700 "123456789012345678901234567890",
                          decode none 20 "4611686018427387903", decode none 20 "9223372036854775807"] ),

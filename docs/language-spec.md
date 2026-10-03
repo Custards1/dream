@@ -422,7 +422,10 @@ A value is one 64-bit word, tagged in the low bits:
 | `...010` | immediate — unit, bool, char, atom, nil, builtin |
 
 Integers get the one-bit tag because arithmetic is the hot path, and the
-tagging preserves order so the JIT can compare two tagged fixnums directly.
+tagging preserves order so the JIT can compare two tagged fixnums directly. An
+integer past 63 bits is a `BigIntObj` on the heap (see
+`dream/src/bigint.hpp`; "Operators on non-numbers" says how arithmetic
+reaches it).
 
 Lists are cons cells and arrays are flat, both as you would expect. **Maps are a
 hash array mapped trie** — a tree branching 32 ways on five bits of the key's
@@ -536,8 +539,20 @@ of nested lists and arrays read as them, and binds like `*`. It is the builtin
 `_tensor_matmul` applied to both sides, so a local of that name shadows it.
 `std.tensor` has the rest, including moving a tensor to the GPU.
 
-Integer arithmetic that overflows a fixnum falls through to `float` rather than
-wrapping silently. `/` and `%` by an integer zero raise `:divide_by_zero`.
+**Integers have no size limit.** One that fits in 63 bits is a fixnum; one
+that does not is a *bignum*, a heap object of 64-bit limbs. The two are one
+type -- `type_of` says `:integer` for both, `==`, `compare`, map keys and
+`match` agree across them, and an operation whose answer fits in 63 bits again
+answers a fixnum -- so a program never chooses between them. Arithmetic
+reaches the bignum code only where a fixnum operation overflows, which is the
+path that used to answer a float, so code that stays inside 63 bits runs
+exactly as it did. A literal of any size is allowed: one past the fixnum range
+is written into the image as its digits and parsed where it is used.
+
+`/` on two integers truncates toward zero and `%` takes the sign of the
+dividend, at any size. `/` and `%` by an integer zero raise
+`:divide_by_zero`. An integer combined with a float is a float; a bignum too
+large for a double becomes an infinity there.
 
 ### `if`
 

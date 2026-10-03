@@ -2016,6 +2016,7 @@ private:
     /// The double `v` stands for, branching to `slow` if it is not a number in
     /// hand. Leaves the insert point on the path where it is.
     llvm::Value* try_double(llvm::Value* v, llvm::BasicBlock* slow);
+    JV int_of_double(llvm::Value* d);
     /// Read a frame slot that the loop carries as a double, or leave for
     /// `bail`. The check is deliberately not a *force*: forcing here would move
     /// where a raising argument raises, and an argument that arrives suspended
@@ -2151,6 +2152,7 @@ private:
     bool failed_ = false;
 
     // Declarations of the runtime helpers.
+    llvm::FunctionCallee rt_number_double_;
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
         rt_frame_slots_, rt_native_, rt_builtin_, rt_switch_head_,
@@ -2204,7 +2206,9 @@ void Emitter::declare_helpers() {
     rt_floor_ = mod_.getOrInsertFunction(
         "dream_rt_floor", llvm::FunctionType::get(i32_, {ptr_, i64_, ptr_}, false));
     rt_int_of_double_ = mod_.getOrInsertFunction(
-        "dream_rt_int_of_double", llvm::FunctionType::get(i64_, {ptr_, dbl_}, false));
+        "dream_rt_int_of_double", llvm::FunctionType::get(i32_, {ptr_, dbl_, ptr_}, false));
+    rt_number_double_ = mod_.getOrInsertFunction(
+        "dream_rt_number_double", llvm::FunctionType::get(i32_, {ptr_, i64_, ptr_}, false));
     rt_type_error_ = mod_.getOrInsertFunction(
         "dream_rt_type_error", llvm::FunctionType::get(i64_, {ptr_, ptr_}, false));
     rt_reduction_slot_ = mod_.getOrInsertFunction(
@@ -3245,13 +3249,48 @@ llvm::Value* Emitter::try_double(llvm::Value* v, llvm::BasicBlock* slow) {
 
 llvm::Value* Emitter::as_double(JV v, const char* message) {
     if (v.dbl) return v.v;
+    // A fixnum or a float box is read inline. Anything else is asked of the
+    // runtime, which answers a bignum's double or says it is not a number --
+    // a call only a bignum's first conversion pays, never a fixnum's.
+    auto* other = bb("num.other");
+    llvm::Value* d = try_double(v.v, other);
+    auto* fast = b_.GetInsertBlock();
+    auto* join = bb("num.join");
+    b_.CreateBr(join);
+
+    b_.SetInsertPoint(other);
+    llvm::Value* slot = entry_alloca(dbl_);
+    llvm::Value* ok = b_.CreateCall(rt_number_double_, {proc_, v.v, slot});
+    auto* big = bb("num.big");
     auto* bad = bb("num.bad");
-    llvm::Value* d = try_double(v.v, bad);
-    auto* here = b_.GetInsertBlock();
+    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), big, bad);
     b_.SetInsertPoint(bad);
     emit_type_error(message);
-    b_.SetInsertPoint(here);
-    return d;
+    b_.SetInsertPoint(big);
+    llvm::Value* from_big = b_.CreateLoad(dbl_, slot);
+    b_.CreateBr(join);
+
+    b_.SetInsertPoint(join);
+    auto* phi = b_.CreatePHI(dbl_, 2);
+    phi->addIncoming(d, fast);
+    phi->addIncoming(from_big, big);
+    return phi;
+}
+
+/// An integer from a double in a register: `to_int` and `math.floor` when the
+/// number is unboxed. The runtime builds it -- a bignum past 2^62 -- and
+/// refuses an infinity or a NaN, which has no integer to be.
+Emitter::JV Emitter::int_of_double(llvm::Value* d) {
+    llvm::Value* out = entry_alloca(i64_);
+    llvm::Value* ok = b_.CreateCall(rt_int_of_double_, {proc_, d, out});
+    llvm::Value* v = b_.CreateLoad(i64_, out);
+    auto* cont = bb("int.ok");
+    auto* raise_bb = bb("int.raise");
+    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), cont, raise_bb);
+    b_.SetInsertPoint(raise_bb);
+    emit_raise(v);
+    b_.SetInsertPoint(cont);
+    return tag(v);
 }
 
 llvm::Value* Emitter::guard_float(llvm::Value* v, llvm::BasicBlock* bail) {
@@ -3477,7 +3516,22 @@ Emitter::JV Emitter::type_test(const Node& n) {
     if (subject.dbl) {
         test = llvm::ConstantInt::getBool(ctx_, n.b == DREAM_TYPE_FLOAT);
     } else if (n.b == DREAM_TYPE_INTEGER) {
-        test = is_fixnum(subject.v);
+        // A fixnum, or a bignum -- whose header is read only behind the
+        // pointer guard, as every other object test here reads its own.
+        auto* object = bb("int.object");
+        auto* done = bb("int.done");
+        llvm::Value* fix = is_fixnum(subject.v);
+        auto* here = b_.GetInsertBlock();
+        b_.CreateCondBr(is_heap_ptr(subject.v), object, done);
+        b_.SetInsertPoint(object);
+        llvm::Value* header = b_.CreateLoad(i8_, b_.CreateIntToPtr(subject.v, ptr_));
+        llvm::Value* big = b_.CreateICmpEQ(header, llvm::ConstantInt::get(i8_, uint8_t(ObjType::BigInt)));
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
+        auto* phi = b_.CreatePHI(llvm::Type::getInt1Ty(ctx_), 2, "int.matches");
+        phi->addIncoming(fix, here);
+        phi->addIncoming(big, object);
+        test = phi;
     } else if (n.b == DREAM_TYPE_CHAR || n.b == DREAM_TYPE_BOOL ||
                n.b == DREAM_TYPE_UNIT || n.b == DREAM_TYPE_ATOM) {
         ImmKind kind = n.b == DREAM_TYPE_CHAR ? IMM_CHAR :
@@ -4189,12 +4243,11 @@ Emitter::JV Emitter::native_call(KnownNative which, const Node& n) {
             break;
         case KnownNative::Floor:
             if (x.dbl) {
-                llvm::Value* d = unary_intrinsic(llvm::Intrinsic::floor, x.v);
-                return tag(b_.CreateCall(rt_int_of_double_, {proc_, d}));
+                return int_of_double(unary_intrinsic(llvm::Intrinsic::floor, x.v));
             }
             break;
         case KnownNative::ToInt:
-            if (x.dbl) return tag(b_.CreateCall(rt_int_of_double_, {proc_, x.v}));
+            if (x.dbl) return int_of_double(x.v);
             break;
         default:
             break;
@@ -4754,6 +4807,7 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_arith_f", reinterpret_cast<void*>(&dream_rt_arith_f));
     add("dream_rt_to_int", reinterpret_cast<void*>(&dream_rt_to_int));
     add("dream_rt_abs", reinterpret_cast<void*>(&dream_rt_abs));
+    add("dream_rt_number_double", reinterpret_cast<void*>(&dream_rt_number_double));
     add("dream_rt_floor", reinterpret_cast<void*>(&dream_rt_floor));
     add("dream_rt_int_of_double", reinterpret_cast<void*>(&dream_rt_int_of_double));
     add("dream_rt_type_error", reinterpret_cast<void*>(&dream_rt_type_error));

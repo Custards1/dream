@@ -53,7 +53,6 @@ import std.io;
 import std.list;
 import std.map;
 import std.net;
-import std.os;
 import std.str;
 import std.streams;
 import std.tls;
@@ -313,7 +312,7 @@ priv let password! conn = match config.Config.password (Conn.config conn) {
 /// password too before the login is believed.
 priv let scram! : Conn -> :unit;
 priv let scram! conn = {
-    let nonce = nonce! ();
+    let nonce = crypto.scram_nonce! ();
     let [bare, first] = crypto.scram_first nonce;
     write! conn (wire.sasl_initial "SCRAM-SHA-256" first)
     let server_first = sasl_step! conn 11;
@@ -332,24 +331,6 @@ priv let sasl_step! conn code = match receive! conn {
     [:authentication, c, data] if c == code => data,
     [:error_response, fields] => raise! (errors.server fields),
     other => unexpected! "during SCRAM" other,
-};
-
-/// Eighteen random bytes as base64, which has no comma in its alphabet and so
-/// can stand in a SCRAM attribute as it is. From the kernel where there is
-/// one; from the clock and the pid, hashed, where there is not -- a nonce must
-/// not repeat, and it need not be secret.
-priv let nonce! : :unit -> :string;
-priv let nonce! u = {
-    let raw = try! {
-        let h = io.open! "/dev/urandom" :read;
-        let got = io.read! h 18;
-        io.close! h
-        got
-    } catch e { "" };
-    let seed = if len raw == 18 { raw }
-               else { str.slice 0 18 (crypto.sha256 (to_string (os.now! ()) + ":" + to_string (os.pid! ())
-                                                + ":" + to_string (os.monotonic! ()))) };
-    bytes.base64_encode seed
 };
 
 /// After the login: the server's parameters and the key to cancel with, up to

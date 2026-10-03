@@ -26,6 +26,14 @@
 // | 8    | list    | four bytes of count, then that many values     |
 // | 9    | array   | the same, and a different tag: see below       |
 // | 10   | map     | four bytes of count, then key, value, key, ... |
+// | 11   | integer | four bytes of length, then that many bytes of  |
+// |      |         | two's complement, little-endian                |
+//
+// **An integer is one of two tags.** Eight bytes hold every integer most
+// programs meet, and every one this format carried before Dream had bignums,
+// so tag 3 is still the integer, now with the whole of the 64-bit range. An
+// integer past it is tag 11, as wide as its two's complement needs and no
+// wider. The writer chooses by the value, so equal integers are equal bytes.
 //
 // **A list and an array are two tags.** They are one type in JSON and two here
 // because they are two types in the language: `type_of` tells them apart, and a
@@ -42,7 +50,7 @@
 // **Nothing here raises.** A message arrives from somewhere else, so every way
 // it can be wrong is an ordinary answer: `decode` reports `[:error, reason]` for
 // a truncated message, a tag that is not a tag, trailing bytes, an integer
-// outside what a Dream integer holds, and a name this program has no atom for.
+// and a name this program has no atom for.
 // The last of those is the one worth understanding, and it is under `read_atom`.
 derive std.codec;
 
@@ -79,6 +87,8 @@ let tag_array : :integer;
 let tag_array  = 9;
 let tag_map : :integer;
 let tag_map    = 10;
+let tag_bigint : :integer;
+let tag_bigint = 11;
 
 /// The bytes a count or a length takes. Four, so a string or a collection stops
 /// at 4 GiB -- the ceiling an image already has.
@@ -110,11 +120,25 @@ let write_unit u = byte tag_unit;
 let write_bool : :bool -> :string;
 let write_bool b = byte (if b { tag_true } else { tag_false });
 
+/// The largest integer eight bytes of two's complement hold, 2^63 - 1.
+priv let i64_max : :integer;
+priv let i64_max = 9223372036854775807;
+
 /// Eight bytes, two's complement, which is what `_str_le` writes for a negative
-/// number. A Dream integer is sixty-three bits, so the eighth byte is sign and
-/// the reader checks it -- see `read_int`.
+/// number; and past what eight bytes hold, tag 11 with as many as it takes.
 let write_int : :integer -> :string;
-let write_int n = tagged tag_int (_str_le n 8);
+let write_int n =
+    if n <= i64_max && n >= 0 - i64_max - 1 { tagged tag_int (_str_le n 8) }
+    else {
+        let w = big_width n 9 ((i64_max + 1) * 256);
+        _str_concat [byte tag_bigint, count w, _str_le n w]
+    };
+
+/// The fewest bytes, from `w`, whose two's complement holds `n`: `half` is
+/// 2^(8w - 1), the first magnitude `w` bytes cannot hold.
+priv let big_width : :integer -> :integer -> :integer -> :integer;
+priv let rec big_width n !w !half =
+    if n < half && n >= 0 - half { w } else { big_width n (w + 1) (half * 256) };
 
 let write_float : :float -> :string;
 let write_float x = tagged tag_float (_float_bytes x);
@@ -189,31 +213,25 @@ priv let le : :string -> :integer -> :integer -> :integer;
 priv let le buf at n = le_from buf at n 0;
 
 /// The same eight bytes `write_int` wrote, back as an integer.
-///
-/// A Dream integer is sixty-three bits and these are sixty-four, so a third of
-/// the range they can spell has no answer here. The top byte says which case
-/// this is before anything is assembled, which is the point: assembling first
-/// and checking after would overflow into a float on the way, and a decoder
-/// that answered a float for an integer field would be worse than one that
-/// refused.
-///
-/// A positive fixnum stops at `2^62 - 1`, so its top byte is under `0x40`; a
-/// negative one stops at `-2^62`, whose two's complement top byte is `0xC0`.
-/// Between those is a number this runtime cannot hold.
 priv let read_int : :string -> :integer -> :any;
-priv let read_int buf at =
-    if not (has buf at 8) { () }
+priv let read_int buf at = if not (has buf at 8) { () } else { [twos buf at 8, at + 8] };
+
+/// Tag 11: a length, then that many bytes of two's complement.
+priv let read_bigint : :string -> :integer -> :any;
+priv let read_bigint buf at =
+    if not (has buf at width) { () }
     else {
-        match _str_byte buf (at + 7) {
-            top if top < 64 => [le buf at 8, at + 8],
-            // The magnitude of the complement, then negated. `0 - m - 1` rather
-            // than `0 - (m + 1)` because at the very bottom of the range `m + 1`
-            // is one past the largest fixnum and would become a float, where
-            // both steps of this stay inside it.
-            top if top >= 192 => [(0 - complement buf at 8 0) - 1, at + 8],
-            _ => (),
-        }
+        let n = le buf at width;
+        if not (has buf (at + width) n) { () } else { [twos buf (at + width) n, at + width + n] }
     };
+
+/// `n` bytes of two's complement at `at`. The top bit is the sign; a negative
+/// number is the magnitude of its complement, plus one, negated.
+priv let twos : :string -> :integer -> :integer -> :integer;
+priv let twos buf at n =
+    if n == 0 { 0 }
+    else if _str_byte buf (at + n - 1) < 128 { le buf at n }
+    else { (0 - complement buf at n 0) - 1 };
 
 /// The magnitude of the two's complement at `at`: every byte inverted,
 /// assembled the same way, which is one less than the value's absolute value.
@@ -316,6 +334,7 @@ priv let rec read buf at = match _str_byte buf at {
               [xs, next]  => [_array_of_list xs, next],
           },
     10 => read_map buf (at + 1),
+    11 => read_bigint buf (at + 1),
     _  => (),
 };
 
@@ -406,13 +425,21 @@ when test {
         test.case "a map value keeps its kind"
             $( test.eq! :atom (type_of (map.get () (result.or_else %{} (decode (encode %{ "k" => :v }))) "k")) ),
 
-        // the edges of an integer
-        test.case "the largest integer"  $( test.true! (trip 4611686018427387903) ),
-        // Written as one less than the largest rather than as itself: a
-        // literal at or past 2^62 is not a fixnum and the compiler cannot
-        // read one, so -2^62 has to be reached by arithmetic.
-        test.case "the smallest integer"
-            $( test.true! (trip (0 - 4611686018427387903 - 1)) ),
+        // the edges of an integer, and past them
+        test.case "the largest fixnum"   $( test.true! (trip 4611686018427387903) ),
+        test.case "the smallest fixnum"  $( test.true! (trip (-4611686018427387904)) ),
+        test.case "past a fixnum, inside eight bytes"
+            $( test.true! (list.all trip [4611686018427387904, 9223372036854775807,
+                                          -9223372036854775808]) ),
+        // A tag and eight bytes; then a tag, a length and nine.
+        test.case "eight bytes, and no more, up to 2^63"
+            $( test.eq! [9, 9, 14, 14]
+                        (list.map (fn n -> len (encode n))
+                                  [9223372036854775807, -9223372036854775808,
+                                   9223372036854775808, -9223372036854775809]) ),
+        test.case "a bignum"
+            $( test.true! (list.all trip [123456789012345678901234567890123456789,
+                                          -340282366920938463463374607431768211456]) ),
         test.case "a byte boundary"      $( test.true! (trip 256) ),
         test.case "a word boundary"      $( test.true! (trip 4294967296) ),
         test.case "minus one"            $( test.true! (trip (0 - 1)) ),
@@ -433,10 +460,8 @@ when test {
             $( test.true! (result.is_error (decode (_str_slice (encode [1, 2]) 0 7))) ),
         test.case "trailing bytes"
             $( test.true! (result.is_error (decode (encode 1 + encode 2))) ),
-        test.case "an integer too large for this runtime"
-            $( test.true! (result.is_error
-                   (decode (_str_concat [_str_of_bytes [3], _str_le 0 4,
-                                             _str_of_bytes [0, 0, 0, 128]]))) ),
+        test.case "a truncated bignum"
+            $( test.true! (result.is_error (decode (_str_slice (encode 9223372036854775808) 0 10))) ),
         test.case "a name this program has no atom for"
             $( test.true! (result.is_error
                    (decode (_str_concat [_str_of_bytes [6], _str_le 3 4, "zzq"]))) ),
@@ -445,11 +470,15 @@ when test {
         test.case "the VM writes what the walk above writes"
             $( test.eq! [] (list.filter (fn v -> encode v != encode_value v)
                                         [(), true, 0 - 1, 4611686018427387903, 2.5, 'λ', "s", :ok, [1, [2]],
+                                         9223372036854775807, -9223372036854775809, 2 * 9223372036854775808,
+                                         -340282366920938463463374607431768211456,
                                          _array_of_list [1, "x"], %{ :b => 1, :a => [2], "k" => %{ 3 => () } },
                                          %{ 1.5 => :f, 'c' => :c, true => :t }, [], %{}]) ),
         test.case "and reads what the reader above reads"
             $( test.eq! [] (list.filter (fn v -> decode (encode_value v) != decode_by_hand (encode_value v))
-                                        [(), 7, "s", :ok, [1, [2, 3]], _array_of_list [4], %{ "a" => [:b] }, 'z']) ),
+                                        [(), 7, "s", :ok, [1, [2, 3]], _array_of_list [4], %{ "a" => [:b] }, 'z',
+                                         -9223372036854775808, 9223372036854775808,
+                                         -340282366920938463463374607431768211457]) ),
         test.case "and refuses what it refuses"
             $( test.eq! [true, true, true, true]
                         (list.map (fn t -> result.is_error (decode t) && result.is_error (decode_by_hand t))

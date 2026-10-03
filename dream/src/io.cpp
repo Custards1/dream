@@ -20,7 +20,7 @@
 #include "interp.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
-#include "sha256.hpp"
+#include "digest.hpp"
 #include "tls.hpp"
 
 #if defined(__linux__) && !defined(DREAM_PORTABLE_POLLER)

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "bigint.hpp"
 #include "builtins.hpp"
 #include "interp.hpp"
 #include "jit.hpp"
@@ -185,13 +186,20 @@ dream_integer dream_value_integer(dream_value v) {
     v = resolve(v);
     if (is_fixnum(v)) return fixnum_value(v);
     if (is_obj(v, ObjType::Float)) return dream_integer(static_cast<FloatObj*>(as_obj(v))->value);
+    if (bigint::is_big(v)) {
+        // Saturated: a host asking for an int64 of something wider gets the
+        // nearest one it can hold, never a wrapped one of the wrong sign.
+        int64_t n;
+        if (bigint::to_int64(v, &n)) return n;
+        return bigint::compare(v, make_fixnum(0)) < 0 ? INT64_MIN : INT64_MAX;
+    }
     return 0;
 }
 
 dream_float dream_value_float(dream_value v) {
     v = resolve(v);
     if (is_obj(v, ObjType::Float)) return static_cast<FloatObj*>(as_obj(v))->value;
-    if (is_fixnum(v)) return dream_float(fixnum_value(v));
+    if (bigint::is_integer(v)) return dream_float(bigint::to_double(v));
     return 0.0;
 }
 

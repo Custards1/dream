@@ -21,6 +21,14 @@ The interpreter, the collector, the scheduler and the JIT: what was measured, wh
 - A JIT that can allocate -- the plan
 - Spilling compiled frames: measured, and not kept
 
+## [Bignums, and the cryptography beside them](bignums.md)
+
+Unbounded integers at no cost to fixnum code, and why their limbs live outside the heap like a GPU tensor's numbers; `std.crypto` as natives.
+
+- Integers past 63 bits (2026-10-03)
+- The first version was 6x slower on `fib`, and the heap was why
+- `std.crypto` (2026-10-03)
+
 ## [Compiling in parallel](parallel-compile.md)
 
 Spreading a self-compile across processes and cores, and what it does on fewer of them.

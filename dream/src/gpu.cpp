@@ -463,7 +463,8 @@ bool upload(Buffer* dst, int dtype, const double* src, size_t n, std::string* er
     std::lock_guard<std::mutex> g(d->lock);
     cl_int code;
     if (dtype == F32) {
-        std::vector<float> tmp(src, src + n);
+        std::vector<float> tmp(n);
+        for (size_t i = 0; i < n; ++i) tmp[i] = float(src[i]);
         code = d->cl.EnqueueWriteBuffer(d->queue, dst->mem, CL_TRUE, 0, n * sizeof(float),
                                         tmp.data(), 0, nullptr, nullptr);
     } else {

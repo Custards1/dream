@@ -183,7 +183,9 @@ set(DREAM_SOURCES
   src/builtins.cpp
   src/ffi.cpp
   src/io.cpp
-  src/sha256.cpp
+  src/digest.cpp
+  src/crypto.cpp
+  src/bigint.cpp
   src/os.cpp
   src/scheduler.cpp
   src/runtime.cpp
@@ -254,7 +256,7 @@ else()
 endif()
 if(WIN32)
   target_compile_definitions(dream PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
-  target_link_libraries(dream PRIVATE ws2_32 secur32 crypt32 ncrypt)
+  target_link_libraries(dream PRIVATE ws2_32 secur32 crypt32 ncrypt bcrypt)
 else()
   target_link_libraries(dream PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()

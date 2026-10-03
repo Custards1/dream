@@ -111,6 +111,7 @@ enum class ObjType : uint8_t {
     Pid,
     Native,    // a host function registered through the C API
     Tensor,    // packed numbers with a shape; see TensorObj
+    BigInt,    // an integer too large for a fixnum; see BigIntObj
     Count
 };
 
@@ -305,6 +306,51 @@ struct ErrorObj : Obj {
 
 struct PidObj : Obj {
     uint64_t id;
+};
+
+/// An integer outside the fixnum range: a sign and a magnitude in 64-bit
+/// limbs, least significant first.
+///
+/// It is the slow half of `:integer` and nothing else -- `type_of` says
+/// `:integer`, and arithmetic reaches it only where a fixnum operation has
+/// already overflowed, which is the path that used to answer a float. So a
+/// program that never leaves 63 bits never meets one, and every fixnum fast
+/// path, in the interpreter and in compiled code, is exactly what it was.
+///
+/// **Canonical, always.** A `BigIntObj` never holds a value a fixnum could:
+/// every operation that makes one trims its top limbs and answers a fixnum when
+/// the result fits (`bigint::finish`). That is what lets equality, hashing and
+/// `match` treat the two representations as disjoint -- a fixnum is never
+/// equal to a bignum -- rather than comparing across them at every test.
+///
+/// `len` may be less than the allocation holds: an operation allocates for the
+/// largest result it could have and trims, and the collector reads the size
+/// from the header, not from here.
+///
+/// **Where the limbs are.** Inline, after these fields, while the whole object
+/// fits the heap's largest size class; past that, in memory of their own, the
+/// way a GPU tensor's numbers are (`Heap::alloc_bigint`). A heap object that
+/// large would be a *big object* -- tenured at birth, a block to itself, and
+/// freed only by a major collection -- and a loop of bignums makes one per
+/// step, nearly all dead by the next. Held outside, the object is a small
+/// young header like any other, and the first minor collection that finds it
+/// unreached frees its limbs (`reap_external`), as it frees everything else
+/// the loop made. `limbs()` is the one place that knows which.
+struct BigIntObj : Obj {
+    uint32_t len;      // limbs in use; the top one is nonzero
+    uint8_t neg;       // 1 when negative
+    uint8_t external;  // 1 when the limbs live outside the heap
+    uint16_t pad;
+    uint64_t* limbs() {
+        return external ? external_limbs() : reinterpret_cast<uint64_t*>(this + 1);
+    }
+    const uint64_t* limbs() const {
+        return external ? *reinterpret_cast<uint64_t* const*>(this + 1)
+                        : reinterpret_cast<const uint64_t*>(this + 1);
+    }
+    // An external bignum's payload: the pointer, then how many limbs it holds.
+    uint64_t*& external_limbs() { return *reinterpret_cast<uint64_t**>(this + 1); }
+    uint64_t& external_capacity() { return reinterpret_cast<uint64_t*>(this + 1)[1]; }
 };
 
 /// A host function: a builtin, a module member, or something registered
