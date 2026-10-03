@@ -147,7 +147,32 @@ constexpr size_t VW = 4;
 #else
 constexpr size_t VW = 2;
 #endif
+#if defined(__GNUC__) || defined(__clang__)
 typedef double vec __attribute__((vector_size(VW * sizeof(double)), aligned(8)));
+#else
+// MSVC has no vector extension. A struct of the same doubles with the four
+// operations `micro` uses gives the same layout -- the tile is copied out with
+// `memcpy` -- and leaves vectorizing to the optimizer.
+struct vec {
+    double x[VW];
+};
+inline vec operator+(vec a, double s) {
+    for (size_t i = 0; i < VW; ++i) a.x[i] += s;
+    return a;
+}
+inline vec operator+(vec a, vec b) {
+    for (size_t i = 0; i < VW; ++i) a.x[i] += b.x[i];
+    return a;
+}
+inline vec operator*(vec a, vec b) {
+    for (size_t i = 0; i < VW; ++i) a.x[i] *= b.x[i];
+    return a;
+}
+inline vec& operator+=(vec& a, vec b) {
+    for (size_t i = 0; i < VW; ++i) a.x[i] += b.x[i];
+    return a;
+}
+#endif
 
 constexpr Z MR = 6, NR = 8, NV = NR / VW, KC = 256, MC = 96, NC = 2048;
 

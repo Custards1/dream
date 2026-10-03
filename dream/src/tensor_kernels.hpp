@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 #include <cstdint>
 
 namespace dream {
@@ -101,6 +102,10 @@ namespace kernels_avx2 { extern const TensorKernels kernels; }
 
 /// The fastest table this CPU can run, chosen on the first call.
 const TensorKernels& tensor_kernels();
+/// Every table this CPU can run, baseline first: what the VM's own tests run
+/// each kernel through. A function rather than the tables themselves because a
+/// Windows DLL exports functions by default and data only when told to.
+std::vector<const TensorKernels*> tensor_kernel_tables();
 /// Its name, for `tensor.backend`: "avx2" or "baseline".
 const char* tensor_kernels_name();
 

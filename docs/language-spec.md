@@ -1854,6 +1854,15 @@ Every VM provides it: a VM built without libffi is not a valid VM, and the
 build refuses to make one. [ffi.md](ffi.md) is the guide, and
 [builtins.md](builtins.md#stdffi) the reference.
 
+### `std.tls`
+
+TLS on a socket, upgraded in place: `tls.connect! sock %{ :host => name }`
+and `tls.accept! sock %{ :identity => p12 }` answer the same handle, and
+`io.read!`, `io.write!` and `io.close!` on it then carry plaintext. Every VM
+provides it, through OpenSSL on Linux and macOS and SChannel on Windows, and
+the same program behaves the same on each. [builtins.md](builtins.md#stdtls)
+is the reference.
+
 ### `mind/std` — the Dream-level library
 
 Anything that can be written in Dream is written in Dream.

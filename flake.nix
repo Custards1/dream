@@ -81,6 +81,9 @@
             ''
               export DREAM=${pkgs.dream-vm}/bin/dream
               export MINDV2_PATH=${pkgs.dreams}/lib/dream:${pkgs.dream-stdlib}/lib/dream/packages
+              # So std.sql.sqlite's tests run against a real database rather
+              # than skipping.
+              export LD_LIBRARY_PATH=${pkgs.sqlite.out}/lib
               $DREAM ${pkgs.dreams}/lib/dream/dreams.dream \
                 ${pkgs.dream-stdlib}/lib/dream/packages/std/all.dr --test \
                 -L ${pkgs.dream-stdlib}/lib/dream/packages -o tests.dream
@@ -102,6 +105,9 @@
 
           shellHook = ''
             echo "dream: just --list, or ./build.sh"
+            # std.sql.sqlite opens libsqlite3 the way the platform's loader
+            # finds one, and on Nix that is only by being told where it is.
+            export LD_LIBRARY_PATH="${pkgs.sqlite.out}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           '';
         };
       });

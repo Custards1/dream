@@ -1,0 +1,165 @@
+// A bounded pool for any SQL driver. Each worker opens and owns its own
+// connection, so native handles never cross process ownership boundaries.
+//
+//     let p = pool.start! (fn () -> sqlite.open! "app.db") 4;
+//     pool.with! p (fn c -> sql.transaction! c update!);
+//     pool.stop! p
+//
+// Callbacks run in the connection's worker, and their results are forced
+// there. Do not return connection/statement handles, depend on the caller's
+// mailbox, or recursively borrow the same saturated pool. Calls wait FIFO;
+// there is no acquisition timeout in std.server. Stop after all producers
+// have stopped submitting work. Shutdown completes active work, rejects
+// queued work, and closes every worker's connection.
+import std.error;
+import std.list;
+import std.server;
+import std.sql;
+
+mod worker {
+    derive std.server;
+    import std.sql;
+    import std.server;
+
+    mapping State { opener, owner, connection = () }
+    let init! : :any -> :any;
+    let init! state = state;
+
+    let close_quietly! : :any -> :unit;
+    let close_quietly! conn = if conn == () { () } else { try! { sql.close! conn } catch ignored { () } };
+
+    let handle_cast! : :any -> :any -> :any;
+    let handle_cast! request state = match request {
+        [:work, work!, from] => {
+            let opened = try! {
+                let conn = match State.connection state {
+                    () => { let open! = State.opener state; open! () },
+                    conn => conn,
+                };
+                strict! conn
+                if not (sql.supports conn :reset) {
+                    close_quietly! conn
+                    sql.fail! "a pooled driver must support session reset" :unsupported ""
+                } else { () }
+                [:ok, conn]
+            } catch e { [:error, e] };
+            let [answer, next] = match opened {
+                [:error, e] => [[:error, e], ()],
+                [:ok, conn] => {
+                    let result = try! {
+                        let v = work! conn;
+                        strict! v
+                        [:ok, v]
+                    } catch e { [:error, e] };
+                    let reset = try! { sql.reset! conn; [:ok] } catch e { [:error, e] };
+                    match reset {
+                        [:ok] => [result, conn],
+                        [:error, e] => {
+                            close_quietly! conn
+                            [match result { [:error, original] => [:error, original], _ => [:error, e] }, ()]
+                        },
+                    }
+                },
+            };
+            strict! answer
+            reply_to! from answer
+            server.cast! (State.owner state) [:idle, self! ()]
+            noreply (State.set_connection state next)
+        },
+        _ => noreply state,
+    };
+
+    let terminate! : :any -> :any -> :any;
+    let terminate! reason state = close_quietly! (State.connection state);
+}
+
+mod keeper {
+    derive std.server;
+    import std.sql.pool.worker;
+    import std.sql;
+    import std.error;
+    import std.list;
+
+    mapping State { opener, size : :integer, workers : [:any] = [], idle : [:any] = [], waiting : [:any] = [] }
+    let init! : :any -> :any;
+    let init! state = state;
+
+    let handle_call! : :any -> :any -> :any -> :any;
+    let handle_call! request from state = match request {
+        [:work, work!] => match State.idle state {
+            [w, ..rest] => {
+                worker.cast! w [:work, work!, from]
+                noreply (State.set_idle state rest)
+            },
+            [] if len (State.workers state) < State.size state => {
+                let owner = self! ();
+                strict! owner
+                let w = worker.start! (worker.State.new (State.opener state) owner);
+                worker.cast! w [:work, work!, from]
+                noreply (State.set_workers state (list.cons w (State.workers state)))
+            },
+            [] => noreply (State.set_waiting state (State.waiting state + [[work!, from]])),
+        },
+        :stats => reply %{ :size => State.size state, :workers => len (State.workers state),
+            :idle => len (State.idle state), :busy => len (State.workers state) - len (State.idle state),
+            :waiting => len (State.waiting state) } state,
+        :drain => {
+            let idle = State.idle state;
+            strict! (list.map worker.stop! idle)
+            reply (len idle) (State.set_idle (State.set_workers state
+                (list.filter (fn w -> not (list.contains w idle)) (State.workers state))) [] )
+        },
+        _ => reply [:error, :unknown_request] state,
+    };
+
+    let handle_cast! : :any -> :any -> :any;
+    let handle_cast! message state = match message {
+        [:idle, w] => match State.waiting state {
+            [[work!, from], ..rest] => {
+                worker.cast! w [:work, work!, from]
+                noreply (State.set_waiting state rest)
+            },
+            [] => noreply (State.set_idle state (list.cons w (State.idle state))),
+        },
+        _ => noreply state,
+    };
+
+    let terminate! : :any -> :any -> :any;
+    let terminate! reason state = {
+        let failure = error.new :sql_error %{ :code => :pool_closed, :message => "the pool is stopping", :sql => "" };
+        strict! failure
+        strict! (list.map (fn [work!, from] -> reply_to! from [:error, failure]) (State.waiting state))
+        strict! (list.map worker.stop! (State.workers state))
+    };
+}
+
+/// The factory runs once per worker connection, in its owning process.
+let start! : (:unit -> sql.Connection) -> :integer -> :process;
+let start! open! size = {
+    if size < 1 { sql.fail! "pool size must be positive" :parameters "" } else { () }
+    keeper.start! (keeper.State.new open! size)
+};
+
+let with! : :process -> (sql.Connection -> a) -> a;
+let with! pool work! = match keeper.call! pool [:work, work!] {
+    [:ok, result] => result,
+    [:error, e] => raise! e,
+};
+
+let stats! : :process -> :map;
+let stats! pool = keeper.call! pool :stats;
+let drain! : :process -> :integer;
+let drain! pool = keeper.call! pool :drain;
+let stop! : :process -> :unit;
+let stop! pool = { keeper.stop! pool; () };
+
+let run! : :process -> sql.Runnable -> sql.Outcome;
+let run! pool query = with! pool (fn c -> sql.run! c query);
+let query! : :process -> sql.Runnable -> [sql.Row];
+let query! pool query = with! pool (fn c -> sql.query! c query);
+let exec! : :process -> sql.Runnable -> :map;
+let exec! pool query = with! pool (fn c -> sql.exec! c query);
+let scalar! : :process -> sql.Runnable -> :any;
+let scalar! pool query = with! pool (fn c -> sql.scalar! c query);
+let transaction! : :process -> (sql.Connection -> a) -> a;
+let transaction! pool work! = with! pool (fn c -> sql.transaction! c work!);

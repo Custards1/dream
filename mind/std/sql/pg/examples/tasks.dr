@@ -1,0 +1,74 @@
+// A small task list against PostgreSQL: the library as a program would use it.
+//
+//     dreams mind/std/sql/pg/examples/tasks.dr -L mind -L . -o tasks.dream
+//     DATABASE_URL=postgres://me@localhost/app dream tasks.dream
+//
+// Configured from the environment, the way `psql` is: `DATABASE_URL`, or the
+// `PG*` variables.
+
+import std.console;
+import std.list;
+import std.sql.pg.config;
+import std.sql.pg.db;
+import std.sql.pg.errors;
+import std.sql.pg.sql;
+
+/// A row of `task`, as a record. Its fields are the table's columns, so a row
+/// read back is one of these as it stands, and one made here inserts as it is.
+mapping Task {
+    id : :integer | :unit = ()
+    title : :string
+    done : :bool = false
+    tags : [:string] = []
+    describe self = (if done self { "[x] " } else { "[ ] " }) + title self
+}
+
+let schema! : :any -> :any;
+let schema! conn = db.script! conn (expand sql.script "
+    CREATE TEMP TABLE task (
+        id    serial PRIMARY KEY,
+        title text NOT NULL UNIQUE,
+        done  boolean NOT NULL DEFAULT false,
+        tags  text[] NOT NULL DEFAULT '{}'
+    );
+");
+
+/// A new task, or `()` when there is one by that title already. The unique
+/// violation is a condition to branch on, not a string to search.
+let add! : :string -> [:string] -> :any -> :any;
+let add! title tags conn = try! {
+    db.one! conn (sql.returning [:id] (sql.insert "task" (Task.new title).[:tags => tags]))
+} catch e {
+    if errors.is :unique_violation e { () } else { raise! e }
+};
+
+let finish! : :string -> :any -> :integer;
+let finish! title conn = db.exec! conn (expand sql.query "UPDATE task SET done = true WHERE title = {title}");
+
+/// Tasks carrying `tag`, checked against `Task` as they arrive.
+let tagged! : :string -> :any -> [:map];
+let tagged! tag conn = db.query_as! Task.type conn
+    (expand sql.query "SELECT * FROM task WHERE {tag} = ANY(tags) ORDER BY id");
+
+/// Several changes that stand or fall together.
+let triage! : :any -> :integer;
+let triage! conn = {
+    add! "write the release notes" ["docs"] conn
+    finish! "fix the flaky test" conn
+};
+
+let main! = {
+    let target = config.from_env! ();
+    let conn = db.connect! target;
+    schema! conn
+    add! "fix the flaky test" ["ci", "urgent"] conn
+    add! "review the pool change" ["review"] conn
+    console.print! (to_string (add! "fix the flaky test" [] conn))       // () -- already there
+    db.transaction! conn triage!
+
+    let open = db.scalar! conn "SELECT count(*) FROM task WHERE NOT done";
+    console.print! ("open: " + to_string open)
+    strict! (list.map (fn t -> console.print! (Task.describe t)) (db.rows! conn "SELECT * FROM task ORDER BY id"))
+    console.print! (to_string (list.map Task.title (tagged! "urgent" conn)))
+    db.close! conn
+};

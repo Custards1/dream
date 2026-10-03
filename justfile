@@ -209,7 +209,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples
+test: test-vm test-e2e test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
 
 # The same suites as `test`, run at once by `mind test`: the repository is a
 # workspace, and each suite is a check. See "Testing" in CLAUDE.md.
@@ -324,6 +324,20 @@ test-bootstrap: bootstrap-check
 test-std: build
     ./{{dreams}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
     ./{{dream}} /tmp/dream-std-tests.dream
+
+# std.tls: a server and its clients in one VM, and the VM against OpenSSL's
+# own client and server in both directions.
+test-tls: build
+    dream={{dream}} dreams={{image}} dream/tests/tls/run.sh
+
+# The PostgreSQL client: its units, the SQL the compiler must refuse, and the
+# whole library against a throwaway cluster -- which skips itself where there
+# is no PostgreSQL to make one with.
+test-pg: build
+    ./{{dreams}} mind/std/sql/pg/all.dr --test -L mind -L . -o /tmp/dream-pg-tests.dream
+    ./{{dream}} /tmp/dream-pg-tests.dream
+    dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/contracts.sh
+    dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/live.sh
 
 # Malformed images must be rejected, never crashed on.
 fuzz ITERATIONS="400": build

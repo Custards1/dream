@@ -21,6 +21,7 @@
 #include "process.hpp"
 #include "scheduler.hpp"
 #include "sha256.hpp"
+#include "tls.hpp"
 
 #if defined(__linux__) && !defined(DREAM_PORTABLE_POLLER)
 #define DREAM_HAVE_EPOLL 1
@@ -100,6 +101,36 @@ bool is_string(Value v) { return is_obj(resolve(v), ObjType::Str); }
 
 void forget_waiter(int fd);
 
+/// A connection that speaks TLS: the engine, and what io.cpp keeps on its
+/// behalf between calls. See tls.hpp for why the engine never sees the socket.
+///
+/// It is held by a `shared_ptr` from the handle, so an operation that has
+/// resolved a handle keeps its session alive even if another process closes
+/// the handle meanwhile -- the same reason `busy` exists for the descriptor.
+struct TlsSession {
+    /// Held around every use of the engine, which is not thread-safe: two
+    /// processes on two workers may hold one handle. Never held across a park.
+    std::mutex mutex;
+    std::unique_ptr<tls::Engine> engine;
+    enum class State { Handshaking, Ready, Failed } state = State::Handshaking;
+    /// Whether `connect!`/`accept!` has answered for a handshake that has
+    /// finished. A handshake that finishes with records still to send parks
+    /// on the socket, and the call is made again when it can be written: this
+    /// is how that second call knows it is the same one, not a second
+    /// handshake asked of a connection that already has one.
+    bool announced = false;
+    /// The network has ended; `feed_eof` has been said.
+    bool eof = false;
+    /// Ciphertext the engine has produced and the socket has not yet taken.
+    std::string out;
+    /// A `write!` whose records did not all fit in the socket is parked until
+    /// they do, and its retry answers `accepted`: the plaintext it handed over
+    /// was taken in full the first time and must not be encrypted twice.
+    uint64_t writer = 0;
+    size_t accepted = 0;
+    tls::Failure failure;
+};
+
 struct Handle {
     int fd = -1;
     HandleKind kind = HandleKind::File;
@@ -119,6 +150,9 @@ struct Handle {
     /// out by the next `open`. Instead `close!` marks the handle closed and
     /// the last operation to finish does the closing.
     int busy = 0;
+    /// Set by `tls.connect!` or `tls.accept!`, after which reads and writes
+    /// go through it.
+    std::shared_ptr<TlsSession> tls;
 };
 
 constexpr uint64_t HANDLE_INDEX_BITS = 32;
@@ -145,6 +179,7 @@ public:
         h.open = true;
         h.connecting = false;
         h.owned = owned;
+        h.tls.reset();
         ++h.generation;
         return int64_t((uint64_t(h.generation) << HANDLE_INDEX_BITS) | uint64_t(i));
     }
@@ -166,13 +201,23 @@ public:
 
     /// Resolve `id` and mark an operation in flight. Returns false when the id
     /// is stale, closed, or was never issued.
-    bool acquire(int64_t id, int* fd, HandleKind* kind) {
+    bool acquire(int64_t id, int* fd, HandleKind* kind, std::shared_ptr<TlsSession>* tls) {
         std::lock_guard<std::mutex> g(mutex_);
         Handle* h = find(id);
         if (!h) return false;
         ++h->busy;
         *fd = h->fd;
         *kind = h->kind;
+        *tls = h->tls;
+        return true;
+    }
+
+    /// Make the handle speak TLS from now on. False when it has closed.
+    bool attach_tls(int64_t id, std::shared_ptr<TlsSession> session) {
+        std::lock_guard<std::mutex> g(mutex_);
+        Handle* h = find(id);
+        if (!h) return false;
+        h->tls = std::move(session);
         return true;
     }
 
@@ -227,6 +272,7 @@ public:
         for (Handle& h : slots_) {
             if (h.open && h.owned && h.fd >= 0) sys::close(h.fd);
             h.open = false;
+            h.tls.reset();
         }
     }
 
@@ -249,9 +295,12 @@ public:
         Value h = resolve(v);
         if (!is_fixnum(h)) return false;
         id_ = fixnum_value(h);
-        ok_ = HandleTable::get().acquire(id_, &fd_, &kind_);
+        ok_ = HandleTable::get().acquire(id_, &fd_, &kind_, &tls_);
         return ok_;
     }
+
+    /// The handle's TLS session, or null for one that speaks plain bytes.
+    const std::shared_ptr<TlsSession>& tls() const { return tls_; }
 
     int fd() const { return fd_; }
     HandleKind kind() const { return kind_; }
@@ -265,6 +314,7 @@ private:
     int fd_ = -1;
     HandleKind kind_ = HandleKind::File;
     bool ok_ = false;
+    std::shared_ptr<TlsSession> tls_;
 };
 
 
@@ -336,25 +386,44 @@ public:
 
     /// Wait for `fd` to become readable (or writable) on behalf of `pid`.
     ///
+    /// A descriptor has waiters in each direction, because a socket is
+    /// full-duplex -- one process may be parked reading it while another is
+    /// parked writing to it, and each must be woken by its own readiness --
+    /// and several in one direction, because several processes may accept on
+    /// one listener. Readiness wakes everyone waiting in that direction; the
+    /// ones that lose the race for it find the operation would block again
+    /// and arm again. It used to be one waiter per descriptor, and a second
+    /// replaced the first, which was then never woken: a hang that needed two
+    /// processes parked at once, so a large loopback buffer on Linux hid it
+    /// and a small one on macOS did not.
+    ///
     /// Returns false when this build cannot wait, so the caller can fall back
     /// to a blocking call rather than parking a process nothing will wake.
     bool arm(int fd, bool writable, uint64_t pid, Scheduler* sched) {
 #if DREAM_HAVE_EPOLL
         if (epoll_fd_ < 0) return false;
+        uint32_t events;
+        bool added;
         {
             std::lock_guard<std::mutex> g(mutex_);
-            waiters_[fd] = Waiter{pid, sched};
-        }
-        epoll_event ev{};
-        ev.events = uint32_t((writable ? EPOLLOUT : EPOLLIN) | EPOLLONESHOT | EPOLLERR | EPOLLHUP);
-        ev.data.fd = fd;
-        // MOD first: the descriptor is usually already in the set from an
-        // earlier wait, and ADD would fail with EEXIST.
-        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-            if (errno != ENOENT || ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
-                std::lock_guard<std::mutex> g(mutex_);
-                waiters_.erase(fd);
-                return false;
+            auto [it, fresh] = waiters_.try_emplace(fd);
+            added = fresh;
+            std::vector<Waiter>& side = writable ? it->second.writers : it->second.readers;
+            side.push_back(Waiter{pid, sched});
+            events = interest(it->second);
+            // Made under the lock, so that two processes arming one descriptor
+            // in opposite directions cannot leave it registered for only one.
+            epoll_event ev{};
+            ev.events = events;
+            ev.data.fd = fd;
+            // MOD first: the descriptor is usually already in the set from an
+            // earlier wait, and ADD would fail with EEXIST.
+            if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
+                if (errno != ENOENT || ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+                    side.pop_back();
+                    if (added) waiters_.erase(it);
+                    return false;
+                }
             }
         }
         sched->note_io_wait(true);
@@ -362,68 +431,74 @@ public:
         return true;
 #else
         std::lock_guard<std::mutex> g(mutex_);
-        if (!running_ || waiters_.count(fd)) return false;
+        if (!running_) return false;
         sched->note_io_wait(true);
-        waiters_[fd] = Waiter{pid, sched, writable};
+        (writable ? waiters_[fd].writers : waiters_[fd].readers).push_back(Waiter{pid, sched});
         changed_.notify_all();
         return true;
 #endif
     }
 
-    /// The process parked on `fd`, or 0 if none is.
+    /// A process parked on `fd`, or 0 if none is.
     uint64_t waiter_of(int fd) {
         std::lock_guard<std::mutex> g(mutex_);
         auto it = waiters_.find(fd);
-        return it == waiters_.end() ? 0 : it->second.pid;
+        if (it == waiters_.end()) return 0;
+        if (!it->second.readers.empty()) return it->second.readers.front().pid;
+        return it->second.writers.empty() ? 0 : it->second.writers.front().pid;
     }
 
     /// Stop watching `fd`, because it is being closed.
     void forget(int fd) {
-#if DREAM_HAVE_EPOLL
-        if (epoll_fd_ < 0) return;
-        Waiter w{};
-        bool had = false;
+        Waiters w{};
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = waiters_.find(fd);
             if (it != waiters_.end()) {
                 w = it->second;
-                had = true;
                 waiters_.erase(it);
             }
+#if DREAM_HAVE_EPOLL
+            if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+#endif
         }
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         // Whoever was waiting must be released, or closing a socket out from
         // under a reader would park that reader for ever. It wakes, retries,
         // and gets the "closed" error the retry produces.
-        if (had && w.sched) {
-            // Wake before releasing the IO-waiter count; see `run_child` in
-            // os.cpp for why the other order invents a deadlock.
-            w.sched->wake(w.pid);
-            w.sched->note_io_wait(false);
-        }
-#else
-        Waiter w{};
-        {
-            std::lock_guard<std::mutex> g(mutex_);
-            auto it = waiters_.find(fd);
-            if (it == waiters_.end()) return;
-            w = it->second;
-            waiters_.erase(it);
-        }
-        w.sched->wake(w.pid);
-        w.sched->note_io_wait(false);
-#endif
+        release(w.readers);
+        release(w.writers);
     }
 
 private:
     struct Waiter {
         uint64_t pid = 0;
         Scheduler* sched = nullptr;
-        bool writable = false;
+    };
+    /// Who is parked on one descriptor, in each direction.
+    struct Waiters {
+        std::vector<Waiter> readers;
+        std::vector<Waiter> writers;
     };
 
+    /// Wake waiters and stop counting them. Wake before releasing the
+    /// IO-waiter count; see `run_child` in os.cpp for why the other order
+    /// invents a deadlock.
+    static void release(const std::vector<Waiter>& ws) {
+        for (const Waiter& w : ws) {
+            w.sched->wake(w.pid);
+            w.sched->note_io_wait(false);
+        }
+    }
+
 #if DREAM_HAVE_EPOLL
+    /// The events to ask for: one-shot, in the directions someone waits in.
+    static uint32_t interest(const Waiters& w) {
+        uint32_t e = EPOLLONESHOT | EPOLLERR | EPOLLHUP;
+        if (!w.readers.empty()) e |= EPOLLIN;
+        if (!w.writers.empty()) e |= EPOLLOUT;
+        return e;
+    }
+
     void loop() {
         std::vector<epoll_event> events(64);
         while (running_.load(std::memory_order_relaxed)) {
@@ -439,20 +514,29 @@ private:
                     [[maybe_unused]] sys::Count r = sys::read(wake_fd_, &drain, sizeof drain);
                     continue;
                 }
-                Waiter w{};
+                uint32_t got = events[i].events;
+                bool failed = (got & (EPOLLERR | EPOLLHUP)) != 0;
+                std::vector<Waiter> readers, writers;
                 {
                     std::lock_guard<std::mutex> g(mutex_);
                     auto it = waiters_.find(fd);
                     if (it == waiters_.end()) continue;
-                    w = it->second;
-                    waiters_.erase(it);
+                    if (failed || (got & EPOLLIN)) readers.swap(it->second.readers);
+                    if (failed || (got & EPOLLOUT)) writers.swap(it->second.writers);
+                    if (it->second.readers.empty() && it->second.writers.empty()) {
+                        waiters_.erase(it);
+                    } else {
+                        // One-shot disarmed the descriptor; whoever is still
+                        // waiting in the other direction needs it armed again.
+                        epoll_event ev{};
+                        ev.events = interest(it->second);
+                        ev.data.fd = fd;
+                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+                    }
                 }
-                if (w.sched) {
-                    IOTRACE("ready fd=%d -> wake pid=%llu", fd, (unsigned long long)w.pid);
-                    // Wake first, then release the count; see `run_child`.
-                    w.sched->wake(w.pid);
-                    w.sched->note_io_wait(false);
-                }
+                IOTRACE("ready fd=%d -> wake %zu readers, %zu writers", fd, readers.size(), writers.size());
+                release(readers);
+                release(writers);
             }
         }
     }
@@ -463,11 +547,17 @@ private:
         std::unique_lock<std::mutex> lock(mutex_);
         while (running_) {
             for (auto it = waiters_.begin(); it != waiters_.end();) {
-                if (!sys::ready(it->first, it->second.writable)) { ++it; continue; }
-                Waiter w = it->second;
-                it = waiters_.erase(it);
-                w.sched->wake(w.pid);
-                w.sched->note_io_wait(false);
+                Waiters& w = it->second;
+                if (!w.readers.empty() && sys::ready(it->first, false)) {
+                    release(w.readers);
+                    w.readers.clear();
+                }
+                if (!w.writers.empty() && sys::ready(it->first, true)) {
+                    release(w.writers);
+                    w.writers.clear();
+                }
+                if (w.readers.empty() && w.writers.empty()) it = waiters_.erase(it);
+                else ++it;
             }
             changed_.wait_for(lock, std::chrono::milliseconds(5));
         }
@@ -479,7 +569,7 @@ private:
     int wake_fd_ = -1;
     std::thread thread_;
     std::mutex mutex_;
-    std::unordered_map<int, Waiter> waiters_;
+    std::unordered_map<int, Waiters> waiters_;
 };
 
 /// Park `p` until `fd` is ready. The caller returns the result unchanged.
@@ -514,6 +604,180 @@ bool set_nonblocking(int fd) {
 }
 
 // ---------------------------------------------------------------------------
+// TLS on a handle
+//
+// The loop every TLS operation runs: write out whatever records the engine has
+// made, ask the engine for what the caller wants, and when it needs more of the
+// network than it has, read some and feed it. Each step that would block parks
+// the process on the socket instead (`wait_for`), and the native is entered
+// again from the top when it can go on -- which is why everything a call has
+// done so far lives in the session and not on the C++ stack. The session's
+// mutex is held for the steps and released by returning, never across a park.
+// ---------------------------------------------------------------------------
+
+enum class Pump { Done, Again, Eof, Failed };
+
+/// Write the session's pending records. `Again` when the socket is full.
+Pump flush_tls(TlsSession& s, int fd, int* err) {
+    while (!s.out.empty()) {
+        sys::Count n = sys::write(fd, s.out.data(), s.out.size());
+        if (n > 0) {
+            s.out.erase(0, size_t(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return Pump::Again;
+        *err = n < 0 ? errno : EPIPE;
+        return Pump::Failed;
+    }
+    return Pump::Done;
+}
+
+/// Read what ciphertext has arrived and feed it to the engine.
+Pump pull_tls(TlsSession& s, int fd, int* err) {
+    char buf[16384];
+    for (;;) {
+        sys::Count n = sys::read(fd, buf, sizeof buf);
+        if (n > 0) {
+            s.engine->feed(buf, size_t(n));
+            return Pump::Done;
+        }
+        if (n == 0) {
+            s.eof = true;
+            s.engine->feed_eof();
+            return Pump::Eof;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return Pump::Again;
+        *err = errno;
+        return Pump::Failed;
+    }
+}
+
+/// Raise what the engine said went wrong, and remember it: a session that has
+/// failed refuses everything after, rather than handing on whatever state the
+/// library was left in.
+///
+/// The peer is told twice over: the alert the engine made, if it made one, and
+/// then the end of this side's stream. A TLS session that has failed sends
+/// nothing more, and a peer that is not told so -- a server whose client
+/// refused its certificate after a handshake the server saw succeed -- waits
+/// for ever on a read. Only the sending half is shut, so whatever the peer
+/// says back can still be read, and the handle stays the program's to close.
+NativeResult tls_failed(Process& p, TlsSession& s, int fd) {
+    s.state = TlsSession::State::Failed;
+    s.failure = s.engine->failure();
+    int ignored = 0;
+    s.out += s.engine->take_output();  // the alert, if there is one
+    flush_tls(s, fd, &ignored);
+    sys::shutdown(fd, SHUT_WR);
+    return fail(p, s.failure.kind.c_str(), s.failure.message);
+}
+
+NativeResult tls_refused(Process& p, TlsSession& s) {
+    if (s.state == TlsSession::State::Handshaking) {
+        return fail(p, "tls_error", "this connection's TLS handshake has not finished");
+    }
+    return fail(p, s.failure.kind.empty() ? "tls_error" : s.failure.kind.c_str(),
+                "TLS on this connection already failed: " + s.failure.message);
+}
+
+/// `read!` on a TLS handle: plaintext, "" at the end of the stream.
+NativeResult tls_read(Process& p, Held& h, size_t want) {
+    TlsSession& s = *h.tls();
+    std::lock_guard<std::mutex> g(s.mutex);
+    if (s.state != TlsSession::State::Ready) return tls_refused(p, s);
+    std::vector<char> buf(want);
+    for (;;) {
+        int err = 0;
+        switch (flush_tls(s, h.fd(), &err)) {
+            case Pump::Again: return wait_for(p, h.fd(), true);
+            case Pump::Failed: return fail_errno(p, "write", err);
+            default: break;
+        }
+        size_t got = 0;
+        tls::Status st = s.engine->read(buf.data(), want, &got);
+        s.out += s.engine->take_output();
+        switch (st) {
+            case tls::Status::Ok:
+                return NativeResult::ok(p.heap().make_string(buf.data(), uint32_t(got)));
+            case tls::Status::Closed:
+                return NativeResult::ok(p.heap().make_string("", 0));
+            case tls::Status::Error:
+                return tls_failed(p, s, h.fd());
+            case tls::Status::WantRead:
+                break;
+        }
+        // An engine that wants more after it was told the network ended has
+        // nothing more coming, and a stream that ended is "".
+        if (s.eof) return NativeResult::ok(p.heap().make_string("", 0));
+        switch (flush_tls(s, h.fd(), &err)) {
+            case Pump::Again: return wait_for(p, h.fd(), true);
+            case Pump::Failed: return fail_errno(p, "write", err);
+            default: break;
+        }
+        switch (pull_tls(s, h.fd(), &err)) {
+            case Pump::Again: return wait_for(p, h.fd(), false);
+            case Pump::Failed: return fail_errno(p, "read", err);
+            default: break;
+        }
+    }
+}
+
+/// `write!` on a TLS handle. Encrypts up to 64 KiB of `data` and answers how
+/// much, once the records it made are all on the wire.
+NativeResult tls_write(Process& p, Held& h, const Bytes& data) {
+    TlsSession& s = *h.tls();
+    std::lock_guard<std::mutex> g(s.mutex);
+    if (s.state != TlsSession::State::Ready) return tls_refused(p, s);
+    int err = 0;
+    if (s.writer == p.id() && s.accepted > 0) {
+        // The retry of a write that parked: its plaintext is already records.
+        switch (flush_tls(s, h.fd(), &err)) {
+            case Pump::Again: return wait_for(p, h.fd(), true);
+            case Pump::Failed: s.writer = 0; s.accepted = 0; return fail_errno(p, "write", err);
+            default: break;
+        }
+        size_t n = s.accepted;
+        s.writer = 0;
+        s.accepted = 0;
+        return NativeResult::ok(make_fixnum(int64_t(n)));
+    }
+    // Records someone else left behind go first, so the stream stays in order.
+    switch (flush_tls(s, h.fd(), &err)) {
+        case Pump::Again: return wait_for(p, h.fd(), true);
+        case Pump::Failed: return fail_errno(p, "write", err);
+        default: break;
+    }
+    size_t take = size_t(std::min<uint64_t>(data.len, 65536));
+    if (s.engine->write(data.data, take) != tls::Status::Ok) return tls_failed(p, s, h.fd());
+    s.out += s.engine->take_output();
+    switch (flush_tls(s, h.fd(), &err)) {
+        case Pump::Again:
+            s.writer = p.id();
+            s.accepted = take;
+            return wait_for(p, h.fd(), true);
+        case Pump::Failed: return fail_errno(p, "write", err);
+        default: break;
+    }
+    return NativeResult::ok(make_fixnum(int64_t(take)));
+}
+
+/// Say goodbye on a TLS handle, as far as the socket will take it without
+/// waiting: a close_notify is a courtesy, and a close that parked for one
+/// would make `close!` something that can hang.
+void tls_goodbye(TlsSession& s, int fd) {
+    std::lock_guard<std::mutex> g(s.mutex);
+    if (s.state != TlsSession::State::Ready) return;
+    s.engine->close();
+    s.out += s.engine->take_output();
+    int ignored = 0;
+    flush_tls(s, fd, &ignored);
+    s.state = TlsSession::State::Failed;
+    s.failure = {"tls_error", "the connection was closed"};
+}
+
+// ---------------------------------------------------------------------------
 // std.io
 // ---------------------------------------------------------------------------
 
@@ -532,6 +796,7 @@ NativeResult io_read(Process& p, Value, Value* args, uint32_t) {
     if (want == 0) return NativeResult::ok(p.heap().make_string("", 0));
     // One call cannot be asked to fill the heap; a reader loops anyway.
     if (want > (1u << 24)) want = 1u << 24;
+    if (h.tls()) return tls_read(p, h, want);
 
     std::vector<char> buf(want);
     for (;;) {
@@ -555,6 +820,7 @@ NativeResult io_write(Process& p, Value, Value* args, uint32_t) {
     Bytes str;
     if (!string_bytes(args[1], &str)) return fail(p, "type_error", "write! needs a string");
     if (str.len == 0) return NativeResult::ok(make_fixnum(0));
+    if (h.tls()) return tls_write(p, h, str);
 
     for (;;) {
         // A big string is written from where it lies in the mapped image, with
@@ -605,6 +871,10 @@ NativeResult io_open(Process& p, Value, Value* args, uint32_t) {
 NativeResult io_close(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_fixnum(v)) return fail(p, "type_error", "close! needs an io handle");
+    {
+        Held held;
+        if (held.open(v) && held.tls()) tls_goodbye(*held.tls(), held.fd());
+    }
     int fd = -1;
     bool close_now = false;
     {
@@ -613,6 +883,7 @@ NativeResult io_close(Process& p, Value, Value* args, uint32_t) {
         if (!h) return fail(p, "io_closed", "this handle is already closed");
         fd = h->fd;
         h->open = false;
+        h->tls.reset();
         // Nobody is mid-syscall on it, so it can go now. Otherwise the last
         // operation to finish closes it -- see `HandleTable::release`.
         if (h->busy == 0 && h->owned && fd >= 0) {
@@ -1147,8 +1418,210 @@ NativeResult net_port(Process& p, Value, Value* args, uint32_t) {
 NativeResult net_shutdown(Process& p, Value, Value* args, uint32_t) {
     Held h;
     if (!h.open(args[0])) return fail(p, "io_closed", "this socket is closed");
+    // Over TLS the end of what this side sends is a close_notify, and only
+    // then the end of the stream.
+    if (h.tls()) tls_goodbye(*h.tls(), h.fd());
     sys::shutdown(h.fd(), SHUT_WR);
     return NativeResult::ok(UNIT);
+}
+
+// ---------------------------------------------------------------------------
+// std.tls
+//
+// A connection becomes TLS in place: `connect!` and `accept!` take a handle
+// that is already a connected stream and answer the same handle, which from
+// then on reads and writes plaintext through the session. In place, rather
+// than a new handle, because the protocols that matter most upgrade a
+// connection they have already spoken on -- PostgreSQL's SSLRequest, SMTP's
+// STARTTLS -- and because every function that takes a handle then takes a TLS
+// one unchanged: `std.streams`, `std.remote`, a program's own reader.
+// ---------------------------------------------------------------------------
+
+/// The value at atom `key` in an options map, forced, or false when absent.
+bool option(Process& p, Value map, const char* key, Value* out) {
+    Value found;
+    if (!map_lookup(p, map, make_atom(p.runtime().intern_atom(key)), &found)) return false;
+    return force_whnf(p, found, out);
+}
+
+/// A string option. False with `*bad` set when it is there and not a string.
+bool string_option(Process& p, Value map, const char* key, std::string* out, bool* bad) {
+    Value v;
+    if (!option(p, map, key, &v) || is_unit(v)) return false;
+    Bytes b;
+    if (!string_bytes(v, &b)) {
+        *bad = true;
+        return false;
+    }
+    out->assign(b.data, size_t(b.len));
+    return true;
+}
+
+/// The options map as a configuration, or a message saying which one is wrong.
+std::string read_config(Process& p, Value options, tls::Config* c) {
+    Value map;
+    if (!force_whnf(p, options, &map)) return "the options could not be evaluated";
+    if (is_unit(map)) return "";
+    if (!is_obj(map, ObjType::Map)) return "the options are a map, such as %{ :host => \"example.com\" }";
+    bool bad = false;
+    string_option(p, map, "host", &c->host, &bad);
+    if (bad) return "`:host` is a string";
+    string_option(p, map, "ca", &c->ca_pem, &bad);
+    if (bad) return "`:ca` is a string of PEM certificates";
+    string_option(p, map, "crl", &c->crl_pem, &bad);
+    if (bad) return "`:crl` is a string of PEM revocation lists";
+    string_option(p, map, "identity", &c->identity_p12, &bad);
+    if (bad) return "`:identity` is a string holding a PKCS#12 bundle";
+    string_option(p, map, "password", &c->identity_password, &bad);
+    if (bad) return "`:password` is a string";
+    Value v;
+    if (option(p, map, "verify", &v)) {
+        if (!is_bool(v)) return "`:verify` is true or false";
+        c->verify = truthy(v);
+    }
+    if (option(p, map, "check_name", &v)) {
+        if (!is_bool(v)) return "`:check_name` is true or false";
+        c->check_name = truthy(v);
+    }
+    if (option(p, map, "alpn", &v)) {
+        Value cur = v;
+        for (;;) {
+            Value cell;
+            if (!force_whnf(p, cur, &cell)) return "`:alpn` could not be evaluated";
+            if (is_nil(cell)) break;
+            if (!is_obj(cell, ObjType::Cons)) return "`:alpn` is a list of protocol names";
+            auto* cons = static_cast<ConsObj*>(as_obj(cell));
+            Value name;
+            Bytes b;
+            if (!force_whnf(p, cons->head, &name) || !string_bytes(name, &b)) {
+                return "`:alpn` is a list of protocol names";
+            }
+            c->alpn.emplace_back(b.data, size_t(b.len));
+            cur = cons->tail;
+        }
+    }
+    return "";
+}
+
+/// The handshake, for either side. Entered again after every park until it
+/// finishes; the session remembers how far it got.
+NativeResult tls_handshake(Process& p, Value* args, bool server) {
+    Held h;
+    if (!h.open(args[0])) return fail(p, "io_closed", "this handle is closed");
+    if (h.kind() != HandleKind::Stream) {
+        return fail(p, "wrong_kind", server ? "tls.accept! needs an accepted connection"
+                                            : "tls.connect! needs a connected socket");
+    }
+    std::shared_ptr<TlsSession> session = h.tls();
+    if (!session) {
+        tls::Config config;
+        config.server = server;
+        config.verify = !server;
+        std::string bad = read_config(p, args[1], &config);
+        if (!bad.empty()) return fail(p, "bad_argument", bad);
+        if (!server && config.verify && config.check_name && config.host.empty()) {
+            return fail(p, "bad_argument",
+                        "a client that verifies needs `:host`, the name the certificate must carry; "
+                        "`:check_name => false` checks the chain alone, and `:verify => false` nothing");
+        }
+        if (server && config.identity_p12.empty()) {
+            return fail(p, "bad_argument", "a server needs `:identity`, a PKCS#12 bundle of its certificate and key");
+        }
+        tls::Failure why;
+        std::unique_ptr<tls::Engine> engine = tls::make_engine(config, &why);
+        if (!engine) return fail(p, why.kind.c_str(), why.message);
+        session = std::make_shared<TlsSession>();
+        session->engine = std::move(engine);
+        if (!HandleTable::get().attach_tls(h.id(), session)) {
+            return fail(p, "io_closed", "this handle is closed");
+        }
+    }
+
+    TlsSession& s = *session;
+    std::lock_guard<std::mutex> g(s.mutex);
+    if (s.state == TlsSession::State::Failed) return tls_refused(p, s);
+    if (s.state == TlsSession::State::Ready && s.announced) {
+        return fail(p, "tls_error", "this connection already speaks TLS");
+    }
+    for (;;) {
+        int err = 0;
+        switch (flush_tls(s, h.fd(), &err)) {
+            case Pump::Again: return wait_for(p, h.fd(), true);
+            case Pump::Failed:
+                s.state = TlsSession::State::Failed;
+                s.failure = {"handshake_failed", std::string("the connection failed: ") + std::strerror(err)};
+                return fail(p, "handshake_failed", s.failure.message);
+            default: break;
+        }
+        if (s.state == TlsSession::State::Ready) {
+            s.announced = true;
+            return NativeResult::ok(make_fixnum(h.id()));
+        }
+        tls::Status st = s.engine->handshake();
+        s.out += s.engine->take_output();
+        switch (st) {
+            case tls::Status::Ok:
+                s.state = TlsSession::State::Ready;
+                continue;
+            case tls::Status::Error:
+                return tls_failed(p, s, h.fd());
+            case tls::Status::Closed:
+                s.state = TlsSession::State::Failed;
+                s.failure = {"handshake_failed", "the peer closed the connection during the handshake"};
+                return fail(p, "handshake_failed", s.failure.message);
+            case tls::Status::WantRead:
+                break;
+        }
+        if (s.eof) {
+            s.state = TlsSession::State::Failed;
+            s.failure = {"handshake_failed", "the peer closed the connection during the handshake"};
+            return fail(p, "handshake_failed", s.failure.message);
+        }
+        switch (flush_tls(s, h.fd(), &err)) {
+            case Pump::Again: return wait_for(p, h.fd(), true);
+            case Pump::Failed: return fail_errno(p, "write", err);
+            default: break;
+        }
+        switch (pull_tls(s, h.fd(), &err)) {
+            case Pump::Again: return wait_for(p, h.fd(), false);
+            case Pump::Failed: return fail_errno(p, "read", err);
+            default: break;
+        }
+    }
+}
+
+NativeResult tls_connect(Process& p, Value, Value* args, uint32_t) { return tls_handshake(p, args, false); }
+NativeResult tls_accept(Process& p, Value, Value* args, uint32_t) { return tls_handshake(p, args, true); }
+
+Value text_or_unit(Process& p, const std::string& s) {
+    return s.empty() ? UNIT : p.heap().make_string(s.data(), uint32_t(s.size()));
+}
+
+/// `%{ :version, :cipher, :alpn, :peer }` for a TLS handle, `()` for a plain one.
+NativeResult tls_info(Process& p, Value, Value* args, uint32_t) {
+    Held h;
+    if (!h.open(args[0])) return fail(p, "io_closed", "this handle is closed");
+    if (!h.tls()) return NativeResult::ok(UNIT);
+    tls::Info info;
+    {
+        std::lock_guard<std::mutex> g(h.tls()->mutex);
+        if (h.tls()->state != TlsSession::State::Ready) return tls_refused(p, *h.tls());
+        info = h.tls()->engine->info();
+    }
+    Value m = p.heap().make_map(4);
+    auto put = [&](const char* key, const std::string& value) {
+        m = map_insert(p, m, make_atom(p.runtime().intern_atom(key)), text_or_unit(p, value));
+    };
+    put("version", info.version);
+    put("cipher", info.cipher);
+    put("alpn", info.alpn);
+    put("peer", info.peer);
+    return NativeResult::ok(m);
+}
+
+NativeResult tls_backend(Process& p, Value, Value*, uint32_t) {
+    std::string name = tls::backend();
+    return NativeResult::ok(p.heap().make_string(name.data(), uint32_t(name.size())));
 }
 
 void forget_waiter(int fd) { Poller::get().forget(fd); }
@@ -1207,6 +1680,16 @@ ModuleDef make_io_module() {
                          {"chmod!", 2, 0b11, io_chmod},
                          {"walk!", 1, 0b1, io_walk},
                          {"async", 1, 0b1, io_async},
+                     }};
+}
+
+ModuleDef make_tls_module() {
+    return ModuleDef{"std.tls",
+                     {
+                         {"connect!", 2, 0b01, tls_connect},
+                         {"accept!", 2, 0b01, tls_accept},
+                         {"info!", 1, 0b1, tls_info},
+                         {"backend", 1, 0b0, tls_backend},
                      }};
 }
 

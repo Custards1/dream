@@ -430,6 +430,53 @@ import std.net;
 
 ---
 
+## `std.tls`
+
+TLS on a socket. A connected stream handle is upgraded **in place**: `connect!` and `accept!` answer the same handle, and from then on `io.read!`, `io.write!`, `io.close!` and `net.shutdown!` on it carry plaintext through the session — so everything written over sockets (`std.streams`, `std.remote`, a program's own reader) works over TLS unchanged. Upgrading a connection that has already spoken plain text is how PostgreSQL's SSLRequest and SMTP's STARTTLS work, and is why there is no separate `dial`.
+
+The library is the platform's and invisible to Dream: OpenSSL 3 on Linux and macOS, SChannel on Windows. The same program behaves the same on each: the options are what every backend can honour, and a failure is one of the kinds below whatever the library called it. Every blocking step — the handshake, a read waiting for a record, a write waiting for the socket — parks the process, not the worker. See `dream/src/tls.hpp` for the design.
+
+```dream
+import std.net;
+import std.tls;
+
+let sock = net.connect! "example.com" 443;
+tls.connect! sock %{ :host => "example.com", :alpn => ["http/1.1"] }
+io.write! sock "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+```
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `connect!` | `socket → options:map → socket` | The client's handshake. Raises the kind of failure below when the server cannot be trusted. |
+| `accept!` | `socket → options:map → socket` | The server's handshake, on a socket from `net.accept!`. |
+| `info!` | `socket → map\|unit` | `%{ :version, :cipher, :alpn, :peer }` for a TLS socket — `:peer` the subject of the other side's certificate, `:alpn` the protocol chosen, either `()` when there is none — and `()` for a plain one. Version and cipher are spelled by the library. |
+| `backend` | `unit → string` | The TLS library this VM was built with, and its version. |
+
+Options, all optional except as noted:
+
+| Key | Meaning |
+|-----|---------|
+| `:host` | The name (or address) the server's certificate must carry, also sent as SNI. **Required** for a client that verifies. |
+| `:verify` | Client: check the server's certificate (default `true`). Server: require a client certificate and check it against `:ca` (default `false`). |
+| `:check_name` | Client: whether checking includes `:host` (default `true`). `false` checks the chain alone — libpq's `verify-ca`. |
+| `:ca` | PEM certificates to trust **instead of** the system's store. Exclusive rather than additional, so a program that names its roots trusts the same thing on every machine. |
+| `:crl` | PEM certificate revocation lists. A certificate one of them lists is refused as `:certificate_revoked`, on either side. |
+| `:identity` | This side's certificate, chain and key, as the bytes of a **PKCS#12** bundle — the one format every backend imports. Required for a server. |
+| `:password` | The PKCS#12 bundle's password. |
+| `:alpn` | Protocol names to offer (client) or accept (server), in preference order. |
+
+TLS 1.2 is the oldest version either side will speak.
+
+**Revocation** is checked from what the handshake already has, never fetched: the lists given as `:crl`, and an OCSP response the server staples (OpenSSL's client asks for one; SChannel consults whatever Windows has cached, a staple included). A certificate one of them says is revoked is refused; a certificate nothing speaks for is accepted, because its status is unknown rather than bad — and because a download in the middle of a handshake would hold a worker for as long as a remote server took.
+
+On Windows SChannel does its cryptography outside the process, so a PKCS#12 identity's key is imported into the user's key store for the life of the VM and deleted when it exits. Each such key is also written down in `%LOCALAPPDATA%\dream\tls-keys`, and a VM that was killed before it could delete its keys has them deleted by the next VM to import an identity.
+
+### Error atoms
+
+`:certificate_untrusted` · `:certificate_expired` · `:certificate_revoked` · `:hostname_mismatch` · `:handshake_failed` · `:tls_config` (an unreadable `:ca`, `:crl` or `:identity`, a wrong password) · `:tls_error` · `:bad_argument` · `:wrong_kind` · `:io_closed`
+
+---
+
 ## `std.os`
 
 Operating system interface: arguments, environment, filesystem traversal, subprocesses.
@@ -1323,6 +1370,82 @@ relying on any of this:
   `proc.serve!`.
 
 ---
+
+### `std.sql`
+
+```dream
+import std.sql;
+import std.sql.sqlite;
+```
+
+SQL for whichever database is on the other end. A statement is built as a
+value and rendered only when the dialect is known: the same query is `$1` and
+`"name"` for Postgres, `?` and `` `name` `` for MySQL. Dialects are maps, so a
+database not listed here is `sql.extend` away. The module's head comment is the
+design.
+
+```dream
+let db = sqlite.open! "notes.db";
+sql.query! db (sql.select ["name", sql.alias (sql.count "id") "n"]
+    |> sql.from "users" |> sql.where (sql.gt "age" 18)
+    |> sql.group_by ["name"] |> sql.order_by [sql.desc "n"] |> sql.limit 10)
+sql.query! db (sql.q "select * from users where id = ? and ?" [7, sql.eq "active" true])
+```
+
+A string means one of three things, depending on where it is written: SQL text
+(`raw`, `concat`, a whole statement), a column (the left of a comparison, a
+select list, `order_by`), or a value (the right of a comparison, a hole in `q`,
+an argument to `call`). A fragment is a fragment in all three places, and a
+query used inside another is a parenthesized subquery.
+
+| Name | Description |
+|------|-------------|
+| `raw` · `param` · `literal` · `ident` · `col` | The pieces: text, a bound value, a value written into the text, a quoted name, a qualified name (`"t.c"`). |
+| `expand sql.query "SELECT .. {name} .."` · `expand sql.fragment` · `expand sql.script` | Templates checked at compile time. `{name}` binds a value, `{..name}` splices SQL. Plain literal statements are checked too; the shared lexer is `std.sql.lint`. |
+| `positional text values` | Turn `$1`-style SQL into a composable fragment, renumbered for the target dialect. |
+| `q text args` | SQL with `?` holes, each filled by a value (as a parameter) or a fragment/query (as SQL). `??` is a literal `?`. |
+| `concat` · `join sep` · `parens` | Put fragments together. |
+| `per_dialect f` | A fragment written differently for each dialect. |
+| `eq` · `ne` · `lt` · `le` · `gt` · `ge` · `like` · `ilike` · `op sym` | Comparisons; `eq c ()` is `IS NULL`. |
+| `in_list` · `not_in` · `in_query` · `between` · `exists` · `is_null` · `is_not_null` | More conditions. An empty `IN` is false. |
+| `all_of` · `any_of` · `negate` | Combine conditions, each parenthesized. |
+| `call` · `count` · `count_all` · `sum` · `avg` · `min` · `max` · `alias` · `asc` · `desc` · `case_when` | Expressions. |
+| `select` · `from` · `join_on` · `left_join` · `right_join` · `full_join` · `cross_join` · `where` · `group_by` · `having` · `order_by` · `limit` · `offset` · `distinct` · `with_cte` · `with_recursive` | Queries, chained with `\|>`. |
+| `union_all` · `union_distinct` · `intersect` · `except` | Compound queries. |
+| `insert_into` · `values` · `values_list` · `values_in` · `insert_select` · `on_conflict_nothing` · `on_conflict_update` · `excluded` · `returning` · `update` · `set` · `delete_from` | Writing. `values` takes a map, and atom keys are allowed, so a record's `to_map` can be inserted as it is. |
+| `create_table` · `column` · `not_null` · `unique` · `primary_key` · `auto_increment` · `default` · `references` · `check` · `primary_key_on` · `unique_on` · `foreign_key` · `check_that` · `drop_table` · `create_index` · `unique_index` · `drop_index` · `add_column` · `if_not_exists` · `if_exists` | Schema. A type is an atom the dialect knows (`:integer`, `:text`, `:bool`, ..), `[:varchar, 80]`, or a string written as given. |
+| `ansi` · `sqlite` · `postgres` · `mysql` · `mssql` · `extend` | Dialects. |
+| `render d x` · `inline d x` | `%{ :text, :params, :problems }` for a dialect, or the text with values written in. |
+| `exec! c x` · `query! c x` · `run! c x` · `first!` · `one!` · `scalar!` · `column!` · `query_as! description` | Run a statement: its effect, rows as maps by column name, the raw outcome, or one piece of it. |
+| `exec_many! c xs` | Many statements; a run of the same text is prepared once. |
+| `script! c text` · `transaction! c f` · `using! c f` · `close! c` · `traced f c` | Scripts, transactions (nested ones are savepoints), scoped connections, and a hook that sees each statement. |
+| `transaction_with! c options f` · `retrying! c attempts options f` · `serializable! c attempts f` | Isolation and read-only options, with bounded retries for serialization failures, deadlocks and lock contention. Retried callbacks may run more than once. |
+| `fold! c x batch f init` · `each! c x batch f` | Stream rows through a fold or effectful callback. SQLite steps natively; PostgreSQL reads portal batches. |
+| `migrate! c migrations` | Apply `[id, name, statements]` migrations the database has not seen, each in its own transaction. |
+| `fail!` · `fail_with!` · `is_sql_error` · `error_code` · `error_field` · `is_retryable` · `is_connection_lost` | A database's refusal: kind `:sql_error`, with a code that is `:unique`, `:foreign_key`, `:not_null`, `:check`, `:constraint`, `:busy`, ... wherever the driver can say so. |
+| `connection d state effects` · `no_rows` | For writing a driver: the effects are `:run`, `:close`, and optionally `:run_many`, `:script` and `:fold`. |
+
+Rows use atom keys for column names already present as atoms in the program,
+and string keys otherwise; `mapping` records can read them directly. In an
+insert, `()` asks for the column default; `sql.null` requests an explicit NULL.
+Other parameter positions still bind `()` as NULL. `sql.blob bytes` distinguishes
+binary data from text. PostgreSQL additionally accepts lists as arrays, maps as
+JSON, and atoms as their names; each dialect validates parameter kinds.
+
+`std.sql.pg.driver` connects PostgreSQL to this API: `driver.open! target` takes a
+`std.sql.pg.config` map, URL or keyword string, and `driver.wrap! conn` adapts an existing
+`std.sql.pg.db` connection. It preserves SQLSTATE as `:state` and the original error as
+`:cause`, returns `bytea` as blobs, streams through portals, and prepares each
+run of equal SQL once for `exec_many!`. Use `RETURNING` for generated keys;
+PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../mind/std/sql/pg/README.md).
+
+`std.sql.sqlite` is the SQLite driver. It binds the system's
+libsqlite3 through `std.foreign`, and the library is found the way the platform's
+loader finds one (on Nix, `nix-shell` puts it on `LD_LIBRARY_PATH`).
+`sqlite.open! path`, `sqlite.memory! ()`, and `sqlite.open_with! path
+%{ :readonly, :busy_timeout, :foreign_keys, :place }`, where `:place` may be a
+`foreign.start!` server to own the database. `sqlite.available! ()` says
+whether the library can be loaded at all.
 
 ### `std.all`
 

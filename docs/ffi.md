@@ -38,6 +38,10 @@ VM however many processes use it. `from` is a path the platform's loader
 understands, `embedded "name"` for a library the image carries (below), or an
 expression in parentheses; without it, the library is the running program,
 which is the C library on any normal system.
+An expression is compiled inside the module the block makes, where only
+`std.ffi` and `std.foreign` are in scope; `foreign.shared_library "sqlite3" "0"`
+is the one to write for a system library, since it is `libsqlite3.so.0`,
+`libsqlite3.0.dylib` or `sqlite3.dll` depending on where it runs.
 
 ## Signatures are types
 

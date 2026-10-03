@@ -59,7 +59,10 @@ let checks ctx =
     |> build.check "std_build" (command.check_in (build.Context.root ctx) "std_build" (tools ctx) "sh" ["-c", std_build])
     |> build.check "e2e" (suite ctx "e2e" "dream/tests/e2e.sh")
     |> build.check "examples" (suite ctx "examples" "examples/run.sh")
-    |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh");
+    |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh")
+    |> build.check "tls" (suite ctx "tls" "dream/tests/tls/run.sh")
+    |> build.check "sql_pg_contracts" (suite ctx "sql_pg_contracts" "mind/std/sql/pg/tests/contracts.sh")
+    |> build.check "sql_pg_live" (suite ctx "sql_pg_live" "mind/std/sql/pg/tests/live.sh");
 
 // --- the VM -------------------------------------------------------------------------
 
@@ -67,7 +70,7 @@ let vm_sources : [:string];
 let vm_sources = list.map (fn s -> "dream/src/" + s + ".cpp")
                           ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "ffi",
                            "io", "sha256", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
-                           "jit_rt"];
+                           "jit_rt", "tls"];
 
 /// GCC's inliner ceilings: dream/CMakeLists.txt says why at length. The
 /// reduction loop is one enormous function, past which GCC will not inline
@@ -124,8 +127,26 @@ let ffi [cflags, libs] t = {
     }
 };
 
-let libdream : :map -> cc.Toolchain -> :any -> [:string] -> cc.Target;
-let libdream ctx tc llvm libffi =
+/// `std.tls`, which every VM has: SChannel where the output runs on Windows,
+/// since it is part of the system, and OpenSSL 3 everywhere else, as
+/// `pkg-config` describes it or from the compiler's own search paths.
+/// src/tls.hpp is the interface both backends answer.
+let tls : cc.Toolchain -> [:string] -> cc.Target -> cc.Target;
+let tls tc [cflags, libs] t = match cc.Toolchain.os tc {
+    :windows => t |> cc.source "dream/src/tls_schannel.cpp"
+                  |> cc.system "secur32" |> cc.system "crypt32" |> cc.system "ncrypt",
+    _ => {
+        let words text = list.filter (fn w -> not (str.is_empty w)) (str.split " " (str.trim text));
+        let with_source = cc.source "dream/src/tls_openssl.cpp" t;
+        match words libs {
+            [] => with_source |> cc.system "ssl" |> cc.system "crypto",
+            found => with_source |> cc.flags_for :gnu (words cflags) |> cc.link_flags_for :gnu found,
+        }
+    },
+};
+
+let libdream : :map -> cc.Toolchain -> :any -> [:string] -> [:string] -> cc.Target;
+let libdream ctx tc llvm libffi openssl =
     cc.shared "dream" vm_sources
     |> cc.standard :cxx20
     |> optimized ctx
@@ -138,6 +159,7 @@ let libdream ctx tc llvm libffi =
     |> cc.include "dream/src"
     |> cc.threads
     |> ffi libffi
+    |> tls tc openssl
     |> cc.system_for :linux "dl"
     |> cc.system_for :windows "ws2_32"
     |> cc.export_all
@@ -160,9 +182,9 @@ let native ctx name source lib =
 let dreams_by : :any -> :any -> :any;
 let dreams_by vm compiler = dream.program "dreams" "dreams/main.dr" compiler vm |> dream.paths ["mind", "."];
 
-let goals : :map -> cc.Toolchain -> :any -> [:string] -> :map;
-let goals ctx tc llvm libffi = {
-    let lib = libdream ctx tc llvm libffi;
+let goals : :map -> cc.Toolchain -> :any -> [:string] -> [:string] -> :map;
+let goals ctx tc llvm libffi openssl = {
+    let lib = libdream ctx tc llvm libffi openssl;
     let cli = native ctx "dream" "dream/src/cli.cpp" lib;
     let vm = steps.artifact tc cli;
     let dreams = dream.artifact (dreams_by vm (build.file "dreams/bootstrap/dreams.dream"));
@@ -171,7 +193,8 @@ let goals ctx tc llvm libffi = {
     |> build.goal "vm" (build.place "build-dream" (build.artifact (steps.link_step tc cli) ""))
     |> build.note "vm" "the VM, and its library beside it, in build-dream/"
     |> build.goal "vm-tests" (build.place "build-dream/bin/dream_tests"
-                                          (steps.artifact tc (native ctx "dream_tests" "dream/tests/test_main.cpp" lib)))
+                                          (steps.artifact tc (native ctx "dream_tests" "dream/tests/test_main.cpp" lib
+                                                                  |> cc.include "dream/tests")))
     |> build.goal "dreams" (build.place "build/dreams.dream" dreams)
     |> build.note "dreams" "the compiler, built by the seed"
     |> build.goal "seed" (build.place "dreams/bootstrap/dreams.dream" stage3)
@@ -194,7 +217,8 @@ let asked_again : :any -> :any;
 let asked_again a = match a { [:artifact, s, n] => build.artifact (build.uncached s) n };
 
 /// The questions that come before the goals: which compiler, whether there is
-/// an LLVM, and where libffi is. Everything else follows from the answers.
+/// an LLVM, and where libffi and OpenSSL are. Everything else follows from the
+/// answers.
 let plan : :map -> :map;
 let plan ctx = build.all [
     checks ctx,
@@ -202,5 +226,7 @@ let plan ctx = build.all [
         build.given (probe.llvm llvm_parts) (fn llvm ->
         build.given (asked_again (probe.pkg_config ctx "--cflags" "libffi")) (fn cflags ->
         build.given (asked_again (probe.pkg_config ctx "--libs" "libffi")) (fn libs ->
-            goals ctx tc (probe.answer llvm) [cflags, libs])))),
+        build.given (asked_again (probe.pkg_config ctx "--cflags" "openssl")) (fn ssl_cflags ->
+        build.given (asked_again (probe.pkg_config ctx "--libs" "openssl")) (fn ssl_libs ->
+            goals ctx tc (probe.answer llvm) [cflags, libs] [ssl_cflags, ssl_libs])))))),
 ];

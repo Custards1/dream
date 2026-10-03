@@ -47,7 +47,7 @@ import std.map;
 /// compilable. It is deliberately not a wildcard: naming the module is what
 /// keeps a typo in an import an error rather than a mystery later.
 let native_modules =
-    ["std.console", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.vm"];
+    ["std.console", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.tls", "std.vm"];
 
 let is_native p = list.contains p native_modules;
 

@@ -1,0 +1,15 @@
+// Every module in the library, so that `--test` collects each one's tests and
+// a module that no longer compiles fails the build rather than being skipped.
+
+import std.sql.pg.bytes;
+import std.sql.pg.config;
+import std.sql.pg.crypto;
+import std.sql.pg.db;
+import std.sql.pg.driver;
+import std.sql.pg.errors;
+import std.sql.pg.pool;
+import std.sql.pg.sql;
+import std.sql.pg.value;
+import std.sql.pg.wire;
+
+import std.sql.pg;

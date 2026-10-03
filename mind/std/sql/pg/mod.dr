@@ -1,0 +1,12 @@
+// PostgreSQL for the shared SQL API. All query code imports std.sql; only
+// connection setup needs to choose std.sql.pg or std.sql.sqlite.
+import std.sql;
+import std.sql.pg.driver;
+import std.sql.pg.db;
+
+let open! : :any -> sql.Connection;
+let open! target = driver.open! target;
+
+/// Adapt a low-level PostgreSQL connection. Closing either closes both.
+let wrap! : db.Conn -> sql.Connection;
+let wrap! conn = driver.wrap! conn;

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -272,7 +273,7 @@ namespace {
 /// exact sizes so that a pooled block fits the next object of nearly the same
 /// size, and only eight per doubling so that it is never much too big.
 size_t big_size_class(size_t sz) {
-    size_t top = size_t(1) << (63 - __builtin_clzll(uint64_t(sz)));
+    size_t top = size_t(1) << (63 - std::countl_zero(uint64_t(sz)));
     size_t step = top >= 8 ? top / 8 : 1;
     return (sz + step - 1) / step * step;
 }
