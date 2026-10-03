@@ -307,7 +307,7 @@ let prepare_work! l work = {
 /// and `MODS` is the only statement in the container of which globals are
 /// whose. Without it the image loads, runs, and has no member of any name.
 let invocation_image ld resolved = {
-    let low = staged_lowering (map.remove (lower.lower_program resolved) :image);
+    let low = staged_lowering (map.remove :image (lower.lower_program resolved));
     let ms = lower.link_modules ld resolved low;
     ir.finish (((lower.prog (list.head ms))).[:modules => (list.nth 1 ms)])
 };

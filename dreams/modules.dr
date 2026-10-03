@@ -301,7 +301,7 @@ let complain_note span message extra source l =
     note (diag.in_source source (diag.with_note extra (diag.error span message))) l;
 
 let mark_visited name l = put :visited (((visited l)).[name => true]) l;
-let is_visited l name = map.has (visited l) name;
+let is_visited l name = map.has name (visited l);
 
 /// Native modules are recorded in first-seen order, because that order is the
 /// index a call to one is compiled to.
@@ -909,8 +909,8 @@ let rec prefetch! l deps = match deps {
     [] => l,
     [dep, ..rest] => {
         let file = if is_host l dep || is_visited l dep { () } else { resolve_path! l dep };
-        let wanted = file != () && not (map.has (fetched l) file)
-                     && not (map.has (by_path l) (path.absolute! file));
+        let wanted = file != () && not (map.has file (fetched l))
+                     && not (map.has (path.absolute! file) (by_path l));
         let text = if wanted { text_of! l file } else { () };
         if text == () { prefetch! l rest }
         else {
@@ -1096,10 +1096,10 @@ let reload_root! l file test_mode = {
             let last = module_count l - 1;
             let unmounted =
                 put :module_count last
-                    (put :modules (map.remove (module_map l) last)
-                        (put :by_name (map.remove (by_name l) name)
-                            (put :by_path (map.remove (by_path l) (path.absolute! file))
-                                (put :visited (map.remove (visited l) name) l))));
+                    (put :modules (map.remove last (module_map l))
+                        (put :by_name (map.remove name (by_name l))
+                            (put :by_path (map.remove (path.absolute! file) (by_path l))
+                                (put :visited (map.remove name (visited l)) l))));
             load_file! unmounted file name ast.no_span 0
         }
     }

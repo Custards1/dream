@@ -76,7 +76,7 @@ let parse ctx said = {
     let os = build.Target.os (build.Context.target ctx);
     let first = str.trim (list.first_or "" (str.split "\n" said));
     match [str.ends_with "cl.exe" cxx || str.contains_str "Microsoft" said, str.contains_str "clang" said] {
-        [true, _] => cc.Toolchain.set_version cc.msvc first,
+        [true, _] => cc.Toolchain.set_version first cc.msvc,
         [_, true] => cc.Toolchain.make :clang :gnu os c cxx "ar" "" first "",
         _ => cc.Toolchain.make :gcc :gnu os c cxx "ar" "" first "",
     }
@@ -253,8 +253,8 @@ when test {
             $( test.eq! ["gcc-14", "clang", "cc", "cl.exe"] (list.map c_for ["g++-14", "clang++", "c++", "cl.exe"]) ),
         test.case "the compilers are the context's, or the platform's"
             $( test.eq! [["cc", "c++"], ["clang", "clang++"], ["gcc", "g++"]]
-                        [compilers ctx, compilers (build.Context.set_env ctx (%{ "CXX" => "clang++" })),
-                         compilers (build.Context.set_env ctx (%{ "CC" => "gcc", "CXX" => "g++" }))] ),
+                        [compilers ctx, compilers (build.Context.set_env (%{ "CXX" => "clang++" }) ctx),
+                         compilers (build.Context.set_env (%{ "CC" => "gcc", "CXX" => "g++" }) ctx)] ),
         test.case "a toolchain is what its compiler says it is"
             $( test.eq! [:gcc, :clang, "g++ (GCC) 14.2.1"]
                         [cc.Toolchain.name (parse ctx "g++ (GCC) 14.2.1\nCopyright"),

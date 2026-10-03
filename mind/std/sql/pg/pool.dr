@@ -53,14 +53,14 @@ mod keeper {
     let handle_call! : :any -> :any -> :any -> :any;
     let handle_call! request from state = match request {
         :checkout => match State.idle state {
-            [conn, ..rest] => reply [:conn, conn] (State.set_idle state rest),
+            [conn, ..rest] => reply [:conn, conn] (State.set_idle rest state),
             [] if State.open state < State.size state =>
-                reply [:open, State.config state] (State.set_open state (State.open state + 1)),
-            [] => noreply (State.set_waiting state (State.waiting state + [from])),
+                reply [:open, State.config state] (State.set_open (State.open state + 1) state),
+            [] => noreply (State.set_waiting (State.waiting state + [from]) state),
         },
         :stats => reply %{ :size => State.size state, :open => State.open state,
                            :idle => len (State.idle state), :waiting => len (State.waiting state) } state,
-        :drain => reply (State.idle state) (State.set_open (State.set_idle state []) (State.open state - len (State.idle state))),
+        :drain => reply (State.idle state) (state |> State.set_idle [] |> State.set_open (State.open state - len (State.idle state))),
         _ => reply [:error, :unknown_request] state,
     };
 
@@ -71,14 +71,14 @@ mod keeper {
     let handle_cast! message state = match [message, State.waiting state] {
         [[:checkin, conn], [first, ..rest]] => {
             reply_to! first [:conn, conn]
-            noreply (State.set_waiting state rest)
+            noreply (State.set_waiting rest state)
         },
-        [[:checkin, conn], []] => noreply (State.set_idle state (list.cons conn (State.idle state))),
+        [[:checkin, conn], []] => noreply (State.set_idle (list.cons conn (State.idle state)) state),
         [:lost, [first, ..rest]] => {
             reply_to! first [:open, State.config state]
-            noreply (State.set_waiting state rest)
+            noreply (State.set_waiting rest state)
         },
-        [:lost, []] => noreply (State.set_open state (State.open state - 1)),
+        [:lost, []] => noreply (State.set_open (State.open state - 1) state),
         _ => noreply state,
     };
 

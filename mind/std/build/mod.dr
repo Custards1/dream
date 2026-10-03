@@ -197,15 +197,15 @@ let step tool name inputs config outputs action = {
 
 /// A step that names what it read in `deps.d`.
 let discovering : :map -> :map;
-let discovering s = Step.set_discovers s true;
+let discovering s = Step.set_discovers true s;
 
 /// A step run every time it is asked for.
 let uncached : :map -> :map;
-let uncached s = Step.set_cache s :never;
+let uncached s = Step.set_cache :never s;
 
 /// A step killed, and failed, after `ms` milliseconds.
 let within : :integer -> :map -> :map;
-let within ms s = Step.set_timeout s ms;
+let within ms s = Step.set_timeout ms s;
 
 /// What an action asks for, carried out in order by the runner, in the step's
 /// directory, stopping at the first that fails. A name is relative to that
@@ -312,35 +312,35 @@ let empty = Plan.make (%{}) (%{}) (%{}) [] () [] [] [] (%{}) (%{}) (%{});
 
 /// Embed a file in the image: `--payload NAME=PATH`.
 let payload : :string -> :any -> :map -> :map;
-let payload name i p = Plan.set_payloads p (claim "payload" name (input i) (Plan.payloads p));
+let payload name i p = Plan.set_payloads (claim "payload" name (input i) (Plan.payloads p)) p;
 
 /// A generated module, imported as `<package>.<name>`.
 let module : :string -> :any -> :map -> :map;
-let module name i p = Plan.set_modules p (claim "module" name (input i) (Plan.modules p));
+let module name i p = Plan.set_modules (claim "module" name (input i) (Plan.modules p)) p;
 
 /// A `when` flag, scoped to the package.
 let define : :string -> :map -> :map;
-let define name p = Plan.set_defines p ((Plan.defines p).[name => true]);
+let define name p = Plan.set_defines ((Plan.defines p).[name => true]) p;
 
 /// A `when` setting with a value.
 let set : :string -> :any -> :map -> :map;
-let set name value p = Plan.set_defines p ((Plan.defines p).[name => value]);
+let set name value p = Plan.set_defines ((Plan.defines p).[name => value]) p;
 
 /// A host module the package needs at run time.
 let host_module : :string -> :map -> :map;
-let host_module name p = Plan.set_hosts p (list.unique (list.append (Plan.hosts p) [name]));
+let host_module name p = Plan.set_hosts (list.unique (list.append (Plan.hosts p) [name])) p;
 
 /// Where the result can run: a list of targets, or `()` to let the compiler
 /// decide. Two plans' targets meet rather than add.
 let target : :any -> :map -> :map;
-let target ts p = Plan.set_target p (meet (Plan.target p) ts);
+let target ts p = Plan.set_target (meet (Plan.target p) ts) p;
 
 /// A check `mind test` runs: it passes when the step's operations all
 /// succeed. Only `mind test` runs checks, and it runs them every time -- a
 /// check is a question, not something made -- after building whatever they
 /// read.
 let check : :string -> :map -> :map -> :map;
-let check name s p = Plan.set_checks p (claim "check" name s (Plan.checks p));
+let check name s p = Plan.set_checks (claim "check" name s (Plan.checks p)) p;
 
 /// Something to ask for by name. `make` builds an input and says where it is;
 /// `place` puts it somewhere of the project's choosing as well, which is the
@@ -369,20 +369,20 @@ let effect : :map -> :any;
 let effect s = Goal.effect (uncached s);
 
 let goal : :string -> :any -> :map -> :map;
-let goal name g p = Plan.set_goals p (claim "goal" name g (Plan.goals p));
+let goal name g p = Plan.set_goals (claim "goal" name g (Plan.goals p)) p;
 
 /// A line saying what a goal or a check is for.
 let note : :string -> :string -> :map -> :map;
-let note name text p = Plan.set_notes p ((Plan.notes p).[name => text]);
+let note name text p = Plan.set_notes ((Plan.notes p).[name => text]) p;
 
 /// Make a step whether or not anything uses it.
 let also : :map -> :map -> :map;
-let also s p = Plan.set_steps p (list.append (Plan.steps p) [s]);
+let also s p = Plan.set_steps (list.append (Plan.steps p) [s]) p;
 
 /// Once `i` is built, read it as a string and merge in `f` of it. `f` is pure,
 /// so the effect is still only in the step that made `i`.
 let given : :any -> (:string -> :map) -> :map;
-let given i f = Plan.set_later empty [[input i, f]];
+let given i f = Plan.set_later [[input i, f]] empty;
 
 /// Every file under `dir` ending in `suffix`, one to a line, relative to the
 /// package. Never kept, since a file can be added under a directory without

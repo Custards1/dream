@@ -61,11 +61,11 @@ let child : :string -> :any -> Child;
 let child name start = child_with name start :permanent;
 
 let child_name : Child -> :any;
-let child_name c = map.get "" c :name;
+let child_name c = map.get "" :name c;
 let child_start : Child -> :any;
-let child_start c = map.get () c :start;
+let child_start c = map.get () :start c;
 let child_restart : Child -> :any;
-let child_restart c = map.get :permanent c :restart;
+let child_restart c = map.get :permanent :restart c;
 
 /// When a child is restarted:
 ///
@@ -150,28 +150,28 @@ let state strategy children lim =
        :restarts => [], :stopping => false };
 
 let s_strategy : State -> :any;
-let s_strategy s = map.get :one_for_one s :strategy;
+let s_strategy s = map.get :one_for_one :strategy s;
 let s_children : State -> :any;
-let s_children s = map.get [] s :children;
+let s_children s = map.get [] :children s;
 let s_limits : State -> :any;
-let s_limits s   = map.get default_limits s :lim;
+let s_limits s   = map.get default_limits :lim s;
 let s_running : State -> :any;
-let s_running s  = map.get map.empty s :running;
+let s_running s  = map.get map.empty :running s;
 let s_restarts : State -> :any;
-let s_restarts s = map.get [] s :restarts;
+let s_restarts s = map.get [] :restarts s;
 let s_watchers : State -> :any;
-let s_watchers s = map.get [] s :watchers;
+let s_watchers s = map.get [] :watchers s;
 let s_stopping : State -> :any;
-let s_stopping s = map.get false s :stopping;
+let s_stopping s = map.get false :stopping s;
 
 let with_running : %{ :string => :process } -> State -> State;
-let with_running r s = map.put s :running r;
+let with_running r s = map.put :running r s;
 let with_restarts : [:integer] -> State -> State;
-let with_restarts r s = map.put s :restarts r;
+let with_restarts r s = map.put :restarts r s;
 let with_watcher : :process -> State -> State;
-let with_watcher w s = map.put s :watchers (list.append (s_watchers s) [w]);
+let with_watcher w s = map.put :watchers (list.append (s_watchers s) [w]) s;
 let stopping : State -> State;
-let stopping s = map.put s :stopping true;
+let stopping s = map.put :stopping true s;
 
 /// The children in start order. Order is part of `:rest_for_one`'s meaning, so
 /// it is kept as a list and never as a map.
@@ -222,7 +222,7 @@ let start_named! sup s name =
         c => {
             let p = start_child! sup c;
             strict! p
-            with_running (map.put (s_running s) name p) s
+            with_running (map.put name p (s_running s)) s
         },
     };
 
@@ -234,12 +234,12 @@ let start_named! sup s name =
 /// the runtime's shape and is written on the tin.
 let stop_child! : State -> :string -> State;
 let stop_child! s name =
-    match map.get () (s_running s) name {
+    match map.get () name (s_running s) {
         () => s,
         p => {
             send! p proc.shutdown
             proc.outcome! p
-            with_running (map.remove (s_running s) name) s
+            with_running (map.remove name (s_running s)) s
         },
     };
 
@@ -251,7 +251,7 @@ let stop_all! s names = list.fold (fn acc n -> stop_child! acc n) s names |> str
 /// Has this supervisor restarted too often to keep trying?
 let over_limit : State -> [:integer] -> :bool;
 let over_limit s times =
-    list.length times > map.get 5 (s_limits s) :limit;
+    list.length times > map.get 5 :limit (s_limits s);
 
 /// Pass a child's ending on to whoever asked to hear about it.
 ///
@@ -267,11 +267,11 @@ let handle_down! : :process -> State -> :string -> :any -> ([:go, State] | [:sto
 let handle_down! sup s name outcome = {
     tell_watchers! s name outcome
     let c = child_named s name;
-    let gone = with_running (map.remove (s_running s) name) s;
+    let gone = with_running (map.remove name (s_running s)) s;
     if c == () || not (should_restart c outcome) { [:go, gone] }
     else {
         let now = os.monotonic! ();
-        let times = recent (map.get 5000 (s_limits s) :window) now (s_restarts gone);
+        let times = recent (map.get 5000 :window (s_limits s)) now (s_restarts gone);
         if over_limit gone times {
             // Giving up is a decision, and it is reported as one: the caller
             // joins the supervisor and gets this instead of a value.
@@ -311,7 +311,7 @@ let handle! sup s m =
             [:go, s]
         },
         [:restart, from, name] => {
-            let started = if map.has (s_running s) name { s } else { start_named! sup s name };
+            let started = if map.has name (s_running s) { s } else { start_named! sup s name };
             strict! (send! from :ok)
             [:go, started]
         },

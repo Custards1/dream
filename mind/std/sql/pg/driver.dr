@@ -43,7 +43,7 @@ priv let cell : :integer -> :any -> :any;
 priv let cell oid v = match v {
     () => (),
     _ => if oid == value.oid.bytea { sql.blob v }
-         else if map.has value.element_of oid && type_of v == :list {
+         else if map.has oid value.element_of && type_of v == :list {
              list.map (cell value.element_of.[oid]) v
          } else { v },
 };

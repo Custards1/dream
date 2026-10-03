@@ -51,9 +51,9 @@ let main! = {
     console.print! ("map:        " + to_string (len ages))
     console.print! ("get:        " + to_string (ages.["ana" else 0]))
     console.print! ("missing:    " + to_string (ages.["zz" else :none]))
-    console.print! ("has:        " + to_string (map.has ages "bo"))
+    console.print! ("has:        " + to_string (map.has "bo" ages))
     console.print! ("put:        " + to_string (len (ages.["di" => 30])))
-    console.print! ("remove:     " + to_string (len (map.remove ages "bo")))
+    console.print! ("remove:     " + to_string (len (map.remove "bo" ages)))
     console.print! ("pairs:      " + to_string (list.length (map.pairs ages)))
 
     // --- conversions and types ---

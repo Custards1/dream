@@ -155,7 +155,7 @@ priv let unmoved! recorded = list.all (fn [p, was] -> match io.stat! p {
 /// Scripts that can share a driver, in the order they came.
 priv let groups : [:map] -> [[:map]];
 priv let groups scripted = {
-    let by = list.fold (fn acc s -> map.update [] (fn xs -> list.append xs [s]) acc (str.join_str "\n" (Scripted.paths s)))
+    let by = list.fold (fn acc s -> map.update [] (fn xs -> list.append xs [s]) (str.join_str "\n" (Scripted.paths s)) acc)
                        (%{}) scripted;
     list.map (fn k -> by.[k]) (list.unique (list.map (fn s -> str.join_str "\n" (Scripted.paths s)) scripted))
 };

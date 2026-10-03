@@ -320,9 +320,8 @@ let build! l out shebang depfile specs said o = {
     let payloads = list.map (fn e -> list.nth 1 e) named;
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
     strict! sizes
-    let with_payloads = compile.Options.set_payload_names
-                            (compile.Options.set_payloads o sizes)
-                            (list.map (fn e -> list.head e) named);
+    let with_payloads = o |> compile.Options.set_payloads sizes
+      |> compile.Options.set_payload_names (list.map (fn e -> list.head e) named);
     let b = compile.build! l with_payloads;
     let unreadable = list.filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
     // Where the image may run, which is only worth reading the payloads' first
@@ -501,7 +500,7 @@ let show_time! o file = {
     // hand, since the lowering has to be kept whole for `share` below.
     let before_lower = os.monotonic! ();
     let low = if parted { lower.link_parallel! l r (compile.Options.units co) } else { lower.link! l r };
-    strict! (map.remove low :image)
+    strict! (map.remove :image low)
     // Read as a statement: a list element is suspended, and a clock read
     // inside one would be read when the row is printed.
     let lower_ms = os.monotonic! () - before_lower;

@@ -56,7 +56,7 @@ let delta : :map -> :map -> :map;
 let delta base r = list.fold (fn acc [k, v] -> match base.[k else [:absent]] {
     same if same == v => acc,
     old if type_of old == :map && type_of v == :map =>
-        acc.[k => [:entries, list.filter (fn [ek, ev] -> not (map.has old ek) || old.[ek] != ev) (map.pairs v)]],
+        acc.[k => [:entries, list.filter (fn [ek, ev] -> not (map.has ek old) || old.[ek] != ev) (map.pairs v)]],
     _ => acc.[k => [:is, v]],
 }) (%{}) (map.pairs r);
 

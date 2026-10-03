@@ -90,7 +90,7 @@ let register! reg name pid = {
     // `std.supervisor` documents the same trap where it takes `self! ()` into
     // a statement of its own.
     let p = strict! pid;
-    agent.get_and_update! reg (fn m -> [map.get () m name, map.put m name p])
+    agent.get_and_update! reg (fn m -> [map.get () name m, map.put name p m])
 };
 
 /// Bind `name` only if nothing holds it: `[:ok, pid]`, or `[:taken, other]`.
@@ -101,8 +101,8 @@ let register! reg name pid = {
 let claim! : server.Handle -> :any -> :process -> ([:ok, :process] | [:taken, :process]);
 let claim! reg name pid = {
     let p = strict! pid;
-    agent.get_and_update! reg (fn m -> match map.get () m name {
-        ()    => [[:ok, p], map.put m name p],
+    agent.get_and_update! reg (fn m -> match map.get () name m {
+        ()    => [[:ok, p], map.put name p m],
         other => [[:taken, other], m],
     })
 };
@@ -110,7 +110,7 @@ let claim! reg name pid = {
 /// Forget `name`. Answers the pid it held, or `()`.
 let unregister! : server.Handle -> :any -> :any;
 let unregister! reg name =
-    agent.get_and_update! reg (fn m -> [map.get () m name, map.remove m name]);
+    agent.get_and_update! reg (fn m -> [map.get () name m, map.remove name m]);
 
 /// Forget every name `pid` holds, for a process registered under several.
 let forget! : server.Handle -> :process -> :ok;
@@ -123,10 +123,10 @@ let forget! reg pid = {
 
 /// The process registered as `name`, or `()`.
 let whereis! : server.Handle -> :any -> :any;
-let whereis! reg name = agent.get! reg (fn m -> map.get () m name);
+let whereis! reg name = agent.get! reg (fn m -> map.get () name m);
 
 let has! : server.Handle -> :any -> :bool;
-let has! reg name = agent.get! reg (fn m -> map.has m name);
+let has! reg name = agent.get! reg (fn m -> map.has name m);
 
 /// Every name, in order.
 let names! : server.Handle -> [:any];

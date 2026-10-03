@@ -100,7 +100,7 @@ let ids = list.fold (fn m [i, n] -> m.[n => i]) (%{}) (list.enumerate names);
 
 
 let is_builtin : :string -> :bool;
-let is_builtin name = map.has ids name;
+let is_builtin name = map.has name ids;
 
 /// What each one takes and answers, as one line.
 ///
@@ -204,8 +204,8 @@ let wrappers = %{
     "_array_new" => "array.new n fill",
     "_array_of_list" => "array.of_list xs",
     "_array_to_list" => "array.to_list a",
-    "_map_has" => "map.has m k",
-    "_map_remove" => "map.remove m k",
+    "_map_has" => "map.has k m",
+    "_map_remove" => "map.remove k m",
     "_map_pairs" => "map.pairs m",
     "_data_count" => "payload.count ()",
     "_data_at" => "payload.at i",
@@ -261,7 +261,7 @@ when test {
             $( test.eq! [false, false, true] [is_primitive "strict!", is_primitive "len",
                                               is_primitive "_list_cons"] ),
         test.case "every builtin has a signature"
-            $( test.eq! [] (list.filter (fn n -> not (map.has signatures n)) names) ),
+            $( test.eq! [] (list.filter (fn n -> not (map.has n signatures)) names) ),
         test.case "every wrapper is of a primitive"
             $( test.eq! [] (list.filter (fn kv -> not (is_primitive (list.head kv)))
                                         (map.pairs wrappers)) ),

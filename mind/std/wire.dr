@@ -423,7 +423,7 @@ when test {
         test.case "list of maps"  $( test.true! (trip [%{ 1 => :a }, %{}]) ),
         test.case "map with mixed keys" $( test.true! (trip %{ 1 => :a, "b" => 2, :c => 3 }) ),
         test.case "a map value keeps its kind"
-            $( test.eq! :atom (type_of (map.get () (result.or_else %{} (decode (encode %{ "k" => :v }))) "k")) ),
+            $( test.eq! :atom (type_of (map.get () "k" (result.or_else %{} (decode (encode %{ "k" => :v }))))) ),
 
         // the edges of an integer, and past them
         test.case "the largest fixnum"   $( test.true! (trip 4611686018427387903) ),

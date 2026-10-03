@@ -215,7 +215,7 @@ mapping Here {
 
 let here mi source owner = Here.make mi source %{} %{} %{} owner %{};
 
-let with_local n t h = Here.set_locals h ((Here.locals h).[n => t]);
+let with_local n t h = Here.set_locals ((Here.locals h).[n => t]) h;
 
 /// A diagnostic, unless it would point into generated code: a record's or a
 /// union's helpers carry spans past 2^31 that name no byte of any file, and
@@ -383,7 +383,7 @@ let type_ref k mi n = match env_of k mi {
     },
 };
 
-let typed_global k gi = if map.has (Checker.named k) gi { gi } else { () };
+let typed_global k gi = if map.has gi (Checker.named k) { gi } else { () };
 
 let module_type k target = match env_of k target {
     () => (),
@@ -617,13 +617,13 @@ let fits k s t = sub k s t fuel;
 ///
 /// `()` says nothing about a variable, and is not allowed to decide one.
 /// It is the library's "nothing there", and so the usual default: in
-/// `map.get () ages name` the value type is the map's, and were `()` to
+/// `map.get () name ages` the value type is the map's, and were `()` to
 /// join it the answer would be `:integer | :unit` -- which every `+` on it
 /// that no test of `()` guards reports (see "narrowing"), and a default is
 /// written precisely so that nothing need test for it. So the
 /// variable is solved from the map alone, the way the caller reads it, and
 /// the `()` is left to fit it (see `sub`). What that gives up is
-/// `map.get () m k + 1`, which is not reported; rule 2 already says it would
+/// `map.get () k m + 1`, which is not reported; rule 2 already says it would
 /// not be, for anything the checker cannot see is wrong.
 let rec solve k p a subst = {
     let a2 = match a { [:named, _, _, _] => peel k a 4, _ => a };
@@ -749,7 +749,7 @@ let rec infer k h e ds = match e {
             },
         }
     },
-    [:block, stmts, _] => block k (Here.set_pending h %{}) stmts () ds,
+    [:block, stmts, _] => block k (Here.set_pending %{} h) stmts () ds,
     [:thunk, x, _] => [:any, list.nth 1 (infer k h x ds)],
     [:try, body, binder, handler, _] => {
         let [bt, ds1] = infer k h body ds;
@@ -849,7 +849,7 @@ let rec check k h e expected why ds =
                     x => check k (narrowing k h c false) x expected why ds2,
                 }
             },
-            [:block, stmts, _] => list.nth 1 (block k (Here.set_pending h %{}) stmts [expected, why] ds),
+            [:block, stmts, _] => list.nth 1 (block k (Here.set_pending %{} h) stmts [expected, why] ds),
             [:match, s, arms, sp] => list.nth 1 (infer_match k h s arms sp [expected, why] ds),
             [:comp, _, x, sp] => match comp_datum k h sp {
                 () => check k h x expected why ds,
@@ -1148,7 +1148,7 @@ let typed_apply k h f ft args sp ds1 = {
 /// What an argument is checked against: every variable as solved, and `()`
 /// besides. `solve` does not let a `()` decide a variable, and this is the
 /// other half -- it may still stand where the variable is, once another
-/// argument has decided it. `map.get () c :start` solves `v` from the record
+/// argument has decided it. `map.get () :start c` solves `v` from the record
 /// `c` and then asks whether the default fits `v`, and `list.head [n, ()]`
 /// solves `a` from `n` and asks whether the `()` does.
 let admit_unit subst =
@@ -1257,15 +1257,15 @@ let statement k h st ds = match st {
     [:sig, n, t, sp] => {
         let ev = [Here.mi h, %{}, Here.ltypes h];
         let ds1 = unknown_types k ev t (Here.source h) ds;
-        [Here.set_pending h ((Here.pending h).[n => [eval_type k ev t, sp]]), ds1]
+        [Here.set_pending ((Here.pending h).[n => [eval_type k ev t, sp]]) h, ds1]
     },
     [:let, n, ps, body, is_rec, sp] => match named_body body {
         [_, desc] =>
-            [with_local n :any (Here.set_ltypes h ((Here.ltypes h).[n =>
-                [list.map (fn p -> ast.param_name p) ps, desc, [Here.mi h, %{}, Here.ltypes h]]])), ds],
+            [with_local n :any (Here.set_ltypes ((Here.ltypes h).[n =>
+                [list.map (fn p -> ast.param_name p) ps, desc, [Here.mi h, %{}, Here.ltypes h]]]) h), ds],
         () => {
             let sig = match (Here.pending h).[n else ()] { () => (), [t, _] => t };
-            let h1 = Here.set_pending h (map.remove (Here.pending h) n);
+            let h1 = Here.set_pending (map.remove n (Here.pending h)) h;
             let self_t = match sig { () => :any, t => flexible t };
             let h2 = if is_rec { with_local n self_t h1 } else { h1 };
             if list.is_empty ps {
@@ -1782,8 +1782,8 @@ let narrow_at k h n sp x f local = if str.ends_with "!" n { h } else {
     if nt == t { h }
     else {
         match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
-            [:global, _, _, gi] => Here.set_narrowed h ((Here.narrowed h).[gi => nt]),
-            [:member, _, _, gi] if gi != () => Here.set_narrowed h ((Here.narrowed h).[gi => nt]),
+            [:global, _, _, gi] => Here.set_narrowed ((Here.narrowed h).[gi => nt]) h,
+            [:member, _, _, gi] if gi != () => Here.set_narrowed ((Here.narrowed h).[gi => nt]) h,
             [:member, _, _, _] => h,
             [:builtin, _] => h,
             _ => if local { with_local n nt h } else { h },
@@ -2004,7 +2004,7 @@ let brief s = {
 /// the expression failed.
 let comp_datum k h sp = {
     let key = Here.source h * 4294967296 + ast.span_start sp;
-    if map.has (Checker.comps k) key { [datum_of (Checker.comps k).[key]] } else { () }
+    if map.has key (Checker.comps k) { [datum_of (Checker.comps k).[key]] } else { () }
 };
 
 /// The value an expression certainly is, read from how it is written:
@@ -2319,12 +2319,12 @@ let contract_place c = list.nth 1 c * 4294967296 + ast.span_start (list.nth 2 c)
 let with_comp_globals r k =
     if len (Checker.comps k) == 0 { k }
     else {
-        Checker.set_uses k (list.fold (fn uses b -> {
+        k |> Checker.set_uses (list.fold (fn uses b -> {
             let [mi, source, d, _] = b;
             match [scope.decl_params d, scope.decl_body d] {
                 [[], [:comp, _, _, sp]] => match gi_of k mi (scope.decl_name d) {
                     () => uses,
-                    gi => if map.has (Checker.sigs k) gi { uses }
+                    gi => if map.has gi (Checker.sigs k) { uses }
                           else {
                               match comp_datum k (here mi source "") sp {
                                   () => uses,
@@ -2432,8 +2432,8 @@ let checker l r = {
         unknown_types k0 (in_module owner) t (modules.module_source (modules.module_at l owner)) d
     }) ds (map.pairs sigs);
     let refined = refined_table k0 named 8;
-    let k1 = Checker.set_refined (Checker.set_sigs (Checker.set_uses k0 uses) evaluated) refined;
-    [Checker.set_heads k1 (heads_of k0 l), unknown]
+    let k1 = k0 |> Checker.set_uses uses |> Checker.set_sigs evaluated |> Checker.set_refined refined;
+    [Checker.set_heads (heads_of k0 l) k1, unknown]
 };
 
 /// The globals that are `std.list`'s `head`, which a test reads a tag with
@@ -2490,7 +2490,7 @@ let analyze l r comps = {
 /// checker this makes.
 let prepared l r comps = {
     let [k0, ds0] = checker l r;
-    [with_comp_globals r (Checker.set_comps k0 comps), ds0]
+    [with_comp_globals r (Checker.set_comps comps k0), ds0]
 };
 
 /// What every body is checked against besides its own module's names: the
@@ -2510,7 +2510,7 @@ let tables k = [Checker.named k, Checker.sigs k, Checker.uses k, Checker.comps k
 /// `scope`), so a part's bodies are checked with the part's resolution and
 /// everything else the checker holds -- the signatures, the named types, what
 /// the `comp`s came to -- is the whole program's.
-let with_resolution k r = Checker.set_r k r;
+let with_resolution k r = Checker.set_r r k;
 
 /// The analysis, given what each body said on its own -- `check_decl k b []`,
 /// in the order the resolver queued the bodies. Checking threads the

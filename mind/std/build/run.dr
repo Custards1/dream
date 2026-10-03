@@ -204,9 +204,9 @@ let stamped! st path = match io.stat! path {
             _ => io.digest! path,
         };
         strict! d
-        let with_digest = State.set_digests st ((State.digests st).[path => d]);
-        let with_stamp = State.set_stamps with_digest ((State.stamps st).[path => [size, modified, d]]);
-        [State.set_reads with_stamp ((State.reads st).[path => [size, modified]]), d]
+        let with_digest = State.set_digests ((State.digests st).[path => d]) st;
+        let with_stamp = State.set_stamps ((State.stamps st).[path => [size, modified, d]]) with_digest;
+        [State.set_reads ((State.reads st).[path => [size, modified]]) with_stamp, d]
     },
 };
 
@@ -501,9 +501,10 @@ let rec launch! ctx run = {
             match current {
                 true => {
                     let reads = record.[:reads];
-                    let settled = State.set_reused (State.set_done checked ((State.done checked).[shape => [result_of key reads, dir]]))
-                                                   (State.reused checked + 1);
-                    launch! ctx (Run.set_waiting (Run.set_state run settled) rest)
+                    let settled = checked
+                        |> State.set_done ((State.done checked).[shape => [result_of key reads, dir]])
+                        |> State.set_reused (State.reused checked + 1);
+                    launch! ctx (run |> Run.set_state settled |> Run.set_waiting rest)
                 },
                 false => {
                     let scratch = dir + ".tmp-" + file.scratch_suffix! ();
@@ -514,8 +515,9 @@ let rec launch! ctx run = {
                     let me = self! ();
                     strict! me
                     spawn! (task me shape scratch outputs (build.Step.timeout s) ops)
-                    launch! ctx (Run.set_running (Run.set_waiting (Run.set_state run checked) rest)
-                                                 ((Run.running run).[shape => [key, scratch]]))
+                    launch! ctx (run |> Run.set_state checked
+                                     |> Run.set_waiting rest
+                                     |> Run.set_running ((Run.running run).[shape => [key, scratch]]))
                 },
             }
         },
@@ -553,8 +555,9 @@ let commit! ctx st s key scratch = {
     // is as good.
     file.remove_all! dir
     try! { io.rename! scratch dir } catch e { file.remove_all! scratch }
-    let made = State.set_done after ((State.done after).[build.Step.shape s => [result_of key kept, dir]]);
-    State.set_ran (State.set_built made (State.built made + 1)) (list.cons (build.Step.name s) (State.ran made))
+    let made = State.set_done ((State.done after).[build.Step.shape s => [result_of key kept, dir]]) after;
+    made |> State.set_built (State.built made + 1)
+         |> State.set_ran (list.cons (build.Step.name s) (State.ran made))
 };
 
 /// Run the graph to the end: start what can start, take whichever step
@@ -575,21 +578,21 @@ let rec drive! ctx run = {
             strict! outcome
             let [key, scratch] = (Run.running started).[shape];
             let s = (Run.steps started).[shape];
-            let running = Run.set_running started (_map_remove (Run.running started) shape);
+            let running = Run.set_running (_map_remove (Run.running started) shape) started;
             let st = Run.state running;
-            let timed = State.set_ms st ((State.ms st).[shape => ms]);
+            let timed = State.set_ms ((State.ms st).[shape => ms]) st;
             match outcome {
                 [:ok, _] => {
                     let committed = commit! ctx timed s key scratch;
                     strict! committed
-                    drive! ctx (Run.set_state running committed)
+                    drive! ctx (Run.set_state committed running)
                 },
                 [_, why] => {
-                    let failed = State.set_failures timed
+                    let failed = timed |> State.set_failures
                         ((State.failures timed).[shape => [build.Step.name s,
                                                            "`" + build.Step.name s + "` (" + build.Step.tool s + ") failed: "
                                                            + why + "\n  its work is in " + scratch]]);
-                    drive! ctx (Run.set_state running failed)
+                    drive! ctx (Run.set_state failed running)
                 },
             }
         },
@@ -617,7 +620,7 @@ let build_all! ctx st steps keep_going = {
 let make! : :map -> [:any] -> [:any];
 let make! ctx inputs = {
     file.mkdir_all! (build.Context.cache ctx)
-    let start = State.set_stamps (State.new ()) (known_stamps! ctx);
+    let start = State.set_stamps (known_stamps! ctx) (State.new ());
     let after = build_all! ctx start (list.fold reach (%{}) inputs) false;
     keep_stamps! ctx (State.stamps after)
     [after, list.map (fn i -> where ctx after (build.input i)) inputs]
@@ -654,7 +657,7 @@ let rec settle! ctx st plan = {
                 text => text,
             })) later;
             strict! decided
-            settle! ctx done (build.all (list.cons (build.Plan.set_later plan []) decided))
+            settle! ctx done (build.all (list.cons (build.Plan.set_later [] plan) decided))
         },
     }
 };
@@ -770,10 +773,10 @@ let known_stamps! ctx = match file.read! (stamps_file ctx) {
 let carry_out! : :map -> :map -> (:map -> :map) -> [:any];
 let carry_out! ctx known plan_of = {
     file.mkdir_all! (build.Context.cache ctx)
-    let [plan, mods, st] = settle! ctx (State.set_stamps (State.new ()) known) (plan_of ctx);
+    let [plan, mods, st] = settle! ctx (State.set_stamps known (State.new ())) (plan_of ctx);
     let [checks, tested] = if build.Context.testing ctx { run_checks! ctx st plan } else { [%{}, st] };
     let [goals, after] = match build.Context.goals ctx { [] => [%{}, tested], _ => make_goals! ctx tested plan };
-    let answer = build.Outcome.set_goals (build.Outcome.set_checks (outcome ctx plan mods after) checks) goals;
+    let answer = build.Outcome.set_goals goals (build.Outcome.set_checks checks (outcome ctx plan mods after));
     strict! answer
     [answer, State.stamps after]
 };
@@ -874,7 +877,7 @@ when test {
 
     let context_in! cache = {
         let here = here! ();
-        build.Context.set_cache (build.Context.new "t" "0" (os.cwd! ()) here here) cache
+        build.Context.set_cache cache (build.Context.new "t" "0" (os.cwd! ()) here here)
     };
 
     let run_sample! cache = {
@@ -917,7 +920,7 @@ when test {
                 let linked = build.artifact (build.step "ld" "prog" [obj] () ["prog"]
                                                         (fn job -> [build.Op.copy (build.path job obj) "prog"])) "prog";
                 let plan = build.empty |> build.payload "prog" linked;
-                let ctx = build.Context.set_root (context_in! (root + "/cache")) root;
+                let ctx = build.Context.set_root root (context_in! (root + "/cache"));
                 let once! () = {
                     let [p, mods, st] = settle! ctx (State.new ()) plan;
                     let r = [State.built st, State.reused st];
@@ -961,7 +964,7 @@ when test {
         test.case "a test run builds what its checks read, runs each, and goes on past a failure"
             $( {
                 let cache = "dream-build-checks-" + to_string (os.pid! ());
-                let ctx = build.Context.set_testing (context_in! cache) true;
+                let ctx = build.Context.set_testing true (context_in! cache);
                 let made = build.write "made.txt" "hello";
                 let holds text = build.step "check" "holds" [made] text []
                                             (fn job -> [build.Op.copy (build.path job made) "copy",
@@ -980,7 +983,7 @@ when test {
                 let dir = "dream-build-goals-" + to_string (os.pid! ());
                 file.mkdir_all! dir
                 let root = os.cwd! () + "/" + dir;
-                let ctx = build.Context.set_goals (build.Context.set_root (context_in! (root + "/cache")) root) ["all"];
+                let ctx = build.Context.set_goals ["all"] (build.Context.set_root root (context_in! (root + "/cache")));
                 let plan = build.empty
                            |> build.goal "text" (build.place "out/t.txt" (build.write "t.txt" "placed"))
                            |> build.goal "all" (build.each ["text"]);

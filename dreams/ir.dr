@@ -229,7 +229,7 @@ let node_c = Node.c;
 
 let leaf op = node op no_node no_node no_node;
 
-let with_flags flags n = Node.set_flags n flags;
+let with_flags flags n = Node.set_flags flags n;
 
 let node_is_impure n = has_flag (node_flags n) f_impure;
 

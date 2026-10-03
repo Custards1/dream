@@ -23,8 +23,8 @@ mod store {
     let init! seed = seed;
 
     let handle_call! request from state = match request {
-        [:get, k]    => reply (map.get :missing state k) state,
-        [:put, k, v] => reply :ok (map.put state k v),
+        [:get, k]    => reply (map.get :missing k state) state,
+        [:put, k, v] => reply :ok (map.put k v state),
         :keys        => reply (map.sorted_keys state) state,
         _            => reply [:error, :unknown] state,
     };

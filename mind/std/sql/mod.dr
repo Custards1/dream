@@ -260,7 +260,7 @@ let is_sql v = match v { [:sql, _] => true, _ => false };
 
 /// Is `v` a query or a statement this module built?
 let is_query : :any -> :bool;
-let is_query v = type_of v == :map && map.has v :kind;
+let is_query v = type_of v == :map && map.has :kind v;
 
 /// A statement with no parameters, written as a string: one statement that
 /// passes `std.sql.lint`. A literal that does not is a compile error wherever
@@ -1833,7 +1833,7 @@ let using! c work = {
 /// Optional native operations this connection actually implements. Portable
 /// bulk insertion and ping work even without native acceleration.
 let capabilities : Connection -> [:atom];
-let capabilities c = list.filter (fn key -> map.has c key)
+let capabilities c = list.filter (fn key -> map.has key c)
     [:fold, :run_many, :prepare_statement, :script, :script_results, :copy_in,
      :cancel, :listen, :unlisten, :notify, :next_notification, :info, :reset];
 
@@ -2027,7 +2027,7 @@ let migrate! c migrations = {
     ] |> if_not_exists)
     let seen = map.set_of (column! c (select ["id"] |> from "dream_migrations"));
     let pending = list.sort_on (fn m -> list.nth 0 m)
-                               (list.filter (fn m -> not (map.member seen (list.nth 0 m))) migrations);
+                               (list.filter (fn m -> not (map.member (list.nth 0 m) seen)) migrations);
     apply_migrations! c pending []
 };
 

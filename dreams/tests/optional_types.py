@@ -186,7 +186,7 @@ let main! = {
     console.print! [types.accepts Listy.type (Listy.make [1, 2] :ok),
                     types.accepts Listy.type (Listy.make [1, 2] (opaque :maybe))]
     console.print! (Point.make (opaque "still untyped") (opaque false))
-    console.print! (try! { types.check Point.type (Point.set_x origin (opaque "bad")) }
+    console.print! (try! { types.check Point.type (Point.set_x (opaque "bad") origin) }
                     catch e { error.kind e })
 };
 ''', '[[1, 0], true, false, false, false]\n[true, false, false]\n[true, false, true]\n'

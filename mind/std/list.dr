@@ -21,7 +21,7 @@
 //   or `result.or_else` is `()` as often as not. So `()` fits any type
 //   variable and never decides one (`solve` and `sub` in
 //   `dreams/typecheck.dr`): `minimum` is `[a] -> a` although its body can
-//   answer `()`, and `map.get () ages name` answers the map's value type
+//   answer `()`, and `map.get () name ages` answers the map's value type
 //   rather than that type or unit -- which a caller that guards with a `()`
 //   arm, exactly as it should, could not otherwise use.
 

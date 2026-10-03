@@ -164,20 +164,20 @@ let main! = {
 import std.list;
 import std.map;
 let ages : %{ :string => :integer } = %{ "ada" => 36 };
-let next = match map.get () ages "bob" { () => 0, n => n + 1 };
+let next = match map.get () "bob" ages { () => 0, n => n + 1 };
 let pair = [1, ()];
 let main! = {
     console.print! next
     console.print! (list.minimum [3, 1] + 1)
     console.print! (list.head pair + 1)
-    console.print! (map.get () (%{ "k" => "v" }) "k")
+    console.print! (map.get () "k" (%{ "k" => "v" }))
 };
 ''', '0\n2\n2\nv\n')
     failure(prelude + '''
 import std.map;
 import std.str;
 let ages : %{ :string => :integer } = %{ "ada" => 36 };
-let main! = console.print! (str.length (map.get () ages "ada"));
+let main! = console.print! (str.length (map.get () "ada" ages));
 ''', 'argument 1 of `str.length` should be `:string`, but this is `:integer`')
     failure(prelude + 'import std.list; let main! = console.print! (list.minimum [3, 1] + "x");',
             'but this is `:integer` and `"x"`')

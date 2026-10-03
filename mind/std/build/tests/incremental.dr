@@ -55,9 +55,9 @@ let main! = {
     file.write! (root + "/src/main.cpp") main_source
     // Several at once, so the schedule is exercised as well as the keys.
     let here = run.here! ();
-    let ctx = build.Context.set_jobs (build.Context.set_cache (build.Context.new "demo" "0" root here here)
-                                                              (root + "/cache"))
-                                     4;
+    let ctx = build.Context.set_jobs 4
+                                     (build.Context.set_cache (root + "/cache")
+                                                              (build.Context.new "demo" "0" root here here));
     // The toolchain as the probe would find it: the compiler asked what it is.
     let cxx = list.nth 1 (steps.compilers ctx);
     let tc = steps.parse ctx (os.exec! cxx ["--version"]).[:out];

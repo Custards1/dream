@@ -67,10 +67,10 @@ let main! = {
     console.print! (expand backwards [1, 2, 3])
     console.print! (expand identity (expand h.twice 7))
     let p = h.Point.make 1 2;
-    let set = h.Point.set_x p;
-    console.print! [p, set 9, h.Point.y p]
+    let set = h.Point.set_x 9;
+    console.print! [p, set p, h.Point.y p]
     let v = h.Vector.make 3 4;
-    console.print! [type_of v, h.Vector.set_y v 8, v]
+    console.print! [type_of v, h.Vector.set_y 8 v, v]
 };
 ''', '12\n[3, 2, 1]\n14\n[[1, 2], [9, 2], 2]\n[:array, #[3, 8], #[3, 4]]\n')
 
@@ -187,15 +187,15 @@ when false { mapping Hidden { unused } }
 let mapping n = n + 1;
 let main! = {
     let pair = Pair.make 20 10;
-    let changed = Pair.set_first pair;
+    let changed = Pair.set_first 30;
     console.print! [type_of pair, pair == %{ :first => 10, :second => 20 }]
-    console.print! [Pair.first pair, Pair.second pair, Pair.first (changed 30), Pair.first pair]
+    console.print! [Pair.first pair, Pair.second pair, Pair.first (changed pair), Pair.first pair]
     console.print! (match pair { %{ :first => x, :second => y } => x + y })
     console.print! (nested.Empty.make () == %{})
     console.print! (Lazy.first (Lazy.make 7 (1 / 0)))
-    console.print! (Lazy.first (Lazy.set_second (Lazy.make 8 9) (1 / 0)))
-    console.print! (Pair.second (Pair.set_first %{ :second => 4, :extra => 5 } 3))
-    console.print! ((Pair.set_first %{ :extra => 5 } 3).[:extra])
+    console.print! (Lazy.first (Lazy.set_second (1 / 0) (Lazy.make 8 9)))
+    console.print! (Pair.second (Pair.set_first 3 %{ :second => 4, :extra => 5 }))
+    console.print! ((Pair.set_first 3 %{ :extra => 5 }).[:extra])
     console.print! (mapping 4)
 };
 ''', '[:map, true]\n[10, 20, 30, 10]\n30\ntrue\n7\n8\n4\n5\n5\n')
@@ -314,8 +314,8 @@ macro wrap e = helper e;
         [vm, compiler, '--repl', '-L', str(root / 'mind'), '-L', str(root)],
         input='macro twice e = [:binary, :add, e, e, [0, 0]];\n'
               'expand twice 21\ngroup Point { x, y }\n'
-              'Point.set_x (Point.make 1 2) 9\nmapping Named { x }\n'
-              'Named.x (Named.set_x (Named.make 1) 73)\n:quit\n',
+              'Point.set_x 9 (Point.make 1 2)\nmapping Named { x }\n'
+              'Named.x (Named.set_x 73 (Named.make 1))\n:quit\n',
         env={**os.environ, 'DREAM': vm}, capture_output=True, text=True, timeout=30)
     assert session.returncode == 0, session.stderr
     assert '42' in session.stdout and '[9, 2]' in session.stdout, session.stdout

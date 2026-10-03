@@ -54,7 +54,7 @@ let is_package m = toml.get "" (doc m) "package" "name" != "";
 // the workspace's -- what belongs to no one member, such as a repository's
 // end-to-end tests.
 
-let is_workspace m = map.has (doc m) "workspace";
+let is_workspace m = map.has "workspace" (doc m);
 
 /// The members, as directories relative to the workspace.
 let members m = match toml.get () (doc m) "workspace" "members" {
@@ -215,14 +215,14 @@ let profiles m = list.map (fn [n, _] -> n) (sections_under m "profile.");
 /// Is `name` a profile this manifest can be built with? `debug` and `release`
 /// always are, declared or not.
 let has_profile m name =
-    name == "debug" || name == "release" || map.has (doc m) ("profile." + name);
+    name == "debug" || name == "release" || map.has ("profile." + name) (doc m);
 
 /// A list-valued key of `[profile.NAME]`, read as `[build]`'s are. An
 /// undeclared `release` defines `release`, which is what `--release` has
 /// always meant; a declared one says for itself.
 let profile_list m name key = {
     let section = "profile." + name;
-    match [map.has (doc m) section, name, key] {
+    match [map.has section (doc m), name, key] {
         [false, "release", "defines"] => ["release"],
         _ => match toml.get () (doc m) section key {
             () => [],

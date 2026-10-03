@@ -48,8 +48,8 @@ group Context {
     no_brace
     indent
     grouped self = make false false (indent self)
-    forbid_brace self = set_no_brace self true
-    allow_brace self = set_no_brace self false
+    forbid_brace self = set_no_brace true self
+    allow_brace self = set_no_brace false self
 }
 
 let ctx = Context.make;
@@ -123,9 +123,9 @@ let is_keyword name = match name {
     "group" => false,
     "struct" => false,
     "mapping" => false,
-    _ => map.has keyword_set name,
+    _ => map.has name keyword_set,
 };
-let is_non_starter name = map.has non_starter_set name;
+let is_non_starter name = map.has name non_starter_set;
 
 /// The token after this one, for the single place that needs to look ahead:
 /// telling `.field` from a `.` that is something else.
@@ -930,7 +930,7 @@ priv let primitive_atom_set = comp set_of primitive_atoms;
 /// keys are strings is what `%{:string => :integer}` should mean.
 let type_key_is_literal ts =
     match peek_kind ts {
-        :atom => not (map.has primitive_atom_set (peek_value ts)),
+        :atom => not (map.has (peek_value ts) primitive_atom_set),
         :str => true, :int => true, :char => true,
         _ => false,
     };

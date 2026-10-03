@@ -587,7 +587,7 @@ let add_spec! source c = {
     match pins {
         [] => base,
         [p] => {
-            let unpinned = list.fold (fn acc k -> map.remove acc k) base ["tag", "branch", "rev"];
+            let unpinned = list.fold (fn acc k -> map.remove k acc) base ["tag", "branch", "rev"];
             unpinned.[p => cli.get () c p]
         },
         _ => fail! "give one of --tag, --branch or --rev",

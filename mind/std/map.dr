@@ -6,6 +6,12 @@
 //
 // Two things are worth knowing before using any of it.
 //
+// **The map comes last.** Every function here that takes a map takes it as
+// its last argument, as `list` takes its list, so `m |> map.put k v` pipes
+// and `map.put k v` is a function from map to map that a fold can apply. The
+// one exception is `merge`, whose two maps are both the subject: it is
+// `merge base overrides`, read left to right as the later one winning.
+//
 // **A map is a value.** `put` answers a new map and leaves the old one alone,
 // which is why it is cheap to keep both: the trie shares every branch the
 // change did not touch. Nothing here mutates anything, so a map handed to
@@ -36,10 +42,10 @@ let merge a b = list.fold_strict (fn m p -> m.[(list.nth 0 p) => (list.nth 1 p)]
 
 // --- looking ----------------------------------------------------------------
 
-let get : v -> %{ k => v } -> k -> v;
-let get default m k = m.[k else default];
-let has : %{ k => v } -> k -> :bool;
-let has m k = _map_has m k;
+let get : v -> k -> %{ k => v } -> v;
+let get default k m = m.[k else default];
+let has : k -> %{ k => v } -> :bool;
+let has k m = _map_has m k;
 let pairs : %{ k => v } -> [[k, v]];
 let pairs m = _map_pairs m;
 let keys : %{ k => v } -> [k];
@@ -58,19 +64,19 @@ let sorted_keys m = list.sort (keys m);
 
 // --- changing ---------------------------------------------------------------
 
-let put : %{ k => v } -> k -> v -> %{ k => v };
-let put m k v = m.[k => v];
-let remove : %{ k => v } -> k -> %{ k => v };
-let remove m k = _map_remove m k;
+let put : k -> v -> %{ k => v } -> %{ k => v };
+let put k v m = m.[k => v];
+let remove : k -> %{ k => v } -> %{ k => v };
+let remove k m = _map_remove m k;
 
 /// Apply `f` to what is at `k`, or to `default` when nothing is:
-/// `update 0 (fn n -> n + 1) counts word` is the whole of counting.
-let update : v -> (v -> v) -> %{ k => v } -> k -> %{ k => v };
-let update default f m k = m.[k => (f (m.[k else default]))];
+/// `update 0 (fn n -> n + 1) word counts` is the whole of counting.
+let update : v -> (v -> v) -> k -> %{ k => v } -> %{ k => v };
+let update default f k m = m.[k => (f (m.[k else default]))];
 
 /// Add only if the key is absent, so a fold over pairs keeps the first.
-let put_new : %{ k => v } -> k -> v -> %{ k => v };
-let put_new m k v = if _map_has m k { m } else { m.[k => v] };
+let put_new : k -> v -> %{ k => v } -> %{ k => v };
+let put_new k v m = if _map_has m k { m } else { m.[k => v] };
 
 let map_values : (v -> w) -> %{ k => v } -> %{ k => w };
 let map_values f m =
@@ -94,9 +100,9 @@ let filter keep m =
 let fold : (a -> k -> v -> a) -> a -> %{ k => v } -> a;
 let fold f init m = list.fold_strict (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (_map_pairs m);
 
-/// Every key of `m` that `other` does not have.
-let without : %{ k => v } -> %{ k => w } -> %{ k => v };
-let without m other = filter (fn k _ -> not (_map_has other k)) m;
+/// Every key of `m` that `other` does not have: `m |> map.without other`.
+let without : %{ k => w } -> %{ k => v } -> %{ k => v };
+let without other m = filter (fn k _ -> not (_map_has other k)) m;
 
 // --- sets, which are maps whose values say nothing ---------------------------
 //
@@ -107,10 +113,10 @@ let without m other = filter (fn k _ -> not (_map_has other k)) m;
 
 let set_of : [a] -> %{ a => :bool };
 let set_of xs = list.fold_strict (fn m x -> m.[x => true]) empty xs;
-let member : %{ a => :bool } -> a -> :bool;
-let member s x = _map_has s x;
-let add : %{ a => :bool } -> a -> %{ a => :bool };
-let add s x = s.[x => true];
+let member : a -> %{ a => :bool } -> :bool;
+let member x s = _map_has s x;
+let add : a -> %{ a => :bool } -> %{ a => :bool };
+let add x s = s.[x => true];
 let members : %{ a => :bool } -> [a];
 let members s = keys s;
 
@@ -122,36 +128,37 @@ when test {
     let m = from_pairs [[:a, 1], [:b, 2]];
 
     let tests = [
-        test.case "empty has nothing"      $( test.false! (has empty :a) ),
-        test.case "from_pairs"             $( test.eq! 1 (get 0 m :a) ),
+        test.case "empty has nothing"      $( test.false! (has :a empty) ),
+        test.case "from_pairs"             $( test.eq! 1 (get 0 :a m) ),
         test.case "a later pair wins"
-            $( test.eq! 2 (get 0 (from_pairs [[:a, 1], [:a, 2]]) :a) ),
-        test.case "a missing key answers the default"  $( test.eq! 0 (get 0 m :zz) ),
+            $( test.eq! 2 (get 0 :a (from_pairs [[:a, 1], [:a, 2]])) ),
+        test.case "a missing key answers the default"  $( test.eq! 0 (get 0 :zz m) ),
         test.case "size"                   $( test.eq! 2 (size m) ),
         test.case "is_empty"               $( test.true! (is_empty empty) ),
         test.case "sorted_keys"            $( test.eq! [:a, :b] (sorted_keys m) ),
         test.case "values follow the sorted keys"
-            $( test.eq! [1, 2] (list.map (fn k -> get 0 m k) (sorted_keys m)) ),
+            $( test.eq! [1, 2] (list.map (fn k -> get 0 k m) (sorted_keys m)) ),
 
         test.case "put leaves the original alone"
-            $( test.eq! [1, 9] [get 0 m :a, get 0 (put m :a 9) :a] ),
-        test.case "remove"                 $( test.false! (has (remove m :a) :a) ),
-        test.case "update an existing key"  $( test.eq! 2 (get 0 (update 0 (fn n -> n + 1) m :a) :a) ),
+            $( test.eq! [1, 9] [get 0 :a m, get 0 :a (put :a 9 m)] ),
+        test.case "remove"                 $( test.false! (has :a (remove :a m)) ),
+        test.case "update an existing key"  $( test.eq! 2 (get 0 :a (update 0 (fn n -> n + 1) :a m)) ),
         test.case "update a missing key starts from the default"
-            $( test.eq! 1 (get 0 (update 0 (fn n -> n + 1) m :zz) :zz) ),
-        test.case "put_new keeps the first" $( test.eq! 1 (get 0 (put_new m :a 9) :a) ),
+            $( test.eq! 1 (get 0 :zz (update 0 (fn n -> n + 1) :zz m)) ),
+        test.case "put_new keeps the first" $( test.eq! 1 (get 0 :a (put_new :a 9 m)) ),
         test.case "map_values"             $( test.eq! [10, 20]
-                                                (list.map (fn k -> get 0 (map_values (fn v -> v * 10) m) k)
+                                                (list.map (fn k -> get 0 k (map_values (fn v -> v * 10) m))
                                                           (sorted_keys m)) ),
         test.case "filter"                 $( test.eq! [:b] (sorted_keys (filter (fn _ v -> v > 1) m)) ),
         test.case "fold sums the values"   $( test.eq! 3 (fold (fn n _ v -> n + v) 0 m) ),
         test.case "merge, the second winning"
-            $( test.eq! 9 (get 0 (merge m (from_pairs [[:a, 9]])) :a) ),
-        test.case "without"                $( test.eq! [:b] (sorted_keys (without m (from_pairs [[:a, 1]]))) ),
+            $( test.eq! 9 (get 0 :a (merge m (from_pairs [[:a, 9]]))) ),
+        test.case "without"                $( test.eq! [:b] (sorted_keys (without (from_pairs [[:a, 1]]) m)) ),
 
-        test.case "a set remembers members" $( test.true! (member (set_of [1, 2]) 2) ),
-        test.case "a set has no others"     $( test.false! (member (set_of [1, 2]) 3) ),
-        test.case "add"                     $( test.true! (member (add (set_of []) :x) :x) ),
+        test.case "a set remembers members" $( test.true! (member 2 (set_of [1, 2])) ),
+        test.case "a set has no others"     $( test.false! (member 3 (set_of [1, 2])) ),
+        test.case "add"                     $( test.true! (member :x (add :x (set_of []))) ),
+        test.case "a pipe of puts"          $( test.eq! [1, 2] (list.map (fn k -> get 0 k (empty |> put :a 1 |> put :b 2)) [:a, :b]) ),
         test.case "members"                 $( test.eq! [1, 2] (list.sort (members (set_of [2, 1]))) ),
     ];
 }

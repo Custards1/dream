@@ -395,7 +395,7 @@ let overlay! n dir s =
         i => {
             let p = at s i;
             let grown = list.append (list.take i (packages s))
-                                    (list.cons (Package.set_overlays p (list.append (overlays p) [dir]))
+                                    (list.cons (Package.set_overlays (list.append (overlays p) [dir]) p)
                                                (list.drop (i + 1) (packages s)));
             set grown (by_name s) (current_index s) (notes s)
         },

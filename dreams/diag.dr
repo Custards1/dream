@@ -64,12 +64,12 @@ let note d = Diagnostic.note d;
 let source_of : :map -> :integer;
 let source_of d = Diagnostic.source d;
 
-let with_note n d = Diagnostic.set_note d n;
+let with_note n d = Diagnostic.set_note n d;
 
 /// Which file the span points into. Set as the diagnostic leaves the pass that
 /// made it, so that a pass working on one file at a time need not thread it.
 let in_source : :integer -> :map -> :map;
-let in_source i d = Diagnostic.set_source d i;
+let in_source i d = Diagnostic.set_source i d;
 
 let is_error : :map -> :bool;
 let is_error d = severity d == :error;

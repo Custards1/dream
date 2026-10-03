@@ -207,32 +207,32 @@ priv let ignored = map.set_of ["connect_timeout", "client_encoding", "target_ses
 priv let apply : :map -> :string -> :string -> [:ok, :map] | [:error, :string];
 priv let apply c k v = match k {
     "host" if str.starts_with "/" v => [:error, "a Unix-domain socket (" + v + ") cannot be opened by this VM; use a TCP host"],
-    "host" => [:ok, Config.set_host c v],
-    "hostaddr" => [:ok, Config.set_host c v],
+    "host" => [:ok, Config.set_host v c],
+    "hostaddr" => [:ok, Config.set_host v c],
     "port" => match num.parse_int v {
-        n if type_of n == :integer && n > 0 && n < 65536 => [:ok, Config.set_port c n],
+        n if type_of n == :integer && n > 0 && n < 65536 => [:ok, Config.set_port n c],
         _ => [:error, "`" + v + "` is not a port"],
     },
-    "user" => [:ok, Config.set_user c v],
-    "password" => [:ok, Config.set_password c v],
-    "dbname" => [:ok, Config.set_database c v],
-    "database" => [:ok, Config.set_database c v],
-    "application_name" => [:ok, Config.set_application_name c v],
+    "user" => [:ok, Config.set_user v c],
+    "password" => [:ok, Config.set_password v c],
+    "dbname" => [:ok, Config.set_database v c],
+    "database" => [:ok, Config.set_database v c],
+    "application_name" => [:ok, Config.set_application_name v c],
     "sslmode" => match ssl_modes.[v else ()] {
         () => [:error, "`" + v + "` is not an sslmode; it is one of disable, allow, prefer, require, verify-ca, verify-full"],
-        mode => [:ok, Config.set_ssl_mode c mode],
+        mode => [:ok, Config.set_ssl_mode mode c],
     },
     "sslrootcert" if v == "system" => [:ok, c],
-    "sslrootcert" => [:ok, Config.set_ssl_root_cert c v],
-    "sslcrl" => [:ok, Config.set_ssl_crl c v],
-    "sslidentity" => [:ok, Config.set_ssl_identity c v],
-    "sslpassword" => [:ok, Config.set_ssl_password c v],
+    "sslrootcert" => [:ok, Config.set_ssl_root_cert v c],
+    "sslcrl" => [:ok, Config.set_ssl_crl v c],
+    "sslidentity" => [:ok, Config.set_ssl_identity v c],
+    "sslpassword" => [:ok, Config.set_ssl_password v c],
     "sslcert" => [:error, "a client certificate is `sslidentity`, a PKCS#12 file -- the format every platform's TLS can"
                           + " import -- rather than `sslcert` and `sslkey`; `openssl pkcs12 -export` makes one"],
     "sslkey" => [:error, "a client key goes with its certificate in `sslidentity`, a PKCS#12 file"],
     "options" => [:ok, c],
-    _ if map.has ignored k => [:ok, c],
-    _ => [:ok, Config.set_settings c ((Config.settings c).[k => v])],
+    _ if map.has k ignored => [:ok, c],
+    _ => [:ok, Config.set_settings ((Config.settings c).[k => v]) c],
 };
 
 // --- the environment ---------------------------------------------------------------

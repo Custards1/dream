@@ -152,7 +152,7 @@ was written.
 What it buys, all in [lucid/analysis.dr](../../lucid/analysis.dr)'s "records" section:
 the outline lists each record with its fields and members underneath it, in
 source order; hover says `` `x record` -- reads `x` of the group `Point` ``,
-`` `set_y record value` -- replaces `y` in the struct `Vector` `` and
+`` `set_y value record` -- replaces `y` in the struct `Vector` `` and
 `` `new host` -- builds the mapping `C`, defaulting `retries` ``; and
 go-to-definition on a generated name lands on **the field**, in the module the
 record was written in — not on the record's own module, whose "path" is a dotted

@@ -80,8 +80,8 @@ let uses t = Target.uses t;
 //
 // Each takes the target last, so a description reads as a pipeline.
 
-let set s t = Target.set_settings t (list.append (settings t) [s]);
-let set_public s t = Target.set_public t (list.append (public t) [s]);
+let set s t = Target.set_settings (list.append (settings t) [s]) t;
+let set_public s t = Target.set_public (list.append (public t) [s]) t;
 
 let standard language t = set (Setting.standard language) t;
 let optimize level t = set (Setting.optimize level) t;
@@ -107,13 +107,13 @@ let public_include dir t = set_public (Setting.include dir) t;
 let public_define name t = set_public (Setting.define name ()) t;
 
 /// Another source file, with no settings of its own.
-let source path t = Target.set_sources t (list.append (sources t) [[path, []]]);
+let source path t = Target.set_sources (list.append (sources t) [[path, []]]) t;
 /// A source file with settings for it alone: `-fno-rtti` for `jit.cpp`.
-let source_with path own t = Target.set_sources t (list.append (sources t) [[path, own]]);
+let source_with path own t = Target.set_sources (list.append (sources t) [[path, own]]) t;
 
 /// Build against another target: its public settings apply to this one's
 /// sources, and it is linked into this one.
-let use other t = Target.set_uses t (list.append (uses t) [other]);
+let use other t = Target.set_uses (list.append (uses t) [other]) t;
 
 // --- toolchains --------------------------------------------------------------
 //

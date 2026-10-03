@@ -50,7 +50,7 @@ not, each found by running the checker over this repository:
   [dreams/typecheck.dr](../../dreams/typecheck.dr). It only ever removes members it
   can see a value cannot be, so an incomplete answer narrows less and never
   reports more. Before it, `if r == () { 0 } else { r + 1 }` was a report.
-  And a *default* is not a maybe: `map.get () ages k` solving `v` as
+  And a *default* is not a maybe: `map.get () k ages` solving `v` as
   `:integer | :unit` made every use of the answer a report, though the
   default was written so that nothing need test. A `()` argument never decides a variable
   (`solve`), fits one wherever it was written even once another argument has

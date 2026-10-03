@@ -30,14 +30,14 @@ let program : :string -> :string -> :any -> :any -> Program;
 let program name entry compiler vm = Program.new name entry (build.input compiler) (build.input vm);
 
 let paths : [:string] -> Program -> Program;
-let paths ps p = Program.set_paths p (list.append (Program.paths p) ps);
+let paths ps p = Program.set_paths (list.append (Program.paths p) ps) p;
 
 let flags : [:string] -> Program -> Program;
-let flags fs p = Program.set_flags p (list.append (Program.flags p) fs);
+let flags fs p = Program.set_flags (list.append (Program.flags p) fs) p;
 
 /// A warning fails the compile, as it does for the examples.
 let no_warnings : Program -> Program;
-let no_warnings p = Program.set_no_warnings p true;
+let no_warnings p = Program.set_no_warnings true p;
 
 /// Is this input an image the VM has to run, rather than a program of its own?
 let is_image : :any -> :bool;

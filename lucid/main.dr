@@ -58,7 +58,7 @@ let roots s = s.[:roots else []];
 let parses s = s.[:parsed else (%{})];
 
 let with_doc path text s = s.[:docs => (((docs s)).[path => text])];
-let without_doc path s = s.[:docs => (map.remove (docs s) path)];
+let without_doc path s = s.[:docs => (map.remove path (docs s))];
 let with_roots rs s = s.[:roots => rs];
 /// Add to what has been parsed. **Merged, never replaced**, and that is not a
 /// detail: a buffer that does not parse names no imports, so the loader for it

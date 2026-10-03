@@ -830,15 +830,23 @@ mapping Position { x, y }
 
 let p = Point.make 3 4;       // [3, 4]
 let x = Point.x p;            // 3
-let q = Point.set_y p 9;      // [3, 9]; p is still [3, 4]
+let q = Point.set_y 9 p;      // [3, 9]; p is still [3, 4]
 let v = Vector.make 3 4;      // #[3, 4]
 let m = Position.make 3 4;    // %{ :x => 3, :y => 4 }
-let n = Position.set_y m 9;  // %{ :x => 3, :y => 9 }; m is unchanged
+let n = Position.set_y 9 m;   // %{ :x => 3, :y => 9 }; m is unchanged
+let r = p |> Point.set_x 1 |> Point.set_y 2;   // [1, 2]
 ```
 
 For each field `f`, the compiler generates `f record` and
-`set_f record value`. `make` takes the fields in declaration order. Helpers
+`set_f value record`. `make` takes the fields in declaration order. Helpers
 are ordinary curried functions, and fields retain normal collection laziness.
+
+The record comes last for the reason `list.map f xs` takes its list last: the
+pipe feeds the left side in as the last argument, and a setter applied to its
+value alone is a function from record to record. So `p |> P.set_x 1` reads in
+the order it happens, a chain of them is a chain of pipes, and `P.set_x 1` can
+be handed to `list.map` as it stands. A member that takes more than the
+receiver is best written the same way, `self` last, for the same reason.
 An empty declaration has a `make ()` constructor. Duplicate fields and names
 that collide with `make`, `new` or another generated helper are rejected.
 

@@ -325,14 +325,14 @@ when test {
         let init! seed = seed;
 
         let handle_call! request from state = match request {
-            [:get, k]    => reply (map.get :missing state k) state,
-            [:put, k, v] => reply :ok (map.put state k v),
+            [:get, k]    => reply (map.get :missing k state) state,
+            [:put, k, v] => reply :ok (map.put k v state),
             :keys        => reply (map.sorted_keys state) state,
             _            => reply [:error, :unknown] state,
         };
 
         let handle_cast! message state = match message {
-            [:put, k, v] => noreply (map.put state k v),
+            [:put, k, v] => noreply (map.put k v state),
             // A way to end this server on purpose, so that a supervisor can be
             // watched putting another one in its place.
             :go_away     => stop :asked state,

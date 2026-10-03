@@ -38,13 +38,13 @@ let double n = expand twice n;
 
 let main! = {
     let point = Point.make 3 4;
-    console.print! [point, Point.x point, Point.set_y point 9, point]
+    console.print! [point, Point.x point, Point.set_y 9 point, point]
     let vector = Vector.make 5 6;
-    console.print! [vector, Vector.y vector, Vector.set_x vector 7, vector]
+    console.print! [vector, Vector.y vector, Vector.set_x 7 vector, vector]
     console.print! (Empty.make ())
     let position = Position.make 3 4;
     console.print! [type_of position, Position.x position,
-                    (Position.set_y position 9).[:y], Position.y position]
+                    (Position.set_y 9 position).[:y], Position.y position]
     console.print! (double 10)
     console.print! (expand ignore name_that_does_not_exist)
     console.print! (expand swap [1, 2])

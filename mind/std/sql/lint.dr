@@ -272,7 +272,7 @@ priv let first_word_problem statement = match statement {
     [[:code, text], .._] => {
         let trimmed = str.trim_start text;
         let word = str.upper (str.slice 0 (str.upto " \t\r\n,*" 0 trimmed) trimmed);
-        if map.has commands word { () }
+        if map.has word commands { () }
         else { "`" + str.slice 0 (str.upto " \t\r\n" 0 trimmed) trimmed + "` does not begin an SQL statement" }
     },
     [[:placeholder, _], .._] => "a statement cannot begin with a value",

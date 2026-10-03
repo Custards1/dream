@@ -1393,7 +1393,7 @@ when test {
     /// A buffer with a record in it, and the three things an editor asks about
     /// one. Line 0 is the declaration -- `x` at column 14, `y` at 17 -- and on
     /// line 1 the three kinds of generated member are at columns 18, 28 and 41.
-    let record_src = "group Point { x, y }\nlet main! = Point.x (Point.set_y (Point.make 1 2) 3);\n";
+    let record_src = "group Point { x, y }\nlet main! = Point.x (Point.set_y 3 (Point.make 1 2));\n";
 
     /// The same, with a member written in it. One line again, and the member
     /// is last so that the fields keep the columns `record_src` uses.
@@ -1547,7 +1547,7 @@ when test {
             $( test.eq! "`x record` -- reads `x` of the group `Point`"
                         (hover_value! record_src 1 18) ),
         test.case "a record's setter says which field it replaces"
-            $( test.eq! "`set_y record value` -- replaces `y` in the group `Point`"
+            $( test.eq! "`set_y value record` -- replaces `y` in the group `Point`"
                         (hover_value! record_src 1 28) ),
         test.case "a record's constructor is shown with its fields"
             $( test.eq! "`make x y` -- builds the group `Point`"

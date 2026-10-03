@@ -143,8 +143,8 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 
 | Primitive | Write | Signature | Description |
 |-----------|-------|-----------|-------------|
-| `_map_has` | `map.has m k` | `map → key → bool` | Returns `true` if `key` is in the map. |
-| `_map_remove` | `map.remove m k` | `map → key → map` | Returns a new map with `key` removed. |
+| `_map_has` | `map.has k m` | `map → key → bool` | Returns `true` if `key` is in the map. |
+| `_map_remove` | `map.remove k m` | `map → key → map` | Returns a new map with `key` removed. |
 | `_map_pairs` | `map.pairs m` | `map → list` | Returns a list of `[key, value]` pairs in unspecified order. |
 
 ### Ordering

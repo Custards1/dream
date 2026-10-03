@@ -433,7 +433,7 @@ let emit_local slot l =
     match ((subst l)).[slot else ()] {
         () => emit (ir.node :local slot ir.no_node ir.no_node) l,
         e  => {
-            let got = lower_expr e (set_subst (map.remove (subst l) slot) l);
+            let got = lower_expr e (set_subst (map.remove slot (subst l)) l);
             [set_subst (subst l) (list.head got), list.nth 1 got]
         },
     };
@@ -1692,9 +1692,9 @@ let lower_program r = {
 let rec comp_dependencies todo seen found pending p funcs globals = match todo {
     [] => found,
     [index, ..rest] =>
-        if not (ir.is_node index) || map.has seen index {
+        if not (ir.is_node index) || map.has index seen {
             comp_dependencies rest seen found pending p funcs globals
-        } else if map.has pending index {
+        } else if map.has index pending {
             comp_dependencies rest (seen.[index => true]) (list.cons index found) pending p funcs globals
         } else {
             let n = ir.node_at index p;
@@ -1727,7 +1727,7 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
 let rec comp_reach todo seen fns p funcs globals = match todo {
     [] => fns,
     [index, ..rest] =>
-        if not (ir.is_node index) || map.has seen index {
+        if not (ir.is_node index) || map.has index seen {
             comp_reach rest seen fns p funcs globals
         } else {
             let n = ir.node_at index p;
@@ -1748,7 +1748,7 @@ let rec comp_reach todo seen fns p funcs globals = match todo {
                 :make_thunk => ir.node_a n,
                 _ => ir.no_node,
             };
-            let fresh = ir.is_node fi && not (map.has fns fi);
+            let fresh = ir.is_node fi && not (map.has fi fns);
             let called = if fresh { [funcs.[fi].[:body]] } else { [] };
             comp_reach (direct + run + called + rest) (seen.[index => true])
                        (if fresh { fns.[fi => true] } else { fns }) p funcs globals
@@ -1786,7 +1786,7 @@ let whole_image fis l = {
     let img = ir.finish (prog l3);
     let cut = list.map (fn pair -> {
         let [fi, f] = pair;
-        if map.has reached fi { f } else { f.[:body => stub] }
+        if map.has fi reached { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (img.[:funcs else []]))) (img.[:funcs else []]));
     emit.to_binary (opt.optimize (img.[:funcs => cut]))
 };
@@ -1810,7 +1810,7 @@ let whole_image fis l = {
 let rec settle_comp_order! rows done built l =
     if list.is_empty rows { l }
     else {
-        let ready = list.filter (fn row -> list.all (fn node -> map.has done node) row.[1]) rows;
+        let ready = list.filter (fn row -> list.all (fn node -> map.has node done) row.[1]) rows;
         if list.is_empty ready {
             complain ast.no_span "cyclic dependency between compile-time expressions" l
         } else {
@@ -2088,7 +2088,7 @@ let reached_wrappers all r = {
             () => close seen rest,
             w => {
                 let next = scope.target_global (list.head w);
-                if map.has seen gi { close seen rest }
+                if map.has gi seen { close seen rest }
                 else { close (seen.[gi => w]) (list.cons next rest) }
             },
         },
@@ -2211,7 +2211,7 @@ let current_arenas l = {
 let rec reach_parts todo seen fns met arenas funcs globals invented_from = match todo {
     [] => [fns, met],
     [key, ..rest] =>
-        if not (ir.is_node key) || map.has seen key {
+        if not (ir.is_node key) || map.has key seen {
             reach_parts rest seen fns met arenas funcs globals invented_from
         } else {
             let k = key / opt.part_base;
@@ -2242,7 +2242,7 @@ let rec reach_parts todo seen fns met arenas funcs globals invented_from = match
                 _ => ir.no_node,
             };
             let waits = if op == :unit && ir.is_node (ir.node_a n) { met.[ir.node_a n + fo => true] } else { met };
-            let fresh = ir.is_node fi && not (map.has fns fi);
+            let fresh = ir.is_node fi && not (map.has fi fns);
             let called = if fresh { [(funcs.[fi]).[:body]] } else { [] };
             reach_parts (direct + run + called + rest) (seen.[key => true])
                         (if fresh { fns.[fi => true] } else { fns }) waits
@@ -2263,7 +2263,7 @@ let parts_image fis l = {
                                          (l.[:invented_from else 0]));
     let cut = list.map (fn pair -> {
         let [fi, f] = pair;
-        if map.has reached fi { f } else { f.[:body => stub] }
+        if map.has fi reached { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (ir.funcs p))) (ir.funcs p));
     emit.to_binary (opt.optimize_parts_filled ((ir.finish_rest p).[:funcs => cut]) (current_arenas l3)
                                               (l.[:invented_from else 0]) (l.[:filled else (%{})]))
@@ -2285,7 +2285,7 @@ let parts_dependencies fi l = {
 let settle_parts_comps! l = {
     let pend = pending_comp l;
     let waiting = list.fold (fn m one -> m.[one.[1] => true]) %{} pend;
-    let rows = list.map (fn one -> [one, list.filter (fn fi -> map.has waiting fi && fi != one.[1])
+    let rows = list.map (fn one -> [one, list.filter (fn fi -> map.has fi waiting && fi != one.[1])
                                                      (parts_dependencies (one.[1]) l)]) pend;
     settle_parts_order! rows %{} () l
 };
@@ -2293,7 +2293,7 @@ let settle_parts_comps! l = {
 let rec settle_parts_order! rows done built l =
     if list.is_empty rows { l }
     else {
-        let ready = list.filter (fn row -> list.all (fn fi -> map.has done fi) row.[1]) rows;
+        let ready = list.filter (fn row -> list.all (fn fi -> map.has fi done) row.[1]) rows;
         if list.is_empty ready {
             complain ast.no_span "cyclic dependency between compile-time expressions" l
         } else {

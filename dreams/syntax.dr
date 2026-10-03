@@ -104,9 +104,12 @@ let record_derived kind name fields members bases span = {
         let field = ast.field_name f;
         let obj = ast.name_e "record" span;
         let key = match kind { :map => ast.atom_e field span, _ => ast.int_e i span };
+        // The setter takes the record last, so `r |> P.set_x 1` pipes and
+        // `P.set_x 1` is a function of the record ("`group`, `struct` and
+        // `mapping`" in docs/language-spec.md).
         [ast.let_d field [ast.param "record" span]
                    (ast.get_e obj key (ast.field_default f) span) false span,
-         ast.let_d ("set_" + field) [ast.param "record" span, ast.param "value" span]
+         ast.let_d ("set_" + field) [ast.param "value" span, ast.param "record" span]
                    (ast.set_e obj key (ast.name_e "value" span) span) false span]
     }) (list.range 0 (list.length fields)));
     // Every record supplies a structural description, without changing its
@@ -171,7 +174,7 @@ let record_sigs kind name fields span =
          ast.sig_d "new" (arrows (takes required) self) span]
         + list.concat (list.map (fn f ->
               [ast.sig_d (ast.field_name f) (arrow (reads f) (field_t f)) span,
-               ast.sig_d ("set_" + ast.field_name f) (arrow self (arrow (field_t f) self)) span])
+               ast.sig_d ("set_" + ast.field_name f) (arrow (field_t f) (arrow self self)) span])
               fields)
     };
 
@@ -459,7 +462,7 @@ let rec c_type env place t = {
         [:atom, a, _] => c_atom place a sp,
         [:unit, _] => c_atom place "void" sp,
         [:name, n, _] =>
-            match [env.[:resources].[n else ()], map.has env.[:structs] n] {
+            match [env.[:resources].[n else ()], map.has n env.[:structs]] {
                 [[dtor], _] => match place {
                     :arg => [:ok, ast.list_e [atom "handle", ast.str_e (lib + "." + n) sp] sp, ast.name_e n sp],
                     :result => owned lib n dtor sp,
@@ -481,7 +484,7 @@ let rec c_type env place t = {
             },
         [:apply, [:name, "borrow", _], [[:name, r, _]], _] =>
             if place != :result && place != :out { fail "`borrow` is a pointer C hands back and keeps" }
-            else if not (map.has env.[:resources] r) { fail ("`" + r + "` is not a resource of `" + lib + "`") }
+            else if not (map.has r env.[:resources]) { fail ("`" + r + "` is not a resource of `" + lib + "`") }
             else { [:ok, ast.list_e [atom "borrow", ast.str_e (lib + "." + r) sp] sp, ast.name_e r sp] },
         [:apply, [:name, "taken", _], [dtor], _] =>
             if place != :result && place != :out { fail "`taken` is a string C hands over, so it is only a result" }

@@ -93,9 +93,9 @@ let global_index e n = expand macros.with_some g ((globals e).[n else ()]) (list
 let global_kind e n = expand macros.with_some g ((globals e).[n else ()]) (list.nth 0 g);
 let with_alias n r e     = e.[:aliases => (aliases e).[n => r]];
 let with_only n v e      = e.[:only => (only e).[n => v]];
-let without_only n e     = e.[:only => (map.remove (only e) n)];
+let without_only n e     = e.[:only => (map.remove n (only e))];
 
-let has_global e n = map.has (globals e) n;
+let has_global e n = map.has n (globals e);
 let alias_of e n   = ((aliases e)).[n else ()];
 let only_of e n    = ((only e)).[n else ()];
 
@@ -105,7 +105,7 @@ let visible_names e =
     list.sort (list.filter (fn n -> not (is_hidden_name n))
                            (list.map (fn kv -> list.head kv) (map.pairs (globals e))));
 
-let is_private e n = map.has (e.[:private else (%{})]) n;
+let is_private e n = map.has n (e.[:private else (%{})]);
 
 /// Public names used by member completion and missing-member diagnostics.
 let exports e = list.filter (fn n -> not (is_private e n)) (visible_names e);
@@ -189,7 +189,7 @@ let diags s   = s.[:diags else []];
 /// walk -- which is what `has_env` is asked, and it used to be spelled
 /// `mi < list.length (envs s)` because a list had no other way to say it.
 let env_at s mi  = (envs s).[mi else ()];
-let has_env s mi = map.has (envs s) mi;
+let has_env s mi = map.has mi (envs s);
 
 /// Replace module `mi`'s environment.
 ///
@@ -419,7 +419,7 @@ let declare_derive l mi d s = {
                 // bound itself, so the base's own code still resolves once it is
                 // copied in here.
                 let inherited = list.fold (fn acc kv ->
-                    if map.has (aliases acc) (list.head kv) { acc }
+                    if map.has (list.head kv) (aliases acc) { acc }
                     else { with_alias (list.head kv) (list.nth 1 kv) acc })
                     e (map.pairs (aliases (env_at s base)));
                 set_env mi (((with_alias (default_alias written ()) (dream_ref base)
@@ -525,7 +525,7 @@ let collect_let l owner d acc s = {
                            (slot + 1), s],
         at =>
             if list.head ((Gather.entries acc).[at]) != owner {
-                [Gather.set_entries acc ((Gather.entries acc).[at => entry]), s]
+                [Gather.set_entries ((Gather.entries acc).[at => entry]) acc, s]
             }
             // A hidden global repeats only where the names beside it repeat, and
             // those are reported in the terms the source was written in.
@@ -1975,7 +1975,7 @@ let resolve_reachable! l declared roots = {
     let rec walk todo seen r all_refs = match todo {
         [] => [r.[:refs => all_refs], seen],
         [[i, p], ..rest] =>
-            if map.has seen i { walk rest seen r all_refs }
+            if map.has i seen { walk rest seen r all_refs }
             else {
                 // This body's occurrences on their own. Merging them into the
                 // running table afterwards keeps reading them proportional to
@@ -1996,11 +1996,11 @@ let resolve_reachable! l declared roots = {
     let rooted = match roots {
         () => queued,
         picked => list.filter (fn [_, p] ->
-            map.has picked (root_key (list.nth 1 p)
-                                          (ast.span_start (decl_span (list.nth 2 p))))) queued,
+            map.has (root_key (list.nth 1 p) (ast.span_start (decl_span (list.nth 2 p)))) picked)
+            queued,
     };
     let [walked, seen] = walk rooted %{} initial %{};
-    let missing = list.filter (fn [i, _] -> not (map.has seen i)) queued;
+    let missing = list.filter (fn [i, _] -> not (map.has i seen)) queued;
     // Which globals the stub is answering for. `resolve_from!` fills a
     // function global's target from the body that was queued for it and leaves
     // `no_function` where there was none -- which is also what an unfilled
@@ -2021,7 +2021,7 @@ let resolve_reachable! l declared roots = {
             // accumulator the queue is built in reverse in.
             let fi = list.nth 3 (list.head (bodies_rev resolved));
             resolved.[:global_recs => (list.map (fn g -> match g {
-                    [gi, n, :function, ()] if map.has stubbed gi => [gi, n, :function, fi],
+                    [gi, n, :function, ()] if map.has gi stubbed => [gi, n, :function, fi],
                     _ => g,
                 }) (r_global_recs resolved))]
         },
@@ -2352,7 +2352,7 @@ let invent_base = 67108864;
 /// never reads. With the modules' names, which the walk reads from the loader
 /// for a group's members.
 let common_key l base = unit.digest [
-    list.fold (fn b k -> map.remove b k) base [:defs, :envs, :diags, :module_recs],
+    list.fold (fn b k -> map.remove k b) base [:defs, :envs, :diags, :module_recs],
     list.map (fn i -> modules.module_name (modules.module_at l i)) (list.range 0 (modules.module_count l)),
 ];
 
@@ -2729,7 +2729,7 @@ let role_spellings es pend base =
             match static_global es (list.nth 0 p) (decl_body d) {
                 () => acc,
                 target =>
-                    if map.has base target { acc.[(decl_name d) => true] } else { acc },
+                    if map.has target base { acc.[(decl_name d) => true] } else { acc },
             }
         }
     }) (list.fold (fn acc n -> acc.[n => true]) (%{}) fuse.member_names)
@@ -2858,8 +2858,8 @@ let stage_shaped r body =
 /// anything is resolved, because most applications in a program are not.
 let spelled_like_a_role r e =
     match e {
-        [:name, n, _]        => map.has (role_names r) n,
-        [:field, _, field, _] => map.has (role_names r) field,
+        [:name, n, _]        => map.has n (role_names r),
+        [:field, _, field, _] => map.has field (role_names r),
         _ => false,
     };
 

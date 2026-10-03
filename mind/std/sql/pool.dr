@@ -64,7 +64,7 @@ mod worker {
             strict! answer
             reply_to! from answer
             server.cast! (State.owner state) [:idle, self! ()]
-            noreply (State.set_connection state next)
+            noreply (State.set_connection next state)
         },
         _ => noreply state,
     };
@@ -89,16 +89,16 @@ mod keeper {
         [:work, work!] => match State.idle state {
             [w, ..rest] => {
                 worker.cast! w [:work, work!, from]
-                noreply (State.set_idle state rest)
+                noreply (State.set_idle rest state)
             },
             [] if len (State.workers state) < State.size state => {
                 let owner = self! ();
                 strict! owner
                 let w = worker.start! (worker.State.new (State.opener state) owner);
                 worker.cast! w [:work, work!, from]
-                noreply (State.set_workers state (list.cons w (State.workers state)))
+                noreply (State.set_workers (list.cons w (State.workers state)) state)
             },
-            [] => noreply (State.set_waiting state (State.waiting state + [[work!, from]])),
+            [] => noreply (State.set_waiting (State.waiting state + [[work!, from]]) state),
         },
         :stats => reply %{ :size => State.size state, :workers => len (State.workers state),
             :idle => len (State.idle state), :busy => len (State.workers state) - len (State.idle state),
@@ -106,8 +106,9 @@ mod keeper {
         :drain => {
             let idle = State.idle state;
             strict! (list.map worker.stop! idle)
-            reply (len idle) (State.set_idle (State.set_workers state
-                (list.filter (fn w -> not (list.contains w idle)) (State.workers state))) [] )
+            reply (len idle) (state
+                |> State.set_workers (list.filter (fn w -> not (list.contains w idle)) (State.workers state))
+                |> State.set_idle [])
         },
         _ => reply [:error, :unknown_request] state,
     };
@@ -117,9 +118,9 @@ mod keeper {
         [:idle, w] => match State.waiting state {
             [[work!, from], ..rest] => {
                 worker.cast! w [:work, work!, from]
-                noreply (State.set_waiting state rest)
+                noreply (State.set_waiting rest state)
             },
-            [] => noreply (State.set_idle state (list.cons w (State.idle state))),
+            [] => noreply (State.set_idle (list.cons w (State.idle state)) state),
         },
         _ => noreply state,
     };

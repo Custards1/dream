@@ -417,7 +417,7 @@ priv let pending columns = Pending.make columns [] [] [] [] () [];
 
 priv let collect! : Conn -> Pending -> [:map];
 priv let rec collect! conn !p = match receive! conn {
-    [:row_description, cols] => collect! conn (Pending.set_columns p cols),
+    [:row_description, cols] => collect! conn (Pending.set_columns cols p),
     [:data_row, fields] => collect! conn (with_row p fields),
     [:command_complete, tag] => collect! conn (closed conn p tag),
     :empty_query => collect! conn (closed conn p ""),
@@ -437,16 +437,16 @@ priv let rec collect! conn !p = match receive! conn {
 };
 
 priv let with_row : Pending -> [:any] -> Pending;
-priv let with_row p fields = forced Pending.set_raw p (strict_cons fields (Pending.raw p));
+priv let with_row p fields = forced Pending.set_raw (strict_cons fields (Pending.raw p)) p;
 
 priv let with_copy : Pending -> :string -> Pending;
-priv let with_copy p data = forced Pending.set_copy p (strict_cons data (Pending.copy p));
+priv let with_copy p data = forced Pending.set_copy (strict_cons data (Pending.copy p)) p;
 
 priv let with_notice : Pending -> :map -> Pending;
-priv let with_notice p fields = forced Pending.set_notices p (strict_cons fields (Pending.notices p));
+priv let with_notice p fields = forced Pending.set_notices (strict_cons fields (Pending.notices p)) p;
 
 priv let with_notification : Pending -> :map -> Pending;
-priv let with_notification p n = forced Pending.set_notifications p (strict_cons n (Pending.notifications p));
+priv let with_notification p n = forced Pending.set_notifications (strict_cons n (Pending.notifications p)) p;
 
 /// A setter whose value is forced first. A change stores what it is given as
 /// it is given, so without this a list grown a row at a time is a chain of
@@ -458,7 +458,7 @@ priv let forced set p !v = set p v;
 /// The first failure is the one that is raised; a later one is about the
 /// first.
 priv let with_failure : Pending -> :any -> Pending;
-priv let with_failure p e = if Pending.failure p == () { Pending.set_failure p e } else { p };
+priv let with_failure p e = if Pending.failure p == () { Pending.set_failure e p } else { p };
 
 /// A cons whose tail is already a value, so a list built a message at a time is
 /// a list and not a tower of suspended conses.
@@ -806,8 +806,8 @@ let prepare_types! conn name text oids = {
 
 priv let described! : Conn -> Prepared -> :any -> Prepared;
 priv let rec described! conn p failure = match receive! conn {
-    [:parameter_description, oids] => described! conn (Prepared.set_parameters p oids) failure,
-    [:row_description, cols] => described! conn (Prepared.set_columns p cols) failure,
+    [:parameter_description, oids] => described! conn (Prepared.set_parameters oids p) failure,
+    [:row_description, cols] => described! conn (Prepared.set_columns cols p) failure,
     [:error_response, fields] => described! conn p (if failure == () { errors.server fields } else { failure }),
     [:ready, _] => if failure == () { p } else { raise! failure },
     _ => described! conn p failure,

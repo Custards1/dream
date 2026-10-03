@@ -52,9 +52,9 @@ let scoped c = Configuration.scoped c;
 /// actually starts from; this is what a test starts from.
 let empty = Configuration.new ();
 
-let define name c = Configuration.set_flags c ((flags c).[name => true]);
+let define name c = Configuration.set_flags ((flags c).[name => true]) c;
 
-let set key value c = Configuration.set_values c ((values c).[key => value]);
+let set key value c = Configuration.set_values ((values c).[key => value]) c;
 
 /// The name a package's settings are filed under.
 let canonical c key = (Configuration.aliases c).[key else key];
@@ -63,7 +63,7 @@ let canonical c key = (Configuration.aliases c).[key else key];
 let set_in key name value c = {
     let k = canonical c key;
     let now = (scoped c).[k else (%{})];
-    Configuration.set_scoped c ((scoped c).[k => now.[name => value]])
+    Configuration.set_scoped ((scoped c).[k => now.[name => value]]) c
 };
 
 /// Accepts `name`, `name=value`, `key:name` or `key:name=value`, which is what
@@ -90,7 +90,7 @@ let define_arg arg c = {
 
 /// The same configuration, read from inside package `key`'s modules. `()` is
 /// a module that belongs to no package, which sees the program's settings only.
-let within key c = Configuration.set_here c (match key { () => (), k => canonical c k });
+let within key c = Configuration.set_here (match key { () => (), k => canonical c k }) c;
 
 /// Refile every scope under its canonical name, now that the names are known:
 /// `-D` is read before the packages are found, so a scope set through a key
@@ -98,12 +98,12 @@ let within key c = Configuration.set_here c (match key { () => (), k => canonica
 /// being unknown when `known` says so -- a `-D` that names no package is a
 /// typo, and a typo that is quietly ignored is the worst answer to one.
 let with_aliases aliases known c = {
-    let named = Configuration.set_aliases c aliases;
+    let named = Configuration.set_aliases aliases c;
     let refiled = list.fold (fn m [k, table] -> {
         let to = canonical named k;
         m.[to => list.fold (fn t [n, v] -> t.[n => v]) (m.[to else (%{})]) (map.pairs table)]
     }) (%{}) (map.pairs (scoped c));
-    [Configuration.set_scoped named refiled,
+    [Configuration.set_scoped refiled named,
      list.filter (fn k -> not (known k)) (list.map (fn [k, _] -> k) (map.pairs (scoped c)))]
 };
 
@@ -136,7 +136,7 @@ let rec define_args args c =
         [a, ..rest] => define_args rest (define_arg a c),
     };
 
-let is_defined name c = map.has (flags c) name;
+let is_defined name c = map.has name (flags c);
 
 /// The value of a setting, or `()` when it has none.
 let value key c = ((values c)).[key else ()];
@@ -173,7 +173,7 @@ let rec eval c cond =
         [:flag, name]   => match option c name {
             [:ok, v] => v != () && v != "false",
             // A setting that has a value counts as defined.
-            _ => is_defined name c || map.has (values c) name,
+            _ => is_defined name c || map.has name (values c),
         },
         [:equals, k, v] => match option c k {
             [:ok, found] => found == v,
