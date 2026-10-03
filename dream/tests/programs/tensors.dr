@@ -2,7 +2,7 @@
 import std.console;
 import std.tensor;
 
-let kind! thunk = try! { thunk () } catch e { error_kind e };
+let kind! thunk = try! { thunk () } catch e { _error_kind e };
 
 let main! = {
     let a = tensor.of_list [[1, 2], [3, 4]];

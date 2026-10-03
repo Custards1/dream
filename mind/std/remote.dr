@@ -99,11 +99,11 @@ import std.wire;
 /// with `+` would copy everything read so far at every step.
 priv let exactly! : :any -> :integer -> [:string] -> :string;
 priv let rec exactly! sock n acc =
-    if n <= 0 { str_concat (list.reverse acc) }
+    if n <= 0 { _str_concat (list.reverse acc) }
     else {
         let chunk = io.read! sock n;
-        if len chunk == 0 { str_concat (list.reverse acc) }
-        else { exactly! sock (n - len chunk) (list_cons chunk acc) }
+        if len chunk == 0 { _str_concat (list.reverse acc) }
+        else { exactly! sock (n - len chunk) (_list_cons chunk acc) }
     };
 
 /// The next message: a `std.result` of the value, or `()` at end of stream.

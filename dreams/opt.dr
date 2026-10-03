@@ -62,6 +62,8 @@ import std.vm;
 
 import dreams.ir;
 import dreams.builtins;
+import std.array;
+import std.map;
 
 // --- what an operand means ----------------------------------------------------
 //
@@ -384,9 +386,9 @@ let primitive_ops = %{
 /// rebuilds, so the IDs are settled here once rather than asked of
 /// `builtins.id` three times a node.
 let list_ops = %{
-    builtins.id "list_cons" => [:cons, 2],
-    builtins.id "list_tail" => [:list_tail, 1],
-    builtins.id "list_is_empty" => [:list_is_empty, 1],
+    builtins.id "_list_cons" => [:cons, 2],
+    builtins.id "_list_tail" => [:list_tail, 1],
+    builtins.id "_list_is_empty" => [:list_is_empty, 1],
 };
 
 let type_of_id = builtins.id "type_of";
@@ -435,13 +437,13 @@ let specialize n s = match ir.node_op n {
 let keep n s =
     if not (shareable n) {
         let i = count s;
-        [((s.[:out => list_cons n (out s)])).[:count => (i + 1)], i]
+        [((s.[:out => list.cons n (out s)])).[:count => (i + 1)], i]
     } else {
         let key = to_string n;
         match ((seen s)).[key else ()] {
             () => {
                 let i = count s;
-                [((((s.[:out => list_cons n (out s)])).[:count => (i + 1)])).[:seen => (((seen s)).[key => i])],
+                [((((s.[:out => list.cons n (out s)])).[:count => (i + 1)])).[:seen => (((seen s)).[key => i])],
                  i]
             },
             found => [s, found],
@@ -553,7 +555,7 @@ let rec rebuild_kids off k many acc s =
     if k >= many { [s, acc] }
     else {
         let got = rebuild (kid_at (off + k) s) s;
-        rebuild_kids off (k + 1) many (list_cons (list.nth 1 got) acc) (list.head got)
+        rebuild_kids off (k + 1) many (list.cons (list.nth 1 got) acc) (list.head got)
     };
 
 // --- the pass ----------------------------------------------------------------------
@@ -592,7 +594,7 @@ let place_captures f s = {
 /// the constant pools keep their indices, so every `int`, `str` and `atom` node
 /// still names what it named, and `funcs` changes in exactly two fields.
 let optimize img =
-    optimize_tables img (array_of_list (img.[:nodes else []])) (array_of_list (img.[:kids else []]));
+    optimize_tables img (array.of_list (img.[:nodes else []])) (array.of_list (img.[:kids else []]));
 
 /// The same, for a program as `lower` builds it: straight from its tables,
 /// which a read indexes as well as it does an array, so the arena is never
@@ -606,7 +608,7 @@ let optimize_tables img nodes kids = {
 
 /// A state to walk from: the arena to read, and nothing written yet.
 let fresh img nodes kids = {
-    let strings = array_of_list (img.[:strs else []]);
+    let strings = array.of_list (img.[:strs else []]);
     let ids = list.map (fn at -> type_codes.[strings.[at else ""] else ()])
                       (img.[:atoms else []]);
     let type_ids = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
@@ -634,7 +636,7 @@ let type_ids_in strs atoms =
                 ai => m.[ai => code],
             },
         }
-    }) %{} (map_pairs type_codes);
+    }) %{} (map.pairs type_codes);
 
 /// Share several arenas into one: `parts` is an array of `%{ :nodes, :kids,
 /// :remap, :fo, :go }`, arrays both, and each of `img`'s functions names its
@@ -669,7 +671,7 @@ let optimize_parts_by_hand img parts invented_from filled = {
         let got = rebuild local entered;
         let caps = place_captures f (enter_part 0 (list.head got));
         [settle (list.head caps),
-         list_cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
+         list.cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
                    (list.nth 1 acc)]
     }) [s0, []] (img.[:funcs else []]);
     finished img (list.head walked) (list.reverse (list.nth 1 walked))
@@ -682,7 +684,7 @@ let walk_funcs fs s0 =
         let got = rebuild (f.[:body else ir.no_node]) (list.head acc);
         let caps = place_captures f (list.head got);
         [settle (list.head caps),
-         list_cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
+         list.cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
                    (list.nth 1 acc)]
     }) [s0, []] fs;
 
@@ -743,17 +745,17 @@ when test {
     /// `comp` placeholder read from part 0, captures, and a node two parts
     /// both have.
     let none = ir.no_node;
-    let pools ints strs = %{ :ints => array_of_list ints, :floats => #[], :strs => array_of_list strs, :atoms => #[] };
-    let parts = array_of_list [
-        %{ :nodes => array_of_list [[:const_int, 0, 1, none, none], [:local, 0, 2, none, none]],
-           :kids => array_of_list [4, 5] },
-        %{ :nodes => array_of_list [[:add, 0, 1, 2, none], [:const_int, 0, 0, none, none],
+    let pools ints strs = %{ :ints => array.of_list ints, :floats => #[], :strs => array.of_list strs, :atoms => #[] };
+    let parts = array.of_list [
+        %{ :nodes => array.of_list [[:const_int, 0, 1, none, none], [:local, 0, 2, none, none]],
+           :kids => array.of_list [4, 5] },
+        %{ :nodes => array.of_list [[:add, 0, 1, 2, none], [:const_int, 0, 0, none, none],
                                     [:global, 0, 70, none, none], [:make_closure, 0, 1, none, none]],
            :kids => #[], :remap => pools [3] [], :fo => 0, :go => 5 },
-        %{ :nodes => array_of_list [[:apply, 0, 1, 0, 2], [:field, 0, 4, 0, none], [:const_int, 0, 0, none, none],
+        %{ :nodes => array.of_list [[:apply, 0, 1, 0, 2], [:field, 0, 4, 0, none], [:const_int, 0, 0, none, none],
                                     [:unit, 0, 0, none, none], [:local, 0, 2, none, none],
                                     [:add, 0, 2, 2, none], [:make_closure, 0, 1, none, none]],
-           :kids => array_of_list [2, 3], :remap => pools [3] [6], :fo => 10, :go => 7 },
+           :kids => array.of_list [2, 3], :remap => pools [3] [6], :fo => 10, :go => 7 },
     ];
     let parted = %{ :funcs => [%{ :body => part_base + 0 },
                                %{ :body => 2 * part_base + 0, :n_captures => 2, :captures_off => 0 },

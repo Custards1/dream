@@ -137,7 +137,7 @@ let rec collect_modules! base dir acc =
         else if list.contains (path.extension entry) module_extensions {
             match module_name base entry {
                 () => found,
-                n  => list_cons n found,
+                n  => list.cons n found,
             }
         }
         else { found }) acc (path.list_dir! dir);

@@ -58,7 +58,7 @@ let pre [_, _, _, p] = p;
 let number : :string -> :integer | :unit;
 let number s =
     if str.is_empty s || (str.byte_length s > 1 && str.starts_with "0" s) { () }
-    else if list.all (fn c -> c >= '0' && c <= '9') (str.chars s) { parse_int s }
+    else if list.all (fn c -> c >= '0' && c <= '9') (str.chars s) { _parse_int s }
     else { () };
 
 /// The text before the first `sep`, and after it (`""` when there is none).

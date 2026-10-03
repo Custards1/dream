@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix='dream-static-') as directory:
             assert message in result.stderr, (message, result.stderr)
         count += 1
 
-    prelude = 'import std.console;  import std.types;\n'
+    prelude = 'import std.console;  import std.types; import std.error;\n'
 
     # --- signatures ------------------------------------------------------------
     #
@@ -61,10 +61,11 @@ let add x y = x + y;
 let limit : :integer = 10;
 let greet who : :string = "hi " + who;
 
+import std.list;
 let map : (a -> b) -> [a] -> [b];
 let map f xs = match xs {
     [] => [],
-    [x, ..rest] => list_cons (f x) (map f rest),
+    [x, ..rest] => list.cons (f x) (map f rest),
 };
 
 let lengths : [:string] -> [:integer];
@@ -106,8 +107,9 @@ let describe n : :string = if n > 0 { "positive" } else { n > 5 };
 let main! = console.print! (describe 1);
 ''', 'should be `:string`, but this is `:bool`')
     failure(prelude + '''
+import std.list;
 let map : (a -> b) -> [a] -> [b];
-let map f xs = match xs { [] => [], [x, ..rest] => list_cons (f x) (map f rest) };
+let map f xs = match xs { [] => [], [x, ..rest] => list.cons (f x) (map f rest) };
 let wrong : [:integer] -> [:string];
 let wrong xs = map (fn n -> n + 1) xs;
 let main! = console.print! (wrong [1]);
@@ -321,9 +323,9 @@ let add : :integer -> :integer -> :integer;
 let add x y = x + y;
 let opaque x = x;
 let main! = {
-    console.print! (error_kind (try! { 1 + "x" } catch e { e }))
-    console.print! (error_kind (try! { (1) 2 } catch e { e }))
-    console.print! (error_kind (try! { add (opaque "one") 2 } catch e { e }))
+    console.print! (error.kind (try! { 1 + "x" } catch e { e }))
+    console.print! (error.kind (try! { (1) 2 } catch e { e }))
+    console.print! (error.kind (try! { add (opaque "one") 2 } catch e { e }))
 };
 ''', ':type_error\n:not_a_function\n:type_error\n')
 

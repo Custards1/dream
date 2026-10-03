@@ -12,6 +12,7 @@ import dreams.lower;
 import dreams.modules;
 import dreams.scope;
 import dreams.syntax;
+import std.map;
 
 let rec has_expansion tree = match type_of tree {
     :list => match tree {
@@ -142,7 +143,7 @@ let vm_starts s = tally s :vm_starts;
 /// reader wants the compile rather than the half of it that worked.
 let merge_meter a b = {
     let join key combine = list.fold (fn m [k, v] -> m.[k => (combine (m.[k else ()]) v)])
-                                     (a.[key else %{}]) (map_pairs (b.[key else %{}]));
+                                     (a.[key else %{}]) (map.pairs (b.[key else %{}]));
     %{ :phases => join :phases (fn old v -> match old {
            () => v,
            _ => list.map (fn [x, y] -> x + y) (list.zip old v),
@@ -282,8 +283,16 @@ let stage_program l work = {
 
 let prepare_work! l work = {
     let staged = stage_program l work;
-    %{ :loader => staged, :declared => scope.declare! staged,
-       :roots => transformer_roots l }
+    let declared = scope.declare! staged;
+    // The whole program resolved, for a round that asks for it (`:whole`),
+    // made at most once per snapshot. The fallback in `sequential!` reuses a
+    // snapshot across every declaration that fails against it, and resolving
+    // the program afresh for each of them was a compile per failing `expand`
+    // -- for a program that does not resolve, every one of them. Lazy, so a
+    // snapshot nobody asks of whole never pays for it.
+    let whole = scope.resolve_reachable! staged declared ();
+    %{ :loader => staged, :declared => declared,
+       :roots => transformer_roots l, :resolved_whole => whole }
 };
 
 /// Lower and link only the temporary wrapper. The base arena and function
@@ -298,7 +307,7 @@ let prepare_work! l work = {
 /// and `MODS` is the only statement in the container of which globals are
 /// whose. Without it the image loads, runs, and has no member of any name.
 let invocation_image ld resolved = {
-    let low = staged_lowering (map_remove (lower.lower_program resolved) :image);
+    let low = staged_lowering (map.remove (lower.lower_program resolved) :image);
     let ms = lower.link_modules ld resolved low;
     ir.finish (((lower.prog (list.head ms))).[:modules => (list.nth 1 ms)])
 };
@@ -392,7 +401,7 @@ let evaluate_round! base s session0 jobs = {
         let body = if alone { list.head named } else { ast.list_e named sp };
         let [wrapper, after] = syntax.fresh
             (ast.let_d "<macro expansion>!" [] body false sp) n;
-        [list_cons [mi, calls, alone, wrapper] acc, after]
+        [list.cons [mi, calls, alone, wrapper] acc, after]
     }) [[], next s] jobs;
     let plans = list.reverse (list.head prepared);
     let s1 = counts (s.[:next => (list.nth 1 prepared)])
@@ -421,8 +430,12 @@ let evaluate_round! base s session0 jobs = {
     // at all: they are the same three values it was handed. That is also why
     // the meter is off by default, and why these are charged where the session
     // is opened rather than here -- charging a phase forces it.
-    let resolved = scope.resolve_reachable! staged base.[:declared]
-        (if base.[:whole else false] { () } else { base.[:roots else ()] });
+    let resolved = if base.[:whole else false] {
+                       match base.[:resolved_whole else ()] {
+                           () => scope.resolve_reachable! staged base.[:declared] (),
+                           r => r,
+                       }
+                   } else { scope.resolve_reachable! staged base.[:declared] (base.[:roots else ()]) };
     let arena = invocation_image staged resolved;
     let bytes = emit.to_binary arena;
 
@@ -494,15 +507,39 @@ let evaluate_round! base s session0 jobs = {
         /// What is wrong with call `i`, or `()`. A resolution error anywhere in
         /// the round is everyone's objection: the round resolved the wrappers
         /// together, so nothing it produced can be trusted.
+        ///
+        /// That includes a macro whose own name resolved. Its body, or
+        /// anything it calls, may name something that did not, and a name
+        /// that did not resolve is lowered to `()`: running it runs a program
+        /// with holes in it, which can raise -- and then be asked again of
+        /// the whole program -- or recurse without end. Refusing is what lets
+        /// a build with an unresolved name in `std` fail in a second rather
+        /// than run the machine out of memory (see "A program that does not
+        /// resolve ran the machine out of memory" in docs/notes/macro-expansion.md).
+        ///
+        /// The errors that matter for that are the transformers' own
+        /// resolution (`resolved`), not the round's: the names the wrappers
+        /// mention resolve, and it is something a transformer reaches -- a
+        /// `std` module with a typo in it -- that does not. Nor is the call
+        /// asked again of the whole program, which is the path a raising call
+        /// takes: that is a compile of the program per call, and for a file
+        /// with dozens of `expand`s it ran out of memory long before it
+        /// reported anything.
+        let sited_errors = list.filter (fn d -> diag.is_error d) (scope.r_diags sited);
         let objection i =
             match list.nth i definitions {
-                () => if diag.error_count (scope.r_diags sited) == 0 {
+                () => if list.is_empty sited_errors {
                           "`expand` needs the name of a declared macro"
                       } else {
                           "cannot compile macro: "
-                          + str.join_str "; " (list.map (fn d -> diag.message d)
-                              (list.filter (fn d -> diag.is_error d) (scope.r_diags sited)))
+                          + str.join_str "; " (list.map (fn d -> diag.message d) sited_errors)
                       },
+                _ if diag.error_count (scope.r_diags resolved) > 0 => {
+                    let broken = list.filter (fn d -> diag.is_error d) (scope.r_diags resolved);
+                    "cannot run macro: what it runs does not compile (" + diag.message (list.head broken)
+                    + (if list.length broken > 1 { ", and " + to_string (list.length broken - 1) + " more" }
+                       else { "" }) + ")"
+                },
                 definition => {
                     let arity = list.length (list.nth 2 definition);
                     let given = list.length (call_args (list.head (list.nth i calls)));
@@ -525,7 +562,7 @@ let evaluate_round! base s session0 jobs = {
             let at = list.nth 1 (list.nth i calls);
             match objection i {
                 why if why != () =>
-                    [fail (counted st :refused 1) mi at why, session, list_cons () answers],
+                    [fail (counted st :refused 1) mi at why, session, list.cons () answers],
                 _ => {
                     let [target_mi, target_name] = macro_target (list.nth i references);
                     let opened = open_round! st session;
@@ -550,7 +587,7 @@ let evaluate_round! base s session0 jobs = {
                         // again.
                         [:error, why] if base.[:whole else false] =>
                             [fail ran mi at ("macro evaluation failed: " + why),
-                             handle, list_cons () answers],
+                             handle, list.cons () answers],
                         // A session of its own, because the base is a
                         // different one: the whole program resolves to a
                         // different image, and this one must not be mistaken
@@ -564,13 +601,13 @@ let evaluate_round! base s session0 jobs = {
                                 other => vm.close_image! other,
                             };
                             strict! spent
-                            [list.head got, handle, list_cons (list.nth 2 got) answers]
+                            [list.head got, handle, list.cons (list.nth 2 got) answers]
                         },
                         [:ok, value] => {
                             let installing = charge! (metering ran) (install! mi m ran value at);
                             let done = list.head installing;
                             [charged (list.head done) :install (list.nth 1 installing),
-                             handle, list_cons (list.nth 1 done) answers]
+                             handle, list.cons (list.nth 1 done) answers]
                         },
                     }
                 },
@@ -582,7 +619,7 @@ let evaluate_round! base s session0 jobs = {
         let got = run! st session plan;
         strict! got
         [list.head got, list.nth 1 got,
-         list_cons (list.reverse (list.nth 2 got)) acc]
+         list.cons (list.reverse (list.nth 2 got)) acc]
     }) [s2, session0, []] plans;
     strict! done
     // The session is handed back rather than closed. It holds an image, a heap
@@ -603,13 +640,13 @@ let evaluate_round! base s session0 jobs = {
 let rec punch tree acc = match tree {
     [:expand, call, sp] => {
         let [calls, n] = acc;
-        [[:expansion_hole, n, sp], [list_cons [call, sp] calls, n + 1]]
+        [[:expansion_hole, n, sp], [list.cons [call, sp] calls, n + 1]]
     },
     _ => if type_of tree != :list { [tree, acc] }
          else {
              let done = list.fold (fn [parts, a] part -> {
                  let got = punch part a;
-                 [list_cons (list.head got) parts, list.nth 1 got]
+                 [list.cons (list.head got) parts, list.nth 1 got]
              }) [[], acc] tree;
              [list.reverse (list.head done), list.nth 1 done]
          },
@@ -703,7 +740,7 @@ let rec rounds_all! base s session items depth = {
         let filled = list.fold (fn [acc, remaining] j -> {
             let calls = list.nth 3 j;
             if list.is_empty calls {
-                [list_cons [list.nth 0 j, list.nth 1 j, list.nth 2 j] acc, remaining]
+                [list.cons [list.nth 0 j, list.nth 1 j, list.nth 2 j] acc, remaining]
             } else {
                 let mi = list.head j;
                 let mine = remaining.[mi else []];
@@ -711,7 +748,7 @@ let rec rounds_all! base s session items depth = {
                     () => ast.unit_e (list.nth 1 (list.nth 1 pair)),
                     answer => answer,
                 }) (list.zip (list.take (list.length calls) mine) calls);
-                [list_cons [mi, list.nth 1 j, fill (list.nth 2 j) answers] acc,
+                [list.cons [mi, list.nth 1 j, fill (list.nth 2 j) answers] acc,
                  remaining.[mi => list.drop (list.length calls) mine]]
             }
         }) [[], pool] punched;
@@ -721,6 +758,12 @@ let rec rounds_all! base s session items depth = {
 
 let base_of s  = s.[:base else ()];
 let put_base b s = s.[:base => b];
+
+/// How many declarations `sequential!` has expanded, and how many it had when
+/// its snapshot was prepared: the snapshot can be stale only if the first has
+/// moved on from the second.
+let succeeded s = s.[:succeeded else 0];
+let base_at s = s.[:base_at else (0 - 1)];
 
 /// Declaration `i` of module `mi`, expanded and put back where it was.
 ///
@@ -761,7 +804,7 @@ let picks_of l mi = {
     if list.is_empty sites { [mi, source, [], [], []] }
     else {
         let numbered = list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
-            [i + 1, list_cons [i, item] acc]) [0, []] (modules.module_items m)));
+            [i + 1, list.cons [i, item] acc]) [0, []] (modules.module_items m)));
         [mi, source, sites, numbered,
          list.filter (fn [_, item] -> in_item sites item) numbered]
     }
@@ -862,6 +905,7 @@ let sequential! l =
                 // it is here because something the reachable-only snapshot
                 // stubbed was demanded, and only a program with no stubs in it
                 // can tell that apart from a macro that genuinely raised.
+                let current = base_of acc == () || base_at acc == succeeded acc;
                 let preparing = charge! (metering acc) (match base_of acc {
                     () => (prepare! (loader acc)).[:whole => true],
                     b => b,
@@ -875,19 +919,32 @@ let sequential! l =
                 let first = charged (expand_item! base acc mi i item)
                                     :snapshot (list.nth 1 preparing);
                 strict! first
+                let kept = if base_of acc == () { first.[:base_at => succeeded acc] } else { first };
                 // A declaration that raised may have been asking for one the
                 // snapshot has not caught up with. That is the only thing a
                 // stale snapshot can do -- see `prepare!` -- so a fresh one
                 // and a second attempt settles which it was, started again
                 // from before the first so that a failure that is real is
                 // still reported exactly once.
-                if complaints first == before { put_base base first }
+                //
+                // Only a snapshot something has been expanded since can be
+                // stale. One made after the last expansion that succeeded is
+                // the program as it stands, and a declaration that fails
+                // against it fails for real -- so preparing another, which is
+                // the cost of a compile, would only fail it again. A program
+                // that does not compile fails every declaration that way, and
+                // asking twice of each was what made such a build run out of
+                // memory instead of failing (see "A program that does not
+                // resolve ran the machine out of memory" in
+                // docs/notes/macro-expansion.md).
+                if complaints first == before { put_base base (kept.[:succeeded => succeeded acc + 1]) }
+                else if current { put_base base kept }
                 else {
                     let again = charge! (metering acc)
                         ((prepare! (loader acc)).[:whole => true]);
                     let fresh = list.head again;
-                    put_base fresh (charged (expand_item! fresh acc mi i item)
-                                            :snapshot (list.nth 1 again))
+                    put_base fresh ((charged (expand_item! fresh acc mi i item)
+                                             :snapshot (list.nth 1 again)).[:base_at => succeeded acc])
                 }
             }
         }) s (list.range 0 (list.length items))

@@ -29,7 +29,7 @@ let case name body = [name, body];
 let case_name : Case -> :string;
 let case_name c = c.[0];
 let case_body : Case -> :any;
-let case_body c = ((list_tail c)).[0];
+let case_body c = ((_list_tail c)).[0];
 
 // --- waiting ----------------------------------------------------------------
 
@@ -103,9 +103,9 @@ let near! tolerance expected actual = {
 
 let has_element : a -> [a] -> :bool;
 let rec has_element x xs =
-    if list_is_empty xs { false }
+    if _list_is_empty xs { false }
     else if xs.[0] == x { true }
-    else { has_element x (list_tail xs) };
+    else { has_element x (_list_tail xs) };
 
 let contains! : a -> [a] -> :ok;
 let contains! x xs = {
@@ -115,7 +115,7 @@ let contains! x xs = {
 
 let empty! : [a] -> :ok;
 let empty! xs = {
-    if list_is_empty xs { :ok }
+    if _list_is_empty xs { :ok }
     else { raise! ("expected an empty list, got " + to_string xs) }
 };
 
@@ -134,7 +134,7 @@ let fail! message = raise! message;
 
 let run_cases! : :integer -> :integer -> [Case] -> [:integer, :integer];
 let rec run_cases! passed failed cases = {
-    if list_is_empty cases { [passed, failed] }
+    if _list_is_empty cases { [passed, failed] }
     else {
         let c = cases.[0];
         let name = case_name c;
@@ -144,10 +144,10 @@ let rec run_cases! passed failed cases = {
         let outcome = try! { join! (spawn! (case_body c)); :pass } catch e { e };
         if outcome == :pass {
             console.write! ("  ok    " + name + "\n")
-            run_cases! (passed + 1) failed (list_tail cases)
+            run_cases! (passed + 1) failed (_list_tail cases)
         } else {
             console.write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n")
-            run_cases! passed (failed + 1) (list_tail cases)
+            run_cases! passed (failed + 1) (_list_tail cases)
         }
     }
 };
@@ -159,7 +159,7 @@ let suite! name cases = {
     console.write! ("\n" + name + "\n")
     let counts = run_cases! 0 0 cases;
     let passed = counts.[0];
-    let failed = ((list_tail counts)).[0];
+    let failed = ((_list_tail counts)).[0];
     console.write! ("  " + to_string passed + " passed"
                     + (if failed > 0 { ", " + to_string failed + " FAILED" } else { "" })
                     + "\n")
@@ -169,11 +169,11 @@ let suite! name cases = {
 /// Run several suites and report the total. Each entry is `[name, cases]`.
 let run_suites! : :integer -> [Suite] -> :integer;
 let rec run_suites! failed suites = {
-    if list_is_empty suites { failed }
+    if _list_is_empty suites { failed }
     else {
         let s = suites.[0];
-        let f = suite! (s.[0]) (((list_tail s)).[0]);
-        run_suites! (failed + f) (list_tail suites)
+        let f = suite! (s.[0]) (((_list_tail s)).[0]);
+        run_suites! (failed + f) (_list_tail suites)
     }
 };
 

@@ -7,6 +7,7 @@ import std.console;
 
 import std.list;
 import std.array;
+import std.map;
 
 let nums = [5, 3, 8, 1, 9, 2];
 
@@ -50,10 +51,10 @@ let main! = {
     console.print! ("map:        " + to_string (len ages))
     console.print! ("get:        " + to_string (ages.["ana" else 0]))
     console.print! ("missing:    " + to_string (ages.["zz" else :none]))
-    console.print! ("has:        " + to_string (map_has ages "bo"))
+    console.print! ("has:        " + to_string (map.has ages "bo"))
     console.print! ("put:        " + to_string (len (ages.["di" => 30])))
-    console.print! ("remove:     " + to_string (len (map_remove ages "bo")))
-    console.print! ("pairs:      " + to_string (list.length (map_pairs ages)))
+    console.print! ("remove:     " + to_string (len (map.remove ages "bo")))
+    console.print! ("pairs:      " + to_string (list.length (map.pairs ages)))
 
     // --- conversions and types ---
     console.print! ("types:      " + to_string (type_of nums) + " " + to_string (type_of arr) + " " + to_string (type_of ages))

@@ -193,7 +193,7 @@ let import_name tc n = match [Toolchain.os tc, Toolchain.family tc] {
 /// that name (docs/build.md, "Profile-guided builds").
 let object_name : Toolchain -> :string -> :string;
 let object_name tc path = {
-    let flat = str_concat (list.map (fn c -> match c { '/' => "#", '\\' => "#", ':' => "_", _ => str_of_chars [c] })
+    let flat = _str_concat (list.map (fn c -> match c { '/' => "#", '\\' => "#", ':' => "_", _ => _str_of_chars [c] })
                                     (str.chars path));
     flat + (match Toolchain.family tc { :msvc => ".obj", _ => ".o" })
 };

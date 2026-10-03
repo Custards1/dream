@@ -37,6 +37,7 @@ import dreams.diag;
 import dreams.fuse;
 import dreams.modules;
 import dreams.unit;
+import std.array;
 
 // --- what a name in front of a dot can be ------------------------------------
 //
@@ -92,9 +93,9 @@ let global_index e n = expand macros.with_some g ((globals e).[n else ()]) (list
 let global_kind e n = expand macros.with_some g ((globals e).[n else ()]) (list.nth 0 g);
 let with_alias n r e     = e.[:aliases => (aliases e).[n => r]];
 let with_only n v e      = e.[:only => (only e).[n => v]];
-let without_only n e     = e.[:only => (map_remove (only e) n)];
+let without_only n e     = e.[:only => (map.remove (only e) n)];
 
-let has_global e n = map_has (globals e) n;
+let has_global e n = map.has (globals e) n;
 let alias_of e n   = ((aliases e)).[n else ()];
 let only_of e n    = ((only e)).[n else ()];
 
@@ -102,9 +103,9 @@ let only_of e n    = ((only e)).[n else ()];
 /// is an implementation detail, so completion must not offer it.
 let visible_names e =
     list.sort (list.filter (fn n -> not (is_hidden_name n))
-                           (list.map (fn kv -> list.head kv) (map_pairs (globals e))));
+                           (list.map (fn kv -> list.head kv) (map.pairs (globals e))));
 
-let is_private e n = map_has (e.[:private else (%{})]) n;
+let is_private e n = map.has (e.[:private else (%{})]) n;
 
 /// Public names used by member completion and missing-member diagnostics.
 let exports e = list.filter (fn n -> not (is_private e n)) (visible_names e);
@@ -150,7 +151,7 @@ let take_global s = [s.[:next_global => (next_global s + 1)], next_global s];
 // accumulator built this way is invisible there and quadratic in *bytes*: on a
 // program of 3,200 declarations, `record_global` and `add_pending` were 282 MB
 // and 281 MB apiece where 1,600 cost 80 MB each -- 3.5x for twice the program,
-// which is the shape of an n^2 with a fixed cost in it. A `list_cons` is one
+// which is the shape of an n^2 with a fixed cost in it. A `_list_cons` is one
 // cell whatever the list behind it, and one `list.reverse` at the end is one
 // pass. Nothing that reads these is in a loop over the program; where something
 // only wanted the length, it asks for the count instead and never builds the
@@ -172,14 +173,14 @@ let pending_count s       = list.length (pending_rev s);
 /// what the module's global points at, because a host module is reached through
 /// the runtime rather than through a function of this program.
 let take_import path alias s =
-    [s.[:imports => (list_cons [path, alias] (s_imports_rev s))],
+    [s.[:imports => (list.cons [path, alias] (s_imports_rev s))],
      list.length (s_imports_rev s)];
 
 /// `[index, name, kind, target]`. A function's target is its function index,
 /// which is not known until its body has been walked, so it is filled in at the
 /// end; a module's is its import index, which is known now.
 let record_global gi name kind target s =
-    s.[:global_recs => (list_cons [gi, name, kind, target] (s_global_recs_rev s))];
+    s.[:global_recs => (list.cons [gi, name, kind, target] (s_global_recs_rev s))];
 let pending s = list.reverse (pending_rev s);
 let diags s   = s.[:diags else []];
 
@@ -188,7 +189,7 @@ let diags s   = s.[:diags else []];
 /// walk -- which is what `has_env` is asked, and it used to be spelled
 /// `mi < list.length (envs s)` because a list had no other way to say it.
 let env_at s mi  = (envs s).[mi else ()];
-let has_env s mi = map_has (envs s) mi;
+let has_env s mi = map.has (envs s) mi;
 
 /// Replace module `mi`'s environment.
 ///
@@ -209,7 +210,7 @@ let has_env s mi = map_has (envs s) mi;
 /// 0..n-1 and `has_env` is what the `mi < list.length` guards were.
 let set_env mi e s = s.[:envs => ((envs s).[mi => e])];
 
-let add_pending p s = s.[:pending => (list_cons p (pending_rev s))];
+let add_pending p s = s.[:pending => (list.cons p (pending_rev s))];
 
 let complain span message source s =
     s.[:diags => (err span message source (diags s))];
@@ -418,9 +419,9 @@ let declare_derive l mi d s = {
                 // bound itself, so the base's own code still resolves once it is
                 // copied in here.
                 let inherited = list.fold (fn acc kv ->
-                    if map_has (aliases acc) (list.head kv) { acc }
+                    if map.has (aliases acc) (list.head kv) { acc }
                     else { with_alias (list.head kv) (list.nth 1 kv) acc })
-                    e (map_pairs (aliases (env_at s base)));
+                    e (map.pairs (aliases (env_at s base)));
                 set_env mi (((with_alias (default_alias written ()) (dream_ref base)
                                                      inherited)).[:derives => base]) s
             },
@@ -448,7 +449,7 @@ let rec effective_items l mi seen =
                         },
                     },
                 _ => acc,
-            }) [[], list_cons mi seen] items;
+            }) [[], list.cons mi seen] items;
         [list.append (list.head bases) (list.map (fn i -> [mi, i]) items), list.nth 1 bases]
     };
 
@@ -567,7 +568,7 @@ let expand_let_pattern item =
     match item {
         [:let_p, pattern, body, span] => {
             let hidden = hidden_name pattern;
-            list_cons (ast.let_d hidden [] (destructure_e pattern body span) false span)
+            list.cons (ast.let_d hidden [] (destructure_e pattern body span) false span)
                       (list.map (fn b -> ast.let_d (list.nth 0 b) []
                                                    (destructured_e hidden pattern (list.nth 1 b))
                                                    false (list.nth 1 b))
@@ -652,7 +653,7 @@ let unimplemented l mi owner v lets s =
 let report_clashes mi span s = {
     let e = env_at s mi;
     let clashing = list.filter (fn n -> has_global e n)
-                               (list.map (fn kv -> list.head kv) (map_pairs (only e)));
+                               (list.map (fn kv -> list.head kv) (map.pairs (only e)));
     list.fold (fn acc n -> {
         let e2 = env_at acc mi;
         let sel = only_of e2 n;
@@ -787,7 +788,7 @@ let declare_module l mi s0 = {
     let checked = report_clashes mi (module_span l mi) declared;
     // A module that declares a virtual is abstract: it has a hole in it, and
     // running it directly would reach one.
-    checked.[:module_recs => (list_cons [mi, globals_from, next_global checked - globals_from,
+    checked.[:module_recs => (list.cons [mi, globals_from, next_global checked - globals_from,
                     not (list.is_empty virtuals), derives (env_at checked mi)]
                    (s_module_recs_rev checked))]
 };
@@ -978,7 +979,7 @@ let staging r ctx source span =
 
 let set_frames fs r = r.[:frames => fs];
 
-let on_front f xs = list_cons (f (list.head xs)) (list.tail xs);
+let on_front f xs = list.cons (f (list.head xs)) (list.tail xs);
 
 /// Replace the innermost frame.
 let update_frame f r =
@@ -987,7 +988,7 @@ let update_frame f r =
 /// Replace the frame `i` steps out from the innermost one.
 let rec update_frame_at i f fs =
     if i <= 0 { on_front f fs }
-    else { list_cons (list.head fs) (update_frame_at (i - 1) f (list.tail fs)) };
+    else { list.cons (list.head fs) (update_frame_at (i - 1) f (list.tail fs)) };
 
 let frame_at r i = list.nth i (frames r);
 let frame_count r = list.length (frames r);
@@ -1112,7 +1113,7 @@ let begin_func name arity impure allow is_rec thunk span r = {
     let fi = func_count r;
     let with_func =
         ((r.[:funcs => (((func_map r)).[fi => (func_rec name arity impure is_rec thunk span)])])).[:func_count => (fi + 1)];
-    [set_frames (list_cons (frame fi allow name) (frames with_func)) with_func, fi]
+    [set_frames (list.cons (frame fi allow name) (frames with_func)) with_func, fi]
 };
 
 /// Pop the frame and write what it learned -- how many slots the function needs
@@ -1126,7 +1127,7 @@ let end_func fi r = {
 
 // --- scopes and slots --------------------------------------------------------------
 
-let push_scope r = update_frame (fn fr -> fr.[:scopes => (list_cons [] (scopes fr))]) r;
+let push_scope r = update_frame (fn fr -> fr.[:scopes => (list.cons [] (scopes fr))]) r;
 
 /// Leaving a scope takes its names out of sight. It does *not* give the slots
 /// back.
@@ -1285,6 +1286,8 @@ let env_of c r i = (r_envs r).[i else ()];
 
 let report c span message r = complain_at span message (ctx_source c) r;
 let report_note c span message note r = complain_note_at span message note (ctx_source c) r;
+let warn_note c span message note r =
+    note_diag (diag.in_source (ctx_source c) (diag.with_note note (diag.warning span message))) r;
 
 /// Record that an effect happens here, rejecting it in a pure function.
 let note_effect c span what r =
@@ -1398,6 +1401,21 @@ let not_a_value c m shown span r =
              _ => "use one of its members, as in `" + shown + ".something`",
          }) r;
 
+/// A primitive named outside `std` resolves -- the program means what it
+/// says -- but is warned about, with the `std` call to write instead. That
+/// call costs nothing over the primitive (see "wrappers" above), so the only
+/// thing writing the primitive buys is a name `std` is free to change.
+let primitive_named c name span r =
+    if not (builtins.is_primitive name) || builtins.written_by_parser name
+       || modules.written_in_std (ctx_l c) (ctx_source c) { r }
+    else {
+        warn_note c span ("`" + name + "` is a primitive, meant to be called through `std`")
+            (match builtins.wrapper name {
+                 () => "nothing outside `std` should need it",
+                 call => "write `" + call + "` instead",
+             }) r
+    };
+
 let check_name c name span r = {
     let e = ctx_env c r;
     let found = resolve_in_frames name r;
@@ -1411,7 +1429,8 @@ let check_name c name span r = {
                            [:global, ctx_mi c, name, global_index e name] r0
                 }
                 else if builtins.is_builtin name {
-                    record (ctx_mi c) (ctx_source c) span [:builtin, name] r0
+                    primitive_named c name span
+                        (record (ctx_mi c) (ctx_source c) span [:builtin, name] r0)
                 }
                 else {
                     match only_of e name {
@@ -1852,7 +1871,7 @@ let check_body l p r = {
     let fi = list.nth 1 started;
     let bound = bind_params c (decl_params d) (list.head started);
     let done = end_func fi (check_expr c (decl_body d) bound);
-    done.[:bodies => (list_cons [mi, source, d, fi] (bodies_rev done))]
+    done.[:bodies => (list.cons [mi, source, d, fi] (bodies_rev done))]
 };
 
 // --- the entry point ---------------------------------------------------------
@@ -1956,18 +1975,18 @@ let resolve_reachable! l declared roots = {
     let rec walk todo seen r all_refs = match todo {
         [] => [r.[:refs => all_refs], seen],
         [[i, p], ..rest] =>
-            if map_has seen i { walk rest seen r all_refs }
+            if map.has seen i { walk rest seen r all_refs }
             else {
                 // This body's occurrences on their own. Merging them into the
                 // running table afterwards keeps reading them proportional to
                 // the body rather than to everything resolved so far, which a
                 // shared table walked once per body would not be.
                 let checked = check_body l p (r.[:refs => %{}]);
-                let occurrences = map_pairs (refs checked);
+                let occurrences = map.pairs (refs checked);
                 let deps = list.fold (fn acc [_, reference] ->
                     match indexed.[target_global reference else ()] {
                         () => acc,
-                        found => list_cons found acc,
+                        found => list.cons found acc,
                     }) [] occurrences;
                 let merged = list.fold (fn acc [key, value] -> acc.[key => value])
                                        all_refs occurrences;
@@ -1977,11 +1996,11 @@ let resolve_reachable! l declared roots = {
     let rooted = match roots {
         () => queued,
         picked => list.filter (fn [_, p] ->
-            map_has picked (root_key (list.nth 1 p)
+            map.has picked (root_key (list.nth 1 p)
                                           (ast.span_start (decl_span (list.nth 2 p))))) queued,
     };
     let [walked, seen] = walk rooted %{} initial %{};
-    let missing = list.filter (fn [i, _] -> not (map_has seen i)) queued;
+    let missing = list.filter (fn [i, _] -> not (map.has seen i)) queued;
     // Which globals the stub is answering for. `resolve_from!` fills a
     // function global's target from the body that was queued for it and leaves
     // `no_function` where there was none -- which is also what an unfilled
@@ -2002,7 +2021,7 @@ let resolve_reachable! l declared roots = {
             // accumulator the queue is built in reverse in.
             let fi = list.nth 3 (list.head (bodies_rev resolved));
             resolved.[:global_recs => (list.map (fn g -> match g {
-                    [gi, n, :function, ()] if map_has stubbed gi => [gi, n, :function, fi],
+                    [gi, n, :function, ()] if map.has stubbed gi => [gi, n, :function, fi],
                     _ => g,
                 }) (r_global_recs resolved))]
         },
@@ -2118,7 +2137,7 @@ let finish_walk declared r0 s_pre walked bs candidates = {
 
     ((walked.[:wrappers => (list.fold (fn acc kv ->
                  acc.[(list.head kv) => (list.nth 1 kv)])
-                       (wrappers r0) (map_pairs aliased))])).[:global_recs => (list.append (list.append (r_global_recs r0) filled) (fused walked))]
+                       (wrappers r0) (map.pairs aliased))])).[:global_recs => (list.append (list.append (r_global_recs r0) filled) (fused walked))]
 };
 
 /// Resolve and purity-check a whole loaded program.
@@ -2200,7 +2219,7 @@ let walk_part l base numbered = {
         let done = check_body l (list.nth 1 np) ((list.head acc).[:diags => []]);
         let said = r_diags done;
         let notes = if list.is_empty said { list.nth 1 acc }
-                    else { list_cons [list.head np, said] (list.nth 1 acc) };
+                    else { list.cons [list.head np, said] (list.nth 1 acc) };
         // Both forced before they are carried, the `ir.settled` way.
         if type_of notes != :nothing && type_of done != :nothing { [done, notes] }
         else { [done, notes] }
@@ -2220,14 +2239,14 @@ let merge_parts declared r0 base walked = {
     // those to where they stand after the declarations and the parts before.
     let counted = list.fold (fn acc r -> {
         let [fo, go, out] = acc;
-        [fo + func_count r - f0, go + next_global r - invent_base, list_cons [fo, g0 - invent_base + go] out]
+        [fo + func_count r - f0, go + next_global r - invent_base, list.cons [fo, g0 - invent_base + go] out]
     }) [0, 0, []] walked;
     // Arrays where a part is read by its index in a loop over the parts, as
     // in `lower.link_head`: read from a list, each is a walk to the part.
-    let offsets = array_of_list (list.reverse (list.nth 2 counted));
+    let offsets = array.of_list (list.reverse (list.nth 2 counted));
     let told = list.map (fn kr -> (list.nth 1 kr).[:part_offsets => offsets.[list.head kr]])
                         (list.zip (list.range 0 (list.length walked)) walked);
-    let ta = array_of_list told;
+    let ta = array.of_list told;
     let funcs = list.fold (fn m k -> {
         let r = ta.[k];
         let fo = list.head (offsets.[k]);
@@ -2286,10 +2305,10 @@ let resolve_parts! l cache = {
     // any process starts, for the reason `lower.link_parallel!` gives.
     let by_module = list.fold (fn m np -> {
         let mi = list.head (list.nth 1 np);
-        m.[mi => list_cons np (m.[mi else []])]
+        m.[mi => list.cons np (m.[mi else []])]
     }) (%{}) numbered;
     let slices = strict! (list.map (fn mi -> list.reverse (by_module.[mi]))
-                                   (list.sort (list.map list.head (map_pairs by_module))));
+                                   (list.sort (list.map list.head (map.pairs by_module))));
     let key_of slice = match cache {
         () => "",
         _ => part_key under base common (list.head (list.nth 1 (list.head slice))),
@@ -2333,7 +2352,7 @@ let invent_base = 67108864;
 /// never reads. With the modules' names, which the walk reads from the loader
 /// for a group's members.
 let common_key l base = unit.digest [
-    list.fold (fn b k -> map_remove b k) base [:defs, :envs, :diags, :module_recs],
+    list.fold (fn b k -> map.remove b k) base [:defs, :envs, :diags, :module_recs],
     list.map (fn i -> modules.module_name (modules.module_at l i)) (list.range 0 (modules.module_count l)),
 ];
 
@@ -2367,8 +2386,8 @@ let modules_under l = {
         let parts = str.split "." (modules.module_name (modules.module_at l i));
         let prefixes = list.map (fn n -> str.join_str "." (list.take n parts)) (list.range 1 (list.length parts));
         list.fold (fn a pre -> {
-            let by_name = a.[pre => list_cons i (a.[pre else []])];
-            match index.[pre else ()] { () => by_name, t => by_name.[t => list_cons i (by_name.[t else []])] }
+            let by_name = a.[pre => list.cons i (a.[pre else []])];
+            match index.[pre else ()] { () => by_name, t => by_name.[t => list.cons i (by_name.[t else []])] }
         }) acc prefixes
     }) (%{}) (list.range 0 count)
 };
@@ -2380,7 +2399,7 @@ let rec reached_modules v acc = match v {
     [:dream, t] if type_of t == :integer => acc.[t => true],
     [:group, p] if type_of p == :string => acc.[p => true],
     xs if type_of xs == :list => list.fold (fn a x -> reached_modules x a) acc xs,
-    m if type_of m == :map => list.fold (fn a kv -> reached_modules (list.nth 1 kv) a) acc (map_pairs m),
+    m if type_of m == :map => list.fold (fn a kv -> reached_modules (list.nth 1 kv) a) acc (map.pairs m),
     _ => acc,
 };
 
@@ -2482,9 +2501,9 @@ let rec wrapper_args params used args acc =
         [a, ..rest] =>
             match wrapper_arg params used a {
                 () => (),
-                [:param, k] => wrapper_args params (list_cons k used) rest
-                                          (list_cons [:param, k] acc),
-                plan => wrapper_args params used rest (list_cons plan acc),
+                [:param, k] => wrapper_args params (list.cons k used) rest
+                                          (list.cons [:param, k] acc),
+                plan => wrapper_args params used rest (list.cons plan acc),
             },
     };
 
@@ -2710,7 +2729,7 @@ let role_spellings es pend base =
             match static_global es (list.nth 0 p) (decl_body d) {
                 () => acc,
                 target =>
-                    if map_has base target { acc.[(decl_name d) => true] } else { acc },
+                    if map.has base target { acc.[(decl_name d) => true] } else { acc },
             }
         }
     }) (list.fold (fn acc n -> acc.[n => true]) (%{}) fuse.member_names)
@@ -2839,8 +2858,8 @@ let stage_shaped r body =
 /// anything is resolved, because most applications in a program are not.
 let spelled_like_a_role r e =
     match e {
-        [:name, n, _]        => map_has (role_names r) n,
-        [:field, _, field, _] => map_has (role_names r) field,
+        [:name, n, _]        => map.has (role_names r) n,
+        [:field, _, field, _] => map.has (role_names r) field,
         _ => false,
     };
 
@@ -2890,7 +2909,7 @@ let rec peel c r e acc fuel =
                         if list.length cargs != n { () }
                         else {
                             peel c r (list.nth 1 cargs)
-                                 (list_cons [stag, list.nth 0 cargs] acc) (fuel - 1)
+                                 (list.cons [stag, list.nth 0 cargs] acc) (fuel - 1)
                         },
                     _ => (),
                 },
@@ -2978,7 +2997,7 @@ let reaches_frame r step =
 /// honest answer here is none.
 let take_fused_global name fi r = {
     let gi = r.[:next_global else 0];
-    [((r.[:next_global => (gi + 1)])).[:fused => (list_cons [gi, name, :function, fi] (fused_rev r))],
+    [((r.[:next_global => (gi + 1)])).[:fused => (list.cons [gi, name, :function, fi] (fused_rev r))],
      gi]
 };
 
@@ -3154,7 +3173,7 @@ when test {
     /// The slot a binder was given, found by name in the recorded binds.
     let binding_slot r name = {
         let hits = list.filter (fn b -> list.head (list.nth 1 b) == name)
-                               (map_pairs (binds r));
+                               (map.pairs (binds r));
         if list.is_empty hits { () } else { list.nth 1 (list.nth 1 (list.head hits)) }
     };
 
@@ -3407,7 +3426,16 @@ when test {
 
         // --- builtins and ordinary module bindings ---
         test.case "runtime primitives need no import"
-            $( test.eq! [] (checked! "let f xs = list_tail xs;") ),
+            $( test.eq! 0 (diag.error_count (checked! "let f xs = _list_tail xs;")) ),
+        test.case "a primitive named outside std is warned about, with the call to write"
+            $( test.eq! [:warning, "`_list_tail` is a primitive, meant to be called through `std`",
+                         "write `list.tail xs` instead"]
+                        (list.map (fn d -> [diag.severity d, diag.message d, diag.note d])
+                                  (checked! "let f xs = _list_tail xs;")).[0] ),
+        test.case "and std names its own primitives without one"
+            $( test.eq! [] (check! (with_module! (bare! ()) "std.t" "let f xs = _list_tail xs;")) ),
+        test.case "the language's own builtins are never warned about"
+            $( test.eq! [] (checked! "let f x = to_string (len x);") ),
         test.case "a module that binds core itself keeps its own"
             $( test.eq! [] (checked! "let core = 1;\nlet f = core;") ),
         test.case "a module that never names core is given nothing"
@@ -3499,20 +3527,20 @@ when test {
         // --- wrappers ---
         test.case "a body that is one get of its parameters is a wrapper"
             $( test.eq! [:op, :get]
-                        (match map_pairs (wrappers (resolved! "let get m k d = m.[k else d];")) {
+                        (match map.pairs (wrappers (resolved! "let get m k d = m.[k else d];")) {
                              [[_, w]] => list.head w,
                              other => other,
                          }) ),
         test.case "so is one set"
             $( test.eq! [:op, :set]
-                        (match map_pairs (wrappers (resolved! "let put m k v = m.[k => v];")) {
+                        (match map.pairs (wrappers (resolved! "let put m k v = m.[k => v];")) {
                              [[_, w]] => list.head w,
                              other => other,
                          }) ),
         // The rule a call's arguments are held to: a parameter used twice would
         // put one argument's work in two places.
         test.case "a get that uses a parameter twice is not"
-            $( test.eq! [] (map_pairs (wrappers (resolved! "let get m k = m.[k else k];"))) ),
+            $( test.eq! [] (map.pairs (wrappers (resolved! "let get m k = m.[k else k];"))) ),
 
         // --- what a language server would ask ---
         test.case "a module's globals are listed in declaration order"

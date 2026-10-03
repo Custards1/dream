@@ -31,7 +31,7 @@ let step b =
     // Above U+FFFF: a surrogate pair, and two units.
     else { [4, 2] };
 
-let is_newline text i = str_byte text i == 10;
+let is_newline text i = str.byte i text == 10;
 
 /// The byte offset where the given zero-based line begins.
 let rec line_start text line = {
@@ -56,7 +56,7 @@ let offset_of text line character = {
         else if i >= n { i }
         else if is_newline text i { i }
         else {
-            match step (str_byte text i) {
+            match step (str.byte i text) {
                 [bytes, us] => walk (i + bytes) (units + us),
             }
         };
@@ -71,7 +71,7 @@ let position_of text offset = {
         if i >= stop { [line, units] }
         else if is_newline text i { walk (i + 1) (line + 1) 0 }
         else {
-            match step (str_byte text i) {
+            match step (str.byte i text) {
                 [bytes, us] =>
                     // A position inside a character belongs to that character,
                     // not to the one after it.

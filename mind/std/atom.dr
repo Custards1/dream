@@ -1,0 +1,22 @@
+// Atoms: finding one by its name.
+//
+// An atom is interned the first time a program mentions it and never freed,
+// so a program that turned every string it read into an atom would leak one
+// per distinct input. `existing` is the safe direction: it finds an atom that
+// already exists and makes none, which is what a decoder wants -- an atom the
+// program was written with is one it can match on, and any other name is not
+// one it could have been expecting.
+
+/// The atom with this name, or `()` if nothing has ever interned it.
+let existing : (:string | :bigstr) -> (:atom | :unit);
+let existing name = _to_existing_atom name;
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "an atom the program names" $( test.eq! :ok (existing "ok") ),
+        test.case "one it never names"
+            $( test.eq! () (existing "no atom anywhere is spelled like this") ),
+    ];
+}

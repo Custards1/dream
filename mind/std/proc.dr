@@ -104,7 +104,7 @@ let call_message : Process -> b -> Call b;
 let call_message from body = [:call, from, body];
 
 let is_call : :any -> :bool;
-let is_call m = list_is_empty m == false && list.nth 0 m == :call;
+let is_call m = _list_is_empty m == false && list.nth 0 m == :call;
 let call_from : :list -> Process;
 let call_from m = list.nth 1 m;
 let call_body : :list -> :any;

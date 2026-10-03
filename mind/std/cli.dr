@@ -336,8 +336,8 @@ let rec fill_default os c =
     match os {
         [] => c,
         [o, ..more] =>
-            if is_option o && map_has o :default &&
-               not (map_has (values c) (long o)) {
+            if is_option o && _map_has o :default &&
+               not (_map_has (values c) (long o)) {
                 let v = o.[:default else ()];
                 let cc = c.[:values => (((values c)).[(long o) => v])];
                 fill_default more cc
@@ -353,7 +353,7 @@ let rec missing_required os c =
         [] => [:ok, ()],
         [o, ..more] =>
             if o.[:required else false] == true &&
-               not (map_has (values c) (long o)) {
+               not (_map_has (values c) (long o)) {
                 [:error, "missing required option --" + long o]
             }
             else { missing_required more c },
@@ -457,7 +457,7 @@ let suffixed_help o = {
         if list.is_empty cs { "" } else { " (one of " + str.join_str ", " cs + ")" }
     };
     let default_text =
-        if map_has o :default {
+        if _map_has o :default {
             " (default " + to_string (o.[:default else ()]) + ")"
         }
         else { "" };
@@ -692,7 +692,7 @@ let parse_as description options args = match parse options args {
 /// presence into a reusable data schema, without running the parser.
 let option_type : Option -> :any;
 let option_type option = {
-    let element = if map_has option :choices {
+    let element = if _map_has option :choices {
         types.enum option.[:choices]
     } else { :string };
     match kind option {
@@ -710,7 +710,7 @@ let values_type options = {
         if not (is_option o) { [required_fields, optional_fields] }
         else {
             let schema = option_type o;
-            if o.[:required else false] == true || map_has o :default {
+            if o.[:required else false] == true || _map_has o :default {
                 [required_fields.[(long o) => schema], optional_fields]
             } else { [required_fields, optional_fields.[(long o) => schema]] }
         }

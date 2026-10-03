@@ -56,16 +56,16 @@ let delta : :map -> :map -> :map;
 let delta base r = list.fold (fn acc [k, v] -> match base.[k else [:absent]] {
     same if same == v => acc,
     old if type_of old == :map && type_of v == :map =>
-        acc.[k => [:entries, list.filter (fn [ek, ev] -> not (map_has old ek) || old.[ek] != ev) (map_pairs v)]],
+        acc.[k => [:entries, list.filter (fn [ek, ev] -> not (map.has old ek) || old.[ek] != ev) (map.pairs v)]],
     _ => acc.[k => [:is, v]],
-}) (%{}) (map_pairs r);
+}) (%{}) (map.pairs r);
 
 /// `base` with a difference laid over it: what `delta` was taken from.
 let restore : :map -> :map -> :map;
 let restore base d = list.fold (fn acc [k, change] -> match change {
     [:entries, pairs] => acc.[k => list.fold (fn m [ek, ev] -> m.[ek => ev]) (acc.[k else %{}]) pairs],
     [:is, v] => acc.[k => v],
-}) base (map_pairs d);
+}) base (map.pairs d);
 
 // --- the cache ---------------------------------------------------------------------
 

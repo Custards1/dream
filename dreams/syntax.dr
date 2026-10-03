@@ -4,6 +4,8 @@
 import std.list;
 import std.str;
 import dreams.ast;
+import std.array;
+import std.map;
 
 let is_span x = match x {
     [a, b] => type_of a == :integer && type_of b == :integer,
@@ -20,7 +22,7 @@ let rec fresh tree next =
         let parts = if has_span { list.take (list.length tree - 1) tree } else { tree };
         let [reversed, end] = list.fold (fn [acc, offset] part -> {
             let [child, after_child] = fresh part offset;
-            [list_cons child acc, after_child]
+            [list.cons child acc, after_child]
         }) [[], next] parts;
         let items = list.reverse reversed;
         if has_span { [items + [[end, end + 1]], end + 2] }
@@ -37,9 +39,9 @@ let rec literal value span = match type_of value {
     :atom => ast.atom_e (ast.atom_name value) span,
     :unit => ast.unit_e span,
     :list => ast.list_e (list.map (fn v -> literal v span) value) span,
-    :array => ast.array_e (list.map (fn v -> literal v span) (array_to_list value)) span,
+    :array => ast.array_e (list.map (fn v -> literal v span) (array.to_list value)) span,
     :map => ast.map_e (list.map (fn kv -> list.map (fn v -> literal v span) kv)
-                              (map_pairs value)) span,
+                              (map.pairs value)) span,
     _ => ast.unit_e span,
 };
 
@@ -214,7 +216,7 @@ let union_decl name params variants members span = {
     let described v = match ast.variant_fields v {
         [] => lit_tag v,
         fs => ast.list_e [ast.atom_e "tuple" at_,
-                          ast.list_e (list_cons (lit_tag v) (list.map field_t fs)) at_] at_,
+                          ast.list_e (list.cons (lit_tag v) (list.map field_t fs)) at_] at_,
     };
     let description = ast.let_d "type" params
         (ast.list_e [ast.atom_e "named" at_, ast.str_e name at_,
@@ -227,7 +229,7 @@ let union_decl name params variants members span = {
             [] => ast.let_d (ast.variant_name v) [] tag false at_,
             _ => ast.let_d (ast.variant_name v)
                     (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
-                    (ast.list_e (list_cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)) at_)
+                    (ast.list_e (list.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)) at_)
                     false at_,
         }
     }) variants;
@@ -397,7 +399,7 @@ let c_function env t = {
                                                (list.range 0 (list.length taken));
                         let answer = if list.is_empty outs { rd }
                                      else { ast.list_e [ast.atom_e "tuple" sp,
-                                                        ast.list_e (list_cons rd (list.map (fn i -> list.nth i dreams) outs)) sp] sp };
+                                                        ast.list_e (list.cons rd (list.map (fn i -> list.nth i dreams) outs)) sp] sp };
                         let dream_args = match visible { [] => [ast.atom_e "unit" sp], is => list.map (fn i -> list.nth i dreams) is };
                         [:ok, args, r, arrows dream_args answer]
                     },
@@ -415,7 +417,7 @@ priv let is_unit_type t = match t { [:atom, "unit", _] => true, [:unit, _] => tr
 priv let rec arrow_parts t = match t {
     [:list, [[:atom, "fn", _], a, b], _] => {
         let [rest, result] = arrow_parts b;
-        [list_cons a rest, result]
+        [list.cons a rest, result]
     },
     _ => [[], t],
 };
@@ -428,7 +430,7 @@ priv let rec c_types env place ts = match ts {
         [:error, m, s] => [:error, m, s],
         [:ok, f, d] => match c_types env place rest {
             [:error, m, s] => [:error, m, s],
-            [:ok, fs, ds] => [:ok, list_cons f fs, list_cons d ds],
+            [:ok, fs, ds] => [:ok, list.cons f fs, list.cons d ds],
         },
     },
 };
@@ -457,7 +459,7 @@ let rec c_type env place t = {
         [:atom, a, _] => c_atom place a sp,
         [:unit, _] => c_atom place "void" sp,
         [:name, n, _] =>
-            match [env.[:resources].[n else ()], map_has env.[:structs] n] {
+            match [env.[:resources].[n else ()], map.has env.[:structs] n] {
                 [[dtor], _] => match place {
                     :arg => [:ok, ast.list_e [atom "handle", ast.str_e (lib + "." + n) sp] sp, ast.name_e n sp],
                     :result => owned lib n dtor sp,
@@ -479,7 +481,7 @@ let rec c_type env place t = {
             },
         [:apply, [:name, "borrow", _], [[:name, r, _]], _] =>
             if place != :result && place != :out { fail "`borrow` is a pointer C hands back and keeps" }
-            else if not (map_has env.[:resources] r) { fail ("`" + r + "` is not a resource of `" + lib + "`") }
+            else if not (map.has env.[:resources] r) { fail ("`" + r + "` is not a resource of `" + lib + "`") }
             else { [:ok, ast.list_e [atom "borrow", ast.str_e (lib + "." + r) sp] sp, ast.name_e r sp] },
         [:apply, [:name, "taken", _], [dtor], _] =>
             if place != :result && place != :out { fail "`taken` is a string C hands over, so it is only a result" }

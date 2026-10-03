@@ -11,12 +11,12 @@ import std.math;
 // so the strictness rule the tier rests on cannot prove it strict -- and does
 // not have to, because every self call hands it straight back.
 let rec sum_bytes s i n acc =
-    if i >= n { acc } else { sum_bytes s (i + 1) n (acc + str_byte s i) };
+    if i >= n { acc } else { sum_bytes s (i + 1) n (acc + _str_byte s i) };
 
 // A list walked through the two natives that walk one. Both parameters are
 // forced on every path here, so this is the shape the tier always could have
 // taken and never did, for want of being allowed to make the call.
-let rec spine xs acc = if list_is_empty xs { acc } else { spine (list_tail xs) (acc + 1) };
+let rec spine xs acc = if _list_is_empty xs { acc } else { spine (_list_tail xs) (acc + 1) };
 
 // --- a carried parameter is moved, not forced ------------------------------
 //
@@ -29,7 +29,7 @@ let rec ignoring x i n acc = if i >= n { acc } else { ignoring x (i + 1) n (acc 
 // of zero once the function is hot: the loop stops before it looks at `s`, so a
 // tier that forced its parameters on entry would raise where nothing should.
 let rec first_byte s i n acc =
-    if i >= n { acc } else { first_byte s (i + 1) n (acc + str_byte s i) };
+    if i >= n { acc } else { first_byte s (i + 1) n (acc + _str_byte s i) };
 
 // --- the containers --------------------------------------------------------
 //
@@ -59,7 +59,7 @@ let rec ranks xs i n acc =
 
 // --- the numeric natives the tier writes out rather than calling -----------
 let rec roots i n acc =
-    if i >= n { acc } else { roots (i + 1) n (acc + math.sqrt (to_float i)) };
+    if i >= n { acc } else { roots (i + 1) n (acc + math.sqrt (_to_float i)) };
 
 // --- what must be declined -------------------------------------------------
 //
@@ -79,20 +79,20 @@ let rec defaults m i n acc =
 // eagerly is work the interpreter might never do. Declined, and the answer is
 // the one it always gave.
 let rec index_from i x xs =
-    if list_is_empty xs { 0 - 1 }
+    if _list_is_empty xs { 0 - 1 }
     else if xs.[0] == x { i }
-    else { index_from (i + 1) x (list_tail xs) };
+    else { index_from (i + 1) x (_list_tail xs) };
 
 // A list builder, whose accumulator is neither forced nor carried -- `cons`
 // leaves both its arguments alone. Declined, and still a list.
-let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (list_cons i acc) };
+let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (_list_cons i acc) };
 
 let show! name v = console.print! (name + " = " + to_string (try! { strict! v } catch e { e }));
 
 let main! = {
     let text = "the quick brown fox jumps over the lazy dog";
     let m = ((((%{})).[3 => 70])).[7 => 900];
-    let a = array_new 64 5;
+    let a = _array_new 64 5;
     let long = upto 1 20000 [];
 
     show! "sum_bytes"  (sum_bytes text 0 (len text) 0);

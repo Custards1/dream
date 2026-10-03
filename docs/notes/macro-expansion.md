@@ -787,3 +787,63 @@ round for that to settle.
 Copying stage 2 would pass the next `bootstrap-check` (which compares stage 2
 with stage 3 of the *next* run) and still leave a seed that does not reproduce
 itself, which is the guarantee the check exists for.
+
+## A program that does not resolve ran the machine out of memory
+
+Found 2026-10-02, renaming the primitives (`list_cons` to `_list_cons`).
+Partway through, `std` called the new spellings while the seed knew only the
+old ones, so a build handed the seed a standard library with a few hundred
+names that did not resolve. That should have been a page of "cannot find" in
+a second. It grew past 3 GB and took a 32 GB desktop down twice -- a
+`systemd-run --user --scope -p MemoryMax=6G` around it did not hold, since a
+user scope may not have the memory controller delegated. `ulimit -v` does
+hold, and the VM runs under it.
+
+Unresolved names alone were not it: two hundred of them in one file fail in
+0.18 s. Nor was `comp`, though settling compile-time expressions in a program
+that has already failed was its own bug and is gone (`link_rest!` now skips
+them on a resolution error, as contracts already were). It was macro
+expansion, and only when a transformer *reaches* the broken code: the
+compiler's own `lower.dr` calls `macros.coalesce`, and `std.macros` calls
+`std.list`, and `std.list` was the module with the holes in it.
+
+Three things compounded:
+
+- **A macro whose own name resolved was run regardless.** `objection` refused
+  a call only when the *macro's name* failed to resolve, and looked for errors
+  in the round's resolution (`sited`), which resolves only the names the
+  wrappers mention. The errors were in the transformers' resolution
+  (`resolved`), which nothing consulted. So the macro ran, on an image where
+  every unresolved name had been lowered to `()`, and raised.
+- **A raising call is asked again of the whole program.** That is the right
+  answer to a stale snapshot and the wrong one to a broken program: the
+  round failed, `expand_work!` fell back to `sequential!`, and `sequential!`
+  prepared a fresh whole-program snapshot for every declaration that failed,
+  then tried it again.
+- **Each whole-program round resolved the program afresh.** `evaluate_round!`
+  built its resolution as a `let`, so a snapshot reused across a dozen
+  failing declarations was resolved a dozen times.
+
+The fixes, one per item:
+
+- A call is refused when the transformers' resolution has an error, with
+  `cannot run macro: what it runs does not compile (first error, and N more)`.
+  The errors themselves are reported by the program's own resolution.
+- `sequential!` retries a failing declaration against a fresh snapshot only
+  when something has expanded since its snapshot was made (`succeeded`,
+  `base_at`). A snapshot made after the last success is the program as it
+  stands, and a fresh one would fail the same way.
+- `prepare_work!` carries the whole-program resolution as a lazy field
+  (`:resolved_whole`), so a snapshot is resolved whole at most once.
+
+| broken `std`, compiling | before | after |
+|---|---|---|
+| 128 `expand`s of a macro reaching it | 6.4 s | **0.41 s** |
+| the compiler, one name broken | > 3 GB, killed | **2.4 s**, 1.5 GB |
+| the compiler, 212 names broken | the machine | **2.8 s**, 1.5 GB |
+| the compiler, nothing broken | 1.7 s | 1.7 s, same image byte for byte |
+
+`dreams/tests/macros.py` has the case: 64 calls of a macro whose helper names
+something that does not exist, under a 4 GB address-space limit and a 20 s
+timeout, which must fail with `cannot run macro`. Run against the compiler
+from before the fix it fails the assertion rather than the machine.

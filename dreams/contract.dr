@@ -69,7 +69,7 @@ let rec emit_datum d l = match type_of d {
 let datum_seq op items n l = {
     let done = list.fold (fn acc x -> {
         let got = emit_datum x (list.head acc);
-        [list.head got, list_cons (list.nth 1 got) (list.nth 1 acc)]
+        [list.head got, list.cons (list.nth 1 got) (list.nth 1 acc)]
     }) [l, []] items;
     let placed = lower.kids (list.reverse (list.nth 1 done)) (list.head done);
     lower.emit (ir.node op (list.nth 1 placed) n ir.no_node) (list.head placed)
@@ -123,7 +123,7 @@ let emit_guarded f l = {
 let batch_image low contracts = {
     let done = list.fold (fn acc c -> {
         let got = emit_guarded (list.nth 5 c) (list.head acc);
-        [list.head got, list_cons (list.nth 1 got) (list.nth 1 acc)]
+        [list.head got, list.cons (list.nth 1 got) (list.nth 1 acc)]
     }) [low, []] contracts;
     let placed = lower.kids (list.reverse (list.nth 1 done)) (list.head done);
     let made = lower.emit (ir.node :make_list (list.nth 1 placed) (list.length contracts) ir.no_node)

@@ -9,7 +9,7 @@ import std.console;
 // --- walking a list ----------------------------------------------------------
 
 // The strict consumer: the empty test, the head and the tail, all inline.
-let rec sum_list !acc xs = if list_is_empty xs { acc } else { sum_list (acc + xs.[0]) (list_tail xs) };
+let rec sum_list !acc xs = if _list_is_empty xs { acc } else { sum_list (acc + xs.[0]) (_list_tail xs) };
 
 // The same through `match`, which lowers to its own natives.
 let rec sum_match !acc xs = match xs { [] => acc, [x, ..rest] => sum_match (acc + x) rest };
@@ -19,35 +19,35 @@ let rec sum_match !acc xs = match xs { [] => acc, [x, ..rest] => sum_match (acc 
 // `1 + len (tail xs)` is not a tail call, and was a machine call a level --
 // given back to the interpreter for good past a few thousand levels. Now it is
 // a loop carrying the pending sum, and these are the ways that can go wrong.
-let rec len_rec xs = if list_is_empty xs { 0 } else { 1 + len_rec (list_tail xs) };
+let rec len_rec xs = if _list_is_empty xs { 0 } else { 1 + len_rec (_list_tail xs) };
 let rec total xs = match xs { [] => 0, [x, ..rest] => x + total rest };
 // A base case that is not a number: the pending sum has nowhere to go, and the
 // call must end exactly as the interpreter ends it.
-let rec total_onto xs base = if list_is_empty xs { base } else { xs.[0] + total_onto (list_tail xs) base };
+let rec total_onto xs base = if _list_is_empty xs { base } else { xs.[0] + total_onto (_list_tail xs) base };
 
 // --- a tail call written through a name --------------------------------------
 //
 // `rest` is read as the answer on one path and handed to a cell on the other.
 // Skipping an element is a loop; keeping one suspends the rest.
 let rec evens xs =
-    if list_is_empty xs { [] }
+    if _list_is_empty xs { [] }
     else {
         let x = xs.[0];
-        let rest = evens (list_tail xs);
-        if x % 2 == 0 { list_cons x rest } else { rest }
+        let rest = evens (_list_tail xs);
+        if x % 2 == 0 { _list_cons x rest } else { rest }
     };
 
 // --- building ----------------------------------------------------------------
 
 // The accumulator is never forced by the loop: it is a lazy parameter, and the
 // cell is built in place rather than suspended.
-let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (list_cons i acc) };
-let rec rev acc xs = if list_is_empty xs { acc } else { rev (list_cons (xs.[0]) acc) (list_tail xs) };
+let rec upto i n acc = if i > n { acc } else { upto (i + 1) n (_list_cons i acc) };
+let rec rev acc xs = if _list_is_empty xs { acc } else { rev (_list_cons (xs.[0]) acc) (_list_tail xs) };
 // A producer: the tail is suspended, so this is only ever as long as it is used.
-let rec from n = list_cons n (from (n + 1));
-let rec take n xs = if n <= 0 { [] } else { list_cons (xs.[0]) (take (n - 1) (list_tail xs)) };
+let rec from n = _list_cons n (from (n + 1));
+let rec take n xs = if n <= 0 { [] } else { _list_cons (xs.[0]) (take (n - 1) (_list_tail xs)) };
 // A lazy element that must never be evaluated: the division is suspended.
-let rec pairs i n acc = if i >= n { acc } else { pairs (i + 1) n (list_cons [i, i / 0] acc) };
+let rec pairs i n acc = if i >= n { acc } else { pairs (i + 1) n (_list_cons [i, i / 0] acc) };
 
 // --- maps and arrays ---------------------------------------------------------
 
@@ -56,19 +56,19 @@ let rec read_map i n m !acc = if i >= n { acc } else { read_map (i + 1) n m (acc
 let rec read_missing i n m !acc = if i >= n { acc } else { read_missing (i + 1) n m (acc + m.[i else 1000]) };
 let rec sum_arr i n a !acc = if i >= n { acc } else { sum_arr (i + 1) n a (acc + a.[i]) };
 let rec count_words ws m =
-    if list_is_empty ws { m }
-    else { let w = ws.[0]; count_words (list_tail ws) (m.[w => m.[w else 0] + 1]) };
+    if _list_is_empty ws { m }
+    else { let w = ws.[0]; count_words (_list_tail ws) (m.[w => m.[w else 0] + 1]) };
 
 // --- calling what it was given -------------------------------------------------
 
-let rec fold_with f !acc xs = if list_is_empty xs { acc } else { fold_with f (f acc (xs.[0])) (list_tail xs) };
+let rec fold_with f !acc xs = if _list_is_empty xs { acc } else { fold_with f (f acc (xs.[0])) (_list_tail xs) };
 // Handed an impure function through a pure parameter, which the purity check
 // cannot see through. Compiled code orders no effects, so the call is given back
 // to the interpreter before the effect -- which must happen once per element,
 // in order, as it does interpreted.
 let rec each f n = if n <= 0 { 0 } else { f n + each f (n - 1) };
 let noisy! x = { console.print! ("side " + to_string x); x };
-let rec any_of pred xs = if list_is_empty xs { false } else { if pred (xs.[0]) { true } else { any_of pred (list_tail xs) } };
+let rec any_of pred xs = if _list_is_empty xs { false } else { if pred (xs.[0]) { true } else { any_of pred (_list_tail xs) } };
 
 let main! = {
     let n = 200000;
@@ -113,7 +113,7 @@ let main! = {
     console.print! (fold_with (fn a b -> a + b * b) 0 [1, 2, 3, 4])
     console.print! (any_of (fn x -> x > 150000) xs)
     console.print! (any_of (fn x -> x < 0) xs)
-    console.print! (try! { list_tail (rev [] []) } catch e { e })
+    console.print! (try! { _list_tail (rev [] []) } catch e { e })
     console.print! (each (fn x -> x * 2) 3)
     console.print! (each noisy! 3)
 };

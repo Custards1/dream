@@ -27,6 +27,8 @@
 import std.list;
 import std.str;
 import std.toml;
+import std.map;
+import std.num;
 
 // --- declarations -----------------------------------------------------------
 
@@ -107,7 +109,7 @@ let declarations section =
         match declare name spec {
             [:ok, d] => [ds.[name => d], errs],
             [:error, why] => [ds, list.append errs [why]],
-        }) [%{}, []] (map_pairs section);
+        }) [%{}, []] (map.pairs section);
 
 // --- values -----------------------------------------------------------------
 
@@ -122,7 +124,7 @@ let check decl v = {
         [:bool, :bool] => [:ok, v],
         [:bool, :string] => match v { "true" => [:ok, true], "false" => [:ok, false], _ => wrong },
         [:integer, :integer] => [:ok, v],
-        [:integer, :string] => match parse_int v { () => wrong, n => [:ok, n] },
+        [:integer, :string] => match num.parse_int v { () => wrong, n => [:ok, n] },
         [:string, :string] => [:ok, v],
         [[:choice, cs], :string] => if list.contains v cs { [:ok, v] } else { wrong },
         _ => wrong,
@@ -151,7 +153,7 @@ let describe d = Decl.name d + " " + summary d;
 /// Every declaration of a package, for the end of a message about it.
 let listing : %{ :string => :any } -> :string;
 let listing decls =
-    match map_pairs decls {
+    match map.pairs decls {
         [] => "it declares no options",
         pairs => "its options:\n" + str.join_str "\n" (list.map (fn [_, d] -> "  " + describe d)
                                                                 (list.sort_on (fn [n, _] -> n) pairs)),
@@ -186,7 +188,7 @@ let split_scoped text = {
 /// defines` for the options they name. `[values, errors]`.
 let initial : %{ :string => :any } -> [:string] -> [%{ :string => :any }, [:string]];
 let initial decls defines = {
-    let defaults = list.fold (fn m [n, d] -> m.[n => Decl.default d]) (%{}) (map_pairs decls);
+    let defaults = list.fold (fn m [n, d] -> m.[n => Decl.default d]) (%{}) (map.pairs decls);
     list.fold (fn [vs, errs] text -> {
         let [name, raw] = split_define text;
         match decls.[name else ()] {

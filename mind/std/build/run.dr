@@ -74,7 +74,7 @@ let rec forced! v = {
     strict! v
     match type_of v {
         :list => fold! (fn _ x -> forced! x) () v,
-        :map => fold! (fn _ pair -> forced! (list.nth 1 pair)) () (map_pairs v),
+        :map => fold! (fn _ pair -> forced! (list.nth 1 pair)) () (_map_pairs v),
         _ => (),
     }
     v
@@ -128,7 +128,7 @@ let rec reach acc i = match build.input i {
 let reach_step : :map -> :map -> :map;
 let reach_step acc s = {
     let shape = build.Step.shape s;
-    if map_has acc shape { acc }
+    if _map_has acc shape { acc }
     else { list.fold reach (acc.[shape => s]) (build.Step.inputs s) }
 };
 
@@ -136,7 +136,7 @@ let reach_step acc s = {
 /// imported by: `version` as `version.dr`, `a.b` as `a/b.dr`. Its directory is
 /// the overlay the compiler searches as the package's own (`-L KEY+=DIR`).
 let overlay : :map -> :any;
-let overlay modules = match map_pairs modules {
+let overlay modules = match _map_pairs modules {
     [] => (),
     pairs => {
         let sorted = list.sort_on list.head pairs;
@@ -196,7 +196,7 @@ let absolute ctx p = match p {
 /// `[state, digest]`.
 let stamped! : :map -> :string -> [:any];
 let stamped! st path = match io.stat! path {
-    _ if map_has (State.digests st) path => [st, (State.digests st).[path]],
+    _ if _map_has (State.digests st) path => [st, (State.digests st).[path]],
     () => [st, ()],
     [size, modified, _] => {
         let d = match (State.stamps st).[path else ()] {
@@ -285,12 +285,12 @@ let reads_hold! st reads = fold! (fn [acc, ok] [p, d] -> match ok {
 /// backslash at its end, a space inside a name escaped by one before it.
 let depfile_reads : :string -> [:string];
 let depfile_reads text = {
-    let joined = str_concat (str.split "\\\n" (str_concat (str.split "\r" text)));
+    let joined = _str_concat (str.split "\\\n" (_str_concat (str.split "\r" text)));
     let body = match str.find ": " joined {
         i if i >= 0 => str.slice (i + 2) (str.byte_length joined - i - 2) joined,
         _ => "",
     };
-    let ended cur acc = match cur { [] => acc, _ => list.cons (str_of_chars (list.reverse cur)) acc };
+    let ended cur acc = match cur { [] => acc, _ => list.cons (_str_of_chars (list.reverse cur)) acc };
     let [names, current, _] = list.fold (fn [acc, cur, escaped] c -> match [escaped, c] {
         [true, _] => [acc, list.cons c cur, false],
         [_, '\\'] => [acc, cur, true],
@@ -334,7 +334,7 @@ let exited program r = match r.[:timed_out else false] {
 let op! : :string -> :integer -> :any -> :any;
 let op! dir ms o = try! {
     let target! name = { let t = dir + "/" + name; file.mkdir_all! (file.parent t); t };
-    let env_list env = list.map (fn [k, v] -> k + "=" + v) (map_pairs env);
+    let env_list env = list.map (fn [k, v] -> k + "=" + v) (_map_pairs env);
     match o {
         [:write, name, text] => { file.write! (target! name) text; [:ok, ()] },
         [:copy, from, name] => { file.copy! from (target! name); [:ok, ()] },
@@ -473,7 +473,7 @@ mapping Run {
 }
 
 let ready : :map -> :string -> :bool;
-let ready run shape = list.all (fn d -> map_has (State.done (Run.state run)) d) ((Run.deps run).[shape else []]);
+let ready run shape = list.all (fn d -> _map_has (State.done (Run.state run)) d) ((Run.deps run).[shape else []]);
 
 let stopped : :map -> :bool;
 let stopped run = not (Run.keep_going run) && not (map.is_empty (State.failures (Run.state run)));
@@ -575,7 +575,7 @@ let rec drive! ctx run = {
             strict! outcome
             let [key, scratch] = (Run.running started).[shape];
             let s = (Run.steps started).[shape];
-            let running = Run.set_running started (map_remove (Run.running started) shape);
+            let running = Run.set_running started (_map_remove (Run.running started) shape);
             let st = Run.state running;
             let timed = State.set_ms st ((State.ms st).[shape => ms]);
             match outcome {
@@ -601,7 +601,7 @@ let rec drive! ctx run = {
 /// has finished; one that keeps going answers the state, failures and all.
 let build_all! : :map -> :map -> :map -> :bool -> :map;
 let build_all! ctx st steps keep_going = {
-    let wanted = list.filter (fn sh -> not (map_has (State.done st) sh)) (map.keys steps);
+    let wanted = list.filter (fn sh -> not (_map_has (State.done st) sh)) (map.keys steps);
     let deps = list.fold (fn m sh -> m.[sh => upstream (steps.[sh])]) (%{}) wanted;
     let finished = drive! ctx (Run.make st steps deps wanted (%{}) keep_going);
     let state = Run.state finished;
@@ -676,7 +676,7 @@ let run_checks! : :map -> :map -> :map -> [:any];
 let run_checks! ctx st plan = {
     let wanted = build.Context.only ctx;
     let named = list.filter (fn [n, _] -> list.is_empty wanted || list.contains n wanted)
-                            (list.sort_on list.head (map_pairs (build.Plan.checks plan)));
+                            (list.sort_on list.head (_map_pairs (build.Plan.checks plan)));
     let steps = list.fold (fn acc [_, s] -> reach_step acc s) (%{}) named;
     let after = build_all! ctx st steps true;
     let results = list.fold (fn m [name, s] -> m.[name => match (State.done after).[build.Step.shape s else ()] {
@@ -825,13 +825,13 @@ let run_all! scripts = {
         f => match file.read! f {
             () => fail! ("cannot read the contexts " + f),
             text => match wire.decode text {
-                [:ok, m] if list.all (fn [_, c] -> build.is_context c) (map_pairs m) => m,
+                [:ok, m] if list.all (fn [_, c] -> build.is_context c) (_map_pairs m) => m,
                 _ => fail! ("the contexts " + f + " are not a map of build.Context"),
             },
         },
     };
     strict! contexts
-    let chosen = list.filter (fn [key, _] -> map_has contexts key) scripts;
+    let chosen = list.filter (fn [key, _] -> _map_has contexts key) scripts;
     match chosen {
         [] => (),
         [[first, _], .._] => {

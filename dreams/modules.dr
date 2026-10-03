@@ -36,6 +36,7 @@ import dreams.package;
 import dreams.parser;
 import dreams.path;
 import dreams.unit;
+import std.map;
 
 /// Modules the VM provides natively. An `import` of one of these resolves to a
 /// runtime lookup rather than to Dream source. This must match the runtime's
@@ -116,7 +117,7 @@ let loader packages cfg search_paths host_modules = {
 /// names none of them.
 let scoped_config ps cfg = {
     let aliases = list.fold (fn m [n, i] -> m.[n => package.name (package.at ps i)])
-                            (%{}) (map_pairs (package.by_name ps));
+                            (%{}) (map.pairs (package.by_name ps));
     config.with_aliases aliases (fn k -> package.find ps k != ()) cfg
 };
 
@@ -205,7 +206,7 @@ let records l      = l.[:records else []];
 /// Every setting a `when` condition read while loading, taken or not, as a
 /// set. What pins an image to the platform it was compiled for.
 let reads : Loader -> [:string];
-let reads l        = map_pairs (l.[:reads else (%{})]) |> list.map (fn [k, _] -> k) |> list.sort;
+let reads l        = map.pairs (l.[:reads else (%{})]) |> list.map (fn [k, _] -> k) |> list.sort;
 
 /// `[owner, name, library, entries, span]` for each `foreign` declaration,
 /// as the parser left it (`ast.foreign_d`). `note_foreigns` adds to this, for
@@ -256,8 +257,26 @@ let module_at l i = (module_map l).[i else ()];
 /// was O(modules^2) bytes. See "A table indexed by module wants to be a map" in
 /// docs/notes/compiler-scaling.md: this is the same finding as `scope.envs`, on the loader's copy of
 /// the same table.
-let add_module m l =
-    put :module_count (module_count l + 1) (put :modules ((module_map l).[module_count l => m]) l);
+let add_module m l = {
+    let added = put :module_count (module_count l + 1) (put :modules ((module_map l).[module_count l => m]) l);
+    if in_std (module_name m) { put :std_sources ((std_sources added).[module_source m => true]) added }
+    else { added }
+};
+
+/// Is this a module of the standard library? `std` may name the primitives
+/// it wraps; nothing else should (see the head of dreams/builtins.dr).
+let in_std : :string -> :bool;
+let in_std name = name == "std" || str.starts_with "std." name;
+
+let std_sources l = l.[:std_sources else (%{})];
+
+/// Was this file written as part of `std`? Asked of a source rather than a
+/// module because a body inherited through `derive` is resolved in the module
+/// that derives it but was written in the one it came from -- and a program
+/// that derives `std.seq` has not named a primitive just because `std.seq`
+/// did. A record's module shares its file, so it answers as the file does.
+let written_in_std : Loader -> :integer -> :bool;
+let written_in_std l source = (std_sources l).[source else false];
 
 /// Replace module `mi`. Expansion rewrites a declaration in place and puts the
 /// module back; nothing here changes the count.
@@ -282,7 +301,7 @@ let complain_note span message extra source l =
     note (diag.in_source source (diag.with_note extra (diag.error span message))) l;
 
 let mark_visited name l = put :visited (((visited l)).[name => true]) l;
-let is_visited l name = map_has (visited l) name;
+let is_visited l name = map.has (visited l) name;
 
 /// Native modules are recorded in first-seen order, because that order is the
 /// index a call to one is compiled to.
@@ -465,14 +484,21 @@ let unresolved_note! l dotted = {
 /// as the file is read, so the rest of the compiler never sees a conditional
 /// item at all -- and an `import` inside a `when` that is off is never
 /// followed, so a module only test builds need is never even opened.
-let rec expand_items cfg items =
+let expand_items cfg items = {
+    let flat = flatten_items cfg items;
+    let inherited = list.filter whole_import flat;
     list.concat (list.map (fn item ->
         match item {
-            [:when, cond, inner, _] =>
-                if config.eval cfg cond { expand_items cfg inner } else { [] },
-            [:priv, d, span] => [d, [:private, span]],
+            // A record's members are written in the file and read as if they
+            // were, so they see what the file imports. Its module is a `mod`
+            // of its own, which would otherwise see nothing -- and a member
+            // that calls `list.cons` has no other way to reach it, now that
+            // the primitive under it is `std`'s to name (see the head of
+            // dreams/builtins.dr). Only a whole module is passed down: a
+            // selected member could be the name of a field, and a `let` and an
+            // import of one name is an error (`report_clashes` in scope.dr).
             [:record, kind, name, fields, members, bases, span] =>
-                [syntax.record_derived kind name fields members bases span],
+                [syntax.record_derived kind name fields members (inherited + bases) span],
             // A union is a module and, in the parent, a global of the same
             // name holding its description -- see `syntax.union_decl`.
             [:union_decl, name, params, variants, members, span] =>
@@ -481,7 +507,25 @@ let rec expand_items cfg items =
             [:foreign_decl, name, library, entries, span] =>
                 syntax.foreign_decl name library entries span,
             other => [other],
+        }) flat)
+};
+
+/// `when` resolved and `priv` unwrapped, with every other item as written.
+let rec flatten_items cfg items =
+    list.concat (list.map (fn item ->
+        match item {
+            [:when, cond, inner, _] =>
+                if config.eval cfg cond { flatten_items cfg inner } else { [] },
+            [:priv, d, span] => [d, [:private, span]],
+            other => [other],
         }) items);
+
+/// `import path` or `import path as name`, but not `import path.{ .. }`.
+let whole_import item =
+    match item {
+        [:import, _, _, (), _] => true,
+        _ => false,
+    };
 
 /// Every record declaration `expand_items` is about to rewrite, in the same
 /// order and under the same `when` conditions -- an item the configuration
@@ -507,7 +551,7 @@ let rec record_items cfg items =
 /// answered `x ` and the end of the file. This is that, kept, and nothing in
 /// the compiler reads it: `owner + "." + name` is the module the rewrite made.
 let note_records owner items l =
-    put :records (records l + list.map (fn r -> list_cons owner r)
+    put :records (records l + list.map (fn r -> list.cons owner r)
                                        (record_items (config_in l owner) items)) l;
 
 /// The settings the `when` conditions among these items read: each condition
@@ -551,7 +595,7 @@ let rec foreign_items cfg items =
 /// survives only as the Dream type it was translated into. Nothing in the
 /// compiler reads this either.
 let note_foreigns owner items l =
-    put :foreigns (foreigns l + list.map (fn f -> list_cons owner f)
+    put :foreigns (foreigns l + list.map (fn f -> list.cons owner f)
                                          (foreign_items (config_in l owner) items)) l;
 
 // --- loading -----------------------------------------------------------------
@@ -845,14 +889,14 @@ let parse_unit! units text = match units {
 let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
 
 let rec import_lines text at acc = {
-    let i = str_find text "\nimport " at;
+    let i = str.find_from at "\nimport " text;
     if i < 0 { acc }
     else {
         let start = i + 8;
-        let stop = str_span text start name_bytes;
-        let named = str_slice text start (stop - start);
-        let bare = if str.ends_with "." named { str_slice named 0 (len named - 1) } else { named };
-        import_lines text stop (if len bare == 0 { acc } else { list_cons bare acc })
+        let stop = str.span name_bytes start text;
+        let named = str.slice start (stop - start) text;
+        let bare = if str.ends_with "." named { str.slice 0 (len named - 1) named } else { named };
+        import_lines text stop (if len bare == 0 { acc } else { list.cons bare acc })
     }
 };
 
@@ -865,8 +909,8 @@ let rec prefetch! l deps = match deps {
     [] => l,
     [dep, ..rest] => {
         let file = if is_host l dep || is_visited l dep { () } else { resolve_path! l dep };
-        let wanted = file != () && not (map_has (fetched l) file)
-                     && not (map_has (by_path l) (path.absolute! file));
+        let wanted = file != () && not (map.has (fetched l) file)
+                     && not (map.has (by_path l) (path.absolute! file));
         let text = if wanted { text_of! l file } else { () };
         if text == () { prefetch! l rest }
         else {
@@ -1052,10 +1096,10 @@ let reload_root! l file test_mode = {
             let last = module_count l - 1;
             let unmounted =
                 put :module_count last
-                    (put :modules (map_remove (module_map l) last)
-                        (put :by_name (map_remove (by_name l) name)
-                            (put :by_path (map_remove (by_path l) (path.absolute! file))
-                                (put :visited (map_remove (visited l) name) l))));
+                    (put :modules (map.remove (module_map l) last)
+                        (put :by_name (map.remove (by_name l) name)
+                            (put :by_path (map.remove (by_path l) (path.absolute! file))
+                                (put :visited (map.remove (visited l) name) l))));
             load_file! unmounted file name ast.no_span 0
         }
     }

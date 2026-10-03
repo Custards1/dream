@@ -14,6 +14,7 @@ import std.console;
 import std.ffi;
 import std.foreign;
 import std.list;
+import std.map;
 
 foreign sample from embedded "sample" {
     resource Counter = counter_free
@@ -135,7 +136,7 @@ let compare! a b = { console.print! "never"; a - b };
 /// whenever the compiler numbers the image differently; what is being tested
 /// is the layout, not the order a map happens to print in.
 let ordered v = match type_of v {
-    :map => list.map (fn [k, x] -> [k, ordered x]) (list.sort_on list.head (map_pairs v)),
+    :map => list.map (fn [k, x] -> [k, ordered x]) (list.sort_on list.head (map.pairs v)),
     :list => list.map ordered v,
     _ => v,
 };

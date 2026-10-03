@@ -2,6 +2,7 @@
 import std.console;
 
 import std.list;
+import std.str;
 
 // --- comp: evaluated by the compiler, baked into the image ------------------
 
@@ -27,7 +28,7 @@ let mixed = comp (1 + 2) * 10;
 //
 // `comp!` also permits effects during compile-time evaluation.
 
-let digits = comp! str_chars "12345";
+let digits = comp! str.chars "12345";
 let squares = comp! list.map (fn x -> x * x) [1, 2, 3, 4];
 
 // --- when: items that exist only under a condition --------------------------
@@ -75,5 +76,5 @@ let main! = {
 
     // The compile-time and run-time answers agree; only the timing differs.
     console.print! ("same:       " + to_string (fib_table == fib_upto 14))
-    console.print! ("same:       " + to_string (digits == str_chars "12345"))
+    console.print! ("same:       " + to_string (digits == str.chars "12345"))
 };

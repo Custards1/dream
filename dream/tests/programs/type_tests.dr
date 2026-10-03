@@ -41,7 +41,7 @@ let main! = {
     console.print! [typed_float 2.0, loose 2, ignore (integer (1 / 0))]
     console.print! [declared_float 2.0, loose_type 2, loose_type true]
     console.print! (integer (4611686018427387903 + 1))
-    console.print! (error_kind (try! { integer (1 / 0) } catch e { e }))
-    console.print! (error_kind (try! { loose true } catch e { e }))
+    console.print! (_error_kind (try! { integer (1 / 0) } catch e { e }))
+    console.print! (_error_kind (try! { loose true } catch e { e }))
     console.print! [count 100 7, count 100 7.0]
 };

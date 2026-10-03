@@ -32,7 +32,7 @@ let empty = [];
 // --- looking at a list ------------------------------------------------------
 
 let is_empty : [a] -> :bool;
-let is_empty xs = list_is_empty xs;
+let is_empty xs = _list_is_empty xs;
 
 /// The first element. Raises on an empty list; `first_or` is the total form.
 let head : [a] -> :any;
@@ -40,15 +40,15 @@ let head xs = xs.[0];
 
 /// Everything after the first element.
 let tail : [a] -> [a];
-let tail xs = list_tail xs;
+let tail xs = _list_tail xs;
 
 /// A new list with `x` on the front. Lazy in both, which is what lets a list
 /// be defined in terms of itself.
 let cons : a -> [a] -> [a];
-let cons x xs = list_cons x xs;
+let cons x xs = _list_cons x xs;
 
 let first_or : a -> [a] -> a;
-let first_or default xs = if list_is_empty xs { default } else { xs.[0] };
+let first_or default xs = if _list_is_empty xs { default } else { xs.[0] };
 
 /// `acc` plus the length of `xs`. The accumulating form `length` was written
 /// in terms of; both walk the spine in the machine now.
@@ -86,8 +86,8 @@ let nth n xs = xs.[n else ()];
 let last : [a] -> :any;
 let last xs = {
     let rec go xs =
-        if list_is_empty (list_tail xs) { xs.[0] } else { go (list_tail xs) };
-    if list_is_empty xs { () } else { go xs }
+        if _list_is_empty (_list_tail xs) { xs.[0] } else { go (_list_tail xs) };
+    if _list_is_empty xs { () } else { go xs }
 };
 
 // --- building ---------------------------------------------------------------
@@ -97,7 +97,7 @@ let last xs = {
 /// This is what `+` on two lists means, so it is written as `+`: the spine of
 /// `xs` is copied by the machine in one operation and its end pointed at `ys`,
 /// with `ys` and every element left untouched. Spelling it out instead --
-/// `list_cons (head xs) (append (list_tail xs) ys)` -- built a cons and a
+/// `_list_cons (head xs) (append (_list_tail xs) ys)` -- built a cons and a
 /// suspended call per cell, and was a fifth of the work in a self-compile,
 /// most of it reached through `concat`.
 ///
@@ -113,7 +113,7 @@ let append xs ys = xs + ys;
 
 let reverse_from : [a] -> [a] -> [a];
 let rec reverse_from acc xs =
-    if list_is_empty xs { acc } else { reverse_from (list_cons (xs.[0]) acc) (list_tail xs) };
+    if _list_is_empty xs { acc } else { reverse_from (_list_cons (xs.[0]) acc) (_list_tail xs) };
 
 let reverse : [a] -> [a];
 let reverse xs = reverse_from [] xs;
@@ -122,39 +122,39 @@ let reverse xs = reverse_from [] xs;
 /// indexes a list exactly.
 let range : :integer -> :integer -> [:integer];
 let rec range from until =
-    if from >= until { [] } else { list_cons from (range (from + 1) until) };
+    if from >= until { [] } else { _list_cons from (range (from + 1) until) };
 
 /// The infinite list `n, n+1, n+2, ...`. Only ever as long as it is used.
 let from : :integer -> [:integer];
-let rec from n = list_cons n (from (n + 1));
+let rec from n = _list_cons n (from (n + 1));
 
 /// An infinite list of one value.
 let repeat : a -> [a];
-let rec repeat x = list_cons x (repeat x);
+let rec repeat x = _list_cons x (repeat x);
 
 /// `x` repeated `n` times.
 let replicate : :integer -> a -> [a];
-let rec replicate n x = if n <= 0 { [] } else { list_cons x (replicate (n - 1) x) };
+let rec replicate n x = if n <= 0 { [] } else { _list_cons x (replicate (n - 1) x) };
 
 // --- transforming -----------------------------------------------------------
 
 /// Lazy: the result's tail is not built until it is asked for.
 let map : (a -> b) -> [a] -> [b];
 let rec map f xs =
-    if list_is_empty xs { [] } else { list_cons (f (xs.[0])) (map f (list_tail xs)) };
+    if _list_is_empty xs { [] } else { _list_cons (f (xs.[0])) (map f (_list_tail xs)) };
 
 let filter : (a -> :bool) -> [a] -> [a];
 let rec filter keep xs =
-    if list_is_empty xs { [] }
+    if _list_is_empty xs { [] }
     else {
         let x = xs.[0];
-        let rest = filter keep (list_tail xs);
-        if keep x { list_cons x rest } else { rest }
+        let rest = filter keep (_list_tail xs);
+        if keep x { _list_cons x rest } else { rest }
     };
 
 let fold : (b -> a -> b) -> b -> [a] -> b;
 let rec fold f acc xs =
-    if list_is_empty xs { acc } else { fold f (f acc (xs.[0])) (list_tail xs) };
+    if _list_is_empty xs { acc } else { fold f (f acc (xs.[0])) (_list_tail xs) };
 
 /// A left fold that forces each step before taking the next.
 ///
@@ -180,49 +180,49 @@ let rec fold f acc xs =
 /// every step and turn a linear fold into a quadratic one.
 let fold_strict : (b -> a -> b) -> b -> [a] -> b;
 let fold_strict f acc xs =
-    if list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (list_tail xs) };
+    if _list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (_list_tail xs) };
 
 priv let strict_steps : (b -> a -> b) -> b -> [a] -> b;
 priv let rec strict_steps f !acc xs =
-    if list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (list_tail xs) };
+    if _list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (_list_tail xs) };
 
 let fold_right : (a -> b -> b) -> b -> [a] -> b;
 let rec fold_right f acc xs =
-    if list_is_empty xs { acc } else { f (xs.[0]) (fold_right f acc (list_tail xs)) };
+    if _list_is_empty xs { acc } else { f (xs.[0]) (fold_right f acc (_list_tail xs)) };
 
 let take : :integer -> [a] -> [a];
 let rec take n xs =
     if n <= 0 { [] }
-    else if list_is_empty xs { [] }
-    else { list_cons (xs.[0]) (take (n - 1) (list_tail xs)) };
+    else if _list_is_empty xs { [] }
+    else { _list_cons (xs.[0]) (take (n - 1) (_list_tail xs)) };
 
 let drop : :integer -> [a] -> [a];
 let rec drop n xs =
-    if n <= 0 { xs } else if list_is_empty xs { [] } else { drop (n - 1) (list_tail xs) };
+    if n <= 0 { xs } else if _list_is_empty xs { [] } else { drop (n - 1) (_list_tail xs) };
 
 let take_while : (a -> :bool) -> [a] -> [a];
 let rec take_while keep xs =
-    if list_is_empty xs { [] }
-    else if keep (xs.[0]) { list_cons (xs.[0]) (take_while keep (list_tail xs)) }
+    if _list_is_empty xs { [] }
+    else if keep (xs.[0]) { _list_cons (xs.[0]) (take_while keep (_list_tail xs)) }
     else { [] };
 
 let drop_while : (a -> :bool) -> [a] -> [a];
 let rec drop_while skip xs =
-    if list_is_empty xs { [] }
-    else if skip (xs.[0]) { drop_while skip (list_tail xs) }
+    if _list_is_empty xs { [] }
+    else if skip (xs.[0]) { drop_while skip (_list_tail xs) }
     else { xs };
 
 let zip : [a] -> [b] -> [[a, b]];
 let rec zip xs ys =
-    if list_is_empty xs { [] }
-    else if list_is_empty ys { [] }
+    if _list_is_empty xs { [] }
+    else if _list_is_empty ys { [] }
     else {
-        list_cons [xs.[0], ys.[0]] (zip (list_tail xs) (list_tail ys))
+        _list_cons [xs.[0], ys.[0]] (zip (_list_tail xs) (_list_tail ys))
     };
 
 let concat : [[a]] -> [a];
 let rec concat xss =
-    if list_is_empty xss { [] } else { append (xss.[0]) (concat (list_tail xss)) };
+    if _list_is_empty xss { [] } else { append (xss.[0]) (concat (_list_tail xss)) };
 
 let flat_map : (a -> [b]) -> [a] -> [b];
 let flat_map f xs = concat (map f xs);
@@ -235,14 +235,14 @@ let enumerate xs = zip (from 0) xs;
 
 let any : (a -> :bool) -> [a] -> :bool;
 let rec any pred xs =
-    if list_is_empty xs { false }
+    if _list_is_empty xs { false }
     else if pred (xs.[0]) { true }
-    else { any pred (list_tail xs) };
+    else { any pred (_list_tail xs) };
 
 let all : (a -> :bool) -> [a] -> :bool;
 let rec all pred xs =
-    if list_is_empty xs { true }
-    else if pred (xs.[0]) { all pred (list_tail xs) }
+    if _list_is_empty xs { true }
+    else if pred (xs.[0]) { all pred (_list_tail xs) }
     else { false };
 
 let contains : a -> [a] -> :bool;
@@ -253,9 +253,9 @@ let count pred xs = fold_strict (fn acc x -> if pred x { acc + 1 } else { acc })
 
 let index_of_from : :integer -> a -> [a] -> :integer;
 let rec index_of_from !i x xs =
-    if list_is_empty xs { 0 - 1 }
+    if _list_is_empty xs { 0 - 1 }
     else if xs.[0] == x { i }
-    else { index_of_from (i + 1) x (list_tail xs) };
+    else { index_of_from (i + 1) x (_list_tail xs) };
 
 /// The index of the first `x`, or -1.
 let index_of : a -> [a] -> :integer;
@@ -274,22 +274,22 @@ let product xs = fold_strict (fn a b -> a * b) 1 xs;
 // compare it on every step anyway, so this forces nothing they did not.
 let min_by_from : a -> (a -> a -> :bool) -> [a] -> a;
 let rec min_by_from !best less xs =
-    if list_is_empty xs { best }
+    if _list_is_empty xs { best }
     else {
         let x = xs.[0];
         let next = if less x best { x } else { best };
-        min_by_from next less (list_tail xs)
+        min_by_from next less (_list_tail xs)
     };
 
 let minimum : [a] -> a;
 let minimum xs =
-    if list_is_empty xs { () }
-    else { min_by_from (xs.[0]) (fn a b -> compare a b < 0) (list_tail xs) };
+    if _list_is_empty xs { () }
+    else { min_by_from (xs.[0]) (fn a b -> compare a b < 0) (_list_tail xs) };
 
 let maximum : [a] -> a;
 let maximum xs =
-    if list_is_empty xs { () }
-    else { min_by_from (xs.[0]) (fn a b -> compare a b > 0) (list_tail xs) };
+    if _list_is_empty xs { () }
+    else { min_by_from (xs.[0]) (fn a b -> compare a b > 0) (_list_tail xs) };
 
 /// The elements that satisfy `pred`, then those that do not.
 let partition : (a -> :bool) -> [a] -> [[a], [a]];
@@ -297,12 +297,12 @@ let partition pred xs = [filter pred xs, filter (fn x -> not (pred x)) xs];
 
 let unique_from : [a] -> [a] -> [a];
 let rec unique_from seen xs =
-    if list_is_empty xs { [] }
+    if _list_is_empty xs { [] }
     else {
         let x = xs.[0];
-        let rest = list_tail xs;
+        let rest = _list_tail xs;
         if contains x seen { unique_from seen rest }
-        else { list_cons x (unique_from (list_cons x seen) rest) }
+        else { _list_cons x (unique_from (_list_cons x seen) rest) }
     };
 
 /// Keeps the first occurrence of each element.
@@ -313,15 +313,15 @@ let unique xs = unique_from [] xs;
 
 let merge_by : (a -> a -> :bool) -> [a] -> [a] -> [a];
 let rec merge_by before xs ys =
-    if list_is_empty xs { ys }
-    else if list_is_empty ys { xs }
+    if _list_is_empty xs { ys }
+    else if _list_is_empty ys { xs }
     else {
         let x = xs.[0];
         let y = ys.[0];
         // `before y x` rather than `before x y` keeps the sort stable: equal
         // elements take the one from `xs` first.
-        if before y x { list_cons y (merge_by before xs (list_tail ys)) }
-        else { list_cons x (merge_by before (list_tail xs) ys) }
+        if before y x { _list_cons y (merge_by before xs (_list_tail ys)) }
+        else { _list_cons x (merge_by before (_list_tail xs) ys) }
     };
 
 let sort_by : (a -> a -> :bool) -> [a] -> [a];
@@ -336,7 +336,7 @@ let rec sort_by before xs = {
 
 /// Ascending, by the runtime's total order over the flat types. Stable.
 ///
-/// The machine sorts (`sort_keyed`): this and `sort_on` were `sort_by`'s merge
+/// The machine sorts (`_sort_keyed`): this and `sort_on` were `sort_by`'s merge
 /// sort, which takes its list apart and builds it again at every level, and
 /// `sort_on` asked for each key at every comparison. A key is forced whole
 /// before the sort starts, where a comparison forces a key only as far as it
@@ -344,24 +344,24 @@ let rec sort_by before xs = {
 /// part that cannot be forced.
 let sort : [a] -> [a];
 let sort xs = {
-    let items = array_of_list xs;
-    sort_keyed (array_to_list items) items
+    let items = _array_of_list xs;
+    _sort_keyed (_array_to_list items) items
 };
 
 /// Ascending by a key extracted from each element, which is asked for once
 /// per element. Stable.
 let sort_on : (a -> b) -> [a] -> [a];
 let sort_on key xs = {
-    let items = array_of_list xs;
-    sort_keyed (map key (array_to_list items)) items
+    let items = _array_of_list xs;
+    _sort_keyed (map key (_array_to_list items)) items
 };
 
 // --- conversion -------------------------------------------------------------
 
 let to_array : [a] -> #[a];
-let to_array xs = array_of_list xs;
+let to_array xs = _array_of_list xs;
 let of_array : #[a] -> [a];
-let of_array a = array_to_list a;
+let of_array a = _array_to_list a;
 
 
 // --- tests ------------------------------------------------------------------
@@ -479,4 +479,4 @@ when test {
 
 // Of checks a finite list in full. Use types.check_each for lazy streams.
 type Of element = [element];
-type NonEmpty element = [element] where fn xs -> not (list_is_empty xs);
+type NonEmpty element = [element] where fn xs -> not (_list_is_empty xs);

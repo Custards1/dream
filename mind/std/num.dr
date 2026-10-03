@@ -1,0 +1,46 @@
+// Numbers: converting between integers, floats and their written forms.
+//
+// Arithmetic is the language's own (`+ - * / %`), and `std.math` is the
+// handful of functions the machine computes natively. This is the rest: the
+// conversions, each of them a runtime primitive under the name a program is
+// meant to write. A call of one compiles to the primitive itself (see
+// "wrappers" in dreams/scope.dr), and the JIT recognises `to_float` and
+// `to_int` there exactly as it did when they were written bare.
+
+/// The same number as a float. A float is answered as it is.
+let to_float : (:integer | :float) -> :float;
+let to_float n = _to_float n;
+
+/// The integer part, rounding toward zero. An integer is answered as it is.
+let to_int : (:integer | :float) -> :integer;
+let to_int x = _to_int x;
+
+/// The integer a decimal numeral writes, or `()` for text that is not one.
+let parse_int : :string -> (:integer | :unit);
+let parse_int s = _parse_int s;
+
+/// The float a numeral writes, or `()` for text that is not one.
+let parse_float : :string -> (:float | :unit);
+let parse_float s = _parse_float s;
+
+/// A float's eight IEEE 754 bytes, little-endian -- what an image and the wire
+/// format store one as. An integer is converted first.
+let float_bytes : (:integer | :float) -> :string;
+let float_bytes x = _float_bytes x;
+
+/// The float eight little-endian bytes hold.
+let float_of_bytes : :string -> :float;
+let float_of_bytes s = _float_of_bytes s;
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "to and from a float"  $( test.eq! [3.0, 3, 2.5] [to_float 3, to_int 3.9, to_float 2.5] ),
+        test.case "toward zero"          $( test.eq! (0 - 3) (to_int (0.0 - 3.9)) ),
+        test.case "a numeral"            $( test.eq! [42, ()] [parse_int "42", parse_int "4x"] ),
+        test.case "a float numeral"      $( test.eq! [2.5, ()] [parse_float "2.5", parse_float "x"] ),
+        test.case "eight bytes and back" $( test.eq! [8, 1.5] [len (float_bytes 1.5),
+                                                              float_of_bytes (float_bytes 1.5)] ),
+    ];
+}

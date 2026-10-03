@@ -76,7 +76,7 @@ let rec all rs =
             [:error, why] => error why,
             [:ok, v] => match all (list.tail rs) {
                 [:error, why] => error why,
-                [:ok, vs] => ok (list_cons v vs),
+                [:ok, vs] => ok (_list_cons v vs),
             },
         }
     };

@@ -65,9 +65,9 @@ let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
 /// The four hex digits of a `\uXXXX` escape, as a number.
 let hex_value : :char -> :integer;
 let hex_value c = match c {
-    _ if c >= '0' && c <= '9' => char_code c - 48,
-    _ if c >= 'a' && c <= 'f' => char_code c - 87,
-    _ if c >= 'A' && c <= 'F' => char_code c - 55,
+    _ if c >= '0' && c <= '9' => _char_code c - 48,
+    _ if c >= 'a' && c <= 'f' => _char_code c - 87,
+    _ if c >= 'A' && c <= 'F' => _char_code c - 55,
     _ => 0 - 1,
 };
 
@@ -85,19 +85,19 @@ let rec hex4 cs n acc =
 ///
 /// Four hex digits cannot reach past U+FFFF, so JSON spells a character above
 /// it as two escapes, a UTF-16 surrogate pair. Half of a pair is not a
-/// character and `char_of_code` refuses one, so the halves are joined here. A
-/// half with no partner becomes U+FFFD -- what `str_chars` makes of bytes that
+/// character and `_char_of_code` refuses one, so the halves are joined here. A
+/// half with no partner becomes U+FFFD -- what `_str_chars` makes of bytes that
 /// do not spell a character -- rather than failing the whole document.
 let unicode_escape : :integer -> [:char] -> [:char, [:char]];
 let unicode_escape code cs =
-    if code < 55296 || code > 57343 { [char_of_code code, cs] }
-    else if code > 56319 || list.take 2 cs != ['\\', 'u'] { [char_of_code 65533, cs] }
+    if code < 55296 || code > 57343 { [_char_of_code code, cs] }
+    else if code > 56319 || list.take 2 cs != ['\\', 'u'] { [_char_of_code 65533, cs] }
     else {
         let low = hex4 (list.drop 2 cs) 4 0;
-        if low == () { [char_of_code 65533, cs] }
-        else if list.head low < 56320 || list.head low > 57343 { [char_of_code 65533, cs] }
+        if low == () { [_char_of_code 65533, cs] }
+        else if list.head low < 56320 || list.head low > 57343 { [_char_of_code 65533, cs] }
         else {
-            [char_of_code (65536 + (code - 55296) * 1024 + (list.head low - 56320)),
+            [_char_of_code (65536 + (code - 55296) * 1024 + (list.head low - 56320)),
              list.head (list.tail low)]
         }
     };
@@ -120,8 +120,8 @@ let rec string_body cs acc =
                 'n'  => string_body after (list.cons '\n' acc),
                 't'  => string_body after (list.cons '\t' acc),
                 'r'  => string_body after (list.cons '\r' acc),
-                'b'  => string_body after (list.cons (char_of_code 8) acc),
-                'f'  => string_body after (list.cons (char_of_code 12) acc),
+                'b'  => string_body after (list.cons (_char_of_code 8) acc),
+                'f'  => string_body after (list.cons (_char_of_code 12) acc),
                 '"'  => string_body after (list.cons '"' acc),
                 '\\' => string_body after (list.cons '\\' acc),
                 '/'  => string_body after (list.cons '/' acc),
@@ -141,7 +141,7 @@ let rec string_body cs acc =
 
 /// Take the characters that can belong to a JSON number, and note whether any
 /// of them made it a float. JSON has no hex or leading `+`, so this is exactly
-/// the set `parse_int`/`parse_float` will accept.
+/// the set `_parse_int`/`_parse_float` will accept.
 let number_chars : [:char] -> [:char] -> :bool -> [[:char], :bool, [:char]];
 let rec number_chars cs acc floaty =
     if list.is_empty cs { [list.reverse acc, floaty, cs] }
@@ -162,7 +162,7 @@ let parse_number cs = {
     let rest = list.nth 2 taken;
     if str.is_empty text { () }
     else {
-        let n = if floaty { parse_float text } else { parse_int text };
+        let n = if floaty { _parse_float text } else { _parse_int text };
         if n == () { () } else { step n rest }
     }
 };
@@ -266,7 +266,7 @@ let escape_char c = match c {
     '\n' => "\\n",
     '\t' => "\\t",
     '\r' => "\\r",
-    _ => match char_code c {
+    _ => match _char_code c {
         8  => "\\b",
         12 => "\\f",
         // The only characters JSON insists on escaping, and the only ones that
@@ -365,7 +365,7 @@ let write v = encode v;
 let write_indented : :integer -> :any -> :string;
 let rec write_indented depth v = match type_of v {
     :list  => indented_items depth v,
-    :array => indented_items depth (array_to_list v),
+    :array => indented_items depth (_array_to_list v),
     :map   => indented_members depth v,
     _      => write v,
 };
@@ -456,7 +456,7 @@ when test {
         test.case "write bool"     $( test.eq! "true" (write true) ),
         test.case "write string"   $( test.eq! "\"a\"" (write "a") ),
         test.case "write escapes"  $( test.eq! "\"a\\nb\"" (write "a\nb") ),
-        test.case "write control"  $( test.eq! "\"\\u0001\"" (write (char_of_code 1 |> fn c -> str.of_chars [c])) ),
+        test.case "write control"  $( test.eq! "\"\\u0001\"" (write (_char_of_code 1 |> fn c -> str.of_chars [c])) ),
         test.case "write array"    $( test.eq! "[1,2]" (write [1, 2]) ),
         test.case "write empty"    $( test.eq! "[]" (write []) ),
         test.case "write atom drops the colon" $( test.eq! "\"ok\"" (write :ok) ),
@@ -494,14 +494,14 @@ when test {
         test.case "two framed messages come back in order"
             $( test.eq! [[:ok, 1], [:ok, "two"]] (list.nth 0 (frames (frame_all [1, "two"]))) ),
         test.case "half a message is not an answer"
-            $( test.eq! () (next_frame (str_slice (frame "hello") 0 6)) ),
+            $( test.eq! () (next_frame (_str_slice (frame "hello") 0 6)) ),
 
         // and what this format loses, stated rather than left to be discovered
         test.case "a list round trips"     $( test.true! (round_trips [1, 2]) ),
         test.case "a string round trips"   $( test.true! (round_trips "hi") ),
         test.case "an atom does not"       $( test.false! (round_trips :ok) ),
         test.case "an array comes back a list"
-            $( test.eq! [1, 2] (parsed (write (array_of_list [1, 2]))) ),
+            $( test.eq! [1, 2] (parsed (write (_array_of_list [1, 2]))) ),
     ];
 }
 

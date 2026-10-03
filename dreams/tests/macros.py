@@ -284,6 +284,31 @@ let main! = expand loop 1;
             'let main! = console.print! (expand through (expand with_some x 3 (x + 1)) [double]);',
             '8\n')
 
+    # A program that does not resolve fails as quickly as one that has no
+    # macros. A transformer that reaches a name which does not exist is
+    # refused rather than run -- running it ran a program with holes in it,
+    # failed, and was asked again of the whole program, a compile per
+    # `expand`; with a few dozen of them it ran a 32 GB machine out of memory.
+    # The limit is what keeps a regression from doing that again here.
+    import resource
+    (temp / 'broken.dr').write_text('''
+let helper xs = no_such_name xs;
+macro wrap e = helper e;
+''')
+    many = 'import std.console;\nimport broken;\n' + ''.join(
+        f'let f{i} x = expand broken.wrap (x + {i});\n' for i in range(64)) + \
+        'let main! = console.print! (f0 1);\n'
+    (temp / 'main.dr').write_text(many)
+    limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (4 << 30, 4 << 30))
+    result = subprocess.run(
+        [vm, compiler, '-L', str(root / 'mind'), '-L', str(temp),
+         str(temp / 'main.dr'), '-o', str(temp / 'out.dream')],
+        text=True, capture_output=True, timeout=20, preexec_fn=limit)
+    assert result.returncode == 1, result.stderr
+    assert 'cannot find `no_such_name`' in result.stderr, result.stderr
+    assert 'cannot run macro' in result.stderr, result.stderr
+    count += 1
+
     # Embedded macro VMs must preserve the REPL's already-open input handle.
     session = subprocess.run(
         [vm, compiler, '--repl', '-L', str(root / 'mind'), '-L', str(root)],

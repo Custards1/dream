@@ -1,0 +1,33 @@
+// Characters: a character and its code point.
+//
+// A character is a value of its own, not a one-byte string and not an
+// integer, so the two conversions between it and its Unicode scalar value are
+// all there is to this module. Each is the runtime's primitive under a name a
+// program is meant to write; a call of one compiles to the primitive itself
+// (see "wrappers" in dreams/scope.dr), so there is nothing to save by reaching
+// past it.
+
+/// The code point: `code 'A'` is 65.
+let code : :char -> :integer;
+let code c = _char_code c;
+
+/// The character with this code point. Raises on a surrogate (U+D800 to
+/// U+DFFF) or on anything past U+10FFFF, neither of which is a character.
+let of_code : :integer -> :char;
+let of_code n = _char_of_code n;
+
+/// Is this an ASCII digit?
+let is_digit : :char -> :bool;
+let is_digit c = c >= '0' && c <= '9';
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a character's code"   $( test.eq! [65, 955] [code 'A', code 'λ'] ),
+        test.case "and back"             $( test.eq! ['A', 'λ'] [of_code 65, of_code 955] ),
+        test.case "a surrogate is not a character"
+            $( test.raises! $( strict! (of_code 55296) ) ),
+        test.case "digits"               $( test.eq! [true, false] [is_digit '7', is_digit 'x'] ),
+    ];
+}

@@ -61,7 +61,7 @@ let unary_e op e span      = [:unary, op, e, span];
 let binary_e op l r span   = [:binary, op, l, r, span];
 
 /// `a @ b` -- the matrix product, or the dot product of two vectors. Not a
-/// `:binary` node: it is the builtin `tensor_matmul` applied to both sides,
+/// `:binary` node: it is the builtin `_tensor_matmul` applied to both sides,
 /// written that way here so that nothing after the parser -- scope, types,
 /// lowering, the optimizer -- has an operator to learn. Every arithmetic
 /// operator is an opcode because a loop of them has to be a loop of machine
@@ -72,7 +72,7 @@ let binary_e op l r span   = [:binary, op, l, r, span];
 /// A name is known by where it is written -- resolution and the language
 /// server both key on it -- and the whole expression starts where `l` does,
 /// so a name given that span was resolved as `l`.
-let matmul_e l r at span = apply_e (name_e "tensor_matmul" at) [l, r] span;
+let matmul_e l r at span = apply_e (name_e "_tensor_matmul" at) [l, r] span;
 
 /// `else` is optional; a missing one is `()`.
 let if_e cond then_e else_e span = [:if, cond, then_e, else_e, span];

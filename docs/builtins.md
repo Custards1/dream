@@ -28,15 +28,15 @@ These are resolved by the compiler without any import. They can be shadowed by a
 
 ### Pattern-match internals
 
-These are emitted by the compiler for `match` expressions. They are technically builtins but are not normally called directly.
+These are emitted by the compiler for `match` expressions. They are primitives (see below) with no `std` wrapper: nothing but the lowering of a pattern has any business calling them.
 
 | Name | Description |
 |------|-------------|
-| `match_is_cons v` | Returns `true` if `v` is a cons cell (a non-empty list). |
-| `match_head v` | Returns the head of a cons cell, unforced. |
-| `match_tail v` | Returns the tail of a cons cell, unforced. |
-| `match_at v i` | Returns element `i` of array `v`, unforced. |
-| `match_key map key` | Returns `[value]` if `key` is in `map`, `[]` if absent; the value unforced. |
+| `_match_is_cons v` | Returns `true` if `v` is a cons cell (a non-empty list). |
+| `_match_head v` | Returns the head of a cons cell, unforced. |
+| `_match_tail v` | Returns the tail of a cons cell, unforced. |
+| `_match_at v i` | Returns element `i` of array `v`, unforced. |
+| `_match_key map key` | Returns `[value]` if `key` is in `map`, `[]` if absent; the value unforced. |
 
 Each takes its arguments forced by the machine, through its strictness mask, and hands back what it found without forcing it: the machine forces the piece as the continuation of the call. That is what lets a chain of reads through patterns — a list rebuilt many times from the rest of the one before — go as deep as the heap allows rather than as deep as the C++ stack. The list-tail opcode and container reads use the same machine continuation.
 
@@ -44,10 +44,28 @@ Each takes its arguments forced by the machine, through its strictness mask, and
 
 ## Runtime primitives
 
-These names are available without imports and can be shadowed. Saturated calls
-compile directly to opcodes; partial applications and function values retain
-ordinary builtin semantics. `str_of_chars`, `str_of_bytes`, `str_concat`, and
-`array_of_list` remain builtin calls because they traverse lazy lists.
+Operations the machine has to provide because Dream cannot write them. Each is
+spelled with a leading `_`, and each is **`std`'s to call**: `std` wraps it in a
+function under an ordinary name -- the second column below -- and a program is
+meant to call that. A primitive named anywhere outside `std` still compiles,
+with a warning saying which call to write instead; the underscore is there so
+that one is never reached for by accident, and so `std` is free to change them.
+
+Calling the wrapper costs nothing. A function whose body only passes its
+parameters on is a *wrapper*, and the compiler emits the call it stands for in
+its place, so `str.byte i s` compiles to exactly what `_str_byte s i` does --
+the same opcode, the same reductions, the same code from the JIT. Passing one as
+a value (`list.map char.of_code cs`) passes the primitive itself when the
+wrapper keeps its parameters in order. Six of the wrappers take theirs in a
+different order from the primitive, subject last, as the rest of `std` does;
+the column says which.
+
+Saturated calls compile directly to opcodes; partial applications and function
+values retain ordinary builtin semantics. `_str_of_chars`, `_str_of_bytes`,
+`_str_concat`, and `_array_of_list` remain builtin calls because they traverse
+lazy lists. None of the twelve language builtins above is a primitive, and
+neither is anything a native module (`std.vm`, `std.math`, `std.io`, ..)
+provides: those are called by their own names.
 
 Container access and updates use `xs.[0]`, `m.[key else default]`, and
 `m.[key => value]`. An empty map is `%{}`; byte length is `len s`.
@@ -56,43 +74,43 @@ Scalar type descriptions such as `Integer` and `Number` live in `std.types`.
 
 ### Lists
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `list_tail` | `list → list` | Everything after the first element. Raises `:type_error` on an empty list. |
-| `list_cons` | `value → list → list` | A new cons cell with the given head and tail. Both sides stay lazy. |
-| `list_is_empty` | `list → bool` | `true` if the list is `[]`. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_list_tail` | `list.tail xs` | `list → list` | Everything after the first element. Raises `:type_error` on an empty list. |
+| `_list_cons` | `list.cons x xs` | `value → list → list` | A new cons cell with the given head and tail. Both sides stay lazy. |
+| `_list_is_empty` | `list.is_empty xs` | `list → bool` | `true` if the list is `[]`. |
 
 ### Strings
 
 Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions below are **byte** offsets, not character offsets.
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `str_chars` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). Bytes that do not spell a Unicode scalar value — a stray or truncated sequence, an overlong form, a surrogate, anything past U+10FFFF — each become U+FFFD, one per byte, so every char it yields is one `char_of_code` would accept. Raises `:type_error` on a bigstr. |
-| `str_of_chars` | `list of char → string` | Encodes a list of characters into a UTF-8 string. |
-| `str_of_bytes` | `list of integer → string` | Builds a string from raw byte values, each `0`–`255`. The inverse of `str_byte`, and the way to produce **binary** output: `str_of_chars` UTF-8-encodes its input, so byte `0x80` would become two bytes. Raises `:type_error` for a non-integer or a value outside `0`–`255`. A `0` byte is an ordinary byte and does not end the string. |
-| `str_slice` | `string\|bigstr → start:integer → len:integer → string\|bigstr` | Returns `len` bytes starting at byte offset `start`. Clamped silently — running past the end is how string-walking loops finish. A slice of a bigstr is another bigstr view, however small: no copy, at any size. |
-| `str_find` | `haystack:string → needle:string → from:integer → integer` | Returns the byte offset of the first occurrence of `needle` at or after `from`, or `-1` if not found. Raises `:type_error` on a bigstr. |
-| `str_byte` | `string\|bigstr → index:integer → integer` | The raw byte value (0–255) at byte `index`, or `-1` if out of range. |
-| `str_span` | `string\|bigstr → from:integer → set:string → integer` | The byte offset of the first byte at or after `from` that is **not** in `set`, or the string's byte length when there is none. `set` is read as the set of its bytes, so `str_span s i " \t"` skips indentation and `str_span s i digits` skips a number. A whole run of a byte class in one operation — the same walk written in Dream is a call and a comparison chain per byte, which is what a lexer spends its time on. |
-| `str_upto` | `string\|bigstr → from:integer → set:string → integer` | The other way round: the offset of the first byte at or after `from` that **is** in `set`, or the byte length when there is none — so `str_upto s i "\n"` is the end of the line whether or not the text ends with one. |
-| `str_concat` | `list of string → string` | Joins the parts, copying each exactly once. Raises `:type_error` on a bigstr. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_str_chars` | `str.chars s` | `string → list of char` | Decodes the string to a list of Unicode codepoints (characters). Bytes that do not spell a Unicode scalar value — a stray or truncated sequence, an overlong form, a surrogate, anything past U+10FFFF — each become U+FFFD, one per byte, so every char it yields is one `_char_of_code` would accept. Raises `:type_error` on a bigstr. |
+| `_str_of_chars` | `str.of_chars cs` | `list of char → string` | Encodes a list of characters into a UTF-8 string. |
+| `_str_of_bytes` | `str.of_bytes bs` | `list of integer → string` | Builds a string from raw byte values, each `0`–`255`. The inverse of `_str_byte`, and the way to produce **binary** output: `_str_of_chars` UTF-8-encodes its input, so byte `0x80` would become two bytes. Raises `:type_error` for a non-integer or a value outside `0`–`255`. A `0` byte is an ordinary byte and does not end the string. |
+| `_str_slice` | `str.slice from count s` | `string\|bigstr → start:integer → len:integer → string\|bigstr` | Returns `len` bytes starting at byte offset `start`. Clamped silently — running past the end is how string-walking loops finish. A slice of a bigstr is another bigstr view, however small: no copy, at any size. |
+| `_str_find` | `str.find_from from needle s` | `haystack:string → needle:string → from:integer → integer` | Returns the byte offset of the first occurrence of `needle` at or after `from`, or `-1` if not found. Raises `:type_error` on a bigstr. |
+| `_str_byte` | `str.byte i s` | `string\|bigstr → index:integer → integer` | The raw byte value (0–255) at byte `index`, or `-1` if out of range. |
+| `_str_span` | `str.span set from s` | `string\|bigstr → from:integer → set:string → integer` | The byte offset of the first byte at or after `from` that is **not** in `set`, or the string's byte length when there is none. `set` is read as the set of its bytes, so `_str_span s i " \t"` skips indentation and `_str_span s i digits` skips a number. A whole run of a byte class in one operation — the same walk written in Dream is a call and a comparison chain per byte, which is what a lexer spends its time on. |
+| `_str_upto` | `str.upto set from s` | `string\|bigstr → from:integer → set:string → integer` | The other way round: the offset of the first byte at or after `from` that **is** in `set`, or the byte length when there is none — so `_str_upto s i "\n"` is the end of the line whether or not the text ends with one. |
+| `_str_concat` | `str.concat_all parts` | `list of string → string` | Joins the parts, copying each exactly once. Raises `:type_error` on a bigstr. |
 
 ### Chars
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `char_code` | `char → integer` | The Unicode scalar value (codepoint) of a character. |
-| `char_of_code` | `integer → char` | The character for a Unicode scalar value. Raises `:type_error` if the integer is not a valid Unicode scalar (must be 0–0x10FFFF, excluding surrogates). |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_char_code` | `char.code c` | `char → integer` | The Unicode scalar value (codepoint) of a character. |
+| `_char_of_code` | `char.of_code n` | `integer → char` | The character for a Unicode scalar value. Raises `:type_error` if the integer is not a valid Unicode scalar (must be 0–0x10FFFF, excluding surrogates). |
 
 ### Numbers
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `to_float` | `integer\|float → float` | Converts a number to `float`. Returns a `float` unchanged. |
-| `to_int` | `integer\|float → integer` | Converts a number to `integer`. Truncates toward zero (like C cast). For floor-division behavior use `math.floor` first. |
-| `parse_int` | `string → integer\|unit` | Parses a base-10 integer from a string. Returns `unit` on failure. The entire string must be a valid integer (trailing non-numeric characters cause failure). |
-| `parse_float` | `string → float\|unit` | Parses a floating-point number from a string. Returns `unit` on failure. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_to_float` | `num.to_float n` | `integer\|float → float` | Converts a number to `float`. Returns a `float` unchanged. |
+| `_to_int` | `num.to_int x` | `integer\|float → integer` | Converts a number to `integer`. Truncates toward zero (like C cast). For floor-division behavior use `math.floor` first. |
+| `_parse_int` | `num.parse_int s` | `string → integer\|unit` | Parses a base-10 integer from a string. Returns `unit` on failure. The entire string must be a valid integer (trailing non-numeric characters cause failure). |
+| `_parse_float` | `num.parse_float s` | `string → float\|unit` | Parses a floating-point number from a string. Returns `unit` on failure. |
 
 ### Atoms
 
@@ -103,19 +121,19 @@ interned text it did not write would grow that table until it died, with no
 collector able to reach it. So the only direction offered is the one that
 cannot leak.
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `to_existing_atom` | `string\|bigstr → atom\|unit` | The atom of this name if there already is one, `unit` if there is not. Never creates one. A name is an atom when the program writes it as one anywhere — an image's atoms are interned when it loads — so this is how text from outside is matched against names the program does know. Accepts a bigstr, since it reads the bytes and builds nothing. Raises `:type_error` on anything that is not a string. The answer only moves one way: the table never forgets, so an atom stays one. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_to_existing_atom` | `atom.existing name` | `string\|bigstr → atom\|unit` | The atom of this name if there already is one, `unit` if there is not. Never creates one. A name is an atom when the program writes it as one anywhere — an image's atoms are interned when it loads — so this is how text from outside is matched against names the program does know. Accepts a bigstr, since it reads the bytes and builds nothing. Raises `:type_error` on anything that is not a string. The answer only moves one way: the table never forgets, so an atom stays one. |
 
 ### Arrays
 
 Arrays are fixed-length, eagerly allocated sequences. Indexing is O(1). All update operations return a new array (values are immutable).
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `array_new` | `length:integer → fill:value → array` | Creates a new array of `length` slots, each initialized to `fill`. |
-| `array_of_list` | `list → array` | Converts a list to an array. Elements remain lazy. |
-| `array_to_list` | `array → list` | Converts an array to a list. Elements remain lazy. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_array_new` | `array.new n fill` | `length:integer → fill:value → array` | Creates a new array of `length` slots, each initialized to `fill`. |
+| `_array_of_list` | `array.of_list xs` | `list → array` | Converts a list to an array. Elements remain lazy. |
+| `_array_to_list` | `array.to_list a` | `array → list` | Converts an array to a list. Elements remain lazy. |
 
 ### Maps
 
@@ -123,19 +141,19 @@ Maps are persistent hash maps — a hash array mapped trie, branching 32 ways on
 
 Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path from the root to the entry it changes — about `log32(n)` nodes — and the map it was given keeps every other node and stays valid. So the ordinary functional way to build a map, folding `m.[key => value]` over a sequence, costs `O(n log n)` in total rather than the `O(n²)` a copy-on-write table would. `len` is constant time: every node knows how many entries hang below it.
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `map_has` | `map → key → bool` | Returns `true` if `key` is in the map. |
-| `map_remove` | `map → key → map` | Returns a new map with `key` removed. |
-| `map_pairs` | `map → list` | Returns a list of `[key, value]` pairs in unspecified order. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_map_has` | `map.has m k` | `map → key → bool` | Returns `true` if `key` is in the map. |
+| `_map_remove` | `map.remove m k` | `map → key → map` | Returns a new map with `key` removed. |
+| `_map_pairs` | `map.pairs m` | `map → list` | Returns a list of `[key, value]` pairs in unspecified order. |
 
 ### Ordering
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `compare` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays, tensors. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Tensors compare by shape, then element by element. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
-| `tensor_matmul` | `tensor\|list\|array → tensor\|list\|array → tensor\|float` | What `a @ b` is written as. See [`std.tensor`](#stdtensor). |
-| `sort_keyed` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `compare` | `compare a b` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays, tensors. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Tensors compare by shape, then element by element. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
+| `_tensor_matmul` | `a @ b` | `tensor\|list\|array → tensor\|list\|array → tensor\|float` | What `a @ b` is written as. See [`std.tensor`](#stdtensor). |
+| `_sort_keyed` | `list.sort_on key xs` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
 ### Large data
 
@@ -144,13 +162,13 @@ The payload region of the image: bytes put there at compile time with
 [bytecode-format.md](bytecode-format.md) for the `LDAT` and `PAYL` sections
 these read.
 
-| Name | Signature | Description |
-|------|-----------|-------------|
-| `data_count` | `unit → integer` | How many large data this image carries. `0` for an image built without `--payload`, which is every ordinary image. |
-| `data_at` | `integer → bigstr` | Datum `i`, as a **bigstr**: a length and a pointer into the mapped image. Constant time and copies nothing, whatever its size. Raises `:type_error` for an index outside `0 .. data_count () - 1`. |
+| Primitive | Write | Signature | Description |
+|-----------|-------|-----------|-------------|
+| `_data_count` | `payload.count ()` | `unit → integer` | How many large data this image carries. `0` for an image built without `--payload`, which is every ordinary image. |
+| `_data_at` | `payload.at i` | `integer → bigstr` | Datum `i`, as a **bigstr**: a length and a pointer into the mapped image. Constant time and copies nothing, whatever its size. Raises `:type_error` for an index outside `0 .. payload.count () - 1`. |
 
 Both are pure. The payload is fixed when the image is written and nothing can
-alter it, so asking for datum `i` is a function of `i` in the way `str_byte` is
+alter it, so asking for datum `i` is a function of `i` in the way `str.byte` is
 a function of its index.
 
 **What a bigstr is for.** A `.dream` file addresses itself with 32-bit offsets,
@@ -184,9 +202,10 @@ what it looks like. `type_of` still tells them apart, so a branch written for
 
 ```dream
 import std.io;
+import std.payload;
 
 let main! = {
-    let data = data_at 0;
+    let data = payload.at 0;
     if str.slice 0 4 data == "%PDF" {
         io.write! (io.stdout! ()) data       // the whole of it, never in memory
     } else { console.error! "not a PDF" }
@@ -730,7 +749,7 @@ A lazy singly-linked list. Most operations work on infinite lists. Functions tha
 | `sort xs` | Stable sort in ascending order by `compare`. Forces the entire spine. |
 | `sort_by before xs` | Stable sort with a custom comparator `before a b → bool`. |
 | `sort_on key xs` | Stable sort ascending by `key` applied to each element. |
-| `to_array xs` | Converts to an array (calls `array_of_list`). |
+| `to_array xs` | Converts to an array (`array.of_list`). |
 | `of_array a` | Converts an array to a list. |
 | `force xs` | Forces every element. Useful before `send!`. |
 
@@ -925,7 +944,7 @@ json.quote "he said \"hi\""                      // 16 characters, including the
 > they were written in. JSON objects are unordered, so this is valid output —
 > but it does mean two maps that compare equal can render as different text,
 > and that output is not stable enough to compare byte-for-byte in a test. Sort
-> `map_pairs` yourself if you need a canonical rendering.
+> `map.pairs` yourself if you need a canonical rendering.
 
 #### Parser internals
 
@@ -998,7 +1017,7 @@ map — which is what lets a dependency carry `path`, `git`, `tag` and the rest.
 | `section table name` | The map for `[name]`, or an **empty map** if there is no such section. A missing section reads exactly like an empty one, so a manifest with no `[dependencies]` needs no special case. |
 | `get default table sec key` | `table[sec][key]`, or `default` if either the section or the key is absent. |
 | `sections table` | The name of every section. Includes `""` when the file had keys before its first header. |
-| `entries table name` | One section's `key = value` pairs as `[key, value]` lists — `map_pairs` of that section. |
+| `entries table name` | One section's `key = value` pairs as `[key, value]` lists — `map.pairs` of that section. |
 
 ```dream
 let t = toml.value (toml.parse text);
@@ -1201,7 +1220,7 @@ import std.error;
 ```
 
 The **kind** and the **payload** of a failure. `try! .. catch e` binds the error
-itself, and before the `error_kind` and `error_payload` primitives there was no
+itself, and before the `_error_kind` and `_error_payload` primitives there was no
 way into one: a caught error could be printed and nothing else. With them a
 failure is an ordinary value to `match` on, and a program can raise failures as
 distinguishable as the runtime's own.

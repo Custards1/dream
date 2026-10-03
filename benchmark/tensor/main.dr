@@ -15,6 +15,7 @@ import std.list;
 import std.os;
 import std.str;
 import std.tensor;
+import std.num;
 
 /// `#[#[..]]`, the same numbers as `t`.
 let nested : :tensor -> #[#[:float]];
@@ -30,7 +31,7 @@ let naive a b = {
 };
 
 let gflops : :integer -> :integer -> :string;
-let gflops n ms = if ms <= 0 { "-" } else { to_string (to_int (2.0 * to_float n * to_float n * to_float n / to_float ms / 1.0e4) / 100.0) };
+let gflops n ms = if ms <= 0 { "-" } else { to_string (num.to_int (2.0 * num.to_float n * num.to_float n * num.to_float n / num.to_float ms / 1.0e4) / 100.0) };
 
 let timed! name n thunk = {
     let before = os.monotonic! ();
@@ -42,7 +43,9 @@ let timed! name n thunk = {
 
 let main! = {
     let args = os.args! ();
-    let n = if args == [] { 256 } else { parse_int (list.head args) };
+    let n = if args == [] { 256 } else {
+        match num.parse_int (list.head args) { () => raise! "the size must be a whole number", k => k }
+    };
     let a = tensor.random 1 [n, n];
     let b = tensor.random 2 [n, n];
     console.print! ("n = " + to_string n + ", cpu kernels: " + tensor.cpu_kernels ());
@@ -61,6 +64,6 @@ let main! = {
         let warm = tensor.host (ga @ gb);
         let g = timed! "tensor @ gpu " n (fn () -> tensor.host (ga @ gb));
         console.print! ("  on " + tensor.gpu_name () + ", agree: " +
-                        to_string (tensor.maximum (tensor.abs (g - fast)) < 1.0e-3 * to_float n))
+                        to_string (tensor.maximum (tensor.abs (g - fast)) < 1.0e-3 * num.to_float n))
     } else { console.print! "no GPU" }
 };

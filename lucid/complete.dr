@@ -53,12 +53,12 @@ let newline = 10;
 /// front of a dot is not a name, which is what keeps `..rest` and `c.[k]` out
 /// of this: neither has a name to the left of the dot that a module could be.
 let rec chain_before src at acc =
-    if at <= 0 || str_byte src (at - 1) != dot { acc }
+    if at <= 0 || str.byte (at - 1) src != dot { acc }
     else {
         let start = analysis.name_start src (at - 1);
         // Nothing but the dot -- a second dot, a bracket, a space.
         if start >= at - 1 { acc }
-        else { chain_before src start (list_cons (str.slice start (at - 1 - start) src) acc) }
+        else { chain_before src start (list.cons (str.slice start (at - 1 - start) src) acc) }
     };
 
 let is_space b = b == 32 || b == 9 || b == 10 || b == 13;
@@ -67,7 +67,7 @@ let is_space b = b == 32 || b == 9 || b == 10 || b == 13;
 /// like everything else in this section, and for the same reason: what comes
 /// before the cursor is text and not a tree.
 let word_before src at = {
-    let rec skip i = if i > 0 && is_space (str_byte src (i - 1)) { skip (i - 1) } else { i };
+    let rec skip i = if i > 0 && is_space (str.byte (i - 1) src) { skip (i - 1) } else { i };
     let ends = skip at;
     let starts = analysis.name_start src ends;
     str.slice starts (ends - starts) src
@@ -90,7 +90,7 @@ let word_before src at = {
 /// moment the two count a character differently.
 let context src offset = {
     let word = analysis.name_start src offset;
-    if word > 0 && str_byte src (word - 1) == dot {
+    if word > 0 && str.byte (word - 1) src == dot {
         match chain_before src word [] {
             [] => [:name],
             segs => if word_before src (analysis.chain_start src word) == "expand" {
@@ -112,8 +112,8 @@ let context src offset = {
 let in_comment src offset = {
     let rec back i =
         if i <= 1 { false }
-        else if str_byte src (i - 1) == newline { false }
-        else if str_byte src (i - 1) == slash && str_byte src (i - 2) == slash { true }
+        else if str.byte (i - 1) src == newline { false }
+        else if str.byte (i - 1) src == slash && str.byte (i - 2) src == slash { true }
         else { back (i - 1) };
     back offset
 };
@@ -354,7 +354,7 @@ let import_items a e = {
                                          "An imported package." rank_import,
                 _ => item n kind_module "" "An import." rank_import,
             }
-        }) (map_pairs (scope.aliases e));
+        }) (map.pairs (scope.aliases e));
     // `import a.{x as y}` binds `y` to `a`'s `x`. What is offered is the name
     // it was bound to, described by where it came from, because that is the
     // pair the reader has to keep straight.
@@ -372,22 +372,23 @@ let import_items a e = {
             item bound kind_variable member
                  ("`" + member + "` of `" + from + "`, brought in by an import.")
                  rank_import
-        }) (map_pairs (scope.only e));
+        }) (map.pairs (scope.only e));
     list.append aliases singles
 };
 
-/// The builtins, less the ones `match` compiles to.
+/// The builtins a program is meant to write: everything but the primitives.
 ///
-/// `match_head` and the rest are real names and resolution does reach them, so
-/// this is not a claim that they cannot be written. They are named the way they
-/// are so that they *are not* written -- see the note beside them in
-/// `dreams/builtins.dr` -- and a list that offers them to somebody typing `mat`
-/// is the accident that naming was meant to prevent.
+/// `_list_cons`, `_match_head` and the rest are real names and resolution does
+/// reach them, so this is not a claim that they cannot be written. They are
+/// spelled with a leading `_` so that they *are not* written outside `std` --
+/// see the note beside them in `dreams/builtins.dr` -- and a list that offers
+/// them to somebody typing `li` is the accident that spelling was meant to
+/// prevent. What to offer instead is the `std` function that wraps each one.
 let builtin_items =
     list.map (fn n -> item n kind_function (builtins.signature n)
                            "A builtin: the language provides it, no module does."
                            rank_builtin)
-             (list.filter (fn n -> not (str.starts_with "match_" n)) builtins.names);
+             (list.filter (fn n -> not (builtins.is_primitive n)) builtins.names);
 
 let keyword_items =
     list.map (fn n -> item n kind_keyword "" "A keyword." rank_keyword) parser.keywords;
@@ -629,8 +630,8 @@ when test {
         test.case "every builtin is offered as a function"
             $( test.true! (list.all (fn i -> i.["kind" else ()] == kind_function)
                                     builtin_items) ),
-        test.case "the builtins `match` compiles to are not offered"
-            $( test.false! (list.any (fn i -> str.starts_with "match_"
+        test.case "the primitives behind `std` are not offered"
+            $( test.false! (list.any (fn i -> str.starts_with "_"
                                                   (i.["label" else ()]))
                                      builtin_items) ),
 

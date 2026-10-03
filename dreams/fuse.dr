@@ -308,7 +308,7 @@ let mentioned_here e = mentioned_in false e;
 let rec mentioned_in deep e =
     match e {
         [:name, n, _] => [n],
-        [:field, obj, field, _] => list_cons field (mentioned_in deep obj),
+        [:field, obj, field, _] => list.cons field (mentioned_in deep obj),
         [:apply, callee, args, _] =>
             list.append (mentioned_in deep callee) (mentioned_all deep args),
         [:pipe, a, b, _] => list.append (mentioned_in deep a) (mentioned_in deep b),
@@ -320,7 +320,7 @@ let rec mentioned_in deep e =
                         (match el { () => [], x => mentioned_in deep x }),
         [:block, stmts, _] => mentioned_stmts deep stmts,
         [:try, body, binder, handler, _] =>
-            list_cons binder (list.append (mentioned_in deep body) (mentioned_in deep handler)),
+            list.cons binder (list.append (mentioned_in deep body) (mentioned_in deep handler)),
         // The three that are a frame of their own.
         [:thunk, x, _] => if deep { mentioned_in deep x } else { [] },
         [:lambda, ps, body, _] =>
@@ -358,7 +358,7 @@ let rec mentioned_stmts deep stmts =
             [:let, n, ps, body, _, _] =>
                 if not (list.is_empty ps) && not deep { [n] }
                 else {
-                    list_cons n (list.append (list.map (fn p -> param_name_of p) ps)
+                    list.cons n (list.append (list.map (fn p -> param_name_of p) ps)
                                              (mentioned_in deep body))
                 },
             [:let_p, pattern, body, _] =>
@@ -379,7 +379,7 @@ let rec pattern_names p =
     match p {
         [:bind, n, _] => [n],
         [:literal, e, _] => mentioned e,
-        [:as_p, inner, n, _, _] => list_cons n (pattern_names inner),
+        [:as_p, inner, n, _, _] => list.cons n (pattern_names inner),
         [:list_p, items, rest, _]  =>
             list.append (list.concat (list.map (fn i -> pattern_names i) items)) (rest_name rest),
         [:array_p, items, rest, _] =>

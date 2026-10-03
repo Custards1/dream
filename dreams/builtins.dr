@@ -3,12 +3,30 @@
 // A builtin is not imported and cannot be shadowed by an import -- resolution
 // reaches it only after every local, every capture and every global has failed,
 // so a `let len x = ..` in a module wins, but `import std.list.{head};` does not
-// silently take over `match_head`.
+// silently take over `_match_head`.
+//
+// There are two kinds, and the spelling says which. The dozen without a prefix
+// -- `spawn!`, `strict!`, `to_string`, `len` and the rest of the first block --
+// are part of the language: every program may call them, and there is no
+// module they would be more at home in. Everything spelled with a leading `_`
+// is a *primitive*: an operation the machine has to provide because Dream
+// cannot write it, which `std` wraps in a function a program is meant to call
+// instead -- `_list_cons` is `list.cons`, `_str_slice` is `str.slice`. The
+// underscore is there so a primitive is never reached for by accident, and
+// outside `std` resolution warns when one is (`check_name` in scope.dr).
+//
+// Calling the wrapper costs nothing. A function whose body only passes its
+// parameters on is a *wrapper*, and lowering emits the call it stands for in
+// place of a call to it -- see "wrappers" in scope.dr -- so `list.cons x xs`
+// and `_list_cons x xs` are the same node, and the same opcode after `opt`.
 //
 // This append-only order is the runtime builtin ID table used by emission.
+// An image names a builtin by its position here, never by its spelling, which
+// is why a rename is free and a reordering is not.
 
 import std.list;
 import std.str;
+import std.map;
 
 /// Effects, and the handful of operations no module could define in Dream.
 let names = [
@@ -23,52 +41,50 @@ let names = [
     "len",        // list|array|map|string -> integer
     "strict!",    // value -> the same value, forced all the way down
 
-    // What `match` compiles to. Named so that they cannot be reached by
-    // accident: a builtin beats an imported name, so calling this one `head`
-    // would quietly shadow `import std.list.{head}` in every module that had
-    // both.
-    "match_is_cons",  // value -> bool, true for a non-empty list
-    "match_head",     // list -> its head, unforced
-    "match_tail",     // list -> its tail, unforced
-    "match_at",       // array -> index -> element, unforced
-    "match_key",      // map -> key -> [value] if present, [] if not
+    // What `match` compiles to. No `std` function wraps these: nothing but
+    // the lowering of a pattern has any business calling them.
+    "_match_is_cons",  // value -> bool, true for a non-empty list
+    "_match_head",     // list -> its head, unforced
+    "_match_tail",     // list -> its tail, unforced
+    "_match_at",       // array -> index -> element, unforced
+    "_match_key",      // map -> key -> [value] if present, [] if not
     "type_assert",    // bool -> description -> value -> value, or :type_error
-    "list_tail",
-    "list_cons",
-    "list_is_empty",
-    "str_chars",
-    "str_of_chars",
-    "str_of_bytes",
-    "str_concat",
-    "error_new",
-    "error_kind",
-    "error_payload",
-    "str_slice",
-    "str_find",
-    "str_byte",
-    "str_le",
-    "str_span",
-    "str_upto",
-    "char_code",
-    "char_of_code",
-    "to_float",
-    "float_bytes",
-    "float_of_bytes",
-    "to_int",
-    "parse_int",
-    "parse_float",
-    "to_existing_atom",
-    "array_new",
-    "array_of_list",
-    "array_to_list",
-    "map_has",
-    "map_remove",
-    "map_pairs",
-    "data_count",
-    "data_at",
+    "_list_tail",
+    "_list_cons",
+    "_list_is_empty",
+    "_str_chars",
+    "_str_of_chars",
+    "_str_of_bytes",
+    "_str_concat",
+    "_error_new",
+    "_error_kind",
+    "_error_payload",
+    "_str_slice",
+    "_str_find",
+    "_str_byte",
+    "_str_le",
+    "_str_span",
+    "_str_upto",
+    "_char_code",
+    "_char_of_code",
+    "_to_float",
+    "_float_bytes",
+    "_float_of_bytes",
+    "_to_int",
+    "_parse_int",
+    "_parse_float",
+    "_to_existing_atom",
+    "_array_new",
+    "_array_of_list",
+    "_array_to_list",
+    "_map_has",
+    "_map_remove",
+    "_map_pairs",
+    "_data_count",
+    "_data_at",
     "compare",
-    "sort_keyed",
-    "tensor_matmul",  // what `a @ b` is written as; see `ast.matmul_e`
+    "_sort_keyed",
+    "_tensor_matmul",  // what `a @ b` is written as; see `ast.matmul_e`
 
 ];
 
@@ -82,8 +98,9 @@ let names = [
 /// wants to be a map; see "Making it faster" in docs/notes/vm-performance.md for the other four.
 let ids = list.fold (fn m [i, n] -> m.[n => i]) (%{}) (list.enumerate names);
 
+
 let is_builtin : :string -> :bool;
-let is_builtin name = map_has ids name;
+let is_builtin name = map.has ids name;
 
 /// What each one takes and answers, as one line.
 ///
@@ -108,50 +125,102 @@ let signatures = %{
     "len"       => "list|array|map|string -> integer",
     "strict!"   => "value -> the same value, forced all the way down",
 
-    "match_is_cons" => "value -> bool, true for a non-empty list",
-    "match_head"    => "list -> its head, unforced",
-    "match_tail"    => "list -> its tail, unforced",
-    "match_at"      => "array -> index -> element, unforced",
-    "match_key"     => "map -> key -> [value] if present, [] if not",
+    "_match_is_cons" => "value -> bool, true for a non-empty list",
+    "_match_head"    => "list -> its head, unforced",
+    "_match_tail"    => "list -> its tail, unforced",
+    "_match_at"      => "array -> index -> element, unforced",
+    "_match_key"     => "map -> key -> [value] if present, [] if not",
     "type_assert"   => "bool -> description -> value -> value, or :type_error",
-    "list_tail" => "list -> list",
-    "list_cons" => "value -> list -> list",
-    "list_is_empty" => "value -> bool",
-    "str_chars" => "string -> list of char",
-    "str_of_chars" => "list of char -> string",
-    "str_of_bytes" => "list of integer -> string",
-    "str_concat" => "list of string -> string",
-    "error_new" => "atom -> value -> error",
-    "error_kind" => "value -> atom|unit",
-    "error_payload" => "value -> value",
-    "str_slice" => "string|bigstr -> start:integer -> len:integer -> string|bigstr",
-    "str_find" => "haystack:string -> needle:string -> from:integer -> integer",
-    "str_byte" => "string|bigstr -> index:integer -> integer",
-    "str_le" => "integer -> width:integer -> string",
-    "str_span" => "string|bigstr -> from:integer -> set:string -> integer",
-    "str_upto" => "string|bigstr -> from:integer -> set:string -> integer",
-    "char_code" => "char -> integer",
-    "char_of_code" => "integer -> char",
-    "to_float" => "integer|float -> float",
-    "float_bytes" => "number -> string",
-    "float_of_bytes" => "string -> float",
-    "to_int" => "integer|float -> integer",
-    "parse_int" => "string -> integer|unit",
-    "parse_float" => "string -> float|unit",
-    "to_existing_atom" => "string|bigstr -> atom|unit",
-    "array_new" => "length:integer -> fill:value -> array",
-    "array_of_list" => "list -> array",
-    "array_to_list" => "array -> list",
-    "map_has" => "map -> key -> bool",
-    "map_remove" => "map -> key -> map",
-    "map_pairs" => "map -> list",
-    "data_count" => "unit -> integer",
-    "data_at" => "integer -> bigstr",
+    "_list_tail" => "list -> list",
+    "_list_cons" => "value -> list -> list",
+    "_list_is_empty" => "value -> bool",
+    "_str_chars" => "string -> list of char",
+    "_str_of_chars" => "list of char -> string",
+    "_str_of_bytes" => "list of integer -> string",
+    "_str_concat" => "list of string -> string",
+    "_error_new" => "atom -> value -> error",
+    "_error_kind" => "value -> atom|unit",
+    "_error_payload" => "value -> value",
+    "_str_slice" => "string|bigstr -> start:integer -> len:integer -> string|bigstr",
+    "_str_find" => "haystack:string -> needle:string -> from:integer -> integer",
+    "_str_byte" => "string|bigstr -> index:integer -> integer",
+    "_str_le" => "integer -> width:integer -> string",
+    "_str_span" => "string|bigstr -> from:integer -> set:string -> integer",
+    "_str_upto" => "string|bigstr -> from:integer -> set:string -> integer",
+    "_char_code" => "char -> integer",
+    "_char_of_code" => "integer -> char",
+    "_to_float" => "integer|float -> float",
+    "_float_bytes" => "number -> string",
+    "_float_of_bytes" => "string -> float",
+    "_to_int" => "integer|float -> integer",
+    "_parse_int" => "string -> integer|unit",
+    "_parse_float" => "string -> float|unit",
+    "_to_existing_atom" => "string|bigstr -> atom|unit",
+    "_array_new" => "length:integer -> fill:value -> array",
+    "_array_of_list" => "list -> array",
+    "_array_to_list" => "array -> list",
+    "_map_has" => "map -> key -> bool",
+    "_map_remove" => "map -> key -> map",
+    "_map_pairs" => "map -> list",
+    "_data_count" => "unit -> integer",
+    "_data_at" => "integer -> bigstr",
     "compare" => "a -> b -> integer",
-    "sort_keyed" => "keys:list -> array -> list",
-    "tensor_matmul" => "tensor|list|array -> tensor|list|array -> tensor|float",
+    "_sort_keyed" => "keys:list -> array -> list",
+    "_tensor_matmul" => "tensor|list|array -> tensor|list|array -> tensor|float",
 
 };
+
+/// The `std` call each primitive is written as, with its arguments, for the
+/// warning a primitive named outside `std` gets -- six of them take theirs in
+/// a different order from the primitive, and the warning is no help if it
+/// sends somebody to `str.byte s i`. A primitive missing here has no wrapper:
+/// the `match` ones are lowering's alone, and the rest are `std`'s own.
+let wrappers = %{
+    "_list_tail" => "list.tail xs",
+    "_list_cons" => "list.cons x xs",
+    "_list_is_empty" => "list.is_empty xs",
+    "_str_chars" => "str.chars s",
+    "_str_of_chars" => "str.of_chars cs",
+    "_str_of_bytes" => "str.of_bytes bs",
+    "_str_concat" => "str.concat_all parts",
+    "_error_new" => "error.new kind payload",
+    "_error_kind" => "error.kind e",
+    "_error_payload" => "error.payload e",
+    "_str_slice" => "str.slice from count s",
+    "_str_find" => "str.find_from from needle s",
+    "_str_byte" => "str.byte i s",
+    "_str_le" => "str.of_int_le width n",
+    "_str_span" => "str.span set from s",
+    "_str_upto" => "str.upto set from s",
+    "_char_code" => "char.code c",
+    "_char_of_code" => "char.of_code n",
+    "_to_float" => "num.to_float n",
+    "_float_bytes" => "num.float_bytes x",
+    "_float_of_bytes" => "num.float_of_bytes s",
+    "_to_int" => "num.to_int x",
+    "_parse_int" => "num.parse_int s",
+    "_parse_float" => "num.parse_float s",
+    "_to_existing_atom" => "atom.existing name",
+    "_array_new" => "array.new n fill",
+    "_array_of_list" => "array.of_list xs",
+    "_array_to_list" => "array.to_list a",
+    "_map_has" => "map.has m k",
+    "_map_remove" => "map.remove m k",
+    "_map_pairs" => "map.pairs m",
+    "_data_count" => "payload.count ()",
+    "_data_at" => "payload.at i",
+    "_sort_keyed" => "list.sort_on key xs",
+};
+
+/// The `std` call a primitive is written as, or `()`.
+let wrapper : :string -> :string | :unit;
+let wrapper name = wrappers.[name else ()];
+
+/// Primitives the parser writes on the program's behalf: `a @ b` is
+/// `_tensor_matmul a b` (`ast.matmul_e`). A name the author did not write is
+/// not one to warn them about.
+let written_by_parser : :string -> :bool;
+let written_by_parser name = name == "_tensor_matmul";
 
 /// A builtin's signature, or its bare name for one that has none.
 let signature : :string -> :string;
@@ -167,6 +236,11 @@ let id name = ids.[name else ()];
 let is_impure_name : :string -> :bool;
 let is_impure_name name = str.ends_with "!" name;
 
+/// A primitive: a builtin `std` wraps, and only `std` should name. See the
+/// head of this file.
+let is_primitive : :string -> :bool;
+let is_primitive name = str.starts_with "_" name;
+
 // --- tests -------------------------------------------------------------------
 
 when test {
@@ -175,19 +249,25 @@ when test {
     let tests = [
         test.case "a builtin is known by name"
             $( test.eq! [true, true, false]
-                        [is_builtin "len", is_builtin "match_head", is_builtin "map"] ),
+                        [is_builtin "len", is_builtin "_match_head", is_builtin "map"] ),
         test.case "a builtin's index is the runtime's"
             $( test.eq! [0, 8, ()] [id "spawn!", id "len", id "nope"] ),
         test.case "the `!` suffix is what makes a name impure"
             $( test.eq! [true, false] [is_impure_name "spawn!", is_impure_name "len"] ),
-        test.case "the match builtins cannot be reached by an ordinary name"
-            $( test.false! (list.any (fn n -> not (str.starts_with "match_" n)
-                                               && str.starts_with "match" n) names) ),
+        test.case "the match builtins are primitives"
+            $( test.true! (list.all (fn n -> is_primitive n)
+                                    (list.filter (fn n -> str.contains_str "match_" n) names)) ),
+        test.case "the language's own builtins are not primitives"
+            $( test.eq! [false, false, true] [is_primitive "strict!", is_primitive "len",
+                                              is_primitive "_list_cons"] ),
         test.case "every builtin has a signature"
-            $( test.eq! [] (list.filter (fn n -> not (map_has signatures n)) names) ),
+            $( test.eq! [] (list.filter (fn n -> not (map.has signatures n)) names) ),
+        test.case "every wrapper is of a primitive"
+            $( test.eq! [] (list.filter (fn kv -> not (is_primitive (list.head kv)))
+                                        (map.pairs wrappers)) ),
         test.case "nothing has a signature that is not a builtin"
             $( test.eq! [] (list.filter (fn kv -> not (is_builtin (list.head kv)))
-                                        (map_pairs signatures)) ),
+                                        (map.pairs signatures)) ),
         test.case "a signature is what the name takes and answers"
             $( test.eq! ["value -> atom", "nope"] [signature "type_of", signature "nope"] ),
     ];

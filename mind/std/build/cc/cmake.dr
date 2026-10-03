@@ -26,7 +26,7 @@ import std.str;
 /// mean, and a `;` inside a generator expression still separates a list.
 let quoted : :string -> :string;
 let quoted s =
-    "\"" + str_concat (list.map (fn c -> match c { '"' => "\\\"", '\\' => "/", _ => str_of_chars [c] }) (str.chars s)) + "\"";
+    "\"" + _str_concat (list.map (fn c -> match c { '"' => "\\\"", '\\' => "/", _ => _str_of_chars [c] }) (str.chars s)) + "\"";
 
 /// A path from the script's root, as seen from the `CMakeLists.txt`. One that
 /// is already absolute -- a probe found it -- is left alone.
@@ -184,7 +184,7 @@ let target_text root all t = {
                       [quoted (place root p), "PROPERTIES", "COMPILE_OPTIONS",
                        quoted (str.join_str ";" (compile_options (cc.language p) settings))]],
     }) (cc.sources t);
-    str_concat (list.concat [
+    _str_concat (list.concat [
         [head],
         [command "set_target_properties" (match properties { [] => [], ps => list.concat [[id, "PROPERTIES"], ps] })],
         [command "target_compile_definitions" (match with_scopes definitions { [] => [], xs => list.cons id xs })],
@@ -213,7 +213,7 @@ let export note project root targets = {
     let langs = list.unique (list.flat_map languages targets);
     let wants_threads = list.any (fn t -> list.contains cc.Setting.threads (list.append (cc.settings t) (cc.public t)))
                                  targets;
-    str_concat (list.concat [
+    _str_concat (list.concat [
         list.map (fn line -> "# " + line + "\n") (str.split "\n" note),
         ["\ncmake_minimum_required(VERSION 3.20)\n",
          "project(" + project + " LANGUAGES "

@@ -313,8 +313,8 @@ native is over-applied.
 
 Three natives vouch today, and all three were already written for it -- they
 kept their position on the value stack and re-read the cell after every force,
-with comments saying why. They are `str_concat`, `str_of_bytes` and
-`str_of_chars`. What changed is that the discipline they were already keeping
+with comments saying why. They are `_str_concat`, `_str_of_bytes` and
+`_str_of_chars`. What changed is that the discipline they were already keeping
 now buys something.
 
 **Where a vouch may go**, which is the part that is easy to get wrong. A native

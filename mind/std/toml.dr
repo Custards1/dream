@@ -96,8 +96,8 @@ let rec quoted_body cs acc = match cs {
         'n'  => quoted_body after (list.cons '\n' acc),
         't'  => quoted_body after (list.cons '\t' acc),
         'r'  => quoted_body after (list.cons '\r' acc),
-        'b'  => quoted_body after (list.cons (char_of_code 8) acc),
-        'f'  => quoted_body after (list.cons (char_of_code 12) acc),
+        'b'  => quoted_body after (list.cons (_char_of_code 8) acc),
+        'f'  => quoted_body after (list.cons (_char_of_code 12) acc),
         '"'  => quoted_body after (list.cons '"' acc),
         '\\' => quoted_body after (list.cons '\\' acc),
         'u'  => escaped_scalar after 4 acc,
@@ -116,14 +116,14 @@ let escaped_scalar cs digits acc = match hex_n cs digits 0 {
     () => (),
     [code, rest] =>
         if (code >= 55296 && code <= 57343) || code > 1114111 { () }
-        else { quoted_body rest (list.cons (char_of_code code) acc) },
+        else { quoted_body rest (list.cons (_char_of_code code) acc) },
 };
 
 let hex_value : :char -> :integer;
 let hex_value c = match c {
-    _ if c >= '0' && c <= '9' => char_code c - 48,
-    _ if c >= 'a' && c <= 'f' => char_code c - 87,
-    _ if c >= 'A' && c <= 'F' => char_code c - 55,
+    _ if c >= '0' && c <= '9' => _char_code c - 48,
+    _ if c >= 'a' && c <= 'f' => _char_code c - 87,
+    _ if c >= 'A' && c <= 'F' => _char_code c - 55,
     _ => 0 - 1,
 };
 
@@ -161,7 +161,7 @@ let parse_number cs = {
     let rest = list.nth 2 taken;
     if str.is_empty text { () }
     else {
-        let n = if floaty { parse_float text } else { parse_int text };
+        let n = if floaty { _parse_float text } else { _parse_int text };
         if n == () { () } else { step n rest }
     }
 };
@@ -323,11 +323,11 @@ let get default table sec key = ((section table sec)).[key else default];
 
 /// The names of every section, in the order the map holds them.
 let sections : Document -> [:string];
-let sections table = list.map (fn p -> list.head p) (map_pairs table);
+let sections table = list.map (fn p -> list.head p) (_map_pairs table);
 
 /// The `key = value` pairs of one section, as `[key, value]` lists.
 let entries : Document -> :string -> [[:string, Value]];
-let entries table name = map_pairs (section table name);
+let entries table name = _map_pairs (section table name);
 
 // --- writing ----------------------------------------------------------------
 //
@@ -359,7 +359,7 @@ let escape_char c = match c {
     '\n' => "\\n",
     '\t' => "\\t",
     '\r' => "\\r",
-    _ => match char_code c {
+    _ => match _char_code c {
         code if code < 32 || code == 127 =>
             "\\u00" + hex_digit ((code / 16) % 16) + hex_digit (code % 16),
         _ => str.of_chars [c],
@@ -464,7 +464,7 @@ let write_document table = {
     };
     let section p = "[" + key_text (list.nth 0 p) + "]\n" + lines (list.nth 1 p);
     let sections = list.map section (list.filter is_section (present table));
-    str.join_str "\n" (list.filter (fn t -> not (str.is_empty t)) (list_cons (loose + unnamed) sections))
+    str.join_str "\n" (list.filter (fn t -> not (str.is_empty t)) (_list_cons (loose + unnamed) sections))
 };
 
 /// The document as text: `encode` under the name a TOML caller would look for.
@@ -551,7 +551,7 @@ when test {
         test.case "write an integer"  $( test.eq! "42" (encode_value 42) ),
         test.case "a whole float keeps its point" $( test.eq! "2.0" (encode_value 2.0) ),
         test.case "a string is quoted and escaped"
-            $( test.eq! "\"a\\\"b\\u0001\"" (encode_value ("a\"b" + str.of_chars [char_of_code 1])) ),
+            $( test.eq! "\"a\\\"b\\u0001\"" (encode_value ("a\"b" + str.of_chars [_char_of_code 1])) ),
         test.case "an inline table"   $( test.eq! "{ a = 1, \"b c\" = [true] }"
                                                     (encode_value %{ "a" => 1, "b c" => [true] }) ),
         test.case "() is left out of a table" $( test.eq! "{ a = 1 }" (encode_value %{ "a" => 1, "b" => () }) ),
@@ -570,7 +570,7 @@ when test {
         test.case "keys before a header round trip"
             $( test.true! (round_trips %{ "" => %{ "k" => "v" }, "a" => %{ "j" => 2.0 } }) ),
         test.case "control characters round trip"
-            $( test.true! (round_trips %{ "" => %{}, "s" => %{ "t" => "tab\there\nline" + str.of_chars [char_of_code 7] } }) ),
+            $( test.true! (round_trips %{ "" => %{}, "s" => %{ "t" => "tab\there\nline" + str.of_chars [_char_of_code 7] } }) ),
         test.case "a table that is not a section lands in \"\""
             $( test.eq! 1 (get () (decode_or %{} (encode %{ "k" => 1 })) "" "k") ),
         test.case "a value is not a document" $( test.false! (round_trips 5) ),

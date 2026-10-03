@@ -22,6 +22,7 @@
 import std.list;
 import std.str;
 import std.dynamic.{fold,map}
+import std.char;
 
 // --- opcodes -------------------------------------------------------------------
 //
@@ -246,7 +247,7 @@ group Pool {
     intern value self = match (index self).[value else ()] {
         () => {
             let next = count self;
-            [make (list_cons value (values self)) (next + 1)
+            [make (list.cons value (values self)) (next + 1)
                   ((index self).[value => next]), next]
         },
         found => [self, found],
@@ -470,7 +471,7 @@ let finish p = (finish_rest p).[:nodes => table_list (nodes p) (node_count p - 1
 /// cons and the positions need no list of their own. A hole reads as `fill`,
 /// which is what `node_at` and `kid_at` answer for one.
 let rec table_list m i fill acc =
-    if i < 0 { acc } else { table_list m (i - 1) fill (list_cons (m.[i else fill]) acc) };
+    if i < 0 { acc } else { table_list m (i - 1) fill (list.cons (m.[i else fill]) acc) };
 
 /// Everything `finish` makes but the arena itself, for a pass that reads the
 /// arena from its tables and writes a new one.
@@ -515,7 +516,7 @@ let show_node img i n = {
                 if at >= list.length ats { ":?" }
                 else { ":" + const_at :strs (nth at ats) }
             },
-            :const_char  => "'" + str.of_chars [char_of_code (node_a n)] + "'",
+            :const_char  => "'" + str.of_chars [char.of_code (node_a n)] + "'",
             :const_bool  => if node_a n == 1 { "true" } else { "false" },
             :unit        => "",
             :local       => "@" + to_string (node_a n),

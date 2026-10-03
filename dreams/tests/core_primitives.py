@@ -40,11 +40,17 @@ primitives = [
     ('array_new', 2), ('array_to_list', 1), ('map_has', 2), ('map_remove', 2),
     ('map_pairs', 1), ('data_count', 1), ('data_at', 1), ('compare', 2),
 ]
+# A primitive is spelled with a leading `_`; `compare` is one of the
+# language's own builtins and keeps its name (see dreams/builtins.dr).
+def spelled(name):
+    return name if name == 'compare' else '_' + name
+
+
 with tempfile.TemporaryDirectory(prefix='dream-primitives-') as directory:
     temp = pathlib.Path(directory)
     src = temp / 'matrix.dr'
     src.write_text('import std.console;\n' + '\n'.join(
-        f'let probe_{name} ' + ' '.join('xyz'[:arity]) + f' = {name} ' + ' '.join('xyz'[:arity]) + ';'
+        f'let probe_{name} ' + ' '.join('xyz'[:arity]) + f' = {spelled(name)} ' + ' '.join('xyz'[:arity]) + ';'
         for name, arity in primitives) + '\nlet main! = console.print! 0;\n')
     image = temp / 'matrix.dream'
     run(vm, compiler, str(src), '-o', str(image))

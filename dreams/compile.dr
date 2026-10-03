@@ -36,6 +36,7 @@ import dreams.typecheck;
 import dreams.contract;
 import dreams.unit;
 import std.vm;
+import std.map;
 
 // --- what to compile it as ------------------------------------------------------
 
@@ -295,8 +296,8 @@ let param_masks img by_global = {
     let found = list.fold (fn acc [gi, mask] -> {
         let g = globals.[gi else ()];
         if g == () || g.[:kind else ir.global_module] != ir.global_function { acc }
-        else { list_cons [g.[:target else 0], mask] acc }
-    }) [] (map_pairs by_global);
+        else { list.cons [g.[:target else 0], mask] acc }
+    }) [] (map.pairs by_global);
     list.sort_on (fn e -> list.head e) found
 };
 

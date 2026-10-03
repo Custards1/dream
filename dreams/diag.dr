@@ -36,7 +36,7 @@ let origin_span s sp = {
     match found { [] => sp, [r, .._] => list.nth 2 r }
 };
 let with_origin start end sp s =
-    [source_path s, source_text s, list_cons [start, end, origin_span s sp] (origins s)];
+    [source_path s, source_text s, list.cons [start, end, origin_span s sp] (origins s)];
 
 // --- a diagnostic -----------------------------------------------------------
 
@@ -88,8 +88,8 @@ let line_col : :string -> :integer -> [:integer, :integer];
 let line_col text offset = {
     let rec walk i line col =
         if i >= offset || i >= str.byte_length text { [line, col] }
-        else if str_byte text i == 10 { walk (i + 1) (line + 1) 1 }
-        else if str_byte text i >= 128 && str_byte text i < 192 { walk (i + 1) line col }
+        else if str.byte i text == 10 { walk (i + 1) (line + 1) 1 }
+        else if str.byte i text >= 128 && str.byte i text < 192 { walk (i + 1) line col }
         else { walk (i + 1) line (col + 1) };
     walk 0 1 1
 };
@@ -106,14 +106,14 @@ let offset_of text line col = {
     let n = str.byte_length text;
     let rec to_line i at =
         if at >= line || i >= n { i }
-        else if str_byte text i == 10 { to_line (i + 1) (at + 1) }
+        else if str.byte i text == 10 { to_line (i + 1) (at + 1) }
         else { to_line (i + 1) at };
     let start = to_line 0 1;
     let rec forward i want =
-        if want <= 1 || i >= n || str_byte text i == 10 { i }
+        if want <= 1 || i >= n || str.byte i text == 10 { i }
         // A continuation byte is part of the character before it, so it does
         // not cost a column.
-        else if str_byte text (i + 1) >= 128 && str_byte text (i + 1) < 192 {
+        else if str.byte (i + 1) text >= 128 && str.byte (i + 1) text < 192 {
             forward (i + 2) (want - 1)
         }
         else { forward (i + 1) (want - 1) };

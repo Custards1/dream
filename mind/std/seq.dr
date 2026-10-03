@@ -105,8 +105,8 @@ let maximum_by rank xs =
 let to_list : :any -> [:any];
 let to_list xs = {
     let rec rev acc ys =
-        if list_is_empty ys { acc } else { rev (list_cons (ys.[0]) acc) (list_tail ys) };
-    rev [] (fold (fn acc x -> list_cons x acc) [] xs)
+        if _list_is_empty ys { acc } else { rev (_list_cons (ys.[0]) acc) (_list_tail ys) };
+    rev [] (fold (fn acc x -> _list_cons x acc) [] xs)
 };
 
 /// Every element rendered and joined with `sep` between them.

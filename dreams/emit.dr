@@ -33,9 +33,10 @@ import std.str;
 import std.vm;
 
 import dreams.ir;
+import std.num;
 
 /// `DAGNCAAF`, as the loader looks for it.
-let magic = str_of_bytes [68, 65, 71, 78, 67, 65, 65, 70];
+let magic = str.of_bytes [68, 65, 71, 78, 67, 65, 65, 70];
 
 let version_major = 0;
 let version_minor = 1;
@@ -54,21 +55,21 @@ let flag_debug = 1;
 let byte_at : :integer -> :integer -> :integer;
 let byte_at v n = (v / n) % 256;
 
-/// Each of these answers a *string* of the bytes. `str_le` is what makes
+/// Each of these answers a *string* of the bytes. `_str_le` is what makes
 /// bytes rather than characters: a byte over 127 encoded as a character would
 /// be two bytes of UTF-8, and an image is bytes or it is nothing.
 ///
-/// These were `str_of_bytes` over a list literal, which is the obvious
+/// These were `_str_of_bytes` over a list literal, which is the obvious
 /// way to say it and was the single largest allocator in the compiler -- a
 /// cons cell and a thunk per byte, a frame for each `byte_at`, and a nested
-/// force inside `str_of_bytes` to read them back, for 128 MB of garbage per
-/// self-compile. `str_le` is the same field with no list in the middle.
+/// force inside `_str_of_bytes` to read them back, for 128 MB of garbage per
+/// self-compile. `_str_le` is the same field with no list in the middle.
 let u8 : :integer -> :string;
-let u8 v = str_le v 1;
+let u8 v = str.of_int_le 1 v;
 let u16 : :integer -> :string;
-let u16 v = str_le v 2;
+let u16 v = str.of_int_le 2 v;
 let u32 : :integer -> :string;
-let u32 v = str_le v 4;
+let u32 v = str.of_int_le 4 v;
 
 /// A 64-bit signed integer. Two's complement, so a negative one is written as
 /// what it would be if it were unsigned.
@@ -111,7 +112,7 @@ let index i = if ir.is_node i { u32 i } else { u32 4294967295 };
 /// because getting that wrong is silent.
 /// The VM hands over the eight bytes as a string already, so there is nothing
 /// left to do to them.
-let f64 v = float_bytes v;
+let f64 v = num.float_bytes v;
 
 // --- sections ---------------------------------------------------------------------
 
@@ -176,7 +177,7 @@ let node_bytes [op, flags, a, b, c] =
 /// The node and kid sections, which are most of an image: the VM writes them
 /// (`vm.node_section`, `vm.index_section`), the same bytes `node_bytes` and
 /// `index` write -- the tests below hold them to it -- in one call a section
-/// rather than a call and a `str_le` a field.
+/// rather than a call and a `_str_le` a field.
 let node_section nodes = vm.node_section [nodes, ir.op_codes];
 let kids_section kids = vm.index_section kids;
 
@@ -219,7 +220,7 @@ let module_bytes m =
 let string_table strs = {
     let offsets = list.reverse (list.nth 1 (list.fold_strict (fn acc s ->
         [list.head acc + str.byte_length s,
-         list_cons [list.head acc, str.byte_length s] (list.nth 1 acc)])
+         list.cons [list.head acc, str.byte_length s] (list.nth 1 acc)])
         [0, []] strs));
     concat_map (fn e -> u32 (list.head e) + u32 (list.nth 1 e)) offsets
 };
@@ -231,7 +232,7 @@ let align8 n = (n + 7) - ((n + 7) % 8);
 /// `n` zero bytes. Sections are eight-byte aligned so a loader can point a
 /// struct at one where it lies.
 let zeros : :integer -> :string;
-let zeros n = str.repeat n (str_of_bytes [0]);
+let zeros n = str.repeat n (str.of_bytes [0]);
 
 // --- large data ---------------------------------------------------------------------
 //
@@ -250,7 +251,7 @@ let zeros n = str.repeat n (str_of_bytes [0]);
 /// is nothing for alignment to buy.
 let data_offsets lens =
     list.reverse (list.nth 1 (list.fold_strict (fn acc n ->
-        [list.head acc + n, list_cons (list.head acc) (list.nth 1 acc)])
+        [list.head acc + n, list.cons (list.head acc) (list.nth 1 acc)])
         [0, []] lens));
 
 /// `LDAT`, `LNAM` and `PAYL`, or nothing at all.
@@ -365,7 +366,7 @@ let emit img = {
         let s = list.head pair;
         let at = list.nth 1 pair;
         [at + sec_len s,
-         list_cons (sec_body s) (list_cons (zeros (at - list.head acc)) (list.nth 1 acc))]
+         list.cons (sec_body s) (list.cons (zeros (at - list.head acc)) (list.nth 1 acc))]
     }) [str.byte_length header + str.byte_length table, []] (list.zip secs placed);
 
     let written = list.head assembled;

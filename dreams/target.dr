@@ -263,7 +263,7 @@ let from_reads cfg reads = {
 let sniff_length = 4096;
 
 let byte : :string -> :integer -> :integer;
-let byte s i = str_byte s i;
+let byte s i = str.byte i s;
 
 let le16 s i = byte s i + byte s (i + 1) * 256;
 let le32 s i = le16 s i + le16 s (i + 2) * 65536;
@@ -354,8 +354,8 @@ let decide said carried pinned =
 when test {
     import std.test;
 
-    let bytes n xs = str.concat_all [str_of_bytes xs, str.repeat (n - list.length xs) (str_of_bytes [0])];
-    let with_at s i xs = str.concat_all [str.slice 0 i s, str_of_bytes xs,
+    let bytes n xs = str.concat_all [str.of_bytes xs, str.repeat (n - list.length xs) (str.of_bytes [0])];
+    let with_at s i xs = str.concat_all [str.slice 0 i s, str.of_bytes xs,
                                          str.slice (i + list.length xs) (str.byte_length s - i - list.length xs) s];
 
     let elf64 = with_at (bytes 64 [127, 69, 76, 70, 2, 1, 1]) 18 [62, 0];

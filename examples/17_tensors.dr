@@ -8,6 +8,7 @@
 
 import std.console;
 import std.tensor;
+import std.num;
 
 /// One layer of a neural network: weights, a bias, and an activation. All of
 /// it is whole-tensor arithmetic, so it runs wherever its arguments live.
@@ -18,7 +19,7 @@ let layer w b x = tensor.relu (w @ x + b);
 /// 2 x 2 system solved by hand.
 let fit : :tensor -> :tensor -> :tensor;
 let fit xs ys = {
-    let n = to_float (len xs);
+    let n = num.to_float (len xs);
     let sx = tensor.sum xs;
     let sy = tensor.sum ys;
     let sxx = xs @ xs;

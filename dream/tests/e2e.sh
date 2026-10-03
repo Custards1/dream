@@ -188,17 +188,17 @@ import std.console;
 import std.io;
 
 let main! = {
-    let a = data_at 0;
-    let b = data_at 1;
-    console.print! ("count " + to_string (data_count ()))
+    let a = _data_at 0;
+    let b = _data_at 1;
+    console.print! ("count " + to_string (_data_count ()))
     console.print! ("type " + to_string (type_of a))
     console.print! ("lens " + to_string (len a) + " " + to_string (len b))
-    console.print! ("byte " + to_string (str_byte a 4))
-    console.print! ("slice " + to_string (str_slice a 4 5 == "quick"))
+    console.print! ("byte " + to_string (_str_byte a 4))
+    console.print! ("slice " + to_string (_str_slice a 4 5 == "quick"))
     console.print! ("whole " + to_string (a == "the quick brown fox"))
     console.print! ("order " + to_string (b < a))
     // A slice is a view too, so slicing one again must land in the same place.
-    console.print! ("again " + to_string (str_slice (str_slice a 4 9) 0 5 == "quick"))
+    console.print! ("again " + to_string (_str_slice (_str_slice a 4 9) 0 5 == "quick"))
     // The bytes cross a process boundary as a view, not as a copy.
     console.print! ("child " + to_string (join! (spawn! $( len b ))))
     // Concatenating one is refused, and the message says what to do instead.
@@ -207,8 +207,8 @@ let main! = {
     // it the way it is for `len` and `==`. `:quick` exists because this line
     // writes it; `:the` is written nowhere, so the same call over the other
     // slice has nothing to find.
-    console.print! ("atom " + to_string (to_existing_atom (str_slice a 4 5) == :quick))
-    console.print! ("noatom " + to_string (to_existing_atom (str_slice a 0 3)))
+    console.print! ("atom " + to_string (_to_existing_atom (_str_slice a 4 5) == :quick))
+    console.print! ("noatom " + to_string (_to_existing_atom (_str_slice a 0 3)))
     io.write! (io.stdout! ()) b
 };
 EOF

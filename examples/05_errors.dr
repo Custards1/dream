@@ -5,11 +5,12 @@
 import std.console;
 
 import std.list;
+import std.num;
 
 let div a b = a / b;
 
 let parse_age! s = {
-    let n = parse_int s;
+    let n = num.parse_int s;
     if n == () { raise! ("not a number: " + s) }
     else if n < 0 { raise! :negative_age }
     else { n }

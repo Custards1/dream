@@ -284,11 +284,11 @@ KnownNative known_native(Runtime& rt, const Image& img, uint32_t callee_node,
                           : img.node(callee_node);
     if (Op(c.op) == Op::Builtin && argc == 1 && c.a < builtin_count()) {
         const char* name = builtin_def(c.a).name;
-        if (std::strcmp(name, "to_float") == 0) return KnownNative::ToFloat;
-        if (std::strcmp(name, "to_int") == 0) return KnownNative::ToInt;
-        if (std::strcmp(name, "match_is_cons") == 0) return KnownNative::MatchIsCons;
-        if (std::strcmp(name, "match_head") == 0) return KnownNative::MatchHead;
-        if (std::strcmp(name, "match_tail") == 0) return KnownNative::MatchTail;
+        if (std::strcmp(name, "_to_float") == 0) return KnownNative::ToFloat;
+        if (std::strcmp(name, "_to_int") == 0) return KnownNative::ToInt;
+        if (std::strcmp(name, "_match_is_cons") == 0) return KnownNative::MatchIsCons;
+        if (std::strcmp(name, "_match_head") == 0) return KnownNative::MatchHead;
+        if (std::strcmp(name, "_match_tail") == 0) return KnownNative::MatchTail;
     }
     if (Op(c.op) != Op::Field) return KnownNative::None;
     const Node& m = img.node(c.a);

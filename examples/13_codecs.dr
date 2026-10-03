@@ -9,6 +9,7 @@ import std.json;
 import std.list;
 import std.record;
 import std.wire;
+import std.str;
 
 // A record says the one thing the language cannot tell it about itself: what
 // its fields are called. Everything else below is inherited.
@@ -39,7 +40,7 @@ let main! = {
     // Framing is what makes a stream of bytes a sequence of messages. Two
     // messages and a third that has only half arrived: the whole ones are
     // answered, and the remainder is kept for the next read.
-    let stream = wire.frame_all [:hello, ada] + str_slice (wire.frame :bye) 0 3;
+    let stream = wire.frame_all [:hello, ada] + str.slice 0 3 (wire.frame :bye);
     let read = wire.frames stream;
     console.print! (to_string (list.nth 0 read));
     console.print! (to_string (len (list.nth 1 read)) + " bytes left over")

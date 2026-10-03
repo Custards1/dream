@@ -9,6 +9,7 @@ import std.list;
 import std.os;
 import std.str;
 import std.tensor;
+import std.num;
 
 let fused : :tensor -> :tensor -> :tensor;
 let fused a b = tensor.relu (a * 2.0 + b - 1.0) * 0.5;
@@ -36,7 +37,9 @@ let best! name thunk = {
 
 let main! = {
     let args = os.args! ();
-    let n = if args == [] { 4000000 } else { parse_int (list.head args) };
+    let n = if args == [] { 4000000 } else {
+        match num.parse_int (list.head args) { () => raise! "the size must be a whole number", k => k }
+    };
     let a = tensor.random 1 [n];
     let b = tensor.random 2 [n];
     console.print! ("n = " + to_string n + " (" + to_string (n * 8 / 1000000) + " MB a tensor)");

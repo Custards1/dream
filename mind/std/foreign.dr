@@ -249,7 +249,7 @@ priv let rec read_array_into! b at t n acc =
     if n <= 0 { acc }
     else {
         let x = ffi.peek! b (at + (n - 1) * ffi.sizeof t) t;
-        read_array_into! b at t (n - 1) (list_cons (strict! x) acc)
+        read_array_into! b at t (n - 1) (_list_cons (strict! x) acc)
     };
 
 // --- structs -------------------------------------------------------------------------

@@ -25,7 +25,7 @@ import std.list;
 /// them on one, and a checker that reports code nobody runs is one people turn
 /// off.
 let fold : (a -> :any -> a) -> a -> :string -> a;
-let fold f init s = list.fold_strict f init (str_chars s);
+let fold f init s = list.fold_strict f init (_str_chars s);
 
 let name : :any -> :string;
 let name s = "string";
@@ -35,7 +35,7 @@ let name s = "string";
 /// The number of characters. Decodes the whole string, because UTF-8 does not
 /// know its own character count without looking.
 let length : :string -> :integer;
-let length s = list.length (str_chars s);
+let length s = list.length (_str_chars s);
 
 /// The number of bytes, which the runtime knows without decoding anything.
 /// For text that is all ASCII the two agree; for anything else they do not.
@@ -48,15 +48,27 @@ let is_empty s = len s == 0;
 // --- characters -------------------------------------------------------------
 
 let chars : :string -> [:char];
-let chars s = str_chars s;
+let chars s = _str_chars s;
 
 let of_chars : [:char] -> :string;
-let of_chars cs = str_of_chars cs;
+let of_chars cs = _str_of_chars cs;
 
 let first_or : a -> :string -> (a | :char);
-let first_or default s = list.first_or default (str_chars s);
+let first_or default s = list.first_or default (_str_chars s);
 
 // --- bytes ------------------------------------------------------------------
+
+/// The string these bytes spell, each an integer from 0 to 255. Not checked
+/// for UTF-8: this is how a binary format is written, and its output was
+/// never meant to be text.
+let of_bytes : [:integer] -> :string;
+let of_bytes bs = _str_of_bytes bs;
+
+/// `n` as `width` bytes, least significant first, two's complement for a
+/// negative number -- a field of a binary format in one step, where the same
+/// thing written in Dream would build a list of bytes to throw away.
+let of_int_le : :integer -> :integer -> :string;
+let of_int_le width n = _str_le n width;
 
 /// `count` bytes from byte offset `from`. Clamped rather than raising: running
 /// off the end is how a loop over a string finishes, and an error there would
@@ -67,16 +79,16 @@ let first_or default s = list.first_or default (str_chars s);
 /// is what the variable says: an answer of `:string | :bigstr` would refuse
 /// `"--" + slice ..` on every caller holding an ordinary string.
 let slice : :integer -> :integer -> s -> s;
-let slice from count s = str_slice s from count;
+let slice from count s = _str_slice s from count;
 
 /// The byte at offset `i`, as an integer, or `-1` when there is none.
 ///
 /// Clamped the same way `slice` is, and for the same reason. This is the way
-/// into a big string (`data_at`), which has no `chars` and no `find`:
+/// into a big string (`_data_at`), which has no `chars` and no `find`:
 /// indexing it is pointer arithmetic and costs nothing, while anything that
 /// would build a string out of it is refused.
 let byte : :integer -> (:string | :bigstr) -> :integer;
-let byte i s = str_byte s i;
+let byte i s = _str_byte s i;
 
 /// Past the run of bytes from `set` that starts at byte offset `from`: the
 /// offset of the first byte that is not one of them, or `byte_length s`.
@@ -86,31 +98,31 @@ let byte i s = str_byte s i;
 /// happens in the runtime, which is the point: doing it a byte at a time in
 /// Dream costs a call and a comparison chain per byte.
 let span : :string -> :integer -> (:string | :bigstr) -> :integer;
-let span set from s = str_span s from set;
+let span set from s = _str_span s from set;
 
 /// The offset of the first byte from `set` at or after `from`, or
 /// `byte_length s` when there is none -- so `upto "\n" i s` is the end of the
 /// line whether or not the text ends with one.
 let upto : :string -> :integer -> (:string | :bigstr) -> :integer;
-let upto set from s = str_upto s from set;
+let upto set from s = _str_upto s from set;
 
 /// The byte offset of `needle` at or after byte offset `from`, or `-1`.
 let find_from : :integer -> :string -> :string -> :integer;
-let find_from from needle s = str_find s needle from;
+let find_from from needle s = _str_find s needle from;
 
 let find : :string -> :string -> :integer;
-let find needle s = str_find s needle 0;
+let find needle s = _str_find s needle 0;
 
 let contains_str : :string -> :string -> :bool;
-let contains_str needle s = str_find s needle 0 >= 0;
+let contains_str needle s = _str_find s needle 0 >= 0;
 
 
 let starts_with : :string -> (:string | :bigstr) -> :bool;
-let starts_with prefix s = str_slice s 0 (len prefix) == prefix;
+let starts_with prefix s = _str_slice s 0 (len prefix) == prefix;
 
 let ends_with : :string -> (:string | :bigstr) -> :bool;
 let ends_with suffix s =
-    str_slice s (len s - len suffix) (len suffix) == suffix;
+    _str_slice s (len s - len suffix) (len suffix) == suffix;
 
 // --- building ---------------------------------------------------------------
 
@@ -125,7 +137,7 @@ let concat a b = a + b;
 /// builds a large output a piece at a time -- an image, a rendered diagnostic,
 /// a dump of a program -- should collect the pieces and come here once.
 let concat_all : [:string] -> :string;
-let concat_all parts = str_concat parts;
+let concat_all parts = _str_concat parts;
 
 /// The strings in `parts` with `sep` between them. `std.seq` supplies `join`,
 /// which renders each element with `to_string`; this one is for strings that
@@ -135,12 +147,12 @@ let join_str sep parts =
     match parts {
         [] => "",
         [first, ..rest] =>
-            str_concat (list_cons first (list.flat_map (fn s -> [sep, s]) rest)),
+            _str_concat (_list_cons first (list.flat_map (fn s -> [sep, s]) rest)),
     };
 
 /// `s` repeated `n` times.
 let repeat : :integer -> :string -> :string;
-let repeat n s = if n <= 0 { "" } else { str_concat (list.replicate n s) };
+let repeat n s = if n <= 0 { "" } else { _str_concat (list.replicate n s) };
 
 /// The parts of `s` between each occurrence of `sep`, as a list of strings.
 /// An empty separator would not make progress, so it yields the whole string.
@@ -150,9 +162,9 @@ let split sep s = {
     let rec go from =
         if from > len s { [] }
         else {
-            let at = str_find s sep from;
-            if at < 0 { [str_slice s from (len s - from)] }
-            else { list_cons (str_slice s from (at - from)) (go (at + seplen)) }
+            let at = _str_find s sep from;
+            if at < 0 { [_str_slice s from (len s - from)] }
+            else { _list_cons (_str_slice s from (at - from)) (go (at + seplen)) }
         };
     if seplen == 0 { [s] } else { go 0 }
 };
@@ -160,13 +172,13 @@ let split sep s = {
 // --- transforming -----------------------------------------------------------
 
 let map : (:char -> :char) -> :string -> :string;
-let map f s = str_of_chars (list.map f (str_chars s));
+let map f s = _str_of_chars (list.map f (_str_chars s));
 
 let filter : (:char -> :bool) -> :string -> :string;
-let filter keep s = str_of_chars (list.filter keep (str_chars s));
+let filter keep s = _str_of_chars (list.filter keep (_str_chars s));
 
 let reverse : :string -> :string;
-let reverse s = str_of_chars (list.reverse (str_chars s));
+let reverse s = _str_of_chars (list.reverse (_str_chars s));
 
 // --- case, for ASCII --------------------------------------------------------
 //
@@ -175,11 +187,11 @@ let reverse s = str_of_chars (list.reverse (str_chars s));
 
 let upper_char : :char -> :char;
 let upper_char c =
-    if c >= 'a' && c <= 'z' { char_of_code (char_code c - 32) } else { c };
+    if c >= 'a' && c <= 'z' { _char_of_code (_char_code c - 32) } else { c };
 
 let lower_char : :char -> :char;
 let lower_char c =
-    if c >= 'A' && c <= 'Z' { char_of_code (char_code c + 32) } else { c };
+    if c >= 'A' && c <= 'Z' { _char_of_code (_char_code c + 32) } else { c };
 
 let upper : :string -> :string;
 let upper s = map upper_char s;
@@ -193,11 +205,11 @@ let is_space : :char -> :bool;
 let is_space c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
 
 let trim_start : :string -> :string;
-let trim_start s = str_of_chars (list.drop_while is_space (str_chars s));
+let trim_start s = _str_of_chars (list.drop_while is_space (_str_chars s));
 
 let trim_end : :string -> :string;
 let trim_end s =
-    str_of_chars (list.reverse (list.drop_while is_space (list.reverse (str_chars s))));
+    _str_of_chars (list.reverse (list.drop_while is_space (list.reverse (_str_chars s))));
 
 let trim : :string -> :string;
 let trim s = trim_end (trim_start s);
@@ -216,6 +228,11 @@ when test {
         test.case "seq minimum"      $( test.eq! 'a' (minimum "cab") ),
         test.case "seq maximum"      $( test.eq! 'c' (maximum "cab") ),
         test.case "seq describe"     $( test.eq! "string of 3" (describe "abc") ),
+
+        // --- binary fields ---
+        test.case "bytes spell a string" $( test.eq! "AB" (of_bytes [65, 66]) ),
+        test.case "little-endian"        $( test.eq! [1, 2, 0] (list.map (fn i -> byte i (of_int_le 3 513)) [0, 1, 2]) ),
+        test.case "two's complement"     $( test.eq! [255, 255] [byte 0 (of_int_le 2 (0 - 1)), byte 1 (of_int_le 2 (0 - 1))] ),
 
         // --- size, and the character/byte distinction ---
         test.case "length"           $( test.eq! 5 (length "hello") ),

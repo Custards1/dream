@@ -158,7 +158,7 @@ priv let reply_of to value   = [:server_reply, to, value];
 /// mailbox.
 priv let tag_of : :any -> :any;
 priv let tag_of m =
-    if type_of m == :list && not (list_is_empty m) { m.[0] } else { () };
+    if type_of m == :list && not (_list_is_empty m) { m.[0] } else { () };
 
 // --- driving the handlers from a mailbox -------------------------------------------
 
@@ -295,7 +295,7 @@ priv let rec await_reply! me kept = {
         requeue! (list.reverse kept)
         list.nth 2 m
     }
-    else { await_reply! me (list_cons m kept) }
+    else { await_reply! me (_list_cons m kept) }
 };
 
 priv let requeue! : [:any] -> :unit;

@@ -33,6 +33,8 @@ import dreams.modules;
 import std.vm;
 import dreams.scope;
 import dreams.unit;
+import std.array;
+import std.char;
 
 // --- the lowering state -----------------------------------------------------
 //
@@ -168,7 +170,7 @@ let const_atom v l = {
     emit (ir.node :const_atom index ir.no_node ir.no_node) (set_prog program l)
 };
 
-let const_char c l = emit (ir.node :const_char (char_code c) ir.no_node ir.no_node) l;
+let const_char c l = emit (ir.node :const_char (char.code c) ir.no_node ir.no_node) l;
 let const_bool b l = emit (ir.node :const_bool (if b { 1 } else { 0 }) ir.no_node ir.no_node) l;
 
 // --- calls ----------------------------------------------------------------------
@@ -180,7 +182,7 @@ let emit_apply callee args l = {
     let made = emit (ir.node :apply callee (list.nth 1 placed) (list.length args))
                     (list.head placed);
     let i = list.nth 1 made;
-    let inherited = inherit i (list_cons callee args) (list.head made);
+    let inherited = inherit i (list.cons callee args) (list.head made);
     // Calling an impure value is itself an effect, and the callee has to be
     // forced where it stands for that effect to happen in written order.
     let sequenced =
@@ -239,7 +241,7 @@ let eq_const v k l = binary :eq v k l;
 // parameters and literals, and nothing else. Here a saturated call of one
 // becomes the call it stands for, which removes a frame and a call per use.
 // Chained wrappers unwrap together: `at_end` is `list.is_empty` is
-// `list_is_empty`, and a call of the first emits the last.
+// `_list_is_empty`, and a call of the first emits the last.
 //
 // The depth cap is not a guess about how deep a chain goes -- two wrappers that
 // name each other would unwrap forever, and a compiler must terminate on a
@@ -310,6 +312,46 @@ let unwrap_global found g args fuel l =
             },
     };
 
+/// A wrapper named as a value rather than called -- `list.map char.of_code
+/// cs` -- is the builtin it wraps, when it passes its parameters on unchanged
+/// and in order. Calling the value then reaches the builtin directly, where
+/// it would otherwise make a frame per call to do nothing but call it, which
+/// is the cost the rewrite above removes from a call and would leave on every
+/// element of a `map`.
+///
+/// Narrower than the call rewrite on purpose. A builtin has a fixed arity and
+/// so does a wrapper of it with the same parameters, so the two values take
+/// the same arguments and do the same thing with them. A reordering, a
+/// literal, or a target that is another Dream function would each need a
+/// value of their own, and are left as the wrapper. Only a bare reference is
+/// rewritten: a call of a wrapper with too few or too many arguments still
+/// calls the wrapper.
+let as_value found l =
+    match builtin_alias found 8 l {
+        () => found,
+        b  => b,
+    };
+
+let rec builtin_alias found fuel l =
+    if fuel <= 0 { () }
+    else {
+        match found {
+            [:builtin, _]                => found,
+            [:global, _, _, g]           => builtin_alias_global g fuel l,
+            [:member, [:dream, _], _, g] => builtin_alias_global g fuel l,
+            _ => (),
+        }
+    };
+
+let builtin_alias_global g fuel l =
+    match ((scope.wrappers (res l))).[g else ()] {
+        [target, plan, arity] =>
+            if plan == list.map (fn k -> [:param, k]) (list.range 0 arity) {
+                builtin_alias target (fuel - 1) l
+            } else { () },
+        _ => (),
+    };
+
 /// The callee of an application, given what it resolved to. A name or a member
 /// whose resolution is already in hand skips the second lookup; anything else
 /// is an ordinary expression.
@@ -353,7 +395,7 @@ let resolved_name found =
 /// that the VM sequences the effect rather than only the compiler knowing about
 /// it. `scope` refused the pure functions that reach an effect; this records
 /// which nodes *are* one.
-let lower_name name span l = lower_resolved name (lookup span l) span l;
+let lower_name name span l = lower_resolved name (as_value (lookup span l) l) span l;
 
 /// The same, for a caller that has already asked what the name resolves to.
 /// Applications ask, because a call of a wrapper is rewritten and one that is
@@ -377,7 +419,7 @@ let emit_local slot l =
     match ((subst l)).[slot else ()] {
         () => emit (ir.node :local slot ir.no_node ir.no_node) l,
         e  => {
-            let got = lower_expr e (set_subst (map_remove (subst l) slot) l);
+            let got = lower_expr e (set_subst (map.remove (subst l) slot) l);
             [set_subst (subst l) (list.head got), list.nth 1 got]
         },
     };
@@ -713,7 +755,7 @@ let rec lower_block stmts span l = {
                 let parts = destructure pattern (list.nth 1 reader) (list.head reader);
                 [list.head parts,
                  list.append (list.nth 1 acc)
-                     (list.map (fn k -> [k, st]) (list_cons (list.nth 1 bound) (list.nth 1 parts)))]
+                     (list.map (fn k -> [k, st]) (list.cons (list.nth 1 bound) (list.nth 1 parts)))]
             },
             _ => {
                 let got = lower_expr st (list.head acc);
@@ -962,7 +1004,7 @@ let rec pattern_test p subject binds l =
 
 /// The value must be a list at all. Without this `[]` would match anything that
 /// is not a cons cell -- an array, a map, a number -- because "not a cell" and
-/// "the end of a list" look the same from `match_is_cons` alone. `type_of`
+/// "the end of a list" look the same from `_match_is_cons` alone. `type_of`
 /// answers `:list` for both the empty list and a cell, so one test covers every
 /// list pattern.
 let rec is_type name subject l = {
@@ -980,12 +1022,12 @@ let rec list_test items rest subject binds l = {
         let test = list.nth 1 acc;
         let cursor = list.nth 2 acc;
         let bs = list.nth 3 acc;
-        let cons_test = call_builtin "match_is_cons" [cursor] l0;
+        let cons_test = call_builtin "_match_is_cons" [cursor] l0;
         let with_cons = bool_and test (list.nth 1 cons_test) (list.head cons_test);
-        let head = call_builtin "match_head" [cursor] (list.head with_cons);
+        let head = call_builtin "_match_head" [cursor] (list.head with_cons);
         let inner = pattern_test item (list.nth 1 head) bs (list.head head);
         let both = bool_and (list.nth 1 with_cons) (list.nth 1 inner) (list.nth 0 inner);
-        let tail = call_builtin "match_tail" [cursor] (list.head both);
+        let tail = call_builtin "_match_tail" [cursor] (list.head both);
         [list.head tail, list.nth 1 both, list.nth 1 tail, list.nth 2 inner]
     }) [list.head typed, list.nth 1 typed, subject, binds] items;
 
@@ -1000,7 +1042,7 @@ let rec list_test items rest subject binds l = {
         [_, name_span] => [l1, test, list.append bs [[name_span, cursor]]],
         // A fixed-length list: what is left must be the end.
         _ => {
-            let cons_test = call_builtin "match_is_cons" [cursor] l1;
+            let cons_test = call_builtin "_match_is_cons" [cursor] l1;
             let ends = binary :not (list.nth 1 cons_test) ir.no_node (list.head cons_test);
             let both = bool_and test (list.nth 1 ends) (list.head ends);
             [list.head both, list.nth 1 both, bs]
@@ -1022,7 +1064,7 @@ let rec array_test items rest subject binds span l = {
     let done = list.fold (fn acc pair -> {
         let l0 = list.nth 0 acc;
         let at = const_int (list.nth 1 pair) l0;
-        let element = call_builtin "match_at" [subject, list.nth 1 at] (list.head at);
+        let element = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
         let inner = pattern_test (list.nth 0 pair) (list.nth 1 element) (list.nth 2 acc)
                                 (list.head element);
         let both = bool_and (list.nth 1 acc) (list.nth 1 inner) (list.nth 0 inner);
@@ -1048,10 +1090,10 @@ let rec map_test pairs subject binds span l = {
         let k = lower_expr (list.nth 0 kv) l0;
         // `[v]` when the key is there, `[]` when it is not -- so presence and
         // the value come out of one lookup.
-        let found = call_builtin "match_key" [subject, list.nth 1 k] (list.head k);
-        let present = call_builtin "match_is_cons" [list.nth 1 found] (list.head found);
+        let found = call_builtin "_match_key" [subject, list.nth 1 k] (list.head k);
+        let present = call_builtin "_match_is_cons" [list.nth 1 found] (list.head found);
         let with_key = bool_and (list.nth 1 acc) (list.nth 1 present) (list.head present);
-        let held = call_builtin "match_head" [list.nth 1 found] (list.head with_key);
+        let held = call_builtin "_match_head" [list.nth 1 found] (list.head with_key);
         let inner = pattern_test (list.nth 1 kv) (list.nth 1 held) (list.nth 2 acc) (list.head held);
         let both = bool_and (list.nth 1 with_key) (list.nth 1 inner) (list.nth 0 inner);
         [list.head both, list.nth 1 both, list.nth 2 inner]
@@ -1118,7 +1160,7 @@ let rec extract p subject want binds l =
                 if not (wants want (list.nth 0 pair)) { acc }
                 else {
                     let at = const_int (list.nth 1 pair) (list.nth 0 acc);
-                    let element = call_builtin "match_at" [subject, list.nth 1 at] (list.head at);
+                    let element = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
                     extract (list.nth 0 pair) (list.nth 1 element) want (list.nth 1 acc)
                             (list.head element)
                 }) [l, binds] (list.zip items (list.range 0 (list.length items))),
@@ -1127,8 +1169,8 @@ let rec extract p subject want binds l =
                 if not (wants want (list.nth 1 kv)) { acc }
                 else {
                     let k = lower_expr (list.nth 0 kv) (list.nth 0 acc);
-                    let found = call_builtin "match_key" [subject, list.nth 1 k] (list.head k);
-                    let held = call_builtin "match_head" [list.nth 1 found] (list.head found);
+                    let found = call_builtin "_match_key" [subject, list.nth 1 k] (list.head k);
+                    let held = call_builtin "_match_head" [list.nth 1 found] (list.head found);
                     extract (list.nth 1 kv) (list.nth 1 held) want (list.nth 1 acc) (list.head held)
                 }) [l, binds] pairs,
         _ => [l, binds],
@@ -1147,12 +1189,12 @@ let rec extract_list items rest cursor want binds l =
             let got =
                 if not (wants want item) { [l, binds] }
                 else {
-                    let head = call_builtin "match_head" [cursor] l;
+                    let head = call_builtin "_match_head" [cursor] l;
                     extract item (list.nth 1 head) want binds (list.head head)
                 };
             if not (list.any (fn i -> wants want i) more || rest_wanted want rest) { got }
             else {
-                let tail = call_builtin "match_tail" [cursor] (list.head got);
+                let tail = call_builtin "_match_tail" [cursor] (list.head got);
                 extract_list more rest (list.nth 1 tail) want (list.nth 1 got) (list.head tail)
             }
         },
@@ -1400,7 +1442,7 @@ let rec lower_arms arms held span l =
              list.nth 1 made,
              // Where each arm's test starts, and the raise after the last:
              // what a switch in front of the chain jumps to (`dispatch`).
-             list_cons (list.nth 1 made) (list.nth 2 otherwise)]
+             list.cons (list.nth 1 made) (list.nth 2 otherwise)]
         },
     };
 
@@ -1462,7 +1504,7 @@ let place_captures caps l = {
     kids encoded l
 };
 
-/// The four `link_*` folds below build their record lists with `list_cons` and
+/// The four `link_*` folds below build their record lists with `_list_cons` and
 /// reverse once at the end rather than appending. `list.append xs [x]` is one
 /// reduction and a copy of `xs`, so a profile counts none of it and the list
 /// costs O(n^2) bytes to build -- these three fold lambdas were, between them,
@@ -1497,7 +1539,7 @@ let link_funcs_from r bodies l from = {
                          ir.fn_global_value
                      } else { 0 });
         [list.head placed,
-         list_cons
+         list.cons
              %{ :name => list.nth 1 named, :body => bodies.[fi else ir.no_node],
                  :arity => scope.func_arity f, :flags => flags,
                  :slots => scope.func_slots f,
@@ -1520,7 +1562,7 @@ let link_globals_from r l from = {
         let named = strk (list.nth 1 g) (list.head acc);
         let is_module = list.nth 2 g == :module;
         [list.head named,
-         list_cons
+         list.cons
              %{ :name => list.nth 1 named,
                 :kind => if is_module { ir.global_module } else { ir.global_function },
                 :target => match list.nth 3 g { () => ir.no_node, t => t },
@@ -1537,7 +1579,7 @@ let link_imports r l = {
         let path = strk (list.nth 0 i) (list.head acc);
         let alias = strk (list.nth 1 i) (list.head path);
         [list.head alias,
-         list_cons %{ :path => list.nth 1 path, :alias => list.nth 1 alias }
+         list.cons %{ :path => list.nth 1 path, :alias => list.nth 1 alias }
                    (list.nth 1 acc)]
     }) [l, []] (scope.r_imports r);
     [list.head built, list.reverse (list.nth 1 built)]
@@ -1550,7 +1592,7 @@ let link_modules ld r l = {
         let named = strk (modules.module_name mod_at) (list.head acc);
         let src = strk (modules.module_path mod_at) (list.head named);
         [list.head src,
-         list_cons
+         list.cons
              %{ :name => list.nth 1 named, :source => list.nth 1 src,
                 :globals_start => list.nth 1 m, :globals_count => list.nth 2 m,
                 :flags => if list.nth 3 m { ir.m_abstract } else { 0 },
@@ -1636,10 +1678,10 @@ let lower_program r = {
 let rec comp_dependencies todo seen found pending p funcs globals = match todo {
     [] => found,
     [index, ..rest] =>
-        if not (ir.is_node index) || map_has seen index {
+        if not (ir.is_node index) || map.has seen index {
             comp_dependencies rest seen found pending p funcs globals
-        } else if map_has pending index {
-            comp_dependencies rest (seen.[index => true]) (list_cons index found) pending p funcs globals
+        } else if map.has pending index {
+            comp_dependencies rest (seen.[index => true]) (list.cons index found) pending p funcs globals
         } else {
             let n = ir.node_at index p;
             let op = ir.node_op n;
@@ -1671,7 +1713,7 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
 let rec comp_reach todo seen fns p funcs globals = match todo {
     [] => fns,
     [index, ..rest] =>
-        if not (ir.is_node index) || map_has seen index {
+        if not (ir.is_node index) || map.has seen index {
             comp_reach rest seen fns p funcs globals
         } else {
             let n = ir.node_at index p;
@@ -1692,7 +1734,7 @@ let rec comp_reach todo seen fns p funcs globals = match todo {
                 :make_thunk => ir.node_a n,
                 _ => ir.no_node,
             };
-            let fresh = ir.is_node fi && not (map_has fns fi);
+            let fresh = ir.is_node fi && not (map.has fns fi);
             let called = if fresh { [funcs.[fi].[:body]] } else { [] };
             comp_reach (direct + run + called + rest) (seen.[index => true])
                        (if fresh { fns.[fi => true] } else { fns }) p funcs globals
@@ -1719,8 +1761,8 @@ let comp_image fis l = if in_parts l { parts_image fis l } else { whole_image fi
 
 let whole_image fis l = {
     let p = prog l;
-    let funcs = array_of_list (ir.funcs p);
-    let globals = array_of_list (ir.globals p);
+    let funcs = array.of_list (ir.funcs p);
+    let globals = array.of_list (ir.globals p);
     let reached = comp_reach (list.map (fn fi -> funcs.[fi].[:body]) fis) %{}
                              (list.fold (fn m fi -> m.[fi => true]) %{} fis)
                              p funcs globals;
@@ -1730,7 +1772,7 @@ let whole_image fis l = {
     let img = ir.finish (prog l3);
     let cut = list.map (fn pair -> {
         let [fi, f] = pair;
-        if map_has reached fi { f } else { f.[:body => stub] }
+        if map.has reached fi { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (img.[:funcs else []]))) (img.[:funcs else []]));
     emit.to_binary (opt.optimize (img.[:funcs => cut]))
 };
@@ -1754,7 +1796,7 @@ let whole_image fis l = {
 let rec settle_comp_order! rows done built l =
     if list.is_empty rows { l }
     else {
-        let ready = list.filter (fn row -> list.all (fn node -> map_has done node) row.[1]) rows;
+        let ready = list.filter (fn row -> list.all (fn node -> map.has done node) row.[1]) rows;
         if list.is_empty ready {
             complain ast.no_span "cyclic dependency between compile-time expressions" l
         } else {
@@ -1783,8 +1825,8 @@ let settle_comps! l = {
     else if in_parts l { settle_parts_comps! l }
     else {
         let p = prog l;
-        let funcs = array_of_list (ir.funcs p);
-        let globals = array_of_list (ir.globals p);
+        let funcs = array.of_list (ir.funcs p);
+        let globals = array.of_list (ir.globals p);
         let pending = list.fold (fn m one -> m.[one.[0] => true]) %{} pend;
         let rows = list.map (fn one -> [one,
             comp_dependencies [funcs.[one.[1]].[:body]] %{} [] pending p funcs globals]) pend;
@@ -1801,7 +1843,16 @@ let link! ld r = link_rest! ld r (lower_program r);
 /// Everything after the arena is built and its functions linked: the
 /// compile-time expressions, the module table and the entry point.
 let link_rest! ld r lowered = {
-    let low = settle_comps! lowered;
+    // Not when the program has already failed. An expression evaluated now
+    // runs the program as it was lowered, and a name that did not resolve was
+    // lowered to `()` -- so all it can do is raise a second error after the
+    // one that matters, or, where a loop or a recursion reads one, not finish
+    // at all. The build is failing either way. Contracts were already checked
+    // only on a program without errors (`type_diags!` in compile.dr); see "A
+    // program that does not resolve ran the machine out of memory" in
+    // docs/notes/macro-expansion.md for the macro half of the same mistake.
+    let low = if diag.error_count (all_diags r lowered) > 0 { lowered }
+              else { settle_comps! lowered };
     let ms = link_modules ld r low;
     let named = strk (modules.module_name (modules.module_at ld
                           (modules.module_count ld - 1)))
@@ -1878,7 +1929,7 @@ let lower_part r numbered = {
         let p = prog done;
         // In the table's own order: a part's numbering is its own business,
         // and sharing the parts renumbers every node in function order anyway.
-        let roots = map_pairs (func_bodies done);
+        let roots = map.pairs (func_bodies done);
         let rebuilt = list.fold (fn st pair -> {
             let got = opt.rebuild (list.nth 1 pair) (list.head st);
             [list.head got, (list.nth 1 st).[list.head pair => list.nth 1 got]]
@@ -1887,7 +1938,7 @@ let lower_part r numbered = {
         let said = l_diags done;
         let waiting = pending_comp done;
         let noted = if list.is_empty said && list.is_empty waiting { notes }
-                    else { list_cons [list.head nb, said, waiting] notes };
+                    else { list.cons [list.head nb, said, waiting] notes };
         let next = opt.settle (list.head rebuilt);
         let found = list.nth 1 rebuilt;
         // Forced before they are carried, the `ir.settled` way: a suspended one
@@ -1900,7 +1951,7 @@ let lower_part r numbered = {
     let p = prog low;
     %{ :nodes => list.reverse (opt.out shared),
        :kids => list.reverse (opt.out_kids shared),
-       :bodies => list.sort_on (fn pair -> list.head pair) (map_pairs bodies),
+       :bodies => list.sort_on (fn pair -> list.head pair) (map.pairs bodies),
        :ints => ir.pool_list (ir.ints p), :floats => ir.pool_list (ir.floats p),
        :strs => ir.pool_list (ir.strs p), :atoms => ir.pool_list (ir.atoms p),
        :notes => list.reverse notes }
@@ -1985,8 +2036,8 @@ let link_parallel! ld r cache = {
     let sharing = share_parts_elsewhere! (vm.share! (for_sharing rs head));
     // What each body said, back in the order of the bodies, with a waiting
     // expression's function moved as the part's functions were.
-    let oa = array_of_list offsets;
-    let pa = array_of_list parts;
+    let oa = array.of_list offsets;
+    let pa = array.of_list parts;
     let notes = list.sort_on (fn note -> list.head note) (list.concat (list.map (fn k -> {
         let fo = list.head (oa.[k]);
         list.map (fn note -> {
@@ -2016,19 +2067,19 @@ let reached_wrappers all r = {
         [:global, _, _, gi] if gi != () => m.[gi => true],
         [:member, _, _, gi] if gi != () => m.[gi => true],
         _ => m,
-    }) (%{}) (map_pairs (scope.refs r));
+    }) (%{}) (map.pairs (scope.refs r));
     let rec close seen todo = match todo {
         [] => seen,
         [gi, ..rest] => match all.[gi else ()] {
             () => close seen rest,
             w => {
                 let next = scope.target_global (list.head w);
-                if map_has seen gi { close seen rest }
+                if map.has seen gi { close seen rest }
                 else { close (seen.[gi => w]) (list.cons next rest) }
             },
         },
     };
-    list.sort_on list.head (map_pairs (close (%{}) (map.keys used)))
+    list.sort_on list.head (map.pairs (close (%{}) (map.keys used)))
 };
 
 /// Whether this lowering was made in parts, and so has no arena of its own:
@@ -2146,7 +2197,7 @@ let current_arenas l = {
 let rec reach_parts todo seen fns met arenas funcs globals invented_from = match todo {
     [] => [fns, met],
     [key, ..rest] =>
-        if not (ir.is_node key) || map_has seen key {
+        if not (ir.is_node key) || map.has seen key {
             reach_parts rest seen fns met arenas funcs globals invented_from
         } else {
             let k = key / opt.part_base;
@@ -2177,7 +2228,7 @@ let rec reach_parts todo seen fns met arenas funcs globals invented_from = match
                 _ => ir.no_node,
             };
             let waits = if op == :unit && ir.is_node (ir.node_a n) { met.[ir.node_a n + fo => true] } else { met };
-            let fresh = ir.is_node fi && not (map_has fns fi);
+            let fresh = ir.is_node fi && not (map.has fns fi);
             let called = if fresh { [(funcs.[fi]).[:body]] } else { [] };
             reach_parts (direct + run + called + rest) (seen.[key => true])
                         (if fresh { fns.[fi => true] } else { fns }) waits
@@ -2191,14 +2242,14 @@ let parts_image fis l = {
     let [l2, zero] = const_int 0 l1;
     let [l3, stub] = emit (ir.node :div one zero ir.no_node) l2;
     let p = prog l3;
-    let funcs = array_of_list (ir.funcs p);
+    let funcs = array.of_list (ir.funcs p);
     let reached = list.head (reach_parts (list.map (fn fi -> (funcs.[fi]).[:body]) fis) %{}
                                          (list.fold (fn m fi -> m.[fi => true]) %{} fis) %{}
-                                         (current_arenas l3) funcs (array_of_list (ir.globals p))
+                                         (current_arenas l3) funcs (array.of_list (ir.globals p))
                                          (l.[:invented_from else 0]));
     let cut = list.map (fn pair -> {
         let [fi, f] = pair;
-        if map_has reached fi { f } else { f.[:body => stub] }
+        if map.has reached fi { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (ir.funcs p))) (ir.funcs p));
     emit.to_binary (opt.optimize_parts_filled ((ir.finish_rest p).[:funcs => cut]) (current_arenas l3)
                                               (l.[:invented_from else 0]) (l.[:filled else (%{})]))
@@ -2208,10 +2259,10 @@ let parts_image fis l = {
 /// expressions that have to be settled before it can be run.
 let parts_dependencies fi l = {
     let p = prog l;
-    let funcs = array_of_list (ir.funcs p);
+    let funcs = array.of_list (ir.funcs p);
     let met = list.nth 1 (reach_parts [(funcs.[fi]).[:body]] %{} (%{fi => true}) %{} (current_arenas l)
-                                      funcs (array_of_list (ir.globals p)) (l.[:invented_from else 0]));
-    list.map (fn kv -> list.head kv) (map_pairs met)
+                                      funcs (array.of_list (ir.globals p)) (l.[:invented_from else 0]));
+    list.map (fn kv -> list.head kv) (map.pairs met)
 };
 
 /// `settle_comps!` for a lowering made in parts: the same order, the same
@@ -2220,7 +2271,7 @@ let parts_dependencies fi l = {
 let settle_parts_comps! l = {
     let pend = pending_comp l;
     let waiting = list.fold (fn m one -> m.[one.[1] => true]) %{} pend;
-    let rows = list.map (fn one -> [one, list.filter (fn fi -> map_has waiting fi && fi != one.[1])
+    let rows = list.map (fn one -> [one, list.filter (fn fi -> map.has waiting fi && fi != one.[1])
                                                      (parts_dependencies (one.[1]) l)]) pend;
     settle_parts_order! rows %{} () l
 };
@@ -2228,7 +2279,7 @@ let settle_parts_comps! l = {
 let rec settle_parts_order! rows done built l =
     if list.is_empty rows { l }
     else {
-        let ready = list.filter (fn row -> list.all (fn fi -> map_has done fi) row.[1]) rows;
+        let ready = list.filter (fn row -> list.all (fn fi -> map.has done fi) row.[1]) rows;
         if list.is_empty ready {
             complain ast.no_span "cyclic dependency between compile-time expressions" l
         } else {
@@ -2272,9 +2323,9 @@ let settle_part_comp! bytes one l = {
 let intern_each intern vs p = {
     let got = list.fold_strict (fn acc v -> {
         let one = intern v (list.head acc);
-        [list.head one, list_cons (list.nth 1 one) (list.nth 1 acc)]
+        [list.head one, list.cons (list.nth 1 one) (list.nth 1 acc)]
     }) [p, []] vs;
-    [list.head got, array_of_list (list.reverse (list.nth 1 got))]
+    [list.head got, array.of_list (list.reverse (list.nth 1 got))]
 };
 
 /// An atom as a part stored it -- the index of its name in the part's string
@@ -2292,8 +2343,8 @@ let link_head r offsets parts = {
     // Arrays, since each is read by a part's index in a loop over the parts:
     // a list read that way is a walk to the part, every time, and the loop
     // quadratic in the number of modules.
-    let pa = array_of_list parts;
-    let oa = array_of_list offsets;
+    let pa = array.of_list parts;
+    let oa = array.of_list offsets;
     // The constant pools, part by part, and each part's table from its own
     // indices to the program's.
     let pooled = list.fold (fn acc part -> {
@@ -2302,10 +2353,10 @@ let link_head r offsets parts = {
         let [p2, floats] = intern_each ir.intern_float (part.[:floats]) p1;
         let [p3, strs] = intern_each ir.intern_str (part.[:strs]) p2;
         let [p4, atoms] = intern_each (fn si q -> intern_atom_at strs si q) (part.[:atoms]) p3;
-        [p4, list_cons %{ :ints => ints, :floats => floats, :strs => strs, :atoms => atoms }
+        [p4, list.cons %{ :ints => ints, :floats => floats, :strs => strs, :atoms => atoms }
                        (list.nth 1 acc)]
     }) [ir.program, []] parts;
-    let ra = array_of_list (list.reverse (list.nth 1 pooled));
+    let ra = array.of_list (list.reverse (list.nth 1 pooled));
     // Every function's body, as the part it is in and its node there -- part
     // k is `k + 1` here, part 0 being this lowering's own arena -- and under
     // the function's index in the whole program: a part numbers its functions
@@ -2322,9 +2373,9 @@ let link_head r offsets parts = {
     let is = link_imports r (list.head gs);
     let p = ((((prog (list.head is)).[:funcs => (list.nth 1 fs)]).[:globals => (list.nth 1 gs)]))
                 .[:imports => (list.nth 1 is)];
-    let arenas = array_of_list (list_cons %{ :nodes => ir.nodes p, :kids => ir.kids p }
-        (list.map (fn k -> %{ :nodes => array_of_list ((pa.[k]).[:nodes]),
-                              :kids => array_of_list ((pa.[k]).[:kids]),
+    let arenas = array.of_list (list.cons %{ :nodes => ir.nodes p, :kids => ir.kids p }
+        (list.map (fn k -> %{ :nodes => array.of_list ((pa.[k]).[:nodes]),
+                              :kids => array.of_list ((pa.[k]).[:kids]),
                               :remap => ra.[k],
                               :fo => list.head (oa.[k]), :go => list.nth 1 (oa.[k]) })
                   (list.range 0 (list.length parts))));
@@ -2350,10 +2401,10 @@ let rec emit_const v l =
         // the name the image stores.
         :atom    => const_atom (str.slice 1 (str.byte_length (to_string v) - 1) (to_string v)) l,
         :list    => const_seq :make_list (list.map (fn x -> x) v) l,
-        :array   => const_seq :make_array (array_to_list v) l,
+        :array   => const_seq :make_array (array.to_list v) l,
         :map     => const_seq :make_map
                         (list.concat (list.map (fn kv -> [list.nth 0 kv, list.nth 1 kv])
-                                               (map_pairs v))) l,
+                                               (map.pairs v))) l,
         _ => emit_leaf :unit l,
     };
 

@@ -37,6 +37,6 @@ let main! = {
 
     // A value holding a suspension it cannot force is refused.
     let f = { let big = table 3; fn x -> big.[x] };
-    let refused = try! { vm.share! f; :shared } catch e { error_kind e };
+    let refused = try! { vm.share! f; :shared } catch e { _error_kind e };
     console.print! ("a closure:       " + to_string refused)
 };

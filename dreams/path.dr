@@ -117,12 +117,12 @@ let rec join_all base parts =
 // and treating `.` and `..` as one is how a path walk loses a directory.
 
 /// Where `needle` last occurs in `p` at or after `from`, or `-1`. It hops from
-/// one occurrence to the next with `str_find`, which the machine does, rather
+/// one occurrence to the next with `_str_find`, which the machine does, rather
 /// than reading a character at a time: loading a program asks this of every
 /// path it tries, and the character walk it replaces was a tenth of a warm
 /// build's loading.
 let last_index : :string -> :string -> :integer -> :integer -> :integer;
-let rec last_index needle p from best = match str_find p needle from {
+let rec last_index needle p from best = match str.find_from from needle p {
     at if at < 0 => best,
     at => last_index needle p (at + 1) at,
 };
@@ -170,10 +170,10 @@ let normalize original = {
             ["..", ..rest] =>
                 match acc {
                     [] => walk rest (if absolute { [] } else { [".."] }),
-                    ["..", .._] => walk rest (list_cons ".." acc),
+                    ["..", .._] => walk rest (list.cons ".." acc),
                     [_, ..up] => walk rest up,
                 },
-            [s, ..rest] => walk rest (list_cons s acc),
+            [s, ..rest] => walk rest (list.cons s acc),
         };
     let body = str.slice (str.byte_length anchor) (str.byte_length p - str.byte_length anchor) p;
     let segs = walk (segments body) [];
@@ -236,7 +236,7 @@ let is_file! p = io.exists! p && not (io.is_dir! p);
 let rec read_chunks! h acc = {
     let chunk = io.read! h 65536;
     if len chunk == 0 { str.join_str "" (list.reverse acc) }
-    else { read_chunks! h (list_cons chunk acc) }
+    else { read_chunks! h (list.cons chunk acc) }
 };
 
 let read_file! p = {

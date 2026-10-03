@@ -26,6 +26,7 @@ import std.str;
 import std.toml;
 
 import util;
+import std.map;
 
 /// `[section, key, source, commit, version]`; `commit` and `version` may be
 /// `()` -- a path dependency has no commit, and a bare directory no version.
@@ -80,8 +81,8 @@ let parse text =
                 let [key, v] = kv;
                 let get k = if type_of v == :map { v.[k else ()] } else { () };
                 entry section key (get "source") (get "commit") (get "version")
-            }) (map_pairs table)
-        }) (list.filter (fn pair -> list.head pair != "") (map_pairs doc))),
+            }) (map.pairs table)
+        }) (list.filter (fn pair -> list.head pair != "") (map.pairs doc))),
         _ => [],
     };
 

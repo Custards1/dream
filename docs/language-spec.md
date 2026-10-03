@@ -445,7 +445,7 @@ value wants is usually decided by how it is read rather than by what it holds:
   standard library defines them that way rather than by recursion. `last` and
   anything ending in `_at` still walk in Dream. Building in front is O(1),
   which is why the idiom everywhere in the standard library is to accumulate
-  with `list_cons` and reverse once at the end. A *lazy* chain costs a cell
+  with `list.cons` and reverse once at the end. A *lazy* chain costs a cell
   each time a new element is forced, so a stream that will be walked twice
   builds every cell of a tail that the second walk then forces again.
 - **An array reads any index in one hop — constant-time like a list's head.**
@@ -453,14 +453,14 @@ value wants is usually decided by how it is read rather than by what it holds:
   built, because a list record reads every field by walking to it. The
   compiler's token is the precedent: as a six-element list, reading one field
   walked to its cell, and reading tokens was a fifth of everything the
-  compiler did. Arrays are built with `array_new` and `a.[index => value]`
+  compiler did. Arrays are built with `array.new` and `a.[index => value]`
   (or `std.array.of_list`), so the more a record is built relative to read,
   the less clear the win is.
 - **A membership test over a fixed set of names wants a map.** Checking a name
   against a flat table of keywords was a tenth of the compiler's work; the
   same check against `%{ }` is a probe of a trie.
 - **A string is a sequence of bytes with two costs.** Byte operations —
-  `len`, `str_byte`, `str.slice` on a byte offset — are O(1);
+  `len`, `str.byte`, `str.slice` on a byte offset — are O(1);
   anything that counts or indexes by *character* (`str.length`, `str.chars`)
   walks. The lexer counts columns in characters and spans in bytes for
   exactly this reason, and a program that slices a string a lot wants to
@@ -533,7 +533,7 @@ it is why `console.print!` puts its label first.
 shape (or one whose shape is the trailing part of its own, which repeats), or
 with a number on either side. `a @ b` is the matrix product of two tensors, or
 of nested lists and arrays read as them, and binds like `*`. It is the builtin
-`tensor_matmul` applied to both sides, so a local of that name shadows it.
+`_tensor_matmul` applied to both sides, so a local of that name shadows it.
 `std.tensor` has the rest, including moving a tensor to the GPU.
 
 Integer arithmetic that overflows a fixnum falls through to `float` rather than
@@ -705,8 +705,11 @@ the way to get it compiled.
 ### Wrappers
 
 A global whose body is one application of its own parameters -- `let tail xs =
-list_tail xs`, `let kind t = t.[0]` -- is a **wrapper**, and a
-saturated call of one is compiled as the call it stands for. The frame that
+_list_tail xs`, `let kind t = t.[0]` -- is a **wrapper**, and a
+saturated call of one is compiled as the call it stands for. A wrapper named
+as a value rather than called is its builtin, when it passes its parameters
+on unchanged and in order: `list.map char.of_code cs` hands `list.map` the
+primitive itself. The frame that
 disappears bound nothing but the arguments the inner call was going to be
 given, and every argument stays the same thunk in the same place, so nothing is
 evaluated that was not before and nothing twice.
@@ -1401,7 +1404,7 @@ with `:stack_overflow` naming the depth, instead of exhausting memory.
 
 ```dream
 let squares = comp build 5;                    // evaluated by the compiler
-let digits  = comp! str_chars "12345";    // evaluated by running it on the VM
+let digits  = comp! str.chars "12345";    // evaluated by running it on the VM
 ```
 
 `comp e` evaluates `e` at compile time and bakes the result into the image.
@@ -1601,10 +1604,11 @@ dynamically typed, so that is found out when a name is used.
 ### How it is compiled
 
 An arm is a decision chain of test-and-bind nodes, and the tests are ordinary
-builtins -- `match_is_cons`, `match_head`, `match_tail`, `match_at`,
-`match_key`. They are named that way on purpose: a builtin beats an imported
+primitives -- `_match_is_cons`, `_match_head`, `_match_tail`, `_match_at`,
+`_match_key`. They are named that way on purpose: a builtin beats an imported
 name, so calling one of them `head` would quietly shadow
-`import std.list.{head}` in every module that had both.
+`import std.list.{head}` in every module that had both, and the underscore
+marks a name no program is meant to write (see Runtime primitives).
 
 The tests force exactly as far as the pattern looks. `[x, ..rest]` forces the
 cell to know whether it is one, and does not force `x`; that is what lets a
@@ -1717,15 +1721,24 @@ example.
 
 ### Runtime primitives
 
-Runtime primitives are available without imports. Container reads and updates
-use `xs.[0]`, `m.[key else default]`, and `m.[key => value]`; empty maps use
-`%{}` and lengths use `len`. The list primitives are `list_cons`, `list_tail`,
-and `list_is_empty`.
+A runtime primitive is an operation the machine provides because Dream cannot
+write it -- `_list_cons`, `_str_slice`, `_data_at` and the rest. Each is
+spelled with a leading `_` and is `std`'s to call: `std` wraps it in a function
+a program calls instead (`list.cons`, `str.slice`, `payload.at`). A primitive
+named outside a `std` module still resolves, needing no import, and is warned
+about with the call to write in its place. The wrapper costs nothing: a
+saturated call of it compiles to the primitive (see Wrappers). The twelve
+language builtins -- `spawn!`, `join!`, `send!`, `recv!`, `self!`, `raise!`,
+`strict!`, `type_of`, `type_assert`, `to_string`, `len` and `compare` -- are
+not primitives and keep their names, as do the members of native modules.
+
+Container reads and updates use `xs.[0]`, `m.[key else default]`, and
+`m.[key => value]`; empty maps use `%{}` and lengths use `len`.
 
 Saturated primitive calls compile to opcodes. Functions that traverse lazy
-lists (`str_of_chars`, `str_of_bytes`, `str_concat`, `array_of_list`) remain
-builtins. Both forms preserve laziness, support partial application, and may
-be shadowed by local bindings. See [the builtin reference](builtins.md#runtime-primitives).
+lists (`_str_of_chars`, `_str_of_bytes`, `_str_concat`, `_array_of_list`)
+remain builtins. Both forms preserve laziness, support partial application, and
+may be shadowed by local bindings. See [the builtin reference](builtins.md#runtime-primitives).
 Scalar type descriptions are exported by `std.types`.
 
 ### `std.console`
@@ -2162,9 +2175,9 @@ spent once.
 
 ### Every value decides its own cost
 
-- **A list is read at the head.** `head`/`tail`/`list_cons` are one hop; `nth`,
+- **A list is read at the head.** `head`/`tail`/`cons` are one hop; `nth`,
   `length`, `last`, `append`, and anything ending in `_at` walk. Accumulate with
-  `list_cons` and reverse once. Prefer a lazy chain precisely where the head is
+  `list.cons` and reverse once. Prefer a lazy chain precisely where the head is
   the point — a stream — because a cell is allocated as it is forced and a
   stream that goes unread costs nothing.
 - **A walk the machine can do is worth ten of the same walk in Dream.** A
@@ -2172,7 +2185,7 @@ spent once.
   natives per element; the same walk behind an opcode or a builtin pays one
   machine step for the whole of it. `list.nth` is `xs.[n else ()]`,
   `list.length` is `len`, `list.append` is `+`, and a lexer's byte classes are
-  `str_span` and `str_upto` — spelling those four out as recursions
+  `str.span` and `str.upto` — spelling those four out as recursions
   instead was a third of a self-compile.
 - **A record is an array when it is read more than it is built.** Matching a
   list pattern (`[:ok, v, rest]`) binds by walking the cells; matching an
@@ -2210,7 +2223,7 @@ Two consequences matter for anything performance-shaped:
   a value it does not know is shared pays once and forgets it.
 - **Natives are where the iron is, and thin accessors are free wrappers.** A
   global whose body is one application of its parameters — `let tail xs =
-  list_tail xs` — is compiled as the call it stands for when it is applied
+  _list_tail xs` — is compiled as the call it stands for when it is applied
   saturated (§5). The accessors that remain (`list.head`, `a.[index]`)
   are natives; each costs one native call, and paying for several on the same
   value — the peek-and-ask pattern — is what a profile shows. Fetch the value

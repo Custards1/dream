@@ -33,9 +33,9 @@
 // at every use or quietly behave differently. The tag costs nothing and the
 // confusion costs a bug.
 //
-// **Little-endian, because `str_le` is.** A field written in Dream is a
+// **Little-endian, because `_str_le` is.** A field written in Dream is a
 // list of byte expressions, and that is a cons cell, a thunk and a frame per
-// byte to produce one byte of output; `str_le` is the same field and no list.
+// byte to produce one byte of output; `_str_le` is the same field and no list.
 // The reader is the other half and is written a byte at a time, because that is
 // what a string is indexed by.
 //
@@ -88,21 +88,21 @@ let width = 4;
 // --- writing ------------------------------------------------------------------
 
 priv let byte : :integer -> :string;
-priv let byte n = str_le n 1;
+priv let byte n = _str_le n 1;
 
 /// A count or a length, in the fixed width above.
 priv let count : :integer -> :string;
-priv let count n = str_le n width;
+priv let count n = _str_le n width;
 
 /// A tag and its payload.
 priv let tagged : :integer -> :string -> :string;
-priv let tagged t payload = str_concat [byte t, payload];
+priv let tagged t payload = _str_concat [byte t, payload];
 
 /// A tag, a count, and that many already-encoded pieces after it. The shape of
 /// every collection here, so the three of them are one line each.
 priv let sequence : :integer -> [:string] -> :string;
 priv let sequence t pieces =
-    str_concat (list_cons (byte t) (list_cons (count (list.length pieces)) pieces));
+    _str_concat (_list_cons (byte t) (_list_cons (count (list.length pieces)) pieces));
 
 let write_unit : :unit -> :string;
 let write_unit u = byte tag_unit;
@@ -110,34 +110,34 @@ let write_unit u = byte tag_unit;
 let write_bool : :bool -> :string;
 let write_bool b = byte (if b { tag_true } else { tag_false });
 
-/// Eight bytes, two's complement, which is what `str_le` writes for a negative
+/// Eight bytes, two's complement, which is what `_str_le` writes for a negative
 /// number. A Dream integer is sixty-three bits, so the eighth byte is sign and
 /// the reader checks it -- see `read_int`.
 let write_int : :integer -> :string;
-let write_int n = tagged tag_int (str_le n 8);
+let write_int n = tagged tag_int (_str_le n 8);
 
 let write_float : :float -> :string;
-let write_float x = tagged tag_float (float_bytes x);
+let write_float x = tagged tag_float (_float_bytes x);
 
 /// The string's own bytes, length first. No escaping and no copy of anything
 /// but the string: a length-prefixed field can hold any byte, including a zero
 /// and including text that is not valid UTF-8, and it comes back as it went in.
 let write_string : :string -> :string;
-let write_string s = str_concat [byte tag_string, count (len s), s];
+let write_string s = _str_concat [byte tag_string, count (len s), s];
 
 /// An atom is its name, and the name is what `to_string` gives without the
 /// colon it writes in front.
 let write_atom : :atom -> :string;
 let write_atom a = {
     let text = to_string a;
-    let name = str_slice text 1 (len text - 1);
-    str_concat [byte tag_atom, count (len name), name]
+    let name = _str_slice text 1 (len text - 1);
+    _str_concat [byte tag_atom, count (len name), name]
 };
 
 /// The Unicode scalar, not the UTF-8 it would encode to: a char is a code
 /// point in this language and this format keeps it one.
 let write_char : :char -> :string;
-let write_char c = tagged tag_char (str_le (char_code c) width);
+let write_char c = tagged tag_char (_str_le (_char_code c) width);
 
 let write_list : [:string] -> :string;
 let write_list parts = sequence tag_list parts;
@@ -152,9 +152,9 @@ let write_array parts = sequence tag_array parts;
 /// and would lose its type if it got any.
 let write_map : [[:any, :any]] -> :string;
 let write_map pairs = {
-    let entry p = str_concat [encode_value (list.nth 0 p), encode_value (list.nth 1 p)];
-    str_concat (list_cons (byte tag_map)
-                               (list_cons (count (list.length pairs)) (list.map entry pairs)))
+    let entry p = _str_concat [encode_value (list.nth 0 p), encode_value (list.nth 1 p)];
+    _str_concat (_list_cons (byte tag_map)
+                               (_list_cons (count (list.length pairs)) (list.map entry pairs)))
 };
 
 let format_name : :any -> :string;
@@ -173,7 +173,7 @@ let format_name u = "wire";
 // collections, so the reason is written once, at the top, by `decode`.
 
 /// Are there `n` more bytes at `at`? Every reader below asks first, because
-/// `str_byte` answers `-1` past the end rather than failing -- which is right
+/// `_str_byte` answers `-1` past the end rather than failing -- which is right
 /// for a scan and wrong for a field, where the missing byte would silently
 /// become part of a number.
 priv let has : :string -> :integer -> :integer -> :bool;
@@ -183,7 +183,7 @@ priv let has buf at n = at + n <= len buf;
 /// the top byte down, so each step is one multiply and one add.
 priv let le_from : :string -> :integer -> :integer -> :integer -> :integer;
 priv let rec le_from buf at n acc =
-    if n <= 0 { acc } else { le_from buf at (n - 1) (acc * 256 + str_byte buf (at + n - 1)) };
+    if n <= 0 { acc } else { le_from buf at (n - 1) (acc * 256 + _str_byte buf (at + n - 1)) };
 
 priv let le : :string -> :integer -> :integer -> :integer;
 priv let le buf at n = le_from buf at n 0;
@@ -204,7 +204,7 @@ priv let read_int : :string -> :integer -> :any;
 priv let read_int buf at =
     if not (has buf at 8) { () }
     else {
-        match str_byte buf (at + 7) {
+        match _str_byte buf (at + 7) {
             top if top < 64 => [le buf at 8, at + 8],
             // The magnitude of the complement, then negated. `0 - m - 1` rather
             // than `0 - (m + 1)` because at the very bottom of the range `m + 1`
@@ -220,11 +220,11 @@ priv let read_int buf at =
 priv let complement : :string -> :integer -> :integer -> :integer -> :integer;
 priv let rec complement buf at n acc =
     if n <= 0 { acc }
-    else { complement buf at (n - 1) (acc * 256 + (255 - str_byte buf (at + n - 1))) };
+    else { complement buf at (n - 1) (acc * 256 + (255 - _str_byte buf (at + n - 1))) };
 
 priv let read_float : :string -> :integer -> :any;
 priv let read_float buf at =
-    if not (has buf at 8) { () } else { [float_of_bytes (str_slice buf at 8), at + 8] };
+    if not (has buf at 8) { () } else { [_float_of_bytes (_str_slice buf at 8), at + 8] };
 
 /// A length, then that many bytes, as a string.
 priv let read_bytes : :string -> :integer -> :any;
@@ -233,12 +233,12 @@ priv let read_bytes buf at =
     else {
         let n = le buf at width;
         if not (has buf (at + width) n) { () }
-        else { [str_slice buf (at + width) n, at + width + n] }
+        else { [_str_slice buf (at + width) n, at + width + n] }
     };
 
 /// A name, as the atom this program already has for it.
 ///
-/// `to_existing_atom` never creates one, and that is what makes it safe to
+/// `_to_existing_atom` never creates one, and that is what makes it safe to
 /// read a name off a socket: an atom is an index into a table the runtime never
 /// shrinks, so a decoder that interned whatever arrived would be a way to kill
 /// the program by sending it names. The cost is that a name this program does
@@ -249,7 +249,7 @@ priv let read_bytes buf at =
 priv let read_atom : :string -> :integer -> :any;
 priv let read_atom buf at = match read_bytes buf at {
     () => (),
-    [name, next] => match to_existing_atom name {
+    [name, next] => match _to_existing_atom name {
         () => (),
         a  => [a, next],
     },
@@ -260,10 +260,10 @@ priv let read_char buf at =
     if not (has buf at width) { () }
     else {
         let code = le buf at width;
-        // `char_of_code` raises on a surrogate or anything past U+10FFFF, and a
+        // `_char_of_code` raises on a surrogate or anything past U+10FFFF, and a
         // decoder must not raise, so the range is checked here instead.
         if code > 1114111 || (code >= 55296 && code <= 57343) { () }
-        else { [char_of_code code, at + width] }
+        else { [_char_of_code code, at + width] }
     };
 
 /// `n` values in a row: `[values, next]`, or `()` if any of them is not one.
@@ -273,7 +273,7 @@ priv let rec read_n buf at n acc =
     else {
         match read buf at {
             () => (),
-            [v, next] => read_n buf next (n - 1) (list_cons v acc),
+            [v, next] => read_n buf next (n - 1) (_list_cons v acc),
         }
     };
 
@@ -299,9 +299,9 @@ priv let rec map_of flat =
     else { ((map_of (list.drop 2 flat))).[(list.nth 0 flat) => (list.nth 1 flat)] };
 
 /// One value at `at`. The tag decides, and a byte that is not a tag -- or the
-/// `-1` that `str_byte` answers past the end -- falls through to `()`.
+/// `-1` that `_str_byte` answers past the end -- falls through to `()`.
 priv let read : :string -> :integer -> :any;
-priv let rec read buf at = match str_byte buf at {
+priv let rec read buf at = match _str_byte buf at {
     0  => [(), at + 1],
     1  => [false, at + 1],
     2  => [true, at + 1],
@@ -313,7 +313,7 @@ priv let rec read buf at = match str_byte buf at {
     8  => read_seq buf (at + 1),
     9  => match read_seq buf (at + 1) {
               ()          => (),
-              [xs, next]  => [array_of_list xs, next],
+              [xs, next]  => [_array_of_list xs, next],
           },
     10 => read_map buf (at + 1),
     _  => (),
@@ -384,13 +384,13 @@ when test {
         test.case "char"        $( test.true! (trip 'a') ),
         test.case "list"        $( test.true! (trip [1, 2, 3]) ),
         test.case "empty list"  $( test.true! (trip []) ),
-        test.case "array"       $( test.true! (trip (array_of_list [1, 2])) ),
+        test.case "array"       $( test.true! (trip (_array_of_list [1, 2])) ),
         test.case "map"         $( test.true! (trip %{ "a" => 1, "b" => 2 }) ),
         test.case "empty map"   $( test.true! (trip %{}) ),
 
         // the kinds stay apart, which is the whole reason for this format
         test.case "an array does not come back a list"
-            $( test.eq! :array (type_of (result.or_else () (decode (encode (array_of_list [1]))))) ),
+            $( test.eq! :array (type_of (result.or_else () (decode (encode (_array_of_list [1]))))) ),
         test.case "an atom does not come back a string"
             $( test.eq! :atom (type_of (result.or_else () (decode (encode :ok)))) ),
         test.case "an integer does not come back a float"
@@ -424,37 +424,37 @@ when test {
 
         // a message that is wrong is an answer, not a raise
         test.case "empty input"     $( test.true! (result.is_error (decode "")) ),
-        test.case "an unknown tag"  $( test.true! (result.is_error (decode (str_of_bytes [99]))) ),
+        test.case "an unknown tag"  $( test.true! (result.is_error (decode (_str_of_bytes [99]))) ),
         test.case "a truncated integer"
-            $( test.true! (result.is_error (decode (str_slice (encode 42) 0 5))) ),
+            $( test.true! (result.is_error (decode (_str_slice (encode 42) 0 5))) ),
         test.case "a truncated string"
-            $( test.true! (result.is_error (decode (str_slice (encode "hello") 0 6))) ),
+            $( test.true! (result.is_error (decode (_str_slice (encode "hello") 0 6))) ),
         test.case "a truncated list"
-            $( test.true! (result.is_error (decode (str_slice (encode [1, 2]) 0 7))) ),
+            $( test.true! (result.is_error (decode (_str_slice (encode [1, 2]) 0 7))) ),
         test.case "trailing bytes"
             $( test.true! (result.is_error (decode (encode 1 + encode 2))) ),
         test.case "an integer too large for this runtime"
             $( test.true! (result.is_error
-                   (decode (str_concat [str_of_bytes [3], str_le 0 4,
-                                             str_of_bytes [0, 0, 0, 128]]))) ),
+                   (decode (_str_concat [_str_of_bytes [3], _str_le 0 4,
+                                             _str_of_bytes [0, 0, 0, 128]]))) ),
         test.case "a name this program has no atom for"
             $( test.true! (result.is_error
-                   (decode (str_concat [str_of_bytes [6], str_le 3 4, "zzq"]))) ),
+                   (decode (_str_concat [_str_of_bytes [6], _str_le 3 4, "zzq"]))) ),
 
         // the VM's codec is this module's, byte for byte
         test.case "the VM writes what the walk above writes"
             $( test.eq! [] (list.filter (fn v -> encode v != encode_value v)
                                         [(), true, 0 - 1, 4611686018427387903, 2.5, 'λ', "s", :ok, [1, [2]],
-                                         array_of_list [1, "x"], %{ :b => 1, :a => [2], "k" => %{ 3 => () } },
+                                         _array_of_list [1, "x"], %{ :b => 1, :a => [2], "k" => %{ 3 => () } },
                                          %{ 1.5 => :f, 'c' => :c, true => :t }, [], %{}]) ),
         test.case "and reads what the reader above reads"
             $( test.eq! [] (list.filter (fn v -> decode (encode_value v) != decode_by_hand (encode_value v))
-                                        [(), 7, "s", :ok, [1, [2, 3]], array_of_list [4], %{ "a" => [:b] }, 'z']) ),
+                                        [(), 7, "s", :ok, [1, [2, 3]], _array_of_list [4], %{ "a" => [:b] }, 'z']) ),
         test.case "and refuses what it refuses"
             $( test.eq! [true, true, true, true]
                         (list.map (fn t -> result.is_error (decode t) && result.is_error (decode_by_hand t))
-                                  ["", str_of_bytes [99], encode 1 + encode 2,
-                                   str_concat [str_of_bytes [6], str_le 3 4, "zzq"]]) ),
+                                  ["", _str_of_bytes [99], encode 1 + encode 2,
+                                   _str_concat [_str_of_bytes [6], _str_le 3 4, "zzq"]]) ),
 
         // decode_or, from std.codec
         test.case "decode_or on a bad message" $( test.eq! :fallback (decode_or :fallback "!") ),
@@ -468,17 +468,17 @@ when test {
         test.case "a frame leaves nothing over"
             $( test.eq! "" (list.nth 1 (next_frame (frame 42))) ),
         test.case "half a frame is not an answer"
-            $( test.eq! () (next_frame (str_slice (frame 42) 0 3)) ),
+            $( test.eq! () (next_frame (_str_slice (frame 42) 0 3)) ),
         test.case "half a body is not an answer either"
-            $( test.eq! () (next_frame (str_slice (frame "hello") 0 8)) ),
+            $( test.eq! () (next_frame (_str_slice (frame "hello") 0 8)) ),
         test.case "two frames come back in order"
             $( test.eq! [[:ok, 1], [:ok, :two]] (list.nth 0 (frames (frame_all [1, :two]))) ),
         test.case "a partial frame is left for later"
-            $( test.eq! 3 (len (list.nth 1 (frames (frame 1 + str_slice (frame 2) 0 3)))) ),
+            $( test.eq! 3 (len (list.nth 1 (frames (frame 1 + _str_slice (frame 2) 0 3)))) ),
         test.case "a frame whose body is nonsense still says where the next one starts"
             $( test.eq! [:ok, 9]
-                        (list.nth 1 (list.nth 0 (frames (str_concat
-                            [str_le 1 4, str_of_bytes [99], frame 9])))) ),
+                        (list.nth 1 (list.nth 0 (frames (_str_concat
+                            [_str_le 1 4, _str_of_bytes [99], frame 9])))) ),
         test.case "nothing at all frames to nothing"
             $( test.eq! [[], ""] (frames "") ),
         test.case "frame_all of nothing is nothing"

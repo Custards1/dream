@@ -42,6 +42,8 @@ import dreams.repl;
 import dreams.scope;
 import dreams.target;
 import dreams.typecheck;
+import std.map;
+import std.num;
 
 let version = "0.1.0";
 
@@ -270,7 +272,7 @@ let copy_payload! out path n =
 /// name, and a `$` would start a variable.
 let make_escaped : :string -> :string;
 let make_escaped p =
-    str_concat (list.map (fn c -> match c { ' ' => "\\ ", '#' => "\\#", '$' => "$$", _ => str_of_chars [c] })
+    str.concat_all (list.map (fn c -> match c { ' ' => "\\ ", '#' => "\\#", '$' => "$$", _ => str.of_chars [c] })
                          (str.chars p));
 
 /// Every file the build read: each source file, each package manifest on the
@@ -499,7 +501,7 @@ let show_time! o file = {
     // hand, since the lowering has to be kept whole for `share` below.
     let before_lower = os.monotonic! ();
     let low = if parted { lower.link_parallel! l r (compile.Options.units co) } else { lower.link! l r };
-    strict! (map_remove low :image)
+    strict! (map.remove low :image)
     // Read as a statement: a list element is suspended, and a clock read
     // inside one would be read when the row is printed.
     let lower_ms = os.monotonic! () - before_lower;
@@ -651,7 +653,7 @@ let is_name_byte b =
 let name_start src offset = {
     let rec back i =
         if i <= 0 { 0 }
-        else if is_name_byte (str_byte src (i - 1)) { back (i - 1) }
+        else if is_name_byte (str.byte (i - 1) src) { back (i - 1) }
         else { i };
     back offset
 };
@@ -660,7 +662,7 @@ let name_start src offset = {
 let name_at src at = {
     let rec forward i =
         if i >= str.byte_length src { i }
-        else if is_name_byte (str_byte src i) { forward (i + 1) }
+        else if is_name_byte (str.byte i src) { forward (i + 1) }
         else { i };
     str.slice at (forward at - at) src
 };
@@ -758,7 +760,7 @@ let parse_position text = {
     let parts = str.split ":" text;
     if list.length parts != 2 { () }
     else {
-        match [parse_int (list.nth 0 parts), parse_int (list.nth 1 parts)] {
+        match [num.parse_int (list.nth 0 parts), num.parse_int (list.nth 1 parts)] {
             [(), _] => (),
             [_, ()] => (),
             both => both,
@@ -885,7 +887,7 @@ let usage! () = {
         "  -I, --include DIR        a directory to search for modules",
         "  --host-module PATH       treat PATH as provided by the host",
         "  --payload [NAME=]FILE    put FILE's bytes in the image, reachable as",
-        "                           `data_at N` in the order given; NAME (FILE's",
+        "                           `payload.at N` in the order given; NAME (FILE's",
         "                           own name by default) is how `std.foreign`",
         "                           finds a library carried this way",
         "",

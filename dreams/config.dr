@@ -17,6 +17,7 @@
 import std.list;
 import std.os;
 import std.str;
+import std.map;
 
 // --- the configuration ------------------------------------------------------
 //
@@ -100,10 +101,10 @@ let with_aliases aliases known c = {
     let named = Configuration.set_aliases c aliases;
     let refiled = list.fold (fn m [k, table] -> {
         let to = canonical named k;
-        m.[to => list.fold (fn t [n, v] -> t.[n => v]) (m.[to else (%{})]) (map_pairs table)]
-    }) (%{}) (map_pairs (scoped c));
+        m.[to => list.fold (fn t [n, v] -> t.[n => v]) (m.[to else (%{})]) (map.pairs table)]
+    }) (%{}) (map.pairs (scoped c));
     [Configuration.set_scoped named refiled,
-     list.filter (fn k -> not (known k)) (list.map (fn [k, _] -> k) (map_pairs (scoped c)))]
+     list.filter (fn k -> not (known k)) (list.map (fn [k, _] -> k) (map.pairs (scoped c)))]
 };
 
 /// A package option as a condition reads it: `[:ok, value]` when the name is
@@ -135,7 +136,7 @@ let rec define_args args c =
         [a, ..rest] => define_args rest (define_arg a c),
     };
 
-let is_defined name c = map_has (flags c) name;
+let is_defined name c = map.has (flags c) name;
 
 /// The value of a setting, or `()` when it has none.
 let value key c = ((values c)).[key else ()];
@@ -172,7 +173,7 @@ let rec eval c cond =
         [:flag, name]   => match option c name {
             [:ok, v] => v != () && v != "false",
             // A setting that has a value counts as defined.
-            _ => is_defined name c || map_has (values c) name,
+            _ => is_defined name c || map.has (values c) name,
         },
         [:equals, k, v] => match option c k {
             [:ok, found] => found == v,
@@ -209,13 +210,13 @@ let rec reads cond =
 /// Every flag and setting, one per line, sorted -- what `--print-cfg` shows.
 /// Settings are quoted so that a value with a space in it still reads as one.
 let describe c = {
-    let named = list.map (fn [name, _] -> name) (map_pairs (flags c));
+    let named = list.map (fn [name, _] -> name) (map.pairs (flags c));
     let valued = list.map (fn [name, value] -> name + " = \"" + value + "\"")
-                          (map_pairs (values c));
+                          (map.pairs (values c));
     // Each package's options under its name, after the program's settings.
     let options = list.sort (list.flat_map (fn [key, table] ->
-        list.map (fn [name, value] -> key + ":" + name + " = \"" + value + "\"") (map_pairs table))
-        (map_pairs (scoped c)));
+        list.map (fn [name, value] -> key + ":" + name + " = \"" + value + "\"") (map.pairs table))
+        (map.pairs (scoped c)));
     list.append (list.sort (list.append named valued)) options
 };
 

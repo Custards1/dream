@@ -1,4 +1,4 @@
-// `to_existing_atom` -- the one direction there is between a string and
+// `_to_existing_atom` -- the one direction there is between a string and
 // an atom, and why there is only the one.
 //
 // An atom is an index into a table the runtime never shrinks: every atom value
@@ -30,27 +30,27 @@ let written = [:ok, :error, :pending];
 /// is what `Analyzer::carried` is for.
 let rec found s i n acc =
     if i >= n { acc }
-    else { found s (i + 1) n (acc + if to_existing_atom s == () { 0 } else { 1 }) };
+    else { found s (i + 1) n (acc + if _to_existing_atom s == () { 0 } else { 1 }) };
 
 let main! = {
     show! "the atoms this program writes -> " written
 
-    show! "a name it writes -> " (to_existing_atom "ok")
-    show! "  and it is that very atom -> " (to_existing_atom "ok" == :ok)
-    show! "another of them -> " (to_existing_atom "pending")
-    show! "one written nowhere -> " (to_existing_atom "no_such_atom_here")
-    show! "the empty name -> " (to_existing_atom "")
+    show! "a name it writes -> " (_to_existing_atom "ok")
+    show! "  and it is that very atom -> " (_to_existing_atom "ok" == :ok)
+    show! "another of them -> " (_to_existing_atom "pending")
+    show! "one written nowhere -> " (_to_existing_atom "no_such_atom_here")
+    show! "the empty name -> " (_to_existing_atom "")
 
     // Asking is not interning: the name it was not given stays absent, which
     // is the whole guarantee this function exists to make.
-    show! "asking did not create it -> " (to_existing_atom "no_such_atom_here")
+    show! "asking did not create it -> " (_to_existing_atom "no_such_atom_here")
 
     // Built while the program runs rather than written as a literal, so the
     // lookup is over bytes and not over something the compiler resolved.
-    show! "a name built at run time -> " (to_existing_atom (str_slice "okay" 0 2))
+    show! "a name built at run time -> " (_to_existing_atom (_str_slice "okay" 0 2))
 
-    show! "not a string -> " (try! { to_existing_atom 5 } catch e { e })
-    show! "an atom is not a name -> " (try! { to_existing_atom :ok } catch e { e })
+    show! "not a string -> " (try! { _to_existing_atom 5 } catch e { e })
+    show! "an atom is not a name -> " (try! { _to_existing_atom :ok } catch e { e })
 
     show! "found 100000 times -> " (found "error" 0 100000 0)
     show! "missed 100000 times -> " (found "no_such_atom_here" 0 100000 0)

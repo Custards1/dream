@@ -377,11 +377,11 @@ payload must satisfy `PAYL.offset + 8 + byte_length <= file size`.
 
 **No opcode names it.** The payload is a host-level feature: nothing in `NODE`,
 `KIDS`, `FUNC` or `KSTR` points at it. A program reaches it through the
-primitives `data_count` and `data_at` (see [builtins.md](builtins.md)),
+primitives `_data_count` and `_data_at` (see [builtins.md](builtins.md)),
 which is what keeps the addition additive — the format needed no new opcode and
 no wider index.
 
-**What a reader hands back.** `data_at i` is O(1) and copies nothing: it is a
+**What a reader hands back.** `_data_at i` (`payload.at i` in `std`) is O(1) and copies nothing: it is a
 length and a pointer into the mapping. The reference VM materializes it as a
 `BigStrObj`, which the collector treats as an atom object — no internal
 references — so promotion is a byte copy and a `spawn!` heap copy shares the
@@ -441,43 +441,47 @@ the machine rather than forcing on the C++ stack. The JIT shares these handlers
 and strictness rules. Opcodes 44–46 implement lazy cons construction, tail
 selection, and the empty-list predicate directly.
 
-The former core functions are builtin IDs 16–49, appended in this order:
+The former core functions are builtin IDs 16–49, appended in this order.
+All but `compare` are now spelled with a leading `_`, which marks a primitive
+`std` wraps (see [builtins.md](builtins.md#runtime-primitives)). An image names
+a builtin by ID and never by spelling, so the rename changed no ID and an image
+written before it runs unchanged:
 
 | ID | Name |
 |---:|------|
-| 16 | `list_tail` |
-| 17 | `list_cons` |
-| 18 | `list_is_empty` |
-| 19 | `str_chars` |
-| 20 | `str_of_chars` |
-| 21 | `str_of_bytes` |
-| 22 | `str_concat` |
-| 23 | `error_new` |
-| 24 | `error_kind` |
-| 25 | `error_payload` |
-| 26 | `str_slice` |
-| 27 | `str_find` |
-| 28 | `str_byte` |
-| 29 | `str_le` |
-| 30 | `str_span` |
-| 31 | `str_upto` |
-| 32 | `char_code` |
-| 33 | `char_of_code` |
-| 34 | `to_float` |
-| 35 | `float_bytes` |
-| 36 | `float_of_bytes` |
-| 37 | `to_int` |
-| 38 | `parse_int` |
-| 39 | `parse_float` |
-| 40 | `to_existing_atom` |
-| 41 | `array_new` |
-| 42 | `array_of_list` |
-| 43 | `array_to_list` |
-| 44 | `map_has` |
-| 45 | `map_remove` |
-| 46 | `map_pairs` |
-| 47 | `data_count` |
-| 48 | `data_at` |
+| 16 | `_list_tail` |
+| 17 | `_list_cons` |
+| 18 | `_list_is_empty` |
+| 19 | `_str_chars` |
+| 20 | `_str_of_chars` |
+| 21 | `_str_of_bytes` |
+| 22 | `_str_concat` |
+| 23 | `_error_new` |
+| 24 | `_error_kind` |
+| 25 | `_error_payload` |
+| 26 | `_str_slice` |
+| 27 | `_str_find` |
+| 28 | `_str_byte` |
+| 29 | `_str_le` |
+| 30 | `_str_span` |
+| 31 | `_str_upto` |
+| 32 | `_char_code` |
+| 33 | `_char_of_code` |
+| 34 | `_to_float` |
+| 35 | `_float_bytes` |
+| 36 | `_float_of_bytes` |
+| 37 | `_to_int` |
+| 38 | `_parse_int` |
+| 39 | `_parse_float` |
+| 40 | `_to_existing_atom` |
+| 41 | `_array_new` |
+| 42 | `_array_of_list` |
+| 43 | `_array_to_list` |
+| 44 | `_map_has` |
+| 45 | `_map_remove` |
+| 46 | `_map_pairs` |
+| 47 | `_data_count` |
+| 48 | `_data_at` |
 | 49 | `compare` |
 
 Images importing the removed `std.core` or `std.native` modules must be recompiled.

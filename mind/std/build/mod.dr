@@ -433,7 +433,7 @@ priv let table_conflicts t =
     list.flat_map (fn pair -> match list.nth 1 pair {
         [:conflict, kind, name] => ["two " + kind + "s are called `" + name + "`"],
         _ => [],
-    }) (map_pairs t);
+    }) (_map_pairs t);
 
 /// Several plans as one. Merging is a union, and a name two of them give
 /// different things to is a conflict rather than one silently winning.
@@ -500,7 +500,7 @@ let write name text =
 /// the step that could change what it makes.
 let keyed : :any -> :any;
 let rec keyed v = match v {
-    [:artifact, s, n] if type_of s == :map && map_has s :shape => [:artifact, Step.shape s, n],
+    [:artifact, s, n] if type_of s == :map && _map_has s :shape => [:artifact, Step.shape s, n],
     _ => match type_of v {
         :list => list.map keyed v,
         :map => map.map_values keyed v,
@@ -519,8 +519,8 @@ let rec is_data v = match type_of v {
     :module => false,
     :error => false,
     :list => list.all is_data v,
-    :array => list.all is_data (array_to_list v),
-    :map => list.all (fn pair -> is_data (list.head pair) && is_data (list.nth 1 pair)) (map_pairs v),
+    :array => list.all is_data (_array_to_list v),
+    :map => list.all (fn pair -> is_data (list.head pair) && is_data (list.nth 1 pair)) (_map_pairs v),
     _ => true,
 };
 
@@ -534,14 +534,14 @@ let rec encode v = match type_of v {
     :bigstr => "s" + to_string (str.byte_length v) + ":" + v,
     :integer => "i" + to_string v + ";",
     :float => "f" + to_string v + ";",
-    :char => "c" + to_string (char_code v) + ";",
+    :char => "c" + to_string (_char_code v) + ";",
     :atom => "a" + to_string v + ";",
     :bool => if v { "T" } else { "F" },
     :unit => "U",
     :list => "[" + str.join_str "" (list.map encode v) + "]",
-    :array => "#[" + str.join_str "" (list.map encode (array_to_list v)) + "]",
+    :array => "#[" + str.join_str "" (list.map encode (_array_to_list v)) + "]",
     :map => "{" + str.join_str "" (list.map (fn pair -> encode (list.head pair) + encode (list.nth 1 pair))
-                                            (list.sort_on list.head (map_pairs v))) + "}",
+                                            (list.sort_on list.head (_map_pairs v))) + "}",
     other => "?" + to_string other + ";",
 };
 

@@ -132,14 +132,14 @@ virtual let decode text;
 
 /// A map's pairs in a settled order.
 ///
-/// `map_pairs` answers in whatever order the trie happens to walk, which
+/// `_map_pairs` answers in whatever order the trie happens to walk, which
 /// depends on the hashes and not on the program -- so the same map could encode
 /// two ways in one run, and two programs that agree about a value would
 /// disagree about its bytes. A map's keys are flat values and `compare`
 /// totally orders those, so one sort buys an encoding that is a function of the
 /// value alone: comparable, hashable, cacheable, and testable.
 let map_entries : :map -> [[:any, :any]];
-let map_entries m = list.sort_on (fn p -> list.nth 0 p) (map_pairs m);
+let map_entries m = list.sort_on (fn p -> list.nth 0 p) (_map_pairs m);
 
 /// The value, in this format, wherever it stands.
 ///
@@ -156,7 +156,7 @@ let rec encode_value v = match type_of v {
     :string  => write_string v,
     :atom    => write_atom v,
     :list    => write_list (list.map encode_value v),
-    :array   => write_array (list.map encode_value (array_to_list v)),
+    :array   => write_array (list.map encode_value (_array_to_list v)),
     :map     => write_map (map_entries v),
     _        => write_opaque v,
 };
@@ -223,13 +223,13 @@ let frame_header = 4;
 let frame : :any -> :string;
 let frame v = {
     let body = encode v;
-    str_concat [str_le (len body) frame_header, body]
+    _str_concat [_str_le (len body) frame_header, body]
 };
 
 /// Every value, each as its own message, back to back. A batch is bytes that
 /// can be split again, not a bigger message.
 let frame_all : [:any] -> :string;
-let frame_all vs = str_concat (list.map frame vs);
+let frame_all vs = _str_concat (list.map frame vs);
 
 /// The length of the message whose prefix is at the front of `buf`, or `-1`
 /// when `buf` does not yet hold a whole prefix.
@@ -248,10 +248,10 @@ let frame_size : :string -> :integer;
 let frame_size buf =
     if len buf < frame_header { 0 - 1 }
     else {
-        str_byte buf 0
-        + str_byte buf 1 * 256
-        + str_byte buf 2 * 65536
-        + str_byte buf 3 * 16777216
+        _str_byte buf 0
+        + _str_byte buf 1 * 256
+        + _str_byte buf 2 * 65536
+        + _str_byte buf 3 * 16777216
     };
 
 /// The first whole message in `buf` and what follows it: `[result, rest]`,
@@ -272,8 +272,8 @@ let next_frame buf = {
         let total = frame_header + size;
         if have < total { () }
         else {
-            [decode (str_slice buf frame_header size),
-             str_slice buf total (have - total)]
+            [decode (_str_slice buf frame_header size),
+             _str_slice buf total (have - total)]
         }
     }
 };
@@ -281,7 +281,7 @@ let next_frame buf = {
 priv let frames_from : [Decoded :any] -> :string -> [[Decoded :any], :string];
 priv let rec frames_from acc buf = match next_frame buf {
     ()        => [list.reverse acc, buf],
-    [r, rest] => frames_from (list_cons r acc) rest,
+    [r, rest] => frames_from (_list_cons r acc) rest,
 };
 
 /// Every whole message in `buf`, and the bytes left over: `[results, rest]`.

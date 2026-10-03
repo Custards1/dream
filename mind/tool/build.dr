@@ -23,6 +23,7 @@ import lock;
 import manifest;
 import script;
 import util;
+import std.map;
 
 // --- the dependency graph ------------------------------------------------------
 //
@@ -90,7 +91,7 @@ let rec build_graphs g =
     list.concat (list.map (fn pair -> {
         let [owner, sub] = pair;
         list.cons [owner, sub] (build_graphs sub)
-    }) (map_pairs (g.[:builds else (%{})])));
+    }) (map.pairs (g.[:builds else (%{})])));
 
 let with_build_graph key sub g = g.[:builds => (g.[:builds else (%{})]).[key => sub]];
 
@@ -281,7 +282,7 @@ let edge_on! owner owner_key d g =
                 let reads = list.fold (fn m n -> m.[n => option_read! owner g n]) (%{}) (config.names cond);
                 let option n = match reads.[n else ()] { () => (), r => [:ok, list.nth 2 r] };
                 let kept = g.[:reads => list.append (g.[:reads else []])
-                                                    (list.filter (fn r -> r != ()) (list.map (fn [_, r] -> r) (map_pairs reads)))];
+                                                    (list.filter (fn r -> r != ()) (list.map (fn [_, r] -> r) (map.pairs reads)))];
                 if config.holds option (g.[:settings else (%{})]) cond { [:on, kept] }
                 else { [:off, kept.[:off => list.cons [owner_key, manifest.dep_name d] (kept.[:off else []])]] }
             },
@@ -492,7 +493,7 @@ let by_dir! m g values =
         let abs = if key == root_key { util.absolute! (manifest.root m) }
                   else { node_abs (node g key) };
         acc.[abs => vs]
-    }) (%{}) (map_pairs values);
+    }) (%{}) (map.pairs values);
 
 // --- settling the options -------------------------------------------------------
 //
@@ -586,7 +587,7 @@ let settle! m o g = {
      list.concat (list.cons stray (list.map (fn s -> list.nth 2 s) settled))]
 };
 
-let map_is_empty m = list.is_empty (map_pairs m);
+let map_is_empty m = list.is_empty (map.pairs m);
 
 /// One package: `[key, values, errors]`. `at` says where a package's
 /// manifest is.
@@ -606,7 +607,7 @@ let settle_one m o packages at key pm addressed = {
                 [:error, why] => [vs, list.append errs [why + " (" + from + ")"]],
             },
         };
-    let entries table from = list.map (fn [n, v] -> [n, v, from]) (map_pairs table);
+    let entries table from = list.map (fn [n, v] -> [n, v, from]) (map.pairs table);
     let configured_by sk sm =
         list.flat_map (fn [ck, table] -> if addressed ck { entries table ("[config." + ck + "] in " + at sk) } else { [] })
                       (manifest.configs sm);
@@ -672,7 +673,7 @@ let rec lock_entries! g section name =
         list.concat (list.map (fn pair -> {
             let [owner, sub] = pair;
             lock_entries! sub (script_section section owner name) name
-        }) (map_pairs (g.[:builds else (%{})]))),
+        }) (map.pairs (g.[:builds else (%{})]))),
     ];
 
 /// What to say about packages that moved under the lock.
@@ -949,12 +950,22 @@ let scripted! m o g = {
                             }) (nodes g)))
 };
 
+/// The `Target` field a name spells. Every value is written out, which is what
+/// the field's type asks for -- and a name that is not one of them is refused
+/// by the compiler before a script could act on it, so `:unknown` is never
+/// what a build goes on to use.
+let os_atom : :string -> (:linux | :macos | :windows | :unknown);
+let os_atom name = match name { "linux" => :linux, "macos" => :macos, "windows" => :windows, _ => :unknown };
+
+let arch_atom : :string -> (:x86_64 | :aarch64 | :unknown);
+let arch_atom name = match name { "x86_64" => :x86_64, "aarch64" => :aarch64, _ => :unknown };
+
 /// A single `--target` naming one system and one architecture, as the target
 /// a script is told it is building for; `()` otherwise, and the script is
 /// told the host.
 let script_target o m = match targets m o {
     [one] => match target_sides one {
-        [[os_name], [arch_name]] => Target.make (to_existing_atom os_name) (to_existing_atom arch_name),
+        [[os_name], [arch_name]] => Target.make (os_atom os_name) (arch_atom arch_name),
         _ => (),
     },
     _ => (),
@@ -983,7 +994,7 @@ let checks! m o =
             [] => [:ok, []],
             own => match script.run_all! (script_setting! m (with_option :testing true o) g) own {
                 [:error, why] => [:error, why],
-                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map_pairs (Outcome.checks outcome))],
+                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map.pairs (Outcome.checks outcome))],
                 [:ok, []] => [:ok, []],
             },
         },
@@ -998,7 +1009,7 @@ let goals! m o names =
             [] => [:error, "`" + manifest.name m + "` has no build script, so it has no goals"],
             own => match script.run_all! (script_setting! m (with_option :goals names o) g) own {
                 [:error, why] => [:error, why],
-                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map_pairs (Outcome.goals outcome))],
+                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map.pairs (Outcome.goals outcome))],
                 [:ok, []] => [:ok, []],
             },
         },
@@ -1110,8 +1121,8 @@ let setting_args m o g =
         repeated "-D" (program_defines m o),
         repeated "-D" (list.flat_map (fn [key, vs] -> {
             let scope = if key == root_key { manifest.name m } else { key };
-            list.map (fn [n, v] -> scope + ":" + n + "=" + config.shown v) (map_pairs vs)
-        }) (map_pairs (g.[:options else (%{})]))),
+            list.map (fn [n, v] -> scope + ":" + n + "=" + config.shown v) (map.pairs vs)
+        }) (map.pairs (g.[:options else (%{})]))),
         repeated "--target" (targets m o),
     ];
 

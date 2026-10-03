@@ -7,6 +7,7 @@
 
 import std.agent;
 import std.array;
+import std.atom;
 import std.build;
 import std.build.cc;
 import std.build.cc.cmake;
@@ -20,6 +21,7 @@ import std.build.fetch;
 import std.build.probe;
 import std.build.run;
 import std.build.tool;
+import std.char;
 import std.cli;
 import std.codec;
 
@@ -29,6 +31,8 @@ import std.foreign;
 import std.json;
 import std.list;
 import std.map;
+import std.num;
+import std.payload;
 import std.macros;
 import std.proc;
 import std.record;
@@ -51,12 +55,12 @@ let version = "0.1.0";
 
 /// The modules this build provides.
 let modules : [:string];
-let modules = ["std.agent", "std.array", "std.build", "std.build.cc", "std.build.cc.cmake",
+let modules = ["std.agent", "std.array", "std.atom", "std.build", "std.build.cc", "std.build.cc.cmake",
                "std.build.cc.gnu", "std.build.cc.msvc", "std.build.cc.steps", "std.build.check",
                "std.build.command", "std.build.dream", "std.build.fetch", "std.build.probe",
-               "std.build.run", "std.build.tool", "std.cli",
+               "std.build.run", "std.build.tool", "std.char", "std.cli",
                "std.codec", "std.error", "std.file", "std.json", "std.list",
-               "std.map", "std.macros", "std.proc", "std.record", "std.registry", "std.remote",
+               "std.map", "std.macros", "std.num", "std.payload", "std.proc", "std.record", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.str", "std.streams",
                "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];
 
@@ -144,7 +148,7 @@ when test {
         test.case "the right shape fits"    $( test.true! (User.fits ada) ),
         test.case "a named map fits"        $( test.true! (User.fits (User.to_map ada)) ),
         test.case "a JSON object fits"      $( test.true! (User.fits %{ "name" => "a", "age" => 1 }) ),
-        test.case "the wrong length does not" $( test.false! (User.fits (array_of_list [1])) ),
+        test.case "the wrong length does not" $( test.false! (User.fits (_array_of_list [1])) ),
         test.case "a missing member does not" $( test.false! (User.fits %{ "name" => "a" }) ),
         test.case "a number is not a record"  $( test.false! (User.fits 1) ),
 
@@ -209,7 +213,7 @@ when test {
         test.case "result validation preserves an existing error" $( test.eq! [:error, "original"]
             (result.validate_ok :integer [:error, "original"]) ),
         test.case "typed errors remain inspectable values" $( test.true!
-            (types.accepts (error.OfKind :type_error) (error_new :type_error :integer)) ),
+            (types.accepts (error.OfKind :type_error) (_error_new :type_error :integer)) ),
         test.case "compile time option schemas are reusable runtime data" $( test.eq! "fast"
             (cli.get "" (result.unwrap! compiled_options) "mode") ),
         test.case "derived option schemas keep optional fields optional" $( test.true!

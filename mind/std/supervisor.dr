@@ -136,7 +136,7 @@ let default_limits = limits 5 5000;
 /// The restart times inside the window, newest first, with `now` added.
 let recent : :integer -> :integer -> [:integer] -> [:integer];
 let recent window now times =
-    list_cons now (list.filter (fn t -> now - t < window) times);
+    _list_cons now (list.filter (fn t -> now - t < window) times);
 
 // --- the supervisor's own state -------------------------------------------------
 
@@ -181,7 +181,7 @@ let names_of s = list.map (fn c -> child_name c) (s_children s);
 let child_named : State -> :string -> :any;
 let child_named s name = {
     let hit = list.filter (fn c -> child_name c == name) (s_children s);
-    if list_is_empty hit { () } else { hit.[0] }
+    if _list_is_empty hit { () } else { hit.[0] }
 };
 
 // --- starting and watching ------------------------------------------------------

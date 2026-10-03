@@ -133,7 +133,7 @@ priv let unmoved! : :map -> :bool;
 priv let unmoved! recorded = list.all (fn [p, was] -> match io.stat! p {
     () => was == (),
     [size, modified, _] => was == [size, modified],
-}) (map_pairs recorded);
+}) (map.pairs recorded);
 
 // --- drivers ---------------------------------------------------------------------------
 //
@@ -327,7 +327,7 @@ priv let run_group! job = {
                     match [r.[:timed_out], r.[:code]] {
                         [true, _] => [:error, "the build scripts ran for longer than " + to_string (deadline_ms / 60000) + " minutes"],
                         [_, 0] => match wire.decode (match answer { () => "", t => t }) {
-                            [:ok, outcomes] if list.all (fn [_, o] -> types.accepts Outcome.type o) (map_pairs outcomes) => {
+                            [:ok, outcomes] if list.all (fn [_, o] -> types.accepts Outcome.type o) (map.pairs outcomes) => {
                                 strict! (list.map (fn [s, _, digest, record_file, record] -> {
                                     let sources = match list.any (fn [m, .._] -> Scripted.key m == Scripted.key s) moved {
                                         true => script_sources! setting s,
@@ -393,7 +393,7 @@ let target_arg t = {
 /// together: two packages embedding a payload under one name.
 let compile_args : [[:any]] -> :any;
 let compile_args outcomes = {
-    let payloads = list.flat_map (fn [key, o] -> list.map (fn [n, p] -> [n, p, key]) (map_pairs (Outcome.payloads o)))
+    let payloads = list.flat_map (fn [key, o] -> list.map (fn [n, p] -> [n, p, key]) (map.pairs (Outcome.payloads o)))
                                  outcomes;
     let clash = list.filter (fn [n, _, k] -> list.any (fn [n2, _, k2] -> n2 == n && k2 != k) payloads) payloads;
     match clash {
@@ -409,7 +409,7 @@ let compile_args outcomes = {
                 list.flat_map (fn [key, o] -> list.flat_map (fn [n, v] -> match v {
                     true => ["-D", key + ":" + n],
                     _ => ["-D", key + ":" + n + "=" + shown v],
-                }) (map_pairs (Outcome.defines o))) outcomes,
+                }) (map.pairs (Outcome.defines o))) outcomes,
                 list.flat_map (fn [_, o] -> list.flat_map (fn h -> ["--host-module", h]) (Outcome.hosts o)) outcomes,
                 match targets {
                     [] => [],

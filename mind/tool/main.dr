@@ -21,7 +21,9 @@ import std.cli;
 import std.console;
 
 import std.io;
+import std.num;
 import std.list;
+import std.map;
 import std.os;
 import std.proc;
 import std.str;
@@ -436,7 +438,7 @@ let cmd_options! m o = {
     let values = g.[:options else (%{})];
     let show! key dm = {
         let decls = build.declared dm;
-        match map_pairs decls {
+        match map.pairs decls {
             [] => (),
             pairs => {
                 console.print! (match key { "" => to_string (manifest.name m) + " (this project)", k => k })
@@ -453,7 +455,7 @@ let cmd_options! m o = {
     show! build.root_key m
     strict! (list.map (fn n -> match build.node_manifest n { () => (), dm => show! (build.node_key n) dm })
                       (build.nodes g))
-    if map_pairs values == [] { console.print! "no package in this build declares an option" }
+    if map.pairs values == [] { console.print! "no package in this build declares an option" }
     :ok
 };
 
@@ -585,7 +587,7 @@ let add_spec! source c = {
     match pins {
         [] => base,
         [p] => {
-            let unpinned = list.fold (fn acc k -> map_remove acc k) base ["tag", "branch", "rev"];
+            let unpinned = list.fold (fn acc k -> map.remove acc k) base ["tag", "branch", "rev"];
             unpinned.[p => cli.get () c p]
         },
         _ => fail! "give one of --tag, --branch or --rev",
@@ -762,7 +764,7 @@ let profile_of! c =
 let jobs_of! c =
     match cli.get () c "jobs" {
         () => (vm.scheduler! ()).[:workers else 1],
-        n => match parse_int n {
+        n => match num.parse_int n {
             j if j != () && j > 0 => j,
             _ => fail! ("-j wants a number of jobs, not `" + n + "`"),
         },

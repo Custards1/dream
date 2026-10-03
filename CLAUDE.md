@@ -29,11 +29,16 @@ the first thing to read before touching either. The same goes for
 describes: that is where the traps are written down, and where a comment's
 `see "Some title"` leads.
 
-There is no `std.core` any more. The primitives (`list_cons`, `str_slice`,
-`data_at`, ...) are plain builtins, declared in
+There is no `std.core` any more. The primitives (`_list_cons`, `_str_slice`,
+`_data_at`, ...) are plain builtins spelled with a leading `_`, declared in
 [dreams/builtins.dr](dreams/builtins.dr) and implemented in
-[dream/src/builtins.cpp](dream/src/builtins.cpp). Older notes still say
-`core.head` and the like; read that as the builtin.
+[dream/src/builtins.cpp](dream/src/builtins.cpp). They are `std`'s to call:
+everything else calls the `std` function that wraps each one (`list.cons`,
+`str.slice`, `payload.at`), which compiles to the same opcode, and naming a
+primitive outside `std` is a warning. The dozen language builtins -- `spawn!`,
+`strict!`, `to_string`, `len`, `compare` and the rest -- keep their names, as
+do native modules' members. Older notes still say `core.head`, `list_cons`
+and the like; read that as the builtin.
 
 ## Where this is going
 
@@ -355,7 +360,7 @@ The lessons that keep coming back:
   planned and not built.
 - `import std.tensor` gives **tensors**: packed numbers with a shape
   (`TensorObj`), on which `+ - * / %` are elementwise and `a @ b` is the
-  matrix product (the parser writes it as the builtin `tensor_matmul`).
+  matrix product (the parser writes it as the builtin `_tensor_matmul`).
   `tensor.gpu t` moves one to the GPU -- OpenCL, `dlopen`ed, so nothing to
   build against -- and everything done to it then runs there; `tensor.host`
   brings it back. Elementwise work on a large tensor is *deferred*: it

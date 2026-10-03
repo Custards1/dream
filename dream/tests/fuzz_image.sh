@@ -58,7 +58,7 @@ let main! = {
     console.print! "fac: " (fac 10)
     console.print! "tab: " (len table)
     console.print! "fun: " (pair 1 2 3)
-    console.print! "dat: " (len (data_at 0))
+    console.print! "dat: " (len (_data_at 0))
 }
 DREAM
 

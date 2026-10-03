@@ -120,11 +120,12 @@ let plan ctx =
 EOF
 cat >"$tmp/p/app/main.dr" <<'EOF'
 import std.console;
+import std.payload;
 import app.info;
 import lib.greet;
 import lib2.made;
 let main! = console.print! (info.made_for + " " + info.version + " " + greet.how + " "
-                            + info.greeting + " " + to_string (data_count ()) + " " + made.word);
+                            + info.greeting + " " + to_string (payload.count ()) + " " + made.word);
 EOF
 
 APP_GREETING=hi run p/app

@@ -1,7 +1,7 @@
 // Maps: the operations a hash trie makes cheap, named.
 //
 // Container syntax handles creation, lookup, and updates. The primitives
-// `map_has`, `map_remove`, and `map_pairs` expose the remaining trie operations.
+// `_map_has`, `_map_remove`, and `_map_pairs` expose the remaining trie operations.
 // This module builds higher-level operations from them.
 //
 // Two things are worth knowing before using any of it.
@@ -32,24 +32,24 @@ let from_pairs ps =
 
 /// The pairs of two maps, the second winning where they overlap.
 let merge : %{ k => v } -> %{ k => v } -> %{ k => v };
-let merge a b = list.fold_strict (fn m p -> m.[(list.nth 0 p) => (list.nth 1 p)]) a (map_pairs b);
+let merge a b = list.fold_strict (fn m p -> m.[(list.nth 0 p) => (list.nth 1 p)]) a (_map_pairs b);
 
 // --- looking ----------------------------------------------------------------
 
 let get : v -> %{ k => v } -> k -> v;
 let get default m k = m.[k else default];
 let has : %{ k => v } -> k -> :bool;
-let has m k = map_has m k;
+let has m k = _map_has m k;
 let pairs : %{ k => v } -> [[k, v]];
-let pairs m = map_pairs m;
+let pairs m = _map_pairs m;
 let keys : %{ k => v } -> [k];
-let keys m = list.map (fn p -> list.nth 0 p) (map_pairs m);
+let keys m = list.map (fn p -> list.nth 0 p) (_map_pairs m);
 let values : %{ k => v } -> [v];
-let values m = list.map (fn p -> list.nth 1 p) (map_pairs m);
+let values m = list.map (fn p -> list.nth 1 p) (_map_pairs m);
 let size : %{ k => v } -> :integer;
-let size m = list.length (map_pairs m);
+let size m = list.length (_map_pairs m);
 let is_empty : %{ k => v } -> :bool;
-let is_empty m = list.is_empty (map_pairs m);
+let is_empty m = list.is_empty (_map_pairs m);
 
 /// The keys in order. The only operation here that imposes one, and it costs a
 /// sort every time it is asked -- a map does not remember it.
@@ -61,7 +61,7 @@ let sorted_keys m = list.sort (keys m);
 let put : %{ k => v } -> k -> v -> %{ k => v };
 let put m k v = m.[k => v];
 let remove : %{ k => v } -> k -> %{ k => v };
-let remove m k = map_remove m k;
+let remove m k = _map_remove m k;
 
 /// Apply `f` to what is at `k`, or to `default` when nothing is:
 /// `update 0 (fn n -> n + 1) counts word` is the whole of counting.
@@ -70,11 +70,11 @@ let update default f m k = m.[k => (f (m.[k else default]))];
 
 /// Add only if the key is absent, so a fold over pairs keeps the first.
 let put_new : %{ k => v } -> k -> v -> %{ k => v };
-let put_new m k v = if map_has m k { m } else { m.[k => v] };
+let put_new m k v = if _map_has m k { m } else { m.[k => v] };
 
 let map_values : (v -> w) -> %{ k => v } -> %{ k => w };
 let map_values f m =
-    list.fold_strict (fn acc p -> acc.[(list.nth 0 p) => (f (list.nth 1 p))]) empty (map_pairs m);
+    list.fold_strict (fn acc p -> acc.[(list.nth 0 p) => (f (list.nth 1 p))]) empty (_map_pairs m);
 
 /// Keep the pairs `keep k v` answers true for.
 let filter : (k -> v -> :bool) -> %{ k => v } -> %{ k => v };
@@ -82,7 +82,7 @@ let filter keep m =
     list.fold_strict (fn acc p ->
         if keep (list.nth 0 p) (list.nth 1 p) { acc.[(list.nth 0 p) => (list.nth 1 p)] }
         else { acc })
-        empty (map_pairs m);
+        empty (_map_pairs m);
 
 /// Fold over the pairs. In trie order, so a fold whose answer depends on the
 /// order is a bug waiting for a different set of keys.
@@ -92,11 +92,11 @@ let filter keep m =
 /// a chain of every version of itself -- see "A lazy value stored in a map
 /// pins the map it was made in" in docs/notes/compiler-scaling.md.
 let fold : (a -> k -> v -> a) -> a -> %{ k => v } -> a;
-let fold f init m = list.fold_strict (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (map_pairs m);
+let fold f init m = list.fold_strict (fn acc p -> f acc (list.nth 0 p) (list.nth 1 p)) init (_map_pairs m);
 
 /// Every key of `m` that `other` does not have.
 let without : %{ k => v } -> %{ k => w } -> %{ k => v };
-let without m other = filter (fn k _ -> not (map_has other k)) m;
+let without m other = filter (fn k _ -> not (_map_has other k)) m;
 
 // --- sets, which are maps whose values say nothing ---------------------------
 //
@@ -108,7 +108,7 @@ let without m other = filter (fn k _ -> not (map_has other k)) m;
 let set_of : [a] -> %{ a => :bool };
 let set_of xs = list.fold_strict (fn m x -> m.[x => true]) empty xs;
 let member : %{ a => :bool } -> a -> :bool;
-let member s x = map_has s x;
+let member s x = _map_has s x;
 let add : %{ a => :bool } -> a -> %{ a => :bool };
 let add s x = s.[x => true];
 let members : %{ a => :bool } -> [a];

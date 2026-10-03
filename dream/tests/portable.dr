@@ -4,6 +4,7 @@ import std.io;
 import std.list;
 import std.net;
 import std.os;
+import std.str;
 
 let forever n = forever (n + 1);
 let main! = {
@@ -13,7 +14,7 @@ let main! = {
         ["timeout"] => console.print! (forever 0),
         [vm, image, file] => {
             console.print! (os.platform ())
-            let bytes = str_of_bytes [0, 10, 13, 26, 128, 255];
+            let bytes = str.of_bytes [0, 10, 13, 26, 128, 255];
             let out = io.open! file :write;
             io.write! out bytes
             io.close! out

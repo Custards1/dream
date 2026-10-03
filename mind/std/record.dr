@@ -88,7 +88,7 @@ virtual let record_name u = "record";
 /// -- a wrong `backing` breaks construction and leaves reading alone.
 let to_fields : :any -> [:any];
 virtual let to_fields self = match type_of self {
-    :array => array_to_list self,
+    :array => _array_to_list self,
     :map   => list.map (fn k -> self.[k else ()]) (fields ()),
     _      => self,
 };
@@ -100,7 +100,7 @@ virtual let to_fields self = match type_of self {
 /// express -- validating, defaulting, or renaming a field that moved.
 let of_fields : [:any] -> :any;
 virtual let of_fields values = match backing () {
-    :array => array_of_list values,
+    :array => _array_of_list values,
     :map   => map.from_pairs (list.zip (fields ()) values),
     _      => values,
 };
@@ -154,7 +154,7 @@ let fits : :any -> :bool;
 let fits v = match type_of v {
     :list  => list.length v == arity (),
     :array => len v == arity (),
-    :map   => list.all (fn k -> map_has v k || map_has v (text_of k)) (fields ()),
+    :map   => list.all (fn k -> _map_has v k || _map_has v (text_of k)) (fields ()),
     _      => false,
 };
 
@@ -191,7 +191,7 @@ let with_fields : :any -> :map -> :any;
 let with_fields self changes = {
     let pick p = {
         let k = list.nth 0 p;
-        if map_has changes k || map_has changes (text_of k) { value_of changes k }
+        if _map_has changes k || _map_has changes (text_of k) { value_of changes k }
         else { list.nth 1 p }
     };
     of_fields (list.map pick (list.zip (fields ()) (to_fields self)))

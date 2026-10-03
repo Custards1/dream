@@ -1,0 +1,24 @@
+// Payloads: the files an image carries.
+//
+// `dreams --payload [NAME=]FILE` puts a file's bytes in the image, and these
+// read them back in the order they were given. A payload is answered as a big
+// string -- a view of the bytes where the image was mapped, copied nowhere --
+// which `str.byte`, `str.slice`, `str.span` and `str.upto` read but nothing
+// that would decode it does. `std.foreign` is the main reader: it is how a C
+// library carried this way is found (`foreign.embedded`).
+
+/// How many payloads the image carries.
+let count : :unit -> :integer;
+let count u = _data_count u;
+
+/// The `i`th payload, counting from 0.
+let at : :integer -> :bigstr;
+let at i = _data_at i;
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "an image built for tests carries none" $( test.eq! 0 (count ()) ),
+    ];
+}
