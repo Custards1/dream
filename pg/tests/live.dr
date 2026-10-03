@@ -22,6 +22,7 @@ import pg.errors;
 import pg.pool;
 import pg.sql;
 import pg.value;
+import pg.tests.standard;
 import std.num;
 
 let port! : :unit -> :integer;
@@ -498,6 +499,7 @@ let pooled_tls! u = {
 };
 
 let main! = test.main_of! [
+    ["pg live: std.sql", standard.tests (as! "postgres" ())],
     ["pg live: logging in", [
         test.case "trust" $( login! "postgres" () ),
         test.case "cleartext password" $( login! "u_clear" "clearpass" ),

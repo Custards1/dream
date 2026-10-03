@@ -1401,6 +1401,8 @@ query used inside another is a parenthesized subquery.
 | Name | Description |
 |------|-------------|
 | `raw` · `param` · `literal` · `ident` · `col` | The pieces: text, a bound value, a value written into the text, a quoted name, a qualified name (`"t.c"`). |
+| `expand sql.query "SELECT .. {name} .."` · `expand sql.fragment` · `expand sql.script` | Templates checked at compile time. `{name}` binds a value, `{..name}` splices SQL. Plain literal statements are checked too; the shared lexer is `std.sql.lint`. |
+| `positional text values` | Turn `$1`-style SQL into a composable fragment, renumbered for the target dialect. |
 | `q text args` | SQL with `?` holes, each filled by a value (as a parameter) or a fragment/query (as SQL). `??` is a literal `?`. |
 | `concat` · `join sep` · `parens` | Put fragments together. |
 | `per_dialect f` | A fragment written differently for each dialect. |
@@ -1417,11 +1419,27 @@ query used inside another is a parenthesized subquery.
 | `exec! c x` · `query! c x` · `run! c x` · `first!` · `one!` · `scalar!` · `column!` · `query_as! description` | Run a statement: its effect, rows as maps by column name, the raw outcome, or one piece of it. |
 | `exec_many! c xs` | Many statements; a run of the same text is prepared once. |
 | `script! c text` · `transaction! c f` · `using! c f` · `close! c` · `traced f c` | Scripts, transactions (nested ones are savepoints), scoped connections, and a hook that sees each statement. |
+| `transaction_with! c options f` · `retrying! c attempts options f` · `serializable! c attempts f` | Isolation and read-only options, with bounded retries for serialization failures, deadlocks and lock contention. Retried callbacks may run more than once. |
+| `fold! c x batch f init` · `each! c x batch f` | Stream rows through a fold or effectful callback. SQLite steps natively; PostgreSQL reads portal batches. |
 | `migrate! c migrations` | Apply `[id, name, statements]` migrations the database has not seen, each in its own transaction. |
-| `fail!` · `is_sql_error` · `error_code` | A database's refusal: kind `:sql_error`, with a code that is `:unique`, `:foreign_key`, `:not_null`, `:check`, `:constraint`, `:busy`, ... wherever the driver can say so. |
-| `connection d state effects` · `no_rows` | For writing a driver: the effects are `:run`, and optionally `:run_many`, `:script` and `:close`. |
+| `fail!` · `fail_with!` · `is_sql_error` · `error_code` · `error_field` · `is_retryable` · `is_connection_lost` | A database's refusal: kind `:sql_error`, with a code that is `:unique`, `:foreign_key`, `:not_null`, `:check`, `:constraint`, `:busy`, ... wherever the driver can say so. |
+| `connection d state effects` · `no_rows` | For writing a driver: the effects are `:run`, `:close`, and optionally `:run_many`, `:script` and `:fold`. |
 
-`std.sql.sqlite` is the driver this library carries. It binds the system's
+Rows use atom keys for column names already present as atoms in the program,
+and string keys otherwise; `mapping` records can read them directly. In an
+insert, `()` asks for the column default; `sql.null` requests an explicit NULL.
+Other parameter positions still bind `()` as NULL. `sql.blob bytes` distinguishes
+binary data from text. PostgreSQL additionally accepts lists as arrays, maps as
+JSON, and atoms as their names; each dialect validates parameter kinds.
+
+`pg.driver` connects PostgreSQL to this API: `driver.open! target` takes a
+`pg.config` map, URL or keyword string, and `driver.wrap! conn` adapts an existing
+`pg.db` connection. It preserves SQLSTATE as `:state` and the original error as
+`:cause`, returns `bytea` as blobs, streams through portals, and prepares each
+run of equal SQL once for `exec_many!`. Use `RETURNING` for generated keys;
+PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../pg/README.md).
+
+`std.sql.sqlite` is the SQLite driver. It binds the system's
 libsqlite3 through `std.foreign`, and the library is found the way the platform's
 loader finds one (on Nix, `nix-shell` puts it on `LD_LIBRARY_PATH`).
 `sqlite.open! path`, `sqlite.memory! ()`, and `sqlite.open_with! path

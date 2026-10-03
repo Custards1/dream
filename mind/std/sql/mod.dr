@@ -49,7 +49,7 @@
 // run one many times, run a script, close. Everything else (`query!`,
 // `one!`, `scalar!`, `transaction!`, `migrate!`) is written here once, in
 // terms of those, so a driver is small and every driver gets all of it.
-// `std.sql.sqlite` is the driver this library carries.
+// `std.sql.sqlite` and `pg.driver` supply these effects.
 //
 // | SQL                | Dream                                     |
 // |--------------------|-------------------------------------------|
@@ -79,9 +79,10 @@ import std.sql.lint;
 
 // --- values -------------------------------------------------------------------
 
-/// What crosses to a database and back. A blob is tagged, because a Dream
-/// string is bytes either way and the database has to be told which it is.
-type Value = :unit | :integer | :float | :string | :bool | [:blob, :string];
+/// Parameter values; the dialect checks which kinds it accepts on render.
+/// A blob is tagged [:blob, bytes], because a string is bytes either way.
+/// PostgreSQL also accepts lists as arrays, maps as JSON, and atoms as names.
+type Value = :unit | :integer | :float | :string | :bool | :list | :map | :atom;
 
 /// Bytes, to be stored as a blob rather than as text.
 let blob : :string -> Value;
@@ -1429,7 +1430,8 @@ priv let column_sql d c = {
 
 type Connection = %{ :atom => :any };
 type Outcome = %{ :atom => :any };
-type Row = %{ :any => Value };
+// Drivers may decode database-specific types (JSON, arrays, custom types).
+type Row = %{ :any => :any };
 
 /// A connection, for a driver to answer from its `open!`.
 let connection : Dialect -> :any -> :map -> Connection;
@@ -1593,14 +1595,14 @@ let one! c x = match query! c x {
 };
 
 /// The first column of the first row, or `()`: `sql.scalar! db (sql.select [sql.count_all] |> sql.from "t")`.
-let scalar! : Connection -> Runnable -> Value;
+let scalar! : Connection -> Runnable -> :any;
 let scalar! c x = match (run! c x).[:rows] {
     [row, ..rest] => list.first_or () row,
     _ => (),
 };
 
 /// The first column of every row.
-let column! : Connection -> Runnable -> [Value];
+let column! : Connection -> Runnable -> [:any];
 let column! c x = list.map (fn row -> list.first_or () row) (run! c x).[:rows];
 
 /// Run many statements, and answer how many rows they changed between them.

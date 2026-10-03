@@ -1,0 +1,99 @@
+// The same public std.sql API used with PostgreSQL, in live.sh's cluster.
+import std.error;
+import std.list;
+import std.sql;
+import std.str;
+import std.test;
+import pg.driver;
+
+mapping Item { id : :integer, body : :string }
+
+let values! : :any -> :unit;
+let values! target = sql.using! (driver.open! target) (fn conn -> {
+    sql.script! conn "CREATE TEMP TABLE shared_items (id bigint PRIMARY KEY, body text DEFAULT 'default', payload bytea);"
+    sql.exec! conn (sql.insert_into "shared_items" |> sql.values %{ :id => 1, :body => (), :payload => sql.blob (str.of_bytes [0, 255, 65]) })
+    sql.exec! conn (sql.insert_into "shared_items" |> sql.values %{ :id => 2, :body => sql.null })
+    test.eq! ["default", ()] (sql.column! conn "SELECT body FROM shared_items ORDER BY id")
+    test.eq! (sql.blob (str.of_bytes [0, 255, 65])) (sql.scalar! conn "SELECT payload FROM shared_items WHERE id = 1")
+    test.eq! [sql.blob "a", ()] (sql.scalar! conn "SELECT ARRAY['a'::bytea, NULL]")
+    let id = 1;
+    let item = sql.one! conn (expand sql.query "SELECT id, body FROM shared_items WHERE id = {id}");
+    test.eq! "default" (Item.body item)
+    test.eq! [1, 2] (sql.scalar! conn (sql.q "SELECT ?::bigint[]" [[1, 2]]))
+    test.eq! %{ "n" => 7 } (sql.scalar! conn (sql.q "SELECT ?::jsonb" [%{ "n" => 7 }]))
+    test.eq! "active" (sql.scalar! conn (sql.q "SELECT ?::text" [:active]))
+    test.eq! [42, "x"] (list.head (sql.run! conn "SELECT 42 AS same, 'x' AS same").[:rows])
+    test.eq! 0 (sql.run! conn "SELECT 1").[:changes]
+    test.eq! 9 (sql.scalar! conn (sql.positional "SELECT $1 + $2" [4, 5]))
+    ()
+});
+
+let many! : :any -> :unit;
+let many! target = sql.using! (driver.open! target) (fn conn -> {
+    sql.exec! conn "CREATE TEMP TABLE shared_many (id bigint PRIMARY KEY, payload bytea)"
+    test.eq! 3 (sql.exec_many! conn (list.map (fn id -> sql.insert_into "shared_many" |> sql.values %{ :id => id, :payload => sql.blob "bytes" }) [1, 2, 3]))
+    test.eq! 0 (sql.exec_many! conn [])
+    test.eq! [sql.blob "bytes", sql.blob "bytes", sql.blob "bytes"] (sql.column! conn "SELECT payload FROM shared_many ORDER BY id")
+    // Return types with overloaded functions need the same OIDs as query!.
+    test.eq! 0 (sql.exec_many! conn [sql.q "SELECT generate_series(?, ?)" [1, 2], sql.q "SELECT generate_series(?, ?)" [3, 4]])
+    let e = try! { sql.exec_many! conn [sql.q "INSERT INTO shared_many (id) VALUES (?)" [4], sql.q "INSERT INTO shared_many (id) VALUES (?)" [1]] } catch e { e };
+    test.eq! :unique (sql.error_code e)
+    test.eq! 4 (sql.scalar! conn "SELECT count(*) FROM shared_many")
+    test.eq! 0 (sql.scalar! conn "SELECT count(*) FROM pg_prepared_statements WHERE name = ''")
+    ()
+});
+
+let streaming! : :any -> :unit;
+let streaming! target = sql.using! (driver.open! target) (fn conn -> {
+    test.eq! 500500 (sql.fold! conn "SELECT generate_series(1, 1000) AS id" 37 (fn acc row -> acc + Item.id row) 0)
+    test.eq! 0 (sql.fold! conn "SELECT 1 AS id WHERE false" 4 (fn acc row -> acc + 1) 0)
+    test.eq! 3 (sql.each! conn "SELECT 'a'::bytea AS payload FROM generate_series(1,3)" 1
+        (fn row -> test.eq! (sql.blob "a") row.[:payload]))
+    let e = try! {
+        sql.fold! conn "SELECT generate_series(1,100) AS id" 3
+            (fn acc row -> raise! (error.new :callback_failed row.[:id])) 0
+    } catch e { e };
+    test.eq! :callback_failed (error.kind e)
+    test.eq! 42 (sql.scalar! conn "SELECT 42")
+    // Also fail in the final, unsuspended batch.
+    let final = try! { sql.each! conn "SELECT 1 AS id" 10 (fn row -> raise! (error.new :last_batch ())) } catch e { e };
+    test.eq! :last_batch (error.kind final)
+    test.eq! 43 (sql.scalar! conn "SELECT 43")
+    let failed = try! { sql.fold! conn "SELECT 1 / 0 AS id" 2 (fn acc row -> acc + 1) 0 } catch e { e };
+    test.eq! "22012" (sql.error_field :state failed)
+    test.eq! 44 (sql.scalar! conn "SELECT 44")
+    ()
+});
+
+let transactions! : :any -> :unit;
+let transactions! target = sql.using! (driver.open! target) (fn conn -> {
+    sql.exec! conn "CREATE TEMP TABLE shared_tx (id bigint PRIMARY KEY)"
+    sql.transaction! conn (fn tx -> {
+        sql.exec! tx "INSERT INTO shared_tx VALUES (1)"
+        let e = try! { sql.transaction! tx (fn nested -> {
+            sql.exec! nested "INSERT INTO shared_tx VALUES (2)"
+            sql.exec! nested "INSERT INTO shared_tx VALUES (1)"
+        }) } catch e { e };
+        test.eq! :unique (sql.error_code e)
+        test.eq! "23505" (sql.error_field :state e)
+        test.eq! "shared_tx_pkey" (sql.error_field :constraint e)
+        sql.exec! tx "INSERT INTO shared_tx VALUES (3)"
+    })
+    test.eq! [1, 3] (sql.column! conn "SELECT id FROM shared_tx ORDER BY id")
+    test.eq! ["serializable", "on"] (sql.transaction_with! conn %{ :isolation => :serializable, :read_only => true }
+        (fn tx -> list.head (sql.run! tx "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')").[:rows]))
+    // Sequences survive rollback, making a real server serialization failure
+    // deterministic: the second attempt observes the next sequence value.
+    sql.script! conn "CREATE TEMP SEQUENCE shared_attempt; CREATE FUNCTION pg_temp.shared_retry() RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE n bigint; BEGIN n := nextval('shared_attempt'); IF n = 1 THEN RAISE EXCEPTION 'retry' USING ERRCODE = '40001'; END IF; RETURN n; END $$;"
+    test.eq! 2 (sql.serializable! conn 3 (fn tx -> sql.scalar! tx "SELECT pg_temp.shared_retry()"))
+    test.eq! 45 (sql.scalar! conn "SELECT 45")
+    ()
+});
+
+let tests : :any -> [:any];
+let tests target = [
+    test.case "shared queries, defaults, NULL, blobs, arrays, JSON and row records" $( values! target ),
+    test.case "prepare once, count changes, and recover from a failed batch" $( many! target ),
+    test.case "portal batches and cleanup after callback or server errors" $( streaming! target ),
+    test.case "shared transactions, nested rollback, options and retries" $( transactions! target ),
+];

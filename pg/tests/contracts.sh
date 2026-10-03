@@ -27,6 +27,7 @@ compile() {
     cat >"$tmp/case.dr" <<DR
 import pg.db;
 import pg.sql;
+import std.sql as shared;
 let run! conn a = $1;
 let main! = ();
 DR
@@ -86,6 +87,18 @@ accepted 'expand sql.query ["SELECT * FROM t WHERE a = ", a + 1, " AND b = ", a 
 accepted 'expand sql.query "SELECT * FROM t WHERE {..a}"'
 accepted 'expand sql.fragment "a = {a} AND ("'
 accepted 'expand sql.query "SELECT $$ {braces} and ; inside $$, {a}"'
+
+# The generic interface enforces the same compile-time contract.
+refused 'shared.query! conn "SELEC 1"' 'should be `Runnable`'
+refused 'shared.query! conn "SELECT 1; DROP TABLE users"' 'should be `Runnable`'
+refused 'shared.script! conn "CREATE TABLE t (a int"' 'should be `Script`'
+refused 'expand shared.query "SELECT {a}; SELECT 2"' 'a query is one'
+refused 'expand shared.query "DELETE FROM t WHERE id = $1"' 'is a numbered parameter'
+accepted 'shared.query! conn "SELECT 1;"'
+accepted 'shared.query! conn (expand shared.query "SELECT {a}")'
+accepted 'shared.param [1, 2]'
+accepted 'shared.param %{ "n" => 1 }'
+accepted 'shared.param :active'
 
 echo "pg contracts: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

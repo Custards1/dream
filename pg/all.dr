@@ -5,6 +5,7 @@ import pg.bytes;
 import pg.config;
 import pg.crypto;
 import pg.db;
+import pg.driver;
 import pg.errors;
 import pg.pool;
 import pg.sql;

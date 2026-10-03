@@ -540,6 +540,12 @@ let count_of tag = match num.parse_int (list.last (str.split " " tag)) {
 let query! : Conn -> sql.Query -> :map;
 let query! conn q = {
     let [text, vs] = sql.render q;
+    query_text! conn text vs
+};
+
+/// Execute already rendered SQL and its parameters, for database adapters.
+let query_text! : Conn -> :string -> [:any] -> :map;
+let query_text! conn text vs = {
     only (exchange! conn (wire.parse "" text (list.map value.oid_of vs)
                           + wire.bind "" "" (list.map value.encode vs)
                           + wire.describe "P" "" + wire.execute "" 0 + wire.sync)
@@ -644,25 +650,35 @@ priv let rec each_step! handle! !n rows = match rows {
 priv let stream! : Conn -> sql.Query -> :integer -> (a -> [:map] -> a) -> a -> a;
 priv let stream! conn q batch step! init = {
     let [text, vs] = sql.render q;
+    fold_text! conn text vs batch
+        (fn acc columns tuples -> step! acc (list.map (row_of columns) tuples)) init
+};
+
+/// Stream rendered SQL through a portal. The callback receives column metadata
+/// and decoded tuples, preserving duplicate names and type information.
+/// The callback must not issue another query on this connection.
+let fold_text! : Conn -> :string -> [:any] -> :integer -> (a -> [:any] -> [[:any]] -> a) -> a -> a;
+let fold_text! conn text vs batch step! init = {
+    let size = if batch < 1 { 1 } else { batch };
     try! {
         write! conn (wire.parse "" text (list.map value.oid_of vs)
                      + wire.bind "" "" (list.map value.encode vs)
-                     + wire.describe "P" "" + wire.execute "" batch + wire.flush)
-        portal! conn batch step! init [] [] ()
+                     + wire.describe "P" "" + wire.execute "" size + wire.flush)
     } catch e { raise! (lost e) }
+    portal! conn size step! init [] [] ()
 };
 
-priv let portal! : Conn -> :integer -> (a -> [:map] -> a) -> a -> [:any] -> [:any] -> :any -> a;
+priv let portal! : Conn -> :integer -> (a -> [:any] -> [[:any]] -> a) -> a -> [:any] -> [:any] -> :any -> a;
 priv let rec portal! conn batch step! !acc columns raw failure = match receive! conn {
     [:row_description, cols] => portal! conn batch step! acc cols raw failure,
     [:data_row, fields] => portal! conn batch step! acc columns (strict_cons fields raw) failure,
     :portal_suspended => {
-        let next = step! acc (batch_rows conn columns raw);
+        let next = portal_step! conn step! acc columns raw;
         write! conn (wire.execute "" batch + wire.flush)
         portal! conn batch step! next columns [] failure
     },
     [:command_complete, _] => {
-        let next = step! acc (batch_rows conn columns raw);
+        let next = portal_step! conn step! acc columns raw;
         write! conn wire.sync
         portal! conn batch step! next columns [] failure
     },
@@ -674,10 +690,16 @@ priv let rec portal! conn batch step! !acc columns raw failure = match receive! 
     _ => portal! conn batch step! acc columns raw failure,
 };
 
-priv let batch_rows : Conn -> [:any] -> [:any] -> [:map];
-priv let batch_rows conn columns raw = {
+// Force callback work before asking for another batch. If it fails, close the
+// portal and drain to ReadyForQuery before rethrowing the original exception.
+priv let portal_step! : Conn -> (a -> [:any] -> [[:any]] -> a) -> a -> [:any] -> [:any] -> a;
+priv let portal_step! conn step! acc columns raw = try! {
     let decoders = config.Config.decoders (Conn.config conn);
-    list.map (fn fields -> row_of columns (decode_tuple decoders columns fields)) (list.reverse raw)
+    let tuples = list.map (decode_tuple decoders columns) (list.reverse raw);
+    strict! (step! acc columns tuples)
+} catch e {
+    try! { exchange! conn (wire.close "P" "" + wire.sync) (pending []) } catch ignored { () }
+    raise! e
 };
 
 // --- transactions ------------------------------------------------------------------
@@ -787,9 +809,13 @@ let savepoint! conn body! = {
 /// Parse `text` once, on the server, as the statement `name`. What the server
 /// infers about its parameters and columns comes back with it.
 let prepare! : Conn -> :string -> :string -> Prepared;
-let prepare! conn name text = {
+let prepare! conn name text = prepare_types! conn name text [];
+
+/// Prepare with declared parameter OIDs, as query_text! does for its values.
+let prepare_types! : Conn -> :string -> :string -> [:integer] -> Prepared;
+let prepare_types! conn name text oids = {
     try! {
-        write! conn (wire.parse name text [] + wire.describe "S" name + wire.sync)
+        write! conn (wire.parse name text oids + wire.describe "S" name + wire.sync)
         described! conn (Prepared.new name text) ()
     } catch e { raise! (lost e) }
 };
