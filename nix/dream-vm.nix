@@ -27,11 +27,15 @@ stdenv.mkDerivation {
     # The build output directories change constantly and none of them affect
     # this build, so they are dropped by name -- but only *directories*: a
     # source file whose name begins with `build` (build.sh, mind/tool/build.dr)
-    # is part of the tree and must stay.
+    # is part of the tree and must stay. And only at the root, which is where
+    # `build`, `build-dream` and `build-pgo` are: `mind/std/build` is the
+    # `std.build` package, and dropping every `build*` directory wherever it
+    # was dropped that too, so nothing that imports it would compile.
     filter = path: type:
       let base = baseNameOf path;
+          atRoot = dirOf path == toString ../.;
       in type != "directory"
-         || (!(lib.hasPrefix "build" base)
+         || (!(atRoot && lib.hasPrefix "build" base)
              && base != "target" && base != ".git" && base != "result");
   };
 
