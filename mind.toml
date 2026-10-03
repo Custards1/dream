@@ -8,3 +8,10 @@ members = ["dreams", "lucid", "mind/std", "mind/tool"]
 
 [build]
 compiler = "build/dreams.dream"
+# The compilers the goals build the VM with, when one is named.
+env = ["CC", "CXX"]
+
+# `mind build vm -D jit=off` builds the VM without the JIT even where there is
+# an LLVM to build it with.
+[options]
+jit = { type = ["auto", "off"], default = "auto", doc = "build the JIT when there is an LLVM" }

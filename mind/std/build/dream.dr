@@ -1,0 +1,110 @@
+// Dream programs, compiled by a compiler that may itself be something the
+// build made.
+//
+// The compiler is an input, so compiling the compiler with what it just built
+// is a second step (docs/build.md, "Dream programs"), and the VM that runs an
+// image compiler is an input too. A program's modules are its discovered
+// inputs: `dreams --depfile` names every file it read, so editing a module
+// rebuilds the images that import it and no others.
+//
+// The compile runs in the package's directory, where the entry and the `-L`
+// roots a script names are, and writes into the step's own.
+
+import std.build;
+import std.list;
+import std.str;
+
+mapping Program {
+    name : :string
+    entry : :string
+    compiler : :any             // an input: an image, or a native program
+    vm : :any                   // an input: what runs an image compiler
+    paths : [:string] = []      // -L roots
+    flags : [:string] = []
+    no_warnings : :bool = false
+}
+
+/// A program compiled from `entry` by `compiler`, run on `vm` when the
+/// compiler is an image.
+let program : :string -> :string -> :any -> :any -> Program;
+let program name entry compiler vm = Program.new name entry (build.input compiler) (build.input vm);
+
+let paths : [:string] -> Program -> Program;
+let paths ps p = Program.set_paths p (list.append (Program.paths p) ps);
+
+let flags : [:string] -> Program -> Program;
+let flags fs p = Program.set_flags p (list.append (Program.flags p) fs);
+
+/// A warning fails the compile, as it does for the examples.
+let no_warnings : Program -> Program;
+let no_warnings p = Program.set_no_warnings p true;
+
+/// Is this input an image the VM has to run, rather than a program of its own?
+let is_image : :any -> :bool;
+let is_image i = match i {
+    [:file, p] => str.ends_with ".dream" p,
+    [:artifact, _, n] => str.ends_with ".dream" n,
+    _ => false,
+};
+
+let file_name : Program -> :string;
+let file_name p = Program.name p + ".dream";
+
+/// The lines of a compile's output that are warnings.
+let warnings : [:string] -> :string;
+let warnings [log] = str.join_str "\n" (list.filter (fn l -> str.contains_str "warning:" l) (str.split "\n" log));
+
+/// The step that compiles the program.
+let image : Program -> :map;
+let image p = {
+    let compiler = Program.compiler p;
+    let runs_on = if is_image compiler { [Program.vm p] } else { [] };
+    build.discovering (build.step "dream.compile" (Program.name p)
+                                  (list.concat [[compiler], runs_on, [build.file (Program.entry p)]])
+                                  [Program.entry p, Program.paths p, Program.flags p, Program.no_warnings p]
+                                  [file_name p] (fn job -> {
+        let head = list.map (fn i -> build.path job i) (list.append runs_on [compiler]);
+        // The flags after the entry: `--shebang` takes the next word as its
+        // line unless it begins with `-`, and would take the entry.
+        let args = list.concat [list.tail head,
+                                list.flat_map (fn r -> ["-L", r]) (Program.paths p),
+                                [Program.entry p],
+                                Program.flags p,
+                                ["-o", build.out job (file_name p), "--depfile", build.out job "deps.d"]];
+        let root = build.Context.root (build.Job.ctx job);
+        list.append [build.Op.run_to root (%{}) (list.head head) args "log"]
+                    (if Program.no_warnings p {
+                         [build.Op.transform ["log"] "warnings" warnings,
+                          build.Op.empty "warnings" "it compiled with warnings:"]
+                     } else { [] })
+    }))
+};
+
+/// The image, as an input to anything else.
+let artifact : Program -> :any;
+let artifact p = build.artifact (image p) (file_name p);
+
+when test {
+    import std.test;
+
+    let seed = build.file "dreams/bootstrap/dreams.dream";
+    let vm = build.file "build-dream/bin/dream";
+    let stage2 = program "dreams" "dreams/main.dr" seed vm |> paths ["mind", "."];
+    let stage3 = program "dreams" "dreams/main.dr" (artifact stage2) vm |> paths ["mind", "."];
+    let here = build.Target.make :linux :x86_64;
+    let ctx = build.Context.new "p" "1" "/p" here here;
+    let job = build.Job.make "/d" ctx (%{ build.input_id seed => "/p/seed.dream", build.input_id vm => "/p/vm" });
+
+    let tests = [
+        test.case "an image compiler is run by the VM, and both are inputs"
+            $( test.eq! [seed, vm, build.file "dreams/main.dr"] (build.Step.inputs (image stage2)) ),
+        test.case "the compiler compiled by itself is another step"
+            $( test.ne! (build.Step.shape (image stage2)) (build.Step.shape (image stage3)) ),
+        test.case "an image is told from a program by its name"
+            $( test.eq! [true, true, false] [is_image seed, is_image (artifact stage2), is_image vm] ),
+        test.case "the compile runs in the package and names what it read"
+            $( test.eq! [[:run_to, "/p", %{}, "/p/vm", ["/p/seed.dream", "-L", "mind", "-L", ".", "dreams/main.dr",
+                                                        "-o", "/d/dreams.dream", "--depfile", "/d/deps.d"], "log"]]
+                        (build.Step.action (image stage2) job) ),
+    ];
+}

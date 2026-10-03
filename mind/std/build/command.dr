@@ -60,7 +60,10 @@ let toolchain ctx = %{ "DREAM" => build.Context.vm ctx, "DREAMS" => list.last (b
 /// A check that runs `program` in the package's directory, with `env` laid over
 /// the environment: what a test suite written as a script is run as. It passes
 /// when the program does. Its inputs are marked in `args` as a step's are, so
-/// what it reads is built first; a check is run every time whatever its key.
+/// what it reads is built first; and it runs every time whatever its key,
+/// since a script reads what it likes and its key cannot say what that was.
+/// `std.build.check` is for a check that declares everything it reads, and is
+/// kept like any step.
 let check : :map -> :string -> %{:string => :string} -> :string -> [:any] -> :map;
 let check ctx name env program args = check_in (build.Context.root ctx) name env program args;
 
@@ -68,13 +71,13 @@ let check ctx name env program args = check_in (build.Context.root ctx) name env
 /// than the package, such as the root of the repository it belongs to.
 let check_in : :string -> :string -> %{:string => :string} -> :string -> [:any] -> :map;
 let check_in dir name env program args =
-    build.step "check" name (list.filter is_input args) [dir, program, env, placed args]
+    build.uncached (build.step "check" name (list.filter is_input args) [dir, program, env, placed args]
                (list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args)
                (fn job -> [build.Op.run dir env program (list.map (fn a -> match a {
                    [:out, n] => build.out job n,
                    _ if is_input a => build.path job a,
                    s => s,
-               }) args)]);
+               }) args)]));
 
 /// Its first output, as an input to something else: what most callers want.
 let make : :string -> :string -> [:any] -> :any;

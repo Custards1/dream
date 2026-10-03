@@ -2,6 +2,7 @@
 //
 //   mind new <name>     start a project
 //   mind build          compile it
+//   mind build GOAL..   make what its build script names: `mind build vm`
 //   mind run [args]     compile and run it
 //   mind test           compile with `--test` and run the result
 //   mind check          compile without writing an image
@@ -74,7 +75,7 @@ let opts = [
 /// own -- `new <name>`, `run [args]` -- read them from the parsed rest.
 let command_spec = [
     cli.command "new"   "create a project in ./<name>" [],
-    cli.command "build" "compile the project to target/<profile>/<name>.dream" [],
+    cli.command "build" "compile the project; GOAL.. makes what its build script names instead" [],
     cli.command "run"   "compile, then run it with the arguments given" [],
     cli.command "test"  "run every test at once: units and checks; NAME narrows" [],
     cli.command "check" "compile without writing an image" [],
@@ -254,6 +255,25 @@ let relay! r =
 let cmd_build! m o = {
     report_build! m o "compiled" false
     console.print! ("  " + to_string (build.output_of m o))
+};
+
+/// `mind build GOAL..`: what the project's build script makes by name rather
+/// than what the compile needs -- the VM, the compiler, an installer -- and
+/// where each one is. A workspace's compiler is its own unless the command
+/// line names one, as for `mind test`.
+let cmd_goals! m o0 names = {
+    let o = match [build.option o0 :compiler (), manifest.compiler m] {
+        [(), ()] => o0,
+        [(), c] => build.with_option :compiler c o0,
+        _ => o0,
+    };
+    match build.goals! m o names {
+        [:error, why] => {
+            console.error! why
+            os.exit! 1
+        },
+        [:ok, made] => strict! (list.map (fn [name, path] -> console.print! (name + "  " + path)) made),
+    }
 };
 
 let cmd_check! m o = {
@@ -779,7 +799,10 @@ let run_command! c theirs = {
                                  [] => fail! "new needs a project name",
                                  [name, .._] => cmd_new! name,
                              },
-                  "build" => cmd_build! (project_in! here) o,
+                  "build" => match cli.rest c {
+                      [] => cmd_build! (project_in! here) o,
+                      names => cmd_goals! (project_in! here) o names,
+                  },
                   "check" => cmd_check! (project_in! here) o,
                   "run"   => cmd_run! (project_in! here) o (list.append (cli.rest c) theirs),
                   "test"  => cmd_test! (project_in! here) o (cli.rest c),

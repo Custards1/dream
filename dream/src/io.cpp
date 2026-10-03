@@ -2,12 +2,14 @@
 
 #include "io.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -805,6 +807,129 @@ NativeResult io_digest(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(hex_string(p, sha.hex()));
 }
 
+// --- what a build does to files ---------------------------------------------
+//
+// Links, copies, trees and permissions: the rest of what a build asks of the
+// file system, beside the stamps and digests above. `std.file` is written on
+// these. Each is one call where the same walk written in Dream would be a
+// recursion over `list_dir!`, a read and a write per file.
+
+std::filesystem::path fs_path(const std::string& utf8) {
+    return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
+
+std::string fs_text(const std::filesystem::path& path) {
+    auto bytes = path.generic_u8string();
+    return std::string(bytes.begin(), bytes.end());
+}
+
+NativeResult fail_fs(Process& p, const std::string& what, const std::error_code& ec) {
+    const char* kind = "io_error";
+    if (ec == std::errc::no_such_file_or_directory) kind = "not_found";
+    else if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) kind = "permission_denied";
+    else if (ec == std::errc::file_exists) kind = "already_exists";
+    else if (ec == std::errc::not_a_directory || ec == std::errc::is_a_directory) kind = "wrong_kind";
+    return fail(p, kind, what + ": " + ec.message());
+}
+
+/// `link! from to` -- `to` becomes another name for `from`: a hard link, or a
+/// copy where one cannot be made (another volume, a file system without
+/// them). Either way `to` is new and must not exist yet. A step's outputs are
+/// never written to again once made, so a link is as good as a copy and costs
+/// nothing; placing a result is a link beside it and a `rename!` over it.
+NativeResult io_link(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0]) || !is_string(args[1])) return fail(p, "type_error", "link! needs two paths");
+    auto from = fs_path(string_arg(args[0]));
+    auto to = fs_path(string_arg(args[1]));
+    std::error_code ec;
+    std::filesystem::create_hard_link(from, to, ec);
+    if (!ec) return NativeResult::ok(make_atom(p.runtime().intern_atom("linked")));
+    if (ec == std::errc::file_exists || ec == std::errc::no_such_file_or_directory) {
+        return fail_fs(p, "link " + fs_text(from) + " to " + fs_text(to), ec);
+    }
+    ec.clear();
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::none, ec);
+    if (ec) return fail_fs(p, "copy " + fs_text(from) + " to " + fs_text(to), ec);
+    return NativeResult::ok(make_atom(p.runtime().intern_atom("copied")));
+}
+
+/// `copy! from to` -- `to` becomes a copy of `from`, replacing it if it is
+/// there, with `from`'s permissions. Where `link!` shares a file, this makes
+/// one of `to`'s own: what a build places outside its cache is copied, so that
+/// anything which later edits it in place -- `strip`, `patchelf`, a linker
+/// writing into its old output -- cannot reach back into the cache.
+NativeResult io_copy(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0]) || !is_string(args[1])) return fail(p, "type_error", "copy! needs two paths");
+    auto from = fs_path(string_arg(args[0]));
+    auto to = fs_path(string_arg(args[1]));
+    std::error_code ec;
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) return fail_fs(p, "copy " + fs_text(from) + " to " + fs_text(to), ec);
+    return NativeResult::ok(UNIT);
+}
+
+/// `chmod! path mode` -- set the permission bits, `0o755` being `493`. On
+/// Windows only the owner's write bit means anything (it is the read-only
+/// attribute), and the rest are accepted and ignored, so a build can mark its
+/// outputs executable without asking what it is running on.
+NativeResult io_chmod(Process& p, Value, Value* args, uint32_t) {
+    Value mode = resolve(args[1]);
+    if (!is_string(args[0]) || !is_fixnum(mode) || fixnum_value(mode) < 0 || fixnum_value(mode) > 07777) {
+        return fail(p, "type_error", "chmod! needs a path and a mode");
+    }
+    std::error_code ec;
+    std::filesystem::permissions(fs_path(string_arg(args[0])),
+                                 std::filesystem::perms(fixnum_value(mode)), ec);
+    if (ec) return fail_fs(p, "chmod " + string_arg(args[0]), ec);
+    return NativeResult::ok(UNIT);
+}
+
+/// `walk! dir` -- every file under `dir`, as paths relative to it with `/`
+/// between the parts, sorted. Directories are walked and not listed, and a
+/// link to a directory is not followed, so a tree that links back into itself
+/// is still finite. Picking files by pattern is left to the caller.
+NativeResult io_walk(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "walk! needs a directory");
+    auto root = fs_path(string_arg(args[0]));
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(
+        root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+    if (ec) return fail_fs(p, "walk " + fs_text(root), ec);
+    std::vector<std::string> files;
+    for (; it != end; it.increment(ec)) {
+        if (ec) return fail_fs(p, "walk " + fs_text(root), ec);
+        std::error_code kind_ec;
+        if (it->is_regular_file(kind_ec)) files.push_back(fs_text(it->path().lexically_relative(root)));
+    }
+    std::sort(files.begin(), files.end());
+    Value list = NIL;
+    for (size_t i = files.size(); i-- > 0;) {
+        list = p.heap().make_cons(p.heap().make_string(files[i].data(), uint32_t(files[i].size())), list);
+    }
+    return NativeResult::ok(list);
+}
+
+/// `mkdir_all! path` -- the directory and any parents it needs. Already there
+/// is not an error.
+NativeResult io_mkdir_all(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "mkdir_all! needs a path");
+    std::error_code ec;
+    std::filesystem::create_directories(fs_path(string_arg(args[0])), ec);
+    if (ec) return fail_fs(p, "mkdir " + string_arg(args[0]), ec);
+    return NativeResult::ok(UNIT);
+}
+
+/// `remove_all! path` -- the path and everything under it, answering how many
+/// entries went. Nothing there is not an error and answers 0: a scratch
+/// directory is cleared whether or not the last run got as far as making it.
+NativeResult io_remove_all(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "remove_all! needs a path");
+    std::error_code ec;
+    auto removed = std::filesystem::remove_all(fs_path(string_arg(args[0])), ec);
+    if (ec) return fail_fs(p, "remove " + string_arg(args[0]), ec);
+    return NativeResult::ok(make_integer(p, int64_t(removed)));
+}
+
 NativeResult io_remove(Process& p, Value, Value* args, uint32_t) {
     if (!is_string(args[0])) return fail(p, "type_error", "remove! needs a path");
     std::string path = string_arg(args[0]);
@@ -1075,6 +1200,12 @@ ModuleDef make_io_module() {
                          {"stat!", 1, 0b1, io_stat},
                          {"digest!", 1, 0b1, io_digest_file},
                          {"digest", 1, 0b1, io_digest},
+                         {"mkdir_all!", 1, 0b1, io_mkdir_all},
+                         {"remove_all!", 1, 0b1, io_remove_all},
+                         {"link!", 2, 0b11, io_link},
+                         {"copy!", 2, 0b11, io_copy},
+                         {"chmod!", 2, 0b11, io_chmod},
+                         {"walk!", 1, 0b1, io_walk},
                          {"async", 1, 0b1, io_async},
                      }};
 }

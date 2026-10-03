@@ -9,7 +9,13 @@ import std.agent;
 import std.array;
 import std.build;
 import std.build.cc;
+import std.build.cc.cmake;
+import std.build.cc.gnu;
+import std.build.cc.msvc;
+import std.build.cc.steps;
+import std.build.check;
 import std.build.command;
+import std.build.dream;
 import std.build.fetch;
 import std.build.probe;
 import std.build.run;
@@ -45,8 +51,10 @@ let version = "0.1.0";
 
 /// The modules this build provides.
 let modules : [:string];
-let modules = ["std.agent", "std.array", "std.build", "std.build.cc", "std.build.command",
-               "std.build.fetch", "std.build.probe", "std.build.run", "std.build.tool", "std.cli",
+let modules = ["std.agent", "std.array", "std.build", "std.build.cc", "std.build.cc.cmake",
+               "std.build.cc.gnu", "std.build.cc.msvc", "std.build.cc.steps", "std.build.check",
+               "std.build.command", "std.build.dream", "std.build.fetch", "std.build.probe",
+               "std.build.run", "std.build.tool", "std.cli",
                "std.codec", "std.error", "std.file", "std.json", "std.list",
                "std.map", "std.macros", "std.proc", "std.record", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.str", "std.streams",

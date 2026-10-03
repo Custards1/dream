@@ -1770,6 +1770,7 @@ waiting for a value.
 | `exec_for! program args ms` | the same, killing the child after `ms` |
 | `exec_in! dir program args ms` | the same, started in `dir`; `0` for no deadline |
 | `exec_with! dir env program args ms` | the same, with `NAME=value`s laid over the environment |
+| `exec_joined! dir env program args ms` | the same, with its errors written in among its output |
 | `replace! program args` | **become** `program`: this VM is gone and it takes over the process |
 | `monotonic! ()` | milliseconds from a fixed point, from a clock that never jumps |
 | `now! ()` | milliseconds since the Unix epoch, from the wall clock |

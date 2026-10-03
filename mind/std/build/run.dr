@@ -15,24 +15,34 @@
 //
 // 1. Evaluate the plan, and collect every step reachable from it -- once
 //    each, by shape, so the same work asked for twice is one step.
-// 2. Work out each step's key: its shape, with the digest of every file it
-//    reads and the key of every step it reads from. File digests are kept
-//    behind a stamp (`io.stat!`), so a file is read again only when its size
-//    or time has moved. That is what makes a build where nothing changed cost
-//    a `stat` per input.
-// 3. Run the steps, dependencies first and up to `jobs` at once. A step whose
-//    directory is already there is done: it was made by this key, which says
-//    everything that could change it. Anything else runs in a scratch
-//    directory renamed into place when it has finished, so a directory named
-//    by a key is always a finished one, and one cache can serve concurrent
-//    builds.
+// 2. Run the steps, each as soon as everything it reads is made and up to
+//    `jobs` at once. A step is keyed when it is ready: its shape, with the
+//    digest of every file it reads and the *result* of every step it reads
+//    from. File digests are kept behind a stamp (`io.stat!`), so a file is
+//    read again only when its size or time has moved. That is what makes a
+//    build where nothing changed cost a `stat` per input.
+// 3. A step whose key has a directory, and whose discovered inputs still have
+//    the digests they had, is done: it was made from everything that could
+//    change it. Anything else runs in a scratch directory renamed into place
+//    when it has finished, so a directory named by a key is always a finished
+//    one, and one cache can serve concurrent builds.
 // 4. Resolve the plan's `given`s -- read each built answer and merge in what
 //    it decides -- and go round again with the merged plan.
-// 5. Write the outcome: what the plan contributes to the compile, every input
+// 5. In a test run, run the checks asked for, going on past one that fails;
+//    for `mind build GOAL`, make the goals asked for and put each where it goes.
+// 6. Write the outcome: what the plan contributes to the compile, every input
 //    resolved to a path, and the stamp of every file the plan read.
+//
+// A step's result is its key when it declares everything it reads, and the
+// key with the digests of what it read when it discovers its inputs
+// (`build.discovering`): a header changed recompiles an object under the same
+// key, and the program linked from it has to see a different input or it
+// would not be relinked. That is why keys are worked out as steps become
+// ready rather than all at once beforehand.
 
 import std.build;
 import std.console;
+import std.error;
 import std.file;
 import std.io;
 import std.list;
@@ -53,6 +63,21 @@ let rec fold! step! !acc xs = match xs {
         strict! next
         fold! step! next rest
     },
+};
+
+/// `v` forced all the way down. What crosses into a step's process has to be
+/// this: a suspension carries its frame, and an action's frame holds the step's
+/// inputs, each of which holds the step it comes from -- the whole graph
+/// upstream, copied for every step run.
+let forced! : :any -> :any;
+let rec forced! v = {
+    strict! v
+    match type_of v {
+        :list => fold! (fn _ x -> forced! x) () v,
+        :map => fold! (fn _ pair -> forced! (list.nth 1 pair)) () (map_pairs v),
+        _ => (),
+    }
+    v
 };
 
 // --- the context ---------------------------------------------------------------------
@@ -96,8 +121,8 @@ let fail! why = {
 /// The steps an input reaches, into `acc` by shape.
 let reach : :map -> :any -> :map;
 let rec reach acc i = match build.input i {
-    [:file, _] => acc,
     [:artifact, s, _] => reach_step acc s,
+    _ => acc,
 };
 
 let reach_step : :map -> :map -> :map;
@@ -122,27 +147,42 @@ let overlay modules = match map_pairs modules {
     },
 };
 
-/// Every step the plan reaches, by shape -- and in a test run, everything its
-/// checks read, though not the checks, which are run rather than built.
-let steps_of : :map -> :any -> :bool -> :map;
-let steps_of plan mods testing = {
+/// Every step the plan needs for the compile, by shape.
+let steps_of : :map -> :any -> :map;
+let steps_of plan mods = {
     let roots = list.concat [map.values (build.Plan.payloads plan),
                              list.map (fn s -> build.artifact s "") (build.Plan.steps plan),
                              list.map (fn [i, _] -> i) (build.Plan.later plan),
-                             match mods { () => [], s => [build.artifact s ""] },
-                             if testing { list.flat_map build.Step.inputs (map.values (build.Plan.checks plan)) } else { [] }];
+                             match mods { () => [], s => [build.artifact s ""] }];
     list.fold reach (%{}) roots
 };
 
-// --- keys -------------------------------------------------------------------------------
-//
-// The state a run carries: `keys` by shape, `digests` by path (this run's), and
-// `stamps` by path -- `[size, modified, digest]`, kept between runs in the
-// cache, which is what spares reading a file whose stamp has not moved.
+/// The shapes of the steps `s` reads from.
+let upstream : :map -> [:string];
+let upstream s = list.unique (list.flat_map (fn i -> match i { [:artifact, t, _] => [build.Step.shape t], _ => [] })
+                                            (build.Step.inputs s));
 
-/// `seen` is the keys this run has already accounted for, so a step a second
-/// wave of `given`s reaches again is counted once, as whichever it was.
-mapping State { keys = %{}, digests = %{}, stamps = %{}, reads = %{}, seen = %{}, built = 0, reused = 0 }
+// --- the state -------------------------------------------------------------------------
+//
+// What a run carries: `stamps` by path -- `[size, modified, digest]`, kept
+// between runs in the cache, which is what spares reading a file whose stamp
+// has not moved -- `digests` by path (this run's), `reads` by path, the stamp of
+// every file the plan read, for `mind` to tell whether to run the script again;
+// `done` by shape, `[result, dir]` for every step this run has settled;
+// `failures` by shape, `[name, why]`; `ms` by shape, how long each step ran;
+// and `ran`, the names of the steps that ran, latest first.
+
+mapping State {
+    stamps = %{}
+    digests = %{}
+    reads = %{}
+    done = %{}
+    failures = %{}
+    ms = %{}
+    ran = []
+    built = 0
+    reused = 0
+}
 
 let absolute : :map -> :string -> :string;
 let absolute ctx p = match p {
@@ -152,88 +192,170 @@ let absolute ctx p = match p {
     _ => build.Context.root ctx + "/" + p,
 };
 
-/// The digest of a file the plan reads, through the stamp cache.
-let digest! : :map -> :map -> :string -> :map;
-let digest! ctx st p = {
-    let path = absolute ctx p;
-    match io.stat! path {
-        _ if map_has (State.digests st) path => st,
-        () => fail! ("`" + p + "` is an input of this build, and there is nothing at " + path),
-        [size, modified, _] => {
-                let d = match (State.stamps st).[path else ()] {
-                    [s, m, known] if s == size && m == modified => known,
-                    _ => io.digest! path,
-                };
-                strict! d
-                let with_digest = State.set_digests st ((State.digests st).[path => d]);
-                let with_stamp = State.set_stamps with_digest ((State.stamps st).[path => [size, modified, d]]);
-                State.set_reads with_stamp ((State.reads st).[path => [size, modified]])
-        },
-    }
+/// A file's digest through the stamp cache, or `()` when nothing is there:
+/// `[state, digest]`.
+let stamped! : :map -> :string -> [:any];
+let stamped! st path = match io.stat! path {
+    _ if map_has (State.digests st) path => [st, (State.digests st).[path]],
+    () => [st, ()],
+    [size, modified, _] => {
+        let d = match (State.stamps st).[path else ()] {
+            [s, m, known] if s == size && m == modified => known,
+            _ => io.digest! path,
+        };
+        strict! d
+        let with_digest = State.set_digests st ((State.digests st).[path => d]);
+        let with_stamp = State.set_stamps with_digest ((State.stamps st).[path => [size, modified, d]]);
+        [State.set_reads with_stamp ((State.reads st).[path => [size, modified]]), d]
+    },
 };
 
-/// What an input contributes to the key of the step that reads it.
-let input_key : :map -> :map -> :any -> :any;
-let input_key ctx st i = match i {
-    [:file, p] => [:file, p, (State.digests st).[absolute ctx p]],
-    [:artifact, s, n] => [:artifact, (State.keys st).[build.Step.shape s], n],
+/// The digest of a file the plan declares it reads, which must be there.
+let digest! : :map -> :map -> :string -> [:any];
+let digest! ctx st p = match stamped! st (absolute ctx p) {
+    [_, ()] => fail! ("`" + p + "` is an input of this build, and there is nothing at " + absolute ctx p),
+    found => found,
 };
 
-/// A step's key, and every key below it, into the state.
-let key! : :map -> :map -> :map -> :map;
-let rec key! ctx st s = {
-    let shape = build.Step.shape s;
-    if map_has (State.keys st) shape { st }
-    else {
-        if not (build.is_data (build.Step.config s)) {
-            fail! ("the step `" + build.Step.name s + "` has a function in its config, which no key can say")
-        }
-        let below = fold! (fn acc i -> match i {
-            [:file, p] => digest! ctx acc p,
-            [:artifact, t, _] => key! ctx acc t,
-        }) st (build.Step.inputs s);
-        let k = io.digest (build.encode [shape, list.map (input_key ctx below) (build.Step.inputs s)]);
-        State.set_keys below ((State.keys below).[shape => k])
-    }
-};
+/// Every file a tree input names, relative to the package, sorted.
+let tree_files! : :map -> :string -> :string -> [:string];
+let tree_files! ctx dir suffix =
+    list.map (fn f -> dir + "/" + f) (list.filter (fn f -> str.ends_with suffix f) (file.walk! (absolute ctx dir)));
 
-// --- running ----------------------------------------------------------------------------
+// --- keys ------------------------------------------------------------------------------
 
 let dir_of : :map -> :string -> :string;
 let dir_of ctx k = build.Context.cache ctx + "/" + k;
 
-/// Where an input is, once everything below it is built.
-let where : :map -> :map -> :any -> :string;
+/// What a step that reads this one is keyed on: its key, and what it read.
+let result_of : :string -> [:any] -> :string;
+let result_of key reads = match reads { [] => key, _ => io.digest (build.encode [key, reads]) };
+
+/// Where an input is, once everything below it is made, or `()` for one whose
+/// step did not finish.
+let where : :map -> :map -> :any -> :any;
 let where ctx st i = match i {
+    [:artifact, s, n] => match (State.done st).[build.Step.shape s else ()] {
+        () => (),
+        [_, dir] => if n == "" { dir } else { dir + "/" + n },
+    },
     [:file, p] => absolute ctx p,
-    [:artifact, s, n] => dir_of ctx ((State.keys st).[build.Step.shape s]) + (if n == "" { "" } else { "/" + n }),
+    [:tree, d, _] => absolute ctx d,
 };
 
-/// How far a step is from the files: 0 when it reads only files. Steps at one
-/// depth never read each other, so each depth can run all at once.
-let depth : :map -> :integer;
-let rec depth s =
-    list.fold (fn d i -> match i {
-        [:artifact, t, _] => { let below = depth t + 1; if below > d { below } else { d } },
-        _ => d,
-    }) 0 (build.Step.inputs s);
+/// A step whose inputs are all made: `[state, key, paths]`, where `paths` is
+/// what an action finds in `Job.paths`.
+let keyed! : :map -> :map -> :map -> [:any];
+let keyed! ctx st s = {
+    if not (build.is_data (build.Step.config s)) {
+        fail! ("the step `" + build.Step.name s + "` has a function in its config, which no key can say")
+    }
+    let [after, parts] = fold! (fn [acc, ps] i -> match i {
+        [:file, p] => { let [st2, d] = digest! ctx acc p; [st2, list.cons [:file, p, d] ps] },
+        [:tree, dir, suffix] => {
+            let [st2, ds] = fold! (fn [stx, found] f -> { let [sty, d] = digest! ctx stx f; [sty, list.cons [f, d] found] })
+                                  [acc, []] (tree_files! ctx dir suffix);
+            [st2, list.cons [:tree, dir, suffix, list.reverse ds] ps]
+        },
+        [:artifact, t, n] => [acc, list.cons [:artifact, list.head ((State.done acc).[build.Step.shape t]), n] ps],
+    }) [st, []] (build.Step.inputs s);
+    let key = io.digest (build.encode [build.Step.shape s, list.reverse parts]);
+    let paths = map.from_pairs (list.map (fn i -> [build.input_id i, where ctx after i]) (build.Step.inputs s));
+    [after, key, paths]
+};
 
-/// One operation, in `dir`. `[:ok, ()]` or `[:error, why]`.
-let op! : :string -> :any -> :any;
-let op! dir o = try! {
+/// A finished step's record: its key and what it read, `[path, digest]`.
+let record_of! : :string -> :any;
+let record_of! dir = match file.read! (dir + "/.record") {
+    () => (),
+    text => match wire.decode text { [:ok, r] => r, _ => () },
+};
+
+/// Do the files a step read last time still have the digests they had?
+let reads_hold! : :map -> [:any] -> [:any];
+let reads_hold! st reads = fold! (fn [acc, ok] [p, d] -> match ok {
+    false => [acc, false],
+    _ => { let [st2, now] = stamped! acc p; [st2, now == d] },
+}) [st, true] reads;
+
+// --- doing what an action asks -----------------------------------------------------------
+
+/// A make rule's prerequisites, as `gcc -MD` and `dreams --depfile` write it:
+/// a target, a colon, and names separated by spaces, a line continued by a
+/// backslash at its end, a space inside a name escaped by one before it.
+let depfile_reads : :string -> [:string];
+let depfile_reads text = {
+    let joined = str_concat (str.split "\\\n" (str_concat (str.split "\r" text)));
+    let body = match str.find ": " joined {
+        i if i >= 0 => str.slice (i + 2) (str.byte_length joined - i - 2) joined,
+        _ => "",
+    };
+    let ended cur acc = match cur { [] => acc, _ => list.cons (str_of_chars (list.reverse cur)) acc };
+    let [names, current, _] = list.fold (fn [acc, cur, escaped] c -> match [escaped, c] {
+        [true, _] => [acc, list.cons c cur, false],
+        [_, '\\'] => [acc, cur, true],
+        [_, ' '] => [ended cur acc, [], false],
+        [_, '\n'] => [ended cur acc, [], false],
+        [_, '\t'] => [ended cur acc, [], false],
+        _ => [acc, list.cons c cur, false],
+    }) [[], [], false] (str.chars body);
+    list.map (fn n -> str.join_str "$" (str.split "$$" n)) (list.reverse (ended current names))
+};
+
+/// The first line where two texts part, for a check's failure.
+let first_difference : :string -> :string -> :string;
+let first_difference wanted got = {
+    let w = str.split "\n" wanted;
+    let g = str.split "\n" got;
+    let rec at i = match i < list.length w && i < list.length g && list.nth i w == list.nth i g {
+        true => at (i + 1),
+        false => i,
+    };
+    let i = at 0;
+    let line xs = if i < list.length xs { list.nth i xs } else { "(nothing)" };
+    "line " + to_string (i + 1) + ":\n  expected: " + line w + "\n  printed:  " + line g
+};
+
+/// What a program printed, as much of it as a person wants in a failure.
+let tail : :string -> :string;
+let tail text = {
+    let lines = str.split "\n" (str.trim text);
+    str.join_str "\n" (list.drop (list.length lines - 40) lines)
+};
+
+let exited : :string -> :map -> :string;
+let exited program r = match r.[:timed_out else false] {
+    true => program + " ran out of time\n" + tail (r.[:out] + r.[:err]),
+    _ => program + " exited with " + to_string r.[:code] + "\n" + tail (r.[:out] + r.[:err]),
+};
+
+/// One operation, in `dir`, the program run for at most `ms` (0 for as long
+/// as it takes). `[:ok, ()]` or `[:error, why]`.
+let op! : :string -> :integer -> :any -> :any;
+let op! dir ms o = try! {
     let target! name = { let t = dir + "/" + name; file.mkdir_all! (file.parent t); t };
+    let env_list env = list.map (fn [k, v] -> k + "=" + v) (map_pairs env);
     match o {
         [:write, name, text] => { file.write! (target! name) text; [:ok, ()] },
         [:copy, from, name] => { file.copy! from (target! name); [:ok, ()] },
+        [:link, from, name] => { io.link! from (target! name); [:ok, ()] },
         [:exec, program, args] => {
-            let r = os.exec_in! dir program args 0;
-            if r.[:code] == 0 { [:ok, ()] }
-            else { [:error, program + " exited with " + to_string r.[:code] + "\n" + r.[:out] + r.[:err]] }
+            let r = os.exec_in! dir program args ms;
+            if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
         },
         [:run, where, env, program, args] => {
-            let r = os.exec_with! where (list.map (fn [k, v] -> k + "=" + v) (map_pairs env)) program args 0;
-            if r.[:code] == 0 { [:ok, ()] }
-            else { [:error, program + " exited with " + to_string r.[:code] + "\n" + r.[:out] + r.[:err]] }
+            let r = os.exec_with! where (env_list env) program args ms;
+            if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
+        },
+        [:run_to, where, env, program, args, name] => {
+            let r = os.exec_joined! (if str.is_empty where { dir } else { where }) (env_list env) program args ms;
+            file.write! (target! name) r.[:out]
+            if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
+        },
+        [:observe, where, env, program, args, name] => {
+            let r = os.exec_joined! (if str.is_empty where { dir } else { where }) (env_list env) program args ms;
+            file.write! (target! name) r.[:out]
+            if r.[:timed_out] { [:error, exited program r] } else { [:ok, ()] }
         },
         [:find, program, name] => { file.write! (target! name) (on_path! program); [:ok, ()] },
         [:capture, program, args, name] => {
@@ -246,9 +368,39 @@ let op! dir o = try! {
             file.write! (target! name) (if r.[:code] == 0 { "yes" } else { "no" })
             [:ok, ()]
         },
+        [:list, from, suffix, name] => {
+            file.write! (target! name) (str.join_str "\n" (list.filter (fn f -> str.ends_with suffix f) (file.walk! from)))
+            [:ok, ()]
+        },
         [:verify, name, digest] => match io.digest! (dir + "/" + name) {
             d if d == digest => [:ok, ()],
             d => [:error, name + " has the SHA-256 " + d + ", and the build pins it to " + digest],
+        },
+        [:transform, from, name, f] => {
+            let text = f (list.map (fn n -> match file.read! (dir + "/" + n) { () => "", t => t }) from);
+            strict! text
+            file.write! (target! name) text
+            [:ok, ()]
+        },
+        [:expect, name, path, bless] => {
+            let got = str.trim_end (match file.read! (dir + "/" + name) { () => "", t => t });
+            let wanted = str.trim_end (match file.read! path { () => "", t => t });
+            match [got == wanted, bless] {
+                [true, _] => [:ok, ()],
+                // The one operation that writes into the package, and only when
+                // a person asked for it with `--bless`.
+                [_, true] => { file.write! path (got + "\n"); [:ok, ()] },
+                _ => [:error, "what it printed is not " + path + ", from " + first_difference wanted got],
+            }
+        },
+        [:same, a, b] => match io.digest! a == io.digest! b {
+            true => [:ok, ()],
+            false => [:error, a + " and " + b + " differ"],
+        },
+        [:empty, name, why] => match file.read! (dir + "/" + name) {
+            () => [:ok, ()],
+            "" => [:ok, ()],
+            text => [:error, why + "\n" + tail text],
         },
     }
 } catch e { [:error, to_string e] };
@@ -273,82 +425,210 @@ let on_path! program = {
     match hits { [] => "", [first, .._] => first }
 };
 
-/// Make one step in a scratch directory and move it into place.
-let make! : :map -> :string -> :map -> :map -> :any;
-let make! ctx k s paths = {
-    let dir = dir_of ctx k;
-    let scratch = dir + ".tmp-" + to_string (os.pid! ());
+/// Carry out a step's operations in `scratch`, stopping at the first that
+/// fails, and check it made what it said it would: `[:ok, ()]` or
+/// `[:error, why]`. The directory each output goes in is made first, so that a
+/// program told to write `bin/x` does not have to make `bin` itself.
+let perform! : :string -> [:string] -> :integer -> [:any] -> :any;
+let perform! scratch outputs ms ops = {
+    file.remove_all! scratch
     file.mkdir_all! scratch
-    let job = build.Job.make scratch ctx paths;
-    let result = fold! (fn acc o -> match acc { [:ok, _] => op! scratch o, failed => failed })
-                       [:ok, ()] (build.Step.action s job);
-    match result {
-        [:ok, _] => {
-            let missing = list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) (build.Step.outputs s);
-            match missing {
-                [] => {
-                    file.write! (scratch + "/.key") k
-                    // Someone else may have finished the same key first, which
-                    // is as good: the directory is named by everything that
-                    // could make it differ.
-                    try! { io.rename! scratch dir } catch e { () }
-                    [:ok, ()]
-                },
-                _ => [:error, "it did not make " + str.join_str ", " missing],
-            }
+    fold! (fn _ o -> file.mkdir_all! (file.parent (scratch + "/" + o))) () outputs
+    match fold! (fn acc o -> match acc { [:ok, _] => op! scratch ms o, failed => failed }) [:ok, ()] ops {
+        [:ok, _] => match list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) outputs {
+            [] => [:ok, ()],
+            missing => [:error, "it did not make " + str.join_str ", " missing],
         },
         failed => failed,
     }
 };
 
-/// Run one step here. Made a function of its own so that the thunk `proc`
-/// spawns carries this frame and not the runner's (see the note on `spawn!`
-/// in CLAUDE.md): what crosses into the process is the step and its paths.
-let run_one! : [:any] -> :any;
-let run_one! job = {
-    let [ctx, k, s, paths] = job;
-    let r = make! ctx k s paths;
+/// What a worker is handed: a thunk that performs one step and tells the
+/// runner how it went. Made here, in a function of its own, because a thunk
+/// carries its frame into the process it is spawned as, and the runner's frame
+/// holds the whole state; and handed the step's operations already worked out
+/// and forced, never the step, since a step holds its inputs and an input the
+/// step it comes from.
+let task : :any -> :string -> :string -> [:string] -> :integer -> [:any] -> :any;
+let task parent shape scratch outputs ms ops = $( {
+    let started = os.monotonic! ();
+    let r = try! { perform! scratch outputs ms ops } catch e { [:error, to_string e] };
     strict! r
-    match r {
-        [:ok, _] => [:ok, ()],
-        [:error, why] => [:error, "`" + build.Step.name s + "` (" + build.Step.tool s + ") failed: " + why
-                                  + "\n  its work is in " + dir_of ctx k + ".tmp-" + to_string (os.pid! ())],
+    send! parent [:build_step, shape, r, os.monotonic! () - started]
+} );
+
+// --- the schedule ----------------------------------------------------------------------------
+
+/// The runner between one event and the next: the state, the steps not yet
+/// started, the steps running (shape => `[key, scratch]`), and whether to keep
+/// going past a failure. A build that is not told to starts nothing after its
+/// first failure; a test run starts everything that does not depend on one.
+mapping Run {
+    state : :map
+    steps : :map            // shape => Step
+    deps : :map             // shape => [shape]
+    waiting : [:string]
+    running = %{}
+    keep_going : :bool = false
+}
+
+let ready : :map -> :string -> :bool;
+let ready run shape = list.all (fn d -> map_has (State.done (Run.state run)) d) ((Run.deps run).[shape else []]);
+
+let stopped : :map -> :bool;
+let stopped run = not (Run.keep_going run) && not (map.is_empty (State.failures (Run.state run)));
+
+/// Start what can be started: every ready step, up to the job count. A step
+/// found already made is settled here and starts nothing.
+let launch! : :map -> :map -> :map;
+let rec launch! ctx run = {
+    let jobs = if build.Context.jobs ctx < 1 { 1 } else { build.Context.jobs ctx };
+    let room = jobs - list.length (map.keys (Run.running run));
+    let next = if stopped run { () } else { list.first_or () (list.filter (fn sh -> ready run sh) (Run.waiting run)) };
+    match next {
+        () => run,
+        _ if room <= 0 => run,
+        shape => {
+            let s = (Run.steps run).[shape];
+            let rest = list.filter (fn w -> w != shape) (Run.waiting run);
+            let [st, key, paths] = keyed! ctx (Run.state run) s;
+            let dir = dir_of ctx key;
+            let record = if build.Step.cache s == :never { () } else { record_of! dir };
+            let [checked, current] = match record {
+                %{ :key => k, :reads => reads } if k == key => reads_hold! st reads,
+                _ => [st, false],
+            };
+            match current {
+                true => {
+                    let reads = record.[:reads];
+                    let settled = State.set_reused (State.set_done checked ((State.done checked).[shape => [result_of key reads, dir]]))
+                                                   (State.reused checked + 1);
+                    launch! ctx (Run.set_waiting (Run.set_state run settled) rest)
+                },
+                false => {
+                    let scratch = dir + ".tmp-" + file.scratch_suffix! ();
+                    let ops = forced! (build.Step.action s (build.Job.make scratch ctx paths));
+                    let outputs = forced! (build.Step.outputs s);
+                    // Forced here: an argument is lazy, and `self! ()` asked
+                    // inside the worker would be the worker.
+                    let me = self! ();
+                    strict! me
+                    spawn! (task me shape scratch outputs (build.Step.timeout s) ops)
+                    launch! ctx (Run.set_running (Run.set_waiting (Run.set_state run checked) rest)
+                                                 ((Run.running run).[shape => [key, scratch]]))
+                },
+            }
+        },
     }
 };
 
-let chunks : :integer -> [a] -> [[a]];
-let rec chunks n xs = match xs {
-    [] => [],
-    _ => list.cons (list.take n xs) (chunks n (list.drop n xs)),
+/// A performed step, put in place: what it read recorded, its scratch
+/// directory renamed to the one its key names.
+let commit! : :map -> :map -> :map -> :string -> :string -> :map;
+let commit! ctx st s key scratch = {
+    let dir = dir_of ctx key;
+    let read = match build.Step.discovers s {
+        true => match file.read! (scratch + "/deps.d") {
+            () => [],
+            text => list.map (fn p -> absolute ctx p) (depfile_reads text),
+        },
+        false => [],
+    };
+    let [after, reads] = fold! (fn [acc, found] p -> {
+        let [st2, d] = stamped! acc p;
+        [st2, list.cons [p, d] found]
+    }) [st, []] (list.unique read);
+    // A step run every time has a key that never moves -- it declares nothing
+    // it reads -- so what reads it is keyed on what it wrote instead: an
+    // answer that changed has to reach the steps that read it.
+    let wrote = match build.Step.cache s {
+        :never => list.map (fn o -> [o, io.digest! (scratch + "/" + o)]) (build.Step.outputs s),
+        _ => [],
+    };
+    let kept = list.append (list.reverse reads) wrote;
+    file.write! (scratch + "/.record") (wire.encode (%{ :key => key, :reads => kept }))
+    // A directory already there is one this key made before, with other reads
+    // or because the step runs every time: the new one replaces it. One that
+    // appears between the two is another build finishing the same work, which
+    // is as good.
+    file.remove_all! dir
+    try! { io.rename! scratch dir } catch e { file.remove_all! scratch }
+    let made = State.set_done after ((State.done after).[build.Step.shape s => [result_of key kept, dir]]);
+    State.set_ran (State.set_built made (State.built made + 1)) (list.cons (build.Step.name s) (State.ran made))
 };
 
-/// Build every step in `steps`, dependencies first, `jobs` at a time.
-let build_all! : :map -> :map -> :map -> :map;
-let build_all! ctx st steps = {
-    let key_of s = (State.keys st).[build.Step.shape s];
-    let pending = list.filter (fn s -> io.stat! (dir_of ctx (key_of s) + "/.key") == ()) (map.values steps);
-    strict! pending
-    let reused = list.length (list.filter (fn s -> not (map_has (State.seen st) (key_of s))) (map.values steps))
-                 - list.length pending;
-    let by_level = list.fold (fn acc s -> map.update [] (fn xs -> list.cons s xs) acc (depth s)) (%{}) pending;
-    let jobs = if build.Context.jobs ctx < 1 { 1 } else { build.Context.jobs ctx };
-    let run_level! done level = {
-        let batch = list.map (fn s -> [ctx, key_of s, s,
-                                        map.from_pairs (list.map (fn i -> [build.input_id i, where ctx st i]) (build.Step.inputs s))])
-                             (by_level.[level]);
-        fold! (fn n group -> {
-            let results = proc.try_map! run_one! group;
-            strict! results
-            fold! (fn m r -> match r {
-                [:ok, [:ok, _]] => m + 1,
-                [:ok, [:error, why]] => fail! ("in `" + build.Context.package ctx + "`, " + why),
-                [:error, e] => fail! (to_string e),
-            }) n results
-        }) done (chunks jobs batch)
-    };
-    let built = fold! run_level! 0 (map.sorted_keys by_level);
-    let seen = list.fold (fn m s -> m.[key_of s => true]) (State.seen st) (map.values steps);
-    State.set_seen (State.set_reused (State.set_built st (State.built st + built)) (State.reused st + reused)) seen
+/// Run the graph to the end: start what can start, take whichever step
+/// finishes next, and go again. What is left waiting at the end depends on a
+/// step that failed, or, with no failure to blame, is a cycle.
+let drive! : :map -> :map -> :map;
+let rec drive! ctx run = {
+    let started = launch! ctx run;
+    match map.is_empty (Run.running started) {
+        true => match [Run.waiting started, map.is_empty (State.failures (Run.state started))] {
+            [[], _] => started,
+            [_, false] => started,
+            [waiting, true] => fail! ("these steps wait on each other: "
+                                      + str.join_str ", " (list.map (fn sh -> build.Step.name ((Run.steps started).[sh])) waiting)),
+        },
+        false => {
+            let [_, shape, outcome, ms] = recv! ();
+            strict! outcome
+            let [key, scratch] = (Run.running started).[shape];
+            let s = (Run.steps started).[shape];
+            let running = Run.set_running started (map_remove (Run.running started) shape);
+            let st = Run.state running;
+            let timed = State.set_ms st ((State.ms st).[shape => ms]);
+            match outcome {
+                [:ok, _] => {
+                    let committed = commit! ctx timed s key scratch;
+                    strict! committed
+                    drive! ctx (Run.set_state running committed)
+                },
+                [_, why] => {
+                    let failed = State.set_failures timed
+                        ((State.failures timed).[shape => [build.Step.name s,
+                                                           "`" + build.Step.name s + "` (" + build.Step.tool s + ") failed: "
+                                                           + why + "\n  its work is in " + scratch]]);
+                    drive! ctx (Run.set_state running failed)
+                },
+            }
+        },
+    }
+};
+
+/// Make every step in `steps` this run has not already settled. A build stops
+/// at its first failure and raises `[:build_failed, why]` once what was running
+/// has finished; one that keeps going answers the state, failures and all.
+let build_all! : :map -> :map -> :map -> :bool -> :map;
+let build_all! ctx st steps keep_going = {
+    let wanted = list.filter (fn sh -> not (map_has (State.done st) sh)) (map.keys steps);
+    let deps = list.fold (fn m sh -> m.[sh => upstream (steps.[sh])]) (%{}) wanted;
+    let finished = drive! ctx (Run.make st steps deps wanted (%{}) keep_going);
+    let state = Run.state finished;
+    match [keep_going, map.values (State.failures state)] {
+        [false, [[_, why], .._]] => raise! [:build_failed, "in `" + build.Context.package ctx + "`, " + why],
+        _ => state,
+    }
+};
+
+/// Make `inputs`, from the stamps the last run in this cache left, and keep
+/// the stamps for the next: `[state, paths]`. What a tool or a test that is
+/// not a script calls; a failure raises as `build_all!` says.
+let make! : :map -> [:any] -> [:any];
+let make! ctx inputs = {
+    file.mkdir_all! (build.Context.cache ctx)
+    let start = State.set_stamps (State.new ()) (known_stamps! ctx);
+    let after = build_all! ctx start (list.fold reach (%{}) inputs) false;
+    keep_stamps! ctx (State.stamps after)
+    [after, list.map (fn i -> where ctx after (build.input i)) inputs]
+};
+
+/// Why a run stopped, for a person: a step that failed is said as itself, and
+/// anything else as what was raised.
+let stopped_by : :any -> :string;
+let stopped_by e = match error.payload e {
+    [:build_failed, why] => why,
+    other => to_string other,
 };
 
 // --- the whole run ----------------------------------------------------------------------
@@ -361,12 +641,11 @@ let rec settle! ctx st plan = {
         found => fail! (str.join_str "\n" found),
     }
     let mods = overlay (build.Plan.modules plan);
-    let steps = steps_of plan mods (build.Context.testing ctx);
-    let keyed = fold! (fn acc s -> key! ctx acc s) st (map.values steps);
-    let files = fold! (fn acc i -> match i { [:file, p] => digest! ctx acc p, _ => acc })
-                      keyed (list.concat [map.values (build.Plan.payloads plan),
-                                          list.map (fn [i, _] -> i) (build.Plan.later plan)]);
-    let done = build_all! ctx files steps;
+    let steps = steps_of plan mods;
+    let files = fold! (fn acc i -> match i { [:file, p] => list.head (digest! ctx acc p), _ => acc })
+                      st (list.concat [map.values (build.Plan.payloads plan),
+                                       list.map (fn [i, _] -> i) (build.Plan.later plan)]);
+    let done = build_all! ctx files steps false;
     match build.Plan.later plan {
         [] => [plan, mods, done],
         later => {
@@ -382,47 +661,91 @@ let rec settle! ctx st plan = {
 
 // --- checks -------------------------------------------------------------------------------
 
-/// One check, in a scratch directory of its own, removed when it passes and
-/// kept when it fails so that what it left can be looked at. A function by
-/// itself for the reason `run_one!` is.
-let check_one! : [:any] -> [:any];
-let check_one! job = {
-    let [ctx, k, s, paths] = job;
-    let dir = dir_of ctx k + ".check-" + to_string (os.pid! ());
-    file.mkdir_all! dir
-    let started = os.monotonic! ();
-    let result = fold! (fn acc o -> match acc { [:ok, _] => op! dir o, failed => failed })
-                       [:ok, ()] (build.Step.action s (build.Job.make dir ctx paths));
-    strict! result
-    let ms = os.monotonic! () - started;
-    match result {
-        [:ok, _] => { file.remove_all! dir; [true, ms, ""] },
-        [:error, why] => [false, ms, why + "\n  its work is in " + dir],
-    }
+/// The step that made `i` failed, or one it needed did: why, for a check.
+let why_not : :map -> :any -> :string;
+let why_not st s = match (State.failures st).[build.Step.shape s else ()] {
+    [_, why] => why,
+    () => "something it needs failed",
 };
 
-/// Every check in the plan, `jobs` at a time: `[results, state]`, the results
-/// by name as `Outcome.checks` keeps them.
+/// Every check in the plan the context asks for, going on past those that
+/// fail: `[results, state]`, the results by name as `Outcome.checks` keeps
+/// them. A check whose key has not moved since it passed is not run again,
+/// and passes in no time; one that runs every time is `build.uncached`.
 let run_checks! : :map -> :map -> :map -> [:any];
 let run_checks! ctx st plan = {
     let wanted = build.Context.only ctx;
     let named = list.filter (fn [n, _] -> list.is_empty wanted || list.contains n wanted)
                             (list.sort_on list.head (map_pairs (build.Plan.checks plan)));
-    let keyed = fold! (fn acc [_, s] -> key! ctx acc s) st named;
-    let jobs = if build.Context.jobs ctx < 1 { 1 } else { build.Context.jobs ctx };
-    let results = fold! (fn found group -> {
-        let got = proc.try_map! check_one!
-                                (list.map (fn [_, s] -> [ctx, (State.keys keyed).[build.Step.shape s], s,
-                                                         map.from_pairs (list.map (fn i -> [build.input_id i, where ctx keyed i])
-                                                                                  (build.Step.inputs s))])
-                                          group);
-        strict! got
-        list.fold (fn m [[name, _], r] -> match r {
-            [:ok, answer] => m.[name => answer],
-            [:error, e] => m.[name => [false, 0, to_string e]],
-        }) found (list.zip group got)
-    }) (%{}) (chunks jobs named);
-    [results, keyed]
+    let steps = list.fold (fn acc [_, s] -> reach_step acc s) (%{}) named;
+    let after = build_all! ctx st steps true;
+    let results = list.fold (fn m [name, s] -> m.[name => match (State.done after).[build.Step.shape s else ()] {
+        () => [false, (State.ms after).[build.Step.shape s else 0], why_not after s],
+        _ => [true, (State.ms after).[build.Step.shape s else 0], ""],
+    }]) (%{}) named;
+    [results, after]
+};
+
+// --- goals --------------------------------------------------------------------------------
+
+/// The goals a name stands for, `each` followed through: `[name, goal]`, the
+/// goal `()` for a name the plan does not have.
+let goals_named : :map -> :string -> [:any];
+let rec goals_named plan name = match (build.Plan.goals plan).[name else ()] {
+    [:each, names] => list.flat_map (fn n -> goals_named plan n) names,
+    g => [[name, g]],
+};
+
+let goal_input : :any -> :any;
+let goal_input g = match g {
+    [:make, i] => i,
+    [:place, _, i] => i,
+    [:effect, s] => build.artifact s "",
+};
+
+/// What there is to ask for, for the answer to a name the plan does not have.
+let listed : :map -> :string;
+let listed plan = str.join_str "\n" (list.map (fn n -> "  " + n + match (build.Plan.notes plan).[n else ()] {
+    () => "",
+    t => "  -- " + t,
+}) (list.sort (map.keys (build.Plan.goals plan))));
+
+/// Put a built file at `dest` without ever writing to `dest`: a copy beside
+/// it, renamed over it. A program that has the old file mapped -- a VM running
+/// the old image -- keeps the pages it had. A copy rather than a link, because
+/// what is placed is the project's to change, and a link would share every
+/// change with the cache.
+let place_file! : :string -> :string -> :unit;
+let place_file! from dest = {
+    file.mkdir_all! (file.parent dest)
+    let scratch = dest + ".placing-" + file.scratch_suffix! ();
+    file.copy! from scratch
+    io.rename! scratch dest
+};
+
+/// Make the goals the context asks for, and put each that is placed where it
+/// goes: `[paths, state]`, each goal's name to where it is.
+let make_goals! : :map -> :map -> :map -> [:any];
+let make_goals! ctx st plan = {
+    let chosen = list.flat_map (fn n -> goals_named plan n) (build.Context.goals ctx);
+    match list.filter (fn [_, g] -> g == ()) chosen {
+        [[n, _], .._] => fail! ("there is no goal `" + n + "`; these are the ones there are:\n" + listed plan),
+        [] => (),
+    }
+    let inputs = list.map (fn [_, g] -> goal_input g) chosen;
+    let after = build_all! ctx st (list.fold reach (%{}) inputs) false;
+    let paths = fold! (fn m [name, g] -> {
+        let made = where ctx after (goal_input g);
+        match g {
+            [:place, dest, [:artifact, s, ""]] => {
+                fold! (fn _ o -> place_file! (made + "/" + o) (absolute ctx dest + "/" + o)) () (build.Step.outputs s)
+                m.[name => absolute ctx dest]
+            },
+            [:place, dest, _] => { place_file! made (absolute ctx dest); m.[name => absolute ctx dest] },
+            _ => m.[name => made],
+        }
+    }) (%{}) chosen;
+    [paths, after]
 };
 
 /// What the compile is handed.
@@ -431,7 +754,7 @@ let outcome ctx plan mods st =
     build.Outcome.make (map.map_values (fn i -> where ctx st i) (build.Plan.payloads plan))
                        (match mods { () => (), s => where ctx st (build.artifact s "") })
                        (build.Plan.defines plan) (build.Plan.hosts plan) (build.Plan.target plan)
-                       (State.reads st) (State.built st) (State.reused st) (%{});
+                       (State.reads st) (State.built st) (State.reused st) (%{}) (%{});
 
 let stamps_file : :map -> :string;
 let stamps_file ctx = build.Context.cache ctx + "/stamps";
@@ -448,8 +771,9 @@ let carry_out! : :map -> :map -> (:map -> :map) -> [:any];
 let carry_out! ctx known plan_of = {
     file.mkdir_all! (build.Context.cache ctx)
     let [plan, mods, st] = settle! ctx (State.set_stamps (State.new ()) known) (plan_of ctx);
-    let [checks, after] = if build.Context.testing ctx { run_checks! ctx st plan } else { [%{}, st] };
-    let answer = build.Outcome.set_checks (outcome ctx plan mods after) checks;
+    let [checks, tested] = if build.Context.testing ctx { run_checks! ctx st plan } else { [%{}, st] };
+    let [goals, after] = match build.Context.goals ctx { [] => [%{}, tested], _ => make_goals! ctx tested plan };
+    let answer = build.Outcome.set_goals (build.Outcome.set_checks (outcome ctx plan mods after) checks) goals;
     strict! answer
     [answer, State.stamps after]
 };
@@ -463,6 +787,11 @@ let carry_out_elsewhere! job = {
     carry_out! ctx known plan_of
 };
 
+/// Written beside and renamed over, so a run stopped halfway through leaves
+/// the last whole table.
+let keep_stamps! : :map -> :map -> :unit;
+let keep_stamps! ctx stamps = file.replace! (stamps_file ctx) (wire.encode stamps);
+
 /// A script run by hand, or by a driver of its own: `run.run! script.plan`.
 /// With no `--context` it builds for this machine and prints what it would
 /// hand the compiler, which is how a script is debugged.
@@ -471,8 +800,8 @@ let run! plan_of = {
     let args = os.args! ();
     let ctx = context! args;
     strict! ctx
-    let [answer, stamps] = carry_out! ctx (known_stamps! ctx) plan_of;
-    file.write! (stamps_file ctx) (wire.encode stamps)
+    let [answer, stamps] = try! { carry_out! ctx (known_stamps! ctx) plan_of } catch e { fail! (stopped_by e) };
+    keep_stamps! ctx stamps
     match flag_value "--outcome" args {
         () => console.print! (to_string answer),
         f => file.write! f (wire.encode answer),
@@ -512,10 +841,10 @@ let run_all! scripts = {
             strict! results
             let [outcomes, stamps] = list.fold (fn [found, st] [[key, _], r] -> match r {
                 [:ok, [answer, more]] => [found.[key => answer], map.merge st more],
-                [:error, e] => fail! ("the build script of `" + key + "` failed: " + to_string e),
+                [:error, e] => fail! ("the build script of `" + key + "` failed: " + stopped_by e),
             }) [%{}, known] (list.zip chosen results);
             strict! outcomes
-            file.write! (stamps_file (contexts.[first])) (wire.encode stamps)
+            keep_stamps! (contexts.[first]) stamps
             match flag_value "--outcomes" args {
                 () => console.print! (to_string outcomes),
                 f => file.write! f (wire.encode outcomes),
@@ -543,14 +872,25 @@ when test {
                    })]
     };
 
-    let run_sample! cache = {
+    let context_in! cache = {
         let here = here! ();
-        let ctx = build.Context.set_cache (build.Context.new "t" "0" (os.cwd! ()) here here) cache;
+        build.Context.set_cache (build.Context.new "t" "0" (os.cwd! ()) here here) cache
+    };
+
+    let run_sample! cache = {
+        let ctx = context_in! cache;
         let [plan, mods, st] = settle! ctx (State.new ()) (sample ctx);
         let answer = outcome ctx plan mods st;
         strict! answer
         answer
     };
+
+    /// A step that copies `from` and writes the file it read to its depfile, as
+    /// a compiler that discovers its headers does: the declared input is the
+    /// source, and the header is what it found.
+    let discovers source header = build.discovering (build.step "cc" "obj" [source] () ["obj", "deps.d"] (fn job ->
+        [build.Op.copy (build.path job source) "obj",
+         build.Op.write "deps.d" ("obj: " + build.path job source + " " + header + "\n")]));
 
     let tests = [
         test.case "a run builds everything once, and a second builds nothing"
@@ -565,46 +905,96 @@ when test {
                 file.remove_all! cache
                 test.eq! [[5, 0], [0, 5], %{ "answered" => true }, "hello", "let v = 1;"] got
             } ),
+        test.case "a changed discovered input runs its step again, and what reads it"
+            $( {
+                let dir = "dream-build-deps-" + to_string (os.pid! ());
+                file.mkdir_all! dir
+                let root = os.cwd! () + "/" + dir;
+                let header = root + "/a.h";
+                file.write! (root + "/a.c") "source"
+                file.write! header "one"
+                let obj = build.artifact (discovers (build.file "a.c") header) "obj";
+                let linked = build.artifact (build.step "ld" "prog" [obj] () ["prog"]
+                                                        (fn job -> [build.Op.copy (build.path job obj) "prog"])) "prog";
+                let plan = build.empty |> build.payload "prog" linked;
+                let ctx = build.Context.set_root (context_in! (root + "/cache")) root;
+                let once! () = {
+                    let [p, mods, st] = settle! ctx (State.new ()) plan;
+                    let r = [State.built st, State.reused st];
+                    strict! r
+                    r
+                };
+                let first = once! ();
+                let again = once! ();
+                file.write! header "two, and longer"
+                let changed = once! ();
+                file.remove_all! dir
+                test.eq! [[2, 0], [0, 2], [2, 0]] [first, again, changed]
+            } ),
         test.case "the questions a step can ask never fail, and verify can"
             $( {
                 let dir = "dream-build-ops-" + to_string (os.pid! ());
                 file.mkdir_all! dir
-                let got = [op! dir (build.Op.write "f" "abc"),
-                           list.head (op! dir (build.Op.verify "f" (io.digest "abc"))),
-                           list.head (op! dir (build.Op.verify "f" (io.digest "abd"))),
-                           list.head (op! dir (build.Op.find "no-such-program-anywhere" "where")),
+                let got = [op! dir 0 (build.Op.write "f" "abc"),
+                           list.head (op! dir 0 (build.Op.verify "f" (io.digest "abc"))),
+                           list.head (op! dir 0 (build.Op.verify "f" (io.digest "abd"))),
+                           list.head (op! dir 0 (build.Op.find "no-such-program-anywhere" "where")),
                            file.read! (dir + "/where"),
-                           list.head (op! dir (build.Op.attempt "no-such-program-anywhere" [] "tried")),
+                           list.head (op! dir 0 (build.Op.attempt "no-such-program-anywhere" [] "tried")),
                            file.read! (dir + "/tried")];
                 strict! got
                 file.remove_all! dir
                 test.eq! [[:ok, ()], :ok, :error, :ok, "", :ok, "no"] got
             } ),
-        test.case "a test run builds what its checks read, and runs each"
+        test.case "transform writes a pure function of some files as another"
+            $( {
+                let dir = "dream-build-transform-" + to_string (os.pid! ());
+                file.mkdir_all! dir
+                op! dir 0 (build.Op.write "f" "abc")
+                op! dir 0 (build.Op.write "h" "def")
+                op! dir 0 (build.Op.transform ["f", "h"] "g" (fn texts -> str.upper (str.join_str "" texts)))
+                let got = file.read! (dir + "/g");
+                strict! got
+                file.remove_all! dir
+                test.eq! "ABCDEF" got
+            } ),
+        test.case "a test run builds what its checks read, runs each, and goes on past a failure"
             $( {
                 let cache = "dream-build-checks-" + to_string (os.pid! ());
-                let here = here! ();
-                let ctx = build.Context.set_testing (build.Context.set_cache (build.Context.new "t" "0" (os.cwd! ()) here here) cache) true;
+                let ctx = build.Context.set_testing (context_in! cache) true;
                 let made = build.write "made.txt" "hello";
                 let holds text = build.step "check" "holds" [made] text []
                                             (fn job -> [build.Op.copy (build.path job made) "copy",
                                                         build.Op.verify "copy" (io.digest text)]);
-                let plan = build.empty |> build.check "passes" (holds "hello") |> build.check "fails" (holds "bye");
+                let plan = build.empty |> build.check "fails" (holds "bye") |> build.check "passes" (holds "hello");
                 let [p, mods, st] = settle! ctx (State.new ()) plan;
-                let [results, _] = run_checks! ctx st p;
+                let [results, after] = run_checks! ctx st p;
                 let got = [(results.["passes"]).[0], (results.["fails"]).[0],
-                           str.contains_str "SHA-256" (results.["fails"]).[2], State.built st];
+                           str.contains_str "SHA-256" (results.["fails"]).[2], State.built after];
                 strict! got
                 file.remove_all! cache
-                test.eq! [true, false, true, 1] got
+                test.eq! [true, false, true, 2] got
             } ),
-        test.case "steps at one depth never read each other"
+        test.case "a goal is made and placed"
             $( {
-                let leaf = build.step "t" "leaf" [] () [] (fn job -> []);
-                let mid = build.step "t" "mid" [build.artifact leaf "x"] () [] (fn job -> []);
-                test.eq! [0, 1, 2] [depth leaf, depth mid,
-                                    depth (build.step "t" "top" [build.artifact mid "y", build.artifact leaf "x"] () []
-                                                      (fn job -> []))]
+                let dir = "dream-build-goals-" + to_string (os.pid! ());
+                file.mkdir_all! dir
+                let root = os.cwd! () + "/" + dir;
+                let ctx = build.Context.set_goals (build.Context.set_root (context_in! (root + "/cache")) root) ["all"];
+                let plan = build.empty
+                           |> build.goal "text" (build.place "out/t.txt" (build.write "t.txt" "placed"))
+                           |> build.goal "all" (build.each ["text"]);
+                let [p, mods, st] = settle! ctx (State.new ()) plan;
+                let [paths, _] = make_goals! ctx st p;
+                let got = [paths.["text"], file.read! (root + "/out/t.txt")];
+                strict! got
+                file.remove_all! dir
+                test.eq! [root + "/out/t.txt", "placed"] got
             } ),
+        test.case "a make rule's prerequisites, continued and escaped"
+            $( test.eq! ["src/a.cpp", "include/a b.h", "/usr/include/stdio.h", "x$y"]
+                        (depfile_reads "obj/a.o: src/a.cpp include/a\\ b.h \\\n  /usr/include/stdio.h x$$y\n") ),
+        test.case "a failure says where the two texts part"
+            $( test.eq! "line 2:\n  expected: b\n  printed:  c" (first_difference "a\nb" "a\nc") ),
     ];
 }

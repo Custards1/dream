@@ -100,7 +100,16 @@ just dreams       # build/dreams.dream, the compiler
 just mind         # build/mind, the build tool
 just lucid        # build/lucid.dream, the language server
 just vm-pgo       # build-pgo/bin/dream, the VM trained on a self-compile
+just mind-build vm  # the VM again, by the repository's own build.dr
 ```
+
+`build.dr` at the root builds the repository from source as goals --
+`vm`, `dreams`, `seed`, `mind`, `lucid`, and `default` for the first four but
+the seed -- through `std.build`: the VM object by object with `std.build.cc`
+and whichever compiler `$CXX` names, not CMake, and the compiler by the VM it
+made. Each goal puts its result where the recipes above do. On Nix it needs
+`pkg-config` and libffi's headers on the path (`nix-shell -p llvm pkg-config
+libffi`), since that is how it finds libffi.
 
 The binaries that matter:
 
@@ -162,6 +171,7 @@ The groups, and what each one is actually asking:
 | `test-e2e` | Real programs under both interpreter and JIT, which must agree |
 | `test-examples` | Every example, output compared against what is recorded beside it |
 | `test-std` | The standard library's `when test` blocks |
+| `test-build` | `std.build.cc` against GCC, Clang and CMake, and the runner rebuilding only what changed |
 | `test-ffi` | `std.ffi`/`std.foreign` against a C library built from `dream/tests/ffi` |
 | `test-mind` | `mind`'s path handling, manifests, dependency specs |
 | `test-dreams` | Every `when test` block `dreams/main.dr` reaches |

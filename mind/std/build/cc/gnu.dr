@@ -1,0 +1,175 @@
+// GCC and Clang: `std.build.cc`'s settings as the flags both of them take.
+//
+// The two share a command line so nearly that one module serves both, and the
+// few places they part are `flags_for :gcc` and `flags_for :clang` in a
+// script, not branches here. MinGW is this family too, on Windows, where a
+// shared library also leaves an import library behind and there is no run
+// path to set.
+
+import std.build.cc;
+import std.list;
+import std.str;
+
+/// The directory part of a path, `.` when there is none.
+let dir_of : :string -> :string;
+let dir_of path = {
+    let cut = list.fold (fn at [i, c] -> if c == '/' || c == '\\' { i } else { at })
+                        (0 - 1) (list.enumerate (str.chars path));
+    if cut < 0 { "." } else { str.slice 0 cut path }
+};
+
+let value_text v = match v { () => "", s if type_of s == :string => s, x => to_string x };
+
+let sanitizer k = str.slice 1 (str.byte_length (to_string k) - 1) (to_string k);
+
+/// The flags one setting adds when compiling a source in `lang`.
+let compile_flags : cc.Toolchain -> :atom -> cc.Setting -> [:string];
+let compile_flags tc lang s = match s {
+    [:standard, l] if cc.standard_is_for lang l =>
+        [(if lang == :cxx { "-std=c++" } else { "-std=c" }) + cc.standard_version l],
+    [:optimize, :size] => ["-Os"],
+    [:optimize, n] => ["-O" + to_string n],
+    [:debug_info, true] => ["-g"],
+    [:warnings, :none] => ["-w"],
+    [:warnings, :all] => ["-Wall"],
+    [:warnings, :extra] => ["-Wall", "-Wextra"],
+    [:warnings_as_errors, true] => ["-Werror"],
+    [:define, n, ()] => ["-D" + n],
+    [:define, n, v] => ["-D" + n + "=" + value_text v],
+    [:include, d] => ["-I" + d],
+    [:rtti, false] if lang == :cxx => ["-fno-rtti"],
+    [:sanitize, k] if k != :none => ["-fsanitize=" + sanitizer k],
+    // Everything is position independent on Windows already, and GCC says so
+    // in a warning for every file that asks.
+    [:pic, true] if cc.Toolchain.os tc != :windows => ["-fPIC"],
+    :threads => ["-pthread"],
+    [:flags_for, sel, fs] if cc.applies sel tc => fs,
+    [:define_for, sel, n] if cc.applies sel tc => ["-D" + n],
+    _ => [],
+};
+
+/// The flags one setting adds to a link.
+let link_flags : cc.Toolchain -> cc.Setting -> [:string];
+let link_flags tc s = match s {
+    :threads => ["-pthread"],
+    [:sanitize, k] if k != :none => ["-fsanitize=" + sanitizer k],
+    [:system, l] => ["-l" + l],
+    [:system_for, os, l] if os == cc.Toolchain.os tc => ["-l" + l],
+    [:library_dir, d] => ["-L" + d],
+    [:link_file, p] => [p],
+    [:runtime_path, d] => match cc.Toolchain.os tc {
+        :linux => ["-Wl,-rpath,$ORIGIN/" + d],
+        :macos => ["-Wl,-rpath,@loader_path/" + d],
+        _ => [],
+    },
+    [:link_flags_for, sel, fs] if cc.applies sel tc => fs,
+    _ => [],
+};
+
+/// What this family cannot do with these settings, said before anything runs.
+let problems : cc.Toolchain -> [cc.Setting] -> [:string];
+let problems tc settings =
+    list.flat_map (fn s -> match [s, cc.Toolchain.os tc] {
+        [[:sanitize, k], :windows] if k != :none =>
+            ["MinGW has no " + sanitizer k + " sanitizer; build with clang-cl or MSVC for :address"],
+        _ => [],
+    }) settings;
+
+/// The settings a target's kind implies: a shared library is position
+/// independent without being told.
+let implied t = match cc.kind t { :shared => [cc.Setting.pic true], _ => [] };
+
+/// The command that compiles one source of `t` into `object`, and writes
+/// the headers it read to `depfile` as a make rule.
+let compile : cc.Toolchain -> cc.Target -> [:any] -> :string -> :string -> [:string];
+let compile tc t [path, own] object depfile = {
+    let lang = cc.language path;
+    let program = if lang == :c { cc.Toolchain.c tc } else { cc.Toolchain.cxx tc };
+    list.concat [[program],
+                 list.flat_map (compile_flags tc lang) (list.append (implied t) (cc.settings_for t own)),
+                 ["-MD", "-MF", depfile, "-c", path, "-o", object]]
+};
+
+/// A target of C alone is linked by the C compiler, so that it does not pick
+/// up the C++ runtime it has no use for.
+let link_program tc t =
+    if list.all (fn [p, _] -> cc.language p == :c) (cc.sources t) { cc.Toolchain.c tc }
+    else { cc.Toolchain.cxx tc };
+
+/// How a shared library says what it is called, so that what links against it
+/// finds it by that name.
+let shared_flags tc t out =
+    match cc.Toolchain.os tc {
+        :macos => ["-dynamiclib", "-Wl,-install_name,@rpath/" + list.last (str.split "/" out)],
+        :windows => ["-shared", "-Wl,--out-implib," + dir_of out + "/" + cc.import_name tc (cc.name t)],
+        _ => ["-shared", "-Wl,-soname," + list.last (str.split "/" out)],
+    };
+
+/// The commands that make `out` from `objects`. `libraries` are the files of
+/// the targets it uses, the import library for a DLL.
+let link : cc.Toolchain -> cc.Target -> [:string] -> [:string] -> :string -> [[:string]];
+let link tc t objects libraries out = match cc.kind t {
+    :static => [list.concat [[cc.Toolchain.archiver tc, "rcs", out], objects]],
+    k => [list.concat [[link_program tc t],
+                       (if k == :shared { shared_flags tc t out } else { [] }),
+                       objects, libraries,
+                       list.flat_map (link_flags tc) (cc.link_settings t),
+                       ["-o", out]]],
+};
+
+when test {
+    import std.test;
+
+    let linux = cc.gcc :linux;
+    let vm = cc.shared "dream" ["src/interp.cpp"]
+             |> cc.standard :cxx20
+             |> cc.optimize 3
+             |> cc.warnings :extra
+             |> cc.public_include "include"
+             |> cc.threads
+             |> cc.flags_for :gcc ["--param", "max-inline-insns-auto=120"]
+             |> cc.flags_for :msvc ["/permissive-"]
+             |> cc.define_for :msvc "_CRT_SECURE_NO_WARNINGS"
+             |> cc.system_for :windows "ws2_32";
+    let cli = cc.executable "dream" ["src/cli.cpp"] |> cc.use vm |> cc.runtime_path "../lib";
+
+    let tests = [
+        test.case "a C++ source of a shared library, with GCC"
+            $( test.eq! ["g++", "-fPIC", "-std=c++20", "-O3", "-Wall", "-Wextra",
+                         "--param", "max-inline-insns-auto=120", "-Iinclude", "-pthread",
+                         "-MD", "-MF", "o.d", "-c", "src/interp.cpp", "-o", "o.o"]
+                        (compile linux vm (list.head (cc.sources vm)) "o.o" "o.d") ),
+        test.case "Clang leaves out what only GCC takes"
+            $( test.eq! ["clang++", "-fPIC", "-std=c++20", "-O3", "-Wall", "-Wextra", "-Iinclude", "-pthread",
+                         "-MD", "-MF", "o.d", "-c", "src/interp.cpp", "-o", "o.o"]
+                        (compile (cc.clang :linux) vm (list.head (cc.sources vm)) "o.o" "o.d") ),
+        test.case "a C source is compiled as C, and a C++ standard does not reach it"
+            $( test.eq! ["gcc", "-O2", "-MD", "-MF", "d", "-c", "a.c", "-o", "a.o"]
+                        (compile linux (cc.static "a" ["a.c"] |> cc.standard :cxx20 |> cc.optimize 2)
+                                 ["a.c", []] "a.o" "d") ),
+        test.case "one source's own settings come last"
+            $( test.eq! ["-fno-rtti"]
+                        (list.filter (fn f -> f == "-fno-rtti")
+                                     (compile linux vm ["src/jit.cpp", [cc.Setting.rtti false]] "o" "d")) ),
+        test.case "a shared library on Linux names itself"
+            $( test.eq! [["g++", "-shared", "-Wl,-soname,libdream.so", "a.o", "-pthread", "-o", "lib/libdream.so"]]
+                        (link linux vm ["a.o"] [] "lib/libdream.so") ),
+        test.case "on macOS it is found through the run path"
+            $( test.eq! ["clang++", "-dynamiclib", "-Wl,-install_name,@rpath/libdream.dylib"]
+                        (list.take 3 (list.head (link (cc.clang :macos) vm ["a.o"] [] "lib/libdream.dylib"))) ),
+        test.case "an executable gets its libraries, what they need, and a run path"
+            $( test.eq! [["g++", "c.o", "lib/libdream.so", "-Wl,-rpath,$ORIGIN/../lib", "-pthread", "-o", "bin/dream"]]
+                        (link linux cli ["c.o"] ["lib/libdream.so"] "bin/dream") ),
+        test.case "MinGW links Windows' libraries and leaves an import library"
+            $( test.eq! [["g++", "-shared", "-Wl,--out-implib,lib/libdream.dll.a", "a.o", "-pthread", "-lws2_32",
+                          "-o", "lib/dream.dll"]]
+                        (link (cc.gcc :windows) vm ["a.o"] [] "lib/dream.dll") ),
+        test.case "a static library is archived"
+            $( test.eq! [["ar", "rcs", "libx.a", "a.o", "b.o"]]
+                        (link linux (cc.static "x" []) ["a.o", "b.o"] [] "libx.a") ),
+        test.case "what MinGW cannot do is said before anything runs"
+            $( test.eq! [1, 0]
+                        [list.length (problems (cc.gcc :windows) [cc.Setting.sanitize :thread]),
+                         list.length (problems linux [cc.Setting.sanitize :thread])] ),
+    ];
+}

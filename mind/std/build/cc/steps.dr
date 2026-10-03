@@ -1,0 +1,272 @@
+// `std.build.cc`'s targets as `std.build` steps.
+//
+// A target becomes a step per source and a step to link. An object step is
+// keyed on the toolchain, the settings that reach that one source and the
+// source's contents, and discovers the headers it read, so a header changed
+// recompiles what includes it and nothing else. It is keyed on nothing about
+// its target but those settings, so two targets that compile a file the same
+// way share the object.
+//
+// A link step lays its outputs out as they will be installed, and so that
+// each artifact runs where it lies:
+//
+//     shared    lib/libx.so, lib/libx.dylib; bin/x.dll with its import library
+//     static    lib/libx.a, lib/x.lib
+//     program   bin/x, bin/x.exe, and every shared library it uses linked
+//               into lib/, or into bin/ on Windows, which has no run path and
+//               looks beside the program
+//
+// A program that uses a shared library is given the run path `../lib` on Linux
+// and macOS unless it says otherwise.
+//
+// The compiler runs in the package's directory, so that the paths a script
+// writes -- sources, include directories -- mean what they say there, and
+// writes into the step's own. Which compiler is a probe's answer
+// (`with_toolchain`): `$CXX` and `$CC` when the manifest lets the script see
+// them (`[build] env = ["CC", "CXX"]`), and the platform's own otherwise.
+
+import std.build;
+import std.build.cc;
+import std.build.cc.gnu;
+import std.build.cc.msvc;
+import std.list;
+import std.str;
+
+// --- finding the compiler ----------------------------------------------------------
+
+/// The C compiler that goes with a C++ one: `g++-14` has `gcc-14`.
+let c_for : :string -> :string;
+let c_for cxx = match [str.contains_str "clang++" cxx, str.contains_str "g++" cxx, str.contains_str "c++" cxx] {
+    [true, _, _] => str.join_str "clang" (str.split "clang++" cxx),
+    [_, true, _] => str.join_str "gcc" (str.split "g++" cxx),
+    [_, _, true] => str.join_str "cc" (str.split "c++" cxx),
+    _ => cxx,
+};
+
+let default_cxx : :atom -> :string;
+let default_cxx os = match os { :windows => "cl.exe", :macos => "clang++", _ => "c++" };
+
+/// `[c, cxx]`: the compilers this build will run, from the variables the
+/// context lets the script see, or the host's own.
+let compilers : :map -> [:string];
+let compilers ctx = {
+    let env = build.Context.env ctx;
+    let set name = match env.[name else ()] { () => (), "" => (), v => v };
+    let cxx = match set "CXX" { () => default_cxx (build.Target.os (build.Context.host ctx)), v => v };
+    [match set "CC" { () => c_for cxx, v => v }, cxx]
+};
+
+/// What the C++ compiler says it is, as a probe: never kept, since installing
+/// another compiler under the same name changes no file of the project's.
+let toolchain : :map -> :any;
+let toolchain ctx = {
+    let [c, cxx] = compilers ctx;
+    let asked = if str.ends_with "cl.exe" cxx { [] } else { ["--version"] };
+    build.artifact (build.uncached (build.step "probe" "compiler" [] [c, cxx] ["said"]
+                                               (fn job -> [build.Op.capture cxx asked "said"])))
+                   "said"
+};
+
+/// The toolchain, from what the compiler said of itself. Its first line is
+/// kept in the toolchain, so a different compiler under the same name still
+/// rebuilds.
+let parse : :map -> :string -> cc.Toolchain;
+let parse ctx said = {
+    let [c, cxx] = compilers ctx;
+    let os = build.Target.os (build.Context.target ctx);
+    let first = str.trim (list.first_or "" (str.split "\n" said));
+    match [str.ends_with "cl.exe" cxx || str.contains_str "Microsoft" said, str.contains_str "clang" said] {
+        [true, _] => cc.Toolchain.set_version cc.msvc first,
+        [_, true] => cc.Toolchain.make :clang :gnu os c cxx "ar" "" first "",
+        _ => cc.Toolchain.make :gcc :gnu os c cxx "ar" "" first "",
+    }
+};
+
+/// A plan made with the machine's toolchain: `f` is handed it once the probe
+/// has answered.
+let with_toolchain : :map -> (cc.Toolchain -> :map) -> :map;
+let with_toolchain ctx f = build.given (toolchain ctx) (fn said -> f (parse ctx said));
+
+// --- where things go ------------------------------------------------------------------
+
+let family : cc.Toolchain -> :atom;
+let family tc = cc.Toolchain.family tc;
+
+let os_of : cc.Toolchain -> :atom;
+let os_of tc = cc.Toolchain.os tc;
+
+/// The file a target's step makes, as a path inside that step's directory.
+let main_file : cc.Toolchain -> cc.Target -> :string;
+let main_file tc t = match [cc.kind t, os_of tc] {
+    [:executable, _] => "bin/" + cc.file_name tc :executable (cc.name t),
+    [:shared, :windows] => "bin/" + cc.file_name tc :shared (cc.name t),
+    [k, _] => "lib/" + cc.file_name tc k (cc.name t),
+};
+
+/// What a user of the target links against: the import library for a DLL.
+let link_file : cc.Toolchain -> cc.Target -> :string;
+let link_file tc t = match [cc.kind t, os_of tc] {
+    [:shared, :windows] => "bin/" + cc.import_name tc (cc.name t),
+    _ => main_file tc t,
+};
+
+/// Every shared library a target uses, however deep, once each.
+let shared_used : cc.Target -> [cc.Target];
+let rec shared_used t =
+    list.unique (list.flat_map (fn u -> match cc.kind u {
+        :shared => list.cons u (shared_used u),
+        _ => shared_used u,
+    }) (cc.uses t));
+
+let runtime_dir : cc.Toolchain -> :string;
+let runtime_dir tc = match os_of tc { :windows => "bin/", _ => "lib/" };
+
+/// A program that uses a shared library finds it beside itself: in `../lib`,
+/// by a run path, unless the target set one.
+let with_run_path : cc.Toolchain -> cc.Target -> cc.Target;
+let with_run_path tc t = {
+    let has = list.any (fn s -> match s { [:runtime_path, _] => true, _ => false }) (cc.settings t);
+    match cc.kind t == :executable && os_of tc != :windows && not has && not (list.is_empty (shared_used t)) {
+        true => cc.runtime_path "../lib" t,
+        false => t,
+    }
+};
+
+// --- steps --------------------------------------------------------------------------
+
+/// A make rule naming what a compile read, for a compiler that does not
+/// write one: MSVC.
+let depfile_text : :string -> [:string] -> :string;
+let depfile_text object reads =
+    str.join_str " \\\n  " (list.cons (object + ":") (list.map (fn r -> str.join_str "\\ " (str.split " " r)) reads)) + "\n";
+
+/// What `cl /showIncludes` printed, as the depfile `gcc -MD` would have
+/// written: the source and every header named.
+let msvc_depfile : :string -> :string -> :string -> [:string] -> :string;
+let msvc_depfile prefix object source printed =
+    depfile_text object (list.cons source (list.head (msvc.headers prefix (list.first_or "" printed))));
+
+/// A command line as an operation run in the package's directory.
+let in_root : :string -> [:string] -> :any;
+let in_root root argv = build.Op.run root (%{}) (list.head argv) (list.tail argv);
+
+/// The step that compiles one source of `t`.
+let compile_step : cc.Toolchain -> cc.Target -> [:any] -> :map;
+let compile_step tc t src = {
+    let path = list.head src;
+    let object = cc.object_name tc path;
+    // What reaches this source and nothing else of the target, so that two
+    // targets compiling it alike share the object.
+    let alike = cc.Target.make (cc.kind t) "" [src] (cc.settings_for t (list.nth 1 src)) [] [];
+    build.discovering (build.step "cc.compile" path [build.file path] [tc, alike] [object] (fn job -> {
+        let root = build.Context.root (build.Job.ctx job);
+        match family tc {
+            :msvc => {
+                let argv = msvc.compile tc alike src (build.out job object);
+                [build.Op.run_to root (%{}) (list.head argv) (list.tail argv) "cl.out",
+                 build.Op.transform ["cl.out"] "deps.d" (msvc_depfile (cc.Toolchain.includes tc) object path)]
+            },
+            _ => [in_root root (gnu.compile tc alike src (build.out job object) (build.out job "deps.d"))],
+        }
+    }))
+};
+
+/// For a DLL that exports everything, the operations that write its `.def`:
+/// the objects' symbols, as CMake's `WINDOWS_EXPORT_ALL_SYMBOLS` finds them.
+let exports : cc.Toolchain -> cc.Target -> :string -> [:string] -> [:any];
+let exports tc t root objects =
+    match family tc == :msvc && cc.kind t == :shared && list.contains cc.Setting.export_all (cc.settings t) {
+        true => {
+            let argv = msvc.symbols_command objects;
+            [build.Op.run_to root (%{}) (list.head argv) (list.tail argv) "symbols",
+             build.Op.transform ["symbols"] (msvc.def_path (main_file tc t)) (fn [listing] -> msvc.def_file (cc.name t) listing)]
+        },
+        false => [],
+    };
+
+/// The step that links `t`, and the steps it needs, made from nothing but
+/// the target: each source's compile step, and each used target's link step.
+let link_step : cc.Toolchain -> cc.Target -> :map;
+let rec link_step tc target = {
+    let t = with_run_path tc target;
+    let objects = list.map (fn src -> { let s = compile_step tc t src; build.artifact s (list.head (build.Step.outputs s)) })
+                           (cc.sources t);
+    let libraries = list.map (fn u -> build.artifact (link_step tc u) (link_file tc u)) (cc.linked_targets t);
+    let runtime = match cc.kind t {
+        :executable => list.map (fn u -> [build.artifact (link_step tc u) (main_file tc u),
+                                         runtime_dir tc + cc.file_name tc :shared (cc.name u)])
+                                (shared_used t),
+        _ => [],
+    };
+    let outputs = list.concat [
+        [main_file tc t],
+        (if cc.kind t == :shared && os_of tc == :windows { [link_file tc t] } else { [] }),
+        list.map (fn r -> list.nth 1 r) runtime,
+    ];
+    build.step "cc.link" (cc.name t) (list.concat [objects, libraries, list.map list.head runtime]) [tc, t] outputs (fn job -> {
+        let root = build.Context.root (build.Job.ctx job);
+        let objs = list.map (fn o -> build.path job o) objects;
+        let libs = list.map (fn l -> build.path job l) libraries;
+        let out = build.out job (main_file tc t);
+        let commands = match family tc {
+            :msvc => msvc.link tc t objs libs out,
+            _ => gnu.link tc t objs libs out,
+        };
+        list.concat [exports tc t root objs,
+                     list.map (fn argv -> in_root root argv) commands,
+                     // The shared libraries a program uses, beside it.
+                     list.map (fn [i, name] -> build.Op.link (build.path job i) name) runtime]
+    })
+};
+
+/// The file a target makes, as an input to anything else: the program, or the
+/// library.
+let artifact : cc.Toolchain -> cc.Target -> :any;
+let artifact tc t = build.artifact (link_step tc t) (main_file tc t);
+
+when test {
+    import std.test;
+
+    let linux = cc.gcc :linux;
+    let lib = cc.shared "demo" ["src/demo.cpp"] |> cc.optimize 2;
+    let app = cc.executable "demo" ["src/main.cpp"] |> cc.use lib;
+    let other = cc.executable "other" ["src/main.cpp"] |> cc.use lib;
+    let here = build.Target.make :linux :x86_64;
+    let ctx = build.Context.new "p" "1" "/p" here here;
+
+    let tests = [
+        test.case "files are laid out as they will be installed"
+            $( test.eq! ["lib/libdemo.so", "bin/demo", "bin/demo.dll", "bin/demo.lib", "bin/demo.exe"]
+                        [main_file linux lib, main_file linux app, main_file cc.msvc lib,
+                         link_file cc.msvc lib, main_file cc.msvc app] ),
+        test.case "a program carries the shared libraries it uses"
+            $( test.eq! ["bin/demo", "lib/libdemo.so"] (build.Step.outputs (link_step linux app)) ),
+        test.case "two programs compiling one file alike share the object"
+            $( test.eq! true (build.Step.shape (compile_step linux app ["src/main.cpp", []])
+                              == build.Step.shape (compile_step linux other ["src/main.cpp", []])) ),
+        test.case "but not when its settings differ"
+            $( test.eq! false (build.Step.shape (compile_step linux app ["src/main.cpp", []])
+                               == build.Step.shape (compile_step linux (app |> cc.optimize 3) ["src/main.cpp", []])) ),
+        test.case "a program using a shared library finds it by a run path"
+            $( test.eq! true (list.contains (cc.Setting.runtime_path "../lib") (cc.settings (with_run_path linux app))) ),
+        test.case "the C compiler that goes with a C++ one"
+            $( test.eq! ["gcc-14", "clang", "cc", "cl.exe"] (list.map c_for ["g++-14", "clang++", "c++", "cl.exe"]) ),
+        test.case "the compilers are the context's, or the platform's"
+            $( test.eq! [["cc", "c++"], ["clang", "clang++"], ["gcc", "g++"]]
+                        [compilers ctx, compilers (build.Context.set_env ctx (%{ "CXX" => "clang++" })),
+                         compilers (build.Context.set_env ctx (%{ "CC" => "gcc", "CXX" => "g++" }))] ),
+        test.case "a toolchain is what its compiler says it is"
+            $( test.eq! [:gcc, :clang, "g++ (GCC) 14.2.1"]
+                        [cc.Toolchain.name (parse ctx "g++ (GCC) 14.2.1\nCopyright"),
+                         cc.Toolchain.name (parse ctx "clang version 19.1.7\nTarget: x86_64"),
+                         cc.Toolchain.version (parse ctx "g++ (GCC) 14.2.1\nCopyright")] ),
+        test.case "a GNU compile runs in the package and writes into the step"
+            $( test.eq! [[:run, "/p", %{}, "g++", ["-fPIC", "-O2", "-MD", "-MF", "/d/deps.d", "-c", "src/demo.cpp",
+                                                    "-o", "/d/src#demo.cpp.o"]]]
+                        (build.Step.action (compile_step linux lib ["src/demo.cpp", []]) (build.Job.make "/d" ctx (%{}))) ),
+        test.case "what cl printed becomes a depfile"
+            $( test.eq! "a.obj: \\\n  a.cpp \\\n  C:\\inc\\a.h\n"
+                        (msvc_depfile "Note: including file:" "a.obj" "a.cpp"
+                                      ["a.cpp\r\nNote: including file: C:\\inc\\a.h\r\n"]) ),
+    ];
+}

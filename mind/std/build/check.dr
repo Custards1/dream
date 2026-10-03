@@ -1,0 +1,111 @@
+// Checks: steps whose success is the test.
+//
+// A check here is kept like any step, so one that passed with these inputs is
+// not run again: `mind test` after a change to one program runs that
+// program's checks and not the rest. That is only right because everything
+// it reads is declared, which is the difference from `command.check`: a
+// suite written as a script reads what it likes, so it runs every time.
+//
+// A check's arguments are written as `std.build.command`'s are -- strings,
+// inputs, `command.out` -- and a variable's value may be an input too, so what
+// it reads is part of its key without being listed twice. `reads` names an
+// input it does not pass on its command line: a directory of tests a script
+// walks by itself. A program under test is run from the package's directory,
+// with its errors written in among its output, the way a person running it
+// sees them, and the variables a check names laid over the environment.
+//
+//     build.check "e2e.fib" (check.output "fib" [vm, image] "tests/fib.expected")
+
+import std.build;
+import std.list;
+import std.map;
+import std.str;
+
+/// An input a check reads without naming it on its command line.
+let reads : :any -> :any;
+let reads i = [:reads, build.input i];
+
+let is_input : :any -> :bool;
+let is_input a = match a { [:file, _] => true, [:tree, _, _] => true, [:artifact, _, _] => true, _ => false };
+
+/// What a check reads: every input on its command line or among its
+/// variables, and what it `reads`.
+let inputs_of : %{:string => :any} -> [:any] -> [:any];
+let inputs_of env argv = list.concat [
+    list.filter is_input (map.values env),
+    list.flat_map (fn a -> match a { [:reads, i] => [i], _ if is_input a => [a], _ => [] }) argv,
+];
+
+/// The arguments made real for this job: an input is its path, an output its
+/// place in the step's directory, and what is only read is left out.
+let resolved : :map -> [:any] -> [:string];
+let resolved job argv = list.flat_map (fn a -> match a {
+    [:reads, _] => [],
+    [:out, n] => [build.out job n],
+    _ if is_input a => [build.path job a],
+    s => [s],
+}) argv;
+
+let env_resolved : :map -> %{:string => :any} -> %{:string => :string};
+let env_resolved job env = map.map_values (fn v -> if is_input v { build.path job v } else { v }) env;
+
+let program_and : :map -> %{:string => :any} -> [:any] -> [:any];
+let program_and job env argv = {
+    let line = resolved job argv;
+    [build.Context.root (build.Job.ctx job), env_resolved job env, list.head line, list.tail line]
+};
+
+/// Passes when the program exits with 0.
+let succeeds : :string -> [:any] -> :map;
+let succeeds name argv = succeeds_with name (%{}) argv;
+
+/// The same, with variables set for it.
+let succeeds_with : :string -> %{:string => :any} -> [:any] -> :map;
+let succeeds_with name env argv =
+    build.step "check.succeeds" name (inputs_of env argv) [build.keyed env, build.keyed argv] ["output"] (fn job -> {
+        let [dir, vars, program, args] = program_and job env argv;
+        [build.Op.run_to dir vars program args "output"]
+    });
+
+/// Passes when what the program prints, errors and all, is the file
+/// `expected`, whatever it exits with. With `mind test --bless`
+/// (`-D bless`), what it printed becomes the file.
+let output : :string -> [:any] -> :string -> :map;
+let output name argv expected = output_with name (%{}) argv expected;
+
+let output_with : :string -> %{:string => :any} -> [:any] -> :string -> :map;
+let output_with name env argv expected =
+    build.step "check.output" name (list.cons (build.file expected) (inputs_of env argv))
+               [build.keyed env, build.keyed argv, expected] ["output"] (fn job -> {
+        let [dir, vars, program, args] = program_and job env argv;
+        [build.Op.observe dir vars program args "output",
+         build.Op.expect "output" (build.path job (build.file expected))
+                         (build.option (build.Job.ctx job) "bless" == true)]
+    });
+
+/// Passes when two files are byte for byte the same.
+let same : :string -> :any -> :any -> :map;
+let same name a b =
+    build.step "check.same" name [a, b] [] [] (fn job -> [build.Op.same (build.path job a) (build.path job b)]);
+
+when test {
+    import std.test;
+
+    let here = build.Target.make :linux :x86_64;
+    let ctx = build.Context.new "p" "1" "/p" here here;
+    let job = build.Job.make "/d" ctx (%{ build.input_id "prog" => "/p/prog", build.input_id "t.expected" => "/p/t.expected" });
+
+    let tests = [
+        test.case "a check reads what its arguments and its variables name"
+            $( test.eq! [build.file "t.expected", build.file "vm", build.file "prog", build.tree "tests" ".dr"]
+                        (build.Step.inputs (output_with "t" (%{ "VM" => build.file "vm" })
+                                                        ["sh", build.file "prog", reads (build.tree "tests" ".dr")]
+                                                        "t.expected")) ),
+        test.case "it runs from the package, and what it only reads is not an argument"
+            $( test.eq! [[:observe, "/p", %{}, "sh", ["/p/prog"], "output"], [:expect, "output", "/p/t.expected", false]]
+                        (build.Step.action (output "t" ["sh", build.file "prog", reads "tests"] "t.expected") job) ),
+        test.case "the key follows the arguments"
+            $( test.ne! (build.Step.shape (succeeds "t" ["sh", build.file "a"]))
+                        (build.Step.shape (succeeds "t" ["sh", build.file "b"])) ),
+    ];
+}

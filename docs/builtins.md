@@ -373,6 +373,12 @@ import std.io;
 | `stat!` | `path:string → [size:integer, modified:integer, kind:atom] \| unit` | A path's stamp: its size, when it was last written in nanoseconds since the epoch (seconds' resolution on Windows), and `:file`, `:dir` or `:other`. `()` when nothing is there, which is an answer rather than a failure: a deleted input has moved as surely as a rewritten one. |
 | `digest!` | `path:string → string` | The SHA-256 of a file's contents, as 64 lowercase hex digits, read in the VM rather than a chunk at a time through the heap. Raises as `open!` does. |
 | `digest` | `data:string → string` | The SHA-256 of a string, the digest `digest!` gives the file holding the same bytes. Pure. |
+| `mkdir_all!` | `path:string → unit` | The directory and every parent it needs. Already there is not an error. |
+| `remove_all!` | `path:string → integer` | The path and everything under it, answering how many entries went. Nothing there answers 0 rather than failing. |
+| `copy!` | `from:string → to:string → unit` | `to` becomes a copy of `from`, with its permissions, replacing it if it is there: a file of its own, so that what edits one later cannot reach the other. |
+| `link!` | `from:string → to:string → atom` | `to` becomes another name for `from`: a hard link (`:linked`), or a copy where one cannot be made (`:copied`). `to` must not exist yet. For a file nothing will write to again, such as another build step's output. |
+| `chmod!` | `path:string → mode:integer → unit` | Set the permission bits, `0o755` being `493`. On Windows only the owner's write bit means anything, and the rest are accepted and ignored. |
+| `walk!` | `dir:string → list of string` | Every file under `dir`, relative to it with `/` between the parts, sorted. Directories are walked and not listed, and a link to a directory is not followed, so a tree that links into itself is still finite. |
 
 ### Error atoms
 
@@ -437,6 +443,7 @@ import std.os;
 | `exec_for!` | `program:string → args:list of string → timeout_ms:integer → map` | Same as `exec!` but kills the child after `timeout_ms` milliseconds. Sets `:timed_out true` in the result map when the deadline is hit, so the caller can distinguish that from an ordinary non-zero exit code. |
 | `exec_in!` | `dir:string → program:string → args:list of string → timeout_ms:integer → map` | `exec_for!` with the child started in `dir`, and `0` for no deadline. The directory is the child's own: `chdir!` moves the whole VM's, which two concurrent build steps cannot share. A relative `program` is looked up from `dir`. |
 | `exec_with!` | `dir:string → env:list of string → program:string → args:list of string → timeout_ms:integer → map` | `exec_in!` with variables of the child's own: each `NAME=value` in `env` is laid over this VM's environment for that child alone, since `set_env!` changes the whole VM's. |
+| `exec_joined!` | `dir:string → env:list of string → program:string → args:list of string → timeout_ms:integer → map` | `exec_with!` with the child's errors written into its output, in the order they happened: `:out` is everything it printed and `:err` is empty. What a check comparing a program's output with a recorded file runs it with, since two streams read apart cannot be put back in order. |
 | `replace!` | `program:string → args:list of string → never` | **Becomes** `program`: `execvp`, so this VM — image, heap and every thread — is gone and the named program takes over the process, inheriting the terminal and every open descriptor. Stdio is flushed first. It returns only by failing, raising `:not_found` when the program cannot be run. Use it to hand over to something interactive; `exec!` gives its child pipes, which is right for a compiler and useless for anything that prompts. |
 
 The result map fields:

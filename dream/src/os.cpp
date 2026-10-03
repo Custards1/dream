@@ -129,6 +129,10 @@ struct Job {
     /// place of -- this VM's own. A child's own, like `dir`: `set_env!` is
     /// the whole VM's, and two checks running at once each want theirs.
     std::vector<std::string> env;
+    /// The child's errors into the same pipe as its output, so that `out`
+    /// holds both in the order they were written -- what a person running it
+    /// in a terminal sees, and what a check compares against a recorded file.
+    bool joined = false;
 
     /// 0 means "wait as long as it takes". Anything else is a deadline after
     /// which the child is killed -- worth having because a build tool spends
@@ -235,7 +239,9 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     start.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     start.StartupInfo.hStdInput = input;
     start.StartupInfo.hStdOutput = out_write;
-    start.StartupInfo.hStdError = err_write;
+    // Joined, the error stream is the output's pipe, and the handle is
+    // listed once below: a handle listed twice is refused.
+    start.StartupInfo.hStdError = job->joined ? out_write : err_write;
     SIZE_T bytes = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
     std::vector<unsigned char> attributes(bytes);
@@ -245,7 +251,8 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     }
     HANDLE inherited[] = {input, out_write, err_write};
     bool ready = UpdateProcThreadAttribute(start.lpAttributeList, 0,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr);
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+        (job->joined ? 2 : 3) * sizeof(HANDLE), nullptr, nullptr);
     std::wstring command;
     for (const auto& arg : argv) {
         if (!command.empty()) command += L' ';
@@ -363,9 +370,12 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, out_pipe[1], 1);
-    posix_spawn_file_actions_adddup2(&actions, err_pipe[1], 2);
+    posix_spawn_file_actions_adddup2(&actions, job->joined ? out_pipe[1] : err_pipe[1], 2);
     posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
     posix_spawn_file_actions_addclose(&actions, err_pipe[0]);
+    // Joined, the child must not hold the error pipe open either, or the
+    // reader of it would wait for the child rather than see its end at once.
+    if (job->joined) posix_spawn_file_actions_addclose(&actions, err_pipe[1]);
     if (!job->dir.empty()) {
         // Before the program is looked up, so a relative program name is
         // relative to `dir`, as it would be to a shell that had `cd`'d there.
@@ -458,7 +468,7 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
 #endif
 
 NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir,
-                          std::vector<std::string> env = {});
+                          std::vector<std::string> env = {}, bool joined = false);
 
 NativeResult os_exec(Process& p, Value, Value* args, uint32_t) {
     return os_exec_with(p, args, 0, UNIT);
@@ -488,10 +498,25 @@ NativeResult os_exec_in(Process& p, Value, Value* args, uint32_t) {
     return os_exec_with(p, args + 1, fixnum_value(ms), args[0]);
 }
 
+NativeResult os_exec_env(Process& p, Value* args, bool joined);
+
 /// `exec_with! dir env program args milliseconds` -- `exec_in!` with variables
 /// of its own: `env` is a list of `NAME=value`, laid over this VM's
 /// environment for the child alone. What a check runs a test suite with.
 NativeResult os_exec_with_env(Process& p, Value, Value* args, uint32_t) {
+    return os_exec_env(p, args, false);
+}
+
+/// `exec_joined! dir env program args milliseconds` -- `exec_with!` with the
+/// child's errors written into its output, interleaved as they happened: `out`
+/// is everything it printed and `err` is empty. A check that compares what a
+/// program printed with a recorded file wants it as a terminal shows it, which
+/// two streams read apart cannot give back.
+NativeResult os_exec_joined(Process& p, Value, Value* args, uint32_t) {
+    return os_exec_env(p, args, true);
+}
+
+NativeResult os_exec_env(Process& p, Value* args, bool joined) {
     if (p.os_pending >= 0) return os_exec_with(p, args + 2, 0, UNIT);
     if (!is_string(args[0])) return fail(p, "type_error", "exec_with! needs a directory");
     std::vector<std::string> env;
@@ -508,11 +533,11 @@ NativeResult os_exec_with_env(Process& p, Value, Value* args, uint32_t) {
     if (!is_fixnum(ms) || fixnum_value(ms) < 0) {
         return fail(p, "type_error", "exec_with! needs a timeout in milliseconds, or 0 for none");
     }
-    return os_exec_with(p, args + 2, fixnum_value(ms), args[0], std::move(env));
+    return os_exec_with(p, args + 2, fixnum_value(ms), args[0], std::move(env), joined);
 }
 
 NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir,
-                          std::vector<std::string> env) {
+                          std::vector<std::string> env, bool joined) {
     // Entered again after the helper thread woke us: the child has exited.
     if (p.os_pending >= 0) {
         int64_t id = p.os_pending;
@@ -563,6 +588,7 @@ NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir
     auto job = std::make_shared<Job>();
     job->timeout_ms = timeout_ms;
     job->env = std::move(env);
+    job->joined = joined;
     if (dir != UNIT) {
         job->dir = string_arg(dir);
         if (job->dir.empty() || job->dir.find('\0') != std::string::npos) {
@@ -832,6 +858,7 @@ ModuleDef make_os_module() {
                          {"exec_for!", 3, 0b101, os_exec_for},
                          {"exec_in!", 4, 0b1011, os_exec_in},
                          {"exec_with!", 5, 0b10101, os_exec_with_env},
+                         {"exec_joined!", 5, 0b10101, os_exec_joined},
                          {"replace!", 2, 0b01, os_replace},
                          {"monotonic!", 1, 0b1, os_monotonic},
                          {"now!", 1, 0b1, os_now},

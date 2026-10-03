@@ -66,6 +66,9 @@ mapping Context {
     compiler : [:string] = []
     // The checks a test run is asked for, by name; every one when empty.
     only : [:string] = []
+    // The goals a run is asked to make, by name (`mind build GOAL..`). A run
+    // asked for none makes what the compile needs and nothing else.
+    goals : [:string] = []
 }
 
 /// Whether `v` is a whole context, its targets included -- what the runner
@@ -77,6 +80,19 @@ let is_context v =
 
 let version : :map -> :string;
 let version ctx = Context.version ctx;
+
+let root : :map -> :string;
+let root ctx = Context.root ctx;
+
+let profile : :map -> :string;
+let profile ctx = Context.profile ctx;
+
+/// One of the package's options (`-D name=value`, `[options]`), or `()`.
+let option : :map -> :string -> :any;
+let option ctx name = (Context.options ctx).[name else ()];
+
+let target_os : :map -> :atom;
+let target_os ctx = Target.os (Context.target ctx);
 
 /// `libsqlite3.so`, `libsqlite3.dylib` or `sqlite3.dll`, for the target.
 /// Every tool needs these, so they are written once.
@@ -95,7 +111,9 @@ let object_name ctx name = match Target.os (Context.target ctx) { :windows => na
 
 // --- inputs and steps ----------------------------------------------------------------
 
-/// A file in the package, relative to its root, or something a step makes.
+/// A file in the package, relative to its root; every file under a directory
+/// whose name ends with `suffix` (`""` for all of them); or something a step
+/// makes.
 ///
 /// An artifact holds the step that makes it, and that one decision is the
 /// graph: a step's inputs name the steps they come from, so the whole graph is
@@ -104,8 +122,18 @@ let object_name ctx name = match Target.os (Context.target ctx) { :windows => na
 /// accepted wherever an input is, and means a file.
 union Input {
     file(path : :string)
+    tree(dir : :string, suffix : :string)
     artifact(step : :map, name : :string)
 }
+
+let file : :string -> :any;
+let file p = Input.file p;
+
+/// Every file under `dir` ending in `suffix`, as one input: what a step reads
+/// that it walks for itself, such as a directory of tests a script runs. A
+/// file added there changes the key as surely as one edited.
+let tree : :string -> :string -> :any;
+let tree dir suffix = Input.tree dir suffix;
 
 /// A bare string made into the input it means.
 let input : :any -> :any;
@@ -123,6 +151,15 @@ let input i = match type_of i { :string => Input.file i, _ => i };
 /// shape with the contents of the files folded in, which only an effect can
 /// read. The name is in neither: two packages asking for the same thing by
 /// different names share the work.
+///
+/// The last three say how it is run rather than what it makes, and are in
+/// neither. `discovers` is a step that writes a make rule to `deps.d` naming
+/// what it read -- `gcc -MD` and `dreams --depfile` both do -- so that a header
+/// or a module it never declared still makes it run again when it changes
+/// (docs/build.md, "Discovered inputs"). `cache` is `:never` for one that runs
+/// every time it is asked for: a question whose answer is not in its inputs,
+/// such as what a directory holds now. `timeout` is in milliseconds, 0 for
+/// none: a step is a program, and a program may diverge.
 mapping Step {
     tool
     name
@@ -131,6 +168,9 @@ mapping Step {
     outputs = []
     action
     shape
+    discovers : :bool = false
+    cache : :atom = :shared
+    timeout : :integer = 0
 }
 
 /// What an action receives. `paths` maps each input (by `input_id`) to where
@@ -142,6 +182,7 @@ mapping Job { dir, ctx, paths = %{} }
 priv let input_shape : :any -> :any;
 priv let input_shape i = match i {
     [:file, p] => [:file, p],
+    [:tree, d, suffix] => [:tree, d, suffix],
     [:artifact, s, n] => [:artifact, Step.shape s, n],
 };
 
@@ -151,8 +192,20 @@ let step : :string -> :string -> [:any] -> :any -> [:string] -> :any -> :map;
 let step tool name inputs config outputs action = {
     let ins = list.map input inputs;
     Step.make tool name ins config outputs action
-        (io.digest (encode [tool, config, outputs, list.map input_shape ins]))
+        (io.digest (encode [tool, config, outputs, list.map input_shape ins])) false :shared 0
 };
+
+/// A step that names what it read in `deps.d`.
+let discovering : :map -> :map;
+let discovering s = Step.set_discovers s true;
+
+/// A step run every time it is asked for.
+let uncached : :map -> :map;
+let uncached s = Step.set_cache s :never;
+
+/// A step killed, and failed, after `ms` milliseconds.
+let within : :integer -> :map -> :map;
+let within ms s = Step.set_timeout s ms;
 
 /// What an action asks for, carried out in order by the runner, in the step's
 /// directory, stopping at the first that fails. A name is relative to that
@@ -166,21 +219,48 @@ let step tool name inputs config outputs action = {
 /// outside the step's directory, and a step that makes something has no use
 /// for it.
 ///
-/// The last four ask the machine a question rather than make something, and
-/// never fail -- the answer is the point, and "no" is one: `find` writes where
-/// a program is on `PATH` (or nothing), `capture` what a program printed when
-/// it succeeded (or nothing), `attempt` `yes` or `no` for whether it
-/// succeeded. `verify` fails unless the file has the SHA-256 given, which is
-/// what pins something fetched.
+/// `run_to` is `run` with everything the program printed, its errors written
+/// in among its output as a terminal shows them, kept in `name` whether or not
+/// it succeeds; an empty `dir` is the step's own. A compile whose output is
+/// itself something to read (MSVC's `/showIncludes`) and a check that compares
+/// what a program printed are both this.
+///
+/// `find`, `capture`, `attempt` and `list` ask the machine a question rather
+/// than make something, and never fail -- the answer is the point, and "no"
+/// is one: `find` writes where a program is on `PATH` (or nothing), `capture`
+/// what a program printed when it succeeded (or nothing), `attempt` `yes` or
+/// `no` for whether it succeeded, and `list` every file under `dir` ending in
+/// `suffix`, one to a line, relative to `dir`. `verify` fails unless the file
+/// has the SHA-256 given, which is what pins something fetched.
+///
+/// `transform` writes `f` of some files' texts as another: a pure function, so
+/// a tool can turn what programs printed into what it needs -- a depfile, an
+/// export list, one answer made of several -- without an effect of its own. `link` is `copy` sharing the
+/// bytes, for a file nothing will write to again: another step's output. The
+/// last two are a check's: `expect` fails, saying where, unless `name` holds
+/// what the file at `path` does, line endings at the end aside -- or, when
+/// `bless`, makes the file hold it -- and `same` unless two files are byte for
+/// byte one. `observe` is `run_to` that keeps what the program printed however
+/// it exits, failing only when it could not be run or ran out of time: what a
+/// check of a program's output runs it with, since the output is the answer,
+/// and `empty` fails, showing what it holds, unless a file is empty.
 union Op {
     write(name : :string, text : :string)
     copy(from : :string, name : :string)
+    link(from : :string, name : :string)
     exec(program : :string, args : [:string])
     run(dir : :string, env : %{:string => :string}, program : :string, args : [:string])
+    run_to(dir : :string, env : %{:string => :string}, program : :string, args : [:string], name : :string)
+    observe(dir : :string, env : %{:string => :string}, program : :string, args : [:string], name : :string)
     find(program : :string, name : :string)
     capture(program : :string, args : [:string], name : :string)
     attempt(program : :string, args : [:string], name : :string)
+    list(dir : :string, suffix : :string, name : :string)
     verify(name : :string, digest : :string)
+    transform(from : [:string], name : :string, f : [:string] -> :string)
+    expect(name : :string, path : :string, bless : :bool)
+    same(a : :string, b : :string)
+    empty(name : :string, why : :string)
 }
 
 /// An output of a step, as an input to another.
@@ -203,13 +283,16 @@ let out job name = Job.dir job + "/" + name;
 
 // --- plans ------------------------------------------------------------------------------
 
-/// What a package contributes to its own compile.
+/// What a package contributes to its own compile, and what there is to ask
+/// of it by name.
 ///
 /// Every contribution takes the plan last, so they chain with `|>`. `later` is
 /// `given`'s: `[input, f]` pairs the runner resolves once the input is built.
 /// `conflicts` is what merging found -- two payloads or two modules under one
 /// name -- kept rather than raised, because building a plan is pure; the
-/// runner reports them before it runs anything.
+/// runner reports them before it runs anything. `goals` and `checks` are what
+/// a person asks for (`mind build GOAL`, `mind test NAME`), and `notes` a line
+/// about either, for the list a wrong name is answered with.
 mapping Plan {
     payloads = %{}
     modules = %{}
@@ -220,10 +303,12 @@ mapping Plan {
     later = []
     conflicts = []
     checks = %{}
+    goals = %{}
+    notes = %{}
 }
 
 let empty : :map;
-let empty = Plan.make (%{}) (%{}) (%{}) [] () [] [] [] (%{});
+let empty = Plan.make (%{}) (%{}) (%{}) [] () [] [] [] (%{}) (%{}) (%{});
 
 /// Embed a file in the image: `--payload NAME=PATH`.
 let payload : :string -> :any -> :map -> :map;
@@ -257,6 +342,39 @@ let target ts p = Plan.set_target p (meet (Plan.target p) ts);
 let check : :string -> :map -> :map -> :map;
 let check name s p = Plan.set_checks p (claim "check" name s (Plan.checks p));
 
+/// Something to ask for by name. `make` builds an input and says where it is;
+/// `place` puts it somewhere of the project's choosing as well, which is the
+/// one way a build writes outside its cache; `each` is several goals under one
+/// name; `effect` runs a step every time it is asked for, for installing and
+/// anything else whose point is outside the build.
+union Goal {
+    make(input : :any)
+    place(path : :string, input : :any)
+    each(names : [:string])
+    effect(step : :map)
+}
+
+let make : :any -> :any;
+let make i = Goal.make (input i);
+
+/// `path` is relative to the package. An input that is a whole step
+/// (`artifact s ""`) places every output of the step beneath `path`.
+let place : :string -> :any -> :any;
+let place path i = Goal.place path (input i);
+
+let each : [:string] -> :any;
+let each names = Goal.each names;
+
+let effect : :map -> :any;
+let effect s = Goal.effect (uncached s);
+
+let goal : :string -> :any -> :map -> :map;
+let goal name g p = Plan.set_goals p (claim "goal" name g (Plan.goals p));
+
+/// A line saying what a goal or a check is for.
+let note : :string -> :string -> :map -> :map;
+let note name text p = Plan.set_notes p ((Plan.notes p).[name => text]);
+
 /// Make a step whether or not anything uses it.
 let also : :map -> :map -> :map;
 let also s p = Plan.set_steps p (list.append (Plan.steps p) [s]);
@@ -265,6 +383,22 @@ let also s p = Plan.set_steps p (list.append (Plan.steps p) [s]);
 /// so the effect is still only in the step that made `i`.
 let given : :any -> (:string -> :map) -> :map;
 let given i f = Plan.set_later empty [[input i, f]];
+
+/// Every file under `dir` ending in `suffix`, one to a line, relative to the
+/// package. Never kept, since a file can be added under a directory without
+/// anything this build knows of changing: it is how a plan asks what is there.
+let listing : :string -> :string -> :any;
+let listing dir suffix =
+    artifact (uncached (step "list" (dir + "/*" + suffix) [] [dir, suffix] ["files"]
+                             (fn job -> [Op.list (Context.root (Job.ctx job) + "/" + dir) suffix "files"])))
+             "files";
+
+/// A plan that depends on which files are under a directory: `f` is handed
+/// their paths, relative to the package.
+let given_files : :string -> :string -> ([:string] -> :map) -> :map;
+let given_files dir suffix f =
+    given (listing dir suffix)
+          (fn text -> f (list.map (fn l -> dir + "/" + l) (list.filter (fn l -> not (str.is_empty l)) (str.split "\n" text))));
 
 /// The table with `name => value` in it. A name already given to something
 /// else is marked as a conflict in the table itself, which is where
@@ -313,12 +447,15 @@ let all plans = list.fold (fn a b ->
               (list.append (Plan.steps a) (Plan.steps b))
               (list.append (Plan.later a) (Plan.later b))
               (list.append (Plan.conflicts a) (Plan.conflicts b))
-              (merge_table "check" (Plan.checks a) (Plan.checks b))) empty plans;
+              (merge_table "check" (Plan.checks a) (Plan.checks b))
+              (merge_table "goal" (Plan.goals a) (Plan.goals b))
+              (map.merge (Plan.notes a) (Plan.notes b))) empty plans;
 
 /// Everything wrong with a plan, before anything is run.
 let conflicts : :map -> [:string];
 let conflicts p = list.concat [Plan.conflicts p, table_conflicts (Plan.payloads p),
-                               table_conflicts (Plan.modules p), table_conflicts (Plan.checks p)];
+                               table_conflicts (Plan.modules p), table_conflicts (Plan.checks p),
+                               table_conflicts (Plan.goals p)];
 
 /// What a run hands the compile, with every input resolved to a path: the
 /// payloads by name, the directory of generated modules (or `()`), the
@@ -339,6 +476,8 @@ mapping Outcome {
     // A test run's checks, by name: whether each passed, how long it took in
     // milliseconds, and what it printed when it failed.
     checks : %{:string => [:bool, :integer, :string]} = %{}
+    // The goals a run was asked for, by name: where each one's result is.
+    goals : %{:string => :string} = %{}
 }
 
 let is_outcome : :any -> :bool;
