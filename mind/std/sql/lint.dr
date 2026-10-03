@@ -1,0 +1,329 @@
+// The lexical shape of SQL: enough to know where code is and where it is not,
+// and to say what is wrong with a statement before a database is asked.
+//
+// This is what `expand sql.query` reads a template with, and what makes a
+// plain string a `sql.Statement` -- `:string where` it passes `problem` -- so
+// a literal statement is checked by the compiler wherever it is written. It
+// came from `pg.sql`, which still reads its own templates with it.
+//
+// **What it knows is lexical, not grammatical**: that a quote ends, that
+// parentheses balance, that a statement starts with a word that can start one,
+// that a query is one statement. Whether a column exists is the database's to
+// say. What it catches is the class of mistake that is cheapest to make and
+// most annoying to find out about late.
+//
+// It is the union of the dialects' lexical rules rather than any one of them,
+// which costs nothing, because each rule only ever keeps text *out* of code:
+// single-quoted strings (with `''` doubling, and `E''` backslash escapes),
+// double-quoted and backquoted identifiers, `--` and nested `/* */` comments,
+// and PostgreSQL's dollar-quoted bodies. A token is
+//
+//   [:code, text]          anything else, verbatim
+//   [:literal, text]       a quoted string, identifier, body or comment
+//   [:open] [:close] [:semicolon]
+//   [:positional, n]       `$n`
+//   [:placeholder, text]   `{text}`, when braces are asked for
+//   [:error, message]
+//
+// and joining every token's text gives back what was scanned, so a fragment
+// built from tokens says exactly what was written.
+
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+
+priv let specials : :string;
+priv let specials = "'\"`-/$();{}";
+
+/// `text` as tokens. `braces` says whether `{..}` is a placeholder (a
+/// template's) or code.
+let scan : :string -> :bool -> [:any];
+let scan text braces = list.reverse (scan_from text braces 0 []);
+
+priv let scan_from : :string -> :bool -> :integer -> [:any] -> [:any];
+priv let rec scan_from text braces !at acc = {
+    let stop = str.upto specials at text;
+    let before = if stop > at { list.cons [:code, str.slice at (stop - at) text] acc } else { acc };
+    let next = str.byte (stop + 1) text;
+    match str.byte stop text {
+        -1 => before,
+        39 => {                                                               // '
+            let escapes = stop > 0 && is_e (str.byte (stop - 1) text)
+                          && not (stop > 1 && is_ident (str.byte (stop - 2) text));
+            let end = quote_end text (stop + 1) 39 escapes;
+            if end < 0 { list.cons [:error, "a string constant is never closed"] before }
+            else { scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before) }
+        },
+        34 => quoted text braces stop 34 "a quoted identifier is never closed" before,      // "
+        96 => quoted text braces stop 96 "a backquoted identifier is never closed" before,  // `
+        45 if next == 45 => {                                                 // --
+            let end = str.upto "\n" stop text;
+            scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before)
+        },
+        47 if next == 42 => {                                                 // /*
+            let end = comment_end text (stop + 2) 1;
+            if end < 0 { list.cons [:error, "a /* comment is never closed"] before }
+            else { scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before) }
+        },
+        36 if is_digit next && not (stop > 0 && is_ident (str.byte (stop - 1) text)) => {   // $1
+            let end = str.span "0123456789" (stop + 1) text;
+            let n = match num.parse_int (str.slice (stop + 1) (end - stop - 1) text) { () => 0, k => k };
+            scan_from text braces end (list.cons [:positional, n] before)
+        },
+        36 if not (stop > 0 && is_ident (str.byte (stop - 1) text)) => match dollar_tag text stop {
+            () => scan_from text braces (stop + 1) (list.cons [:code, "$"] before),
+            tag => {
+                let close = str.find_from (stop + len tag) tag text;
+                if close < 0 { list.cons [:error, "a dollar-quoted " + tag + " body is never closed"] before }
+                else {
+                    let end = close + len tag;
+                    scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before)
+                }
+            },
+        },
+        40 => scan_from text braces (stop + 1) (list.cons [:open] before),     // (
+        41 => scan_from text braces (stop + 1) (list.cons [:close] before),    // )
+        59 => scan_from text braces (stop + 1) (list.cons [:semicolon] before), // ;
+        123 if braces => {                                                     // {
+            let close = str.find_from stop "}" text;
+            if close < 0 { list.cons [:error, "a `{` is never closed with `}`"] before }
+            else {
+                scan_from text braces (close + 1)
+                          (list.cons [:placeholder, str.trim (str.slice (stop + 1) (close - stop - 1) text)] before)
+            }
+        },
+        125 if braces => list.cons [:error, "a `}` with no `{` before it"] before,
+        b => scan_from text braces (stop + 1) (list.cons [:code, str.of_bytes [b]] before),
+    }
+};
+
+/// A quoted identifier, `"..."` or `` `...` ``, as one literal token.
+priv let quoted : :string -> :bool -> :integer -> :integer -> :string -> [:any] -> [:any];
+priv let quoted text braces stop q unclosed before = {
+    let end = quote_end text (stop + 1) q false;
+    if end < 0 { list.cons [:error, unclosed] before }
+    else { scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before) }
+};
+
+priv let is_digit : :integer -> :bool;
+priv let is_digit b = b >= 48 && b <= 57;
+
+priv let is_e : :integer -> :bool;
+priv let is_e b = b == 69 || b == 101;
+
+priv let is_ident_start : :integer -> :bool;
+priv let is_ident_start b = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128;
+
+priv let is_ident : :integer -> :bool;
+priv let is_ident b = is_ident_start b || is_digit b || b == 36;
+
+/// Past the closing quote of a string or identifier whose opening quote is
+/// just before `at`, or -1. A doubled quote is one quote; in an `E''` string a
+/// backslash escapes whatever follows it.
+priv let quote_end : :string -> :integer -> :integer -> :bool -> :integer;
+priv let rec quote_end text at q escapes = {
+    let stop = str.upto (if escapes { str.of_bytes [q, 92] } else { str.of_bytes [q] }) at text;
+    match str.byte stop text {
+        -1 => -1,
+        92 => quote_end text (stop + 2) q escapes,
+        _ if str.byte (stop + 1) text == q => quote_end text (stop + 2) q escapes,
+        _ => stop + 1,
+    }
+};
+
+/// Past the end of a block comment whose `/*` is before `at`. PostgreSQL's
+/// comments nest, so `depth` counts; in a dialect whose comments do not, a
+/// comment that nests is one nobody writes.
+priv let comment_end : :string -> :integer -> :integer -> :integer;
+priv let rec comment_end text at depth = {
+    let stop = str.upto "*/" at text;
+    let next = str.byte (stop + 1) text;
+    match str.byte stop text {
+        -1 => -1,
+        42 if next == 47 => if depth == 1 { stop + 2 } else { comment_end text (stop + 2) (depth - 1) },
+        47 if next == 42 => comment_end text (stop + 2) (depth + 1),
+        _ => comment_end text (stop + 1) depth,
+    }
+};
+
+/// The `$tag$` opening a dollar-quoted body at `at`, or `()` when the `$` there
+/// opens nothing.
+priv let dollar_tag : :string -> :integer -> :any;
+priv let dollar_tag text at = {
+    let first = str.byte (at + 1) text;
+    if first == 36 { "$$" }
+    else if not (is_ident_start first) { () }
+    else {
+        let end = tag_end text (at + 2);
+        if str.byte end text == 36 { str.slice at (end - at + 1) text } else { () }
+    }
+};
+
+priv let tag_end : :string -> :integer -> :integer;
+priv let rec tag_end text !at = {
+    let b = str.byte at text;
+    if is_ident_start b || is_digit b { tag_end text (at + 1) } else { at }
+};
+
+/// A token's text, as it was written.
+let token_text : :any -> :string;
+let token_text t = match t {
+    [:code, s] => s,
+    [:literal, s] => s,
+    [:open] => "(",
+    [:close] => ")",
+    [:semicolon] => ";",
+    [:positional, n] => "$" + to_string n,
+    [:placeholder, s] => "{" + s + "}",
+    _ => "",
+};
+
+// --- the lint ---------------------------------------------------------------------
+
+/// The words a statement can begin with, in any of the dialects.
+priv let commands : %{:string => :bool};
+priv let commands = map.set_of [
+    "ABORT", "ALTER", "ANALYZE", "ANALYSE", "ATTACH", "BEGIN", "CALL", "CHECKPOINT", "CLOSE",
+    "CLUSTER", "COMMENT", "COMMIT", "COPY", "CREATE", "DEALLOCATE", "DECLARE", "DELETE", "DESC",
+    "DESCRIBE", "DETACH", "DISCARD", "DO", "DROP", "END", "EXEC", "EXECUTE", "EXPLAIN", "FETCH",
+    "GRANT", "IMPORT", "INSERT", "LISTEN", "LOAD", "LOCK", "MERGE", "MOVE", "NOTIFY", "PRAGMA",
+    "PREPARE", "REASSIGN", "REFRESH", "REINDEX", "RELEASE", "RENAME", "REPLACE", "RESET", "REVOKE",
+    "ROLLBACK", "SAVE", "SAVEPOINT", "SECURITY", "SELECT", "SET", "SHOW", "START", "TABLE",
+    "TRUNCATE", "UNLISTEN", "UPDATE", "USE", "VACUUM", "VALUES", "WITH",
+];
+
+/// What is wrong with `tokens` as SQL, or `()`.
+///
+/// `several` allows more than one statement; `positional` allows `$n`, which
+/// numbered SQL (`sql.positional`) has and a template must not. A placeholder
+/// is a value wherever it appears, and only a splice can hide text -- so where
+/// there is one, the parentheses and the first word are not judged, since the
+/// fragment it stands for may hold either.
+let lint : [:any] -> :bool -> :bool -> :any;
+let lint tokens several positional = lint_as true tokens several positional;
+
+/// The same, for a piece of a statement when `whole` is false: only what is
+/// wrong whatever the piece is joined to -- a quote or comment left open, a
+/// stray `$n` -- since a piece may well begin mid-clause or open a parenthesis
+/// that the statement around it closes.
+let lint_as : :bool -> [:any] -> :bool -> :bool -> :any;
+let lint_as whole tokens several positional = {
+    let errors = list.filter (fn t -> t.[0] == :error) tokens;
+    let splices = list.any (fn t -> t.[0] == :placeholder && str.starts_with ".." t.[1]) tokens;
+    let positionals = list.filter (fn t -> t.[0] == :positional) tokens;
+    let code = list.filter (fn t -> not (t.[0] == :code && str.trim t.[1] == "") && not (is_comment t)) tokens;
+    match [errors, code] {
+        [[[:error, message], .._], _] => message,
+        [_, []] if whole => "the statement is empty",
+        _ if not positional && not (list.is_empty positionals) =>
+            "`$" + to_string (list.head positionals).[1] + "` is a numbered parameter, but there are no values to number;"
+            + " write `{name}` in `sql.query`, or build the statement with `sql.positional`",
+        _ if splices || not whole => (),
+        _ => match balance code 0 {
+            () => statements code several,
+            message => message,
+        },
+    }
+};
+
+priv let is_comment : :any -> :bool;
+priv let is_comment t = match t {
+    [:literal, s] => str.starts_with "--" s || str.starts_with "/*" s,
+    _ => false,
+};
+
+/// Whether the parentheses close, in order.
+priv let balance : [:any] -> :integer -> :any;
+priv let rec balance tokens !depth = match tokens {
+    [] => if depth == 0 { () } else { "a `(` is never closed" },
+    [[:open], ..rest] => balance rest (depth + 1),
+    [[:close], ..rest] => if depth == 0 { "a `)` closes nothing" } else { balance rest (depth - 1) },
+    [_, ..rest] => balance rest depth,
+};
+
+/// The statements between the semicolons: each must begin with a command, and
+/// unless `several` there must be only one, though it may end with `;`.
+priv let statements : [:any] -> :bool -> :any;
+priv let statements code several = {
+    let pieces = list.filter (fn p -> not (list.is_empty p)) (split_statements code [] []);
+    match pieces {
+        [] => "the statement is empty",
+        [_, _, .._] if not several =>
+            "this is " + to_string (len pieces) + " statements, and a query is one;"
+            + " several in one string are a script",
+        _ => match list.filter (fn p -> p != ()) (list.map first_word_problem pieces) {
+            [] => (),
+            [message, .._] => message,
+        },
+    }
+};
+
+priv let split_statements : [:any] -> [:any] -> [[:any]] -> [[:any]];
+priv let rec split_statements tokens current acc = match tokens {
+    [] => list.reverse (list.cons (list.reverse current) acc),
+    [[:semicolon], ..rest] => split_statements rest [] (list.cons (list.reverse current) acc),
+    [t, ..rest] => split_statements rest (list.cons t current) acc,
+};
+
+priv let first_word_problem : [:any] -> :any;
+priv let first_word_problem statement = match statement {
+    [[:open], .._] => (),
+    [[:code, text], .._] => {
+        let trimmed = str.trim_start text;
+        let word = str.upper (str.slice 0 (str.upto " \t\r\n,*" 0 trimmed) trimmed);
+        if map.has commands word { () }
+        else { "`" + str.slice 0 (str.upto " \t\r\n" 0 trimmed) trimmed + "` does not begin an SQL statement" }
+    },
+    [[:placeholder, _], .._] => "a statement cannot begin with a value",
+    _ => "a statement must begin with a command such as SELECT",
+};
+
+/// What is wrong with `text` as one statement with no parameters, or `()`.
+let problem : :string -> :any;
+let problem text = lint (scan text false) false false;
+
+/// What is wrong with `text` as a script of statements, or `()`.
+let script_problem : :string -> :any;
+let script_problem text = lint (scan text false) true false;
+
+when test {
+    import std.test;
+
+    let kinds : [:any] -> [:atom];
+    let kinds ts = list.map (fn t -> t.[0]) ts;
+
+    let tests = [
+        test.case "quotes, comments and dollar bodies are not code"
+            $( test.eq! [:code, :literal, :code, :literal, :code, :literal, :code, :positional]
+                        (kinds (scan "a '{x}' b /* c /* d */ e */ f $q$ $1 ) $q$ g $1" false)) ),
+        test.case "E strings escape, plain strings double"
+            $( test.eq! [[[:code, "E"], [:literal, "'it\\'s'"], [:code, " x"]], [[:literal, "'it''s'"]]]
+                        [scan "E'it\\'s' x" false, scan "'it''s'" false] ),
+        test.case "a backquoted name is one token"
+            $( test.eq! [[:code, "SELECT "], [:literal, "`a;b`"]] (scan "SELECT `a;b`" false) ),
+        test.case "a $ inside a name is part of it"
+            $( test.eq! [[:code, :code, :code], "a$1"]
+                        [kinds (scan "a$1" false), str.concat_all (list.map token_text (scan "a$1" false))] ),
+        test.case "what the lint accepts"
+            $( test.eq! [(), (), (), (), (), ()]
+                        [problem "SELECT 1", problem "  select (1);  ", problem "WITH x AS (SELECT 1) SELECT * FROM x",
+                         problem "-- why\nINSERT INTO t VALUES ('a;b', $$ ; $$)", problem "PRAGMA foreign_keys = ON",
+                         script_problem "CREATE TABLE t (a int); INSERT INTO t VALUES (1);"] ),
+        test.case "what the lint refuses"
+            $( test.eq! ["a string constant is never closed", "a `(` is never closed",
+                         "a `)` closes nothing", "`SELEC` does not begin an SQL statement",
+                         "the statement is empty"]
+                        [problem "SELECT 'oops", problem "SELECT (1", problem "SELECT 1)",
+                         problem "SELEC 1", problem " -- nothing\n"] ),
+        test.case "one statement, and no numbered parameters without values"
+            $( test.true! (problem "SELECT 1; SELECT 2" != () && problem "SELECT $1" != ()) ),
+        test.case "a piece of a statement is checked only for what is wrong anywhere"
+            $( test.eq! [(), (), "a string constant is never closed", (), "the statement is empty"]
+                        [lint_as false (scan "n % 2 = 0 AND (" true) false false,
+                         lint_as false (scan "" true) false false,
+                         lint_as false (scan "name = 'x" true) false false,
+                         lint (scan "SELECT * FROM t WHERE {..w}" true) false false,
+                         lint (scan "" true) false false] ),
+    ];
+}

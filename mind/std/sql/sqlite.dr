@@ -28,6 +28,7 @@
 import std.foreign;
 import std.list;
 import std.sql;
+import std.str;
 
 foreign sqlite3 from (foreign.shared_library "sqlite3" "0") {
     resource Db = sqlite3_close_v2
@@ -95,8 +96,13 @@ let open_with! path options = {
     let place = options.[:place else foreign.here];
     let flags = (if options.[:readonly else false] { open_readonly } else { open_readwrite + open_create }) + open_uri;
     let db = foreign.run! place (fn () -> open_here! path flags options);
+    let effects = %{ :run => run!, :run_many => run_many!, :script => script!, :close => close! };
+    // Rows are streamed only where the database is: a fold handed to a server
+    // would run its handler in the server, which is not where a program
+    // expects its own code to run. Elsewhere `sql.fold!` reads the whole
+    // result, which is the same answer.
     sql.connection sql.sqlite %{ :db => db, :place => place }
-                   %{ :run => run!, :run_many => run_many!, :script => script!, :close => close! }
+                   (if place == foreign.here { effects.[:fold => fold_rows!] } else { effects })
 };
 
 priv let open_readonly : :integer;
@@ -277,6 +283,42 @@ priv let bind_one! st i v = match v {
     },
 };
 
+/// The rows `batch` at a time, each batch handed to `step!` as it is read,
+/// so a result of any size is held a batch at a time.
+priv let fold_rows! : :map -> :string -> [sql.Value] -> :integer -> (a -> [:string] -> [[sql.Value]] -> a) -> a -> a;
+priv let fold_rows! state text params batch step! init = {
+    let db = state.[:db];
+    let [rc, st] = sqlite3.prepare! db text (len text) ();
+    if rc != 0 { fail_db! db text } else { () }
+    match st {
+        () => init,
+        _ => foreign.using! st (fn st -> {
+            bind_all! db st text 1 params
+            let n = sqlite3.column_count! st;
+            let names = column_names! st 0 n [];
+            fold_steps! db st text n names batch step! init [] 0
+        }),
+    }
+};
+
+priv let fold_steps! : sqlite3.Db -> sqlite3.Stmt -> :string -> :integer -> [:string] -> :integer
+                       -> (a -> [:string] -> [[sql.Value]] -> a) -> a -> [[sql.Value]] -> :integer -> a;
+priv let rec fold_steps! db st text n names batch step! !acc !pending !count = {
+    let rc = sqlite3.step! st;
+    match rc {
+        100 => {
+            let row = read_row! st 0 n [];
+            if count + 1 >= batch {
+                let next = step! acc names (list.reverse (keep row pending));
+                strict! next
+                fold_steps! db st text n names batch step! next [] 0
+            } else { fold_steps! db st text n names batch step! acc (keep row pending) (count + 1) }
+        },
+        101 => if list.is_empty pending { acc } else { step! acc names (list.reverse pending) },
+        _ => fail_db! db text,
+    }
+};
+
 priv let run_many! : :map -> :string -> [[sql.Value]] -> :integer;
 priv let run_many! state text param_lists = {
     let db = state.[:db];
@@ -343,8 +385,19 @@ priv let fail_db! db text = {
     let code = sqlite3.extended_errcode! db;
     strict! message
     strict! code
-    sql.fail! message (code_of code) text
+    sql.fail_with! %{ :message => message, :code => code_named code message, :sql => text, :sqlite_code => code }
 };
+
+/// SQLite says what kind of mistake a statement is in its message rather than
+/// its code, which is `SQLITE_ERROR` for all of them; the messages are stable,
+/// and these three are the ones a program asks about.
+priv let code_named : :integer -> :string -> :any;
+priv let code_named code message =
+    if code != 1 { code_of code }
+    else if str.contains_str "syntax error" message { :syntax }
+    else if str.starts_with "no such table" message { :undefined_table }
+    else if str.starts_with "no such column" message { :undefined_column }
+    else { code };
 
 /// SQLite's extended result codes, in the words `std.sql.fail!` lists, so that
 /// a program can catch a duplicate key without knowing it was SQLite that
@@ -361,6 +414,9 @@ priv let code_of code = match code {
         5 => :busy,
         6 => :locked,
         8 => :readonly,
+        3 => :permission,
+        23 => :permission,
+        9 => :canceled,
         14 => :cantopen,
         _ => code,
     },
@@ -369,8 +425,17 @@ priv let code_of code = match code {
 when test {
     import std.console;
     import std.error;
-    import std.str;
     import std.test;
+
+    let age_of : :any -> :integer;
+    let age_of row = match row.[:age] { () => 0, n => n };
+
+    /// A record whose fields are the columns, which is therefore a row.
+    mapping Person {
+        id = ()
+        name
+        age = ()
+    }
 
     /// `f` against a fresh database in memory, or nothing where the library
     /// cannot be loaded -- `test-std` runs on machines that have no SQLite,
@@ -396,7 +461,7 @@ when test {
     let people = [
         %{ :name => "ada", :age => 36, :photo => sql.blob (str.of_bytes [0, 1, 255]) },
         %{ :name => "bob", :age => 17 },
-        %{ :name => "cy", :age => (), :photo => sql.blob "" },
+        %{ :name => "cy", :age => sql.null, :photo => sql.blob "" },
     ];
 
     let seeded! db = {
@@ -414,8 +479,40 @@ when test {
         test.case "values come back as they went in" $( with_db! (fn db -> test.eq!
             [[1, "x", 2.5, (), [:blob, "a\0b"]]]
             (sql.run! db (sql.q "select ?, ?, ?, ?, ?" [1, "x", 2.5, (), sql.blob "a\0b"])).[:rows]) ),
-        test.case "a row is a map by column name" $( with_db! (fn db -> test.eq!
-            [%{ "a" => 1, "b" => "two" }] (sql.query! db (sql.raw "select 1 as a, 'two' as b"))) ),
+        test.case "a row is keyed by atom where the program has the atom" $( with_db! (fn db -> test.eq!
+            [%{ :a => 1, :b => "two", "zz_no_atom_has_this_name" => 3 }]
+            (sql.query! db "select 1 as a, 'two' as b, 3 as zz_no_atom_has_this_name")) ),
+        test.case "a template's names are its parameters" $( with_db! (fn db -> {
+            seeded! db
+            let min_age = 18;
+            let starts = sql.like "name" "a%";
+            test.eq! ["ada"] (sql.column! db (expand sql.query "SELECT name FROM people WHERE age >= {min_age} AND {..starts}"))
+        }) ),
+        test.case "a template's list form" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! [17] (sql.column! db (expand sql.query ["SELECT age FROM people WHERE age < ", 20 - 1]))
+        }) ),
+        test.case "a record goes in as it is, and comes out as one" $( with_db! (fn db -> {
+            seeded! db
+            sql.exec! db (sql.insert_into "people" |> sql.values (Person.new "dee"))
+            let dee = sql.one! db (sql.select ["id", "name", "age"] |> sql.from "people" |> sql.where (sql.eq "name" "dee"));
+            test.eq! [4, "dee", ()] [Person.id dee, Person.name dee, Person.age dee]
+        }) ),
+        test.case "fold reads in batches" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! [53, 3] [sql.fold! db (sql.select ["age"] |> sql.from "people") 2
+                                        (fn total row -> total + age_of row) 0,
+                              sql.each! db (sql.select [] |> sql.from "people") 1 (fn row -> row)]
+        }) ),
+        test.case "a transaction that takes the lock first" $( with_db! (fn db -> {
+            seeded! db
+            test.eq! 3 (sql.transaction_with! db %{ :lock => :immediate }
+                (fn tx -> sql.scalar! tx (sql.select [sql.count_all] |> sql.from "people")))
+        }) ),
+        test.case "a serializable transaction answers" $( with_db! (fn db ->
+            test.eq! 1 (sql.serializable! db 3 (fn tx -> sql.scalar! tx "select 1"))) ),
+        test.case "a missing table is :undefined_table" $( with_db! (fn db ->
+            test.eq! :undefined_table (kind_of! (fn () -> sql.query! db "select * from nowhere"))) ),
         test.case "inserts in one prepared statement" $( with_db! (fn db -> {
             seeded! db
             test.eq! 3 (sql.scalar! db (sql.select [sql.count_all] |> sql.from "people"))
@@ -431,14 +528,14 @@ when test {
         }) ),
         test.case "a query with every clause" $( with_db! (fn db -> {
             seeded! db
-            test.eq! [%{ "name" => "ada" }]
+            test.eq! [%{ :name => "ada" }]
                      (sql.query! db (sql.select ["name"] |> sql.from "people"
                                      |> sql.where (sql.ge "age" 18) |> sql.where (sql.like "name" "a%")
                                      |> sql.order_by [sql.desc "age"] |> sql.limit 5))
         }) ),
         test.case "returning" $( with_db! (fn db -> {
             seeded! db
-            test.eq! [%{ "id" => 4, "name" => "dee" }]
+            test.eq! [%{ :id => 4, :name => "dee" }]
                      (sql.query! db (sql.insert_into "people" |> sql.values %{ "name" => "dee" }
                                      |> sql.returning ["id", "name"]))
         }) ),
@@ -457,8 +554,8 @@ when test {
             seeded! db
             test.eq! :unique (kind_of! (fn () -> sql.exec! db (sql.insert_into "people" |> sql.values %{ "name" => "ada" })))
         }) ),
-        test.case "bad SQL is an :sql_error" $( with_db! (fn db ->
-            test.true! (kind_of! (fn () -> sql.query! db "selec 1") != :no_error)) ),
+        test.case "bad SQL the compiler did not see is a :syntax error" $( with_db! (fn db ->
+            test.eq! :syntax (kind_of! (fn () -> sql.query! db (sql.raw "selec 1")))) ),
         test.case "a transaction that raises leaves nothing" $( with_db! (fn db -> {
             seeded! db
             kind_of! (fn () -> sql.transaction! db (fn tx -> {
@@ -496,7 +593,7 @@ when test {
             test.eq! 3 (sql.scalar! db (sql.select [sql.sum "x"] |> sql.from "a"))
         }) ),
         test.case "an empty statement is nothing" $( with_db! (fn db ->
-            test.eq! [] (sql.query! db "-- nothing")) ),
+            test.eq! [] (sql.query! db (sql.raw "-- nothing"))) ),
         test.case "a database in a server" $( {
             if available! () {
                 let server = foreign.start! ();
