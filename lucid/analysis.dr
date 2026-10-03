@@ -503,7 +503,7 @@ let in_item it offset acc =
             }
             else { acc },
         [:let_p, _, body, _] => expr_binders body offset acc,
-        [:virtual, _, ps, body, _] =>
+        [:virtual, _, ps, body, _, _] =>
             match body {
                 () => acc,
                 b => if holds b offset {
@@ -549,7 +549,7 @@ let rec find_decl items name =
             match it {
                 [:let, n, _, _, _, _]  => if n == name { it } else { find_decl rest name },
                 [:macro, n, _, _, _]   => if n == name { it } else { find_decl rest name },
-                [:virtual, n, _, _, _] => if n == name { it } else { find_decl rest name },
+                [:virtual, n, _, _, _, _] => if n == name { it } else { find_decl rest name },
                 [:when, _, inner, _] =>
                     match find_decl inner name { () => find_decl rest name, d => d },
                 _ => find_decl rest name,
@@ -593,7 +593,7 @@ let is_private_global a mi name =
 /// no implementation: in the base, and in a module that derived it without
 /// answering.
 let is_virtual_global a mi name =
-    match signature_decl a mi name { [_, [:virtual, _, _, _, _]] => true, _ => false };
+    match signature_decl a mi name { [_, [:virtual, _, _, _, _, _]] => true, _ => false };
 
 /// What the line declaring a global says about it, beyond its name: `priv`,
 /// `virtual`, or nothing at all. Empty rather than a word like "global",

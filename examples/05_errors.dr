@@ -17,6 +17,36 @@ let parse_age! s = {
     else { n }
 };
 
+// Pure code cannot raise -- raising is an effect -- so a step that can fail
+// answers `[:ok, v]` or `[:error, e]`. `let?` takes one step of a chain: on
+// `[:ok, v]` it binds `v` and goes on, and on anything else that is the
+// block's answer, and nothing after it runs.
+type Checked = [:ok, :integer] | [:error, :any];
+
+let number : :string -> Checked;
+let number s = match num.parse_int s {
+    () => [:error, "not a number: " + s],
+    n => [:ok, n],
+};
+
+let positive : :integer -> Checked;
+let positive n = if n > 0 { [:ok, n] } else { [:error, :not_positive] };
+
+let ratio : :string -> :string -> Checked;
+let ratio a b = {
+    let? x = number a;
+    let? y = number b;
+    let? d = positive y;
+    [:ok, x / d]
+};
+
+// A pattern binds out of the payload, as a destructuring `let` does.
+let area : [:ok, [:integer]] | [:error, :any] -> Checked;
+let area sides = {
+    let? [w, h] = sides;
+    [:ok, w * h]
+};
+
 // A total wrapper: turn a raised error into an ordinary value.
 let attempt! thunk = try! { join! (spawn! thunk) } catch e { [:error, e] };
 
@@ -54,4 +84,10 @@ let main! = {
     // computation cannot take the rest down with it.
     console.print! ("in process:" + to_string (attempt! $( div 1 0 )))
     console.print! ("survived:  " + to_string (list.map (fn n -> try! { 100 / n } catch e { :skipped }) [5, 0, 2]))
+
+    // Errors as values, chained with `let?`. The zero never reaches `/`.
+    console.print! ("ratio ok:  " + to_string (ratio "84" "2"))
+    console.print! ("ratio nan: " + to_string (ratio "x" "2"))
+    console.print! ("ratio 0:   " + to_string (ratio "84" "0"))
+    console.print! ("area:      " + to_string [area [:ok, [3, 4]], area [:error, :no_sides]])
 };

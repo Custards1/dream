@@ -287,7 +287,17 @@ let let_pattern_d pattern body span = [:let_p, pattern, body, span];
 let import_d path alias names span = [:import, path, alias, names, span];
 let mod_d name items span          = [:mod, name, items, span];
 let derive_d path span             = [:derive, path, span];
-let virtual_d name params body span = [:virtual, name, params, body, span];
+
+/// `derive dyn path` in a record's header: its values carry the record's
+/// implementations of the base's `dyn` virtuals. Written beside the plain
+/// `derive` it comes with, so everything that only follows a derive -- the
+/// dependency walk, the inherited items -- needs to know nothing about it.
+let dispatch_d path span           = [:dispatch, path, span];
+
+/// `dyn` is true for `virtual dyn let`: called in the module that declares
+/// it, the virtual dispatches on its last argument (see "Dispatch" in
+/// docs/language-spec.md).
+let virtual_d name params body dyn span = [:virtual, name, params, body, dyn, span];
 let when_d cond items span         = [:when, cond, items, span];
 
 /// The root returned by the parser for one source file.
@@ -479,9 +489,10 @@ let rec show e =
             + (match alias { () => "", a => " as " + a })
             + ")",
         [:derive, segments, _]  => "(derive " + str.join_str "." segments + ")",
+        [:dispatch, segments, _] => "(dispatch " + str.join_str "." segments + ")",
         [:mod, n, items, _]     => "(mod " + n + " " + show_all items + ")",
-        [:virtual, n, ps, body, _] =>
-            "(virtual " + n + (if list.is_empty ps { "" } else { " " + show_params ps })
+        [:virtual, n, ps, body, dyn, _] =>
+            "(virtual " + (if dyn { "dyn " } else { "" }) + n + (if list.is_empty ps { "" } else { " " + show_params ps })
             + (match body { () => "", b => " " + show b }) + ")",
         [:when, cond, items, _] => "(when " + show_cfg cond + " " + show_all items + ")",
         other => "(?" + to_string (other.[0]) + ")",

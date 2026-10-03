@@ -180,7 +180,7 @@ let suite! name cases = {
 
 /// Run several suites and report the total. Each entry is `[name, cases]`.
 let run_suites! : :integer -> [Suite] -> :integer;
-let rec run_suites! failed suites = {
+let rec run_suites! !failed suites = {
     if _list_is_empty suites { failed }
     else {
         let s = suites.[0];

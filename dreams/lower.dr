@@ -1338,7 +1338,7 @@ let rec arm_key p = match p {
 };
 
 /// The position of the first element `pred` accepts, or `()`.
-let rec find_index_from i pred xs = match xs {
+let rec find_index_from !i pred xs = match xs {
     [] => (),
     [x, ..rest] => if pred x { i } else { find_index_from (i + 1) pred rest },
 };

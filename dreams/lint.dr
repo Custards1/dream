@@ -29,7 +29,7 @@ import dreams.ast;
 /// and whether anything else touches it. `other` is what clears it.
 group Uses { grows = false, other = false }
 
-let no_uses = Uses.new;
+let no_uses = Uses.new ();
 let grown u = Uses.set_grows true u;
 let touched u = Uses.set_other true u;
 

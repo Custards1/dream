@@ -66,7 +66,7 @@ let to_int text = {
 
 /// Read exactly `n` bytes. A pipe may hand over fewer than asked for, and
 /// stopping at the first short read is how a message gets truncated.
-let rec read_exactly! h n acc =
+let rec read_exactly! h n !acc =
     if n <= 0 { acc }
     else {
         match io.read! h n {

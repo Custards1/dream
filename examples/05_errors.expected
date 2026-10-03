@@ -14,3 +14,7 @@ parse bad: <error :error not a number: abc>
 parse neg: <error :error :negative_age>
 in process:[:error, <error :divide_by_zero division by zero>]
 survived:  [20, :skipped, 50]
+ratio ok:  [:ok, 42]
+ratio nan: [:error, "not a number: x"]
+ratio 0:   [:error, :not_positive]
+area:      [[:ok, 12], [:error, :no_sides]]

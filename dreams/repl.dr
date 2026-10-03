@@ -283,7 +283,7 @@ let load_file! s path roots cfg source image =
             s
         },
         h => {
-            let rec slurp! acc =
+            let rec slurp! !acc =
                 match io.read! h 65536 {
                     "" => acc,
                     chunk => slurp! (acc + chunk),

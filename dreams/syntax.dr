@@ -80,13 +80,26 @@ let rec literal value span = match type_of value {
 /// collide.
 let record kind name fields members span = record_derived kind name fields members [] span;
 
+/// The global a `derive dyn` record's values carry in slot 0. Angle brackets
+/// cannot be written, so it can name nothing else.
+let dispatch_table_name = "<dispatch>";
+
 let record_derived kind name fields members bases span = {
     let named f = ast.name_e (ast.field_name f) (ast.field_span f);
+    // `derive dyn`: every value carries its record's dispatch table in slot 0
+    // -- the first position of a list or an array, the key `0` of a map, so
+    // a base reads it with one `.[0]` whatever the record is backed by -- and
+    // the fields move up one. The table is the global `<dispatch>`, which
+    // scope makes once it knows the base's virtuals (`dispatch_table`).
+    let dispatched = list.any (fn b -> b.[0] == :dispatch) bases;
+    let table = ast.name_e dispatch_table_name span;
+    let offset = if dispatched && kind != :map { 1 } else { 0 };
     let build of_field = match kind {
-        :list => ast.list_e (list.map of_field fields) span,
-        :array => ast.array_e (list.map of_field fields) span,
-        :map => ast.map_e (list.map (fn f ->
-            [ast.atom_e (ast.field_name f) (ast.field_span f), of_field f]) fields) span,
+        :list => ast.list_e ((if dispatched { [table] } else { [] }) + list.map of_field fields) span,
+        :array => ast.array_e ((if dispatched { [table] } else { [] }) + list.map of_field fields) span,
+        :map => ast.map_e ((if dispatched { [[ast.int_e 0 span, table]] } else { [] })
+                           + list.map (fn f -> [ast.atom_e (ast.field_name f) (ast.field_span f), of_field f])
+                                      fields) span,
     };
     let constructor = ast.let_d "make"
         (if list.is_empty fields { [ast.param () span] }
@@ -103,7 +116,7 @@ let record_derived kind name fields members bases span = {
         let f = list.nth i fields;
         let field = ast.field_name f;
         let obj = ast.name_e "record" span;
-        let key = match kind { :map => ast.atom_e field span, _ => ast.int_e i span };
+        let key = match kind { :map => ast.atom_e field span, _ => ast.int_e (i + offset) span };
         // The setter takes the record last, so `r |> P.set_x 1` pipes and
         // `P.set_x 1` is a function of the record ("`group`, `struct` and
         // `mapping`" in docs/language-spec.md).
@@ -118,15 +131,18 @@ let record_derived kind name fields members bases span = {
     let type_fields = list.map (fn i -> {
         let f = list.nth i fields;
         let key = if kind == :map { ast.atom_e (ast.field_name f) span }
-                  else { ast.int_e i span };
+                  else { ast.int_e (i + offset) span };
         let description = match ast.field_type f { () => ast.atom_e "any" span, t => t };
         let defaults = match ast.field_default f { () => [], d => [d] };
         ast.list_e [key, description, ast.list_e defaults span] span
     }) (list.range 0 (list.length fields));
+    let table_field = if dispatched {
+        [ast.list_e [ast.int_e 0 span, ast.atom_e "map" span, ast.list_e [] span] span]
+    } else { [] };
     let description = ast.let_d "type" []
         (ast.list_e [ast.atom_e "named" span, ast.str_e name span,
             ast.list_e [ast.atom_e "shape" span, literal kind span,
-                        ast.list_e type_fields span] span] span) false span;
+                        ast.list_e (table_field + type_fields) span] span] span) false span;
     let generated = list.head (fresh ([constructor, from_default] + helpers)
                                      (2147483648 + ast.span_start span * 128));
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)

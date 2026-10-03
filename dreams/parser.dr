@@ -98,13 +98,13 @@ let token_continues c t =
 
 /// Keywords are ordinary identifiers that the parser recognises; the lexer has
 /// no idea they are special.
-let keywords = ["let", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
+let keywords = ["let", "let?", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
                 "match", "macro", "expand", "group", "struct", "mapping", "type", "union"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
-let non_starters = ["let", "priv", "rec", "else", "import", "as", "catch", "virtual", "derive",
+let non_starters = ["let", "let?", "priv", "rec", "else", "import", "as", "catch", "virtual", "derive",
                     "when", "mod", "macro", "type", "union"];
 
 /// The lists above are the readable form; these are how they are asked. A
@@ -622,7 +622,11 @@ let rec parse_block c sp ts = block_stmts (allow_brace (ctx true (ctx_no_brace c
 let rec block_stmts c acc ts sp =
     if at ts :semi { block_stmts c acc (list.tail ts) sp }
     else if at ts :rbrace {
-        ok (ast.block_e (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts)
+        let end = ast.span_to sp (peek_span ts);
+        match unfold_let_try (list.reverse acc) end {
+            [:error, m, s] => err m s,
+            stmts => ok (ast.block_e stmts end) (list.tail ts),
+        }
     }
     else if at_end ts { err "unterminated block: expected `}`" sp }
     else {
@@ -635,6 +639,7 @@ let rec block_stmts c acc ts sp =
 /// A statement is a `let` declaration or an expression.
 let rec parse_statement c ts =
     if is_kw ts "let" { parse_let c (peek_span ts) (list.tail ts) }
+    else if is_kw ts "let?" { parse_let_try c (peek_span ts) (list.tail ts) }
     else if is_kw ts "type" { parse_type c (peek_span ts) (list.tail ts) }
     else { parse_expr c ts };
 
@@ -678,6 +683,92 @@ let rec parse_let c sp ts = {
         }
     }
 };
+
+// --- `let?` ------------------------------------------------------------------
+//
+// Errors are values here -- raising is an effect, so a pure function that can
+// fail answers `[:ok, v]` or `[:error, e]` -- and a chain of fallible steps
+// written out by hand is a staircase of `match`es, each passing the error on.
+// `let?` is one step of that staircase:
+//
+//     let? x = step one;          match step one {
+//     let? y = step x;      ==        [:ok, x] => match step x {
+//     [:ok, x + y]                        [:ok, y] => [:ok, x + y],
+//                                         other => other },
+//                                     other => other }
+//
+// Anything that is not `[:ok, _]` is the block's answer as it stands, which is
+// what `macros.with_ok` and `result.and_then` already mean by it. A pattern
+// binds as a destructuring `let` does, lazily, out of the payload.
+//
+// It is unfolded here rather than given a node, because every later stage
+// already knows `match` and `let` -- scope, the checker, lowering, the language
+// server -- and a step that means exactly one of those is not worth teaching to
+// each of them. The statement is parsed on its own (`parse_let_try`) and only
+// the block can unfold it, since what it wraps is the statements after it.
+
+/// The name the payload and the passed-on value are held by. Angle brackets
+/// cannot be written, so no name in the program can be it; a nested `let?`
+/// shadows the outer one, which is finished with by then.
+let let_try_name = "<let?>";
+
+/// Where each name the unfolding makes is written: a byte inside the `let?`
+/// keyword itself. Resolution keys a name by the offset it starts at, so two
+/// of them given the statement's span would be one name to it -- the read of
+/// the payload would resolve to the binder of the other arm, which is never
+/// bound on this path. Nothing the programmer wrote starts inside the keyword,
+/// so offsets 1 to 3 are free: 1 binds the payload, 2 binds what is passed on
+/// and reads it back (a binder and a use are kept apart), 3 reads the payload.
+let let_try_at span k = [ast.span_start span + k, ast.span_start span + k + 1];
+
+/// `let? name = e` or `let? pattern = e`, as `[:let_try, binding, e, span,
+/// keyword]`: the `let` it binds with, its value replaced by the payload's
+/// name, and where the `let?` keyword is.
+///
+/// The `let` is given the span of what it binds rather than the keyword's:
+/// the `match` it unfolds into starts at the keyword, and a `match` holds its
+/// subject in a slot keyed there, so a `let` starting there too would bind to
+/// the same slot and read itself.
+let rec parse_let_try c sp ts =
+    match parse_let c (peek_span ts) ts {
+        [:error, m, s] => err m s,
+        [:ok, [:let, name, [], value, false, span], rest] =>
+            ok [:let_try, ast.let_d name [] (ast.name_e let_try_name (let_try_at sp 3)) false span,
+                value, span, sp] rest,
+        [:ok, [:let_p, pattern, value, span], rest] =>
+            ok [:let_try, ast.let_pattern_d pattern (ast.name_e let_try_name (let_try_at sp 3)) span,
+                value, span, sp] rest,
+        [:ok, _, _] =>
+            err "`let?` binds one value: it takes no parameters, `rec` or signature" sp,
+    };
+
+/// A block's statements with every `let?` folded into the `match` it means,
+/// or `[:error, m, span]` for one with nothing after it to guard.
+let rec unfold_let_try stmts end =
+    match stmts {
+        [] => [],
+        [[:let_try, _, _, _, sp]] =>
+            err "`let?` must be followed by the statements it guards" sp,
+        [[:let_try, binding, value, _, sp], ..rest] =>
+            match unfold_let_try rest end {
+                [:error, m, s] => [:error, m, s],
+                after => {
+                    let body = ast.span_to sp end;
+                    let ok_p = ast.list_p [ast.literal_p (ast.atom_e "ok" sp) sp,
+                                           ast.bind_p let_try_name (let_try_at sp 1)] () sp;
+                    let passed = let_try_at sp 2;
+                    [ast.match_e value
+                         [ast.arm ok_p () (ast.block_e (list.cons binding after) body) body,
+                          ast.arm (ast.bind_p let_try_name passed) () (ast.name_e let_try_name passed) sp]
+                         body]
+                },
+            },
+        [st, ..rest] =>
+            match unfold_let_try rest end {
+                [:error, m, s] => [:error, m, s],
+                after => list.cons st after,
+            },
+    };
 
 // --- signatures ---------------------------------------------------------------
 //
@@ -1529,7 +1620,12 @@ let rec parse_item c ts = {
         :ident => match peek_value ts {
             "import" => parse_import c sp (list.tail ts),
             "mod" => parse_mod c sp (list.tail ts),
-            "derive" => parse_derive c sp (list.tail ts),
+            "derive" =>
+                if is_dyn (list.tail ts) {
+                    err ("only a record's values can carry what they derive: write `derive dyn` "
+                         + "in a `group`, `struct` or `mapping` header") sp
+                }
+                else { parse_derive c sp (list.tail ts) },
             "virtual" => parse_virtual c sp (list.tail ts),
             "when" => parse_when c sp (list.tail ts),
             "let" => parse_let c sp (list.tail ts),
@@ -1957,14 +2053,25 @@ let rec c_struct_fields c sname acc ts =
         }
     };
 
-/// A record specializes a behavior just as an ordinary module does.
+/// A record specializes a behavior just as an ordinary module does, and
+/// `derive dyn path` also makes its values carry what it specialized, for the
+/// base's `dyn` virtuals to dispatch through.
 let record_base c ts =
     if is_kw ts "derive" {
-        match parse_derive c (peek_span ts) (list.tail ts) {
-            [:ok, d, rest] => ok [d] rest,
+        let after = list.tail ts;
+        let dyn = is_dyn after;
+        match parse_derive c (peek_span ts) (if dyn { list.tail after } else { after }) {
+            [:ok, [:derive, segs, span], rest] =>
+                ok (if dyn { [[:derive, segs, span], ast.dispatch_d segs span] }
+                    else { [[:derive, segs, span]] }) rest,
             other => other,
         }
     } else { ok [] ts };
+
+/// `dyn` is contextual: a word only before another name, so a module called
+/// `dyn` can still be derived (`derive dyn;`) and a virtual called `dyn` still
+/// declared (`virtual let dyn x`).
+let is_dyn ts = is_kw ts "dyn" && at (list.tail ts) :ident;
 
 /// A record body is a list of entries, and it is newline-sensitive for the
 /// same reason a block is: an entry may be a function definition, and nobody
@@ -2191,8 +2298,13 @@ let rec parse_derive c sp ts =
 
 /// `virtual let area s;` -- a hole. With a body it has a default and filling
 /// it is optional. A virtual needs at least one parameter, because one without
-/// would be a constant rather than a hole.
+/// would be a constant rather than a hole. `virtual dyn let` is one that
+/// dispatches on its last argument when called in the module declaring it.
 let rec parse_virtual c sp ts =
+    if is_dyn ts && is_kw (list.tail ts) "let" { parse_virtual_as c sp true (list.tail ts) }
+    else { parse_virtual_as c sp false ts };
+
+let rec parse_virtual_as c sp dyn ts =
     match expect ts :ident "`let` after `virtual`" {
         [:error, m, s] => err m s,
         [:ok, _, _] =>
@@ -2211,13 +2323,13 @@ let rec parse_virtual c sp ts =
                                      + "than a hole to fill") sp
                             }
                             else if not (at rest :eq) {
-                                ok (ast.virtual_d name params () (ast.span_to sp sp)) rest
+                                ok (ast.virtual_d name params () dyn (ast.span_to sp sp)) rest
                             }
                             else {
                                 match parse_expr c (list.tail rest) {
                                     [:error, m, s] => err m s,
                                     [:ok, body, rest2] =>
-                                        ok (ast.virtual_d name params body
+                                        ok (ast.virtual_d name params body dyn
                                                           (ast.span_to sp (ast.span body))) rest2,
                                 }
                             },
@@ -2683,6 +2795,26 @@ when test {
             $( test.eq! "(block (name a) (name b))" (shape "{ a\n  b }") ),
         test.case "semicolons separate statements too"
             $( test.eq! "(block (name a) (name b))" (shape "{ a; b }") ),
+        test.case "`let?` is the match that passes anything but `[:ok, _]` on"
+            $( test.eq! "(block (match (name f) [[(atom ok) <let?>] (block (let x (name <let?>)) (apply (name g) (name x)))] [<let?> (name <let?>)]))"
+                        (shape "{ let? x = f; g x }") ),
+        test.case "the statements after a `let?` are what it guards, the ones before are not"
+            $( test.eq! ("(block (name a) (match (name f) [[(atom ok) <let?>] (block (let x (name <let?>))"
+                         + " (match (apply (name g) (name x)) [[(atom ok) <let?>] (block (let y (name <let?>))"
+                         + " (apply (name h) (name x) (name y)))] [<let?> (name <let?>)]))] [<let?> (name <let?>)]))")
+                        (shape "{ a\n  let? x = f\n  let? y = g x\n  h x y }") ),
+        test.case "a `let?` pattern destructures the payload as a `let` does"
+            $( test.eq! "(block (match (name f) [[(atom ok) <let?>] (block (let [a b] (name <let?>)) (binary add (name a) (name b)))] [<let?> (name <let?>)]))"
+                        (shape "{ let? [a, b] = f; a + b }") ),
+        test.case "a `let?` with nothing after it has nothing to guard"
+            $( test.eq! "`let?` must be followed by the statements it guards" (fails "{ let? x = f }") ),
+        test.case "a `let?` binds a value, not a function"
+            $( test.eq! "`let?` binds one value: it takes no parameters, `rec` or signature"
+                        (fails "{ let? f x = g x; f }") ),
+        test.case "`let?` is a keyword, and `let ?` is not it"
+            $( test.eq! [true, true]
+                        [str.contains_str "keyword" (fails "{ let let? = 1; 2 }"),
+                         fails "{ let ?x = f; x }" != "parsed when it should not have"] ),
         test.case "a block may declare a let"
             $( test.eq! "(block (let x (int 1)) (name x))" (shape "{ let x = 1\n  x }") ),
         test.case "a let with parameters is a function"
@@ -2806,6 +2938,17 @@ when test {
                         (items "virtual let name xs = \"sequence\";") ),
         test.case "a virtual needs a parameter"
             $( test.true! (str.contains_str "constant" (fails_module "virtual let x = 1;")) ),
+        test.case "a `dyn` virtual dispatches, and says so"
+            $( test.eq! "(virtual dyn area self)" (items "virtual dyn let area self;") ),
+        test.case "`dyn` is contextual: a virtual may still be called it"
+            $( test.eq! "(virtual dyn x)" (items "virtual let dyn x;") ),
+        test.case "a record's `derive dyn` is a derive and a dispatch"
+            $( test.eq! "(struct R (derive shape) (dispatch shape) w)"
+                        (items "struct R derive dyn shape { w }") ),
+        test.case "and a module called `dyn` can still be derived"
+            $( test.eq! "(derive dyn)" (items "derive dyn;") ),
+        test.case "only a record's values can carry what they derive"
+            $( test.true! (str.contains_str "only a record" (fails_module "derive dyn shape;")) ),
         test.case "mod"
             $( test.eq! "(mod math (let square x (name x)))"
                         (items "mod math { let square x = x }") ),

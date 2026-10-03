@@ -73,7 +73,7 @@ let describe t =
 
 /// Tokenize, and print one token per line with where it came from.
 let tokenize! file src = {
-    let rec put! ts n =
+    let rec put! ts !n =
         match ts {
             [] => n,
             [t, ..rest] =>

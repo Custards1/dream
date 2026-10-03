@@ -721,6 +721,13 @@ parameter named `strict`. A `fold` whose lambda has a strict parameter is not
 fused (see `dreams/fuse.dr`), because the fused loop inlines the body and would
 drop the force.
 
+The compiler warns about the plainest case of the trap: a parameter of `f`
+whose every use is either a call of `f` itself that hands it on grown by `+`,
+`-` or `*` (or unchanged), or `f`'s answer. Any other use -- a test, a call of
+something else, a lambda naming it -- may be what forces it, so it silences the
+warning; the check misses chains it cannot see but never reports one that is
+not there. `dreams/lint.dr` is the rule.
+
 For the JIT, a strict parameter is forced on every path by construction, which
 is exactly what admission asks (below). Marking a loop's parameters strict is
 the way to get it compiled.
@@ -1112,7 +1119,8 @@ let name r = "circle";
 A virtual needs at least one parameter — a parameterless virtual would be a
 constant, not a hole. Because Dream compiles whole programs, `derive`
 specializes the base module's *syntax tree* against the deriving module's
-implementations, so there is no run-time dispatch.
+implementations, so there is no run-time dispatch unless it is asked for
+(**Dispatch**, below).
 
 These modules are Dream's **behaviors**: explicit contracts and reusable
 implementations over dynamically typed values. Each implementation must be
@@ -1151,7 +1159,49 @@ implementations are compile errors even if no caller uses them.
 A module or record derives one base module. Calls name the implementing
 namespace (`Rectangle.area value`); values keep their ordinary collection
 representation. For generic callers, pass operations as ordinary function
-arguments. This mechanism does not add automatic dispatch on a value's type.
+arguments, or opt in to dispatch.
+
+#### Dispatch: `virtual dyn` and `derive dyn`
+
+A function written once against a behavior, for values of any record that
+implements it, needs the value to say which implementation it has. That is
+opt-in on both sides:
+
+```dream
+mod solid {
+    virtual dyn let volume self;
+    virtual dyn let label self = "solid";
+    let report self = label self + ": " + to_string (volume self);
+}
+
+struct Cube derive dyn solid { edge, volume self = edge self * edge self * edge self }
+mapping Slab derive dyn solid { w, d, h, volume self = w self * d self * h self }
+
+list.map solid.report [Cube.make 3, Slab.make 2 3 4]   // ["solid: 27", "solid: 24"]
+```
+
+- **`virtual dyn let`** declares a virtual that, *called through the module
+  that declares it*, dispatches on its **last** argument -- the receiver, by
+  the convention that a member takes `self` last. Everywhere else it is an
+  ordinary virtual: a deriving module still gets its own specialized copy, and
+  `Cube.report` calls `Cube.volume` directly.
+- **`derive dyn path`**, in a `group`, `struct` or `mapping` header, makes the
+  record's values carry a table of its implementations of every `dyn` virtual
+  it inherits. The table is slot 0 -- the first element of a list or an
+  array, the key `0` of a map -- and the fields move up one, which the
+  generated accessors, constructors and description account for. A pattern
+  written against the underlying collection sees it.
+
+A value that carries no table gets the virtual's default, or, for a hole, an
+error saying the value carries no implementation. `derive dyn` of a module
+with no `dyn` virtual is a compile error, as is `derive dyn` outside a record
+header, since only a record constructs the values that would carry it.
+
+The cost is where it was asked for: a base without a `dyn` virtual and a
+record without `dyn` compile exactly as before. A dispatched call reads slot
+0, checks it is a table, and looks the virtual up by name, a few reductions
+more than the direct call it ends in. `dyn` is a contextual word, so a module
+or a virtual may still be named `dyn`.
 
 ### `when` — conditional compilation
 
@@ -1400,6 +1450,34 @@ Well-known kinds the runtime raises:
 
 Both `raise!` and `try!` are impure, so error handling is an effect and stays
 out of pure functions.
+
+### `let?` — errors as values
+
+A pure function that can fail answers `[:ok, value]` or `[:error, reason]`,
+and a chain of such steps is written with `let?`, a block statement:
+
+```dream
+let ratio a b = {
+    let? x = number a;          // [:ok, x] binds x and goes on;
+    let? y = number b;          // anything else is the block's answer,
+    let? d = positive y;        // and nothing after it runs
+    [:ok, x / d]
+};
+```
+
+`let? p = e; rest` means exactly
+
+```dream
+match e { [:ok, v] => { let p = v; rest }, other => other }
+```
+
+so `p` may be a pattern, bound lazily as a destructuring `let` binds, and
+everything that is not `[:ok, _]` -- an `[:error, _]`, or any other value -- is
+passed on unchanged, as `result.and_then` and `macros.with_ok` pass it. It
+binds one value: parameters, `rec` and a signature are errors, and so is a
+`let?` with no statements after it, since there would be nothing for it to
+guard. The parser unfolds it, so nothing after the parser has a new form to
+learn. `let?` is one keyword; `let ?x` is not it.
 
 ### Runaway processes
 
