@@ -90,8 +90,27 @@ let transactions! target = sql.using! (driver.open! target) (fn conn -> {
     ()
 });
 
+let errors! : :any -> :unit;
+let errors! target = {
+    let refused = try! { driver.open! target.[:database => "no_such_db"] } catch e { e };
+    test.eq! :invalid_catalog_name (sql.error_code refused)
+    let conn = driver.open! target;
+    sql.exec! conn "CREATE TEMP TABLE shared_errors (id bigint PRIMARY KEY, n bigint NOT NULL CHECK (n > 0))"
+    let missing = try! { sql.exec! conn "INSERT INTO shared_errors (id) VALUES (1)" } catch e { e };
+    test.eq! :not_null (sql.error_code missing)
+    let checked = try! { sql.exec! conn "INSERT INTO shared_errors VALUES (1, -1)" } catch e { e };
+    test.eq! :check (sql.error_code checked)
+    let undefined = try! { sql.query! conn "SELECT * FROM shared_missing_table" } catch e { e };
+    test.eq! :undefined_table (sql.error_code undefined)
+    sql.close! conn
+    let closed = try! { sql.query! conn "SELECT 1" } catch e { e };
+    test.true! (sql.is_connection_lost closed)
+    ()
+};
+
 let tests : :any -> [:any];
 let tests target = [
+    test.case "open failures, constraint codes and a closed connection" $( errors! target ),
     test.case "shared queries, defaults, NULL, blobs, arrays, JSON and row records" $( values! target ),
     test.case "prepare once, count changes, and recover from a failed batch" $( many! target ),
     test.case "portal batches and cleanup after callback or server errors" $( streaming! target ),
