@@ -573,6 +573,7 @@ let rec pattern p = match p {
     [:wildcard, sp] => is_span sp,
     [:bind, n, sp] => string n && is_span sp,
     [:literal, e, sp] => expression e && is_span sp,
+    [:cons_p, head, tail, op, sp] => pattern head && pattern tail && is_span op && is_span sp,
     [:list_p, xs, rest, sp] => sequence pattern xs && rest_pattern rest && is_span sp,
     [:array_p, xs, rest, sp] => sequence pattern xs && rest_pattern rest && is_span sp,
     [:map_p, xs, sp] => sequence (pair expression pattern) xs && is_span sp,

@@ -86,6 +86,16 @@ inline int open(const char* path, int flags, int mode) {
 inline int stat(const char* path, FileStat* st) { return _wstat64(windows::wide(path).c_str(), st); }
 inline int fstat(int fd, FileStat* st) { return _fstat64(fd, st); }
 inline int fsync(int fd) { return _commit(fd); }
+inline bool is_terminal(int fd) {
+    return socket_of(fd) == INVALID_SOCKET && ::_isatty(fd) != 0;
+}
+inline bool enable_ansi(int fd) {
+    if (!is_terminal(fd)) return false;
+    HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    DWORD mode = 0;
+    return GetConsoleMode(handle, &mode) &&
+           SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
 inline Offset lseek(int fd, Offset offset, int origin) { return _lseeki64(fd, offset, origin); }
 inline int mkdir(const char* path, int) { return _wmkdir(windows::wide(path).c_str()); }
 inline int remove(const char* path) {
@@ -192,6 +202,8 @@ using ::read; using ::write; using ::bind; using ::listen;
 using ::connect; using ::setsockopt; using ::getsockopt;
 using ::getpeername; using ::getsockname; using ::shutdown;
 inline bool init() { return true; }
+inline bool is_terminal(int fd) { return ::isatty(fd) != 0; }
+inline bool enable_ansi(int fd) { return is_terminal(fd); }
 inline bool nonblocking(int fd) {
     int flags = ::fcntl(fd, F_GETFL, 0);
     return flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;

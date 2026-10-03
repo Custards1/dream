@@ -198,12 +198,18 @@ let rec link_step tc target = {
                                 (shared_used t),
         _ => [],
     };
+    // Explicit dependency files participate in the key, so replacing a
+    // system archive at the same path relinks its consumers.
+    let files = list.flat_map (fn setting -> match setting {
+        [:link_file, path] => [build.file path],
+        _ => [],
+    }) (cc.link_settings t);
     let outputs = list.concat [
         [main_file tc t],
         (if cc.kind t == :shared && os_of tc == :windows { [link_file tc t] } else { [] }),
         list.map (fn r -> list.nth 1 r) runtime,
     ];
-    build.step "cc.link" (cc.name t) (list.concat [objects, libraries, list.map list.head runtime]) [tc, t] outputs (fn job -> {
+    build.step "cc.link" (cc.name t) (list.concat [objects, libraries, files, list.map list.head runtime]) [tc, t] outputs (fn job -> {
         let root = build.Context.root (build.Job.ctx job);
         let objs = list.map (fn o -> build.path job o) objects;
         let libs = list.map (fn l -> build.path job l) libraries;

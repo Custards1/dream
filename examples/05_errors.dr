@@ -3,6 +3,7 @@
 // Both `raise!` and `try!` are impure, so error handling is an effect and the
 // purity rule keeps it out of pure functions.
 import std.console;
+import std.math;
 
 import std.list;
 import std.num;
@@ -24,7 +25,7 @@ let main! = {
     console.print! ("divide:    " + to_string (try! { div 1 0 } catch e { e }))
     console.print! ("type:      " + to_string (try! { 1 + "x" } catch e { e }))
     console.print! ("not a fn:  " + to_string (try! { (1) 2 } catch e { e }))
-    console.print! ("no member: " + to_string (try! { console.nope! 1 } catch e { e }))
+    console.print! ("no member: " + to_string (try! { math.nope! 1 } catch e { e }))
     console.print! ("bounds:    " + to_string (try! { (#[1]).[9] } catch e { e }))
 
     // Raising a value of your own.

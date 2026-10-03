@@ -15,3 +15,5 @@ env = ["CC", "CXX"]
 # an LLVM to build it with.
 [options]
 jit = { type = ["auto", "off"], default = "auto", doc = "build the JIT when there is an LLVM" }
+
+link_deps = { type = ["prefer_static", "static", "shared"], default = "prefer_static", doc = "how to link LLVM and libffi into libdream" }

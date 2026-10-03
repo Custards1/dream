@@ -155,7 +155,7 @@ packages it depends on, however deep:
 
   [profile.release]                                   # mind build --release
   defines = [\"release\"]
-  flags   = [\"--no-types\"]
+  flags   = [\"--no-opt\"]
   [profile.release.config.sqlite]
   threads = \"multi\"
 

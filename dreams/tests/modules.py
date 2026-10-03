@@ -11,6 +11,7 @@ parser.add_argument('--compiler', default='build/dreams.dream')
 args = parser.parse_args()
 vm = str(pathlib.Path(args.dream).resolve())
 compiler = str(pathlib.Path(args.compiler).resolve())
+root = pathlib.Path(__file__).resolve().parents[2]
 
 with tempfile.TemporaryDirectory(prefix='dream-modules-') as directory:
     temp = pathlib.Path(directory)
@@ -27,7 +28,7 @@ mod dot {
             f'import std.console; {imports}\n'
             f'let main! = console.print! ({expression});\n')
         result = subprocess.run(
-            [vm, compiler, str(temp / 'main.dr'), '-o', str(temp / 'out.dream')],
+            [vm, compiler, '-L', str(root / 'mind'), str(temp / 'main.dr'), '-o', str(temp / 'out.dream')],
             capture_output=True, text=True, timeout=60)
         if error:
             assert result.returncode != 0, imports

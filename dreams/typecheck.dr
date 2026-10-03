@@ -32,7 +32,7 @@
 //      the machine" at the end -- and the JIT guards every value a hint
 //      describes, so a wrong one costs speed and never an answer. A program
 //      whose signatures declare no float compiles to the image it compiled to
-//      before. `--no-types` skips both.
+//      before.
 //
 // The types are the ones `std.types` describes, read from the same grammar,
 // so a `type` declaration means the same thing to this pass and to
@@ -1319,6 +1319,12 @@ let statement k h st ds = match st {
 let rec bind_pattern k h p t = match p {
     [:bind, n, _] => with_local n t h,
     [:as_p, inner, n, _, _] => with_local n t (bind_pattern k h inner t),
+    [:cons_p, head, tail, _, _] => {
+        let found = sequence_members k t :list [head] [()];
+        let heads = union_of (list.map (fn m -> match m { [:seq, ts] => list.head ts, [:rep, e] => e, _ => :any }) found);
+        let tails = union_of (list.map (fn m -> match m { [:seq, ts] => [:tuple, list.tail ts], [:rep, e] => [:list_of, e], _ => :any }) found);
+        bind_pattern k (bind_pattern k h head heads) tail tails
+    },
     [:list_p, items, rest, _] => bind_items k h items rest (sequence_members k t :list items rest) :list,
     [:array_p, items, rest, _] => bind_items k h items rest (sequence_members k t :array items rest) :array,
     [:map_p, kvs, _] => list.fold (fn acc kv ->
@@ -1547,6 +1553,10 @@ let rec covers p m = match p {
         [[:lit, _, _], [:lit, _, _]] => literal_type e == m,
         _ => false,
     },
+    [:cons_p, head, tail, _, _] => match m {
+        [:tuple, [h, ..ts]] => covers head h && covers tail [:tuple, ts],
+        _ => false,
+    },
     [:list_p, [], rest, _] if rest != () => match m {
         [:tuple, _] => true,
         [:list_of, _] => true,
@@ -1570,6 +1580,12 @@ let rec may_match k p m = match p {
     [:literal, e, _] => match comparable (literal_type e) {
         () => true,
         l => fits k l m,
+    },
+    [:cons_p, head, tail, _, _] => match peel k m 8 {
+        [:tuple, []] => false,
+        [:tuple, [h, ..ts]] => may_match k head h && may_match k tail [:tuple, ts],
+        [:list_of, e] => may_match k head e && may_match k tail [:list_of, e],
+        _ => sequence_may k [head] [()] m :list,
     },
     [:list_p, items, rest, _] => sequence_may k items rest m :list,
     [:array_p, items, rest, _] => sequence_may k items rest m :array,
@@ -1884,6 +1900,10 @@ let rec arm_misses p v = match p {
     [:literal, e, _] => match [literal_type e, v] {
         [:unit, :unit] => false,
         [l, [:lit, _, _]] => l != v,
+        _ => true,
+    },
+    [:cons_p, head, tail, _, _] => match v {
+        [:tuple, [h, ..ts]] => element_misses head h || arm_misses tail [:tuple, ts],
         _ => true,
     },
     [:list_p, items, rest, _] => match v {

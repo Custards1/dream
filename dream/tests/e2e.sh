@@ -43,6 +43,12 @@ if [[ -z "$DREAMS" ]]; then
   exit 1
 fi
 if [[ "$DREAMS" == *.dream ]]; then compile=("$dream" "$DREAMS"); else compile=("$DREAMS"); fi
+# The checkout's own `std`, named rather than found. A program under
+# `programs/` finds it by walking up to `mind/`, but the shebang, payload and
+# session programs are written to a temporary directory, which has no `mind`
+# above it -- and since `std.console` became Dream, even a one-line program
+# needs a `std` to compile.
+compile+=(-L "$ROOT/mind")
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

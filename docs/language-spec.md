@@ -335,8 +335,9 @@ member is expected must fit in every member; beyond that, anything the checker
 cannot see into passes. A refinement is checked as its base type, since its
 predicate only runs at run time.
 
-Signatures compile to nothing: a program's image is byte-identical with the
-checker or without it, and `dreams --no-types` skips it. There is no runtime
+Signatures compile to nothing but the JIT's parameter hints: a signature over
+anything but integers and floats leaves the image as it was, and the checker
+always runs. There is no runtime
 check on a signed function's arguments — `types.enforce` is that, where it is
 wanted.
 
@@ -492,8 +493,8 @@ value wants is usually decided by how it is read rather than by what it holds:
 makes, compiled to the same `cons` operator, so the tail is lazy. It is the one
 operator that groups to the right, because a list is built from its end:
 `1 :: 2 :: []` is `[1, 2]`. Below `+`, so `n - 1 :: rest` puts the difference
-at the front; above the comparisons, so `x :: xs == ys` compares lists. It is an
-expression only: a pattern still takes a list apart as `[x, ..rest]`.
+at the front; above the comparisons, so `x :: xs == ys` compares lists. In a pattern,
+`x :: rest` takes apart a non-empty list, as `[x, ..rest]` does.
 
 Every other infix operator is left-associative. The single most important
 consequence: **application binds tighter than everything**, so
@@ -527,10 +528,9 @@ x |> f a           // f a x
 [1,2,3] |> list.map inc |> list.sum
 ```
 
-The pipe is folded during lowering, not desugared into a nested call: `x |> f a`
-becomes a **single** application of `f` to `[a, x]`. That is what lets
-`v |> console.print! "got: "` land as one variadic call `print! "got: " v`, and
-it is why `console.print!` puts its label first.
+The pipe is folded during lowering: `x |> f a` becomes a single application
+of `f` to `[a, x]`. For example, `["Ada", 42] |> console.printf! "{}: {}"`
+passes the value list as the formatter's final argument.
 
 ### Operators on non-numbers
 
@@ -1535,14 +1535,19 @@ first that matches wins.
 | `1`, `1.5`, `'c'`, `true`, `"s"`, `:atom`, `()` | that literal, by the same equality `==` uses |
 | `[]` | the empty list |
 | `[a, b, c]` | a list of exactly three elements |
-| `[x, ..rest]` | a non-empty list; `rest` is the tail |
+| `[x, ..rest]`, `x :: rest` | a non-empty list; `rest` is the tail |
+| `a :: b :: []` | exactly two elements; cons patterns associate right |
 | `#[a, b]` | an array of exactly two elements |
 | `#[a, ..rest]` | an array of at least one element |
 | `%{ :k => v }` | a map containing key `:k`; other keys ignored |
 | `p as name` | `p`, also binding the whole value to `name` |
 | `(p)` | `p`; parentheses only group |
 
-Patterns nest. A name may be bound at most once per arm.
+Patterns nest. A name may be bound at most once per arm. `::` binds tighter
+than `as`: `head :: tail as whole` aliases the whole list, while
+`head :: (tail as rest)` aliases its tail. Either side may be another pattern;
+matching `head :: tail` does not force either part. Parenthesized cons patterns
+also work in destructuring lets and parameters.
 
 ```dream
 let rec sum xs = match xs {
@@ -1774,29 +1779,18 @@ Scalar type descriptions are exported by `std.types`.
 
 ### `std.console`
 
-| | |
-|-|-|
-| `print! ..` | writes every argument, then a newline, to stdout |
-| `write! ..` | the same without the trailing newline |
-| `line! ..` | as `print!` |
-| `error! ..` | as `print!`, to stderr |
-
-**Every member is variadic**: it takes however many arguments the call site
-passed, writes each in turn with no separator between them, and forces every
-one.
+A Dream library over native byte I/O, providing output, checked formatting,
+interactive prompts, terminal-aware colors and configurable logging. The four
+basic functions take one value: `print!` and `line!` add a newline on stdout,
+`write!` omits it, and `error!` prints a line on stderr.
 
 ```dream
-console.print! "done"
-console.print! "x = " x ", y = " y
-x |> console.print! "x = "            // one application, so this still works
+console.printf! "x = {}, y = {}" [x, y]
+console.styled! [:bold, :green] "done"
+let answer = console.confirm! "Continue?" false;
 ```
 
-Variadic is possible here only because Dream lowers `a |> f b` to a *single*
-application node, so a variadic native can take "everything at this call site"
-as its meaning. The flip side is that **a variadic function is never partially
-applied** — currying cannot tell `f a b` from a half-finished `f a b c` — so
-`console.print! "label"` prints immediately rather than returning a function
-waiting for a value.
+See [Console](console.md) for the complete API and EOF/error behavior.
 
 ### `std.math`
 

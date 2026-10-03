@@ -48,15 +48,19 @@ let suite ctx name program = command.check_in (build.Context.root ctx) name (too
 /// what changed and nothing else (`just test-build`).
 let std_build : :string;
 let std_build = "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
-    + " && for p in toolchains incremental; do"
+    + " && for p in toolchains incremental dependencies; do"
     + " \"$dream\" \"$dreams\" -L mind mind/std/build/tests/$p.dr -o \"$t/$p.dream\" >/dev/null"
-    + " && \"$dream\" \"$t/$p.dream\" || exit 1; done";
+    + " && \"$dream\" \"$t/$p.dream\" || exit 1; done"
+    + " && python3 dream/tests/static_link.py";
 
 let checks : :map -> :map;
 let checks ctx =
     build.empty
     |> build.check "vm" (suite ctx "vm" (file.parent (build.Context.vm ctx) + "/dream_tests"))
     |> build.check "std_build" (command.check_in (build.Context.root ctx) "std_build" (tools ctx) "sh" ["-c", std_build])
+    |> build.check "console" (command.check_in (build.Context.root ctx) "console" (tools ctx) "python3"
+        ["dream/tests/console.py", "--dream", build.Context.vm ctx,
+         "--compiler", list.last (build.Context.compiler ctx)])
     |> build.check "e2e" (suite ctx "e2e" "dream/tests/e2e.sh")
     |> build.check "examples" (suite ctx "examples" "examples/run.sh")
     |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh")
@@ -91,10 +95,19 @@ let avx2 ctx tc t = match [build.Target.arch (build.Context.target ctx), cc.Tool
     _ => t,
 };
 
+/// Archive and shared-library paths are tracked as file inputs; flags remain
+/// in the compiler's dialect.
+let link_libraries : cc.Toolchain -> [:string] -> cc.Target -> cc.Target;
+let link_libraries tc libs t = list.fold (fn target lib ->
+    if (str.starts_with "/" lib || (str.byte_length lib > 2 && str.slice 1 1 lib == ":"))
+       && not (str.starts_with "/LIBPATH:" lib) {
+        cc.set (cc.Setting.link_file lib) target
+    } else { cc.link_flags_for (cc.Toolchain.family tc) [lib] target }) t libs;
+
 /// `jit.cpp` when LLVM answered and the JIT was not turned off (`-D jit=off`),
 /// the stub otherwise.
-let jit : :map -> :any -> cc.Target -> cc.Target;
-let jit ctx llvm t = match [build.option ctx "jit", llvm] {
+let jit : :map -> cc.Toolchain -> :any -> cc.Target -> cc.Target;
+let jit ctx tc llvm t = match [build.option ctx "jit", llvm] {
     ["off", _] => cc.source "dream/src/jit_stub.cpp" t,
     [_, ()] => cc.source "dream/src/jit_stub.cpp" t,
     [_, l] =>
@@ -105,7 +118,7 @@ let jit ctx llvm t = match [build.option ctx "jit", llvm] {
           |> cc.flags_for :gnu ["-isystem", l.[:includes]]
           |> cc.flags_for :msvc ["/external:I" + l.[:includes], "/external:W0"]
           |> cc.set (cc.Setting.library_dir l.[:libdir])
-          |> cc.link_flags_for :gnu l.[:libraries],
+          |> link_libraries tc l.[:libraries],
 };
 
 let optimized : :map -> cc.Target -> cc.Target;
@@ -117,13 +130,13 @@ let optimized ctx t = match build.profile ctx {
 /// libffi as `pkg-config` describes it, or the compiler's own search paths
 /// when it has nothing to say: a system with libffi installed where the
 /// compiler looks needs no flags at all. Nix keeps the headers where it does
-/// not look, and `nix-shell -p pkg-config libffi` is the answer there.
-let ffi : [:string] -> cc.Target -> cc.Target;
-let ffi [cflags, libs] t = {
+/// not look; the repository's `nix-shell` supplies pkg-config and PIC libffi.
+let ffi : cc.Toolchain -> [:string] -> cc.Target -> cc.Target;
+let ffi tc [cflags, libs] t = {
     let words text = list.filter (fn w -> not (str.is_empty w)) (str.split " " (str.trim text));
     match words libs {
         [] => t |> cc.system "ffi",
-        found => t |> cc.flags_for :gnu (words cflags) |> cc.link_flags_for :gnu found,
+        found => t |> cc.flags_for :gnu (words cflags) |> link_libraries tc found,
     }
 };
 
@@ -158,14 +171,15 @@ let libdream ctx tc llvm libffi openssl =
     |> cc.public_include "dream/include"
     |> cc.include "dream/src"
     |> cc.threads
-    |> ffi libffi
+    |> ffi tc libffi
     |> tls tc openssl
     |> cc.system_for :linux "dl"
     |> cc.system_for :windows "ws2_32"
     |> cc.system_for :windows "bcrypt"
     |> cc.export_all
+    |> cc.link_flags_for :gnu (if cc.Toolchain.os tc == :linux { ["-Wl,--exclude-libs,ALL", "-Wl,--as-needed", "-Wl,--gc-sections"] } else { [] })
     |> avx2 ctx tc
-    |> jit ctx llvm;
+    |> jit ctx tc llvm;
 
 let native : :map -> :string -> :string -> cc.Target -> cc.Target;
 let native ctx name source lib =
@@ -217,17 +231,82 @@ let llvm_parts = ["core", "orcjit", "native", "support", "target", "analysis", "
 let asked_again : :any -> :any;
 let asked_again a = match a { [:artifact, s, n] => build.artifact (build.uncached s) n };
 
-/// The questions that come before the goals: which compiler, whether there is
-/// an LLVM, and where libffi and OpenSSL are. Everything else follows from the
-/// answers.
+/// A strict request fails as a build step, with a useful diagnostic.
+let unavailable : :string -> :map;
+let unavailable why = build.given (build.artifact
+    (build.step "configure" why [] [why] ["answer"]
+        (fn job -> [build.Op.write "answer" why, build.Op.empty "answer" why])) "answer") (fn _ -> build.empty);
+
+let words : :string -> [:string];
+let words text = list.filter (fn w -> not (str.is_empty w)) (str.split " " (str.trim text));
+
+let ffi_probe : :string;
+let ffi_probe = "#define FFI_STATIC_BUILD\n#include <ffi.h>\nextern \"C\" void probe() { ffi_cif c; "
+    + "ffi_prep_cif(&c, FFI_DEFAULT_ABI, 0, &ffi_type_void, nullptr); ffi_call(&c, nullptr, nullptr, nullptr); }\n";
+
+let llvm_probe : :string;
+let llvm_probe = "#include <llvm-c/LLJIT.h>\n#include <llvm-c/Target.h>\nextern \"C\" void probe() { "
+    + "LLVMInitializeNativeTarget(); LLVMInitializeNativeAsmPrinter(); LLVMOrcLLJITRef jit; "
+    + "LLVMOrcCreateLLJIT(&jit, nullptr); LLVMOrcDisposeLLJIT(jit); }\n";
+
+/// Prefer usable static dependencies, and fall back only when requested.
+let dependencies : :map -> cc.Toolchain -> :string -> [:string] -> [:string] -> :string -> :map;
+let dependencies ctx tc config libffi openssl dir = {
+    let mode = build.option ctx "link_deps";
+    let with_llvm : [:string] -> :map;
+    let with_llvm ffi_libs =
+        if build.option ctx "jit" == "off" { goals ctx tc () ffi_libs openssl }
+        else {
+            let shared = build.given (probe.llvm_link config "--link-shared" llvm_parts)
+                (fn text -> if probe.answer text == () && config != "llvm-config" {
+                    unavailable "llvm-config cannot supply shared LLVM libraries; install shared LLVM or request static linkage"
+                } else { goals ctx tc (probe.answer text) ffi_libs openssl });
+            if mode == "shared" { shared }
+            else { build.given (probe.llvm_link config "--link-static" llvm_parts) (fn text ->
+                match probe.answer text {
+                    () => if mode == "static" {
+                        // LLVM remains optional when it is not installed.
+                        build.given (probe.llvm_link config "--link-shared" llvm_parts) (fn found ->
+                            if probe.answer found == () && config == "llvm-config" { goals ctx tc () ffi_libs openssl }
+                            else { unavailable "LLVM static archives are unavailable" })
+                    } else { shared },
+                    l => {
+                        // LLVM reports libxml2 for WindowsManifest, outside these
+                        // JIT components. Match CMake without weakening other dependencies.
+                        let selected = l.[:libraries => list.filter (fn lib -> lib != "-lxml2") l.[:libraries]];
+                        build.given (probe.shared_link tc llvm_probe [(if cc.Toolchain.family tc == :msvc { "/I" } else { "-I" }) + l.[:includes]]
+                                        (list.cons ((if cc.Toolchain.family tc == :msvc { "/LIBPATH:" } else { "-L" }) + l.[:libdir]) selected.[:libraries])) (fn works ->
+                        if works == "yes" { goals ctx tc selected ffi_libs openssl }
+                        else if mode == "static" { unavailable "LLVM archives cannot link into libdream; check PIC and system libraries" }
+                        else { shared })
+                    },
+                })
+            }
+        };
+    if cc.Toolchain.family tc != :gnu && mode == "static" { unavailable "static libffi discovery requires a GNU-style compiler; use CMake for MSVC" }
+    else if mode == "shared" || cc.Toolchain.family tc != :gnu { with_llvm libffi }
+    else if str.is_empty (str.trim dir) {
+        if mode == "static" { unavailable "libffi's archive directory is unavailable; install pkg-config and PIC libffi" }
+        else { with_llvm libffi }
+    } else {
+        let archive = str.trim dir + "/libffi.a";
+        build.given (probe.shared_link tc ffi_probe (words (list.head libffi)) [archive]) (fn works ->
+            if works == "yes" { with_llvm [list.head libffi + (if cc.Toolchain.os tc == :windows { " -DFFI_STATIC_BUILD" } else { "" }), archive] }
+            else if mode == "static" { unavailable "libffi.a cannot link into libdream; build libffi with --with-pic" }
+            else { with_llvm libffi })
+    }
+};
+
 let plan : :map -> :map;
 let plan ctx = build.all [
     checks ctx,
     steps.with_toolchain ctx (fn tc ->
-        build.given (probe.llvm llvm_parts) (fn llvm ->
+        build.given (asked_again (probe.program ctx "llvm-config")) (fn config ->
         build.given (asked_again (probe.pkg_config ctx "--cflags" "libffi")) (fn cflags ->
         build.given (asked_again (probe.pkg_config ctx "--libs" "libffi")) (fn libs ->
+        build.given (asked_again (probe.pkg_config ctx "--variable=libdir" "libffi")) (fn dir ->
         build.given (asked_again (probe.pkg_config ctx "--cflags" "openssl")) (fn ssl_cflags ->
         build.given (asked_again (probe.pkg_config ctx "--libs" "openssl")) (fn ssl_libs ->
-            goals ctx tc (probe.answer llvm) [cflags, libs] [ssl_cflags, ssl_libs])))))),
+            dependencies ctx tc (if str.is_empty config { "llvm-config" } else { config })
+                         [cflags, libs] [ssl_cflags, ssl_libs] dir))))))),
 ];

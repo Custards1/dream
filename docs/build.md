@@ -811,7 +811,7 @@ A profile is a named set of build options for the whole program:
 ```toml
 [profile.release]
 defines = ["release"]
-flags = ["--no-types"]           # compiler flags
+flags = ["--no-opt"]           # compiler flags
 target = "linux"
 
 [profile.release.config.sqlite]
@@ -1034,3 +1034,31 @@ Settled:
   a pure script may make; operations won because they are data -- a step's
   work can be shown, compared and moved to a worker without the frame it was
   written in -- and everything the other needed fitted in a few more of them.
+
+## Building the VM's dependencies
+
+The repository's `build.dr` prefers static LLVM component archives and a PIC
+`libffi.a`, matching CMake's default `DREAM_LINK_DEPS=PREFER_STATIC`. It tests
+archives with the selected compiler by linking a shared library that references
+the dependency. If an archive is absent, has incompatible relocations, or needs
+unavailable system libraries, the default falls back to shared linkage.
+
+Use `mind build vm -D link_deps=static` to require usable archives, or
+`-D link_deps=shared` to request shared dependencies. The CMake equivalents are
+`-DDREAM_LINK_DEPS=STATIC` and `-DDREAM_LINK_DEPS=SHARED`. These settings govern
+LLVM and libffi; `libdream` remains shared, and OpenSSL and LLVM's system
+libraries may still be runtime dependencies. LLVM stays optional, and
+`-D jit=off` skips LLVM discovery and validation.
+
+The Dream build finds LLVM through `llvm-config` on `PATH`, and libffi through
+`pkg-config`, including its `libdir`. Use `nix-shell` for the repository's full
+development environment, including PIC libffi, LLVM and zlib. CMake additionally
+accepts `DREAM_LLVM_CONFIG`, `LLVM_DIR`, `DREAM_FFI_INCLUDE` and `DREAM_FFI_LIB`.
+The Dream build's automatic static-libffi selection supports GNU-style
+compilers; use CMake for a strict static build with MSVC.
+
+Explicit archive files are build inputs. Replacing one at the same path relinks
+its consumers. `std.build.probe.llvm_link` exposes LLVM's linkage selection,
+and `std.build.probe.shared_link` tests whether dependency flags and a reference
+program can form a shared library. `just test-build` checks PIC rejection,
+unresolved symbols and incremental relinking alongside the compiler tests.

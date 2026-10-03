@@ -12,13 +12,25 @@
 //         test.case "reverse" $( test.eq! [3, 2, 1] (list.reverse [1, 2, 3]) ),
 //     ]
 
-// Only `std.console` is imported, never `std.list`. A module's own tests import
-// this framework, so anything it depends on could not have tests of its own --
-// the import would be a cycle. Walking lists with the primitives directly is a
-// small price for letting every module test itself.
-import std.console;
+// Keep the test runner dependent only on native I/O and OS operations.
+// Console is a Dream library now, and imports collections whose own tests
+// import this framework. Depending on console would make that a cycle.
+import std.io;
 import std.os;
 
+let write! : :string -> :unit;
+let write! text = {
+    let handle = io.stdout! ();
+    let rec put! !offset = {
+        let left = len text - offset;
+        if left > 0 {
+            let n = io.write! handle (_str_slice text offset left);
+            if n <= 0 { raise! "test output made no progress" }
+            put! (offset + n)
+        }
+    };
+    put! 0
+};
 
 // --- cases ------------------------------------------------------------------
 
@@ -143,10 +155,10 @@ let rec run_cases! passed failed cases = {
         // the runner with it.
         let outcome = try! { join! (spawn! (case_body c)); :pass } catch e { e };
         if outcome == :pass {
-            console.write! ("  ok    " + name + "\n")
+            write! ("  ok    " + name + "\n")
             run_cases! (passed + 1) failed (_list_tail cases)
         } else {
-            console.write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n")
+            write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n")
             run_cases! passed (failed + 1) (_list_tail cases)
         }
     }
@@ -156,11 +168,11 @@ let rec run_cases! passed failed cases = {
 /// suites and exit accordingly.
 let suite! : :string -> [Case] -> :integer;
 let suite! name cases = {
-    console.write! ("\n" + name + "\n")
+    write! ("\n" + name + "\n")
     let counts = run_cases! 0 0 cases;
     let passed = counts.[0];
     let failed = ((_list_tail counts)).[0];
-    console.write! ("  " + to_string passed + " passed"
+    write! ("  " + to_string passed + " passed"
                     + (if failed > 0 { ", " + to_string failed + " FAILED" } else { "" })
                     + "\n")
     failed
@@ -182,10 +194,10 @@ let main_of! : [Suite] -> :ok;
 let main_of! suites = {
     let failed = run_suites! 0 suites;
     if failed > 0 {
-        console.write! ("\n" + to_string failed + " test(s) failed\n")
+        write! ("\n" + to_string failed + " test(s) failed\n")
         raise! :tests_failed
     } else {
-        console.write! "\nall tests passed\n"
+        write! "\nall tests passed\n"
         :ok
     }
 };

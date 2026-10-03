@@ -94,17 +94,8 @@ let quiet_main = "let main! = ();";
 
 // --- reading an entry -----------------------------------------------------------
 
-/// One line from a handle, or `()` at end of input.
-///
-/// A byte at a time, because a terminal hands over a line at a time and there
-/// is nothing to gain by buffering; and reading past the newline would take
-/// input that belongs to the next entry.
-let rec read_line! h acc =
-    match io.read! h 1 {
-        "" => if str.is_empty acc { () } else { acc },
-        "\n" => acc,
-        c => read_line! h (acc + c),
-    };
+/// Share console's bounded, CRLF-aware line reader without reading past an entry.
+let read_line! h = console.read_line_from! 1048576 h;
 
 /// Whether the parser's complaint is "there is more of this to come".
 ///
@@ -153,7 +144,7 @@ let complete text =
 /// line ends a continuation whatever the parser thinks, because otherwise a
 /// missing brace is a prompt with no way out.
 let rec read_entry! h acc =
-    match read_line! h "" {
+    match read_line! h {
         () => if str.is_empty (str.trim acc) { () } else { acc },
         line => {
             let text = if str.is_empty acc { line } else { acc + "\n" + line };

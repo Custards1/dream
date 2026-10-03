@@ -1,0 +1,56 @@
+// A PIC archive must link into a shared library. A non-PIC archive and an
+// unresolved dependency must be rejected. Replacing an explicit archive at
+// the same path must relink its consumer without recompiling the consumer.
+import std.build;
+import std.build.cc;
+import std.build.cc.steps;
+import std.build.probe;
+import std.build.run;
+import std.console;
+import std.file;
+import std.list;
+import std.os;
+import std.str;
+
+let command! program args = {
+    let r = os.exec! program args;
+    if r.[:code] != 0 { raise! [:failed, r.[:out] + r.[:err]] }
+};
+
+let main! = {
+    let here = run.here! ();
+    if build.Target.os here != :linux { console.print! "archive dependency tests: skipped (requires Linux)" }
+    else {
+        let root = "/tmp/dream-dependencies-" + to_string (os.pid! ());
+        file.mkdir_all! root
+        let ctx = build.Context.set_cache (root + "/cache") (build.Context.new "deps" "0" root here here);
+        let cxx = list.nth 1 (steps.compilers ctx);
+        let tc = steps.parse ctx (os.exec! cxx ["--version"]).[:out];
+        let archive! pic name n = {
+            file.write! (root + "/dep.cpp") ("int global = " + to_string n + "; int dependency() { return global; }\n")
+            command! cxx (list.concat [(if pic { ["-fPIC"] } else { ["-fno-PIC", "-fno-PIE"] }),
+                                       ["-c", root + "/dep.cpp", "-o", root + "/dep.o"]])
+            command! (cc.Toolchain.archiver tc) ["rcs", root + "/" + name, root + "/dep.o"]
+        };
+        archive! true "pic.a" 1
+        archive! false "nonpic.a" 1
+        let source = "int dependency(); extern \"C\" int probe() { return dependency(); }\n";
+        let asked = list.map (fn libs -> probe.shared_link tc source [] libs)
+                            [[root + "/pic.a"], [root + "/nonpic.a"], []];
+        let [_, paths] = run.make! ctx asked;
+        let answers = list.map file.read! paths;
+        strict! answers
+        if answers != ["yes", "no", "no"] { raise! [:bad_probes, answers] }
+        file.write! (root + "/consumer.cpp") source
+        let target = cc.shared "consumer" ["consumer.cpp"] |> cc.set (cc.Setting.link_file (root + "/pic.a"));
+        let input = steps.artifact tc target;
+        run.make! ctx [input]
+        let [unchanged, _] = run.make! ctx [input];
+        if run.State.ran unchanged != [] { raise! [:rebuilt_unchanged_archive] }
+        archive! true "pic.a" 2
+        let [changed, _] = run.make! ctx [input];
+        if run.State.ran changed != ["consumer"] { raise! [:archive_rebuild, run.State.ran changed] }
+        file.remove_all! root
+        console.print! "archive dependency probes and incremental relinking passed"
+    }
+};

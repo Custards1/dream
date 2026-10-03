@@ -22,7 +22,7 @@ pkgs.mkShell {
   ];
 
   buildInputs = with pkgs; [
-    libffi                     # std.ffi, required
+    (pkgs.callPackage ./nix/libffi-static.nix { })  # std.ffi, required; linked in, not loaded
     openssl                    # std.tls, required
     zlib                       # LLVM links against it
     sqlite                     # std.sql.sqlite, loaded when a program opens a database

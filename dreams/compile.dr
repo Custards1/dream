@@ -43,8 +43,9 @@ import std.map;
 /// The choices a build makes that are not the program's.
 ///
 /// `types` holds the program to its signatures and runs its compile-time
-/// contracts; off, a signature compiles to nothing and costs nothing but its
-/// parse, which is what `--no-types` is for. `optimize` shares the arena
+/// contracts. A program always is: there is no flag to turn it off, and only
+/// the REPL's scratch build below does, holding a session to nothing it has not
+/// always been held to. `optimize` shares the arena
 /// (`dreams/opt.dr`); off, the image is the arena exactly as `lower` built it,
 /// which is what to reach for when an image misbehaves. `payloads` are the
 /// *sizes* of what `--payload` appends, because they are part of the section

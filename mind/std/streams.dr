@@ -1,16 +1,27 @@
 import std.io;
 import std.str;
-/// A short write is not an error, so writing means looping until it is all out.
-let write_all! : :any -> :string -> :atom;
-let rec write_all! handle text = {
-    let n = str.byte_length text;
-    if n == 0 { :done }
-    else {
-        let wrote = io.write! handle text;
-        if wrote >= n { :done } else { write_all! handle (str.slice wrote (n - wrote) text) }
-    }
+/// Write all bytes, including when the writer accepts only a prefix. A
+/// writer reporting zero or an impossible count is an error, not an infinite
+/// retry. Taking the writer explicitly also lets adapters exercise short writes.
+let write_all_with! : (:string -> :integer) -> :string -> :atom;
+let write_all_with! writer! text = {
+    let size = str.byte_length text;
+    let rec put! !offset = {
+        if offset >= size { :done }
+        else {
+            let remaining = size - offset;
+            let wrote = writer! (str.slice offset remaining text);
+            if type_of wrote != :integer || wrote <= 0 || wrote > remaining {
+                raise! (_error_new :io_error "write made no progress or returned an invalid byte count")
+            }
+            put! (offset + wrote)
+        }
+    };
+    put! 0
 };
 
+let write_all! : :any -> :string -> :atom;
+let write_all! handle text = write_all_with! (io.write! handle) text;
 
 // --- optional types ---------------------------------------------------------
 

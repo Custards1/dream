@@ -306,7 +306,7 @@ A profile is a named way to build the whole program:
 ```toml
 [profile.release]
 defines = ["release"]
-flags   = ["--no-types"]    # compiler flags
+flags   = ["--no-opt"]    # compiler flags
 target  = "linux"           # --target
 
 [profile.release.config.sqlite]

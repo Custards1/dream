@@ -1463,6 +1463,7 @@ let rec pattern_bindings p =
     match p {
         [:bind, n, span] => [[n, span]],
         [:as_p, inner, n, name_span, _] => list.append (pattern_bindings inner) [[n, name_span]],
+        [:cons_p, head, tail, _, _] => list.append (pattern_bindings head) (pattern_bindings tail),
         [:list_p, items, rest, _] =>
             list.append (list.concat (list.map (fn i -> pattern_bindings i) items))
                         (rest_bindings rest),
@@ -1475,6 +1476,24 @@ let rec pattern_bindings p =
 
 /// A named `..rest` binds where its name is written, not where its list starts.
 let rest_bindings rest = match rest { [n, name_span] => [[n, name_span]], _ => [] };
+
+/// A name a pattern binds twice -- `x :: x`, `[x, x]` -- is reported where it
+/// is bound the second time. It reads like a request that the two parts be
+/// equal, and nothing would check that: the later binding would quietly shadow
+/// the earlier one and the arm would match whatever the two parts were.
+let check_repeats c p r = {
+    let step acc b = {
+        let [seen, r0] = acc;
+        let n = list.nth 0 b;
+        // `_` binds nothing anyone can name, so it may be written as often as
+        // there are parts to ignore.
+        if n != "_" && map.has n seen {
+            [seen, report c (list.nth 1 b) ("`" + n + "` is bound more than once in this pattern") r0]
+        }
+        else { [map.put n true seen, r0] }
+    };
+    list.nth 1 (list.fold step [map.empty, r] (pattern_bindings p))
+};
 
 let rec check_expr c e r =
     match e {
@@ -1703,7 +1722,8 @@ let rec check_block c stmts r =
                 [:let_p, pattern, body, span] => {
                     let held = bind_one (ctx_mi c) (ctx_source c) "_" span r;
                     let walked = check_destructure c pattern "a `let`"
-                        (check_pattern c pattern (check_expr c body (list.head held)));
+                        (check_repeats c pattern
+                            (check_pattern c pattern (check_expr c body (list.head held))));
                     let checked = bind_one (ctx_mi c) (ctx_source c) "_" (checked_span pattern) walked;
                     check_block c rest
                         (bind_all (ctx_mi c) (ctx_source c) (pattern_bindings pattern) (list.head checked))
@@ -1719,7 +1739,7 @@ let rec check_block c stmts r =
 /// well as the body -- a guard exists to ask about what the pattern bound.
 let rec check_arm c arm r = {
     let p = ast.arm_pattern arm;
-    let r1 = check_pattern c p r;
+    let r1 = check_repeats c p (check_pattern c p r);
     let scoped = push_scope r1;
     let bound = bind_all (ctx_mi c) (ctx_source c) (pattern_bindings p) scoped;
     let r2 = match ast.arm_guard arm { () => bound, g => check_expr c g bound };
@@ -1736,6 +1756,7 @@ let rec check_pattern c p r =
     match p {
         [:literal, e, _] => check_expr c e r,
         [:as_p, inner, _, _, _] => check_pattern c inner r,
+        [:cons_p, head, tail, _, _] => check_pattern c tail (check_pattern c head r),
         [:list_p, items, _, _]  => list.fold (fn acc i -> check_pattern c i acc) r items,
         [:array_p, items, _, _] => list.fold (fn acc i -> check_pattern c i acc) r items,
         [:map_p, pairs, _] =>
@@ -1764,6 +1785,7 @@ let rec pattern_shape p = match p { [:as_p, inner, _, _, _] => pattern_shape inn
 
 let takes_apart p =
     match pattern_shape p {
+        [:cons_p, _, _, _, _] => true,
         [:list_p, _, _, _]  => true,
         [:array_p, _, _, _] => true,
         [:map_p, _, _]      => true,
@@ -1774,9 +1796,9 @@ let takes_apart p =
 /// A binder is recorded where its name starts, a pattern parameter where its
 /// pattern starts, a destructuring `let`'s value where the `let` starts -- and no
 /// name starts at a `]` or a `}`.
-let checked_span p = {
-    let e = ast.span_end (ast.span (pattern_shape p));
-    ast.span_of (e - 1) e
+let checked_span p = match pattern_shape p {
+    [:cons_p, _, _, operator_span, _] => operator_span,
+    shape => { let e = ast.span_end (ast.span shape); ast.span_of (e - 1) e },
 };
 
 /// The first part of a pattern that asks a question -- a literal -- or `()`.
@@ -1784,6 +1806,7 @@ let rec refutable_part p =
     match p {
         [:literal, _, _]        => p,
         [:as_p, inner, _, _, _] => refutable_part inner,
+        [:cons_p, head, tail, _, _] => first_refutable [head, tail],
         [:list_p, items, _, _]  => first_refutable items,
         [:array_p, items, _, _] => first_refutable items,
         [:map_p, pairs, _]      => first_refutable (list.map (fn kv -> list.nth 1 kv) pairs),
@@ -1846,7 +1869,8 @@ let bind_params c ps r =
         match ast.param_pattern p {
             () => acc,
             pattern => {
-                let walked = check_destructure c pattern "a parameter" (check_pattern c pattern acc);
+                let walked = check_destructure c pattern "a parameter"
+                                 (check_repeats c pattern (check_pattern c pattern acc));
                 let checked = bind_one (ctx_mi c) (ctx_source c) "_" (checked_span pattern) walked;
                 bind_all (ctx_mi c) (ctx_source c) (pattern_bindings pattern) (list.head checked)
             },
@@ -3279,6 +3303,13 @@ when test {
                         (first (checked! "let f = { { let a = 1; a } a };")) ),
 
         // --- patterns ---
+        test.case "cons binders are visible in guards and bodies"
+            $( test.eq! [] (checked! "let f xs = match xs { h :: t if h > 0 => t, _ => [] };") ),
+        test.case "cons binders cannot repeat"
+            $( test.true! (not (list.is_empty (checked! "let f xs = match xs { x :: x => x };"))) ),
+        test.case "a list pattern's binders cannot repeat either"
+            $( test.eq! "`x` is bound more than once in this pattern"
+                        (first (checked! "let f v = match v { [x, x] => x, _ => 0 };")) ),
         test.case "a pattern binds for the arm's body"
             $( test.eq! [] (checked! "let f v = match v { [x, y] => x + y, };") ),
         test.case "a `..rest` binds a name"
@@ -3371,8 +3402,8 @@ when test {
             $( test.true! (str.contains_str "ending its name with `!`"
                                             (note_of (checked! "let go! = 1;\nlet f = go!;"))) ),
         test.case "a host module's impure member is an effect too"
-            $( test.eq! "cannot use the impure member `print!` inside the pure function `f`"
-                        (first (checked! "import std.console;\nlet f x = console.print! x;")) ),
+            $( test.eq! "cannot use the impure member `stdout!` inside the pure function `f`"
+                        (first (checked! "import std.io;\nlet f x = io.stdout! x;")) ),
         test.case "a lambda inside a pure function is still pure"
             $( test.true! (str.contains_str "inside the pure function `<lambda>`"
                    (first (checked! "let go! = 1;\nlet f = fn x -> go!;"))) ),
@@ -3385,7 +3416,7 @@ when test {
 
         // --- modules as values ---
         test.case "a host module named alone is a value"
-            $( test.eq! [] (checked! "import std.console;\nlet f = console;") ),
+            $( test.eq! [] (checked! "import std.io;\nlet f = io;") ),
         test.case "a Dream module named alone is not"
             $( test.eq! "`a` is a module, not a value"
                         (first (checked_two! "let x = 1;" "import a;\nlet f = a;")) ),
@@ -3413,8 +3444,8 @@ when test {
             $( test.true! (str.contains_str "already bound"
                    (first (checked_two! "let x = 1;" "import a.{x};\nlet x = 2;"))) ),
         test.case "importing the same alias twice is reported"
-            $( test.eq! "`console` is already imported here"
-                        (first (checked! "import std.console;\nimport std.console;")) ),
+            $( test.eq! "`io` is already imported here"
+                        (first (checked! "import std.io;\nimport std.io;")) ),
         test.case "an impure member keeps its purity through an import list"
             $( test.eq! "cannot use the impure function `a.go!` inside the pure function `f`"
                         (first (checked_two! "let go! = 1;" "import a.{go!};\nlet f = go!;")) ),
@@ -3472,9 +3503,9 @@ when test {
                         { let src = "let f xs = len xs;";
                           at (resolved! src) 0 0 (str.find "len" src) } ),
         test.case "a host module's member is recorded with the module it came from"
-            $( test.eq! [:member, [:native, "std.console", 0], "print!", ()]
-                        { let src = "import std.console;\nlet f! x = console.print! x;";
-                          at (resolved! src) 0 0 (str.find "console.print!" src) } ),
+            $( test.eq! [:member, [:native, "std.io", 0], "stdout!", ()]
+                        { let src = "import std.io;\nlet f! x = io.stdout! x;";
+                          at (resolved! src) 0 0 (str.find "io.stdout!" src) } ),
 
         // --- captures ---
         test.case "a name from the enclosing function becomes a capture"
@@ -3553,10 +3584,10 @@ when test {
                           let r = resolved! src;
                           [at r 0 0 (str.find "a;\nlet f" src), at r 0 0 (str.find "b;" src)] } ),
         test.case "an imported host module takes a global of its own"
-            $( test.eq! [:global, 0, "console", 0]
-                        { let src = "import std.console;\nlet f = console;";
+            $( test.eq! [:global, 0, "io", 0]
+                        { let src = "import std.io;\nlet f = io;";
                           // The use, not the mention inside the import.
-                          at (resolved! src) 0 0 (str.find "f = console" src + 4) } ),
+                          at (resolved! src) 0 0 (str.find "f = io" src + 4) } ),
         test.case "a definition can be found by name"
             $( test.true! { let src = "let a = 1;\nlet f = a;";
                             match definition (resolved! src) 0 "a" {

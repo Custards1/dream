@@ -209,7 +209,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
+test: test-vm test-e2e test-console test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
 
 # The same suites as `test`, run at once by `mind test`: the repository is a
 # workspace, and each suite is a check. See "Testing" in CLAUDE.md.
@@ -237,6 +237,13 @@ test-build: build
     ./{{dream}} /tmp/dream-toolchains.dream
     ./{{dreams}} -L mind mind/std/build/tests/incremental.dr -o /tmp/dream-incremental.dream
     ./{{dream}} /tmp/dream-incremental.dream
+    ./{{dreams}} -L mind mind/std/build/tests/dependencies.dr -o /tmp/dream-dependencies.dream
+    ./{{dream}} /tmp/dream-dependencies.dream
+    python3 dream/tests/static_link.py
+
+# Console output, prompts, formatting, colors and logging through real streams.
+test-console: build
+    python3 dream/tests/console.py --dream {{dream}} --compiler {{image}}
 
 # Real programs, run under both the interpreter and the JIT, which must agree.
 test-e2e: build

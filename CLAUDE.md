@@ -113,9 +113,9 @@ just mind-build vm  # the VM again, by the repository's own build.dr
 `vm`, `dreams`, `seed`, `mind`, `lucid`, and `default` for the first four but
 the seed -- through `std.build`: the VM object by object with `std.build.cc`
 and whichever compiler `$CXX` names, not CMake, and the compiler by the VM it
-made. Each goal puts its result where the recipes above do. On Nix it needs
-`pkg-config` and libffi's headers on the path (`nix-shell -p llvm pkg-config
-libffi`), since that is how it finds libffi.
+made. Each goal puts its result where the recipes above do. It prefers static LLVM and PIC libffi, like CMake; `-D link_deps=static`
+requires them and `-D link_deps=shared` requests shared dependencies. On Nix,
+use the repository's `nix-shell` for LLVM, pkg-config, PIC libffi and zlib.
 
 The binaries that matter:
 
@@ -353,7 +353,7 @@ The lessons that keep coming back:
   `let f x : answer = e` are the inline forms. A free lowercase name in one is
   a type variable. A signature changes no node -- the one thing it adds to an
   image is a hint for the JIT -- code no signature touches is
-  never rejected, and `--no-types` skips the pass. [docs/notes/static-types.md](docs/notes/static-types.md)
+  never rejected. [docs/notes/static-types.md](docs/notes/static-types.md)
   is the design.
 - `union Shape { circle(radius : :float), empty }` declares a **discriminated
   union**: a module of constructors whose values are `[:circle, r]` and
