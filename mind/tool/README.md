@@ -1,49 +1,74 @@
-# mind
+# mind, the Dream build tool
 
-The build tool for Dream — what Cargo is to rustc.
+`mind` is to `dreams` what Cargo is to `rustc`: it reads a manifest, finds and
+fetches the packages a project needs, runs their build scripts, and hands the
+lot to the compiler. It is written in Dream and compiled by `dreams`, like any
+other program here.
 
-`mind` is itself written in Dream and compiled by `dreams`, like any other
-program in this repository. It has no compiler of its own: Dream compiles whole
-programs, so a build is *find the packages, hand them to `dreams`, run it*.
-There is no object file and no link step. What is cached is what build
-scripts make, below.
+There is no object file and no link step. Dream compiles whole programs, so a
+build is *find the packages, hand them to the compiler, run it*. What is kept
+between builds is what the compiler keeps of each module (its parse, walk,
+lowering and type check) and what build scripts make.
 
 ```
-just mind                 # build it to build/mind
-dream build/mind help
+just mind                       # build/mind, from this checkout
+just install                    # and into ~/.mindv2/bin, with everything it needs
 ```
+
+## A project
+
+```
+mind new hello                  # hello/mind.toml and hello/main.dr
+cd hello
+mind run                        # build target/debug/hello.dream and run it
+mind add ../util                # depend on a directory
+mind test                       # every test, at once
+```
+
+```toml
+# mind.toml
+[package]
+name = "hello"
+version = "0.1.0"
+
+[dependencies]
+util = "../util"
+```
+
+Every command but `new` looks for `mind.toml` here or above, so they work from
+anywhere inside a project, the way `git` finds its root. `-C DIR` names
+another.
 
 ## Commands
 
 | | |
-|-|-|
-| `mind new <name>` | create a project in `./<name>` |
+|---|---|
+| `mind new NAME` | create a project in `./NAME` |
 | `mind build` | compile to `target/<profile>/<name>.dream` |
-| `mind run [args]` | compile, then run with the arguments given |
+| `mind build GOAL..` | make what the build script names instead ([Goals](#goals)) |
+| `mind run [-- args]` | compile, then run with the arguments given |
 | `mind test [NAME..]` | run every test at once: each package's units and its build script's checks |
 | `mind check` | compile without writing an image |
-| `mind add <source>` | add a dependency: a directory, a git URL, or a tarball |
-| `mind remove <name>` | take one out again |
+| `mind repl` | an interactive session with this project's packages on the path |
+| `mind add SOURCE` | add a dependency: a directory, a git URL, or a tarball |
+| `mind remove NAME` | take one out again |
 | `mind fetch` | download dependencies without building |
-| `mind update [name]` | fetch git and url dependencies again |
-| `mind deps` | list every package the project resolves to |
-| `mind tree` | the same, as the tree of who needs what |
+| `mind update [NAME]` | fetch git and URL dependencies again |
+| `mind deps`, `mind tree` | every package the project resolves to, as a list or as who needs what |
+| `mind info` | what this build would run, without running it |
 | `mind options` | every package's options, and what this build sets them to |
 | `mind clean` | remove `target/` |
 
-Every command but `new` looks for a `mind.toml` here or above, so they work
-from anywhere inside a project — the way `git` finds its root.
+`mind help` lists the flags. The ones a build takes are the compiler's
+(`-L`, `-D`, `--target`, `--release`), plus `--profile`, `--compiler`,
+`-j` and `-f ARG` to pass anything else through as written.
 
 ## Dependencies
 
-**Listing a dependency is the whole of using it.** Nothing goes in `[build]`
-to make a dependency importable:
+**Listing a dependency is the whole of using it.** Nothing else goes in the
+manifest to make one importable:
 
 ```toml
-[package]
-name = "app"
-version = "0.1.0"
-
 [dependencies]
 util  = "../util"                                   # a directory
 json  = "https://github.com/u/dream-json#v1.0"      # git, pinned after the #
@@ -54,8 +79,8 @@ quiet = "https://example.com/quiet-1.0.tar.gz"      # a tarball
 bench = "../bench"
 ```
 
-and then `import util.strings`, `import json.parse`. Or let `mind` write the
-line:
+then `import util.strings`, `import json.parse`. Or let `mind` write the line,
+which it does without disturbing the rest of the file:
 
 ```
 mind add ../util
@@ -64,83 +89,81 @@ mind add --dev ../bench
 mind remove bench
 ```
 
-What that buys, and each was something you used to have to do by hand:
-
 - **The key is the import name.** `json = ..` is imported as `json`, whatever
-  the package's own `[package] name` says. The compiler records the key as a
-  second name for the package (`-L json=DIR`), so a package whose repository
-  calls it `dream-json` or `jsonlib` is still `json` to you.
+  the package calls itself, so a repository named `dream-json` is still `json`
+  to you. (`-L json=DIR` is how the compiler is told.)
 - **A bare string is a source.** A path, or a URL: `url#tag`, `url#branch` and
-  `url#<commit>` are git (a 7-40 digit hex ref is a commit), a `.tar.gz` is a
-  tarball. The inline-table form says the same thing longhand.
-- **A dependency needs no manifest.** A directory of `.dr` files -- local,
-  cloned or unpacked -- is a package named by its key. Its modules are in
-  `src/` when there is one, as for any package.
-- **What a dependency needs travels with it.** Its own `[build] includes`
-  and `host-modules` are added to every build that uses it. Its `defines` are
-  not, except for the options it declares: a program-wide `when` flag is a
-  decision about the whole program, and a package's options are how it is
-  configured instead (below).
-- **Transitive dependencies are found.** Every dependency's own
-  `[dependencies]` is followed; a package reached twice (a diamond) is
+  `url#<commit>` are git (7 to 40 hex digits is a commit), a `.tar.gz` is a
+  tarball. The table form says the same thing longhand.
+- **A package needs no manifest.** A directory of `.dr` files is a package
+  named by its key; its modules are in `src/` when there is one.
+- **Paths are relative to the manifest that wrote them**, so moving a project
+  does not change what its dependencies mean.
+- **Git must be pinned** with `tag`, `rev` or `branch`. "Whatever is on the
+  default branch today" is a moving target, and the build it breaks next week
+  will not say why.
+- **What a dependency needs travels with it**: its `[build] includes` and
+  `host-modules`, and its options (below) -- but not its program-wide
+  `defines`, which are the root's to decide.
+- **Transitive dependencies are followed**, and a package reached twice is
   compiled once.
 - **Conflicts are reported, not guessed at.** A program has one namespace of
-  packages, so two *different* directories under one name cannot both be
-  built. `mind` says which two and who asked for each.
-
-The details:
-
-- **`path`** is resolved relative to the manifest that named it, so moving a
-  project does not change what its dependencies mean. `mind add` takes a path
-  relative to where you are and writes it relative to the manifest.
-- **`git`** must be pinned with `tag`, `rev` or `branch`. An unpinned
-  dependency is refused: "whatever is on the default branch today" is not a
-  dependency, it is a moving target, and the build that breaks next week will
-  not say why.
-- **`url`** is a `.tar.gz` whose single top-level directory holds the package.
+  packages, so two different directories under one name cannot both be
+  built; `mind` says which two, and who asked for each.
 
 ### Versions
 
-A dependency may say which versions it accepts, in the long form:
+There is no registry, so there is nothing to choose between: a program has one
+package under each key. A requirement is checked against the `version` the
+fetched package declares:
 
 ```toml
-[dependencies]
 json = { git = "https://github.com/u/dream-json", tag = "v1.4.0", version = "^1.2" }
 util = { path = "../util", version = ">=0.3, <0.5" }
 ```
 
-`^1.2` is compatible with 1.2 (below 2.0; below 1.0 the minor is the
-breaking number, so `^0.3` is below 0.4), `~1.2.3` takes patch releases,
-`=`, `<`, `<=`, `>`, `>=` compare, `,` joins, `*` is anything, and a bare
-`1.2` means `^1.2`. `std.version` is the grammar, for a build script too.
+`^1.2` is compatible with 1.2 (below 1.0 the minor is the breaking number),
+`~1.2.3` takes patch releases, `= < <= > >=` compare, `,` joins, `*` is
+anything, and a bare `1.2` means `^1.2`. A mismatch lists every requirement
+with where it was written, and whether any version could have met them all.
+`std.version` is the grammar.
 
-There is no registry, so there is nothing to choose between: a program has
-one package under each key, and `mind` checks that the version it fetched --
-its `[package] version` -- is one every requirement on it accepts. When one
-is not, it says what was found and lists every requirement with where it was
-written, and whether any version could have met them all. A directory with
-no manifest has no version, so a requirement on one is an error.
+### `mind.lock`
 
-### Build dependencies
+What the graph resolved to -- every package, its source, its version, and for
+git the commit checked out -- is written to `mind.lock`. Commit it. A build
+that finds a different commit behind the same source (a tag moved, a cache
+edited) stops and says so; `mind update` fetches again and accepts what it
+finds. Editing a dependency in the manifest is not drift; the lock follows.
 
-`[build-dependencies]` are what a package's build script is compiled with
-(docs/build.md). The script is a program of its own, so its packages are a
-namespace of their own: a tool may use `json` 1.x while the program uses 2.x.
-`mind deps` marks them `[build: ...]` and `mind tree` hangs them under
-`[build]`.
+Fetched packages are cached in `$MIND_HOME/cache` by URL and revision and
+shared between projects. Fetching shells out to `git`, `curl` and `tar`,
+which already know about proxies, credentials and certificate stores.
+
+### Cycles
+
+Every kind of dependency means "must be ready first", so a loop cannot be
+built -- including one through a build script. It is reported as the whole
+loop, each edge with the manifest that made it:
+
+```
+mind: these packages need each other, so none of them can be built first:
+  app      uses         sqlite   (mind.toml)
+  sqlite   builds with  codegen  (../sqlite/mind.toml)
+  codegen  uses         app      (../codegen/mind.toml)
+```
 
 ## Build scripts
 
 A package may carry a `build.dr` beside its manifest, for what it needs made
-before it compiles and cannot write by hand: a module generated from data, a
-file to embed, a switch that depends on the machine. **It is optional.** A
-package without one builds exactly as before, and nothing is written for it.
+before it compiles and cannot write by hand: a generated module, a file to
+embed, a C library, a switch that depends on the machine. **It is optional**;
+a package without one builds exactly as if scripts did not exist.
 
 A script is a pure function from a context to a plan, written with
 `std.build`:
 
 ```dream
-// build.dr
 import std.build;
 import std.build.command;
 
@@ -151,43 +174,51 @@ let plan ctx =
     |> build.define "generated";
 ```
 
-`build.module` makes `<package>.version` importable, as the package's own
-module; `build.payload` embeds a file; `build.define` sets a `when` flag for
-this package alone. `build.given` lets a step's answer decide the rest of the
-plan, and `build.all` merges plans. docs/build.md is the whole design.
+`build.module` makes `<package>.version` importable; `build.payload` embeds a
+file in the image; `build.define` sets a `when` flag for this package alone.
+`std.build.cc` compiles C and C++ with GCC, Clang, MSVC or through CMake from
+one description.
 
-Every step is cached by a key made of what it was given and the contents of
-the files it reads, in one cache every project on the machine shares
-(`$MIND_HOME/build`, or `$MIND_BUILD_CACHE`): the same step asked for by two
-projects is done once. A build where nothing changed runs no script and starts
-no VM: it costs a `stat` per input. Scripts whose build dependencies are the
-same are compiled into one driver and run as one program, each in a process of
-its own, and the steps inside them run `-j` at once (default: one per core).
+Every step is cached by what it was given and the contents of what it reads,
+in one cache shared by every project on the machine, so a build where nothing
+changed runs no script and starts no VM -- it costs a `stat` per input. Steps
+run `-j` at once.
 
-A script sees only the environment variables its manifest lists:
+A script sees only the environment variables its manifest lists, and is
+compiled against `[build-dependencies]`, a namespace of its own:
 
 ```toml
 [build]
 env = ["CC", "PKG_CONFIG_PATH"]
 script = "tools/build.dr"        # when it is not build.dr
+
+[build-dependencies]
+codegen = "../codegen"
 ```
+
+[docs/build.md](../../docs/build.md) is the whole design.
+
+### Goals
+
+A plan can name things to make on request -- `build.goal name goal` -- and
+`mind build NAME` makes them instead of the program. The repository's own
+`build.dr` is the example: `mind build vm` builds the VM with `std.build.cc`,
+and `mind build default` the VM, the compiler and `mind`.
 
 ## Tests
 
-`mind test` runs every test a project has, at once, `-j` at a time: each
-package's **units** -- its `when test` blocks, compiled with `--test` and run
--- and the **checks** its build script declares. A test is named for its
-package, and `mind test NAME` runs the ones called NAME or beginning with it
-and a dot:
+`mind test` runs every test a project has, at once: each package's **units**
+(its `when test` blocks, compiled with `--test` and run) and the **checks** its
+build script declares. A test is named for its package, and a name narrows:
 
 ```
-mind test                     # everything
-mind test dreams              # one package's
-mind test dreams.contracts    # one check
+mind test                       # everything
+mind test dreams                # one package's
+mind test dreams.bootstrap      # one check
 ```
 
-A check is a step that passes when it succeeds, declared in `build.dr` and run
-only by `mind test`, every time:
+A check is a step that passes when it succeeds, run only by `mind test` and
+every time:
 
 ```dream
 let plan ctx =
@@ -195,13 +226,12 @@ let plan ctx =
     |> build.check "golden" (command.check ctx "golden" (command.toolchain ctx) "tests/golden.sh" []);
 ```
 
-`command.check` runs a program in the package's directory, with the
-variables given laid over the environment; `command.toolchain ctx` is the VM
-and compiler this build uses (`DREAM`, `DREAMS`), for a suite that runs them.
-A library with no program of its own names the file its tests are gathered
-from, `[test] entry = "all.dr"`.
+`command.toolchain ctx` hands the check the VM and compiler this build uses,
+as `DREAM` and `DREAMS`. A library with no program names the file its tests
+are gathered from: `[test] entry = "all.dr"`.
 
-A **workspace** tests several packages as one project:
+A **workspace** tests several packages as one project. The repository's own
+`mind.toml` is one:
 
 ```toml
 [workspace]
@@ -209,52 +239,13 @@ name = "dream"
 members = ["dreams", "lucid", "mind/std", "mind/tool"]
 
 [build]
-compiler = "build/dreams.dream"     # the members' too, unless --compiler says
+compiler = "build/dreams.dream"
 ```
 
-`mind test` in it runs every member's tests and the workspace's own checks
-(its `build.dr`). The repository's own `mind.toml` is one.
-
-### Cycles
-
-Every kind of dependency means "must be ready first", so a loop cannot be
-built, including one through a build script (a package whose script needs a
-tool that uses the package). It is reported as the whole loop, each edge with
-the manifest that made it:
-
-```
-mind: these packages need each other, so none of them can be built first:
-  app      uses         sqlite   (mind.toml)
-  sqlite   builds with  codegen  (../sqlite/mind.toml)
-  codegen  uses         app      (../codegen/mind.toml)
-```
-
-### `mind.lock`
-
-What the graph resolved to is written to `mind.lock` beside the manifest:
-every package of the program and of each build script, with its source, its
-version, and for git the commit that was checked out. Commit it. A build
-that resolves a package to a different commit from the same source -- a tag
-moved, a cache edited -- stops and says so; `mind update` fetches again and
-accepts what it finds. Changing a dependency in the manifest is not drift,
-and the lock simply follows. The lock is only rewritten when it changes.
-
-Fetched packages go in `$MIND_HOME/cache` (default `~/.mind/cache`), keyed by
-URL and revision, and are shared between projects — a repository at a given
-revision is the same bytes whoever asked for it. A cached dependency is never
-re-fetched; `mind update` (or `mind update NAME`) throws the cached copies away
-and fetches them again, which is how a branch-pinned dependency moves.
-
-Fetching shells out to `git`, `curl` and `tar` rather than speaking those
-protocols. They are already installed, already know about proxies and
-credentials and certificate stores, and none of that is a build tool's
-business. It is also why `mind` needs no TLS in the VM.
-
-## Options
+## Options and profiles
 
 A package declares what it can be built as. Each option has a type -- `bool`,
-`integer`, `string`, or a list of choices -- and a default; a bare value
-declares its own type:
+`integer`, `string`, or a list of choices -- and a default:
 
 ```toml
 [options]
@@ -263,92 +254,75 @@ threads  = { type = ["off", "single", "multi"], default = "multi" }
 cache_mb = 64
 ```
 
-`when vendored` in that package's code reads the option, and `when
-sqlite.vendored` reads it from anywhere else. An option is set, a later place
-winning:
+`when vendored` reads it inside the package and `when sqlite.vendored` from
+anywhere else. A setting is decided by, the later winning: the default; the
+package's `[build] defines`; `[config.KEY]` in any manifest that depends on
+it; the profile's `[profile.NAME.config.KEY]`; and `-D KEY:name=value`. Two
+dependencies that configure a third two ways are a conflict for the root to
+settle. A name or value the package does not declare is an error that lists
+what it accepts, never a setting quietly ignored.
 
-1. its default;
-2. the package's own `[build] defines` (`defines = ["vendored"]`);
-3. `[config.KEY]` in any manifest that depends on it, however deep;
-4. the profile's `[profile.NAME.config.KEY]`;
-5. `mind build -D KEY:name=value`.
+A dependency can hang on an option -- `sqlite_sys = { path = "..", when = "not vendored" }`
+-- in the compiler's `when` grammar. An edge whose condition is false is not
+fetched, not built and not a conflict.
 
-```toml
-[config.sqlite]
-threads = "off"
-```
-
-The root's `[config.KEY]` wins over its dependencies'. Two dependencies that
-configure a third two ways are a conflict, and `mind` names both; the root
-settles it by saying which. Every name and value is checked against the
-declaration, so a typo is an error that lists what the package accepts, not a
-setting that is quietly ignored. The root declares options the same way, and
-`-D name` sets one of them rather than defining a program-wide flag.
-`mind options` shows every package's options and where this build left them.
-
-A dependency may hang on an option of the package that lists it:
-
-```toml
-[dependencies]
-sqlite_sys = { path = "../sqlite-sys", when = "not vendored" }
-```
-
-The condition is the compiler's grammar (`not`, `&&`, `||`, `==`, `!=`,
-parentheses, dotted names), read against the package's settled options and
-the program's settings (`os`, `family`, `test`, the root's defines). An edge
-whose condition is false is not in the graph: not fetched, not built, and not
-a conflict.
-
-### Profiles
-
-A profile is a named way to build the whole program:
+A **profile** is a named way to build the whole program:
 
 ```toml
 [profile.release]
 defines = ["release"]
-flags   = ["--no-opt"]    # compiler flags
-target  = "linux"           # --target
+flags   = ["--no-opt"]
+target  = "linux"
 
 [profile.release.config.sqlite]
 threads = "multi"
 ```
 
-`--profile NAME` picks one, `--release` is `--profile release`, and `debug` is
-the default. `debug` and `release` exist whether declared or not; an
-undeclared `release` defines `release`, as `--release` always has. A
-dependency's profiles are ignored: how the program is built is the root's
-decision. `[build] target` is the target when neither `--target` nor the
-profile says.
+`--profile NAME` picks one, `--release` is `--profile release`, `debug` is
+the default, and only the root's profiles count. The image goes to
+`target/<profile>/<name>.dream`, with the platform first when a target is
+stated (`target/linux/release/`), so no build overwrites another's image.
 
-The image goes to `target/<profile>/<name>.dream`, and a build that states a
-target puts the platforms first: `target/linux/debug/`,
-`target/macos-aarch64/release/`, `target/linux-macos/debug/` for two. So a
-release build does not overwrite the debug image, and building for one
-platform does not overwrite the image for another. The directory is named for
-the target the compiler records, so `linux` and `os=linux` are one directory.
-`--output` and `[build] output` are used as written.
+## Finding the compiler and the library
+
+The compiler is `--compiler`, then `[build] compiler`, then `$DREAMS`, then
+`dreams.dream` from the installation (`$MINDV2_PATH`). A name ending in
+`.dream` is run by the VM (`$DREAM`, default `dream`); anything else is run
+directly.
+
+The standard library is `$MIND_STDLIB`, then `$MIND_HOME/std`, then a `mind/`
+directory holding `std` at or above the working directory -- which is what
+makes this repository work with no configuration -- and last the
+installation's copy: the first directory of `$MINDV2_PATH` (or `~/.mindv2`)
+holding `std`, which is where `just install` puts it. A checkout comes before
+the installation, so an installed library never shadows the one being worked
+on.
 
 ## Environment
 
 | | |
-|-|-|
-| `DREAMS` | the compiler to call (default: `dreams.dream` from `$MINDV2_PATH`) |
-| `DREAM` | the VM to run images with (default: `dream`) |
-| `MIND_STDLIB` | where the standard library lives (default: `mind`) |
-| `MIND_HOME` | where fetched packages are cached (default: `~/.mind`) |
-| `MIND_UNITS` | where the compiler keeps each file's parse and each module's walk, lowering and type check between builds (default: `$MIND_HOME/units`; `off` for none). A unit no build has used in 30 days is removed, the cache being looked over at most once a day |
-| `MIND_BUILD_CACHE` | where build steps are cached (default: `$MIND_HOME/build`, shared by every project) |
+|---|---|
+| `DREAMS` | the compiler |
+| `DREAM` | the VM that runs images (default `dream`) |
+| `MINDV2_PATH` | the installation: where `dreams.dream` is found |
+| `MIND_STDLIB` | the directory holding `std` |
+| `MIND_HOME` | fetched packages, the build cache and the unit cache (default `~/.mind`) |
+| `MIND_BUILD_CACHE` | where build steps are cached (default `$MIND_HOME/build`) |
+| `MIND_UNITS` | where the compiler keeps each module's work between builds (default `$MIND_HOME/units`; `off` for none). Entries unused for 30 days are removed |
 
 ## Layout
 
 | | |
-|-|-|
-| `main.dr` | the commands, and argument parsing |
+|---|---|
+| `main.dr` | the commands and their arguments |
 | `manifest.dr` | reading `mind.toml`, and the line edits `add` and `remove` make |
-| `fetch.dr` | resolving a dependency to a directory, fetching if needed |
-| `build.dr` | the dependency graph, and calling the compiler |
-| `script.dr` | running packages' build scripts, and folding what they make into the compile |
-| `lock.dr` | `mind.lock`: writing it, reading it, and what counts as drift |
-| `util.dr` | paths and files |
+| `fetch.dr` | a dependency to a directory, fetching when needed |
+| `build.dr` | the dependency graph, options, and calling the compiler |
+| `script.dr` | running build scripts and folding what they make into the compile |
+| `lock.dr` | `mind.lock`, and what counts as drift |
+| `config.dr`, `util.dr` | settings, paths and files |
 
-Run its own tests with `just test-mind`.
+```
+just test-mind          # the units, and the graph, options and script suites in tests/
+mind test mind          # the same
+```

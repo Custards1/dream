@@ -1,5 +1,6 @@
 // A behavior is a module with required methods and optional defaults.
 import std.console;
+import std.list;
 
 mod shape {
     virtual let area self;
@@ -22,8 +23,33 @@ mapping Measured derive shape {
 // Functions remain first-class: generic callers can accept an operation.
 let describe_with describe value = describe value;
 
+// Or the values can carry their operations. A `dyn` virtual, called through
+// the module that declares it, dispatches on its last argument; a record
+// written `derive dyn` makes values that carry what to dispatch to. Both are
+// opt-in, and a record without `dyn` is laid out exactly as above.
+mod solid {
+    virtual dyn let volume self;
+    virtual dyn let label self = "solid";
+    let report self = label self + ": " + to_string (volume self);
+}
+
+struct Cube derive dyn solid {
+    edge : :integer
+    volume self = edge self * edge self * edge self
+    label self = "cube"
+}
+
+mapping Slab derive dyn solid {
+    w, d, h
+    volume self = w self * d self * h self
+}
+
 let main! = {
     console.print! (Rectangle.describe (Rectangle.make 3 4))
     console.print! (Measured.describe (Measured.make 9))
     console.print! (describe_with Rectangle.describe (Rectangle.new 5 6))
+
+    // One function, written once against `solid`, over two different records.
+    console.print! (to_string (list.map solid.report [Cube.make 3, Slab.make 2 3 4]))
+    console.print! (to_string (Cube.edge (Cube.set_edge 5 (Cube.make 3))))
 };

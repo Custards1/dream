@@ -35,6 +35,8 @@ import dreams.ast;
 import dreams.builtins;
 import dreams.diag;
 import dreams.fuse;
+import dreams.syntax;
+import dreams.lint;
 import dreams.modules;
 import dreams.unit;
 import std.array;
@@ -240,7 +242,8 @@ let decl_impure d = builtins.is_impure_name (decl_name d);
 let virtual_name v   = list.nth 1 v;
 let virtual_params v = list.nth 2 v;
 let virtual_body v   = list.nth 3 v;
-let virtual_span v   = list.nth 4 v;
+let virtual_dyn v    = list.nth 4 v;
+let virtual_span v   = list.nth 5 v;
 
 /// A virtual with a body has a default, which becomes an ordinary `let` of the
 /// module that did not implement it -- checked there, so the default sees that
@@ -257,7 +260,11 @@ let virtual_as_hole name v =
     ast.let_d (virtual_name v) (virtual_params v)
               (ast.apply_e (ast.name_e "raise!" (virtual_span v))
                            [ast.str_e ("`" + virtual_name v + "` is a virtual of module `"
-                                       + name + "` with no implementation")
+                                       + name + (if virtual_dyn v {
+                                                     "`, and the value it was called on does not carry "
+                                                     + "an implementation: only a record written "
+                                                     + "`derive dyn` does"
+                                                 } else { "` with no implementation" }))
                                       (virtual_span v)]
                            (virtual_span v))
               false (virtual_span v);
@@ -582,7 +589,7 @@ let rec collect_virtuals items acc =
         [] => acc,
         [oi, ..rest] =>
             match list.nth 1 oi {
-                [:virtual, n, _, _, _] =>
+                [:virtual, n, _, _, _, _] =>
                     if list.any (fn ov -> virtual_name (list.nth 1 ov) == n) acc {
                         collect_virtuals rest acc
                     }
@@ -613,7 +620,10 @@ let check_virtual_impl l v od s = {
 /// A virtual nobody implemented. Three outcomes, and which one depends on who
 /// left the hole open.
 let unimplemented l mi owner v lets s =
-    match virtual_body v {
+    if owner == mi && virtual_dyn v {
+        [list.append lets (dispatching mi (modules.module_name (modules.module_at l mi)) v), s]
+    }
+    else { match virtual_body v {
         // No body: a hole, and whether that is an error depends on who left it.
         // This arm comes first because `()` is a value like any other -- a bare
         // binder below it would match the hole too, and every virtual would
@@ -645,7 +655,117 @@ let unimplemented l mi owner v lets s =
         // A default body: it becomes a `let` of the module that did not
         // implement it, and is checked there.
         _ => [list.append lets [[owner, virtual_as_let v, true, ()]], s],
-    };
+    } };
+
+// --- dispatch -----------------------------------------------------------------
+//
+// `derive` specializes: a record that derives `shape` gets its own copy of
+// `describe`, compiled against its own `area`, and nothing is decided at run
+// time. What that cannot give is a function written once against `shape` for
+// values of any record -- `shape.area x` in the module that declared the hole
+// raises, and the generic caller has to be handed the operations instead.
+//
+// `virtual dyn let` and `derive dyn` are the opt-in for that, one on each
+// side, and each side is compiled from its own module alone (which is what
+// keeps a module's unit independent of who derives it):
+//
+//   - A record written `derive dyn shape` carries a table in slot 0 of every
+//     value (`syntax.record_derived` lays it out): the global `<dispatch>`, a
+//     map from each `dyn` virtual it inherits -- named `module.virtual`, so a
+//     virtual of the base's own base is told apart -- to the record's
+//     implementation of it. `dispatch_table` writes that global.
+//
+//   - In the module that declares it, a `dyn` virtual is a dispatcher: it
+//     reads slot 0 of its *last* argument -- the receiver, by the convention
+//     that a member takes `self` last so it pipes -- and calls what the table
+//     names; anything without a table gets the default, or the hole's raise,
+//     which moves to a hidden global of its own (`dispatching`).
+//
+// A record that derives without `dyn` is laid out exactly as before, and a
+// base with no `dyn` virtual compiles exactly as before: the cost is paid by
+// the declarations that ask for it, and only there. The dispatcher looks at
+// what it is handed before trusting it, so a plain list whose first element
+// happens to be a map is still a plain list -- unless that map has the
+// virtual's own key, which no program writes by accident.
+
+/// The table's key for a virtual: the declaring module's name and its own.
+let dispatch_key module v = module + "." + virtual_name v;
+
+/// The name the default (or the hole) of a `dyn` virtual moves to.
+let dispatch_default_name v = "<" + virtual_name v + " default>";
+
+/// A `dyn` virtual in the module that declared it: two `let` entries, the
+/// dispatcher under the virtual's own name and the default it falls back on.
+///
+/// The dispatcher is generated whole and given generated spans (`syntax.fresh`,
+/// in a block keyed by the virtual's position): resolution keys a name by where
+/// it is written, so its several references to the receiver must each be
+/// somewhere different. The default keeps the spans it was written with, and
+/// moves aside unchanged, so a diagnostic in it still points into the source.
+let dispatching mi module v = {
+    let at = virtual_span v;
+    let n = list.length (virtual_params v);
+    let arg i = "<arg " + to_string i + ">";
+    let args = list.map (fn i -> ast.name_e (arg i) at) (list.range 0 n);
+    let receiver = ast.name_e (arg (n - 1)) at;
+    let kind_is k = ast.binary_e :eq (ast.name_e "<kind>" at) (ast.atom_e k at) at;
+    let lookup =
+        ast.match_e (ast.apply_e (ast.name_e "type_of" at) [receiver] at)
+            [ast.arm (ast.bind_p "<kind>" at)
+                     (ast.binary_e :or (ast.binary_e :or (kind_is "list") (kind_is "array") at)
+                                   (kind_is "map") at)
+                     (ast.match_e (ast.get_e receiver (ast.int_e 0 at) (ast.unit_e at) at)
+                          [ast.arm (ast.bind_p "<table>" at)
+                                   (ast.binary_e :eq (ast.apply_e (ast.name_e "type_of" at)
+                                                                  [ast.name_e "<table>" at] at)
+                                                 (ast.atom_e "map" at) at)
+                                   (ast.get_e (ast.name_e "<table>" at)
+                                              (ast.str_e (dispatch_key module v) at)
+                                              (ast.unit_e at) at) at,
+                           ast.arm (ast.wildcard_p at) () (ast.unit_e at) at] at) at,
+             ast.arm (ast.wildcard_p at) () (ast.unit_e at) at] at;
+    let body =
+        ast.match_e lookup
+            [ast.arm (ast.literal_p (ast.unit_e at) at) ()
+                     (ast.apply_e (ast.name_e (dispatch_default_name v) at) args at) at,
+             ast.arm (ast.bind_p "<impl>" at) ()
+                     (ast.apply_e (ast.name_e "<impl>" at) args at) at] at;
+    let params = list.map (fn i -> ast.param (arg i) at) (list.range 0 n);
+    let generated = list.head (syntax.fresh [params, body]
+                                            (3221225472 + ast.span_start at * 128));
+    let hole = virtual_body v == ();
+    let fallback = if hole { virtual_as_hole module v } else { virtual_as_let v };
+    let aside = 3221225472 + ast.span_start at * 128 + 126;
+    [[mi, ast.let_d (virtual_name v) (list.head generated) (list.nth 1 generated) false at, true, ()],
+     [mi, ast.let_d (dispatch_default_name v) (decl_params fallback) (decl_body fallback) false
+                    [aside, aside + 1],
+      true, if hole || builtins.is_impure_name (virtual_name v) { true } else { () }]]
+};
+
+/// The global `<dispatch>` of a `derive dyn` record: each `dyn` virtual it
+/// inherits, by key, to the name of its implementation here -- resolved in
+/// this module, so it is the record's own, or the default it inherited.
+/// Answers the `let` entries to add and the state, which has an error in it
+/// when the base has no `dyn` virtual and there would be nothing to carry.
+let dispatch_table l mi virtuals span lets s = {
+    let dyns = list.filter (fn ov -> virtual_dyn (list.nth 1 ov)) virtuals;
+    if list.is_empty dyns {
+        [lets,
+         complain_note span "`derive dyn` names a module with no `dyn` virtual, so there is nothing to dispatch"
+             "declare the operations to call generically as `virtual dyn let ..`, or write `derive`"
+             (modules.module_source (modules.module_at l mi)) s]
+    }
+    else {
+        let pairs = list.map (fn ov -> {
+            let v = list.nth 1 ov;
+            [ast.str_e (dispatch_key (modules.module_name (modules.module_at l (list.head ov))) v) span,
+             ast.name_e (virtual_name v) span]
+        }) dyns;
+        let table = list.head (syntax.fresh (ast.map_e pairs span)
+                                            (3221225472 + ast.span_start span * 128));
+        [list.append lets [[mi, ast.let_d syntax.dispatch_table_name [] table false span, true, ()]], s]
+    }
+};
 
 /// A `let` and an `import path.{ .. }` of the same name would both bind it, and
 /// the `let` would quietly win. Say so instead: which one the author meant is
@@ -767,10 +887,16 @@ let declare_module l mi s0 = {
         else { unimplemented l mi (list.head ov) v (list.head acc) (list.nth 1 acc) }
     }) collected virtuals;
 
+    // A `derive dyn` record's table, now that its virtuals are known.
+    let filled = list.fold (fn acc item -> match item {
+        [:dispatch, _, span] => dispatch_table l mi virtuals span (list.head acc) (list.nth 1 acc),
+        _ => acc,
+    }) filled items;
+
     // Check every inherited declaration, including a contract redeclared by
     // an intermediate module. Deduplicating defaults must not hide a contract.
     let contracts = list.fold (fn acc oi -> match list.nth 1 oi {
-        [:virtual, _, _, _, _] => {
+        [:virtual, _, _, _, _, _] => {
             let v = list.nth 1 oi;
             match list.first_or () (list.filter
                 (fn od -> decl_name (list.nth 1 od) == virtual_name v) (list.head filled)) {
@@ -1393,6 +1519,22 @@ let rec as_namespace c r e =
         _ => (),
     };
 
+/// A warning for each parameter of `let n ps = body` that is an accumulator
+/// nothing forces -- grown by a call of `n` itself and otherwise only answered
+/// -- with the one character that fixes it. dreams/lint.dr says what is and is
+/// not counted, and why the check is read off the syntax.
+let lazy_accumulators_warned c n ps body r =
+    if list.is_empty ps { r }
+    else {
+        list.fold (fn acc hit -> {
+            let p = list.head hit;
+            warn_note c (list.nth 1 hit)
+                ("`" + p + "` is an accumulator nothing forces: each call of `" + n
+                 + "` hands it on suspended, and the chain overflows when it is read")
+                ("make it strict with `!" + p + "`, so each call forces it as it starts") acc
+        }) r (lint.lazy_accumulators n ps body)
+    };
+
 /// A module or a namespace written where a value belongs.
 let not_a_value c m shown span r =
     report_note c span ("`" + shown + "` is a module, not a value")
@@ -1708,7 +1850,8 @@ let rec check_block c stmts r =
                             let fi = list.nth 1 started;
                             let bound = bind_params c ps (list.head started);
                             record (ctx_mi c) (ctx_source c) span [:closure, fi]
-                                   (end_func fi (check_expr c body bound))
+                                   (end_func fi (check_expr c body
+                                                    (lazy_accumulators_warned c n ps body bound)))
                         };
                     check_block c rest
                         (if is_rec { r1 }
@@ -1893,7 +2036,8 @@ let check_body l p r = {
     let started = begin_func (decl_name d) (list.length (decl_params d)) impure impure
                              (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) r;
     let fi = list.nth 1 started;
-    let bound = bind_params c (decl_params d) (list.head started);
+    let bound = lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
+                    (bind_params c (decl_params d) (list.head started));
     let done = end_func fi (check_expr c (decl_body d) bound);
     done.[:bodies => (list.cons [mi, source, d, fi] (bodies_rev done))]
 };
@@ -3465,6 +3609,22 @@ when test {
                                   (checked! "let f xs = _list_tail xs;")).[0] ),
         test.case "and std names its own primitives without one"
             $( test.eq! [] (check! (with_module! (bare! ()) "std.t" "let f xs = _list_tail xs;")) ),
+        test.case "a record may carry a base's `dyn` virtuals"
+            $( test.eq! []
+                   (messages (checked! ("mod shape { virtual dyn let area s; let twice s = 2 * area s }\n"
+                                        + "struct Sq derive dyn shape { side\n area s = side s * side s }"))) ),
+        test.case "`derive dyn` of a base with nothing to dispatch is an error"
+            $( test.eq! "`derive dyn` names a module with no `dyn` virtual, so there is nothing to dispatch"
+                   (first (checked! "mod shape { virtual let area s; }\nstruct Sq derive dyn shape { area s = 1 }")) ),
+        test.case "an accumulator nothing forces is warned about, with the `!` that fixes it"
+            $( test.eq! [:warning, "make it strict with `!acc`, so each call forces it as it starts"]
+                        (list.map (fn d -> [diag.severity d, diag.note d])
+                                  (checked! "let rec t i acc = if i == 0 { acc } else { t (i - 1) (acc + i) };")).[0] ),
+        test.case "and so is one in a block's own `let rec`"
+            $( test.eq! 1 (list.length (checked!
+                   "let f n = { let rec t i acc = if i == 0 { acc } else { t (i - 1) (acc + i) }; t n 0 };")) ),
+        test.case "a strict one is not"
+            $( test.eq! [] (checked! "let rec t i !acc = if i == 0 { acc } else { t (i - 1) (acc + i) };") ),
         test.case "the language's own builtins are never warned about"
             $( test.eq! [] (checked! "let f x = to_string (len x);") ),
         test.case "a module that binds core itself keeps its own"

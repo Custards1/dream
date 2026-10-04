@@ -108,7 +108,7 @@ let char_bytes s i = {
 
 /// Characters, not bytes, between two offsets. A UTF-8 continuation byte is
 /// `10xxxxxx`: the middle of a character rather than one of its own.
-let rec char_len s i stop acc =
+let rec char_len s i stop !acc =
     if i >= stop { acc }
     else if str.byte i s >= 128 && str.byte i s < 192 { char_len s (i + 1) stop acc }
     else { char_len s (i + 1) stop (acc + 1) };
@@ -319,9 +319,17 @@ let ident_run s i = str.span ident_bytes i s;
 /// An identifier, including a trailing `!` when there is one -- the `!` is part
 /// of the name and is what marks the binding impure. It is taken greedily, so
 /// `a!= b` is the name `a!` and then `=`, exactly as the Rust lexer reads it.
+///
+/// `let?` is the one word that ends in `?`, and only that word: `?` is no
+/// operator, so nothing else could be meant by it, and keeping it to one
+/// spelling leaves `?` free for anything the language wants later.
 let identifier s i = {
     let j = ident_run s i;
-    if str.byte j s == 33 { j + 1 } else { j }
+    match str.byte j s {
+        33 => j + 1,
+        63 if j - i == 3 && str.slice i 3 s == "let" => j + 1,
+        _ => j,
+    }
 };
 
 // --- operators --------------------------------------------------------------

@@ -288,10 +288,36 @@ let usage = cli.usage "lucid" "a language server for Dream"
 /// The standard library, wherever this installation keeps it. An editor is not
 /// going to pass `-L` for it, and a project that cannot see `std` reports every
 /// import of it as an error.
+///
+/// Last of all it is the installation's own copy -- the first directory of
+/// `$MINDV2_PATH`, or `~/.mindv2`, that holds `std` -- which is where
+/// `just install` puts it, and where the VM running this server found it.
 let stdlib_roots! () =
     match os.env! "MIND_STDLIB" {
-        () => match os.env! "DREAM_PACKAGES" { () => [], p => [path.expand_home! p] },
+        () => match os.env! "DREAM_PACKAGES" {
+            () => match installed_std! () { () => [], d => [d] },
+            p => [path.expand_home! p],
+        },
         p => [path.expand_home! p],
+    };
+
+let installed_std! () =
+    match os.env! "MINDV2_PATH" {
+        () => match path.home! () {
+            () => (),
+            h => first_with_std! [path.join h ".mindv2"],
+        },
+        v => first_with_std! (str.split (match os.platform () { :windows => ";", _ => ":" }) v),
+    };
+
+let rec first_with_std! dirs =
+    match dirs {
+        [] => (),
+        ["", ..rest] => first_with_std! rest,
+        [d, ..rest] => {
+            let dir = path.expand_home! d;
+            if io.is_dir! (path.join dir "std") { dir } else { first_with_std! rest }
+        },
     };
 
 let main! =

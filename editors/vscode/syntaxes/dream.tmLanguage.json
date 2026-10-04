@@ -116,7 +116,7 @@
         },
         {
           "name": "keyword.declaration.dream",
-          "match": "\\b(let|priv|rec|fn|import|as|mod|virtual|derive|comp|macro|expand|group|struct|mapping|type)\\b"
+          "match": "\\blet\\?|\\b(let|priv|rec|fn|import|as|mod|virtual|derive|comp|macro|expand|group|struct|mapping|type)\\b"
         },
         {
           "name": "constant.language.boolean.dream",
@@ -179,7 +179,7 @@
     },
     "declaration": {
       "comment": "The name a `let` introduces, so a definition stands out from a use. `resource` is contextual -- a C library's handle type, and a name anywhere else -- so it is a keyword only here, in front of the name it declares; `foreign` has a rule of its own.",
-      "match": "\\b(let|macro|group|struct|mapping|type|union|resource)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
+      "match": "\\b(let\\?|let|macro|group|struct|mapping|type|union|resource)\\s+(rec\\s+)?([A-Za-z_][A-Za-z0-9_]*!?)",
       "captures": {
         "1": {
           "name": "keyword.declaration.dream"

@@ -1,138 +1,180 @@
-# The Dream Language
+# The Dream language
 
-A reference for the Dream language as it is actually implemented.
+Dream is a lazily evaluated functional language. Effects are marked in names
+and checked; concurrency is green processes that share nothing; types are
+optional descriptions that the compiler checks wherever a program writes one.
+This document is the language as the compiler in [`dreams/`](../dreams) and
+the VM in [`dream/`](../dream) implement it today. The examples were compiled
+and run against the current toolchain, and where one shows output or a
+diagnostic, that is what it prints. Fragments write `..` for code left out.
 
-Dream is **dynamically typed**, **lazily evaluated**, and **functional**, with
-green processes for concurrency and a purity rule enforced by the spelling of a
-name. Types are optional: a signature is checked at compile time where one is
-written, and code without one is never rejected ([§3](#signatures-checked-at-compile-time)).
-Two programs implement it:
-
-| | |
-|-|-|
-| [`dreams/`](../dreams) | the compiler, written in Dream — `.dr` source to a `.dream` image |
-| [`dream/`](../dream) | the VM, `dream`, in C++ — interpreter, processes, LLVM JIT |
-| [`mind/`](../mind) | the standard library and build system, written in Dream |
-
-The compiler is written in the language it compiles and builds from an image of
-itself. Where this document points at a source file for a canonical list, that
-is the implementation the VM is checked against by tests.
-
-> **Status.** Everything in this document is implemented and covered by tests.
-
----
+It is a reference rather than a tutorial. For a tour, read the programs in
+[`examples/`](../examples/README.md) in order. For the library, see
+[builtins.md](builtins.md) and [`mind/std`](../mind/std/README.md). For how
+the machine works, see the [VM's README](../dream/README.md).
 
 ## Contents
 
-1. [Dream in sixty seconds](#1-dream-in-sixty-seconds)
+1. [A first program](#1-a-first-program)
 2. [Lexical structure](#2-lexical-structure)
-3. [Values and types](#3-values-and-types)
+3. [Values](#3-values)
 4. [Expressions](#4-expressions)
 5. [Laziness and strictness](#5-laziness-and-strictness)
 6. [Purity](#6-purity)
-7. [Declarations](#7-declarations)
-8. [Modules and packages](#8-modules-and-packages)
-9. [Processes](#9-processes)
-10. [Errors](#10-errors)
-11. [Compile-time evaluation](#11-compile-time-evaluation)
-12. [Pattern matching](#12-pattern-matching)
-13. [The standard library](#13-the-standard-library)
-14. [The toolchain](#14-the-toolchain)
-15. [Embedding](#15-embedding)
-16. [Writing code that runs fast](#16-writing-code-that-runs-fast)
+7. [Bindings and patterns](#7-bindings-and-patterns)
+8. [Errors](#8-errors)
+9. [Types](#9-types)
+10. [Records and unions](#10-records-and-unions)
+11. [Modules and packages](#11-modules-and-packages)
+12. [Behaviours: `virtual` and `derive`](#12-behaviours-virtual-and-derive)
+13. [Processes](#13-processes)
+14. [Compile time: `comp`, `when` and macros](#14-compile-time-comp-when-and-macros)
+15. [C libraries: `foreign`](#15-c-libraries-foreign)
+16. [Tests](#16-tests)
+17. [Running a program](#17-running-a-program)
+18. [Writing code that runs fast](#18-writing-code-that-runs-fast)
+19. [Grammar summary](#19-grammar-summary)
 
 ---
 
-## 1. Dream in sixty seconds
+## 1. A first program
 
 ```dream
 import std.console;
+import std.list;
 
-let rec fac n = if n <= 1 { 1 } else { n * fac (n - 1) };
+union Shape { circle(radius : :float), square(side : :float) }
 
-let greet! who result = {
-    who    |> console.print! "Hi, "
-    result |> console.print! "The result is "
-};
+let area shape : :float =
+    match shape {
+        [:circle, r] => 3.14159 * r * r,
+        [:square, s] => s * s,
+    };
+
+let rec total !acc shapes =
+    match shapes {
+        [] => acc,
+        [s, ..rest] => total (acc + area s) rest,
+    };
 
 let main! = {
-    let number = fac 5;
-    spawn! $( greet! "process 2" number )
-    let safe = try! { 12 / 0 } catch e { 0 };
-    greet! "process 1" safe
+    let shapes = [Shape.circle 1.0, Shape.square 2.0];
+    let worker = spawn! $( total 0.0 shapes );
+    console.print! ("total area: " + to_string (join! worker))
+
+    // An infinite list, of which only five squares are ever computed.
+    let squares = list.map (fn n -> n * n) (list.from 1);
+    console.print! (list.take 5 squares)
 };
 ```
 
-Six rules carry most of the language:
+```
+$ just run first.dr
+total area: 7.14159
+[1, 4, 9, 16, 25]
+```
 
-1. **Application is juxtaposition and binds tighter than every operator.**
-   `fac n - 1` is `(fac n) - 1`. The recursive call needs `fac (n - 1)`.
-2. **Functions are curried.** `f a b` is `(f a) b`.
-3. **`x |> f a` feeds `x` in as the _last_ argument**, giving `f a x`.
-4. **A trailing `!` on a name means impure.** A pure function may not reach an
-   impure one; the compiler rejects it.
-5. **Everything is lazy** unless the compiler marked it strict — the statements
-   of an impure block, an `if` condition, a `try!` body.
-6. **`$( e )` suspends `e`** as a thunk, which is what `spawn!` runs.
+Most of the language comes down to seven rules:
+
+1. **Application is juxtaposition, and it binds tighter than every
+   operator.** `f a b` calls `f` with `a` and `b`. `fac n - 1` is
+   `(fac n) - 1`, so a recursive call needs `fac (n - 1)`.
+2. **Functions are curried.** `f a b` is `(f a) b`, and `f a` is a function
+   waiting for `b`.
+3. **`x |> f a` passes `x` as the last argument**: it is `f a x`.
+4. **A name ending in `!` is impure, and a pure function may not reach
+   one.** The compiler checks this across every import.
+5. **Everything is lazy** until something needs its value. The statements
+   of an impure block run in order; most other things are computed only if
+   they are used.
+6. **`$( e )` suspends `e`** as a value, which is what `spawn!` runs.
+7. **Types are optional.** A signature is checked where it is written, and
+   code that no signature touches is never rejected.
 
 ---
 
 ## 2. Lexical structure
 
+A source file is UTF-8 text with the extension `.dr`.
+
 ### Comments
 
 ```dream
-// to end of line
-/* block, which does not nest */
+// to the end of the line
+/* a block, which does not nest */
 ```
 
-### Identifiers and the `!` suffix
+By convention, `///` before a declaration documents it.
+
+### Names
 
 ```
-ident  ::=  [A-Za-z_] [A-Za-z0-9_]* '!'?
+name  ::=  [A-Za-z_] [A-Za-z0-9_]* '!'?
 ```
 
-The `!` is **part of the name**, not an operator: `print!` and `print` are
-different identifiers, and the `!` is what marks the binding impure ([§6](#6-purity)).
+The trailing `!` is **part of the name**: `print!` and `print` are different
+names, and the `!` is what marks a binding impure ([§6](#6-purity)). It is
+taken greedily, so `a!= b` is the name `a!` followed by `=`; write `a != b`.
 
-Keywords, which may not be used as ordinary names:
+`_` alone is the wildcard pattern. Names beginning with `_` followed by a
+letter are the runtime's primitives (`_list_cons`), which belong to `std`
+([§3](#builtins-and-primitives)).
+
+### Keywords
 
 ```
-let  priv  rec  if  else  import  as  catch  true  false
-not  try!  fn  virtual  derive  comp  comp!  when  mod  type  union
+let  let?  priv  rec  if  else  import  as  catch  true  false  not  try!
+fn  virtual  derive  comp  comp!  when  mod  match  macro  expand  type  union
 ```
 
-Of these, `let  priv  rec  else  import  as  catch  virtual  derive  when  mod` can
-never begin an expression, so encountering one ends an application's argument
-list.
+Some words are **contextual**: they mean something only where a declaration
+or form can begin, and are ordinary names elsewhere.
+
+| Word | Special where |
+|---|---|
+| `group`, `struct`, `mapping` | at the start of an item: a record ([§10](#10-records-and-unions)) |
+| `foreign` | at the start of an item: a C library ([§15](#15-c-libraries-foreign)) |
+| `dyn` | after `virtual` or a record's `derive` ([§12](#dispatch-virtual-dyn-and-derive-dyn)) |
+| `where` | inside a type ([§9](#the-type-grammar)) |
+| `strict` | in `(strict name)`, a strict parameter |
+
+So `let group = 1` in a block, and `import std.foreign;` followed by
+`foreign.call!`, both work.
 
 ### Literals
 
-| Form | Example |
-|------|---------|
+| Form | Examples |
+|---|---|
 | integer | `42`, `1_000_000`, `0xFF`, `0b1010`, `0o755` |
-| float | `1.5`, `1_0.25`, `2.5e-3`, `1e9` |
-| string | `"hello\n"`, `"\u{1F600}"` |
-| char | `'c'`, `'\n'`, `'\u{41}'` |
+| float | `1.5`, `2.5e-3`, `1e9`, `1_0.25` |
+| string | `"hello\n"`, `"tab\there"`, `"\u{1F600}"` |
+| character | `'c'`, `'\n'`, `'\u{41}'` |
 | atom | `:ok`, `:not_found` |
-| bool | `true`, `false` |
+| boolean | `true`, `false` |
 | unit | `()` |
-| list | `[1, 2, 3]` |
+| list | `[1, 2, 3]`, `[]` |
 | array | `#[1, 2, 3]` |
-| map | `%{ :k => 1, :j => 2 }` |
+| map | `%{ :name => "Ada", "age" => 36 }`, `%{}` |
 | thunk | `$( expr )` |
 
-Escapes inside strings and chars: `\n \t \r \0 \\ \' \"` and `\u{HEX}`.
-Underscores are permitted as digit separators in every numeric base.
+- `_` separates digits in any base and is ignored.
+- A float needs a digit on both sides of its point, so `1..2` is `1`, `..`,
+  `2`, and `x.field` is never a number. `1e` is the number `1` followed by
+  the name `e`.
+- Integers have no size limit; a literal of any length is allowed.
+- Escapes in strings and characters are `\n \t \r \0 \\ \' \"` and
+  `\u{HEX}`, a Unicode scalar value. An unknown escape stands for the
+  character itself (`\q` is `q`).
+- A string may contain line breaks as written.
+- An atom is `:` followed directly by a name.
 
-### Newlines are significant
+### Line breaks end statements
 
-Inside a block and at top level, **a line break ends a statement**. Three rules
-relax that:
+Inside a block, a record body and at the top level, **a line break ends a
+statement** unless one of these applies:
 
-- **A line indented past the statement it follows continues it.** This is what
-  lets a call be spread over several lines, and it is the same cue a reader
-  already goes by:
+- **The next line is indented further** than the line the statement started
+  on. This is what lets a call run over several lines:
 
   ```dream
   let total = add3 (1 + 1)
@@ -140,789 +182,832 @@ relax that:
                    (3 + 3);
   ```
 
-  A line at the same indentation, or less, starts a new statement.
-- A line that *begins* with an infix operator, `.`, `else`, or `catch`
-  continues the previous line whatever its indentation, since none of those can
-  start a statement.
-- Newlines never end a statement inside `(`, `[`, `$(`, `#[`, or `%{`. Braces
-  `{ }` are *not* in that list — a block is newline-sensitive.
+- **The next line begins with something that cannot begin a statement**: an
+  infix operator, `|>`, `.`, `else` or `catch`. It continues the previous
+  line whatever its indentation.
+
+  ```dream
+  let sum = 1
+      + 2
+  + 3;                              // still the same statement: 6
+
+  let n = [1, 2, 3]
+      |> list.map (fn x -> x * 10)
+      |> list.sum;
+
+  let v = if false { 1 }
+  else { 2 };
+  ```
+
+- **It is inside brackets**: `( )`, `[ ]`, `#[ ]`, `%{ }` or `$( )`. Braces
+  `{ }` are not in that list, because a block is a sequence of statements.
+
+`;` ends a statement explicitly and is always allowed. A line at the same
+indentation as the statement, or less, starts a new one:
 
 ```dream
-let total = a
-    + b            // continues: the line starts with an operator
-    + c;
-
-let names! = vm
-    .modules! ();  // continues: the line starts with `.`
-
 let main! = {
-    print! "a"     // two statements: same indentation
-    print! "b"
+    console.print! "a"     // two statements
+    console.print! "b"
 };
 ```
 
-`;` ends a statement explicitly and is always allowed.
-
 ---
 
-## 3. Values and types
+## 3. Values
 
-`type_of v` returns the type's name as an atom. The canonical list lives in
-the VM's `bi_type_of` ([`dream/src/builtins.cpp`](../dream/src/builtins.cpp));
-the compiler lowers `type_of` to that builtin, and this table is checked
-against it by tests rather than kept in step by hand.
+Dream is dynamically typed: every value carries its kind, and `type_of`
+answers it as an atom.
 
-### Optional type descriptions
+| `type_of` | Values | Written |
+|---|---|---|
+| `:integer` | integers of any size | `42`, `0xFF` |
+| `:float` | IEEE 754 doubles | `1.5` |
+| `:bool` | `true`, `false` | |
+| `:char` | one Unicode scalar value | `'c'` |
+| `:unit` | `()`, the value of an expression with nothing to say | `()` |
+| `:atom` | an interned name, compared by identity | `:ok` |
+| `:string` | UTF-8 text, immutable | `"text"` |
+| `:list` | a chain of cells, lazy in head and tail | `[1, 2]`, `x :: xs` |
+| `:array` | a flat sequence with constant-time indexing | `#[1, 2]` |
+| `:map` | a hash trie from keys to values | `%{ k => v }` |
+| `:pure_fn` | a function, closure or thunk | `fn x -> x`, `$( e )` |
+| `:impure_fn` | a function whose name ends in `!` | `let f! x = ..` |
+| `:error` | an error value: a kind and a payload | caught by `try!` |
+| `:process` | a green process | `spawn! $( .. )` |
+| `:module` | a module, as `import` binds it | |
+| `:tensor` | packed numbers with a shape ([`std.tensor`](notes/tensors.md)) | `tensor.of_list [1.0]` |
+| `:bigstr` | a string past 4 GiB, read from an image's payload ([large-data.md](notes/large-data.md)) | |
 
-A type is an ordinary Dream value that describes a set of values. Naming one
-changes nothing about how a value is represented and makes no check happen:
-checking is a function call a program chooses to make, where it wants it.
+### Numbers
+
+**Integers are unbounded.** One that fits in 63 bits is held unboxed; one
+that does not is a bignum. The two are one type: `type_of` says `:integer`
+for both, `==`, `compare`, map keys and `match` agree across them, and a
+result that fits in 63 bits again is small again. A program never chooses.
 
 ```dream
-import std.types;
-
-type Min      = :integer -> :integer -> :integer;
-type Ints     = [:integer];
-type Outcome v = [:ok, v] | [:error, :string];
-type Port     = :integer where fn n -> n >= 1 && n <= 65535;
-
-let count  = types.check Port input;                 // checked when demanded
-let primes = comp types.check Ints [2, 3, 5];        // checked while compiling
-let schema = comp Ints;                              // bake a description as data
+9223372036854775807 * 10        // 92233720368547758070
+7 / 2                           // 3     -- integer division truncates toward zero
+-7 / 2                          // -3
+-7 % 3                          // -1    -- `%` takes the sign of the dividend
+7.0 / 2                         // 3.5
+1 + 2.5                         // 3.5   -- an integer with a float is a float
 ```
 
-`types.accepts T value` tests membership. `types.check T value` answers the
-original value or raises `:type_error` carrying `T`. A failed check inside
-`comp` is a compile error. There is no inference, no coercion, and no check
-on assignment or application; a function opts in by checking what it takes or
-what it answers, and a partially applied `types.check T` is an ordinary
-reusable checking function.
+`/` and `%` by an integer zero raise `:divide_by_zero`. Float division by zero
+follows IEEE 754. `std.num` converts between numbers and text, and
+`std.math` has the floating-point functions.
 
-`type Name params = description` is shorthand for
-`let Name params = [:named, "Name", description]`, so a type follows `let`'s
-rules for imports, privacy (`priv type`), currying and local binding, and a
-local type may capture runtime values.
+### Strings and characters
 
-#### The type grammar
+A string is immutable UTF-8 text, and a character is a value of its own, not
+a one-character string. Strings are indexed by **byte**: `len`,
+`str.byte_length`, `str.slice` and `str.find` work in bytes and cost O(1);
+`str.length` and `str.chars` count characters and walk.
 
-The right-hand side of a `type`, and a record field's annotation, are read in
-a grammar of their own. It is the only place a bracket means a type: in an
-ordinary expression `[:integer]` is still the list holding one atom, and a
-description is built there by calling `std.types` instead.
+```dream
+len "héllo"              // 6
+str.length "héllo"       // 5
+"ab" + "cd"              // "abcd"
+```
 
-| written | means |
+### Lists, arrays and maps
+
+These are the three containers, and they differ in cost more than in what
+they hold:
+
+- **A list** is a chain of cells, each lazy in its head *and* its tail, so a
+  list can be infinite and is built only as far as it is read. Reaching the
+  front is one step; `len`, `.[n]` and `+` walk. Build one at the front (with
+  `x :: xs` or `list.cons`) and reverse once at the end.
+- **An array** reads any position in one step. It is the shape for a fixed
+  record that is read more often than it is built. Changing an element
+  copies the array.
+- **A map** is a hash array mapped trie. Its keys are forced and its values
+  are lazy. A change shares everything it did not touch, so building one key
+  at a time is cheap. Numbers, strings, atoms, characters, booleans, unit and
+  processes are compared as keys by value; anything else (a list, an array, a
+  map, a function) is a key by identity, so an equal list built elsewhere
+  does not find it. `1` and `1.0` are different keys.
+
+Every value is immutable. "Changing" a container answers a new one and
+leaves the original as it was ([`.[ ]`](#reading-and-changing-a-container)).
+
+### Equality and order
+
+`==` and `!=` compare structurally and never raise: `[1, 2] == [1, 2]`,
+`%{ :a => 1 } == %{ :a => 1 }`, `1 == 1.0`. Values of different kinds are
+unequal (`"1" == 1` is `false`).
+
+`<`, `<=`, `>` and `>=` order numbers, characters and strings, and raise
+`:type_error` on anything else. `compare a b` answers `-1`, `0` or `1` and
+orders values of any kind, including lists, which is what `list.sort` uses.
+
+### Functions and thunks
+
+A function is a value. A closure captures the variables it uses. A thunk
+written `$( e )` is a function of no arguments, and `type_of` reports it as
+`:pure_fn`. `spawn!` runs a thunk in a new process, and `std.test` holds a
+test case in one.
+
+### Builtins and primitives
+
+A few names are part of the language and need no import. A binding of the
+same name shadows them.
+
+| | |
 |---|---|
-| `:integer`, `:string`, `:pure_fn`, … | a primitive: the atoms `type_of` answers with |
-| `:any`, `:never` | everything, without forcing it; and nothing |
-| `:ok`, `"fast"`, `3`, `'c'` | a literal: that value and no other |
-| `Name`, `mod.Name`, `Name arg` | a named type, and the application of a parameterised one |
-| `a -> b` | a function. Right-associative, so `a -> b -> c` is a function of `a` answering `b -> c` |
-| `a \| b \| c` | a union: any one of them |
-| `[t]` | a list of `t`, of any length |
-| `[a, b, …]` | a list of exactly that many, in that order — which is what makes `[:ok, value]` read as itself |
-| `#[t]`, `#[a, b]` | the same two readings, for an array |
-| `%{k => v}` | a map, when the key names a kind: `%{:string => :integer}` |
-| `%{:host => t, …}` | a record, when the keys are literals. The named keys must be there; others are allowed |
-| `t where predicate` | a refinement: `t`, and the predicate answers `true` |
-| `( t )` | grouping |
+| `spawn!`, `join!`, `send!`, `recv!`, `self!` | processes ([§13](#13-processes)) |
+| `raise!` | raise an error ([§8](#8-errors)) |
+| `strict!` | force a value all the way down ([§5](#5-laziness-and-strictness)) |
+| `type_of` | a value's kind, as an atom |
+| `to_string` | any value as text |
+| `len` | the length of a list, array, map, or string (in bytes) |
+| `compare` | the order of any two values: `-1`, `0` or `1` |
+| `type_assert` | what a checked `types.enforce` compiles to |
 
-`where` takes an ordinary expression, which is how a description reaches
-anything the grammar cannot say. It is contextual, so a program is still free
-to bind the name `where` elsewhere.
+Everything else the machine provides is a **primitive**, spelled with a
+leading underscore (`_list_cons`, `_str_slice`) and declared in
+[`dreams/builtins.dr`](../dreams/builtins.dr). Primitives are `std`'s to
+call: every one has a `std` function that wraps it (`list.cons`,
+`str.slice`) and compiles to the same operation. Naming a primitive outside
+`std` compiles, with a warning:
 
-**One spelling serves two meanings, and the value decides which.** `:error`
-names every error box, and it is also the tag of `[:error, reason]`; `:list`
-names every list, and it is one of the three answers `record.backing` gives.
-An atom is compared against an atom and asked its kind otherwise, so
-`[:ok, v] | [:error, reason]` means what it looks like and `error.Error` still
-matches a real error. The cost is over-acceptance in cases that do not arise:
-`:integer` also accepts the atom `:integer`, and `:list` read as a tag also
-accepts an actual list. `types.literal :list` is the exact form for a program
-that cares.
-
-#### Building a description at run time
-
-The `std.types` constructors build the same data the grammar does, for a
-program that decides at run time what to check against: `list_of T`,
-`array_of T`, `tuple [T, …]`, `array [T, …]`, `map_of K V`,
-`record %{key => T}`, `one_of [T, …]`, `all_of [T, …]`, `optional T`,
-`literal value`, `fn_of A B`, `refine T predicate`, `enum [values]`,
-`range lo hi` and `sized lo hi T`. Each accepts its argument written either
-way, so `types.enum [:flag, :value]` means the same in a `type` as in an
-expression.
-
-An arrow can only be *tested* for being a function — seeing what it does with
-an argument means applying it, which a membership test may not do.
-`types.enforce (A -> B) f` is the other half: it wraps `f` so that each
-application checks one arrow, argument in and answer out.
-
-Checks force only what membership needs. A homogeneous list type walks the
-spine; `list_of :any` leaves the elements alone; a union stops at its first
-match; an unused check never runs. Predicates obey ordinary purity rules. A
-description holding a closure can be used while checking inside `comp` but
-cannot itself be baked into an image, since a `comp` result must be data.
-
-#### Records
-
-```dream
-group Point { x : :integer, y : :integer = 0 }
-struct Vector { x : :float, y : :float }
-mapping Config { host : :string, retries : :integer = 3 }
-
-let point  = comp types.check Point.type (Point.new 5);
-let config = types.check Config.type incoming;
 ```
-
-A field's optional `: description` contributes to `Name.type`. Separate the
-annotation colon from what follows with whitespace (`x : :integer`), because
-`:integer` is itself an atom token. Descriptions are read in the record's
-generated module and have the same scope as its members; they do not capture
-names from the surrounding module. Fields with no annotation accept anything.
-
-`group` checks lists, `struct` arrays, and `mapping` maps. A missing field is
-accepted when its accessor default satisfies the field's type; extra map keys
-are allowed, extra positional elements are not. Constructors, accessors and
-setters do not check at run time — `types.check Name.type value` is how a
-boundary gets checked there — but a record with at least one annotated field
-gives them signatures, so the compiler checks their uses (below). These are
-structural, so a matching raw collection is accepted too, and `Name.type` is
-an ordinary named description that composes with everything above.
-
-### Signatures, checked at compile time
-
-A signature says what a name is, in the type grammar above, and the compiler
-holds the program to it:
-
-```dream
-let add : :integer -> :integer -> :integer;     // a signature on its own
-let add x y = x + y;                             // ..and the definition
-
-let limit : :integer = 10;                       // a value and its type
-let greet who : :string = "hi " + who;           // what a function answers
-
-let map : (a -> b) -> [a] -> [b];                // a free lowercase name is a type variable
+warning: `_list_cons` is a primitive, meant to be called through `std`
+    = write `list.cons x xs` instead
 ```
-
-The type after a function's parameters is what it *answers*, so `greet` is
-`:any -> :string`. A signature on its own names no parameters — the whole
-arrow is the type of the name — and must be followed by a `let` of the same
-name in the same module or block. Signatures work in blocks as well as at the
-top level.
-
-What is checked, all of it at compile time:
-
-- the definition against its signature — the body, each branch of an `if`,
-  each arm of a `match`, each parameter's use;
-- every use of a signed name — each argument against its parameter, and the
-  number of arguments against the number of arrows;
-- the standard library's own signatures (`std.list` has them), so
-  `list.map 5 xs` is an error in a program that annotated nothing;
-- every `match` over a declared union, for a variant it does not handle
-  ([§7](#union--discriminated-unions)).
-
-A lambda passed where a function type is expected takes its parameter types
-from it, so `list.map (fn w -> w * 2) words` knows `w` is a string if `words`
-is a `[:string]` — and says `*` wants a number. A generic function's variables
-are solved from each call's arguments.
-
-**It is optional in the sense that matters: code no signature touches is never
-rejected.** A name with no signature is `:any`, and `:any` fits everywhere in
-both directions. An operator given the wrong kinds, or a value applied as a
-function, is reported only when a declared type is involved: `1 + "x"` is left
-alone — it raises when forced, and a program may mean exactly that inside a
-`try!` — while `name + 1` with `name : :string` is an error. A union where one
-member is expected must fit in every member; beyond that, anything the checker
-cannot see into passes. A refinement is checked as its base type, since its
-predicate only runs at run time.
-
-Signatures compile to nothing but the JIT's parameter hints: a signature over
-anything but integers and floats leaves the image as it was, and the checker
-always runs. There is no runtime
-check on a signed function's arguments — `types.enforce` is that, where it is
-wanted.
-
-#### Compile-time contracts
-
-A refinement is checked as its base type almost everywhere, because its
-predicate is a function and only running it says what it answers. Where the
-compiler already *has* the value, it runs it:
-
-```dream
-type Port = :integer where fn n -> n >= 1 && n <= 65535;
-let connect : Port -> :string;
-
-connect 8080                 // fine
-connect 70000                // error: `70000` is not a `Port` -- its `where` answered false
-let p = 99999; connect p     // error: a local bound to a literal is that literal
-let limit : Port = comp (70 * 1000);   // error: a `comp` is the value it produced
-```
-
-A value is known at compile time when it is a literal (including lists, arrays
-and maps of literals, and a negated number), a local bound to one, or the
-result of `comp` / `comp!`. Where such a value meets a *named* type whose
-description has a `where` anywhere in it, the predicates that decide it are run
-on the VM against the program being built — the same closure `types.check`
-would apply at run time — and a value one of them rejects is reported where it
-was written. The structure decides which predicates are asked: a union is
-accepted by any member, so `()` meets `Port | :unit` without running anything;
-a list asks each element; a tagged variant asks only the variant its tag picks;
-a record asks the fields the value has.
-
-This is what makes a signature a compile-time API. A library that writes
-`type Pattern = :string where fn s -> valid s` and `let compile : Pattern ->
-Regex` rejects `compile "a(b"` in every program that calls it, with nothing
-for the caller to opt into.
-
-- A predicate that answers anything but `true` rejects the value; one that
-  raises is reported as having raised. All of a program's contracts are one
-  run, and each is attributed to its own call.
-- A refinement written inline in a signature, `(:integer where p) -> ..`, is
-  not run: a signature is never compiled. Name the type.
-- A parameterised type is checked for its structure only.
-- A value that is only known at run time is left to run time, as before.
-- Contracts are checked only in a build — `dreams --check` stops before
-  anything runs — and only when the program has no other type errors.
-- They add nothing to the image.
-
-### Scalars
-
-| Type | |
-|------|-|
-| `integer` | a signed integer |
-| `float` | double precision |
-| `char` | one Unicode scalar value |
-| `bool` | `true` or `false` |
-| `unit` | `()`, the value of an expression with nothing to say |
-
-### Object kinds
-
-`object` is the umbrella type; these are its kinds.
-
-| Kind | |
-|------|-|
-| `pure_fn` | a function with no effects |
-| `impure_fn` | a function whose name ends in `!` |
-| `module` | what `import` binds, and what `mod` declares |
-| `list` | `[a, b, c]` — a cons chain, lazy in head *and* tail |
-| `array` | `#[a, b, c]` — flat, constant-time indexing |
-| `map` | `%{ k => v }` — keys forced, values lazy |
-| `tensor` | packed numbers with a shape, on the host or a GPU — see `std.tensor` |
-| `error` | a raised kind and payload, caught by `try!` |
-| `process` | a green process (`thread` is an accepted alias) |
-| `atom` | an interned name, `:like_this`; compares by identity |
-| `string` | UTF-8 text |
-
-### Representation
-
-A value is one 64-bit word, tagged in the low bits:
-
-| Pattern | Meaning |
-|---------|---------|
-| `....1` | fixnum — a 63-bit signed integer, `(int64)v >> 1` |
-| `...000` | pointer to a heap object (8-byte aligned); `0` means "no value" |
-| `...010` | immediate — unit, bool, char, atom, nil, builtin |
-
-Integers get the one-bit tag because arithmetic is the hot path, and the
-tagging preserves order so the JIT can compare two tagged fixnums directly. An
-integer past 63 bits is a `BigIntObj` on the heap (see
-`dream/src/bigint.hpp`; "Operators on non-numbers" says how arithmetic
-reaches it).
-
-Lists are cons cells and arrays are flat, both as you would expect. **Maps are a
-hash array mapped trie** — a tree branching 32 ways on five bits of the key's
-hash per level. That shape is chosen for the same reason the rest of the runtime
-is: a value here is never updated, only succeeded. A flat table would have to be
-copied on every `map_put` to leave the original standing, which makes building a
-map an entry at a time quadratic; a trie shares everything the change does not
-touch, so the update is `log32(n)` new nodes and the map it came from is
-untouched and still cheap to use.
-
-The three container shapes differ in cost as much as in kind, and which one a
-value wants is usually decided by how it is read rather than by what it holds:
-
-- **A cons chain answers the head in one hop and everything else by walking.**
-  `nth`, `length`, `last` and `append` are all linear in the list: reading the
-  end or joining two of them walks the whole chain. What differs is *where*
-  the walk happens. `nth` is `xs.[n]`, `length` is `len`, and `append` is `+`,
-  so each of those is one machine operation over the spine rather than a
-  reduction per cell -- which is worth about a factor of ten and is why the
-  standard library defines them that way rather than by recursion. `last` and
-  anything ending in `_at` still walk in Dream. Building in front is O(1),
-  which is why the idiom everywhere in the standard library is to accumulate
-  with `list.cons` and reverse once at the end. A *lazy* chain costs a cell
-  each time a new element is forced, so a stream that will be walked twice
-  builds every cell of a tail that the second walk then forces again.
-- **An array reads any index in one hop — constant-time like a list's head.**
-  An array is the right shape for a fixed record that is read more than it is
-  built, because a list record reads every field by walking to it. The
-  compiler's token is the precedent: as a six-element list, reading one field
-  walked to its cell, and reading tokens was a fifth of everything the
-  compiler did. Arrays are built with `array.new` and `a.[index => value]`
-  (or `std.array.of_list`), so the more a record is built relative to read,
-  the less clear the win is.
-- **A membership test over a fixed set of names wants a map.** Checking a name
-  against a flat table of keywords was a tenth of the compiler's work; the
-  same check against `%{ }` is a probe of a trie.
-- **A string is a sequence of bytes with two costs.** Byte operations —
-  `len`, `str.byte`, `str.slice` on a byte offset — are O(1);
-  anything that counts or indexes by *character* (`str.length`, `str.chars`)
-  walks. The lexer counts columns in characters and spans in bytes for
-  exactly this reason, and a program that slices a string a lot wants to
-  thread offsets, not characters.
 
 ---
 
 ## 4. Expressions
 
-### Precedence, loosest to tightest
+### Precedence
 
-| Level | Operators | Associativity |
-|-------|-----------|---------------|
-| lowest | `\|>` | left |
-| 0 | `\|\|` | left |
-| 1 | `&&` | left |
-| 2 | `==` `!=` `<` `<=` `>` `>=` | left |
-| 3 | `::` | **right** |
-| 4 | `+` `-` | left |
-| 5 | `*` `/` `%` `@` | left |
-| 6 | unary `-`, `not` | prefix |
-| 7 | `comp`, `comp!` | prefix |
-| tightest | **application** `f a b`, then postfix `.field` | left |
+From loosest to tightest:
 
-`x :: xs` is the list with `x` in front of `xs` -- the cell `list.cons x xs`
-makes, compiled to the same `cons` operator, so the tail is lazy. It is the one
-operator that groups to the right, because a list is built from its end:
-`1 :: 2 :: []` is `[1, 2]`. Below `+`, so `n - 1 :: rest` puts the difference
-at the front; above the comparisons, so `x :: xs == ys` compares lists. In a pattern,
-`x :: rest` takes apart a non-empty list, as `[x, ..rest]` does.
+| Operators | Associativity |
+|---|---|
+| `\|>` | left |
+| `\|\|` | left |
+| `&&` | left |
+| `==` `!=` `<` `<=` `>` `>=` | left |
+| `::` | **right** |
+| `+` `-` | left |
+| `*` `/` `%` `@` | left |
+| prefix `-`, `not`, and `comp`, `comp!`, `expand` | prefix |
+| application `f a b` | left |
+| `.name`, `.[ ]` | postfix |
 
-Every other infix operator is left-associative. The single most important
-consequence: **application binds tighter than everything**, so
+Consequences worth knowing:
 
 ```dream
-fac n - 1      //  (fac n) - 1
-fac (n - 1)    //  what a recursive call usually wants
-f a b + g c    //  (f a b) + (g c)
+fac n - 1          // (fac n) - 1
+fac (n - 1)        // a recursive call
+f a b + g c        // (f a b) + (g c)
+not f x            // not (f x)
+- 3 + 1            // -2
+f x.y              // f (x.y)
+1 :: 2 :: []       // [1, 2]
+n - 1 :: rest      // (n - 1) :: rest
 ```
 
-`comp` sits between the operators and application, so `comp f x` folds the whole
-call.
+**A negative argument needs parentheses.** `-` cannot begin an argument, so
+`f -1` is `f - 1`, a subtraction, and raises `:type_error` when it runs.
+Write `f (-1)`.
 
-### Application and currying
+### Application, currying and the pipe
 
 ```dream
 let add a b = a + b;
-let inc = add 1;        // partial application
-inc 41                  // 42
+let inc = add 1;                  // partial application
+inc 41                            // 42
+
+[1, 2, 3] |> list.map inc |> list.sum      // list.sum (list.map inc [1, 2, 3])
 ```
 
-`()` in a parameter list is a unit parameter that occupies a slot but binds no
-name — `let now! () = ...` is called as `now! ()`.
+A parameter written `()` takes a slot but binds no name: `let now! () = ..`
+is called as `now! ()`.
 
-### Pipe
+### Operators
 
-`|>` feeds the left side in as the **last** argument of the right side:
+| | |
+|---|---|
+| `+` | adds numbers; joins two strings; joins two lists (without forcing their elements) |
+| `- * / %` | arithmetic ([§3](#numbers)) |
+| `+ - * / %` on tensors | elementwise; `a @ b` is the matrix product ([`std.tensor`](notes/tensors.md)) |
+| `::` | `x :: xs`, a list with `x` in front of `xs`; the tail stays lazy |
+| `==`, `!=`, `<` .. `>=` | [§3](#equality-and-order) |
+| `&&`, `\|\|` | short-circuit: the right side is evaluated only if it decides the answer |
+| `not` | boolean negation |
 
-```dream
-x |> f a           // f a x
-[1,2,3] |> list.map inc |> list.sum
-```
-
-The pipe is folded during lowering: `x |> f a` becomes a single application
-of `f` to `[a, x]`. For example, `["Ada", 42] |> console.printf! "{}: {}"`
-passes the value list as the formatter's final argument.
-
-### Operators on non-numbers
-
-`+` is overloaded by the runtime:
-
-- two numbers — arithmetic
-- two strings — concatenation
-- two lists — concatenation, **without forcing the elements**
-
-`+ - * / %` on a **tensor** are elementwise: with another tensor of the same
-shape (or one whose shape is the trailing part of its own, which repeats), or
-with a number on either side. `a @ b` is the matrix product of two tensors, or
-of nested lists and arrays read as them, and binds like `*`. It is the builtin
-`_tensor_matmul` applied to both sides, so a local of that name shadows it.
-`std.tensor` has the rest, including moving a tensor to the GPU.
-
-**Integers have no size limit.** One that fits in 63 bits is a fixnum; one
-that does not is a *bignum*, a heap object of 64-bit limbs. The two are one
-type -- `type_of` says `:integer` for both, `==`, `compare`, map keys and
-`match` agree across them, and an operation whose answer fits in 63 bits again
-answers a fixnum -- so a program never chooses between them. Arithmetic
-reaches the bignum code only where a fixnum operation overflows, which is the
-path that used to answer a float, so code that stays inside 63 bits runs
-exactly as it did. A literal of any size is allowed: one past the fixnum range
-is written into the image as its digits and parsed where it is used.
-
-`/` on two integers truncates toward zero and `%` takes the sign of the
-dividend, at any size. `/` and `%` by an integer zero raise
-`:divide_by_zero`. An integer combined with a float is a float; a bignum too
-large for a double becomes an infinity there.
+An operator applied to kinds it does not take raises `:type_error` at run time,
+unless a signature lets the compiler see it first ([§9](#signatures)).
 
 ### `if`
 
 ```dream
-if cond { then_expr } else { else_expr }
-if a { .. } else if b { .. } else { .. }
+if n < 0 { :negative } else if n == 0 { :zero } else { :positive }
 ```
 
-The branches are blocks, so the braces are required. The condition is forced;
-the taken branch is not, unless the surrounding context forces it. `else` is
-optional, and a missing one yields `()`.
-
-While parsing an `if` condition, `{` starts the branch body rather than a block
-being passed as an argument.
+The branches are blocks, so the braces are required. The condition is
+evaluated; only the branch it picks is. Without an `else`, a false condition
+gives `()`. In a condition, a `{` opens the branch rather than passing a
+block as an argument.
 
 ### Blocks
 
 ```dream
-{ stmt; stmt; last_expr }
+{ let a = 1; let b = a + 1; a + b }        // 3
 ```
 
-A block's value is its last statement, or `()` when empty. Statements are
-separated by newlines or `;`. A block may contain `let` declarations, which
-scope to the rest of the block.
+A block is a sequence of statements. Its value is the last one, or `()` when
+it is empty. A `let` in a block is in scope for the statements after it.
+
+### `match`
+
+```dream
+match value {
+    0 => :zero,
+    n if n < 0 => :negative,
+    [x, ..rest] => [:list, x, rest],
+    _ => :other,
+}
+```
+
+Arms are tried in order and the first that matches wins. Patterns are
+described in [§7](#patterns).
 
 ### Lambdas
 
 ```dream
 fn x -> x + 1
 fn a b -> a * b
+fn [k, v] -> k + v             // a parameter may be a pattern
+fn !acc x -> acc + x           // or strict
 ```
 
-`fn` needs at least one parameter. The body extends as far as the expression
-grammar allows, so parenthesize when passing a lambda as a non-final argument.
-
-### Thunks, and forcing them
-
-`$( e )` suspends `e` as a first-class thunk object. It is what `spawn!` turns
-into a process, and what `std.test` uses to hold a test case for later.
-
-`strict! e` is the other direction: it evaluates `e` **all the way down** and
-hands it back. Laziness is the default and usually right, but it has one sharp
-edge — an effect in a lazy position does not happen until something forces it,
-and "something" may be much later, or never:
-
-```dream
-// Every `spawn!` here is a thunk. They run one at a time, as each `join!`
-// forces its element -- which is the opposite of what the code looks like.
-let ps = list.map (fn n -> spawn! $( work n )) jobs;
-
-// Now they have all started before the first `join!`.
-let ps = strict! (list.map (fn n -> spawn! $( work n )) jobs);
-```
-
-It forces *deeply* rather than to weak head normal form, because forcing the
-list without forcing its elements would leave the effects exactly where they
-were. It is impure by name, which is right: forcing is when effects happen.
-Forcing a value that is already forced costs nothing.
-
-The block form reads well when several things have to happen first:
-
-```dream
-strict! { let a = expensive (); [a, a * 2] }
-```
-
-### Collections
-
-```dream
-[1, 2, 3]                     // list  — lazy head and tail
-#[1, 2, 3]                    // array — constant-time indexing
-%{ :a => 1, "b" => 2 }        // map   — keys forced, values lazy
-```
-
-**`obj.field` is module-member access and nothing else.** The field name may
-carry a trailing `!` (`console.print!`). It is not map or record indexing —
-applying it to anything but a module raises `:no_such_member`.
+A lambda needs at least one parameter. Its body runs as far as the
+expression goes, so a lambda passed as anything but the last argument needs
+parentheses.
 
 ### Reading and changing a container
 
 ```dream
-point.[:r]                    // the value at `:r`; `:no_such_key` when there is none
-point.[:r else 0]             // ..or `0`, evaluated only when it is the answer
-point.[:r => 5]               // a map like `point` with `:r` bound to 5
-arr.[0]                       // an array or a list, by position
-grid.[y].[x => 0]             // postfix, so it chains like `.field`
+point.[:x]                    // the value at the key; :no_such_key when absent
+point.[:x else 0]             // ..or 0, evaluated only when it is the answer
+point.[:x => 5]               // a new map like `point`, with :x bound to 5
+xs.[0]                        // a list or an array, by position
+grid.[y].[x => 0]             // postfix, so it chains
 ```
 
-`.[ ]` is one pair of operations over every container: a map is read and changed
-by key, an array or a list by position, and a position past either end of a
-sequence raises `:out_of_bounds`. The dot is what tells it from application —
+`.[ ]` is one pair of operations over every container: a map is read and
+changed by key, and an array or a list by position. A position past either
+end raises `:out_of_bounds`. The dot is what tells it from application:
 `f [0]` passes a list to `f`, and `xs.[0]` reads one.
 
-A change answers a new container and leaves the one it was given alone, as
-every value is left alone. A map shares everything the change did not touch; an
-array is copied; a list rebuilds the cells in front of the position and shares
-the rest. So a record that is changed often wants to be a map, and one that is
-only read wants to be an array.
+A change answers a new container. A map shares everything the change did not
+touch, an array is copied, and a list rebuilds the cells in front of the
+position and shares the rest.
 
-Nothing is forced that the operation does not need. The container and the key
-are; the element read is the answer, so it is forced as any answer is, and its
-neighbours are not; a fallback is evaluated only when it is used; and the value
-a change stores stays a thunk. `[1 / 0, 7].[1]` is `7`.
+Nothing is forced that the operation does not need. The container and key
+are; the element read is the answer, and its neighbours are not; a fallback
+is evaluated only when it is used; and a stored value stays unevaluated.
+`[1 / 0, 7].[1]` is `7`.
 
-They are opcodes, not functions, and that is what makes reading a lazy field
-safe at any depth: see [runtime primitives](#runtime-primitives).
+### Members
+
+`m.name` reads the member `name` of a **module**, and nothing else. A name
+with a `!` is spelled with it (`console.print!`). `.name` is not field
+access: on a map it raises `:type_error`. Use `.[:name]` for a map's entry,
+or a record's accessor ([§10](#10-records-and-unions)).
 
 ---
 
 ## 5. Laziness and strictness
 
-Every argument, list element, map value and `let` binding starts as a **thunk**:
-a node index plus the frame to evaluate it in. Forcing a thunk overwrites it in
-place with an indirection to its result, so every holder sees the computed value
-and the work happens once.
-
-**The compiler decides where evaluation order is observable and says so in the
-bytecode.** The VM forces a node only when it is marked `STRICT`:
-
-- the statements of an **impure block**,
-- an **`if` condition**,
-- a **`try!` body**.
-
-Everything else stays suspended. A discarded *pure* statement is not evaluated
-at all, so it cannot raise an error the program never asked for.
+Every argument, list element, map value and `let` binding starts out
+**suspended**: a thunk that knows how to compute it. Forcing a thunk computes
+the value and overwrites the thunk with it, so the work happens once and
+everyone holding it sees the result.
 
 ```dream
-let ones = list.repeat 1;      // an infinite list
-list.take 5 ones               // fine: only five cells are ever built
+let ones = list.repeat 1;          // an infinite list
+list.take 3 ones                   // [1, 1, 1]
+
+let [a, b] = [1 / 0, 2];           // b is 2, and nothing ever divides by zero
 ```
 
-Sharing is preserved by returning the *binding's* thunk rather than a fresh
-wrapper, and the allocation is skipped entirely when a node is already a value
-(constants, variable references, closures).
+What is evaluated without being asked:
+
+- the statements of an **impure block**, in order;
+- the condition of an **`if`**, and the subject of a **`match`** as far as
+  its patterns look;
+- the body of a **`try!`**;
+- a **strict parameter**, when the function is entered.
+
+A pure statement whose value is not used is never evaluated, so it cannot
+raise an error the program never asked for.
+
+### `strict!`
+
+`strict! e` evaluates `e` **all the way down** (every element of every list,
+every value in every map) and answers it. Laziness has one sharp edge: an
+effect in a suspended position does not happen until something forces it.
+
+```dream
+// Each spawn! is suspended in the list, and runs only when join! reaches it.
+let ps = list.map (fn n -> spawn! $( work n )) jobs;
+
+// Every process has started before the first join!.
+let ps = strict! (list.map (fn n -> spawn! $( work n )) jobs);
+```
+
+`strict!` is impure by name, because forcing is when effects happen. Forcing
+something already forced costs nothing. It takes a block too:
+`strict! { let a = 2; [a, a * 2] }`.
+
+**`strict!` inside a value is itself suspended.** `[:ok, strict! x]` builds
+a list whose second element is a thunk of the force. To force `x` first, make
+it a statement: `strict! x` on its own line, then `[:ok, x]`.
 
 ### Strict parameters
 
-A parameter written `!name`, or `(strict name)`, is forced when the function is
-entered, before anything in its body runs, in the order the parameters are
-written. Everything else about the call is unchanged. The argument still
-arrives suspended, and it is the callee that forces it.
+A parameter written `!name`, or `(strict name)`, is forced when the function
+is entered, before its body runs:
 
 ```dream
-let rec sum_to !acc n = if n == 0 { acc } else { sum_to (acc + n * 2) (n - 1) };
-let total = list.fold (fn !acc x -> acc + x) 0 xs;
+let rec sum_to !acc n = if n == 0 { acc } else { sum_to (acc + n) (n - 1) };
+sum_to 0 1000000                   // 500000500000
+
+list.fold (fn !acc x -> acc + x) 0 xs
 ```
 
-It exists for the accumulator. Without it, `acc + n * 2` is suspended on each
-call, the suspension holds the previous one, and a million-step loop builds a
-million-link chain. It overflows the machine when the answer is finally looked
-at, and holds all of it in memory until then. With it, each call's `acc` is a
-value before the next suspension is made of it.
+This is the fix for an accumulator. Without the `!`, each call suspends
+`acc + n` with a reference to the previous suspension, and a million-step
+loop builds a million-link chain that overflows when it is finally read. A
+strict parameter is forced even when the body never uses it, so
+`let ignores !x y = y` raises if `x` does.
 
-A strict parameter is forced even when the body never uses it, so
-`let ignores !x y = y` raises if `x` does. That is the point of writing one.
-Only a name can be strict. The `!` goes in front and means something different
-from the `!` at the end of an impure name. `(strict)` on its own is still a
-parameter named `strict`. A `fold` whose lambda has a strict parameter is not
-fused (see `dreams/fuse.dr`), because the fused loop inlines the body and would
-drop the force.
-
-For the JIT, a strict parameter is forced on every path by construction, which
-is exactly what admission asks (below). Marking a loop's parameters strict is
-the way to get it compiled.
-
-### Wrappers
-
-A global whose body is one application of its own parameters -- `let tail xs =
-_list_tail xs`, `let kind t = t.[0]` -- is a **wrapper**, and a
-saturated call of one is compiled as the call it stands for. A wrapper named
-as a value rather than called is its builtin, when it passes its parameters
-on unchanged and in order: `list.map char.of_code cs` hands `list.map` the
-primitive itself. The frame that
-disappears bound nothing but the arguments the inner call was going to be
-given, and every argument stays the same thunk in the same place, so nothing is
-evaluated that was not before and nothing twice.
-
-A body that is one `get` or `set` of the parameters is a wrapper under the same
-rule — `let map_get m k d = m.[k else d]` — and a saturated call of it compiles
-to the operation itself.
-
-The conditions are narrow on purpose: one application, every parameter passed
-on exactly once, and literals for the rest. A call that is not saturated is
-left alone, which is what keeps a variadic host function honest -- a variadic
-native means "everything at this call site".
-
-### What this means for the JIT
-
-The JIT compiles only the strict numeric spine — arithmetic, comparisons,
-branches, self tail recursion. That limit is a soundness requirement: compiled
-code evaluates a self tail call's arguments eagerly, and doing that to an
-argument the callee would never have forced turns a terminating program into one
-that raises. A **strictness analysis** runs first, and a function is compiled
-only if every parameter is provably forced on every path:
+The compiler warns about the plainest case, a parameter that is only ever
+handed on to the function's own recursive call, grown by `+`, `-` or `*`:
 
 ```
-strict(Local i)      = {i}
-strict(If c, t, e)   = strict(c) ∪ (strict(t) ∩ strict(e))
-strict(a `binop` b)  = strict(a) ∪ strict(b)
-strict(a && b)       = strict(a)          -- b is conditional
+warning: `acc` is an accumulator nothing forces: each call of `count` hands it on suspended, and the chain overflows when it is read
+    = make it strict with `!acc`, so each call forces it as it starts
 ```
 
-Functions that do not qualify stay interpreted, where laziness is explicit and
-free.
+A strict parameter is also how a loop gets compiled by the JIT
+([§18](#18-writing-code-that-runs-fast)).
 
 ---
 
 ## 6. Purity
 
-**A name ending in `!` denotes an impure value, and a pure function may not
-reach one.**
+**A name ending in `!` is impure, and a pure function may not reach one.**
 
-```
-error: cannot use the impure member `print!` inside the pure function `greet`
- --> greet.dr:2:5
-  |
-2 |     console.print! name
-  |     ^^^^^^^^^^^^^^
-  = note: mark the function impure by ending its name with `!`, e.g. `let f! x = ..`
+```dream
+import std.console;
+let greet name = console.print! name;
 ```
 
-This is checked during lowering, and it is what makes `pure_fn` and `impure_fn`
-genuinely distinct object types rather than a naming convention. It is also what
-lets the compiler decide where evaluation order matters: statements in an impure
-block are sequenced, everything else stays lazy.
+```
+greet.dr:2:18: error: cannot use the impure function `console.print!` inside the pure function `greet`
+    = mark the function impure by ending its name with `!`, e.g. `let f! x = ..`
+```
 
-Because every process operation ends in `!` (`spawn!`, `join!`, `send!`,
-`recv!`, `self!`), **starting or addressing a process is an effect** and the
-purity rule already keeps concurrency out of pure functions. The same holds for
-`raise!` and for `try!`.
+What counts as impure is spelled with a `!`: printing and IO, `spawn!`,
+`send!`, `recv!`, `join!`, `self!`, `raise!`, `try!`, `strict!`, and every
+function a program names with one. The rule holds across imports, and
+through `import m.{f!}` as through `m.f!`.
+
+Purity is what makes laziness safe to reason about. A pure expression can be
+computed late, early, once or not at all, and nothing observable changes.
+Statements in an impure block run in order, because an impure block is where
+order is visible.
+
+A pure function can still fail: `1 / 0` raises wherever it is forced. What it
+cannot do is *choose* to raise or catch. A pure function that can fail
+answers a result value ([`let?`](#let-errors-as-values)).
 
 ---
 
-## 7. Declarations
+## 7. Bindings and patterns
 
 ### `let`
 
 ```dream
 let name = expr;                    // a value
 let f a b = expr;                   // a function, curried
-let rec loop n = ...;               // may refer to itself
-let impure! x = ...;                // impure, by the trailing `!`
-let [a, b] = pair;                  // the names a pattern binds -- see §12
-let area %{ :w => w, :h => h } = w * h;   // a parameter may be a pattern too
+let rec loop n = ..;                // may refer to itself
+let effect! x = ..;                 // impure, by the `!`
+let [a, b] = pair;                  // destructuring
+let area %{ :w => w, :h => h } = w * h;    // a parameter may be a pattern
+priv let helper x = ..;             // not visible outside this module
 ```
 
-`let` appears both at top level (as an item) and inside a block (as a
-statement), and the two differ in one way:
+**At the top level, every `let` is a global, and globals are mutually
+visible**: they may refer to each other in any order, so mutual recursion
+needs nothing special, and `rec` is optional (the standard library writes it
+anyway, as documentation).
 
-- **Top-level `let`s are mutually visible.** Every one is a global, so they can
-  refer to each other and to themselves in any order, and `rec` is optional.
-- **A block-local `let` is in scope only for the statements after it.** A local
-  that refers to itself needs `rec`, or the name is not yet bound:
+```dream
+let even n = if n == 0 { true } else { odd (n - 1) };
+let odd n = if n == 0 { false } else { even (n - 1) };
+```
 
-  ```
-  error: cannot find `go` in this scope
-   --> f.dr:3:39
-    |
-  3 |     let go n = if n <= 0 { 0 } else { go (n - 1) };
-    |                                       ^^
-  ```
+**In a block, a `let` is in scope only after it**, so one that refers to
+itself needs `rec`:
 
-Writing `rec` at top level is still worth doing where it documents intent; the
-standard library does.
+```
+error: cannot find `go` in this scope
+```
+
+A `let` may carry a signature ([§9](#signatures)).
+
+### Patterns
+
+| Pattern | Matches |
+|---|---|
+| `_` | anything, binding nothing |
+| `x` | anything, binding it to `x` |
+| `1`, `-1`, `1.5`, `'c'`, `"s"`, `:atom`, `true`, `()` | that literal, by `==` |
+| `[]` | the empty list |
+| `[a, b, c]` | a list of exactly three elements |
+| `[x, ..rest]`, `x :: rest` | a non-empty list; `rest` is the tail |
+| `[x, ..]` | a non-empty list, ignoring the tail |
+| `#[a, b]`, `#[a, ..rest]` | an array of exactly two elements, or at least one |
+| `%{ :k => p }` | a map with the key `:k` whose value matches `p`; other keys are ignored |
+| `p as name` | `p`, also binding the whole value to `name` |
+| `(p)` | `p`: parentheses only group |
+
+Patterns nest, and a name may be bound once per pattern. `::` groups to the
+right and binds tighter than `as`: `h :: t as whole` names the whole list,
+and `h :: (t as rest)` names the tail. A map pattern's key is an expression.
+
+A `match` arm may have a **guard**: `pattern if condition => body`. The guard
+runs only after the pattern matched, and can use what it bound.
+
+**A pattern forces only what it needs to decide.** `_` and a name force
+nothing. Any other pattern forces the value to its outermost constructor,
+and a nested pattern does the same along the path it inspects: `[x, ..rest]`
+forces the first cell but neither `x` nor `rest`, which is what lets a
+`match` walk a list that is still being produced.
+
+A `match` with no arm that matches raises: `try!` sees an error of kind
+`:error` whose payload is the atom `:match_error`. Make a `match` total with a
+final `_` arm, or, on a declared union, by covering every variant
+([§10](#unions)).
+
+### Destructuring
+
+A `let`, a parameter and a lambda's parameter take the patterns an arm takes,
+and bind the names in them:
+
+```dream
+let [first, ..rest] = xs;
+let %{ :x => x, :y => y } = point;
+let [a, b] as pair = line;
+let add [a, b] = a + b;
+let f ([x, ..] as whole) n = ..;          // an `as` goes in parentheses
+list.map (fn [k, v] -> k * v) pairs
+```
+
+It is as lazy as any `let`. Nothing is checked where it is written. The first
+time one of its names is used, the whole pattern is checked against the
+value, once, and a value that does not fit raises the `:match_error` above. A
+destructuring none of whose names is used never looks at its value.
+
+A literal in a destructuring pattern is a compile error, because a `let` has
+no other arm to fall through to:
+
+```
+error: `:ok` could fail to match, and a `let` has no other arm to try
+    = use `match`, with an arm for whatever else the value can be
+```
+
+So is a pattern that binds no name (`let [_, _] = p`) and one with no shape
+to take apart (`let (x as y) = v`).
+
+### `let?`: errors as values
+
+A pure function that can fail answers `[:ok, value]` or `[:error, reason]`.
+A chain of such steps is written with `let?`:
+
+```dream
+let number s = if s == "x" { [:error, "not a number"] } else { [:ok, 2] };
+
+let ratio a b = {
+    let? x = number a;          // [:ok, x] binds x and goes on;
+    let? y = number b;          // anything else is the block's answer
+    [:ok, x + y]
+};
+
+ratio "a" "b"                   // [:ok, 4]
+ratio "x" "b"                   // [:error, "not a number"]
+```
+
+`let? p = e; rest` means exactly
+
+```dream
+match e { [:ok, v] => { let p = v; rest }, other => other }
+```
+
+so `p` may be a pattern, and every value that is not `[:ok, _]` is passed on
+unchanged, as `std.result` and `macros.with_ok` pass it. `let?` binds one
+value with no parameters, `rec` or signature, and must be followed by the
+statements it guards.
+
+---
+
+## 8. Errors
+
+An error is a value with a **kind** (an atom) and a **payload** (anything).
+
+```dream
+raise! "something went wrong"              // kind :error, payload "something went wrong"
+raise! (error.new :my_kind detail)         // a kind of your own (std.error)
+
+try! { 12 / 0 } catch e { 0 }              // 0
+```
+
+`raise!` raises any value. An error value is raised as it is, and anything
+else is raised as an error of kind `:error` with that value as its payload.
+`try! { body } catch name { handler }` evaluates the body strictly, so the
+error surfaces at the `try!` and not wherever the value would later have been
+forced. The `catch` and its name are required. An error renders as
+`<error :kind payload>`, and `std.error` reads one (`error.kind`,
+`error.payload`) and makes one (`error.new`, `error.raise_as!`).
+
+Both are impure. Code that must stay pure reports failure with result values
+and `let?` ([§7](#let-errors-as-values)).
+
+Kinds the runtime raises:
+
+| Kind | Raised by |
+|---|---|
+| `:divide_by_zero` | integer `/` or `%` by zero |
+| `:type_error` | an operation given a kind it does not take; `types.check` |
+| `:not_a_function` | applying something that is not a function |
+| `:no_such_key` | `m.[k]` where the map has no `k` |
+| `:out_of_bounds` | a position past either end of a list or array |
+| `:no_such_member` | a member a module does not have, found only at run time |
+| `:loop` | a value whose computation needs itself |
+| `:stack_overflow`, `:out_of_memory` | a process past its limits (below) |
+| `:not_found`, `:permission_denied`, `:io_error`, ... | IO; [builtins.md](builtins.md#runtime-error-atoms) has the list |
+
+A failed `match` and a failed destructuring raise `:match_error`, which
+arrives with kind `:error` and payload `:match_error`.
+
+### Runaway processes
+
+The runtime bounds what one process may use, and raises **in that process**
+rather than failing the whole program:
+
+| Limit | Default | Raises | Set with |
+|---|---|---|---|
+| pending continuations | 4,194,304 | `:stack_overflow` | `DREAM_MAX_DEPTH` |
+| value stack entries | 4,194,304 | `:stack_overflow` | `DREAM_MAX_STACK` |
+| heap bytes per process | 1 GiB | `:out_of_memory` | `DREAM_MAX_HEAP` |
+
+These are ordinary errors: `try!` catches them, `join!` delivers them, and
+other processes carry on. A tail call uses no stack, so a loop never comes
+near the first limit. Runaway *non-tail* recursion does, and the usual cause
+is the precedence rule:
+
+```dream
+let rec f n = f n - 1;      // (f n) - 1: the subtraction waits on every call
+let rec f n = f (n - 1);    // what was meant
+```
+
+---
+
+## 9. Types
+
+Types in Dream are optional, and come in two layers that use one notation:
+
+- A **description** is an ordinary value describing a set of values, which a
+  program checks against when and where it chooses (`std.types`).
+- A **signature** says what a name is, and the compiler checks the program
+  against it. Code that no signature touches is never rejected.
+
+Nothing is inferred into a value and nothing is coerced. A type changes how
+a value is checked, never how it is represented.
+
+### `type`
+
+```dream
+type Port      = :integer where fn n -> n >= 1 && n <= 65535;
+type Ints      = [:integer];
+type Pair a    = [a, a];
+type Outcome v = [:ok, v] | [:error, :string];
+```
+
+`type Name params = description` is a `let` whose value is the description,
+named, so a type follows `let`'s rules for imports, `priv`, currying and
+local scope. A type name must be pure.
+
+### The type grammar
+
+The right side of a `type`, a signature, and a record field's annotation are
+read in a grammar of their own. It is the only place a bracket means a type;
+everywhere else `[:integer]` is still the list holding one atom.
+
+| Written | Means |
+|---|---|
+| `:integer`, `:string`, `:pure_fn`, ... | a primitive: an atom `type_of` answers ([§3](#3-values)) |
+| `:any`, `:never` | everything (without forcing it), and nothing |
+| `:ok`, `"fast"`, `3`, `'c'`, `true`, `()` | a literal: that value and no other |
+| `Name`, `mod.Name`, `Name arg` | a named type, and a parameterised one applied |
+| `a`, `b`, ... | in a signature, a lowercase name nothing defines is a type variable |
+| `a -> b` | a function; right-associative |
+| `a \| b` | either |
+| `[t]` | a list of `t`, of any length |
+| `[a, b, ...]` | a list of exactly those, in order, which is why `[:ok, v]` reads as itself |
+| `#[t]`, `#[a, b]` | the same two, for an array |
+| `%{k => v}` | a map, when the key names a kind: `%{:string => :integer}` |
+| `%{:host => t, ...}` | a record, when the keys are literals; the named keys must be present |
+| `t where predicate` | `t`, and the predicate (an ordinary expression) answers `true` |
+| `( t )` | grouping |
+
+In a field annotation, put a space between the `:` and the type
+(`x : :integer`), because `:integer` is itself one token.
+
+### Checking against a description
+
+```dream
+import std.types;
+
+type Step = :integer -> :integer;
+
+types.accepts Port 80            // true
+types.accepts Port 0             // false
+types.check Port 70000           // raises :type_error carrying `Port`
+types.enforce Step f             // f, checking each argument and answer
+```
+
+The type grammar is only read after `type`, a signature's `:` and a field's
+`:`, so a description used in an expression is named first, as `Step` is
+here.
+
+`types.check T v` answers `v` or raises. A check forces only what membership
+needs: a list type walks the spine, `[:any]` leaves the elements alone, and
+a union stops at its first match. `std.types` also builds descriptions at
+run time (`list_of`, `one_of`, `record`, `refine`, `enum`, `range`, ...),
+producing the same data the grammar does.
+
+### Signatures
+
+```dream
+let add : :integer -> :integer -> :integer;     // a signature on its own..
+let add x y = x + y;                             // ..and its definition
+
+let limit : :integer = 10;                       // a value and its type
+let greet who : :string = "hi " + who;           // what a function answers
+
+let first : [a] -> a;                            // `a` is a type variable
+```
+
+The type written after a function's parameters is what it *answers*, so
+`greet` is `:any -> :string`. A signature on its own must be followed by a
+`let` of the same name in the same module or block. Signatures work in
+blocks as well as at the top level.
+
+At compile time, the checker holds:
+
+- the definition to its signature: the body, each branch of an `if`, each
+  arm of a `match`, and each use of a parameter;
+- every use of a signed name: each argument to its parameter, and the number
+  of arguments to the number of arrows;
+- the standard library's own signatures, so `list.map 5 xs` is an error in a
+  program that annotated nothing;
+- every `match` on a declared union, for a variant it does not handle
+  ([§10](#unions)).
+
+```
+error: argument 2 of `add` should be `:integer`, but this is `"two"`
+error: `add` takes 2 arguments, but it is given 3
+error: `n` should be `:string`, but this is `:integer`
+```
+
+A lambda passed where a function type is expected takes its parameter types
+from it, so in `list.map (fn w -> w * 2) words` with `words : [:string]`, the
+checker knows `w` is a string and says `*` wants a number. A generic
+function's type variables are solved from each call.
+
+**Optional means optional.** A name with no signature is `:any`, which fits
+everywhere. An operator given the wrong kinds is reported only when a
+declared type is involved: `1 + "x"` compiles and raises when it runs (inside
+a `try!`, that may be the point), while `s + 1` with `s : :string` is an error.
+A refinement is checked as its base type, since its predicate can only run
+on a value. There is no run-time check of a signed function's arguments.
+`types.enforce` is that, where it is wanted.
+
+**Narrowing.** The checker follows what a test proves. After an unguarded
+`() => ..` arm, or in the branch where `x != ()`, `x` is not `()`; after
+`type_of x == :string`, `x` is a string; comparing `x` (or `x.[0]`, or
+`x.[:kind]`) with an atom narrows `x` to the variants that could carry it.
+Inside a `match` arm, the subject is only what the pattern could match.
+
+```dream
+let find : :string -> :integer | :unit;
+
+let next s = match find s { () => 0, n => n + 1 };          // fine: `n` is :integer
+let twice s = { let r = find s; if r != () { r * 2 } else { 0 } };
+let bad s = find s + 1;                                      // error: `:integer | :unit` and `1`
+```
+
+### Compile-time contracts
+
+Where the compiler already *has* a value, it runs the predicates of the
+refinements that value must satisfy:
+
+```dream
+type Port = :integer where fn n -> n >= 1 && n <= 65535;
+let connect : Port -> :string;
+
+connect 8080             // fine
+connect 70000            // error
+```
+
+```
+error: argument 1 of `connect` should be `Port`, but `70000` is not: a `where` it has to satisfy answered `false` at compile time
+```
+
+A value is known when it is a literal (including lists, arrays and maps of
+literals), a local bound to one, or the result of `comp`. The predicate runs
+on the VM against the program being built, the same function `types.check`
+would apply at run time. This is what makes a signature a compile-time API:
+`std.sql`'s `Statement` is `:string where` a SQL lint passes, so
+`sql.query! db "SELEC 1"` is refused in every program that writes it.
+
+Contracts run only in a build (`-o`), not in `--check`, and only when the
+program has no other type errors. A refinement written inline in a signature
+is not run; name the type. They add nothing to the image.
+
+### What a signature costs
+
+Nothing at run time. A signature over integers or floats is passed to the JIT
+as a hint (it favours the integer fast paths, or unboxed doubles), and
+otherwise leaves the image exactly as it was.
+
+---
+
+## 10. Records and unions
 
 ### `group`, `struct` and `mapping`
 
-Records declare a namespace of generated functions. `group` uses a list;
-`struct` uses an array (a fixed-size positional tuple); `mapping` uses a map
-whose keys are atoms named after the fields.
+A record declaration makes a module of functions over an ordinary
+collection: `group` over a list, `struct` over an array, `mapping` over a map
+keyed by atoms named after the fields.
 
 ```dream
-group Point { x, y }
-struct Vector { x, y }
-mapping Position { x, y }
-
-let p = Point.make 3 4;       // [3, 4]
-let x = Point.x p;            // 3
-let q = Point.set_y 9 p;      // [3, 9]; p is still [3, 4]
-let v = Vector.make 3 4;      // #[3, 4]
-let m = Position.make 3 4;    // %{ :x => 3, :y => 4 }
-let n = Position.set_y 9 m;   // %{ :x => 3, :y => 9 }; m is unchanged
-let r = p |> Point.set_x 1 |> Point.set_y 2;   // [1, 2]
-```
-
-For each field `f`, the compiler generates `f record` and
-`set_f value record`. `make` takes the fields in declaration order. Helpers
-are ordinary curried functions, and fields retain normal collection laziness.
-
-The record comes last for the reason `list.map f xs` takes its list last: the
-pipe feeds the left side in as the last argument, and a setter applied to its
-value alone is a function from record to record. So `p |> P.set_x 1` reads in
-the order it happens, a chain of them is a chain of pipes, and `P.set_x 1` can
-be handed to `list.map` as it stands. A member that takes more than the
-receiver is best written the same way, `self` last, for the same reason.
-An empty declaration has a `make ()` constructor. Duplicate fields and names
-that collide with `make`, `new` or another generated helper are rejected.
-
-Entries are separated by `,`, or by a line break where no comma is written —
-the same rule a block uses for `;`. An entry may run over as many lines as it
-is indented past.
-
-**Defaults.** `f = e` gives a field a default: what reading it answers when
-the collection has nothing at that key or position. The default is the `else`
-of the read the accessor compiles to, so it costs nothing where it is not used
-and is lazy where it is. A default may not name anything — it is compiled
-inside the module the declaration becomes, which cannot see the one it is
-written in.
-
-**`new`.** Arity is fixed, so a default does not make `make`'s parameter
-optional. `new` is the constructor that takes only the fields *without*
-defaults, in declaration order, and fills the rest in:
-
-```dream
-mapping Config { host, retries = 3 }
-
-let a = Config.make "h" 9;    // %{ :host => "h", :retries => 9 }
-let b = Config.new "h";       // %{ :host => "h", :retries => 3 }
-let c = Config.retries %{};   // 3 -- the accessor's fallback
-```
-
-`new` writes the default into the collection rather than leaving the slot
-empty, so `Config.new "h" == Config.make "h" 3`. It is generated for every
-record; one with no defaults gets two names for the same constructor.
-
-**Members.** An entry with parameters is a function rather than a field:
-
-```dream
+group Point { x, y = 0 }
+struct Vec { x, y }
 mapping Person {
     name
     greeting = "Hi"
     say_hi self = greeting self + " " + name self
-    louder self = say_hi self + "!"
 }
 
-let p = Person.new "Ada";
-let s = Person.say_hi p;      // "Hi Ada"
+Point.make 1 2                    // [1, 2]
+Point.new 1                       // [1, 0]: the fields without defaults
+Point.y [1]                       // 0: the default, where the collection has nothing
+Point.set_x 9 (Point.make 1 2)    // [9, 2]
+Vec.make 1 2                      // #[1, 2]
+Person.new "Ada"                  // %{:greeting => "Hi", :name => "Ada"}
+Person.say_hi (Person.new "Ada")  // "Hi Ada"
+Point.make 1 2 |> Point.set_x 5 |> Point.set_y 6      // [5, 6]
 ```
 
-Having parameters is the whole of what tells a member from a field — `x = 0`
-has none and is a field, `f self = 0` has one and is a member. A member
-occupies no slot in the collection, `make` and `new` do not take it, and it
-has no setter. Its body is compiled *inside* the generated module, so it may
-name the accessors, the setters, the constructors and the other members
-without importing anything; it may not name anything from the module the
-declaration was written in, which is the ordinary rule for a nested `mod`.
+For each field `f`, the module has `f record` and `set_f value record`. The
+record comes last, as `list.map f xs` takes its list last, so setters chain
+with `|>` and `Point.set_x 1` is a function from record to record. `make`
+takes every field in order. `new` takes only the fields without a default,
+and writes the defaults in.
 
-The receiver is an ordinary parameter with no special standing: `self` above
-is a name the author picked, and the language does not know it. A member may
-be impure (`f! self = ..`); a field may not, because reading one is pure.
+- **Entries** are separated by `,` or by a line break, and an entry may run
+  over as many lines as it is indented past.
+- **A default** (`y = 0`) is what reading the field answers when the
+  collection has nothing there. It is compiled inside the record's module,
+  so it may not name anything from the enclosing one.
+- **A member** is an entry with parameters (`say_hi self = ..`): an ordinary
+  function compiled inside the record's module, where the accessors,
+  setters and other members are in scope without an import. Having
+  parameters is the whole of what tells a member from a field. `self` is
+  just a name. A member may be impure; a field may not.
+- **A field annotation** (`x : :integer`) contributes to `Point.type`, a
+  description of the record, and gives the generated functions signatures
+  that the checker uses.
 
-These declarations add no runtime type or tag: indexing, equality, `type_of`,
-and list/array/map patterns work exactly as for the underlying collection.
-Mapping getters read the corresponding atom key; setters insert or replace
-that key, preserving any other entries in the map.
-Records can appear wherever module declarations can, including `mod` and
-`when` blocks, and their helper namespaces can be imported. `group`,
-`struct` and `mapping` are contextual declaration keywords; existing local
-bindings with those names continue to work.
+A record adds no tag or runtime type. Its values are the list, array or map,
+and indexing, equality, patterns and `type_of` see exactly that. A record
+can be declared wherever a module item can, including in `mod` and `when`.
 
-### `union` — discriminated unions
+### Unions
 
-A union is a value that is exactly one of its variants, and which one is
+A union is a value that is exactly one of its variants, with the variant
 written on the value:
 
 ```dream
@@ -932,7 +1017,7 @@ union Shape {
     empty
 
     area self = match self {
-        [:circle, r]  => 3.14 * r * r,
+        [:circle, r]  => 3.0 * r * r,
         [:rect, w, h] => w * h,
         :empty        => 0.0,
     }
@@ -940,1041 +1025,367 @@ union Shape {
 
 union Option a { some(value : a), none }
 
-let s = Shape.circle 2.0;        // [:circle, 2.0]
-let e = Shape.empty;             // :empty
-Shape.area s                     // 12.56
+Shape.circle 1.0                 // [:circle, 1.0]
+Shape.empty                      // :empty
+Shape.area (Shape.rect 2.0 3.0)  // 6.0
 types.check Shape s              // the union's name is its description
 ```
 
-A variant with fields is the list `[:tag, field, ..]`; one without is the
-atom `:tag`. That is the representation Dream code already uses by hand —
-`[:ok, value] | [:error, why]` — so a declared union describes the values
-existing code builds, and is taken apart with the patterns it already uses.
+A variant with fields is the list `[:tag, field, ...]`, and one without is the
+atom `:tag`. That is the representation Dream code already uses by hand, so
 `union Outcome v { ok(value : v), error(reason : :string) }` is exactly the
 shape of every result in the standard library.
 
-Entries are separated by `,` or a line break, as a record's are. A field's
-`: type` is optional (`:any` without one). An entry with parameters and a `=`
-is a member, compiled inside the union's module as a record's is. Parameters
-after the name make it generic, and a field may use them as types.
+The declaration makes a module `Shape` (a constructor per variant, the
+members, `Shape.type`, and a signature for each constructor) and a global
+`Shape` holding the description, so `Shape` is a type wherever a type is
+written. A field's type is optional. Parameters after the name make the
+union generic.
 
-The declaration becomes:
-
-- a module `Shape` holding one constructor per variant (`Shape.circle`,
-  `Shape.empty`), `Shape.type`, the members, and a signature for every
-  constructor — `circle : :float -> Shape`;
-- a global `Shape` in the enclosing module holding the description, so
-  `Shape` is a type wherever a type is written. `Shape.circle` still reaches
-  the module: a name in front of a dot is looked up as a module first.
-
-**A `match` on a declared union must handle every variant**, checked at compile
-time when the scrutinee's type is known to be that union:
+**A `match` on a declared union must handle every variant**, wherever the
+checker knows the subject's type is that union:
 
 ```
-error: this `match` on `Shape` does not handle `:empty`; add an arm for it,
-or `_ =>` to handle everything else
+error: this `match` on `Shape` does not handle `:empty`; add an arm for it, or `_ =>` to handle everything else
 ```
 
-A wildcard or a binder handles everything. An arm with a guard, or one that
-takes a field apart with a nested pattern, counts as handling its variant,
-since it might. A pattern also narrows: in `[:circle, r] => ..`, `r` is the
-radius's type, not the union of every variant's second field. So does an arm
-*above* it: after an unguarded `() => ..`, a later arm's binder is the rest
-of the union, and after `if x == ()` (or `!=`, under `not`, `&&` and `||`)
-`x` is known to be `()` in one branch and not to be in the other.
-`type_of x == :integer` narrows the same way, to the members of that kind or
-to the rest, and so does a `match` on `type_of x` whose arms are kinds. `x`
-may be a local, a global or a module's member (`m.x`); an impure name is never
-narrowed, since two reads of it are two answers.
+A wildcard or a bare name handles everything. An arm with a guard, or one
+that takes a field apart with a nested pattern, counts as handling its
+variant.
 
-A union's values and tags are tests too. `x == :pending` narrows `x` to that
-atom, and `x != :pending` to the rest -- which is how a `union` variant with no
-fields is told apart. A variant with fields is a tagged list, and its tag is
-read with `list.head x`, `x.[0]` or `x.[0 else ()]`; comparing that with an atom
-narrows `x` to the variants that could carry it, and a record's discriminating
-field, `x.[:kind]`, works the same way. A `match` on such a read narrows arm by
-arm, and inside any `match` arm the scrutinee is only what the pattern could
-match, so in `[:circle, _] => area x` the whole `x` is the circle. Only atoms,
-booleans and `()` narrow: `3 == 3.0` is true, and a `bigstr` equals the string
-of its bytes, so a number or a string says less about a type than it seems to.
+---
 
-```dream
-let find : :string -> :integer | :unit;
+## 11. Modules and packages
 
-let next s = match find s { () => 0, n => n + 1 };      // `n` is `:integer`
-let twice s = { let r = find s; if r != () { r * 2 } else { 0 } };
+### Modules
 
-let pick : :integer -> :integer | :string;
-let size n = { let v = pick n; if type_of v == :string { 0 } else { v + 1 } };
+**A module is a file.** `import a.b.c` finds `a/b/c.dr`, or `a/b/c/mod.dr`
+once the module has grown into a directory; importers do not change when it
+does. A module's top-level `let`s are its members, and `priv let` keeps one
+private:
 
-union Shape { circle(radius : :float), square(side : :float), empty }
-let radius : [:circle, :float] -> :float;
-let r s = if s != :empty && s.[0] == :circle { radius s } else { 0.0 };
+```
+error: member `m.hidden` is private
 ```
 
-### `foreign` — a C library
-
-```dream
-foreign sqlite from "libsqlite3.so.0" {
-    resource Db = sqlite3_close
-    resource Stmt = sqlite3_finalize
-    struct Point { x : :i32, y : :double }
-
-    open! : :cstr -> out Db -> :int = sqlite3_open
-    prepare! : Db -> :cstr -> :int -> out Stmt -> :ptr -> :int = sqlite3_prepare_v2
-    errmsg : Db -> :cstr = sqlite3_errmsg
-    libversion : :void -> :cstr = sqlite3_libversion
-}
-
-let [status, db] = sqlite.open! "notes.db";
-```
-
-declares a C library and what the program calls in it. Each function is
-written as its C signature, in the type grammar, and bound to a name; `= sym`
-gives the C name when it is not the Dream name without its `!`. The words a
-C signature is written in:
-
-| Written | In C | On this side |
-|---|---|---|
-| `:int`, `:long`, `:size`, `:i32`, `:u8`, .. | that number | `:integer` |
-| `:f32`, `:f64`, `:double` | that float | `:float` |
-| `:cstr` | `const char *` | `:string` |
-| `:void -> t` | a function of no arguments | `:unit -> t` |
-| a `resource` `R` | `R *` passed in | the handle type `R` |
-| `R` as a result | `R *` handed over, freed by `R`'s destructor | `R` |
-| `borrow R` | `R *` C keeps | `R` |
-| `out t` | `t *` C writes through | leaves the arguments, joins the result: `[result, out, ..]` |
-| `taken free` | a `char *` the caller frees with `free` | `:string` |
-| `(a -> b)` | a function pointer | a pure Dream function |
-| a `struct` `P` | `P *` | `foreign.Buffer` |
-| `t \| ()` | a result that may be `NULL` | `t \| :unit` |
-
-There is no `:float`, because in Dream that is a double and a signature is
-exactly where the two would be confused.
-
-The declaration becomes a module `sqlite` holding `library`, a type for each
-resource (`sqlite.Db`), a module for each struct (`sqlite.Point.new!`,
-`.read!`, `.write!`, `.offset`, `.size`, `.layout`), and each function, bound
-through `std.ffi` and **signed with its type on this side** — so a `Stmt`
-where a `Db` is wanted is a compile error. A name with `!` is bound as an
-effect; one without is a pure function, which only the program can know a C
-function is. A C type that means nothing (`Nope`, `:float`, `out` as a result)
-is reported where it was written.
-
-The library is `from "path"`, `from embedded "name"` (a payload: `dreams
---payload NAME=FILE`), `from (expression)`, or nothing for the running program.
-`foreign` is contextual: it is still the name every program gives
-`std.foreign`. [ffi.md](ffi.md) is the guide.
-
-### `import`
-
-```dream
-import std.console;                 // binds `console`
-import std.list as l;               // binds `l`
-import std.list.{map, filter};      // binds the members, unqualified
-import std;                         // the whole package, as `std.list.map`
-```
-
-The alias defaults to the last path segment. All four forms, and what a package
-namespace can and cannot be used for, are in
-[§8](#8-modules-and-packages).
-
-### `mod`
+`mod` writes a module inside another, holding what a file holds, and nests:
 
 ```dream
 mod util {
     let helper x = x + 1;
+    mod deep { let answer = 42; }
 }
+
+util.helper 1          // 2
+util.deep.answer       // 42
 ```
 
-A module written inside another, reached as `util.helper`. It holds the same
-items a file does and nests freely; see [§8](#8-modules-and-packages).
+Inside module `m`, `mod util { .. }` *is* the module `m.util`, which `m`
+imports, so a submodule and a file are the same thing to everything after
+the parser. A module does not re-export what it imports. An import is
+resolved relative to the current module first, so `import util.{helper}` in
+a module that declares `mod util` means that submodule.
 
-### `virtual` and `derive`
-
-A **virtual** declares a hole in a module; a module that `derive`s it fills the
-hole. A default body makes filling it optional.
+### `import`
 
 ```dream
-// shape.dr  -- in the package `shapes`
-virtual let area s;                       // must be filled
-virtual let name s = "shape";             // may be overridden
-let describe s = name s + " of area " + to_string (area s);
-
-// circle.dr
-derive shapes.shape;
-let area r = 3.14159 * r * r;
-let name r = "circle";
+import std.console;                   // binds `console`
+import std.list as l;                 // binds `l`
+import std.list.{map, sum as total};  // binds members, unqualified, renaming as it goes
+import std;                           // a package: `std.list.map`
 ```
 
-`shapes.circle.describe 2.0` is then `"circle of area 12.56636"`.
+A member import resolves exactly as `path.name` would, purity included. A
+member the module does not export is an error that lists what it does
+export. A package import binds a namespace, not a value: `std.list.map` can
+be passed around, but `std` and `std.list` alone cannot.
 
-A virtual needs at least one parameter — a parameterless virtual would be a
-constant, not a hole. Because Dream compiles whole programs, `derive`
-specializes the base module's *syntax tree* against the deriving module's
-implementations, so there is no run-time dispatch.
+### Packages
 
-These modules are Dream's **behaviors**: explicit contracts and reusable
-implementations over dynamically typed values. Each implementation must be
-public and declare exactly as many parameters as its virtual declaration,
-including when overriding a default. A function alias must spell out those
-parameters (`let area self = other.area self`). Parameter names may differ;
-parameter and return types are not checked. The `!` suffix is part of the
-contract's name, and ordinary purity checking applies to method bodies.
-
-Records implement a behavior with `derive` between the name and body:
-
-```dream
-mod shape {
-    virtual let area self;
-    virtual let name self = "shape";
-    let describe self = name self + " of area " + to_string (area self);
-}
-
-struct Rectangle derive shape {
-    width
-    height
-    area self = width self * height self
-    name self = "rectangle"
-}
-
-Rectangle.describe (Rectangle.make 3 4)   // "rectangle of area 12"
-```
-
-The same syntax works for `group` and `mapping`. Generated helpers can satisfy
-requirements too: `mapping Measured derive shape { area }` implements `area`
-through its field accessor and inherits the default `name`. Derived paths
-resolve just as they do inside an ordinary module, including sibling modules
-and modules in other files. Missing methods, wrong arities, and private
-implementations are compile errors even if no caller uses them.
-
-A module or record derives one base module. Calls name the implementing
-namespace (`Rectangle.area value`); values keep their ordinary collection
-representation. For generic callers, pass operations as ordinary function
-arguments. This mechanism does not add automatic dispatch on a value's type.
-
-### `when` — conditional compilation
-
-```dream
-when test {
-    import std.vm;
-    let verbose = true;
-}
-
-when os == "linux" && not release {
-    let trace! msg = console.error! "[trace] " msg;
-}
-
-when release  let verbose = false;        // single item, no braces
-```
-
-The condition vocabulary is deliberately the language's own — `&&`, `||`, `not`,
-parentheses, `true`, `false`, a bare flag, or `setting == "value"`. A `when` is
-resolved **before anything is loaded**, so an import inside a false branch is
-never even followed, and a module that only test builds need is never read.
-`when` may contain any item, including another `when`.
-
-A **flag** is either defined or not; a **setting** has a value. A setting that
-has a value also counts as defined, so `when os { .. }` is true and
-`when nonsense { .. }` is false.
-
-| Setting | Known without being told |
-|---------|--------------------------|
-| `os` | `"linux"`, `"macos"`, … |
-| `arch` | `"x86_64"`, `"aarch64"`, … |
-| `family` | `"unix"`, `"windows"` |
-| `dream_version` | the compiler's version |
-
-Everything else comes from `-D name`, `-D name=value`, `--test` (defines
-`test`), `--release` (defines `release`), and `--debug-cfg` (defines `debug`).
-`dreams --print-cfg` prints the lot.
-
-A package's **options** are settings scoped to it. `-D sqlite:vendored` and
-`-D sqlite:threads=off` set them for the modules of the package `sqlite`
-(named by its own name or by the key it was listed under) and for nobody
-else. Inside `sqlite`, `when vendored` reads its own option first and the
-program's settings only when it has no option of that name. An option whose
-value is `false` is off, which is how a `bool` option says no, so it shadows a
-program-wide `vendored` rather than falling through to it. Any module may read
-another package's option by its dotted name, `when sqlite.threads == "off"`,
-and a dotted name nobody set is off. A `-D KEY:..` whose key names no package
-is an error. `mind` passes every declared option of every package this way,
-defaults included, from `[options]` and `[config.KEY]` ([build](build.md)).
-
----
-
-## 8. Modules and packages
-
-**A module is one file** — or a `mod` block inside one. `import a.b.c` resolves
-to `a/b/c.dr`, or to `a/b/c/mod.dr` if the module has grown into a directory —
-importers do not change when it does. The only module extension is `.dr`.
-
-### `mod` — a module written inside another
-
-```dream
-mod math {
-    let square x = x * x;
-    let cube x = x * square x;
-
-    mod deep {
-        let answer = 42;
-    }
-}
-
-let main! = { math.square 5 };        // 25
-                                      // math.deep.answer is 42
-```
-
-A `mod` body holds exactly what a file holds: `let`, `import`, `derive`,
-`virtual`, `when`, and further `mod`s. That is not a coincidence — the loader
-registers `mod util { .. }` inside module `m` as the module **`m.util`** and
-leaves `m` importing it, so from that point on a submodule and a file are the
-same thing to every later pass. Purity, `derive` and member lookup need no
-special case.
-
-Two consequences worth knowing:
-
-- **A submodule does not re-export what it imports.** `mod text { import
-  std.list; .. }` gives you `text`'s own members, not `text.list`. A module's
-  aliases hold its imports as well as its declarations, so only a module
-  actually named `text.<name>` counts as a submodule. (A *host* module is the
-  exception, because it is a value as well as a namespace.)
-- **An import resolves relative to the current module first,** so
-  `import util.{ helper };` inside a module declaring `mod util { .. }` means
-  that submodule rather than some file called `util.dr`.
-
-**A package is a named group of modules,** marked by a `mind.toml` at its root
-(`dusk.toml` is also accepted). A package declares its own name, so `import
-std.list` means "the module `list` in the package called `std`", wherever that
-package happens to sit on disk.
+**A package is a directory of modules with a name**, given by a `mind.toml`
+at its root:
 
 ```toml
 [package]
-name = "std"
+name = "textstats"
 version = "0.1.0"
 src = "."
 
 [dependencies]
-other = { path = "../other" }
-json  = "../vendor/dream-json"
+util = "../util"
 ```
 
-`name` is required; `version` defaults to `0.0.0` and `src` to a `src`
-directory when there is one and the manifest's own directory otherwise. The
-compiler follows path dependencies (`{ path = .. }`, or a bare string); `mind`
-also fetches git and tarball dependencies and hands them over with `-L`.
+`import textstats.report` means the module `report` in the package called
+`textstats`, wherever that package is. A package's own modules are also
+reachable from inside it unqualified (`import report`). `src` defaults to a
+`src` directory when there is one. A directory with no manifest can still be
+a package, named by the key that lists it.
 
-**A dependency's key is a name it can be imported by.** `json = ..` above makes
-`import json.parse` work whatever the package at that path calls itself: the key
-is recorded as a second name for the same package, and a module's identity is
-still its file, so reaching it through either name is reaching one module. A
-dependency directory with **no manifest** is a package too, named by its key.
-On the command line, `-L NAME=DIR` says the same thing.
+The compiler is told where packages are with `-L DIR` (a package, or a
+directory of packages) and `-L NAME=DIR` (the package at `DIR`, imported as
+`NAME`), and follows path dependencies itself. [`mind`](../mind/tool/README.md)
+does the rest: fetching, versions, build scripts and options.
 
-A project is itself a package, so its own modules are reachable both as
-`mypkg.util` and, from inside, as plain `util`. Dropping a manifest into a
-directory is the whole ceremony.
-
-Dream **compiles whole programs**: every reachable module is parsed and lowered
-into a single image, which is what makes a cross-module call resolve to a global
-index at compile time rather than a name lookup at run time. A module path with
-no file behind it is assumed to be host-provided; those are listed explicitly
-(see [§13](#13-the-standard-library)) so a typo in an import is an error rather
-than a mystery at run time.
-
-### The three forms of `import`
-
-```dream
-import std.list;                      // binds `list`
-import std.list as l;                 // binds `l`
-import std.list.{map, filter};        // binds `map` and `filter`, unqualified
-import std.list.{sum as total};       // ..renaming as it goes
-import std;                           // the whole package: `std.list.map`
-```
-
-**`import path.{ a, b }`** binds members rather than the module. Each name
-resolves exactly as `path.a` would, so the two spellings can never disagree —
-including about purity, which is why `import std.console.{print!};` still keeps
-`print!` out of a pure function. A name that the module does not export is an
-error naming what it does export, and a name that collides with a `let` in the
-importing module is an error too rather than the `let` quietly winning.
-
-**`import <package>;`** names a package rather than a module and brings in
-every module the package provides, reached through it:
-
-```dream
-import std;
-
-let main! = { std.list.map (fn x -> x * 2) [1, 2, 3] };
-```
-
-The package name is a **namespace, not a value**: `std` and `std.list` are
-compile-time names, and only `std.list.map` is something you can pass around.
-Mentioning either on its own is an error that says so.
-
-`-L DIR` adds a package search root; `dreams FILE --packages` and
-`dreams FILE --modules` report what a program pulls in.
-
-An **embedder's own host module** is declared with `--host-module PATH`, which
-is what lets `import host;` compile against a module registered through
-`dream_vm_register_module` ([§15](#15-embedding)). It is deliberately not a
-wildcard — naming the module is what keeps a typo in an import a compile error
-rather than a mystery at run time.
+**Compilation is whole-program.** Every module a program reaches is compiled
+into one image, so a call across modules is resolved when the program is
+compiled, not by name at run time. A module that no file provides is an error,
+except for the VM's native modules (`std.io`, `std.os`, ...) and modules an
+embedder declares with `--host-module NAME`.
 
 ---
 
-## 9. Processes
+## 12. Behaviours: `virtual` and `derive`
 
-A **process** is the unit of concurrency, of failure, and of garbage collection.
-Processes share no memory: `send!` deep-copies the message, so nothing one
-process does to a value can be seen by another.
+A `virtual` declares a hole in a module, and a module that `derive`s it fills
+the hole. Everything else in the base module is written in terms of its
+holes, and the deriving module gets all of it.
 
-| Operation | Meaning |
-|-----------|---------|
-| `spawn! $( .. )` | run a suspended computation in a new process; returns it |
+```dream
+mod shape {
+    virtual let area self;                       // must be filled
+    virtual let name self = "shape";             // has a default
+    let describe self = name self + " of area " + to_string (area self);
+}
+
+struct Rect derive shape {
+    w
+    h
+    area self = w self * h self
+    name self = "rect"
+}
+
+Rect.describe (Rect.make 3 4)                    // "rect of area 12"
+```
+
+A file derives with `derive path;` as an item, and a record with `derive path`
+between its name and its body. Because Dream compiles whole programs,
+`derive` specializes the base module's **syntax** against each deriving
+module, so `Rect.describe` is ordinary code with `Rect.area` called directly:
+no dispatch and no table. `std.seq` is the library's own example. It declares
+`fold`, and `std.array` and `std.str` get `sum`, `count`, `any`, `contains`
+and the rest by deriving it.
+
+- A virtual needs at least one parameter.
+- An implementation must be public and take as many parameters as the
+  virtual. Names may differ; the `!` may not.
+- A record's field accessor can satisfy a virtual:
+  `mapping Measured derive shape { area }`.
+- A module derives one base. Missing implementations and wrong arities are
+  compile errors, whether or not anything calls them.
+
+### Dispatch: `virtual dyn` and `derive dyn`
+
+A function written once against a behaviour, for values of any record that
+implements it, needs the value to say which implementation it has. That is
+opt-in on both sides:
+
+```dream
+mod solid {
+    virtual dyn let volume self;
+    virtual dyn let label self = "solid";
+    let report self = label self + ": " + to_string (volume self);
+}
+
+struct Cube derive dyn solid { edge, volume self = edge self * edge self * edge self }
+mapping Slab derive dyn solid { w, d, h, volume self = w self * d self * h self }
+
+list.map solid.report [Cube.make 3, Slab.make 2 3 4]    // ["solid: 27", "solid: 24"]
+```
+
+- **`virtual dyn let`** declares a virtual that, *called through the module
+  that declares it*, dispatches on its **last** argument (by convention, a
+  member's `self`). A deriving module still gets its own specialized copy.
+- **`derive dyn path`** in a record header makes the record's values carry a
+  table of their implementations in slot 0: the first element of a list or
+  array, or key `0` of a map. The generated functions account for it, and a
+  pattern over the raw collection sees it.
+
+A value with no table gets the virtual's default, or an error for a hole. A
+dispatched call costs a few reductions more than a direct one, and code that
+asks for no `dyn` compiles exactly as before.
+
+---
+
+## 13. Processes
+
+A **process** is the unit of concurrency, of failure, and of garbage
+collection. Processes share no memory: a message is copied into the
+receiver's heap, so nothing one process does to a value can be seen by
+another.
+
+| | |
+|---|---|
+| `spawn! $( e )` | run `e` in a new process; answers the process |
 | `send! p v` | copy `v` into `p`'s mailbox |
-| `recv! ()` | take the next message, parking until one arrives |
+| `recv! ()` | the next message, waiting until one arrives |
 | `self! ()` | the current process |
-| `join! p` | wait for `p` and take its result; a failure arrives as an error |
+| `join! p` | wait for `p` to finish and answer its result; a failure arrives as its error |
 
 ```dream
 let worker! () = {
     let msg = recv! ();
-    msg |> console.print! "got: "
+    [:got, msg]
 };
 
 let main! = {
     let w = spawn! $( worker! () );
     send! w :hello
-    join! w
+    console.print! (join! w)          // [:got, :hello]
 };
 ```
 
-**Isolation buys three things:** collection never stops the world and never takes
-a lock; thunk update needs no atomics, because only one process can force a
-thunk; and one process failing cannot corrupt another. The cost is that a thunk
-shared between two processes is evaluated twice — for a language with both
-concurrency and laziness, isolation is the better trade.
+Processes are cheap (a heap and two small stacks) and preemptively scheduled
+across a pool of threads, so one that loops cannot starve the others, and
+waiting on a message, a socket or a child process parks the process rather
+than the thread. A process that fails and that nobody joins is reported when
+the program ends. When every process is waiting on a message that cannot
+arrive, the runtime says so rather than hanging.
 
-**Scheduling** is per-worker run queues with work stealing. A process runs for a
-fixed number of reductions and then goes back on a queue, whatever it is in the
-middle of — including inside a JIT-compiled loop, which writes its loop-carried
-values back to the frame and exits to the interpreter. When every worker is idle
-and processes remain, they are all parked on messages that cannot arrive, and
-the runtime says so rather than hanging.
+Isolation is what makes the rest simple: collection is per process and never
+stops the world, a thunk can be updated without locks because only one
+process can force it, and one process failing cannot corrupt another. The
+cost is that a value shared by copying is computed in each process that
+forces it.
 
-A process that fails and that nobody joins is reported at shutdown. One that a
-joiner is waiting for is that joiner's business, and is not reported twice.
-
----
-
-## 10. Errors
-
-An `error` is a value: a **kind** (an atom) and a **payload**.
-
-```dream
-raise! "something went wrong"           // raise any value
-try! { 12 / 0 } catch e { 0 }           // catch it and supply a fallback
-```
-
-`try!` requires a `catch` with a binder — `try! { .. } catch e { .. }` — and the
-body is strict, so the error surfaces where the `try!` is rather than wherever
-the value later happens to be forced.
-
-Well-known kinds the runtime raises:
-
-| Kind | Raised by |
-|------|-----------|
-| `:divide_by_zero` | `/` or `%` with an integer zero on the right |
-| `:type_error` | an operation applied to a type it does not accept |
-| `:not_a_function` | applying arguments to something that is not callable |
-| `:no_such_member` | `mod.name` where the module has no such member |
-| `:out_of_bounds` | an array index outside the array |
-| `:loop` | a value that depends on itself |
-| `:stack_overflow` | recursion too deep — see **Runaway processes** below |
-| `:out_of_memory` | a process's heap grew past its limit |
-| `:killed`, `:timeout` | process failure |
-
-`:normal` and `:ok` are used as success markers. An error renders as
-`<error :kind message>`.
-
-Both `raise!` and `try!` are impure, so error handling is an effect and stays
-out of pure functions.
-
-### Runaway processes
-
-A process is the unit of failure, and that has to hold even when the failure is
-running out of memory. So the runtime bounds what one process may use, and
-**raises in the process that exceeded the bound** rather than letting the
-allocator throw and lose the whole system:
-
-| Limit | Default | Raises | Set with |
-|-------|---------|--------|----------|
-| pending continuations | 4,194,304 | `:stack_overflow` | `DREAM_MAX_DEPTH` |
-| value stack entries | 4,194,304 | `:stack_overflow` | `DREAM_MAX_STACK` |
-| heap bytes per process | 1 GiB | `:out_of_memory` | `DREAM_MAX_HEAP` |
-
-These are ordinary errors: `try!` catches them, `join!` delivers them, and every
-other process carries on.
-
-A tail call pops its continuation, so a loop runs in constant space and never
-approaches the first limit. What does is runaway **non-tail** recursion — and
-the usual cause is the precedence rule in [§4](#4-expressions):
-
-```dream
-let rec f n = f n - 1;      // `(f n) - 1` -- the subtraction is always pending
-let rec f n = f (n - 1);    // what was meant
-```
-
-The first leaves a continuation on every call and never returns. It now fails
-with `:stack_overflow` naming the depth, instead of exhausting memory.
+The shapes built on these (servers that hold state, supervisors, registries,
+the same server over a socket) are in the standard library:
+`std.server`, `std.supervisor`, `std.registry`, `std.remote`. See
+[`examples/14_servers.dr`](../examples/14_servers.dr) and after.
 
 ---
 
-## 11. Compile-time evaluation
+## 14. Compile time: `comp`, `when` and macros
+
+### `comp` and `comp!`
 
 ```dream
-let squares = comp build 5;                    // evaluated by the compiler
-let digits  = comp! str.chars "12345";    // evaluated by running it on the VM
+let squares = comp list.map (fn n -> n * n) (list.range 1 5);    // [1, 4, 9, 16]
+let built_on = comp! os.platform ();                              // :linux
 ```
 
-`comp e` evaluates `e` at compile time and bakes the result into the image.
-`comp! e` is the same but may perform effects, so it is evaluated by running it
-on a real VM rather than by the compiler's own evaluator — the compiler embeds
-the VM through the C API described in [§15](#15-embedding) and reads the value
-back.
+`comp e` evaluates `e` while compiling and puts the value in the image.
+`comp! e` may perform effects. Both run on a VM embedded in the compiler. A
+`comp` binds like a prefix operator over an application, so `comp f x` folds
+the whole call and `comp (1 + 2) * 10` is `30`. The result must be data: a
+value holding a closure cannot be put in an image. A `comp` is typed by the
+value it produced, and one that fails is reported where it is written.
 
-`comp` binds tighter than any operator but looser than application, so
-`comp f x` folds the whole call and `comp (1 + 2) * 10` is `30`.
+### `when`
 
-Pure runtime primitives are available to `comp`; effects require `comp!`.
+```dream
+when test {
+    import std.test;
+    let tests = [ .. ];
+}
 
-A `comp` is typed by the value it produced: `let n : :string = comp (1 + 2)` is
-a compile error, and a global with no signature whose body is a `comp` has that
-value's type at every use. A value that has to satisfy a refinement is checked
-against it at compile time — see "Compile-time contracts" in §3. A `comp` that
-fails to evaluate is reported at the `comp`.
+when os == "linux" && not release {
+    let trace! msg = console.error! msg;
+}
 
-### Syntax macros
+when release let verbose = false;        // a single item needs no braces
+```
 
-`macro` defines a Dream function over unevaluated syntax. `expand` invokes it
-at compile time and replaces the call with its returned expression tree,
-before runtime names and effects are checked.
+`when` includes items only if its condition holds. It is resolved **before
+anything is loaded**, so an import inside a false `when` is never followed.
+The condition is written with `&&`, `||`, `not`, parentheses, `true`,
+`false`, a bare flag, and `setting == "value"`.
+
+A **flag** is defined or not, and a **setting** has a value (and also counts
+as defined). The compiler sets `os` (`"linux"`, `"macos"`, `"windows"`) and
+`family` (`"unix"`, `"windows"`). Everything else comes from the command
+line: `-D name`, `-D name=value`, `--test` (defines `test`), `--release`
+(`release`), `--debug-cfg` (`debug`). `dreams --print-cfg` prints what is
+set.
+
+A package's **options** are settings scoped to that package. `-D
+sqlite:threads=off` sets one; inside `sqlite`, `when threads == "off"` reads
+it, and anywhere else `when sqlite.threads == "off"` does. `mind` passes
+every package's options this way ([mind's README](../mind/tool/README.md#options-and-profiles)).
+
+### Macros
+
+A macro is a function over syntax, run while compiling:
 
 ```dream
 macro twice e = [:binary, :add, e, e, [0, 0]];
-macro discard e = [:int, 42, [0, 0]];
 
-let double n = expand twice n;
-let answer = expand discard nonexistent_name;  // 42; the argument is discarded
+macro swap e = match e {
+    [:list, [a, b], span] => [:list, [b, a], span],
+    other => other,
+};
+
+let doubled n = expand twice n;          // n + n
+expand swap [1, 2]                       // [2, 1]
 ```
 
-Arguments are AST values, using the tagged-list forms in
-[`dreams/ast.dr`](../dreams/ast.dr). For example, `x + 1` arrives as
-`[:binary, :add, [:name, "x", span], [:int, 1, span], span]`.
-Each node ends in a `[start, end]` span. A transformer can use normal Dream
-functions, imports, recursion, and `match` to inspect and construct trees.
-The compiler validates the returned tree and assigns fresh occurrence spans;
-diagnostics in generated expressions point back to the expansion call.
+`expand name args` calls the macro with its arguments **unevaluated**, as
+syntax, and replaces the call with the syntax it answers. Syntax is ordinary
+Dream data: tagged lists whose last element is a source span, in the forms
+[`dreams/ast.dr`](../dreams/ast.dr) defines. `x + 1` arrives as
+`[:binary, :add, [:name, "x", span], [:int, 1, span], span]`. A transformer
+uses ordinary functions, imports and `match` to read and build it.
 
-`expand` takes a macro name (including a qualified or selectively imported
-name) and exactly its declared number of syntax arguments. It has the same
-precedence as `comp`: `expand twice x + 1` expands `twice x`, then adds one.
-Use parentheses to pass an entire operator expression. A parameterless macro
-is invoked as `expand name`.
+- `expand` takes a macro name (qualified or imported) and exactly as many
+  arguments as the macro has parameters. It binds like `comp`:
+  `expand twice x + 1` is `(expand twice x) + 1`.
+- Expansion is outside-in. Arguments are not expanded first, and what a macro
+  answers is expanded again, to a depth of 64.
+- A macro answering `[:error, "message"]` reports that message at the call.
+- Macros are not hygienic. Names in the answer resolve where the macro is
+  called, and the imports generated code needs must be in the caller.
+- Expansion runs on the embedded VM, as `comp!` does, and ordinary purity
+  rules apply to the transformer.
 
-Expansion is outside-in. Arguments are not expanded before the transformer
-receives them; returned syntax is expanded recursively, with a maximum nesting
-of 64 macro calls. A transformer may call another transformer as an ordinary
-function on syntax values. Helpers used during macro evaluation cannot demand
-an expression whose own `expand` has not yet been processed.
-
-This initial interface manipulates raw, **unhygienic** syntax: names in the
-result resolve at the call site, and introduced bindings can capture names.
-There is no implicit quoting, interpolation, or automatic renaming. Imports
-needed by generated code must already be declared in the caller. A macro's
-function is also available as an ordinary function on AST data; only `expand`
-passes unevaluated arguments and inserts returned syntax into the program.
-
-A transformer can return `[:error, "message"]` to reject its arguments with a
-compile-time diagnostic at the expansion site. This lets libraries report an
-invalid syntax shape without raising an exception.
-
-Macro execution uses the embedded VM, as `comp!` does. Ordinary purity rules
-apply to transformer bodies; effects need the usual `!` spelling or `comp!`.
-Unrelated `comp!` expressions are not evaluated while running a transformer.
+`std.macros` has the standard ones (`when_true`, `cond`, `coalesce`,
+`with_ok`, `clamp`, `attempt`, ...), and `std.sql`'s `expand sql.query
+"SELECT .. {name}"` is a macro that checks SQL while compiling. See
+[`examples/11_standard_macros.dr`](../examples/11_standard_macros.dr).
 
 ---
 
-## 12. Pattern matching
-
-`match` is implemented and is used throughout the compiler itself, and `let`
-and parameter lists take its patterns apart the same way.
-
-### Syntax
+## 15. C libraries: `foreign`
 
 ```dream
-match expr {
-    pattern => expr,
-    pattern if guard => expr,
-    _ => expr,
+foreign libc from "libc.so.6" {
+    strlen : :cstr -> :size
+    getpid! : :void -> :int
 }
+
+libc.strlen "hello"            // 5
+libc.getpid! ()                // the process id
 ```
 
-`=>` is already the map separator, and `{ }` already delimits every other
-control form, so `match` introduces no new punctuation. Arms are separated by
-commas; a trailing comma is allowed. Arms are tried **in source order** and the
-first that matches wins.
+`foreign` declares a C library and the functions a program calls in it. Each
+line is a C signature in the type grammar, bound to a name, with `= symbol`
+when the C name is not the Dream name without its `!`. A name with `!` is
+bound as an effect, and one without as a pure function, which only the
+program can know a C function is. Each function is signed with its type on
+the Dream side, so passing a `Stmt` where a `Db` is wanted is a compile error.
 
-### Patterns
+| Written | In C | In Dream |
+|---|---|---|
+| `:int`, `:long`, `:size`, `:i32`, `:u8`, ... | that integer | `:integer` |
+| `:f32`, `:f64`, `:double` | that float | `:float` |
+| `:cstr` | `const char *` | `:string` |
+| `:void -> t` | no arguments | `:unit -> t` |
+| `resource R = destructor` | an opaque pointer, freed by `destructor` | a handle of type `R` |
+| `borrow R` | a pointer C keeps | `R` |
+| `out t` | a `t *` C writes through | joins the result: `[result, out, ..]` |
+| `struct P { x : :i32, .. }` | a C struct | `P.new!`, `.read!`, `.write!`, ... |
+| `(a -> b)` | a function pointer | a pure Dream function |
+| `t \| ()` | a result that may be `NULL` | `t \| :unit` |
 
-| Pattern | Matches |
-|---------|---------|
-| `_` | anything, binding nothing |
-| `x` | anything, binding it to `x` |
-| `1`, `1.5`, `'c'`, `true`, `"s"`, `:atom`, `()` | that literal, by the same equality `==` uses |
-| `[]` | the empty list |
-| `[a, b, c]` | a list of exactly three elements |
-| `[x, ..rest]`, `x :: rest` | a non-empty list; `rest` is the tail |
-| `a :: b :: []` | exactly two elements; cons patterns associate right |
-| `#[a, b]` | an array of exactly two elements |
-| `#[a, ..rest]` | an array of at least one element |
-| `%{ :k => v }` | a map containing key `:k`; other keys ignored |
-| `p as name` | `p`, also binding the whole value to `name` |
-| `(p)` | `p`; parentheses only group |
-
-Patterns nest. A name may be bound at most once per arm. `::` binds tighter
-than `as`: `head :: tail as whole` aliases the whole list, while
-`head :: (tail as rest)` aliases its tail. Either side may be another pattern;
-matching `head :: tail` does not force either part. Parenthesized cons patterns
-also work in destructuring lets and parameters.
-
-```dream
-let rec sum xs = match xs {
-    []          => 0,
-    [x, ..rest] => x + sum rest,
-};
-
-let classify v = match v {
-    0                => :zero,
-    n if n < 0       => :negative,
-    n                => :positive,
-};
-
-let route msg = match msg {
-    %{ :kind => :get, :path => p }  => handle_get p,
-    %{ :kind => :post } as m        => handle_post m,
-    other                           => reject other,
-};
-```
-
-### Forcing — the part that matters in a lazy language
-
-**A pattern forces exactly as much of the scrutinee as it needs to decide.**
-
-- `_` and a bare binder force nothing.
-- Every other pattern forces the scrutinee to weak head normal form.
-- A nested pattern forces its sub-position to WHNF, recursively, and only along
-  the path it is inspecting: `[x, ..rest]` forces the first cell but neither
-  `x` nor `rest`.
-- A guard is evaluated strictly, but only after its arm's pattern has matched.
-
-Arms are tried in order, so an earlier arm's forcing is observable by a later
-one. This is the same bargain `if` already makes with its condition.
-
-### Interaction with the rest of the language
-
-- **Purity.** `match` is pure. The scrutinee, guards and arm bodies follow the
-  ordinary rule: impure only inside an impure context.
-- **Strictness analysis.** `strict(Match s, arms) = strict(s) ∪ ⋂ strict(armᵢ)` —
-  the same shape as `If`, which is what lets a `match`-written loop stay
-  JIT-eligible.
-- **Exhaustiveness.** Dream is dynamically typed, so exhaustiveness cannot be
-  checked in general. A `match` with no arm that matches raises `:match_error`
-  carrying the unmatched value. A `_` arm is therefore the way to be total.
-
-### Destructuring `let` and parameters
-
-A `let` and a parameter take the patterns an arm takes, and bind the names in
-them:
-
-```dream
-let [first, ..rest] = xs;
-let %{ :x => x, :y => y } = point;
-let [a, b] as pair = line;
-
-let add [a, b] = a + b;                   // a parameter
-let area %{ :w => w, :h => h } = w * h;
-let f ([x, ..] as whole, n) = ...;        // an `as` goes in the parenthesised list
-list.map (fn [k, v] -> k * v) pairs       // and a lambda's parameters too
-```
-
-**It is as lazy as any `let`.** Nothing is forced where the destructuring is
-written. The first time a name it binds is used, the *whole* pattern is checked
-against the value -- forcing what a `match` arm would, the cells of a list but
-not its elements -- and a value that does not fit raises `:match_error`. The
-check runs once however many of the names are used, and a destructuring none of
-whose names is used never looks at its value:
-
-```dream
-let [x, y] = [1 / 0, 2];      // y is 2; x is never read, so nothing divides
-let [only] = [1, 2];          // compiles; using `only` raises :match_error
-```
-
-A value with effects is still bound where it is written, as a plain `let`'s is.
-At the top level each name is a global of its own, and a module that `derive`s
-may override any one of them like any other global.
-
-Three patterns are compile errors, because none could mean what it looks like:
-
-- **A literal anywhere in it** -- `let [:ok, v] = r` -- since a `let` has no
-  other arm to fall through to. A pattern that asks a question is a `match`.
-- **No shape to take apart** -- `let (x as y) = v` -- since that only names the
-  value, which a name already does.
-- **No names bound** -- `let [_, _] = pair` -- since the check waits for a name
-  to be used, and would never happen.
-
-A shape that does not fit, `let [a, b] = [1]`, is not one of them: Dream is
-dynamically typed, so that is found out when a name is used.
-
-### How it is compiled
-
-An arm is a decision chain of test-and-bind nodes, and the tests are ordinary
-primitives -- `_match_is_cons`, `_match_head`, `_match_tail`, `_match_at`,
-`_match_key`. They are named that way on purpose: a builtin beats an imported
-name, so calling one of them `head` would quietly shadow
-`import std.list.{head}` in every module that had both, and the underscore
-marks a name no program is meant to write (see Runtime primitives).
-
-The tests force exactly as far as the pattern looks. `[x, ..rest]` forces the
-cell to know whether it is one, and does not force `x`; that is what lets a
-`match`-written loop walk a list that is still being produced.
-
-Bindings become frame slots exactly as parameters do, so scope resolution and
-the purity check needed no changes for `match`, and the image format needed
-none either: the arms lower to existing node kinds plus opcodes **appended** to
-the table, because an opcode's position is its identity and inserting one would
-invalidate every image already built.
-
-A destructuring is that same test with the value itself as the only arm's body.
-One slot holds the value, as a plain `let`'s would; a second holds it
-*checked* -- `if test { value } else { raise! :match_error }`, bound lazily --
-and each name is bound, lazily too, to its part of the second, read with the
-same builtins. Reading any name forces the checked slot first, which is how the
-check happens once and before anything is read. At the top level the checked
-value is a hidden global instead, which being forced once and remembered gives
-the same property; it is named after its pattern, as `<let [a b]>`, which no
-source can write. A pattern parameter's argument is already in its slot, so it
-takes only the second.
+A pointer C hands back is **owned** by the process that made the call, and is
+freed when it is released or the process ends. The library is
+`from "path"`, `from embedded "name"` (a payload carried in the image), or
+`from (expression)`. [ffi.md](ffi.md) is the guide.
 
 ---
 
-## 13. The standard library
+## 16. Tests
 
-Two layers. **Native modules** are C++ in the VM and are listed explicitly by
-both the compiler ([`dreams/modules.dr`](../dreams/modules.dr)) and the VM's
-registry, with a test proving the two agree. **Dream modules** live in
-[`mind/std/`](../mind/std) and are compiled like any other package.
-
-### Builtins
-
-Resolved directly, without an import, unless shadowed by a binding:
-
-| | |
-|-|-|
-| `spawn!` | thunk → process |
-| `join!` | process → value |
-| `send!` | process → value → unit |
-| `recv!` | unit → value |
-| `self!` | unit → process |
-| `raise!` | value → never |
-| `type_of` | value → atom |
-| `to_string` | value → string |
-| `len` | list \| array \| map \| string → integer |
-| `strict!` | value → the same value, evaluated all the way down |
-
-### `std.macros` — syntax conveniences
-
-Import `std.macros` and call its macros with `expand`. The module name is
-spelled `macros`. All transformers are pure; any effects in the code they
-produce are checked in the caller. Generated code needs no additional imports.
-
-```dream
-import std.macros;
-
-let bounded n = expand macros.clamp n 0 100;
-let port config = expand macros.coalesce config.[:port else ()] 8080;
-let doubled result = expand macros.with_ok value result [:ok, value * 2];
-```
-
-| Macro arguments | Result |
-|---|---|
-| `when_true condition body` | `body` when true, otherwise `()` |
-| `unless condition body` | `body` when false, otherwise `()` |
-| `and_all [conditions...]` | Short-circuit conjunction; empty list gives `true` |
-| `or_any [conditions...]` | Short-circuit disjunction; empty list gives `false` |
-| `cond [[condition, body], ...] fallback` | First true branch, otherwise the fallback |
-| `coalesce value fallback` | Fallback only for `()`; false, zero and empty collections stay intact |
-| `if_some name value body absent` | Bind a present value in `body`; evaluate `absent` for `()` |
-| `with_some name value body` | As `if_some`, with `()` for the absent branch |
-| `with_ok name result body` | Bind an `[:ok, value]` payload in `body`; pass non-ok results through |
-| `pipe value [stages...]` | Ordinary `\|>` stages, left to right; an empty list returns the value |
-| `update collection key transform` | Apply the function to one entry and return an updated collection |
-| `between value lower upper` | Inclusive range check |
-| `clamp value lower upper` | Clamp to inclusive bounds, assuming `lower <= upper` |
-| `assert condition message` | Return `()` or raise the message; requires an impure context |
-| `attempt expression` | Deeply evaluate inside `try!`, returning `[:ok, value]` or `[:error, exception]`; requires an impure context |
-| `tap value observer` | Call the observer, force its result to weak head normal form, and return the shared value |
-
-Lists supplied to `and_all`, `or_any`, `cond`, and `pipe` must be literal
-syntax lists, so the transformer can generate the branches or stages at
-compile time. Their contents remain ordinary runtime expressions. Invalid
-list shapes and non-name binding arguments produce compile-time diagnostics.
-
-`with_ok` composes result-returning expressions; its body must supply any
-`[:ok, ...]` wrapper it wants. It does not perform an early return from the
-surrounding function. Bindings in `if_some`, `with_some`, and `with_ok` are
-visible only in the present/success branch, and shadow caller names there.
-
-Repeated inputs are shared: for example, `clamp` does not run an effectful
-value or bound twice, and `update` shares its collection and key. Unused
-branches remain lazy. `update` retains the laziness of the replacement in
-`.[key => value]`; a missing entry raises when the original entry is demanded.
-The macros introduce temporary names that cannot be written as ordinary
-source identifiers and avoid names already present in their argument trees.
-This avoids accidental capture by these helpers without adding general macro
-hygiene to the language. Generated builtin names follow normal caller lookup.
-
-`attempt` deliberately uses `strict!`: it catches errors in deferred list,
-array, and map contents before returning. Consequently it is unsuitable for
-infinite structures. It preserves the exception object, including its kind
-and payload. `tap` forces only enough of the observer result to ensure the
-call ran; it does not deeply force that result or parts of the original value
-the observer ignores. Effectful observers still require an impure context.
-
-See [`11_standard_macros.dr`](../examples/11_standard_macros.dr) for a runnable
-example.
-
-### Runtime primitives
-
-A runtime primitive is an operation the machine provides because Dream cannot
-write it -- `_list_cons`, `_str_slice`, `_data_at` and the rest. Each is
-spelled with a leading `_` and is `std`'s to call: `std` wraps it in a function
-a program calls instead (`list.cons`, `str.slice`, `payload.at`). A primitive
-named outside a `std` module still resolves, needing no import, and is warned
-about with the call to write in its place. The wrapper costs nothing: a
-saturated call of it compiles to the primitive (see Wrappers). The twelve
-language builtins -- `spawn!`, `join!`, `send!`, `recv!`, `self!`, `raise!`,
-`strict!`, `type_of`, `type_assert`, `to_string`, `len` and `compare` -- are
-not primitives and keep their names, as do the members of native modules.
-
-Container reads and updates use `xs.[0]`, `m.[key else default]`, and
-`m.[key => value]`; empty maps use `%{}` and lengths use `len`.
-
-Saturated primitive calls compile to opcodes. Functions that traverse lazy
-lists (`_str_of_chars`, `_str_of_bytes`, `_str_concat`, `_array_of_list`)
-remain builtins. Both forms preserve laziness, support partial application, and
-may be shadowed by local bindings. See [the builtin reference](builtins.md#runtime-primitives).
-Scalar type descriptions are exported by `std.types`.
-
-### `std.console`
-
-A Dream library over native byte I/O, providing output, checked formatting,
-interactive prompts, terminal-aware colors and configurable logging. The four
-basic functions take one value: `print!` and `line!` add a newline on stdout,
-`write!` omits it, and `error!` prints a line on stderr.
-
-```dream
-console.printf! "x = {}, y = {}" [x, y]
-console.styled! [:bold, :green] "done"
-let answer = console.confirm! "Continue?" false;
-```
-
-See [Console](console.md) for the complete API and EOF/error behavior.
-
-### `std.math`
-
-`sqrt` · `abs` · `floor`
-
-### `std.os`
-
-| | |
-|-|-|
-| `args! ()` | the arguments after the image on the command line |
-| `env! name` / `set_env! name value` | environment variables; `()` when unset |
-| `cwd! ()` / `chdir! path` | the working directory |
-| `list_dir! path` | the names in a directory, sorted, without `.` and `..` |
-| `exec! program args` | run a child to completion → `%{ :code, :out, :err, :timed_out }` |
-| `exec_for! program args ms` | the same, killing the child after `ms` |
-| `exec_in! dir program args ms` | the same, started in `dir`; `0` for no deadline |
-| `exec_with! dir env program args ms` | the same, with `NAME=value`s laid over the environment |
-| `exec_joined! dir env program args ms` | the same, with its errors written in among its output |
-| `replace! program args` | **become** `program`: this VM is gone and it takes over the process |
-| `monotonic! ()` | milliseconds from a fixed point, from a clock that never jumps |
-| `now! ()` | milliseconds since the Unix epoch, from the wall clock |
-| `pid! ()` · `platform ()` · `exit! code` | |
-
-`replace!` is `execvp`. `exec!` gives its child pipes and reads them to the end,
-which is right for a compiler and useless for anything that prompts, so a tool
-handing over to something interactive -- an editor, a shell, a REPL -- wants
-this instead: the child inherits the terminal because it inherits everything.
-
-`monotonic!` is for durations and `now!` is for stamps, and they are not
-interchangeable: the wall clock can jump, forwards or back. Timing anything in
-this language means forcing it first, because a stage that has not been forced
-has not run:
-
-```dream
-let value = stage ();          // builds a thunk; nothing has happened
-let before = os.monotonic! ();
-strict! value                  // this is where the work is
-let after = os.monotonic! ();
-```
-
-**`exec!` parks the process, not the worker.** Waiting for a child on a worker
-thread would block every process queued behind it, so the whole job — spawn,
-read both pipes, reap — goes to a helper thread, and the calling process parks
-through the same handshake `recv!` uses. Five children each sleeping a second
-finish in one second on a single worker.
-
-`exec_for!` matters for anything that runs other people's programs: a `git
-clone` against an unreachable host would otherwise wait for ever. A child that
-outlives the deadline is killed, and `timed_out` distinguishes that from an
-ordinary non-zero exit.
-
-### `std.vm` — the runtime describing itself
-
-`processes! ()` · `reductions! ()` · `collections! ()` · `heap_bytes! ()` ·
-`modules! ()` · `async_io ()`
-
-And, for when a program has stopped doing what it looked like it would:
-
-| | |
-|-|-|
-| `processes_info! ()` | every process: status, what it is waiting on, reductions, heap |
-| `process_info! p` | one of them |
-| `scheduler! ()` | workers, idle, runnable, queued, `io_waiters`, deadlocked |
-| `io! ()` | every open handle, and which process is parked on it |
-| `dump! ()` | all of the above, to stderr |
-
-`waiting_on` is the part worth having. A process parked on a message and one
-parked on a socket look identical from outside, and the difference is usually
-the whole answer. `DREAM_STUCK_SECONDS=n` prints the same report from the
-runtime when nothing has spent a reduction for that long — at which point no
-Dream code can run to ask on its own.
-
-### `std.ffi` and `std.foreign`
-
-`std.ffi` binds a C symbol to a signature, written as data, and answers an
-ordinary Dream function; a [`foreign` declaration](#foreign--a-c-library) is
-how a program writes one, and `std.foreign` is the rest of the library to wrap
-C against. A pointer C hands back is *owned*: it becomes a handle,
-`[:foreign, tag, id]`, and the process that made the call owns it until it
-says `release!` or ends. Releasing a handle releases what was made from it
-first. A library can also run as a server process that owns everything made
-through it, and `foreign.run! server (fn () -> ..)` is work done there. A
-library can be carried in the image with `dreams --payload NAME=FILE`.
-
-Every VM provides it: a VM built without libffi is not a valid VM, and the
-build refuses to make one. [ffi.md](ffi.md) is the guide, and
-[builtins.md](builtins.md#stdffi) the reference.
-
-### `std.tls`
-
-TLS on a socket, upgraded in place: `tls.connect! sock %{ :host => name }`
-and `tls.accept! sock %{ :identity => p12 }` answer the same handle, and
-`io.read!`, `io.write!` and `io.close!` on it then carry plaintext. Every VM
-provides it, through OpenSSL on Linux and macOS and SChannel on Windows, and
-the same program behaves the same on each. [builtins.md](builtins.md#stdtls)
-is the reference.
-
-### `mind/std` — the Dream-level library
-
-Anything that can be written in Dream is written in Dream.
-
-- **`std.list`** — the list library. Most of it works on lists that are never
-  fully built; functions that must see the whole list to answer (`length`,
-  `reverse`, `sort`) say so in their doc comment.
-- **`std.seq`** — the generic sequence layer, described below.
-- **`std.array`** — arrays. `derive`s `std.seq`, and adds `get`, `set`, `build`,
-  `slice`, `map`, `sort` and the rest of what is specific to a flat, finite,
-  constant-time-indexed sequence.
-- **`std.str`** — text. Also `derive`s `std.seq`, over **characters**, and adds
-  `split`, `trim`, `upper`, `find` and friends.
-- **`std.json`** — JSON, parsed and written. `parse` answers `[:ok, value]` or
-  `[:error, message]` rather than raising, so it stays usable from pure code.
-- **`std.toml`** — the subset of TOML a manifest uses: comments, `[section]` and
-  `[a.b]` headers, strings, numbers, booleans, arrays and inline tables. What is
-  missing — `[[array-of-tables]]`, multi-line strings, dates — is an error
-  naming the problem rather than a quietly wrong parse.
-- **`std.cli`** — command lines. An option is described once — a spelling, a
-  short form, whether it takes a value, and a line of help — and both the parser
-  and the usage message read that one description, so an option cannot be
-  parsed without being documented or documented without being parsed. Handles
-  `--name value`, `--name=value`, `-o value`, `-ovalue`, repeated options that
-  collect in order, and `--` to end the options.
-- **`std.test`** — the test framework. Each case runs in **its own process**, so
-  a case that raises or loops is isolated, and the failure reaches the runner as
-  an ordinary value through `join!` rather than having already unwound the
-  runner's stack.
-- **`std.all`** — imports every module, so that adding a module there is all it
-  takes for its tests to run, and a module that no longer compiles fails the
-  build rather than being quietly skipped.
-
-### `std.seq` — what `virtual` and `derive` are for
-
-`std.seq` is the standard library's own use of the feature in
-[§7](#virtual-and-derive). It declares **one hole**:
-
-```dream
-virtual let fold f init xs;
-virtual let name xs = "sequence";     // optional, has a default
-```
-
-and writes `length`, `is_empty`, `sum`, `product`, `count`, `any`, `all`,
-`contains`, `minimum`, `maximum`, `minimum_by`, `maximum_by`, `to_list`, `join`
-and `describe` in terms of it. A container becomes a full sequence by answering
-that one question:
-
-```dream
-// std/array.dr
-derive std.seq;
-let fold f init xs = { .. };          // a counted loop
-let name xs = "array";
-let length xs = len xs;               // override: an array knows its own size
-```
-
-```dream
-array.sum #[1, 2, 3]                  // 6      -- from std.seq
-str.count (fn c -> c == 'l') "hello"  // 2      -- from std.seq, over characters
-array.describe #[1, 2, 3]             // "array of 3"
-```
-
-Because Dream compiles whole programs, `derive` specializes `std.seq`'s syntax
-tree against each module's `fold`, so `array.sum` is ordinary code with the
-array loop inlined into it. **The generality costs nothing at run time** — there
-is no dispatch and no wrapper.
-
-Two things follow from having only `fold`, and the module says both out loud
-rather than leaving them to be discovered:
-
-- **Nothing in `std.seq` is lazy.** `fold` walks the whole container, so every
-  operation is strict and terminates only on a finite one. This is exactly why
-  `std.list` keeps its own implementations instead of deriving: `take 5 (from 1)`
-  has to work on an infinite list, and it cannot through a fold.
-- **`any` and `all` do not short-circuit.** A fold has no way to stop early, so
-  they fold the whole sequence either way.
-
-`std.str` also keeps **characters and bytes apart by name**: `length` and
-everything inherited from `std.seq` count characters, while `byte_length`,
-`slice` and `find` work in bytes, because the runtime's string primitives are
-byte-indexed. `length "héllo"` is `5` and `byte_length "héllo"` is `6`.
-
-### Writing tests
-
-A module opts into the test runner by defining a **parameterless `tests`
-binding**, conventionally inside a `when test { .. }` so it costs nothing in a
-normal build:
+A module's tests live in it, in a `when test` block, so they cost nothing in
+an ordinary build:
 
 ```dream
 when test {
@@ -1987,314 +1398,119 @@ when test {
 }
 ```
 
-`dreams FILE --test` then scans **the modules it actually loaded** for that
-binding and generates an entry point that runs each suite it found. There is no
-registry to keep in step, and no test that is silently never run; a program with
-no `tests` anywhere still compiles, and reports that there was nothing to run.
+`dreams FILE --test` defines `test`, finds the `tests` binding of every
+module the program loaded, and generates an entry point that runs them. Each
+case runs in a process of its own, so a case that raises or loops is
+isolated from the rest. The assertions (`test.eq!`, `test.ne!`,
+`test.true!`, `test.false!`, `test.near!`) raise on failure, which ends the
+case. `mind test` builds and runs every package's tests at once.
 
-Assertions — `test.eq!`, `test.ne!`, `test.true!`, `test.false!`, `test.near!` —
-raise on failure, which is what ends a case at its first failure and what the
-runner catches.
+---
+
+## 17. Running a program
+
+A program's entry point is the global `main!`. Its value is computed and then
+discarded. A program that ends normally exits with `0`; an error nothing
+caught is printed (`dream: uncaught error: <error :kind payload>`) and exits
+with `1`; `os.exit! n` ends the program at once with `n`. The command-line
+arguments after the image are `os.args! ()`.
 
 ```
-just test-std                       # the standard library's own suite
-dreams mind/std/all.dr --test -L mind -o t.dream && dream t.dream
+dreams -L mind main.dr -o main.dream      # compile (mind does this for a project)
+dream main.dream arg1 arg2                # run
+dream -e other! main.dream                # run another entry
+```
+
+[`dreams/README.md`](../dreams/README.md) is the compiler's command line,
+[`dream/README.md`](../dream/README.md) the VM's, and
+[`mind/tool/README.md`](../mind/tool/README.md) the build tool's. An image is
+portable bytecode and runs unchanged on Linux, macOS and Windows
+([platforms.md](platforms.md)). [bytecode-format.md](bytecode-format.md) is
+its format, and the VM's [C API](../dream/README.md#embedding) is how to
+run one from C.
+
+---
+
+## 18. Writing code that runs fast
+
+The runtime charges for a few things, and each rule here comes from a
+measurement ([notes/](notes/README.md) has them).
+
+**Pick the container by how it is read.** A list is cheap at the front and
+linear everywhere else: build with `::` or `list.cons` and reverse once, and
+never grow an accumulator with `xs + [x]`, which copies the list each time. An
+array reads any position in one step. A table searched more often than it is
+built wants to be a map; this is the most often repeated lesson in this
+codebase.
+
+**Let the machine walk.** A walk the runtime does in one operation (`len`,
+`.[n]`, `+` on lists, `str.span`, `str.find`) costs a fraction of the same
+walk written as a Dream recursion. `std` already uses them, so prefer its
+functions to hand-written loops.
+
+**Force accumulators.** A strict parameter (`!acc`) keeps an accumulator a
+value instead of a chain of suspensions. It is also what gets a loop
+compiled. The JIT compiles a function once it is hot, but only where it can
+prove that evaluating arguments early changes nothing, and a strict
+parameter is that proof. `std`'s folds (`list.fold_strict`, `list.sum`) are
+written this way.
+
+**Write pipelines.** A chain of `std.list` combinators over a range
+(`list.range 1 n |> list.map f |> list.filter p |> list.sum`) is compiled into
+one loop that builds no list at all ([deforestation](notes/deforestation.md)).
+
+**Force what you store.** A suspended value stored in a map holds everything
+its computation refers to, including older versions of the map it is stored
+in. Force values before storing them where they will live long.
+
+**A suspended value carries its frame.** A thunk given to `spawn!` is copied
+into the new process with everything it refers to. Build it in a small
+function that refers only to what the process needs.
+
+**Measure before believing.**
+
+```
+dreams --time FILE           # what each compiler stage cost
+dream --profile 20 IMG       # the hottest functions, by reductions
+dream --stats IMG            # reductions, collections, allocation, the JIT
 ```
 
 ---
 
-## 14. The toolchain
+## 19. Grammar summary
 
-### `dreams` — the compiler
-
-```
-dreams FILE [-o OUT.dream] [options]
-```
-
-| Flag | |
-|------|-|
-| `-o`, `--output PATH` | where to write the image |
-| `-I`, `--include DIR` | add a module search directory |
-| `-L`, `--package-path DIR` | add a package search root; `NAME=DIR` adds the package at `DIR`, importable as `NAME` |
-| `--host-module PATH` | a module the host registers at run time (repeatable) |
-| `-D`, `--define NAME[=VALUE]` | define a `when` flag; `KEY:NAME[=VALUE]` sets package `KEY`'s option |
-| `--target SPEC` | where the image may run: `os=NAME,arch=NAME` or bare names, repeatable; `any` records nothing ([platforms](platforms.md)) |
-| `--test` | define `test` and generate a runner (see below) |
-| `--release` / `--debug-cfg` | define `release` / `debug` |
-| `--print-cfg` | print the flags that are defined |
-| `--modules` / `--packages` | report what the program pulls in |
-| `--ir` | print the execution trees the program lowers to |
-| `--ast` / `--tokens` | print the syntax tree, or the tokens |
-| `--parse` | parse this file alone, following no imports |
-| `--symbols` / `--at LINE:COL` | what a file declares; what is at a position |
-| `--stats` / `--time` | count what a program contains; say what each stage cost |
-| `-i`, `--repl` | an interactive session |
-| `--shebang [LINE]` | prefix the image with a `#!` line and make it executable |
-| `--check`, `--no-emit` | check only: scope and purity, across the whole program |
-
-A file is compiled without being told where the standard library is: a root
-file's own directory, `$MINDV2_PATH`, and the nearest enclosing `mind`
-directory holding a `std` are searched without being named.
-
-### `dream` — the VM
+Informal; [`dreams/parser.dr`](../dreams/parser.dr) is the definition.
 
 ```
-dream PROGRAM.dream [options]
+file        ::= item*
+item        ::= 'import' path ( 'as' name | '.{' member (',' member)* '}' )?
+              | 'priv'? 'let' binding
+              | 'priv'? 'type' name param* '=' type
+              | 'mod' name '{' item* '}'
+              | 'derive' path
+              | 'virtual' 'dyn'? 'let' name param+ ( '=' expr )?
+              | 'when' cond ( '{' item* '}' | item )
+              | 'macro' name param* '=' expr
+              | ('group' | 'struct' | 'mapping') name ('derive' 'dyn'? path)? '{' entry* '}'
+              | 'union' name param* '{' (variant | member)* '}'
+              | 'foreign' name ('from' library)? '{' foreign_entry* '}'
+binding     ::= 'rec'? name param* ( ':' type )? '=' expr
+              | name ':' type
+              | pattern '=' expr
+param       ::= name | '!' name | '(' 'strict' name ')' | '()' | '[' .. ']' | '#[' .. ']' | '%{' .. '}'
+              | '(' pattern (',' pattern)* ')'
+statement   ::= binding-let | 'let?' (name | pattern) '=' expr | 'type' .. | expr
+expr        ::= expr '|>' expr | expr binop expr | ('-' | 'not') expr
+              | ('comp' | 'comp!' | 'expand') application | application
+application ::= postfix postfix*
+postfix     ::= primary ( '.' name | '.[' expr ( 'else' expr | '=>' expr )? ']' )*
+primary     ::= literal | name | '(' expr ')' | '[' exprs ']' | '#[' exprs ']'
+              | '%{' (expr '=>' expr),* '}' | '$(' expr ')' | block
+              | 'if' expr block ('else' (block | 'if' ..))?
+              | 'match' expr '{' (pattern ('if' expr)? '=>' expr),* '}'
+              | 'fn' param+ '->' expr
+              | 'try!' block 'catch' name block
+block       ::= '{' (statement (';' | newline))* '}'
+cond        ::= cond '||' cond | cond '&&' cond | 'not' cond | '(' cond ')'
+              | 'true' | 'false' | dotted_name | dotted_name '==' string
 ```
-
-| Flag | |
-|------|-|
-| `-e`, `--entry NAME` | entry point (default `main!`) |
-| `-j`, `--workers N` | scheduler threads; `0` means one per hardware thread |
-| `--no-jit` | interpreter only |
-| `--any-target` | run an image built for another platform anyway |
-| `--jit-threshold N` | calls before a function is compiled (default 32) |
-| `--dump-jit FN` | print the LLVM IR generated for one function |
-| `-x`, `--exec NAME` | run `$MINDV2_PATH/NAME.dream`, and nothing from here |
-| `--dump` | disassemble the loaded image |
-| `--stats` | reductions and collections |
-| `--profile [N]` | count reductions per function and print the hottest |
-
-An image is named the way a program is: `dream mind` tries `mind`, then
-`mind.dream`, then both of those under `$MINDV2_PATH`. `-x` is the half of that
-without the working directory, so a stray file cannot shadow an installed
-program.
-
-`--profile` attributes every reduction to the function whose frame was current,
-which is how the compiler was made to say where its own time went. Natives do
-not reduce, so work done inside a builtin shows up against its caller.
-
-### `just`
-
-```
-just                 # the VM, then the compiler built from its own seed
-just run FILE        # compile and run
-just repl            # an interactive session
-just check FILE      # scope, purity and verification, no image
-just test            # VM, end-to-end, examples, library, compiler and server tests
-just test-all        # the above plus fuzzing, heap verification, no-JIT build
-```
-
-`DREAM_VERIFY_HEAP=1` verifies the heap after every collection.
-
-### The pipeline
-
-```
-.dr source
-   │  lexer.dr     a lazy token stream, newline and column tracking
-   │  parser.dr    recursive descent, precedence climbing
-   │  modules.dr   whole-program module and package resolution
-   │  scope.dr     name resolution, closure conversion, purity checking
-   │  lower.dr     execution trees, `derive` specialization, `comp`
-   │  ir.dr        node arena, opcodes, constant pool
-   │  emit.dr      container writer
-   ▼
-.dream image        a flat arena of 16-byte nodes linked by index
-   │                (format: docs/bytecode-format.md)
-   ▼
-dream              image.cpp loads and revalidates; interp.cpp reduces;
-                    jit.cpp compiles the strict numeric spine
-```
-
-Every one of those is a module of `dreams`, which is an ordinary Dream program,
-so the language server imports the front end as a library rather than parsing a
-compiler's output back out of a pipe.
-
-`--shebang` writes an interpreter line before the image and sets the execute
-bit, so a compiled program can be run as a command:
-
-```
-dreams hello.dr --shebang -o hello    # `#!/usr/bin/env dream` by default
-./hello
-```
-
-The VM skips a leading `#!` line on any image it loads, so such a file is still
-an ordinary image — `dream hello` works too. An image is binary and its magic
-number begins with `D`, so a leading `#` is never ambiguous.
-
-An image is a flat arena of 16-byte execution-tree nodes linked by index, so the
-VM can map the file and start forcing nodes without rebuilding a tree. The VM
-**revalidates every image it loads** — a malformed one is rejected, never
-crashed on.
-
----
-
-## 15. Embedding
-
-[`dream/include/dream/dream.h`](../dream/include/dream/dream.h) is a C API:
-create a VM, load an image, register host modules, run an entry point.
-
-```c
-dream_vm* vm = dream_vm_new();
-
-const char* names[]           = {"shout!", "total!"};
-const uint32_t arities[]      = {1, DREAM_VARIADIC};
-const uint32_t strict[]       = {1, 0};
-const dream_native_fn fns[]   = {host_shout, host_total};
-dream_vm_register_module(vm, "host", names, arities, strict, fns, 2);
-
-dream_vm_load_file(vm, "program.dream", err, sizeof err);
-dream_vm_run(vm, NULL);           /* runs main! */
-puts(dream_vm_result_text(vm));
-dream_vm_free(vm);
-```
-
-The Dream side is compiled with the module named, so that the import resolves:
-
-```
-dreams program.dr --host-module host -o program.dream
-```
-
-[`dream/examples/embed.c`](../dream/examples/embed.c) is this example in full,
-and it is built as part of the VM.
-
-The surface falls into six groups:
-
-| Group | |
-|-------|-|
-| lifecycle | `dream_vm_new` `dream_vm_free` `dream_vm_load_file` `dream_vm_load_bytes` |
-| configuration | `dream_vm_set_workers` `dream_vm_set_jit` `dream_vm_register_module` |
-| running | `dream_vm_run` `dream_vm_run_value` `dream_vm_result_text` `dream_vm_failed` |
-| reading values | `dream_value_type` and the `dream_value_*` accessors; `dream_force` `dream_vm_force_deep` |
-| building values | `dream_make_*`, `dream_array_set` (takes the owning process), `dream_map_insert`, `dream_map_get` |
-| introspection | `dream_vm_reductions` `dream_vm_collections` `dream_vm_process_count` `dream_vm_module_count` `dream_vm_native_module_count` |
-
-Four things are worth knowing:
-
-- **Host functions receive forced arguments** unless the registration cleared
-  their bit in `strict_mask`. One trampoline serves every registered function —
-  the C function pointer travels on the function value itself — so the number of
-  host functions is unlimited rather than capped by a table of generated thunks.
-- **An arity of `DREAM_VARIADIC`** makes a member take however many arguments
-  its call site passed, with every one forced — `strict_mask` is a 32-bit map of
-  argument positions, and an unbounded list has no fixed positions to map. Such
-  a member is never partially applied, for the reason given under
-  [`std.console`](#stdconsole). This is how `console.print!` is registered.
-- **`dream_vm_run_value` is for tools that want the answer rather than a
-  transcript.** The result is forced all the way down before it is handed over,
-  so every nested value is safe to inspect. This is how the compiler's `comp!`
-  works.
-- **Values are only meaningful relative to the process that owns them,** and a
-  borrowed string pointer is valid only until the next allocation.
-
-`dream_vm_native_module_count` / `_name` exist so a test can prove the
-compiler's list of native modules and the runtime's registry still agree.
-
----
-
-## 16. Writing code that runs fast
-
-Everything above is how the language is meant to be written. This section is
-what actually costs, learned from making the compiler — itself an ordinary
-Dream program — report where its own time went. The rules are few, because the
-runtime charges by a few mechanisms, and each is described with the measurement
-that established it.
-
-Two instruments make the rest of this section possible:
-
-```
-dreams --time FILE        # what each stage of a compile cost
-dream --profile [N] IMG   # the hottest functions, by reductions
-```
-
-`--time` forces each stage where it reads the clock, because a lazy stage that
-has not been forced has not run. `--profile` attributes every reduction to the
-function whose frame is current, and **natives do not reduce** — the seconds
-inside a builtin are charged to its caller. That single rule explains three
-surprising facts about a profile: a thin member of a host module (`head`)
-can look hot while really being the native it calls; a function that wraps
-another function in a frame shows up as its own cost; and a function that does
-`a.[index]` three times in a row is paying three distinct charges it could have
-spent once.
-
-### Every value decides its own cost
-
-- **A list is read at the head.** `head`/`tail`/`cons` are one hop; `nth`,
-  `length`, `last`, `append`, and anything ending in `_at` walk. Accumulate with
-  `list.cons` and reverse once. Prefer a lazy chain precisely where the head is
-  the point — a stream — because a cell is allocated as it is forced and a
-  stream that goes unread costs nothing.
-- **A walk the machine can do is worth ten of the same walk in Dream.** A
-  linear operation written as a recursion pays a call, a frame and a couple of
-  natives per element; the same walk behind an opcode or a builtin pays one
-  machine step for the whole of it. `list.nth` is `xs.[n else ()]`,
-  `list.length` is `len`, `list.append` is `+`, and a lexer's byte classes are
-  `str.span` and `str.upto` — spelling those four out as recursions
-  instead was a third of a self-compile.
-- **A record is an array when it is read more than it is built.** Matching a
-  list pattern (`[:ok, v, rest]`) binds by walking the cells; matching an
-  array pattern length-checks and indexes. The compiler's token used to be a
-  six-element list and reading one was a fifth of everything the compiler
-  did — the arrayed token now reads any field in one hop, and the decision is
-  recorded at the top of [the lexer](../dreams/lexer.dr).
-- **Membership is a map; a table is a scan.** The keyword check was a tenth of
-  the compiler until keywords became a `%{ }` set. A *table* that is only ever
-  matched against — that is documentation in code — is still the right shape,
-  but then the lookup should be the `match`, not the table: the compiler
-  keeps an `operators` table for reading while `operator_at` dispatches on
-  the byte, and [ast.dr](../dreams/ast.dr) documents why the infix table is
-  consulted by `match` rather than by walking it.
-- **Count columns in characters and indexes in bytes.** Byte operations are the
-  O(1) ones on a string. Spanning and slicing by byte offset is how the lexer
-  gives a diagnostic its text back; character walks are the rare case.
-
-### Laziness is real, and it is the whole allocation story
-
-Every argument, list element, map value and binding is a thunk until forced.
-Two consequences matter for anything performance-shaped:
-
-- **Forcing a lazy stream complicates walking it.** A cell is memoized once
-  forced, but only that cell — the recursive tail is still a thunk. Walking a
-  stream once to *ask a question about it* and then again to *consume it*
-  forces every cell twice and, before every cell is a value, allocates it
-  twice. The compiler's parser used to force the whole token stream looking
-  for a lexical error and then parse it; the error is now a token of its own,
-  reported when the parse reaches it, and the redundant walk was five percent
-  of a whole compile.
-- **`strict!` is linear in data, not in paths.** Objects mark themselves
-  deeply forced once, so forcing the same shared structure from several
-  directions costs O(1) per object after the first. A function that `strict!`s
-  a value it does not know is shared pays once and forgets it.
-- **Natives are where the iron is, and thin accessors are free wrappers.** A
-  global whose body is one application of its parameters — `let tail xs =
-  _list_tail xs` — is compiled as the call it stands for when it is applied
-  saturated (§5). The accessors that remain (`list.head`, `a.[index]`)
-  are natives; each costs one native call, and paying for several on the same
-  value — the peek-and-ask pattern — is what a profile shows. Fetch the value
-  once and ask all your questions of that one reference.
-
-### Errors are values in the shape of your data
-
-A function that returns a lazy structure cannot also return an error "up
-front" without forcing everything it was ashamed of — which is what kills the
-laziness. The lexer's answer is to make **errors tokens**: a failure is a
-`:error` token at the point it happened, the last cell of the stream, carrying
-its message and its span, and a consumer that pulls only the head never sees
-it. The rule generalizes: a component that walks a structure should put its
-error where the walk will meet it, and a walk that is only *looking for* an
-error is a walk that does not need to happen.
-
-### Repeating work is the only real bug
-
-Dream has no mutation, which removes a class of bug and imports one: a subvalue
-that is forced from two places computes twice, unless it was already forced
-(`strict!`, or because the result was a value). The wrapper rule of §5 is
-deliberately narrow — it records *which* globals are wrappers at scope time, so
-lowering can rewrite a saturated call *because* it knows the frame it stands
-for adds nothing. When a measurement shows a function hot for no apparent
-reason, the first question is whether a lazy list is being walked twice.
-
-### Private declarations
-
-Module declarations are public by default. Prefix a declaration with `priv`
-to keep its bindings private to that module:
-
-```dream
-priv let helper x = x + 1;
-let increment x = helper x;
-```
-
-`priv let rec` and `priv let [a, b] = pair` are also supported. Other modules
-cannot access private bindings through qualified names or selective imports.
-Block-local bindings already have lexical scope; `priv` applies to module
-declarations only.

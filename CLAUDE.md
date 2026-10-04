@@ -316,6 +316,15 @@ The lessons that keep coming back:
   `local` statement at the top of the body (`lower_body`).
   `std` uses it wherever an accumulator could grow (`list.fold_strict`,
   `list.sum`, the folds of `std.seq` and `std.map`).
+- `let? x = e;` in a block is one step of an errors-as-values chain: on
+  `[:ok, v]` it binds `v` and goes on, and anything else is the block's
+  answer. The parser unfolds it to a `match` (`unfold_let_try`). The compiler
+  also warns about an accumulator nothing forces (`dreams/lint.dr`).
+- `virtual dyn let f self` and a record's `derive dyn base` opt in to run-time
+  dispatch: the record's values carry a table in slot 0, and `base.f x`
+  called through the declaring module dispatches on its last argument.
+  Everything else about `derive` is still compile-time specialization;
+  "Dispatch" in docs/language-spec.md and `dispatching` in dreams/scope.dr.
 - `when test { .. }` holds a module's tests, collected by compiling with
   `--test`. Tests are `test.case "name" $( test.eq! expected actual )`.
 - `macro name params = ..` declares a syntax transformer and `expand name args`
@@ -346,8 +355,8 @@ The lessons that keep coming back:
   `types.accepts` tests, `types.check` raises, `types.enforce` wraps a
   function against an arrow. Nothing is inferred or coerced, and a `type` is
   a `let`, so imports, `priv`, currying and local capture need no new rules.
-  "Optional type descriptions" in [docs/language-spec.md](docs/language-spec.md)
-  is the grammar and the one ambiguity it has to resolve.
+  "The type grammar" in [docs/language-spec.md](docs/language-spec.md)
+  is the grammar.
 - `let name : type` is a **signature**, checked at compile time
   ([dreams/typecheck.dr](dreams/typecheck.dr)); `let x : t = e` and
   `let f x : answer = e` are the inline forms. A free lowercase name in one is

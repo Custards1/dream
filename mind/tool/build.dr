@@ -746,9 +746,15 @@ let dep_hosts g =
 ///   2. `$MIND_HOME/std` (default `~/.mind/std`), where an install puts it.
 ///   3. a `mind` directory at or above the working directory -- which is what
 ///      makes the library's own repository work with no configuration at all.
+///   4. the installation: the first directory of `$MINDV2_PATH` (or
+///      `~/.mindv2`) holding `std`, which is where `just install` puts the
+///      library beside the compiler it was built with.
 ///
-/// The last is a search rather than a fixed path because a build may be run
-/// from anywhere inside a project, exactly as `git` may be.
+/// The third is a search rather than a fixed path because a build may be run
+/// from anywhere inside a project, exactly as `git` may be. It comes before
+/// the installation so that an installed library never shadows the checkout
+/// being worked on -- an installed `std` older than the checkout's `dreams` is
+/// a compiler that cannot build itself.
 let stdlib_root! () = {
     let named = util.env_path! "MIND_STDLIB";
     if named != () { named }
@@ -758,12 +764,42 @@ let stdlib_root! () = {
         if io.is_dir! installed { home }
         else {
             match find_upwards! (os.cwd! ()) "mind" {
-                () => "mind",
+                () => match installation_with_std! () {
+                    () => "mind",
+                    found => found,
+                },
                 found => found,
             }
         }
     }
 };
+
+/// The first installation directory that holds `std`, or `()`. The VM looks
+/// for installed images in the same places (`dream --mindv2-path`): the
+/// directories `$MINDV2_PATH` lists, or `~/.mindv2` when it is unset.
+let installation_with_std! () =
+    match os.env! "MINDV2_PATH" {
+        () => match util.home! () {
+            () => (),
+            h => first_with_std! [util.join h ".mindv2"],
+        },
+        v => first_with_std! (str.split (path_list_separator ()) v),
+    };
+
+/// Each entry has its `~` expanded here, as every path from the environment
+/// does, and an empty one (`a::b`) is skipped.
+let rec first_with_std! dirs =
+    match dirs {
+        [] => (),
+        ["", ..rest] => first_with_std! rest,
+        [d, ..rest] => {
+            let dir = util.expand_home! d;
+            if io.is_dir! (util.join dir "std") { dir } else { first_with_std! rest }
+        },
+    };
+
+/// `PATH`'s separator, which `$MINDV2_PATH` shares.
+let path_list_separator () = match os.platform () { :windows => ";", _ => ":" };
 
 /// The nearest `name` directory at or above `from`, or `()`. Holds a library
 /// whose `std` is a package, so it is the *parent* that becomes a `-L` root.
