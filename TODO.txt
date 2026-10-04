@@ -30,9 +30,7 @@ Done (branch monitors-recv-match):
    are in scope.r_diags, which --check, `mind check` and lucid's
    compile.checked all report.
 
-Left:
-3. Shared, frozen, fully forced values -- this already exists as vm.share!.
-   What is missing is a way to free one (it lives until the runtime ends).
+Left: nothing on this list.
 
 Follow-ups from 1, 2 and 5:
 - Done: a kill reaches a process inside one long nested force (raised where
@@ -48,5 +46,5 @@ Follow-ups from 1, 2 and 5:
 - Done: a failed match is one call of the builtin `_match_fail`, not an
   `_error_new`, a list and a `raise!`: the compiler's image 1,198 -> 1,139
   KB, and a self-compile ~4% faster (2.03-2.09 s -> 1.94-1.99 s).
-- 3 (freeing shared values) is designed, not built: "Freeing what was
-  shared" in docs/gc.md, with the refinements found starting the build.
+- Done: 3, freeing shared values -- vm.release! and vm.collect_shared!, a
+  region per share and a census ("Freeing what was shared" in docs/gc.md).

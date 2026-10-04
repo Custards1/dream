@@ -62,6 +62,32 @@ constexpr uint8_t GC_BUSY = 32;
 constexpr uint8_t GC_SHARED = 64;
 
 class Heap;
+class SharedArea;
+struct SharedRegion;
+
+/// Regions waiting to be freed, in every runtime. While it is zero -- every
+/// program that never calls `vm.release!` -- a copy that meets a shared object
+/// pays one relaxed load for it and nothing else. See "Freeing what was
+/// shared" in docs/gc.md.
+extern std::atomic<int> g_condemned_regions;
+
+/// A shared object met while copying from one heap to another: if its region
+/// is condemned, a census in progress can no longer trust what it has heard.
+/// The slow half of `note_shared_crossing`.
+void shared_crossing_slow(const Obj* o);
+inline void note_shared_crossing(const Obj* o) {
+    if (g_condemned_regions.load(std::memory_order_relaxed) > 0) shared_crossing_slow(o);
+}
+
+/// A census major met a shared object: if its region is condemned, it is seen
+/// in `round`.
+void shared_observe(const Obj* o, uint64_t round);
+
+/// Walk everything `v` reaches without touching a mark bit, noting every
+/// condemned region it meets as seen in `round`. For values no collector of
+/// the round will trace: messages in flight, kill reasons, and what finished
+/// processes left for `join!`.
+void shared_census_walk(Value v, uint64_t round);
 
 /// What a tensor that lives outside the heap holds, and how its reference is
 /// taken and given back. Implemented in tensor.cpp, which knows what a GPU
@@ -249,6 +275,14 @@ public:
     /// of the runtime only ever reads `marking()` to pick the legal next move.
     bool start_concurrent_mark(RootSource& roots);
     void finalize_concurrent_mark(RootSource& roots);
+
+    /// A census major: a whole-world `major_collect` that notes every
+    /// condemned shared region it meets as seen in `round`. A concurrent mark
+    /// in flight is finalized first, because its helpers marked without
+    /// looking. Safe only where a major is.
+    void census_collect(RootSource& roots, uint64_t round);
+    /// Where a copy into this heap meets a shared object. See `copy_value`.
+    void met_shared(const Obj* o) { note_shared_crossing(o); }
     /// True between `start_concurrent_mark` and `finalize_concurrent_mark`.
     bool marking() const { return marking_; }
     /// True once the helpers have drained their last batch: the mark is done
@@ -766,6 +800,10 @@ private:
     /// The clock reading taken when the helpers were launched; the overlap
     /// window is the difference to the start of the finalize.
     uint64_t concurrent_started_ = 0;
+    /// Nonzero while `census_collect` runs: the round a shared object met by
+    /// the trace is seen in. Read by every marking thread, written only
+    /// between collections.
+    uint64_t observe_round_ = 0;
 };
 
 /// The size in bytes of an object, from its header.
@@ -822,9 +860,32 @@ inline uint64_t identity_hash(Obj* o) {
 ///     `claim_mark`). A heap's objects may point in; nothing here points out,
 ///     because everything reachable from a shared object was copied in with
 ///     it. So no heap's collection ever has a reason to look inside.
-///   - Nothing is freed until the runtime is. That is the price, and it is the
-///     right one for what this is for -- a table built once and read for the
-///     rest of a run -- and the wrong one for anything built in a loop.
+///   - Nothing is freed until nothing can reach it, and nothing is even looked
+///     at until a program says it is done with something (`release`). Each
+///     `share` copies into a **region** of its own; a released region is
+///     *condemned*, and a census -- every heap's major, every message, every
+///     finished process -- frees the condemned regions nobody turned out to
+///     hold. See "Freeing what was shared" in docs/gc.md for why each step is
+///     there.
+struct SharedRegion {
+    SharedArea* area = nullptr;
+    std::vector<uint8_t*> blocks;
+    uint8_t* cursor = nullptr;
+    size_t left = 0;
+    size_t next_block = 0;
+    size_t bytes = 0;
+    std::atomic<bool> condemned{false};
+    /// The last round started when this was condemned: only a later round
+    /// asked every process about it.
+    uint64_t condemned_at = 0;
+    /// The last round a census met it in.
+    std::atomic<uint64_t> seen_round{0};
+    /// Regions this one points into, which it keeps alive; and how many live
+    /// regions point into this one.
+    std::vector<SharedRegion*> deps;
+    uint32_t dependents = 0;
+};
+
 class SharedArea {
 public:
     SharedArea() = default;
@@ -838,8 +899,25 @@ public:
     /// again, so sharing a table that contains a shared table costs only the
     /// new part.
     bool share(Value v, Value* out, std::string* why);
-    /// Bytes handed out so far.
-    size_t bytes() const { return bytes_; }
+    /// Bytes held now: handed out and not yet freed.
+    size_t bytes() const { return bytes_.load(std::memory_order_relaxed); }
+
+    /// Condemn the region `v` was shared into. Answers false for a value that
+    /// is not a shared object. Frees nothing by itself: a census does that.
+    bool release(Value v);
+    /// Any condemned region still here?
+    bool any_condemned();
+    /// Start a census round, answering its number.
+    uint64_t begin_round();
+    /// A copy carried a condemned pointer while a round was running.
+    void spoil() { spoiled_.store(true, std::memory_order_relaxed); }
+    /// End round `round`: free every condemned region it neither met nor
+    /// found depended upon, unless it was spoiled. Answers the bytes freed.
+    size_t finish_round(uint64_t round);
+    /// Where the copy that builds a region meets an object already shared.
+    void met_shared(const Obj* o);
+    /// The region an object of this area lives in, or null.
+    static SharedRegion* region_of(const Obj* o);
     /// True when `p` lies in a block of some live shared area. For the heap
     /// verifier, which meets pointers it must not dereference until it knows
     /// whose they are -- including, on purpose, ones that are nobody's.
@@ -866,11 +944,14 @@ public:
 
 private:
     Obj* alloc(ObjType type, size_t extra);
+    void free_region(SharedRegion* r);
     std::mutex mutex_;
-    std::vector<uint8_t*> blocks_;
-    uint8_t* cursor_ = nullptr;
-    size_t left_ = 0;
-    size_t bytes_ = 0;
+    std::vector<std::unique_ptr<SharedRegion>> regions_;
+    /// The region the share in progress copies into.
+    SharedRegion* building_ = nullptr;
+    std::atomic<size_t> bytes_{0};
+    std::atomic<bool> spoiled_{false};
+    uint64_t rounds_ = 0;
     std::string refused_;
 };
 

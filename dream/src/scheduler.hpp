@@ -119,6 +119,14 @@ public:
     /// Forget a timer that has not fired. Harmless on one that has.
     void cancel_timer(uint64_t seq);
 
+    /// Start a census of the shared area -- or, with one already running, ask
+    /// for another when it ends. Every live process reports once: a parked one
+    /// is censused here and now, under its lock, and a running or queued one
+    /// at its next slice or as it parks. The last report walks mailboxes, kill
+    /// reasons and finished processes, and frees what nobody holds. See
+    /// "Freeing what was shared" in docs/gc.md.
+    void request_census();
+
     /// Make a parked process runnable again. Public because the IO poller
     /// calls it from its own thread when a descriptor becomes ready, which is
     /// the same handshake a message arriving uses.
@@ -171,6 +179,14 @@ private:
     /// Put a message in `target`'s mailbox and wake it. False for no such pid.
     bool deliver(uint64_t target, std::unique_ptr<Message> msg);
     void timer_loop();
+
+    /// A process has been censused for `round`, or has ended.
+    void census_report(uint64_t pid, uint64_t round);
+    /// Census `p`'s heap for `round` if it owes one. The caller is the one
+    /// thread allowed to touch `p` right now.
+    void census_if_due(Process& p);
+    /// The round's last report: the walks, and the freeing.
+    void census_finish(uint64_t round);
     void note_idle(bool idle);
 
     Runtime& rt_;
@@ -239,6 +255,13 @@ private:
     uint64_t next_timer_ = 1;
     bool timers_running_ = false;
     std::thread timer_thread_;
+
+    /// The census round in progress, or 0, and the processes it is waiting to
+    /// hear from. Lock order: a process's `sched_mutex`, then this.
+    std::mutex census_mutex_;
+    uint64_t census_round_ = 0;
+    std::unordered_map<uint64_t, bool> census_waiting_;
+    bool census_again_ = false;
 
     std::mutex failures_mutex_;
     std::unordered_map<uint64_t, std::string> failures_;

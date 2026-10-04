@@ -189,6 +189,7 @@ void Scheduler::run_slice(const std::shared_ptr<Process>& p, unsigned index) {
         terminate(p);
         return;
     }
+    census_if_due(*p);
     p->status.store(ProcStatus::Running, std::memory_order_relaxed);
     p->wait_reason.store(WaitReason::None, std::memory_order_relaxed);
     p->wait_fd.store(-1, std::memory_order_relaxed);
@@ -210,7 +211,14 @@ void Scheduler::run_slice(const std::shared_ptr<Process>& p, unsigned index) {
         std::lock_guard<std::mutex> g(p->sched_mutex);
         if (p->park_requested) {
             p->park_requested = false;
-            if (!p->wake_pending) {
+            // A census asked of a running process is answered before it parks:
+            // parked, nothing would run it to answer. It is not answered *here*
+            // -- this lock is held, and the last report takes every process's
+            // -- but by not parking: the process goes round once more, as a
+            // wake that beat the park sends it, and answers at the start of
+            // that slice. The blocking native it was in looks again and asks
+            // to park again.
+            if (!p->wake_pending && !p->census_due.load(std::memory_order_acquire)) {
                 p->status.store(ProcStatus::Waiting, std::memory_order_release);
                 return;
             }
@@ -309,6 +317,14 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
         cancel_timer(p->timer_seq);
         p->timer_seq = 0;
     }
+    // Ended, so it has nothing more to say to a census: what it left is
+    // `exit_value`, which the round's last report walks.
+    uint64_t round;
+    {
+        std::lock_guard<std::mutex> g(census_mutex_);
+        round = census_round_;
+    }
+    if (round) census_report(p->id(), round);
     live_.fetch_sub(1, std::memory_order_acq_rel);
     for (uint64_t id : waiters) wake(id);
     notify_done();
@@ -402,6 +418,83 @@ void Scheduler::demonitor(Process& p, uint64_t target) {
     auto& ms = proc->monitors;
     auto it = std::find(ms.begin(), ms.end(), p.id());
     if (it != ms.end()) ms.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// The census of the shared area
+// ---------------------------------------------------------------------------
+
+void Scheduler::request_census() {
+    uint64_t round;
+    std::vector<std::shared_ptr<Process>> procs = rt_.all_processes();
+    {
+        std::lock_guard<std::mutex> g(census_mutex_);
+        if (census_round_) {
+            census_again_ = true;
+            return;
+        }
+        round = rt_.shared().begin_round();
+        census_round_ = round;
+        census_waiting_.clear();
+        for (auto& p : procs)
+            if (!p->is_done()) census_waiting_.emplace(p->id(), true);
+        if (census_waiting_.empty()) {
+            census_finish(round);
+            return;
+        }
+    }
+    for (auto& p : procs) {
+        if (p->is_done()) continue;
+        std::unique_lock<std::mutex> g(p->sched_mutex);
+        if (p->status.load(std::memory_order_acquire) == ProcStatus::Waiting) {
+            // Parked: nobody is touching it, and a wake has to take this lock
+            // before it can make it runnable. So its heap is censused here.
+            p->heap().census_collect(*p, round);
+            g.unlock();
+            census_report(p->id(), round);
+        } else {
+            p->census_due.store(round, std::memory_order_release);
+        }
+    }
+}
+
+void Scheduler::census_if_due(Process& p) {
+    uint64_t due = p.census_due.exchange(0, std::memory_order_acq_rel);
+    if (!due) return;
+    p.heap().census_collect(p, due);
+    census_report(p.id(), due);
+}
+
+void Scheduler::census_report(uint64_t pid, uint64_t round) {
+    bool again = false;
+    {
+        std::lock_guard<std::mutex> g(census_mutex_);
+        if (round != census_round_) return;
+        if (!census_waiting_.erase(pid)) return;
+        if (!census_waiting_.empty()) return;
+        census_finish(round);
+        again = census_again_;
+        census_again_ = false;
+    }
+    if (again) request_census();
+}
+
+void Scheduler::census_finish(uint64_t round) {
+    // Called with `census_mutex_` held. What no collector of the round traced:
+    // a message waiting in a mailbox, a kill's reason, and what a finished
+    // process left for whoever joins it.
+    for (auto& p : rt_.all_processes()) {
+        p->mailbox.for_each([&](Value v) { shared_census_walk(v, round); });
+        // Written once, under the process's lock, before `kill_requested` is
+        // published -- so readable here without that lock, which a worker
+        // reporting from its own slice may be holding.
+        if (p->kill_requested.load(std::memory_order_acquire) && p->kill_reason) {
+            shared_census_walk(p->kill_reason->value, round);
+        }
+        if (p->is_done()) shared_census_walk(p->exit_value, round);
+    }
+    rt_.shared().finish_round(round);
+    census_round_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -607,13 +700,11 @@ bool Scheduler::send(Process& sender, uint64_t target, Value message) {
 
 bool Scheduler::receive(Process& p, Value* out) {
     std::lock_guard<std::mutex> g(p.sched_mutex);
-    auto msg = p.mailbox.pop();
-    if (!msg) {
+    if (!p.mailbox.pop_into(p.heap(), out)) {
         p.park_requested = true;
         p.wait_reason.store(WaitReason::Message, std::memory_order_relaxed);
         return false;
     }
-    *out = Heap::copy_between(p.heap(), msg->value);
     return true;
 }
 

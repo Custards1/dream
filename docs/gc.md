@@ -23,8 +23,8 @@ The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp
       back the ones it found empty (2026-10-03). See "Evacuating sparse
       blocks" -- including why it bought less than this list expected.
 - [ ] Later -- full compaction. Nothing measured asks for it yet.
-- [ ] Freeing shared regions: designed (2026-10-03), not built. See "Freeing
-      what was shared".
+- [x] Freeing shared regions (2026-10-03): `vm.release!` and a census. See
+      "Freeing what was shared" -- including the race the stress test found.
 
 ## The collector today
 
@@ -691,7 +691,7 @@ sparse ones -- the safety argument does not change -- and the reason it is not
 built is the one evacuation's measurements give: what the compiler wastes now
 is empty blocks, not half-full ones.
 
-## Freeing what was shared -- the design (2026-10-03, not built)
+## Freeing what was shared (2026-10-03)
 
 `vm.share!` copies a value, once, into memory every process reads and none
 owns (`SharedArea` in heap.hpp), and nothing there is freed until the runtime
@@ -850,7 +850,39 @@ Settled while starting the build, which stopped before any code changed:
   no dependents is freed, its dependencies lose a dependent, and the loop
   repeats. A chain of released tables goes in one round.
 
-### What it would take
+### What was built, and where it differs
+
+Built as designed, with these departures, each for a reason found on the way:
+
+- **A range table after all, not block headers.** A header at the start of
+  each block only finds the region when blocks are aligned to their own size,
+  which costs up to an alignment unit per region -- and the compiler shares
+  once per module part. The table is the sorted list of blocks the verifier
+  already kept, now with the region beside each, behind a reader-writer lock;
+  a thread-local cache of the last block, invalidated by a generation count,
+  keeps the census's lookups off the lock. Nothing looks it up outside a
+  census, a verification, or a copy made while a region is condemned.
+- **A region records the round it was condemned in**, and only a later round
+  may free it. Released during a round, a region was never looked for by the
+  processes censused before the release, so to that round it would look
+  unseen.
+- **A process asked for a census does not park.** Answering in the parking
+  handshake would hold its lock while the round's last report takes every
+  process's; instead it goes round once more, as a wake that beat the park
+  sends it, and answers at the start of that slice.
+- **The race the stress test found.** `receive` popped a message and then
+  copied it, out of the mailbox's lock: for that moment the message was in no
+  mailbox and in no heap, a round finishing then freed its region, and the copy
+  read freed memory -- six runs in forty under `test-heap`'s settings, as a
+  `len` on a value that was no longer a list. `Mailbox::pop_into` copies under
+  the lock, as `peek_into` already did, so the walk either sees the message or
+  the copy has spoiled the round. 120 runs since, none failing.
+
+`dream/tests/programs/share_release.dr` is the test: freed when nobody holds
+it, kept while a parked process or a mailbox does, kept by a dependency, and
+four pairs passing a released table back and forth through a hundred rounds.
+
+### What it would have taken
 
 `SharedArea` grows regions, aligned blocks, the region table and the
 dependency sets; `copy_value` the spoil check; `mark_object`/`forward_in`

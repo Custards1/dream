@@ -158,6 +158,15 @@ class Mailbox {
 public:
     void push(std::unique_ptr<Message> m);
     std::unique_ptr<Message> pop();
+    /// Take the first message, copied into `dest`; false when there is none.
+    ///
+    /// The copy is made *before* the lock is let go, and that is not tidiness.
+    /// A census walks mailboxes under this lock to find what messages hold,
+    /// and a message popped and then copied is, for that moment, in no
+    /// mailbox and not yet in any heap -- a census finishing then would free
+    /// a region the copy is about to read. Under the lock, either the walk
+    /// sees the message or the copy has already told the census it crossed.
+    bool pop_into(Heap& dest, Value* out);
     bool empty() const;
     size_t size() const;
 
@@ -173,6 +182,12 @@ public:
     bool peek_into(size_t i, Heap& dest, Value* out) const;
     /// Remove the message at `i`; false when there is none.
     bool remove_at(size_t i);
+    /// Every message waiting, under the lock, for a census to walk.
+    template <class F>
+    void for_each(F&& f) const {
+        std::lock_guard<std::mutex> g(mutex_);
+        for (const auto& m : queue_) f(m->value);
+    }
 
 private:
     mutable std::mutex mutex_;
@@ -427,6 +442,12 @@ public:
     /// second entry knows its timer is already set.
     uint64_t timer_seq = 0;
     int64_t timer_deadline = -1;
+
+    /// A census round this process owes a report for, or 0: set by
+    /// `Scheduler::request_census` when the process was running or queued, and
+    /// honoured -- a census major of its own heap -- at the start of its next
+    /// slice or as it parks, whichever comes first.
+    std::atomic<uint64_t> census_due{0};
 
     /// Guards the parking handshake below. Only the worker currently running a
     /// process may change its machine state, so a blocking builtin does not

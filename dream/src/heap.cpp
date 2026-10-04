@@ -1,6 +1,9 @@
 #include <unordered_map>
 #include "heap.hpp"
 
+#include <shared_mutex>
+#include <unordered_set>
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -989,7 +992,10 @@ template <bool Par>
 void Heap::mark_object(GcCtx& c, Value v) {
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
-    if (is_shared_obj(o)) return;
+    if (is_shared_obj(o)) {
+        if (observe_round_) shared_observe(o, observe_round_);
+        return;
+    }
     if constexpr (Par) {
         // The mark is the claim: whoever sets the bit owns the scan, so an
         // object two threads reach at once is still scanned exactly once.
@@ -1084,8 +1090,13 @@ void Heap::forward_in(GcCtx& c, Value* slot) {
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
     uint8_t gc = read_gc<Par>(o);
-    // Not this heap's, and nothing under it is: see `SharedArea`.
-    if (gc & GC_SHARED) return;
+    // Not this heap's, and nothing under it is: see `SharedArea`. A census
+    // major notes it and goes no further either -- what a region reaches is
+    // the region's dependencies, not this heap's business.
+    if (gc & GC_SHARED) {
+        if (observe_round_) shared_observe(o, observe_round_);
+        return;
+    }
     if (gc & (GC_YOUNG | GC_FORWARDED | GC_BUSY)) {
         forward_slow<Par>(c, slot);
         return;
@@ -1114,7 +1125,10 @@ void Heap::forward_slow(GcCtx& c, Value* slot) {
     if (!is_ptr(v)) return;
     Obj* o = as_obj(v);
     uint8_t gc = read_gc<Par>(o);
-    if (gc & GC_SHARED) return;
+    if (gc & GC_SHARED) {
+        if (observe_round_) shared_observe(o, observe_round_);
+        return;
+    }
     // A young object is copied to old space and the slot rewritten to the
     // copy. A forwarded one is a young object already copied this cycle; its
     // first payload word holds the copy, so sharing survives promotion.
@@ -2705,7 +2719,12 @@ Value copy_value(Dest& dest, Value v, CopySeen& seen) {
     if (!is_ptr(v)) return v;
     v = resolve(v);
     if (!is_ptr(v)) return v;
-    if (is_shared_obj(as_obj(v))) return v;
+    if (is_shared_obj(as_obj(v))) {
+        // Crossing by pointer, which is the point of sharing -- and the one
+        // moment a census has to hear about. See `note_shared_crossing`.
+        dest.met_shared(as_obj(v));
+        return v;
+    }
 
     if (auto* it = seen.find(v)) return it->second;
 
@@ -2977,72 +2996,161 @@ Value Heap::copy_between(Heap& dest, Value v) {
 // The shared area
 // ---------------------------------------------------------------------------
 
+std::atomic<int> g_condemned_regions{0};
+
 namespace {
-constexpr size_t kSharedBlock = size_t(1) << 20;
+/// A region's first block. Each next one doubles, up to `kSharedBlockMax`, so
+/// a small share wastes little and a large one takes few blocks.
+constexpr size_t kSharedBlockMin = size_t(64) << 10;
+constexpr size_t kSharedBlockMax = size_t(1) << 20;
 
-/// Every block of every live shared area, as `[start, end)`, for
-/// `SharedArea::any_contains`. Only the verifier reads it, so a lock and a
-/// linear scan are enough.
-std::mutex g_shared_ranges_mutex;
-std::vector<std::pair<uintptr_t, uintptr_t>> g_shared_ranges;
+/// Every block of every live shared area, sorted by address, with the region
+/// it belongs to: `[start, end, region]`.
+///
+/// Two readers. The heap verifier asks `any_contains` of pointers it must not
+/// dereference until it knows whose they are. A census asks `region_of` of
+/// every shared object a major meets and every one a copy carries while a
+/// region is condemned -- often, so a reader takes the lock shared and keeps
+/// the last block it found in a thread-local cache, which is valid while the
+/// table's generation has not moved. Nothing reads it outside a census or a
+/// verification.
+struct SharedRange {
+    uintptr_t lo;
+    uintptr_t hi;
+    SharedRegion* region;
+};
+std::shared_mutex g_shared_ranges_mutex;
+std::vector<SharedRange> g_shared_ranges;
+std::atomic<uint64_t> g_shared_generation{1};
 
-void note_shared_block(const uint8_t* at, size_t bytes) {
-    std::lock_guard<std::mutex> g(g_shared_ranges_mutex);
+void note_shared_block(const uint8_t* at, size_t bytes, SharedRegion* r) {
+    std::unique_lock<std::shared_mutex> g(g_shared_ranges_mutex);
     auto start = reinterpret_cast<uintptr_t>(at);
-    g_shared_ranges.emplace_back(start, start + bytes);
+    SharedRange range{start, start + bytes, r};
+    auto it = std::lower_bound(g_shared_ranges.begin(), g_shared_ranges.end(), start,
+                               [](const SharedRange& x, uintptr_t v) { return x.lo < v; });
+    g_shared_ranges.insert(it, range);
+    g_shared_generation.fetch_add(1, std::memory_order_release);
 }
 
 void forget_shared_block(const uint8_t* at) {
-    std::lock_guard<std::mutex> g(g_shared_ranges_mutex);
+    std::unique_lock<std::shared_mutex> g(g_shared_ranges_mutex);
     auto start = reinterpret_cast<uintptr_t>(at);
-    for (size_t i = 0; i < g_shared_ranges.size(); ++i) {
-        if (g_shared_ranges[i].first == start) {
-            g_shared_ranges[i] = g_shared_ranges.back();
-            g_shared_ranges.pop_back();
-            return;
-        }
-    }
+    auto it = std::lower_bound(g_shared_ranges.begin(), g_shared_ranges.end(), start,
+                               [](const SharedRange& x, uintptr_t v) { return x.lo < v; });
+    if (it != g_shared_ranges.end() && it->lo == start) g_shared_ranges.erase(it);
+    g_shared_generation.fetch_add(1, std::memory_order_release);
+}
+
+/// The range holding `at`, or one with a null region. The caller holds the
+/// lock shared.
+SharedRange find_range(uintptr_t at) {
+    auto it = std::upper_bound(g_shared_ranges.begin(), g_shared_ranges.end(), at,
+                               [](uintptr_t v, const SharedRange& x) { return v < x.lo; });
+    if (it == g_shared_ranges.begin()) return {0, 0, nullptr};
+    --it;
+    if (at >= it->lo && at < it->hi) return *it;
+    return {0, 0, nullptr};
 }
 }  // namespace
 
+SharedRegion* SharedArea::region_of(const Obj* o) {
+    thread_local SharedRange last{0, 0, nullptr};
+    thread_local uint64_t last_generation = 0;
+    auto at = reinterpret_cast<uintptr_t>(o);
+    uint64_t gen = g_shared_generation.load(std::memory_order_acquire);
+    if (gen == last_generation && at >= last.lo && at < last.hi) return last.region;
+    std::shared_lock<std::shared_mutex> g(g_shared_ranges_mutex);
+    SharedRange r = find_range(at);
+    last = r;
+    last_generation = g_shared_generation.load(std::memory_order_relaxed);
+    return r.region;
+}
+
 bool SharedArea::any_contains(const void* p) {
     auto at = reinterpret_cast<uintptr_t>(p);
-    std::lock_guard<std::mutex> g(g_shared_ranges_mutex);
-    for (auto& [lo, hi] : g_shared_ranges)
-        if (at >= lo && at + sizeof(Obj) <= hi) return true;
-    return false;
+    std::shared_lock<std::shared_mutex> g(g_shared_ranges_mutex);
+    SharedRange r = find_range(at);
+    return r.region && at + sizeof(Obj) <= r.hi;
+}
+
+void shared_crossing_slow(const Obj* o) {
+    SharedRegion* r = SharedArea::region_of(o);
+    if (r && r->condemned.load(std::memory_order_relaxed)) r->area->spoil();
+}
+
+void shared_observe(const Obj* o, uint64_t round) {
+    SharedRegion* r = SharedArea::region_of(o);
+    if (r && r->condemned.load(std::memory_order_relaxed)) r->seen_round.store(round, std::memory_order_relaxed);
+}
+
+void shared_census_walk(Value v, uint64_t round) {
+    // Read-only: no mark bit is set, so this may run over a heap another
+    // thread is reading -- a finished process's, which a `join!` copies from
+    // -- and over a message's, which nobody collects.
+    std::unordered_set<Obj*> visited;
+    std::vector<Obj*> todo;
+    auto push = [&](Value w) {
+        if (is_ptr(w)) todo.push_back(as_obj(w));
+    };
+    push(v);
+    while (!todo.empty()) {
+        Obj* o = todo.back();
+        todo.pop_back();
+        if (is_shared_obj(o)) {
+            shared_observe(o, round);
+            continue;
+        }
+        if (!visited.insert(o).second) continue;
+        for_each_slot(o, o->type, [&](Value* slot) { push(*slot); });
+    }
+}
+
+void Heap::census_collect(RootSource& roots, uint64_t round) {
+    if (marking_) finalize_concurrent_mark(roots);
+    observe_round_ = round;
+    major_collect(roots);
+    observe_round_ = 0;
 }
 
 SharedArea::~SharedArea() {
-    for (uint8_t* b : blocks_) {
-        forget_shared_block(b);
-        std::free(b);
+    for (auto& r : regions_) {
+        for (uint8_t* b : r->blocks) {
+            forget_shared_block(b);
+            std::free(b);
+        }
+        if (r->condemned.load(std::memory_order_relaxed)) g_condemned_regions.fetch_sub(1);
     }
 }
 
 Obj* SharedArea::alloc(ObjType type, size_t extra) {
+    SharedRegion* r = building_;
     size_t bytes = align_up(sizeof(Obj) + extra);
     uint8_t* at;
-    if (bytes > kSharedBlock / 4) {
+    if (bytes > kSharedBlockMax / 4) {
         // A large object gets a block of its own, so the bump block it would
         // have ended is not thrown away half used.
         at = static_cast<uint8_t*>(std::malloc(bytes));
         if (!at) throw std::bad_alloc();
-        blocks_.push_back(at);
-        note_shared_block(at, bytes);
+        r->blocks.push_back(at);
+        note_shared_block(at, bytes, r);
     } else {
-        if (bytes > left_) {
-            cursor_ = static_cast<uint8_t*>(std::malloc(kSharedBlock));
-            if (!cursor_) throw std::bad_alloc();
-            blocks_.push_back(cursor_);
-            note_shared_block(cursor_, kSharedBlock);
-            left_ = kSharedBlock;
+        if (bytes > r->left) {
+            size_t size = r->next_block ? r->next_block : kSharedBlockMin;
+            while (size < bytes) size *= 2;
+            r->next_block = std::min(size * 2, kSharedBlockMax);
+            r->cursor = static_cast<uint8_t*>(std::malloc(size));
+            if (!r->cursor) throw std::bad_alloc();
+            r->blocks.push_back(r->cursor);
+            note_shared_block(r->cursor, size, r);
+            r->left = size;
         }
-        at = cursor_;
-        cursor_ += bytes;
-        left_ -= bytes;
+        at = r->cursor;
+        r->cursor += bytes;
+        r->left -= bytes;
     }
-    bytes_ += bytes;
+    r->bytes += bytes;
+    bytes_.fetch_add(bytes, std::memory_order_relaxed);
     std::memset(at, 0, bytes);
     auto* o = reinterpret_cast<Obj*>(at);
     o->type = type;
@@ -3050,6 +3158,78 @@ Obj* SharedArea::alloc(ObjType type, size_t extra) {
     o->aux = AUX_DEEP_FORCED;
     o->bytes = uint32_t(bytes);
     return o;
+}
+
+void SharedArea::met_shared(const Obj* o) {
+    note_shared_crossing(o);
+    // An object already shared is not copied again, so the region being built
+    // points into the one it is in, and must keep it.
+    SharedRegion* on = region_of(o);
+    if (!on || on == building_) return;
+    for (SharedRegion* d : building_->deps)
+        if (d == on) return;
+    building_->deps.push_back(on);
+}
+
+void SharedArea::free_region(SharedRegion* r) {
+    for (SharedRegion* d : r->deps) --d->dependents;
+    for (uint8_t* b : r->blocks) {
+        forget_shared_block(b);
+        std::free(b);
+    }
+    bytes_.fetch_sub(r->bytes, std::memory_order_relaxed);
+    if (r->condemned.load(std::memory_order_relaxed)) g_condemned_regions.fetch_sub(1);
+}
+
+bool SharedArea::release(Value v) {
+    v = resolve(v);
+    if (!is_ptr(v) || !is_shared_obj(as_obj(v))) return false;
+    std::lock_guard<std::mutex> g(mutex_);
+    SharedRegion* r = region_of(as_obj(v));
+    if (!r || r->area != this) return false;
+    if (!r->condemned.exchange(true)) {
+        r->condemned_at = rounds_;
+        g_condemned_regions.fetch_add(1);
+    }
+    return true;
+}
+
+bool SharedArea::any_condemned() {
+    std::lock_guard<std::mutex> g(mutex_);
+    for (auto& r : regions_)
+        if (r->condemned.load(std::memory_order_relaxed)) return true;
+    return false;
+}
+
+uint64_t SharedArea::begin_round() {
+    std::lock_guard<std::mutex> g(mutex_);
+    spoiled_.store(false, std::memory_order_relaxed);
+    return ++rounds_;
+}
+
+size_t SharedArea::finish_round(uint64_t round) {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (spoiled_.load(std::memory_order_relaxed)) return 0;
+    size_t freed = 0;
+    // A fixpoint: freeing a region can leave one it depended on with no
+    // dependents, which may then go in the same round.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t i = 0; i < regions_.size(); ++i) {
+            SharedRegion* r = regions_[i].get();
+            if (!r->condemned.load(std::memory_order_relaxed)) continue;
+            if (r->condemned_at >= round) continue;  // condemned after the round began
+            if (r->seen_round.load(std::memory_order_relaxed) == round) continue;
+            if (r->dependents > 0) continue;
+            freed += r->bytes;
+            free_region(r);
+            regions_[i] = std::move(regions_.back());
+            regions_.pop_back();
+            --i;
+            changed = true;
+        }
+    }
+    return freed;
 }
 
 Value SharedArea::make_float(double v) {
@@ -3158,19 +3338,29 @@ Value SharedArea::make_pap(Value fn, uint32_t nargs) {
 }
 
 bool SharedArea::share(Value v, Value* out, std::string* why) {
-    // One copy at a time. A share is rare and large, and the bump block is the
-    // area's only state, so a lock around the whole copy is the simple answer
-    // and costs nothing anyone would measure.
+    // One copy at a time. A share is rare and large, and the region being
+    // built is the area's only state, so a lock around the whole copy is the
+    // simple answer and costs nothing anyone would measure.
     std::lock_guard<std::mutex> g(mutex_);
     refused_.clear();
+    auto region = std::make_unique<SharedRegion>();
+    region->area = this;
+    building_ = region.get();
     CopySeen seen;
     Value copied = copy_value(*this, v, seen);
+    building_ = nullptr;
     if (!refused_.empty()) {
-        // What was copied before the refusal stays allocated and unreachable
-        // until the runtime ends. A refusal is a program error, not a path
-        // anything takes in a loop, so it is not worth undoing.
+        // Nothing can reach what was copied before the refusal, so the region
+        // goes now, as it is.
+        free_region(region.get());
         if (why) *why = "cannot share a " + refused_ + ": force it first";
         return false;
+    }
+    // A share that copied nothing -- an immediate, or a value already shared
+    // -- leaves no region behind.
+    if (!region->blocks.empty()) {
+        for (SharedRegion* d : region->deps) ++d->dependents;
+        regions_.push_back(std::move(region));
     }
     *out = copied;
     return true;

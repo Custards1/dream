@@ -616,6 +616,8 @@ These report figures for the **calling** process.
 | `node_section` | `[nodes, op_codes] → string` | An image's NODE section: each node `[op, flags, a, b, c]` as `u8 opcode, u8 flags, u16 0` and three indices, `:none` as all ones, the opcode from the compiler's table. The bytes `emit.node_bytes` writes, which `emit`'s tests hold it to. |
 | `index_section` | `list → string` | An image's KIDS section: each index as a little-endian `u32`, `:none` as all ones. The bytes `emit.index` writes. |
 | `shared_bytes!` | `unit → integer` | Bytes in the runtime's shared area. |
+| `release!` | `value → :ok \| :not_shared` | Say the program is done with what a `share!` answered. Its region is freed once a census finds nothing anywhere still holding it -- a value still in use simply stays, so a wrong release breaks nothing. Starts that census. |
+| `collect_shared!` | `unit → :ok` | Run a census again, for regions released while something still held them. |
 
 Processes share nothing: a value that crosses between two is copied, which is
 what lets each heap collect on its own. For a large table that many processes
@@ -631,11 +633,12 @@ Three things follow, and they are the contract:
 - A value must be data after forcing. A closure whose captured state is still
   a suspension is refused with `:type_error` rather than shared, because
   forcing a suspension writes to it and nothing shared may ever be written.
-- **Nothing shared is freed until the runtime ends.** That is the right bargain
-  for a table built once and read for the rest of a run, and the wrong one for
-  anything built in a loop: a language server that shared each request's parse
-  would grow for ever. `dreams` shares only when it is compiling from the
-  command line.
+- **Nothing shared is freed until it is released and nobody holds it.** Each
+  `share!` copies into a region of its own; `release!` asks for it back, and a
+  census -- a major in every process, a walk of every message waiting and of
+  what finished processes left -- frees it once nothing reaches it. A census
+  costs a major per process, so it runs only when asked. `dreams` shares only
+  when it is compiling from the command line and never releases: it exits.
 
 ### Watching, stopping and waiting
 

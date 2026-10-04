@@ -1203,6 +1203,30 @@ NativeResult vm_sleep_until(Process& p, Value, Value* args, uint32_t) {
     return park_until(p, deadline, WaitReason::Timer);
 }
 
+/// `vm.release! v` -- say the program is done with what `vm.share!` gave it.
+/// `v` is the answer of a `share!` (or anything inside it). Its region is
+/// freed once a census finds nothing anywhere still holding it, so a value
+/// still in use simply stays; there is nothing a wrong release can break.
+/// Starts that census. Answers `:ok`, or `:not_shared` for a value that is
+/// not in the shared area.
+NativeResult vm_release(Process& p, Value, Value* args, uint32_t) {
+    if (!p.runtime().shared().release(args[0])) {
+        return NativeResult::ok(make_atom(p.runtime().intern_atom("not_shared")));
+    }
+    if (Scheduler* s = p.runtime().scheduler()) s->request_census();
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
+/// `vm.collect_shared! ()` -- run a census again, for regions released while
+/// something still held them. Answers `:ok`; `shared_bytes!` shows what it
+/// freed once it has.
+NativeResult vm_collect_shared(Process& p, Value, Value*, uint32_t) {
+    if (Scheduler* s = p.runtime().scheduler(); s && p.runtime().shared().any_condemned()) {
+        s->request_census();
+    }
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
 /// Bytes in the runtime's shared area.
 NativeResult vm_shared_bytes(Process& p, Value, Value*, uint32_t) {
     return NativeResult::ok(make_integer(p, int64_t(p.runtime().shared().bytes())));
@@ -1465,6 +1489,8 @@ ModuleDef make_vm_module() {
                          {"heap_bytes!", 1, 0b1, vm_heap_bytes},
                          {"share!", 1, 0b0, vm_share, 0, true},
                          {"shared_bytes!", 1, 0b1, vm_shared_bytes},
+                         {"release!", 1, 0b1, vm_release},
+                         {"collect_shared!", 1, 0b1, vm_collect_shared},
                          {"modules!", 1, 0b1, vm_modules},
                          {"host_members", 1, 0b1, vm_host_members},
                          {"async_io", 1, 0b1, vm_async_io},
