@@ -74,6 +74,13 @@ let binary_e op l r span   = [:binary, op, l, r, span];
 /// so a name given that span was resolved as `l`.
 let matmul_e l r at span = apply_e (name_e "_tensor_matmul" at) [l, r] span;
 
+/// `$"a {x} b"`: the pieces in order -- the literal text as strings, the
+/// expressions as written -- joined by rendering each as `to_string` does. A
+/// unary operator over the list of pieces, as `::` is a binary one, so every
+/// pass that walks expressions already walks into the pieces; only the
+/// lowering knows it is the `str_interp` opcode.
+let interp_e pieces span = unary_e :interp (list_e pieces span) span;
+
 /// `else` is optional; a missing one is `()`.
 let if_e cond then_e else_e span = [:if, cond, then_e, else_e, span];
 

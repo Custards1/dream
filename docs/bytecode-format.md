@@ -194,6 +194,7 @@ lazy VM cannot work out for itself:
 | 71 | `data_count` | builtin ID 47 | kids offset | argument count 1 |
 | 72 | `data_at` | builtin ID 48 | kids offset | argument count 1 |
 | 73 | `compare` | builtin ID 49 | kids offset | argument count 2 |
+| 74 | `str_interp` | builtin ID 52 | kids offset | argument count 1 |
 
 
 `type_is` forces its subject to WHNF and compares its runtime type, answering a
@@ -433,7 +434,7 @@ existing builtin IDs are unchanged. Images that use it require an updated VM.
 
 ### Primitive calls
 
-Opcodes 47–73 invoke a fixed primitive without evaluating a callee. Their
+Opcodes 47–74 invoke a fixed primitive without evaluating a callee. Their
 argument run uses the corresponding builtin's strictness mask, in argument
 order; unforced arguments remain lazy. The loader validates the builtin ID,
 arity and every child index. Returning a stored value resumes evaluation in
@@ -483,5 +484,9 @@ written before it runs unchanged:
 | 47 | `_data_count` |
 | 48 | `_data_at` |
 | 49 | `compare` |
+
+Later appends: `_sort_keyed` (50), `_tensor_matmul` (51) and `_str_interp`
+(52), the last the builtin behind opcode 74, which an interpolated string
+`$"..{x}.."` lowers to directly: one kid, the list of its pieces.
 
 Images importing the removed `std.core` or `std.native` modules must be recompiled.

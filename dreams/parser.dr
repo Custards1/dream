@@ -144,6 +144,7 @@ let describe ts =
             :int => "a number",
             :float => "a number",
             :str => "a string",
+            :interp => "a string",
             :char => "a character",
             :atom => "an atom",
             :error => to_string (peek_value ts),
@@ -274,6 +275,7 @@ let can_start_arg c ts = {
         match kind_of t {
             :ident => not (is_non_starter (lexer.value t)),
             :int => true, :float => true, :str => true, :char => true, :atom => true,
+            :interp => true,
             :lparen => true, :lbracket => true,
             :dollar_paren => true, :hash_bracket => true, :percent_brace => true,
             :lbrace => not (ctx_no_brace c),
@@ -353,6 +355,29 @@ let rec index_operand c e ts build =
 
 // --- primaries --------------------------------------------------------------
 
+/// The pieces of an interpolated string, from the lexer's: text stays text,
+/// and each `{..}` -- its tokens, lexed in place, and where its `}` is -- must
+/// be exactly one expression. Parsed as if parenthesised, since the braces
+/// already say where it ends.
+let rec parse_pieces parts acc = match parts {
+    [] => ok (list.reverse acc) [],
+    [part, ..more] =>
+        if type_of part == :string { parse_pieces more (list.cons (ast.str_e part ast.no_span) acc) }
+        else {
+            let [tokens, close] = part;
+            match parse_expr (grouped top) tokens {
+                // Out of tokens: the parser has nothing to point at but the
+                // file's start, so point at the `}` that ended them.
+                [:error, _, s] if s == ast.no_span =>
+                    err "expected an expression before this `}`" (ast.span_of close (close + 1)),
+                [:error, m, s] => err m s,
+                [:ok, e, []] => parse_pieces more (list.cons e acc),
+                [:ok, _, left] => err ("expected `}` to end the interpolated expression, found "
+                                       + describe left) (peek_span left),
+            }
+        },
+};
+
 let rec parse_primary c ts = {
     let t = peek ts;
     // One peek, once: kind, value and span all come from the token itself,
@@ -367,6 +392,10 @@ let rec parse_primary c ts = {
             :str   => ok (ast.str_e (lexer.value t) sp) rest,
             :char  => ok (ast.char_e (lexer.value t) sp) rest,
             :atom  => ok (ast.atom_e (lexer.value t) sp) rest,
+            :interp => match parse_pieces (lexer.value t) [] {
+                [:error, m, s] => err m s,
+                [:ok, pieces, _] => ok (ast.interp_e pieces sp) rest,
+            },
 
             :lparen        => parse_paren c sp rest,
             :lbracket      => parse_sequence c sp rest :rbracket (fn items span -> ast.list_e items span) "]",
@@ -2715,6 +2744,13 @@ when test {
             $( test.eq! "(binary lt (binary add (name a) (int 1)) (name b))" (shape "a + 1 < b") ),
         test.case "every operator but :: is left-associative"
             $( test.eq! "(binary sub (binary sub (int 1) (int 2)) (int 3))" (shape "1 - 2 - 3") ),
+        test.case "an interpolated string is str_interp over its pieces"
+            $( test.eq! "(unary interp (list (str \"n=\") (binary add (name n) (int 1))))"
+                        (shape "$\"n={n + 1}\"") ),
+        test.case "a piece must be one expression"
+            $( test.true! (str.starts_with "expected `}`" (fails "$\"{a)}\"")) ),
+        test.case "a piece that stops short says where"
+            $( test.eq! "expected an expression before this `}`" (fails "$\"{1 + }\"") ),
         test.case ":: groups to the right"
             $( test.eq! "(binary cons (int 1) (binary cons (int 2) (list )))" (shape "1 :: 2 :: []") ),
         test.case ":: is looser than arithmetic"

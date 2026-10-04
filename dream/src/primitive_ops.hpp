@@ -29,7 +29,8 @@
     X(MapPairs, 70, 46, 1) \
     X(DataCount, 71, 47, 1) \
     X(DataAt, 72, 48, 1) \
-    X(Compare, 73, 49, 2)
+    X(Compare, 73, 49, 2) \
+    X(StrInterp, 74, 52, 1)
 
 #define DREAM_PRIMITIVE_CASE(name, code, builtin, arity) case Op::name:
 #define DREAM_PRIMITIVE_CASES DREAM_PRIMITIVES(DREAM_PRIMITIVE_CASE)

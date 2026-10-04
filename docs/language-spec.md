@@ -148,6 +148,7 @@ So `let group = 1` in a block, and `import std.foreign;` followed by
 | integer | `42`, `1_000_000`, `0xFF`, `0b1010`, `0o755` |
 | float | `1.5`, `2.5e-3`, `1e9`, `1_0.25` |
 | string | `"hello\n"`, `"tab\there"`, `"\u{1F600}"` |
+| interpolated string | `$"{name} is {age} years old"` |
 | character | `'c'`, `'\n'`, `'\u{41}'` |
 | atom | `:ok`, `:not_found` |
 | boolean | `true`, `false` |
@@ -166,6 +167,8 @@ So `let group = 1` in a block, and `import std.foreign;` followed by
   `\u{HEX}`, a Unicode scalar value. An unknown escape stands for the
   character itself (`\q` is `q`).
 - A string may contain line breaks as written.
+- In an interpolated string, `{` opens an expression and `\{` is a brace.
+  A plain string's braces are text.
 - An atom is `:` followed directly by a name.
 
 ### Line breaks end statements
@@ -271,6 +274,22 @@ len "héllo"              // 6
 str.length "héllo"       // 5
 "ab" + "cd"              // "abcd"
 ```
+
+An **interpolated string** is a `$` in front of the quote, and each `{expr}`
+in it is any one expression, rendered as `to_string` renders it -- a string as
+its text, anything else as it prints:
+
+```dream
+let n = 3;
+$"{n} squared is {n * n}"      // "3 squared is 9"
+$"items: {[1, 2]}"             // "items: [1, 2]"
+$"a literal \{ brace"          // "a literal { brace"
+```
+
+The prefix is what opts in: a plain string keeps every `{` it has, since
+strings that spell JSON or code are common. The pieces are evaluated when the
+string is, so one that raises raises there. It compiles to one opcode,
+`str_interp`, over the list of its pieces, and costs one copy of the result.
 
 ### Lists, arrays and maps
 

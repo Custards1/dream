@@ -85,6 +85,7 @@ let names = [
     "compare",
     "_sort_keyed",
     "_tensor_matmul",  // what `a @ b` is written as; see `ast.matmul_e`
+    "_str_interp",     // what `$"..{x}.."` is written as; see `ast.interp_e`
 
 ];
 
@@ -167,6 +168,7 @@ let signatures = %{
     "compare" => "a -> b -> integer",
     "_sort_keyed" => "keys:list -> array -> list",
     "_tensor_matmul" => "tensor|list|array -> tensor|list|array -> tensor|float",
+    "_str_interp" => "list of any -> string, each rendered as `to_string` renders it",
 
 };
 
@@ -217,10 +219,11 @@ let wrapper : :string -> :string | :unit;
 let wrapper name = wrappers.[name else ()];
 
 /// Primitives the parser writes on the program's behalf: `a @ b` is
-/// `_tensor_matmul a b` (`ast.matmul_e`). A name the author did not write is
+/// `_tensor_matmul a b` (`ast.matmul_e`), and an interpolated string's pieces
+/// are joined by `_str_interp` (`ast.interp_e`). A name the author did not write is
 /// not one to warn them about.
 let written_by_parser : :string -> :bool;
-let written_by_parser name = name == "_tensor_matmul";
+let written_by_parser name = name == "_tensor_matmul" || name == "_str_interp";
 
 /// A builtin's signature, or its bare name for one that has none.
 let signature : :string -> :string;

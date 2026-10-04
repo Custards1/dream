@@ -168,6 +168,7 @@ const char* op_name(Op op) {
         case Op::DataCount: return "data_count";
         case Op::DataAt: return "data_at";
         case Op::Compare: return "compare";
+        case Op::StrInterp: return "str_interp";
 
         case Op::Cons: return "cons";
         case Op::ListTail: return "list_tail";

@@ -11,15 +11,18 @@ Done (branch monitors-recv-match):
    target dies.
 5. A better match failure.  :match_error is its own kind with payload
    [value, path, line, col]; an uncaught one prints as a diagnostic.
+4. Found already in place: exhaustiveness is checked for any *named* type
+   (`union`, or a `type` alias like result.Of) through lets, constructors and
+   lambdas.  The one gap is a match on an unsigned function's result, which
+   is rule 1 of dreams/typecheck.dr ("nothing unannotated is ever an
+   error") working as designed, so it stays.
+6. String interpolation: `$"{n} squared is {n * n}"`.  The lexer lexes each
+   `{..}` in place, the parser makes `[:unary, :interp, [pieces]]`, and the
+   lowering emits the new `str_interp` opcode (74, builtin `_str_interp`).
 
 Left:
 3. Shared, frozen, fully forced values -- this already exists as vm.share!.
    What is missing is a way to free one (it lives until the runtime ends).
-4. Union types flowing further: a real `union Result` in std.result, and the
-   checker carrying a constructor's type through `let`, so more matches are
-   checked for exhaustiveness.  Also: warn on a match with no wildcard over a
-   known type (the other half of 5).
-6. String interpolation: "area: {a}" lowered to str.concat over to_string.
 7. The array-backed union (the planned `struct` to `union`'s `group`).
 8. Peak heap on large programs (1.7 GB at 6,400 decls, dreams/TODO.md):
    --stats live set by kind, look for lazy values pinned in scope maps.

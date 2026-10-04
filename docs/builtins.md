@@ -153,6 +153,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 |-----------|-------|-----------|-------------|
 | `compare` | `compare a b` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays, tensors. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Tensors compare by shape, then element by element. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
 | `_tensor_matmul` | `a @ b` | `tensor\|list\|array → tensor\|list\|array → tensor\|float` | What `a @ b` is written as. See [`std.tensor`](#stdtensor). |
+| `_str_interp` | `$"..{x}.."` | `list → string` | Every element rendered as `to_string` renders it, joined: what an interpolated string is written as, lowered straight to the `str_interp` opcode. |
 | `_sort_keyed` | `list.sort_on key xs` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
 ### Large data

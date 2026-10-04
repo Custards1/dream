@@ -2109,6 +2109,53 @@ NativeResult core_str_concat(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
 }
 
+/// `_str_interp pieces` -- what `$"..{x}.."` comes to: every piece rendered as
+/// `to_string` renders it, joined. The parser hands it the literal text and the
+/// expressions in order, as one list, and the `str_interp` opcode calls this.
+///
+/// It walks the list the way `str_concat` does, with the cursor on the value
+/// stack, but does not vouch for the collector: a piece is rendered by
+/// `stringify`, which keeps C++ locals across its forces, exactly as
+/// `to_string` does. A few pieces of a literal are not the walk the vouch was
+/// for.
+NativeResult core_str_interp(Process& p, Value, Value* args, uint32_t) {
+    std::string out;
+    const size_t base = p.stack.size();
+    p.stack.push_back(args[0]);
+    for (;;) {
+        Value w;
+        if (!force_whnf(p, p.stack[base], &w)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (is_nil(w)) break;
+        if (!is_obj(w, ObjType::Cons)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_interp needs a list");
+        }
+        p.stack[base] = w;
+        Value head;
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(w))->head, &head)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (is_obj(head, ObjType::BigStr)) {
+            p.stack.resize(base);
+            return bigstr_refused(p, "a string interpolation");
+        }
+        if (is_obj(head, ObjType::Str)) {
+            auto* part = static_cast<StrObj*>(as_obj(head));
+            out.append(part->data(), part->len);
+        } else if (!stringify(p, head, &out)) {
+            p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        p.stack[base] = static_cast<ConsObj*>(as_obj(p.stack[base]))->tail;
+    }
+    p.stack.resize(base);
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
 NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
     Bytes b;
     Value from = resolve(args[1]);
@@ -3436,6 +3483,7 @@ const BuiltinDef BUILTINS[] = {
     {"compare", 2, 0b11, core_compare},
     {"_sort_keyed", 2, 0b10, core_sort_keyed, true},
     {"_tensor_matmul", 2, 0b11, tensor_matmul_builtin},
+    {"_str_interp", 1, 0b1, core_str_interp},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

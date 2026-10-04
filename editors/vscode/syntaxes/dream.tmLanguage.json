@@ -7,6 +7,9 @@
       "include": "#comment"
     },
     {
+      "include": "#interpolated"
+    },
+    {
       "include": "#string"
     },
     {
@@ -59,6 +62,37 @@
         {
           "name": "comment.line.double-slash.dream",
           "match": "//.*$"
+        }
+      ]
+    },
+    "interpolated": {
+      "name": "string.interpolated.dream",
+      "begin": "\\$\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.dream",
+          "match": "\\\\(u\\{[0-9A-Fa-f]+\\}|.)"
+        },
+        {
+          "name": "meta.embedded.interpolation.dream",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.begin.dream"
+            }
+          },
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.end.dream"
+            }
+          },
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
         }
       ]
     },

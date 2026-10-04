@@ -510,6 +510,16 @@ let rec lower_expr e l =
                 _ => lower_expr (ast.apply_e rhs [lhs] span) l,
             },
 
+        // An interpolated string is the `str_interp` opcode over the list of
+        // its pieces (`ast.interp_e`), emitted directly, as `::` is `:cons`.
+        [:unary, :interp, x, _] => {
+            let a = lower_expr x l;
+            let placed = kids [list.nth 1 a] (list.head a);
+            let made = emit (ir.node :str_interp (builtins.id "_str_interp") (list.nth 1 placed) 1)
+                            (list.head placed);
+            [inherit (list.nth 1 made) [list.nth 1 a] (list.head made), list.nth 1 made]
+        },
+
         // `:neg` and `:not` are what the parser already calls them, and what
         // the arena calls them, so there is nothing to translate.
         [:unary, op, x, _] => {
