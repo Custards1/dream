@@ -228,13 +228,17 @@ let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
 /// The description is then a function of them, as a parameterised `type` is,
 /// and the constructors' signatures say `a -> Option a` -- `a` being free in a
 /// signature is what makes it a type variable.
-let union_decl name params variants members span = {
+let union_decl name params variants members kind span = {
     let at_ = span;
     let lit_tag v = ast.list_e [ast.atom_e "literal" at_, ast.atom_e (ast.variant_name v) at_] at_;
     let field_t f = match list.nth 2 f { () => ast.atom_e "any" at_, t => t };
+    // `union struct` makes a variant with fields an array, `#[:tag, ..]`, and
+    // says so in its description; one with none is the atom either way.
+    let shape = if kind == :array { "array" } else { "tuple" };
+    let built items = if kind == :array { ast.array_e items at_ } else { ast.list_e items at_ };
     let described v = match ast.variant_fields v {
         [] => lit_tag v,
-        fs => ast.list_e [ast.atom_e "tuple" at_,
+        fs => ast.list_e [ast.atom_e shape at_,
                           ast.list_e (list.cons (lit_tag v) (list.map field_t fs)) at_] at_,
     };
     let description = ast.let_d "type" params
@@ -248,7 +252,7 @@ let union_decl name params variants members span = {
             [] => ast.let_d (ast.variant_name v) [] tag false at_,
             _ => ast.let_d (ast.variant_name v)
                     (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
-                    (ast.list_e (list.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)) at_)
+                    (built (list.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)))
                     false at_,
         }
     }) variants;

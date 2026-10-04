@@ -1733,7 +1733,19 @@ let rec parse_record c kind sp ts =
 // a member -- `area self = ..` -- when it has parameters and a `=`, which is
 // how a record tells a member from a field too.
 
+/// `union Name {..}`, or `union struct Name {..}` for one whose variants with
+/// fields are arrays. `struct` here is only a word in front of a name, so it
+/// takes no name from anyone.
 let rec parse_union c sp ts =
+    if at ts :ident && peek_value ts == "struct" && at (list.tail ts) :ident {
+        match parse_union_named c sp (list.tail ts) {
+            [:ok, [:union_decl, n, ps, vs, ms, _, s], rest] => ok (ast.array_union_d n ps vs ms s) rest,
+            other => other,
+        }
+    }
+    else { parse_union_named c sp ts };
+
+let rec parse_union_named c sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a union name" (peek_span ts)
     } else if str.ends_with "!" (peek_value ts) {
@@ -2744,6 +2756,12 @@ when test {
             $( test.eq! "(binary lt (binary add (name a) (int 1)) (name b))" (shape "a + 1 < b") ),
         test.case "every operator but :: is left-associative"
             $( test.eq! "(binary sub (binary sub (int 1) (int 2)) (int 3))" (shape "1 - 2 - 3") ),
+        test.case "union struct is a union whose variants are arrays"
+            $( test.eq! [:union_decl, "Shape", :array]
+                        (match parse_module "union struct Shape { circle(r), empty }" {
+                             [:ok, [[:union_decl, n, _, _, _, kind, _]], _] => [:union_decl, n, kind],
+                             other => other,
+                         }) ),
         test.case "an interpolated string is str_interp over its pieces"
             $( test.eq! "(unary interp (list (str \"n=\") (binary add (name n) (int 1))))"
                         (shape "$\"n={n + 1}\"") ),

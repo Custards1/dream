@@ -266,7 +266,10 @@ let sig_d name t span = [:sig, name, t, span];
 ///
 /// A variant is `[name, span, fields]` and a field `[name, span, type]`, with
 /// `()` for a field written without a type.
-let union_d name params variants members span = [:union_decl, name, params, variants, members, span];
+let union_d name params variants members span = [:union_decl, name, params, variants, members, :list, span];
+/// `union struct Shape { .. }`: the same union, its variants with fields
+/// arrays rather than lists -- what `struct` is to `group`.
+let array_union_d name params variants members span = [:union_decl, name, params, variants, members, :array, span];
 /// `foreign name from lib { .. }`: a C library, which the loader rewrites into
 /// a module of bound functions, resource types and struct layouts
 /// (`syntax.foreign_decl`). `library` is the expression that names it, or `()`
@@ -469,8 +472,8 @@ let rec show e =
             + (if list.is_empty ps { "" } else { " " + show_params ps }) + " " + show b + ")",
         [:priv, d, _] => "(priv " + show d + ")",
         [:sig, n, t, _] => "(sig " + n + " " + show t + ")",
-        [:union_decl, n, ps, variants, members, _] =>
-            "(union " + n + (if list.is_empty ps { "" } else { " " + show_params ps })
+        [:union_decl, n, ps, variants, members, kind, _] =>
+            "(union " + (if kind == :array { "struct " } else { "" }) + n + (if list.is_empty ps { "" } else { " " + show_params ps })
             + " " + str.join_str " " (list.map (fn v ->
                   "(" + variant_name v
                   + str.join_str "" (list.map (fn f ->

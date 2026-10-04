@@ -501,8 +501,8 @@ let expand_items cfg items = {
                 [syntax.record_derived kind name fields members (inherited + bases) span],
             // A union is a module and, in the parent, a global of the same
             // name holding its description -- see `syntax.union_decl`.
-            [:union_decl, name, params, variants, members, span] =>
-                syntax.union_decl name params variants members span,
+            [:union_decl, name, params, variants, members, kind, span] =>
+                syntax.union_decl name params variants members kind span,
             // A C library is a module of bindings -- see `syntax.foreign_decl`.
             [:foreign_decl, name, library, entries, span] =>
                 syntax.foreign_decl name library entries span,

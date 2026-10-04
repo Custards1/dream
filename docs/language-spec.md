@@ -1070,6 +1070,23 @@ members, `Shape.type`, and a signature for each constructor) and a global
 written. A field's type is optional. Parameters after the name make the
 union generic.
 
+`union struct Shape { .. }` is the same union with its variants that have
+fields made **arrays**, `#[:circle, 1.0]`, and matched with array patterns --
+what `struct` is to `group`. A field is then one step away instead of a walk
+down the list, and a variant of `n` fields is one object instead of `n + 1`
+cells. A variant with no fields is still the atom. `match` dispatches on the
+tag of either kind in one step.
+
+```dream
+union struct Op { push(n : :integer), add, clamp(lo : :integer, hi : :integer) }
+
+match op {
+    #[:push, n] => n,
+    :add => acc + 1,
+    #[:clamp, lo, hi] => ..,
+}
+```
+
 **A `match` on a declared union must handle every variant**, wherever the
 checker knows the subject's type is that union:
 

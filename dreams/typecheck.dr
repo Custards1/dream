@@ -1876,6 +1876,7 @@ let tagged_variant v = match v {
     [:lit, _, _] => true,
     :unit => true,
     [:tuple, [tag, .._]] => is_tag tag,
+    [:array_t, [tag, .._]] => is_tag tag,
     _ => false,
 };
 
@@ -1893,6 +1894,8 @@ let tag_name t = match t {
 let show_variant v = match v {
     [:tuple, [tag, ..fields]] =>
         "[:" + tag_name tag + str.join_str "" (list.map (fn f -> ", _") fields) + "]",
+    [:array_t, [tag, ..fields]] =>
+        "#[:" + tag_name tag + str.join_str "" (list.map (fn f -> ", _") fields) + "]",
     _ => show v,
 };
 
@@ -1917,7 +1920,14 @@ let rec arm_misses p v = match p {
         },
         _ => true,
     },
-    [:array_p, _, _, _] => true,
+    [:array_p, items, rest, _] => match v {
+        [:array_t, ts] => {
+            let n = list.length items;
+            let sized = if rest == () { n == list.length ts } else { n <= list.length ts };
+            not sized || list.any (fn pt -> element_misses (list.nth 0 pt) (list.nth 1 pt)) (list.zip items ts)
+        },
+        _ => true,
+    },
     [:map_p, _, _] => true,
     _ => false,
 };

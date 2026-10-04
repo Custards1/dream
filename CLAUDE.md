@@ -368,8 +368,9 @@ The lessons that keep coming back:
   union**: a module of constructors whose values are `[:circle, r]` and
   `:empty` -- the tagged lists Dream already writes by hand -- plus a global
   `Shape` holding its description. A `match` on one must handle every
-  variant. Lists back it; an array opt-in, as `struct` is to `group`, is
-  planned and not built.
+  variant. Lists back it; `union struct Shape { .. }` makes the variants
+  with fields arrays (`#[:circle, r]`) instead, as `struct` is to `group`,
+  and `switch_head` dispatches on either.
 - `import std.tensor` gives **tensors**: packed numbers with a shape
   (`TensorObj`), on which `+ - * / %` are elementwise and `a @ b` is the
   matrix product (the parser writes it as the builtin `_tensor_matmul`).

@@ -223,8 +223,9 @@ time on the continuation stack, never recursively.
 match. Each key is an `atom` node, followed by the node to evaluate when the
 key is that atom; the last kid is the node for every other key. `switch_atom`
 keys on its subject, when the subject is an atom. `switch_head` keys on the
-head of a list cell, which it forces first; a subject that is not a cell, or
-whose head is not an atom, takes the default. The subject is forced to weak
+head of a list cell, or the first element of a non-empty array (a `union
+struct` variant), which it forces first; any other subject, or one whose head
+is not an atom, takes the default. The subject is forced to weak
 head normal form. The compiler emits these only where the tests they skip could
 not have matched and where the chain of arm tests would itself have forced the
 same head first, so a VM that ran every target's arm tests from the top would

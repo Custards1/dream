@@ -1621,11 +1621,17 @@ void take_switch(Process& p, uint32_t node, Value subject, Value frame) {
         eval_node(p, switch_target(p, n, subject), frame);
         return;
     }
-    if (!is_obj(subject, ObjType::Cons)) {
+    // The head of a list cell, or the first element of an array: a variant of
+    // a `union struct` is `#[:tag, ..]` and is told apart the same way.
+    Value head;
+    if (is_obj(subject, ObjType::Cons)) {
+        head = resolve(static_cast<ConsObj*>(as_obj(subject))->head);
+    } else if (is_obj(subject, ObjType::Array) && static_cast<ArrayObj*>(as_obj(subject))->len > 0) {
+        head = resolve(static_cast<ArrayObj*>(as_obj(subject))->items()[0]);
+    } else {
         eval_node(p, img_of(p).kid(n.b + n.c - 1), frame);
         return;
     }
-    Value head = resolve(static_cast<ConsObj*>(as_obj(subject))->head);
     if (is_whnf(head)) {
         eval_node(p, switch_target(p, n, head), frame);
         return;

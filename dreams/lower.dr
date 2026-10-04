@@ -1425,6 +1425,10 @@ let rec arm_key p = match p {
     [:as_p, inner, _, _, _] => arm_key inner,
     [:literal, [:atom, n, _], _] => [:atom, n],
     [:list_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
+    // A `union struct` variant: `switch_head` reads an array's first element
+    // as it reads a cell's head, and the arm's own test still tells the two
+    // apart, so a list arm and an array arm with one tag share a key safely.
+    [:array_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
     _ => :any,
 };
 
