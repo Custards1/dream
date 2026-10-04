@@ -1,0 +1,43 @@
+// SHA256SUMS: one line per file of a release, as `sha256sum -c` reads it.
+//
+// Every file in the output directory, sorted, with its digest -- the
+// packages, the tarballs, the formula and the install script alike -- so a
+// release page can carry one file that vouches for the rest, and a user can
+// check what they downloaded with the tool their system already has. What
+// `ship` keeps for itself (`aur/`, a scratch directory) is left out, as is
+// the sums file itself.
+
+import std.file;
+import std.io;
+import std.list;
+import std.str;
+
+/// The files of `dir` a release publishes: not in a directory, not hidden.
+let published! : :string -> [:string];
+let published! dir = list.filter (fn f -> not (str.contains_str "/" f) && not (str.starts_with "." f) && f != "SHA256SUMS")
+                                 (file.walk! dir);
+
+let line : :string -> :string -> :string;
+let line digest name = digest + "  " + name + "\n";
+
+/// Write `SHA256SUMS` into `dir`, answering its path.
+let make! : :string -> [:ok, :string] | [:error, :string];
+let make! dir = match published! dir {
+    [] => [:error, "sums: nothing in " + dir + " to sum"],
+    files => {
+        let lines = list.map (fn f -> line (io.digest! (dir + "/" + f)) f) files;
+        strict! lines
+        let path = dir + "/SHA256SUMS";
+        file.write! path (str.concat_all lines)
+        [:ok, path]
+    },
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a line sha256sum reads"
+            $( test.eq! "abc  hello.deb\n" (line "abc" "hello.deb") ),
+    ];
+}

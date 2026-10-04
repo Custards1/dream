@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <filesystem>
 #include "windows.hpp"
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <cerrno>
@@ -902,8 +905,63 @@ std::vector<std::string> split_dir_list(const std::string& list) {
     return dirs;
 }
 
+/// Where the running binary is, with every link on the way resolved, or an
+/// empty path when the system will not say. `/usr/bin/dream` may be a link
+/// into `/usr/lib/dream/bin`, and it is the file's own place that says which
+/// installation it came with, not the name it was run by.
+std::filesystem::path own_executable() {
+    std::error_code ec;
+    std::filesystem::path exe;
+#if defined(_WIN32)
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (n == 0) return {};
+        if (n < buf.size()) {
+            buf.resize(n);
+            break;
+        }
+        buf.resize(buf.size() * 2);
+    }
+    exe = std::filesystem::path(buf);
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buf(size, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+    exe = std::filesystem::path(buf.c_str());
+#else
+    exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) return {};
+#endif
+    std::filesystem::path real = std::filesystem::canonical(exe, ec);
+    return ec ? exe : real;
+}
+
+/// The installation this VM was installed with: `lib/dream` beside the
+/// directory the binary is in, so `/usr/bin/dream` has `/usr/lib/dream` and a
+/// Homebrew keg or a tarball unpacked into `~/.local` has its own. That is
+/// the layout `ship` packages Dream in (the `[ship]` sections of the
+/// repository's mind.toml). A VM in a build tree has no such directory and
+/// answers `""`.
+std::string own_installation() {
+    const std::filesystem::path exe = own_executable();
+    if (exe.empty()) return "";
+    const std::filesystem::path dir = exe.parent_path().parent_path() / "lib" / "dream";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return "";
+    const std::u8string text = dir.u8string();
+    return std::string(text.begin(), text.end());
+}
+
 std::string install_path() {
     if (const char* from_env = std::getenv("MINDV2_PATH")) return std::string(from_env);
+    // Before `~/.mindv2`: a packaged VM is one with its standard library and
+    // compiler beside it, and a `~/.mindv2` left from building by hand is
+    // older or newer than both -- the mismatch `just install-artifacts` warns
+    // about, where the installed `std` cannot build the installed compiler.
+    const std::string own = own_installation();
+    if (!own.empty()) return own;
     const std::string home = home_dir();
     if (home.empty()) return "";
     std::string candidate = home + "/.mindv2";

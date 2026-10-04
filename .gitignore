@@ -22,3 +22,4 @@ lib/
 bin/
 
 build-portable*/
+/dist/

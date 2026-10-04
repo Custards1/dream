@@ -1,0 +1,365 @@
+// What a package installs, found on disk.
+//
+// `[ship.files]` maps where each thing goes to what it is made from. A
+// destination that is relative lands under the prefix (`bin/dream` is
+// `/usr/bin/dream`), and one that begins with `/` lands where it says
+// (`/etc/dream.toml`). A source that is a directory ships everything under it,
+// less what its `exclude` names (`glob.dr`) and what version control keeps
+// beside it:
+//
+//     "bin/dream" = "build/stage/bin/dream"
+//     "lib/dream/std" = { src = "mind/std", exclude = ["target", "*.lock"] }
+//     "/etc/dream/dream.toml" = { src = "dream.toml", config = true }
+//
+// `[ship.links]` adds symbolic links, target as written:
+//
+//     "lib/libdream.so.0" = "libdream.so.0.1"
+//
+// and either section may be said again for one system, `[ship.files.linux]`
+// or `[ship.links.macos]`, whose entries are added when packaging for it.
+//
+// The answer is every file and link, by its path from the root without the
+// leading `/` (`usr/bin/dream`), sorted -- which is the order every archive
+// here is written in, so the same inputs make the same bytes -- and the time
+// every member is stamped with: `SOURCE_DATE_EPOCH` when the environment sets
+// it, as reproducible builds ask, and otherwise the newest source, so a
+// rebuild of unchanged files is the same package.
+//
+// A permission a manifest does not give is worked out, because `std.io` does
+// not report one: a file in a `bin`, `sbin` or `libexec` directory, a script
+// (`#!`) and a native program are executable, a shared library and
+// everything else are not.
+
+import std.char;
+import std.io;
+import std.list;
+import std.map;
+import std.num;
+import std.os;
+import std.result;
+import std.str;
+
+import glob;
+import item;
+import item.{Item};
+import platform;
+import spec;
+import spec.Spec;
+
+mapping Layout {
+    // Files and links, by path, sorted.
+    items : [:any]
+    // The paths among them a package manager must not overwrite once a user
+    // has edited them: everything under `etc`, and what says `config = true`.
+    config : [:string]
+    epoch : :integer
+}
+
+/// One `[ship.files]` entry, as written.
+mapping Source {
+    dest : :string
+    src : :string
+    mode = ()
+    exclude : [:string] = []
+    config : :bool = false
+}
+
+// --- reading the entries ---------------------------------------------------------------
+
+/// A permission written as `"755"`, `"0755"`, `"0o755"` or `755`: always octal,
+/// since that is how anyone who writes one thinks of it.
+let parse_mode : :any -> [:ok, :integer] | [:error, :string];
+let parse_mode v = {
+    let digits = match spec.text_of v {
+        t if str.starts_with "0o" t => str.slice 2 (str.byte_length t - 2) t,
+        t => t,
+    };
+    let rec go cs !acc = match cs {
+        [] => [:ok, acc],
+        [c, ..rest] if c >= '0' && c <= '7' => go rest (acc * 8 + char.code c - 48),
+        _ => [:error, "mode `" + spec.text_of v + "`: write it in octal, as \"755\""],
+    };
+    match str.chars digits { [] => [:error, "mode: empty"], cs => go cs 0 }
+};
+
+let source_of : [:string, :any] -> [:ok, Source] | [:error, :string];
+let source_of [dest, value] = match type_of value {
+    :string => [:ok, Source.new dest value],
+    :map => match spec.text_of value.["src" else ()] {
+        "" => [:error, "[ship.files] \"" + dest + "\": say where it comes from, as src = \"...\""],
+        src => {
+            let? mode = match value.["mode" else ()] {
+                () => [:ok, ()],
+                m => parse_mode m,
+            };
+            [:ok, Source.new dest src
+                  |> Source.set_mode mode
+                  |> Source.set_exclude (list.map spec.text_of (spec.as_list value.["exclude" else ()]))
+                  |> Source.set_config (value.["config" else false] == true)]
+        },
+    },
+    _ => [:error, "[ship.files] \"" + dest + "\": a path, or { src = \"...\" }"],
+};
+
+/// Where a destination is, from the root: under the prefix unless it begins
+/// with `/`. `..` is refused, since a package that writes outside what it
+/// says it writes is not one anybody should install.
+let dest_path : Spec -> :string -> [:ok, :string] | [:error, :string];
+let dest_path sp dest = {
+    let names = list.filter (fn n -> n != "" && n != ".") (str.split "/" dest);
+    let under = if str.starts_with "/" dest { [] }
+                else { list.filter (fn n -> n != "") (str.split "/" (spec.prefix_path sp)) };
+    if list.contains ".." names { [:error, "\"" + dest + "\": `..` is not allowed in a destination"] }
+    else if list.is_empty names { [:error, "\"" + dest + "\": install it somewhere below the root"] }
+    else { [:ok, str.join_str "/" (under + names)] }
+};
+
+// --- permissions -----------------------------------------------------------------------
+
+/// The first bytes of a file, to tell a program from a library or text.
+let head! : :string -> :string;
+let head! path = {
+    let h = io.open! path :read;
+    let got = io.read! h 4;
+    io.close! h
+    got
+};
+
+/// Whether a file name is a library's: `libx.so`, `libx.so.1.2`, `libx.dylib`,
+/// an archive or an object. Libraries are native code and are not run.
+let is_library : :string -> :bool;
+let is_library name =
+    str.ends_with ".so" name || str.contains_str ".so." name || str.ends_with ".dylib" name
+    || str.ends_with ".a" name || str.ends_with ".o" name;
+
+/// ELF (Linux) and Mach-O (macOS), both byte orders and the universal form.
+let is_native : :string -> :bool;
+let is_native bytes =
+    bytes == "\u{7f}ELF"
+    || list.contains (list.map (fn i -> str.byte i bytes) [0, 1, 2, 3])
+                     [[207, 250, 237, 254], [254, 237, 250, 207], [206, 250, 237, 254], [202, 254, 186, 190]];
+
+let in_program_dir : :string -> :bool;
+let in_program_dir path = {
+    let names = str.split "/" path;
+    list.any (fn n -> n == "bin" || n == "sbin" || n == "libexec") (list.take (list.length names - 1) names)
+};
+
+/// The mode for a file installed at `path` from `source`, when none is given.
+let guess_mode! : :string -> :string -> :integer;
+let guess_mode! path source = {
+    let name = list.last (str.split "/" path);
+    if in_program_dir path && not (is_library name) { item.executable }
+    else {
+        let first = head! source;
+        if str.starts_with "#!" first || (is_native first && not (is_library name)) { item.executable }
+        else { item.regular }
+    }
+};
+
+let mode_of! : Source -> :string -> :string -> :integer;
+let mode_of! s path source = match Source.mode s {
+    () => guess_mode! path source,
+    m => m,
+};
+
+// --- collecting ------------------------------------------------------------------------
+
+/// One file, and when it was last written.
+let file_at! : Source -> :string -> :string -> [:ok, [Item, :integer]] | [:error, :string];
+let file_at! s path source = match io.stat! source {
+    [size, modified, :file] => {
+        let mode = mode_of! s path source;
+        [:ok, [item.Item.file path mode source size, modified]]
+    },
+    _ => [:error, source + " is not a file it can read"],
+};
+
+/// Everything one entry installs.
+let expand! : Spec -> Source -> [:ok, [[Item, :integer]]] | [:error, :string];
+let expand! sp s = {
+    let? dest = dest_path sp (Source.dest s);
+    let from = spec.join (Spec.root sp) (Source.src s);
+    match io.stat! from {
+        () => [:error, "[ship.files] \"" + Source.dest s + "\": " + from + " is not there"],
+        [_, _, :dir] => {
+            let patterns = glob.always + Source.exclude s;
+            let wanted = list.filter (fn rel -> not (glob.excluded patterns rel)) (io.walk! from);
+            all! (list.map (fn rel -> file_at! s (dest + "/" + rel) (from + "/" + rel)) wanted)
+        },
+        [_, _, :file] => {
+            let? one = file_at! s dest from;
+            [:ok, [one]]
+        },
+        _ => [:error, "[ship.files] \"" + Source.dest s + "\": " + from + " is neither a file nor a directory"],
+    }
+};
+
+/// The results of a list of steps, run in order: every answer, or the first
+/// failure. The list is forced here, since each step reads the disk.
+let all! : [:any] -> [:ok, [:any]] | [:error, :string];
+let all! results = {
+    strict! results
+    match list.filter (fn r -> list.head r == :error) results {
+        [] => [:ok, list.map (fn r -> r.[1]) results],
+        [first, ..] => first,
+    }
+};
+
+/// Every path two entries both install, and every file another sits inside.
+let clashes : [Item] -> [:string];
+let clashes items = {
+    let counts = list.fold (fn acc i -> map.update 0 (fn n -> n + 1) (item.path i) acc) (%{}) items;
+    let twice = list.filter (fn [_, n] -> n > 1) (map.pairs counts);
+    let inside = list.filter (fn i -> list.any (fn p -> map.has p counts) (parents (item.path i))) items;
+    list.map (fn [p, _] -> "/" + p + " is installed by more than one entry") (list.sort_on (fn e -> list.head e) twice)
+    + list.map (fn i -> "/" + item.path i + " is inside a file") inside
+};
+
+/// When every member is stamped: `SOURCE_DATE_EPOCH`, or the newest source.
+let epoch! : [:integer] -> :integer;
+let epoch! modified = match os.env! "SOURCE_DATE_EPOCH" {
+    () => match modified {
+        [] => os.now! () / 1000,
+        ts => list.maximum ts / 1000000000,
+    },
+    text => match num.parse_int (str.trim text) {
+        () => raise! ("SOURCE_DATE_EPOCH is `" + text + "`, not a number of seconds"),
+        n => n,
+    },
+};
+
+let links_of : Spec -> [:ok, [Item]] | [:error, :string];
+let links_of sp = result.all (list.map (fn [dest, target] -> {
+    let? path = dest_path sp dest;
+    match spec.text_of target {
+        "" => [:error, "[ship.links] \"" + dest + "\": say what it points to"],
+        t => [:ok, item.Item.link path t],
+    }
+}) (sections sp "ship.links"));
+
+/// A section's entries and those of the same section for the system being
+/// packaged for: `[ship.files]` and `[ship.files.macos]`, since a shared
+/// library is `libx.so.1` on one and `libx.1.dylib` on the other.
+let sections : Spec -> :string -> [[:string, :any]];
+let sections sp name = spec.entries sp name + spec.entries sp (name + "." + platform.os_name (Spec.os sp));
+
+/// Everything the manifest installs, found on disk and checked.
+let collect! : Spec -> [:ok, Layout] | [:error, :string];
+let collect! sp = {
+    let? sources = result.all (list.map source_of (sections sp "ship.files"));
+    let? expanded = all! (list.map (fn s -> expand! sp s) sources);
+    let? links = links_of sp;
+    let found = list.concat expanded;
+    let items = list.sort_on item.path (list.map (fn f -> list.head f) found + links);
+    match clashes items {
+        [] => {
+            let configured = list.flat_map (fn s -> match [Source.config s, dest_path sp (Source.dest s)] {
+                [true, [:ok, d]] => [d],
+                _ => [],
+            }) sources;
+            let config = list.filter (fn p -> str.starts_with "etc/" p
+                                              || list.any (fn d -> p == d || str.starts_with (d + "/") p) configured)
+                                     (list.map item.path (list.filter (fn i -> list.head i == :file) items));
+            [:ok, Layout.make items config (epoch! (list.map (fn f -> f.[1]) found))]
+        },
+        problems => [:error, str.join_str "\n" problems],
+    }
+};
+
+// --- what the formats ask of a layout ------------------------------------------------
+
+/// The directories above a path: `usr/bin/x` is in `usr` and `usr/bin`.
+let parents : :string -> [:string];
+let parents path = {
+    let names = str.split "/" path;
+    list.map (fn n -> str.join_str "/" (list.take n names)) (list.range 1 (list.length names))
+};
+
+/// Every directory something is installed in, sorted, each once.
+let dirs : [Item] -> [:string];
+let dirs items = list.sort (map.members (map.set_of (list.flat_map (fn i -> parents (item.path i)) items)));
+
+/// The bytes a package takes once installed.
+let installed_size : [Item] -> :integer;
+let installed_size items = list.fold_strict (fn !acc i -> acc + item.size i) 0 items;
+
+/// A path relative to the prefix, for the formats laid out from it -- a
+/// tarball, a formula. One outside the prefix keeps its path from the root.
+let relative : Spec -> :string -> :string;
+let relative sp path = match spec.prefix_path sp {
+    "" => path,
+    pre if str.starts_with (pre + "/") path => str.slice (str.byte_length pre + 1) (str.byte_length path - str.byte_length pre - 1) path,
+    _ => path,
+};
+
+/// The directories every system already has, which a package that puts a
+/// file in one does not own. RPM records the directories a package owns and
+/// removes them with it, so owning `/usr/bin` would be a package that tries
+/// to take it away; dpkg and pacman count the packages using each directory
+/// instead, and need no list.
+let shared : %{:string => :bool} = map.set_of [
+    "bin", "sbin", "lib", "lib64", "etc", "opt", "var", "var/lib", "var/log", "usr", "usr/bin", "usr/sbin",
+    "usr/lib", "usr/lib64", "usr/libexec", "usr/include", "usr/share", "usr/share/doc", "usr/share/licenses",
+    "usr/share/info", "usr/share/locale", "usr/share/applications", "usr/share/icons", "usr/share/pixmaps",
+    "usr/share/man", "usr/share/man/man1", "usr/share/man/man2", "usr/share/man/man3", "usr/share/man/man4",
+    "usr/share/man/man5", "usr/share/man/man6", "usr/share/man/man7", "usr/share/man/man8",
+    "usr/share/bash-completion", "usr/share/bash-completion/completions", "usr/share/zsh",
+    "usr/share/zsh/site-functions", "usr/share/fish", "usr/share/fish/vendor_completions.d",
+    "usr/lib/systemd", "usr/lib/systemd/system", "usr/lib/systemd/user", "usr/lib/pkgconfig",
+    "usr/share/pkgconfig", "etc/profile.d", "etc/bash_completion.d", "etc/systemd", "etc/systemd/system",
+    "usr/local", "usr/local/bin", "usr/local/lib", "usr/local/share", "usr/local/include",
+];
+
+/// The directories this package creates and should take away with it.
+let owned : [Item] -> [:string];
+let owned items = list.filter (fn d -> not (map.member d shared)) (dirs items);
+
+when test {
+    import std.test;
+    import std.toml;
+
+    let sp! () = match toml.parse "[package]\nname = \"demo\"\nversion = \"1.0\"\n[ship]\nsummary = \"x\"\n" {
+        [:ok, doc] => match spec.of_doc "." doc (%{}) (%{}) { [:ok, s] => s, other => raise! other },
+        other => raise! other,
+    };
+
+    let tests = [
+        test.case "modes are octal however they are written"
+            $( test.eq! [[:ok, 493], [:ok, 493], [:ok, 493], [:ok, 420], :error]
+                        [parse_mode "755", parse_mode "0o755", parse_mode 755, parse_mode "0644",
+                         list.head (parse_mode "9")] ),
+        test.case "an entry is a path or a table"
+            $( test.eq! [[:ok, ["bin/x", "x", (), [], false]], [:ok, ["etc/y", "y", 384, ["*.o"], true]], :error]
+                        [result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
+                                    (source_of ["bin/x", "x"]),
+                         result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
+                                    (source_of ["etc/y", %{ "src" => "y", "mode" => "600", "exclude" => "*.o", "config" => true }]),
+                         list.head (source_of ["z", %{ "mode" => "600" }])] ),
+        test.case "destinations are under the prefix unless absolute"
+            $( {
+                let s = sp! ();
+                test.eq! [[:ok, "usr/bin/x"], [:ok, "etc/x.conf"], :error, :error]
+                         [dest_path s "bin/x", dest_path s "/etc/x.conf", list.head (dest_path s "../x"),
+                          list.head (dest_path s "/")]
+            } ),
+        test.case "paths relative to the prefix"
+            $( {
+                let s = sp! ();
+                test.eq! ["bin/x", "etc/x", "usr2/x"] [relative s "usr/bin/x", relative s "etc/x", relative s "usr2/x"]
+            } ),
+        test.case "libraries and programs"
+            $( test.eq! [true, true, true, false, false, true]
+                        [is_library "libdream.so", is_library "libdream.so.0.1", is_library "libx.dylib",
+                         is_library "dreams.dream", is_library "solar", is_native "\u{7f}ELF"] ),
+        test.case "the directories above"
+            $( test.eq! [["usr", "usr/bin"], [], ["a", "a/b", "c"]]
+                        [parents "usr/bin/x", parents "x",
+                         dirs [item.Item.text "a/b/x" 420 "", item.Item.text "a/y" 420 "", item.Item.link "c/z" "a"]] ),
+        test.case "two entries installing one path"
+            $( test.eq! ["/a/b is installed by more than one entry", "/a/b/c is inside a file"]
+                        (clashes [item.Item.text "a/b" 420 "", item.Item.text "a/b" 420 "", item.Item.text "a/b/c" 420 ""]) ),
+        test.case "the system's directories are not owned"
+            $( test.eq! ["usr/lib/demo"] (owned [item.Item.text "usr/lib/demo/x" 420 "", item.Item.text "usr/bin/y" 420 ""]) ),
+    ];
+}

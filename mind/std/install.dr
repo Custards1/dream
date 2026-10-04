@@ -1,7 +1,8 @@
 // Where an installation keeps what it ships.
 //
 // An installation is a list of directories -- `$MINDV2_PATH`, joined as
-// `PATH` is, or `~/.mindv2` when that is unset and exists -- holding images
+// `PATH` is; or, when that is unset, `lib/dream` beside the directory the VM's
+// binary is in, as a package installs it; or `~/.mindv2` -- holding images
 // (`dreams.dream`, `lucid.dream`), the standard library (`std`), and C
 // libraries that ship beside them (`lib`). The VM is what reads it: `dream
 // NAME` runs an installed image by its name, `std.image` opens one, and a

@@ -1,0 +1,94 @@
+// Numbers as the fields of binary formats.
+//
+// Every format `ship` writes is a run of fixed-width fields, and they spell a
+// number four different ways: tar in octal digits ending in a NUL, cpio in
+// hexadecimal digits, ar in decimal padded with spaces, and RPM as big-endian
+// binary. Dream has no bitwise operators, so each is division and remainder;
+// none of them is ever hot, since a field is written once per file.
+
+import std.list;
+import std.str;
+
+priv let digit_chars : :string = "0123456789abcdef";
+
+/// `n` in `base`, at least `width` digits, zero-filled on the left. A number
+/// too wide for the field is answered whole, and the caller that has a field
+/// to fill checks the width (`fits`) -- truncating it would write a smaller
+/// number, which every reader would believe.
+let in_base : :integer -> :integer -> :integer -> :string;
+let in_base base width n = {
+    let rec spell !m acc = match m {
+        0 => acc,
+        _ => spell (m / base) (list.cons (str.slice (m % base) 1 digit_chars) acc),
+    };
+    pad_left width "0" (str.concat_all (spell n []))
+};
+
+/// Whether `n` can be written in `width` digits of `base`.
+let fits : :integer -> :integer -> :integer -> :bool;
+let fits base width n = n >= 0 && str.byte_length (in_base base 1 n) <= width;
+
+let octal : :integer -> :integer -> :string;
+let octal width n = in_base 8 width n;
+
+let hex : :integer -> :integer -> :string;
+let hex width n = in_base 16 width n;
+
+/// `s` widened to `width` bytes by `fill` on the left.
+let pad_left : :integer -> :string -> :string -> :string;
+let pad_left width fill s = str.repeat (width - str.byte_length s) fill + s;
+
+/// `s` widened to `width` bytes by `fill` on the right.
+let pad_right : :integer -> :string -> :string -> :string;
+let pad_right width fill s = s + str.repeat (width - str.byte_length s) fill;
+
+/// `s` as a field of exactly `width` bytes: NUL-filled, or cut. Only for
+/// text a caller has already checked fits, such as a name in a tar header.
+let field : :integer -> :string -> :string;
+let field width s = pad_right width "\0" (str.slice 0 width s);
+
+/// `n` zero bytes, which every block format pads with.
+let zeros : :integer -> :string;
+let zeros n = str.repeat n "\0";
+
+/// How far `n` is short of the next multiple of `block`.
+let padding : :integer -> :integer -> :integer;
+let padding block n = (block - n % block) % block;
+
+/// `n` as `width` bytes, most significant first: RPM's integers.
+let be : :integer -> :integer -> :string;
+let be width n = {
+    let le = str.of_int_le width n;
+    str.of_bytes (list.map (fn i -> str.byte (width - 1 - i) le) (list.range 0 width))
+};
+
+/// The sum of every byte of `s`: tar's header checksum.
+let byte_sum : :string -> :integer;
+let byte_sum s = {
+    let size = str.byte_length s;
+    let rec go !i !acc = if i >= size { acc } else { go (i + 1) (acc + str.byte i s) };
+    go 0 0
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "octal fields are zero-filled"
+            $( test.eq! ["0000755", "00000000000", "17"] [octal 7 493, octal 11 0, octal 1 15] ),
+        test.case "hex fields are lowercase"
+            $( test.eq! ["000001ed", "ff"] [hex 8 493, hex 2 255] ),
+        test.case "a number too wide does not fit"
+            $( test.eq! [true, false, false] [fits 8 7 2097151, fits 8 7 2097152, fits 8 7 (0 - 1)] ),
+        test.case "big-endian integers"
+            $( test.eq! [[0, 0, 1, 2], [255, 255]]
+                        [list.map (fn i -> str.byte i (be 4 258)) [0, 1, 2, 3],
+                         list.map (fn i -> str.byte i (be 2 (0 - 1))) [0, 1]] ),
+        test.case "padding to a block"
+            $( test.eq! [0, 511, 1, 0] [padding 512 0, padding 512 1, padding 4 3, padding 4 8] ),
+        test.case "a field is cut or filled"
+            $( test.eq! ["ab\0\0", "abcd"] [field 4 "ab", field 4 "abcdef"] ),
+        test.case "the byte sum"
+            $( test.eq! 195 (byte_sum "abc" - 99) ),
+    ];
+}

@@ -31,10 +31,12 @@ const char* USAGE =
     "usage: dream <image> [options]\n"
     "\n"
     "<image> is a file, that file with `.dream` added, or either of those in\n"
-    "$MINDV2_PATH -- so `dream mind` runs ./mind.dream, or the installed one.\n"
+    "the installation -- so `dream mind` runs ./mind.dream, or the installed one.\n"
+    "The installation is $MINDV2_PATH; or lib/dream beside the directory this\n"
+    "binary is in, as a package installs it; or ~/.mindv2.\n"
     "\n"
     "options:\n"
-    "  -x, --exec <name>    run <name>.dream from $MINDV2_PATH, not from here\n"
+    "  -x, --exec <name>    run <name>.dream from the installation, not from here\n"
     "  -e, --entry <name>   run this global instead of `main!`\n"
     "  -j, --workers <n>    scheduler threads (default: cores, capped at 8)\n"
     "      --dump           disassemble the image and exit\n"
@@ -46,7 +48,7 @@ const char* USAGE =
     "      --dump-jit <fn>  print the LLVM IR generated for a function, named or\n"
     "                       given as #N, its index -- generated functions share names\n"
     "      --mindv2         mindv2 path override\n"
-    "      --mindv2-path    print the effective $MINDV2_PATH and exit\n"
+    "      --mindv2-path    print the installation's directories and exit\n"
     "  -h, --help           show this message\n";
 // --- the image's target ---------------------------------------------------------
 //

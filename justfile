@@ -96,6 +96,25 @@ mind: dreams
     mkdir -p build
     ./{{dreams}} -L mind/std mind/tool/main.dr --shebang -o build/mind
 
+# `ship`, the packager: a program and its files made into a .deb, an .rpm, an
+# Arch package, a release tarball, a Homebrew formula, a PKGBUILD and an
+# install script (ship/README.md).
+ship: dreams
+    mkdir -p build
+    ./{{dreams}} -L mind ship/main.dr --shebang -o build/ship
+
+# Dream itself, packaged every way `ship` knows, into dist/: the `[ship]`
+# sections of mind.toml say what goes in. The VM is staged by `cmake --install`
+# rather than copied from the build tree, since only the installed binary
+# looks for `libdream` beside it (`$ORIGIN/../lib`) rather than in this
+# checkout. `SOURCE_DATE_EPOCH` from the last commit makes the packages the
+# same bytes on every machine that builds this commit.
+package: vm dreams mind lucid ship
+    cmake -S . -B {{build_dir}} -DCMAKE_INSTALL_LIBDIR=lib >/dev/null
+    rm -rf build/stage
+    cmake --install {{build_dir}} --prefix build/stage >/dev/null
+    SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ./{{dream}} build/ship all
+
 # The language server. It imports `dreams` as a library, so it is the one
 # program here that is both built by the compiler and made of it.
 lucid: dreams
@@ -218,7 +237,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-console test-std test-build test-ffi test-image test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
+test: test-vm test-e2e test-console test-std test-build test-ffi test-image test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg test-ship
 
 # The same suites as `test`, run at once by `mind test`: the repository is a
 # workspace, and each suite is a check. See "Testing" in CLAUDE.md.
@@ -298,7 +317,7 @@ test-dreams: build
 # program, and following its imports would be asking something else.
 test-dreams-corpus: build
     @for f in mind/std/*.dr mind/std/build/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
-              dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr; do \
+              dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr ship/*.dr; do \
         ./{{dreams}} --parse "$f" || exit 1; \
     done
     @echo "every file in the corpus parses"
@@ -328,6 +347,12 @@ test-dreams-compile: build
 # promises. Needs `npm install` in editors/vscode first.
 test-vscode:
     cd editors/vscode && npm test
+
+# The Neovim plugin in a headless Neovim, against the server `just lucid`
+# builds: filetype, highlighting, indentation, and lucid attaching and
+# answering. Needs `nvim` on PATH.
+test-nvim: lucid
+    DREAM="$PWD/{{dream}}" timeout 120 nvim --headless --clean --cmd 'set rtp^=editors/nvim' -l editors/nvim/test/run.lua
 
 # `lucid`'s own tests: positions, framing, and the URI/path boundary.
 test-lucid: build
@@ -360,6 +385,16 @@ test-pg: build
     ./{{dream}} /tmp/dream-pg-tests.dream
     dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/contracts.sh
     dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/live.sh
+
+# `ship`: its units, then every package it makes from ship/tests/fixture
+# handed to the program that installs it -- dpkg, rpm, pacman, makepkg, ruby,
+# shellcheck -- each skipped, saying so, where this machine has not got it.
+# `nix-shell -p dpkg rpm pacman fakeroot ruby shellcheck --run 'just test-ship'`
+# has them all.
+test-ship: build
+    ./{{dreams}} ship/main.dr --test -L mind -o /tmp/dream-ship-tests.dream
+    ./{{dream}} /tmp/dream-ship-tests.dream
+    dream={{dream}} dreams={{image}} ship/tests/formats.sh
 
 # Malformed images must be rejected, never crashed on.
 fuzz ITERATIONS="400": build

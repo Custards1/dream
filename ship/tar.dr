@@ -1,0 +1,235 @@
+// tar: POSIX `ustar`, with pax records or GNU's where ustar runs out.
+//
+// Every format here is a tar inside, or beside, something else: a .deb is
+// two of them in an `ar`, an Arch package is one compressed, and a release
+// tarball is one with a directory on top. So this is written once and kept
+// strict about the three things that make a tar wrong in ways the reader
+// does not report:
+//
+// - **Names.** ustar holds a name in 100 bytes, or split at a `/` into a
+//   155-byte prefix and a 100-byte rest. A longer one -- `lib/dream/std/`
+//   gets there quickly -- needs a record of its own before the member, and
+//   there are two kinds, because of dpkg. The standard one is pax's `x`
+//   record, which libarchive, GNU tar, busybox and Python all read, and which
+//   every format here uses but one. dpkg unpacks a .deb with a tar reader of
+//   its own, which knows GNU's `././@LongLink` and refuses pax ("unsupported
+//   PAX tar header type 'x'") -- while `dpkg-deb --contents`, which runs the
+//   system's tar, lists the same package without complaint. So a .deb is
+//   written in the `gnu` style, as dpkg-deb writes it: GNU's magic, and an
+//   `L` (or for a link's target, `K`) record holding the whole name.
+// - **Reproducibility.** Every member is owned by root, 0/0, and stamped
+//   with one time for the whole archive (`SOURCE_DATE_EPOCH`, or the newest
+//   input; see `layout.epoch!`). The same inputs make the same bytes, so a
+//   checksum published once stays true.
+// - **Sizes.** A header says how many bytes follow, and is written before
+//   they are copied, so `out.copy_exactly!` refuses a file that moved.
+
+import std.io;
+import std.list;
+import std.str;
+
+import bytes;
+import item;
+import item.{Item};
+import out;
+
+/// Which records carry what ustar cannot: `:pax` everywhere but dpkg.
+type Style = :pax | :gnu;
+
+/// One `key=value` pax record: its own length in decimal, counting itself.
+let pax_record : :string -> :string -> :string;
+let pax_record key value = {
+    let body = " " + key + "=" + value + "\n";
+    let base = str.byte_length body;
+    let guess = base + str.byte_length (to_string base);
+    let n = if str.byte_length (to_string guess) == str.byte_length (to_string base) { guess }
+            else { base + str.byte_length (to_string guess) };
+    to_string n + body
+};
+
+/// Where to cut `name` into a ustar prefix and name, or `()` when no `/`
+/// leaves both short enough. The last such `/` keeps the name half longest,
+/// which is the half a reader that ignores the prefix still shows.
+let split_name : :string -> [:string, :string] | :unit;
+let split_name name = {
+    let size = str.byte_length name;
+    let rec at i = match i {
+        n if n <= 0 => (),
+        n if str.byte n name == 47 && n <= 155 && size - n - 1 <= 100 && size - n - 1 > 0 =>
+            [str.slice 0 n name, str.slice (n + 1) (size - n - 1) name],
+        n => at (n - 1),
+    };
+    if size <= 100 { ["", name] } else { at (size - 1) }
+};
+
+/// The magic and version: POSIX's `ustar\0` `00`, or GNU's `ustar  \0`.
+let magic : Style -> :string;
+let magic style = match style { :pax => "ustar\0" + "00", :gnu => "ustar  \0" };
+
+/// One 512-byte header.
+let block : Style -> :string -> :string -> :integer -> :integer -> :integer -> :string -> :string -> :string;
+let block style name prefix mode size epoch kind linkname = {
+    let num = fn width n -> bytes.octal (width - 1) n + "\0";
+    let fields chk =
+        bytes.field 100 name + num 8 (mode % 4096) + num 8 0 + num 8 0 + num 12 size + num 12 epoch + chk
+        + kind + bytes.field 100 linkname + magic style + bytes.field 32 "root" + bytes.field 32 "root"
+        + num 8 0 + num 8 0 + bytes.field 155 prefix + bytes.zeros 12;
+    let sum = bytes.byte_sum (fields "        ");
+    fields (bytes.octal 6 sum + "\0 ")
+};
+
+/// The type flag of an item: a file, a link, a directory.
+let kind_of : Item -> :string;
+let kind_of i = match i {
+    [:file, _, _, _, _] => "0",
+    [:text, _, _, _] => "0",
+    [:dir, _, _] => "5",
+    [:link, _, _] => "2",
+};
+
+let link_target : Item -> :string;
+let link_target i = match i { [:link, _, t] => t, _ => "" };
+
+/// `data` and the zeros that fill out its last block.
+let padded : :string -> :string;
+let padded data = data + bytes.zeros (bytes.padding 512 (str.byte_length data));
+
+/// The bytes an item's header says follow it.
+let body_size : Item -> :integer;
+let body_size i = match i { [:link, _, _] => 0, [:dir, _, _] => 0, _ => item.size i };
+
+/// A pax header: a record first when the name, the link or the size does not
+/// fit ustar, then the ustar header, carrying a cut-down name for a reader
+/// that ignores pax.
+let pax_header : :integer -> Item -> :string;
+let pax_header epoch i = {
+    let name = item.path i;
+    let target = link_target i;
+    let size = body_size i;
+    let split = split_name name;
+    let records =
+        (match split { () => [pax_record "path" name], _ => [] })
+        + (if str.byte_length target > 100 { [pax_record "linkpath" target] } else { [] })
+        + (if bytes.fits 8 11 size { [] } else { [pax_record "size" (to_string size)] });
+    let [prefix, rest] = match split { () => ["", str.slice 0 100 name], p => p };
+    let ustar = block :pax rest prefix (item.mode i) (if bytes.fits 8 11 size { size } else { 0 }) epoch (kind_of i)
+                      (str.slice 0 100 target);
+    match records {
+        [] => ustar,
+        rs => {
+            let data = str.concat_all rs;
+            let pax_name = str.slice 0 100 ("PaxHeader/" + list.last (str.split "/" name));
+            block :pax pax_name "" 0o644 (str.byte_length data) epoch "x" "" + padded data + ustar
+        },
+    }
+};
+
+/// A GNU header: an `L` record for a name past 100 bytes and a `K` record for
+/// a link's target, each holding the whole thing and a NUL, then the header.
+/// GNU spells a size past 8 GiB in base 256, which nothing here writes;
+/// `fits` is how a caller refuses one first.
+let gnu_header : :integer -> Item -> :string;
+let gnu_header epoch i = {
+    let name = item.path i;
+    let target = link_target i;
+    let size = body_size i;
+    let long = fn kind text -> if str.byte_length text <= 100 { "" }
+                               else { block :gnu "././@LongLink" "" 0o644 (str.byte_length text + 1) 0 kind ""
+                                      + padded (text + "\0") };
+    long "L" name + long "K" target
+    + block :gnu (str.slice 0 100 name) "" (item.mode i) size epoch (kind_of i) (str.slice 0 100 target)
+};
+
+/// Whether every item can be written in `style`.
+let fits : Style -> [Item] -> :bool;
+let fits style items = match style {
+    :pax => true,
+    :gnu => list.all (fn i -> bytes.fits 8 11 (body_size i)) items,
+};
+
+let header : Style -> :integer -> Item -> :string;
+let header style epoch i = match style { :pax => pax_header epoch i, :gnu => gnu_header epoch i };
+
+/// Write one member onto `h`: its header, its bytes, and the padding to the
+/// next block.
+let member! : :any -> Style -> :integer -> Item -> :unit;
+let member! h style epoch i = {
+    out.write! h (header style epoch i)
+    match i {
+        [:file, _, _, source, size] => {
+            out.copy_exactly! h source size
+            out.write! h (bytes.zeros (bytes.padding 512 size))
+        },
+        [:text, _, _, data] => out.write! h (padded data),
+        _ => (),
+    }
+};
+
+/// A whole archive of `items`, in the order given, onto `h`; then the two
+/// empty blocks that end one.
+let write! : :any -> Style -> :integer -> [Item] -> :unit;
+let write! h style epoch items = {
+    let rec each! xs = match xs {
+        [] => (),
+        [i, ..rest] => {
+            member! h style epoch i
+            each! rest
+        },
+    };
+    each! items
+    out.write! h (bytes.zeros 1024)
+};
+
+/// A whole archive of `items` in a new file at `path`.
+let file! : :string -> Style -> :integer -> [Item] -> :unit;
+let file! path style epoch items = {
+    let h = io.open! path :write;
+    write! h style epoch items
+    io.close! h
+};
+
+when test {
+    import std.test;
+
+    let long = str.repeat 30 "abcd/" + "file.txt";
+    let longest = str.repeat 300 "x";
+
+    let tests = [
+        test.case "a pax record counts its own length"
+            $( test.eq! ["13 path=abcd\n", "101 path=" + str.repeat 91 "a" + "\n"]
+                        [pax_record "path" "abcd", pax_record "path" (str.repeat 91 "a")] ),
+        test.case "a short name needs no prefix"
+            $( test.eq! ["", "usr/bin/dream"] (split_name "usr/bin/dream") ),
+        test.case "a long name is split at a slash"
+            $( {
+                let [prefix, rest] = split_name long;
+                test.eq! [true, true, long] [str.byte_length prefix <= 155, str.byte_length rest <= 100,
+                                             prefix + "/" + rest]
+            } ),
+        test.case "a name with no slash to split at"
+            $( test.eq! () (split_name longest) ),
+        test.case "a header is one block, and checks out"
+            $( {
+                let h = header :pax 0 (item.Item.text "a.txt" 420 "hello");
+                let stored = str.slice 148 6 h;
+                let blanked = str.slice 0 148 h + "        " + str.slice 156 356 h;
+                test.eq! [512, "ustar\0", bytes.octal 6 (bytes.byte_sum blanked)]
+                         [str.byte_length h, str.slice 257 6 h, stored]
+            } ),
+        test.case "a name past ustar goes in a pax record first"
+            $( {
+                let h = header :pax 0 (item.Item.text longest 420 "x");
+                test.eq! [1536, "x", "0"] [str.byte_length h, str.slice 156 1 h, str.slice (1024 + 156) 1 h]
+            } ),
+        test.case "or in a GNU long name, holding all of it"
+            $( {
+                let h = header :gnu 0 (item.Item.text longest 420 "x");
+                test.eq! [1536, "L", "ustar  \0", longest + "\0", "0", str.repeat 100 "x"]
+                         [str.byte_length h, str.slice 156 1 h, str.slice 257 8 h, str.slice 512 301 h,
+                          str.slice (1024 + 156) 1 h, str.slice 1024 100 h]
+            } ),
+        test.case "GNU never splits a name"
+            $( test.eq! [1536, 512] [str.byte_length (header :gnu 0 (item.Item.text long 420 "x")),
+                                     str.byte_length (header :pax 0 (item.Item.text long 420 "x"))] ),
+    ];
+}

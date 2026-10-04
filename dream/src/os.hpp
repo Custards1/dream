@@ -30,9 +30,15 @@ std::string expand_home(const std::string& path);
 /// split, each with its `~` expanded and the empty ones dropped.
 std::vector<std::string> split_dir_list(const std::string& list);
 
-/// `$MINDV2_PATH`, or `~/.mindv2` when that is unset and the directory exists,
-/// or `""` when there is no installation at all.
+/// `$MINDV2_PATH`; or else the installation this VM came with, `lib/dream`
+/// beside the directory its binary is in (`/usr/bin/dream` has
+/// `/usr/lib/dream`); or else `~/.mindv2` when that directory exists; or
+/// `""` when there is no installation at all.
 std::string install_path();
+
+/// The second of those: `lib/dream` beside the running binary's directory,
+/// links resolved, or `""` when there is none.
+std::string own_installation();
 
 /// The same, split: every directory an installation keeps things in.
 std::vector<std::string> install_dirs();

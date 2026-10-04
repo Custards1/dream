@@ -1,0 +1,57 @@
+// ar, the container a .deb is.
+//
+// A .deb is an `ar` archive of exactly three members, in this order:
+// `debian-binary`, then `control.tar[.ext]`, then `data.tar[.ext]`. The format
+// is a magic line and, per member, a 60-byte header of space-padded decimal
+// and octal text followed by the bytes, padded to an even length with a
+// newline. Names are written as dpkg writes them, without the trailing `/`
+// GNU ar adds; dpkg reads both, and older tools only the first.
+
+import std.io;
+import std.list;
+import std.str;
+
+import bytes;
+import out;
+
+let magic : :string = "!<arch>\n";
+
+/// The 60-byte header of a member `name` of `size` bytes.
+let header : :string -> :integer -> :integer -> :integer -> :string;
+let header name epoch mode size =
+    bytes.pad_right 16 " " name + bytes.pad_right 12 " " (to_string epoch) + bytes.pad_right 6 " " "0"
+    + bytes.pad_right 6 " " "0" + bytes.pad_right 8 " " (bytes.octal 1 mode)
+    + bytes.pad_right 10 " " (to_string size) + "`\n";
+
+/// An archive at `path` of `members`, each `[name, source file]`, copied from
+/// disk a chunk at a time.
+let write! : :string -> :integer -> [[:string, :string]] -> :unit;
+let write! path epoch members = {
+    let h = io.open! path :write;
+    out.write! h magic
+    let rec each! ms = match ms {
+        [] => (),
+        [[name, source], ..rest] => {
+            let size = out.size_of! source;
+            out.write! h (header name epoch 0o100644 size)
+            out.copy_exactly! h source size
+            out.write! h (if size % 2 == 1 { "\n" } else { "" })
+            each! rest
+        },
+    };
+    each! members
+    io.close! h
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a header is sixty bytes, and ends with the magic"
+            $( {
+                let h = header "debian-binary" 0 0o100644 4;
+                test.eq! [60, "`\n", "debian-binary   0           0     0     100644  4         "]
+                         [str.byte_length h, str.slice 58 2 h, str.slice 0 58 h]
+            } ),
+    ];
+}

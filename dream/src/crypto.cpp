@@ -5,7 +5,8 @@
 // `std.sql.pg.crypto` did for MD5, and why a SCRAM login spent its time in
 // four thousand rounds of PBKDF2 each built from two native digests and a
 // thirty-two byte xor in Dream. Every member here is one call where that was
-// thousands of reductions, and every one is pure except `random_bytes!`.
+// thousands of reductions, and every one is pure except `random_bytes!` and
+// `digest_file!`, which read the world.
 //
 // **Bytes in, bytes out.** A digest, a MAC and a derived key are raw bytes in
 // a string, because that is what the next step wants -- an HMAC key, a PBKDF2
@@ -26,6 +27,8 @@
 
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -104,6 +107,38 @@ NativeResult crypto_digest_by(Process& p, Value, Value* args, uint32_t) {
     if (!string_bytes(args[1], &b)) return crypto_fail(p, "type_error", "digest needs a string");
     Hasher h(alg);
     h.update(b.data, size_t(b.len));
+    uint8_t out[kMaxDigest];
+    h.finish(out);
+    return NativeResult::ok(bytes_value(p, out, h.digest_size()));
+}
+
+/// `digest_file! alg path`: the digest of a file's contents, read here a block
+/// at a time. The file never has to fit on the Dream heap, which is the point:
+/// `ship` writes the MD5 of every file into a .deb, the largest of them a
+/// 100 MB library, and reading one into a string to hand to `digest` held it
+/// whole -- and the collector's headroom over it, four times its size in all.
+NativeResult crypto_digest_file(Process& p, Value, Value* args, uint32_t) {
+    HashAlg alg = HashAlg::Sha256;
+    if (!hash_alg(p, args[0], &alg)) return bad_alg(p, "digest_file!");
+    Bytes b;
+    if (!string_bytes(args[1], &b)) return crypto_fail(p, "type_error", "digest_file! needs a path");
+    const std::string path(b.data, size_t(b.len));
+    const std::filesystem::path where(std::u8string(path.begin(), path.end()));
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(where, ec)) {
+        return crypto_fail(p, std::filesystem::exists(where, ec) ? "wrong_kind" : "not_found",
+                           "digest_file!: " + path + " is not a file");
+    }
+    std::ifstream in(where, std::ios::binary);
+    if (!in) return crypto_fail(p, "permission_denied", "digest_file!: cannot open " + path);
+    Hasher h(alg);
+    std::vector<char> buf(1 << 16);
+    while (in) {
+        in.read(buf.data(), std::streamsize(buf.size()));
+        const std::streamsize got = in.gcount();
+        if (got > 0) h.update(buf.data(), size_t(got));
+    }
+    if (in.bad()) return crypto_fail(p, "io_error", "digest_file!: reading " + path + " failed");
     uint8_t out[kMaxDigest];
     h.finish(out);
     return NativeResult::ok(bytes_value(p, out, h.digest_size()));
@@ -380,6 +415,7 @@ ModuleDef make_crypto_module() {
                          {"sha384", 1, 0b1, crypto_digest, uint64_t(HashAlg::Sha384)},
                          {"sha512", 1, 0b1, crypto_digest, uint64_t(HashAlg::Sha512)},
                          {"digest", 2, 0b11, crypto_digest_by},
+                         {"digest_file!", 2, 0b11, crypto_digest_file},
                          {"hmac", 3, 0b111, crypto_hmac},
                          {"pbkdf2", 5, 0b11111, crypto_pbkdf2},
                          {"hkdf", 5, 0b11111, crypto_hkdf},

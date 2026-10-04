@@ -4,7 +4,7 @@
 # check. `just test` is the same suite run one group at a time.
 [workspace]
 name = "dream"
-members = ["dreams", "lucid", "mind/std", "mind/tool"]
+members = ["dreams", "lucid", "mind/std", "mind/tool", "ship"]
 
 [build]
 compiler = "build/dreams.dream"
@@ -17,3 +17,65 @@ env = ["CC", "CXX"]
 jit = { type = ["auto", "off"], default = "auto", doc = "build the JIT when there is an LLVM" }
 
 link_deps = { type = ["prefer_static", "static", "shared"], default = "prefer_static", doc = "how to link LLVM and libffi into libdream" }
+
+# --- Dream itself, as packages ----------------------------------------------------
+#
+# What `just package` hands to `ship` (ship/README.md): the VM, the compiler,
+# the language server, `mind`, `ship` and the standard library, laid out as an
+# installation the VM finds by itself -- `bin/dream` with `lib/dream` beside it
+# (`own_installation` in dream/src/os.cpp), so that `dream -x dreams` and
+# `mind` work from a package with nothing set. The VM and its library come
+# from `cmake --install` into build/stage, which gives `bin/dream` the
+# `$ORIGIN/../lib` it needs to find `libdream` wherever it is unpacked.
+#
+# The dependencies are each distribution's names for what `ldd` shows a
+# release VM needs once LLVM is linked in statically -- the C++ runtime,
+# OpenSSL, zlib and libffi -- and want checking against a build made on the
+# oldest release of each that is to be supported.
+[ship]
+name = "dream"
+version = "0.1.0"
+summary = "Lazily evaluated functional language: its VM, compiler and tools"
+description = "Dream is a lazily evaluated functional language with green processes, a JIT,\nand a self-hosted compiler. This package is the VM (dream), the compiler\n(dream -x dreams), the build tool (mind), the language server (dream -x\nlucid), the packager (ship) and the standard library."
+maintainer = "Custards1 <blake.d.brown77@gmail.com>"
+homepage = "https://github.com/Custards1/dream"
+url = "https://github.com/Custards1/dream/releases/download/v{version}/{file}"
+arch = "native"
+
+[ship.files]
+"bin/dream" = "build/stage/bin/dream"
+"bin/mind" = "build/mind"
+"bin/ship" = "build/ship"
+"include" = "build/stage/include"
+"lib/dream/dreams.dream" = "build/dreams.dream"
+"lib/dream/lucid.dream" = "build/lucid.dream"
+"lib/dream/std" = { src = "mind/std", exclude = ["target"] }
+
+[ship.files.linux]
+"lib/libdream.so.0.1" = "build/stage/lib/libdream.so.0.1"
+
+[ship.links.linux]
+"lib/libdream.so.0" = "libdream.so.0.1"
+"lib/libdream.so" = "libdream.so.0"
+
+[ship.files.macos]
+"lib/libdream.0.1.dylib" = "build/stage/lib/libdream.0.1.dylib"
+
+[ship.links.macos]
+"lib/libdream.0.dylib" = "libdream.0.1.dylib"
+"lib/libdream.dylib" = "libdream.0.dylib"
+
+[ship.deb]
+depends = ["libc6", "libstdc++6", "libgcc-s1", "libssl3t64 | libssl3", "zlib1g", "libffi8"]
+section = "devel"
+
+[ship.rpm]
+depends = ["libstdc++", "openssl-libs", "zlib", "libffi"]
+group = "Development/Languages"
+
+[ship.arch]
+depends = ["gcc-libs", "openssl", "zlib", "libffi"]
+
+[ship.brew]
+depends = ["openssl@3", "libffi"]
+test = "(testpath/\"hello.dr\").write \"import std.console;\\nlet main! = console.print! \\\"hi\\\";\\n\"\nsystem bin/\"dream\", \"-x\", \"dreams\", \"hello.dr\", \"-o\", \"hello.dream\"\nassert_equal \"hi\\n\", shell_output(\"#{bin}/dream hello.dream\")"

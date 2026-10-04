@@ -1,0 +1,313 @@
+// An RPM: what `dnf`, `yum`, `zypper` and `rpm` install, on Fedora, RHEL and
+// its rebuilds, openSUSE and the rest.
+//
+// Written here byte by byte, without `rpmbuild`, so that an RPM can be made
+// on a machine that has never heard of one. A package is four things, one
+// after another:
+//
+//     lead                96 bytes nothing reads but `file(1)`, kept for it
+//     signature header    the digests that `rpm -K` checks, then padding to 8
+//     header              everything about the package: tags, in a table
+//     payload             the files, as a compressed cpio
+//
+// A header (rpm's lib/header.c is the definition) is a magic, an index of
+// 16-byte entries -- tag, type, offset, count -- and a store of the data they
+// point into. rpm 4.20 is strict about it, and each rule below is one it
+// refused a package for while this was written:
+//
+// - **The first entry is a region**, tag 63 (62 in a signature), pointing at
+//   a 16-byte trailer at the end of the store whose offset is minus the size
+//   of the index. It is what marks the header as written whole by one tool.
+// - **The data is in index order**, entries sorted by tag, each aligned to
+//   its type's size: no entry's data may begin before the previous one ends.
+// - **Each tag has its type**: FILEMODES is 16-bit, SUMMARY is an i18n
+//   string, the script interpreters are string arrays. rpmtag.h's comment on
+//   each tag is the list, and `tag_types` below is copied from it.
+// - **A binary package names its source**: SOURCERPM is how rpm tells a
+//   binary package from a source one, though no source package exists.
+//
+// The digests are what `rpm -K` and every install check: SHA-256 and SHA-1
+// of the header, MD5 of header and payload in the signature, and SHA-256 of
+// the compressed payload in the header itself. A package is otherwise
+// unsigned; `rpmsign --addsign` signs one made here as it would any other.
+
+import std.crypto;
+import std.file;
+import std.io;
+import std.list;
+import std.map;
+import std.result;
+import std.str;
+
+import bytes;
+import compress;
+import cpio;
+import deps;
+import item;
+import item.{Item};
+import layout;
+import layout.Layout;
+import out;
+import platform;
+import scratch;
+import spec;
+import spec.Spec;
+
+// --- tags ---------------------------------------------------------------------------
+
+/// A tag's value, by the type rpm stores it as.
+union Value {
+    int16s(xs : [:integer])
+    int32s(xs : [:integer])
+    string(s : :string)
+    strings(xs : [:string])
+    i18n(s : :string)
+    bin(b : :string)
+}
+
+/// An entry ready to be laid out: its tag, its type's number, how many
+/// values, the bytes, and what its offset must be a multiple of.
+group Entry { tag : :integer, kind : :integer, count : :integer, data : :string, align : :integer }
+
+let entry : :integer -> Value -> Entry;
+let entry tag v = match v {
+    [:int16s, xs] => Entry.make tag 3 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 2 n) xs)) 2,
+    [:int32s, xs] => Entry.make tag 4 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 4 n) xs)) 4,
+    [:string, s] => Entry.make tag 6 1 (s + "\0") 1,
+    [:strings, xs] => Entry.make tag 8 (list.length xs) (str.concat_all (list.map (fn s -> s + "\0") xs)) 1,
+    [:i18n, s] => Entry.make tag 9 1 (s + "\0") 1,
+    [:bin, b] => Entry.make tag 7 (str.byte_length b) b 1,
+};
+
+let int32 : :integer -> :integer -> Entry;
+let int32 tag n = entry tag (Value.int32s [n]);
+
+let string : :integer -> :string -> Entry;
+let string tag s = entry tag (Value.string s);
+
+/// A header: the region entry, the index sorted by tag, and the store, each
+/// entry's data aligned as its type needs and the region's trailer last.
+let header : :integer -> [Entry] -> :string;
+let header region entries = {
+    let sorted = list.sort_on Entry.tag entries;
+    let place = fn [offset, placed] e -> {
+        let at = offset + bytes.padding (Entry.align e) offset;
+        [at + str.byte_length (Entry.data e), [at - offset, at, e] :: placed]
+    };
+    let [store_size, placements] = list.fold place [0, []] sorted;
+    let laid = list.reverse placements;
+    let count = list.length sorted + 1;
+    let index_entry = fn tag kind offset n -> bytes.be 4 tag + bytes.be 4 kind + bytes.be 4 offset + bytes.be 4 n;
+    let trailer = index_entry region 7 (0 - count * 16) 16;
+    let store = str.concat_all (list.map (fn [gap, _, e] -> bytes.zeros gap + Entry.data e) laid) + trailer;
+    let index = index_entry region 7 store_size 16
+                + str.concat_all (list.map (fn [_, at, e] -> index_entry (Entry.tag e) (Entry.kind e) at (Entry.count e)) laid);
+    str.of_bytes [142, 173, 232, 1] + bytes.zeros 4 + bytes.be 4 count + bytes.be 4 (str.byte_length store) + index + store
+};
+
+/// The 96 bytes before everything: a magic, a format version, the package's
+/// name, and that what follows is a header-style signature (type 5).
+let lead : Spec -> :string;
+let lead sp = {
+    let archnum = match Spec.arch sp { :x86_64 => 1, :aarch64 => 19, :all => 0 };
+    str.of_bytes [237, 171, 238, 219, 3, 0] + bytes.be 2 0 + bytes.be 2 archnum
+    + bytes.field 66 (str.slice 0 65 (Spec.name sp + "-" + spec.full_version sp)) + bytes.be 2 1 + bytes.be 2 5
+    + bytes.zeros 16
+};
+
+// --- the files ----------------------------------------------------------------------
+
+/// What the package lists: its files and links, and the directories it
+/// creates (not `/usr/bin`; see `layout.owned`), by path, each with the inode
+/// cpio gives it.
+let entries_of : Layout -> [[:integer, Item]];
+let entries_of lay = {
+    let items = Layout.items lay;
+    let dirs = list.map (fn d -> item.Item.dir d item.executable) (layout.owned items);
+    list.enumerate (list.sort_on item.path (items + dirs)) |> list.map (fn [n, i] -> [n + 1, i])
+};
+
+/// `usr/bin/x` as rpm stores it: the directory `/usr/bin/` and the name `x`.
+let split_path : :string -> [:string, :string];
+let split_path path = {
+    let names = str.split "/" path;
+    ["/" + str.join_str "/" (list.take (list.length names - 1) names) + (if list.length names > 1 { "/" } else { "" }),
+     list.last names]
+};
+
+/// The file tags, from the files in the order the payload holds them.
+let file_tags! : Layout -> [[:integer, Item]] -> [Entry];
+let file_tags! lay listed = {
+    let items = list.map (fn m -> m.[1]) listed;
+    let config = map.set_of (Layout.config lay);
+    let split = list.map (fn i -> split_path (item.path i)) items;
+    let dirnames = list.unique (list.map (fn s -> list.head s) split);
+    let dir_index = map.from_pairs (list.map (fn [n, d] -> [d, n]) (list.enumerate dirnames));
+    let n = list.length items;
+    let digests = list.map (fn i -> match i { [:file, _, _, source, _] => io.digest! source, _ => "" }) items;
+    strict! digests
+    [entry 1028 (Value.int32s (list.map (fn i -> match i { [:dir, _, _] => 4096, _ => item.size i }) items)),
+     entry 1030 (Value.int16s (list.map (fn i -> cpio.type_bits i + item.mode i % 4096) items)),
+     entry 1033 (Value.int16s (list.replicate n 0)),
+     entry 1034 (Value.int32s (list.replicate n (Layout.epoch lay))),
+     entry 1035 (Value.strings digests),
+     entry 1036 (Value.strings (list.map (fn i -> match i { [:link, _, t] => t, _ => "" }) items)),
+     entry 1037 (Value.int32s (list.map (fn i -> if map.member (item.path i) config { 17 } else { 0 }) items)),
+     entry 1039 (Value.strings (list.replicate n "root")),
+     entry 1040 (Value.strings (list.replicate n "root")),
+     entry 1045 (Value.int32s (list.replicate n (0 - 1))),
+     entry 1095 (Value.int32s (list.replicate n 1)),
+     entry 1096 (Value.int32s (list.map (fn m -> list.head m) listed)),
+     entry 1097 (Value.strings (list.replicate n "")),
+     entry 1116 (Value.int32s (list.map (fn s -> dir_index.[list.head s]) split)),
+     entry 1117 (Value.strings (list.map (fn s -> s.[1]) split)),
+     entry 1118 (Value.strings dirnames),
+     int32 5011 8]
+};
+
+// --- dependencies -------------------------------------------------------------------
+
+/// rpm's sense flags for what it needs of itself, and for a script's shell.
+let rpmlib : :integer = 16777226;
+let interp : :integer = 256;
+
+/// The features of rpm a package made here relies on, as rpmbuild names them.
+let rpmlib_needs : compress.Compression -> [[:string, :integer, :string]];
+let rpmlib_needs c =
+    [["rpmlib(CompressedFileNames)", rpmlib, "3.0.4-1"], ["rpmlib(FileDigests)", rpmlib, "4.6.0-1"],
+     ["rpmlib(PayloadFilesHavePrefix)", rpmlib, "4.0-1"]]
+    + (match c {
+        :xz => [["rpmlib(PayloadIsXz)", rpmlib, "5.2-1"]],
+        :zstd => [["rpmlib(PayloadIsZstd)", rpmlib, "5.4.18-1"]],
+        _ => [],
+    });
+
+/// The hooks, by the tag holding each script, the tag naming its shell, and
+/// the flag its shell is needed with.
+let script_tags : [[:string, :integer, :integer, :integer]] = [
+    ["preinst", 1023, 1085, 512], ["postinst", 1024, 1086, 1024],
+    ["prerm", 1025, 1087, 2048], ["postrm", 1026, 1088, 4096],
+];
+
+let as_triple : :any -> [:string, :integer, :string];
+let as_triple d = [deps.Dep.name d, deps.rpm_flags (deps.Dep.op d), deps.Dep.version d];
+
+/// Three parallel tags -- names, flags and versions -- for one relationship.
+let relation : :integer -> :integer -> :integer -> [[:string, :integer, :string]] -> [Entry];
+let relation names flags versions ds = match ds {
+    [] => [],
+    _ => [entry names (Value.strings (list.map (fn d -> d.[0]) ds)),
+          entry flags (Value.int32s (list.map (fn d -> d.[1]) ds)),
+          entry versions (Value.strings (list.map (fn d -> d.[2]) ds))],
+};
+
+let relations : Spec -> compress.Compression -> [:ok, [Entry]] | [:error, :string];
+let relations sp c = {
+    let? needs = deps.parse_all (spec.strings sp "rpm" "depends");
+    let? provides = deps.parse_all (spec.strings sp "rpm" "provides");
+    let? conflicts = deps.parse_all (spec.strings sp "rpm" "conflicts");
+    let? obsoletes = deps.parse_all (spec.strings sp "rpm" "replaces");
+    let shells = list.flat_map (fn [hook, _, _, flag] -> match (Spec.scripts sp).[hook else ()] {
+        () => [],
+        _ => [["/bin/sh", interp + flag, ""]],
+    }) script_tags;
+    [:ok, relation 1049 1048 1050 (list.map as_triple needs + shells + rpmlib_needs c)
+          + relation 1047 1112 1113 ([Spec.name sp, 8, spec.full_version sp] :: list.map as_triple provides)
+          + relation 1054 1053 1055 (list.map as_triple conflicts)
+          + relation 1090 1114 1115 (list.map as_triple obsoletes)]
+};
+
+// --- the package --------------------------------------------------------------------
+
+let file_name : Spec -> :string;
+let file_name sp = Spec.name sp + "-" + spec.full_version sp + "." + platform.rpm (Spec.arch sp) + ".rpm";
+
+/// Everything about the package but its files.
+let package_tags : Spec -> Layout -> compress.Compression -> :string -> [Entry];
+let package_tags sp lay c payload_digest = {
+    let scripts = list.flat_map (fn [hook, body_tag, prog_tag, _] -> match (Spec.scripts sp).[hook else ()] {
+        () => [],
+        body => [string body_tag body, entry prog_tag (Value.strings ["/bin/sh"])],
+    }) script_tags;
+    [entry 100 (Value.strings ["C"]),
+     string 1000 (Spec.name sp), string 1001 (Spec.version sp), string 1002 (to_string (Spec.release sp)),
+     entry 1004 (Value.i18n (Spec.summary sp)), entry 1005 (Value.i18n (Spec.description sp)),
+     int32 1006 (Layout.epoch lay), string 1007 "ship",
+     int32 1009 (layout.installed_size (Layout.items lay)),
+     string 1014 (match Spec.license sp { "" => "Unknown", l => l }),
+     entry 1016 (Value.i18n (spec.text sp "rpm" "group" "Unspecified")),
+     string 1021 "linux", string 1022 (platform.rpm (Spec.arch sp)),
+     string 1044 (Spec.name sp + "-" + spec.full_version sp + ".src.rpm"),
+     string 1124 "cpio", string 1125 (compress.name c), string 1126 (compress.level c),
+     entry 5092 (Value.strings [payload_digest]), int32 5093 8]
+    + (match Spec.maintainer sp { "" => [], m => [string 1015 m] })
+    + (match Spec.homepage sp { "" => [], u => [string 1020 u] })
+    + scripts
+};
+
+/// The signature: the digests of what follows it.
+let signature : :string -> :string -> :integer -> :string;
+let signature head payload cpio_size = {
+    let sig = header 62 [string 269 (crypto.hex (crypto.sha1 head)), string 273 (crypto.hex (crypto.sha256 head)),
+                         int32 1000 (str.byte_length head + str.byte_length payload),
+                         entry 1004 (Value.bin (crypto.md5 (head + payload))), int32 1007 cpio_size];
+    sig + bytes.zeros (bytes.padding 8 (str.byte_length sig))
+};
+
+/// rpm stores every size as 32 bits unless told otherwise, and this writes
+/// only the 32-bit tags.
+let too_big : :integer = 4294967295;
+
+let build! : Spec -> Layout -> compress.Compression -> [Entry] -> :string -> :string -> [:ok, :string] | [:error, :string];
+let build! sp lay c deps_tags dir dest = {
+    let listed = entries_of lay;
+    let payload = dir + "/payload.cpio";
+    let h = io.open! payload :write;
+    cpio.write! h (Layout.epoch lay) (list.map (fn [n, i] -> [n, item.renamed (fn p -> "./" + p) i]) listed)
+    io.close! h
+    let cpio_size = out.size_of! payload;
+    let? packed = compress.file! c payload;
+    let compressed = match file.read! packed { () => raise! ("cannot read back " + packed), data => data };
+    let head = header 63 (package_tags sp lay c (io.digest! packed) + deps_tags + file_tags! lay listed);
+    strict! head
+    if cpio_size > too_big || str.byte_length compressed + str.byte_length head > too_big {
+        raise! "an RPM of 4 GiB or more needs 64-bit size tags, which ship does not write"
+    }
+    let made = dir + "/" + file_name sp;
+    let w = io.open! made :write;
+    out.write! w (lead sp + signature head compressed cpio_size + head)
+    out.write! w compressed
+    io.close! w
+    let target = dest + "/" + file_name sp;
+    scratch.place! made target
+    [:ok, target]
+};
+
+/// Make the package in `out`, answering its path.
+let make! : Spec -> Layout -> :string -> :any -> [:ok, :string] | [:error, :string];
+let make! sp lay dest wanted = {
+    let? c = compress.pick! wanted [:xz, :zstd, :gzip];
+    let? deps_tags = relations sp c;
+    scratch.within! dest "rpm" (fn dir -> build! sp lay c deps_tags dir dest)
+};
+
+when test {
+    import std.test;
+
+    let u32 = fn s at -> list.fold (fn acc i -> acc * 256 + str.byte (at + i) s) 0 [0, 1, 2, 3];
+
+    let tests = [
+        test.case "the lead is 96 bytes"
+            $( test.eq! 96 (str.byte_length (lead (spec.Spec.new "." (%{}) "demo" "1.0" :x86_64 :linux))) ),
+        test.case "a header: region first, data in tag order, aligned, trailer last"
+            $( {
+                let h = header 63 [string 1000 "abc", entry 1030 (Value.int16s [1, 2]), int32 1028 7];
+                // magic, reserved, 4 entries, store: "abc\0" (4) + int32 (4, at 4) + int16s (4, at 8) + trailer (16)
+                test.eq! [4, 28, 63, 12, 1000, 0, 1028, 4, 1030, 8, 0 - 64]
+                         [u32 h 8, u32 h 12, u32 h 16, u32 h 24, u32 h 32, u32 h 40, u32 h 48, u32 h 56, u32 h 64,
+                          u32 h 72, u32 h (16 + 64 + 12 + 8) - 4294967296]
+            } ),
+        test.case "a path as rpm stores it"
+            $( test.eq! [["/usr/bin/", "dream"], ["/", "x"]] [split_path "usr/bin/dream", split_path "x"] ),
+    ];
+}

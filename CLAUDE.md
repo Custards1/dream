@@ -18,7 +18,9 @@ Dont forget about strict parameters, use them when needed
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
 | `mind/std/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/sql/pg/README.md](mind/std/sql/pg/README.md). | Dream |
+| `ship/` | `ship`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [ship/README.md](ship/README.md). | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
+| `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. | Lua, Vim |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
 | `docs/` | `language-spec.md`, `builtins.md`, `ffi.md`, `gc.md`, `bytecode-format.md`. | — |
 | `docs/notes/` | The design and performance log: what was measured, kept and thrown away. | — |
@@ -106,6 +108,8 @@ just dreams       # build/dreams.dream, the compiler
 just mind         # build/mind, the build tool
 just lucid        # build/lucid.dream, the language server
 just vm-pgo       # build-pgo/bin/dream, the VM trained on a self-compile
+just ship         # build/ship, the packager
+just package      # Dream itself as every package ship makes, into dist/
 just mind-build vm  # the VM again, by the repository's own build.dr
 ```
 
@@ -189,11 +193,13 @@ The groups, and what each one is actually asking:
 | `test-lucid` | The language server's units: positions, framing, URIs, completion context |
 | `test-lucid-session` | One whole LSP conversation, against a running server |
 | `test-pg` | The PostgreSQL client's units, the SQL the compiler must refuse, and a live throwaway cluster (skipped without PostgreSQL) |
+| `test-ship` | `ship`'s units, then each package it makes installed, verified and removed by dpkg, rpm and pacman (each skipped without its tool) |
 
 The `dreams/tests/*.sh` scripts run directly with no environment set; there is
 one left, `compile.sh`, and it needs only the VM and the seed.
 
-`just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
+`just test-nvim` runs the Neovim plugin headless against `build/lucid.dream`,
+and is likewise outside `just test`. `just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
 is **not** in `just test`, because it needs `npm install` in `editors/vscode`
 first and the rest of the suite needs nothing from outside the repository.
 
@@ -234,12 +240,18 @@ terminal over with `os.replace!` (`execvp`) rather than running a child, because
 it still starts, with just the standard library.
 
 The VM resolves an image four ways, nearest first: the name as written, that
-name with `.dream` added, and both of those under `$MINDV2_PATH`. So `dream
+name with `.dream` added, and both of those in the installation. So `dream
 mind` runs `./mind.dream` if there is one and the installed `mind.dream`
 otherwise, and an arbitrary path still means that path. `dream -x NAME` is the
 other half — the installation and nothing else, so a file in the working
 directory cannot shadow an installed program. `just install` is what puts
 `dreams.dream` and `lucid.dream` there.
+
+The installation is `$MINDV2_PATH` when it is set; otherwise `lib/dream`
+beside the directory the VM's binary is in (`/usr/bin/dream` has
+`/usr/lib/dream`), which is how a package made by `just package` finds its
+standard library and compiler with nothing set; otherwise `~/.mindv2`
+(`install_path` in dream/src/os.cpp).
 
 ## Making it faster
 

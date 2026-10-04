@@ -1,0 +1,184 @@
+// A Debian package: what `apt` and `dpkg` install, on Debian, Ubuntu, Mint
+// and everything built on them.
+//
+// A .deb is an `ar` of three members (deb(5)): `debian-binary`, saying `2.0`;
+// `control.tar`, the package's description and its maintainer scripts; and
+// `data.tar`, the files, laid out from the root as `./usr/bin/dream`. Both
+// tars are compressed with the same program, xz by default, which every dpkg
+// since 2014 reads; zstd needs dpkg 1.21.18 (Debian 12, Ubuntu 21.10) and is
+// used only when asked for.
+//
+// Both tars are written as dpkg-deb writes them, in GNU's style: dpkg reads
+// a package with a tar reader of its own, which refuses the pax records
+// everything else here uses for a long name (`tar.dr`).
+//
+// The control file is written as dpkg-deb would write it -- fields in the
+// order of Debian policy §5.3, the description's long lines indented one
+// space and a blank line spelled ` .` -- with an `md5sums` beside it, which
+// `dpkg --verify` and debsums check installed files against, and a
+// `conffiles` naming what dpkg must not overwrite once a user has edited it.
+
+import std.crypto;
+import std.file;
+import std.list;
+import std.result;
+import std.str;
+
+import ar;
+import compress;
+import deps;
+import item;
+import item.{Item};
+import layout;
+import layout.Layout;
+import platform;
+import scratch;
+import spec;
+import spec.Spec;
+import tar;
+
+let file_name : Spec -> :string;
+let file_name sp = Spec.name sp + "_" + spec.full_version sp + "_" + platform.deb (Spec.arch sp) + ".deb";
+
+/// The long description in Debian's form, after the summary line.
+let long_lines : Spec -> :string;
+let long_lines sp = match str.trim (Spec.description sp) {
+    "" => "",
+    d if d == Spec.summary sp => "",
+    d => str.concat_all (list.map (fn l -> if str.trim l == "" { "\n ." } else { "\n " + str.trim_end l })
+                                  (str.split "\n" d)),
+};
+
+let field : :string -> :string -> :string;
+let field name value = if str.is_empty value { "" } else { name + ": " + value + "\n" };
+
+/// What the package takes once installed, in KiB, as dpkg counts it: each
+/// file rounded up to a whole KiB, and one for each directory and link.
+let installed_kib : Layout -> :integer;
+let installed_kib lay = {
+    let items = Layout.items lay;
+    let one = fn i -> match i { [:link, _, _] => 1, _ => (item.size i + 1023) / 1024 };
+    list.fold_strict (fn !acc i -> acc + one i) 0 items + list.length (layout.dirs items)
+};
+
+/// The relationships Debian has, in policy's order.
+let relations : [[:string, :string]] = [
+    ["Pre-Depends", "pre-depends"], ["Depends", "depends"], ["Recommends", "recommends"],
+    ["Suggests", "suggests"], ["Breaks", "breaks"], ["Conflicts", "conflicts"],
+    ["Provides", "provides"], ["Replaces", "replaces"],
+];
+
+let control : Spec -> Layout -> [:ok, :string] | [:error, :string];
+let control sp lay = {
+    let? lines = result.all (list.map (fn [label, key] -> result.map (fn v -> field label v)
+                                                                       (deps.deb_list (spec.strings sp "deb" key)))
+                                      relations);
+    [:ok, field "Package" (Spec.name sp)
+          + field "Version" (spec.full_version sp)
+          + field "Architecture" (platform.deb (Spec.arch sp))
+          + field "Maintainer" (Spec.maintainer sp)
+          + field "Installed-Size" (to_string (installed_kib lay))
+          + str.concat_all lines
+          + field "Section" (spec.text sp "deb" "section" "misc")
+          + field "Priority" (spec.text sp "deb" "priority" "optional")
+          + field "Homepage" (Spec.homepage sp)
+          + "Description: " + Spec.summary sp + long_lines sp + "\n"]
+};
+
+/// What Debian needs that the other formats do not.
+let problems : Spec -> [:ok, :unit] | [:error, :string];
+let problems sp =
+    if str.is_empty (Spec.maintainer sp) { [:error, "deb: a Debian package needs a maintainer: set maintainer = \"Name <email>\" in [ship]"] }
+    else { [:ok, ()] };
+
+/// The files, from the root: every directory above them, then each in order.
+let data_items : Layout -> [Item];
+let data_items lay = {
+    let items = Layout.items lay;
+    let dirs = list.map (fn d -> item.Item.dir ("./" + d + "/") item.executable) (layout.dirs items);
+    list.sort_on item.path (item.Item.dir "./" item.executable :: dirs
+                            + list.map (fn i -> item.renamed (fn p -> "./" + p) i) items)
+};
+
+/// `md5sums`: the digest of each file, as debsums reads it.
+let md5sums! : Layout -> :string;
+let md5sums! lay = {
+    let lines = list.map (fn i -> match i {
+        [:file, path, _, source, _] => crypto.hex (crypto.digest_file! :md5 source) + "  " + path + "\n",
+        _ => "",
+    }) (Layout.items lay);
+    strict! lines
+    str.concat_all lines
+};
+
+let control_items! : Spec -> Layout -> :string -> [Item];
+let control_items! sp lay text = {
+    let sums = md5sums! lay;
+    strict! sums
+    let conffiles = str.concat_all (list.map (fn p -> "/" + p + "\n") (Layout.config lay));
+    let scripts = list.flat_map (fn hook -> match (Spec.scripts sp).[hook else ()] {
+        () => [],
+        body => [item.Item.text ("./" + hook) item.executable body],
+    }) spec.hooks;
+    list.sort_on item.path ([item.Item.dir "./" item.executable,
+                             item.Item.text "./control" item.regular text,
+                             item.Item.text "./md5sums" item.regular sums]
+                            + (if str.is_empty conffiles { [] } else { [item.Item.text "./conffiles" item.regular conffiles] })
+                            + scripts)
+};
+
+let build! : Spec -> Layout -> :string -> compress.Compression -> :string -> :string -> [:ok, :string] | [:error, :string];
+let build! sp lay text c dir out = {
+    let epoch = Layout.epoch lay;
+    file.write! (dir + "/debian-binary") "2.0\n"
+    tar.file! (dir + "/control.tar") :gnu epoch (control_items! sp lay text)
+    let? control_tar = compress.file! c (dir + "/control.tar");
+    if not (tar.fits :gnu (Layout.items lay)) { raise! "a file of 8 GiB or more cannot go in a .deb" }
+    tar.file! (dir + "/data.tar") :gnu epoch (data_items lay)
+    let? data_tar = compress.file! c (dir + "/data.tar");
+    let made = dir + "/" + file_name sp;
+    ar.write! made epoch [["debian-binary", dir + "/debian-binary"],
+                         ["control.tar" + compress.extension c, control_tar],
+                         ["data.tar" + compress.extension c, data_tar]]
+    let target = out + "/" + file_name sp;
+    scratch.place! made target
+    [:ok, target]
+};
+
+/// Make the package in `out`, answering its path.
+let make! : Spec -> Layout -> :string -> :any -> [:ok, :string] | [:error, :string];
+let make! sp lay out wanted = {
+    let? _ = problems sp;
+    let? c = compress.pick! wanted [:xz, :gzip, :zstd, :none];
+    let? text = control sp lay;
+    scratch.within! out "deb" (fn dir -> build! sp lay text c dir out)
+};
+
+when test {
+    import std.test;
+    import std.toml;
+
+    let sp! () = match toml.parse ("[package]\nname = \"demo\"\nversion = \"1.0\"\n[ship]\nsummary = \"a demo\"\n"
+                                   + "description = \"First.\\n\\nSecond.\"\nmaintainer = \"A <a@b>\"\narch = \"amd64\"\n"
+                                   + "[ship.deb]\ndepends = [\"libc6 >= 2.31\", \"libssl3 | libssl1.1\"]\n") {
+        [:ok, doc] => match spec.of_doc "." doc (%{}) (%{}) { [:ok, s] => s, other => raise! other },
+        other => raise! other,
+    };
+
+    let lay = Layout.make [item.Item.file "usr/bin/demo" 493 "x" 2048, item.Item.link "usr/bin/d" "demo"] [] 0;
+
+    let tests = [
+        test.case "the file is named as Debian names it"
+            $( test.eq! "demo_1.0-1_amd64.deb" (file_name (sp! ())) ),
+        test.case "the control file"
+            $( test.eq! [:ok, "Package: demo\nVersion: 1.0-1\nArchitecture: amd64\nMaintainer: A <a@b>\nInstalled-Size: 5\n"
+                              + "Depends: libc6 (>= 2.31), libssl3 | libssl1.1\nSection: misc\nPriority: optional\n"
+                              + "Description: a demo\n First.\n .\n Second.\n"]
+                        (control (sp! ()) lay) ),
+        test.case "the data starts at the root, directories first"
+            $( test.eq! ["./", "./usr/", "./usr/bin/", "./usr/bin/d", "./usr/bin/demo"]
+                        (list.map item.path (data_items lay)) ),
+        test.case "a package needs a maintainer"
+            $( test.eq! :error (list.head (problems (Spec.set_maintainer "" (sp! ())))) ),
+    ];
+}

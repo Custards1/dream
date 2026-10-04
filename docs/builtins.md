@@ -411,6 +411,11 @@ import std.io;
 | `copy!` | `from:string → to:string → unit` | `to` becomes a copy of `from`, with its permissions, replacing it if it is there: a file of its own, so that what edits one later cannot reach the other. |
 | `link!` | `from:string → to:string → atom` | `to` becomes another name for `from`: a hard link (`:linked`), or a copy where one cannot be made (`:copied`). `to` must not exist yet. For a file nothing will write to again, such as another build step's output. |
 | `chmod!` | `path:string → mode:integer → unit` | Set the permission bits, `0o755` being `493`. On Windows only the owner's write bit means anything, and the rest are accepted and ignored. |
+| `mode!` | `path:string → integer \| unit` | The permission bits of what the path leads to, as `chmod!` takes them (`0o755` is `493`); `()` when nothing is there. Windows reports only its read-only attribute: `0o666` or `0o444`, plus execute bits for a directory or a program. |
+| `lstat!` | `path:string → [size:integer, modified:integer, kind:atom] \| unit` | `stat!` of the name itself rather than where it leads: a symbolic link answers `:link`, its size the length of its target, and a dangling one is still there. Anything else answers what `stat!` does. |
+| `is_link!` | `path:string → bool` | Whether the name is a symbolic link, dangling or not. |
+| `symlink!` | `target:string → to:string → unit` | `to` becomes a symbolic link holding `target` as written, in `ln -s`'s order. A relative target is read from the link's directory and need not exist; `to` must not. On Windows it needs developer mode or the privilege, and otherwise raises `:permission_denied`. |
+| `read_link!` | `path:string → string` | The target a symbolic link holds, as written rather than resolved. `:wrong_kind` when the path is not a link. |
 | `walk!` | `dir:string → list of string` | Every file under `dir`, relative to it with `/` between the parts, sorted. Directories are walked and not listed, and a link to a directory is not followed, so a tree that links into itself is still finite. |
 
 ### Error atoms
@@ -510,6 +515,7 @@ crypto.equal expected_mac given_mac            // constant time
 |------|-----------|-------------|
 | `md5`, `sha1`, `sha256`, `sha384`, `sha512` | `string → string` | The digest, as raw bytes (16, 20, 32, 48, 64). |
 | `digest` | `alg → string → string` | The same, with the hash chosen by the caller. |
+| `digest_file!` | `alg → path → string` | The digest of a file's contents, read by the VM a block at a time, so a file of any size costs the heap nothing. Raises `:not_found`, `:wrong_kind` (a directory) or `:permission_denied`. |
 | `hmac` | `alg → key → message → string` | HMAC (RFC 2104). |
 | `pbkdf2` | `alg → password → salt → iterations → length → string` | PBKDF2 with HMAC (RFC 8018). The key's padding is hashed once, so each round costs two compressions. |
 | `hkdf` | `alg → key → salt → info → length → string` | HKDF extract-and-expand (RFC 5869). An empty salt is the RFC's default. |

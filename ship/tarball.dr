@@ -1,0 +1,91 @@
+// A release tarball: the package laid out from its prefix, for whatever
+// installs from an archive -- Homebrew, the AUR, `install.sh`, a person
+// unpacking it by hand into `~/.local` or `/opt`.
+//
+//     hello-1.2.0-linux-x86_64.tar.gz
+//       hello-1.2.0/bin/hello
+//       hello-1.2.0/share/hello/...
+//       hello-1.2.0/etc/hello/hello.conf      -- outside the prefix, from the root
+//
+// One directory on top, as every source and binary release has, which
+// Homebrew steps into by itself and `tar --strip-components=1` removes. The
+// name says the system and machine it runs on, because a tarball has no
+// other way to; a package that runs anywhere (`arch = "all"`) is just
+// `hello-1.2.0.tar.gz`. `release.dr` reads these names back to find the
+// tarballs a formula or an install script points at, so each machine in a
+// release's build makes its own and one place makes the rest.
+
+import std.list;
+import std.str;
+
+import compress;
+import item;
+import item.{Item};
+import layout;
+import layout.Layout;
+import platform;
+import scratch;
+import spec;
+import spec.Spec;
+import tar;
+
+/// The name for the system and machine given, or the one name of a package
+/// that runs anywhere.
+let file_for : Spec -> :string -> :string -> compress.Compression -> :string;
+let file_for sp os machine c = match machine {
+    "any" => Spec.name sp + "-" + Spec.version sp + ".tar" + compress.extension c,
+    _ => Spec.name sp + "-" + Spec.version sp + "-" + os + "-" + machine + ".tar" + compress.extension c,
+};
+
+let file_name : Spec -> compress.Compression -> :string;
+let file_name sp c = file_for sp (platform.os_name (Spec.os sp)) (platform.uname (Spec.arch sp)) c;
+
+/// The directory on top.
+let top : Spec -> :string;
+let top sp = Spec.name sp + "-" + Spec.version sp;
+
+let items : Spec -> Layout -> [Item];
+let items sp lay = {
+    let moved = list.map (fn i -> item.renamed (fn p -> top sp + "/" + layout.relative sp p) i) (Layout.items lay);
+    let dirs = list.map (fn d -> item.Item.dir (d + "/") item.executable) (layout.dirs moved);
+    list.sort_on item.path (dirs + moved)
+};
+
+let build! : Spec -> Layout -> compress.Compression -> :string -> :string -> [:ok, :string] | [:error, :string];
+let build! sp lay c dir dest = {
+    let tar_path = dir + "/release.tar";
+    tar.file! tar_path :pax (Layout.epoch lay) (items sp lay)
+    let? packed = compress.file! c tar_path;
+    let target = dest + "/" + file_name sp c;
+    scratch.place! packed target
+    [:ok, target]
+};
+
+/// Make the tarball in `dest`, answering its path. gzip unless asked, since
+/// it is the one every `tar` and every Homebrew unpacks.
+let make! : Spec -> Layout -> :string -> :any -> [:ok, :string] | [:error, :string];
+let make! sp lay dest wanted = {
+    let? c = compress.pick! wanted [:gzip, :xz, :zstd];
+    scratch.within! dest "tarball" (fn dir -> build! sp lay c dir dest)
+};
+
+when test {
+    import std.test;
+    import std.toml;
+
+    let sp! a = match toml.parse ("[package]\nname = \"demo\"\nversion = \"1.0\"\n[ship]\nsummary = \"x\"\n") {
+        [:ok, doc] => match spec.of_doc "." doc (%{ "arch" => a, "os" => "linux" }) (%{}) { [:ok, s] => s, other => raise! other },
+        other => raise! other,
+    };
+
+    let tests = [
+        test.case "the name says what it runs on"
+            $( test.eq! ["demo-1.0-linux-x86_64.tar.gz", "demo-1.0.tar.gz"]
+                        [file_name (sp! "x86_64") :gzip, file_name (sp! "all") :gzip] ),
+        test.case "laid out from the prefix, under one directory"
+            $( test.eq! ["demo-1.0/", "demo-1.0/bin/", "demo-1.0/bin/demo", "demo-1.0/etc/", "demo-1.0/etc/demo.conf"]
+                        (list.map item.path (items (sp! "x86_64")
+                                                   (Layout.make [item.Item.text "usr/bin/demo" 493 "",
+                                                                 item.Item.text "etc/demo.conf" 420 ""] [] 0))) ),
+    ];
+}
