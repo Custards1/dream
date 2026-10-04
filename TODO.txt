@@ -49,4 +49,4 @@ Follow-ups from 1, 2 and 5:
   `_error_new`, a list and a `raise!`: the compiler's image 1,198 -> 1,139
   KB, and a self-compile ~4% faster (2.03-2.09 s -> 1.94-1.99 s).
 - 3 (freeing shared values) is designed, not built: "Freeing what was
-  shared" in docs/gc.md.
+  shared" in docs/gc.md, with the refinements found starting the build.

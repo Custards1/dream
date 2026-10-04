@@ -813,6 +813,43 @@ read it.
 - **Images and other runtimes.** An `ImageSession` or a `comp` runtime has an
   area of its own and frees it when it ends, as today.
 
+### Refinements from reading the code (2026-10-03)
+
+Settled while starting the build, which stopped before any code changed:
+
+- **No region table.** Each region block is 64 KiB and 64 KiB-aligned
+  (`aligned_alloc`) and starts with a small header naming its region, so an
+  object's region is `addr & ~0xFFFF` and one load. An object larger than a
+  quarter block gets an aligned block of its own, still with the header first,
+  so its start stays within the first 64 KiB. Lookups take no lock, and only
+  `any_contains` keeps the range list it has today, for the verifier.
+- **A refused share frees its region at once.** Today the partial copy is
+  leaked; with a region per share, nothing can reach it, so it can go.
+- **Parked processes are censused by the round's thread**, under the process's
+  `sched_mutex`, with `major_collect` run on its heap directly. A wake blocks
+  on that mutex until the census is done. Waking a parked process to census it
+  would make one parked on a descriptor arm the poller twice. A running or
+  queued process gets a `census_round` flag instead, checked at the start of
+  its slice and in the parking handshake before it publishes `Waiting`. With
+  the flag only at slice start, a process that parks first would never report.
+- **Lock order** is `sched_mutex` → census → area → mailbox. The round's setup
+  takes the census lock alone, then visits processes without it, so a worker
+  reporting from inside its parking handshake cannot deadlock against it.
+- **A census major** finalizes any concurrent mark in flight first, because
+  its helpers marked without the observer. It then runs `major_collect` with
+  the heap's `observe_round_` set. The observer goes where marking stops at a
+  shared object today: `mark_object`, `forward_in` and `forward_slow`.
+  `claim_mark` is the concurrent mark's and is not used by a census.
+- **The read-only walk** of mailboxes, kill reasons and finished processes'
+  `exit_value` needs a child enumeration per object type without mark bits. It
+  should be written beside `scan_object` and checked against it, type by type.
+- **A process that finishes mid-round reports from `finish`**, after
+  `exit_value` is set, and the walk of finished processes covers what it left.
+  A kill goes through `finish`, so it is covered too.
+- **Freeing is a fixpoint within the round.** A condemned, unseen region with
+  no dependents is freed, its dependencies lose a dependent, and the loop
+  repeats. A chain of released tables goes in one round.
+
 ### What it would take
 
 `SharedArea` grows regions, aligned blocks, the region table and the
