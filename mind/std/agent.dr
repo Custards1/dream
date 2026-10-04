@@ -106,7 +106,7 @@ when test {
     // A second server, to check what `std.server` claims about one server
     // calling another. It holds the pid of an agent and asks it for its value
     // from inside a handler, which is the shape that would deadlock or lose a
-    // message if `await_reply!` were not careful.
+    // message if `server.call!` took anything but its own reply.
     mod relay {
         derive std.server;
 
@@ -145,6 +145,16 @@ when test {
                 let n = get! a (fn xs -> list.length xs);
                 stop! a
                 test.eq! 3 n
+            } ),
+        test.case "a call that times out does not answer the next one"
+            $( {
+                let a = start! 7;
+                // Slow enough to outlast the limit: the agent is still adding
+                // when the caller gives up, and answers later.
+                let slow = server.call_within! a [:get, fn n -> list.sum (list.range 0 2000000) * 0 + n] 1;
+                let next = value! a;
+                stop! a
+                test.eq! [:timeout, 7] [slow, next]
             } ),
         test.case "get_and_update! answers the old and keeps the new"
             $( {
@@ -234,8 +244,8 @@ when test {
             } ),
 
         // What a call does with a message that is not its reply. The noise is
-        // put in this process's own mailbox first, so `await_reply!` is certain
-        // to meet it before the agent answers -- no timing involved.
+        // put in this process's own mailbox first, so the call is certain to
+        // meet it before the agent answers -- no timing involved.
         test.case "a call keeps a message that is not its reply"
             $( {
                 let a = start! 5;

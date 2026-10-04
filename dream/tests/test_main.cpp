@@ -1289,6 +1289,12 @@ static void test_builtin_table_matches_compiler() {
                               "compare",
                               "_sort_keyed",
                               "_tensor_matmul",
+                              "_str_interp",
+                              "_mailbox_peek!",
+                              "_mailbox_take!",
+                              "_await_message!",
+                              "_deadline_in!",
+                              "_match_fail",
     };
     const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
     CHECK_EQ(builtin_count(), n);

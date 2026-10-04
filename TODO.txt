@@ -1,0 +1,50 @@
+Language and VM improvements, in the order we are doing them.
+
+Done (branch monitors-recv-match):
+1. Monitors and kill.  vm.monitor!/demonitor!/kill!, wrapped by std.proc;
+   std.supervisor monitors its children (no watcher processes) and kills a
+   child that ignores shutdown after the limits' :shutdown wait.
+2. Receive with a timeout, and selective receive.  vm.mailbox_peek!/take!,
+   vm.await_message! (absolute deadline), vm.sleep_until!, a timer thread in
+   the scheduler; std.proc.recv_where!/recv_within!/recv_until!/sleep!.
+   proc.call! and server.call! pick their reply out and raise :down if the
+   target dies.
+5. A better match failure.  :match_error is its own kind with payload
+   [value, path, line, col]; an uncaught one prints as a diagnostic.
+4. Found already in place: exhaustiveness is checked for any *named* type
+   (`union`, or a `type` alias like result.Of) through lets, constructors and
+   lambdas.  The one gap is a match on an unsigned function's result, which
+   is rule 1 of dreams/typecheck.dr ("nothing unannotated is ever an
+   error") working as designed, so it stays.
+6. String interpolation: `$"{n} squared is {n * n}"`.  The lexer lexes each
+   `{..}` in place, the parser makes `[:unary, :interp, [pieces]]`, and the
+   lowering emits the new `str_interp` opcode (74, builtin `_str_interp`).
+7. `union struct Name { .. }`: variants with fields are arrays; the checker
+   knows them, and switch_head reads an array's first element as a tag.
+8. Peak heap on large programs: one quadratic left, the item fold in
+   modules.load_items!/hoist_mod! appending per item.  At 6,400 decls live
+   at the heaps' peaks 1,175 -> 681 MB, promoted 1,226 -> 765 MB, compile
+   7.3 -> 6.6 s; memory per doubling is linear again ("The item list was
+   appended to" in docs/notes/compiler-scaling.md).
+9. Found already in place: lint.dr runs inside resolution, so its warnings
+   are in scope.r_diags, which --check, `mind check` and lucid's
+   compile.checked all report.
+
+Left: nothing on this list.
+
+Follow-ups from 1, 2 and 5:
+- Done: a kill reaches a process inside one long nested force (raised where
+  its slice would have ended, past every `try!`), and a killed process
+  parked on a descriptor is withdrawn from the poller.
+- Done: proc.call_within! and server.call_within!; a request carries a
+  vm.unique! reference and its reply echoes it, so a late reply is never
+  taken for the next call's.
+- Done: std.registry is a small server that monitors every process it names
+  and drops a name when its process ends.
+- Done: `receive! { pattern => body, .., after ms => body }`, lowered to a
+  scan over four new primitives, so it needs no import.
+- Done: a failed match is one call of the builtin `_match_fail`, not an
+  `_error_new`, a list and a `raise!`: the compiler's image 1,198 -> 1,139
+  KB, and a self-compile ~4% faster (2.03-2.09 s -> 1.94-1.99 s).
+- Done: 3, freeing shared values -- vm.release! and vm.collect_shared!, a
+  region per share and a census ("Freeing what was shared" in docs/gc.md).

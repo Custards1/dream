@@ -1594,7 +1594,10 @@ let check_name c name span r = {
             local => record (ctx_mi c) (ctx_source c) span local r0,
         };
     if builtins.is_impure_name name {
-        note_effect c span ("the impure function `" + name + "`") r1
+        // `receive!` is syntax, and what it becomes calls this; say what was
+        // written (see `syntax.receive_e`).
+        let shown = if name == "__receive_start!" { "a `receive!`" } else { "the impure function `" + name + "`" };
+        note_effect c span shown r1
     }
     else { r1 }
 };

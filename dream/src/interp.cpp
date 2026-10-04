@@ -1621,11 +1621,17 @@ void take_switch(Process& p, uint32_t node, Value subject, Value frame) {
         eval_node(p, switch_target(p, n, subject), frame);
         return;
     }
-    if (!is_obj(subject, ObjType::Cons)) {
+    // The head of a list cell, or the first element of an array: a variant of
+    // a `union struct` is `#[:tag, ..]` and is told apart the same way.
+    Value head;
+    if (is_obj(subject, ObjType::Cons)) {
+        head = resolve(static_cast<ConsObj*>(as_obj(subject))->head);
+    } else if (is_obj(subject, ObjType::Array) && static_cast<ArrayObj*>(as_obj(subject))->len > 0) {
+        head = resolve(static_cast<ArrayObj*>(as_obj(subject))->items()[0]);
+    } else {
         eval_node(p, img_of(p).kid(n.b + n.c - 1), frame);
         return;
     }
-    Value head = resolve(static_cast<ConsObj*>(as_obj(subject))->head);
     if (is_whnf(head)) {
         eval_node(p, switch_target(p, n, head), frame);
         return;
@@ -2237,6 +2243,13 @@ bool unwind(Process& p, size_t floor) {
             continue;
         }
         if (c.kind == ContKind::Catch) {
+            // A process being killed is not unwound to a handler: `kill!`
+            // ends it, and a `try!` that could catch that would be a process
+            // that could refuse. Its stack goes with the frame.
+            if (p.kill_requested.load(std::memory_order_relaxed)) {
+                p.stack.resize(c.c);
+                continue;
+            }
             p.stack.resize(c.c);
             auto* fo = static_cast<FrameObj*>(as_obj(c.v1));
             value_slot_store(&fo->slots()[c.b], p.result);
@@ -2782,6 +2795,15 @@ bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* o
         if (p.reductions <= 0) {
             p.slice_spent = true;
             p.reductions = p.slice;
+            // A kill waits for the slice to end, and a force this long may not
+            // end at all -- `strict!` over something endless, a native walking
+            // a list that never stops. So the kill is raised here, where the
+            // slice would have ended; `unwind` passes every handler, and the
+            // natives above give the raise back as they would any other.
+            if (p.mode != Mode::Raise && p.kill_requested.load(std::memory_order_relaxed)) {
+                do_raise(p, p.kill_error());
+                continue;
+            }
         }
 
         // A blocking native inside the value being forced -- `join!`, `recv!`,

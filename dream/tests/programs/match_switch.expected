@@ -23,6 +23,6 @@ fallback
 cell
 not a cell
 3
-<error :error :match_error>
+<error :match_error [[:d], "match_switch.dr", 55, 21]>
 <error :divide_by_zero division by zero>
-<error :error :match_error>
+<error :match_error [7, "match_switch.dr", 55, 21]>

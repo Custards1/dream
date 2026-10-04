@@ -7,20 +7,20 @@
 //
 // What the runtime gives us, and what it does not, shapes everything here.
 //
-// **There is no monitor and no link.** The only way to learn that a process
-// finished is `join!`, which blocks. A supervisor that joined its children
-// could watch exactly one. So each child gets a *watcher*: a process that joins
-// the child, turns the outcome into a message, and sends it to the supervisor.
-// The supervisor then does nothing but read its mailbox, which is also what
-// lets it answer questions while its children run.
+// **A child is monitored.** The supervisor starts each child and asks to hear
+// when it ends (`proc.monitor!`), so a death arrives as `[:down, pid, outcome]`
+// in the one mailbox the supervisor reads -- which is also what lets it answer
+// questions while its children run. A report names the *process*, not the
+// child, and one for a process the supervisor no longer counts as running (it
+// stopped that child itself, or has already restarted it) is ignored: a
+// restart can never be triggered twice by one death.
 //
-// **There is no kill.** A process that will not stop cannot be stopped from
-// outside -- there is no primitive for it. So a supervisor asks: it sends
-// `proc.shutdown` and waits for the child to finish. A child that never reads
-// its mailbox cannot be shut down by anyone, and a strategy that has to stop
-// its siblings will wait for it. That is not a flaw in this module; it is the
-// runtime's shape, and the honest thing is to say so rather than pretend.
-// Anything meant to be supervised should be written around `proc.serve!`.
+// **A child is asked to stop, then made to.** The supervisor sends
+// `proc.shutdown` and waits for the child to go down -- for the limits'
+// `:shutdown` milliseconds, five seconds unless said otherwise -- and kills it
+// (`proc.kill!`, reason `:shutdown`) if it has not. Asking first is the point:
+// a server that is asked can let go of what it holds. Anything meant to be
+// supervised should still be written around `proc.serve!`.
 //
 // **A thunk runs once.** `$( work )` remembers its result, so a restart cannot
 // re-spawn the same thunk -- the second spawn would find a value. A child is
@@ -96,9 +96,9 @@ let should_restart c outcome =
 ///   - `:rest_for_one` -- stop and restart everything *after* the one that
 ///     died, in start order. For a chain where each depends on the one before.
 ///
-/// The last two have to stop their siblings, and stopping is a request (see the
-/// note at the top). A child that does not answer `proc.shutdown` will hold up
-/// the restart it is part of.
+/// The last two have to stop their siblings, and stopping is a request first
+/// (see the note at the top). A child that does not answer `proc.shutdown` holds
+/// up the restart it is part of until it is killed.
 let strategies : [Strategy];
 let strategies = [:one_for_one, :one_for_all, :rest_for_one];
 
@@ -127,6 +127,14 @@ let affected strategy names name =
 
 let limits : :integer -> :integer -> Limits;
 let limits limit window_ms = %{ :limit => limit, :window => window_ms };
+
+/// The same limits, with how long a child asked to stop is given before it is
+/// killed.
+let with_shutdown : :integer -> Limits -> Limits;
+let with_shutdown ms lim = map.put :shutdown ms lim;
+
+let shutdown_after : Limits -> :integer;
+let shutdown_after lim = map.get 5000 :shutdown lim;
 
 /// Five restarts in five seconds, which is a compromise nobody will love and
 /// everybody can override.
@@ -186,24 +194,20 @@ let child_named s name = {
 
 // --- starting and watching ------------------------------------------------------
 
-/// Tell `sup` how a child ended. This runs in its own process, one per child,
-/// and joining is the whole of it: `join!` is the only way to learn that a
-/// process is done, and it blocks, so it happens somewhere the supervisor is
-/// not.
-let watch! : :process -> :string -> :process -> :any;
-let watch! sup name p = {
-    let outcome = proc.outcome! p;
-    send! sup [:down, name, outcome]
-};
-
-/// Start one child and the watcher that reports it.
-let start_child! : :process -> Child -> :process;
-let start_child! sup c = {
+/// Start one child, monitored by the process this runs in -- which must be the
+/// supervisor, since a monitor reports to whoever asked for it.
+let start_child! : Child -> :process;
+let start_child! c = {
     let go = child_start c;
     let p = spawn! $( go () );
-    spawn! $( watch! sup (child_name c) p )
+    proc.monitor! p
     p
 };
+
+/// The name of the running child that is process `p`, or `()` for one the
+/// supervisor no longer counts as running.
+let name_of : State -> :process -> :any;
+let name_of s p = map.fold (fn found name q -> if q == p { name } else { found }) () (s_running s);
 
 /// Start the child called `name` and record it as running.
 ///
@@ -215,30 +219,38 @@ let start_child! sup c = {
 /// listed as running and never ran, and a watcher waiting to hear it go down
 /// waited for ever. It showed only when the machine was busy enough for the
 /// first child's death to reach the supervisor before the restart did.
-let start_named! : :process -> State -> :string -> State;
-let start_named! sup s name =
+let start_named! : State -> :string -> State;
+let start_named! s name =
     match child_named s name {
         () => s,
         c => {
-            let p = start_child! sup c;
+            let p = start_child! c;
             strict! p
             with_running (map.put name p (s_running s)) s
         },
     };
 
-/// Ask a child to stop, and wait until it has.
+/// Ask a child to stop, and wait until it has; kill it if it takes longer
+/// than the limits allow.
 ///
 /// The wait is what makes a group restart mean anything: starting a fresh child
 /// while the old one is still holding whatever it holds is the bug this is
-/// meant to prevent. A child that ignores `shutdown` waits for ever, which is
-/// the runtime's shape and is written on the tin.
+/// meant to prevent. Waiting for the child's `[:down ..]` rather than joining
+/// it also takes that report out of the mailbox, so the loop never sees the
+/// death of a child it stopped on purpose.
 let stop_child! : State -> :string -> State;
 let stop_child! s name =
     match map.get () name (s_running s) {
         () => s,
         p => {
             send! p proc.shutdown
-            proc.outcome! p
+            match proc.recv_where_within! (fn m -> proc.is_down_of p m) (shutdown_after (s_limits s)) {
+                [:ok, _] => (),
+                _ => {
+                    proc.kill! p :shutdown
+                    proc.recv_where! (fn m -> proc.is_down_of p m)
+                },
+            }
             with_running (map.remove name (s_running s)) s
         },
     };
@@ -263,8 +275,8 @@ let tell_watchers! s name outcome =
     list.map (fn w -> send! w [:down, name, outcome]) (s_watchers s) |> strict!;
 
 /// One `[:down, name, outcome]`.
-let handle_down! : :process -> State -> :string -> :any -> ([:go, State] | [:stop, :any]);
-let handle_down! sup s name outcome = {
+let handle_down! : State -> :string -> :any -> ([:go, State] | [:stop, :any]);
+let handle_down! s name outcome = {
     tell_watchers! s name outcome
     let c = child_named s name;
     let gone = with_running (map.remove name (s_running s)) s;
@@ -284,7 +296,7 @@ let handle_down! sup s name outcome = {
             // stop before any of them is started again.
             let others = list.filter (fn n -> n != name) group;
             let cleared = stop_all! (with_restarts times gone) others;
-            let next = list.fold (fn acc n -> start_named! sup acc n) cleared group;
+            let next = list.fold (fn acc n -> start_named! acc n) cleared group;
             // Forcing here, in a statement, and not inside the answer below.
             // Starting a child is an effect held in a lazy position -- the
             // state's `:running` values are the spawns themselves -- and an
@@ -302,59 +314,49 @@ let handle_down! sup s name outcome = {
 
 /// The message loop. Everything a supervisor does happens here, because
 /// everything it learns arrives as a message.
-let handle! : :process -> State -> :any -> ([:go, State] | [:stop, :any]);
-let handle! sup s m =
+let handle! : State -> :any -> ([:go, State] | [:stop, :any]);
+let handle! s m =
     match m {
-        [:down, name, outcome] => handle_down! sup s name outcome,
+        [:down, p, outcome] => match name_of s p {
+            () => [:go, s],
+            name => handle_down! s name outcome,
+        },
         [:which, from] => {
-            strict! (send! from (map.sorted_keys (s_running s)))
+            answer! from (map.sorted_keys (s_running s))
             [:go, s]
         },
         [:restart, from, name] => {
-            let started = if map.has name (s_running s) { s } else { start_named! sup s name };
-            strict! (send! from :ok)
+            let started = if map.has name (s_running s) { s } else { start_named! s name };
+            strict! started
+            answer! from :ok
             [:go, started]
         },
         [:notify, from] => {
             let told = with_watcher from s;
-            strict! (send! from :ok)
+            answer! from :ok
             [:go, told]
         },
         [:stop_all, from] => {
             let cleared = stop_all! s (names_of s);
-            strict! (send! from :stopped)
+            strict! cleared
+            answer! from :stopped
             [:stop, [:ok, :stopped]]
         },
         _ => [:go, s],
     };
 
-/// `self! ()` is taken here, in a statement, and not written inside the
-/// handler below.
-///
-/// An argument is a thunk, and a thunk that reaches another process is
-/// evaluated *there*. Written as `handle! (self! ()) st m`, the supervisor's
-/// own identity would travel unevaluated into every child's watcher -- where
-/// `self!` answers the watcher -- and each watcher would dutifully report the
-/// child's death to itself. The supervisor waited for a message it had asked
-/// somebody else to send to themselves, and the runtime called that a deadlock,
-/// which it was.
 let serve! : State -> :any;
-let serve! s = {
-    let me = strict! self! ();
-    proc.serve! s (fn st m -> handle! me st m)
-};
+let serve! s = proc.serve! s (fn st m -> handle! st m);
 
 /// Start a supervisor and its children. Answers the supervisor's process.
 ///
-/// The children are started by the supervisor itself, not by the caller, so
-/// that every watcher reports to the process that will still be there to hear
-/// it.
+/// The children are started by the supervisor itself, not by the caller,
+/// because a monitor reports to the process that asked for it.
 let start_with! : Strategy -> [Child] -> Limits -> :process;
 let start_with! strategy children lim = {
     let s = state strategy children lim;
     spawn! $( {
-        let me = strict! self! ();
-        let started = list.fold (fn acc n -> start_named! me acc n) s (names_of s) |> strict!;
+        let started = list.fold (fn acc n -> start_named! acc n) s (names_of s) |> strict!;
         serve! started
     } )
 };
@@ -363,13 +365,31 @@ let start! : Strategy -> [Child] -> :process;
 let start! strategy children = start_with! strategy children default_limits;
 
 // --- asking it things -----------------------------------------------------------
+//
+// Every answer comes back tagged `[:supervisor, sup, value]` and is picked out
+// of the mailbox by that tag, so a process can ask a supervisor something while
+// other messages -- reports from `notify!` among them -- are waiting for it.
+
+priv let answer! : :process -> :any -> :any;
+priv let answer! to value = strict! (send! to [:supervisor, self! (), value]);
+
+priv let ask! : :process -> :any -> :any;
+priv let ask! sup request = {
+    strict! (send! sup request)
+    match proc.recv_where! (fn m -> is_answer_from sup m) {
+        [_, _, value] => value,
+    }
+};
+
+priv let is_answer_from : :process -> :any -> :bool;
+priv let is_answer_from sup m = match m {
+    [:supervisor, from, _] => from == sup,
+    _ => false,
+};
 
 /// The names of the children now running, in order.
 let which! : :process -> [:string];
-let which! sup = {
-    strict! (send! sup [:which, self! ()])
-    recv! ()
-};
+let which! sup = ask! sup [:which, self! ()];
 
 /// Start a child that is not running -- by name, from its spec.
 ///
@@ -377,19 +397,13 @@ let which! sup = {
 /// one: a child that ended and was not restarted, or one deliberately started
 /// late. A name that is already running is left alone.
 let restart! : :process -> :string -> :any;
-let restart! sup name = {
-    strict! (send! sup [:restart, self! (), name])
-    recv! ()
-};
+let restart! sup name = ask! sup [:restart, self! (), name];
 
 /// Hear about every child that goes down from now on, as `[:down, name,
 /// outcome]` messages. Answers once the supervisor has taken note, so a caller
 /// that registers before starting the work cannot miss the first failure.
 let notify! : :process -> :any;
-let notify! sup = {
-    strict! (send! sup [:notify, self! ()])
-    recv! ()
-};
+let notify! sup = ask! sup [:notify, self! ()];
 
 /// Stop every child, then the supervisor. Answers when it is all down.
 ///
@@ -398,8 +412,7 @@ let notify! sup = {
 /// whoever starts one owns stopping it.
 let stop! : :process -> :any;
 let stop! sup = {
-    strict! (send! sup [:stop_all, self! ()])
-    recv! ()
+    ask! sup [:stop_all, self! ()]
     proc.outcome! sup
 };
 
@@ -420,19 +433,19 @@ when test {
             }
             else { [:go, n + 1] });
 
+    /// A child that never reads its mailbox, so it can only be killed.
+    let rec deaf! () = deaf! ();
+
     /// A child that ends immediately, for the restart policies.
     let quitter! () = :done;
 
     /// Register for reports, say so, and answer the first one.
     ///
-    /// It listens in a process of its own, and that is the point. A process
-    /// that both asks a supervisor questions and listens to its reports gets
-    /// replies and reports in one mailbox, and with no selective receive
-    /// `recv!` hands over whichever arrived first -- so a sieve that waits for
-    /// one particular message can swallow a reply somebody else was waiting
-    /// for, and both sides stop. Here the report comes back as this process's
-    /// *value*, through `join!`, which is a channel of exactly one message that
-    /// nothing else can land in.
+    /// It listens in a process of its own, which predates selective receive:
+    /// answers are picked out of the mailbox by their tag now, so a process
+    /// could ask and listen at once. The report comes back as this process's
+    /// *value*, through `join!`, which is still the simplest channel a test
+    /// can wait on.
     let listener! sup parent = {
         notify! sup
         send! parent :ready
@@ -527,6 +540,13 @@ when test {
                 let names = which! sup;
                 stop! sup
                 test.eq! ["x"] names
+            } ),
+
+        test.case "a child that ignores shutdown is killed"
+            $( {
+                let sup = start_with! :one_for_one [child "deaf" deaf!] (with_shutdown 50 default_limits);
+                let ended = stop! sup;
+                test.eq! [:ok, [:ok, :stopped]] ended
             } ),
 
         test.case "stop! takes the children down with it"

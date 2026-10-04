@@ -137,6 +137,7 @@ let node_runs = [
     [:data_count, 1, 2, 1],
     [:data_at, 1, 2, 1],
     [:compare, 1, 2, 1],
+    [:str_interp, 1, 2, 1],
 
     [:apply, 1, 2, 1],
     [:block, 0, 1, 1],
@@ -379,6 +380,7 @@ let primitive_ops = %{
     47 => [:data_count, 1],
     48 => [:data_at, 1],
     49 => [:compare, 2],
+    52 => [:str_interp, 1],
 };
 
 /// The three list builtins that become opcodes of their own, keyed by the

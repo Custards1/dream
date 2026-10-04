@@ -229,6 +229,82 @@ let rec string_body s i pieces opened =
         string_body s j (list.cons (str.slice i (j - i) s) pieces) opened
     };
 
+// --- interpolated strings -----------------------------------------------------
+//
+// `$"total: {n + 1}"` is one token whose value is its pieces in order: a string
+// for each run of literal text, and for each `{..}` the tokens of the
+// expression inside it. Those are lexed here, in place, by the same `stream`
+// that lexes the file -- so every span in them is the file's own, and the
+// parser only has to parse a token list it was handed. The prefix is what
+// makes it opt in: a plain string keeps every `{` it has, and strings that
+// spell JSON or Dream are common. A `{` that should be text is written `\{`.
+
+/// The offset of the `}` that closes a `{` whose body starts at `i`:
+/// `[:ok, offset]`, or an error. Braces nest, and a string or character
+/// literal inside is stepped over whole, so a `"}"` in one closes nothing.
+let rec brace_end s i depth = {
+    let b = str.byte i s;
+    if b == eof { [:error, "unterminated `{` in an interpolated string", i] }
+    else if b == 123 { brace_end s (i + 1) (depth + 1) }
+    else if b == 125 { if depth == 0 { [:ok, i] } else { brace_end s (i + 1) (depth - 1) } }
+    else if b == 34 {
+        let r = string_body s (i + 1) [] i;
+        if list.head r == :error { r } else { brace_end s (list.nth 2 r) depth }
+    }
+    else if b == 39 {
+        let r = char_literal s i;
+        if list.head r == :error { r } else { brace_end s (list.nth 2 r) depth }
+    }
+    else { brace_end s (i + 1) depth }
+};
+
+/// The tokens of `ts` that start before `end`.
+let rec tokens_before ts end = match ts {
+    [] => [],
+    [t, ..rest] => if span_start t >= end { [] } else { list.cons t (tokens_before rest end) },
+};
+
+/// Literal text gathered so far, as one piece in front of `parts`.
+let flush_text pieces parts =
+    if list.is_empty pieces { parts } else { list.cons (str.join_str "" (list.reverse pieces)) parts };
+
+/// A run of interpolated-string text: up to a quote, a backslash, a `{`, or
+/// the end of the file.
+let rec interp_run s i = {
+    let b = str.byte i s;
+    if b == eof || b == 34 || b == 92 || b == 123 { i } else { interp_run s (i + 1) }
+};
+
+/// The body of a `$"..."`: `[:ok, pieces, next]` or an error.
+let rec interp_body s i pieces parts opened = {
+    let b = str.byte i s;
+    if b == eof { [:error, "unterminated string", opened] }
+    else if b == 34 { [:ok, list.reverse (flush_text pieces parts), i + 1] }
+    else if b == 92 {
+        let e = escape_at s (i + 1);
+        if e == () && str.byte (i + 1) s == 117 { [:error, "expected \\u{HEX}", i] }
+        else if e == () { [:error, "unterminated string", opened] }
+        else { interp_body s (list.nth 1 e) (list.cons (list.head e) pieces) parts opened }
+    }
+    else if b == 123 {
+        match brace_end s (i + 1) 0 {
+            [:ok, j] =>
+                if j == i + 1 { [:error, "an empty `{}` in an interpolated string; write `\\{` for a brace", i] }
+                else {
+                    // The `}` goes with the tokens, so a parse that runs out
+                    // of them can say where.
+                    let code = [tokens_before (stream s (i + 1) 1 false) j, j];
+                    interp_body s (j + 1) [] (list.cons code (flush_text pieces parts)) opened
+                },
+            failed => failed,
+        }
+    }
+    else {
+        let j = interp_run s i;
+        interp_body s j (list.cons (str.slice i (j - i) s) pieces) parts opened
+    }
+};
+
 /// A `'c'` literal: one character, or one escape, then a closing quote.
 let char_literal s i = {
     let inner = if str.byte (i + 1) s == 92 { escape_at s (i + 2) }
@@ -423,6 +499,10 @@ let token_at s i = {
     else if b == 39 {
         let r = char_literal s i;
         if list.head r == :error { r } else { [:char, list.nth 1 r, list.nth 2 r] }
+    }
+    else if b == 36 && str.byte (i + 1) s == 34 {
+        let r = interp_body s (i + 2) [] [] i;
+        if list.head r == :error { r } else { [:interp, list.nth 1 r, list.nth 2 r] }
     }
     else {
         let op = operator_at s i;
@@ -661,6 +741,22 @@ when test {
             $( test.eq! ["q"] (values "\"\\q\"") ),
         test.case "char"           $( test.eq! ['c'] (values "'c'") ),
         test.case "escaped char"   $( test.eq! ['\n'] (values "'\\n'") ),
+        test.case "an interpolated string is one token"
+            $( test.eq! [:interp, :semi] (kinds "$\"a {x} b\";") ),
+        test.case "its pieces are text and the tokens inside each brace"
+            $( {
+                let [a, code, b] = value (one "$\"a {x + 1} b\"");
+                test.eq! ["a ", [:ident, :plus, :int], 10, " b"]
+                         [a, list.map (fn t -> kind t) (list.head code), list.nth 1 code, b]
+            } ),
+        test.case "a brace in a nested string does not close the piece"
+            $( test.eq! 2 (len (value (one "$\"{f \"}\"}!\""))) ),
+        test.case "an escaped brace is text"
+            $( test.eq! ["a{b"] (value (one "$\"a\\{b\"")) ),
+        test.case "a plain string keeps its braces"
+            $( test.eq! ["{x}"] (values "\"{x}\"") ),
+        test.case "an empty brace is an error"
+            $( test.true! (str.starts_with "an empty `{}`" (lex_error "$\"{}\"")) ),
         test.case "unterminated string"
             $( test.eq! "unterminated string" (lex_error "\"oops") ),
         test.case "a bad unicode escape is an error"

@@ -1,0 +1,47 @@
+// `union struct`: a union whose variants with fields are arrays, `#[:tag, ..]`.
+//
+// Enough tagged variants that `match` dispatches on the tag with `switch_head`,
+// which reads an array's first element as it reads a list cell's head; and a
+// loop hot enough for the JIT, which must agree with the interpreter.
+import std.console;
+import std.list;
+import std.types;
+
+union struct Op {
+    push(n : :integer)
+    add
+    scale(by : :integer)
+    shift(by : :integer)
+    clamp(lo : :integer, hi : :integer)
+}
+
+let step : :integer -> Op -> :integer;
+let step acc op = match op {
+    #[:push, n] => n,
+    :add => acc + 1,
+    #[:scale, by] => acc * by,
+    #[:shift, by] => acc + by,
+    #[:clamp, lo, hi] => if acc < lo { lo } else if acc > hi { hi } else { acc },
+};
+
+/// A list cell with the same tag is not the array variant: the switch sends
+/// both to the same arm, whose own test tells them apart.
+let kind v = match v {
+    #[:push, _] => :array_push,
+    [:push, _] => :list_push,
+    #[:scale, _] => :array_scale,
+    #[:shift, _] => :array_shift,
+    _ => :other,
+};
+
+let rec run !i !acc = if i == 0 { acc } else {
+    run (i - 1) (step (step (step acc (Op.scale 3)) (Op.shift 1)) (Op.clamp 0 1000000))
+};
+
+let main! = {
+    console.print! (Op.clamp 1 2)
+    console.print! (list.fold step 0 [Op.push 2, Op.add, Op.scale 5, Op.shift (0 - 4), Op.clamp 0 10])
+    console.print! (list.map kind [Op.push 1, [:push, 1], Op.scale 2, Op.shift 3, :add, #[]])
+    console.print! [types.accepts Op (Op.push 1), types.accepts Op [:push, 1], types.accepts Op :add]
+    console.print! (run 50000 1)
+};

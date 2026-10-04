@@ -48,6 +48,7 @@ const char* wait_reason_name(WaitReason r) {
         case WaitReason::Message: return "message";
         case WaitReason::Join: return "join";
         case WaitReason::Io: return "io";
+        case WaitReason::Timer: return "timer";
         case WaitReason::None: break;
     }
     return "none";
@@ -91,6 +92,43 @@ bool Mailbox::empty() const {
 size_t Mailbox::size() const {
     std::lock_guard<std::mutex> g(mutex_);
     return queue_.size();
+}
+
+Value Process::kill_error() {
+    Value reason = UNIT;
+    {
+        std::lock_guard<std::mutex> g(sched_mutex);
+        if (kill_reason) reason = Heap::copy_between(heap_, kill_reason->value);
+    }
+    // `reason` is held across one allocation, which cannot collect.
+    return heap_.make_error(make_atom(well_known(rt_).killed), reason);
+}
+
+bool Mailbox::pop_into(Heap& dest, Value* out) {
+    std::unique_ptr<Message> m;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        if (queue_.empty()) return false;
+        *out = Heap::copy_between(dest, queue_.front()->value);
+        m = std::move(queue_.front());
+        queue_.pop_front();
+    }
+    // The message's own heap goes after the lock, with `m`.
+    return true;
+}
+
+bool Mailbox::peek_into(size_t i, Heap& dest, Value* out) const {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (i >= queue_.size()) return false;
+    *out = Heap::copy_between(dest, queue_[i]->value);
+    return true;
+}
+
+bool Mailbox::remove_at(size_t i) {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (i >= queue_.size()) return false;
+    queue_.erase(queue_.begin() + std::ptrdiff_t(i));
+    return true;
 }
 
 // ---------------------------------------------------------------------------

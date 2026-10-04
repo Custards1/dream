@@ -510,6 +510,16 @@ let rec lower_expr e l =
                 _ => lower_expr (ast.apply_e rhs [lhs] span) l,
             },
 
+        // An interpolated string is the `str_interp` opcode over the list of
+        // its pieces (`ast.interp_e`), emitted directly, as `::` is `:cons`.
+        [:unary, :interp, x, _] => {
+            let a = lower_expr x l;
+            let placed = kids [list.nth 1 a] (list.head a);
+            let made = emit (ir.node :str_interp (builtins.id "_str_interp") (list.nth 1 placed) 1)
+                            (list.head placed);
+            [inherit (list.nth 1 made) [list.nth 1 a] (list.head made), list.nth 1 made]
+        },
+
         // `:neg` and `:not` are what the parser already calls them, and what
         // the arena calls them, so there is nothing to translate.
         [:unary, op, x, _] => {
@@ -1136,14 +1146,96 @@ let rec map_test pairs subject binds span l = {
 // so nothing happens until a name is used -- and reading any name's part forces
 // the checked slot first, which runs the check once for all of them.
 
+// --- a failed match ---------------------------------------------------------------
+//
+// A `match` that nothing fits, and a destructuring the value does not, raise an
+// error of kind `:match_error` whose payload is `[value, path, line, col]`: what
+// did not fit, and where. Until this said both, the error was the bare atom,
+// and the only way to find which of a program's thousands of `match`es had
+// failed, or on what, was to go looking.
+//
+// The position is worked out here, from the places table `with_places` puts on
+// the resolution, because the image carries no spans for the machine to report
+// from. A lowering without one -- a macro's, the REPL's -- reports `"?"` and
+// zeros. One string per *file*, not per site: a site's line and column are
+// integers, so the image's string table grows by the files it was read from.
+
+/// Where each source's lines start, by source index: `[path, starts,
+/// origins]`, where `origins` maps a macro's generated text back to its call.
+let places_of : modules.Loader -> %{ :integer => :list };
+let places_of ld = list.fold (fn acc i -> {
+    let src = modules.file_at ld i;
+    // The text itself is left behind: only its line starts and the ranges a
+    // macro generated are wanted, and this table is shared with every part.
+    let origins = [diag.source_path src, "", diag.origins src];
+    // Left lazy: `vm.share!` forces it where the table is shared, and a whole
+    // lowering builds a file's table only once a `match` in it asks.
+    acc.[i => [shown_path ld (diag.source_path src), diag.line_starts (diag.source_text src), origins]]
+}) (%{}) (list.range 0 (modules.file_count ld));
+
+/// A file's name as a failed match reports it: relative to the search path it
+/// was found under -- `std/list.dr`, not wherever this machine keeps `mind` --
+/// and as it was written when no search path holds it. The image carries it,
+/// and an image should say the same thing whoever built it.
+let shown_path : modules.Loader -> :string -> :string;
+let shown_path ld p = {
+    let dirs = list.map (fn d -> if str.ends_with "/" d { d } else { d + "/" }) (modules.search_paths ld);
+    let longest = list.fold (fn best d ->
+        if str.starts_with d p && str.byte_length d > str.byte_length best { d } else { best }) "" dirs;
+    str.slice (str.byte_length longest) (str.byte_length p) p
+};
+
+/// The resolution, carrying the places table its lowering reports from.
+let with_places : modules.Loader -> scope.Resolution -> scope.Resolution;
+let with_places ld r = r.[:places => places_of ld];
+
+let places r = r.[:places else (%{})];
+
+/// `[path, line, col]` for a span in the source being lowered.
+let place_of span l = match (places (res l)).[source l else ()] {
+    () => ["?", 0, 0],
+    [path, starts, src] => {
+        let at = diag.place_in starts (ast.span_start (diag.origin_span src span));
+        [path, list.nth 0 at, list.nth 1 at]
+    },
+};
+
+/// What the places of a part's sources come to, for its unit key: a part
+/// lowered against one set of line starts is not the part lowered against
+/// another, even where every span in it is the same.
+let places_key r bodies = {
+    let srcs = list.unique (list.map (fn nb -> list.nth 1 (list.nth 1 nb)) bodies);
+    list.map (fn i -> match (places r).[i else ()] {
+        () => (),
+        [path, starts, _] => [path, starts],
+    }) (list.sort srcs)
+};
+
+/// The raise a failed match comes to: `subject` is the node that reads what
+/// did not fit, and `span` where it was written.
+///
+/// One call of `_match_fail`, which builds the error and raises it. Built here
+/// from `_error_new`, a list and `raise!`, every site was four nodes and seven
+/// kids of its own, and the compiler's image grew 13% for its two thousand
+/// sites; as one call the builtin, the path and the small integers are shared
+/// constants and a site is the call and its four kids.
+let match_failure subject span l = {
+    let at = place_of span l;
+    let path = const_str (list.nth 0 at) l;
+    let line = const_int (list.nth 1 at) (list.head path);
+    let col = const_int (list.nth 2 at) (list.head line);
+    let raised = call_builtin "_match_fail" [subject, list.nth 1 path, list.nth 1 line, list.nth 1 col]
+                              (list.head col);
+    [set_flag (list.nth 1 raised) ir.f_strict (list.head raised), list.nth 1 raised]
+};
+
 /// The value if it fits the pattern, and a raise of `:match_error` if it does
 /// not: a `match` whose one arm hands the value back.
 let check_value pattern value l = {
     let tested = pattern_test pattern value [] l;
     let test = list.nth 1 tested;
-    let kind = const_atom "match_error" (list.nth 0 tested);
-    let raised = call_builtin "raise!" [list.nth 1 kind] (list.head kind);
-    let failing = set_flag (list.nth 1 raised) ir.f_strict (list.head raised);
+    let raised = match_failure value (ast.span pattern) (list.nth 0 tested);
+    let failing = list.head raised;
     let made = emit (ir.node :if test value (list.nth 1 raised)) failing;
     [set_flag test ir.f_strict
         (inherit (list.nth 1 made) [test, value, list.nth 1 raised] (list.head made)),
@@ -1334,6 +1426,10 @@ let rec arm_key p = match p {
     [:as_p, inner, _, _, _] => arm_key inner,
     [:literal, [:atom, n, _], _] => [:atom, n],
     [:list_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
+    // A `union struct` variant: `switch_head` reads an array's first element
+    // as it reads a cell's head, and the arm's own test still tells the two
+    // apart, so a list arm and an array arm with one tag share a key safely.
+    [:array_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
     _ => :any,
 };
 
@@ -1410,14 +1506,14 @@ let dispatch arms suffixes held chain l = {
 
 let rec lower_arms arms held span l =
     match arms {
-        // Nothing matched. Dream is dynamically typed, so exhaustiveness cannot
-        // be checked; saying so at run time is the honest answer, and a `_` arm
-        // is how a program declares itself total.
+        // Nothing matched. Exhaustiveness is checked only where the checker
+        // knows the subject is a declared union; everywhere else saying so at
+        // run time, with the value and the place, is the honest answer, and a
+        // `_` arm is how a program declares itself total.
         [] => {
-            let kind = const_atom "match_error" l;
-            let raised = call_builtin "raise!" [list.nth 1 kind] (list.head kind);
-            [set_flag (list.nth 1 raised) ir.f_strict (list.head raised), list.nth 1 raised,
-             [list.nth 1 raised]]
+            let subject = emit (ir.node :local held ir.no_node ir.no_node) l;
+            let raised = match_failure (list.nth 1 subject) span (list.head subject);
+            [list.head raised, list.nth 1 raised, [list.nth 1 raised]]
         },
         [arm, ..rest] => {
             let subject = emit (ir.node :local held ir.no_node ir.no_node) l;
@@ -1875,7 +1971,7 @@ let settle_comps! l = {
 /// wanted here and nowhere else, which is why it is a separate way in rather
 /// than an argument threaded through every step.
 let link! : modules.Loader -> scope.Resolution -> Lowering;
-let link! ld r = link_rest! ld r (lower_program r);
+let link! ld r = link_rest! ld r (lower_program (with_places ld r));
 
 /// Everything after the arena is built and its functions linked: the
 /// compile-time expressions, the module table and the entry point.
@@ -2000,7 +2096,7 @@ let lower_part r numbered = {
 /// joining it is a pointer too.
 /// The cache is strict: see `scope.walk_elsewhere!` for what an unforced
 /// argument carried into every part's process.
-let part_elsewhere! !cache r slice = spawn! $( vm.share! (lower_unit! cache (lowering_key cache r) r slice) );
+let part_elsewhere! !cache r slice = spawn! $( vm.share! (lower_unit! cache (lowering_key cache r slice) r slice) );
 
 /// What a part is lowered against besides its own walk: the wrappers it
 /// reaches, as a key. Only those -- a literal in a wrapper keeps its span,
@@ -2009,12 +2105,15 @@ let part_elsewhere! !cache r slice = spawn! $( vm.share! (lower_unit! cache (low
 /// typed anywhere above a wrapper re-lowered every part in the program.
 /// Worked out in the part's own process: worked out in the one that starts
 /// them, it was every part's key one after another before any part began.
-let lowering_key : unit.Cache -> scope.Resolution -> :string | :unit;
-let lowering_key cache r = match cache {
+/// The line starts of the part's own files are in it as well, because a failed
+/// `match` reports its line (see "a failed match").
+let lowering_key : unit.Cache -> scope.Resolution -> [:any] -> :string | :unit;
+let lowering_key cache r slice = match cache {
     () => (),
     _ => match scope.unit_key r {
         () => (),
-        walk => unit.key ["lower", walk, unit.digest (reached_wrappers (scope.wrappers r) r)],
+        walk => unit.key ["lower", walk, unit.digest (reached_wrappers (scope.wrappers r) r),
+                          unit.digest (places_key r slice)],
     },
 };
 
@@ -2044,7 +2143,7 @@ let lower_unit! cache k r slice = match [cache, slice] {
 /// `part_count` processes. Each part comes back shared within itself.
 let link_parallel! : modules.Loader -> scope.Resolution -> :any -> Lowering;
 let link_parallel! ld r cache = {
-    let rs = vm.share! r;
+    let rs = vm.share! (with_places ld r);
     // A resolution made in parts is lowered in the same parts, each against
     // the part that walked it -- which is the only one that knows what its
     // names mean (`scope.parts`) -- with the wrappers of the whole program.
@@ -2058,7 +2157,8 @@ let link_parallel! ld r cache = {
         },
         walked => {
             let wrappers = vm.share! (scope.wrappers rs);
-            list.map (fn pr -> [pr.[:wrappers => wrappers], scope.part_bodies pr]) walked
+            let where = vm.share! (places rs);
+            list.map (fn pr -> [pr.[:wrappers => wrappers].[:places => where], scope.part_bodies pr]) walked
         },
     };
     // Dealt before any process starts: a slice left lazy would cross into its

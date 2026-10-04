@@ -204,6 +204,84 @@ let shown_as name t span = ast.list_e [ast.atom_e "named" span, ast.str_e name s
 /// `a -> b` as the type grammar builds it.
 let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
 
+// --- receive! ------------------------------------------------------------------
+
+/// `receive! { pattern => body, .., after ms => timeout }`: the first message
+/// in the mailbox that one of the arms takes, taken out and matched, with every
+/// other message left where it was. It is `proc.recv_until!` written inline,
+/// over the primitives `std.proc` uses, so a program needs no import for it:
+///
+///     {
+///         let rec scan! !at !deadline = match _mailbox_peek! at {
+///             [:ok, m] => if (match m { arm patterns and guards => true, _ => false }) {
+///                             _mailbox_take! at; [:ok, m]
+///                         } else { scan! (at + 1) deadline },
+///             _ => match _await_message! at deadline { :ok => scan! at deadline, _ => :timeout },
+///         };
+///         let start! ms = scan! 0 (if ms < 0 { -1 } else { _deadline_in! ms });
+///         match start! ms { [:ok, m] => match m { the arms }, _ => timeout }
+///     }
+///
+/// with `ms` -1 when there is no `after`. The function around it makes one
+/// impure call, `start!`, written where `receive!` is -- so a `receive!` in a
+/// pure function is reported once, there, and `scope` names it `receive!`.
+///
+/// The patterns and guards are written twice -- once to choose, once to bind
+/// -- and the first copy is given fresh spans, as everything generated here
+/// is: resolution keys a binder by where it starts, and two binders at one
+/// offset would be one binder in two frames. A guard is evaluated twice, which
+/// is unobservable for the pure expression a guard has to be. The arms and the
+/// timeout keep the spans they were written at, so a mistake in one is
+/// reported where it is.
+let receive_e arms after span = {
+    let at_ = span;
+    let n x = ast.name_e x at_;
+    let call f args = ast.apply_e (n f) args at_;
+    let m = "__receive_message";
+    let scan = "__receive_scan!";
+    let pos = "__receive_at";
+    let deadline = "__receive_deadline";
+    let ok_p inner = ast.list_p [ast.literal_p (ast.atom_e "ok" at_) at_, inner] () at_;
+    let chooses = ast.match_e (n m)
+        (list.map (fn a -> ast.arm (ast.arm_pattern a) (ast.arm_guard a) (ast.bool_e true at_) at_) arms
+         + [ast.arm (ast.wildcard_p at_) () (ast.bool_e false at_) at_]) at_;
+    let take = ast.block_e [call "_mailbox_take!" [n pos],
+                            ast.list_e [ast.atom_e "ok" at_, n m] at_] at_;
+    let next = call scan [ast.binary_e :add (n pos) (ast.int_e 1 at_) at_, n deadline];
+    let waited = ast.match_e (call "_await_message!" [n pos, n deadline])
+        [ast.arm (ast.literal_p (ast.atom_e "ok" at_) at_) () (call scan [n pos, n deadline]) at_,
+         ast.arm (ast.wildcard_p at_) () (ast.atom_e "timeout" at_) at_] at_;
+    let body = ast.match_e (call "_mailbox_peek!" [n pos])
+        [ast.arm (ok_p (ast.bind_p m at_)) () (ast.if_e chooses take next at_) at_,
+         ast.arm (ast.wildcard_p at_) () waited at_] at_;
+    let never = ast.int_e (0 - 1) at_;
+    let starts = call scan [ast.int_e 0 at_,
+                            ast.if_e (ast.binary_e :lt (n "__receive_ms") (ast.int_e 0 at_) at_)
+                                     never (call "_deadline_in!" [n "__receive_ms"]) at_];
+    let scaffold = ast.block_e [
+        ast.let_d scan [ast.strict_param pos at_, ast.strict_param deadline at_] body true at_,
+        ast.let_d "__receive_start!" [ast.param "__receive_ms" at_] starts false at_,
+        ast.match_e [:receive_hole, :start]
+            [ast.arm (ok_p (ast.bind_p m at_)) () (ast.match_e (n m) [:receive_hole, :arms] at_) at_,
+             ast.arm (ast.wildcard_p at_) () [:receive_hole, :timeout] at_] at_,
+    ] at_;
+    let [generated, _] = fresh scaffold (3221225472 + ast.span_start span * 128);
+    // The user's own pieces go in after the freshening, so they keep their
+    // spans. A hole is a list with no span, which `fresh` passes through. The
+    // call that starts it all is written where the keyword is.
+    let keyword = ast.span_of (ast.span_start span) (ast.span_start span + 8);
+    let rec fill t = match t {
+        [:receive_hole, :arms] => arms,
+        [:receive_hole, :start] =>
+            ast.apply_e (ast.name_e "__receive_start!" keyword)
+                        [match after { () => never, [ms, _] => ms }] keyword,
+        [:receive_hole, :timeout] => match after { () => ast.unit_e at_, [_, e] => e },
+        [_, .._] => list.map fill t,
+        _ => t,
+    };
+    fill generated
+};
+
 // --- unions --------------------------------------------------------------------
 
 /// `union Shape { circle(radius : :float), empty }`, as a module of ordinary
@@ -228,13 +306,17 @@ let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
 /// The description is then a function of them, as a parameterised `type` is,
 /// and the constructors' signatures say `a -> Option a` -- `a` being free in a
 /// signature is what makes it a type variable.
-let union_decl name params variants members span = {
+let union_decl name params variants members kind span = {
     let at_ = span;
     let lit_tag v = ast.list_e [ast.atom_e "literal" at_, ast.atom_e (ast.variant_name v) at_] at_;
     let field_t f = match list.nth 2 f { () => ast.atom_e "any" at_, t => t };
+    // `union struct` makes a variant with fields an array, `#[:tag, ..]`, and
+    // says so in its description; one with none is the atom either way.
+    let shape = if kind == :array { "array" } else { "tuple" };
+    let built items = if kind == :array { ast.array_e items at_ } else { ast.list_e items at_ };
     let described v = match ast.variant_fields v {
         [] => lit_tag v,
-        fs => ast.list_e [ast.atom_e "tuple" at_,
+        fs => ast.list_e [ast.atom_e shape at_,
                           ast.list_e (list.cons (lit_tag v) (list.map field_t fs)) at_] at_,
     };
     let description = ast.let_d "type" params
@@ -248,7 +330,7 @@ let union_decl name params variants members span = {
             [] => ast.let_d (ast.variant_name v) [] tag false at_,
             _ => ast.let_d (ast.variant_name v)
                     (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
-                    (ast.list_e (list.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)) at_)
+                    (built (list.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)))
                     false at_,
         }
     }) variants;
@@ -618,7 +700,7 @@ let rec expression e = match e {
     [:field, obj, n, sp] => expression obj && string n && is_span sp,
     [:apply, f, args, sp] => expression f && sequence expression args && is_span sp,
     [:pipe, l, r, sp] => expression l && expression r && is_span sp,
-    [:unary, op, x, sp] => list.contains op [:neg, :not] && expression x && is_span sp,
+    [:unary, op, x, sp] => list.contains op [:neg, :not, :interp] && expression x && is_span sp,
     [:binary, op, l, r, sp] => list.contains op [:add, :sub, :mul, :div, :mod, :cons,
         :eq, :ne, :lt, :le, :gt, :ge, :and, :or] && expression l && expression r && is_span sp,
     [:if, c, t, f, sp] => expression c && expression t && optional expression f && is_span sp,

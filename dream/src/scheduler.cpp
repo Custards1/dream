@@ -40,10 +40,26 @@ void Scheduler::start() {
     for (unsigned i = 0; i < workers_.size(); ++i) {
         workers_[i]->thread = std::thread([this, i] { worker_loop(i); });
     }
+    {
+        std::lock_guard<std::mutex> g(timer_mutex_);
+        timers_running_ = true;
+    }
+    timer_thread_ = std::thread([this] { timer_loop(); });
 }
 
 void Scheduler::stop() {
     if (!running_.exchange(false)) return;
+    {
+        std::lock_guard<std::mutex> g(timer_mutex_);
+        timers_running_ = false;
+        // Nothing will run to be woken now, so a timer still pending is
+        // dropped along with the count of waits it was holding up.
+        for (size_t i = 0; i < timers_.size(); ++i) note_io_wait(false);
+        timers_.clear();
+        timer_index_.clear();
+    }
+    timer_cv_.notify_all();
+    if (timer_thread_.joinable()) timer_thread_.join();
     GcPool::instance().set_idle_hint(nullptr);
     work_cv_.notify_all();
     for (auto& w : workers_) {
@@ -167,6 +183,13 @@ void Scheduler::worker_loop(unsigned index) {
 }
 
 void Scheduler::run_slice(const std::shared_ptr<Process>& p, unsigned index) {
+    // A kill is honoured here and nowhere else: between slices nothing of the
+    // process is on any C++ stack, so ending it is a matter of not running it.
+    if (p->kill_requested.load(std::memory_order_acquire)) {
+        terminate(p);
+        return;
+    }
+    census_if_due(*p);
     p->status.store(ProcStatus::Running, std::memory_order_relaxed);
     p->wait_reason.store(WaitReason::None, std::memory_order_relaxed);
     p->wait_fd.store(-1, std::memory_order_relaxed);
@@ -188,7 +211,14 @@ void Scheduler::run_slice(const std::shared_ptr<Process>& p, unsigned index) {
         std::lock_guard<std::mutex> g(p->sched_mutex);
         if (p->park_requested) {
             p->park_requested = false;
-            if (!p->wake_pending) {
+            // A census asked of a running process is answered before it parks:
+            // parked, nothing would run it to answer. It is not answered *here*
+            // -- this lock is held, and the last report takes every process's
+            // -- but by not parking: the process goes round once more, as a
+            // wake that beat the park sends it, and answers at the start of
+            // that slice. The blocking native it was in looks again and asks
+            // to park again.
+            if (!p->wake_pending && !p->census_due.load(std::memory_order_acquire)) {
                 p->status.store(ProcStatus::Waiting, std::memory_order_release);
                 return;
             }
@@ -250,14 +280,18 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
     // look at what the C side holds must find its resources already let go.
     release_foreign(*p);
     std::vector<uint64_t> waiters;
+    std::vector<uint64_t> monitors;
     bool had_waiters = false;
     {
         std::lock_guard<std::mutex> g(p->waiters_mutex);
         p->exit_value = p->result;
-        had_waiters = !p->waiters.empty();
+        // A monitor is told the outcome as a value, as a joiner is, so a
+        // failure it hears about is handled by the same reasoning.
+        had_waiters = !p->waiters.empty() || !p->monitors.empty();
         p->status.store(p->failed ? ProcStatus::Failed : ProcStatus::Finished,
                         std::memory_order_release);
         waiters.swap(p->waiters);
+        monitors.swap(p->monitors);
 
         // Record the failure only when nobody is waiting for it. A joiner
         // receives the error as a value and decides what it means; reporting it
@@ -270,16 +304,254 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
         // handled failure was then reported at shutdown as uncaught, whenever
         // the timer happened to put the join exactly there.
         if (p->failed && !had_waiters) {
-            std::string text;
-            stringify(*p, p->result, &text);
+            std::string text = describe_failure(*p, p->result);
             std::lock_guard<std::mutex> gf(failures_mutex_);
             failures_.emplace(p->id(), "process " + std::to_string(p->id()) + ": " + text);
         }
     }
 
+    // Sent before `live_` drops, so a program whose last two processes are a
+    // monitor and what it watches cannot be counted finished in between.
+    for (uint64_t id : monitors) deliver(id, down_message(*p));
+    if (p->timer_seq) {
+        cancel_timer(p->timer_seq);
+        p->timer_seq = 0;
+    }
+    // Ended, so it has nothing more to say to a census: what it left is
+    // `exit_value`, which the round's last report walks.
+    uint64_t round;
+    {
+        std::lock_guard<std::mutex> g(census_mutex_);
+        round = census_round_;
+    }
+    if (round) census_report(p->id(), round);
     live_.fetch_sub(1, std::memory_order_acq_rel);
     for (uint64_t id : waiters) wake(id);
     notify_done();
+}
+
+void Scheduler::terminate(const std::shared_ptr<Process>& p) {
+    // Parked on a descriptor, it is still the poller's: take it back, or the
+    // poller would go on counting a wait nobody is making, and the deadlock
+    // check would never again find the program stuck.
+    if (p->wait_reason.load(std::memory_order_relaxed) == WaitReason::Io) {
+        int fd = p->wait_fd.load(std::memory_order_relaxed);
+        if (fd >= 0) io_cancel_wait(fd, p->id());
+    }
+    p->result = p->kill_error();
+    p->failed = true;
+    p->mode = Mode::Halted;
+    p->conts.clear();
+    p->stack.clear();
+    p->pins.clear();
+    finish(p);
+}
+
+std::unique_ptr<Message> Scheduler::down_message(Process& p) {
+    const WellKnownAtoms& wk = well_known(rt_);
+    auto msg = std::make_unique<Message>();
+    msg->heap = std::make_unique<Heap>(1024);
+    Heap& h = *msg->heap;
+    Value value = Heap::copy_between(h, p.exit_value);
+    Value outcome = h.make_cons(make_atom(p.failed ? wk.error : wk.ok), h.make_cons(value, NIL));
+    Value pid = h.make_pid(p.id());
+    msg->value = h.make_cons(make_atom(rt_.intern_atom("down")),
+                             h.make_cons(pid, h.make_cons(outcome, NIL)));
+    msg->from_pid = p.id();
+    return msg;
+}
+
+bool Scheduler::deliver(uint64_t target, std::unique_ptr<Message> msg) {
+    auto proc = rt_.find_process(target);
+    if (!proc) return false;
+    proc->mailbox.push(std::move(msg));
+    // Push first, then wake: a receiver that parks between those two steps is
+    // still found by `wake`, because parking takes the same lock.
+    wake(target);
+    return true;
+}
+
+bool Scheduler::kill(Process& from, uint64_t target, Value reason) {
+    auto proc = rt_.find_process(target);
+    if (!proc) return false;
+    if (proc->is_done()) return true;
+    {
+        std::lock_guard<std::mutex> g(proc->sched_mutex);
+        if (!proc->kill_reason) {
+            auto msg = std::make_unique<Message>();
+            msg->heap = std::make_unique<Heap>(256);
+            msg->value = Heap::copy_between(*msg->heap, reason);
+            msg->from_pid = from.id();
+            proc->kill_reason = std::move(msg);
+        }
+    }
+    proc->kill_requested.store(true, std::memory_order_release);
+    // Parked, it has to run once more to be stopped; running, the note this
+    // leaves keeps it from parking before the slice that stops it.
+    wake(target);
+    return true;
+}
+
+void Scheduler::monitor(Process& p, uint64_t target) {
+    auto proc = rt_.find_process(target);
+    if (!proc) return;
+    std::unique_ptr<Message> now;
+    {
+        std::lock_guard<std::mutex> g(proc->waiters_mutex);
+        if (!proc->is_done()) {
+            proc->monitors.push_back(p.id());
+            return;
+        }
+        now = down_message(*proc);
+        if (proc->failed) {
+            std::lock_guard<std::mutex> gf(failures_mutex_);
+            failures_.erase(target);
+        }
+    }
+    deliver(p.id(), std::move(now));
+}
+
+void Scheduler::demonitor(Process& p, uint64_t target) {
+    auto proc = rt_.find_process(target);
+    if (!proc) return;
+    std::lock_guard<std::mutex> g(proc->waiters_mutex);
+    auto& ms = proc->monitors;
+    auto it = std::find(ms.begin(), ms.end(), p.id());
+    if (it != ms.end()) ms.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// The census of the shared area
+// ---------------------------------------------------------------------------
+
+void Scheduler::request_census() {
+    uint64_t round;
+    std::vector<std::shared_ptr<Process>> procs = rt_.all_processes();
+    {
+        std::lock_guard<std::mutex> g(census_mutex_);
+        if (census_round_) {
+            census_again_ = true;
+            return;
+        }
+        round = rt_.shared().begin_round();
+        census_round_ = round;
+        census_waiting_.clear();
+        for (auto& p : procs)
+            if (!p->is_done()) census_waiting_.emplace(p->id(), true);
+        if (census_waiting_.empty()) {
+            census_finish(round);
+            return;
+        }
+    }
+    for (auto& p : procs) {
+        if (p->is_done()) continue;
+        std::unique_lock<std::mutex> g(p->sched_mutex);
+        if (p->status.load(std::memory_order_acquire) == ProcStatus::Waiting) {
+            // Parked: nobody is touching it, and a wake has to take this lock
+            // before it can make it runnable. So its heap is censused here.
+            p->heap().census_collect(*p, round);
+            g.unlock();
+            census_report(p->id(), round);
+        } else {
+            p->census_due.store(round, std::memory_order_release);
+        }
+    }
+}
+
+void Scheduler::census_if_due(Process& p) {
+    uint64_t due = p.census_due.exchange(0, std::memory_order_acq_rel);
+    if (!due) return;
+    p.heap().census_collect(p, due);
+    census_report(p.id(), due);
+}
+
+void Scheduler::census_report(uint64_t pid, uint64_t round) {
+    bool again = false;
+    {
+        std::lock_guard<std::mutex> g(census_mutex_);
+        if (round != census_round_) return;
+        if (!census_waiting_.erase(pid)) return;
+        if (!census_waiting_.empty()) return;
+        census_finish(round);
+        again = census_again_;
+        census_again_ = false;
+    }
+    if (again) request_census();
+}
+
+void Scheduler::census_finish(uint64_t round) {
+    // Called with `census_mutex_` held. What no collector of the round traced:
+    // a message waiting in a mailbox, a kill's reason, and what a finished
+    // process left for whoever joins it.
+    for (auto& p : rt_.all_processes()) {
+        p->mailbox.for_each([&](Value v) { shared_census_walk(v, round); });
+        // Written once, under the process's lock, before `kill_requested` is
+        // published -- so readable here without that lock, which a worker
+        // reporting from its own slice may be holding.
+        if (p->kill_requested.load(std::memory_order_acquire) && p->kill_reason) {
+            shared_census_walk(p->kill_reason->value, round);
+        }
+        if (p->is_done()) shared_census_walk(p->exit_value, round);
+    }
+    rt_.shared().finish_round(round);
+    census_round_ = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Timers
+// ---------------------------------------------------------------------------
+
+static int64_t monotonic_ns() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+uint64_t Scheduler::arm_timer(uint64_t pid, int64_t deadline_ns) {
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> g(timer_mutex_);
+        seq = next_timer_++;
+        auto it = timers_.emplace(deadline_ns, TimerEntry{seq, pid});
+        timer_index_.emplace(seq, it);
+        note_io_wait(true);
+    }
+    timer_cv_.notify_one();
+    return seq;
+}
+
+void Scheduler::cancel_timer(uint64_t seq) {
+    std::lock_guard<std::mutex> g(timer_mutex_);
+    auto it = timer_index_.find(seq);
+    if (it == timer_index_.end()) return;
+    timers_.erase(it->second);
+    timer_index_.erase(it);
+    note_io_wait(false);
+}
+
+void Scheduler::timer_loop() {
+    std::unique_lock<std::mutex> lk(timer_mutex_);
+    while (timers_running_) {
+        if (timers_.empty()) {
+            timer_cv_.wait(lk);
+            continue;
+        }
+        auto first = timers_.begin();
+        int64_t now = monotonic_ns();
+        if (first->first > now) {
+            timer_cv_.wait_for(lk, std::chrono::nanoseconds(first->first - now));
+            continue;
+        }
+        TimerEntry e = first->second;
+        timer_index_.erase(e.seq);
+        timers_.erase(first);
+        lk.unlock();
+        // Wake before releasing the count, for the reason the poller does:
+        // the other order leaves an instant with nothing runnable and nothing
+        // owed, which the deadlock check reads as a deadlock.
+        wake(e.pid);
+        note_io_wait(false);
+        lk.lock();
+    }
 }
 
 void Scheduler::notify_done() {
@@ -418,30 +690,21 @@ uint64_t Scheduler::spawn_from(Process& parent, Value work) {
 }
 
 bool Scheduler::send(Process& sender, uint64_t target, Value message) {
-    auto proc = rt_.find_process(target);
-    if (!proc) return false;
-
+    if (!rt_.find_process(target)) return false;
     auto msg = std::make_unique<Message>();
     msg->heap = std::make_unique<Heap>(1024);
     msg->value = Heap::copy_between(*msg->heap, message);
     msg->from_pid = sender.id();
-    proc->mailbox.push(std::move(msg));
-
-    // Push first, then wake: a receiver that parks between those two steps is
-    // still found by `wake`, because parking takes the same lock.
-    wake(target);
-    return true;
+    return deliver(target, std::move(msg));
 }
 
 bool Scheduler::receive(Process& p, Value* out) {
     std::lock_guard<std::mutex> g(p.sched_mutex);
-    auto msg = p.mailbox.pop();
-    if (!msg) {
+    if (!p.mailbox.pop_into(p.heap(), out)) {
         p.park_requested = true;
         p.wait_reason.store(WaitReason::Message, std::memory_order_relaxed);
         return false;
     }
-    *out = Heap::copy_between(p.heap(), msg->value);
     return true;
 }
 

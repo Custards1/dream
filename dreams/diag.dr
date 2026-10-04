@@ -13,6 +13,7 @@
 // Everything here is pure. Rendering produces a string; printing it is the
 // caller's business.
 
+import std.array;
 import std.list;
 import std.str;
 
@@ -94,6 +95,42 @@ let line_col text offset = {
     walk 0 1 1
 };
 
+// --- positions a running program reports -------------------------------------
+//
+// A failed `match` names where it was written, and that position is worked out
+// when the program is lowered, for every `match` in it -- not, like a
+// diagnostic's, for the handful that get rendered. So the scan above, which
+// walks from the top of the file for each offset, would make lowering
+// quadratic in the length of a file. Instead each file's line starts are found
+// once, by the machine's own search for each newline, and a position is a
+// binary search of them.
+
+/// Where each line of `text` starts, as byte offsets, in order.
+let line_starts : :string -> #[:integer];
+let line_starts text = {
+    let rec walk from !acc = match str.find_from from "\n" text {
+        -1 => acc,
+        at => walk (at + 1) (list.cons (at + 1) acc),
+    };
+    array.of_list (list.reverse (walk 0 [0]))
+};
+
+/// The 1-based `[line, col]` of `offset` in a file whose line starts are
+/// `starts`. The column counts bytes, which for the ASCII nearly every line
+/// of code is written in is the same thing `line_col` counts.
+let place_in : #[:integer] -> :integer -> [:integer, :integer];
+let place_in starts offset = {
+    // The last start at or before `offset`.
+    let rec search !lo !hi =
+        if hi - lo <= 1 { lo }
+        else {
+            let mid = (lo + hi) / 2;
+            if starts.[mid] <= offset { search mid hi } else { search lo mid }
+        };
+    let line = search 0 (len starts);
+    [line + 1, offset - starts.[line] + 1]
+};
+
 /// The byte offset of a 1-based line and column: the inverse of `line_col`.
 ///
 /// An editor speaks in lines and columns and the compiler speaks in offsets, so
@@ -170,6 +207,13 @@ when test {
             $( test.eq! [1, 3] (line_col "ééx" 4) ),
         test.case "a position names the file it points into"
             $( test.eq! "a.dr:2:1" (position (source_path src) (source_text src) 11) ),
+        test.case "place_in agrees with line_col"
+            $( {
+                let text = "ab\ncd\n\nefg";
+                let starts = line_starts text;
+                test.eq! (list.map (fn o -> line_col text o) [0, 1, 3, 4, 6, 7, 9])
+                         (list.map (fn o -> place_in starts o) [0, 1, 3, 4, 6, 7, 9])
+            } ),
         test.case "a diagnostic renders as one line"
             $( test.eq! ["a.dr:1:5: error: bad"]
                         (render sources (in_source 0 (error (ast.span_of 4 5) "bad"))) ),

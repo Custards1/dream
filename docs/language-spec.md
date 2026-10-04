@@ -148,6 +148,7 @@ So `let group = 1` in a block, and `import std.foreign;` followed by
 | integer | `42`, `1_000_000`, `0xFF`, `0b1010`, `0o755` |
 | float | `1.5`, `2.5e-3`, `1e9`, `1_0.25` |
 | string | `"hello\n"`, `"tab\there"`, `"\u{1F600}"` |
+| interpolated string | `$"{name} is {age} years old"` |
 | character | `'c'`, `'\n'`, `'\u{41}'` |
 | atom | `:ok`, `:not_found` |
 | boolean | `true`, `false` |
@@ -166,6 +167,8 @@ So `let group = 1` in a block, and `import std.foreign;` followed by
   `\u{HEX}`, a Unicode scalar value. An unknown escape stands for the
   character itself (`\q` is `q`).
 - A string may contain line breaks as written.
+- In an interpolated string, `{` opens an expression and `\{` is a brace.
+  A plain string's braces are text.
 - An atom is `:` followed directly by a name.
 
 ### Line breaks end statements
@@ -271,6 +274,22 @@ len "héllo"              // 6
 str.length "héllo"       // 5
 "ab" + "cd"              // "abcd"
 ```
+
+An **interpolated string** is a `$` in front of the quote, and each `{expr}`
+in it is any one expression, rendered as `to_string` renders it -- a string as
+its text, anything else as it prints:
+
+```dream
+let n = 3;
+$"{n} squared is {n * n}"      // "3 squared is 9"
+$"items: {[1, 2]}"             // "items: [1, 2]"
+$"a literal \{ brace"          // "a literal { brace"
+```
+
+The prefix is what opts in: a plain string keeps every `{` it has, since
+strings that spell JSON or code are common. The pieces are evaluated when the
+string is, so one that raises raises there. It compiles to one opcode,
+`str_interp`, over the list of its pieces, and costs one copy of the result.
 
 ### Lists, arrays and maps
 
@@ -655,10 +674,17 @@ and a nested pattern does the same along the path it inspects: `[x, ..rest]`
 forces the first cell but neither `x` nor `rest`, which is what lets a
 `match` walk a list that is still being produced.
 
-A `match` with no arm that matches raises: `try!` sees an error of kind
-`:error` whose payload is the atom `:match_error`. Make a `match` total with a
-final `_` arm, or, on a declared union, by covering every variant
-([§10](#unions)).
+A `match` with no arm that matches raises an error of kind `:match_error`
+whose payload is `[value, path, line, col]`: what did not fit, and where the
+`match` was written, the path relative to the search path the file was found
+under. Uncaught, it is reported the way a compiler diagnostic is:
+
+```
+dream: uncaught error: shapes.dr:12:5: no pattern fits [:hexagon, 2]
+```
+
+Make a `match` total with a final `_` arm, or, on a declared union, by
+covering every variant ([§10](#unions)).
 
 ### Destructuring
 
@@ -754,11 +780,13 @@ Kinds the runtime raises:
 | `:out_of_bounds` | a position past either end of a list or array |
 | `:no_such_member` | a member a module does not have, found only at run time |
 | `:loop` | a value whose computation needs itself |
+| `:match_error` | a `match` no arm fits, or a destructuring the value does not; `[value, path, line, col]` |
+| `:killed` | `proc.kill!`: the process was stopped from outside ([§13](#13-processes)) |
 | `:stack_overflow`, `:out_of_memory` | a process past its limits (below) |
 | `:not_found`, `:permission_denied`, `:io_error`, ... | IO; [builtins.md](builtins.md#runtime-error-atoms) has the list |
 
-A failed `match` and a failed destructuring raise `:match_error`, which
-arrives with kind `:error` and payload `:match_error`.
+A failed `match` and a failed destructuring raise `:match_error`, with the
+value and its position as the payload ([§7](#patterns)).
 
 ### Runaway processes
 
@@ -1042,6 +1070,23 @@ members, `Shape.type`, and a signature for each constructor) and a global
 written. A field's type is optional. Parameters after the name make the
 union generic.
 
+`union struct Shape { .. }` is the same union with its variants that have
+fields made **arrays**, `#[:circle, 1.0]`, and matched with array patterns --
+what `struct` is to `group`. A field is then one step away instead of a walk
+down the list, and a variant of `n` fields is one object instead of `n + 1`
+cells. A variant with no fields is still the atom. `match` dispatches on the
+tag of either kind in one step.
+
+```dream
+union struct Op { push(n : :integer), add, clamp(lo : :integer, hi : :integer) }
+
+match op {
+    #[:push, n] => n,
+    :add => acc + 1,
+    #[:clamp, lo, hi] => ..,
+}
+```
+
 **A `match` on a declared union must handle every variant**, wherever the
 checker knows the subject's type is that union:
 
@@ -1246,6 +1291,50 @@ stops the world, a thunk can be updated without locks because only one
 process can force it, and one process failing cannot corrupt another. The
 cost is that a value shared by copying is computed in each process that
 forces it.
+
+`recv!` takes the next message, whatever it is. `std.proc` adds the rest,
+on a handful of `std.vm` natives:
+
+| | |
+|---|---|
+| `proc.recv_where! wanted` | the first message `wanted` accepts; the others stay where they were, in order |
+| `proc.recv_within! ms` | `[:ok, message]`, or `:timeout` after `ms` milliseconds |
+| `proc.monitor! p` | be sent `[:down, p, outcome]` when `p` ends, without waiting for it |
+| `proc.kill! p reason` | end `p` as a failure of kind `:killed`; it cannot catch it |
+| `proc.sleep! ms` | wait |
+
+```dream
+let w = spawn! $( worker! () );
+proc.monitor! w
+match proc.recv_where_within! (fn m -> proc.is_down_of w m) 1000 {
+    [:ok, [:down, _, outcome]] => outcome,
+    :timeout => { proc.kill! w :too_slow; :gave_up },
+}
+```
+
+`receive!` is the same selective receive written as syntax, with `match`'s
+arms and an optional `after` for a timeout, and it needs no import:
+
+```dream
+receive! {
+    [:reply, v] if v > 5 => v,
+    [:error, why] => raise! why,
+    after 1000 => :timeout,
+}
+```
+
+The first message in the mailbox that one of the arms takes is taken out and
+matched; every other message stays where it was, in order. Without `after`
+it waits as long as it takes. Patterns and guards are tried once to choose a
+message and again to bind it, so a guard is evaluated twice -- which no pure
+expression can tell. `receive!` is only syntax when a `{` follows it, so a
+function of that name still works as one.
+
+A kill takes effect at the start of the target's next slice, which is as
+prompt as preemption already is -- and a process inside one long force (a
+`strict!` over something endless) is stopped where its slice would have
+ended. A `try!` cannot catch it. A failure reported to a monitor counts as
+handled, as one delivered to a joiner does.
 
 The shapes built on these (servers that hold state, supervisors, registries,
 the same server over a socket) are in the standard library:

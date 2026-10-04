@@ -1,0 +1,5 @@
+#[:clamp, 1, 2]
+10
+[:array_push, :list_push, :array_scale, :array_shift, :other, :other]
+[true, false, true]
+1000000

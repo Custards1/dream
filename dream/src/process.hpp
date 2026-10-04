@@ -158,8 +158,36 @@ class Mailbox {
 public:
     void push(std::unique_ptr<Message> m);
     std::unique_ptr<Message> pop();
+    /// Take the first message, copied into `dest`; false when there is none.
+    ///
+    /// The copy is made *before* the lock is let go, and that is not tidiness.
+    /// A census walks mailboxes under this lock to find what messages hold,
+    /// and a message popped and then copied is, for that moment, in no
+    /// mailbox and not yet in any heap -- a census finishing then would free
+    /// a region the copy is about to read. Under the lock, either the walk
+    /// sees the message or the copy has already told the census it crossed.
+    bool pop_into(Heap& dest, Value* out);
     bool empty() const;
     size_t size() const;
+
+    /// Selective receive. Only the owning process ever removes a message, so a
+    /// position it has looked at stays the same message until it removes it:
+    /// senders only append. That is what lets the scan live in Dream, one
+    /// position at a time, rather than in a native that would have to run the
+    /// caller's predicate underneath itself.
+    ///
+    /// `peek_into` copies the message at `i` into `dest` and answers false when
+    /// there is no such message. The copy is made under the lock because the
+    /// message's heap is about to be read by a thread that does not own it.
+    bool peek_into(size_t i, Heap& dest, Value* out) const;
+    /// Remove the message at `i`; false when there is none.
+    bool remove_at(size_t i);
+    /// Every message waiting, under the lock, for a census to walk.
+    template <class F>
+    void for_each(F&& f) const {
+        std::lock_guard<std::mutex> g(mutex_);
+        for (const auto& m : queue_) f(m->value);
+    }
 
 private:
     mutable std::mutex mutex_;
@@ -196,6 +224,7 @@ enum class WaitReason : uint8_t {
     Message,   // `recv!`
     Join,      // `join!`
     Io,        // a descriptor the poller is watching
+    Timer,     // `vm.sleep_until!`, or a message wait with a deadline
 };
 
 const char* wait_reason_name(WaitReason r);
@@ -391,6 +420,34 @@ public:
     /// against a process that has already exited.
     std::mutex waiters_mutex;
     std::vector<uint64_t> waiters;
+    /// Processes that asked, with `vm.monitor!`, to be told when this one
+    /// ends. Each is sent `[:down, pid, outcome]` by `Scheduler::finish`.
+    /// Under `waiters_mutex`, for the reason `waiters` is: registering and
+    /// finishing must not interleave.
+    std::vector<uint64_t> monitors;
+
+    /// Set by `vm.kill!`. A process is only ever stopped by the worker running
+    /// it, so a kill is a request: it takes effect at the start of the next
+    /// slice, and `kill!` wakes a parked target so there is one. A slice is
+    /// 4000 reductions, which is as prompt as preemption already is.
+    std::atomic<bool> kill_requested{false};
+    /// Why, copied out of the killer's heap the way a message is. Written once,
+    /// under `sched_mutex`, by whichever kill arrived first.
+    std::unique_ptr<Message> kill_reason;
+
+    /// The timer a timed wait armed (`Scheduler::arm_timer`), or 0, and the
+    /// deadline it was armed for. Touched only by the worker running this
+    /// process -- from the native that waits -- so it needs no lock. A blocked
+    /// native is re-entered from the top on every wake, and this is how the
+    /// second entry knows its timer is already set.
+    uint64_t timer_seq = 0;
+    int64_t timer_deadline = -1;
+
+    /// A census round this process owes a report for, or 0: set by
+    /// `Scheduler::request_census` when the process was running or queued, and
+    /// honoured -- a census major of its own heap -- at the start of its next
+    /// slice or as it parks, whichever comes first.
+    std::atomic<uint64_t> census_due{0};
 
     /// Guards the parking handshake below. Only the worker currently running a
     /// process may change its machine state, so a blocking builtin does not
@@ -418,6 +475,11 @@ public:
     void maybe_collect();
 
     void visit_roots(Heap& heap) override;
+
+    /// The error a kill ends this process with: kind `:killed`, the reason
+    /// `kill!` was given as the payload. Allocates in this heap; call it only
+    /// where an allocation is allowed.
+    Value kill_error();
 
     // Convenience for natives and the interpreter.
     Value make_error_value(const char* kind, const char* message);

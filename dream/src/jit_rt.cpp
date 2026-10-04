@@ -37,11 +37,13 @@ int dream_rt_force(Process* p, Value v, Value* out) {
 
 int dream_rt_switch_head(Process* p, Value v, Value* out) {
     v = resolve(v);
-    if (!is_obj(v, ObjType::Cons)) {
-        *out = UNIT;
-        return 1;
+    // As `take_switch`: a list cell's head, or an array's first element.
+    if (is_obj(v, ObjType::Cons)) return dream_rt_force(p, static_cast<ConsObj*>(as_obj(v))->head, out);
+    if (is_obj(v, ObjType::Array) && static_cast<ArrayObj*>(as_obj(v))->len > 0) {
+        return dream_rt_force(p, static_cast<ArrayObj*>(as_obj(v))->items()[0], out);
     }
-    return dream_rt_force(p, static_cast<ConsObj*>(as_obj(v))->head, out);
+    *out = UNIT;
+    return 1;
 }
 
 int dream_rt_arith(Process* p, int32_t op, Value a, Value b, Value* out) {

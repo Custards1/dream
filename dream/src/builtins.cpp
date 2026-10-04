@@ -564,6 +564,30 @@ bool stringify(Process& p, Value v, std::string* out) {
     return stringify_into(p, v, out, false, 0);
 }
 
+std::string describe_failure(Process& p, Value err) {
+    std::string text;
+    stringify(p, err, &text);
+    Value v = resolve(err);
+    if (!is_obj(v, ObjType::ErrorBox)) return text;
+    auto* e = static_cast<ErrorObj*>(as_obj(v));
+    if (resolve(e->kind) != make_atom(p.runtime().intern_atom("match_error"))) return text;
+    // `[value, path, line, col]`, as the lowering of a failed match builds it
+    // (see "a failed match" in dreams/lower.dr). Anything else -- one raised
+    // by hand, or by an older compiler -- is shown as it is.
+    Value items[4];
+    Value cell = resolve(e->payload);
+    for (Value& item : items) {
+        if (!is_obj(cell, ObjType::Cons)) return text;
+        item = resolve(static_cast<ConsObj*>(as_obj(cell))->head);
+        cell = resolve(static_cast<ConsObj*>(as_obj(cell))->tail);
+    }
+    if (!is_nil(cell) || !is_fixnum(items[2]) || !is_fixnum(items[3])) return text;
+    std::string path, shown;
+    if (!stringify(p, items[1], &path) || !stringify(p, items[0], &shown)) return text;
+    return path + ":" + std::to_string(fixnum_value(items[2])) + ":" +
+           std::to_string(fixnum_value(items[3])) + ": no pattern fits " + shown;
+}
+
 // ---------------------------------------------------------------------------
 // Builtins
 // ---------------------------------------------------------------------------
@@ -983,6 +1007,226 @@ NativeResult vm_share(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(out);
 }
 
+// --- processes: kill, monitor, and waiting with a deadline ------------------
+//
+// `spawn!`, `send!`, `recv!` and `join!` are the language's; what follows is
+// what `std.proc` builds selective receive, timeouts and supervision out of.
+// They are natives of `std.vm` rather than builtins so that adding them needs
+// no new compiler: a builtin is a position in the compiler's own table, and
+// that table is in the seed.
+
+/// The pid in a process argument, or 0 with `*err` set.
+uint64_t pid_arg(Process& p, Value v, const char* who, NativeResult* err) {
+    if (is_obj(v, ObjType::Pid)) return static_cast<PidObj*>(as_obj(v))->id;
+    *err = NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error,
+                                           std::string(who) + " needs a process"));
+    return 0;
+}
+
+/// An integer argument that must fit a fixnum, or false with `*err` set.
+bool int_arg(Process& p, Value v, const char* who, int64_t* out, NativeResult* err) {
+    if (is_fixnum(v)) {
+        *out = fixnum_value(v);
+        return true;
+    }
+    *err = NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error,
+                                           std::string(who) + " needs an integer"));
+    return false;
+}
+
+int64_t monotonic_now_ns() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+/// Let go of the timer a timed wait armed. Every way out of a wait but
+/// blocking again comes through here, so a timer never outlives the wait.
+void drop_timer(Process& p) {
+    if (!p.timer_seq) return;
+    p.runtime().scheduler()->cancel_timer(p.timer_seq);
+    p.timer_seq = 0;
+    p.timer_deadline = -1;
+}
+
+/// Park until woken, with a timer at `deadline_ns` when it is not negative.
+/// Called with `p.sched_mutex` held, which is what makes the condition the
+/// caller just tested and the park one step for a waker: a message pushed
+/// after the test finds the process still running and leaves a note.
+NativeResult park_until(Process& p, int64_t deadline_ns, WaitReason why) {
+    if (deadline_ns >= 0 && (p.timer_seq == 0 || p.timer_deadline != deadline_ns)) {
+        drop_timer(p);
+        p.timer_seq = p.runtime().scheduler()->arm_timer(p.id(), deadline_ns);
+        p.timer_deadline = deadline_ns;
+    }
+    p.park_requested = true;
+    p.wait_reason.store(why, std::memory_order_relaxed);
+    return NativeResult::block();
+}
+
+/// `vm.kill! p reason` -- stop `p`. It ends as a failure of kind `:killed`
+/// with `reason` as the payload, at the start of its next slice; it cannot
+/// catch that, and nothing after it in its program runs. Answers `:ok`, or
+/// raises for something that was never a process. A process can kill itself,
+/// in which case this call does not return.
+NativeResult vm_kill(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    uint64_t target = pid_arg(p, args[0], "kill!", &err);
+    if (!target) return err;
+    // Copied into the target's keeping, so it must not hold a suspension
+    // pointing back into this heap -- the reason `send!` forces its message.
+    Value reason;
+    if (!force_deep(p, args[1], &reason)) return NativeResult::raise(p.result);
+    Scheduler* sched = p.runtime().scheduler();
+    if (!sched->kill(p, target, reason)) {
+        return NativeResult::raise(raise_error(p, well_known(p.runtime()).error, "no such process"));
+    }
+    if (target == p.id()) {
+        // End the slice now. The kill's own wake left a note, so asking to
+        // park sends the process straight back to the queue, and the slice
+        // that would run it is the one that stops it.
+        std::lock_guard<std::mutex> g(p.sched_mutex);
+        p.park_requested = true;
+        return NativeResult::block();
+    }
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
+/// `vm.monitor! p` -- be sent `[:down, p, outcome]` when `p` ends, where
+/// `outcome` is `[:ok, value]` or `[:error, e]`. A process already finished is
+/// reported at once. Answers `:ok`.
+NativeResult vm_monitor(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    uint64_t target = pid_arg(p, args[0], "monitor!", &err);
+    if (!target) return err;
+    p.runtime().scheduler()->monitor(p, target);
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
+/// `vm.demonitor! p` -- stop monitoring `p`, once. A `[:down, p, ..]` that
+/// already arrived is left in the mailbox. Answers `:ok`.
+NativeResult vm_demonitor(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    uint64_t target = pid_arg(p, args[0], "demonitor!", &err);
+    if (!target) return err;
+    p.runtime().scheduler()->demonitor(p, target);
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
+/// `vm.unique! ()` -- an integer no other call of this in this VM has answered.
+/// What a request carries so its reply can be told from every other, even one
+/// that arrives after the caller stopped waiting for it.
+NativeResult vm_unique(Process& p, Value, Value*, uint32_t) {
+    static std::atomic<int64_t> next{1};
+    return NativeResult::ok(make_integer(p, next.fetch_add(1, std::memory_order_relaxed)));
+}
+
+/// `_deadline_in! ms` -- `vm.now_ns!` `ms` milliseconds from now: the deadline
+/// `receive! { .., after ms => .. }` waits until.
+NativeResult vm_deadline_in(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    int64_t ms;
+    if (!int_arg(p, args[0], "after", &ms, &err)) return err;
+    return NativeResult::ok(make_integer(p, monotonic_now_ns() + ms * 1000000));
+}
+
+/// `vm.mailbox_size! ()` -- messages waiting, received or not looked at.
+NativeResult vm_mailbox_size(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::ok(make_fixnum(int64_t(p.mailbox.size())));
+}
+
+/// `vm.mailbox_peek! i` -- `[:ok, message]` for the message at position `i`,
+/// left where it is, or `:none` past the end. Positions are stable until this
+/// process takes a message: nobody else removes one.
+NativeResult vm_mailbox_peek(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    int64_t i;
+    if (!int_arg(p, args[0], "mailbox_peek!", &i, &err)) return err;
+    Value msg;
+    if (i < 0 || !p.mailbox.peek_into(size_t(i), p.heap(), &msg)) {
+        return NativeResult::ok(make_atom(p.runtime().intern_atom("none")));
+    }
+    // `msg` is held across one allocation and no collection: a heap only
+    // collects at a safepoint, and an allocation is not one.
+    Value tail = p.heap().make_cons(msg, NIL);
+    return NativeResult::ok(p.heap().make_cons(make_atom(well_known(p.runtime()).ok), tail));
+}
+
+/// `vm.mailbox_take! i` -- remove the message at position `i`. Answers `:ok`;
+/// raises `:out_of_bounds` when there is none.
+NativeResult vm_mailbox_take(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    int64_t i;
+    if (!int_arg(p, args[0], "mailbox_take!", &i, &err)) return err;
+    if (i < 0 || !p.mailbox.remove_at(size_t(i))) {
+        return NativeResult::raise(raise_error(p, well_known(p.runtime()).out_of_bounds,
+                                               "mailbox_take!: no message at that position"));
+    }
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
+/// `vm.await_message! n deadline_ns` -- wait until the mailbox holds more than
+/// `n` messages, answering `:ok`, or until `vm.now_ns!` reaches `deadline_ns`,
+/// answering `:timeout`. A negative deadline waits for ever.
+///
+/// The deadline is absolute because a blocked native is re-entered from the
+/// top on every wake, with the arguments it was first given: "500 ms from now"
+/// would start counting again each time.
+NativeResult vm_await_message(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    int64_t n, deadline;
+    if (!int_arg(p, args[0], "await_message!", &n, &err)) return err;
+    if (!int_arg(p, args[1], "await_message!", &deadline, &err)) return err;
+    std::lock_guard<std::mutex> g(p.sched_mutex);
+    if (int64_t(p.mailbox.size()) > n) {
+        drop_timer(p);
+        return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+    }
+    if (deadline >= 0 && monotonic_now_ns() >= deadline) {
+        drop_timer(p);
+        return NativeResult::ok(make_atom(well_known(p.runtime()).timeout));
+    }
+    return park_until(p, deadline, deadline >= 0 ? WaitReason::Timer : WaitReason::Message);
+}
+
+/// `vm.sleep_until! deadline_ns` -- park until `vm.now_ns!` reaches it.
+/// Answers `:ok`. Messages arriving meanwhile wake the process, which looks at
+/// the clock and parks again.
+NativeResult vm_sleep_until(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    int64_t deadline;
+    if (!int_arg(p, args[0], "sleep_until!", &deadline, &err)) return err;
+    std::lock_guard<std::mutex> g(p.sched_mutex);
+    if (monotonic_now_ns() >= deadline) {
+        drop_timer(p);
+        return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+    }
+    return park_until(p, deadline, WaitReason::Timer);
+}
+
+/// `vm.release! v` -- say the program is done with what `vm.share!` gave it.
+/// `v` is the answer of a `share!` (or anything inside it). Its region is
+/// freed once a census finds nothing anywhere still holding it, so a value
+/// still in use simply stays; there is nothing a wrong release can break.
+/// Starts that census. Answers `:ok`, or `:not_shared` for a value that is
+/// not in the shared area.
+NativeResult vm_release(Process& p, Value, Value* args, uint32_t) {
+    if (!p.runtime().shared().release(args[0])) {
+        return NativeResult::ok(make_atom(p.runtime().intern_atom("not_shared")));
+    }
+    if (Scheduler* s = p.runtime().scheduler()) s->request_census();
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
+/// `vm.collect_shared! ()` -- run a census again, for regions released while
+/// something still held them. Answers `:ok`; `shared_bytes!` shows what it
+/// freed once it has.
+NativeResult vm_collect_shared(Process& p, Value, Value*, uint32_t) {
+    if (Scheduler* s = p.runtime().scheduler(); s && p.runtime().shared().any_condemned()) {
+        s->request_census();
+    }
+    return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
+}
+
 /// Bytes in the runtime's shared area.
 NativeResult vm_shared_bytes(Process& p, Value, Value*, uint32_t) {
     return NativeResult::ok(make_integer(p, int64_t(p.runtime().shared().bytes())));
@@ -1245,11 +1489,23 @@ ModuleDef make_vm_module() {
                          {"heap_bytes!", 1, 0b1, vm_heap_bytes},
                          {"share!", 1, 0b0, vm_share, 0, true},
                          {"shared_bytes!", 1, 0b1, vm_shared_bytes},
+                         {"release!", 1, 0b1, vm_release},
+                         {"collect_shared!", 1, 0b1, vm_collect_shared},
                          {"modules!", 1, 0b1, vm_modules},
                          {"host_members", 1, 0b1, vm_host_members},
                          {"async_io", 1, 0b1, vm_async_io},
                          {"processes_info!", 1, 0b1, vm_process_list},
                          {"process_info!", 1, 0b1, vm_process_info},
+                         // what `std.proc` builds receive, timeouts and supervision from
+                         {"kill!", 2, 0b01, vm_kill},
+                         {"monitor!", 1, 0b1, vm_monitor},
+                         {"demonitor!", 1, 0b1, vm_demonitor},
+                         {"unique!", 1, 0b1, vm_unique},
+                         {"mailbox_size!", 1, 0b1, vm_mailbox_size},
+                         {"mailbox_peek!", 1, 0b1, vm_mailbox_peek},
+                         {"mailbox_take!", 1, 0b1, vm_mailbox_take},
+                         {"await_message!", 2, 0b11, vm_await_message},
+                         {"sleep_until!", 1, 0b1, vm_sleep_until},
                          {"scheduler!", 1, 0b1, vm_scheduler},
                          {"io!", 1, 0b1, vm_io},
                          {"dump!", 1, 0b1, vm_dump},
@@ -1895,6 +2151,66 @@ NativeResult core_str_concat(Process& p, Value, Value* args, uint32_t) {
     }
     p.stack.resize(base);
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+/// `_str_interp pieces` -- what `$"..{x}.."` comes to: every piece rendered as
+/// `to_string` renders it, joined. The parser hands it the literal text and the
+/// expressions in order, as one list, and the `str_interp` opcode calls this.
+///
+/// It walks the list the way `str_concat` does, with the cursor on the value
+/// stack, but does not vouch for the collector: a piece is rendered by
+/// `stringify`, which keeps C++ locals across its forces, exactly as
+/// `to_string` does. A few pieces of a literal are not the walk the vouch was
+/// for.
+NativeResult core_str_interp(Process& p, Value, Value* args, uint32_t) {
+    std::string out;
+    const size_t base = p.stack.size();
+    p.stack.push_back(args[0]);
+    for (;;) {
+        Value w;
+        if (!force_whnf(p, p.stack[base], &w)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (is_nil(w)) break;
+        if (!is_obj(w, ObjType::Cons)) {
+            p.stack.resize(base);
+            return type_fail(p, "str_interp needs a list");
+        }
+        p.stack[base] = w;
+        Value head;
+        if (!force_whnf(p, static_cast<ConsObj*>(as_obj(w))->head, &head)) {
+            if (!p.force_blocked) p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        if (is_obj(head, ObjType::BigStr)) {
+            p.stack.resize(base);
+            return bigstr_refused(p, "a string interpolation");
+        }
+        if (is_obj(head, ObjType::Str)) {
+            auto* part = static_cast<StrObj*>(as_obj(head));
+            out.append(part->data(), part->len);
+        } else if (!stringify(p, head, &out)) {
+            p.stack.resize(base);
+            return NativeResult::raise(p.result);
+        }
+        p.stack[base] = static_cast<ConsObj*>(as_obj(p.stack[base]))->tail;
+    }
+    p.stack.resize(base);
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+/// `_match_fail value path line col` -- what a failed `match` or destructuring
+/// comes to: an error of kind `:match_error` whose payload is `[value, path,
+/// line, col]`, raised. The value is carried as it is, unforced.
+NativeResult core_match_fail(Process& p, Value, Value* args, uint32_t) {
+    Heap& h = p.heap();
+    // Built from the end; nothing here collects, so the locals stay good.
+    Value list = h.make_cons(args[3], NIL);
+    list = h.make_cons(args[2], list);
+    list = h.make_cons(args[1], list);
+    list = h.make_cons(args[0], list);
+    return NativeResult::raise(h.make_error(make_atom(p.runtime().intern_atom("match_error")), list));
 }
 
 NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
@@ -3224,6 +3540,12 @@ const BuiltinDef BUILTINS[] = {
     {"compare", 2, 0b11, core_compare},
     {"_sort_keyed", 2, 0b10, core_sort_keyed, true},
     {"_tensor_matmul", 2, 0b11, tensor_matmul_builtin},
+    {"_str_interp", 1, 0b1, core_str_interp},
+    {"_mailbox_peek!", 1, 0b1, vm_mailbox_peek},
+    {"_mailbox_take!", 1, 0b1, vm_mailbox_take},
+    {"_await_message!", 2, 0b11, vm_await_message},
+    {"_deadline_in!", 1, 0b1, vm_deadline_in},
+    {"_match_fail", 4, 0b1110, core_match_fail},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

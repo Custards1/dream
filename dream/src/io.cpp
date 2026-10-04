@@ -469,6 +469,45 @@ public:
         release(w.writers);
     }
 
+    /// Stop waiting on `fd` for one process, which is being killed. Its count
+    /// as an IO waiter goes with it; the descriptor stays watched for anyone
+    /// else waiting on it.
+    void cancel(int fd, uint64_t pid) {
+        size_t dropped = 0;
+        Scheduler* sched = nullptr;
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = waiters_.find(fd);
+            if (it == waiters_.end()) return;
+            for (std::vector<Waiter>* side : {&it->second.readers, &it->second.writers}) {
+                for (size_t i = 0; i < side->size();) {
+                    if ((*side)[i].pid == pid) {
+                        sched = (*side)[i].sched;
+                        side->erase(side->begin() + std::ptrdiff_t(i));
+                        ++dropped;
+                    } else {
+                        ++i;
+                    }
+                }
+            }
+            if (!dropped) return;
+#if DREAM_HAVE_EPOLL
+            if (it->second.readers.empty() && it->second.writers.empty()) {
+                waiters_.erase(it);
+                if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+            } else if (epoll_fd_ >= 0) {
+                epoll_event ev{};
+                ev.events = interest(it->second);
+                ev.data.fd = fd;
+                ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+            }
+#else
+            if (it->second.readers.empty() && it->second.writers.empty()) waiters_.erase(it);
+#endif
+        }
+        for (size_t i = 0; i < dropped; ++i) sched->note_io_wait(false);
+    }
+
 private:
     struct Waiter {
         uint64_t pid = 0;
@@ -571,6 +610,12 @@ private:
     std::mutex mutex_;
     std::unordered_map<int, Waiters> waiters_;
 };
+
+}  // namespace
+
+void io_cancel_wait(int fd, uint64_t pid) { Poller::get().cancel(fd, pid); }
+
+namespace {
 
 /// Park `p` until `fd` is ready. The caller returns the result unchanged.
 ///

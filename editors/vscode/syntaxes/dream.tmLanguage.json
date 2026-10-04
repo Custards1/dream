@@ -7,6 +7,9 @@
       "include": "#comment"
     },
     {
+      "include": "#interpolated"
+    },
+    {
       "include": "#string"
     },
     {
@@ -62,6 +65,37 @@
         }
       ]
     },
+    "interpolated": {
+      "name": "string.interpolated.dream",
+      "begin": "\\$\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.dream",
+          "match": "\\\\(u\\{[0-9A-Fa-f]+\\}|.)"
+        },
+        {
+          "name": "meta.embedded.interpolation.dream",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.begin.dream"
+            }
+          },
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.end.dream"
+            }
+          },
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
     "string": {
       "name": "string.quoted.double.dream",
       "begin": "\"",
@@ -113,6 +147,11 @@
           "comment": "The parser's list, exactly. `try!`, `comp!` and the rest carry their bang.",
           "name": "keyword.control.dream",
           "match": "\\b(if|else|match|catch|when)\\b|\\b(try!|comp!)"
+        },
+        {
+          "comment": "Contextual: `receive!` is syntax only before a brace, and a function may still be called that.",
+          "name": "keyword.control.dream",
+          "match": "\\breceive!(?=\\s*\\{)"
         },
         {
           "name": "keyword.declaration.dream",

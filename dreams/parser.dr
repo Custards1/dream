@@ -144,6 +144,7 @@ let describe ts =
             :int => "a number",
             :float => "a number",
             :str => "a string",
+            :interp => "a string",
             :char => "a character",
             :atom => "an atom",
             :error => to_string (peek_value ts),
@@ -274,6 +275,7 @@ let can_start_arg c ts = {
         match kind_of t {
             :ident => not (is_non_starter (lexer.value t)),
             :int => true, :float => true, :str => true, :char => true, :atom => true,
+            :interp => true,
             :lparen => true, :lbracket => true,
             :dollar_paren => true, :hash_bracket => true, :percent_brace => true,
             :lbrace => not (ctx_no_brace c),
@@ -353,6 +355,29 @@ let rec index_operand c e ts build =
 
 // --- primaries --------------------------------------------------------------
 
+/// The pieces of an interpolated string, from the lexer's: text stays text,
+/// and each `{..}` -- its tokens, lexed in place, and where its `}` is -- must
+/// be exactly one expression. Parsed as if parenthesised, since the braces
+/// already say where it ends.
+let rec parse_pieces parts acc = match parts {
+    [] => ok (list.reverse acc) [],
+    [part, ..more] =>
+        if type_of part == :string { parse_pieces more (list.cons (ast.str_e part ast.no_span) acc) }
+        else {
+            let [tokens, close] = part;
+            match parse_expr (grouped top) tokens {
+                // Out of tokens: the parser has nothing to point at but the
+                // file's start, so point at the `}` that ended them.
+                [:error, _, s] if s == ast.no_span =>
+                    err "expected an expression before this `}`" (ast.span_of close (close + 1)),
+                [:error, m, s] => err m s,
+                [:ok, e, []] => parse_pieces more (list.cons e acc),
+                [:ok, _, left] => err ("expected `}` to end the interpolated expression, found "
+                                       + describe left) (peek_span left),
+            }
+        },
+};
+
 let rec parse_primary c ts = {
     let t = peek ts;
     // One peek, once: kind, value and span all come from the token itself,
@@ -367,6 +392,10 @@ let rec parse_primary c ts = {
             :str   => ok (ast.str_e (lexer.value t) sp) rest,
             :char  => ok (ast.char_e (lexer.value t) sp) rest,
             :atom  => ok (ast.atom_e (lexer.value t) sp) rest,
+            :interp => match parse_pieces (lexer.value t) [] {
+                [:error, m, s] => err m s,
+                [:ok, pieces, _] => ok (ast.interp_e pieces sp) rest,
+            },
 
             :lparen        => parse_paren c sp rest,
             :lbracket      => parse_sequence c sp rest :rbracket (fn items span -> ast.list_e items span) "]",
@@ -392,6 +421,9 @@ let rec parse_ident c word sp rest =
         "if" => parse_if c sp rest,
         "fn" => parse_lambda c sp rest,
         "try!" => parse_try c sp rest,
+        // Contextual: `receive!` is also a name programs give their own
+        // functions, and only a `{` straight after it makes it this.
+        "receive!" if at rest :lbrace => parse_receive c sp (list.tail rest),
         "match" => parse_match c sp rest,
         "comp" => parse_comp c false sp rest,
         "comp!" => parse_comp c true sp rest,
@@ -1385,6 +1417,57 @@ let rec parse_match c sp ts =
             },
     };
 
+/// `receive! { pattern => body, .., after ms => body }` -- see
+/// `syntax.receive_e`, which is what it becomes.
+let rec parse_receive c sp ts =
+    match receive_arms (grouped c) [] ts {
+        [:error, m, s] => err m s,
+        [:ok, [arms, after, close], rest] =>
+            if list.is_empty arms { err "a `receive!` needs at least one arm" sp }
+            else { ok (syntax.receive_e arms after (ast.span_to sp close)) rest },
+    };
+
+/// Arms as `match_arms` reads them, and an `after ms => body` that must come
+/// last: `[arms, after or (), close]`. `after` is only that when what follows
+/// it is not `=>` or `if`; otherwise it is a pattern binding a name.
+let rec receive_arms c acc ts =
+    if at ts :rbrace { ok [list.reverse acc, (), peek_span ts] (list.tail ts) }
+    else if at_end ts { err "unterminated `receive!`: expected `}`" (peek_span ts) }
+    else if is_kw ts "after" && not (at (list.tail ts) :fat_arrow) && not (is_kw (list.tail ts) "if") {
+        match parse_expr (no_brace c) (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, ms, rest] =>
+                match expect rest :fat_arrow "`=>` after the time an `after` waits" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        match parse_expr c rest2 {
+                            [:error, m, s] => err m s,
+                            [:ok, body, rest3] => {
+                                let rest4 = if at rest3 :comma { list.tail rest3 } else { rest3 };
+                                if at rest4 :rbrace { ok [list.reverse acc, [ms, body], peek_span rest4] (list.tail rest4) }
+                                else { err "`after` is the last arm of a `receive!`" (peek_span rest4) }
+                            },
+                        },
+                },
+        }
+    }
+    else {
+        match parse_pattern c ts {
+            [:error, m, s] => err m s,
+            [:ok, pat, rest] =>
+                match arm_guard_and_body c pat rest {
+                    [:error, m, s] => err m s,
+                    [:ok, a, rest2] => {
+                        let acc2 = list.cons a acc;
+                        if at rest2 :comma { receive_arms c acc2 (list.tail rest2) }
+                        else if at rest2 :rbrace { ok [list.reverse acc2, (), peek_span rest2] (list.tail rest2) }
+                        else { err ("expected `,` or `}` after a `receive!` arm, found " + describe rest2)
+                                   (peek_span rest2) }
+                    },
+                },
+        }
+    };
+
 /// The arms and the span of the `}` that ended them.
 ///
 /// The brace is handed back for the reason `comma_list` gives: it is consumed
@@ -1704,7 +1787,19 @@ let rec parse_record c kind sp ts =
 // a member -- `area self = ..` -- when it has parameters and a `=`, which is
 // how a record tells a member from a field too.
 
+/// `union Name {..}`, or `union struct Name {..}` for one whose variants with
+/// fields are arrays. `struct` here is only a word in front of a name, so it
+/// takes no name from anyone.
 let rec parse_union c sp ts =
+    if at ts :ident && peek_value ts == "struct" && at (list.tail ts) :ident {
+        match parse_union_named c sp (list.tail ts) {
+            [:ok, [:union_decl, n, ps, vs, ms, _, s], rest] => ok (ast.array_union_d n ps vs ms s) rest,
+            other => other,
+        }
+    }
+    else { parse_union_named c sp ts };
+
+let rec parse_union_named c sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a union name" (peek_span ts)
     } else if str.ends_with "!" (peek_value ts) {
@@ -2715,6 +2810,22 @@ when test {
             $( test.eq! "(binary lt (binary add (name a) (int 1)) (name b))" (shape "a + 1 < b") ),
         test.case "every operator but :: is left-associative"
             $( test.eq! "(binary sub (binary sub (int 1) (int 2)) (int 3))" (shape "1 - 2 - 3") ),
+        test.case "receive! is syntax only before a brace"
+            $( test.eq! ["(apply (name receive!) (name conn))", "error: `after` is the last arm of a `receive!`"]
+                        [shape "receive! conn", shape "receive! { after 1 => 0, x => x }"] ),
+        test.case "union struct is a union whose variants are arrays"
+            $( test.eq! [:union_decl, "Shape", :array]
+                        (match parse_module "union struct Shape { circle(r), empty }" {
+                             [:ok, [[:union_decl, n, _, _, _, kind, _]], _] => [:union_decl, n, kind],
+                             other => other,
+                         }) ),
+        test.case "an interpolated string is str_interp over its pieces"
+            $( test.eq! "(unary interp (list (str \"n=\") (binary add (name n) (int 1))))"
+                        (shape "$\"n={n + 1}\"") ),
+        test.case "a piece must be one expression"
+            $( test.true! (str.starts_with "expected `}`" (fails "$\"{a)}\"")) ),
+        test.case "a piece that stops short says where"
+            $( test.eq! "expected an expression before this `}`" (fails "$\"{1 + }\"") ),
         test.case ":: groups to the right"
             $( test.eq! "(binary cons (int 1) (binary cons (int 2) (list )))" (shape "1 :: 2 :: []") ),
         test.case ":: is looser than arithmetic"

@@ -121,6 +121,8 @@ let ops = [
     [:data_count, 71, "data_count"],
     [:data_at, 72, "data_at"],
     [:compare, 73, "compare"],
+    /// `$"..{x}.."`: `a` = builtin id, kids are one list of the pieces.
+    [:str_interp, 74, "str_interp"],
 
 ];
 

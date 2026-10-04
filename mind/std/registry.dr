@@ -21,24 +21,24 @@
 //     registry.call! reg "store" [:put, "a", 1]           // here
 //     remote.serve_via! 0 (registry.finder! reg "store")  // and over a socket
 //
-// **It is an agent, and that is the whole of it.** One value that several
-// processes read and change, with the read-modify-write happening in one place
-// rather than in each of them, is exactly what `std.agent` is -- so there is no
-// mailbox loop here and no second server. What is written below is the
-// vocabulary: a name goes in and a pid comes out, over handlers that are
-// `std.agent`'s.
+// **It is a small server, and it watches what it names.** One table that
+// several processes read and change, with the read-modify-write happening in
+// one place, is what `std.agent` is, and this was one until the runtime had
+// monitors. An agent's updates are pure functions, though, and noticing a
+// death means asking to be told of one (`proc.monitor!`), which is an effect --
+// so the table is now `table`, a `std.server` whose calls are the agent's
+// own (`[:get, f]`, `[:get_and_update, f]`) and which monitors every process
+// that appears in it. When one ends, every name it held is dropped.
 //
 // **What this is not.** Each of these is something Erlang's registry does and
 // this one does not, and none of them are oversights -- they are what the
 // runtime's shape leaves:
 //
-//   - **It does not notice a death.** There are no monitors (see the head of
-//     `std.supervisor`), so nothing tells the registry that a process it names
-//     has gone. An entry outlives its process, and `whereis!` will hand back a
-//     pid whose process is finished. What stops that being a lie for ever is
-//     that the replacement registers over it, so the window is the length of a
-//     restart -- but a caller who arrives inside that window gets the dead pid
-//     and waits on it, exactly as a local `call!` to a dead server does.
+//   - **It notices a death a moment late.** The report of one is a message,
+//     and the registry reads it in turn, so a `whereis!` that arrives just
+//     before it can still be handed the pid of a process that has ended. A
+//     caller who then calls it is told so -- `server.call!` raises `:down` --
+//     and one who asks again finds the name free, or held by the replacement.
 //     A program that must not wait there watches the supervisor
 //     (`supervisor.notify!`) and calls `unregister!` when a child goes down.
 //   - **It is not the runtime's.** `send!` takes a pid and has never heard of a
@@ -53,17 +53,63 @@
 // something that makes many calls in a row, and can live with a restart
 // happening between two of them, is free to look the name up once and use the
 // pid it got.
-import std.agent;
 import std.error;
+import std.list;
 import std.map;
+import std.proc;
 import std.server;
 import std.supervisor;
 
 // --- the table ------------------------------------------------------------
 
+/// The registry's process: the names, and the processes it already monitors,
+/// so that one registered under many names is watched once.
+mod table {
+    derive std.server;
+    import std.list;
+    import std.map;
+    import std.proc;
+
+    let server_name u = "registry";
+
+    let init! names = [strict! names, []];
+
+    let handle_call! request from state = {
+        let [names, watched] = state;
+        match request {
+            :value => reply names state,
+            [:get, f] => reply (strict! (f names)) state,
+            [:get_and_update, f] => {
+                let pair = strict! (f names);
+                let next = list.nth 1 pair;
+                reply (list.nth 0 pair) [next, watch_new! next watched]
+            },
+            _ => reply [:error, :unknown_request] state,
+        }
+    };
+
+    /// A process that has ended takes its names with it.
+    let handle_info! message state = match message {
+        [:down, p, _] => {
+            let [names, watched] = state;
+            noreply [map.filter (fn _ v -> v != p) names, list.filter (fn w -> w != p) watched]
+        },
+        _ => noreply state,
+    };
+
+    /// Monitor every process in `names` that is not watched yet, and answer
+    /// the processes watched now. Forced as it goes: a monitor is an effect,
+    /// and one left in a lazy list would be asked for by nobody.
+    let watch_new! names watched = {
+        let fresh = list.unique (list.filter (fn p -> not (list.contains p watched)) (map.values names));
+        strict! (list.map (fn p -> proc.monitor! p) fresh)
+        list.append fresh watched
+    };
+}
+
 /// An empty registry, in a process of its own.
 let start! : :unit -> server.Handle;
-let start! u = agent.start! map.empty;
+let start! u = table.start! map.empty;
 
 /// Stop it, and answer the table it stopped with.
 ///
@@ -72,7 +118,7 @@ let start! u = agent.start! map.empty;
 /// first -- a child restarted after this has gone cannot register itself and
 /// dies of trying.
 let stop! : server.Handle -> :any;
-let stop! reg = agent.stop! reg;
+let stop! reg = list.head (server.stop! reg);
 
 /// Bind `name` to `pid`, over whatever was there. Answers what it replaced,
 /// or `()`.
@@ -90,7 +136,7 @@ let register! reg name pid = {
     // `std.supervisor` documents the same trap where it takes `self! ()` into
     // a statement of its own.
     let p = strict! pid;
-    agent.get_and_update! reg (fn m -> [map.get () name m, map.put name p m])
+    server.call! reg [:get_and_update, fn m -> [map.get () name m, map.put name p m]]
 };
 
 /// Bind `name` only if nothing holds it: `[:ok, pid]`, or `[:taken, other]`.
@@ -101,40 +147,40 @@ let register! reg name pid = {
 let claim! : server.Handle -> :any -> :process -> ([:ok, :process] | [:taken, :process]);
 let claim! reg name pid = {
     let p = strict! pid;
-    agent.get_and_update! reg (fn m -> match map.get () name m {
+    server.call! reg [:get_and_update, fn m -> match map.get () name m {
         ()    => [[:ok, p], map.put name p m],
         other => [[:taken, other], m],
-    })
+    }]
 };
 
 /// Forget `name`. Answers the pid it held, or `()`.
 let unregister! : server.Handle -> :any -> :any;
 let unregister! reg name =
-    agent.get_and_update! reg (fn m -> [map.get () name m, map.remove name m]);
+    server.call! reg [:get_and_update, fn m -> [map.get () name m, map.remove name m]];
 
 /// Forget every name `pid` holds, for a process registered under several.
 let forget! : server.Handle -> :process -> :ok;
 let forget! reg pid = {
     let p = strict! pid;
-    agent.update! reg (fn m -> map.filter (fn _ v -> v != p) m)
+    server.call! reg [:get_and_update, fn m -> [:ok, map.filter (fn _ v -> v != p) m]]
 };
 
 // --- asking it things -------------------------------------------------------
 
 /// The process registered as `name`, or `()`.
 let whereis! : server.Handle -> :any -> :any;
-let whereis! reg name = agent.get! reg (fn m -> map.get () name m);
+let whereis! reg name = server.call! reg [:get, fn m -> map.get () name m];
 
 let has! : server.Handle -> :any -> :bool;
-let has! reg name = agent.get! reg (fn m -> map.has name m);
+let has! reg name = server.call! reg [:get, fn m -> map.has name m];
 
 /// Every name, in order.
 let names! : server.Handle -> [:any];
-let names! reg = agent.get! reg (fn m -> map.sorted_keys m);
+let names! reg = server.call! reg [:get, fn m -> map.sorted_keys m];
 
 /// The whole table, as a map of name to pid.
 let all! : server.Handle -> Entries;
-let all! reg = agent.value! reg;
+let all! reg = server.call! reg :value;
 
 /// `whereis!` as a function of unit, for something that will ask again later.
 ///
@@ -259,7 +305,9 @@ when test {
     /// are both moments nothing here can order, so it asks until they have
     /// happened, for as long as `test.eventually!` allows -- by the clock, not
     /// by a count of asks, which a loaded machine used up before the restart.
-    priv let settle! reg name was = test.eventually! (fn () -> whereis! reg name) (fn p -> p != was) test.patience;
+    /// The name passes through `()` on the way: the registry drops it when the
+    /// old process's death reaches it, and the new one registers after that.
+    priv let settle! reg name was = test.eventually! (fn () -> whereis! reg name) (fn p -> p != was && p != ()) test.patience;
 
     /// A registry, a body run against it, and the registry stopped again.
     ///
@@ -281,6 +329,13 @@ when test {
                    let found = whereis! reg "c";
                    counter.stop! p
                    found == p
+               })) ),
+        test.case "a name goes when its process ends"
+            $( test.eq! () (with_registry! (fn reg -> {
+                   let p = counter.start! 0;
+                   register! reg "c" p
+                   counter.stop! p
+                   test.eventually! (fn () -> whereis! reg "c") (fn q -> q == ()) test.patience
                })) ),
         test.case "a name nothing holds is ()"
             $( test.eq! () (with_registry! (fn reg -> whereis! reg "nobody")) ),
