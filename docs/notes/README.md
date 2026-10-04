@@ -80,6 +80,7 @@ a program `dreams` can compile.
 - Sharing the arena
 - A lazy value stored in a map pins the map it was made in
 - The arena was a chain of its own versions, and `push_node` never saw it
+- The item list was appended to
 
 ## [What macro expansion costs](macro-expansion.md)
 

@@ -570,3 +570,35 @@ where a hundred megabytes is. Worth knowing before reaching for it: with the
 arena settled, `opt` costs **no peak heap at all** -- 202 MB with it and 204 MB
 with `--no-opt` -- where before this it cost 61 MB, all of which was the pass
 forcing the suspended nodes it was handed.
+
+## The item list was appended to (2026-10-03)
+
+`scale.py` at 1,600, 3,200 and 6,400 declarations in one module had compile
+time linear (2.00, 2.07) and memory not: live at the heaps' peaks went 182,
+405, 1,083 MB, ratios 2.22 and 2.68, and promotion 225, 481, 1,261 MB.
+
+The JIT moves a profile's attribution between sizes -- a compiled callee's
+reductions are charged to its caller, and which functions get compiled
+changes with the input -- so the per-function ratios under the JIT named four
+"quadratic" functions that were not: total reductions went *down* per
+declaration (101.8M to 186.4M, 1.83). Profiled `--no-jit`, every function
+was within a few percent of 2.0 but one: an anonymous lambda allocating 124
+MB at 3,200 and 493 MB at 6,400, 3.98 times.
+
+It was the fold in `load_items!` that hoists submodules out of a module's
+items, building its output with `list.append acc [item]` -- every item
+copying every item before it -- and `hoist_mod!` had the same fold for a
+submodule's items. Consed and reversed once:
+
+| 6,400 declarations, `--no-jit` | before | after |
+|---|---|---|
+| allocated | 4,714 MB | **3,761 MB** |
+| promoted | 1,226 MB | **765 MB** |
+| live at the heaps' peaks | 1,175 MB | **681 MB** |
+| compile, JIT on (3 interleaved runs) | 7.29-7.35 s | **6.62-6.67 s** |
+
+Allocation and promotion per doubling are 1.94 and 1.96 now. The image is
+byte-identical. This is the fifth time the lesson at the top of CLAUDE.md
+has been found by measuring rather than reading: the fold was in plain
+sight, under a comment about ordering, and a repository whose largest module
+has a few hundred items cannot feel it.

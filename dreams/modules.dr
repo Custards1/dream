@@ -779,15 +779,16 @@ let rec hoist_mod! l parent source m =
                 // Its own `when`s and nested `mod`s, resolved the way a file's
                 // are: by the time this is recorded it is an ordinary module.
                 let kept = expand_items (config_in l full) items;
+                // Consed and reversed once, as `load_items!` does its own.
                 let nested = list.fold (fn acc item ->
                     match item {
                         [:mod, _, _, _] => {
                             let done = hoist_mod! (list.head acc) full source item;
-                            [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
+                            [list.head done, list.cons (list.nth 1 done) (list.nth 1 acc)]
                         },
-                        other => [list.head acc, list.append (list.nth 1 acc) [other]],
+                        other => [list.head acc, list.cons other (list.nth 1 acc)],
                     }) [note_reads full items (note_foreigns full items (note_records full items l)), []] kept;
-                let inner_items = list.nth 1 nested;
+                let inner_items = list.reverse (list.nth 1 nested);
 
                 // A submodule may import, so follow those before it is recorded.
                 let followed = list.fold (fn acc d -> {
@@ -976,15 +977,21 @@ let load_items! l source parsed display name file text = {
             // here on a submodule and a file are the same thing to every later
             // pass. Submodules go into the list first, which keeps the
             // dependencies-first order.
+            //
+            // The items are consed and reversed once. Appended one at a time,
+            // each item copied every item before it: a module of 6,400
+            // declarations allocated 493 MB here, four times what half as many
+            // did -- see "The item list was appended to" in
+            // docs/notes/compiler-scaling.md.
             let hoisted = list.fold (fn acc item ->
                 match item {
                     [:mod, _, _, _] => {
                         let done = hoist_mod! (list.head acc) name source item;
-                        [list.head done, list.append (list.nth 1 acc) [list.nth 1 done]]
+                        [list.head done, list.cons (list.nth 1 done) (list.nth 1 acc)]
                     },
-                    other => [list.head acc, list.append (list.nth 1 acc) [other]],
+                    other => [list.head acc, list.cons other (list.nth 1 acc)],
                 }) [enter name noted, []] kept;
-            let items_out = list.nth 1 hoisted;
+            let items_out = list.reverse (list.nth 1 hoisted);
 
             // Follow this module's own imports before recording it, so the
             // module list comes out with dependencies first.
