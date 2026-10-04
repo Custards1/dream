@@ -20,19 +20,25 @@
 // `comp regex.compile ".."` does the compiling itself while building, so the
 // program carries the finished matcher; it is plain data.
 //
-// **The engine is a Pike VM**, as in RE2 and Go's `regexp`: the pattern is
-// compiled to a small program, and every way of matching it is followed at
-// once, a character at a time, so no pattern takes more than (text length) x
-// (program length) steps. There is no backtracking and therefore no
-// catastrophic case -- `(a*)*b` against a long run of `a`s is as quick as
-// anything else. What that rules out is what RE2 rules out: backreferences and
-// lookaround, which this refuses with a message rather than silently
-// misreading.
+// **The engine is the VM's** (`vm.regex_run`, dream/src/regex.cpp). Parsing
+// and compiling happen here, in Dream; the program is then encoded as bytes
+// (`Regex.code`) and run natively by a lazy DFA -- a table lookup per
+// character, which finds where a match ends, and over the pattern reversed
+// where it starts -- and by a Pike VM for what a DFA cannot do: the spans of
+// groups, and the assertions `^`, `$` and `\b`. Both are linear in the text
+// and neither backtracks, so there is no catastrophic case -- `(a*)*b`
+// against a long run of `a`s is as quick as anything else -- and text no
+// match can start in is skipped with `memchr`. Counting the matches in a few
+// megabytes takes milliseconds. What linear time rules out is what RE2 rules
+// out: backreferences and lookaround, which this refuses with a message
+// rather than silently misreading.
 //
 // Matching is **leftmost-first**, as in Perl and every regex a programmer has
 // used: of the matches starting earliest, the one the pattern prefers --
 // greedy repetition as long as it can be, `a|ab` taking `a` -- is the one
-// found.
+// found. One corner differs from Perl, as it does in RE2 and Go: a loop
+// whose body prefers to match nothing (`(?:a??)*`) still takes the
+// characters it can, where Perl would stop at the empty iteration.
 //
 // **Offsets are bytes and matching is by character.** `.` and a class
 // consume a whole UTF-8 character, and `start`, `stop` and every group's span
@@ -57,22 +63,24 @@ import std.num;
 import std.parse as p;
 import std.result;
 import std.str;
+import std.vm;
 
 // --- the compiled form ---------------------------------------------------------------
 
-/// A compiled pattern: its source, the program, how many groups it has (the
-/// whole match is group 0), the names of the named ones, the literal text
-/// every match starts with, and the bytes a match can start with (`()` when
-/// that is not a short list of ASCII). The last two are how a search skips
-/// text: `str.find` and `str.upto` run in the runtime, and a position no
-/// match can start at costs the machine nothing.
+/// A compiled pattern: its source, how many groups it has (the whole match
+/// is group 0), the names of the named ones, the literal text every match
+/// starts with, the bytes a match can start with (`()` when that is not a
+/// short list of ASCII), and the program encoded for the VM's matcher --
+/// once as written, and once anchored at both ends for `matches`. All of it
+/// is data, so `comp regex.compile ".."` can build it while compiling.
 struct Regex {
     !source : :string
-    !program : :array
     !groups : :integer
     !names : :map
     !prefix : :string
     !starts : :any
+    !code : :string
+    !full : :string
 }
 
 /// One match: the text matched, its byte span, and each group's span
@@ -106,7 +114,7 @@ let compile source = compile_with [] source;
 let compile_with : [Flag] -> Pattern -> Regex;
 let compile_with flags source = match parse_with flags source {
     [:ok, re] => re,
-    [:error, why] => type_assert false ("not a regular expression: " + why) (Regex.make source #[] 0 %{} "" ()),
+    [:error, why] => type_assert false ("not a regular expression: " + why) (Regex.make source 0 %{} "" () "" ""),
 };
 
 /// The pattern compiled, or `[:error, why]`: for patterns that arrive at run
@@ -126,10 +134,16 @@ let parse_with flags source = match p.run regex_syntax source {
         match check_sizes ast {
             () => {
                 let body = emit ast 1 initial;
-                let program = array.of_list ([#[:save, 0]] + body + [#[:save, 1], #[:match]]);
-                result.ok (Regex.make source program groups (group_names ast %{})
-                                      (if initial.[:i] { "" } else { literal_prefix ast })
-                                      (start_bytes ast initial))
+                let prefix = if initial.[:i] { "" } else { literal_prefix ast };
+                let starts = start_bytes ast initial;
+                let program = [#[:save, 0]] + body + [#[:save, 1], #[:match]];
+                let whole = [#[:save, 0]] + body + [#[:assert, :text_end], #[:save, 1], #[:match]];
+                // The pattern backwards, for the machine's reverse DFA, which
+                // finds where a match starts from where it ends; its groups
+                // are of no interest there.
+                let backwards = encode (emit (reversed ast) 0 initial + [#[:match]]) 1 "" () "";
+                result.ok (Regex.make source groups (group_names ast %{}) prefix starts
+                                      (encode program groups prefix starts backwards) (encode whole groups "" () ""))
             },
             why => result.error why,
         }
@@ -505,152 +519,120 @@ priv let is_letter_code c = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 priv let fold : :integer -> :integer;
 priv let fold c = if c >= 65 && c <= 90 { c + 32 } else { c };
 
-// --- the machine ---------------------------------------------------------------------------
+// --- encoding for the machine ------------------------------------------------------------
 //
-// A thread is `#[pc, captures]`, the captures an array of byte offsets (-1
-// for unset), two per group. A step takes every thread waiting on a
-// character, in priority order, and builds the threads for the next
-// character; following the jumps, splits and saves that need no character is
-// `add`, which visits each instruction at most once per step -- that is the
-// whole of the linear bound, and also why an empty loop like `(a*)*` cannot
-// spin. A thread reaching `match` records its captures and cuts off every
-// thread after it in the list, which is what makes it leftmost-first.
+// The program as the bytes `vm.regex_run` reads; dream/src/regex.cpp has the
+// layout. Two things change on the way. A case-insensitive character becomes
+// a class of its two cases, so the machine has one fewer instruction. And a
+// class's items -- ranges, `\d` inside `[..]`, `\D` inside `[..]` -- become one
+// sorted list of disjoint ranges, with case folding already applied, so the
+// machine tests a character with a bitmap or by halving.
 
-/// The captures of the first match starting at or after byte `from` (only at
-/// `from` when `anchored`), or `()`.
-priv let run_at : Regex -> :string -> :integer -> :bool -> :any;
-priv let run_at re s from0 anchored = {
-    let prog = Regex.program re;
-    let starts = if anchored { () } else { Regex.starts re };
-    let from = skip_to starts s from0;
-    let fresh = array.of_list (list.replicate (2 * Regex.groups re) (0 - 1));
-    let [start, _] = add prog s [] %{} 0 fresh from;
-    if from > len s { () } else { machine prog s from (list.reverse start) anchored starts fresh () }
-};
-
-/// The next offset at or after `i` where a match can start: `i` itself when
-/// nothing is known, or past the end when nowhere can.
-priv let skip_to : :any -> :string -> :integer -> :integer;
-priv let skip_to starts s i = match starts {
-    () => i,
-    set => { let at = str.upto set i s; if at >= len s { len s + 1 } else { at } },
-};
-
-priv let machine : :array -> :string -> :integer -> [:array] -> :bool -> :any -> :array -> :any -> :any;
-priv let rec machine prog s i0 threads0 anchored starts fresh found = {
-    // With nothing running and nothing found, jump to where a match can
-    // start rather than stepping through text that cannot begin one.
-    let i = if list.is_empty threads0 && found == () && starts != () { skip_to starts s i0 } else { i0 };
-    let threads = if i == i0 { threads0 } else { (add prog s [] %{} 0 fresh i).[0] };
-    let decoded = p.char_at s i;
-    let code = match decoded { () => 0 - 1, [c, _] => char.code c };
-    let next_i = match decoded { () => i, [_, w] => i + w };
-    let [next_rev, _, found2] = step prog s threads code next_i [] %{} found;
-    let seeded = if found2 == () && not anchored && decoded != () {
-        let [more, _] = add prog s next_rev (visited_of next_rev) 0 fresh next_i;
-        more
-    } else { next_rev };
-    // No threads left ends an anchored search, or one that has its match; an
-    // unanchored one without a match goes on, seeding at every character.
-    if i > len s || decoded == () || (list.is_empty seeded && (anchored || found2 != ())) { found2 }
-    else { machine prog s next_i (list.reverse seeded) anchored starts fresh found2 }
-};
-
-priv let visited_of : [:array] -> :map;
-priv let visited_of threads = list.fold (fn m t -> m.[t.[0] => true]) %{} threads;
-
-/// One character's worth: `[next threads (reversed), visited, found]`.
-priv let step : :array -> :string -> [:array] -> :integer -> :integer -> [:array] -> :map -> :any -> [:any];
-priv let rec step prog s threads code next_i acc visited found = match threads {
-    [] => [acc, visited, found],
-    [t, ..rest] => {
-        let pc = t.[0];
-        let caps = t.[1];
-        match prog.[pc] {
-            #[:match] => [acc, visited, caps],
-            instr => if code >= 0 && consumes instr code {
-                let [acc2, visited2] = add prog s acc visited (pc + 1) caps next_i;
-                step prog s rest code next_i acc2 visited2 found
-            } else { step prog s rest code next_i acc visited found },
-        }
-    },
-};
-
-priv let consumes : :array -> :integer -> :bool;
-priv let consumes instr c = match instr {
-    #[:char, k] => c == k,
-    #[:char_ci, k] => fold c == k,
-    #[:any] => c != 10,
-    #[:any_nl] => true,
-    #[:class, neg, items, ci] => {
-        let hit = in_items items c || (ci && is_letter_code c && (in_items items (fold c) || in_items items (fold c - 32)));
-        if neg { not hit } else { hit }
-    },
-    _ => false,
-};
-
-priv let in_items : [:any] -> :integer -> :bool;
-priv let rec in_items items c = match items {
-    [] => false,
-    [[:range, lo, hi], ..rest] => (c >= lo && c <= hi) || in_items rest c,
-    [[:any_of, inner], ..rest] => in_items inner c || in_items rest c,
-    [[:not, inner], ..rest] => not (in_items inner c) || in_items rest c,
-};
-
-/// Follow what needs no character from `pc`, adding the threads that wait on
-/// one (or on `match`) to `acc`, reversed: `[acc, visited]`.
-priv let add : :array -> :string -> [:array] -> :map -> :integer -> :array -> :integer -> [:any];
-priv let rec add prog s acc visited pc caps i =
-    if visited.[pc else false] { [acc, visited] }
-    else {
-        let v2 = visited.[pc => true];
-        match prog.[pc] {
-            #[:jmp, to] => add prog s acc v2 to caps i,
-            #[:split, a, b] => {
-                let [acc1, v3] = add prog s acc v2 a caps i;
-                add prog s acc1 v3 b caps i
-            },
-            #[:save, slot] => add prog s acc v2 (pc + 1) (caps.[slot => i]) i,
-            #[:assert, kind] => if holds kind s i { add prog s acc v2 (pc + 1) caps i } else { [acc, v2] },
-            _ => [#[pc, caps] :: acc, v2],
-        }
+priv let encode : [:any] -> :integer -> :string -> :any -> :string -> :string;
+priv let encode program groups prefix starts backwards = {
+    let step = fn [pieces, classes, n] instr -> match instr {
+        #[:char, c] => [inst 0 c 0 :: pieces, classes, n],
+        #[:char_ci, c] => [inst 3 n 0 :: pieces, [false, normalize [[c, c], [c - 32, c - 32]]] :: classes, n + 1],
+        #[:any] => [inst 1 0 0 :: pieces, classes, n],
+        #[:any_nl] => [inst 2 0 0 :: pieces, classes, n],
+        #[:class, neg, items, ci] => {
+            let ranges = item_ranges items;
+            [inst 3 n 0 :: pieces, [neg, if ci { normalize (ranges + fold_ranges ranges) } else { ranges }] :: classes, n + 1]
+        },
+        #[:split, x, y] => [inst 4 x y :: pieces, classes, n],
+        #[:jmp, x] => [inst 5 x 0 :: pieces, classes, n],
+        #[:save, k] => [inst 6 k 0 :: pieces, classes, n],
+        #[:assert, kind] => [inst 7 (assert_code kind) 0 :: pieces, classes, n],
+        #[:match] => [inst 8 0 0 :: pieces, classes, n],
     };
-
-priv let holds : :atom -> :string -> :integer -> :bool;
-priv let holds kind s i = match kind {
-    :text_start => i == 0,
-    :text_end => i >= len s,
-    :line_start => i == 0 || str.byte (i - 1) s == 10,
-    :line_end => i >= len s || str.byte i s == 10,
-    :word => word_byte s (i - 1) != word_byte s i,
-    :not_word => word_byte s (i - 1) == word_byte s i,
+    let [pieces, classes, n] = list.fold step [[], [], 0] program;
+    let class_bytes = list.map (fn [neg, ranges] -> str.concat_all ([str.of_bytes [if neg { 1 } else { 0 }], u32 (list.length ranges)]
+                                                                    + list.flat_map (fn [lo, hi] -> [u32 lo, u32 hi]) ranges))
+                               (list.reverse classes);
+    str.concat_all (["DRX1", u32 groups, u32 (list.length program)] + list.reverse pieces
+                    + [u32 n] + class_bytes + [u32 (len prefix), prefix]
+                    + (match starts { () => [str.of_bytes [0]], set => [str.of_bytes [1], bitmap set] })
+                    + [u32 (len backwards), backwards])
 };
 
-priv let word_byte : :string -> :integer -> :bool;
-priv let word_byte s i = {
-    let b = str.byte i s;
-    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+/// The pattern that matches the reverse of what `node` matches: sequences
+/// read the other way, and groups dropped, since only where the reversed
+/// pattern matches is wanted of it.
+priv let reversed : :any -> :any;
+priv let rec reversed node = match node {
+    [:seq, nodes] => [:seq, list.reverse (list.map reversed nodes)],
+    [:alt, nodes] => [:alt, list.map reversed nodes],
+    [:cap, _, _, inner] => reversed inner,
+    [:repeat, inner, lo, hi, greedy] => [:repeat, reversed inner, lo, hi, greedy],
+    [:flags, f, inner] => [:flags, f, reversed inner],
+    other => other,
 };
 
-/// The first match at or after byte `from`, as captures, using the literal
-/// prefix to jump to where one can start.
-priv let search : Regex -> :string -> :integer -> :any;
-priv let rec search re s from =
-    if from > len s { () }
-    else {
-        let prefix = Regex.prefix re;
-        if prefix == "" { run_at re s from false }
-        else {
-            let at = str.find_from from prefix s;
-            if at < 0 { () }
-            else {
-                match run_at re s at true {
-                    () => search re s (at + 1),
-                    caps => caps,
-                }
-            }
-        }
+priv let inst : :integer -> :integer -> :integer -> :string;
+priv let inst op a b = str.of_bytes [op] + str.of_int_le 4 a + str.of_int_le 4 b;
+
+priv let u32 : :integer -> :string;
+priv let u32 n = str.of_int_le 4 n;
+
+priv let assert_code : :atom -> :integer;
+priv let assert_code kind = match kind {
+    :text_start => 0, :text_end => 1, :line_start => 2, :line_end => 3, :word => 4, :not_word => 5,
+};
+
+/// A set of bytes as 32 bytes of bits, bit `b % 8` of byte `b / 8`.
+priv let bitmap : :string -> :string;
+priv let bitmap set = {
+    let bytes = list.unique (list.map (fn i -> str.byte i set) (list.range 0 (len set)));
+    str.of_bytes (list.map (fn k -> list.fold_strict (fn acc b -> acc + pow2 (b % 8)) 0 (list.filter (fn b -> b / 8 == k) bytes))
+                           (list.range 0 32))
+};
+
+priv let pow2 : :integer -> :integer;
+priv let rec pow2 n = if n <= 0 { 1 } else { 2 * pow2 (n - 1) };
+
+/// A class's items as sorted, disjoint ranges of code points.
+priv let item_ranges : [:any] -> [[:integer]];
+priv let item_ranges items = normalize (list.flat_map (fn item -> match item {
+    [:range, lo, hi] => [[lo, hi]],
+    [:any_of, inner] => item_ranges inner,
+    [:not, inner] => complement (item_ranges inner),
+}) items);
+
+/// Sorted by their low ends, with overlapping and touching ranges merged.
+priv let normalize : [[:integer]] -> [[:integer]];
+priv let normalize ranges = {
+    let rec merge rs acc = match [rs, acc] {
+        [[], _] => list.reverse acc,
+        [[r, ..rest], []] => merge rest [r],
+        [[[lo, hi], ..rest], [[plo, phi], ..done]] =>
+            if lo <= phi + 1 { merge rest ([plo, list.maximum [hi, phi]] :: done) }
+            else { merge rest ([lo, hi] :: acc) },
     };
+    merge (list.sort ranges) []
+};
+
+/// Every code point the ranges do not cover.
+priv let complement : [[:integer]] -> [[:integer]];
+priv let complement ranges = {
+    let rec gaps from rs = match rs {
+        [] => if from <= 1114111 { [[from, 1114111]] } else { [] },
+        [[lo, hi], ..rest] => if lo > from { [from, lo - 1] :: gaps (hi + 1) rest } else { gaps (hi + 1) rest },
+    };
+    gaps 0 ranges
+};
+
+/// The other ASCII case of whatever letters the ranges cover.
+priv let fold_ranges : [[:integer]] -> [[:integer]];
+priv let fold_ranges ranges = list.flat_map (fn [lo, hi] -> {
+    let upper = [list.maximum [lo, 65], list.minimum [hi, 90]];
+    let lower = [list.maximum [lo, 97], list.minimum [hi, 122]];
+    (if upper.[0] <= upper.[1] { [[upper.[0] + 32, upper.[1] + 32]] } else { [] })
+        + (if lower.[0] <= lower.[1] { [[lower.[0] - 32, lower.[1] - 32]] } else { [] })
+}) ranges;
+
+/// The machine's modes; see dream/src/regex.cpp.
+priv let run : :string -> :string -> :integer -> :integer -> :any;
+priv let run code s from mode = vm.regex_run code s from mode;
 
 priv let match_of : Regex -> :string -> :array -> Match;
 priv let match_of re s caps = {
@@ -666,21 +648,11 @@ priv let match_of re s caps = {
 
 /// Whether the pattern matches anywhere in `s`.
 let is_match : Regex -> :string -> :bool;
-let is_match re s = search re s 0 != ();
+let is_match re s = run (Regex.code re) s 0 0;
 
 /// Whether it matches the whole of `s`, as if written `\A(?:..)\z`.
 let matches : Regex -> :string -> :bool;
-let matches re s = match run_at (whole re) s 0 true { () => false, _ => true };
-
-priv let whole : Regex -> Regex;
-priv let whole re = {
-    let prog = Regex.program re;
-    let n = array.length prog;
-    // The program ends `save 1; match`; put a text-end check in front.
-    let body = list.map (fn k -> prog.[k]) (list.range 0 (n - 2));
-    Regex.make (Regex.source re) (array.of_list (body + [#[:assert, :text_end], #[:save, 1], #[:match]]))
-               (Regex.groups re) (Regex.names re) "" ()
-};
+let matches re s = run (Regex.full re) s 0 4 != ();
 
 /// The first match, or `()`.
 let find : Regex -> :string -> (Match | :unit);
@@ -688,32 +660,22 @@ let find re s = find_from 0 re s;
 
 /// The first match starting at or after byte `from`.
 let find_from : :integer -> Regex -> :string -> (Match | :unit);
-let find_from from re s = match search re s from { () => (), caps => match_of re s caps };
+let find_from from re s = match run (Regex.code re) s from 1 { () => (), caps => match_of re s caps };
 
-/// Every match, left to right, not overlapping, as a lazy list. An empty
-/// match is followed by a search one character further on, so `a*` over
-/// "baa" finds "", "aa" and "".
+/// Every match, left to right, not overlapping. An empty match is followed by
+/// a search one character further on, so `a*` over "baa" finds "", "aa" and
+/// "". The machine finds them all in one call; each becomes a `Match` only
+/// when the list is read that far.
 let find_all : Regex -> :string -> [Match];
-let find_all re s = all_from re s 0;
-
-priv let all_from : Regex -> :string -> :integer -> [Match];
-priv let rec all_from re s from = match search re s from {
-    () => [],
-    caps => {
-        let m = match_of re s caps;
-        let next = if Match.stop m > Match.start m { Match.stop m }
-                   else { match p.char_at s (Match.stop m) { () => len s + 1, [_, w] => Match.stop m + w } };
-        m :: all_from re s next
-    },
-};
+let find_all re s = list.map (fn caps -> match_of re s caps) (run (Regex.code re) s 0 2);
 
 /// The text of every match.
 let find_all_text : Regex -> :string -> [:string];
 let find_all_text re s = list.map Match.text (find_all re s);
 
-/// How many matches there are.
+/// How many matches there are, counted by the machine without building any.
 let count : Regex -> :string -> :integer;
-let count re s = list.length (find_all re s);
+let count re s = run (Regex.code re) s 0 3;
 
 // --- reading a match -------------------------------------------------------------------------------
 
@@ -842,7 +804,7 @@ let split re s = {
 /// A parser that matches the pattern at the current offset, answering the
 /// match: a regex as a token inside a larger grammar.
 let parser : Regex -> p.Parser Match;
-let parser re s at = match run_at re s at true {
+let parser re s at = match run (Regex.code re) s at 4 {
     () => #[:fail, #[at, ["text matching /" + Regex.source re + "/"]]],
     caps => #[:ok, match_of re s caps, caps.[1], ()],
 };

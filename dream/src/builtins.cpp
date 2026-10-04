@@ -1,4 +1,5 @@
 #include "builtins.hpp"
+#include "regex.hpp"
 #include "digest.hpp"
 
 #include "io.hpp"
@@ -1560,6 +1561,8 @@ ModuleDef make_vm_module() {
                          // `emit`'s node and kid sections; see "The image's two largest sections".
                          {"node_section", 1, 0b0, vm_node_section, 0, true},
                          {"index_section", 1, 0b0, vm_index_section, 0, true},
+                         // `std.regex`'s matcher; see dream/src/regex.cpp.
+                         {"regex_run", 4, 0b1111, vm_regex_run},
                          // measuring
                          {"now_ns!", 1, 0b1, vm_now_ns},
                          {"wall_ms!", 1, 0b1, vm_wall_ms},

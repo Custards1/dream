@@ -705,6 +705,7 @@ set(DREAM_SOURCES
   src/io.cpp
   src/digest.cpp
   src/crypto.cpp
+  src/regex.cpp
   src/bigint.cpp
   src/os.cpp
   src/scheduler.cpp
