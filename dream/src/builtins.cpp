@@ -2174,6 +2174,19 @@ NativeResult core_str_interp(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
 }
 
+/// `_match_fail value path line col` -- what a failed `match` or destructuring
+/// comes to: an error of kind `:match_error` whose payload is `[value, path,
+/// line, col]`, raised. The value is carried as it is, unforced.
+NativeResult core_match_fail(Process& p, Value, Value* args, uint32_t) {
+    Heap& h = p.heap();
+    // Built from the end; nothing here collects, so the locals stay good.
+    Value list = h.make_cons(args[3], NIL);
+    list = h.make_cons(args[2], list);
+    list = h.make_cons(args[1], list);
+    list = h.make_cons(args[0], list);
+    return NativeResult::raise(h.make_error(make_atom(p.runtime().intern_atom("match_error")), list));
+}
+
 NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
     Bytes b;
     Value from = resolve(args[1]);
@@ -3506,6 +3519,7 @@ const BuiltinDef BUILTINS[] = {
     {"_mailbox_take!", 1, 0b1, vm_mailbox_take},
     {"_await_message!", 2, 0b11, vm_await_message},
     {"_deadline_in!", 1, 0b1, vm_deadline_in},
+    {"_match_fail", 4, 0b1110, core_match_fail},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

@@ -93,6 +93,7 @@ let names = [
     "_mailbox_take!",
     "_await_message!",
     "_deadline_in!",
+    "_match_fail",     // what a failed `match` raises with; see `lower.match_failure`
 
 ];
 
@@ -180,6 +181,7 @@ let signatures = %{
     "_mailbox_take!" => "integer -> :ok, removing the message at that position",
     "_await_message!" => "integer -> deadline -> :ok | :timeout, once the mailbox holds more than that many",
     "_deadline_in!" => "integer -> integer, the monotonic clock that many milliseconds from now",
+    "_match_fail" => "value -> path -> line -> col -> never, raising :match_error with [value, path, line, col]",
 
 };
 
@@ -236,7 +238,7 @@ let wrapper name = wrappers.[name else ()];
 let written_by_parser : :string -> :bool;
 let written_by_parser name =
     list.contains name ["_tensor_matmul", "_str_interp", "_mailbox_peek!", "_mailbox_take!",
-                        "_await_message!", "_deadline_in!"];
+                        "_await_message!", "_deadline_in!", "_match_fail"];
 
 /// A builtin's signature, or its bare name for one that has none.
 let signature : :string -> :string;

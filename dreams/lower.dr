@@ -1213,18 +1213,19 @@ let places_key r bodies = {
 
 /// The raise a failed match comes to: `subject` is the node that reads what
 /// did not fit, and `span` where it was written.
+///
+/// One call of `_match_fail`, which builds the error and raises it. Built here
+/// from `_error_new`, a list and `raise!`, every site was four nodes and seven
+/// kids of its own, and the compiler's image grew 13% for its two thousand
+/// sites; as one call the builtin, the path and the small integers are shared
+/// constants and a site is the call and its four kids.
 let match_failure subject span l = {
     let at = place_of span l;
-    let kind = const_atom "match_error" l;
-    let path = const_str (list.nth 0 at) (list.head kind);
+    let path = const_str (list.nth 0 at) l;
     let line = const_int (list.nth 1 at) (list.head path);
     let col = const_int (list.nth 2 at) (list.head line);
-    let items = [subject, list.nth 1 path, list.nth 1 line, list.nth 1 col];
-    let placed = kids items (list.head col);
-    let payload = emit (ir.node :make_list (list.nth 1 placed) 4 ir.no_node) (list.head placed);
-    let carried = inherit (list.nth 1 payload) items (list.head payload);
-    let made = call_builtin "_error_new" [list.nth 1 kind, list.nth 1 payload] carried;
-    let raised = call_builtin "raise!" [list.nth 1 made] (list.head made);
+    let raised = call_builtin "_match_fail" [subject, list.nth 1 path, list.nth 1 line, list.nth 1 col]
+                              (list.head col);
     [set_flag (list.nth 1 raised) ir.f_strict (list.head raised), list.nth 1 raised]
 };
 

@@ -45,7 +45,8 @@ Follow-ups from 1, 2 and 5:
   and drops a name when its process ends.
 - Done: `receive! { pattern => body, .., after ms => body }`, lowered to a
   scan over four new primitives, so it needs no import.
-- The match positions cost the compiler's image 13% (1.05 -> 1.18 MB);
-  self-compile time unchanged.
+- Done: a failed match is one call of the builtin `_match_fail`, not an
+  `_error_new`, a list and a `raise!`: the compiler's image 1,198 -> 1,139
+  KB, and a self-compile ~4% faster (2.03-2.09 s -> 1.94-1.99 s).
 - 3 (freeing shared values) is designed, not built: "Freeing what was
   shared" in docs/gc.md.
