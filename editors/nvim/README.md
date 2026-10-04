@@ -54,6 +54,11 @@ extension:
    finds it even when Neovim was not started with `$MINDV2_PATH` set -- as
    under the Nix flake's wrapped `dream`.
 
+When the image is the project's own build and `build-dream/bin/dream` is
+beside it, that VM runs it rather than the one on `PATH` (unless `vm` is set):
+an image built from the checkout can name builtins an installed VM does not
+have yet, and fails with `unknown builtin id`.
+
 **The project root** is the outermost `mind.toml` that declares a
 `[workspace]`, then the nearest `mind.toml`, then the repository, then the
 file's directory. The workspace wins because its members import one another;

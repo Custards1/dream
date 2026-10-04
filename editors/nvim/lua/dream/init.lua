@@ -134,7 +134,17 @@ function M.cmd(root)
   local cfg = M.config
   local server = M.find_server(root)
   if not server then return nil end
-  local cmd = { expand(cfg.vm) or 'dream', server }
+  -- An image is only as good as the VM it was built for: the checkout's
+  -- `build/lucid.dream` names builtins an installed VM may not have yet
+  -- ("unknown builtin id"). So when the server is the project's own build and
+  -- the project has built a VM beside it, that VM runs it, unless `vm` was set.
+  local vm = expand(cfg.vm) or 'dream'
+  local local_vm = root and vim.fs.joinpath(root, 'build-dream', 'bin', 'dream')
+  if vm == defaults.vm and root and vim.startswith(server, root .. '/')
+      and local_vm and vim.fn.executable(local_vm) == 1 then
+    vm = local_vm
+  end
+  local cmd = { vm, server }
   local roots = { root }
   vim.list_extend(roots, cfg.package_paths or {})
   if cfg.stdlib then table.insert(roots, cfg.stdlib) end
