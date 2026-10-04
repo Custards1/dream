@@ -23,6 +23,8 @@ The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp
       back the ones it found empty (2026-10-03). See "Evacuating sparse
       blocks" -- including why it bought less than this list expected.
 - [ ] Later -- full compaction. Nothing measured asks for it yet.
+- [ ] Freeing shared regions: designed (2026-10-03), not built. See "Freeing
+      what was shared".
 
 ## The collector today
 
@@ -688,6 +690,139 @@ old space would be the same machinery applied to every block rather than the
 sparse ones -- the safety argument does not change -- and the reason it is not
 built is the one evacuation's measurements give: what the compiler wastes now
 is empty blocks, not half-full ones.
+
+## Freeing what was shared -- the design (2026-10-03, not built)
+
+`vm.share!` copies a value, once, into memory every process reads and none
+owns (`SharedArea` in heap.hpp), and nothing there is freed until the runtime
+ends. That is right for a table built once and read for the rest of a run,
+which is what the compiler does with it, and it rules the feature out for
+anything long-lived that builds such tables repeatedly: a language server
+that shared each request's parse would grow for ever, and so `lucid` does
+not share at all. This is a design for giving that memory back, written
+before anything is built because every part of it touches an invariant
+above.
+
+### What "unreachable" has to mean
+
+A shared object can be referred to from more places than a heap object can,
+and a region may be freed only when it is referred to from none of them:
+
+1. **A process heap.** Any process, running, parked or queued: its roots
+   (stacks, `globals`, `native_cache`, `string_cache`, `pins`) and everything
+   its old and young space reach.
+2. **A finished process.** Its heap is kept for `join!`, and `exit_value` is
+   read from another thread when one arrives.
+3. **A message in flight.** A `Message` carries a heap of its own, and a
+   shared pointer copies into it as a pointer (`copy_value` stops at
+   `is_shared_obj`). The same holds for a kill's reason.
+4. **Another shared region.** `share!` does not copy what is already shared,
+   so a table shared after another may point into it.
+5. **Something moving between processes right now.** `send!`, `spawn!`,
+   `join!`, a monitor's report and a kill all copy from one heap to another,
+   and the copy is the one moment a reference can appear in a place a census
+   has already declared clean.
+
+Nothing else holds a `Value` across a slice boundary: no C++ frame does
+(`pins` is empty between slices, which `kill!` already relies on), and a
+compile-time evaluation runs in a runtime of its own with its own area.
+
+### Regions
+
+A **region** is what one `share!` call allocated. Today every share bumps
+through one shared 1 MiB block; a region instead takes blocks of its own --
+64 KiB, aligned to 64 KiB, with a large object given an aligned block of its
+own -- so the region of an object is its address shifted right by 16 and
+looked up in a table, without a word in the header. The header has none to
+give: `gc` is `GC_SHARED` and nothing else, and `aux` carries
+`AUX_DEEP_FORCED` and an identity hash that a shared copy keeps
+(`carry_identity`). Small shares waste the end of a 64 KiB block; a region
+that is a few hundred bytes can be packed into a shared "small" block that is
+simply never freed, which is today's behaviour for exactly the values too
+small to matter.
+
+The copier records **dependencies**: when the copy that builds region R
+meets an object already shared in region Q, R depends on Q. Q cannot be
+freed while R is alive.
+
+### Releasing is a request, and a census decides
+
+`vm.release! v` -- `v` being what a `share!` answered -- **condemns** v's
+region. It promises nothing and frees nothing: a program that still holds `v`
+somewhere keeps it, because the region is only freed once a census finds no
+reference. So there is no use-after-free for a program to commit, and the
+operation is safe to expose; the worst a wrong release does is nothing.
+
+A **census round** starts with each release (and can be asked for again with
+`vm.collect_shared!`). Its answer is gathered from four places:
+
+- **Every live process runs a major at the start of its next slice** -- the
+  same point a kill is honoured, where nothing of the process is on a C++
+  stack -- with an observer: whenever marking meets a `GC_SHARED` object,
+  the object's region is looked up and, if condemned, marked *seen* for this
+  round. Marking already stops at a shared object (`mark_object`,
+  `forward_in`), and it still does: what is inside a region is the
+  dependency table's business, not the heap's. A parked process is woken for
+  it -- a wake is only ever a hint, and the blocking native it was in looks
+  again and parks again -- and its slice runs the major and nothing else of
+  note.
+- **Every finished process** has `exit_value` walked, read-only, with a
+  visited set, from the thread running the round. No mark bits are touched,
+  so a concurrent `join!` reading the same heap is undisturbed.
+- **Every mailbox and kill reason** is walked the same way, under the
+  mailbox's lock.
+- **Dependencies:** a condemned region that a live region depends on is seen.
+
+When every process counted at the start of the round has reported, a
+condemned region nobody saw is freed: its blocks go back to the allocator,
+its entries leave the region table and `any_contains`, and its own
+dependencies are dropped -- which can make another condemned region free at
+the next round.
+
+### The barrier that makes a census sound
+
+A census is not instantaneous: process A reports clean, then B -- not yet
+censused -- sends A a reference, and B drops its own copy before its turn.
+Every place then reports clean and A holds a dangling pointer. The fix is the
+one place every transfer already goes through: `copy_value`, at the moment
+it returns a shared pointer. While any region is condemned (one relaxed load
+of a global count, so a program that never releases pays nothing), that
+pointer's region is looked up, and if it is condemned the round in progress
+is **spoiled**: it frees nothing, and the region stays condemned for the
+next. A round can only free a region that no transfer touched while it ran,
+and a reference that crossed after a process was censused is exactly such a
+transfer.
+
+The marking observer is in the collector's hottest loop, and so it is gated
+the same way: the region lookup happens only when the round asked this major
+to observe, and the table it reads is published as an immutable sorted array
+behind an atomic pointer, replaced by the round's thread when a region is
+added or freed, so a marking thread on another core never takes a lock to
+read it.
+
+### What it does not cover, on purpose
+
+- **Nothing is moved.** Compaction of the shared area would need every heap's
+  pointers into it rewritten, which is a stop-the-world in all but name, and
+  the reason the area exists is that no collection of it ever has to look
+  inside a heap.
+- **No automatic rounds.** A census costs a major in every process, so it
+  runs when a program asks. A server that shares a table per request
+  releases the previous one and pays one round per release; a compiler that
+  shares and exits never pays at all.
+- **Images and other runtimes.** An `ImageSession` or a `comp` runtime has an
+  area of its own and frees it when it ends, as today.
+
+### What it would take
+
+`SharedArea` grows regions, aligned blocks, the region table and the
+dependency sets; `copy_value` the spoil check; `mark_object`/`forward_in`
+the observer, behind a per-major flag; `Scheduler::run_slice` the census
+request beside the kill check; and `std.vm` `release!` and `collect_shared!`.
+The test that matters is a race test in the `test-races` mould: two
+processes passing a released table back and forth while rounds run, under
+`DREAM_GC_EVACUATE=all`, with the heap verifier on -- the dangling pointer the
+barrier exists to prevent is not something a single-threaded test can make.
 
 ## Where we are
 
