@@ -92,11 +92,28 @@ Next round (2026-10-03), most valuable first.
 3. Better errors at run time.
    Attach to a raised error the span it was raised at, and the span where
    the thunk that raised it was *created*, not only where it was forced.
+   Done (2026-10-04): an error remembers where it was first raised -- the
+   functions running, innermost first, and the functions that made each
+   value being forced (`locate_error` in interp.cpp, a walk of the top of
+   the continuation stack at the first unwind). The places are functions':
+   FUNC records now carry a line, column and file, in what were an unread
+   byte span and a reserved word. An uncaught error prints them a line
+   each; `error.trace!`/`trace_lines!` (builtin `_error_trace!`) answer
+   them; std.test prints six under a failed case. Not a node's place,
+   because opt shares identical nodes program-wide; and a tail call takes
+   its caller's frame with it, so a test case's own `$( )` is often gone.
 
 4. Let types flow through unannotated code, as warnings.
    Infer an unsigned function's result from its body so std's signatures
    reach further. Report what that finds as warnings, keeping "code no
    signature touches is never rejected" for errors.
+   Done (2026-10-04): the check runs twice; the first also answers what
+   each unsigned body answers (literals widened, `()` of a sometimes-
+   something answer dropped), the second holds every body naming one of
+   those, and what only it finds is a warning. The repository had two,
+   both fixed (target.dr's arch lists, cc.Target.kind). Cost: `types`
+   183 -> 355 ms sequential, self-compile 2.17 -> 2.34 s -- not yet
+   reduced. "What an unsigned function answers" in static-types.md.
 
 5. Allocation in the VM.
    Frames are ~40% of allocation. A body that makes no closure or thunk
@@ -111,7 +128,9 @@ Next round (2026-10-03), most valuable first.
      repository; 17 files would change, ~120 lines, almost all real fixes.
      Not run over the repository yet. Left: turning if/else-if chains into
      `match`, which needs the tree rather than the text.
-   - lucid: inlay hints from the checker's types, rename
+   - lucid: inlay hints from the checker's types, rename. Done
+     (2026-10-04): textDocument/inlayHint, prepareRename and rename;
+     "Inlay hints and rename" in docs/notes/lucid.md.
 
 Already planned, and in the right order:
    - .libdream / a package at a time (12,800 declarations still do not fit)

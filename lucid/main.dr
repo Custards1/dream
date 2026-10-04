@@ -148,6 +148,8 @@ let capabilities =
                             "definitionProvider" => true,
                             "documentSymbolProvider" => true,
                             "documentFormattingProvider" => true,
+                            "inlayHintProvider" => true,
+                            "renameProvider" => %{ "prepareProvider" => true },
                             "completionProvider" =>
                                 %{ "triggerCharacters" => ["."] } },
        "serverInfo" => %{ "name" => "lucid", "version" => version } };
@@ -168,6 +170,13 @@ let roots_from p = {
 };
 
 let answer! out id result = rpc.write_message! out (rpc.response id result);
+
+/// `[:ok, result]` answered, `[:error, why]` refused: an LSP request failure,
+/// whose message an editor shows.
+let refusable! out id outcome = match outcome {
+    [:ok, result] => answer! out id result,
+    [:error, why] => rpc.write_message! out (rpc.error_response id (0 - 32803) why),
+};
 
 /// One request or notification. Answers `[:go, state]` or `[:exit, code]`.
 let handle! out s m = {
@@ -247,6 +256,32 @@ let handle! out s m = {
         "textDocument/documentSymbol" => {
             let a = analysed! s path;
             answer! out (rpc.id m) (analysis.symbols a)
+            [:go, carrying a s]
+        },
+
+        // The types the checker gave the bindings nobody wrote one for, in
+        // the lines on screen. See "inlay hints" in analysis.dr.
+        "textDocument/inlayHint" => {
+            let a = analysed! s path;
+            let range = p.["range" else (%{})];
+            let first = (range.["start" else (%{})]).["line" else 0];
+            let last = (range.["end" else (%{})]).["line" else 1000000000];
+            answer! out (rpc.id m) (analysis.inlay_hints a first last)
+            [:go, carrying a s]
+        },
+
+        // Rename, asked first whether the cursor is on something that can be
+        // renamed and then for the edit. A refusal is an error response, which
+        // is what makes a client show the reason rather than nothing.
+        "textDocument/prepareRename" => {
+            let a = analysed! s path;
+            refusable! out (rpc.id m) (analysis.prepare_rename_at a (line_of p) (character_of p))
+            [:go, carrying a s]
+        },
+        "textDocument/rename" => {
+            let a = analysed! s path;
+            refusable! out (rpc.id m)
+                (analysis.rename_at a (line_of p) (character_of p) (p.["newName" else ""]))
             [:go, carrying a s]
         },
 

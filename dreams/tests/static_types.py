@@ -483,4 +483,61 @@ let main! = console.print! (area (shapes.Shape.circle 2.0));
     failure('union U { type }', '`type` is a keyword and cannot name a variant or a member')
     failure('union U { a(x, x) }', '`x` is already a field of this variant')
 
+    # --- what an unsigned function answers -------------------------------------
+    #
+    # The check runs a second time with what each unsigned body answers as the
+    # type of its uses, and what only that finds is a warning: the build still
+    # succeeds and runs, and rule 1 -- nothing unannotated is ever an error --
+    # holds.
+    def warns(source, expected, *messages):
+        global count
+        result = compile_source(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        for message in messages:
+            assert message in result.stderr, (message, result.stderr)
+        assert 'a signature on it would make this an error' in result.stderr, result.stderr
+        run = subprocess.run([vm, str(temp / 'out.dream')], text=True, capture_output=True, timeout=30)
+        assert run.stdout == expected, (run.stdout, expected)
+        count += 1
+
+    def quiet(source, expected):
+        result = compile_source(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'warning' not in result.stderr, result.stderr
+        success(source, expected)
+
+    # A signature reaches through a function that has none.
+    warns(prelude + '''
+let label n = "item " + to_string n;
+let half : :integer -> :integer;
+let half x = x / 2;
+let main! = console.print! (try! { half (label 3) } catch e { 0 });
+''', '0\n', 'warning: argument 1 of `half` should be `:integer`, but this is `:string`')
+
+    # A match on what an unsigned function answers is held to every variant
+    # of the union it answers.
+    warns(prelude + '''
+union Shape { circle(radius : :float), empty }
+let pick n = if n > 0 { Shape.circle 1.0 } else { Shape.empty };
+let main! = console.print! (match pick 1 { [:circle, r] => r });
+''', '1\n', 'warning:', '`:empty`')
+
+    # `()` on some path is "nothing there", not a union every caller must
+    # take apart, and a program that agrees with itself says nothing.
+    quiet(prelude + '''
+let first xs = match xs { [] => (), [x, .._] => x * 2 };
+let twice : :integer -> :integer;
+let twice n = n * 2;
+let main! = console.print! (twice (first [1, 2]));
+''', '4\n')
+
+    # A function whose answer is known is still `:any` to a caller when the
+    # answer says nothing: an unsigned parameter passed through.
+    quiet(prelude + '''
+let same x = x;
+let twice : :integer -> :integer;
+let twice n = n * 2;
+let main! = console.print! (twice (same 4));
+''', '8\n')
+
     print(f'{count} static type cases passed under interpreter and JIT')

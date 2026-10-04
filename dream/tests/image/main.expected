@@ -1,5 +1,5 @@
 9
-%{:sum => 7, :count => 2}
+%{:count => 2, :sum => 7}
   (shapes says: hello from the caller)
 shapes 1
 5

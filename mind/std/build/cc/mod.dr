@@ -49,7 +49,9 @@ union Setting {
 type Kind = :executable | :shared | :static | :external;
 
 mapping Target {
-    kind : :atom        // a Kind
+    // `Kind`, written out: a record is a module of its own, and cannot name
+    // a type declared beside it.
+    kind : :executable | :shared | :static | :external
     name : :string
     sources = []        // [[path, [Setting]]]: each file, and its own settings
     settings = []       // [Setting], for every source of this target

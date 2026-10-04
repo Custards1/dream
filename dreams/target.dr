@@ -273,12 +273,14 @@ let starts_with : [:integer] -> :string -> :bool;
 let starts_with prefix s =
     list.all (fn [i, b] -> byte s i == b) (list.zip (list.range 0 (list.length prefix)) prefix);
 
-let elf_arch m = match m { 62 => :x86_64, 183 => :aarch64, _ => () };
-let pe_arch m = match m { 34404 => :x86_64, 43620 => :aarch64, _ => () };
+// Each answers the architectures a machine field names: one, or none for a
+// machine this does not know, which leaves the binary's architecture open.
+let elf_arch m = match m { 62 => [:x86_64], 183 => [:aarch64], _ => [] };
+let pe_arch m = match m { 34404 => [:x86_64], 43620 => [:aarch64], _ => [] };
 /// Mach-O's CPU types are the 64-bit flag, `0x01000000`, over a family.
-let macho_arch m = match m { 16777223 => :x86_64, 16777228 => :aarch64, _ => () };
+let macho_arch m = match m { 16777223 => [:x86_64], 16777228 => [:aarch64], _ => [] };
 
-let one os arch = make [os] (match arch { () => [], a => [a] });
+let one os archs = make [os] archs;
 
 /// A universal binary: a big-endian count, then twenty bytes per slice with
 /// the CPU type first. Java class files share the magic, and are told apart by
@@ -288,7 +290,7 @@ let fat s = {
     if n < 1 || n > 20 || str.byte_length s < 8 + n * 20 { () }
     else {
         let archs = list.map (fn i -> macho_arch (be32 s (8 + i * 20))) (list.range 0 n);
-        make [:macos] (if list.contains () archs { [] } else { archs })
+        make [:macos] (if list.contains [] archs { [] } else { list.concat archs })
     }
 };
 
@@ -296,7 +298,7 @@ let fat s = {
 /// whose machine field follows it.
 let pe s = {
     let at = le32 s 60;
-    if byte s (at + 5) < 0 || not (starts_with [80, 69, 0, 0] (str.slice at 4 s)) { one :windows () }
+    if byte s (at + 5) < 0 || not (starts_with [80, 69, 0, 0] (str.slice at 4 s)) { one :windows [] }
     else { one :windows (pe_arch (le16 s (at + 4))) }
 };
 
@@ -307,7 +309,7 @@ let sniff s =
     if str.byte_length s < 8 { () }
     else if starts_with [127, 69, 76, 70] s { one :linux (elf_arch (le16 s 18)) }
     else if starts_with [207, 250, 237, 254] s { one :macos (macho_arch (le32 s 4)) }
-    else if starts_with [206, 250, 237, 254] s { one :macos () }
+    else if starts_with [206, 250, 237, 254] s { one :macos [] }
     else if starts_with [202, 254, 186, 190] s { fat s }
     else if starts_with [77, 90] s && str.byte_length s >= 64 { pe s }
     else { () };

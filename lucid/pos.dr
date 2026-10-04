@@ -17,6 +17,8 @@
 
 import std.list;
 import std.str;
+
+import dreams.diag;
 /// How many bytes the character starting with this byte occupies, and how many
 /// UTF-16 units it becomes. Read from the UTF-8 lead byte alone, which is the
 /// point of UTF-8: `[bytes, units]`.
@@ -82,6 +84,23 @@ let position_of text offset = {
     walk 0 0 0
 };
 
+/// The same, for many offsets into one text: `position_of` walks from the
+/// start of the file, which for a question asked once is nothing and for a
+/// hint per binding in a long file is a walk of the file per hint. This walks
+/// each offset's own line, found in `starts` -- `diag.line_starts text`.
+let position_in starts text offset = {
+    let [line, col] = diag.place_in starts offset;
+    let from = starts.[line - 1];
+    let rec walk i !units =
+        if i >= offset { units }
+        else {
+            match step (str.byte i text) {
+                [bytes, us] => if i + bytes > offset { units } else { walk (i + bytes) (units + us) },
+            }
+        };
+    [line - 1, walk from 0]
+};
+
 /// An LSP `Range`, as the JSON object it is sent as.
 let range text from until = {
     let a = position_of text from;
@@ -106,6 +125,10 @@ when test {
     let emoji = "a\u{1F600}b";
 
     let tests = [
+        test.case "a position found by its line agrees with one walked from the start"
+            $( test.eq! (list.map (fn o -> position_of "ab\ncé\nd" o) [0, 3, 4, 6, 7, 8])
+                        (list.map (fn o -> position_in (diag.line_starts "ab\ncé\nd") "ab\ncé\nd" o)
+                                  [0, 3, 4, 6, 7, 8]) ),
         test.case "the first line starts at nothing"
             $( test.eq! 0 (line_start "a\nb" 0) ),
         test.case "a later line starts after its newline"
