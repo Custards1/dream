@@ -1,0 +1,650 @@
+// Randomness: reproducible streams for simulations and tests, and the
+// operating system's for anything that must not be guessed.
+//
+//     import std.random;
+//
+//     random.int! 1 6                          // a die, from the OS
+//     random.uuid! ()                          // "3f0c2a9e-..."
+//     random.token! 32                         // a URL-safe secret
+//
+//     let rng = random.seed 42;                // the same every run, everywhere
+//     let [roll, rng2] = random.int 1 6 rng;   // a value and the generator after it
+//     list.take 5 (random.values (random.int 1 6) rng)    // [4, 1, 6, 6, 2], lazily
+//
+//     let point = random.map2 (fn x y -> [x, y]) random.float random.float;
+//     random.sample (random.list_of point) rng            // a list of points
+//
+// **A generator is a value, and drawing from it is pure.** A program that
+// wants the same numbers twice -- a simulation to replay, a test to rerun --
+// cannot use a hidden global, so `Rng` is passed in and the next one handed
+// back: every draw has the shape `args.. -> Rng -> [value, Rng]`. That shape
+// is also what a *generator of values* is, so `random.int 1 6`, partially
+// applied, is the generator of die rolls, and the combinators (`map`,
+// `and_then`, `list_of`, `one_of`, `frequency`, ...) build bigger ones out of
+// it. `values` turns any of them into an infinite lazy list, which is how
+// laziness takes the threading away: `list.take 1000 (random.values g rng)`.
+//
+// **The algorithm is MRG32k3a**, L'Ecuyer's combined multiple recursive
+// generator: period 2^191, passes TestU01's BigCrush, and -- the reason it was
+// picked -- needs nothing but multiplication and remainder on numbers under
+// 2^53. Dream has no bitwise operators, which rules out xorshift, PCG and
+// SplitMix written in Dream, and a generator that leans on bignums would be
+// slow. Each step is a few multiplications and yields one word in
+// `[0, 4294967087)`. `split` derives two independent generators by hashing
+// the state, so a parallel computation gives each process its own stream.
+// None of this is fit for secrets: the state can be recovered from outputs.
+//
+// **The functions ending in `!` are the operating system's** (`getrandom`,
+// `arc4random_buf`, `BCryptGenRandom`, through `std.crypto`), read fresh on
+// every call. `int!`, `bytes!`, `uuid!` and `token!` use those bytes
+// directly and are fit for keys, session ids and anything else that must not
+// be predicted. `draw!` runs any pure generator on a generator seeded from
+// the OS, which is unpredictable but not cryptographic.
+//
+// **A generator can also read from a tape**: `of_tape words` answers the
+// words given, then zeros. Nothing else here knows the difference, and that
+// is what lets `std.property` shrink a failing case built by *any* generator,
+// however it was composed: it shrinks the tape, and every draw is written so
+// that smaller words give simpler values (`int` gives its low end for 0, a
+// list ends, `one_of` takes its first choice).
+
+import std.array;
+import std.crypto;
+import std.list;
+import std.map;
+import std.math;
+import std.num;
+import std.str;
+
+// --- the generator ---------------------------------------------------------------
+
+/// A generator's state: MRG32k3a's six words, or a tape of words to replay.
+union struct Rng {
+    mrg(a0 : :integer, a1 : :integer, a2 : :integer, b0 : :integer, b1 : :integer, b2 : :integer)
+    tape(words : [:integer], used : :integer)
+}
+
+/// What a generator of values is: a function from a generator state to a
+/// value and the state after it.
+type Gen a = Rng -> [a, Rng];
+
+priv let m1 : :integer;
+priv let m1 = 4294967087;
+priv let m2 : :integer;
+priv let m2 = 4294944443;
+
+/// The size of a word: `next` answers one in `[0, word_range)`.
+let word_range : :integer;
+let word_range = 4294967087;
+
+/// One word, uniform in `[0, word_range)`, and the generator after it.
+let next : Rng -> [:integer, Rng];
+let next rng = match rng {
+    #[:mrg, a0, a1, a2, b0, b1, b2] => {
+        let p1 = mod_pos (1403580 * a1 - 810728 * a0) m1;
+        let p2 = mod_pos (527612 * b2 - 1370589 * b0) m2;
+        let z = mod_pos (p1 - p2) m1;
+        [z, Rng.mrg a1 a2 p1 b1 b2 p2]
+    },
+    #[:tape, words, used] => match words {
+        [] => [0, Rng.tape [] (used + 1)],
+        [w, ..rest] => [w, Rng.tape rest (used + 1)],
+    },
+};
+
+priv let mod_pos : :integer -> :integer -> :integer;
+priv let mod_pos x m = { let r = x % m; if r < 0 { r + m } else { r } };
+
+/// A generator determined by `seed`, which may be any value: the same seed
+/// gives the same stream on every machine and every run.
+let seed : :any -> Rng;
+let seed s = of_bytes (crypto.sha256 ("std.random:" + to_string s));
+
+/// A generator seeded from the operating system: different every time.
+let new! : :unit -> Rng;
+let new! () = of_bytes (crypto.random_bytes! 32);
+
+/// The state from 24 or more bytes. Each component of MRG32k3a must not be all
+/// zeros, which a hash essentially never produces and which is mended here
+/// rather than trusted.
+priv let of_bytes : :string -> Rng;
+priv let of_bytes b = {
+    let w k = u32 b (4 * k);
+    let fix a b2 c m = if a % m == 0 && b2 % m == 0 && c % m == 0 { [1, 1, 1] } else { [a % m, b2 % m, c % m] };
+    let [a0, a1, a2] = fix (w 0) (w 1) (w 2) m1;
+    let [b0, b1, b2] = fix (w 3) (w 4) (w 5) m2;
+    Rng.mrg a0 a1 a2 b0 b1 b2
+};
+
+priv let u32 : :string -> :integer -> :integer;
+priv let u32 s at = ((str.byte at s * 256 + str.byte (at + 1) s) * 256 + str.byte (at + 2) s) * 256 + str.byte (at + 3) s;
+
+/// Two generators whose streams are independent of each other and of the one
+/// they came from: for handing to two processes, or to two halves of a
+/// computation that should not depend on how much the other one drew.
+let split : Rng -> [Rng, Rng];
+let split rng = {
+    let state = to_string rng;
+    [of_bytes (crypto.sha256 ("L" + state)), of_bytes (crypto.sha256 ("R" + state))]
+};
+
+/// A generator that answers `words` in order and zeros after them. What
+/// `std.property` replays and shrinks; useful for a test that wants a draw to
+/// come out a particular way.
+let of_tape : [:integer] -> Rng;
+let of_tape words = Rng.tape words 0;
+
+/// How many words a tape generator has answered.
+let tape_used : Rng -> :integer;
+let tape_used rng = match rng { #[:tape, _, used] => used, _ => 0 };
+
+// --- running a generator ----------------------------------------------------------------
+
+/// The value and the generator after it. Every generator is already this
+/// function; `run` is for reading.
+let run : Gen a -> Rng -> [a, Rng];
+let run g rng = g rng;
+
+/// Just the value.
+let sample : Gen a -> Rng -> a;
+let sample g rng = (g rng).[0];
+
+/// An endless lazy list of values: `list.take 10 (values (int 1 6) rng)`.
+let values : Gen a -> Rng -> [a];
+let rec values g rng = {
+    let [v, rng2] = g rng;
+    v :: values g rng2
+};
+
+/// A value from a generator seeded by the operating system: `draw! (list_of
+/// (int 0 9))` is a random list of digits, different every run.
+let draw! : Gen a -> a;
+let draw! g = sample g (new! ());
+
+// --- numbers ---------------------------------------------------------------------------------
+
+/// An integer from `lo` to `hi`, both included, every one equally likely --
+/// exactly, not nearly: words are combined until they cover the range, and a
+/// draw past the largest multiple of it is drawn again, so no value is
+/// favoured by the remainder. Any range works, a bignum one included.
+///
+/// Smaller words give values nearer zero: the low end of a range that is all
+/// positive or all negative, and for one that spans zero the order 0, -1, 1,
+/// -2, 2, .. -- which is what a shrinker means by a simpler integer.
+let int : :integer -> :integer -> Gen :integer;
+let int lo hi rng =
+    if hi <= lo { [lo, rng] }
+    else {
+        let [k, rng2] = below (hi - lo + 1) rng;
+        [nearest_zero_first lo hi k, rng2]
+    };
+
+/// The `k`th value of `[lo, hi]` in order of distance from zero.
+priv let nearest_zero_first : :integer -> :integer -> :integer -> :integer;
+priv let nearest_zero_first lo hi k =
+    if lo >= 0 { lo + k }
+    else if hi <= 0 { hi - k }
+    else {
+        let m = list.minimum [0 - lo, hi];
+        if k <= 2 * m { if k % 2 == 1 { 0 - (k + 1) / 2 } else { k / 2 } }
+        else if hi > 0 - lo { m + (k - 2 * m) }
+        else { 0 - (m + (k - 2 * m)) }
+    };
+
+/// `[0, range)`, uniformly, by rejection. The answer is the draw *divided*
+/// down rather than reduced modulo the range, so it rises with the words:
+/// each value is a run of consecutive draws, and a smaller word never gives
+/// a larger value.
+priv let below : :integer -> Gen :integer;
+priv let rec below range rng = {
+    let [words, bound] = words_for range 1 word_range;
+    let [acc, rng2] = accumulate words 0 rng;
+    let per = bound / range;
+    if acc < per * range { [acc / per, rng2] } else { below range rng2 }
+};
+
+priv let words_for : :integer -> :integer -> :integer -> [:integer, :integer];
+priv let rec words_for range k bound = if bound >= range { [k, bound] } else { words_for range (k + 1) (bound * word_range) };
+
+priv let accumulate : :integer -> :integer -> Gen :integer;
+priv let rec accumulate k !acc rng =
+    if k <= 0 { [acc, rng] }
+    else {
+        let [w, rng2] = next rng;
+        accumulate (k - 1) (acc * word_range + w) rng2
+    };
+
+/// A float in `[0, 1)`: one of the 2^53 multiples of 2^-53 there, each
+/// equally likely, which is every double in the interval that a uniform
+/// choice could fairly give.
+let float : Gen :float;
+let float rng = {
+    let [n, rng2] = below 9007199254740992 rng;
+    [num.to_float n / 9007199254740992.0, rng2]
+};
+
+/// A float in `[lo, hi)`.
+let float_in : :float -> :float -> Gen :float;
+let float_in lo hi rng = {
+    let [u, rng2] = float rng;
+    [lo + u * (hi - lo), rng2]
+};
+
+/// `true` or `false`, evenly.
+let bool : Gen :bool;
+let bool rng = { let [w, rng2] = next rng; [w >= word_range / 2, rng2] };
+
+/// `true` with probability `p`.
+let chance : :float -> Gen :bool;
+let chance p rng = { let [u, rng2] = float rng; [u >= 1.0 - p, rng2] };
+
+/// A normally distributed float, by Marsaglia's polar method -- the
+/// Box-Muller transform without the trigonometry, which `std.math` lacks.
+let normal : :float -> :float -> Gen :float;
+let rec normal mean deviation rng = {
+    let [u, r1] = float rng;
+    let [v, r2] = float r1;
+    let x = 2.0 * u - 1.0;
+    let y = 2.0 * v - 1.0;
+    let s = x * x + y * y;
+    if s >= 1.0 || s == 0.0 { normal mean deviation r2 }
+    else { [mean + deviation * x * math.sqrt (-2.0 * ln s / s), r2] }
+};
+
+/// An exponentially distributed float: the wait between events that happen
+/// `rate` times per unit on average.
+let exponential : :float -> Gen :float;
+let exponential rate rng = {
+    let [u, rng2] = float rng;
+    [0.0 - ln (1.0 - u) / rate, rng2]
+};
+
+/// The natural logarithm, for the distributions above. `x` is brought into
+/// `[1, 2)` by halving or doubling, and the rest is the series for
+/// `2 atanh((x - 1) / (x + 1))`, which converges quickly there.
+priv let ln : :float -> :float;
+priv let ln x0 = {
+    let rec reduce x !e = if x >= 2.0 { reduce (x / 2.0) (e + 1) } else if x < 1.0 { reduce (x * 2.0) (e - 1) } else { [x, e] };
+    let [x, e] = reduce x0 0;
+    let z = (x - 1.0) / (x + 1.0);
+    let z2 = z * z;
+    let rec series term !k !acc = if k > 41 { acc } else { series (term * z2) (k + 2) (acc + term / num.to_float k) };
+    num.to_float e * 0.6931471805599453 + 2.0 * series z 1 0.0
+};
+
+// --- choosing ------------------------------------------------------------------------------------
+
+/// One element of a non-empty list, array or string's characters, evenly.
+let pick : :any -> Gen :any;
+let pick xs rng = {
+    let items = as_array xs;
+    let [i, rng2] = int 0 (array.length items - 1) rng;
+    [items.[i], rng2]
+};
+
+/// A value chosen with probability in proportion to its weight:
+/// `weighted [[70, :common], [25, :rare], [5, :legendary]]`. Integer weights
+/// are drawn exactly; any float makes the draw a float one.
+let weighted : [[:any]] -> Gen :any;
+let weighted pairs rng = {
+    let total = list.sum (list.map (fn p -> p.[0]) pairs);
+    let [r, rng2] = if type_of total == :integer { int 0 (total - 1) rng }
+                    else { let [u, r2] = float rng; [u * total, r2] };
+    [choose_weighted pairs r, rng2]
+};
+
+priv let choose_weighted : [[:any]] -> :any -> :any;
+priv let rec choose_weighted pairs r = match pairs {
+    [[w, v]] => v,
+    [[w, v], ..rest] => if r < w { v } else { choose_weighted rest (r - w) },
+};
+
+/// The elements in a random order, every order equally likely: Fisher-Yates,
+/// over a persistent map so that each swap costs `log n` rather than a copy.
+let shuffle : :any -> Gen [:any];
+let shuffle xs rng = {
+    let items = as_array xs;
+    let n = array.length items;
+    let [m, rng2] = fisher_yates (n - 1) 0 (indexed items) rng;
+    [list.map (fn i -> m.[i]) (list.range 0 n), rng2]
+};
+
+/// `k` distinct elements, in the order they were drawn: the first `k` steps
+/// of a shuffle, so it costs `k`, not the length of the list.
+let sample_of : :integer -> :any -> Gen [:any];
+let sample_of k xs rng = {
+    let items = as_array xs;
+    let n = array.length items;
+    let take = list.minimum [k, n];
+    let [m, rng2] = fisher_yates (n - 1) (n - take) (indexed items) rng;
+    [list.map (fn i -> m.[i]) (list.reverse (list.range (n - take) n)), rng2]
+};
+
+priv let fisher_yates : :integer -> :integer -> :map -> Gen :map;
+priv let rec fisher_yates i stop !m rng =
+    if i < 1 || i < stop { [m, rng] }
+    else {
+        // Each element is forced as it moves, so the map never holds a read
+        // of the version before it (see `map.put_strict`).
+        let [j, rng2] = int 0 i rng;
+        fisher_yates (i - 1) stop (map.put_strict j (m.[i]) (map.put_strict i (m.[j]) m)) rng2
+    };
+
+priv let indexed : :array -> :map;
+priv let indexed items = map.from_pairs (list.map (fn i -> [i, items.[i]]) (list.range 0 (array.length items)));
+
+priv let as_array : :any -> :array;
+priv let as_array xs = match type_of xs {
+    :array => xs,
+    :string => array.of_list (str.chars xs),
+    _ => array.of_list xs,
+};
+
+// --- bytes and text ---------------------------------------------------------------------------------
+
+/// `n` bytes, as a string.
+let bytes : :integer -> Gen :string;
+let bytes n rng = {
+    let rec go k acc r =
+        if k <= 0 { [str.concat_all acc, r] }
+        else {
+            let take = list.minimum [k, 4];
+            let [w, r2] = below (pow256 take) r;
+            go (k - take) (str.of_int_le take w :: acc) r2
+        };
+    go n [] rng
+};
+
+priv let pow256 : :integer -> :integer;
+priv let rec pow256 n = if n <= 0 { 1 } else { 256 * pow256 (n - 1) };
+
+/// A string of `n` characters, each from `alphabet` evenly.
+let string_from : :string -> :integer -> Gen :string;
+let string_from alphabet n rng = {
+    let [cs, rng2] = list_n n (pick alphabet) rng;
+    [str.of_chars cs, rng2]
+};
+
+/// A character from `lo` to `hi`, both included.
+let char_in : :char -> :char -> Gen :char;
+let char_in lo hi rng = {
+    let [c, rng2] = int (_char_code lo) (_char_code hi) rng;
+    [_char_of_code c, rng2]
+};
+
+/// A version 4 UUID: `"3f0c2a9e-41d7-4b1e-9f6a-0c2d5e8b7a14"`.
+let uuid : Gen :string;
+let uuid rng = { let [b, rng2] = bytes 16 rng; [uuid_text b, rng2] };
+
+priv let uuid_text : :string -> :string;
+priv let uuid_text b = {
+    // Version 4 in the high nibble of byte 6, and the RFC 9562 variant (10xx)
+    // in the high bits of byte 8 -- written with arithmetic, there being no
+    // bitwise operators to write it with.
+    let fixed = str.slice 0 6 b + str.of_bytes [str.byte 6 b % 16 + 64] + str.slice 7 1 b
+                + str.of_bytes [str.byte 8 b % 64 + 128] + str.slice 9 7 b;
+    let h = crypto.hex fixed;
+    str.slice 0 8 h + "-" + str.slice 8 4 h + "-" + str.slice 12 4 h + "-" + str.slice 16 4 h + "-" + str.slice 20 12 h
+};
+
+// --- building generators ------------------------------------------------------------------------------
+
+/// Always `v`, drawing nothing.
+let constant : a -> Gen a;
+let constant v rng = [v, rng];
+
+let map : (a -> b) -> Gen a -> Gen b;
+let map f g rng = { let [v, rng2] = g rng; [f v, rng2] };
+
+let map2 : (a -> b -> c) -> Gen a -> Gen b -> Gen c;
+let map2 f ga gb rng = {
+    let [a, r1] = ga rng;
+    let [b, r2] = gb r1;
+    [f a b, r2]
+};
+
+let map3 : (a -> b -> c -> d) -> Gen a -> Gen b -> Gen c -> Gen d;
+let map3 f ga gb gc rng = {
+    let [a, r1] = ga rng;
+    let [b, r2] = gb r1;
+    let [c, r3] = gc r2;
+    [f a b c, r3]
+};
+
+/// A generator chosen by a value drawn first: `and_then (fn n -> list_n n
+/// float) (int 1 5)` is a list of between one and five floats.
+let and_then : (a -> Gen b) -> Gen a -> Gen b;
+let and_then f g rng = { let [v, rng2] = g rng; f v rng2 };
+
+/// One value from each generator, as a list: `all [int 0 9, bool]`.
+let all : [Gen :any] -> Gen [:any];
+let all gens rng = match gens {
+    [] => [[], rng],
+    [g, ..rest] => {
+        let [v, r1] = g rng;
+        let [vs, r2] = all rest r1;
+        [v :: vs, r2]
+    },
+};
+
+/// Exactly `n` values.
+let list_n : :integer -> Gen a -> Gen [a];
+let list_n n g rng = {
+    let rec go k acc r = if k <= 0 { [list.reverse acc, r] } else { let [v, r2] = g r; go (k - 1) (v :: acc) r2 };
+    go n [] rng
+};
+
+/// A list of values, of a length that is usually small and occasionally not:
+/// before each element a word decides whether there is one, ending the list
+/// with probability 1/8 (so 7 elements on average) and always by 100. That
+/// way of deciding is what lets a shrinker make the list shorter by making a
+/// single word smaller.
+let list_of : Gen a -> Gen [a];
+let list_of g rng = list_up_to 100 g rng;
+
+/// The same, at most `most` long.
+let list_up_to : :integer -> Gen a -> Gen [a];
+let list_up_to most g rng = {
+    let rec go k acc r =
+        if k >= most { [list.reverse acc, r] }
+        else {
+            let [w, r1] = next r;
+            if w < word_range / 8 { [list.reverse acc, r1] }
+            else { let [v, r2] = g r1; go (k + 1) (v :: acc) r2 }
+        };
+    go 0 [] rng
+};
+
+/// An array of values, as `list_of` makes a list.
+let array_of : Gen a -> Gen #[a];
+let array_of g rng = map array.of_list (list_of g) rng;
+
+/// A string of characters from `cg`, as `list_of` makes a list.
+let string_of : Gen :char -> Gen :string;
+let string_of cg rng = map str.of_chars (list_of cg) rng;
+
+/// Printable ASCII text.
+let ascii : Gen :string;
+let ascii rng = string_of (char_in ' ' '~') rng;
+
+/// A map from keys to values, as `list_of` makes a list. Keys that collide
+/// keep the last value, so the map can be smaller than the draws.
+let map_of : Gen k -> Gen v -> Gen :map;
+let map_of gk gv rng = map map.from_pairs (list_of (map2 (fn k v -> [k, v]) gk gv)) rng;
+
+/// The value of one generator, chosen evenly. The first is what a draw of
+/// zero picks, so put the simplest first: a shrinker prefers it.
+let one_of : [Gen a] -> Gen a;
+let one_of gens rng = { let [g, rng2] = pick gens rng; g rng2 };
+
+/// One generator, chosen in proportion to its weight:
+/// `frequency [[9, int 0 9], [1, constant 1000000]]`.
+let frequency : [[:any]] -> Gen :any;
+let frequency pairs rng = { let [g, rng2] = weighted pairs rng; g rng2 };
+
+/// `()` a quarter of the time, otherwise a value.
+let optional : Gen a -> Gen (a | :unit);
+let optional g rng = { let [w, r1] = next rng; if w < word_range / 4 { [(), r1] } else { g r1 } };
+
+/// Values that pass `keep`, drawing again until one does. A filter that
+/// rarely passes makes for a slow generator; build the value directly instead
+/// when you can.
+let such_that : (a -> :bool) -> Gen a -> Gen a;
+let rec such_that keep g rng = { let [v, rng2] = g rng; if keep v { [v, rng2] } else { such_that keep g rng2 } };
+
+/// A generator that names itself, for recursive data: `delay` puts off
+/// building it until a value is drawn, so a generator can refer to one that
+/// is defined in terms of it.
+///
+///     let tree = random.one_of [random.constant :leaf,
+///                               random.delay (fn () -> random.map2 node tree tree)];
+let delay : (:unit -> Gen a) -> Gen a;
+let delay make rng = (make ()) rng;
+
+// --- from the operating system ---------------------------------------------------------------------------
+
+/// `n` bytes from the operating system's secure generator.
+let bytes! : :integer -> :string;
+let bytes! n = crypto.random_bytes! n;
+
+/// An integer from `lo` to `hi`, both included, from the operating system's
+/// secure generator, exactly uniform.
+let int! : :integer -> :integer -> :integer;
+let int! lo hi = if hi <= lo { lo } else { lo + secure_below! (hi - lo + 1) };
+
+priv let secure_below! : :integer -> :integer;
+priv let rec secure_below! range = {
+    let [k, bound] = bytes_for range 1 256;
+    let raw = crypto.random_bytes! k;
+    let n = list.fold (fn acc i -> acc * 256 + str.byte i raw) 0 (list.range 0 k);
+    let limit = bound - bound % range;
+    if n < limit { n % range } else { secure_below! range }
+};
+
+priv let bytes_for : :integer -> :integer -> :integer -> [:integer, :integer];
+priv let rec bytes_for range k bound = if bound >= range { [k, bound] } else { bytes_for range (k + 1) (bound * 256) };
+
+/// A float in `[0, 1)` from the secure generator.
+let float! : :unit -> :float;
+let float! () = num.to_float (secure_below! 9007199254740992) / 9007199254740992.0;
+
+let bool! : :unit -> :bool;
+let bool! () = secure_below! 2 == 1;
+
+/// An element of a non-empty list, array or string, chosen securely.
+let pick! : :any -> :any;
+let pick! xs = { let items = as_array xs; items.[secure_below! (array.length items)] };
+
+/// The elements in an unpredictable order.
+let shuffle! : :any -> [:any];
+let shuffle! xs = draw! (shuffle xs);
+
+/// A version 4 UUID from the secure generator.
+let uuid! : :unit -> :string;
+let uuid! () = uuid_text (crypto.random_bytes! 16);
+
+/// A secret of `n` random bytes, written in URL-safe base64 without padding:
+/// what a session id, a CSRF token or an API key wants to look like.
+let token! : :integer -> :string;
+let token! n = {
+    let b64 = crypto.base64 (crypto.random_bytes! n);
+    let safe = str.map (fn c -> match c { '+' => '-', '/' => '_', other => other }) b64;
+    str.slice 0 (str.upto "=" 0 safe) safe
+};
+
+/// `n` random bytes written in lowercase hex.
+let hex! : :integer -> :string;
+let hex! n = crypto.hex (crypto.random_bytes! n);
+
+when test {
+    import std.test;
+
+    let rng = seed 42;
+    let die = values (int 1 6) rng;
+    let counts xs = list.fold (fn m x -> m.[x => m.[x else 0] + 1]) %{} xs;
+
+    let tests = [
+        test.case "a seed is a stream"           $( test.eq! (list.take 20 die) (list.take 20 (values (int 1 6) (seed 42))) ),
+        test.case "different seeds differ"       $( test.ne! (list.take 20 die) (list.take 20 (values (int 1 6) (seed 43))) ),
+        test.case "the reference stream"         $( {
+            // MRG32k3a from L'Ecuyer's reference seed, 12345 in every word.
+            // His C code's first output is 0.127011122046577, which is
+            // 545508589 / (m1 + 1): the raw words are that stream.
+            let start = Rng.mrg 12345 12345 12345 12345 12345 12345;
+            test.eq! [545508589, 1368065410, 1327943761] (list.take 3 (values next start))
+        } ),
+        test.case "a die lands on every face, fairly"
+            $( {
+                let c = counts (list.take 6000 die);
+                test.true! (list.all (fn face -> c.[face else 0] > 850 && c.[face else 0] < 1150) [1, 2, 3, 4, 5, 6])
+            } ),
+        test.case "int covers its ends"          $( test.eq! [0, 1] (list.sort (list.unique (list.take 50 (values (int 0 1) rng)))) ),
+        test.case "an empty range is its end"    $( test.eq! [5, 5] [sample (int 5 5) rng, sample (int 5 3) rng] ),
+        test.case "a range past a word"          $( test.true! (list.all (fn n -> n >= 0 && n < 1000000000000000000000)
+                                                                       (list.take 100 (values (int 0 999999999999999999999) rng))) ),
+        test.case "floats stay in [0, 1)"        $( test.true! (list.all (fn f -> f >= 0.0 && f < 1.0) (list.take 1000 (values float rng))) ),
+        test.case "floats average a half"        $( test.near! 0.03 0.5 (list.sum (list.take 2000 (values float rng)) / 2000.0) ),
+        test.case "normals have their moments"   $( {
+            let xs = list.take 4000 (values (normal 10.0 2.0) rng);
+            let mean = list.sum xs / 4000.0;
+            let variance = list.sum (list.map (fn x -> (x - mean) * (x - mean)) xs) / 4000.0;
+            test.near! 0.15 10.0 mean
+            test.near! 0.4 4.0 variance
+        } ),
+        test.case "exponentials have their mean" $( test.near! 0.05 0.5 (list.sum (list.take 4000 (values (exponential 2.0) rng)) / 4000.0) ),
+        test.case "the logarithm"                $( test.near! 0.000000000001 2.302585092994046 (ln 10.0) ),
+        test.case "a shuffle keeps everything"   $( test.eq! (list.range 0 50) (list.sort (sample (shuffle (list.range 0 50)) rng)) ),
+        test.case "a shuffle moves things"       $( test.ne! (list.range 0 50) (sample (shuffle (list.range 0 50)) rng) ),
+        test.case "shuffles are uniform"         $( {
+            let c = counts (list.map to_string (list.take 6000 (values (shuffle [1, 2, 3]) rng)));
+            test.eq! 6 (map.size c)
+            test.true! (list.all (fn v -> v > 850 && v < 1150) (map.values c))
+        } ),
+        test.case "a sample is distinct"         $( {
+            let s = sample (sample_of 10 (list.range 0 20)) rng;
+            test.eq! [10, 10] [list.length s, list.length (list.unique s)]
+        } ),
+        test.case "pick from a string"           $( test.true! (str.contains (sample (pick "xyz") rng) "xyz") ),
+        test.case "weights are honoured"         $( {
+            let c = counts (list.take 4000 (values (weighted [[3, :a], [1, :b]]) rng));
+            test.near! 150 3000 (c.[:a])
+        } ),
+        test.case "bytes are bytes"              $( test.eq! [7, 0] [len (sample (bytes 7) rng), len (sample (bytes 0) rng)] ),
+        test.case "a UUID's version and variant" $( {
+            let u = sample uuid rng;
+            test.eq! [36, "4", true] [len u, str.slice 14 1 u, str.contains (str.byte 19 u |> _char_of_code) "89ab"]
+        } ),
+        test.case "split streams differ"         $( {
+            let [a, b] = split rng;
+            test.ne! (sample (list_n 5 next) a) (sample (list_n 5 next) b)
+        } ),
+        test.case "a tape replays"               $( test.eq! [[7, 0, 0], 3] { let [ws, r] = list_n 3 next (of_tape [7]); [ws, tape_used r] } ),
+        test.case "zeros make the simplest value" $( test.eq! [0, [], (), :first, "", false]
+                                                        [sample (int 0 100) (of_tape []), sample (list_of float) (of_tape []),
+                                                         sample (optional bool) (of_tape []),
+                                                         sample (one_of [constant :first, constant :second]) (of_tape []),
+                                                         sample ascii (of_tape []), sample bool (of_tape [])] ),
+        test.case "combinators"                  $( test.eq! [3, 2, [true, 6]]
+                                                        [sample (map (fn x -> x + 1) (constant 2)) rng,
+                                                         list.length (sample (and_then (fn n -> list_n n bool) (constant 2)) rng),
+                                                         sample (all [constant true, map2 (fn a b -> a + b) (constant 2) (constant 4)]) rng] ),
+        test.case "such_that filters"            $( test.true! (list.all (fn n -> n % 2 == 0) (list.take 50 (values (such_that (fn n -> n % 2 == 0) (int 0 100)) rng))) ),
+        test.case "recursive generators end"     $( {
+            let rec tree r = one_of [constant :leaf, delay (fn () -> map2 (fn a b -> [a, b]) tree tree)] r;
+            test.eq! 30 (list.length (list.take 30 (values tree rng)))
+        } ),
+        test.case "lists average seven"          $( test.near! 1.0 7.0 (num.to_float (list.sum (list.map list.length (list.take 400 (values (list_of bool) rng)))) / 400.0) ),
+
+        test.case "secure ints are in range"     $( test.true! (list.all (fn n -> n >= 1 && n <= 6) (list.map (fn _ -> int! 1 6) (list.range 0 200))) ),
+        test.case "secure ints reach both ends"  $( test.eq! [0, 1] (list.sort (list.unique (list.map (fn _ -> int! 0 1) (list.range 0 64)))) ),
+        test.case "secure floats"                $( { let f = float! (); test.true! (f >= 0.0 && f < 1.0) } ),
+        test.case "tokens are URL-safe"          $( {
+            let t = token! 32;
+            test.eq! [43, false] [len t, str.any (fn c -> c == '+' || c == '/' || c == '=') t]
+        } ),
+        test.case "secure UUIDs differ"          $( test.ne! (uuid! ()) (uuid! ()) ),
+        test.case "hex"                          $( test.eq! 16 (len (hex! 8)) ),
+        test.case "draw! runs a generator"       $( test.eq! 3 (list.length (draw! (list_n 3 bool))) ),
+        test.case "new! seeds differ"            $( test.ne! (sample (list_n 4 next) (new! ())) (sample (list_n 4 next) (new! ())) ),
+    ];
+}

@@ -1,0 +1,63 @@
+// Reading text: parsers that compose, and regular expressions checked while
+// compiling.
+//
+// `std.parse` builds a parser out of small functions. A grammar is ordinary
+// Dream -- `let`, recursion through `lazy`, a table for operators -- and a
+// failure says where it happened and what would have been accepted there.
+// `std.regex` compiles a pattern to a small program run without
+// backtracking, so no pattern is slow, and a malformed pattern written in the
+// source is a compile error rather than a surprise at run time.
+import std.console;
+import std.list;
+import std.map;
+import std.parse as p;
+import std.regex;
+import std.result;
+
+// "key = value" lines, with `#` comments: a pipeline reads in the order the
+// text does. `keep` keeps what a parser read; `skip` only checks it.
+let line = p.succeed (fn k v -> [k, v])
+    |> p.keep (p.lexeme p.identifier)
+    |> p.skip (p.symbol "=")
+    |> p.keep (p.or p.quoted (p.map (fn n -> to_string n) p.number));
+let comment = p.text "#" |> p.then p.rest_of_line;
+let config = p.spaces |> p.then (p.many (p.lexeme line |> p.skip (p.many (p.lexeme comment))))
+                      |> p.map map.from_pairs;
+
+// Arithmetic: precedence and associativity are a table, loosest first.
+let calculator = p.operators (p.lexeme p.integer |> p.or (p.parens (p.lazy (fn () -> calculator))))
+    [[:left, [["+", fn a b -> a + b], ["-", fn a b -> a - b]]],
+     [:left, [["*", fn a b -> a * b], ["/", fn a b -> a / b]]],
+     [:prefix, [["-", fn a -> 0 - a]]]];
+
+// Compiled while the program is: `comp` puts the finished matcher in the image.
+let date = comp regex.compile "(?<y>\\d{4})-(?<m>\\d\\d)-(?<d>\\d\\d)";
+let words = regex.compile "\\w+";
+
+let show r = match r {
+    [:ok, v] => to_string v,
+    [:error, e] => p.describe e,
+};
+
+let main! = {
+    console.print! (show (p.run config "name = \"dream\"\nversion = 2  # the second\n"))
+    console.print! (show (p.run config "name = dream"))
+
+    console.print! (show (p.run calculator "2 * (3 + 4) - -1"))
+    console.print! (show (p.run calculator "2 * (3 + )"))
+    match p.run calculator "1 + 2 * x" {
+        [:error, e] => console.print! (p.explain e "1 + 2 * x"),
+        _ => (),
+    }
+
+    let text = "Released 2026-03-28, patched 2026-04-02.";
+    console.print! (regex.find_all_text date text)
+    console.print! (regex.find date text |> regex.named "m")
+    console.print! (regex.replace_all date "${d}/${m}/${y}" text)
+    console.print! (regex.count words "the quick brown fox")
+    console.print! (regex.split (regex.compile "\\s*[,;]\\s*") "a, b;c ,d")
+
+    // Text from outside is checked with `parse`, which answers a result.
+    console.print! (regex.parse "(unclosed" |> result.map (fn re -> ()))
+    console.print! (regex.problem "a{3,1}")
+};

@@ -1,0 +1,681 @@
+// HTTP: requests and responses, the HTTP/1.1 wire format, and a client.
+//
+//     import std.http;
+//
+//     http.get_text! "https://example.com/"                  // [:ok, "<!doctype html>.."]
+//     http.get_json! "https://api.example.com/users/1"       // [:ok, %{ "name" => "Ada", .. }]
+//
+//     let? resp = http.request "POST" "https://api.example.com/users"
+//         |> http.with_json %{ "name" => "Ada" }
+//         |> http.with_bearer token
+//         |> http.with_timeout (time.seconds 5)
+//         |> http.send!;
+//     http.status resp                                        // 201
+//     http.header "location" resp                             // "/users/7"
+//
+// and a server is `std.http.server`, which answers the same `Request` with
+// the same `Response`:
+//
+//     server.serve! 8080 (fn req -> http.text ("hello, " + http.query_value "name" req))
+//
+// **A message is a record.** `Request` and `Response` are `mapping`s, so a
+// handler is an ordinary function from one map to another, a test builds a
+// request with `http.request` and calls the handler with no socket in sight,
+// and middleware is a function from handler to handler. Headers are a list
+// of `[name, value]` pairs with the names in lower case, kept in order and
+// with repeats -- `Set-Cookie` is the header that is legitimately repeated --
+// and every function that reads one is case-insensitive, as HTTP is.
+//
+// **Bodies are strings**, which in Dream are bytes, so a body is whatever was
+// sent, text or not. `json`, `with_json` and `body_json` are the conversions
+// most programs want.
+//
+// **Every way a request can fail is a value.** `send!` and the helpers answer
+// `[:ok, response]` or `[:error, e]`, where `e` is an error value whose
+// `error.kind` says what kind of failure it was -- `:timeout`,
+// `:connection_refused`, `:certificate_untrusted`, `:bad_response`,
+// `:too_many_redirects`, `:bad_url`, `:status` (from `expect_ok`) -- so a
+// program can retry one and report another, and `let?` chains them. A 404 is
+// a response, not an error: the server answered. `get_text!` and `get_json!`
+// are the exceptions, for the common case where anything but a 2xx is a
+// failure.
+//
+// **The client speaks HTTP/1.1** over `std.net`, and `https` through
+// `std.tls` with the system's roots and the host name checked. Each request
+// is one connection (`Connection: close`), run in a process of its own so a
+// timeout covers everything -- the DNS lookup, the handshake, a server that
+// sends one byte a minute -- and a stuck exchange costs the caller only the
+// timeout. Redirects are followed (up to 10 by default) the way browsers
+// follow them, and the response says the URL it finally came from.
+
+import std.crypto;
+import std.error;
+import std.io;
+import std.json;
+import std.list;
+import std.map;
+import std.net;
+import std.num;
+import std.result;
+import std.str;
+import std.streams;
+import std.time;
+import std.tls;
+import std.http.url;
+
+// --- messages ---------------------------------------------------------------------
+
+/// A request. On the client, `url` is the absolute URL to send it to, and
+/// `options` holds how (`:timeout`, `:redirects`, `:tls`). On a server, `url`
+/// is the target as the client wrote it (`/a/b?c=d`), `path` and `query` are
+/// it taken apart, `peer` is who sent it, and `params` are what a router
+/// read out of the path. `context` is for middleware to hand things on to
+/// the handler.
+mapping Request {
+    method : :string = "GET"
+    url : :string = "/"
+    path : :string = "/"
+    query : :map = %{}
+    headers : [[:string]] = []
+    body : :string = ""
+    version : :string = "HTTP/1.1"
+    params : :map = %{}
+    peer : :string = ""
+    options : :map = %{}
+    context : :map = %{}
+}
+
+/// A response. On the client, `url` is where it came from after redirects.
+mapping Response {
+    status : :integer = 200
+    headers : [[:string]] = []
+    body : :string = ""
+    url : :string = ""
+}
+
+/// Every reason phrase RFC 9110 registers, and a few that are in common use.
+let reason : :integer -> :string;
+let reason status = match status {
+    100 => "Continue", 101 => "Switching Protocols", 103 => "Early Hints",
+    200 => "OK", 201 => "Created", 202 => "Accepted", 203 => "Non-Authoritative Information", 204 => "No Content",
+    205 => "Reset Content", 206 => "Partial Content",
+    300 => "Multiple Choices", 301 => "Moved Permanently", 302 => "Found", 303 => "See Other", 304 => "Not Modified",
+    307 => "Temporary Redirect", 308 => "Permanent Redirect",
+    400 => "Bad Request", 401 => "Unauthorized", 402 => "Payment Required", 403 => "Forbidden", 404 => "Not Found",
+    405 => "Method Not Allowed", 406 => "Not Acceptable", 407 => "Proxy Authentication Required", 408 => "Request Timeout",
+    409 => "Conflict", 410 => "Gone", 411 => "Length Required", 412 => "Precondition Failed", 413 => "Content Too Large",
+    414 => "URI Too Long", 415 => "Unsupported Media Type", 416 => "Range Not Satisfiable", 417 => "Expectation Failed",
+    418 => "I'm a teapot", 421 => "Misdirected Request", 422 => "Unprocessable Content", 425 => "Too Early",
+    426 => "Upgrade Required", 428 => "Precondition Required", 429 => "Too Many Requests",
+    431 => "Request Header Fields Too Large", 451 => "Unavailable For Legal Reasons",
+    500 => "Internal Server Error", 501 => "Not Implemented", 502 => "Bad Gateway", 503 => "Service Unavailable",
+    504 => "Gateway Timeout", 505 => "HTTP Version Not Supported",
+    _ => if status < 200 { "Informational" } else if status < 300 { "Success" } else if status < 400 { "Redirection" }
+         else if status < 500 { "Client Error" } else { "Server Error" },
+};
+
+// --- headers ------------------------------------------------------------------------
+//
+// These work on a request and a response alike: both keep their headers
+// under `:headers`.
+
+/// The first value of a header, or `()`.
+let header : :string -> :map -> (:string | :unit);
+let header name msg = {
+    let key = str.lower name;
+    match list.filter (fn [k, _] -> k == key) (msg.[:headers else []]) { [] => (), [[_, v], .._] => v }
+};
+
+/// Every value of a header, in order.
+let header_all : :string -> :map -> [:string];
+let header_all name msg = { let key = str.lower name; list.map (fn [_, v] -> v) (list.filter (fn [k, _] -> k == key) (msg.[:headers else []])) };
+
+/// The message with this header set, replacing any it had.
+let with_header : :string -> :any -> :map -> :map;
+let with_header name value msg = {
+    let key = str.lower name;
+    msg.[:headers => list.filter (fn [k, _] -> k != key) (msg.[:headers else []]) + [[key, header_value value]]]
+};
+
+/// The message with this header added after any it had.
+let add_header : :string -> :any -> :map -> :map;
+let add_header name value msg = msg.[:headers => msg.[:headers else []] + [[str.lower name, header_value value]]];
+
+/// The message without this header.
+let without_header : :string -> :map -> :map;
+let without_header name msg = { let key = str.lower name; msg.[:headers => list.filter (fn [k, _] -> k != key) (msg.[:headers else []])] };
+
+/// Several headers set at once, from pairs or a map.
+let with_headers : :any -> :map -> :map;
+let with_headers pairs msg = {
+    let ps = if type_of pairs == :map { map.pairs pairs } else { pairs };
+    list.fold (fn m [k, v] -> with_header (text_of k) v m) msg ps
+};
+
+/// A header's value as text, with any line break taken out: a value with
+/// `\r\n` in it would let whoever chose it write headers of their own.
+priv let header_value : :any -> :string;
+priv let header_value v = str.filter (fn c -> c != '\r' && c != '\n') (text_of v);
+
+priv let text_of : :any -> :string;
+priv let text_of v = match type_of v { :string => v, :atom => str.slice 1 (len (to_string v)) (to_string v), _ => to_string v };
+
+/// The media type, without its parameters and in lower case:
+/// `application/json` for `Application/JSON; charset=utf-8`.
+let content_type : :map -> (:string | :unit);
+let content_type msg = match header "content-type" msg {
+    () => (),
+    v => str.lower (str.trim (str.slice 0 (str.upto ";" 0 v) v)),
+};
+
+// --- reading messages ---------------------------------------------------------------
+
+let status : :map -> :integer;
+let status resp = Response.status resp;
+
+let body : :map -> :string;
+let body msg = msg.[:body else ""];
+
+/// Whether the status is 2xx.
+let is_success : :map -> :bool;
+let is_success resp = Response.status resp >= 200 && Response.status resp < 300;
+
+/// The body decoded as JSON.
+let body_json : :map -> result.Of :any :string;
+let body_json msg = json.decode (body msg);
+
+/// The body decoded as a form (`a=1&b=2`), the first value of each name.
+let body_form : :map -> :map;
+let body_form msg = list.fold (fn m [k, v] -> if map.has k m { m } else { m.[k => v] }) %{} (url.decode_query (body msg));
+
+/// A query parameter of a request, or `()`.
+let query_value : :string -> :map -> (:string | :unit);
+let query_value name req = (Request.query req).[name else ()];
+
+/// A path parameter a router read (`:id` in `/users/:id`), or `()`.
+let param : :string -> :map -> (:string | :unit);
+let param name req = (Request.params req).[name else ()];
+
+/// The cookies a request carries, by name.
+let cookies : :map -> :map;
+let cookies req = list.fold (fn m pair -> {
+    let eq = str.find "=" pair;
+    if eq <= 0 { m } else { m.[str.trim (str.slice 0 eq pair) => str.trim (str.slice (eq + 1) (len pair) pair)] }
+}) %{} (list.flat_map (fn v -> str.split ";" v) (header_all "cookie" req));
+
+/// The response itself when it is 2xx, otherwise `[:error, e]` of kind
+/// `:status` carrying the response: for a pipeline that treats any other
+/// answer as a failure.
+let expect_ok : :map -> result.Of :map :error;
+let expect_ok resp = if is_success resp { result.ok resp }
+                     else { result.error (error.new :status (to_string (Response.status resp) + " " + reason (Response.status resp) + " from " + Response.url resp)) };
+
+// --- building responses ---------------------------------------------------------------
+
+/// A response with a status and a body, and nothing else.
+let respond : :integer -> :string -> :map;
+let respond code text = Response.new () |> Response.set_status code |> Response.set_body text;
+
+/// Plain text, 200.
+let text : :string -> :map;
+let text body_text = respond 200 body_text |> with_header "content-type" "text/plain; charset=utf-8";
+
+/// HTML, 200.
+let html : :string -> :map;
+let html body_text = respond 200 body_text |> with_header "content-type" "text/html; charset=utf-8";
+
+/// A value as JSON, 200.
+let json : :any -> :map;
+let json value = respond 200 (json.write value) |> with_header "content-type" "application/json";
+
+/// A bare status, its reason phrase as the body.
+let status_only : :integer -> :map;
+let status_only code = respond code (if code == 204 || code == 304 { "" } else { reason code })
+                       |> with_header "content-type" "text/plain; charset=utf-8";
+
+let not_found : :map;
+let not_found = status_only 404;
+
+let no_content : :map;
+let no_content = respond 204 "";
+
+let bad_request : :string -> :map;
+let bad_request why = text why |> Response.set_status 400;
+
+/// A redirect, 302 by default: see `redirect_with` for the others.
+let redirect : :string -> :map;
+let redirect location = redirect_with 302 location;
+
+/// A redirect with a particular status: 301 and 308 are permanent, 303 says
+/// "now GET this", 307 and 308 keep the method.
+let redirect_with : :integer -> :string -> :map;
+let redirect_with code location = respond code "" |> with_header "location" location;
+
+/// The response with a different status.
+let with_status : :integer -> :map -> :map;
+let with_status code resp = Response.set_status code resp;
+
+/// A `Set-Cookie` on the response. `attributes` is a map such as
+/// `%{ "Path" => "/", "Max-Age" => 3600, "HttpOnly" => true, "SameSite" => "Lax" }`;
+/// `true` writes the bare attribute.
+let with_cookie : :string -> :string -> :map -> :map -> :map;
+let with_cookie name value attributes resp = {
+    let attrs = list.map (fn [k, v] -> if v == true { text_of k } else { text_of k + "=" + text_of v })
+                         (list.filter (fn [_, v] -> v != false && v != ())
+                                      (list.map (fn k -> [k, attributes.[k]]) (map.sorted_keys attributes)));
+    add_header "set-cookie" (str.join_str "; " ((name + "=" + value) :: attrs)) resp
+};
+
+// --- building requests ------------------------------------------------------------------
+
+/// A request to send: a method and an absolute URL.
+let request : :string -> :string -> :map;
+let request method address = Request.new () |> Request.set_method (str.upper method) |> Request.set_url address;
+
+/// The request with a body.
+let with_body : :string -> :map -> :map;
+let with_body text_body msg = msg.[:body => text_body];
+
+/// The request with a JSON body and its content type.
+let with_json : :any -> :map -> :map;
+let with_json value msg = with_header "content-type" "application/json" (with_body (json.write value) msg);
+
+/// The request with a form body (`a=1&b=2`) from pairs or a map.
+let with_form : :any -> :map -> :map;
+let with_form pairs msg = with_header "content-type" "application/x-www-form-urlencoded" (with_body (url.encode_query pairs) msg);
+
+/// The request with pairs added to its URL's query.
+let with_query : :any -> :map -> :map;
+let with_query pairs req = match url.parse (Request.url req) {
+    [:ok, u] => Request.set_url (url.to_text (url.add_query pairs u)) req,
+    _ => req,
+};
+
+/// `Authorization: Bearer token`.
+let with_bearer : :string -> :map -> :map;
+let with_bearer token req = with_header "authorization" ("Bearer " + token) req;
+
+/// `Authorization: Basic ..`, from a user and password.
+let with_basic_auth : :string -> :string -> :map -> :map;
+let with_basic_auth user password req = with_header "authorization" ("Basic " + crypto.base64 (user + ":" + password)) req;
+
+/// How long the whole exchange may take, redirects included. 30 seconds
+/// unless this says otherwise.
+let with_timeout : :integer -> :map -> :map;
+let with_timeout d req = Request.set_options ((Request.options req).[:timeout => d]) req;
+
+/// How many redirects to follow; 0 to follow none and answer the redirect.
+let with_redirects : :integer -> :map -> :map;
+let with_redirects n req = Request.set_options ((Request.options req).[:redirects => n]) req;
+
+/// Options for `std.tls` when the URL is `https`, laid over the defaults:
+/// `%{ :ca => pem }` to trust a private root, `%{ :verify => false }` for a
+/// test server you have no other way to trust.
+let with_tls : :map -> :map -> :map;
+let with_tls options req = Request.set_options ((Request.options req).[:tls => options]) req;
+
+// --- the wire: reading -------------------------------------------------------------------
+//
+// A `Reader` is a socket and the bytes read from it that have not been used
+// yet. Reading answers the value and the reader after it, so the bytes of the
+// next message on a kept-alive connection -- or the body after a head -- are
+// never lost between calls. A malformed message raises an error of kind
+// `:bad_message`, one that is too big `:too_large`; the client and the server
+// each catch those at the edge and answer in their own terms.
+
+struct Reader {
+    !socket : :any
+    !buffer : :string
+    !at : :integer
+}
+
+let reader : :any -> Reader;
+let reader socket = Reader.make socket "" 0;
+
+/// More bytes from the socket: `[reader, got_any]`.
+priv let fill! : Reader -> [Reader, :bool];
+priv let fill! r = {
+    let chunk = io.read! (Reader.socket r) 65536;
+    let buf = Reader.buffer r;
+    let at = Reader.at r;
+    if len chunk == 0 { [r, false] }
+    else { [Reader.make (Reader.socket r) (str.slice at (len buf - at) buf + chunk) 0, true] }
+};
+
+/// A line, without its `\r\n` (a bare `\n` is accepted too), or `()` at the
+/// end of the stream. Longer than `limit` raises `:too_large`.
+let read_line! : Reader -> :integer -> [:any, Reader];
+let read_line! r limit = {
+    let buf = Reader.buffer r;
+    let at = Reader.at r;
+    let nl = str.find_from at "\n" buf;
+    if nl >= 0 {
+        let stop = if nl > at && str.byte (nl - 1) buf == 13 { nl - 1 } else { nl };
+        if stop - at > limit { raise! (error.new :too_large "a line longer than the limit") }
+        [str.slice at (stop - at) buf, Reader.make (Reader.socket r) buf (nl + 1)]
+    } else if len buf - at > limit {
+        raise! (error.new :too_large "a line longer than the limit")
+    } else {
+        match fill! r {
+            [r2, true] => read_line! r2 limit,
+            [r2, false] => if len buf == at { [(), r2] } else { raise! (error.new :bad_message "the stream ended inside a line") },
+        }
+    }
+};
+
+/// Exactly `n` bytes; fewer raises `:bad_message`, as a body cut short is.
+let read_exact! : Reader -> :integer -> [:string, Reader];
+let read_exact! r n = {
+    let buf = Reader.buffer r;
+    let at = Reader.at r;
+    if len buf - at >= n { [str.slice at n buf, Reader.make (Reader.socket r) buf (at + n)] }
+    else {
+        match fill! r {
+            [r2, true] => read_exact! r2 n,
+            [_, false] => raise! (error.new :bad_message ("the stream ended " + to_string (n - (len buf - at)) + " bytes short of the body")),
+        }
+    }
+};
+
+/// Everything until the other side closes, up to `limit`.
+let read_to_end! : Reader -> :integer -> [:string, Reader];
+let read_to_end! r limit = match fill! r {
+    [r2, true] => if len (Reader.buffer r2) > limit { raise! (error.new :too_large "a body larger than the limit") }
+                  else { read_to_end! r2 limit },
+    [r2, false] => { let buf = Reader.buffer r2; let at = Reader.at r2; [str.slice at (len buf - at) buf, Reader.make (Reader.socket r2) buf (len buf)] },
+};
+
+/// The start line and the headers up to the blank line: `[start, headers,
+/// reader]`, or `()` when the stream ended before anything arrived -- a
+/// kept-alive connection closing between messages, which is not an error.
+let read_head! : Reader -> :integer -> :any;
+let read_head! r limit = match read_line! r 8192 {
+    [(), _] => (),
+    // A blank line before the start line is allowed and skipped (RFC 9112 2.2).
+    ["", r2] => read_head! r2 limit,
+    [start, r2] => {
+        let rec headers! rr acc !size = match read_line! rr 8192 {
+            [(), _] => raise! (error.new :bad_message "the stream ended inside the headers"),
+            ["", r3] => [list.reverse acc, r3],
+            [line, r3] => {
+                if size + len line > limit { raise! (error.new :too_large "headers larger than the limit") }
+                let colon = str.find ":" line;
+                if colon <= 0 { raise! (error.new :bad_message ("not a header: " + line)) }
+                let name = str.lower (str.slice 0 colon line);
+                if str.upto " \t" 0 name < len name { raise! (error.new :bad_message ("space in a header name: " + line)) }
+                headers! r3 ([name, str.trim (str.slice (colon + 1) (len line) line)] :: acc) (size + len line)
+            },
+        };
+        let [hs, r4] = headers! r2 [] 0;
+        [start, hs, r4]
+    },
+};
+
+/// A body as the headers describe it: chunked, a length, or (for a response
+/// that has neither) everything until the connection closes.
+let read_body! : Reader -> [[:string]] -> :bool -> :integer -> [:string, Reader];
+let read_body! r headers until_close limit = {
+    let msg = %{ :headers => headers };
+    let encoding = match header "transfer-encoding" msg { () => "", v => str.lower v };
+    if str.contains_str "chunked" encoding { read_chunked! r limit [] 0 }
+    else {
+        match header "content-length" msg {
+            () => if until_close { read_to_end! r limit } else { ["", r] },
+            v => match num.parse_int (str.trim v) {
+                n if n != () && n >= 0 => if n > limit { raise! (error.new :too_large "a body larger than the limit") } else { read_exact! r n },
+                _ => raise! (error.new :bad_message ("not a length: " + v)),
+            },
+        }
+    }
+};
+
+priv let read_chunked! : Reader -> :integer -> [:string] -> :integer -> [:string, Reader];
+priv let rec read_chunked! r limit acc !total = match read_line! r 8192 {
+    [(), _] => raise! (error.new :bad_message "the stream ended inside a chunked body"),
+    [line, r2] => {
+        let size_text = str.trim (str.slice 0 (str.upto ";" 0 line) line);
+        let size = hex_number size_text;
+        if size < 0 { raise! (error.new :bad_message ("not a chunk size: " + line)) }
+        if size == 0 {
+            // Trailers, which nothing here uses, up to the blank line.
+            let rec trailers! rr = match read_line! rr 8192 { ["", r3] => r3, [(), r3] => r3, [_, r3] => trailers! r3 };
+            [str.concat_all (list.reverse acc), trailers! r2]
+        } else {
+            if total + size > limit { raise! (error.new :too_large "a body larger than the limit") }
+            let [data, r3] = read_exact! r2 size;
+            let [_, r4] = read_line! r3 8192;
+            read_chunked! r4 limit (data :: acc) (total + size)
+        }
+    },
+};
+
+priv let hex_number : :string -> :integer;
+priv let hex_number t =
+    if t == "" || str.span "0123456789abcdefABCDEF" 0 t != len t || len t > 15 { 0 - 1 }
+    else { list.fold (fn acc c -> acc * 16 + hex_digit c) 0 (str.chars t) };
+
+priv let hex_digit : :char -> :integer;
+priv let hex_digit c = { let k = _char_code c; if k <= 57 { k - 48 } else if k <= 70 { k - 55 } else { k - 87 } };
+
+// --- the wire: writing -----------------------------------------------------------------------
+
+/// A request as bytes: the request line with `target`, a `Host` header, the
+/// request's own headers, a `Content-Length` when there is a body to send.
+let encode_request : :map -> :string -> :string -> :string;
+let encode_request req target host = {
+    let body_text = body req;
+    let method = Request.method req;
+    let needs_length = len body_text > 0 || method == "POST" || method == "PUT" || method == "PATCH";
+    let base = req |> with_header "host" host
+                   |> (fn r -> if needs_length { with_header "content-length" (len body_text) r } else { r });
+    str.concat_all ([method, " ", target, " HTTP/1.1\r\n"]
+                    + list.flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Request.headers base)
+                    + ["\r\n", body_text])
+};
+
+/// A response as bytes. A `Content-Length` is always written, except where
+/// HTTP forbids a body; `head` leaves the body off while keeping its length.
+let encode_response : :map -> :bool -> :string;
+let encode_response resp head = {
+    let code = Response.status resp;
+    let bodiless = code < 200 || code == 204 || code == 304;
+    let with_len = if bodiless { without_header "content-length" resp } else { with_header "content-length" (len (body resp)) resp };
+    str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
+                    + list.flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers with_len)
+                    + ["\r\n", if head || bodiless { "" } else { body resp }])
+};
+
+/// `content-type` as `Content-Type`: how a header name is usually written,
+/// for peers that are fussier than the RFC lets them be.
+let canonical : :string -> :string;
+let canonical name = str.join_str "-" (list.map (fn part -> match str.chars part {
+    [] => "",
+    [c, ..rest] => str.of_chars (str.upper_char c :: rest),
+}) (str.split "-" name));
+
+// --- the client --------------------------------------------------------------------------------
+
+/// The default for `with_timeout`.
+let default_timeout : :integer;
+let default_timeout = 30000000000;
+
+/// The largest response body the client reads, 256 MiB.
+let max_response : :integer;
+let max_response = 268435456;
+
+/// Send a request and read the response: `[:ok, response]` or `[:error, e]`.
+let send! : :map -> result.Of :map :error;
+let send! req = {
+    let opts = Request.options req;
+    let timeout = opts.[:timeout else default_timeout];
+    match time.within! timeout (follow! req (opts.[:redirects else 10])) {
+        [:ok, resp] => result.ok resp,
+        [:error, e] => result.error (if error.is_error e { e } else { error.new :error e }),
+        :timeout => result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
+    }
+};
+
+let get! : :string -> result.Of :map :error;
+let get! address = send! (request "GET" address);
+
+let head! : :string -> result.Of :map :error;
+let head! address = send! (request "HEAD" address);
+
+let delete! : :string -> result.Of :map :error;
+let delete! address = send! (request "DELETE" address);
+
+/// POST a body as it is; set a content type with `request` and `with_header`
+/// when it matters.
+let post! : :string -> :string -> result.Of :map :error;
+let post! address text_body = send! (request "POST" address |> with_body text_body);
+
+let post_json! : :string -> :any -> result.Of :map :error;
+let post_json! address value = send! (request "POST" address |> with_json value);
+
+let post_form! : :string -> :any -> result.Of :map :error;
+let post_form! address pairs = send! (request "POST" address |> with_form pairs);
+
+let put_json! : :string -> :any -> result.Of :map :error;
+let put_json! address value = send! (request "PUT" address |> with_json value);
+
+/// The body of a 2xx response, or an error -- including for any other status.
+let get_text! : :string -> result.Of :string :error;
+let get_text! address = {
+    let? resp = get! address;
+    let? good = expect_ok resp;
+    result.ok (body good)
+};
+
+/// The body of a 2xx response decoded as JSON, or an error.
+let get_json! : :string -> result.Of :any :error;
+let get_json! address = {
+    let? text_body = get_text! address;
+    result.map_error (fn why -> error.new :bad_json why) (json.decode text_body)
+};
+
+/// Save the body of a 2xx response to a file: `[:ok, bytes written]`.
+let download! : :string -> :string -> result.Of :integer :error;
+let download! address path = {
+    let? text_body = get_text! address;
+    try! { _file_write! path text_body; result.ok (len text_body) } catch e { result.error e }
+};
+
+priv let _file_write! : :string -> :string -> :unit;
+priv let _file_write! path content = {
+    let h = io.open! path :write;
+    streams.write_all! h content
+    io.close! h
+};
+
+/// One exchange, then the redirects, as browsers follow them: 303, and 301
+/// or 302 after anything but GET or HEAD, become a GET without a body;
+/// 307 and 308 repeat the request as it was. Credentials are not carried to
+/// another host.
+priv let follow! : :map -> :integer -> :map;
+priv let rec follow! req left = {
+    let resp = exchange! req;
+    let code = Response.status resp;
+    let location = header "location" resp;
+    if location == () || not (list.contains code [301, 302, 303, 307, 308]) { resp }
+    else if left <= 0 { raise! (error.new :too_many_redirects ("still redirected after the last allowed, to " + location)) }
+    else {
+        let here = url.parse_or_raise (Request.url req);
+        let there = url.resolve here location;
+        let to_get = code == 303 || ((code == 301 || code == 302) && Request.method req != "GET" && Request.method req != "HEAD");
+        let moved = req |> Request.set_url (url.to_text (there |> url.Url.set_fragment ""))
+                        |> (fn r -> if to_get { r |> Request.set_method "GET" |> with_body "" |> without_header "content-type" |> without_header "content-length" } else { r })
+                        |> (fn r -> if url.Url.host there != url.Url.host here { without_header "authorization" (without_header "cookie" r) } else { r });
+        follow! moved (left - 1)
+    }
+};
+
+/// Connect, send, read, close.
+priv let exchange! : :map -> :map;
+priv let exchange! req = {
+    let u = match url.parse (Request.url req) {
+        [:ok, parsed] => parsed,
+        [:error, why] => raise! (error.new :bad_url why),
+    };
+    let scheme = url.Url.scheme u;
+    if scheme != "http" && scheme != "https" { raise! (error.new :bad_url ("not an http or https URL: " + Request.url req)) }
+    if url.Url.host u == "" { raise! (error.new :bad_url ("no host in " + Request.url req)) }
+    let sock = net.connect! (url.bare_host u) (url.port_of u);
+    let outcome = try! {
+        if scheme == "https" {
+            let opts = map.merge %{ :host => url.bare_host u, :alpn => ["http/1.1"] } ((Request.options req).[:tls else %{}]);
+            tls.connect! sock opts
+        }
+        let defaults = [["user-agent", "dream-http/1.0"], ["accept", "*/*"], ["connection", "close"]];
+        let prepared = list.fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req defaults;
+        streams.write_all! sock (encode_request prepared (url.target u) (url.host_header u))
+        let resp = read_response! (reader sock) (Request.method req == "HEAD");
+        strict! resp
+        [:ok, Response.set_url (Request.url req) resp]
+    } catch e { [:error, e] };
+    try! { io.close! sock } catch ignored { () }
+    match outcome { [:ok, resp] => resp, [:error, e] => raise! e }
+};
+
+/// A response from the reader, skipping any 1xx before it.
+let read_response! : Reader -> :bool -> :map;
+let read_response! r head = match read_head! r 65536 {
+    () => raise! (error.new :bad_response "the server closed the connection without answering"),
+    [start, headers, r2] => {
+        let parts = str.split " " start;
+        let parsed = match parts { [_, c, .._] => num.parse_int c, _ => () };
+        match (if str.starts_with "HTTP/" start { parsed } else { () }) {
+            () => raise! (error.new :bad_response ("not a status line: " + start)),
+            code if code >= 100 && code < 200 => read_response! r2 head,
+            code => {
+                let bodiless = head || code == 204 || code == 304;
+                let [body_text, _] = if bodiless { ["", r2] } else { read_body! r2 headers true max_response };
+                Response.new () |> Response.set_status code |> Response.set_headers headers |> Response.set_body body_text
+            },
+        }
+    },
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "headers are case-insensitive" $( test.eq! ["a", ["a", "b"], ()]
+            { let m = Response.new () |> with_header "X-Thing" "a" |> add_header "x-thing" "b";
+              [header "x-THING" m, header_all "X-Thing" m, header "nope" m] } ),
+        test.case "with_header replaces" $( test.eq! [["x", "2"]] (Response.headers (Response.new () |> with_header "X" 1 |> with_header "x" 2)) ),
+        test.case "line breaks are taken out of values" $( test.eq! "aSet-Cookie: x" (header "x" (with_header "x" "a\r\nSet-Cookie: x" (Response.new ()))) ),
+        test.case "content type without parameters" $( test.eq! "application/json"
+            (content_type (with_header "Content-Type" "Application/JSON; charset=utf-8" (Response.new ()))) ),
+        test.case "a JSON response" $( test.eq! [200, "{\"a\":1}", "application/json"]
+            { let r = json %{ "a" => 1 }; [status r, body r, header "content-type" r] } ),
+        test.case "a redirect" $( test.eq! [303, "/x"] { let r = redirect_with 303 "/x"; [status r, header "location" r] } ),
+        test.case "a cookie" $( test.eq! "sid=abc; HttpOnly; Path=/"
+            (header "set-cookie" (with_cookie "sid" "abc" %{ "Path" => "/", "HttpOnly" => true, "Secure" => false } (text ""))) ),
+        test.case "reading cookies" $( test.eq! %{ "a" => "1", "b" => "two" }
+            (cookies (with_header "cookie" "a=1; b=two" (Request.new ()))) ),
+        test.case "a request with JSON and a query" $( test.eq! ["POST", "http://x/p?a=1&b=two+words", "{\"k\":true}"]
+            { let r = request "post" "http://x/p?a=1" |> with_query [["b", "two words"]] |> with_json %{ "k" => true };
+              [Request.method r, Request.url r, body r] } ),
+        test.case "basic auth" $( test.eq! "Basic YWRhOnB3" (header "authorization" (with_basic_auth "ada" "pw" (request "GET" "http://x"))) ),
+        test.case "a form body" $( test.eq! %{ "a" => "1", "b" => "x y" } (body_form (with_form [["a", 1], ["b", "x y"]] (request "POST" "http://x"))) ),
+        test.case "encode a request" $( test.eq! "POST /p HTTP/1.1\r\nContent-Type: text/plain\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi"
+            (encode_request (request "POST" "http://x/p" |> with_header "content-type" "text/plain" |> with_body "hi") "/p" "x") ),
+        test.case "encode a response" $( test.eq! "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+            (encode_response (respond 404 "") false) ),
+        test.case "a HEAD response keeps its length but not its body" $( test.eq! "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"
+            (encode_response (respond 200 "hi") true) ),
+        test.case "no length where there can be no body" $( test.eq! "HTTP/1.1 204 No Content\r\n\r\n" (encode_response no_content false) ),
+        test.case "canonical names" $( test.eq! ["Content-Type", "X-Request-Id", "Etag"] [canonical "content-type", canonical "x-request-id", canonical "etag"] ),
+        test.case "expect_ok" $( test.eq! [true, :status] [result.is_ok (expect_ok (text "")),
+                                                        error.kind (result.reason () (expect_ok (status_only 500)))] ),
+        test.case "reasons" $( test.eq! ["Not Found", "I'm a teapot", "Client Error"] [reason 404, reason 418, reason 499] ),
+        test.case "a bad URL is an error" $( test.eq! :bad_url (error.kind (result.reason () (get! "not a url"))) ),
+        test.case "a refused connection is an error" $( {
+            // A port that was just free: listen, note it, close.
+            let l = net.listen! 0;
+            let port = net.port! l;
+            io.close! l
+            test.eq! :connection_refused (error.kind (result.reason () (get! ("http://127.0.0.1:" + to_string port + "/"))))
+        } ),
+    ];
+}

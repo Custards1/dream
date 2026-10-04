@@ -1,0 +1,138 @@
+// The proleptic Gregorian calendar, as arithmetic on day numbers.
+//
+// Everything `std.time` says about dates comes down to two conversions: a day
+// number (days since 1970-01-01) to a year, month and day, and back. They are
+// Howard Hinnant's `days_from_civil` and `civil_from_days`, which work in
+// 400-year eras -- the Gregorian cycle repeats exactly every 146097 days -- so
+// both are a handful of integer operations for any date, BC included, with no
+// table and no loop.
+//
+// This module is its own so that `std.time.zone` can use it: a POSIX rule
+// ("the second Sunday in March") is a date computed per year, and the zone
+// reader cannot import `std.time`, which imports it.
+//
+// **Dream's `/` and `%` truncate toward zero**, and calendar arithmetic wants
+// them to round toward negative infinity: the day before the epoch is day -1,
+// which is in the era before, not the one after. `floor_div` and `floor_mod`
+// are that, and nothing here divides any other way.
+
+/// `a / b` rounded toward negative infinity, for `b > 0`.
+let floor_div : :integer -> :integer -> :integer;
+let floor_div a b = if a >= 0 { a / b } else { 0 - ((b - 1 - a) / b) };
+
+/// The remainder that goes with `floor_div`: always in `0 .. b - 1`.
+let floor_mod : :integer -> :integer -> :integer;
+let floor_mod a b = a - b * floor_div a b;
+
+let is_leap_year : :integer -> :bool;
+let is_leap_year y = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+
+let days_in_year : :integer -> :integer;
+let days_in_year y = if is_leap_year y { 366 } else { 365 };
+
+let days_in_month : :integer -> :integer -> :integer;
+let days_in_month y m = match m {
+    2 => if is_leap_year y { 29 } else { 28 },
+    4 => 30, 6 => 30, 9 => 30, 11 => 30,
+    _ => 31,
+};
+
+/// Days since 1970-01-01 of a year, month (1-12) and day (1-31).
+///
+/// The year is shifted to begin in March, so that February -- the month whose
+/// length varies -- is the last of it, and the day of the year is then a
+/// fixed formula in the month: `(153 * m + 2) / 5` is the number of days
+/// before month `m` of a March-based year.
+let days_from_civil : :integer -> :integer -> :integer -> :integer;
+let days_from_civil y m d = {
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = floor_div y2 400;
+    let yoe = y2 - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+};
+
+/// `[year, month, day]` of a day number, the inverse of `days_from_civil`.
+let civil_from_days : :integer -> [:integer, :integer, :integer];
+let civil_from_days z0 = {
+    let z = z0 + 719468;
+    let era = floor_div z 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 });
+    [y, m, d]
+};
+
+/// The day of the week of a day number: 1 for Monday through 7 for Sunday, as
+/// ISO 8601 counts them. Day 0 was a Thursday.
+let weekday_of_days : :integer -> :integer;
+let weekday_of_days z = floor_mod (z + 3) 7 + 1;
+
+/// The day of the year, 1 for January 1st.
+let day_of_year : :integer -> :integer -> :integer -> :integer;
+let day_of_year y m d = days_from_civil y m d - days_from_civil y 1 1 + 1;
+
+/// The day number of the `n`th `weekday` (1 Monday .. 7 Sunday) of a month,
+/// where `n` of 5 means the last one -- the "M" form of a POSIX zone rule,
+/// which is how every daylight-saving rule in use is written.
+let nth_weekday : :integer -> :integer -> :integer -> :integer -> :integer;
+let nth_weekday y m n weekday = {
+    let first = days_from_civil y m 1;
+    let shift = floor_mod (weekday - weekday_of_days first) 7;
+    let day = first + shift + 7 * (n - 1);
+    let last = first + days_in_month y m - 1;
+    if day > last { day - 7 } else { day }
+};
+
+/// The ISO 8601 week of a date: `[week_year, week]`. Week 1 is the week with
+/// the year's first Thursday in it, so the first days of January can belong
+/// to the last week of the year before, and the last of December to week 1.
+let iso_week : :integer -> :integer -> :integer -> [:integer, :integer];
+let iso_week y m d = {
+    let days = days_from_civil y m d;
+    // The Thursday of this date's week decides which year the week is in.
+    let thursday = days - weekday_of_days days + 4;
+    let [ty, _, _] = civil_from_days thursday;
+    let week = (thursday - days_from_civil ty 1 1) / 7 + 1;
+    [ty, week]
+};
+
+when test {
+    import std.test;
+    import std.list;
+
+    let tests = [
+        test.case "the epoch is day 0"       $( test.eq! 0 (days_from_civil 1970 1 1) ),
+        test.case "and back"                 $( test.eq! [1970, 1, 1] (civil_from_days 0) ),
+        test.case "the day before the epoch" $( test.eq! [1969, 12, 31] (civil_from_days (0 - 1)) ),
+        test.case "a leap day"               $( test.eq! [2000, 2, 29] (civil_from_days (days_from_civil 2000 2 29)) ),
+        test.case "far in the past"          $( test.eq! [(0 - 4713), 11, 24] (civil_from_days (days_from_civil (0 - 4713) 11 24)) ),
+        test.case "a known day number"       $( test.eq! 20365 (days_from_civil 2025 10 4) ),
+        test.case "every day of 400 years round-trips"
+            $( test.true! (list.all (fn z -> { let [y, m, d] = civil_from_days z; days_from_civil y m d == z })
+                                    (list.range (0 - 73000) 73000 |> list.filter (fn z -> z % 37 == 0))) ),
+        test.case "floor division"           $( test.eq! [(0 - 1), 6, 2, 1] [floor_div (0 - 1) 7, floor_mod (0 - 1) 7,
+                                                                         floor_div 14 7, floor_mod 8 7] ),
+        test.case "leap years"               $( test.eq! [true, false, true, false]
+                                                    [is_leap_year 2024, is_leap_year 1900, is_leap_year 2000, is_leap_year 2023] ),
+        test.case "month lengths"            $( test.eq! [29, 28, 30, 31] [days_in_month 2024 2, days_in_month 2023 2,
+                                                                         days_in_month 2023 4, days_in_month 2023 12] ),
+        test.case "the epoch was a Thursday" $( test.eq! 4 (weekday_of_days 0) ),
+        test.case "2025-10-04 is a Saturday" $( test.eq! 6 (weekday_of_days (days_from_civil 2025 10 4)) ),
+        test.case "day of year"              $( test.eq! [1, 60, 366] [day_of_year 2024 1 1, day_of_year 2024 2 29,
+                                                                     day_of_year 2024 12 31] ),
+        test.case "second Sunday in March 2025"
+            $( test.eq! [2025, 3, 9] (civil_from_days (nth_weekday 2025 3 2 7)) ),
+        test.case "last Sunday in October 2025"
+            $( test.eq! [2025, 10, 26] (civil_from_days (nth_weekday 2025 10 5 7)) ),
+        test.case "ISO weeks at the edges of a year"
+            $( test.eq! [[2020, 53], [2021, 1], [2025, 1], [2025, 40]]
+                        [iso_week 2021 1 1, iso_week 2021 1 4, iso_week 2024 12 30, iso_week 2025 10 4] ),
+    ];
+}

@@ -1,0 +1,457 @@
+// Time zones: what the offset from UTC was, or will be, at a given instant.
+//
+// A zone is not an offset. "America/Denver" is UTC-7 in January and UTC-6 in
+// July, and was something else again before 1967; the only faithful account
+// of it is the one the operating system keeps, the IANA database compiled
+// into TZif files under `/usr/share/zoneinfo`. This module reads those files
+// (RFC 8536) and answers the offset at an instant from them, so a program
+// gets the same answer `date` does and nothing about a zone is written here.
+//
+// **A TZif file does not list every transition.** Modern ones are "slim":
+// the table stops at the last change to the rules, and a POSIX TZ string in
+// the file's footer -- `MST7MDT,M3.2.0,M11.1.0` -- says what happens every
+// year after it. So the footer is parsed too, into a `Rule`, and the offset of
+// any instant past the table is computed from the rule for that year. The
+// same parser reads `$TZ` when it holds a rule rather than a name.
+//
+// Everything here works in **whole seconds** since the epoch, because that is
+// the resolution of the database. `std.time` hands in an instant's seconds
+// and keeps its fraction to itself.
+//
+// Offsets are seconds **east** of UTC throughout, so Denver in winter is
+// -25200. POSIX writes them the other way round (`MST7` is seven hours
+// *behind*), and the sign is flipped once, where the rule is read.
+
+import std.array;
+import std.file;
+import std.io;
+import std.list;
+import std.num;
+import std.os;
+import std.result;
+import std.str;
+import std.time.calendar;
+
+// --- the shape of a zone ------------------------------------------------------
+
+/// One period of a zone's history: its offset, whether it is daylight-saving
+/// time, and the abbreviation people write (`MDT`).
+struct Period {
+    !offset : :integer
+    !dst : :bool
+    !abbrev : :string
+}
+
+/// A recurring yearly rule, from a TZ string. `start` and `end` are each a
+/// `[day, seconds]`: a day rule (`[:m, month, week, weekday]`, `[:j, n]` or
+/// `[:n, n]`) and the local time of day the change happens at.
+struct Rule {
+    !standard : :array
+    !daylight : :any
+    !start : :any
+    !end : :any
+}
+
+/// A zone: its name, the transitions its file lists (each `#[at, Period]`,
+/// sorted by `at`), the period before the first of them, and the rule for
+/// after the last, when it has one.
+struct Zone {
+    !name : :string
+    !transitions : :array
+    !initial : :array
+    !rule : :any
+}
+
+let utc : Zone;
+let utc = Zone.make "UTC" #[] (Period.make 0 false "UTC") ();
+
+/// A zone that is always `offset` seconds east of UTC, written `abbrev`.
+let fixed : :integer -> :string -> Zone;
+let fixed offset abbrev = Zone.make abbrev #[] (Period.make offset false abbrev) ();
+
+// --- the offset at an instant -------------------------------------------------
+
+/// The period in force at `t` seconds since the epoch.
+let period_at : Zone -> :integer -> Period;
+let period_at zone t = {
+    let ts = Zone.transitions zone;
+    let n = array.length ts;
+    let rule = Zone.rule zone;
+    if n == 0 {
+        if rule == () { Zone.initial zone } else { rule_period rule t }
+    } else if t < ts.[0].[0] {
+        Zone.initial zone
+    } else if t >= ts.[n - 1].[0] && rule != () {
+        rule_period rule t
+    } else {
+        ts.[last_at_or_before ts t 0 (n - 1)].[1]
+    }
+};
+
+/// The offset east of UTC at `t`, in seconds.
+let offset_at : Zone -> :integer -> :integer;
+let offset_at zone t = Period.offset (period_at zone t);
+
+/// The instant, in seconds since the epoch, at which a zone's clocks read
+/// `local` (seconds since the epoch *as if the clocks were UTC*).
+///
+/// Twice a year that question has no single answer. When clocks go back an
+/// hour, a local time happens twice, and this answers the **earlier** of the
+/// two, as most libraries do. When they go forward, an hour of local times
+/// never happens at all, and this answers the instant the gap's local time
+/// would have been under the offset before it -- 02:30 on the morning clocks
+/// skip from 02:00 to 03:00 is read as 03:30, which is where a person who set
+/// an alarm for it would want it to ring.
+let local_to_utc : Zone -> :integer -> :integer;
+let local_to_utc zone local = {
+    let guess = offset_at zone local;
+    let t1 = local - guess;
+    let o1 = offset_at zone t1;
+    if o1 == guess {
+        // Consistent; but an hour earlier may also read the same, when this
+        // local time is one that happens twice. Prefer that one.
+        let earlier = offset_at zone (t1 - 3600);
+        if earlier != o1 && local - earlier < t1 && offset_at zone (local - earlier) == earlier {
+            local - earlier
+        } else { t1 }
+    } else {
+        let t2 = local - o1;
+        if offset_at zone t2 == o1 { t2 } else { local - guess }
+    }
+};
+
+/// The index of the last transition at or before `t`, found by halving.
+priv let last_at_or_before : :array -> :integer -> :integer -> :integer -> :integer;
+priv let rec last_at_or_before ts t !lo !hi =
+    if lo >= hi { lo }
+    else {
+        let mid = (lo + hi + 1) / 2;
+        if ts.[mid].[0] <= t { last_at_or_before ts t mid hi }
+        else { last_at_or_before ts t lo (mid - 1) }
+    };
+
+// --- yearly rules -----------------------------------------------------------------
+
+/// The period a rule puts `t` in.
+let rule_period : Rule -> :integer -> Period;
+let rule_period rule t = match Rule.daylight rule {
+    () => Rule.standard rule,
+    daylight => {
+        let std_period = Rule.standard rule;
+        let [y, _, _] = calendar.civil_from_days (calendar.floor_div t 86400);
+        // The changes are written in local time: the start in standard time,
+        // the end in daylight time, since those are what the clocks read at
+        // the moment each happens.
+        let start = rule_day y (Rule.start rule) - Period.offset std_period;
+        let end = rule_day y (Rule.end rule) - Period.offset daylight;
+        let in_dst = if start < end { t >= start && t < end }
+                     else { t >= start || t < end };   // the southern hemisphere
+        if in_dst { daylight } else { std_period }
+    },
+};
+
+/// The local seconds since the epoch at which a rule's change falls in `y`.
+priv let rule_day : :integer -> :any -> :integer;
+priv let rule_day y [day, seconds] = {
+    let days = match day {
+        [:m, month, week, weekday] =>
+            calendar.nth_weekday y month week (if weekday == 0 { 7 } else { weekday }),
+        // Jn: 1-365, February 29th never counted, so March 1st is always 60.
+        [:j, n] => calendar.days_from_civil y 1 1 + n - 1
+                   + (if calendar.is_leap_year y && n >= 60 { 1 } else { 0 }),
+        // n: 0-365, counting February 29th when there is one.
+        [:n, n] => calendar.days_from_civil y 1 1 + n,
+    };
+    days * 86400 + seconds
+};
+
+// --- POSIX TZ strings ---------------------------------------------------------------
+//
+// `std offset [dst [offset] [,start[/time],end[/time]]]`, e.g.
+// `CET-1CEST,M3.5.0,M10.5.0/3` or `<+0330>-3:30`. Each piece is read by a
+// function from a byte offset to `[value, next]`, or `()` when it is not there.
+
+/// The rule a TZ string writes, or `[:error, why]`.
+let parse_rule : :string -> result.Of Rule :string;
+let parse_rule s = {
+    let fail = result.error ("not a POSIX TZ rule: " + s);
+    match tz_name s 0 {
+        () => fail,
+        [std_name, i] => match tz_offset s i {
+            () => fail,
+            [std_west, i2] => {
+                let standard = Period.make (0 - std_west) false std_name;
+                if i2 >= len s { result.ok (Rule.make standard () () ()) }
+                else {
+                    match tz_name s i2 {
+                        () => fail,
+                        [dst_name, i3] => {
+                            let [dst_west, i4] = match tz_offset s i3 {
+                                () => [std_west - 3600, i3],
+                                found => found,
+                            };
+                            let daylight = Period.make (0 - dst_west) true dst_name;
+                            // A zone with daylight time and no rule gets the
+                            // United States' rule, which is what POSIX says.
+                            let rules = if i4 >= len s { "M3.2.0,M11.1.0" }
+                                        else if str.byte i4 s == 44 { str.slice (i4 + 1) (len s) s }
+                                        else { "" };
+                            match str.split "," rules {
+                                [a, b] => match [tz_change a, tz_change b] {
+                                    [[:ok, start], [:ok, end]] => result.ok (Rule.make standard daylight start end),
+                                    _ => fail,
+                                },
+                                _ => fail,
+                            }
+                        },
+                    }
+                }
+            },
+        },
+    }
+};
+
+/// An abbreviation: three or more letters, or anything in `<..>`.
+priv let tz_name : :string -> :integer -> :any;
+priv let tz_name s i =
+    if i < len s && str.byte i s == 60 {
+        let close = str.find_from i ">" s;
+        if close < 0 { () } else { [str.slice (i + 1) (close - i - 1) s, close + 1] }
+    } else {
+        let stop = str.span "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" i s;
+        if stop - i < 3 { () } else { [str.slice i (stop - i) s, stop] }
+    };
+
+/// `[+-]hh[:mm[:ss]]` as seconds -- west of UTC, in a zone's offset, because
+/// that is how POSIX writes it, and the caller flips it.
+priv let tz_offset : :string -> :integer -> :any;
+priv let tz_offset s i = {
+    let b = str.byte i s;
+    let sign = if b == 45 { 0 - 1 } else { 1 };
+    let at = if b == 45 || b == 43 { i + 1 } else { i };
+    match clock_seconds s at {
+        () => (),
+        [secs, next] => [sign * secs, next],
+    }
+};
+
+/// `hh[:mm[:ss]]` as seconds.
+priv let clock_seconds : :string -> :integer -> :any;
+priv let clock_seconds s i = {
+    let rec fields at n acc =
+        match digits s at {
+            () => if n == 0 { () } else { [acc, at] },
+            [v, next] => {
+                let total = acc + v * (if n == 0 { 3600 } else if n == 1 { 60 } else { 1 });
+                if n < 2 && next < len s && str.byte next s == 58 { fields (next + 1) (n + 1) total }
+                else { [total, next] }
+            },
+        };
+    fields i 0 0
+};
+
+priv let digits : :string -> :integer -> :any;
+priv let digits s i = {
+    let stop = str.span "0123456789" i s;
+    if stop == i { () } else { [num.parse_int (str.slice i (stop - i) s), stop] }
+};
+
+/// One `date[/time]` of a rule: `[day, seconds]`, the time defaulting to 2am.
+priv let tz_change : :string -> result.Of :any :string;
+priv let tz_change text = {
+    let [day_text, time_text] = match str.split "/" text {
+        [d] => [d, "2"],
+        [d, t, .._] => [d, t],
+        [] => ["", "2"],
+    };
+    let seconds = match tz_offset time_text 0 { () => (), [v, _] => v };
+    let day = match str.byte 0 day_text {
+        77 => match list.map (fn p -> num.parse_int p) (str.split "." (str.slice 1 (len day_text) day_text)) {
+            [m, w, d] if m != () && w != () && d != () => [:m, m, w, d],
+            _ => (),
+        },
+        74 => match num.parse_int (str.slice 1 (len day_text) day_text) { () => (), n => [:j, n] },
+        _ => match num.parse_int day_text { () => (), n => [:n, n] },
+    };
+    if day == () || seconds == () { result.error ("not a rule date: " + text) }
+    else { result.ok [day, seconds] }
+};
+
+// --- TZif ----------------------------------------------------------------------------
+
+/// A zone from the bytes of a TZif file.
+let of_tzif : :string -> :string -> result.Of Zone :string;
+let of_tzif name bytes =
+    if str.slice 0 4 bytes != "TZif" { result.error (name + " is not a TZif file") }
+    else {
+        let version = str.byte 4 bytes;
+        let v1 = header bytes 0;
+        // Version 2 and later repeat the data with 64-bit times after the
+        // version 1 block, followed by the footer. That block is the one to
+        // read: the first stops in 2038.
+        if version >= 50 {
+            let second = 44 + block_size v1 4;
+            read_block name bytes (header bytes second) (second + 44) 8
+        } else {
+            read_block name bytes v1 44 4
+        }
+    };
+
+/// The six counts of a header at `at`: isut, isstd, leap, time, type, char.
+priv let header : :string -> :integer -> [:integer];
+priv let header bytes at = list.map (fn k -> u32 bytes (at + 20 + 4 * k)) [0, 1, 2, 3, 4, 5];
+
+priv let block_size : [:integer] -> :integer -> :integer;
+priv let block_size [isut, isstd, leap, times, types, chars] width =
+    times * width + times + types * 6 + chars + leap * (width + 4) + isstd + isut;
+
+priv let read_block : :string -> :string -> [:integer] -> :integer -> :integer -> result.Of Zone :string;
+priv let read_block name bytes counts at width = {
+    let [isut, isstd, leap, times, types, chars] = counts;
+    let idx_at = at + times * width;
+    let types_at = idx_at + times;
+    let chars_at = types_at + types * 6;
+    let abbrevs = str.slice chars_at chars bytes;
+    let period k = {
+        let p = types_at + 6 * k;
+        let ai = str.byte (p + 5) bytes;
+        let stop = str.upto "\0" ai abbrevs;
+        Period.make (i32 bytes p) (str.byte (p + 4) bytes == 1) (str.slice ai (stop - ai) abbrevs)
+    };
+    let periods = array.of_list (list.map period (list.range 0 types));
+    let at_time k = if width == 8 { i64 bytes (at + 8 * k) } else { i32 bytes (at + 4 * k) };
+    let transitions = array.of_list (list.map (fn k -> #[at_time k, periods.[str.byte (idx_at + k) bytes]])
+                                              (list.range 0 times));
+    // RFC 8536: the period before the first transition is type 0.
+    let initial = if types > 0 { periods.[0] } else { Period.make 0 false "UTC" };
+    let end = at + block_size counts width;
+    let rule = if width == 8 && str.byte end bytes == 10 {
+        let stop = str.upto "\n" (end + 1) bytes;
+        match parse_rule (str.slice (end + 1) (stop - end - 1) bytes) { [:ok, r] => r, _ => () }
+    } else { () };
+    if types == 0 { result.error (name + " has no local time types") }
+    else { result.ok (Zone.make name transitions initial rule) }
+};
+
+priv let u32 : :string -> :integer -> :integer;
+priv let u32 s at = ((str.byte at s * 256 + str.byte (at + 1) s) * 256 + str.byte (at + 2) s) * 256 + str.byte (at + 3) s;
+
+priv let i32 : :string -> :integer -> :integer;
+priv let i32 s at = { let u = u32 s at; if u >= 2147483648 { u - 4294967296 } else { u } };
+
+priv let i64 : :string -> :integer -> :integer;
+priv let i64 s at = {
+    let u = u32 s at * 4294967296 + u32 s (at + 4);
+    if u >= 9223372036854775808 { u - 18446744073709551616 } else { u }
+};
+
+// --- finding zones on this machine ------------------------------------------------
+
+/// Where the database is looked for: `$TZDIR` first, then the places Linux,
+/// the BSDs, macOS and NixOS keep it.
+let search_dirs! : :unit -> [:string];
+let search_dirs! () = {
+    let standard = ["/usr/share/zoneinfo", "/etc/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo"];
+    match os.env! "TZDIR" { () => standard, "" => standard, dir => dir :: standard }
+};
+
+/// The zone of an IANA name (`"Europe/London"`), read from this machine's
+/// database. `"UTC"` and `"Z"` need no database.
+let load! : :string -> result.Of Zone :string;
+let load! name =
+    if name == "UTC" || name == "Z" || name == "Etc/UTC" { result.ok utc }
+    else if str.contains_str ".." name || str.starts_with "/" name || name == "" {
+        result.error ("not a zone name: " + name)
+    } else { load_from! name (search_dirs! ()) };
+
+priv let load_from! : :string -> [:string] -> result.Of Zone :string;
+priv let rec load_from! name dirs = match dirs {
+    [] => result.error ("no time zone called " + name + " on this machine"),
+    [dir, ..rest] => match file.read! (dir + "/" + name) {
+        () => load_from! name rest,
+        bytes => of_tzif name bytes,
+    },
+};
+
+/// The zone this machine's clocks are set to: `$TZ` when it is set, as a
+/// name, a path or a POSIX rule; otherwise `/etc/localtime`; otherwise UTC.
+let local! : :unit -> Zone;
+let local! () = match os.env! "TZ" {
+    () => localtime! (),
+    "" => utc,
+    tz => {
+        let spec = if str.starts_with ":" tz { str.slice 1 (len tz) tz } else { tz };
+        if str.starts_with "/" spec { from_file_or_utc! spec spec }
+        else {
+            match load! spec {
+                [:ok, z] => z,
+                _ => match parse_rule spec {
+                    [:ok, rule] => Zone.make spec #[] (Rule.standard rule) rule,
+                    _ => utc,
+                },
+            }
+        }
+    },
+};
+
+priv let localtime! : :unit -> Zone;
+priv let localtime! () = {
+    // The link's target names the zone -- `../usr/share/zoneinfo/America/Denver`
+    // -- which is a better name than "localtime" for anything that prints one.
+    let path = "/etc/localtime";
+    let name = try! {
+        let target = io.read_link! path;
+        let at = str.find "zoneinfo/" target;
+        if at < 0 { "localtime" } else { str.slice (at + 9) (len target) target }
+    } catch e { "localtime" };
+    from_file_or_utc! name path
+};
+
+priv let from_file_or_utc! : :string -> :string -> Zone;
+priv let from_file_or_utc! name path = match file.read! path {
+    () => utc,
+    bytes => result.or_else utc (of_tzif name bytes),
+};
+
+when test {
+    import std.test;
+
+    let denver = parse_rule "MST7MDT,M3.2.0,M11.1.0";
+    let sydney = parse_rule "AEST-10AEDT,M10.1.0,M4.1.0/3";
+    let at y m d h = calendar.days_from_civil y m d * 86400 + h * 3600;
+    let off r t = Period.offset (rule_period (result.or_else () r) t);
+
+    let tests = [
+        test.case "a rule parses"           $( test.true! (result.is_ok denver) ),
+        test.case "winter in Denver"        $( test.eq! (0 - 25200) (off denver (at 2025 1 15 12)) ),
+        test.case "summer in Denver"        $( test.eq! (0 - 21600) (off denver (at 2025 7 15 12)) ),
+        test.case "the change is at 2am local"
+            $( test.eq! [(0 - 25200), (0 - 21600)] [off denver (at 2025 3 9 8 - 1), off denver (at 2025 3 9 9)] ),
+        test.case "the southern hemisphere" $( test.eq! [39600, 36000] [off sydney (at 2025 1 15 0), off sydney (at 2025 7 15 0)] ),
+        test.case "a rule with no daylight time"
+            $( test.eq! 19800 (off (parse_rule "IST-5:30") (at 2025 7 1 0)) ),
+        test.case "a quoted name"
+            $( test.eq! [true, 10800] [result.is_ok (parse_rule "<+03>-3"), off (parse_rule "<+03>-3") 0] ),
+        test.case "abbreviations"
+            $( test.eq! ["MST", "MDT"] [Period.abbrev (rule_period (result.or_else () denver) (at 2025 1 1 0)),
+                                       Period.abbrev (rule_period (result.or_else () denver) (at 2025 7 1 0))] ),
+        test.case "nonsense is refused"     $( test.true! (result.is_error (parse_rule "7")) ),
+        test.case "UTC needs no database"   $( test.eq! [:ok, utc] (load! "UTC") ),
+        test.case "paths are not names"     $( test.true! (result.is_error (load! "../../etc/passwd")) ),
+        test.case "a fixed zone"            $( test.eq! 3600 (offset_at (fixed 3600 "X") 0) ),
+        test.case "a skipped local time moves forward" $( {
+            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (result.or_else () denver);
+            // 02:30 on 2025-03-09 never happened in Denver; 03:30 MDT did.
+            test.eq! (at 2025 3 9 9 + 1800) (local_to_utc z (at 2025 3 9 2 + 1800))
+        } ),
+        test.case "a repeated local time takes the first" $( {
+            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (result.or_else () denver);
+            // 01:30 on 2025-11-02 happened twice; the first was MDT, 07:30 UTC.
+            test.eq! (at 2025 11 2 7 + 1800) (local_to_utc z (at 2025 11 2 1 + 1800))
+        } ),
+        test.case "an ordinary local time"  $( {
+            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (result.or_else () denver);
+            test.eq! (at 2025 7 1 18) (local_to_utc z (at 2025 7 1 12))
+        } ),
+    ];
+}

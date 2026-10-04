@@ -432,6 +432,16 @@ The lessons that keep coming back:
   and roots are PEM because those are what every backend imports.
   [dream/src/tls.hpp](dream/src/tls.hpp) is the design, and
   `dream/tests/tls` the fixtures, which portable.py runs on all three OSes.
+- The application libraries, each with its design at the head of the file:
+  `std.time` (instants and durations are integer nanoseconds; zones read
+  from the system's TZif files and POSIX rules), `std.random` (pure,
+  splittable MRG32k3a; `!` functions use the OS's secure bytes),
+  `std.property` (property tests that shrink by replaying a smaller tape),
+  `std.parse` (parser combinators), `std.regex` (a linear-time Pike VM; a
+  bad literal pattern is a compile error through `Pattern`'s `where`),
+  `std.log` (structured events, `DREAM_LOG=warn,db=debug`), and `std.http`
+  with `std.http.server` and `std.http.url` (HTTP/1.1 client and server).
+  Examples 18-21 tour them.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

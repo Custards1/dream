@@ -29,16 +29,24 @@ import std.console;
 import std.error;
 import std.file;
 import std.foreign;
+import std.http;
+import std.http.server as http_server;
+import std.http.url;
 import std.image;
 import std.install;
 import std.json;
 import std.list;
+import std.log;
 import std.map;
 import std.num;
 import std.payload;
 import std.macros;
+import std.parse;
 import std.proc;
+import std.property;
+import std.random;
 import std.record;
+import std.regex;
 import std.registry;
 import std.remote;
 import std.result;
@@ -53,6 +61,9 @@ import std.str;
 import std.streams;
 import std.supervisor;
 import std.test;
+import std.time;
+import std.time.calendar;
+import std.time.zone;
 import std.toml;
 import std.version;
 import std.wire;
@@ -67,10 +78,11 @@ let modules = ["std.agent", "std.array", "std.atom", "std.build", "std.build.cc"
                "std.build.cc.gnu", "std.build.cc.msvc", "std.build.cc.steps", "std.build.check",
                "std.build.command", "std.build.dream", "std.build.fetch", "std.build.probe",
                "std.build.run", "std.build.tool", "std.char", "std.cli",
-               "std.codec", "std.console", "std.error", "std.file", "std.json", "std.list",
-               "std.map", "std.macros", "std.num", "std.payload", "std.proc", "std.record", "std.registry", "std.remote",
+               "std.codec", "std.console", "std.error", "std.file", "std.http", "std.http.server", "std.http.url",
+               "std.json", "std.list", "std.log", "std.map", "std.macros", "std.num", "std.parse", "std.payload", "std.proc",
+               "std.property", "std.random", "std.record", "std.regex", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.sql", "std.sql.lint", "std.sql.pg", "std.sql.pool", "std.sql.sqlite", "std.str", "std.streams",
-               "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];
+               "std.supervisor", "std.test", "std.time", "std.time.calendar", "std.time.zone", "std.toml", "std.types", "std.wire"];
 
 // --- the tests std.record cannot hold ----------------------------------------
 //

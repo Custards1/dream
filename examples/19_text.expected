@@ -1,0 +1,14 @@
+%{"name" => "dream", "version" => "2"}
+line 1, column 8: expected a number or a quoted string, found "d"
+15
+line 1, column 10: expected "-", an integer or "(", found ")"
+line 1, column 9: expected "-", an integer or "(", found "x"
+  1 | 1 + 2 * x
+    |         ^
+["2026-03-28", "2026-04-02"]
+03
+Released 28/03/2026, patched 02/04/2026.
+4
+["a", "b", "c", "d"]
+[:error, "column 10: expected \"|\" or \")\", found the end of the text"]
+a repetition whose maximum is below its minimum

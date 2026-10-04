@@ -1,0 +1,1123 @@
+// Time: instants, durations, the calendar, time zones, and their written forms.
+//
+//     import std.time;
+//
+//     let start = time.now! ();
+//     let later = start + 90 * time.minute;           // instants and durations add
+//     time.rfc3339 later                               // "2026-10-04T18:21:07.512Z"
+//
+//     let denver = time.zone_or_utc! "America/Denver";
+//     let dt = time.in_zone denver later;              // a DateTime, offset -6h in summer
+//     time.format "%a %d %b %Y, %H:%M %Z" dt           // "Sun 04 Oct 2026, 12:21 MDT"
+//     time.add_months 1 dt |> time.localize denver     // a month on, with the right offset
+//
+//     time.parse_rfc3339 "2026-10-04T12:00:00+02:00"   // [:ok, instant]
+//     time.parse_duration "1h30m"                      // [:ok, 5400000000000]
+//
+// **Two numbers and a record.** An `Instant` is an integer: nanoseconds since
+// 1970-01-01 UTC. A `Duration` is an integer too: nanoseconds. That is the
+// whole representation of time as a quantity, and it is what makes the
+// arithmetic the language's own -- `deadline - now`, `start + 5 * time.second`,
+// `list.minimum stamps` and `compare` all just work, with nothing to convert.
+// Integers are unbounded, so nanoseconds overflow nowhere (Go's `time` stops in
+// the year 2262; this does not). The two are kept apart by name and signature
+// (`Instant`, `Duration`), not by a tag.
+//
+// A `DateTime` is the other view: what a clock and a calendar *read* at an
+// instant somewhere -- year, month, day, hour, minute, second, nanosecond, the
+// offset from UTC in force there and its abbreviation. It is a `struct`, so it
+// is an array and costs one object. Every DateTime carries its offset, so it
+// always names exactly one instant (`to_instant`), and there is no "naive"
+// date-time to mistake for one.
+//
+// **Zones are the operating system's.** `std.time.zone` reads the IANA
+// database (TZif files) and its POSIX rules, so `in_zone` gives the offset
+// `date` would, for any instant, past or future. `localize` goes the other way,
+// from what a clock reads to the instant it read it, and says what it does
+// about the hour that happens twice each autumn and the hour that never happens
+// each spring.
+//
+// The wall clock has millisecond resolution (`os.now!`); `monotonic!` is in
+// nanoseconds, from a clock that never jumps, and is the one to time anything
+// with. Nothing here keeps state: there is no default zone hiding in a global,
+// and every function that reads a clock says so with a `!`.
+
+import std.char;
+import std.list;
+import std.map;
+import std.num;
+import std.os;
+import std.proc;
+import std.result;
+import std.str;
+import std.vm;
+import std.time.calendar;
+import std.time.zone as tz;
+
+// --- the two quantities ---------------------------------------------------------
+
+/// Nanoseconds since 1970-01-01T00:00:00Z.
+type Instant = :integer;
+/// A span of time, in nanoseconds. Negative is allowed: `a - b` of two instants.
+type Duration = :integer;
+type Weekday = :monday | :tuesday | :wednesday | :thursday | :friday | :saturday | :sunday;
+/// What `truncate` rounds down to.
+type Unit = :year | :month | :week | :day | :hour | :minute | :second | :millisecond | :microsecond;
+type Zone = tz.Zone.type;
+
+let nanosecond : Duration;
+let nanosecond = 1;
+let microsecond : Duration;
+let microsecond = 1000;
+let millisecond : Duration;
+let millisecond = 1000000;
+let second : Duration;
+let second = 1000000000;
+let minute : Duration;
+let minute = 60000000000;
+let hour : Duration;
+let hour = 3600000000000;
+let day : Duration;
+let day = 86400000000000;
+let week : Duration;
+let week = 604800000000000;
+
+/// `n` of a unit, as a duration. A float is allowed and rounded to the
+/// nanosecond, so `seconds 1.5` is a second and a half.
+let nanoseconds : (:integer | :float) -> Duration;
+let nanoseconds n = whole n;
+let microseconds : (:integer | :float) -> Duration;
+let microseconds n = whole (n * microsecond);
+let milliseconds : (:integer | :float) -> Duration;
+let milliseconds n = whole (n * millisecond);
+let seconds : (:integer | :float) -> Duration;
+let seconds n = whole (n * second);
+let minutes : (:integer | :float) -> Duration;
+let minutes n = whole (n * minute);
+let hours : (:integer | :float) -> Duration;
+let hours n = whole (n * hour);
+let days : (:integer | :float) -> Duration;
+let days n = whole (n * day);
+let weeks : (:integer | :float) -> Duration;
+let weeks n = whole (n * week);
+
+priv let whole : (:integer | :float) -> :integer;
+priv let whole x = if type_of x == :float { num.to_int (if x < 0.0 { x - 0.5 } else { x + 0.5 }) } else { x };
+
+/// A duration in whole units, rounded toward zero: `to_milliseconds d` is how
+/// many complete milliseconds it holds.
+let to_microseconds : Duration -> :integer;
+let to_microseconds d = d / microsecond;
+let to_milliseconds : Duration -> :integer;
+let to_milliseconds d = d / millisecond;
+let to_whole_seconds : Duration -> :integer;
+let to_whole_seconds d = d / second;
+let to_whole_minutes : Duration -> :integer;
+let to_whole_minutes d = d / minute;
+let to_whole_hours : Duration -> :integer;
+let to_whole_hours d = d / hour;
+let to_whole_days : Duration -> :integer;
+let to_whole_days d = d / day;
+
+/// A duration in seconds, with the fraction: `to_seconds (time.ms 1500)` is 1.5.
+let to_seconds : Duration -> :float;
+let to_seconds d = num.to_float d / 1000000000.0;
+let to_minutes : Duration -> :float;
+let to_minutes d = num.to_float d / 60000000000.0;
+let to_hours : Duration -> :float;
+let to_hours d = num.to_float d / 3600000000000.0;
+
+/// The magnitude of a duration.
+let abs : Duration -> Duration;
+let abs d = if d < 0 { 0 - d } else { d };
+
+/// `d` rounded down to a multiple of `unit`, toward negative infinity: a
+/// timestamp floored to the minute is `floor_to time.minute t`.
+let floor_to : Duration -> :integer -> :integer;
+let floor_to unit d = calendar.floor_div d unit * unit;
+
+/// `d` rounded to the nearest multiple of `unit`, halves away from zero.
+let round_to : Duration -> :integer -> :integer;
+let round_to unit d = if d < 0 { 0 - round_to unit (0 - d) } else { (d + unit / 2) / unit * unit };
+
+// --- clocks ----------------------------------------------------------------------
+
+/// The wall clock, now. It can jump -- the system's time is set, or NTP slews
+/// it -- so it is what to stamp a record with, and never what to subtract to
+/// find how long something took. Millisecond resolution.
+let now! : :unit -> Instant;
+let now! () = os.now! () * millisecond;
+
+/// A steady clock, in nanoseconds from an arbitrary point in this VM's life.
+/// Only differences between two readings mean anything, and they always mean
+/// elapsed time: this clock is never set.
+let monotonic! : :unit -> :integer;
+let monotonic! () = vm.now_ns! ();
+
+/// How long since `t`, by the wall clock.
+let since! : Instant -> Duration;
+let since! t = now! () - t;
+
+/// How long until `t`, by the wall clock; negative once it has passed.
+let until! : Instant -> Duration;
+let until! t = t - now! ();
+
+/// How long it takes to compute `value`, and the value: `[value, duration]`.
+///
+/// The argument is what is timed, and it is timed *because it is lazy*: Dream
+/// hands it over unevaluated, and it is forced all the way down between two
+/// readings of the monotonic clock. A value that something already forced
+/// takes no time at all, which is the truth about it.
+///
+///     let [sorted, took] = time.measure! (list.sort xs);
+let measure! : a -> [a, Duration];
+let measure! value = {
+    let start = vm.now_ns! ();
+    strict! value
+    let took = vm.now_ns! () - start;
+    [value, took]
+};
+
+/// Park this process for `d`. Other processes run meanwhile.
+let sleep! : Duration -> :atom;
+let sleep! d = if d <= 0 { :ok } else { vm.sleep_until! (vm.now_ns! () + d) };
+
+/// Park until the wall clock reaches `t`.
+let sleep_until! : Instant -> :atom;
+let sleep_until! t = sleep! (until! t);
+
+/// `[:ok, value]` if `value` can be computed within `d`, or `:timeout`.
+///
+/// The value is computed in a process of its own, which is killed at the
+/// deadline: a computation that never finishes costs this caller `d` and
+/// nothing more. A value that raises answers `[:error, e]`.
+let within! : Duration -> a -> ([:ok, a] | [:error, :any] | :timeout);
+let within! d value = {
+    let worker = spawn! $( strict! value );
+    proc.monitor! worker
+    match proc.recv_where_within! (fn m -> proc.is_down_of worker m) (to_milliseconds (d + millisecond - 1)) {
+        [:ok, [:down, _, outcome]] => outcome,
+        _ => {
+            // Wait for the kill to land and take its report: left in the
+            // mailbox, a stray `[:down, ..]` would be the next thing an
+            // innocent `recv!` in the caller saw.
+            proc.kill! worker :timeout
+            proc.recv_where! (fn m -> proc.is_down_of worker m)
+            :timeout
+        },
+    }
+};
+
+// --- the calendar view -------------------------------------------------------------
+
+/// What a calendar and a clock read at one instant, somewhere. `offset` is
+/// seconds east of UTC, and `abbrev` what people there call the zone at that
+/// moment (`"CEST"`), or the offset written out when nothing better is known.
+struct DateTime {
+    !year : :integer
+    !month : :integer
+    !day : :integer
+    !hour : :integer
+    !minute : :integer
+    !second : :integer
+    !nano : :integer
+    !offset : :integer
+    !abbrev : :string
+}
+
+let is_leap_year : :integer -> :bool;
+let is_leap_year y = calendar.is_leap_year y;
+let days_in_month : :integer -> :integer -> :integer;
+let days_in_month y m = calendar.days_in_month y m;
+let days_in_year : :integer -> :integer;
+let days_in_year y = calendar.days_in_year y;
+
+/// A DateTime in UTC. Out-of-range fields are carried, as a clock would:
+/// `datetime 2025 1 31 25 0 0` is 01:00 on February 1st.
+let datetime : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> DateTime;
+let datetime y mo d h mi s = to_utc (instant_of y mo d h mi s 0 0);
+
+/// Midnight UTC at the start of a date.
+let date : :integer -> :integer -> :integer -> DateTime;
+let date y mo d = datetime y mo d 0 0 0;
+
+/// A DateTime as a zone's clocks read it: `datetime_in denver 2025 7 4 9 0 0`
+/// is 9am on the fourth of July in Denver, with Denver's offset that day.
+let datetime_in : Zone -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> DateTime;
+let datetime_in zone y mo d h mi s = localize zone (DateTime.make y mo d h mi s 0 0 "");
+
+/// The instant a calendar reading names.
+let to_instant : DateTime -> Instant;
+let to_instant dt =
+    instant_of (DateTime.year dt) (DateTime.month dt) (DateTime.day dt) (DateTime.hour dt)
+               (DateTime.minute dt) (DateTime.second dt) (DateTime.nano dt) (DateTime.offset dt);
+
+/// The instant whose clock at `offset` reads these fields. The month is
+/// carried into the year first, and everything else is plain arithmetic on
+/// seconds, so fields out of range carry the way `datetime` says.
+priv let instant_of : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> Instant;
+priv let instant_of y mo d h mi s nano offset = {
+    let m0 = mo - 1;
+    let year = y + calendar.floor_div m0 12;
+    let month = calendar.floor_mod m0 12 + 1;
+    let days = calendar.days_from_civil year month 1 + d - 1;
+    (days * 86400 + h * 3600 + mi * 60 + s - offset) * second + nano
+};
+
+/// What clocks `offset` seconds east of UTC read at `t`, called `abbrev`.
+let at_offset : :integer -> :string -> Instant -> DateTime;
+let at_offset offset abbrev t = {
+    let secs = calendar.floor_div t second;
+    let nano = t - secs * second;
+    let local = secs + offset;
+    let days = calendar.floor_div local 86400;
+    let sod = local - days * 86400;
+    let [y, m, d] = calendar.civil_from_days days;
+    DateTime.make y m d (sod / 3600) (sod % 3600 / 60) (sod % 60) nano offset
+                  (if abbrev == "" { offset_text ":" offset } else { abbrev })
+};
+
+/// The instant in UTC.
+let to_utc : Instant -> DateTime;
+let to_utc t = at_offset 0 "UTC" t;
+
+/// The instant as a zone's clocks read it.
+let in_zone : Zone -> Instant -> DateTime;
+let in_zone zone t = {
+    let p = tz.period_at zone (calendar.floor_div t second);
+    at_offset (tz.Period.offset p) (tz.Period.abbrev p) t
+};
+
+/// The same instant, read at another offset or in another zone.
+let to_offset : :integer -> DateTime -> DateTime;
+let to_offset offset dt = at_offset offset "" (to_instant dt);
+let to_zone : Zone -> DateTime -> DateTime;
+let to_zone zone dt = in_zone zone (to_instant dt);
+
+/// The wall-clock fields of `dt` -- its offset ignored -- read as a time in
+/// `zone`, with the offset the zone has then. This is what to call after
+/// changing a DateTime's fields (`add_days`, `add_months`, a setter) to put it
+/// back in its zone: a day added across the change to summer time is still
+/// 9am, and it is `localize` that says 9am is now an hour closer to UTC.
+///
+/// When the clocks go back, the hour that happens twice answers its first
+/// occurrence; when they go forward, a time in the skipped hour moves forward
+/// by the gap. `std.time.zone`'s `local_to_utc` is the detail.
+let localize : Zone -> DateTime -> DateTime;
+let localize zone dt = {
+    let local = calendar.days_from_civil (DateTime.year dt) (DateTime.month dt) 1 * 86400
+                + (DateTime.day dt - 1) * 86400
+                + DateTime.hour dt * 3600 + DateTime.minute dt * 60 + DateTime.second dt;
+    in_zone zone (tz.local_to_utc zone local * second + DateTime.nano dt)
+};
+
+// --- zones ---------------------------------------------------------------------------
+
+let utc : Zone;
+let utc = tz.utc;
+
+/// A zone at a fixed offset east of UTC, in seconds.
+let fixed_zone : :integer -> Zone;
+let fixed_zone offset = tz.fixed offset (if offset == 0 { "UTC" } else { offset_text ":" offset });
+
+/// An IANA zone by name (`"Asia/Kolkata"`), from this machine's database.
+let zone! : :string -> result.Of Zone :string;
+let zone! name = tz.load! name;
+
+/// A zone from a POSIX TZ rule, needing no database:
+/// `posix_zone "CET-1CEST,M3.5.0,M10.5.0/3"` is central Europe as its rules
+/// stand. Right for any date the rule covers; for history before it, use
+/// `zone!`.
+let posix_zone : :string -> result.Of Zone :string;
+let posix_zone rule = result.map (fn r -> tz.Zone.make rule #[] (tz.Rule.standard r) r) (tz.parse_rule rule);
+
+/// The same, falling back to UTC when this machine does not know the name.
+let zone_or_utc! : :string -> Zone;
+let zone_or_utc! name = result.or_else utc (tz.load! name);
+
+/// The zone this machine's clock is set to (`$TZ`, then `/etc/localtime`).
+let local_zone! : :unit -> Zone;
+let local_zone! () = tz.local! ();
+
+/// Now, as this machine's clock reads it.
+let local_now! : :unit -> DateTime;
+let local_now! () = in_zone (tz.local! ()) (now! ());
+
+/// A zone's name, as it was asked for.
+let zone_name : Zone -> :string;
+let zone_name zone = tz.Zone.name zone;
+
+/// The offset east of UTC, in seconds, that `zone` has at `t`.
+let offset_in : Zone -> Instant -> :integer;
+let offset_in zone t = tz.offset_at zone (calendar.floor_div t second);
+
+/// Whether `zone` is on daylight-saving time at `t`.
+let is_dst : Zone -> Instant -> :bool;
+let is_dst zone t = tz.Period.dst (tz.period_at zone (calendar.floor_div t second));
+
+// --- reading a DateTime ----------------------------------------------------------------
+
+/// 1 for Monday through 7 for Sunday, as ISO 8601 numbers them.
+let weekday_number : DateTime -> :integer;
+let weekday_number dt = calendar.weekday_of_days (day_number dt);
+
+let weekday : DateTime -> Weekday;
+let weekday dt = weekday_atoms.[weekday_number dt - 1];
+
+/// 1 for January 1st.
+let day_of_year : DateTime -> :integer;
+let day_of_year dt = calendar.day_of_year (DateTime.year dt) (DateTime.month dt) (DateTime.day dt);
+
+/// `[week_year, week]`, the ISO 8601 week. Near New Year the week's year can
+/// differ from the date's.
+let iso_week : DateTime -> [:integer, :integer];
+let iso_week dt = calendar.iso_week (DateTime.year dt) (DateTime.month dt) (DateTime.day dt);
+
+/// The local date as a day number, days since 1970-01-01.
+priv let day_number : DateTime -> :integer;
+priv let day_number dt = calendar.days_from_civil (DateTime.year dt) (DateTime.month dt) (DateTime.day dt);
+
+priv let weekday_atoms : #[Weekday];
+priv let weekday_atoms = #[:monday, :tuesday, :wednesday, :thursday, :friday, :saturday, :sunday];
+
+/// Whether `a` is earlier than `b`, as instants: two readings in different
+/// zones compare by when they happened, not by what their clocks said.
+let before : DateTime -> DateTime -> :bool;
+let before a b = to_instant a < to_instant b;
+let after : DateTime -> DateTime -> :bool;
+let after a b = to_instant a > to_instant b;
+/// The duration from `a` to `b`.
+let between : DateTime -> DateTime -> Duration;
+let between a b = to_instant b - to_instant a;
+
+// --- calendar arithmetic ------------------------------------------------------------------
+//
+// Adding a duration to an instant is `+`. These are the other kind: "the same
+// time tomorrow" and "a month from now", which are not a fixed number of
+// seconds. Each works on the clock's fields and keeps the offset as it was;
+// `localize` puts the answer back in a zone whose offset may have moved.
+
+/// The same clock time `n` days later (or earlier, for negative `n`).
+let add_days : :integer -> DateTime -> DateTime;
+let add_days n dt = with_date (calendar.civil_from_days (day_number dt + n)) dt;
+
+let add_weeks : :integer -> DateTime -> DateTime;
+let add_weeks n dt = add_days (7 * n) dt;
+
+/// `n` months later, clamping the day to the month's length: January 31st plus
+/// one month is February 28th (or 29th), not March 3rd.
+let add_months : :integer -> DateTime -> DateTime;
+let add_months n dt = {
+    let m0 = DateTime.month dt - 1 + n;
+    let y = DateTime.year dt + calendar.floor_div m0 12;
+    let m = calendar.floor_mod m0 12 + 1;
+    let d = list.minimum [DateTime.day dt, calendar.days_in_month y m];
+    with_date [y, m, d] dt
+};
+
+let add_years : :integer -> DateTime -> DateTime;
+let add_years n dt = add_months (12 * n) dt;
+
+/// Add a duration, keeping the offset: the clock moves as an instant does.
+let add : Duration -> DateTime -> DateTime;
+let add d dt = at_offset (DateTime.offset dt) (DateTime.abbrev dt) (to_instant dt + d);
+
+/// Whole days from the date of `a` to the date of `b`, by their calendars.
+let days_between : DateTime -> DateTime -> :integer;
+let days_between a b = day_number b - day_number a;
+
+/// Whole calendar months from `a` to `b`: 31 January to 28 February is one,
+/// 31 January to 27 February none.
+let months_between : DateTime -> DateTime -> :integer;
+let months_between a b = {
+    let raw = (DateTime.year b - DateTime.year a) * 12 + DateTime.month b - DateTime.month a;
+    let shifted = add_months raw a;
+    if raw > 0 && compare (clock_key shifted) (clock_key b) > 0 { raw - 1 }
+    else if raw < 0 && compare (clock_key shifted) (clock_key b) < 0 { raw + 1 }
+    else { raw }
+};
+
+priv let clock_key : DateTime -> [:integer];
+priv let clock_key dt = [DateTime.year dt, DateTime.month dt, DateTime.day dt, DateTime.hour dt,
+                         DateTime.minute dt, DateTime.second dt, DateTime.nano dt];
+
+priv let with_date : [:integer, :integer, :integer] -> DateTime -> DateTime;
+priv let with_date [y, m, d] dt = DateTime.make y m d (DateTime.hour dt) (DateTime.minute dt) (DateTime.second dt)
+                                                (DateTime.nano dt) (DateTime.offset dt) (DateTime.abbrev dt);
+
+/// The start of the `unit` that `dt` falls in, on its own clock: the start of
+/// its day, its month, its ISO week (a Monday), and so on.
+let truncate : Unit -> DateTime -> DateTime;
+let truncate unit dt = {
+    let y = DateTime.year dt;
+    let mo = DateTime.month dt;
+    let d = DateTime.day dt;
+    let h = DateTime.hour dt;
+    let mi = DateTime.minute dt;
+    let s = DateTime.second dt;
+    let ns = DateTime.nano dt;
+    let o = DateTime.offset dt;
+    let a = DateTime.abbrev dt;
+    match unit {
+        :year => DateTime.make y 1 1 0 0 0 0 o a,
+        :month => DateTime.make y mo 1 0 0 0 0 o a,
+        :week => add_days (1 - weekday_number dt) (DateTime.make y mo d 0 0 0 0 o a),
+        :day => DateTime.make y mo d 0 0 0 0 o a,
+        :hour => DateTime.make y mo d h 0 0 0 o a,
+        :minute => DateTime.make y mo d h mi 0 0 o a,
+        :second => DateTime.make y mo d h mi s 0 o a,
+        :millisecond => DateTime.make y mo d h mi s (ns / 1000000 * 1000000) o a,
+        :microsecond => DateTime.make y mo d h mi s (ns / 1000 * 1000) o a,
+    }
+};
+
+/// The start of the day after `dt`'s.
+let end_of_day : DateTime -> DateTime;
+let end_of_day dt = add_days 1 (truncate :day dt);
+
+/// The last day of `dt`'s month, at the same clock time.
+let end_of_month : DateTime -> DateTime;
+let end_of_month dt = with_date [DateTime.year dt, DateTime.month dt,
+                                 calendar.days_in_month (DateTime.year dt) (DateTime.month dt)] dt;
+
+// --- written forms ----------------------------------------------------------------------------
+
+/// RFC 3339 in UTC, the form for machines: `2026-10-04T18:21:07Z`, with a
+/// fraction of a second only when there is one, and only as long as it needs.
+let rfc3339 : Instant -> :string;
+let rfc3339 t = datetime_text (to_utc t);
+
+/// RFC 3339 at a DateTime's own offset: `2026-10-04T12:21:07-06:00`.
+let datetime_text : DateTime -> :string;
+let datetime_text dt =
+    date_text dt + "T" + pad 2 (DateTime.hour dt) + ":" + pad 2 (DateTime.minute dt) + ":"
+    + pad 2 (DateTime.second dt) + fraction (DateTime.nano dt)
+    + (if DateTime.offset dt == 0 { "Z" } else { offset_text ":" (DateTime.offset dt) });
+
+/// `2026-10-04`.
+let date_text : DateTime -> :string;
+let date_text dt = year_text (DateTime.year dt) + "-" + pad 2 (DateTime.month dt) + "-" + pad 2 (DateTime.day dt);
+
+/// `18:21:07`.
+let clock_text : DateTime -> :string;
+let clock_text dt = pad 2 (DateTime.hour dt) + ":" + pad 2 (DateTime.minute dt) + ":" + pad 2 (DateTime.second dt);
+
+/// The date HTTP uses, RFC 9110's IMF-fixdate: `Sun, 04 Oct 2026 18:21:07 GMT`.
+let http_date : Instant -> :string;
+let http_date t = format "%a, %d %b %Y %H:%M:%S GMT" (to_utc t);
+
+priv let fraction : :integer -> :string;
+priv let fraction nano =
+    if nano == 0 { "" }
+    else {
+        let digits = pad 9 nano;
+        let rec trim n = if n > 1 && str.byte (n - 1) digits == 48 { trim (n - 1) } else { n };
+        "." + str.slice 0 (trim 9) digits
+    };
+
+/// `n` in decimal, at least `width` digits, zeros in front; a minus sign
+/// before the zeros for a negative number.
+let pad : :integer -> :integer -> :string;
+let pad width n =
+    if n < 0 { "-" + pad width (0 - n) }
+    else {
+        let digits = to_string n;
+        str.repeat (width - len digits) "0" + digits
+    };
+
+priv let year_text : :integer -> :string;
+priv let year_text y = if y > 9999 { "+" + to_string y } else { pad 4 y };
+
+/// An offset as `+05:30` (with `sep` ":") or `+0530` (with "").
+let offset_text : :string -> :integer -> :string;
+let offset_text sep offset = {
+    let sign = if offset < 0 { "-" } else { "+" };
+    let a = if offset < 0 { 0 - offset } else { offset };
+    let secs = a % 60;
+    sign + pad 2 (a / 3600) + sep + pad 2 (a % 3600 / 60) + (if secs == 0 { "" } else { sep + pad 2 secs })
+};
+
+priv let month_names : #[:string];
+priv let month_names = #["January", "February", "March", "April", "May", "June", "July",
+                         "August", "September", "October", "November", "December"];
+priv let day_names : #[:string];
+priv let day_names = #["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+priv let short : :string -> :string;
+priv let short name = str.slice 0 3 name;
+
+/// A DateTime written to a pattern, strftime's way. Each `%x` is replaced and
+/// everything else is copied:
+///
+/// | | | | |
+/// |---|---|---|---|
+/// | `%Y` year, `2026` | `%y` two digits | `%m` month `01` | `%d` day `04` |
+/// | `%e` day, space-padded | `%j` day of year `277` | `%H` hour `18` | `%I` hour `06` of 12 |
+/// | `%M` minute | `%S` second | `%L` milliseconds `512` | `%f` microseconds |
+/// | `%N` nanoseconds | `%p` `AM`/`PM` | `%z` `+0530` | `%:z` `+05:30` |
+/// | `%Z` abbreviation `IST` | `%a` `Sun` | `%A` `Sunday` | `%b` `Oct` |
+/// | `%B` `October` | `%u` weekday 1-7 | `%G`/`%V` ISO year and week | `%s` Unix seconds |
+/// | `%F` `%Y-%m-%d` | `%T` `%H:%M:%S` | `%R` `%H:%M` | `%%` a percent sign |
+let format : :string -> DateTime -> :string;
+let format pattern dt = str.concat_all (format_pieces (expand_pattern pattern) 0 dt);
+
+priv let format_pieces : :string -> :integer -> DateTime -> [:string];
+priv let rec format_pieces p i dt =
+    if i >= len p { [] }
+    else {
+        let at = str.upto "%" i p;
+        let literal = str.slice i (at - i) p;
+        if at >= len p { [literal] }
+        else if str.slice (at + 1) 2 p == ":z" {
+            literal :: offset_text ":" (DateTime.offset dt) :: format_pieces p (at + 3) dt
+        } else {
+            literal :: directive (str.byte (at + 1) p) dt :: format_pieces p (at + 2) dt
+        }
+    };
+
+priv let directive : :integer -> DateTime -> :string;
+priv let directive code dt = match char.of_code (if code < 0 { 37 } else { code }) {
+    'Y' => year_text (DateTime.year dt),
+    'y' => pad 2 (calendar.floor_mod (DateTime.year dt) 100),
+    'C' => pad 2 (calendar.floor_div (DateTime.year dt) 100),
+    'm' => pad 2 (DateTime.month dt),
+    'd' => pad 2 (DateTime.day dt),
+    'e' => { let d = DateTime.day dt; if d < 10 { " " + to_string d } else { to_string d } },
+    'j' => pad 3 (day_of_year dt),
+    'H' => pad 2 (DateTime.hour dt),
+    'I' => pad 2 (twelve (DateTime.hour dt)),
+    'l' => to_string (twelve (DateTime.hour dt)),
+    'M' => pad 2 (DateTime.minute dt),
+    'S' => pad 2 (DateTime.second dt),
+    'L' => pad 3 (DateTime.nano dt / 1000000),
+    'f' => pad 6 (DateTime.nano dt / 1000),
+    'N' => pad 9 (DateTime.nano dt),
+    'p' => if DateTime.hour dt < 12 { "AM" } else { "PM" },
+    'P' => if DateTime.hour dt < 12 { "am" } else { "pm" },
+    'z' => offset_text "" (DateTime.offset dt),
+    'Z' => DateTime.abbrev dt,
+    'a' => short (day_names.[weekday_number dt - 1]),
+    'A' => day_names.[weekday_number dt - 1],
+    'b' => short (month_names.[DateTime.month dt - 1]),
+    'h' => short (month_names.[DateTime.month dt - 1]),
+    'B' => month_names.[DateTime.month dt - 1],
+    'u' => to_string (weekday_number dt),
+    'w' => to_string (weekday_number dt % 7),
+    'G' => to_string ((iso_week dt).[0]),
+    'V' => pad 2 ((iso_week dt).[1]),
+    's' => to_string (calendar.floor_div (to_instant dt) second),
+    'n' => "\n",
+    't' => "\t",
+    '%' => "%",
+    other => "%" + str.of_chars [other],
+};
+
+priv let twelve : :integer -> :integer;
+priv let twelve h = { let r = h % 12; if r == 0 { 12 } else { r } };
+
+/// The composite directives, spelled out, so that `format` and `parse` handle
+/// only the simple ones.
+priv let expand_pattern : :string -> :string;
+priv let expand_pattern p =
+    if str.find "%" p < 0 { p }
+    else {
+        list.fold (fn acc [from, to] -> str.join_str to (str.split from acc)) p
+                  [["%%", "\u{1}"], ["%F", "%Y-%m-%d"], ["%T", "%H:%M:%S"], ["%R", "%H:%M"],
+                   ["%D", "%m/%d/%y"], ["%r", "%I:%M:%S %p"], ["%c", "%a %b %e %H:%M:%S %Y"],
+                   ["\u{1}", "%%"]]
+    };
+
+// --- reading written times ---------------------------------------------------------------------
+
+/// A DateTime read to a pattern, the inverse of `format`: the same directives,
+/// with `%z` reading `Z`, `+05:30` or `+0530`, `%Z` reading an abbreviation
+/// (only `UTC`, `GMT` and `Z` carry an offset), names of days and months read
+/// in any case, and a space in the pattern matching any run of white space.
+/// What the pattern does not mention defaults to 1970-01-01 00:00:00 UTC.
+///
+///     time.parse "%d/%m/%Y %H:%M" "04/10/2026 18:21"
+let parse : :string -> :string -> result.Of DateTime :string;
+let parse pattern text = {
+    let p = expand_pattern pattern;
+    match read_fields p 0 text 0 %{} {
+        [:error, why] => result.error why,
+        [:ok, fields] => build fields,
+    }
+};
+
+/// `parse`, answering the instant.
+let parse_instant : :string -> :string -> result.Of Instant :string;
+let parse_instant pattern text = result.map to_instant (parse pattern text);
+
+priv let read_fields : :string -> :integer -> :string -> :integer -> :map -> result.Of :map :string;
+priv let rec read_fields p pi s si fields =
+    if pi >= len p {
+        if si >= len s { result.ok fields }
+        else { result.error ("unexpected text at byte " + to_string si + ": " + str.slice si 20 s) }
+    } else {
+        let c = str.byte pi p;
+        if c == 37 && pi + 1 < len p {
+            let colon = str.byte (pi + 1) p == 58 && str.byte (pi + 2) p == 122;
+            let code = if colon { 122 } else { str.byte (pi + 1) p };
+            match read_directive code s si {
+                () => result.error ("expected " + directive_name code + " at byte " + to_string si
+                                    + (if si < len s { ", found " + str.slice si 12 s } else { ", found the end" })),
+                [key, value, next] => {
+                    let fields2 = if key == () { fields } else { fields.[key => value] };
+                    read_fields p (pi + (if colon { 3 } else { 2 })) s next fields2
+                },
+            }
+        } else if c == 32 || c == 9 {
+            read_fields p (pi + 1) s (str.span " \t\n\r" si s) fields
+        } else if si < len s && str.byte si s == c {
+            read_fields p (pi + 1) s (si + 1) fields
+        } else {
+            result.error ("expected " + str.slice pi 1 p + " at byte " + to_string si)
+        }
+    };
+
+priv let directive_name : :integer -> :string;
+priv let directive_name code = match char.of_code code {
+    'Y' => "a year", 'm' => "a month", 'd' => "a day", 'e' => "a day", 'H' => "an hour",
+    'I' => "an hour", 'M' => "a minute", 'S' => "a second", 'z' => "an offset",
+    'b' => "a month name", 'B' => "a month name", 'h' => "a month name",
+    'a' => "a day name", 'A' => "a day name", 'p' => "AM or PM",
+    _ => "%" + str.of_chars [char.of_code code],
+};
+
+/// One directive read from byte `i`: `[field, value, next]`, a `()` field for
+/// what is checked and dropped, or `()` when it is not there.
+priv let read_directive : :integer -> :string -> :integer -> :any;
+priv let read_directive code s i = match char.of_code code {
+    'Y' => signed_number s i 1 9 |> tagged :year,
+    'y' => number s i 2 2 |> tagged :year2,
+    'm' => number s i 1 2 |> tagged :month,
+    'd' => number s i 1 2 |> tagged :day,
+    'e' => number s (str.span " " i s) 1 2 |> tagged :day,
+    'j' => number s i 1 3 |> tagged :yday,
+    'H' => number s i 1 2 |> tagged :hour,
+    'I' => number s i 1 2 |> tagged :hour12,
+    'l' => number s (str.span " " i s) 1 2 |> tagged :hour12,
+    'M' => number s i 1 2 |> tagged :minute,
+    'S' => number s i 1 2 |> tagged :second,
+    'L' => fraction_digits s i |> tagged :nano,
+    'f' => fraction_digits s i |> tagged :nano,
+    'N' => fraction_digits s i |> tagged :nano,
+    's' => signed_number s i 1 30 |> tagged :epoch,
+    'z' => read_offset s i |> tagged :offset,
+    'Z' => {
+        let stop = str.span "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" i s;
+        if stop == i { () }
+        else {
+            let name = str.slice i (stop - i) s;
+            if list.contains (str.upper name) ["UTC", "GMT", "Z", "UT"] { [:offset, 0, stop] }
+            else { [:abbrev, name, stop] }
+        }
+    },
+    'b' => name_at month_names s i |> tagged :month,
+    'B' => name_at month_names s i |> tagged :month,
+    'h' => name_at month_names s i |> tagged :month,
+    'a' => name_at day_names s i |> tagged (),
+    'A' => name_at day_names s i |> tagged (),
+    'p' => match str.upper (str.slice i 2 s) { "AM" => [:pm, false, i + 2], "PM" => [:pm, true, i + 2], _ => () },
+    'P' => match str.upper (str.slice i 2 s) { "AM" => [:pm, false, i + 2], "PM" => [:pm, true, i + 2], _ => () },
+    'u' => number s i 1 1 |> tagged (),
+    'w' => number s i 1 1 |> tagged (),
+    'n' => [(), (), str.span " \t\n\r" i s],
+    't' => [(), (), str.span " \t\n\r" i s],
+    '%' => if str.byte i s == 37 { [(), (), i + 1] } else { () },
+    _ => (),
+};
+
+priv let tagged : :any -> :any -> :any;
+priv let tagged key found = match found { () => (), [v, next] => [key, v, next] };
+
+/// Between `least` and `most` decimal digits at `i`: `[value, next]`.
+priv let number : :string -> :integer -> :integer -> :integer -> :any;
+priv let number s i least most = {
+    let stop = list.minimum [str.span "0123456789" i s, i + most];
+    if stop - i < least { () } else { [num.parse_int (str.slice i (stop - i) s), stop] }
+};
+
+priv let signed_number : :string -> :integer -> :integer -> :integer -> :any;
+priv let signed_number s i least most = {
+    let b = str.byte i s;
+    let negative = b == 45;
+    match number s (if b == 45 || b == 43 { i + 1 } else { i }) least most {
+        () => (),
+        [v, next] => [if negative { 0 - v } else { v }, next],
+    }
+};
+
+/// A fraction's digits as nanoseconds: "5" is 500000000.
+priv let fraction_digits : :string -> :integer -> :any;
+priv let fraction_digits s i = {
+    let stop = str.span "0123456789" i s;
+    if stop == i { () }
+    else {
+        let digits = str.slice i (list.minimum [stop - i, 9]) s;
+        [num.parse_int (digits + str.repeat (9 - len digits) "0"), stop]
+    }
+};
+
+/// `Z`, or `+hh:mm`, `+hhmm` or `+hh`, as seconds east.
+priv let read_offset : :string -> :integer -> :any;
+priv let read_offset s i = {
+    let b = str.byte i s;
+    if b == 90 || b == 122 { [0, i + 1] }
+    else if b != 43 && b != 45 { () }
+    else {
+        let sign = if b == 45 { 0 - 1 } else { 1 };
+        match number s (i + 1) 2 2 {
+            () => (),
+            [h, j] => {
+                let k = if str.byte j s == 58 { j + 1 } else { j };
+                match number s k 2 2 {
+                    () => [sign * h * 3600, j],
+                    [m, next] => [sign * (h * 3600 + m * 60), next],
+                }
+            },
+        }
+    }
+};
+
+/// The 1-based position of the name at `i` among `names`, matched in any
+/// case, full or by its first three letters.
+priv let name_at : #[:string] -> :string -> :integer -> :any;
+priv let name_at names s i = {
+    let rec try_from k =
+        if k >= len names { () }
+        else {
+            let name = names.[k];
+            if str.lower (str.slice i (len name) s) == str.lower name { [k + 1, i + len name] }
+            else if str.lower (str.slice i 3 s) == str.lower (short name) { [k + 1, i + 3] }
+            else { try_from (k + 1) }
+        };
+    try_from 0
+};
+
+priv let build : :map -> result.Of DateTime :string;
+priv let build f = {
+    let offset = f.[:offset else 0];
+    let abbrev = f.[:abbrev else ""];
+    match f.[:epoch else ()] {
+        () => {
+            let year = match f.[:year else ()] {
+                () => match f.[:year2 else ()] { () => 1970, y2 => if y2 < 69 { 2000 + y2 } else { 1900 + y2 } },
+                y => y,
+            };
+            let [month, day] = match f.[:yday else ()] {
+                () => [f.[:month else 1], f.[:day else 1]],
+                yday => { let [_, m, d] = calendar.civil_from_days (calendar.days_from_civil year 1 1 + yday - 1); [m, d] },
+            };
+            let hour = match f.[:hour12 else ()] {
+                () => f.[:hour else 0],
+                h12 => (h12 % 12) + (if f.[:pm else false] { 12 } else { 0 }),
+            };
+            let minute = f.[:minute else 0];
+            let sec = f.[:second else 0];
+            if month < 1 || month > 12 { result.error ("no month " + to_string month) }
+            else if day < 1 || day > calendar.days_in_month year month {
+                result.error ("no day " + to_string day + " in " + month_names.[month - 1] + " " + to_string year)
+            } else if hour > 23 || minute > 59 || sec > 60 {
+                result.error ("not a time of day: " + pad 2 hour + ":" + pad 2 minute + ":" + pad 2 sec)
+            } else {
+                // A leap second (`:60`) is read as the last second of its
+                // minute, since an instant here is a count of SI seconds that
+                // leap seconds are not in.
+                let dt = DateTime.make year month day hour minute (list.minimum [sec, 59]) f.[:nano else 0] offset
+                                       (if abbrev == "" { if offset == 0 { "UTC" } else { offset_text ":" offset } } else { abbrev });
+                result.ok dt
+            }
+        },
+        epoch => result.ok (at_offset offset abbrev (epoch * second + f.[:nano else 0])),
+    }
+};
+
+/// An RFC 3339 / ISO 8601 date-time, as an instant. Accepts what RFC 3339
+/// says -- `2026-10-04T18:21:07.5Z`, `2026-10-04t18:21:07+02:00` -- and the
+/// ISO forms people write besides: a space for the `T`, `+0200` or `+02` for
+/// the offset, no seconds, or a date alone (midnight). A time with no offset
+/// at all is refused, because it does not name an instant; read one with
+/// `parse_local` and say where it was.
+let parse_rfc3339 : :string -> result.Of Instant :string;
+let parse_rfc3339 text = result.map to_instant (parse_iso text);
+
+/// The same, as a DateTime keeping the offset it was written with.
+let parse_iso : :string -> result.Of DateTime :string;
+let parse_iso text = {
+    let s = str.trim text;
+    if len s == 10 { parse "%Y-%m-%d" s }
+    else {
+        let sep = str.byte 10 s;
+        if sep != 84 && sep != 116 && sep != 32 { result.error ("not an RFC 3339 date-time: " + text) }
+        else {
+            let rest = str.slice 11 (len s) s;
+            let clock = if str.byte 5 rest == 58 { "%H:%M:%S" } else { "%H:%M" };
+            let after_clock = if clock == "%H:%M" { 5 } else { 8 };
+            let frac = if str.byte after_clock rest == 46 || str.byte after_clock rest == 44 { ".%N" } else { "" };
+            let date_part = str.slice 0 10 s;
+            let pattern = "%Y-%m-%dT" + clock + frac + "%z";
+            let cleaned = date_part + "T" + str.join_str "." (str.split "," rest);
+            match parse pattern cleaned {
+                [:error, why] => if parse_local_ok (date_part + "T" + rest) {
+                                     result.error ("a time with no offset is not an instant: " + text)
+                                 } else { result.error ("not an RFC 3339 date-time: " + text + " (" + why + ")") },
+                ok => ok,
+            }
+        }
+    }
+};
+
+priv let parse_local_ok : :string -> :bool;
+priv let parse_local_ok s = list.any (fn p -> result.is_ok (parse p s)) ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S.%N"];
+
+/// A date-time written without an offset, read as `zone`'s clocks would show
+/// it: `parse_local denver "2026-07-04 09:00"`.
+let parse_local : Zone -> :string -> result.Of DateTime :string;
+let parse_local zone text = {
+    let s = str.join_str "T" (str.split " " (str.trim text));
+    let patterns = ["%Y-%m-%dT%H:%M:%S.%N", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"];
+    match list.filter result.is_ok (list.map (fn p -> parse p s) patterns) {
+        [[:ok, dt], .._] => result.ok (localize zone dt),
+        _ => result.error ("not a local date-time: " + text),
+    }
+};
+
+/// An HTTP date (RFC 9110): IMF-fixdate, and the two obsolete forms a server
+/// must still accept, RFC 850 and C's `asctime`.
+let parse_http_date : :string -> result.Of Instant :string;
+let parse_http_date text = {
+    let s = str.trim text;
+    let forms = ["%a, %d %b %Y %H:%M:%S GMT", "%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"];
+    match list.filter result.is_ok (list.map (fn p -> parse_instant p s) forms) {
+        [found, .._] => found,
+        [] => result.error ("not an HTTP date: " + text),
+    }
+};
+
+// --- durations as text -------------------------------------------------------------------------
+
+/// A duration the way Go writes one: `1h2m3.5s`, `250ms`, `1.5µs`, `0s`. The
+/// largest units that fit, the seconds with as much fraction as they need,
+/// and a sub-second duration in the unit that makes it a small number.
+let format_duration : Duration -> :string;
+let format_duration d =
+    if d < 0 { "-" + format_duration (0 - d) }
+    else if d == 0 { "0s" }
+    else if d < microsecond { to_string d + "ns" }
+    else if d < millisecond { decimal d microsecond + "µs" }
+    else if d < second { decimal d millisecond + "ms" }
+    else {
+        let h = d / hour;
+        let m = d % hour / minute;
+        let rest = d % minute;
+        (if h > 0 { to_string h + "h" } else { "" })
+        + (if h > 0 || m > 0 { to_string m + "m" } else { "" })
+        + decimal rest second + "s"
+    };
+
+/// `n / unit` in decimal, with only the fraction digits it needs.
+priv let decimal : :integer -> :integer -> :string;
+priv let decimal n unit = {
+    let whole_part = to_string (n / unit);
+    let frac = n % unit;
+    if frac == 0 { whole_part }
+    else {
+        let width = len (to_string unit) - 1;
+        let digits = pad width frac;
+        let rec trim k = if k > 1 && str.byte (k - 1) digits == 48 { trim (k - 1) } else { k };
+        whole_part + "." + str.slice 0 (trim width) digits
+    }
+};
+
+/// A duration written as numbers and units -- `1h30m`, `1.5s`, `250ms`,
+/// `2d12h`, `-5m`, with `ns`, `us` (or `µs`), `ms`, `s`, `m`, `h`, `d` and `w`.
+/// Spaces between the parts are allowed. The inverse of `format_duration`.
+let parse_duration : :string -> result.Of Duration :string;
+let parse_duration text = {
+    let s = str.trim text;
+    let negative = str.starts_with "-" s;
+    let body = if negative || str.starts_with "+" s { str.slice 1 (len s) s } else { s };
+    let rec parts i !acc =
+        if i >= len body { result.ok acc }
+        else {
+            let digits_end = str.span "0123456789" i body;
+            let frac_end = if str.byte digits_end body == 46 { str.span "0123456789" (digits_end + 1) body } else { digits_end };
+            let unit_end = str.upto "0123456789. " frac_end body;
+            let unit_text = str.slice frac_end (unit_end - frac_end) body;
+            if frac_end == i { result.error ("expected a number at byte " + to_string i + " of " + text) }
+            else {
+                match unit_size unit_text {
+                    () => result.error ("not a unit of time: \"" + unit_text + "\" in " + text),
+                    size => {
+                        let whole_n = digits_value (str.slice i (digits_end - i) body);
+                        let frac_digits = if frac_end > digits_end { str.slice (digits_end + 1) (frac_end - digits_end - 1) body } else { "" };
+                        let frac_value = digits_value frac_digits * size / pow10 (len frac_digits);
+                        parts (str.span " " unit_end body) (acc + whole_n * size + frac_value)
+                    },
+                }
+            }
+        };
+    if body == "" { result.error "an empty duration" }
+    else if body == "0" { result.ok 0 }
+    else { result.map (fn d -> if negative { 0 - d } else { d }) (parts 0 0) }
+};
+
+priv let unit_size : :string -> :any;
+priv let unit_size u = match u {
+    "ns" => nanosecond, "us" => microsecond, "µs" => microsecond, "μs" => microsecond,
+    "ms" => millisecond, "s" => second, "m" => minute, "h" => hour, "d" => day, "w" => week,
+    _ => (),
+};
+
+/// Decimal digits as their value, `""` as 0.
+priv let digits_value : :string -> :integer;
+priv let digits_value s = match num.parse_int s { () => 0, n => n };
+
+priv let pow10 : :integer -> :integer;
+priv let rec pow10 n = if n <= 0 { 1 } else { 10 * pow10 (n - 1) };
+
+/// A duration for a person, to its largest unit, rounded: `3 minutes`,
+/// `1 hour`, `2 days`, `less than a second`.
+let humanize : Duration -> :string;
+let humanize d0 = {
+    let d = abs d0;
+    let say n unit = to_string n + " " + unit + (if n == 1 { "" } else { "s" });
+    let rounded u = (d + u / 2) / u;
+    if d < second { "less than a second" }
+    else if d < minute { say (rounded second) "second" }
+    else if d < hour { say (rounded minute) "minute" }
+    else if d < day { say (rounded hour) "hour" }
+    else if d < 30 * day { say (rounded day) "day" }
+    else if d < 365 * day { say (rounded (30 * day)) "month" }
+    else { say (rounded (365 * day)) "year" }
+};
+
+/// When `t` is, said from `now`: `3 minutes ago`, `in 2 days`, `just now`.
+let relative : Instant -> Instant -> :string;
+let relative now t = {
+    let d = t - now;
+    if abs d < second { "just now" }
+    else if d < 0 { humanize d + " ago" }
+    else { "in " + humanize d }
+};
+
+when test {
+    import std.test;
+
+    // 2026-10-04T18:21:07.512Z
+    let t = datetime 2026 10 4 18 21 7 |> to_instant |> (fn i -> i + 512 * millisecond);
+    let denver_rule = result.or_else () (tz.parse_rule "MST7MDT,M3.2.0,M11.1.0");
+    let denver = tz.Zone.make "America/Denver" #[] (tz.Rule.standard denver_rule) denver_rule;
+
+    let tests = [
+        // durations
+        test.case "durations add"              $( test.eq! 5400000000000 (hour + 30 * minute) ),
+        test.case "fractional constructors"    $( test.eq! [1500000000, 250000000] [seconds 1.5, milliseconds 250] ),
+        test.case "whole units"                $( test.eq! [1, 90, 1.5] [to_whole_hours (minutes 90), to_whole_minutes (minutes 90), to_hours (minutes 90)] ),
+        test.case "format a duration"          $( test.eq! ["1h30m0s", "1.5s", "250ms", "1.5µs", "7ns", "0s", "-5m0s", "26h3m4.005s"]
+                                                    [format_duration (minutes 90), format_duration (seconds 1.5),
+                                                     format_duration (milliseconds 250), format_duration 1500,
+                                                     format_duration 7, format_duration 0, format_duration (minutes (0 - 5)),
+                                                     format_duration (hours 26 + minutes 3 + seconds 4 + milliseconds 5)] ),
+        test.case "parse a duration"           $( test.eq! [[:ok, minutes 90], [:ok, seconds 1.5], [:ok, days 2 + hours 12],
+                                                           [:ok, 0 - minutes 5], [:ok, milliseconds 250]]
+                                                    [parse_duration "1h30m", parse_duration "1.5s", parse_duration "2d 12h",
+                                                     parse_duration "-5m", parse_duration "250ms"] ),
+        test.case "a duration round-trips"     $( test.eq! [:ok, hours 26 + seconds 4 + 5] (parse_duration (format_duration (hours 26 + seconds 4 + 5))) ),
+        test.case "a bad unit is said"         $( test.true! (result.is_error (parse_duration "5 parsecs")) ),
+        test.case "rounding"                   $( test.eq! [minute * 2, minute, 0 - minute] [round_to minute (seconds 90), floor_to minute (seconds 90),
+                                                                                          floor_to minute (0 - seconds 1)] ),
+        test.case "humanize"                   $( test.eq! ["3 minutes", "1 hour", "2 days", "less than a second"]
+                                                    [humanize (minutes 3), humanize (minutes 61), humanize (hours 47), humanize 5] ),
+        test.case "relative"                   $( test.eq! ["3 minutes ago", "in 2 days", "just now"]
+                                                    [relative t (t - minutes 3), relative t (t + days 2), relative t t] ),
+
+        // the calendar view
+        test.case "an instant in UTC"          $( test.eq! [2026, 10, 4, 18, 21, 7, 512000000]
+                                                    (list.take 7 (array_list (to_utc t))) ),
+        test.case "and back"                   $( test.eq! t (to_instant (to_utc t)) ),
+        test.case "before the epoch"           $( test.eq! "1969-12-31T23:59:59.5Z" (rfc3339 (0 - millisecond * 500)) ),
+        test.case "fields carry"               $( test.eq! "2025-02-01T01:00:00Z" (datetime_text (datetime 2025 1 31 25 0 0)) ),
+        test.case "an offset"                  $( test.eq! "2026-10-05T00:21:07.512+06:00" (datetime_text (at_offset 21600 "" t)) ),
+        test.case "a rule zone in summer"      $( test.eq! "2026-10-04T12:21:07.512-06:00 MDT"
+                                                    (datetime_text (in_zone denver t) + " " + DateTime.abbrev (in_zone denver t)) ),
+        test.case "a rule zone in winter"      $( test.eq! "MST" (DateTime.abbrev (in_zone denver (to_instant (date 2026 1 1)))) ),
+        test.case "localize finds the offset"  $( test.eq! "2026-07-04T09:00:00-06:00" (datetime_text (datetime_in denver 2026 7 4 9 0 0)) ),
+        test.case "a day across the change keeps the clock"
+            $( test.eq! "2026-03-09T09:00:00-06:00"
+                        (datetime_text (localize denver (add_days 1 (datetime_in denver 2026 3 8 9 0 0)))) ),
+        test.case "weekdays"                   $( test.eq! [:sunday, 7, 277] [weekday (to_utc t), weekday_number (to_utc t), day_of_year (to_utc t)] ),
+        test.case "add months clamps"          $( test.eq! ["2024-02-29", "2025-02-28", "2023-12-31"]
+                                                    [date_text (add_months 1 (date 2024 1 31)), date_text (add_years 1 (date 2024 2 29)),
+                                                     date_text (add_months (0 - 2) (date 2024 2 29) |> end_of_month)] ),
+        test.case "months between"             $( test.eq! [1, 0, (0 - 1), 12]
+                                                    [months_between (date 2025 1 31) (date 2025 2 28),
+                                                     months_between (date 2025 1 31) (date 2025 2 27),
+                                                     months_between (date 2025 3 1) (date 2025 1 31),
+                                                     months_between (date 2024 2 29) (date 2025 2 28)] ),
+        test.case "days between"               $( test.eq! 365 (days_between (date 2025 1 1) (date 2026 1 1)) ),
+        test.case "truncate"                   $( test.eq! ["2026-10-01T00:00:00Z", "2026-09-28T00:00:00Z", "2026-10-04T18:00:00Z"]
+                                                    [datetime_text (truncate :month (to_utc t)), datetime_text (truncate :week (to_utc t)),
+                                                     datetime_text (truncate :hour (to_utc t))] ),
+        test.case "comparisons across offsets"  $( test.eq! [false, 0] [before (to_utc t) (at_offset 3600 "" t), between (to_utc t) (at_offset 3600 "" t)] ),
+
+        // written forms
+        test.case "RFC 3339"                   $( test.eq! "2026-10-04T18:21:07.512Z" (rfc3339 t) ),
+        test.case "an HTTP date"               $( test.eq! "Sun, 04 Oct 2026 18:21:07 GMT" (http_date t) ),
+        test.case "strftime"                   $( test.eq! "Sunday 04 October 2026 06:21:07 PM +0000 UTC 512 277 2026-W40"
+                                                    (format "%A %d %B %Y %I:%M:%S %p %z %Z %L %j %G-W%V" (to_utc t)) ),
+        test.case "composites and escapes"     $( test.eq! "2026-10-04 18:21:07 100%" (format "%F %T 100%%" (to_utc t)) ),
+        test.case "parse a pattern"            $( test.eq! [:ok, "2026-10-04T18:21:00Z"]
+                                                    (result.map datetime_text (parse "%d/%m/%Y %H:%M" "04/10/2026 18:21")) ),
+        test.case "parse names and 12 hours"   $( test.eq! [:ok, "2026-10-04T18:21:00-06:00"]
+                                                    (result.map datetime_text (parse "%a %b %e %Y %I:%M %p %z" "sun OCT  4 2026 6:21 pm -06:00")) ),
+        test.case "parse refuses a bad day"    $( test.true! (result.is_error (parse "%Y-%m-%d" "2025-02-29")) ),
+        test.case "parse says what it wanted"  $( test.eq! [:error, "expected a month at byte 5, found xx-01"] (parse "%Y-%m-%d" "2025-xx-01") ),
+        test.case "format and parse agree"     $( test.eq! [:ok, t] (parse_instant "%Y-%m-%dT%H:%M:%S.%L%z" (format "%Y-%m-%dT%H:%M:%S.%L%z" (to_utc t))) ),
+        test.case "epoch seconds"              $( test.eq! [:ok, 1700000000 * second] (parse_instant "%s" "1700000000") ),
+        test.case "RFC 3339 parses"            $( test.eq! [[:ok, t], [:ok, t - hours 2], [:ok, t - 512 * millisecond]]
+                                                    [parse_rfc3339 "2026-10-04T18:21:07.512Z", parse_rfc3339 "2026-10-04T18:21:07.512+02:00",
+                                                     parse_rfc3339 "2026-10-04 18:21:07z"] ),
+        test.case "ISO's other forms"          $( test.eq! [[:ok, to_instant (date 2026 10 4)], [:ok, t - 7512 * millisecond]]
+                                                    [parse_rfc3339 "2026-10-04", parse_rfc3339 "2026-10-04T18:21+0000"] ),
+        test.case "no offset, no instant"      $( test.eq! [:error, "a time with no offset is not an instant: 2026-10-04T18:21:07"]
+                                                    (parse_rfc3339 "2026-10-04T18:21:07") ),
+        test.case "a local time in a zone"     $( test.eq! [:ok, "2026-07-04T09:00:00-06:00"]
+                                                    (result.map datetime_text (parse_local denver "2026-07-04 09:00")) ),
+        test.case "HTTP dates, all three forms"
+            $( test.eq! [[:ok, 784111777 * second], [:ok, 784111777 * second], [:ok, 784111777 * second]]
+                        [parse_http_date "Sun, 06 Nov 1994 08:49:37 GMT", parse_http_date "Sunday, 06-Nov-94 08:49:37 GMT",
+                         parse_http_date "Sun Nov  6 08:49:37 1994"] ),
+
+        // clocks
+        test.case "a zone from a rule"         $( test.eq! [:ok, "CEST"]
+                                                    (result.map (fn z -> DateTime.abbrev (in_zone z t)) (posix_zone "CET-1CEST,M3.5.0,M10.5.0/3")) ),
+        test.case "the clock is after 2025"    $( test.true! (now! () > to_instant (date 2025 1 1)) ),
+        test.case "measure forces what it times" $( {
+            let [v, took] = measure! (list.sum (list.range 1 1000));
+            test.eq! [499500, true] [v, took >= 0]
+        } ),
+        test.case "sleep sleeps"               $( {
+            let start = monotonic! ();
+            sleep! (milliseconds 20)
+            test.true! (monotonic! () - start >= milliseconds 20)
+        } ),
+        test.case "within, in time"            $( test.eq! [:ok, 3] (within! second (1 + 2)) ),
+        test.case "within, too slow"           $( test.eq! :timeout (within! (milliseconds 20) (list.length (list.from 1))) ),
+        test.case "a real zone, when the machine has one" $( match zone! "America/Denver" {
+            [:ok, z] => test.eq! ["-06:00", "-07:00", "1966-01-01T00:00:00-07:00"]
+                                 [offset_text ":" (offset_in z t), offset_text ":" (offset_in z (to_instant (date 2026 1 1))),
+                                  datetime_text (in_zone z (to_instant (datetime 1966 1 1 7 0 0)))],
+            _ => :ok,
+        } ),
+        test.case "the far future uses the zone's rule" $( match zone! "Europe/London" {
+            [:ok, z] => test.eq! ["BST", "GMT"] [DateTime.abbrev (in_zone z (to_instant (date 2300 7 1))),
+                                                DateTime.abbrev (in_zone z (to_instant (date 2300 12 1)))],
+            _ => :ok,
+        } ),
+    ];
+
+    let array_list a = list.map (fn i -> a.[i]) (list.range 0 8);
+}
