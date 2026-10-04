@@ -155,7 +155,7 @@ public:
     Value make_thunk(uint32_t node, Value frame);
     Value make_frame(Value closure, uint32_t nslots);
     Value make_pap(Value fn, uint32_t nargs);
-    Value make_error(Value kind, Value payload);
+    Value make_error(Value kind, Value payload, Value where = UNIT);
     Value make_pid(uint64_t id);
     /// A bignum with room for `limbs` limbs, uninitialised: the caller writes
     /// them and sets `len` and `neg`. See `bigint::finish`.
@@ -935,7 +935,7 @@ public:
     Value make_array(uint32_t len);
     Value make_map_branch(uint32_t nslots);
     Value make_map_leaf(uint64_t hash, Value key, Value value, Value next);
-    Value make_error(Value kind, Value payload);
+    Value make_error(Value kind, Value payload, Value where = UNIT);
     Value make_module(uint32_t import_index, Value name);
     Value make_closure(uint32_t func, uint32_t ncaps);
     Value make_pap(Value fn, uint32_t nargs);

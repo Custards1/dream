@@ -572,10 +572,11 @@ Value Heap::make_pap(Value fn, uint32_t nargs) {
     return from_obj(o);
 }
 
-Value Heap::make_error(Value kind, Value payload) {
-    auto* o = static_cast<ErrorObj*>(alloc_bare(ObjType::ErrorBox, 2 * sizeof(Value)));
+Value Heap::make_error(Value kind, Value payload, Value where) {
+    auto* o = static_cast<ErrorObj*>(alloc_bare(ObjType::ErrorBox, 3 * sizeof(Value)));
     o->kind = kind;
     o->payload = payload;
+    o->where = where;
     return from_obj(o);
 }
 
@@ -1284,6 +1285,7 @@ inline void for_each_slot(Obj* o, ObjType type, F&& visit) {
             auto* e = static_cast<ErrorObj*>(o);
             visit(&e->kind);
             visit(&e->payload);
+            visit(&e->where);
             break;
         }
         case ObjType::Module: {
@@ -2522,6 +2524,7 @@ struct VerifyWalk {
                     auto* e = static_cast<ErrorObj*>(o);
                     push(e->kind, v);
                     push(e->payload, v);
+                    push(e->where, v);
                     break;
                 }
                 case ObjType::Module:
@@ -2883,7 +2886,8 @@ Value copy_object(Dest& dest, Value v, CopySeen& seen) {
             auto* src = static_cast<ErrorObj*>(o);
             Value kind = copy_value(dest, src->kind, seen);
             Value payload = copy_value(dest, src->payload, seen);
-            return dest.make_error(kind, payload);
+            Value where = copy_value(dest, src->where, seen);
+            return dest.make_error(kind, payload, where);
         }
         case ObjType::Module: {
             auto* src = static_cast<ModuleObj*>(o);
@@ -3308,10 +3312,11 @@ Value SharedArea::make_map_leaf(uint64_t hash, Value key, Value value, Value nex
     return from_obj(o);
 }
 
-Value SharedArea::make_error(Value kind, Value payload) {
-    auto* o = static_cast<ErrorObj*>(alloc(ObjType::ErrorBox, 2 * sizeof(Value)));
+Value SharedArea::make_error(Value kind, Value payload, Value where) {
+    auto* o = static_cast<ErrorObj*>(alloc(ObjType::ErrorBox, 3 * sizeof(Value)));
     o->kind = kind;
     o->payload = payload;
+    o->where = where;
     return from_obj(o);
 }
 

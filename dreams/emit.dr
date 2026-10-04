@@ -190,9 +190,11 @@ let func_bytes f =
         u16 (f.[:slots else 0]),
         u16 (f.[:n_captures else 0]),
         u32 (f.[:captures_off else 0]),
-        u32 (f.[:span_start else 0]),
-        u32 (f.[:span_end else 0]),
-        u32 0,   // reserved
+        // Where it was written, for an error to report: the file is a string
+        // index plus one, so that zero says "not known".
+        u32 (f.[:line else 0]),
+        u32 (f.[:col else 0]),
+        u32 (f.[:source else 0]),
     ];
 
 let global_bytes g =

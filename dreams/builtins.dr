@@ -94,6 +94,7 @@ let names = [
     "_await_message!",
     "_deadline_in!",
     "_match_fail",     // what a failed `match` raises with; see `lower.match_failure`
+    "_error_trace!",   // where an error was raised; see `error.trace!`
 
 ];
 
@@ -181,6 +182,7 @@ let signatures = %{
     "_await_message!" => "integer -> deadline -> :ok | :timeout, once the mailbox holds more than that many",
     "_deadline_in!" => "integer -> integer, the monotonic clock that many milliseconds from now",
     "_match_fail" => "value -> path -> line -> col -> never, raising :match_error with [value, path, line, col]",
+    "_error_trace!" => "error -> list of [:in | :made, name, path, line, col], innermost first",
 
 };
 
@@ -224,6 +226,7 @@ let wrappers = %{
     "_data_count" => "payload.count ()",
     "_data_at" => "payload.at i",
     "_sort_keyed" => "list.sort_on key xs",
+    "_error_trace!" => "error.trace! e",
 };
 
 /// The `std` call a primitive is written as, or `()`.

@@ -137,8 +137,24 @@ bool force_deep(Process& p, Value v, Value* out);
 /// goes, so it can raise; returns false when it does.
 bool stringify(Process& p, Value v, std::string* out);
 
+/// One place in where an error was raised (see `locate_error` in interp.cpp):
+/// a function that was running, or -- `made` -- the function that made a value
+/// being forced. `path` is empty and `line` zero when the image does not say.
+struct TracePlace {
+    bool made;
+    std::string name;
+    std::string path;
+    uint32_t line;
+    uint32_t col;
+};
+
+/// Where `err` was raised, innermost first; empty for a value that is not an
+/// error or has not been raised.
+std::vector<TracePlace> error_trace(Process& p, Value err);
+
 /// How a process's failure is reported when nobody handled it: its rendering,
-/// except that a failed `match` reads as a diagnostic, `path:line:col: ...`.
+/// except that a failed `match` reads as a diagnostic, `path:line:col: ...`,
+/// followed by where it was raised, a line a place.
 std::string describe_failure(Process& p, Value err);
 
 /// A short, non-forcing description, for error messages.

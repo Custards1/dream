@@ -155,6 +155,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 | `_tensor_matmul` | `a @ b` | `tensor\|list\|array → tensor\|list\|array → tensor\|float` | What `a @ b` is written as. See [`std.tensor`](#stdtensor). |
 | `_mailbox_peek!` · `_mailbox_take!` · `_await_message!` · `_deadline_in!` | `receive! { .. }` | | What `receive!` is written with: the `std.vm` natives of the same names (`_deadline_in! ms` is `vm.now_ns!` that many milliseconds on), as builtins so the syntax needs no import. |
 | `_match_fail` | a `match` no arm fits | `value → path → line → col → never` | Raises `:match_error` with `[value, path, line, col]`: one call per failure site, so a site costs one node and its kids. |
+| `_error_trace!` | `error.trace! e` | `error → list` | Where the error was first raised, innermost first: `[:in, name, path, line, col]` for a function running then, `[:made, ..]` for the function that made a value being forced. `[]` for one never raised. |
 | `_str_interp` | `$"..{x}.."` | `list → string` | Every element rendered as `to_string` renders it, joined: what an interpolated string is written as, lowered straight to the `str_interp` opcode. |
 | `_sort_keyed` | `list.sort_on key xs` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
@@ -1368,6 +1369,7 @@ match error.kind e {
 | `new k p` | An error as a value, without raising it — how a pure function *returns* a typed failure. |
 | `raise_as! k p` | Raise one of a named kind. The typed form of `raise!`, which otherwise wraps everything in `:error`. |
 | `rethrow! e` | Re-raise unchanged, which is what keeps the original kind readable. |
+| `trace! e` · `trace_lines! e` | Where it was first raised: the functions running, innermost first, and the ones that made each value being forced -- in a lazy program usually the line that matters, since a value fails where it is needed and not where it was written. The lines are what an uncaught error is printed with, and what `std.test` prints under a case that failed. A place is a function's, not a line within it. |
 
 ### `std.proc`
 

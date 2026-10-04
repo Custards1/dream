@@ -98,7 +98,7 @@ Unknown section kinds must be skipped, not treated as an error.
 | `GLBL` | 16 bytes (below)                                    | module-level bindings |
 | `IMPT` | `u32 path, u32 alias`                               | imports; both are `KSTR` indices |
 | `MODS` | 24 bytes (below)                                    | module records: which globals belong to which module |
-| `SPAN` | `u32 start, u32 end`                                 | per-node source spans, parallel to `NODE` |
+| `SPAN` | `u32 start, u32 end`                                 | per-node source spans, parallel to `NODE`; reserved, never written |
 | `ITYP` | `u32 func, u32 reserved, u64 integer_params`        | integer signature hints for the JIT |
 | `TYPE` | `u32 func, u32 reserved, u64 float_params`          | what signatures declared, for the JIT (below) |
 | `LDAT` | `u64 offset, u64 length`                            | large-data table, into `PAYL` |
@@ -243,9 +243,19 @@ run is in range, and every key is an `atom` node.
 | 12     | 2    | `slots`        | frame size: parameters plus block-local bindings |
 | 14     | 2    | `n_captures`   | |
 | 16     | 4    | `captures_off` | `KIDS` offset of `n_captures` capture descriptors |
-| 20     | 4    | `span_start`   | |
-| 24     | 4    | `span_end`     | |
-| 28     | 4    | reserved       | must be zero |
+| 20     | 4    | `line`         | 1-based line the function was written on; 0 when not known |
+| 24     | 4    | `col`          | 1-based column (bytes) |
+| 28     | 4    | `source`       | `KSTR` index of the file, **plus one**; 0 when not known |
+
+The place is what an error reports where it was raised from: the VM walks
+the continuation stack when an error first unwinds and keeps the functions it
+finds there, running and having made a value being forced, and an uncaught
+error is printed with a line for each (`locate_error` in
+dream/src/interp.cpp, `error.trace!` in std/error.dr). It is a function's place
+and not a node's because the optimizer shares identical nodes across the whole
+program. These bytes were a byte span and a reserved zero once, which nothing
+read; an image written then reads as "not known" everywhere, since `source` is
+zero.
 
 Function flags: `0x01 IMPURE`, `0x02 REC`, `0x04 THUNK` (a generated 0-arity
 body), `0x08 GLOBAL_VALUE` (a pure top-level value: force once, then memoize).
@@ -488,6 +498,8 @@ written before it runs unchanged:
 
 Later appends: `_sort_keyed` (50), `_tensor_matmul` (51) and `_str_interp`
 (52), the last the builtin behind opcode 74, which an interpolated string
-`$"..{x}.."` lowers to directly: one kid, the list of its pieces.
+`$"..{x}.."` lowers to directly: one kid, the list of its pieces. Then `_mailbox_peek!`,
+`_mailbox_take!`, `_await_message!`, `_deadline_in!` (53-56), `_match_fail`
+(57) and `_error_trace!` (58).
 
 Images importing the removed `std.core` or `std.native` modules must be recompiled.

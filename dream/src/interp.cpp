@@ -2227,9 +2227,90 @@ void step_return(Process& p, size_t floor) {
   }
 }
 
+/// The function a frame belongs to, or `NO_NODE` for a frame that has none
+/// to name -- one copied from another heap before its closure was.
+uint32_t frame_function(Value frame) {
+    if (!is_obj(frame, ObjType::Frame)) return NO_NODE;
+    Value cl = static_cast<FrameObj*>(as_obj(frame))->closure;
+    if (!is_obj(cl, ObjType::Closure)) return NO_NODE;
+    return static_cast<ClosureObj*>(as_obj(cl))->func;
+}
+
+/// Say where an error is being raised, the first time it is: which functions
+/// were running, innermost first, and which suspensions were being forced.
+///
+/// A lazy program's failure is rarely where it was written. The function that
+/// raised is the one whose frame is current, and a suspension being forced
+/// names the function that *made* it -- the place the value was written, and
+/// usually the line a reader wants, since that is the code that asked for the
+/// work and not the code that happened to need it first. Both are on the
+/// continuation stack already: a frame rides with most continuations, and an
+/// update carries the thunk it will overwrite. So locating an error is a walk
+/// down the top of that stack, and it costs nothing until something raises.
+///
+/// The answer is a list of fixnums, `fi + 1` for a function that was running
+/// and `-(fi + 1)` for one that made a value being forced, which
+/// `error_trace` turns into places from the image's function records. It is
+/// written once: a `catch` that raises the same error again keeps where it
+/// started, and a nested force that fails hands its outer machine an error
+/// that is already located, more precisely than the outer one could.
+///
+/// Granularity is the function, because that is what the image records: the
+/// optimizer shares identical nodes across the whole program, so a node has
+/// no one place to report.
+void locate_error(Process& p) {
+    Value v = resolve(p.result);
+    if (!is_obj(v, ObjType::ErrorBox)) return;
+    auto* e = static_cast<ErrorObj*>(as_obj(v));
+    if (e->where != UNIT || is_shared_obj(e)) return;
+
+    constexpr size_t kMaxEntries = 12;
+    constexpr size_t kMaxScan = 512;
+    int64_t found[kMaxEntries];
+    size_t n = 0;
+    auto note = [&](int64_t entry) {
+        if (n < kMaxEntries && (n == 0 || found[n - 1] != entry)) found[n++] = entry;
+    };
+    uint32_t fi = frame_function(p.frame);
+    if (fi != NO_NODE) note(int64_t(fi) + 1);
+    size_t scanned = 0;
+    for (size_t i = p.conts.size(); i > 0 && n < kMaxEntries && scanned < kMaxScan; --i, ++scanned) {
+        const Cont& c = p.conts.begin()[i - 1];
+        switch (c.kind) {
+            case ContKind::UpdateThunk: {
+                // A blackhole while it is forced, and still a thunk's shape.
+                Obj* o = as_obj(c.v1);
+                ObjType t = obj_type(o);
+                if (t != ObjType::Thunk && t != ObjType::Blackhole) break;
+                uint32_t made = frame_function(static_cast<ThunkObj*>(o)->frame);
+                if (made != NO_NODE) note(-(int64_t(made) + 1));
+                break;
+            }
+            case ContKind::IfBranch: case ContKind::BinRight: case ContKind::LogicRight:
+            case ContKind::BlockNext: case ContKind::Catch: case ContKind::NativeArgs:
+            case ContKind::IndexKey: case ContKind::IndexApply: case ContKind::GetWalk:
+            case ContKind::SetWalk: case ContKind::SwitchOn: case ContKind::SwitchKey:
+            case ContKind::EnterRetry: {
+                uint32_t at = frame_function(c.v1);
+                if (at != NO_NODE) note(int64_t(at) + 1);
+                break;
+            }
+            default: break;
+        }
+    }
+    if (n == 0) return;
+    // Built from the end. Nothing here collects, so `e` stays good.
+    Heap& h = p.heap();
+    Value list = NIL;
+    for (size_t i = n; i > 0; --i) list = h.make_cons(make_fixnum(found[i - 1]), list);
+    e->where = list;
+    h.remember_if_old(e, list);
+}
+
 /// Unwind to the nearest catch at or above `floor`. Returns false when the
 /// error escapes it.
 bool unwind(Process& p, size_t floor) {
+    locate_error(p);
     while (p.conts.size() > floor) {
         Cont c = p.conts.back();
         p.conts.pop_back();
@@ -2266,6 +2347,31 @@ bool unwind(Process& p, size_t floor) {
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
+
+std::vector<TracePlace> error_trace(Process& p, Value err) {
+    std::vector<TracePlace> out;
+    Value v = resolve(err);
+    if (!is_obj(v, ObjType::ErrorBox)) return out;
+    const Image& img = img_of(p);
+    for (Value cur = resolve(static_cast<ErrorObj*>(as_obj(v))->where);
+         is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        Value entry = resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        if (!is_fixnum(entry)) break;
+        int64_t n = fixnum_value(entry);
+        bool made = n < 0;
+        uint64_t fi = uint64_t(made ? -n : n) - 1;
+        if (fi >= img.func_count()) break;
+        const FuncRec& f = img.func(uint32_t(fi));
+        TracePlace place{made, img.str(f.name).str(), "", 0, 0};
+        if (f.source != 0 && f.source - 1 < img.string_count()) {
+            place.path = img.str(f.source - 1).str();
+            place.line = f.line;
+            place.col = f.col;
+        }
+        out.push_back(std::move(place));
+    }
+    return out;
+}
 
 /// `DREAM_PROBE_THUNK`: count the suspensions a run makes, by the kind of
 /// expression suspended, and report them with `--stats`.

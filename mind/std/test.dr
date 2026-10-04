@@ -145,6 +145,24 @@ let fail! message = raise! message;
 
 // --- running ----------------------------------------------------------------
 
+/// Where a failing case raised, a few lines of it under the failure: enough to
+/// reach the case's own `$( .. )`, which is what made the value the check was
+/// forcing, past the check that raised. See "where it was raised" in
+/// std/error.dr, whose `place_line` this is written out again from because
+/// `std.error` reaches `std.list`, whose tests import this module.
+priv let raised_where! : :any -> :string;
+priv let raised_where! e = {
+    let line_of at = {
+        let [how, name, path, line, col] = at;
+        (if how == :made { "forcing a value made in `" } else { "in `" }) + name + "`"
+            + (if line == 0 { "" } else { " (" + path + ":" + to_string line + ":" + to_string col + ")" })
+    };
+    let rec lines places n = if _list_is_empty places || n == 0 { "" }
+                             else { "            " + line_of (places.[0]) + "\n"
+                                    + lines (_list_tail places) (n - 1) };
+    lines (_error_trace! e) 6
+};
+
 let run_cases! : :integer -> :integer -> [Case] -> [:integer, :integer];
 let rec run_cases! passed failed cases = {
     if _list_is_empty cases { [passed, failed] }
@@ -159,7 +177,8 @@ let rec run_cases! passed failed cases = {
             write! ("  ok    " + name + "\n")
             run_cases! (passed + 1) failed (_list_tail cases)
         } else {
-            write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n")
+            write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n"
+                    + raised_where! outcome)
             run_cases! passed (failed + 1) (_list_tail cases)
         }
     }

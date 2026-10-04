@@ -129,9 +129,13 @@ struct FuncRec {
     uint16_t slots;
     uint16_t n_captures;
     uint32_t captures_off;
-    uint32_t span_start;
-    uint32_t span_end;
-    uint32_t reserved;
+    /// Where the function was written: a 1-based line and column, and the
+    /// file as a `KSTR` index plus one, so that zero -- what an image written
+    /// before these fields existed holds -- means "not known". Read only to
+    /// say where an error was raised (`error_trace` in interp.cpp).
+    uint32_t line;
+    uint32_t col;
+    uint32_t source;
 };
 static_assert(sizeof(FuncRec) == 32, "function records are 32 bytes on disk");
 

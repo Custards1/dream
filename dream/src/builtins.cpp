@@ -567,7 +567,33 @@ bool stringify(Process& p, Value v, std::string* out) {
     return stringify_into(p, v, out, false, 0);
 }
 
+namespace {
+
+/// `text`, then where the error was raised, a line a place: the lines an
+/// uncaught error is reported with.
+std::string with_trace(Process& p, Value err, std::string text) {
+    for (const TracePlace& at : error_trace(p, err)) {
+        text += at.made ? "\n    forcing a value made in `" : "\n    in `";
+        text += at.name + "`";
+        if (at.line != 0) {
+            text += " (" + at.path + ":" + std::to_string(at.line) + ":" +
+                    std::to_string(at.col) + ")";
+        }
+    }
+    return text;
+}
+
+std::string describe_untraced(Process& p, Value err);
+
+}  // namespace
+
 std::string describe_failure(Process& p, Value err) {
+    return with_trace(p, err, describe_untraced(p, err));
+}
+
+namespace {
+
+std::string describe_untraced(Process& p, Value err) {
     std::string text;
     stringify(p, err, &text);
     Value v = resolve(err);
@@ -590,6 +616,8 @@ std::string describe_failure(Process& p, Value err) {
     return path + ":" + std::to_string(fixnum_value(items[2])) + ":" +
            std::to_string(fixnum_value(items[3])) + ": no pattern fits " + shown;
 }
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Builtins
@@ -2553,6 +2581,32 @@ NativeResult core_match_fail(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::raise(h.make_error(make_atom(p.runtime().intern_atom("match_error")), list));
 }
 
+/// `_error_trace! e` -- where `e` was raised, innermost first: `[:in, name,
+/// path, line, col]` for a function that was running and `[:made, ..]` for
+/// the one that made a value being forced. `[]` for an error never raised.
+/// Impure because the answer is filled in by the raise, so asking before and
+/// after are different questions about the same value.
+NativeResult core_error_trace(Process& p, Value, Value* args, uint32_t) {
+    std::vector<TracePlace> places = error_trace(p, args[0]);
+    Heap& h = p.heap();
+    // Built from the end, each place pinned while the next is made.
+    Pin list(p, NIL);
+    Value in = make_atom(p.runtime().intern_atom("in"));
+    Value made = make_atom(p.runtime().intern_atom("made"));
+    for (size_t i = places.size(); i > 0; --i) {
+        const TracePlace& at = places[i - 1];
+        Pin path(p, h.make_string(at.path.data(), uint32_t(at.path.size())));
+        Pin name(p, h.make_string(at.name.data(), uint32_t(at.name.size())));
+        Value item = h.make_cons(make_fixnum(at.col), NIL);
+        item = h.make_cons(make_fixnum(at.line), item);
+        item = h.make_cons(path.get(), item);
+        item = h.make_cons(name.get(), item);
+        item = h.make_cons(at.made ? made : in, item);
+        p.pins[list.at] = h.make_cons(item, list.get());
+    }
+    return NativeResult::ok(list.get());
+}
+
 NativeResult core_str_slice(Process& p, Value, Value* args, uint32_t) {
     Bytes b;
     Value from = resolve(args[1]);
@@ -3888,6 +3942,7 @@ const BuiltinDef BUILTINS[] = {
     {"_await_message!", 2, 0b11, vm_await_message},
     {"_deadline_in!", 1, 0b1, vm_deadline_in},
     {"_match_fail", 4, 0b1110, core_match_fail},
+    {"_error_trace!", 1, 0b1, core_error_trace},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }
