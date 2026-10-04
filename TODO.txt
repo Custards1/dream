@@ -1,0 +1,40 @@
+Language and VM improvements, in the order we are doing them.
+
+Done (branch monitors-recv-match):
+1. Monitors and kill.  vm.monitor!/demonitor!/kill!, wrapped by std.proc;
+   std.supervisor monitors its children (no watcher processes) and kills a
+   child that ignores shutdown after the limits' :shutdown wait.
+2. Receive with a timeout, and selective receive.  vm.mailbox_peek!/take!,
+   vm.await_message! (absolute deadline), vm.sleep_until!, a timer thread in
+   the scheduler; std.proc.recv_where!/recv_within!/recv_until!/sleep!.
+   proc.call! and server.call! pick their reply out and raise :down if the
+   target dies.
+5. A better match failure.  :match_error is its own kind with payload
+   [value, path, line, col]; an uncaught one prints as a diagnostic.
+
+Left:
+3. Shared, frozen, fully forced values -- this already exists as vm.share!.
+   What is missing is a way to free one (it lives until the runtime ends).
+4. Union types flowing further: a real `union Result` in std.result, and the
+   checker carrying a constructor's type through `let`, so more matches are
+   checked for exhaustiveness.  Also: warn on a match with no wildcard over a
+   known type (the other half of 5).
+6. String interpolation: "area: {a}" lowered to str.concat over to_string.
+7. The array-backed union (the planned `struct` to `union`'s `group`).
+8. Peak heap on large programs (1.7 GB at 6,400 decls, dreams/TODO.md):
+   --stats live set by kind, look for lazy values pinned in scope maps.
+9. Lint warnings (dreams/lint.dr) in `mind check` and in lucid as you type.
+
+Follow-ups from 1, 2 and 5:
+- A kill lands at a slice boundary.  A process inside one long nested force
+  (strict! over a huge structure) or parked on IO is stopped only when that
+  returns or the descriptor wakes it; its poller entry is not cancelled.
+- call with a timeout wants a reference in the request and the reply, so a
+  late reply to a timed-out call is not taken as the next call's answer
+  (needs a vm.unique! counter).
+- std.registry could monitor what it names and drop the entry on [:down ..];
+  it is an agent, whose loop has no handler for a raw message yet.
+- The match positions cost the compiler's image 13% (1.05 -> 1.18 MB, 41.7k
+  -> 47.2k nodes); self-compile time unchanged.  A shared failure stub per
+  function would win most of that back.
+- `recv! { pattern => .. }` syntax lowering to recv_where!.

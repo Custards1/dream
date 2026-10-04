@@ -137,6 +137,10 @@ bool force_deep(Process& p, Value v, Value* out);
 /// goes, so it can raise; returns false when it does.
 bool stringify(Process& p, Value v, std::string* out);
 
+/// How a process's failure is reported when nobody handled it: its rendering,
+/// except that a failed `match` reads as a diagnostic, `path:line:col: ...`.
+std::string describe_failure(Process& p, Value err);
+
 /// A short, non-forcing description, for error messages.
 std::string describe(Process& p, Value v);
 

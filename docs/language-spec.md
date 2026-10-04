@@ -655,10 +655,17 @@ and a nested pattern does the same along the path it inspects: `[x, ..rest]`
 forces the first cell but neither `x` nor `rest`, which is what lets a
 `match` walk a list that is still being produced.
 
-A `match` with no arm that matches raises: `try!` sees an error of kind
-`:error` whose payload is the atom `:match_error`. Make a `match` total with a
-final `_` arm, or, on a declared union, by covering every variant
-([§10](#unions)).
+A `match` with no arm that matches raises an error of kind `:match_error`
+whose payload is `[value, path, line, col]`: what did not fit, and where the
+`match` was written, the path relative to the search path the file was found
+under. Uncaught, it is reported the way a compiler diagnostic is:
+
+```
+dream: uncaught error: shapes.dr:12:5: no pattern fits [:hexagon, 2]
+```
+
+Make a `match` total with a final `_` arm, or, on a declared union, by
+covering every variant ([§10](#unions)).
 
 ### Destructuring
 
@@ -754,11 +761,13 @@ Kinds the runtime raises:
 | `:out_of_bounds` | a position past either end of a list or array |
 | `:no_such_member` | a member a module does not have, found only at run time |
 | `:loop` | a value whose computation needs itself |
+| `:match_error` | a `match` no arm fits, or a destructuring the value does not; `[value, path, line, col]` |
+| `:killed` | `proc.kill!`: the process was stopped from outside ([§13](#13-processes)) |
 | `:stack_overflow`, `:out_of_memory` | a process past its limits (below) |
 | `:not_found`, `:permission_denied`, `:io_error`, ... | IO; [builtins.md](builtins.md#runtime-error-atoms) has the list |
 
-A failed `match` and a failed destructuring raise `:match_error`, which
-arrives with kind `:error` and payload `:match_error`.
+A failed `match` and a failed destructuring raise `:match_error`, with the
+value and its position as the payload ([§7](#patterns)).
 
 ### Runaway processes
 
@@ -1246,6 +1255,30 @@ stops the world, a thunk can be updated without locks because only one
 process can force it, and one process failing cannot corrupt another. The
 cost is that a value shared by copying is computed in each process that
 forces it.
+
+`recv!` takes the next message, whatever it is. `std.proc` adds the rest,
+on a handful of `std.vm` natives:
+
+| | |
+|---|---|
+| `proc.recv_where! wanted` | the first message `wanted` accepts; the others stay where they were, in order |
+| `proc.recv_within! ms` | `[:ok, message]`, or `:timeout` after `ms` milliseconds |
+| `proc.monitor! p` | be sent `[:down, p, outcome]` when `p` ends, without waiting for it |
+| `proc.kill! p reason` | end `p` as a failure of kind `:killed`; it cannot catch it |
+| `proc.sleep! ms` | wait |
+
+```dream
+let w = spawn! $( worker! () );
+proc.monitor! w
+match proc.recv_where_within! (fn m -> proc.is_down_of w m) 1000 {
+    [:ok, [:down, _, outcome]] => outcome,
+    :timeout => { proc.kill! w :too_slow; :gave_up },
+}
+```
+
+A kill takes effect at the start of the target's next slice, which is as
+prompt as preemption already is. A failure reported to a monitor counts as
+handled, as one delivered to a joiner does.
 
 The shapes built on these (servers that hold state, supervisors, registries,
 the same server over a socket) are in the standard library:

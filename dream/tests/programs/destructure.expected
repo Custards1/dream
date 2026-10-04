@@ -10,5 +10,5 @@ lazy:       2
 infinite:   3
 effects:    at the let
             and then 3
-mismatch:   <error :error :match_error>
-wrong kind: <error :error :match_error>
+mismatch:   <error :match_error [[1, 2], "destructure.dr", 52, 9]>
+wrong kind: <error :match_error [%{}, "destructure.dr", 18, 14]>

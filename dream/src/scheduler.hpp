@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <mutex>
@@ -94,6 +95,30 @@ public:
     bool receive(Process& p, Value* out);
     JoinState join(Process& p, uint64_t target, Value* out);
 
+    /// Ask `target` to stop, with `reason`. It ends at the start of its next
+    /// slice as a failure of kind `:killed` whose payload is the reason, which
+    /// is what its joiners and monitors are told. A kill cannot be caught: the
+    /// process is not unwound, it is simply not run again. Answers false for a
+    /// pid that does not exist; killing a finished process does nothing.
+    bool kill(Process& from, uint64_t target, Value reason);
+
+    /// Send `p` `[:down, target, outcome]` when `target` ends -- at once, if
+    /// it already has. `outcome` is `[:ok, value]` or `[:error, e]`, the shape
+    /// `proc.outcome!` answers, and a failure delivered this way counts as
+    /// handled, as one delivered to a joiner does.
+    void monitor(Process& p, uint64_t target);
+    /// Undo one `monitor` of `target` by `p`. A `[:down ..]` already sent
+    /// stays in the mailbox; the caller takes it out if it cares.
+    void demonitor(Process& p, uint64_t target);
+
+    /// Wake `pid` at `deadline_ns` on the monotonic clock `vm.now_ns!` reads.
+    /// Answers a sequence number for `cancel_timer`. A pending timer counts as
+    /// a wait on something outside the scheduler, as a descriptor does, so a
+    /// program whose every process is asleep is not mistaken for a deadlock.
+    uint64_t arm_timer(uint64_t pid, int64_t deadline_ns);
+    /// Forget a timer that has not fired. Harmless on one that has.
+    void cancel_timer(uint64_t seq);
+
     /// Make a parked process runnable again. Public because the IO poller
     /// calls it from its own thread when a descriptor becomes ready, which is
     /// the same handshake a message arriving uses.
@@ -139,6 +164,13 @@ private:
     void run_slice(const std::shared_ptr<Process>& p, unsigned index);
     void requeue(unsigned index, const std::shared_ptr<Process>& p);
     void finish(const std::shared_ptr<Process>& p);
+    /// End a process whose `kill_requested` is set, from the worker running it.
+    void terminate(const std::shared_ptr<Process>& p);
+    /// The message a monitor is sent when `p` ends. Called with `p` finished.
+    std::unique_ptr<Message> down_message(Process& p);
+    /// Put a message in `target`'s mailbox and wake it. False for no such pid.
+    bool deliver(uint64_t target, std::unique_ptr<Message> msg);
+    void timer_loop();
     void note_idle(bool idle);
 
     Runtime& rt_;
@@ -190,6 +222,23 @@ private:
     std::atomic<size_t> io_waiters_{0};
     std::atomic<uint64_t> total_reductions_{0};
     std::atomic<bool> deadlocked_{false};
+
+    /// Timed waits, by deadline. One thread sleeps until the earliest and
+    /// wakes whoever it belongs to; `timer_index_` is how a cancel finds an
+    /// entry without a walk. A wake is only ever a hint -- a woken native
+    /// looks again at what it was waiting for -- so a timer that fires just
+    /// after the message it was racing costs one spurious wake.
+    struct TimerEntry {
+        uint64_t seq;
+        uint64_t pid;
+    };
+    std::mutex timer_mutex_;
+    std::condition_variable timer_cv_;
+    std::multimap<int64_t, TimerEntry> timers_;
+    std::unordered_map<uint64_t, std::multimap<int64_t, TimerEntry>::iterator> timer_index_;
+    uint64_t next_timer_ = 1;
+    bool timers_running_ = false;
+    std::thread timer_thread_;
 
     std::mutex failures_mutex_;
     std::unordered_map<uint64_t, std::string> failures_;

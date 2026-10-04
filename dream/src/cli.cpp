@@ -638,8 +638,7 @@ int dream_main(int argc, char** argv) {
         sched.dump("deadlock");
         status = 1;
     } else if (root->failed) {
-        std::string text;
-        stringify(*root, root->exit_value, &text);
+        std::string text = describe_failure(*root, root->exit_value);
         std::fprintf(stderr, "dream: uncaught error: %s\n", text.c_str());
         status = 1;
     }

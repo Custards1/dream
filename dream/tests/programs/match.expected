@@ -21,4 +21,4 @@ as pattern: [3, 4] 7
 lazy elems: :two_cells
 infinite:   3
 order:      :first
-no match:   <error :error :match_error>
+no match:   <error :match_error [7, "match.dr", 56, 56]>

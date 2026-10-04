@@ -634,6 +634,28 @@ Three things follow, and they are the contract:
   would grow for ever. `dreams` shares only when it is compiling from the
   command line.
 
+### Watching, stopping and waiting
+
+What `std.proc` builds selective receive, timeouts and supervision from; a
+program reaches for `std.proc`, which says the same things in fewer words.
+They are natives of this module rather than builtins so that adding them took
+no new compiler.
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `monitor!` | `process → :ok` | Be sent `[:down, p, outcome]` when `p` ends -- at once if it has -- where `outcome` is `[:ok, value]` or `[:error, e]`. A failure delivered this way counts as handled, as one delivered to a joiner does. |
+| `demonitor!` | `process → :ok` | Undo one `monitor!`. A report already sent stays in the mailbox. |
+| `kill!` | `process → value → :ok` | End the process as a failure of kind `:killed` whose payload is the value. It is not unwound and cannot catch it: it is not run again after its current slice. A parked process is woken to be stopped. A process can kill itself, and then the call does not return. |
+| `mailbox_size!` | `unit → integer` | Messages waiting. |
+| `mailbox_peek!` | `integer → [:ok, value] \| :none` | The message at a position, left where it is. Only the owner ever removes a message, so a position keeps naming the same one until this process takes it. |
+| `mailbox_take!` | `integer → :ok` | Remove the message at a position; `:out_of_bounds` when there is none. |
+| `await_message!` | `integer → integer → :ok \| :timeout` | Wait until the mailbox holds more than `n` messages, or until `now_ns!` reaches the deadline; a negative deadline waits for ever. The deadline is absolute because a blocked native is re-entered from the top on every wake. |
+| `sleep_until!` | `integer → :ok` | Park until `now_ns!` reaches the deadline. |
+
+A timed wait counts, for the deadlock check, as a wait on something outside the
+scheduler -- as a descriptor does -- so a program whose every process is asleep
+is not reported as deadlocked.
+
 ### Inspection
 
 | Name | Signature | Description |
@@ -644,7 +666,7 @@ Three things follow, and they are the contract:
 | `io!` | `unit → list of map` | Every open I/O handle: `:handle`, `:fd`, `:kind`, `:busy`, `:waiting` (pid or `unit`). |
 | `dump!` | `unit → unit` | Prints the full VM state (scheduler + all processes + all handles) to stderr. Same output as `DREAM_STUCK_SECONDS`. |
 
-Process info map fields: `:id` · `:status` (`:runnable`, `:running`, `:waiting`, `:finished`, `:failed`) · `:waiting_on` (`:recv`, `:join`, `:io`, `:none`) · `:fd` · `:reductions` · `:heap_bytes` · `:collections` · `:mailbox` (count) · `:failed`
+Process info map fields: `:id` · `:status` (`:runnable`, `:running`, `:waiting`, `:finished`, `:failed`) · `:waiting_on` (`:message`, `:join`, `:io`, `:timer`, `:none`) · `:fd` · `:reductions` · `:heap_bytes` · `:collections` · `:mailbox` (count) · `:failed`
 
 ### Compile-time evaluation
 
@@ -1342,9 +1364,9 @@ The shapes the process builtins leave to the caller. Three properties of the
 runtime decide what is here: **a thunk runs once** (so anything restartable
 takes a function of unit, not a thunk), **spawning is lazy** (so anything
 starting more than one process forces the list, and that `strict!` is the
-difference between parallel and sequential), and **there is no selective
-receive and no way to kill** (so a server is written around a handler that sees
-every message and decides).
+difference between parallel and sequential), and **`recv!` takes the next
+message, whatever it is** -- selective receive, timeouts, monitors and kill are
+built here on the `std.vm` natives below it.
 
 | Name | Description |
 |------|-------------|
@@ -1354,7 +1376,13 @@ every message and decides).
 | `outcome! p` · `outcomes! ps` | `[:ok, v]` or `[:error, e]` — what `join!` would raise, as a value. |
 | `parallel! thunks` | Run these at once and answer their values in order. |
 | `map! f xs` · `try_map! f xs` | `list.map` with one process per element; the second keeps failures as values. |
-| `call! target body` · `reply! m value` | Request and reply. The request carries the process to answer, because `recv!` hands over a message and nothing else. |
+| `call! target body` · `reply! m value` | Request and reply. The request carries the process to answer; the reply is `[:reply, value]`, picked out of the mailbox with everything else left in place. The target is monitored for the call, so one that dies first raises an error of kind `:down` whose payload is its outcome. |
+| `recv_where! wanted` | The first message `wanted` accepts, taken out of the mailbox; the rest stay where they were, in order. Waits as long as it takes. |
+| `recv_within! ms` · `recv_where_within! wanted ms` | The same with a limit: `[:ok, message]`, or `:timeout`. |
+| `recv_until! wanted deadline` | What the three above are: `deadline` is a reading of `vm.now_ns!` (`deadline_in! ms` makes one), `forever` waits for ever, and `0` only looks. |
+| `sleep! ms` | Wait. Messages that arrive meanwhile wait too. |
+| `monitor! p` · `demonitor! p` · `is_down_of p m` | Be sent `[:down, p, outcome]` when `p` ends (at once if it has), `outcome` as `outcome!` answers it; a failure reported this way counts as handled. `demonitor!` also takes back a report already sent. |
+| `kill! p reason` | End `p` as a failure of kind `:killed`, payload `reason`. It cannot be caught, and takes effect at the start of `p`'s next slice. For the process that will not stop when asked. |
 | `is_call m` · `call_from m` · `call_body m` | Reading a request. |
 | `serve! state handle!` | A message loop. `handle!` answers `[:go, state]` or `[:stop, value]`. |
 | `shutdown` · `is_shutdown m` | The conventional stop message, so a worker and its supervisor need not agree on a spelling. |
@@ -1399,17 +1427,18 @@ Restart policies: `:permanent` (always), `:transient` (only after a failure),
 `:one_for_all` (stop the rest and start them all again), `:rest_for_one` (it and
 everything started after it).
 
-Two things the runtime's shape forces, and they are worth knowing before
-relying on any of this:
+How it watches and stops its children:
 
-- **There is no monitor.** The only way to learn that a process finished is
-  `join!`, which blocks, so each child gets a watcher process that joins it and
-  reports. The supervisor itself does nothing but read its mailbox.
-- **There is no kill.** A supervisor *asks* a child to stop, by sending
-  `proc.shutdown`, and waits. A child that never reads its mailbox cannot be
-  stopped by anyone, and a group strategy that has to stop its siblings will
-  wait for it. Anything meant to be supervised should be written around
-  `proc.serve!`.
+- **Each child is monitored** (`proc.monitor!`), so a death arrives as
+  `[:down, pid, outcome]` in the one mailbox the supervisor reads. A report for
+  a process it no longer counts as running -- one it stopped itself, or has
+  already restarted -- is ignored, so one death never restarts a child twice.
+- **A child is asked to stop, then killed.** The supervisor sends
+  `proc.shutdown` and waits for the child to go down for the limits'
+  `:shutdown` milliseconds (`with_shutdown ms limits`; five seconds by
+  default), then kills it with reason `:shutdown`. Anything meant to be
+  supervised should still be written around `proc.serve!`, so that being asked
+  is enough.
 
 ---
 
@@ -1531,7 +1560,9 @@ These atoms are raised by the built-in operations. A `match` on the error kind o
 | `:type_error` | Wrong type passed to an operation |
 | `:not_a_function` | Applying a non-callable value |
 | `:no_such_member` | `module.name` where `name` is not exported |
-| `:match_error` | A `match` with no arm that matched |
+| `:match_error` | A `match` with no arm that matched, or a destructuring the value does not fit. The payload is `[value, path, line, col]` |
+| `:killed` | `vm.kill!`: the process was stopped from outside. The payload is the reason |
+| `:down` | `proc.call!` and `server.call!`: the process called ended before it answered. The payload is its outcome |
 | `:out_of_bounds` | Array index outside the valid range |
 | `:shape_error` | Tensors whose shapes do not fit the operation |
 | `:device_error` | A host tensor and a GPU tensor in one operation |

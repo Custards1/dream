@@ -161,6 +161,19 @@ public:
     bool empty() const;
     size_t size() const;
 
+    /// Selective receive. Only the owning process ever removes a message, so a
+    /// position it has looked at stays the same message until it removes it:
+    /// senders only append. That is what lets the scan live in Dream, one
+    /// position at a time, rather than in a native that would have to run the
+    /// caller's predicate underneath itself.
+    ///
+    /// `peek_into` copies the message at `i` into `dest` and answers false when
+    /// there is no such message. The copy is made under the lock because the
+    /// message's heap is about to be read by a thread that does not own it.
+    bool peek_into(size_t i, Heap& dest, Value* out) const;
+    /// Remove the message at `i`; false when there is none.
+    bool remove_at(size_t i);
+
 private:
     mutable std::mutex mutex_;
     std::deque<std::unique_ptr<Message>> queue_;
@@ -196,6 +209,7 @@ enum class WaitReason : uint8_t {
     Message,   // `recv!`
     Join,      // `join!`
     Io,        // a descriptor the poller is watching
+    Timer,     // `vm.sleep_until!`, or a message wait with a deadline
 };
 
 const char* wait_reason_name(WaitReason r);
@@ -391,6 +405,28 @@ public:
     /// against a process that has already exited.
     std::mutex waiters_mutex;
     std::vector<uint64_t> waiters;
+    /// Processes that asked, with `vm.monitor!`, to be told when this one
+    /// ends. Each is sent `[:down, pid, outcome]` by `Scheduler::finish`.
+    /// Under `waiters_mutex`, for the reason `waiters` is: registering and
+    /// finishing must not interleave.
+    std::vector<uint64_t> monitors;
+
+    /// Set by `vm.kill!`. A process is only ever stopped by the worker running
+    /// it, so a kill is a request: it takes effect at the start of the next
+    /// slice, and `kill!` wakes a parked target so there is one. A slice is
+    /// 4000 reductions, which is as prompt as preemption already is.
+    std::atomic<bool> kill_requested{false};
+    /// Why, copied out of the killer's heap the way a message is. Written once,
+    /// under `sched_mutex`, by whichever kill arrived first.
+    std::unique_ptr<Message> kill_reason;
+
+    /// The timer a timed wait armed (`Scheduler::arm_timer`), or 0, and the
+    /// deadline it was armed for. Touched only by the worker running this
+    /// process -- from the native that waits -- so it needs no lock. A blocked
+    /// native is re-entered from the top on every wake, and this is how the
+    /// second entry knows its timer is already set.
+    uint64_t timer_seq = 0;
+    int64_t timer_deadline = -1;
 
     /// Guards the parking handshake below. Only the worker currently running a
     /// process may change its machine state, so a blocking builtin does not

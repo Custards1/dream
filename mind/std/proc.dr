@@ -23,14 +23,26 @@
 // that `strict!` is the difference between running in parallel and running in
 // sequence.
 //
-// **There is no selective receive and no way to kill.** `recv!` answers the
-// next message whatever it is, so a process expecting a reply must be prepared
-// for anything else that was sent to it; and a process that will not stop
-// cannot be stopped from outside. Both are why the server loop below is written
-// around a handler that sees every message and decides.
+// **`recv!` takes the next message, whatever it is.** Everything subtler is
+// built here on four natives of `std.vm`: look at the message at a position,
+// take the message at a position, wait for the mailbox to grow past a length
+// (with a deadline), and sleep. `recv_where!` scans for the first message a
+// predicate accepts and leaves the rest where they were, so a process waiting
+// for a reply no longer has to take, and then re-send, whatever else arrived
+// first. The scan is Dream, not a native, because the predicate is the
+// caller's and running it underneath a native is the one thing a native here
+// must not do.
+//
+// **A process can be watched and stopped from outside.** `monitor!` asks to be
+// sent `[:down, p, outcome]` when `p` ends, which is what `join!` tells a
+// joiner but without blocking anyone; `kill! p reason` ends `p` as a failure
+// of kind `:killed`, and nothing it does can prevent that. A server is still
+// written around a handler that reads its mailbox and stops when asked: a kill
+// is for the one that will not.
 
 import std.error;
 import std.list;
+import std.vm;
 
 // --- starting ---------------------------------------------------------------
 
@@ -110,21 +122,123 @@ let call_from m = list.nth 1 m;
 let call_body : :list -> :any;
 let call_body m = list.nth 2 m;
 
-/// Send `body` to `target` and wait for the reply.
+let is_reply : :any -> :bool;
+let is_reply m = match m {
+    [:reply, _] => true,
+    _ => false,
+};
+
+/// Send `body` to `target` and wait for the reply, leaving every other
+/// message where it was.
 ///
-/// The reply is whatever arrives next. With no selective receive that is the
-/// best that can be promised, so this is for a process that is waiting on one
-/// answer and nothing else -- which is the usual case, and the reason to say
-/// so here rather than leave it to be discovered.
+/// The target is monitored for the length of the call, so a target that dies
+/// before it answers -- or was never alive -- raises an error of kind `:down`
+/// whose payload is its outcome, rather than leaving the caller parked on a
+/// reply that cannot come.
 let call! : Process -> :any -> :any;
 let call! target body = {
-    send! target (call_message (self! ()) body)
-    recv! ()
+    let me = self! ();
+    monitor! target
+    send! target (call_message me body)
+    let answer = recv_where! (fn m -> is_reply m || is_down_of target m);
+    demonitor! target
+    match answer {
+        [:reply, value] => value,
+        [:down, _, outcome] => raise! (error.new :down outcome),
+    }
 };
 
 /// Answer a request. The other half of `call!`.
 let reply! : :list -> :any -> :any;
-let reply! m value = send! (call_from m) value;
+let reply! m value = send! (call_from m) [:reply, value];
+
+// --- receiving ----------------------------------------------------------------
+
+/// A deadline that never comes, for the waits below.
+let forever : :integer;
+let forever = 0 - 1;
+
+/// The monotonic clock `ms` milliseconds from now: a deadline for the waits
+/// below. Deadlines rather than durations, because a wait that is woken and
+/// waits again must not start counting again.
+let deadline_in! : :integer -> :integer;
+let deadline_in! ms = vm.now_ns! () + ms * 1000000;
+
+/// The first message `wanted` accepts, taken out of the mailbox as
+/// `[:ok, message]`, or `:timeout` once the clock reaches `deadline` (see
+/// `deadline_in!`; `forever` waits for ever, and `0` only looks). Messages it
+/// does not accept stay where they were, in order.
+///
+/// A position, once looked at, keeps meaning the same message: only this
+/// process ever removes one, and senders only append. So the scan resumes
+/// where it stopped after each wait, and looks at each message once.
+let recv_until! : (:any -> :bool) -> :integer -> ([:ok, :any] | :timeout);
+let recv_until! wanted deadline = scan! wanted deadline 0;
+
+priv let scan! : (:any -> :bool) -> :integer -> :integer -> ([:ok, :any] | :timeout);
+priv let rec scan! wanted deadline !at = match vm.mailbox_peek! at {
+    [:ok, m] =>
+        if wanted m {
+            vm.mailbox_take! at
+            [:ok, m]
+        }
+        else { scan! wanted deadline (at + 1) },
+    _ => match vm.await_message! at deadline {
+        :ok => scan! wanted deadline at,
+        _ => :timeout,
+    },
+};
+
+/// The first message `wanted` accepts, waiting as long as it takes.
+let recv_where! : (:any -> :bool) -> :any;
+let recv_where! wanted = match recv_until! wanted forever {
+    [:ok, m] => m,
+    // Unreachable: there is no deadline to reach. Said, so the match is whole.
+    other => raise! (error.new :timeout other),
+};
+
+/// The next message as `[:ok, message]`, or `:timeout` after `ms`
+/// milliseconds without one.
+let recv_within! : :integer -> ([:ok, :any] | :timeout);
+let recv_within! ms = recv_until! (fn m -> true) (deadline_in! ms);
+
+/// `recv_where!` with a limit of `ms` milliseconds.
+let recv_where_within! : (:any -> :bool) -> :integer -> ([:ok, :any] | :timeout);
+let recv_where_within! wanted ms = recv_until! wanted (deadline_in! ms);
+
+/// Do nothing for `ms` milliseconds. Messages that arrive meanwhile wait.
+let sleep! : :integer -> :atom;
+let sleep! ms = vm.sleep_until! (deadline_in! ms);
+
+// --- watching and stopping -------------------------------------------------------
+
+/// Be sent `[:down, p, outcome]` when `p` ends -- at once, if it already has.
+/// `outcome` is what `outcome!` answers. A failure reported this way counts as
+/// handled, as one delivered to a joiner does.
+let monitor! : Process -> :atom;
+let monitor! p = vm.monitor! p;
+
+/// Stop monitoring `p`, and take back the `[:down ..]` for it if it already
+/// came, so a monitor that was only wanted for a while leaves nothing behind.
+let demonitor! : Process -> :atom;
+let demonitor! p = {
+    vm.demonitor! p
+    recv_until! (fn m -> is_down_of p m) 0
+    :ok
+};
+
+let is_down_of : Process -> :any -> :bool;
+let is_down_of p m = match m {
+    [:down, q, _] => q == p,
+    _ => false,
+};
+
+/// End `p` now, as a failure of kind `:killed` with `reason` as its payload:
+/// that is what its joiners and monitors are told. It cannot be caught, and a
+/// process can kill itself. Prefer asking (`shutdown`) for anything that holds
+/// something it should let go of; this is for the process that will not stop.
+let kill! : Process -> :any -> :atom;
+let kill! p reason = vm.kill! p reason;
 
 // --- serving ----------------------------------------------------------------
 
@@ -164,6 +278,9 @@ when test {
     import std.test;
 
     let double x = x * 2;
+
+    /// Never answers and never reads its mailbox: what `kill!` is for.
+    let rec spin !n = spin (n + 1);
 
     /// A worker that adds up what it is sent and answers its total when asked
     /// to stop. Every test below drives one of these, because a process that
@@ -213,6 +330,64 @@ when test {
                 send! p shutdown
                 test.eq! 2 (join! p)
             } ),
+        test.case "recv_where! leaves what it skips, in order"
+            $( {
+                let me = self! ();
+                send! me :a
+                send! me [:b, 1]
+                send! me :c
+                let got = recv_where! (fn m -> m != :a && m != :c);
+                test.eq! [[:b, 1], :a, :c] [got, recv! (), recv! ()]
+            } ),
+        test.case "recv_within! times out"
+            $( test.eq! :timeout (recv_within! 20) ),
+        test.case "recv_within! answers a message that is there"
+            $( {
+                send! (self! ()) :here
+                test.eq! [:ok, :here] (recv_within! 1000)
+            } ),
+        test.case "recv_where_within! waits for a late message"
+            $( {
+                let me = self! ();
+                spawn! $( { sleep! 20; send! me :late } )
+                test.eq! [:ok, :late] (recv_where_within! (fn m -> m == :late) 5000)
+            } ),
+        test.case "kill! stops a loop that reads nothing"
+            $( {
+                let p = spawn! $( spin 0 );
+                kill! p :enough
+                let [tag, e] = outcome! p;
+                test.eq! [:error, :killed, :enough] [tag, error.kind e, error.payload e]
+            } ),
+        test.case "monitor! reports how a process ended"
+            $( {
+                let p = spawn! $( 6 * 7 );
+                monitor! p
+                test.eq! [:ok, 42] (list.nth 2 (recv_where! (fn m -> is_down_of p m)))
+            } ),
+        test.case "demonitor! takes back a report already sent"
+            $( {
+                let p = spawn! $( 1 );
+                join! p
+                monitor! p
+                demonitor! p
+                test.eq! :timeout (recv_within! 0)
+            } ),
+        test.case "call! raises when the target dies first"
+            $( {
+                let p = spawn! $( raise! :gone );
+                let e = try! { call! p 1 } catch e { e };
+                test.eq! :down (error.kind e)
+            } ),
+        test.case "call! keeps messages that are not the reply"
+            $( {
+                let p = spawn! $( adder! () );
+                send! (self! ()) :unrelated
+                let answer = call! p 4;
+                send! p shutdown
+                join! p
+                test.eq! [4, :unrelated] [answer, recv! ()]
+            } ),
         test.case "a server keeps its state between messages"
             $( {
                 let p = spawn! $( adder! () );
@@ -232,4 +407,5 @@ when test {
 
 type Process = :process;
 type Call body = [:call, Process, body];
+type Reply value = [:reply, value];
 type Outcome value = [:ok, value] | [:error, :any];

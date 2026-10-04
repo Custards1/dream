@@ -48,6 +48,7 @@ const char* wait_reason_name(WaitReason r) {
         case WaitReason::Message: return "message";
         case WaitReason::Join: return "join";
         case WaitReason::Io: return "io";
+        case WaitReason::Timer: return "timer";
         case WaitReason::None: break;
     }
     return "none";
@@ -91,6 +92,20 @@ bool Mailbox::empty() const {
 size_t Mailbox::size() const {
     std::lock_guard<std::mutex> g(mutex_);
     return queue_.size();
+}
+
+bool Mailbox::peek_into(size_t i, Heap& dest, Value* out) const {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (i >= queue_.size()) return false;
+    *out = Heap::copy_between(dest, queue_[i]->value);
+    return true;
+}
+
+bool Mailbox::remove_at(size_t i) {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (i >= queue_.size()) return false;
+    queue_.erase(queue_.begin() + std::ptrdiff_t(i));
+    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -46,8 +46,9 @@
 //     the far side gets is `error.describe`, which a person can read and a
 //     `match` cannot. Structure the failures a caller must branch on into the
 //     reply value itself.
-//   - A server that dies leaves its connections waiting, exactly as a local
-//     `call!` waits, because there are no monitors. Supervise it -- and when
+//   - A server that dies mid-request answers that request with an error: the
+//     local `server.call!` monitors it and raises `:down`, and the reply is
+//     what any failed call's is. Supervise it -- and when
 //     you do, serve it by *name* rather than by pid, because a restarted
 //     server is a new pid and a listener started against the old one would go
 //     on offering that one for ever. `serve_via!` takes a lookup instead of a

@@ -40,16 +40,15 @@
 // Four things about this runtime decide the rest, and each one is visible
 // below rather than hidden:
 //
-// **There is no selective receive.** `recv!` hands over the next message
-// whatever it is, so a caller waiting for a reply is handed everything else
-// that was sent to it first. `call!` therefore keeps what it did not want and
-// puts it back -- see `await_reply!`, which says exactly what that costs.
+// **A reply is picked out, not waited for in line.** `call!` takes the reply
+// with `proc.recv_where!` and leaves everything else in the caller's mailbox,
+// in order, and it monitors the server while it waits, so a server that dies
+// mid-call raises in the caller instead of leaving it parked.
 //
-// **There is no kill and no monitor.** A server is stopped by *asking*
-// (`proc.shutdown`), so the loop below always honours that message, whatever
-// the handlers say -- a server that could decline it could not be supervised.
-// And `std.supervisor` learns a child died by joining it in a separate
-// process, which is why nothing here has to.
+// **A server is stopped by asking first.** `proc.shutdown` is always honoured
+// by the loop below, whatever the handlers say -- a server that could decline
+// it would leave a supervisor nothing to do but kill it, which it will, after
+// its limits' `:shutdown` wait, but which lets go of nothing the server holds.
 //
 // **A thunk runs once.** `start!` builds its thunk inside itself, so calling it
 // twice starts two servers; `child` hands the supervisor a function of unit for
@@ -62,6 +61,7 @@
 // (`AUX_DEEP_FORCED`), so re-forcing a state that only grew at one edge costs
 // the edge.
 
+import std.error;
 import std.debug;
 import std.list;
 import std.proc;
@@ -266,43 +266,33 @@ let child_with! name args restart = supervisor.child_with name (started! args) r
 // --- talking to one ------------------------------------------------------------------
 
 /// Ask, and wait for the answer.
+///
+/// The reply is picked out of the mailbox (`proc.recv_where!`) and everything
+/// else is left where it was, in order, for the caller's own loop -- which is
+/// what makes a server calling another server safe. Two servers calling *each
+/// other* still deadlock, as they do in Erlang: each is waiting on a reply the
+/// other will not send until its own arrives.
+///
+/// The server is monitored for the length of the call, so one that dies before
+/// it answers raises an error of kind `:down` here, with its outcome as the
+/// payload, instead of leaving the caller waiting for ever.
 let call! : Handle -> :any -> :any;
 let call! pid request = {
     let me = self! ();
+    proc.monitor! pid
     send! pid (call_of me request)
-    await_reply! me []
-};
-
-/// Wait for the reply to this call, keeping anything else that turns up.
-///
-/// With no selective receive there is no way to look past a message without
-/// taking it, and no way to put one back where it was. So the ones that are not
-/// the reply are held and re-sent afterwards. What that preserves is their
-/// order relative to *each other*; what it cannot preserve is their order
-/// relative to whatever arrived while this was waiting, which ends up in front
-/// of them. That is the honest cost of a synchronous call here, and it is still
-/// better than the alternative of treating the next message as the answer --
-/// which loses them outright, and answers the caller with the wrong value.
-///
-/// It is also what makes a server calling another server safe: the messages
-/// meant for the caller's own loop are waiting for it when the call returns.
-/// Two servers calling *each other* still deadlock, as they do in Erlang --
-/// each is waiting on a reply the other will not send until its own arrives.
-priv let await_reply! : Handle -> [:any] -> :any;
-priv let rec await_reply! me kept = {
-    let m = recv! ();
-    if tag_of m == :server_reply && list.nth 1 m == me {
-        requeue! (list.reverse kept)
-        list.nth 2 m
+    let answer = proc.recv_where! (fn m -> is_reply_to me m || proc.is_down_of pid m);
+    proc.demonitor! pid
+    match answer {
+        [:server_reply, _, value] => value,
+        [:down, _, outcome] => raise! (error.new :down outcome),
     }
-    else { await_reply! me (_list_cons m kept) }
 };
 
-priv let requeue! : [:any] -> :unit;
-priv let requeue! ms = {
-    let me = self! ();
-    strict! (list.map (fn m -> send! me m) ms)
-    ()
+priv let is_reply_to : Handle -> :any -> :bool;
+priv let is_reply_to me m = match m {
+    [:server_reply, to, _] => to == me,
+    _ => false,
 };
 
 /// Tell, and carry on. Nothing comes back, including a failure: a cast to a
