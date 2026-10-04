@@ -55,7 +55,7 @@ function findServer(config, folders) {
   for (const folder of folders || []) {
     const root = folder.uri.fsPath;
     candidates.push(path.join(root, 'build', 'lucid.dream'));
-    candidates.push(path.join(root, 'build-drain', 'bin', 'lucid.dream'));
+    candidates.push(path.join(root, 'build-dream', 'bin', 'lucid.dream'));
   }
 
   if (process.env.LUCID_IMAGE) candidates.push(expandPath(process.env.LUCID_IMAGE));

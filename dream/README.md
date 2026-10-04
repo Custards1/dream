@@ -1,223 +1,260 @@
 # dream, the Dream VM
 
-A virtual machine for [Dream](../docs/language-spec.md), a dynamically typed,
-lazily evaluated functional language. The VM has three parts worth knowing
-about:
+The virtual machine that runs `.dream` images. It knows nothing about source
+code: the compiler, [`dreams`](../dreams/README.md), is itself an image this VM
+runs. What is here:
 
-- a **lazy graph-reduction interpreter** written as an explicit state machine,
+- a **lazy graph-reduction interpreter**, written as an explicit state machine;
 - **green processes** with isolated heaps and copied messages, in the style of
-  the BEAM,
-- an optional **LLVM JIT** that compiles the strict numeric spine of hot
-  functions.
+  the BEAM, scheduled preemptively across cores;
+- a **generational collector** per process, parallel and partly concurrent;
+- an **LLVM JIT** that compiles hot functions, numeric and list code alike;
+- the **native modules** -- `std.io`, `std.os`, `std.net`, `std.tls`,
+  `std.ffi`, `std.math`, `std.crypto`, `std.tensor`, `std.vm` -- that the rest
+  of the standard library is written on.
+
+## Building and running
 
 ```
-cmake -S . -B build && cmake --build build -j
-./build-dream/bin/dream program.dream
-```cd /home/blake/project/dream
-sed -i 's|#include <atomic>|#include <algorithm>\n#include <atomic>|' dream/src/os.cpp
-just build 2>&1 | grep -E "error:" -A 5 | head -20; echo "=== BUILT ==="
-S=/tmp/nix-shell-140670-2475414227/claude-1000/-home-blake-project-dream/916c0e2f-75ef-4c7b-8714-dbe1054b4db5/scratchpad
-cat > $S/os1.dr <<'EOF'
-import std.console;
-import std.os;
-import std.list;
-let main! = {
-    console.print! "platform: " (os.platform ())
-    console.print! "args:     " (os.args! ())
-    console.print! "HOME set: " (os.env! "HOME" != ())
-    console.print! "missing:  " (os.env! "DEFINITELY_NOT_SET_XYZ")
-    console.print! "cwd ends: " (os.cwd! () != "")
-    console.print! "pid > 0:  " (os.pid! () > 0)
+just vm                      # build-dream/bin/dream, with the JIT if LLVM is found
+just vm-no-jit               # build-nojit/bin/dream, the interpreter alone
+just vm-pgo                  # build-pgo/bin/dream, trained on a self-compile (~12% faster)
+just mind-build vm           # the same VM, built by std.build rather than CMake
 
-    let r = os.exec! "echo" ["hello", "from", "exec"];
-    console.print! "exec out: " r.[:out else ""]
-    console.print! "exec code:" r.[:code else (0 - 1)]
+./build-dream/bin/dream program.dream [args]
+```
 
-    let f = os.exec! "false" [];
-    console.print! "fail code:" f.[:code else (0 - 1)]
+The build needs a C++20 compiler, CMake 3.20, **libffi** and **OpenSSL 3**
+(SChannel on Windows). Both are required: `std.ffi` and `std.tls` are part of
+the interface every VM provides, and a VM without them is not a valid one.
+LLVM is optional; without it the VM is the interpreter alone, still correct,
+just slower. On Nix, the repository's `nix-shell` has everything.
 
-    let e = os.exec! "sh" ["-c", "echo oops >&2; exit 3"];
-    console.print! "stderr:   " e.[:err else ""]
-    console.print! "code:     " e.[:code else (0 - 1)]
+`build-dream/` is the VM's build directory. `build/` is where the Dream-side
+recipes write their images (`dreams.dream`, `mind`, `lucid.dream`), and there
+is no VM in it.
 
-    console.print! "missing:  " (try! { os.exec! "no_such_program_xyz" [] } catch err { err })
-    console.print! "dir has:  " (list.contains "mind" (os.list_dir! "."))
-};
-EOF
-./build-dream/bin/dream build/dreams.dream $S/os1.dr -L mind -o $S/os1.dream >/dev/null 2>&1 && build-dream/bin/dream $S/os1.dream one twov
+### The command line
+
+```
+dream <image> [options] [program args]
+```
+
+An image is found as the name written, that name with `.dream` added, or
+either under `$MINDV2_PATH` -- so `dream mind` runs `./mind.dream` if there is
+one and the installed one otherwise. `dream -x NAME` looks only in the
+installation.
+
+VM options go **before** the image; everything after it belongs to the program.
+
+| | |
+|---|---|
+| `-x, --exec NAME` | run `NAME.dream` from `$MINDV2_PATH`, ignoring the working directory |
+| `-e, --entry NAME` | run this global instead of `main!` |
+| `-j, --workers N` | scheduler threads (default: the cores, at most 8) |
+| `--stats` | reductions, collections, bytes allocated and promoted, the live set by kind, what the JIT took |
+| `--profile [N]` | the N hottest functions, by reductions |
+| `--dump` | disassemble the image and exit |
+| `--no-jit` | stay in the interpreter |
+| `--jit-threshold N` | calls before a function is compiled (default 32) |
+| `--dump-jit FN` | print the LLVM IR generated for one function |
+| `--any-target` | run an image built for another platform anyway |
+| `--mindv2-path` | print the effective `$MINDV2_PATH` and exit |
+
+### Environment
+
+| | |
+|---|---|
+| `MINDV2_PATH` | where installed images are found |
+| `DREAM_MAX_HEAP`, `DREAM_MAX_DEPTH`, `DREAM_MAX_STACK` | per-process limits: heap bytes (1 GB), pending continuations, value-stack depth |
+| `DREAM_NURSERY_MAX` | the cap a process's nursery may grow to (32 MiB) |
+| `DREAM_GC_THREADS`, `DREAM_GC_PAR_MIN` | the collector's helper threads, and the size of heap worth dividing among them |
+| `DREAM_GC_CONCURRENT` | `1` overlaps every major's marking with the program, `0` none; unset lets size decide |
+| `DREAM_GC_EVACUATE` | `all` empties every old block at every major (a test setting) |
+| `DREAM_GC_TRACE` | print every collection |
+| `DREAM_VERIFY_HEAP` | walk and check the heap after every collection |
+| `DREAM_STUCK_SECONDS` | report what every process is doing if nothing has progressed for this long |
+| `DREAM_JIT_SYNC` | compile on the calling thread rather than in the background |
+| `DREAM_JIT_TRACE` | print every compile, whether it was taken, and what it cost |
+| `DREAM_TENSOR_THREADS`, `DREAM_OPENCL_LIB` | tensor parallelism, and which OpenCL to `dlopen` |
 
 ## Why the interpreter is a state machine
 
-The obvious way to write an evaluator is a recursive `eval`. That choice would
-have cost all three of the things above.
+The obvious way to write an evaluator is a recursive `eval`. That would have
+cost most of what follows.
 
-A process's entire state — where it is in the program, what it is waiting to do
-with the result, and every value it can still reach — lives in two vectors it
-owns: a value stack and a continuation stack. Nothing sits in a C++ local across
-a step. That single decision buys:
+A process's entire state -- where it is in the program, what it will do with
+the result, and every value it can still reach -- lives in two vectors it owns:
+a value stack and a continuation stack. Nothing sits in a C++ local across a
+step. That one decision buys:
 
 - **Preemption.** A process can be stopped between any two reductions and
-  resumed later on a different OS thread, because there is no native stack to
-  save. That is what makes one process unable to starve the others.
+  resumed later on another OS thread, because there is no native stack to
+  save. No process can starve the others.
 - **Precise GC roots.** The collector enumerates a list, not a stack. There is
   no conservative scanning and no pinning.
 - **Proper tail calls.** A tail call pops its continuation before entering the
-  callee, so a tail-recursive loop runs in constant space. `count_down 2000000`
-  finishes without growing anything.
-- **Cheap processes.** A process is a heap and two small vectors, so hundreds of
-  thousands of them fit in memory.
+  callee, so a tail-recursive loop runs in constant space.
+- **Cheap processes.** A process is a heap and two small vectors, so hundreds
+  of thousands of them fit in memory.
 
 ## Values
 
 One 64-bit word, tagged in the low bits:
 
-| Pattern  | Meaning |
-|----------|---------|
-| `....1`  | fixnum — a 63-bit signed integer, `(int64)v >> 1` |
+| Pattern | Meaning |
+|---|---|
+| `....1` | fixnum -- a 63-bit signed integer, `(int64)v >> 1` |
 | `...000` | pointer to a heap object (8-byte aligned); `0` means "no value" |
-| `...010` | immediate — unit, bool, char, atom, nil, builtin |
+| `...010` | immediate -- unit, bool, char, atom, the empty list, a builtin |
 
 Integers get the one-bit tag because arithmetic is the hot path: testing and
 untagging cost a shift each, and the JIT can compare two tagged fixnums
-directly, since the tagging preserves order.
+directly, since the tagging preserves order. An integer that does not fit in
+63 bits is a bignum, whose limbs live outside the heap, so fixnum code pays
+nothing for integers being unbounded
+([docs/notes/bignums.md](../docs/notes/bignums.md)).
 
 ## Laziness
 
-Every argument, list element, map value and `let` binding starts as a **thunk**:
-a node index plus the frame to evaluate it in. Forcing a thunk overwrites it in
-place with an indirection to its result, so every holder of that pointer sees
-the computed value and the work happens once.
+Every argument, list element, map value and `let` binding starts as a
+**thunk**: a node of the program plus the frame to evaluate it in. Forcing a
+thunk overwrites it in place with an indirection to its result, so every holder
+of that pointer sees the value and the work happens once.
 
-The compiler decides where evaluation order is observable and says so in the
-bytecode. The VM forces a node only when it is marked `STRICT` — the statements
-of an impure block, an `if` condition, a `try!` body — and otherwise leaves
-things suspended. A discarded pure statement is not evaluated at all, so it
-cannot raise an error the program never asked for.
+The compiler decides where evaluation order is observable and marks it in the
+bytecode. The VM forces a node only when it is marked strict -- the statements
+of an impure block, an `if` condition, a `try!` body, a strict parameter --
+and otherwise leaves it suspended. A discarded pure statement is never
+evaluated, so it cannot raise an error the program never asked for.
 
-`thunk_for` skips the allocation when a node is already a value: constants,
-variable references and closures are returned directly. Returning the
-*binding's* thunk rather than a fresh wrapper is also what preserves sharing.
+A node that is already a value -- a constant, a variable, a closure -- is
+returned as itself rather than wrapped. Returning the *binding's* thunk rather
+than a fresh one is also what preserves sharing.
 
 ## Processes
 
 Processes share no memory. Each owns a heap that nothing else can reach, and a
-message is deep-copied on the way out. That is the BEAM bargain, and it buys the
-same things here:
+message is deep-copied on the way out. That is the BEAM bargain, and it buys
+the same things here:
 
-- collection never stops the world and never takes a lock,
-- thunk update needs no atomics, because only one process can force a thunk,
+- one process's collection never stops another and never takes a lock;
+- updating a thunk needs no atomics, because only one process can force it;
 - one process failing cannot corrupt another.
 
 The cost is that a thunk shared between two processes is evaluated twice. For a
-language with concurrency and laziness, isolation is the better trade.
+language with both concurrency and laziness, isolation is the better trade.
 
-| Operation | Meaning |
-|-----------|---------|
-| `spawn! $( .. )` | run a suspended computation in a new process; returns it |
+| | |
+|---|---|
+| `spawn! $( .. )` | run a suspended computation in a new process; answers the process |
 | `send! p v` | copy `v` into `p`'s mailbox |
 | `recv! ()` | take the next message, parking until one arrives |
 | `self! ()` | the current process |
 | `join! p` | wait for `p` and take its result; a failure arrives as an error |
 
-A process that fails and that nobody joins is reported at shutdown. One that a
-joiner is waiting for is that joiner's business, and is not reported twice.
+A process that fails and that nobody joins is reported at shutdown.
 
-**Running out of memory is a process's failure, not the runtime's.** A process
-that recurses without bound, or allocates without bound, would otherwise grow
-until `alloc` throws and `terminate` takes every other process with it. So the
-runtime bounds pending continuations (`DREAM_MAX_DEPTH`), value-stack depth
-(`DREAM_MAX_STACK`) and heap bytes (`DREAM_MAX_HEAP`) per process, and raises
-`:stack_overflow` or `:out_of_memory` in the offender. The checks sit at
-interpreter safepoints rather than in `push_cont` or `alloc`: there the process
-is already consistent, and safepoints are one reduction apart, so a limit can
-only be overshot by a bounded amount. Making the allocator itself fail would
-mean every caller of `alloc` -- most of which hold raw object pointers -- had to
-cope with a null.
+**Running out is a process's failure, not the runtime's.** A process that
+recurses or allocates without bound is stopped with `:stack_overflow` or
+`:out_of_memory` when it passes `DREAM_MAX_DEPTH`, `DREAM_MAX_STACK` or
+`DREAM_MAX_HEAP`, and the rest of the program carries on. The checks sit at
+safepoints, where the process is consistent; safepoints are one reduction
+apart, so a limit is overshot by a bounded amount at most.
 
 **Scheduling** is per-worker run queues with work stealing. A process runs for
-`REDUCTIONS_PER_SLICE` reductions and then goes back on a queue, whatever it is
-in the middle of. When every worker is idle and processes remain, they are all
-parked on messages that cannot arrive, and the runtime says so rather than
-hanging.
+4000 reductions and goes back on a queue, whatever it is in the middle of.
+Blocking IO parks the process, not the thread. When every worker is idle and
+processes remain, they are all waiting on messages that cannot arrive, and the
+runtime says so rather than hanging.
 
-**Parking is a handshake.** A blocking builtin does not park the process; it
-asks to be parked, and the worker does it once it has stopped touching the
-machine state. A waker that finds the process still running leaves a note that
-the worker checks before it commits. Without that, a message arriving in the
-window between "the mailbox is empty" and "mark me waiting" would be lost.
+**Parking is a handshake.** A blocking builtin asks to be parked, and the
+worker parks it once it has stopped touching the machine state. A waker that
+finds the process still running leaves a note the worker checks before it
+commits; otherwise a message arriving between "the mailbox is empty" and "mark
+me waiting" would be lost.
 
 ## Garbage collection
 
-A Cheney-style copying collector, per process, running only at interpreter
-safepoints where the roots are exactly the two stacks, the frame, the result and
-the global cache.
+Per process, and generational: a **nursery** that new objects bump-allocate
+into, and an **old space** of size-classed blocks.
 
-Allocation never collects. That is deliberate: the caller of `alloc` usually
-holds raw object pointers in C++ locals, and a collection would invalidate them.
-Growing the heap between safepoints is bounded because safepoints are one
-reduction apart.
+- A **minor** collection promotes everything reachable in the nursery to old
+  space, tracing from the roots and the remembered set the write barrier
+  keeps. A nursery starts at 64 KiB and doubles when a minor promotes more
+  than a quarter of it, up to `DREAM_NURSERY_MAX`, so a process that allocates
+  little stays small.
+- A **major** is mark-sweep over the whole heap onto segregated free lists. It
+  collapses the indirection chains thunk updates leave, evacuates the old
+  blocks its last sweep found sparse, and hands empty blocks back.
+- A large heap's collection is divided across helper threads, and a major's
+  marking can run alongside the process's own reductions.
 
-Collection also collapses indirection chains left by thunk updates, so long-run
-sharing does not accumulate hops.
+Collection happens only at interpreter safepoints, where the roots are exactly
+the two stacks, the frame, the result and the globals. Allocation never
+collects: its caller usually holds raw pointers in C++ locals, and a
+collection would move them. A native that forces a value -- and so may run a
+collection underneath itself -- has to vouch for its locals first.
+
+[docs/gc.md](../docs/gc.md) is the design, the rules a native must follow, and
+the measurements.
 
 ## The JIT
 
-Off by default only in the sense that it warms up: a function is compiled after
-it has been entered `--jit-threshold` times (32 by default).
+A function is compiled after it has been entered `--jit-threshold` times (32
+by default), on a background thread, within a budget of the program's run
+time. Compiled code covers arithmetic and comparisons, branches and `match`
+dispatch, self tail calls, calls to other compiled functions and to
+natives, and the list, array and map operations a loop makes -- the empty
+test, head and tail, cons, `.[k]` reads and writes. With deforestation in the
+compiler, a pipeline of `std.list` combinators becomes one compiled loop.
 
-**What it compiles, and why the line is there.** It compiles the strict numeric
-spine — arithmetic, comparisons, branches, and self tail recursion — and leaves
-everything else interpreted. The limit is a soundness requirement, not a missing
-feature. Compiled code evaluates a self tail call's arguments eagerly, and doing
-that to an argument the callee would never have forced turns a program that
-terminates quietly into one that raises. So a **strictness analysis** runs first
-and the function is compiled only if every parameter is provably forced on every
-path:
-
-```
-strict(Local i)      = {i}
-strict(If c, t, e)   = strict(c) ∪ (strict(t) ∩ strict(e))
-strict(a `binop` b)  = strict(a) ∪ strict(b)
-strict(a && b)       = strict(a)          -- b is conditional
-```
-
-`let rec loop n = if n <= 0 { 0 } else { loop (n - 1) }` qualifies. A function
-that passes an argument it might never use does not, and stays interpreted,
-where laziness is explicit and free.
+**What it will not compile, and why.** Compiled code evaluates a self tail
+call's arguments eagerly. Doing that to an argument the callee would never
+have forced turns a program that terminates quietly into one that raises, so
+a strictness analysis runs first and an argument the function might not force
+is left lazy or the function stays interpreted. A strict parameter (`!acc`)
+is the way to tell it what the analysis cannot prove.
 
 Every fast path is inline and every slow path calls the interpreter's own
-helper, so the two tiers cannot drift apart about what an operation means. The
-end-to-end tests run every program under both tiers and require identical
-output.
+helper, so the two tiers cannot disagree about what an operation means. The
+end-to-end tests run every program under both and require identical output.
 
-**Compiled loops stay preemptible.** The back-edge spends a reduction, and when
-the budget runs out the loop writes its loop-carried values back to the frame
-and returns a "yield" status — an OSR exit. The interpreter picks the next
-iteration up from the top of the body, and the scheduler preempts normally. A
-compiled 40-million-iteration loop does not starve its neighbours.
+**Compiled loops stay preemptible.** A back edge spends a reduction; when the
+budget runs out the loop writes its values back to the frame and yields, and
+the interpreter resumes it at the top of the body.
 
-On a tail-recursive counting loop the compiled version runs about 14× faster
-than the interpreter and allocates nothing, where the interpreter allocated a
-thunk per iteration.
+Type signatures reach the JIT as hints: an integer signature favors the
+fixnum fast paths, and a float one can select guarded unboxed doubles.
+`--dump-jit FN` prints the IR. Against CPython, on the workloads in
+[`benchmark/`](../benchmark/README.md), compiled numeric and list loops are
+several times faster; [docs/notes/vm-performance.md](../docs/notes/vm-performance.md)
+is the record of how, and of what was tried and not kept.
 
-Atom and list-head switches compile to LLVM dispatch with a default arm.
-List-head dispatch forces the head only for a cons, and branch analysis keeps
-lazy arguments and tail calls in the same order as the interpreter. Integer
-signature hints favor the existing checked fixnum fast paths; float hints can
-select guarded unboxed doubles.
+## Native modules
 
-Primitive type comparisons use a `type_is` bytecode instruction, including
-container checks generated by patterns. The JIT emits tag and object-header
-tests directly and folds tests of guarded unboxed floats. Gradual callers still
-get their actual runtime type, and checking a container never forces its contents.
+The parts of the standard library that must touch the machine are here, in
+C++, and everything else in [`mind/std`](../mind/std/README.md) is Dream
+written on top of them. [docs/builtins.md](../docs/builtins.md) is the
+reference.
 
-`--dump-jit <function>` prints the generated LLVM IR.
+| | |
+|---|---|
+| `std.io` | handles, bytes, files, pipes; reads that park the process, not the thread |
+| `std.os` | arguments, environment, directories, child processes (`exec!`, `replace!`), clocks, the platform |
+| `std.net` | TCP sockets and listeners, through epoll on Linux and a poller elsewhere |
+| `std.tls` | TLS on a socket, upgraded in place: OpenSSL on Linux and macOS, SChannel on Windows ([src/tls.hpp](src/tls.hpp)) |
+| `std.ffi` | calling C through libffi; C pointers as owned handles ([docs/ffi.md](../docs/ffi.md)) |
+| `std.math` | the floating-point functions |
+| `std.crypto` | hashes, HMAC, PBKDF2, HKDF, constant-time comparison, random bytes |
+| `std.tensor` | packed numeric arrays with fused, vectorized kernels and an OpenCL backend ([docs/notes/tensors.md](../docs/notes/tensors.md)) |
+| `std.vm` | the compiler's hook into a VM of its own, for compile-time evaluation and macros |
 
 ## Embedding
 
-`include/dream/dream.h` is a C API: create a VM, load an image, register host
-modules, run an entry point. Host functions receive forced arguments and return
-values or errors.
+[`include/dream/dream.h`](include/dream/dream.h) is a C API: create a VM, load
+an image, register host modules, run an entry point, read the result.
+[`examples/embed.c`](examples/embed.c) is a complete program.
 
 ```c
 dream_vm* vm = dream_vm_new();
@@ -227,33 +264,43 @@ puts(dream_vm_result_text(vm));
 dream_vm_free(vm);
 ```
 
-A member registered with an arity of `DREAM_VARIADIC` takes however many
-arguments its call site passed, with every one forced. Because functions are
-curried, such a member can never be partially applied -- `f a b` and a
-half-finished `f a b c` are the same thing until the application node says
-otherwise -- so it is the right shape for something like `console.print!` and
-the wrong one for anything a caller might want to pre-fill.
+A host function receives its arguments forced and returns a value or an error.
+One registered with arity `DREAM_VARIADIC` takes however many arguments its
+call site passed. Because functions are curried, such a member can never be
+partially applied, so it suits a logging call and not anything a caller might
+want to pre-fill.
 
 ## Layout
 
-| Path | |
-|------|-|
-| `src/value.hpp`   | value tagging and heap object layouts |
-| `src/heap.cpp`    | per-process heap and copying collector |
-| `src/image.cpp`   | `.dream` loader and validator |
-| `src/interp.cpp`  | the reduction machine |
-| `src/process.cpp` | process state and mailbox |
-| `src/scheduler.cpp` | workers, run queues, parking |
-| `src/builtins.cpp` | builtins and the `std.*` modules |
-| `src/jit.cpp`     | strictness analysis and LLVM code generation |
-| `src/capi.cpp`    | the C embedding API |
+| | |
+|---|---|
+| `src/value.hpp` | value tagging and the heap objects' layouts |
+| `src/heap.cpp`, `src/gc_pool.cpp` | the per-process heap, the collector, and its helper threads |
+| `src/image.cpp` | loading, mapping and validating a `.dream` image ([docs/bytecode-format.md](../docs/bytecode-format.md)) |
+| `src/interp.cpp` | the reduction machine |
+| `src/process.cpp`, `src/scheduler.cpp` | processes, mailboxes, workers, run queues, parking |
+| `src/runtime.cpp` | a loaded program and the processes running it |
+| `src/builtins.cpp` | the builtins and the primitives `std` wraps |
+| `src/io.cpp`, `src/os.cpp` | files, sockets, processes, the event loop |
+| `src/tls*.cpp` | TLS, one file per backend |
+| `src/ffi.cpp` | `std.ffi` |
+| `src/bigint.cpp`, `src/crypto.cpp`, `src/digest.cpp` | bignums and cryptography |
+| `src/tensor*.cpp`, `src/gpu.cpp` | tensors: the CPU kernels (baseline and AVX2) and OpenCL |
+| `src/jit.cpp`, `src/jit_rt.cpp` | strictness analysis, LLVM code generation, and the runtime compiled code calls |
+| `src/capi.cpp` | the C embedding API |
+| `src/cli.cpp` | the `dream` command |
 
 ## Tests
 
 ```
-cmake --build build && ctest --test-dir build
+just test-vm           # the C++ unit tests: values, heap, images, atoms
+just test-e2e          # real programs under the interpreter and the JIT, which must agree
+just test-heap         # the same programs, the heap verified after every collection
+just test-races        # the same under ThreadSanitizer
+just fuzz              # malformed images must be refused, never crashed on
+just test-ffi          # std.ffi against a C library built from tests/ffi
+just test-tls          # std.tls against itself and against OpenSSL's tools
 ```
 
-`dream_tests` covers values, the collector, cross-heap copying, image validation
-and maps. `tests/e2e.sh` compiles real programs and checks their output under
-both tiers.
+`tests/programs/` holds the end-to-end programs and the output each must
+produce.

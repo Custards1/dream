@@ -1,17 +1,17 @@
 // `dreams` -- the Dream compiler, written in Dream.
 //
-// Built by `mind`, like any other Dream project: `mind build`, `mind test`,
-// `mind run -- FILE`. It has no build of its own and needs none.
+// This file is the command line and nothing more. The pipeline it runs is
+// `compile.build!` (dreams/compile.dr), which the REPL and `lucid` call too;
+// it is built from the seed in dreams/bootstrap and reproduces it byte for byte.
 //
-// The front end is complete: a program is lexed, parsed, followed through every
-// file it imports, resolved, purity-checked, and lowered to execution trees.
-// What is missing is the image writer -- the arena exists, but nothing turns it
-// into bytes yet -- and `comp`, which needs a VM to evaluate on.
-//
-// Every stage is a command rather than a stub, which is what makes each one
-// usable on the way to the next. Several of them exist because something other
-// than a batch compile wants them: `--symbols` and `--at` are questions an
-// editor asks, and they read the same tables lowering does.
+// Each stage can also be stopped at and printed -- `--tokens`, `--ast`,
+// `--modules`, `--ir`, `--check` -- which is how a stage is debugged without
+// the ones after it. Several exist because something other than a batch
+// compile wants them: `--symbols` and `--at` are questions an editor asks,
+// and they read the same tables lowering does. `--repl` hands over to
+// repl.dr, and `--units` keeps each module's parts between builds (unit.dr).
+// What an option does is said once, in the usage text below, which is what
+// `--help` prints.
 
 import std.console;
 

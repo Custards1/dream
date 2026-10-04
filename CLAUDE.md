@@ -355,8 +355,8 @@ The lessons that keep coming back:
   `types.accepts` tests, `types.check` raises, `types.enforce` wraps a
   function against an arrow. Nothing is inferred or coerced, and a `type` is
   a `let`, so imports, `priv`, currying and local capture need no new rules.
-  "Optional type descriptions" in [docs/language-spec.md](docs/language-spec.md)
-  is the grammar and the one ambiguity it has to resolve.
+  "The type grammar" in [docs/language-spec.md](docs/language-spec.md)
+  is the grammar.
 - `let name : type` is a **signature**, checked at compile time
   ([dreams/typecheck.dr](dreams/typecheck.dr)); `let x : t = e` and
   `let f x : answer = e` are the inline forms. A free lowercase name in one is
