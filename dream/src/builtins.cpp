@@ -1730,8 +1730,17 @@ NativeResult run_compile_time(Process& p, Runtime& rt, Scheduler& sched,
                               const std::shared_ptr<Process>& root) {
     bool clean = sched.run(root);
 
-    if (root->failed || !clean) {
-        return comp_fail(p, "comp_failed", "the compile-time expression failed");
+    // Two different failures, and they used to share one message. Under load
+    // `comp_failed` turned up a few runs in twenty-four, and nothing could say
+    // whether the expression had raised or its scheduler had given up on it.
+    if (root->failed) {
+        return comp_fail(p, "comp_failed",
+                         "the compile-time expression raised " + describe_failure(*root, root->exit_value));
+    }
+    if (!clean) {
+        return comp_fail(p, "comp_failed",
+                         "the compile-time expression stopped making progress: every process in it "
+                         "was waiting for something that could not arrive");
     }
     Value deep;
     if (!force_deep(*root, root->exit_value, &deep)) {
@@ -3765,7 +3774,9 @@ NativeResult vm_wire_decode(Process& p, Value, Value* args, uint32_t) {
     Bytes b;
     if (!string_bytes(args[0], &b)) return type_fail(p, "wire_decode needs a string");
     WireReader r{p, reinterpret_cast<const unsigned char*>(b.data), b.len};
-    Value v;
+    // Read only when `read` succeeded, which -O1 cannot see: a TSan build
+    // warned that it may be used uninitialized.
+    Value v = UNIT;
     const char* why = nullptr;
     if (!r.read(&v, 0)) why = "not a wire value";
     else if (r.at != r.len) why = "trailing bytes after a wire value";

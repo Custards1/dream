@@ -409,7 +409,7 @@ public:
             auto [it, fresh] = waiters_.try_emplace(fd);
             added = fresh;
             std::vector<Waiter>& side = writable ? it->second.writers : it->second.readers;
-            side.push_back(Waiter{pid, sched});
+            side.push_back(Waiter{pid, sched->serial()});
             events = interest(it->second);
             // Made under the lock, so that two processes arming one descriptor
             // in opposite directions cannot leave it registered for only one.
@@ -433,7 +433,7 @@ public:
         std::lock_guard<std::mutex> g(mutex_);
         if (!running_) return false;
         sched->note_io_wait(true);
-        (writable ? waiters_[fd].writers : waiters_[fd].readers).push_back(Waiter{pid, sched});
+        (writable ? waiters_[fd].writers : waiters_[fd].readers).push_back(Waiter{pid, sched->serial()});
         changed_.notify_all();
         return true;
 #endif
@@ -474,7 +474,7 @@ public:
     /// else waiting on it.
     void cancel(int fd, uint64_t pid) {
         size_t dropped = 0;
-        Scheduler* sched = nullptr;
+        uint64_t sched = 0;
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = waiters_.find(fd);
@@ -505,13 +505,15 @@ public:
             if (it->second.readers.empty() && it->second.writers.empty()) waiters_.erase(it);
 #endif
         }
-        for (size_t i = 0; i < dropped; ++i) sched->note_io_wait(false);
+        Scheduler::release_io_waits(sched, dropped);
     }
 
 private:
+    /// The scheduler is named by its serial, not held: this thread outlives
+    /// it. See `Scheduler::serial`.
     struct Waiter {
         uint64_t pid = 0;
-        Scheduler* sched = nullptr;
+        uint64_t sched = 0;
     };
     /// Who is parked on one descriptor, in each direction.
     struct Waiters {
@@ -523,10 +525,7 @@ private:
     /// IO-waiter count; see `run_child` in os.cpp for why the other order
     /// invents a deadlock.
     static void release(const std::vector<Waiter>& ws) {
-        for (const Waiter& w : ws) {
-            w.sched->wake(w.pid);
-            w.sched->note_io_wait(false);
-        }
+        for (const Waiter& w : ws) Scheduler::wake_external(w.sched, w.pid);
     }
 
 #if DREAM_HAVE_EPOLL

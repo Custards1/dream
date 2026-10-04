@@ -208,10 +208,10 @@ std::string slurp(HANDLE pipe) {
 }
 
 void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
-               uint64_t pid, Scheduler* sched) {
+               uint64_t pid, uint64_t sched) {
     auto finish = [&] {
         job->done.store(true, std::memory_order_release);
-        if (sched) { sched->wake(pid); sched->note_io_wait(false); }
+        Scheduler::wake_external(sched, pid);
     };
     HANDLE out_read = nullptr, out_write = nullptr, err_read = nullptr, err_write = nullptr;
     HANDLE input = INVALID_HANDLE_VALUE;
@@ -333,8 +333,12 @@ std::string slurp(int fd) {
 }
 
 /// Spawn `argv`, collect both streams, reap, and wake `pid`.
+///
+/// The scheduler is named by its serial rather than held, because this thread
+/// can outlive it: a program may end while a child it started is still being
+/// reaped. See `Scheduler::serial`.
 void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
-               uint64_t pid, Scheduler* sched) {
+               uint64_t pid, uint64_t sched) {
     int out_pipe[2] = {-1, -1};
     int err_pipe[2] = {-1, -1};
     auto finish = [&] {
@@ -353,8 +357,7 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
             //
             // This way round the count is merely released a moment late, which
             // can only delay a real deadlock report, never invent one.
-            sched->wake(pid);
-            sched->note_io_wait(false);
+            Scheduler::wake_external(sched, pid);
         }
     };
 
@@ -607,7 +610,7 @@ NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir
         p.wait_reason.store(WaitReason::Io, std::memory_order_relaxed);
     }
     sched->note_io_wait(true);
-    job->worker = std::thread(run_child, job, std::move(argv), p.id(), sched);
+    job->worker = std::thread(run_child, job, std::move(argv), p.id(), sched->serial());
     return NativeResult::block();
 }
 

@@ -36,13 +36,16 @@ let python ctx name =
     suite ctx name (%{}) "python3" ["dreams/tests/" + name + ".py", "--dream", build.Context.vm ctx,
                               "--compiler", list.last (build.Context.compiler ctx)];
 
-/// The seed, compiling this source, makes an image that makes itself: the
-/// byte equality the bootstrap promises.
+/// The seed, compiling this source, makes itself: the byte equality the
+/// bootstrap promises. Stage 3 against stage 2 alone let a seed that had
+/// fallen behind the source pass, since a stale seed still builds a compiler
+/// that reproduces itself -- just not one that is the seed.
 let bootstrap : :string;
 let bootstrap = "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
     + " && \"$dream\" \"$seed\" -L mind -L . -o \"$t/stage2.dream\" dreams/main.dr >/dev/null"
     + " && \"$dream\" \"$t/stage2.dream\" -L mind -L . -o \"$t/stage3.dream\" dreams/main.dr >/dev/null"
-    + " && cmp \"$t/stage2.dream\" \"$t/stage3.dream\"";
+    + " && cmp \"$t/stage2.dream\" \"$t/stage3.dream\""
+    + " && { cmp -s \"$seed\" \"$t/stage2.dream\" || { echo 'the seed is stale: it builds a different compiler from this source' >&2; exit 1; }; }";
 
 /// Every Dream file in the repository parses, and the parser's own tests pass.
 let corpus : :string;

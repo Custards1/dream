@@ -113,12 +113,13 @@ bootstrap: vm
     ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/main.dr
 
 # The seed must still reproduce itself from this source: what it builds must
-# build an identical third image. That equality is the whole guarantee -- it
+# be the seed again, and build an identical third image. That equality is the whole guarantee -- it
 # says the compiler in the tree and the compiler in the image agree.
 bootstrap-check: vm
     ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/main.dr
     ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/main.dr
     cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
+    @cmp -s {{seed}} /tmp/dreams-stage2.dream || { echo "the seed is stale: it builds a different compiler from this source -- copy /tmp/dreams-stage2.dream over {{seed}}"; exit 1; }
     @echo "the bootstrap image reproduces itself"
 
 # `mind`'s own tests: path handling, manifest reading, dependency specs.

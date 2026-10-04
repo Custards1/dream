@@ -365,15 +365,20 @@ when test {
 
     priv let here! port = connect! "127.0.0.1" port;
 
-    /// Ask the registry for `name` until the answer is something other than
+    /// Ask the registry for `name` until it is bound to something other than
     /// `was`, or give up and answer whatever it is.
     ///
     /// A supervisor is asynchronous and a child registers itself once it is
     /// running, so "the name is bound" and "the name is bound to the new one"
     /// are both moments nothing here can order, so it asks until they have
-    /// happened, for as long as `test.eventually!` allows.
+    /// happened, for as long as `test.eventually!` allows. Unbound is not
+    /// one of them: between the old process ending and the new one
+    /// registering, the registry has dropped the name, and `()` is not `was`
+    /// -- accepting it sent the next call into that gap about one run in
+    /// twenty-four, as "nothing is serving this listener now".
     priv let settle! reg name was =
-        test.eventually! (fn () -> registry.whereis! reg name) (fn p -> p != was) test.patience;
+        test.eventually! (fn () -> registry.whereis! reg name) (fn p -> p != was && p != ())
+                         test.patience;
 
     let tests = [
         test.case "a call goes out and an answer comes back"

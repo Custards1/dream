@@ -52,15 +52,25 @@ Follow-ups from 1, 2 and 5:
 
 Next round (2026-10-03), most valuable first.
 
-1. Fix the known flakes first.
-   - scheduler shutdown use-after-free (effects_once under test-races)
-   - std tests hang after "all tests passed", ~10% of runs
-   - comp_failed under load, ~20% with many concurrent compiles (mind test)
-   - effects_once hangs ~1 in 100
-   - std.remote "a restarted server is still reachable" fails ~1 in 24
-     (`nothing is serving this listener now`): a restart racing the lookup
-   - bootstrap-check compares stage2/stage3, not seed/stage2, so a stale
-     seed passes. Add the seed comparison.
+1. Fix the known flakes first. Worked through 2026-10-04:
+   - std.remote "a restarted server is still reachable" (~1 in 24): FIXED.
+     The test's `settle!` took the gap where the registry has dropped the
+     dead pid and the new child has not registered (`()`) for "settled".
+   - std tests hang after their summary (~1 in 10): FIXED. Caught under
+     gdb: a failing case had skipped its teardown and left a listener in
+     `accept!`. The runner (`std.test.main_of!`) now ends with `os.exit!`
+     and says how many processes a case left running.
+   - scheduler shutdown use-after-free: FIXED. The child reaper and the IO
+     poller held a `Scheduler*` and could wake into one already destroyed;
+     they now hold its serial and go through `Scheduler::wake_external`,
+     which finds nothing once it is gone. effects_once under TSan: 0/30.
+   - comp_failed under load: does not reproduce, with the old VM or the
+     new one (0 in 288 concurrent contracts runs, 3 `mind test`s). Its two
+     causes used to share a message; it now says whether the expression
+     raised (and what) or its scheduler stalled, for next time.
+   - effects_once hang (~1 in 100): does not reproduce, old VM or new
+     (0 in 350 each, JIT on and off). Probably fixed by an earlier change.
+   - bootstrap-check now also compares the seed with stage 2: FIXED.
 
 2. Make the laziness trap hard to fall into, in the language.
    A lazy value stored in a map pins every earlier version of it; that has

@@ -7,6 +7,7 @@
 #include "io.hpp"
 
 #include <chrono>
+#include <shared_mutex>
 
 #include "builtins.hpp"
 #include "cores.hpp"
@@ -17,15 +18,64 @@ namespace dream {
 
 using namespace std::chrono_literals;
 
+// The schedulers that exist, by serial, for the threads that wake into one
+// without owning it -- see `Scheduler::serial`. A wake holds the shared lock
+// for as long as it is touching the scheduler, and a destructor takes the
+// exclusive one to leave, so a destructor waits out a wake already under way
+// and every wake after it finds nothing.
+namespace {
+std::shared_mutex& live_mutex() {
+    static std::shared_mutex m;
+    return m;
+}
+std::unordered_map<uint64_t, Scheduler*>& live_schedulers() {
+    static std::unordered_map<uint64_t, Scheduler*> m;
+    return m;
+}
+std::atomic<uint64_t> next_serial{1};
+}  // namespace
+
 Scheduler::Scheduler(Runtime& rt, unsigned worker_count) : rt_(rt) {
     if (worker_count == 0) worker_count = 1;
     for (unsigned i = 0; i < worker_count; ++i) {
         workers_.push_back(std::make_unique<Worker>());
     }
+    serial_ = next_serial.fetch_add(1);
+    {
+        std::unique_lock<std::shared_mutex> g(live_mutex());
+        live_schedulers()[serial_] = this;
+    }
     rt_.set_scheduler(this);
 }
 
-Scheduler::~Scheduler() { stop(); }
+Scheduler::~Scheduler() {
+    // Unreachable from outside first, then stopped: a wake that arrives in
+    // between finds no scheduler, which is right -- nothing will run again.
+    {
+        std::unique_lock<std::shared_mutex> g(live_mutex());
+        live_schedulers().erase(serial_);
+    }
+    stop();
+    // And the runtime forgets it, so that nothing asking the runtime later --
+    // its own destructor, closing what the program left open -- is handed a
+    // pointer to this.
+    if (rt_.scheduler() == this) rt_.set_scheduler(nullptr);
+}
+
+void Scheduler::wake_external(uint64_t serial, uint64_t pid) {
+    std::shared_lock<std::shared_mutex> g(live_mutex());
+    auto it = live_schedulers().find(serial);
+    if (it == live_schedulers().end()) return;
+    it->second->wake(pid);
+    it->second->note_io_wait(false);
+}
+
+void Scheduler::release_io_waits(uint64_t serial, size_t count) {
+    std::shared_lock<std::shared_mutex> g(live_mutex());
+    auto it = live_schedulers().find(serial);
+    if (it == live_schedulers().end()) return;
+    for (size_t i = 0; i < count; ++i) it->second->note_io_wait(false);
+}
 
 unsigned Scheduler::default_workers() {
     return std::min(usable_cores(), 8u);
