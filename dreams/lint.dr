@@ -126,6 +126,48 @@ let lazy_accumulators f ps body = {
     }) (list.range 0 k))
 };
 
+// --- a force that is itself suspended ------------------------------------------
+//
+// The other trap, and the one docs/language-spec.md has to warn about in
+// words: `[:ok, strict! x]` reads as "force `x`, then build the pair", and it
+// is a pair whose second element is a suspended force. An element of a list,
+// array or map is suspended like any other, and a `strict!` written as one is
+// an element, so it forces nothing until the element is read -- which is the
+// moment it would have been forced anyway. The fix is to make it a statement,
+// which a block runs in order: `strict! x;` and then `[:ok, x]`.
+//
+// Only the literal element is read. `f (strict! x)` is as suspended, but an
+// argument may go to a native that forces it, or be forced in the callee's
+// first line, and telling those apart is a strictness analysis; an element of
+// a literal is never anything but stored.
+
+/// Is this `strict! e`?
+let is_force e = match e {
+    [:apply, [:name, "strict!", _], [_], _] => true,
+    _ => false,
+};
+
+let element_force acc x = if is_force x { list.cons (ast.span x) acc } else { acc };
+
+/// The spans of every `strict!` written as an element of a literal in `e`, in
+/// the order they were written.
+let suspended_forces : :any -> [:any];
+let suspended_forces e = list.reverse (forces_in e []);
+
+let rec forces_in e acc =
+    if type_of e != :list { acc }
+    else {
+        let here = match e {
+            [:list, items, _] if type_of items == :list => list.fold element_force acc items,
+            [:array, items, _] if type_of items == :list => list.fold element_force acc items,
+            [:map, pairs, _] if type_of pairs == :list =>
+                list.fold (fn a pair -> match pair { [k, v] => element_force (element_force a k) v, _ => a })
+                          acc pairs,
+            _ => acc,
+        };
+        list.fold (fn a x -> forces_in x a) here e
+    };
+
 when test {
     import std.test;
     import dreams.parser;
@@ -137,7 +179,23 @@ when test {
         other => other,
     };
 
+    /// How many suspended forces the first declaration of `src` has.
+    let forces src = match parser.parse_module src {
+        [:ok, [[:let, _, _, body, _, _], .._], _] => list.length (suspended_forces body),
+        other => other,
+    };
+
     let tests = [
+        test.case "a force in a list is suspended"
+            $( test.eq! 1 (forces "let f! x = [:ok, strict! x];") ),
+        test.case "in an array and a map, key or value"
+            $( test.eq! 3 (forces "let f! x = [#[strict! x], %{ (strict! x) => 1, :k => strict! x }];") ),
+        test.case "a force as a statement is not"
+            $( test.eq! 0 (forces "let f! x = { strict! x; [:ok, x] };") ),
+        test.case "nor one around the literal"
+            $( test.eq! 0 (forces "let f! x = strict! [:ok, x];") ),
+        test.case "nested literals are read too"
+            $( test.eq! 1 (forces "let f! x = { let y = [1, [2, strict! x]]; y };") ),
         test.case "an accumulator grown by + and only answered is flagged"
             $( test.eq! ["acc"] (flagged "let rec t i n acc = if i > n { acc } else { t (i + 1) n (acc + i) };") ),
         test.case "the counter beside it is tested, so only the accumulator is"

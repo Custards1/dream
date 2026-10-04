@@ -3,7 +3,6 @@
 import std.console;
 import std.math;
 
-
 // --- a loop whose body is one native call ----------------------------------
 //
 // `s` is the shape the whole thing is for: a parameter the loop carries and

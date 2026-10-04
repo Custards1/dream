@@ -106,11 +106,11 @@ let compile_options lang settings =
 
 let link_options settings =
     per_compiler (fn tc -> list.flat_map (fn s -> if native s { [] } else {
-                               match cc.Toolchain.family tc {
-                                   :msvc => msvc.link_flags tc s,
-                                   _ => gnu.link_flags tc s,
-                               }
-                           }) settings)
+        match cc.Toolchain.family tc {
+            :msvc => msvc.link_flags tc s,
+            _ => gnu.link_flags tc s,
+        }
+    }) settings)
                  (fn ids -> "CXX_COMPILER_ID:" + ids);
 
 let definitions settings = list.flat_map (fn s -> match s {
@@ -193,7 +193,7 @@ let target_text root all t = {
                  (match list.flat_map (fn l -> compile_options l own) languages_here {
                       [] => [], xs => list.concat [[id, scope_of "PRIVATE"], xs] })],
         [command "target_link_options" (match link_options (list.append own pub) {
-                      [] => [], xs => list.concat [[id, scope_of "PRIVATE"], xs] })],
+            [] => [], xs => list.concat [[id, scope_of "PRIVATE"], xs] })],
         [command "target_link_libraries"
                  (match list.append (with_scopes (libraries root))
                                     (match list.map (fn u -> target_id all u) (cc.uses t) {

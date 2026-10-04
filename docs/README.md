@@ -12,6 +12,7 @@ and are the first thing to read before working on what they describe.
 | [builtins.md](builtins.md) | Every builtin and every native module's members, with their types. |
 | [console.md](console.md) | `std.console`: output, prompts, formatting, colour and logging. |
 | [ffi.md](ffi.md) | Calling C: `std.ffi`, `std.foreign`, and `foreign` declarations. |
+| [images.md](images.md) | Calling another Dream image: `std.image`, and `image` declarations. |
 | [build.md](build.md) | Build scripts and `std.build`: plans, steps, caching, goals, checks, and C/C++ with any compiler. |
 | [platforms.md](platforms.md) | What an image may assume about where it runs, and what stays platform-specific. |
 

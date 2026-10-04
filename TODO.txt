@@ -48,3 +48,62 @@ Follow-ups from 1, 2 and 5:
   KB, and a self-compile ~4% faster (2.03-2.09 s -> 1.94-1.99 s).
 - Done: 3, freeing shared values -- vm.release! and vm.collect_shared!, a
   region per share and a census ("Freeing what was shared" in docs/gc.md).
+
+
+Next round (2026-10-03), most valuable first.
+
+1. Fix the known flakes first.
+   - scheduler shutdown use-after-free (effects_once under test-races)
+   - std tests hang after "all tests passed", ~10% of runs
+   - comp_failed under load, ~20% with many concurrent compiles (mind test)
+   - effects_once hangs ~1 in 100
+   - std.remote "a restarted server is still reachable" fails ~1 in 24
+     (`nothing is serving this listener now`): a restart racing the lookup
+   - bootstrap-check compares stage2/stage3, not seed/stage2, so a stale
+     seed passes. Add the seed comparison.
+
+2. Make the laziness trap hard to fall into, in the language.
+   A lazy value stored in a map pins every earlier version of it; that has
+   been found five times, and `[:ok, strict! x]` does not do what it reads as.
+   - strict record fields: `struct P { !x, y }`, forced by make/new/set_x
+   - a strict-valued map (forces on insert), as ir.settled/scope.forced do
+   - a lint for `strict!` in a value position (list literal, argument)
+   Done (2026-10-03): `!x` fields in group/struct/mapping; map.put_strict
+   and map.update_strict; a warning for `strict!` as a literal's element,
+   which found std.registry's `init!` doing exactly that. Strict fields
+   turned up a compiler bug on the way: scope.dr's wrapper rewrite replaced
+   `let f !v r = r.[0 => v]` by its `set` at the call site and dropped the
+   force; a function with a strict parameter is no longer a wrapper.
+   opt.dr's `keep` (TODO.md "What to do next" item 4): forcing the
+   unshareable node before storing it was measured and changed nothing --
+   map branches/entries 0.66 either way (it was 1.5 before ir.settled),
+   peak and image identical -- so it was not kept. The 0.66 is not there.
+
+3. Better errors at run time.
+   Attach to a raised error the span it was raised at, and the span where
+   the thunk that raised it was *created*, not only where it was forced.
+
+4. Let types flow through unannotated code, as warnings.
+   Infer an unsigned function's result from its body so std's signatures
+   reach further. Report what that finds as warnings, keeping "code no
+   signature touches is never rejected" for errors.
+
+5. Allocation in the VM.
+   Frames are ~40% of allocation. A body that makes no closure or thunk
+   referring to its frame could keep that frame on a stack. Measure first.
+
+6. Tooling.
+   - a formatter. Done (2026-10-04): `dreams --fmt`/`--fmt-check`,
+     `just fmt`, and textDocument/formatting in lucid (dreams/fmt.dr). It
+     keeps every line, reindents by the grammar's own line rules, keeps a
+     block anchored where this codebase anchors blocks, and refuses to write
+     unless the file parses to the same tree. Idempotent over the whole
+     repository; 17 files would change, ~120 lines, almost all real fixes.
+     Not run over the repository yet. Left: turning if/else-if chains into
+     `match`, which needs the tree rather than the text.
+   - lucid: inlay hints from the checker's types, rename
+
+Already planned, and in the right order:
+   - .libdream / a package at a time (12,800 declarations still do not fit)
+   - a JIT that can allocate
+   - freeing what vm.share! shared

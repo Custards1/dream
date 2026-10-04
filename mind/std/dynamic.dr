@@ -6,7 +6,6 @@ mod get {
     import std.array
     import std.error;
 
-
     let fold_from kind = match kind {
         :list => list.fold,
         :array => array.fold,
@@ -53,19 +52,17 @@ let nth : :integer -> Collection -> :any;
 let nth i l = (get.nth_from (type_of l)) i l;
 
 let reverse : Collection -> Collection;
-let reverse c = (get.reverse_from (type_of c) c); 
-
+let reverse c = (get.reverse_from (type_of c) c);
 
 let name : :any -> :string;
 let name x = "dynamic"
-
 
 // when test {
 //     import std.test;
 //     let arr = #[1,2,3,4,5,6]
 //     let accum x acc = x+acc
 //     let arr_sum = fold accum 0 arr
-    
+
 //     let li = [1,2,3,4,5,6]
 //     let li_sum = fold accum 0 li;
 //     let tests = [

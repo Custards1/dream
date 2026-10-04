@@ -27,6 +27,7 @@
 import std.cli;
 import std.console;
 
+import std.install;
 import std.io;
 import std.json;
 import std.list;
@@ -34,10 +35,12 @@ import std.map;
 import std.os;
 import std.str;
 
+import dreams.fmt;
 import dreams.path;
 
 import analysis;
 import complete;
+import pos;
 import rpc;
 
 let version = "0.1.0";
@@ -144,6 +147,7 @@ let capabilities =
                             "hoverProvider" => true,
                             "definitionProvider" => true,
                             "documentSymbolProvider" => true,
+                            "documentFormattingProvider" => true,
                             "completionProvider" =>
                                 %{ "triggerCharacters" => ["."] } },
        "serverInfo" => %{ "name" => "lucid", "version" => version } };
@@ -246,6 +250,22 @@ let handle! out s m = {
             [:go, carrying a s]
         },
 
+        // The compiler's formatter, on the buffer as it is. One edit that
+        // replaces the whole document, which is what a formatter that keeps
+        // every line has to say anyway, and nothing at all when the buffer
+        // is already laid out or does not parse -- the diagnostics already
+        // say why, and an editor that formats on save must still save.
+        "textDocument/formatting" => {
+            let text = ((docs s)).[path else ""];
+            let edits = match fmt.format text {
+                [:ok, out] => if out == text { [] }
+                              else { [%{ "range" => pos.range text 0 (str.byte_length text), "newText" => out }] },
+                _ => [],
+            };
+            answer! out (rpc.id m) edits
+            [:go, s]
+        },
+
         // A request must be answered even when it is not understood, or the
         // client waits for it forever. A notification must not be.
         _ => {
@@ -295,29 +315,10 @@ let usage = cli.usage "lucid" "a language server for Dream"
 let stdlib_roots! () =
     match os.env! "MIND_STDLIB" {
         () => match os.env! "DREAM_PACKAGES" {
-            () => match installed_std! () { () => [], d => [d] },
+            () => match install.holding! "std" { () => [], d => [d] },
             p => [path.expand_home! p],
         },
         p => [path.expand_home! p],
-    };
-
-let installed_std! () =
-    match os.env! "MINDV2_PATH" {
-        () => match path.home! () {
-            () => (),
-            h => first_with_std! [path.join h ".mindv2"],
-        },
-        v => first_with_std! (str.split (match os.platform () { :windows => ";", _ => ":" }) v),
-    };
-
-let rec first_with_std! dirs =
-    match dirs {
-        [] => (),
-        ["", ..rest] => first_with_std! rest,
-        [d, ..rest] => {
-            let dir = path.expand_home! d;
-            if io.is_dir! (path.join dir "std") { dir } else { first_with_std! rest }
-        },
     };
 
 let main! =

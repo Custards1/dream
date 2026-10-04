@@ -116,7 +116,6 @@ let find needle s = _str_find s needle 0;
 let contains_str : :string -> :string -> :bool;
 let contains_str needle s = _str_find s needle 0 >= 0;
 
-
 let starts_with : :string -> (:string | :bigstr) -> :bool;
 let starts_with prefix s = _str_slice s 0 (len prefix) == prefix;
 

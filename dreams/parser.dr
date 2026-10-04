@@ -1741,6 +1741,9 @@ let rec parse_item c ts = {
             // name every program gives `std.foreign`, and `foreign.x` cannot
             // begin an item anyway.
             "foreign" => parse_foreign c sp (list.tail ts),
+            // Contextual for the same reason: `image` is what a program calls
+            // `std.image`.
+            "image" => parse_image c sp (list.tail ts),
             "group" => parse_record c :list sp (list.tail ts),
             "struct" => parse_record c :array sp (list.tail ts),
             "mapping" => parse_record c :map sp (list.tail ts),
@@ -1959,9 +1962,11 @@ let rec variant_fields c acc ts =
 // and `syntax` decides what the result stands for. So the grammar of a binding
 // is the grammar of a signature, which is what a binding is.
 //
-// The library is a path (`from "libm.so.6"`), a payload the image carries
-// (`from embedded "sqlite"`), any expression in parentheses, or nothing, for
-// the running program. Entries are separated as a union's are.
+// The library is a path (`from "libm.so.6"`), one installed on the system
+// and searched for (`from system "sqlite3"`, or `from system "sqlite3" "0"` for
+// one ABI version -- `foreign.system`), a payload the image carries (`from
+// embedded "sqlite"`), any expression in parentheses, or nothing, for the
+// running program. Entries are separated as a union's are.
 
 let rec parse_foreign c sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
@@ -1981,7 +1986,8 @@ let rec parse_foreign c sp ts =
         }
     };
 
-/// `from "path"`, `from embedded "name"`, `from (expr)`, or nothing.
+/// `from "path"`, `from system "name"` (and its version), `from embedded
+/// "name"`, `from (expr)`, or nothing.
 let foreign_library c ts =
     if not (is_kw ts "from") { ok () ts }
     else {
@@ -1998,6 +2004,28 @@ let foreign_library c ts =
                             [:ok, _, rest3] => ok e rest3,
                         },
                 },
+            :ident if peek_value rest == "system" => {
+                let after = list.tail rest;
+                if not (at after :str) {
+                    err "expected the library's name, as a string, after `system`" (peek_span after)
+                }
+                else {
+                    let lib = ast.str_e (peek_value after) (peek_span after);
+                    let more = list.tail after;
+                    // A second string is the ABI version: `system "sqlite3" "0"`.
+                    if at more :str {
+                        let at_ = ast.span_to sp (peek_span more);
+                        ok (ast.apply_e (ast.field_e (ast.name_e "foreign" sp) "system_version" sp)
+                                        [lib, ast.str_e (peek_value more) (peek_span more)] at_)
+                           (list.tail more)
+                    }
+                    else {
+                        ok (ast.apply_e (ast.field_e (ast.name_e "foreign" sp) "system" sp) [lib]
+                                        (ast.span_to sp (peek_span after)))
+                           more
+                    }
+                }
+            },
             :ident if peek_value rest == "embedded" => {
                 let after = list.tail rest;
                 if not (at after :str) {
@@ -2009,7 +2037,7 @@ let foreign_library c ts =
                        (list.tail after)
                 }
             },
-            _ => err ("expected a path, `embedded \"name\"` or `(expression)` after `from`, found "
+            _ => err ("expected a path, `system \"name\"`, `embedded \"name\"` or `(expression)` after `from`, found "
                       + describe rest) sp,
         }
     };
@@ -2115,6 +2143,136 @@ let foreign_entry c lib entries ts =
         }
     };
 
+// --- images ----------------------------------------------------------------------
+//
+//     image fmt from installed "formatter" {
+//         pretty : :string -> :string
+//         check! : :string -> [:ok, :string] | [:error, :string] = formatter.lint.check!
+//     }
+//
+// is another Dream image and what this program calls in it, which the loader
+// makes a module (`syntax.image_decl`) as it does a `foreign` block. Each
+// entry is a name, its type in the type grammar, and -- when the function is
+// not the image's top-level `name` -- `= module.member` for where it is.
+//
+// The image is a path (`from "fmt.dream"`), an installed image (`from
+// installed "formatter"`), one carried in this image's payload (`from embedded
+// "formatter"`), or any expression in parentheses (`std.image`'s `any_of`).
+// Unlike a C library there is no default: a program is not a library of itself.
+
+let rec parse_image c sp ts =
+    if not (at ts :ident) || is_keyword (peek_value ts) {
+        err "expected a name for the image after `image`" (peek_span ts)
+    } else if str.ends_with "!" (peek_value ts) {
+        err "an image's name must be pure" (peek_span ts)
+    } else {
+        let name = peek_value ts;
+        let rest = list.tail ts;
+        if not (is_kw rest "from") {
+            err ("expected `from` and where `" + name + "` is: a path, `installed \"name\"`, "
+                 + "`embedded \"name\"` or `(expression)`") (peek_span rest)
+        }
+        else {
+            match image_source c (list.tail rest) {
+                [:error, m, s] => err m s,
+                [:ok, source, rest2] =>
+                    match expect rest2 :lbrace "`{` before the image's functions" {
+                        [:error, m, s] => err m s,
+                        [:ok, _, rest3] =>
+                            image_body (ctx true false (ctx_indent c)) name source sp [] rest3,
+                    },
+            }
+        }
+    };
+
+/// What comes after `from` in an `image` block: an expression for the image.
+let image_source c ts = {
+    let sp = peek_span ts;
+    let named word = {
+        let after = list.tail ts;
+        if not (at after :str) {
+            err ("expected the image's name, as a string, after `" + word + "`") (peek_span after)
+        }
+        else {
+            ok (ast.apply_e (ast.field_e (ast.name_e "image" sp) word sp)
+                            [ast.str_e (peek_value after) (peek_span after)]
+                            (ast.span_to sp (peek_span after)))
+               (list.tail after)
+        }
+    };
+    match peek_kind ts {
+        :str => ok (ast.str_e (peek_value ts) sp) (list.tail ts),
+        :lparen =>
+            match parse_expr (grouped c) (list.tail ts) {
+                [:error, m, s] => err m s,
+                [:ok, e, rest] =>
+                    match expect rest :rparen "`)` after the image" {
+                        [:error, m, s] => err m s,
+                        [:ok, _, rest2] => ok e rest2,
+                    },
+            },
+        :ident if peek_value ts == "installed" => named "installed",
+        :ident if peek_value ts == "embedded" => named "embedded",
+        _ => err ("expected a path, `installed \"name\"`, `embedded \"name\"` or `(expression)` "
+                  + "after `from`, found " + describe ts) sp,
+    }
+};
+
+let rec image_body c name source sp entries ts =
+    if at ts :comma { image_body c name source sp entries (list.tail ts) }
+    else if at ts :rbrace {
+        let written = list.reverse entries;
+        match syntax.image_problem name written {
+            () => ok (ast.image_d name source written (ast.span_to sp (peek_span ts))) (list.tail ts),
+            [m, at_] => err m at_,
+        }
+    }
+    else if at_end ts { err "unterminated `image`: expected `}`" sp }
+    else {
+        match image_entry (at_statement c ts) name entries ts {
+            [:error, m, s] => err m s,
+            [:ok, entry, rest] => image_body c name source sp (list.cons entry entries) rest,
+        }
+    };
+
+/// `name : type`, and `= module.member` when the function is not the image's
+/// top-level `name`.
+let image_entry c img entries ts =
+    if not (at ts :ident) || is_keyword (peek_value ts) {
+        err ("expected a function or `}` in `" + img + "`, found " + describe ts) (peek_span ts)
+    } else {
+        let word = peek_value ts;
+        let at_word = peek_span ts;
+        if list.any (fn e -> list.nth 1 e == word) entries {
+            err ("`" + word + "` is already declared in `" + img + "`") at_word
+        }
+        else {
+            match expect (list.tail ts) :colon ("`:` and the type of `" + word + "`") {
+                [:error, m, s] => err m s,
+                [:ok, _, rest] =>
+                    match parse_type_expr c rest {
+                        [:error, m, s] => err m s,
+                        [:ok, t, rest2] =>
+                            if not (at rest2 :eq) {
+                                ok [:image_function, word, t, word, ast.span_to at_word (ast.span t)] rest2
+                            }
+                            else {
+                                let after = list.tail rest2;
+                                let target_at = peek_span after;
+                                match dotted_path [] after {
+                                    [:error, _, _] =>
+                                        err ("expected where `" + word + "` is in the image, as "
+                                             + "`module.member`, found " + describe after) target_at,
+                                    [:ok, segs, rest3] =>
+                                        ok [:image_function, word, t, str.join_str "." segs,
+                                            ast.span_to at_word target_at] rest3,
+                                }
+                            },
+                    },
+            }
+        }
+    };
+
 /// A C name: an identifier, or a string for one that is not a Dream identifier.
 let c_symbol ts = match peek_kind ts {
     :ident => ok [peek_value ts, peek_span ts] (list.tail ts),
@@ -2207,7 +2365,8 @@ let record_keyword kind = match kind { :list => "group", :array => "struct", :ma
 /// parameters are parsed first and the answer follows from whether there were
 /// any -- no lookahead for `=`, and no keyword to introduce either form.
 let rec record_entry c name fields members ts =
-    if not (at ts :ident) {
+    if starts_strict_param ts { strict_record_field c name fields members ts }
+    else if not (at ts :ident) {
         err ("expected a field, a member or `}` in `" + name + "`, found " + describe ts) (peek_span ts)
     } else if is_keyword (peek_value ts) {
         err ("`" + to_string (peek_value ts) + "` is a keyword and cannot name a field or a member")
@@ -2218,26 +2377,51 @@ let rec record_entry c name fields members ts =
         match let_params c [] (list.tail ts) {
             [:error, m, s] => err m s,
             [:ok, params, rest] =>
-                if list.is_empty params { record_field_entry c name fields members entry at_name rest }
+                if list.is_empty params { record_field_entry c name fields members entry at_name false rest }
                 else { record_member_entry c name fields members entry at_name params rest }
         }
     };
 
+/// A strict field: `!x`, or `(strict x)`, spelled as a strict parameter is
+/// because it is one -- `make`'s, `new`'s and `set_x`'s -- so the value is
+/// forced before it goes into the collection. That is the whole fix for the
+/// trap this repository keeps falling into: a suspension stored in a record
+/// holds everything its frame reached, and a record kept in a map holds the
+/// map it was made from. A member cannot be strict, since a member is not
+/// stored anywhere; `!` before one is said to be a mistake rather than read as
+/// a field followed by something else.
+let strict_record_field c name fields members ts =
+    match strict_param ts {
+        [:error, m, s] => err m s,
+        [:ok, p, rest] => {
+            let entry = ast.param_name p;
+            let at_name = list.nth 1 p;
+            match let_params c [] rest {
+                [:error, m, s] => err m s,
+                [:ok, [], _] => record_field_entry c name fields members entry at_name true rest,
+                [:ok, _, _] =>
+                    err ("`!` makes a field strict, and `" + entry + "` has parameters, which makes it "
+                         + "a member: a member is not stored, so there is nothing to force") at_name,
+            }
+        },
+    };
+
 /// A field, which may be given a default: what reading it answers when the
 /// collection has nothing at that key or position.
-let record_field_entry c name fields members entry at_name ts =
+let record_field_entry c name fields members entry at_name strict ts =
     if at ts :colon {
         match parse_type_expr c (list.tail ts) {
             [:error, m, s] => err m s,
             [:ok, description, rest] =>
-                match record_field_default c name fields members entry at_name rest {
+                match record_field_default c name fields members entry at_name strict rest {
                     [:ok, [:field, f], after] => ok [:field, f + [description]] after,
                     other => other,
                 },
         }
-    } else { record_field_default c name fields members entry at_name ts };
+    } else { record_field_default c name fields members entry at_name strict ts };
 
-let record_field_default c name fields members entry at_name ts =
+let record_field_default c name fields members entry at_name strict ts = {
+    let param = if strict { ast.strict_param entry at_name } else { ast.param entry at_name };
     if str.ends_with "!" entry {
         err "a record field must be a plain name: `!` marks a name impure, and reading a field is pure"
             at_name
@@ -2252,11 +2436,12 @@ let record_field_default c name fields members entry at_name ts =
                          + "compiled inside the module `" + name + "` becomes, which "
                          + "cannot see the one it is written in") (ast.span e)
                 } else {
-                    ok [:field, ast.record_field (ast.param entry at_name) e] after
+                    ok [:field, ast.record_field param e] after
                 },
         },
-        _ => ok [:field, ast.record_field (ast.param entry at_name) ()] ts,
-    } };
+        _ => ok [:field, ast.record_field param ()] ts,
+    } }
+};
 
 /// A member: an ordinary function, compiled inside the module the record
 /// becomes. Its body may name anything that module holds -- the accessors, the
@@ -3094,6 +3279,19 @@ when test {
         test.case "a payload is a library"
             $( test.eq! "(foreign m (list (atom payload) (str \"lib\")))"
                         (items "foreign m from embedded \"lib\" {}") ),
+        test.case "a system library is a search for one"
+            $( test.eq! "(foreign m (apply (field (name foreign) system_version) (str \"sqlite3\") (str \"0\")))"
+                        (items "foreign m from system \"sqlite3\" \"0\" {}") ),
+        test.case "an image is a module of functions in another image"
+            $( test.eq! "(image f (apply (field (name image) installed) (str \"fmt\")) (pretty (list (atom fn) (atom string) (atom string)) pretty) (check! (list (atom fn) (atom string) (atom bool)) fmt.lint.check!))"
+                        (items "image f from installed \"fmt\" {\n    pretty : :string -> :string\n    check! : :string -> :bool = fmt.lint.check!\n}") ),
+        test.case "only data crosses into an image"
+            $( test.true! (str.contains_str "only data" (fails_module "image f from \"f.dream\" { g : (:int -> :int) -> :int }")) ),
+        test.case "a value in an image is not an effect"
+            $( test.true! (str.contains_str ":unit ->" (fails_module "image f from \"f.dream\" { now! : :integer }")) ),
+        test.case "`image` is still a name everywhere else"
+            $( test.eq! "(let x (apply (field (name image) installed) (str \"a\")))"
+                        (items "let x = image.installed \"a\";") ),
         test.case "`foreign` is still a name everywhere else"
             $( test.eq! "(let x (apply (field (name foreign) run!) (int 1)))"
                         (items "let x = foreign.run! 1;") ),

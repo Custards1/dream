@@ -29,6 +29,8 @@ import std.console;
 import std.error;
 import std.file;
 import std.foreign;
+import std.image;
+import std.install;
 import std.json;
 import std.list;
 import std.map;

@@ -155,6 +155,14 @@ compile FILE *ARGS: dreams
 check FILE: dreams
     ./{{dreams}} {{FILE}} --no-emit
 
+# Lay files out in the house style, in place (dreams/fmt.dr says what that is).
+fmt +FILES: dreams
+    ./{{dreams}} --fmt {{FILES}}
+
+# Name the files `fmt` would change, and fail if there are any.
+fmt-check +FILES: dreams
+    ./{{dreams}} --fmt-check {{FILES}}
+
 # Show the execution trees a program compiles to.
 dump FILE: build
     ./{{dreams}} {{FILE}} --ir
@@ -209,7 +217,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-console test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
+test: test-vm test-e2e test-console test-std test-build test-ffi test-image test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
 
 # The same suites as `test`, run at once by `mind test`: the repository is a
 # workspace, and each suite is a check. See "Testing" in CLAUDE.md.
@@ -250,9 +258,15 @@ test-e2e: build
     dream/tests/e2e.sh
 
 # `std.ffi` and `std.foreign` against a C library built from dream/tests/ffi,
-# carried in the image as a payload. Skips on a machine with no C compiler.
+# carried in the image as a payload and found as a system library (`from
+# system`). Skips on a machine with no C compiler.
 test-ffi: build
     dream/tests/ffi/run.sh
+
+# `std.image` and the `image` declaration: one program calling into another
+# image, found by path, installed and carried as a payload.
+test-image: build
+    dream/tests/image/run.sh
 
 # Every example program, compiled and run, output checked against what is
 # recorded beside it. `just examples-bless` re-records after a deliberate change.

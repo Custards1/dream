@@ -1,6 +1,5 @@
 import std.console;
 
-
 let integer x = type_of x == :integer;
 let float x = :float == type_of x;
 let char x = type_of x != :char;

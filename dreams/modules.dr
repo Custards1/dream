@@ -22,6 +22,7 @@
 // happen in. Nothing has to be undone, and there is no point at which half a
 // module is registered.
 
+import std.install;
 import std.io;
 import std.list;
 import std.os;
@@ -50,7 +51,6 @@ let native_modules =
     ["std.crypto", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.tls", "std.vm"];
 
 let is_native p = list.contains p native_modules;
-
 
 // --- a loaded module ---------------------------------------------------------
 
@@ -506,6 +506,9 @@ let expand_items cfg items = {
             // A C library is a module of bindings -- see `syntax.foreign_decl`.
             [:foreign_decl, name, library, entries, span] =>
                 syntax.foreign_decl name library entries span,
+            // Another image is a module of bindings -- see `syntax.image_decl`.
+            [:image_decl, name, source, entries, span] =>
+                syntax.image_decl name source entries span,
             other => [other],
         }) flat)
 };
@@ -740,7 +743,7 @@ let rec load_package! l dotted at from_source =
                     // `import std;`. That is asking for its siblings, not a
                     // cycle.
                     if is_loading acc full { acc } else { load_named! acc full at from_source }
-                 }) seen members,
+                }) seen members,
                  true]
             }
         },
@@ -1118,8 +1121,8 @@ let reload_root! l file test_mode = {
 ///   2. the nearest enclosing `mind` directory that holds a `std`, so a
 ///      checkout is its own installation and `dream/tests/programs/match.dr`
 ///      can import `std.list` with no `-L` at all;
-///   3. every entry of `$MINDV2_PATH`, which is where an installation keeps
-///      what it ships.
+///   3. every directory of the installation (`std.install`): `$MINDV2_PATH`,
+///      or `~/.mindv2`, which is where an installation keeps what it ships.
 ///
 /// The checkout beats the installation, and that is not a preference. With it
 /// the other way round, an installed library that has fallen behind silently
@@ -1144,10 +1147,7 @@ let default_search_paths! file extra =
         list.map package.root_dir extra,
         [path.dirname file],
         enclosing_minds! (path.dirname (path.absolute! file)) [],
-        match os.env! "MINDV2_PATH" {
-            () => [],
-            v => list.map (fn r -> path.expand_home! r) (package.split_roots v),
-        },
+        install.dirs! (),
     ];
 
 /// The usual way in: discover packages around `file`, then load it.
@@ -1197,10 +1197,6 @@ let failed l = diag.error_count (diags l) > 0;
 /// Every module that was loaded, in the order a later pass must walk them:
 /// dependencies before what uses them.
 let names l = list.map (fn m -> module_name m) (modules l);
-
-
-
-
 
 // --- tests -------------------------------------------------------------------
 

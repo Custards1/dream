@@ -107,7 +107,6 @@ let names = [
 /// wants to be a map; see "Making it faster" in docs/notes/vm-performance.md for the other four.
 let ids = list.fold (fn m [i, n] -> m.[n => i]) (%{}) (list.enumerate names);
 
-
 let is_builtin : :string -> :bool;
 let is_builtin name = map.has name ids;
 

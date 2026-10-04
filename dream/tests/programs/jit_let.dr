@@ -15,7 +15,6 @@
 
 import std.console;
 
-
 // --- the plain case --------------------------------------------------------
 let rec squares i n acc =
     if i > n { acc } else {

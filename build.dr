@@ -64,6 +64,7 @@ let checks ctx =
     |> build.check "e2e" (suite ctx "e2e" "dream/tests/e2e.sh")
     |> build.check "examples" (suite ctx "examples" "examples/run.sh")
     |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh")
+    |> build.check "image" (suite ctx "image" "dream/tests/image/run.sh")
     |> build.check "tls" (suite ctx "tls" "dream/tests/tls/run.sh")
     |> build.check "sql_pg_contracts" (suite ctx "sql_pg_contracts" "mind/std/sql/pg/tests/contracts.sh")
     |> build.check "sql_pg_live" (suite ctx "sql_pg_live" "mind/std/sql/pg/tests/live.sh");

@@ -2,6 +2,7 @@
 #include "digest.hpp"
 
 #include "io.hpp"
+#include "os.hpp"
 
 #include <array>
 #include <unordered_map>
@@ -12,6 +13,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 
 #include "bigint.hpp"
@@ -1472,6 +1475,8 @@ NativeResult vm_host_members(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_open_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_call_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_close_image(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_image_function(Process& p, Value self, Value* args, uint32_t n);
+NativeResult vm_locate_image(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_image_digest(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_wire_encode(Process& p, Value self, Value* args, uint32_t n);
 NativeResult vm_share_arenas(Process& p, Value self, Value* args, uint32_t n);
@@ -1514,6 +1519,10 @@ ModuleDef make_vm_module() {
                          {"open_image!", 1, 0b1, vm_open_image},
                          {"call_image!", 4, 0b1111, vm_call_image, 0, true},
                          {"close_image!", 1, 0b1, vm_close_image},
+                         // An image as a library; see "Images as libraries".
+                         {"image_function", 3, 0b110, vm_image_function, 0},
+                         {"pure_image_function", 3, 0b110, vm_image_function, 1},
+                         {"locate_image!", 1, 0b0, vm_locate_image},
                          {"image_digest", 1, 0b1, vm_image_digest},
                          // `std.wire`'s format, done here; see "The wire format, natively".
                          {"wire_encode", 1, 0b0, vm_wire_encode, 0, true},
@@ -1908,6 +1917,328 @@ NativeResult vm_close_image(Process& p, Value, Value* args, uint32_t) {
     int64_t handle = fixnum_value(hv);
     bool closed = handle >= 0 && p.runtime().close_session(uint64_t(handle));
     return NativeResult::ok(make_bool(closed));
+}
+
+// ---------------------------------------------------------------------------
+// Images as libraries
+// ---------------------------------------------------------------------------
+//
+// `std.image` is to a `.dream` image what `std.ffi` is to a C library: the
+// image is found and opened the first time something in it is called, kept
+// for the life of the runtime, and each function in it is bound once and
+// handed to the program as an ordinary function value. Under that it is a
+// session (`ImageSession`), the same machinery macro expansion runs on, so the
+// rules are a session's: the image runs in a runtime of its own, and what
+// crosses in either direction is *data* -- `import_across` -- because a
+// closure or a process names things in a heap the other side has never seen.
+// Taking functions across is what merging images would buy; see
+// docs/dynamic-linking.md.
+//
+// A call runs on the calling worker, on a one-worker scheduler made for it,
+// to completion, and holds the session's lock while it does: one runtime is
+// driven by one scheduler at a time.
+
+/// What one descriptor names: a file to read, or bytes already in hand.
+struct ImageSource {
+    std::string key, label, path;
+    const char* bytes = nullptr;
+    uint64_t length = 0;
+};
+
+const char* const IMAGE_DESCRIPTORS =
+    "an image is a path, `[:installed, name]`, `[:payload, name]` or `[:any, images]`";
+
+bool text_of(Value v, std::string* out) {
+    v = resolve(v);
+    if (!is_obj(v, ObjType::Str)) return false;
+    auto* s = static_cast<StrObj*>(as_obj(v));
+    out->assign(s->data(), s->len);
+    return true;
+}
+
+/// The sources a forced descriptor names, in the order to try them; an
+/// `[:any, ..]` contributes each of its own. False, with `why`, when the
+/// descriptor is not one, or names something that is not there.
+bool image_sources(Process& p, Value v, std::vector<ImageSource>* out, std::string* why) {
+    v = resolve(v);
+    std::string path;
+    if (text_of(v, &path)) {
+        std::error_code ec;
+        auto canonical = std::filesystem::weakly_canonical(
+            std::filesystem::path(std::u8string(path.begin(), path.end())), ec);
+        auto u8 = (ec ? std::filesystem::path(path) : canonical).generic_u8string();
+        ImageSource s;
+        s.path = path;
+        s.key = "file:" + std::string(u8.begin(), u8.end());
+        s.label = path;
+        out->push_back(std::move(s));
+        return true;
+    }
+    std::vector<Value> items;
+    for (Value cur = v; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        items.push_back(resolve(static_cast<ConsObj*>(as_obj(cur))->head));
+    }
+    std::string tag = items.size() == 2 && is_atom(items[0])
+                          ? p.runtime().atom_name(uint32_t(imm_payload(items[0])))
+                          : "";
+    std::string name;
+    if (tag == "installed" && text_of(items[1], &name)) {
+        std::vector<std::string> dirs = install_dirs();
+        std::string found = installed_image(name, dirs);
+        if (found.empty()) {
+            std::string where;
+            for (const std::string& d : dirs) where += (where.empty() ? "" : ", ") + d;
+            *why = "no installed image `" + name + "`" +
+                   (dirs.empty() ? std::string(": there is no installation ($MINDV2_PATH, or ~/.mindv2)")
+                                 : " in " + where);
+            return false;
+        }
+        return image_sources(p, p.heap().make_string(found.data(), uint32_t(found.size())), out, why);
+    }
+    if (tag == "payload" && text_of(items[1], &name)) {
+        const Image& img = p.runtime().image();
+        int64_t index = img.data_index(name);
+        if (index < 0) {
+            *why = "this image carries no payload called `" + name + "`; build it with `--payload " +
+                   name + "=FILE`";
+            return false;
+        }
+        ImageSource s;
+        s.bytes = img.data_bytes(uint32_t(index));
+        s.length = img.data_length(uint32_t(index));
+        s.key = "payload:" + std::to_string(reinterpret_cast<uintptr_t>(s.bytes));
+        s.label = "payload `" + name + "`";
+        out->push_back(std::move(s));
+        return true;
+    }
+    if (tag == "any") {
+        std::string reasons;
+        bool any = false;
+        for (Value cur = items[1]; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+            std::string one;
+            if (image_sources(p, static_cast<ConsObj*>(as_obj(cur))->head, out, &one)) any = true;
+            else reasons += "\n  " + one;
+        }
+        // Said even when another was found, so that if that one cannot be
+        // opened either, the account of what was tried is whole.
+        *why = any ? reasons : "none of the images could be found:" + reasons;
+        return any;
+    }
+    *why = IMAGE_DESCRIPTORS;
+    return false;
+}
+
+/// The session a descriptor opens as -- the one already open, or a new one --
+/// or 0 with `why`.
+uint64_t open_image_library(Process& p, Value desc, std::string* why) {
+    std::vector<ImageSource> sources;
+    std::string reasons;
+    if (!image_sources(p, desc, &sources, &reasons)) {
+        *why = reasons;
+        return 0;
+    }
+    Runtime& rt = p.runtime();
+    for (const ImageSource& src : sources) {
+        if (uint64_t open = rt.library_session(src.key)) return open;
+        auto session = std::make_unique<ImageSession>();
+        session->label = src.label;
+        if (src.bytes) {
+            session->bytes.assign(src.bytes, size_t(src.length));
+        } else {
+            std::ifstream in(std::filesystem::path(std::u8string(src.path.begin(), src.path.end())),
+                             std::ios::binary);
+            if (!in) {
+                reasons += "\n  " + src.label + (is_file(src.path) ? ": cannot be read" : ": no such file");
+                continue;
+            }
+            session->bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        session->runtime = std::make_unique<Runtime>(/*owns_host_services=*/false);
+        std::string message;
+        if (!session->runtime->load_image_bytes(
+                reinterpret_cast<const uint8_t*>(session->bytes.data()), session->bytes.size(), message)) {
+            reasons += "\n  " + src.label + ": " + message;
+            continue;
+        }
+        uint64_t handle = rt.open_session(std::move(session));
+        uint64_t kept = rt.note_library_session(src.key, handle);
+        if (kept != handle) rt.close_session(handle);  // another process opened it first
+        return kept;
+    }
+    *why = sources.size() == 1 && reasons.find('\n', 1) == std::string::npos
+               ? "cannot open the image " + reasons.substr(3)
+               : "none of the images could be opened:" + reasons;
+    return 0;
+}
+
+/// The functions an image's root module has, for the message that says the
+/// one asked for is not among them.
+std::string functions_in(const Image& img, const std::string& module_name) {
+    std::string names;
+    for (uint32_t mi = 0; mi < img.module_count(); ++mi) {
+        const ModuleRec& m = img.module(mi);
+        StringRef mn = img.str(m.name);
+        if (std::string(mn.data, mn.len) != module_name) continue;
+        for (uint32_t i = m.globals_start; i < m.globals_start + m.globals_count; ++i) {
+            const GlobalRec& g = img.global(i);
+            if (g.kind != GLOBAL_FUNCTION) continue;
+            StringRef gn = img.str(g.name);
+            names += (names.empty() ? "" : ", ") + std::string(gn.data, gn.len);
+        }
+    }
+    return names;
+}
+
+NativeResult image_fail(Process& p, const std::string& message) {
+    return comp_fail(p, "image_error", message);
+}
+
+/// What a binding does when it is called: the arguments forced and carried
+/// across, the function run in the image to completion, and its answer -- or
+/// the error it raised -- carried back.
+NativeResult image_invoke(Process& p, Value self, Value* args, uint32_t) {
+    Runtime::ImageBinding b;
+    if (!p.runtime().image_binding(static_cast<NativeObj*>(as_obj(self))->user, &b)) {
+        return image_fail(p, "a binding into an image that is not open");
+    }
+    // The arguments as data, all the way down, before anything is taken
+    // across. Written back where the collector can see them.
+    for (uint32_t i = 0; i < b.arity; ++i) {
+        Value deep;
+        if (!force_deep(p, args[i], &deep)) return NativeResult::raise(p.result);
+        args[i] = deep;
+    }
+    ImageSession* session = p.runtime().session(b.session);
+    if (session == nullptr) return image_fail(p, "the image `" + b.name + "` was in is closed");
+    std::lock_guard<std::mutex> one_at_a_time(session->calls);
+    Runtime& rt = *session->runtime;
+    Scheduler sched(rt, 1);
+    auto root = sched.create_process();
+    for (uint32_t i = 0; i < b.arity; ++i) {
+        Value crossed;
+        if (!import_across(*root, p.runtime(), args[i], &crossed, 0)) {
+            return image_fail(p, "argument " + std::to_string(i + 1) + " of `" + b.name +
+                                     "` is a function or a process, and only data can be passed "
+                                     "to an image");
+        }
+        root->stack.push_back(crossed);
+    }
+    prime_apply(*root, root->heap().make_closure(b.func, 0), b.arity);
+    bool clean = sched.run(root);
+
+    Value answer = root->exit_value;
+    bool raised = root->failed;
+    if (!raised && clean) {
+        Value deep;
+        if (force_deep(*root, answer, &deep)) answer = deep;
+        else {
+            raised = true;
+            answer = root->result;
+        }
+    }
+    if (!clean && !raised) {
+        return image_fail(p, "`" + b.name + "` in " + session->label + " did not finish");
+    }
+    if (raised) {
+        // An error is data with a kind, and is raised again here as the
+        // caller's own: the image is a library, and a library's errors are
+        // its caller's to handle.
+        Value err = resolve(answer);
+        if (is_obj(err, ObjType::ErrorBox)) {
+            auto* e = static_cast<ErrorObj*>(as_obj(err));
+            std::string kind = rt.atom_name(uint32_t(imm_payload(resolve(e->kind))));
+            Value payload;
+            if (!import_across(p, rt, e->payload, &payload, 0)) payload = UNIT;
+            Pin kept(p, payload);
+            Value k = make_atom(p.runtime().intern_atom(kind));
+            return NativeResult::raise(p.heap().make_error(k, kept.get()));
+        }
+        Value crossed;
+        if (import_across(p, rt, err, &crossed, 0)) return NativeResult::raise(crossed);
+        return image_fail(p, "`" + b.name + "` in " + session->label + " failed");
+    }
+    Value out;
+    if (!import_across(p, rt, answer, &out, 0)) {
+        return image_fail(p, "`" + b.name + "` answered a function or a process, and only data "
+                             "comes back from an image");
+    }
+    return NativeResult::ok(out);
+}
+
+/// `image_function lib target arity` and `pure_image_function ..`: open the
+/// image if it is not open, find `target` -- `module.member`, or a bare
+/// member of the image's root module -- and answer a function of `arity`
+/// arguments that calls it. Which of the two is the member's `user`, and
+/// decides only the name the function carries, which is the runtime's
+/// reading of its purity, as it is for `ffi.function`.
+NativeResult vm_image_function(Process& p, Value callee, Value* args, uint32_t) {
+    const bool pure = static_cast<NativeObj*>(as_obj(callee))->user == 1;
+    Value desc;
+    if (!force_deep(p, args[0], &desc)) return NativeResult::raise(p.result);
+    std::string target;
+    if (!text_of(args[1], &target) || target.empty()) {
+        return type_fail(p, "image_function needs the name of a function in the image");
+    }
+    Value av = resolve(args[2]);
+    if (!is_fixnum(av) || fixnum_value(av) < 0) return type_fail(p, "image_function needs an arity");
+    uint32_t arity = uint32_t(fixnum_value(av));
+
+    std::string why;
+    uint64_t handle = open_image_library(p, desc, &why);
+    if (handle == 0) return image_fail(p, why);
+    ImageSession* session = p.runtime().session(handle);
+    const Image& img = session->runtime->image();
+
+    size_t dot = target.rfind('.');
+    StringRef root = img.module_name();
+    std::string module_name = dot == std::string::npos ? std::string(root.data, root.len)
+                                                       : target.substr(0, dot);
+    std::string member = dot == std::string::npos ? target : target.substr(dot + 1);
+    uint32_t func = global_in_module(img, module_name, member);
+    if (func == NO_NODE || func >= img.func_count()) {
+        std::string has = functions_in(img, module_name);
+        return image_fail(p, session->label + " has no function `" + module_name + "." + member + "`" +
+                                 (has.empty() ? " (and no module `" + module_name + "`)"
+                                              : "; `" + module_name + "` has " + has));
+    }
+    // A function of fewer parameters may answer one that takes the rest, and
+    // a value global is applied to whatever it comes to; but one that wants
+    // more than it is given would answer a partial application, which cannot
+    // come back.
+    uint32_t takes = img.func(func).arity;
+    if (takes > arity) {
+        auto count = [](uint32_t n) {
+            return std::to_string(n) + (n == 1 ? " argument" : " arguments");
+        };
+        return image_fail(p, "`" + module_name + "." + member + "` in " + session->label + " takes " +
+                                 count(takes) + ", and the binding gives it " + std::to_string(arity));
+    }
+    Runtime::ImageBinding b;
+    b.session = handle;
+    b.func = func;
+    b.arity = arity;
+    b.name = module_name + "." + member;
+    uint64_t id = p.runtime().add_image_binding(b);
+    std::string name = pure ? member : (member.size() && member.back() == '!' ? member : member + "!");
+    Value name_v = p.heap().make_string(name.data(), uint32_t(name.size()));
+    // Dream applies a function of nothing to unit, so one of no arguments
+    // takes a unit it ignores -- as a C function of none does.
+    return NativeResult::ok(make_native(p, image_invoke, name_v, arity == 0 ? 1 : arity, 0, id));
+}
+
+/// `locate_image! lib`: the file an image descriptor names, or why there is
+/// none, as `[:ok, label]` or `[:error, why]`. It opens the image, which is
+/// O(1) once read, and is what using it would do anyway.
+NativeResult vm_locate_image(Process& p, Value, Value* args, uint32_t) {
+    Value desc;
+    if (!force_deep(p, args[0], &desc)) return NativeResult::raise(p.result);
+    std::string why;
+    uint64_t handle = open_image_library(p, desc, &why);
+    std::string said = handle ? p.runtime().session(handle)->label : why;
+    Value text = p.heap().make_string(said.data(), uint32_t(said.size()));
+    Pin kept(p, text);
+    Value rest = p.heap().make_cons(kept.get(), NIL);
+    return NativeResult::ok(p.heap().make_cons(make_atom(p.runtime().intern_atom(handle ? "ok" : "error")), rest));
 }
 
 /// Decode one UTF-8 scalar starting at `i`, advancing it. Invalid bytes are

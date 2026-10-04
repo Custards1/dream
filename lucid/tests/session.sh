@@ -96,6 +96,9 @@ derived='import std.console;\nderive behavior;\n\nlet name self = \"app\";\n\nle
 # resolves it. Line 2 is the declaration, with `x` at column 14 and `y` at 17;
 # line 4 reaches an accessor at column 26.
 records='import std.console;\n\ngroup Point { x, y }\n\nlet main! = {\n    console.print! (Point.x (Point.make 1 2))\n};\n'
+# A buffer laid out two columns short, and the same buffer as it should be.
+unformatted='let main! = {\n  1\n};\n'
+formatted='let main! = {\n    1\n};\n'
 navigation='import nav;\nimport nav.types as t;\nlet f : t.Count -> t.Count;\nlet f n = n;\nlet main! = t.value;\nlet other = nav.types.value;\n'
 
 {
@@ -127,6 +130,10 @@ navigation='import nav;\nimport nav.types as t;\nlet f : t.Count -> t.Count;\nle
     set -- $request
     msg '{"jsonrpc":"2.0","id":'"$1"',"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":'"$2"',"character":'"$3"'}}}'
   done
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$unformatted"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":26,"method":"textDocument/formatting","params":{"textDocument":{"uri":"'"$uri"'"},"options":{"tabSize":4,"insertSpaces":true}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$formatted"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":27,"method":"textDocument/formatting","params":{"textDocument":{"uri":"'"$uri"'"},"options":{"tabSize":4,"insertSpaces":true}}}'
   msg '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}'
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
 } > "$tmp/in"
@@ -162,6 +169,10 @@ has "the outline is missing"                     '"name":"main!"'
 # ever mentions it.
 has "an unsaved edit is not what gets compiled"  'has no member .missing'
 has "shutdown is not answered"                   '"id":5'
+# Formatting is the compiler's formatter on the buffer: one edit with the
+# whole text when it changes, and none when it is already laid out.
+has_in "formatting does not reindent the buffer"  26 'newText":"let main! = {\\n    1\\n};'
+has_in "a laid-out buffer is still edited"        27 '"result":\[\]'
 
 # Completion, asked twice. Request 6 sits on a bare name in a buffer that
 # parses, and must reach what a bare name reaches.

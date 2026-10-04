@@ -57,8 +57,6 @@ let home! () = match os.env! "HOME" {
     home => home,
 };
 
-
-
 /// The non-empty pieces between the slashes. A leading slash is not one of
 /// them -- `is_absolute` is what remembers it -- so `of_segments` needs telling
 /// which kind of path it is rebuilding.
@@ -95,13 +93,13 @@ let join original_a original_b = {
     let a = slashes original_a;
     let b = slashes original_b;
     match [a, b] {
-    [_, ""] => a,
-    [_, "."] => a,
-    ["", _] => b,
-    [".", _] => b,
-    _ if is_absolute b => b,
-    _ if str.ends_with separator a => a + b,
-    _ => a + separator + b,
+        [_, ""] => a,
+        [_, "."] => a,
+        ["", _] => b,
+        [".", _] => b,
+        _ if is_absolute b => b,
+        _ if str.ends_with separator a => a + b,
+        _ => a + separator + b,
     }
 };
 

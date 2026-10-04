@@ -1,0 +1,450 @@
+// The formatter: `dreams --fmt FILE`, and `textDocument/formatting` in lucid.
+//
+// Dream's layout is part of its grammar, which decides most of what a
+// formatter here may do. A line break ends a statement unless the next line is
+// indented past the column the statement started at, or begins with something
+// that cannot begin one -- so moving a line left or right can turn a
+// continuation into a statement of its own. A formatter that reprinted the
+// syntax tree would also have to put back every comment (the lexer keeps
+// none), every `let?` the parser has already unfolded into a `match`, and the
+// hand alignment this codebase uses everywhere: arguments under the argument
+// above them, `=` signs in a column, a comment beside each arm. None of that
+// is in the tree.
+//
+// So this works on the text, a line at a time, and keeps every line:
+//
+// - nothing is joined or split, so no line break appears or disappears;
+// - a line that starts a statement goes to its block's indent, and every
+//   other line of that statement moves by the same amount, which keeps
+//   "indented past the statement" true for exactly the lines it was true for
+//   and keeps any alignment inside it;
+// - a block's indent is four columns past what it belongs to. This codebase
+//   means more than one thing by that -- the statement, the `match` or `fn`
+//   that owns the brace, the expression after a leading `$(` -- so where the
+//   block already sits four past one of those, it stays anchored there; any
+//   other indentation goes four past the statement (`opened_block`);
+// - a line inside brackets moves with the line the bracket opened on, and a
+//   line that starts with a closer goes back to what its block is anchored
+//   at, or for a bracket, under the bracket or to its line;
+// - a comment line moves with the code after it, or with the code before it
+//   when what comes next is a closing bracket;
+// - a line that starts inside a string is the string's and is left alone.
+//
+// And within a line, only what never carries alignment: the trailing
+// whitespace is dropped, a `,` or `;` written against the next token gets a
+// space, a run of blank lines becomes one, and the file ends with one newline.
+//
+// The rules above are an account of the grammar rather than the grammar, so
+// they are checked rather than trusted: the file is parsed before and after,
+// and if the trees differ by anything but positions the formatter says so and
+// changes nothing. A file the parser refuses is not formatted at all.
+//
+// What this does not do is anything that needs the tree: turning an
+// `if`/`else if` chain into a `match`, or wrapping a line that is too long.
+
+import std.list;
+import std.str;
+import dreams.ast;
+import dreams.lexer;
+import dreams.parser;
+import dreams.syntax;
+
+/// How far a block's statements sit past what they belong to.
+let step : :integer;
+let step = 4;
+
+/// One open bracket, as the walk down the file sees it.
+///
+/// `anchor` is the column, in the new layout, that a closer on a line of its
+/// own goes back to, and `delta` how far the line the bracket was opened on
+/// moved -- which is how far every line inside a `(`, `[` and the rest moves
+/// with it.
+///
+/// A block (`{`) also tracks the statement it is in the middle of: the column
+/// it started at, before and after, which is what says whether the next line
+/// continues it. `stmt_old` is `()` until a statement has begun. And a block
+/// does not know where its statements go until its first line of its own is
+/// seen: `cands` are the columns it could be anchored at, `[old, new]`;
+/// `body` is `()` until one of them is chosen, and `fallback` is where they
+/// go when none is.
+///
+/// Every frame also gathers the candidates written inside it (`seen`), so
+/// that a block opened further on can be anchored at a `match` whose subject
+/// took three lines. A block's are its current statement's, and start again
+/// with each statement -- except that a block whose first statement is still
+/// the one written on its own opening line (`inline`) also offers what is
+/// outside it: in `else { match e {` the arms may sit past the `else`.
+struct Frame { !block, !anchor, !delta, !stmt_old, !stmt_new, cands, !body, !fallback, seen, !inline }
+
+/// A bracket's only candidate is itself: a closer written under its opener
+/// stays under it, and anywhere else goes back to the line it opened on.
+let group_frame new d col = Frame.make false new d () () [[col, col + d]] () () [] false;
+
+/// The file's own level: a block whose statements sit at column zero.
+let root : Frame;
+let root = Frame.make true (0 - step) 0 () () [] 0 0 [] false;
+
+/// One line of the source, by byte offsets: where it starts, where it stops
+/// (before its newline), how wide its indentation is, and what kind of line it
+/// is -- `:blank`, `:code` (a token starts it), `:verbatim` (it starts inside a
+/// string, which owns every byte of it) or `:other` (a comment, or the inside
+/// of a block comment). `keep_end` says its end is inside a token, so its
+/// trailing whitespace is a string's.
+struct Line { !start, !stop, !lead, !kind, toks, !keep_end }
+
+let is_opener k = k == :lbrace || k == :lparen || k == :lbracket || k == :hash_bracket
+                  || k == :percent_brace || k == :dollar_paren;
+let is_closer k = k == :rbrace || k == :rparen || k == :rbracket;
+
+/// Can a line that starts with this token begin a statement? An infix
+/// operator, `|>`, `.`, `else` and `catch` cannot, and continue the statement
+/// above them whatever their indentation ("Line breaks end statements" in
+/// docs/language-spec.md).
+let begins t = {
+    let k = lexer.kind t;
+    if ast.infix_of k != () || k == :pipe_into || k == :dot { false }
+    else if k == :ident { lexer.value t != "else" && lexer.value t != "catch" }
+    else { true }
+};
+
+let at_least_zero n = if n < 0 { 0 } else { n };
+
+// --- reading the lines ------------------------------------------------------------
+
+/// `[start, stop]` of every line, in order.
+let rec line_spans src !at acc = {
+    let stop = str.upto "\n" at src;
+    let acc2 = list.cons [at, stop] acc;
+    if stop >= str.byte_length src { list.reverse acc2 }
+    else { line_spans src (stop + 1) acc2 }
+};
+
+/// Each line, with the tokens that start on it. `inside` is the furthest end
+/// of any token so far: a line that starts before it starts inside that token.
+let rec classify src spans toks !inside acc =
+    match spans {
+        [] => list.reverse acc,
+        [[start, stop], ..rest] => {
+            let mine = list.take_while (fn t -> lexer.span_start t <= stop) toks;
+            let others = list.drop (list.length mine) toks;
+            let lead = str.span " \t" start src - start;
+            let reach = list.fold_strict (fn m t -> if lexer.span_end t > m { lexer.span_end t } else { m })
+                                         inside mine;
+            let kind = if start < inside { :verbatim }
+                       else if start + lead >= stop { :blank }
+                       else { match mine {
+                           [first, .._] if lexer.span_start first == start + lead => :code,
+                           _ => :other,
+                       } };
+            classify src rest others reach
+                     (list.cons (Line.make start stop lead kind mine (reach > stop)) acc)
+        },
+    };
+
+// --- the walk ---------------------------------------------------------------------
+
+/// Can the expression starting at `t` be what a block is anchored at? The
+/// first token of a line, or of a bracket, or after a line's leading
+/// operator, and the words that introduce a block of their own. Any token at
+/// all would be too many: in `let f x = match x {` a body four past the `f`
+/// is a coincidence, not a choice.
+let owners = ["match", "if", "else", "fn", "try!", "catch", "strict!", "receive!", "comp", "comp!",
+              "when", "mod"];
+let owns t leads =
+    leads || is_opener (lexer.kind t) || (lexer.kind t == :ident && list.contains (lexer.value t) owners);
+
+/// Add a candidate to the frame on top.
+let noted c stack = list.cons (Frame.set_seen (list.cons c (Frame.seen (list.head stack))) (list.head stack))
+                              (list.tail stack);
+
+/// The candidates a `{` opened now can choose from: what every frame down to
+/// the innermost block has seen, and that block's statement start.
+let rec candidates stack acc =
+    match stack {
+        [] => acc,
+        [f, ..rest] =>
+            if Frame.block f {
+                let mine = acc + Frame.seen f;
+                let all = if Frame.stmt_old f == () { mine } else { list.cons [Frame.stmt_old f, Frame.stmt_new f] mine };
+                if Frame.inline f { candidates rest all } else { all }
+            }
+            else { candidates rest (acc + Frame.seen f) },
+    };
+
+/// The statement-start column of the innermost block, new, or `()`.
+let rec statement_at stack =
+    match stack {
+        [] => (),
+        [f, ..rest] => if Frame.block f { Frame.stmt_new f } else { statement_at rest },
+    };
+
+/// The brackets a line opens and closes, applied to the stack in order, and
+/// the candidates it writes noted where they were written. The stack always
+/// keeps `root` at the bottom, so a stray closer cannot empty it. `prev` is
+/// the kind of the token before, and `i` the token's place on the line.
+let rec brackets toks new d prev lead_op i stack =
+    match toks {
+        [] => stack,
+        [t, ..rest] => {
+            let k = lexer.kind t;
+            let col = lexer.col t - 1;
+            let leads = i == 0 || (prev != () && is_opener prev) || (i == 1 && lead_op);
+            // A brace that begins an expression (`$( {`) is one of its own
+            // block's candidates, so it is noted before the block is made.
+            let stack1 = if owns t leads { noted [col, col + d] stack } else { stack };
+            let stack2 =
+                if k == :lbrace { list.cons (opened_block rest new d stack1) stack1 }
+                else if is_opener k { list.cons (group_frame new d col) stack1 }
+                else if is_closer k && not (list.is_empty (list.tail stack1)) { list.tail stack1 }
+                else { stack1 };
+            brackets rest new d k (lead_op || (i == 0 && not (begins t))) (i + 1) stack2
+        },
+    };
+
+/// A `{`, and where its statements may go.
+///
+/// This codebase anchors a block at more than one thing -- the start of the
+/// statement it is in, the `match` or `fn` that owns it (`x => match y {`),
+/// the expression after a leading `$(` or a leading `+` -- and every one of
+/// them is a column that something written before the brace begins at. So
+/// they are all candidates, and the block's first line says which was meant:
+/// one `step` past a candidate keeps that candidate, moved as it moved, and
+/// anything else is indentation nobody chose, and goes `step` past the
+/// statement -- or past the line, when the brace is inside brackets.
+///
+/// A `{` with a statement after it on the same line has begun that statement
+/// already, at that token's column, and by default the ones after it line up
+/// with it.
+let opened_block rest new d stack = {
+    let at = match statement_at stack { () => new, n => if Frame.block (list.head stack) { n } else { new } };
+    let cands = candidates stack [];
+    match rest {
+        [n, .._] if not (is_closer (lexer.kind n)) => {
+            let col = lexer.col n - 1;
+            Frame.make true at d col (col + d) cands () (col + d) [] true
+        },
+        _ => Frame.make true at d () () cands () (at + step) [] false,
+    }
+};
+
+/// The new column of the candidate at old column `old`, or `()`.
+let candidate_at old cands =
+    match list.filter (fn c -> list.head c == old) cands {
+        [[_, new], .._] => new,
+        _ => (),
+    };
+
+/// A block's first line of its own settles where the block is anchored.
+let settled top old =
+    if Frame.body top != () { top }
+    else {
+        match candidate_at (old - step) (Frame.cands top) {
+            () => Frame.set_body (Frame.fallback top) top,
+            a => top |> Frame.set_anchor a |> Frame.set_body (a + step),
+        }
+    };
+
+/// Where a line that starts with `t`, `old` columns in, goes, and the frame it
+/// leaves on top of the stack: `[new, frame]`.
+let place t old top =
+    if is_closer (lexer.kind t) {
+        // A block with no line of its own may still close at a candidate,
+        // and a bracket under its opener.
+        let at = if Frame.body top == () {
+                     match candidate_at old (Frame.cands top) { () => Frame.anchor top, a => a }
+                 } else { Frame.anchor top };
+        [at_least_zero at, top]
+    }
+    else if Frame.block top {
+        let top2 = settled top old;
+        if Frame.stmt_old top2 == () || (old <= Frame.stmt_old top2 && begins t) {
+            let n = Frame.body top2;
+            [n, top2 |> Frame.set_stmt_old old |> Frame.set_stmt_new n |> Frame.set_seen []
+                     |> Frame.set_inline false]
+        }
+        else { [at_least_zero (old + Frame.stmt_new top2 - Frame.stmt_old top2), top2] }
+    }
+    else { [at_least_zero (old + Frame.delta top), top] };
+
+/// The new indent of every line, forward. A comment line cannot be placed
+/// until the code after it has been, so it is left as `[:after, d]`, where `d`
+/// is how far the code before it moved.
+let rec walk lines stack !last acc =
+    match lines {
+        [] => list.reverse acc,
+        [l, ..rest] => match Line.kind l {
+            :code => {
+                let t = list.head (Line.toks l);
+                let old = Line.lead l;
+                let [new, top] = place t old (list.head stack);
+                let d = new - old;
+                let stack2 = brackets (Line.toks l) new d () false 0 (list.cons top (list.tail stack));
+                walk rest stack2 d (list.cons [:at, new, d, is_closer (lexer.kind t)] acc)
+            },
+            // A line that starts inside a string still has its tokens, and any
+            // bracket among them counts.
+            :verbatim => walk rest (brackets (Line.toks l) 0 last () false 1 stack) last (list.cons [:keep] acc),
+            :other => walk rest stack last (list.cons [:after, last] acc),
+            _ => walk rest stack last (list.cons [:keep] acc),
+        },
+    };
+
+/// The comment lines, backward: each moves as the code after it does, unless
+/// that code closes a bracket, in which case it belongs to what came before.
+let rec settle_comments placed lines next acc =
+    match [placed, lines] {
+        [[], _] => acc,
+        [[p, ..ps], [l, ..ls]] => match p {
+            [:at, new, d, closes] => settle_comments ps ls (if closes { () } else { d }) (list.cons new acc),
+            [:after, before] => {
+                let d = match next { () => before, n => n };
+                settle_comments ps ls next (list.cons (at_least_zero (Line.lead l + d)) acc)
+            },
+            _ => settle_comments ps ls next (list.cons () acc),
+        },
+    };
+
+// --- writing it out ---------------------------------------------------------------
+
+/// The offsets where a `,` or `;` is written against the token after it.
+let rec tight toks acc =
+    match toks {
+        [t, n, ..rest] => {
+            let k = lexer.kind t;
+            let wants = (k == :comma || k == :semi) && lexer.span_end t == lexer.span_start n
+                        && not (is_closer (lexer.kind n));
+            tight (list.cons n rest) (if wants { list.cons (lexer.span_end t) acc } else { acc })
+        },
+        _ => list.reverse acc,
+    };
+
+/// Where a line's text ends once its trailing whitespace is gone.
+let rec trimmed_end src start !stop =
+    if stop > start && (str.byte (stop - 1) src == 32 || str.byte (stop - 1) src == 9
+                        || str.byte (stop - 1) src == 13) {
+        trimmed_end src start (stop - 1)
+    } else { stop };
+
+/// `src` from `from` to `stop`, with a space at each of `gaps`.
+let rec spaced src from stop gaps acc =
+    match gaps {
+        [g, ..rest] if g < stop => spaced src g stop rest (list.cons " " (list.cons (str.slice from (g - from) src) acc)),
+        _ => str.join_str "" (list.reverse (list.cons (str.slice from (stop - from) src) acc)),
+    };
+
+let render src l new =
+    match Line.kind l {
+        :blank => "",
+        :verbatim => str.slice (Line.start l) (Line.stop l - Line.start l) src,
+        _ => {
+            let from = Line.start l + Line.lead l;
+            let stop = if Line.keep_end l { Line.stop l } else { trimmed_end src from (Line.stop l) };
+            str.repeat new " " + spaced src from stop (tight (Line.toks l) []) []
+        },
+    };
+
+/// Runs of blank lines become one, and none are kept at either end.
+let rec squeeze rendered kinds !blank acc =
+    match [rendered, kinds] {
+        [[r, ..rs], [k, ..ks]] =>
+            if k == :blank {
+                squeeze rs ks true acc
+            } else {
+                let acc2 = if blank && not (list.is_empty acc) { list.cons "" acc } else { acc };
+                squeeze rs ks false (list.cons r acc2)
+            },
+        _ => list.reverse acc,
+    };
+
+// --- checking it ------------------------------------------------------------------
+
+/// A syntax tree with its positions taken out, which is what two layouts of
+/// the same program have in common.
+let rec unplaced e =
+    if syntax.is_span e { () }
+    else if type_of e == :list { list.map unplaced e }
+    else { e };
+
+let meaning src = match parser.parse_module src {
+    [:ok, items, _] => [:ok, unplaced items],
+    [:error, message, span] => [:error, message, ast.span_start span],
+};
+
+// --- the formatter ----------------------------------------------------------------
+
+/// The file laid out: `[:ok, text]`, or `[:error, message, offset]` when it
+/// does not parse -- or, which would be a bug here, when the layout would
+/// change what it means.
+let format : :string -> ([:ok, :string] | [:error, :string, :integer]);
+let format src =
+    match meaning src {
+        [:error, message, at] => [:error, message, at],
+        [:ok, before] => match lexer.lex src {
+            [:error, message, at] => [:error, message, at],
+            [:ok, toks] => {
+                let lines = classify src (line_spans src 0 []) toks 0 [];
+                let indents = settle_comments (list.reverse (walk lines [root] 0 []))
+                                              (list.reverse lines) () [];
+                let rendered = list.map (fn [l, new] -> render src l new) (list.zip lines indents);
+                let out = str.join_str "\n" (squeeze rendered (list.map Line.kind lines) false []) + "\n";
+                match meaning out {
+                    [:ok, after] =>
+                        if after == before { [:ok, out] }
+                        else { [:error, "formatting would change what this file means, so it was left alone", 0] },
+                    [:error, message, at] =>
+                        [:error, "formatting would break this file (" + message + "), so it was left alone", 0],
+                }
+            },
+        },
+    };
+
+when test {
+    import std.test;
+
+    let formatted src = match format src { [:ok, out] => out, other => other };
+
+    let tests = [
+        test.case "a block's statements go four past its opener"
+            $( test.eq! "let f x = {\n    let a = 1;\n    a + x\n};\n"
+                        (formatted "let f x = {\n  let a = 1;\n  a + x\n};\n") ),
+        test.case "a continuation moves with its statement, alignment and all"
+            $( test.eq! "let f x = {\n    g 1\n      2\n};\n"
+                        (formatted "let f x = {\n  g 1\n    2\n};\n") ),
+        test.case "a closer goes back to the line that opened it"
+            $( test.eq! "let xs = [\n    1,\n];\n" (formatted "let xs = [\n    1,\n        ];\n") ),
+        test.case "a comment moves with the code after it"
+            $( test.eq! "let f = {\n    // why\n    1\n};\n" (formatted "let f = {\n  // why\n  1\n};\n") ),
+        test.case "a comment before a closer stays with the body"
+            $( test.eq! "let f = {\n    1\n    // done\n};\n" (formatted "let f = {\n  1\n  // done\n};\n") ),
+        test.case "a string's own lines are left alone"
+            $( test.eq! "let s = {\n    \"a\n  b  \"\n};\n" (formatted "let s = {\n  \"a\n  b  \"\n};\n") ),
+        test.case "trailing space, tight commas, blank runs, the last newline"
+            $( test.eq! "let a = [1, 2];\n\nlet b = 3;\n" (formatted "let a = [1,2];   \n\n\n\nlet b = 3;") ),
+        test.case "an operator line continues whatever its indent"
+            $( test.eq! "let f = {\n    1\n    + 2\n};\n" (formatted "let f = {\n  1\n  + 2\n};\n") ),
+        test.case "match arms are statements of their braces"
+            $( test.eq! "let f x = match x {\n    1 => :a,\n    _ => :b,\n};\n"
+                        (formatted "let f x = match x {\n        1 => :a,\n        _ => :b,\n};\n") ),
+        test.case "a block stays anchored at the match that owns it"
+            $( test.eq! "let f x = match x {\n    1 => match y {\n             1 => 2,\n         },\n};\n"
+                        (formatted "let f x = match x {\n  1 => match y {\n           1 => 2,\n       },\n};\n") ),
+        test.case "or at the statement, when the brace is on a later line"
+            $( test.eq! "let f = {\n    if a\n       || b {\n        c\n    }\n};\n"
+                        (formatted "let f = {\n  if a\n     || b {\n      c\n  }\n};\n") ),
+        test.case "or at the match whose subject took two lines"
+            $( test.eq! "let f = match (g\n                 1) {\n    _ => 2,\n};\n"
+                        (formatted "let f = match (g\n                 1) {\n    _ => 2,\n};\n") ),
+        test.case "a brace after a bracket is its own anchor"
+            $( test.eq! "let t = f $( {\n              1\n          });\n"
+                        (formatted "let t = f $( {\n              1\n          });\n") ),
+        test.case "an else's block anchors past the else"
+            $( test.eq! "let f = if a { 1 } else { match b {\n    _ => 2,\n} };\n"
+                        (formatted "let f = if a { 1 } else { match b {\n    _ => 2,\n} };\n") ),
+        test.case "indentation nobody chose goes four past the statement"
+            $( test.eq! "let f = {\n    1\n};\n" (formatted "let f = {\n         1\n};\n") ),
+        test.case "formatting twice changes nothing"
+            $( { let once = formatted "let f x = {\n  g 1\n    2\n};\n"; test.eq! once (formatted once) } ),
+        test.case "a file that does not parse is refused"
+            $( test.eq! :error (list.head (format "let = ;")) ),
+    ];
+}

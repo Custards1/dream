@@ -72,7 +72,10 @@ mod table {
 
     let server_name u = "registry";
 
-    let init! names = [strict! names, []];
+    let init! names = {
+        strict! names;
+        [names, []]
+    };
 
     let handle_call! request from state = {
         let [names, watched] = state;

@@ -88,6 +88,13 @@ const cases = [
   ['foreign sqlite from embedded "sqlite" {', 'sqlite', 'entity.name.function.dream'],
   ['foreign here {', 'here', 'entity.name.function.dream'],
   ['let r = foreign.run! s f;', 'foreign', '!keyword.declaration.dream'],
+  ['foreign sqlite3 from system "sqlite3" "0" {', 'system', 'keyword.declaration.dream'],
+  // `image` declares another Dream image, and is `std.image`'s name elsewhere.
+  ['image fmt from installed "formatter" {', 'image', 'keyword.declaration.dream'],
+  ['image fmt from installed "formatter" {', 'fmt', 'entity.name.function.dream'],
+  ['image fmt from installed "formatter" {', 'installed', 'keyword.declaration.dream'],
+  ['let f = image.installed "fmt";', 'image', '!keyword.declaration.dream'],
+  ['let n = count image xs;', 'image', '!keyword.declaration.dream'],
   // A binding is `name : C signature`, and the name is what it declares.
   ['    open! : :cstr -> out Db -> :int = sqlite3_open', 'open!', 'entity.name.function.dream'],
   ['    scale : :f32 -> :double', 'scale', 'entity.name.function.dream'],

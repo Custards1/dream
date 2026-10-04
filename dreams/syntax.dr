@@ -17,6 +17,13 @@ let is_span x = match x {
 /// macro may insert it twice, under two different lexical scopes.
 let rec fresh tree next =
     if type_of tree != :list || list.is_empty tree { [tree, next] }
+    // A strict parameter keeps its span second and its marker last, so the
+    // walk below would not see a span in it and would leave it where it was
+    // written -- two generated binders at one offset, which resolution reads
+    // as one binder in two frames.
+    else if ast.param_strict tree && is_span (list.nth 1 tree) {
+        [ast.strict_param (ast.param_name tree) [next, next + 1], next + 2]
+    }
     else {
         let has_span = is_span (list.last tree);
         let parts = if has_span { list.take (list.length tree - 1) tree } else { tree };
@@ -116,13 +123,17 @@ let record_derived kind name fields members bases span = {
         let f = list.nth i fields;
         let field = ast.field_name f;
         let obj = ast.name_e "record" span;
+        // A strict field's setter forces what it stores, as `make` and `new`
+        // do through the field's own parameter.
+        let value = if ast.param_strict (ast.field_param f) { ast.strict_param "value" span }
+                    else { ast.param "value" span };
         let key = match kind { :map => ast.atom_e field span, _ => ast.int_e (i + offset) span };
         // The setter takes the record last, so `r |> P.set_x 1` pipes and
         // `P.set_x 1` is a function of the record ("`group`, `struct` and
         // `mapping`" in docs/language-spec.md).
         [ast.let_d field [ast.param "record" span]
                    (ast.get_e obj key (ast.field_default f) span) false span,
-         ast.let_d ("set_" + field) [ast.param "value" span, ast.param "record" span]
+         ast.let_d ("set_" + field) [value, ast.param "record" span]
                    (ast.set_e obj key (ast.name_e "value" span) span) false span]
     }) (list.range 0 (list.length fields)));
     // Every record supplies a structural description, without changing its
@@ -722,3 +733,75 @@ let arm a = match a {
     [p, g, b, sp] => pattern p && optional expression g && expression b && is_span sp,
     _ => false,
 };
+
+// --- images ------------------------------------------------------------------------
+
+/// `image name from source { .. }`, as a module: the image, and for each entry
+/// the binding `std.image` makes of it together with the signature written for
+/// it. So `pretty : :string -> :string` is `image.pure_function library
+/// "pretty" 1`, signed `:string -> :string`, and the checker holds callers to
+/// the type exactly as it would a function written here.
+///
+/// The arity is the number of arrows, which is the one thing about the
+/// function the image is asked to confirm when it is bound; the rest of the
+/// type is this program's promise. An entry with no arrow is a value of the
+/// image, bound once (`image.value`).
+///
+/// Purity is the name's, as it is for a `foreign` block: `check!` is bound
+/// with `image.function`, and an entry without a `!` may be called from pure
+/// code because the program says the function it names is pure.
+let image_decl name source entries span = {
+    let at_ = span;
+    let name_ n = ast.name_e n at_;
+    let apply f args = ast.apply_e f args at_;
+    let from_image member = ast.field_e (name_ "image") member at_;
+    let imports = [ast.import_d ["std", "image"] () () at_];
+    let lib = ast.let_d "library" [] source false at_;
+    let bindings = list.map (fn e -> match e {
+        [:image_function, f, t, target, sp] => {
+            let arity = list.length (list.head (arrow_parts t));
+            let target_e = ast.str_e target at_;
+            let body = if arity == 0 { apply (from_image "value") [name_ "library", target_e] }
+                       else {
+                           let bind = if str.ends_with "!" f { "function" } else { "pure_function" };
+                           apply (from_image bind) [name_ "library", target_e, ast.int_e arity at_]
+                       };
+            [ast.let_d f [] body false at_, ast.sig_d f t sp]
+        },
+    }) entries;
+    let lets = list.map (fn pair -> list.head pair) bindings;
+    let sigs = list.map (fn pair -> list.nth 1 pair) bindings;
+    let [generated, _] = fresh (imports + [lib] + lets) (2147483648 + ast.span_start span * 128);
+    [ast.mod_d name (generated + sigs) span]
+};
+
+/// The first thing wrong with an `image` block's entries, as `[message,
+/// span]`, or `()`. The parser asks, so it is reported where it was written.
+///
+/// Only data crosses into an image -- its heap is not this one -- so a
+/// parameter that is a function is refused here rather than at the first
+/// call. And a member of no parameters is a value, which is computed once and
+/// cannot be an effect: an effect of nothing takes `()`, as everywhere else.
+let image_problem img entries =
+    list.fold (fn found e -> if found != () { found } else {
+        match e {
+            [:image_function, f, t, _, sp] => {
+                let [params, _] = arrow_parts t;
+                let functions = list.filter (fn i -> is_arrow (list.nth i params))
+                                            (list.range 0 (list.length params));
+                match functions {
+                    [i, .._] => ["argument " + to_string (i + 1) + " of `" + img + "." + f
+                                 + "` is a function, and only data can be passed to an image",
+                                 ast.span (list.nth i params)],
+                    [] => if list.is_empty params && str.ends_with "!" f {
+                              ["`" + f + "` takes nothing, so it is a value of the image and cannot be "
+                               + "an effect; an effect of nothing is `" + f + " : :unit -> ..`", sp]
+                          }
+                          else { () },
+                }
+            },
+            _ => (),
+        }
+    }) () entries;
+
+priv let is_arrow t = match t { [:list, [[:atom, "fn", _], _, _], _] => true, _ => false };

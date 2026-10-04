@@ -566,7 +566,7 @@ when test {
                    "package" => %{ "name" => "demo", "version" => "0.1.0", "n" => 3, "x" => 1.5,
                                    "on" => true, "tags" => ["a", "b"] },
                    "dependencies" => %{ "json" => %{ "git" => "https://x", "deep" => %{ "y" => [1, 2] } } },
-               }) ),
+            }) ),
         test.case "keys before a header round trip"
             $( test.true! (round_trips %{ "" => %{ "k" => "v" }, "a" => %{ "j" => 2.0 } }) ),
         test.case "control characters round trip"

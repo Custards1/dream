@@ -692,22 +692,22 @@ let cmd_clean! m = {
 
 let filepatch! filein outfile using  = {
     let rec update_writer! out cont = {
-         if cont && out{
+        if cont && out{
             let data = recv!();
             if data {
                 strict! {
                     data |> io.write! out
                 }
-                update_writer! out data 
+                update_writer! out data
             }
-            
-         } else {
+
+        } else {
             false
-         }
+        }
 
     }
     let writer = spawn! $(update_writer! (io.open! outfile :write) true )
-  
+
     let reader = io.open! filein :read
     let rec read_and_update! r w remaining = {
         match remaining {

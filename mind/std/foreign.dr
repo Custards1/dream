@@ -91,9 +91,12 @@ type Arg = Scalar | :ptr | :cstr | :bytes | :buffer
          | [:callback, [CallbackArg], CallbackResult];
 
 /// Where a library is: a path the platform's loader understands, `()` for the
-/// program itself (which is the C library, on any normal system), or a file
-/// carried in the image's payload.
-type Library = :unit | :string | [:payload, :string | :integer];
+/// program itself (which is the C library, on any normal system), a file
+/// carried in the image's payload, a library installed on the system and
+/// searched for (`system`), or the first of several that opens (`any_of`).
+type Library = :unit | :string | [:payload, :string | :integer]
+             | [:search, :string, [:string], [:string]]
+             | [:any, [:any]];
 
 /// A pointer this process owns, by its tag: `type Db = foreign.Handle "sqlite3"`.
 /// Two tags are two types, so a statement where a database is wanted is a
@@ -128,20 +131,100 @@ let taken destructor = [:cstr, destructor];
 let library : :string -> Library;
 let library path = path;
 
-/// A library installed on the system, by the name its loader knows it by on
-/// the platform this is running on: `shared_library "sqlite3" "0"` is
-/// `libsqlite3.so.0` on Linux, `libsqlite3.0.dylib` on macOS and `sqlite3.dll`
-/// on Windows. The version is the soname's, and `""` leaves it off.
-///
-/// This lives here rather than with the library that wants it because a
-/// `foreign` declaration's `from (..)` is compiled inside the module the
-/// declaration makes, which sees `std.ffi` and `std.foreign` and nothing else.
-let shared_library : :string -> :string -> Library;
-let shared_library name version = match os.platform () {
-    :windows => name + ".dll",
-    :macos => if version == "" { "lib" + name + ".dylib" } else { "lib" + name + "." + version + ".dylib" },
-    _ => if version == "" { "lib" + name + ".so" } else { "lib" + name + ".so." + version },
+// --- finding a library on the system -----------------------------------------
+//
+// A library installed on the system has a different file name on every
+// platform and a different home on every distribution: `libsqlite3.so.0` in
+// the loader's path on Debian, Homebrew's prefix on macOS (which the loader
+// never searches), a store path on NixOS. Naming one file and handing it to
+// the loader is right on one machine. So `system` describes a *search* --
+// the names the file goes by here, best first, and the directories a package
+// manager puts libraries in -- and the VM does the looking when the library is
+// first used: `$DREAM_LIB_<NAME>`, then `$DREAM_LIBRARY_PATH` and the
+// installation's `lib`, then the platform's loader, then these directories.
+// What it tried is the error when nothing is found. "Finding a library" in
+// dream/src/ffi.cpp is that half.
+//
+// The descriptor is computed here rather than in the VM because it is
+// knowledge, not mechanism, and it wants to be read and tested.
+//
+// This lives here rather than with the library that wants it because a
+// `foreign` declaration's `from (..)` is compiled inside the module the
+// declaration makes, which sees `std.ffi` and `std.foreign` and nothing else.
+
+/// A library installed on the system, by its name without `lib` or an
+/// extension: `system "sqlite3"` is whichever `libsqlite3.so`,
+/// `libsqlite3.dylib` or `sqlite3.dll` this machine has, newest first.
+/// `foreign sqlite from system "sqlite3" { .. }` says the same.
+let system : :string -> Library;
+let system name = search_on (os.platform ()) (os.arch ()) name "";
+
+/// The same, held to one ABI version -- the number in the library's soname:
+/// `system_version "sqlite3" "0"` is `libsqlite3.so.0` on Linux and
+/// `libsqlite3.0.dylib` on macOS, and never a `libsqlite3.so.1` that happens
+/// to be beside it, which would load and then fail to mean the same thing.
+let system_version : :string -> :string -> Library;
+let system_version name version = search_on (os.platform ()) (os.arch ()) name version;
+
+/// The first of `libs` that opens: `any_of [embedded "sqlite", system "sqlite3"]`
+/// carries a copy for the machines that lack one, and prefers what is there.
+let any_of : [Library] -> Library;
+let any_of libs = [:any, libs];
+
+/// Where a library is found -- `[:ok, file]` -- or `[:error, why]`, the same
+/// account of what was looked for and where that using it would raise. It
+/// opens the library to find out, since a file that is there but built for
+/// another machine is not one this program can use.
+let locate! : Library -> [:ok, :string] | [:error, :string];
+let locate! lib = ffi.locate! lib;
+
+/// The search `system` makes, for a given platform and architecture.
+let search_on : :atom -> :atom -> :string -> :string -> Library;
+let search_on platform arch name version =
+    [:search, name, library_files platform name version, library_dirs platform arch];
+
+/// What the file is called, best first. A `*` is a version, and in a
+/// directory means the newest one there.
+let library_files : :atom -> :string -> :string -> [:string];
+let library_files platform name version = match [platform, version] {
+    [:windows, ""] => [name + ".dll", "lib" + name + ".dll", "lib" + name + "-*.dll"],
+    [:windows, v] => [name + ".dll", "lib" + name + "-" + v + ".dll", "lib" + name + ".dll"],
+    [:macos, ""] => ["lib" + name + ".dylib", "lib" + name + ".*.dylib"],
+    [:macos, v] => ["lib" + name + "." + v + ".dylib", "lib" + name + "." + v + ".*.dylib"],
+    [_, ""] => ["lib" + name + ".so", "lib" + name + ".so.*"],
+    [_, v] => ["lib" + name + ".so." + v, "lib" + name + ".so." + v + ".*"],
 };
+
+/// Where package managers put libraries the platform's loader may not know
+/// about, most deliberate first. A `~` is the home directory. Windows has no
+/// such convention: its loader's search, `PATH` included, is all there is.
+let library_dirs : :atom -> :atom -> [:string];
+let library_dirs platform arch = match platform {
+    :windows => [],
+    :macos => ["/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib"] + nix_dirs,
+    _ => {
+        let multiarch = match multiarch_triplet arch {
+            () => [],
+            t => ["/usr/lib/" + t, "/lib/" + t],
+        };
+        ["/usr/local/lib"] + multiarch
+        + ["/usr/lib64", "/usr/lib", "/lib64", "/lib", "/home/linuxbrew/.linuxbrew/lib"] + nix_dirs
+    },
+};
+
+/// Debian's name for an architecture's library directory, `/usr/lib/TRIPLET`.
+priv let multiarch_triplet : :atom -> :string | :unit;
+priv let multiarch_triplet arch = match arch {
+    :x86_64 => "x86_64-linux-gnu",
+    :aarch64 => "aarch64-linux-gnu",
+    _ => (),
+};
+
+/// Nix keeps nothing where a loader looks; a profile is where what a person
+/// installed is gathered.
+priv let nix_dirs : [:string];
+priv let nix_dirs = ["~/.nix-profile/lib", "/run/current-system/sw/lib",
+                     "/nix/var/nix/profiles/default/lib"];
 
 /// The running program, and everything linked into it.
 let this_program : Library = ();
@@ -443,6 +526,18 @@ when test {
                         (with_shape (layout [[:a, :u8], [:b, :u8], [:c, :u16]])) ),
         test.case "an empty struct is empty"
             $( test.eq! 0 (layout []).[:size] ),
+        test.case "a library is searched for under every name its platform gives it"
+            $( test.eq! [["libsqlite3.so.0", "libsqlite3.so.0.*"],
+                         ["libsqlite3.dylib", "libsqlite3.*.dylib"],
+                         ["sqlite3.dll", "libsqlite3.dll", "libsqlite3-*.dll"]]
+                        [library_files :linux "sqlite3" "0", library_files :macos "sqlite3" "",
+                         library_files :windows "sqlite3" ""] ),
+        test.case "and in the directories its package managers use"
+            $( test.eq! [true, true, true, []]
+                        [list.contains "/usr/lib/aarch64-linux-gnu" (library_dirs :linux :aarch64),
+                         list.contains "/opt/homebrew/lib" (library_dirs :macos :aarch64),
+                         list.contains "/run/current-system/sw/lib" (library_dirs :linux :x86_64),
+                         library_dirs :windows :x86_64] ),
         test.case "C's own names are the platform's widths"
             $( test.eq! [sizeof :i32, sizeof :size] [sizeof :int, sizeof :uintptr] ),
     ];

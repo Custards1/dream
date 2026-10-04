@@ -19,7 +19,6 @@
 
 import std.console;
 
-
 // --- a loop the hint is for -------------------------------------------------
 //
 // No float literal in its self call, so nothing but the signature says that

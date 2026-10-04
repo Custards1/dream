@@ -933,7 +933,6 @@ let literal_text d v = match v {
     },
 };
 
-
 /// `to_string 1.0` is `"1"`, which SQL would read back as an integer.
 priv let float_text : :float -> :string;
 priv let float_text x = {

@@ -1,0 +1,89 @@
+// Calling into another Dream image.
+//
+// A `.dream` image is a whole program, and this is how one program uses
+// another as a library -- found where it is installed or carried in the
+// image's payload, opened the first time something in it is called, and its
+// functions handed over as ordinary functions. Most of it is written by a
+// declaration:
+//
+//     image fmt from installed "formatter" {
+//         pretty : :string -> :string
+//         check! : :string -> [:ok, :string] | [:error, :string] = formatter.lint.check!
+//     }
+//
+//     let main! = console.print! (fmt.pretty source);
+//
+// which the compiler makes a module (`syntax.image_decl` in dreams): each line
+// bound with `function` or `pure_function` below, by its `!`, and signed with
+// the type written for it, so the checker holds callers to it. A target with
+// no module, `pretty`, is a function of the image's own top-level module.
+//
+// **The image is a library, not a module.** It was compiled on its own, so the
+// signature written here is a promise this program makes about it, and only
+// the arity is checked when it is bound. It runs in a runtime of its own --
+// heap, atoms, scheduler -- and what crosses, either way, is data: numbers,
+// strings, atoms, lists, arrays, maps, errors. A function or a process cannot
+// be passed in or come back, because it names things in a heap the other side
+// has never seen; docs/dynamic-linking.md is the plan that would lift that.
+// An error the image raises is raised again in the caller, as the caller's.
+//
+// A call runs to completion on the worker that made it, and one image runs
+// one call at a time. "Images as libraries" in dream/src/builtins.cpp is the
+// VM's half.
+
+import std.vm;
+
+/// Where an image is: a path, an installed image by name (`installed`), one
+/// this image carries in its payload (`embedded`), or the first of several
+/// that can be found (`any_of`).
+type Image = :string | [:installed, :string] | [:payload, :string] | [:any, [:any]];
+
+/// An image file, by its path.
+let file : :string -> Image;
+let file path = path;
+
+/// The image an installation calls `name`, found as `dream NAME` finds one:
+/// `name` or `name.dream` in the first directory of `$MINDV2_PATH` (or
+/// `~/.mindv2`) that has it. See `std.install`.
+let installed : :string -> Image;
+let installed name = [:installed, name];
+
+/// An image this one carries: `dreams --payload NAME=FILE`.
+let embedded : :string -> Image;
+let embedded name = [:payload, name];
+
+/// The first of `images` that can be found and opened: `any_of [installed
+/// "fmt", embedded "fmt"]` prefers the installed one and carries its own.
+let any_of : [Image] -> Image;
+let any_of images = [:any, images];
+
+/// A function in `img`, as a Dream function of `arity` arguments. `target`
+/// is `module.member`, or a bare member of the image's top-level module.
+/// Calling it is an effect, so bind it to a name that says so. The image is
+/// opened, and `target` found, when this is first evaluated.
+let function : Image -> :string -> :integer -> :any;
+let function img target arity = vm.image_function img target arity;
+
+/// The same for a function with no effects, which a pure function may call.
+/// Only the program can know that it is pure.
+let pure_function : Image -> :string -> :integer -> :any;
+let pure_function img target arity = vm.pure_image_function img target arity;
+
+/// A value in `img`: what a member of no parameters comes to there.
+let value : Image -> :string -> :any;
+let value img target = (vm.pure_image_function img target 0) ();
+
+/// Where `img` is found -- `[:ok, file]` -- or why it cannot be, `[:error,
+/// why]`, naming where it looked.
+let locate! : Image -> [:ok, :string] | [:error, :string];
+let locate! img = vm.locate_image! img;
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "an image is described as data, so a declaration's `from` is a value"
+            $( test.eq! [[:installed, "fmt"], [:payload, "fmt"], [:any, ["a.dream", [:installed, "b"]]]]
+                        [installed "fmt", embedded "fmt", any_of [file "a.dream", installed "b"]] ),
+    ];
+}

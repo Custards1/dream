@@ -752,9 +752,9 @@ let foreign_of a mi = {
             if own == full { [:library, f] }
             else {
                 match list.filter (fn e -> match e {
-                          [:c_struct, s, _, _] => own + "." + s == full,
-                          _ => false,
-                      }) (foreign_entries f) {
+                    [:c_struct, s, _, _] => own + "." + s == full,
+                    _ => false,
+                }) (foreign_entries f) {
                     [e, .._] => [:struct, f, e],
                     [] => (),
                 }

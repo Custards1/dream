@@ -2626,6 +2626,6 @@ let dump l = {
                              + "@" + to_string (f.[:captures_off else 0]),
                    })
                 + "  body=" + to_string (f.[:body else ir.no_node])
-             }) (list.range 0 (list.length fs)))
+            }) (list.range 0 (list.length fs)))
             [ir.dump img])
 };

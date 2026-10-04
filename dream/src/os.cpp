@@ -841,9 +841,92 @@ NativeResult os_replace(Process& p, Value, Value* args, uint32_t) {
                 std::string("cannot run `") + argv[0] + "`: " + std::strerror(errno));
 }
 
+/// `install_dirs! ()`: every directory the installation keeps things in, as
+/// the VM itself would search them for `dream NAME` -- `$MINDV2_PATH` split,
+/// or `~/.mindv2`, or nothing. See "the installation" in os.hpp.
+NativeResult os_install_dirs(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::ok(string_list(p, install_dirs()));
+}
+
 }  // namespace
 
 void os_shutdown() { Jobs::get().drain(); }
+
+std::string home_dir() {
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    // `getenv` answers null for a variable that is not set, and constructing a
+    // `std::string` from null is undefined rather than empty.
+    return home ? std::string(home) : std::string();
+}
+
+/// The shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
+/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
+/// called that, so every lookup under it silently found nothing, which reads as
+/// "the image is not installed" when it is sitting right there. A path is not
+/// text to this program, so expanding it is this program's job.
+std::string expand_home(const std::string& path) {
+    if (path.empty() || path[0] != '~') return path;
+    if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;  // `~other`, a user
+    const std::string home = home_dir();
+    if (home.empty()) return path;
+    return home + path.substr(1);
+}
+
+/// A list rather than one directory: the toolchain wrapper sets
+/// `$MINDV2_PATH` to what an installation ships in whatever store paths those
+/// live in, so the compiler image and the standard library can sit apart. A
+/// plain `~/.mindv2` is a list of one. Each element gets the `~` treatment
+/// here too, because a tilde inside a joined list is hidden from the shell.
+std::vector<std::string> split_dir_list(const std::string& list) {
+    std::vector<std::string> dirs;
+    const char sep =
+#if defined(_WIN32)
+        ';';
+#else
+        ':';
+#endif
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        std::size_t end = list.find(sep, start);
+        if (end == std::string::npos) end = list.size();
+        if (end > start) dirs.push_back(expand_home(list.substr(start, end - start)));
+        start = end + 1;
+    }
+    return dirs;
+}
+
+std::string install_path() {
+    if (const char* from_env = std::getenv("MINDV2_PATH")) return std::string(from_env);
+    const std::string home = home_dir();
+    if (home.empty()) return "";
+    std::string candidate = home + "/.mindv2";
+    std::error_code ec;
+    if (std::filesystem::is_directory(std::filesystem::path(std::u8string(candidate.begin(), candidate.end())), ec)) {
+        return candidate;
+    }
+    return "";
+}
+
+std::vector<std::string> install_dirs() { return split_dir_list(install_path()); }
+
+bool is_file(const std::string& path) {
+    std::error_code ec;
+    auto st = std::filesystem::status(std::filesystem::path(std::u8string(path.begin(), path.end())), ec);
+    return !ec && std::filesystem::exists(st) && !std::filesystem::is_directory(st);
+}
+
+std::string installed_image(const std::string& name, const std::vector<std::string>& dirs) {
+    for (const std::string& dir : dirs) {
+        for (const std::string& candidate : {dir + "/" + name, dir + "/" + name + ".dream"}) {
+            if (is_file(candidate)) return candidate;
+        }
+    }
+    return "";
+}
 
 ModuleDef make_os_module() {
     return ModuleDef{"std.os",
@@ -864,6 +947,7 @@ ModuleDef make_os_module() {
                          {"now!", 1, 0b1, os_now},
                          {"pid!", 1, 0b1, os_pid},
                          {"platform", 1, 0b1, os_platform},
+                         {"install_dirs!", 1, 0b1, os_install_dirs},
                          {"arch", 1, 0b1, os_arch},
                          {"exit!", 1, 0b1, os_exit},
                      }};

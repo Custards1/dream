@@ -537,6 +537,7 @@ import std.os;
 | `args!` | `unit → list of string` | The command-line arguments that follow the image name. |
 | `env!` | `name:string → string\|unit` | The value of an environment variable, or `unit` if unset. |
 | `set_env!` | `name:string → value:string → unit` | Sets an environment variable for the current process. |
+| `install_dirs!` | `unit → list of string` | Every directory of the installation, as the VM searches them for `dream NAME`: `$MINDV2_PATH` split and `~`-expanded, or `~/.mindv2` when that is unset and exists, or `[]`. `std.install` is the module to use. |
 
 ### Directories
 
@@ -691,6 +692,9 @@ argument.
 | `open_image!` | `string → integer` | Load an image and **keep** it, answering a handle that names it. |
 | `call_image!` | `integer → string → string → list → value` | Call `module.member` in an open image with the arguments in the list, and answer what it produced. |
 | `close_image!` | `integer → bool` | Free an open image. `false` when the handle named none; closing twice is not an error. |
+| `image_function` | `image → string → integer → fn` | A function in another image as a Dream function of that many arguments, named with a `!`; see [images.md](images.md). The image is opened once per runtime, on first use. |
+| `pure_image_function` | same | The same, named without one: for a function with no effects. |
+| `locate_image!` | `image → [:ok, file] \| [:error, why]` | Where an image descriptor is found, or why it is not. |
 
 `eval_image!` is for one image and one question: the image *is* the expression.
 The other three are for one image and many questions — a package's macros,
@@ -737,12 +741,15 @@ let puts! = ffi.function () "puts" [:cstr] :int;
 | `function` | `library → symbol → [arg type] → result type → fn` | A C function as a Dream function of its arguments -- every one that is not `[:out, t]`. Named `symbol!`, so the runtime treats calling it as an effect; bind it to a `!` name. |
 | `pure_function` | same | The same, named `symbol`: for a C function with no effects, which a pure function may call. |
 | `call!` | `fn → [args] → value` | A foreign function applied to a list -- what lets a function and its arguments travel in one message. |
+| `locate!` | `library → [:ok, file] \| [:error, why]` | Open a library and say which file it came from, or what was tried. |
 
 Both constructors are pure and lazy: nothing is loaded until the function is
 made, and a library is opened once per VM. A library is a path, `()` or `""`
-for the running program (the C library on any normal system), or
+for the running program (the C library on any normal system),
 `[:payload, name]` / `[:payload, index]` for one carried in the image by
-`dreams --payload NAME=FILE`.
+`dreams --payload NAME=FILE`, `[:search, name, files, dirs]` for one installed
+on the system (`foreign.system` makes it; [ffi.md](ffi.md#finding-a-library-on-the-system)
+is the search), or `[:any, libraries]` for the first of several that opens.
 
 **Types.** Scalars: `:void` (result only), `:bool`, `:i8`…`:i64`, `:u8`…`:u64`,
 `:f32`, `:f64`, and C's own names, whose widths are the platform's: `:char`,
@@ -1301,6 +1308,7 @@ thing here that imposes one, and it costs a sort every time.
 | `sorted_keys m` | The keys in order, for output that has to be stable. |
 | `put m k v` · `remove m k` | A new map with that key set or gone. |
 | `update default f m k` | Apply `f` to what is there, or to `default`. Counting is `update 0 (fn n -> n + 1)`. |
+| `put_strict k v m` · `update_strict default f k m` | `put` and `update` that force the value before storing it, so it does not hold the frame that computed it -- or the map, when the frame held that. |
 | `put_new m k v` | Add only if absent, so a fold keeps the first. |
 | `map_values f m` · `filter keep m` · `fold f init m` | Over the pairs. `fold` sees `acc k v`. |
 | `without m other` | Every key of `m` that `other` does not have. |
@@ -1519,8 +1527,10 @@ run of equal SQL once for `exec_many!`. Use `RETURNING` for generated keys;
 PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../mind/std/sql/pg/README.md).
 
 `std.sql.sqlite` is the SQLite driver. It binds the system's
-libsqlite3 through `std.foreign`, and the library is found the way the platform's
-loader finds one (on Nix, `nix-shell` puts it on `LD_LIBRARY_PATH`).
+libsqlite3 through `std.foreign` as `from system "sqlite3" "0"`, which searches
+the loader's path and the directories package managers use; where it is
+somewhere else, `$DREAM_LIB_SQLITE3` names the file and `$DREAM_LIBRARY_PATH`
+adds a directory.
 `sqlite.open! path`, `sqlite.memory! ()`, and `sqlite.open_with! path
 %{ :readonly, :busy_timeout, :foreign_keys, :place }`, where `:place` may be a
 `foreign.start!` server to own the database. `sqlite.available! ()` says

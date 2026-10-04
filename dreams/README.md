@@ -83,6 +83,7 @@ What to do (the default is `--check`):
 | `--stats` | count what the program contains |
 | `--time` | compile the whole way and say what each stage cost |
 | `--repl` | an interactive session |
+| `--fmt FILE..`, `--fmt-check FILE..` | lay files out in the house style in place, or name the ones that would change |
 
 Where to look, and what to compile it as:
 
@@ -127,6 +128,7 @@ its text does; a runtime value does not. [`repl.dr`](repl.dr) and
 | `fuse.dr` | deforestation: `std.list` pipelines as loops |
 | `typecheck.dr`, `contract.dr` | signatures, and compile-time contracts |
 | `lint.dr` | warnings about programs that are correct and will still go wrong |
+| `fmt.dr` | the formatter: reindents by the grammar's own line rules, and proves the tree did not change |
 | `opt.dr` | sharing the finished arena |
 | `emit.dr` | the image writer ([docs/bytecode-format.md](../docs/bytecode-format.md)) |
 | `unit.dr` | compile units: the parts a build keeps |

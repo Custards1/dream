@@ -18,6 +18,7 @@ cannot disagree, because its answers come from the same tables.
 | **Hover** | what a name resolved to, and which module it came from |
 | **Outline** | what a file declares |
 | **Completion** | a module's members after `.`, and the names in scope everywhere else |
+| **Formatting** | the compiler's formatter (`dreams --fmt`) on the buffer, so format-on-save works |
 
 It analyses the editor's **buffer**, not the file on disk -- the loader reads
 open documents from a map of path to text instead -- so it answers about the

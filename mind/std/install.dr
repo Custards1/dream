@@ -1,0 +1,49 @@
+// Where an installation keeps what it ships.
+//
+// An installation is a list of directories -- `$MINDV2_PATH`, joined as
+// `PATH` is, or `~/.mindv2` when that is unset and exists -- holding images
+// (`dreams.dream`, `lucid.dream`), the standard library (`std`), and C
+// libraries that ship beside them (`lib`). The VM is what reads it: `dream
+// NAME` runs an installed image by its name, `std.image` opens one, and a
+// `foreign` library looks in each directory's `lib`. So the reading is done
+// once, in the VM (`os.install_dirs!`; "the installation" in
+// dream/src/os.hpp), and this is that answer for a Dream program.
+//
+// It was six copies before: the command line's, two in `mind`, two in the
+// compiler and one in the language server -- and they had drifted, the
+// compiler's alone never falling back to `~/.mindv2`. A program that wants to
+// know where things are installed asks here, and gets what the VM would do.
+
+import std.io;
+import std.list;
+import std.os;
+
+/// Every directory of the installation, in the order they are searched, each
+/// with its `~` expanded; `[]` when there is none.
+let dirs! : :unit -> [:string];
+let dirs! u = os.install_dirs! ();
+
+/// The first installation directory that has `entry` in it -- a file or a
+/// directory, named relative to it -- or `()`. `holding! "std"` is where the
+/// installed standard library is.
+let holding! : :string -> :string | :unit;
+let holding! entry = first_dir_holding! entry (dirs! ());
+
+/// The installed image called `name`, as `dream NAME` and `dream -x NAME` find
+/// it -- `DIR/name` or `DIR/name.dream` in the first directory with either --
+/// or `()`.
+let image! : :string -> :string | :unit;
+let image! name = first_file! (list.flat_map (fn dir -> [dir + "/" + name, dir + "/" + name + ".dream"])
+                                              (dirs! ()));
+
+priv let first_dir_holding! : :string -> [:string] -> :string | :unit;
+priv let rec first_dir_holding! entry dirs = match dirs {
+    [] => (),
+    [dir, ..rest] => if io.exists! (dir + "/" + entry) { dir } else { first_dir_holding! entry rest },
+};
+
+priv let first_file! : [:string] -> :string | :unit;
+priv let rec first_file! paths = match paths {
+    [] => (),
+    [p, ..rest] => if io.exists! p && not (io.is_dir! p) { p } else { first_file! rest },
+};

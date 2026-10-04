@@ -28,6 +28,7 @@ import dreams.config;
 import dreams.diag;
 import dreams.emit;
 import dreams.expand as expansion;
+import dreams.fmt;
 import dreams.ir;
 import dreams.lexer;
 import dreams.lower;
@@ -108,6 +109,42 @@ let ast! file src =
             1
         },
     };
+
+/// `--fmt` and `--fmt-check`: each file laid out by `dreams/fmt.dr`. A file
+/// already in shape is not written, so its time stamp says nothing changed. A
+/// file that does not parse is reported as a parse error and left as it is,
+/// and the rest are still done; the exit code says whether any went wrong --
+/// or, checking, whether any would change.
+let format_files! files checking = {
+    let failed = list.fold_strict (fn !n file -> n + format_one! file checking) 0 files;
+    if failed > 0 { 1 } else { 0 }
+};
+
+let format_one! file checking =
+    with_source! file (fn src ->
+        match fmt.format src {
+            [:error, message, at] => {
+                report! file src message at
+                1
+            },
+            [:ok, out] =>
+                if out == src { 0 }
+                else if checking {
+                    console.print! file
+                    1
+                }
+                else { match try! { io.open! file :write } catch e { () } {
+                    () => {
+                        console.error! ("dreams: cannot write " + file)
+                        1
+                    },
+                    h => {
+                        streams.write_all! h out
+                        io.close! h
+                        0
+                    },
+                } },
+        });
 
 /// Parse without printing: the exit code is the whole answer. File-local, so it
 /// says nothing about imports -- which is exactly what a check on every keypress
@@ -777,6 +814,8 @@ let rec parse_args args o =
         ["--tokens", ..rest]    => parse_args rest (with_opt :command :tokens o),
         ["--ast", ..rest]       => parse_args rest (with_opt :command :ast o),
         ["--parse", ..rest]     => parse_args rest (with_opt :command :parse o),
+        ["--fmt", ..rest]       => parse_args rest (with_opt :command :fmt o),
+        ["--fmt-check", ..rest] => parse_args rest (with_opt :command :fmt_check o),
         ["--check", ..rest]     => parse_args rest (with_opt :command :check o),
         // `--no-emit` is kept as an alias for `--check`: a build tool that
         // learned the one spelling should not have to learn the other.
@@ -848,7 +887,9 @@ let rec parse_args args o =
 
         [arg, ..rest] =>
             if str.starts_with "-" arg { with_opt :error ("unknown option " + arg) o }
-            else if opt o :file != () { with_opt :error "only one file, please" o }
+            // More than one is for the formatter, and `run!` says so to
+            // anything else: the command may come after the files.
+            else if opt o :file != () { parse_args rest (append_opt :more_files arg o) }
             else { parse_args rest (with_opt :file arg o) },
     };
 
@@ -864,6 +905,8 @@ let usage! () = {
         "  --parse        parse this file alone, following no imports",
         "  --tokens       print the tokens",
         "  --ast          print the syntax tree",
+        "  --fmt FILE..   lay the files out in the house style, in place",
+        "  --fmt-check FILE..  name the files --fmt would change, and fail if any",
         "  --modules      list the modules the program pulls in",
         "  --packages     list the packages that were found",
         "  --ir           print the execution trees the program lowers to",
@@ -948,6 +991,8 @@ let run_command! o file =
         :tokens    => with_source! file (fn src -> tokenize! file src),
         :ast       => with_source! file (fn src -> ast! file src),
         :parse     => with_source! file (fn src -> parse_only! file src),
+        :fmt       => format_files! (list.cons file (o.[:more_files else []])) false,
+        :fmt_check => format_files! (list.cons file (o.[:more_files else []])) true,
         :check     => check_program! (load! o file) (compile_options o),
         :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :depfile)
                              (opt o :payloads)
@@ -988,7 +1033,12 @@ let run! args = {
                 _ =>
                     match opt o :file {
                         () => usage! (),
-                        file => run_command! o file,
+                        file =>
+                            if opt o :more_files != () && opt o :command != :fmt
+                               && opt o :command != :fmt_check {
+                                console.error! "dreams: only one file, please"
+                                usage! ()
+                            } else { run_command! o file },
                     },
             },
         why => {

@@ -178,7 +178,8 @@ The groups, and what each one is actually asking:
 | `test-examples` | Every example, output compared against what is recorded beside it |
 | `test-std` | The standard library's `when test` blocks |
 | `test-build` | `std.build.cc` against GCC, Clang and CMake, and the runner rebuilding only what changed |
-| `test-ffi` | `std.ffi`/`std.foreign` against a C library built from `dream/tests/ffi` |
+| `test-ffi` | `std.ffi`/`std.foreign` against a C library built from `dream/tests/ffi`, carried and found as a system library |
+| `test-image` | `std.image`: one image calling another, found by path, installed and carried |
 | `test-tls` | `std.tls`: a server and clients in one VM, and against OpenSSL's `s_server`/`s_client` |
 | `test-mind` | `mind`'s path handling, manifests, dependency specs |
 | `test-dreams` | Every `when test` block `dreams/main.dr` reaches |
@@ -214,6 +215,7 @@ times in a row afterwards, which is the shape of a race and not of a bug.
 just repl              # an interactive session
 just run FILE [args]   # compile and run
 just check FILE        # scope- and purity-check, no image
+just fmt FILE..        # lay files out in the house style (dreams/fmt.dr)
 just dump FILE         # the execution trees it compiles to
 just modules FILE      # what it pulls in
 ```
@@ -394,7 +396,21 @@ The lessons that keep coming back:
   a handle owned by the calling process and destroyed when it is released or
   the process ends; `foreign.run! server (fn () -> ..)` does work in a library
   server that owns what is made through it. `foreign` is contextual -- still
-  the name of `std.foreign`. [docs/ffi.md](docs/ffi.md).
+  the name of `std.foreign`. [docs/ffi.md](docs/ffi.md). `from system "sqlite3"
+  "0"` names a library installed on the system rather than a file: the VM
+  searches `$DREAM_LIB_SQLITE3`, `$DREAM_LIBRARY_PATH`, the installation's
+  `lib`, the loader, then the package managers' directories, and says all of
+  that when nothing is found ("Finding a library" in dream/src/ffi.cpp).
+- `image fmt from installed "formatter" { pretty : :string -> :string }` is
+  the same for another compiled Dream image: a module of `std.image` bindings,
+  typed as written, the image opened in a runtime of its own on first use
+  (`from "x.dream"`, `installed`, `embedded`, or `(expr)`). Only data crosses,
+  and a call runs to completion holding that image. It is built on
+  `vm.open_image!`'s sessions, not on docs/dynamic-linking.md, which is still
+  a plan. Where an installation is -- `$MINDV2_PATH` or `~/.mindv2` -- is
+  answered once, by the VM (`os.install_dirs!`), and `std.install` is that
+  answer in Dream; do not split `$MINDV2_PATH` again.
+  [docs/images.md](docs/images.md).
 - `import std.tls` gives **TLS** on a socket, upgraded in place:
   `tls.connect! sock %{ :host => h }` answers the same handle, and `io.read!`
   and `io.write!` on it then carry plaintext. The VM drives a TLS library

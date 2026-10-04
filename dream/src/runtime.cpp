@@ -320,6 +320,35 @@ bool Runtime::close_session(uint64_t handle) {
     return true;
 }
 
+uint64_t Runtime::library_session(const std::string& key) const {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    auto it = library_sessions_.find(key);
+    return it == library_sessions_.end() ? 0 : it->second;
+}
+
+uint64_t Runtime::note_library_session(const std::string& key, uint64_t handle) {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    return library_sessions_.emplace(key, handle).first->second;
+}
+
+uint64_t Runtime::add_image_binding(ImageBinding binding) {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    std::string key = std::to_string(binding.session) + ":" + std::to_string(binding.func);
+    auto it = image_binding_ids_.find(key);
+    if (it != image_binding_ids_.end()) return it->second;
+    image_bindings_.push_back(std::move(binding));
+    uint64_t id = image_bindings_.size();
+    image_binding_ids_.emplace(key, id);
+    return id;
+}
+
+bool Runtime::image_binding(uint64_t id, ImageBinding* out) const {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    if (id == 0 || id > image_bindings_.size()) return false;
+    *out = image_bindings_[id - 1];
+    return true;
+}
+
 bool Runtime::load_image_file(const std::string& path, std::string& error) {
     auto img = std::make_unique<Image>();
     if (!img->load_file(path, error)) return false;

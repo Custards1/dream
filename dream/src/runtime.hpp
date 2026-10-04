@@ -131,6 +131,13 @@ struct ImageSession {
     /// leave every node record pointing at freed memory.
     std::string bytes;
     std::unique_ptr<Runtime> runtime;
+    /// Held for the length of a call made through a binding (`std.image`).
+    /// Each call brings a scheduler of its own, but the runtime under them is
+    /// one, and nothing in a runtime was written to have two schedulers
+    /// driving it at once.
+    std::mutex calls;
+    /// Where it came from, for messages.
+    std::string label;
 
     ImageSession();
     ~ImageSession();
@@ -243,6 +250,28 @@ public:
     /// Forget a session and free it. False when the handle named none.
     bool close_session(uint64_t handle);
 
+    // --- images opened as libraries ---
+    //
+    // A session a program opened through `std.image` rather than by handle:
+    // keyed by the file it came from, opened on first use and kept for the
+    // life of the runtime, as a C library is. A binding is one function in
+    // one of them, and a function value names it by a small id.
+
+    struct ImageBinding {
+        uint64_t session = 0;
+        uint32_t func = 0;
+        uint32_t arity = 0;
+        std::string name;  // `module.member`, for messages
+    };
+    /// The session `key` was opened as, or 0.
+    uint64_t library_session(const std::string& key) const;
+    /// Remember that `key` is open as `handle`, and answer the session to use:
+    /// `handle`, or the one another process remembered first.
+    uint64_t note_library_session(const std::string& key, uint64_t handle);
+    uint64_t add_image_binding(ImageBinding binding);
+    /// A copy, because the table may grow while the caller holds it.
+    bool image_binding(uint64_t id, ImageBinding* out) const;
+
     // --- the profile ---
     //
     // Where a program's time goes, counted in reductions and attributed to the
@@ -343,6 +372,9 @@ private:
     mutable std::mutex sessions_mutex_;
     std::unordered_map<uint64_t, std::unique_ptr<ImageSession>> sessions_;
     uint64_t next_session_ = 1;
+    std::unordered_map<std::string, uint64_t> library_sessions_;
+    std::vector<ImageBinding> image_bindings_;
+    std::unordered_map<std::string, uint64_t> image_binding_ids_;
 
     Scheduler* scheduler_ = nullptr;
     std::vector<std::atomic<const ModuleDef*>> import_defs_;

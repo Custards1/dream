@@ -283,6 +283,15 @@ let array_union_d name params variants members span = [:union_decl, name, params
 ///
 /// where a C type is written in the type grammar and read by `syntax`.
 let foreign_d name library entries span = [:foreign_decl, name, library, entries, span];
+/// `image name from source { .. }`: another Dream image, which the loader
+/// rewrites into a module of functions bound in it (`syntax.image_decl`).
+/// `source` is the expression that names it. An entry is
+///
+///     [:image_function, name, type, target, span]
+///
+/// where `target` is `module.member` in the image, or a bare member of its
+/// top-level module.
+let image_d name source entries span = [:image_decl, name, source, entries, span];
 
 let variant name span fields = [name, span, fields];
 let variant_name v = list.nth 0 v;
@@ -491,6 +500,11 @@ let rec show e =
                       "(struct " + s + str.join_str "" (list.map (fn f ->
                           " (" + list.nth 0 f + " " + show (list.nth 2 f) + ")") fs) + ")",
                   [:c_function, f, t, sym, _] => "(" + f + " " + show t + " " + sym + ")",
+              }) entries) + ")",
+        [:image_decl, n, src, entries, _] =>
+            "(image " + n + " " + show src
+            + str.join_str "" (list.map (fn e -> match e {
+                  [:image_function, f, t, target, _] => " (" + f + " " + show t + " " + target + ")",
               }) entries) + ")",
         [:let_p, pattern, b, _] => "(let " + show_pattern pattern + " " + show b + ")",
         [:import, segments, alias, names, _] =>

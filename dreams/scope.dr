@@ -1535,6 +1535,16 @@ let lazy_accumulators_warned c n ps body r =
         }) r (lint.lazy_accumulators n ps body)
     };
 
+/// A warning for each `strict!` written as an element of a list, array or map
+/// literal, where it is suspended with the element and forces nothing early.
+/// dreams/lint.dr says why only a literal's element is read.
+let suspended_forces_warned c body r =
+    list.fold (fn acc span ->
+        warn_note c span
+            "this `strict!` is an element, and an element is suspended: it forces nothing until the element is read"
+            "force it as a statement first -- `strict! x;` -- and put `x` in the literal" acc)
+        r (lint.suspended_forces body);
+
 /// A module or a namespace written where a value belongs.
 let not_a_value c m shown span r =
     report_note c span ("`" + shown + "` is a module, not a value")
@@ -2039,8 +2049,9 @@ let check_body l p r = {
     let started = begin_func (decl_name d) (list.length (decl_params d)) impure impure
                              (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) r;
     let fi = list.nth 1 started;
-    let bound = lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
-                    (bind_params c (decl_params d) (list.head started));
+    let bound = suspended_forces_warned c (decl_body d)
+                    (lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
+                        (bind_params c (decl_params d) (list.head started)));
     let done = end_func fi (check_expr c (decl_body d) bound);
     done.[:bodies => (list.cons [mi, source, d, fi] (bodies_rev done))]
 };
@@ -2192,9 +2203,9 @@ let resolve_reachable! l declared roots = {
             // accumulator the queue is built in reverse in.
             let fi = list.nth 3 (list.head (bodies_rev resolved));
             resolved.[:global_recs => (list.map (fn g -> match g {
-                    [gi, n, :function, ()] if map.has gi stubbed => [gi, n, :function, fi],
-                    _ => g,
-                }) (r_global_recs resolved))]
+                [gi, n, :function, ()] if map.has gi stubbed => [gi, n, :function, fi],
+                _ => g,
+            }) (r_global_recs resolved))]
         },
     }
 };
@@ -2712,6 +2723,11 @@ let wrapper_of r mi source d = {
     // once and shared. Rewriting its uses into the call it came from would do
     // the work at every use instead.
     if list.is_empty params { () }
+    // A strict parameter is forced by the frame the rewrite removes, so a
+    // wrapper with one is not an identity: `let set_x !v r = r.[0 => v]` made
+    // into a `set` at the call site stored the argument suspended, and a
+    // strict record field was exactly as lazy as any other.
+    else if list.any ast.param_strict params { () }
     else {
         match decl_body d {
             [:apply, callee, args, _] => {

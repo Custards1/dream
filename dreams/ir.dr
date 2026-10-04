@@ -21,7 +21,7 @@
 
 import std.list;
 import std.str;
-import std.dynamic.{fold,map}
+import std.dynamic.{fold, map}
 import std.char;
 
 // --- opcodes -------------------------------------------------------------------
