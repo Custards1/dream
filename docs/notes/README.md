@@ -34,10 +34,10 @@ end.
 - List and map code in the JIT
 - Building ahead: a producer makes a run of cells a call
 - Reusing the frame of a self tail call: measured, and not built
-- A JIT that can allocate -- the plan
+- A JIT that can allocate -- the plan, and how it was done instead
 - Spilling compiled frames: measured, and not kept
 
-The collector has a document of its own, [../gc.md](../gc.md).
+The collector has a document of its own, [../gc.md](../gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
 
 ## [Bignums, and the cryptography beside them](bignums.md)
 

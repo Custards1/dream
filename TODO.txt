@@ -133,6 +133,17 @@ Next round (2026-10-03), most valuable first.
      "Inlay hints and rename" in docs/notes/lucid.md.
 
 Already planned, and in the right order:
-   - .libdream / a package at a time (12,800 declarations still do not fit)
-   - a JIT that can allocate
-   - freeing what vm.share! shared
+   - .libdream / a package at a time. Its reason, "12,800 declarations
+     still do not fit", was measured again on 2026-10-04 and is gone:
+     25,600 declarations in one module compile under the default cap, and
+     51,200 over 64 modules in 16 s. What is left is one module of 51,200,
+     whose parse outgrows 1 GB, and dividing by package cannot move that
+     ("Where the wall is now" in docs/notes/compiler-scaling.md). Deferred
+     until linking rather than recompiling is wanted for its own sake.
+   - a JIT that can allocate. Done (2026-10-04): compiled code already
+     allocated; what it could not do was let anything collect underneath
+     it. Now a collection under compiled code scans the machine stack and
+     pins what it points at in place -- no generated code changes, so no
+     hot-path cost. Self-compile 1.04 GB held against 2.16, same time,
+     same image. "Collecting under compiled code" in docs/gc.md.
+   - freeing what vm.share! shared. Done (vm.release!, see above).

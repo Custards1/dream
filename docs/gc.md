@@ -22,6 +22,9 @@ The collector today is described in `dream/src/heap.hpp` and `dream/src/heap.cpp
 - [x] A major evacuates the old blocks its last sweep found sparse, and hands
       back the ones it found empty (2026-10-03). See "Evacuating sparse
       blocks" -- including why it bought less than this list expected.
+- [x] A collection may run underneath JIT-compiled code: the machine stack
+      is scanned and what it points at is pinned in place (2026-10-04). See
+      "Collecting under compiled code".
 - [ ] Later -- full compaction. Nothing measured asks for it yet.
 - [x] Freeing shared regions (2026-10-03): `vm.release!` and a census. See
       "Freeing what was shared" -- including the race the stress test found.
@@ -555,6 +558,130 @@ moved, from how many blocks, and how many the sweep chose next on its line.
 The tests: `test_major_evacuates_sparse_blocks` in the VM's units, and the
 e2e programs under the verifier with `DREAM_GC_EVACUATE=all`, serially and
 with every collection parallel and every mark concurrent.
+
+## Collecting under compiled code
+
+Built 2026-10-04. Until then nothing could collect while a JIT-compiled frame
+was on the stack: every runtime helper compiled code calls raised
+`force_pins` (`PinsTheHeap`), because the frame keeps its values in machine
+registers and stack slots, and a collection would move what they name. The
+cost was memory, as it had been for natives before "Collecting underneath a
+native": a compiled loop calling something that built and dropped a long list
+held every cell of it until the call returned. A probe of that shape -- a
+compiled `go` calling `work`, which walks a lazily built list of six million
+cells -- ran in 0.3 MB interpreted and **770 MB** compiled, with no
+collection at all in between.
+
+**The roots are the machine stack, read conservatively.** Compiled code is
+not changed. A collection underneath it treats every word on the C++ stack,
+from the collector up to the machine loop that entered the outermost compiled
+frame, as a possible reference, and *pins* whatever object a word lands in --
+its start or anywhere inside it, since a compiled loop may keep only a field's
+address. Pinned objects do not move; everything they point at is traced and
+moved as usual, because the collector rewrites a pinned object's fields and
+never the word that pinned it.
+
+That is the whole trick, and it is why this is cheap where the first attempt
+was not. "Spilling compiled frames: measured, and not kept" in
+[notes/vm-performance.md](notes/vm-performance.md) rooted the live values
+*precisely* and read them back after each call that could collect, and the
+reload made every such call a merge point for everything the frame held: 21%
+on `fib` and 40% on `mapfilter`, in code whose spill path never even ran.
+Nothing is reloaded here, because nothing that compiled code holds has moved.
+The hot path is untouched; the cost is a scan of a few hundred words, paid
+only by a collection that runs under compiled code.
+
+**Where the scan starts and stops.** `run_process` and the nested loop behind
+`force_whnf` each note their own frame address (`Process::loop_stack_hi`); they
+keep nothing in C++ locals at a safepoint. `enter_function` copies the
+innermost one to `Process::jit_stack_hi` when it enters the outermost compiled
+frame, and clears it on the way out. While it is set, `Process::maybe_collect`
+goes through `collect_under_compiled`, which pushes every callee-saved register
+onto its own frame (`__builtin_unwind_init` -- not `setjmp`, whose saved frame
+pointer glibc mangles, and a compiled body with no frame pointer uses that
+register like any other) and calls the collection one frame further down, so
+that the scan's lower bound is below the saved registers. Everything between --
+compiled bodies, the `dream_rt_*` helpers, the interpreter frames that entered
+them -- is covered without any of it having to say what it holds.
+
+**Which helpers stop pinning.** Only `dream_rt_force` and `dream_rt_apply`,
+the two a compiled loop can spend unbounded time under; they vouch now
+(`ScannedForGc` in jit_rt.cpp), and pin as before when there is no loop to
+scan up to. The rest still pin, because what they reach keeps values where a
+scan of the stack does not look: `arith` on two lists is `concat_lists`, a
+native is whatever it is, and both may hold a value in a `std::vector`.
+
+**A pinned young object stays young.** The first version promoted it in place
+-- its nursery block became an old block -- and that was wrong in a way worth
+recording. The object a compiled loop is holding is usually the thunk it is
+forcing, which a moment later is updated to point at what it produced: an old
+object pointing at a young one, remembered, and every minor after that
+promoted everything produced since. The probe held 452 MB that way. So a young
+pinned object is marked `GC_PINNED` instead, is never copied, and its nursery
+block is *held*: not emptied by the minor and not freed by a major. Everything
+else in a held block is dead or the stub of something promoted, and is made
+`GC_FREE` so that a stale word on a later scan cannot revive it -- its fields
+name objects that have since moved. A surviving old object found pointing at a
+pinned one is put on the remembered set, since it now points at a young object.
+When the collection ends the bit is cleared, and the next collection judges the
+object like any other young one. A held block's bytes are counted as allocated
+but neither as new nursery allocation nor as old space
+(`nursery_held_`); counted as either, the next collection was due the moment
+this one ended, and the probe ran a million minors.
+
+**An old pinned object** is kept out of the evacuation by clearing its block's
+`evacuate` choice. And after an evacuation the sweep rewrites references to
+what moved in every live object it walks -- which is never the nursery -- so a
+pinned young object's fields are rewritten by hand (`forward_pin_refs`). The
+verifier found that one: a pinned frame naming a stub in a block that had been
+handed back.
+
+**A concurrent mark is not started from under compiled code.** Its snapshot
+would be taken while compiled frames hold values it cannot see, and nothing
+would pin those again at the finalize but a second scan of a stack that has
+moved on. A whole-world major costs that one collection its overlap. A mark
+already in flight is finalized there as usual; the pinning happens after the
+helpers are joined, since it writes the byte they claim marks with.
+
+**Arguments that outlive their use.** A conservative scan keeps alive what a
+dead stack slot still names, and one case of that was the whole list again:
+compiled code hands `dream_rt_apply` its arguments in an array on its own
+stack, and the array named the list's first cell for as long as the call ran.
+The helper now clears it once the arguments are on the value stack
+(`apply_whnf_taking`).
+
+What it bought, on the probe above (`--jit-threshold 1`, so that the outer
+loop is compiled):
+
+| | before | after |
+|---|---|---|
+| held from the OS at the peak | 770 MB | **0.9 MB** |
+| collections | 0 major, 2 minor | 10,782 major, 10,783 minor |
+| wall | 0.98 s | 1.76 s |
+
+The wall clock is the price of collecting at all, and it is the probe's
+shape rather than the mechanism's: the scan is a few microseconds a
+collection. A compiled loop keeps the frame it was entered with until its
+slice ends, because a bail reruns the call from it, so a collection in the
+middle of a slice finds everything consumed since the slice began still
+reachable, promotes it, and is followed by a major -- which resets the nursery
+to its smallest. The interpreter pays 13.5 s for the same program. The same
+one-major-per-minor ratio was already there with the JIT on by default, where
+collections waited for the slice to end.
+
+Where it matters, it is free. A self-compile, three interleaved runs each:
+2.18-2.21 s against 2.22-2.26 s before, a byte-identical image, and
+**1.04 GB held from the OS against 2.16 GB** (summed over the build's
+processes). The 12,800-declaration program from `scale.py`: 5.55 GB held
+against 2.23 GB, the live set unchanged. `benchmark/benchmark/run.sh` moves
+nothing outside the noise.
+
+`DREAM_GC_TRACE=1` prints a line for each collection under compiled code:
+the words scanned, the objects pinned and the blocks held. The tests are
+`dream/tests/programs/jit_collects.dr`, which counts the collections inside one
+compiled call -- none before this, so the two tiers disagree on the VM without
+it -- and holds a list, a float, a map and a string across them; and
+`test-heap`, which runs it under the verifier with every evacuation setting.
 
 ## Why generational, why parallel, why concurrent
 

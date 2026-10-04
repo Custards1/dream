@@ -4179,10 +4179,14 @@ Emitter::JV Emitter::apply(uint32_t idx, const Node& n) {
 /// callee is free not to look at them; and the answer is forced, because this
 /// is an evaluated position. A reduction is spent for the `Apply` node.
 ///
-/// What it costs is a nested machine loop per call with the heap pinned. The
-/// loop's own reductions come off the same budget; when they exhaust the slice
-/// the helper leaves it at zero, so the compiled loop around the call yields at
-/// its next back-edge rather than running on under a pin.
+/// What it costs is a nested machine loop per call. The loop may collect --
+/// the machine stack is scanned for what this frame holds, see
+/// `Process::jit_stack_hi` -- and the helper clears `items` once the arguments
+/// are on the value stack, because nothing here reads it again and a scan
+/// would otherwise keep them alive for as long as the call ran. The loop's
+/// own reductions come off the same budget; when they exhaust the slice the
+/// helper leaves it at zero, so the compiled loop around the call yields at
+/// its next back-edge.
 Emitter::JV Emitter::closure_call(const Node& n) {
     JV callee = node(n.a);
     if (failed_ || !callee.v) return none();

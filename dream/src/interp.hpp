@@ -43,6 +43,12 @@ bool force_whnf(Process& p, Value v, Value* out);
 /// closure with: the arguments arrive as they stand, suspended or not, exactly
 /// as `do_apply` would have been handed them. Same collector rules as above.
 bool apply_whnf(Process& p, Value callee, const Value* args, uint32_t argc, Value* out);
+/// The same, taking the arguments: once they are on the value stack, `args`
+/// is cleared. For a caller whose array is on the machine stack while a
+/// collection may scan it (`Process::jit_stack_hi`): left as it was, it would
+/// keep the arguments alive for as long as the call runs, which for a lazy
+/// list handed to a loop is the whole list.
+bool apply_whnf_taking(Process& p, Value callee, Value* args, uint32_t argc, Value* out);
 
 /// How many continuations a process may have pending: `DREAM_MAX_DEPTH`.
 size_t max_depth_limit();
@@ -98,12 +104,14 @@ struct VouchesForGc {
 ///
 /// Compiled code is why this exists. A JIT-compiled function keeps its slots in
 /// machine registers -- that is what compiling it is *for* -- and the collector
-/// has no way to find them, let alone rewrite them, so a collection underneath
-/// a compiled frame loses every value that frame is holding. Such a frame
-/// cannot vouch; and it cannot rely on nobody below it vouching either, because
-/// the runtime helpers it calls run the machine (`dream_rt_arith` on two lists
-/// is `concat_lists`, which forces a whole spine). So it says so, and
-/// `force_pins` makes the answer stick however deep the call goes.
+/// cannot rewrite them. Underneath a force or a call (`dream_rt_force`,
+/// `dream_rt_apply`) that no longer stops a collection: the machine stack is
+/// scanned and what it points at is pinned in place (`Process::jit_stack_hi`).
+/// The other runtime helpers still say this, because what they run keeps
+/// values where a scan of the stack does not look -- `dream_rt_arith` on two
+/// lists is `concat_lists`, which forces a whole spine, and a native may hold
+/// one in a `std::vector` -- and `force_pins` makes the answer stick however
+/// deep the call goes.
 ///
 /// This is not hypothetical. Vouching for `concat_lists` -- which is written
 /// correctly and keeps everything on the value stack -- made `effects_once`

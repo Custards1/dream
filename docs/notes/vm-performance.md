@@ -911,7 +911,7 @@ one of two things, and both were projects rather than edits:
   `sum` runs the top line of that table rather than the bottom one: 4.6 ns an
   element instead of 420, which is the whole of the distance between 13.0x and
   0.15x.
-- **A JIT that can allocate.** The tier's scope is "the strict numeric spine"
+- **A JIT that can allocate** -- done; see the section of that name. The tier's scope was "the strict numeric spine"
   and the reason is not ambition, it is the collector: a compiled frame keeps
   its slots in registers the collector cannot find or rewrite, which is what
   `PinsTheHeap` says. So compiled code may not allocate, and until fusion
@@ -1163,6 +1163,18 @@ numeric loops, and those are the ones the JIT already takes with no frame at
 all -- which is why JIT on and off leave the same 73.8K.
 
 ## A JIT that can allocate -- the plan
+
+**Done, 2026-10-04, and not by either route below.** Compiled code allocates,
+since "List and map code in the JIT", and since 2026-10-04 a collection may run
+underneath it: the machine stack is scanned conservatively and whatever it
+points at is pinned in place, so nothing compiled code holds ever moves and
+nothing has to be reloaded. That sidesteps the PHI web "Spilling compiled
+frames" below measured, rather than making it smaller, and it changes no
+generated code. The design, and the two things the first version of it got
+wrong -- promoting a pinned object in place, and an argument array that kept a
+whole list alive -- are "Collecting under compiled code" in
+[docs/gc.md](../gc.md). What follows is kept for the reasoning, which is still
+why the precise route costs what it does.
 
 *The plan below was drafted by an AI coding assistant (2026-09-13), not by the
 human author of these notes. It is a proposal, not a record: update it as the

@@ -18,7 +18,8 @@ namespace dream {
 std::atomic<uint64_t> g_thunk_counts[64];
 const bool g_probe_thunk = std::getenv("DREAM_PROBE_THUNK") != nullptr;
 
-bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out);
+bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out,
+                 Value* taken = nullptr);
 
 namespace {
 
@@ -34,6 +35,20 @@ struct ForceNest {
     ~ForceNest() { --p.force_nest; }
     ForceNest(const ForceNest&) = delete;
     ForceNest& operator=(const ForceNest&) = delete;
+};
+
+/// The machine loop now running on this C++ stack, for a collection under
+/// compiled code to scan up to (`Process::jit_stack_hi`). Its frame address
+/// is passed in rather than taken here, because it has to be the loop's.
+struct LoopStack {
+    Process& p;
+    void* const saved;
+    LoopStack(Process& proc, void* frame) : p(proc), saved(proc.loop_stack_hi) {
+        p.loop_stack_hi = frame;
+    }
+    ~LoopStack() { p.loop_stack_hi = saved; }
+    LoopStack(const LoopStack&) = delete;
+    LoopStack& operator=(const LoopStack&) = delete;
 };
 
 inline void eval_node(Process& p, uint32_t node, Value frame) {
@@ -360,7 +375,13 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             const int64_t before = p.reductions;
             const uint64_t before_total = p.total_reductions;
             const size_t stack_before = p.stack.size();
+            // The outermost compiled frame on this stack says where a scan of
+            // it ends: at the machine loop that is running this call. Inner
+            // ones, entered from forces under it, are inside that already.
+            void* const outer_hi = p.jit_stack_hi;
+            if (!outer_hi) p.jit_stack_hi = p.loop_stack_hi;
             Value r = fn(&p, frame, &status);
+            p.jit_stack_hi = outer_hi;
             // Clamped, because a nested force underneath this call may have
             // re-armed the budget (`Process::slice_spent`), which leaves more
             // in it than there was to start with.
@@ -2708,6 +2729,7 @@ inline void step_return_counted(Process& p, size_t floor) {
 }
 
 void run_process(Process& p, int64_t budget) {
+    LoopStack loop(p, __builtin_frame_address(0));
     p.reductions = budget;
     p.slice = budget;
     p.slice_spent = false;
@@ -2806,6 +2828,10 @@ bool apply_whnf(Process& p, Value callee, const Value* args, uint32_t argc, Valu
     return nested_whnf(p, callee, args, argc, out);
 }
 
+bool apply_whnf_taking(Process& p, Value callee, Value* args, uint32_t argc, Value* out) {
+    return nested_whnf(p, callee, args, argc, out, args);
+}
+
 Value literal_string_value(Process& p, uint32_t index) { return literal_string(p, index); }
 
 /// The nested machine loop behind `force_whnf` and `apply_whnf`: force `v`,
@@ -2813,8 +2839,10 @@ Value literal_string_value(Process& p, uint32_t index) { return literal_string(p
 /// primed the way `prime_apply` primes a fresh process. The arguments go on the
 /// value stack under an `ApplyTo`, where `do_apply` looks for them and where
 /// the collector can see them.
-bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out) {
+bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out,
+                 Value* taken) {
     ForceNest nest(p);
+    LoopStack loop(p, __builtin_frame_address(0));
     // Run a nested machine loop down to the current continuation depth.
     //
     // Whether it may collect is decided here and nowhere else. The caller
@@ -2848,6 +2876,7 @@ bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* o
 
     if (args) {
         for (uint32_t i = 0; i < argc; ++i) p.stack.push_back(args[i]);
+        if (taken) std::fill(taken, taken + argc, UNIT);
         push_cont(p, ContKind::ApplyTo, argc, 0, 0, UNIT);
     }
     enter(p, v);
