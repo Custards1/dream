@@ -109,11 +109,14 @@ let try_map! f xs = outcomes! (start_each! (fn x -> f x) xs);
 // --- talking ----------------------------------------------------------------
 //
 // A request carries the process to answer, because the runtime has no notion of
-// a sender: `recv!` hands over a message and nothing else. `[:call, from, body]`
-// is that convention written down, and `serve!` below understands it.
+// a sender: `recv!` hands over a message and nothing else. `[:call, from, body,
+// ref]` is that convention written down, and `serve!` below understands it. The
+// reference (`vm.unique!`) is what the reply carries back, so the caller picks
+// out *its* answer: one that arrives after a `call_within!` gave up waiting
+// for it cannot be taken for the answer to the next call.
 
-let call_message : Process -> b -> Call b;
-let call_message from body = [:call, from, body];
+let call_message : Process -> b -> :integer -> Call b;
+let call_message from body ref = [:call, from, body, ref];
 
 let is_call : :any -> :bool;
 let is_call m = _list_is_empty m == false && list.nth 0 m == :call;
@@ -121,10 +124,12 @@ let call_from : :list -> Process;
 let call_from m = list.nth 1 m;
 let call_body : :list -> :any;
 let call_body m = list.nth 2 m;
+let call_ref : :list -> :integer;
+let call_ref m = list.nth 3 m;
 
-let is_reply : :any -> :bool;
-let is_reply m = match m {
-    [:reply, _] => true,
+let is_reply_of : :integer -> :any -> :bool;
+let is_reply_of ref m = match m {
+    [:reply, r, _] => r == ref,
     _ => false,
 };
 
@@ -136,21 +141,38 @@ let is_reply m = match m {
 /// whose payload is its outcome, rather than leaving the caller parked on a
 /// reply that cannot come.
 let call! : Process -> :any -> :any;
-let call! target body = {
+let call! target body = match await_reply! target body forever {
+    [:ok, value] => value,
+    // Unreachable: there is no deadline to reach. Said, so the match is whole.
+    other => raise! (error.new :timeout other),
+};
+
+/// `call!` that gives up after `ms` milliseconds: `[:ok, reply]`, or
+/// `:timeout`. A reply that comes later is left in the mailbox, where
+/// nothing that waits for a reference will take it -- but a plain `recv!`
+/// will, so a process that times out calls should not also read its mailbox
+/// blind.
+let call_within! : Process -> :any -> :integer -> ([:ok, :any] | :timeout);
+let call_within! target body ms = await_reply! target body (deadline_in! ms);
+
+priv let await_reply! : Process -> :any -> :integer -> ([:ok, :any] | :timeout);
+priv let await_reply! target body deadline = {
     let me = self! ();
+    let ref = vm.unique! ();
     monitor! target
-    send! target (call_message me body)
-    let answer = recv_where! (fn m -> is_reply m || is_down_of target m);
+    send! target (call_message me body ref)
+    let answer = recv_until! (fn m -> is_reply_of ref m || is_down_of target m) deadline;
     demonitor! target
     match answer {
-        [:reply, value] => value,
-        [:down, _, outcome] => raise! (error.new :down outcome),
+        [:ok, [:reply, _, value]] => [:ok, value],
+        [:ok, [:down, _, outcome]] => raise! (error.new :down outcome),
+        _ => :timeout,
     }
 };
 
 /// Answer a request. The other half of `call!`.
 let reply! : :list -> :any -> :any;
-let reply! m value = send! (call_from m) [:reply, value];
+let reply! m value = send! (call_from m) [:reply, call_ref m, value];
 
 // --- receiving ----------------------------------------------------------------
 
@@ -379,6 +401,41 @@ when test {
                 let e = try! { call! p 1 } catch e { e };
                 test.eq! :down (error.kind e)
             } ),
+        test.case "call_within! times out on a target that never answers"
+            $( {
+                // Takes the request and then waits for something that never
+                // comes; one that just took it would end, and be `:down`.
+                let p = spawn! $( { recv! (); recv! () } );
+                let got = call_within! p 1 30;
+                kill! p :done
+                // Taken, so its end is handled rather than reported at exit.
+                outcome! p
+                test.eq! :timeout got
+            } ),
+        test.case "a reply after a timeout is not the next call's answer"
+            $( {
+                // Answers its first request late, and its second at once.
+                let slow! () = {
+                    let first = recv! ();
+                    sleep! 60
+                    reply! first :late
+                    let second = recv! ();
+                    reply! second :prompt
+                };
+                let p = spawn! $( slow! () );
+                let missed = call_within! p 1 10;
+                sleep! 80
+                let next = call! p 2;
+                test.eq! [:timeout, :prompt] [missed, next]
+            } ),
+        test.case "kill! reaches a force that never ends, through a try!"
+            $( {
+                let rec from !n = list.cons n (from (n + 1));
+                let p = spawn! $( try! { strict! (list.length (from 0)) } catch e { :caught } );
+                sleep! 20
+                kill! p :stop
+                test.eq! :killed (error.kind (list.nth 1 (outcome! p)))
+            } ),
         test.case "call! keeps messages that are not the reply"
             $( {
                 let p = spawn! $( adder! () );
@@ -406,6 +463,6 @@ when test {
 // --- optional types ---------------------------------------------------------
 
 type Process = :process;
-type Call body = [:call, Process, body];
-type Reply value = [:reply, value];
+type Call body = [:call, Process, body, :integer];
+type Reply value = [:reply, :integer, value];
 type Outcome value = [:ok, value] | [:error, :any];

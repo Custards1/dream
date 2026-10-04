@@ -66,6 +66,7 @@ import std.debug;
 import std.list;
 import std.proc;
 import std.supervisor;
+import std.vm;
 
 // --- the holes a server fills ---------------------------------------------------
 //
@@ -135,20 +136,19 @@ let stop_with_reply reason value state = [:stop, reason, value, state];
 // names nothing else uses, because `recv!` hands over every message a process
 // was sent and a server has to tell its own protocol from a program's.
 //
-// A call carries the caller's pid twice over: once as where to send the reply,
-// and once *inside* the reply, as the token that says this reply is the one
-// that was waited for. One pid is enough of a token because a caller blocks
-// until its reply comes back, so it never has two calls outstanding -- and
-// there are no timeouts here, so it can never abandon one and be handed a stale
-// answer later. Adding a timeout would break that argument and would need a
-// real reference.
+// A call carries `from`: the caller's pid, where the reply goes, and a
+// reference (`vm.unique!`) the reply carries back, which is what says this
+// reply is the one that was waited for. The pid alone was enough while a caller
+// could only block until its answer came; `call_within!` can give up, and the
+// answer to a call it gave up on must not be taken for the next one's.
+// Handlers never look inside `from`; they hand it to `reply_to!`.
 
-priv let call_of : Handle -> r -> Call r;
+priv let call_of : From -> r -> Call r;
 priv let call_of from request = [:server_call, from, request];
 priv let cast_of : m -> Cast m;
 priv let cast_of message     = [:server_cast, message];
-priv let reply_of : Handle -> v -> [:server_reply, Handle, v];
-priv let reply_of to value   = [:server_reply, to, value];
+priv let reply_of : From -> v -> [:server_reply, :integer, v];
+priv let reply_of to value   = [:server_reply, list.nth 1 to, value];
 
 /// The tag of a message, or `()` for a message that has none.
 ///
@@ -167,8 +167,8 @@ priv let tag_of m =
 /// `from` is what `handle_call!` was given. Holding on to one and replying
 /// later is how a server answers something it must wait for without making
 /// every other client wait too.
-let reply_to! : Handle -> :any -> :any;
-let reply_to! from value = send! from (reply_of from value);
+let reply_to! : From -> :any -> :any;
+let reply_to! from value = send! (list.head from) (reply_of from value);
 
 /// What one message does to the server: `[:continue, state]` or `[:done, value]`.
 priv let step! : :any -> :any -> [:atom, :any];
@@ -183,7 +183,7 @@ priv let step! state m = match tag_of m {
     _            => after! (handle_info! m state),
 };
 
-priv let after_call! : Handle -> :any -> [:atom, :any];
+priv let after_call! : From -> :any -> [:atom, :any];
 priv let after_call! from answer = match answer {
     [:reply, value, next] => {
         reply_to! from value
@@ -277,21 +277,36 @@ let child_with! name args restart = supervisor.child_with name (started! args) r
 /// it answers raises an error of kind `:down` here, with its outcome as the
 /// payload, instead of leaving the caller waiting for ever.
 let call! : Handle -> :any -> :any;
-let call! pid request = {
-    let me = self! ();
+let call! pid request = match await_reply! pid request proc.forever {
+    [:ok, value] => value,
+    // Unreachable: there is no deadline to reach. Said, so the match is whole.
+    other => raise! (error.new :timeout other),
+};
+
+/// `call!` that gives up after `ms` milliseconds: `[:ok, reply]` or
+/// `:timeout`. A reply that arrives afterwards stays in the caller's mailbox
+/// and is never taken for another call's.
+let call_within! : Handle -> :any -> :integer -> ([:ok, :any] | :timeout);
+let call_within! pid request ms = await_reply! pid request (proc.deadline_in! ms);
+
+priv let await_reply! : Handle -> :any -> :integer -> ([:ok, :any] | :timeout);
+priv let await_reply! pid request deadline = {
+    let ref = vm.unique! ();
+    let from = [self! (), ref];
     proc.monitor! pid
-    send! pid (call_of me request)
-    let answer = proc.recv_where! (fn m -> is_reply_to me m || proc.is_down_of pid m);
+    send! pid (call_of from request)
+    let answer = proc.recv_until! (fn m -> is_reply_to ref m || proc.is_down_of pid m) deadline;
     proc.demonitor! pid
     match answer {
-        [:server_reply, _, value] => value,
-        [:down, _, outcome] => raise! (error.new :down outcome),
+        [:ok, [:server_reply, _, value]] => [:ok, value],
+        [:ok, [:down, _, outcome]] => raise! (error.new :down outcome),
+        _ => :timeout,
     }
 };
 
-priv let is_reply_to : Handle -> :any -> :bool;
-priv let is_reply_to me m = match m {
-    [:server_reply, to, _] => to == me,
+priv let is_reply_to : :integer -> :any -> :bool;
+priv let is_reply_to ref m = match m {
+    [:server_reply, r, _] => r == ref,
     _ => false,
 };
 
@@ -354,7 +369,9 @@ let answer! request state = match handle_call! request :nobody state {
 // --- optional types ---------------------------------------------------------
 
 type Handle = :process;
-type Call request = [:server_call, :process, request];
+/// Who asked: where the reply goes, and the reference it carries back.
+type From = [:process, :integer];
+type Call request = [:server_call, From, request];
 type Cast message = [:server_cast, message];
 type Action value state = [:reply, value, state]
                         | [:noreply, state]

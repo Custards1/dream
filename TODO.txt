@@ -35,15 +35,17 @@ Left:
    What is missing is a way to free one (it lives until the runtime ends).
 
 Follow-ups from 1, 2 and 5:
-- A kill lands at a slice boundary.  A process inside one long nested force
-  (strict! over a huge structure) or parked on IO is stopped only when that
-  returns or the descriptor wakes it; its poller entry is not cancelled.
-- call with a timeout wants a reference in the request and the reply, so a
-  late reply to a timed-out call is not taken as the next call's answer
-  (needs a vm.unique! counter).
-- std.registry could monitor what it names and drop the entry on [:down ..];
-  it is an agent, whose loop has no handler for a raw message yet.
-- The match positions cost the compiler's image 13% (1.05 -> 1.18 MB, 41.7k
-  -> 47.2k nodes); self-compile time unchanged.  A shared failure stub per
-  function would win most of that back.
-- `recv! { pattern => .. }` syntax lowering to recv_where!.
+- Done: a kill reaches a process inside one long nested force (raised where
+  its slice would have ended, past every `try!`), and a killed process
+  parked on a descriptor is withdrawn from the poller.
+- Done: proc.call_within! and server.call_within!; a request carries a
+  vm.unique! reference and its reply echoes it, so a late reply is never
+  taken for the next call's.
+- Done: std.registry is a small server that monitors every process it names
+  and drops a name when its process ends.
+- Done: `receive! { pattern => body, .., after ms => body }`, lowered to a
+  scan over four new primitives, so it needs no import.
+- The match positions cost the compiler's image 13% (1.05 -> 1.18 MB);
+  self-compile time unchanged.
+- 3 (freeing shared values) is designed, not built: "Freeing what was
+  shared" in docs/gc.md.

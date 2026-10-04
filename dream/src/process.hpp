@@ -455,6 +455,11 @@ public:
 
     void visit_roots(Heap& heap) override;
 
+    /// The error a kill ends this process with: kind `:killed`, the reason
+    /// `kill!` was given as the payload. Allocates in this heap; call it only
+    /// where an allocation is allowed.
+    Value kill_error();
+
     // Convenience for natives and the interpreter.
     Value make_error_value(const char* kind, const char* message);
     [[noreturn]] void unreachable(const char* what);

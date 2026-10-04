@@ -2243,6 +2243,13 @@ bool unwind(Process& p, size_t floor) {
             continue;
         }
         if (c.kind == ContKind::Catch) {
+            // A process being killed is not unwound to a handler: `kill!`
+            // ends it, and a `try!` that could catch that would be a process
+            // that could refuse. Its stack goes with the frame.
+            if (p.kill_requested.load(std::memory_order_relaxed)) {
+                p.stack.resize(c.c);
+                continue;
+            }
             p.stack.resize(c.c);
             auto* fo = static_cast<FrameObj*>(as_obj(c.v1));
             value_slot_store(&fo->slots()[c.b], p.result);
@@ -2788,6 +2795,15 @@ bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* o
         if (p.reductions <= 0) {
             p.slice_spent = true;
             p.reductions = p.slice;
+            // A kill waits for the slice to end, and a force this long may not
+            // end at all -- `strict!` over something endless, a native walking
+            // a list that never stops. So the kill is raised here, where the
+            // slice would have ended; `unwind` passes every handler, and the
+            // natives above give the raise back as they would any other.
+            if (p.mode != Mode::Raise && p.kill_requested.load(std::memory_order_relaxed)) {
+                do_raise(p, p.kill_error());
+                continue;
+            }
         }
 
         // A blocking native inside the value being forced -- `join!`, `recv!`,

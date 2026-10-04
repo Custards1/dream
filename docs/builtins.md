@@ -153,6 +153,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 |-----------|-------|-----------|-------------|
 | `compare` | `compare a b` | `a → b → integer` | Total order comparison. Returns `-1`, `0`, or `1`. Ranks, in order: integers and floats (numerically), chars, bools, atoms, strings, unit, lists, arrays, tensors. A bigstr ranks with the strings and compares by its bytes. Lists and arrays compare element by element, forcing as they go, and a prefix sorts before what it prefixes. Tensors compare by shape, then element by element. Values of different types order by their rank. Maps, functions and pids compare equal to anything of their own kind. |
 | `_tensor_matmul` | `a @ b` | `tensor\|list\|array → tensor\|list\|array → tensor\|float` | What `a @ b` is written as. See [`std.tensor`](#stdtensor). |
+| `_mailbox_peek!` · `_mailbox_take!` · `_await_message!` · `_deadline_in!` | `receive! { .. }` | | What `receive!` is written with: the `std.vm` natives of the same names (`_deadline_in! ms` is `vm.now_ns!` that many milliseconds on), as builtins so the syntax needs no import. |
 | `_str_interp` | `$"..{x}.."` | `list → string` | Every element rendered as `to_string` renders it, joined: what an interpolated string is written as, lowered straight to the `str_interp` opcode. |
 | `_sort_keyed` | `list.sort_on key xs` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
@@ -647,6 +648,7 @@ no new compiler.
 | `monitor!` | `process → :ok` | Be sent `[:down, p, outcome]` when `p` ends -- at once if it has -- where `outcome` is `[:ok, value]` or `[:error, e]`. A failure delivered this way counts as handled, as one delivered to a joiner does. |
 | `demonitor!` | `process → :ok` | Undo one `monitor!`. A report already sent stays in the mailbox. |
 | `kill!` | `process → value → :ok` | End the process as a failure of kind `:killed` whose payload is the value. It is not unwound and cannot catch it: it is not run again after its current slice. A parked process is woken to be stopped. A process can kill itself, and then the call does not return. |
+| `unique!` | `unit → integer` | An integer no other call in this VM has answered: the reference a request carries so its reply cannot be mistaken for another's. |
 | `mailbox_size!` | `unit → integer` | Messages waiting. |
 | `mailbox_peek!` | `integer → [:ok, value] \| :none` | The message at a position, left where it is. Only the owner ever removes a message, so a position keeps naming the same one until this process takes it. |
 | `mailbox_take!` | `integer → :ok` | Remove the message at a position; `:out_of_bounds` when there is none. |
@@ -1377,7 +1379,8 @@ built here on the `std.vm` natives below it.
 | `outcome! p` · `outcomes! ps` | `[:ok, v]` or `[:error, e]` — what `join!` would raise, as a value. |
 | `parallel! thunks` | Run these at once and answer their values in order. |
 | `map! f xs` · `try_map! f xs` | `list.map` with one process per element; the second keeps failures as values. |
-| `call! target body` · `reply! m value` | Request and reply. The request carries the process to answer; the reply is `[:reply, value]`, picked out of the mailbox with everything else left in place. The target is monitored for the call, so one that dies first raises an error of kind `:down` whose payload is its outcome. |
+| `call! target body` · `reply! m value` | Request and reply. The request carries the process to answer and a reference (`vm.unique!`); the reply is `[:reply, ref, value]`, picked out of the mailbox with everything else left in place. The target is monitored for the call, so one that dies first raises an error of kind `:down` whose payload is its outcome. |
+| `call_within! target body ms` | The same, giving up after `ms` milliseconds: `[:ok, reply]` or `:timeout`. A reply that comes later stays in the mailbox and is never taken for another call's answer. `std.server` has the same `call_within!`. |
 | `recv_where! wanted` | The first message `wanted` accepts, taken out of the mailbox; the rest stay where they were, in order. Waits as long as it takes. |
 | `recv_within! ms` · `recv_where_within! wanted ms` | The same with a limit: `[:ok, message]`, or `:timeout`. |
 | `recv_until! wanted deadline` | What the three above are: `deadline` is a reading of `vm.now_ns!` (`deadline_in! ms` makes one), `forever` waits for ever, and `0` only looks. |

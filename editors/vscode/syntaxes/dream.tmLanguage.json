@@ -149,6 +149,11 @@
           "match": "\\b(if|else|match|catch|when)\\b|\\b(try!|comp!)"
         },
         {
+          "comment": "Contextual: `receive!` is syntax only before a brace, and a function may still be called that.",
+          "name": "keyword.control.dream",
+          "match": "\\breceive!(?=\\s*\\{)"
+        },
+        {
           "name": "keyword.declaration.dream",
           "match": "\\blet\\?|\\b(let|priv|rec|fn|import|as|mod|virtual|derive|comp|macro|expand|group|struct|mapping|type)\\b"
         },

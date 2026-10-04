@@ -315,14 +315,14 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
 }
 
 void Scheduler::terminate(const std::shared_ptr<Process>& p) {
-    Value reason = UNIT;
-    {
-        std::lock_guard<std::mutex> g(p->sched_mutex);
-        if (p->kill_reason) reason = Heap::copy_between(p->heap(), p->kill_reason->value);
+    // Parked on a descriptor, it is still the poller's: take it back, or the
+    // poller would go on counting a wait nobody is making, and the deadlock
+    // check would never again find the program stuck.
+    if (p->wait_reason.load(std::memory_order_relaxed) == WaitReason::Io) {
+        int fd = p->wait_fd.load(std::memory_order_relaxed);
+        if (fd >= 0) io_cancel_wait(fd, p->id());
     }
-    // No collection can happen between these two: nothing here runs the
-    // machine, and a heap only collects when it is asked to.
-    p->result = p->heap().make_error(make_atom(well_known(rt_).killed), reason);
+    p->result = p->kill_error();
     p->failed = true;
     p->mode = Mode::Halted;
     p->conts.clear();

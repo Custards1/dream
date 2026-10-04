@@ -94,6 +94,16 @@ size_t Mailbox::size() const {
     return queue_.size();
 }
 
+Value Process::kill_error() {
+    Value reason = UNIT;
+    {
+        std::lock_guard<std::mutex> g(sched_mutex);
+        if (kill_reason) reason = Heap::copy_between(heap_, kill_reason->value);
+    }
+    // `reason` is held across one allocation, which cannot collect.
+    return heap_.make_error(make_atom(well_known(rt_).killed), reason);
+}
+
 bool Mailbox::peek_into(size_t i, Heap& dest, Value* out) const {
     std::lock_guard<std::mutex> g(mutex_);
     if (i >= queue_.size()) return false;

@@ -421,6 +421,9 @@ let rec parse_ident c word sp rest =
         "if" => parse_if c sp rest,
         "fn" => parse_lambda c sp rest,
         "try!" => parse_try c sp rest,
+        // Contextual: `receive!` is also a name programs give their own
+        // functions, and only a `{` straight after it makes it this.
+        "receive!" if at rest :lbrace => parse_receive c sp (list.tail rest),
         "match" => parse_match c sp rest,
         "comp" => parse_comp c false sp rest,
         "comp!" => parse_comp c true sp rest,
@@ -1412,6 +1415,57 @@ let rec parse_match c sp ts =
                             else { ok (ast.match_e scrutinee arms (ast.span_to sp close)) rest3 },
                     },
             },
+    };
+
+/// `receive! { pattern => body, .., after ms => body }` -- see
+/// `syntax.receive_e`, which is what it becomes.
+let rec parse_receive c sp ts =
+    match receive_arms (grouped c) [] ts {
+        [:error, m, s] => err m s,
+        [:ok, [arms, after, close], rest] =>
+            if list.is_empty arms { err "a `receive!` needs at least one arm" sp }
+            else { ok (syntax.receive_e arms after (ast.span_to sp close)) rest },
+    };
+
+/// Arms as `match_arms` reads them, and an `after ms => body` that must come
+/// last: `[arms, after or (), close]`. `after` is only that when what follows
+/// it is not `=>` or `if`; otherwise it is a pattern binding a name.
+let rec receive_arms c acc ts =
+    if at ts :rbrace { ok [list.reverse acc, (), peek_span ts] (list.tail ts) }
+    else if at_end ts { err "unterminated `receive!`: expected `}`" (peek_span ts) }
+    else if is_kw ts "after" && not (at (list.tail ts) :fat_arrow) && not (is_kw (list.tail ts) "if") {
+        match parse_expr (no_brace c) (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, ms, rest] =>
+                match expect rest :fat_arrow "`=>` after the time an `after` waits" {
+                    [:error, m, s] => err m s,
+                    [:ok, _, rest2] =>
+                        match parse_expr c rest2 {
+                            [:error, m, s] => err m s,
+                            [:ok, body, rest3] => {
+                                let rest4 = if at rest3 :comma { list.tail rest3 } else { rest3 };
+                                if at rest4 :rbrace { ok [list.reverse acc, [ms, body], peek_span rest4] (list.tail rest4) }
+                                else { err "`after` is the last arm of a `receive!`" (peek_span rest4) }
+                            },
+                        },
+                },
+        }
+    }
+    else {
+        match parse_pattern c ts {
+            [:error, m, s] => err m s,
+            [:ok, pat, rest] =>
+                match arm_guard_and_body c pat rest {
+                    [:error, m, s] => err m s,
+                    [:ok, a, rest2] => {
+                        let acc2 = list.cons a acc;
+                        if at rest2 :comma { receive_arms c acc2 (list.tail rest2) }
+                        else if at rest2 :rbrace { ok [list.reverse acc2, (), peek_span rest2] (list.tail rest2) }
+                        else { err ("expected `,` or `}` after a `receive!` arm, found " + describe rest2)
+                                   (peek_span rest2) }
+                    },
+                },
+        }
     };
 
 /// The arms and the span of the `}` that ended them.
@@ -2756,6 +2810,9 @@ when test {
             $( test.eq! "(binary lt (binary add (name a) (int 1)) (name b))" (shape "a + 1 < b") ),
         test.case "every operator but :: is left-associative"
             $( test.eq! "(binary sub (binary sub (int 1) (int 2)) (int 3))" (shape "1 - 2 - 3") ),
+        test.case "receive! is syntax only before a brace"
+            $( test.eq! ["(apply (name receive!) (name conn))", "error: `after` is the last arm of a `receive!`"]
+                        [shape "receive! conn", shape "receive! { after 1 => 0, x => x }"] ),
         test.case "union struct is a union whose variants are arrays"
             $( test.eq! [:union_decl, "Shape", :array]
                         (match parse_module "union struct Shape { circle(r), empty }" {

@@ -1112,6 +1112,23 @@ NativeResult vm_demonitor(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_atom(well_known(p.runtime()).ok));
 }
 
+/// `vm.unique! ()` -- an integer no other call of this in this VM has answered.
+/// What a request carries so its reply can be told from every other, even one
+/// that arrives after the caller stopped waiting for it.
+NativeResult vm_unique(Process& p, Value, Value*, uint32_t) {
+    static std::atomic<int64_t> next{1};
+    return NativeResult::ok(make_integer(p, next.fetch_add(1, std::memory_order_relaxed)));
+}
+
+/// `_deadline_in! ms` -- `vm.now_ns!` `ms` milliseconds from now: the deadline
+/// `receive! { .., after ms => .. }` waits until.
+NativeResult vm_deadline_in(Process& p, Value, Value* args, uint32_t) {
+    NativeResult err;
+    int64_t ms;
+    if (!int_arg(p, args[0], "after", &ms, &err)) return err;
+    return NativeResult::ok(make_integer(p, monotonic_now_ns() + ms * 1000000));
+}
+
 /// `vm.mailbox_size! ()` -- messages waiting, received or not looked at.
 NativeResult vm_mailbox_size(Process& p, Value, Value*, uint32_t) {
     return NativeResult::ok(make_fixnum(int64_t(p.mailbox.size())));
@@ -1457,6 +1474,7 @@ ModuleDef make_vm_module() {
                          {"kill!", 2, 0b01, vm_kill},
                          {"monitor!", 1, 0b1, vm_monitor},
                          {"demonitor!", 1, 0b1, vm_demonitor},
+                         {"unique!", 1, 0b1, vm_unique},
                          {"mailbox_size!", 1, 0b1, vm_mailbox_size},
                          {"mailbox_peek!", 1, 0b1, vm_mailbox_peek},
                          {"mailbox_take!", 1, 0b1, vm_mailbox_take},
@@ -3484,6 +3502,10 @@ const BuiltinDef BUILTINS[] = {
     {"_sort_keyed", 2, 0b10, core_sort_keyed, true},
     {"_tensor_matmul", 2, 0b11, tensor_matmul_builtin},
     {"_str_interp", 1, 0b1, core_str_interp},
+    {"_mailbox_peek!", 1, 0b1, vm_mailbox_peek},
+    {"_mailbox_take!", 1, 0b1, vm_mailbox_take},
+    {"_await_message!", 2, 0b11, vm_await_message},
+    {"_deadline_in!", 1, 0b1, vm_deadline_in},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

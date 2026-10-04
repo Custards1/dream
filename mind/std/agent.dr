@@ -146,6 +146,16 @@ when test {
                 stop! a
                 test.eq! 3 n
             } ),
+        test.case "a call that times out does not answer the next one"
+            $( {
+                let a = start! 7;
+                // Slow enough to outlast the limit: the agent is still adding
+                // when the caller gives up, and answers later.
+                let slow = server.call_within! a [:get, fn n -> list.sum (list.range 0 2000000) * 0 + n] 1;
+                let next = value! a;
+                stop! a
+                test.eq! [:timeout, 7] [slow, next]
+            } ),
         test.case "get_and_update! answers the old and keeps the new"
             $( {
                 let a = start! 10;

@@ -62,6 +62,10 @@ struct IoHandleInfo {
 /// Every handle currently open, and who is waiting on it.
 std::vector<IoHandleInfo> io_snapshot();
 
+/// Withdraw process `pid` from waiting on `fd`: it is being killed, and a
+/// waiter left behind would be counted as owed a wake-up for ever.
+void io_cancel_wait(int fd, uint64_t pid);
+
 ModuleDef make_io_module();
 ModuleDef make_net_module();
 ModuleDef make_tls_module();

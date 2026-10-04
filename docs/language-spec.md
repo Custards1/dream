@@ -1312,8 +1312,28 @@ match proc.recv_where_within! (fn m -> proc.is_down_of w m) 1000 {
 }
 ```
 
+`receive!` is the same selective receive written as syntax, with `match`'s
+arms and an optional `after` for a timeout, and it needs no import:
+
+```dream
+receive! {
+    [:reply, v] if v > 5 => v,
+    [:error, why] => raise! why,
+    after 1000 => :timeout,
+}
+```
+
+The first message in the mailbox that one of the arms takes is taken out and
+matched; every other message stays where it was, in order. Without `after`
+it waits as long as it takes. Patterns and guards are tried once to choose a
+message and again to bind it, so a guard is evaluated twice -- which no pure
+expression can tell. `receive!` is only syntax when a `{` follows it, so a
+function of that name still works as one.
+
 A kill takes effect at the start of the target's next slice, which is as
-prompt as preemption already is. A failure reported to a monitor counts as
+prompt as preemption already is -- and a process inside one long force (a
+`strict!` over something endless) is stopped where its slice would have
+ended. A `try!` cannot catch it. A failure reported to a monitor counts as
 handled, as one delivered to a joiner does.
 
 The shapes built on these (servers that hold state, supervisors, registries,
