@@ -62,10 +62,13 @@ import std.streams;
 import std.time;
 import std.tls;
 import std.http.url;
+import std.http.pool as connections;
 
 // --- messages ---------------------------------------------------------------------
 
-/// A request. On the client, `url` is the absolute URL to send it to, and
+/// A request. `stream`, when it is not `()`, is a body that arrives in pieces
+/// rather than as `body` (see "Streams" below). On the client, `url` is the
+/// absolute URL to send it to, and
 /// `options` holds how (`:timeout`, `:redirects`, `:tls`). On a server, `url`
 /// is the target as the client wrote it (`/a/b?c=d`), `path` and `query` are
 /// it taken apart, `peer` is who sent it, and `params` are what a router
@@ -83,14 +86,21 @@ mapping Request {
     peer : :string = ""
     options : :map = %{}
     context : :map = %{}
+    stream : :any = ()
 }
 
-/// A response. On the client, `url` is where it came from after redirects.
+/// A response. On the client, `url` is where it came from after redirects;
+/// `stream` is a body sent in pieces as they are made, rather than `body`.
+/// `upgrade`, on a server's 101, is what takes the connection over once the
+/// response is sent: a function of the socket and the reader holding what
+/// has been read past the request (see `std.http.websocket`).
 mapping Response {
     status : :integer = 200
     headers : [[:string]] = []
     body : :string = ""
     url : :string = ""
+    stream : :any = ()
+    upgrade : :any = ()
 }
 
 /// Every reason phrase RFC 9110 registers, and a few that are in common use.
@@ -379,11 +389,7 @@ let read_exact! r n = {
 
 /// Everything until the other side closes, up to `limit`.
 let read_to_end! : Reader -> :integer -> [:string, Reader];
-let read_to_end! r limit = match fill! r {
-    [r2, true] => if len (Reader.buffer r2) > limit { raise! (error.new :too_large "a body larger than the limit") }
-                  else { read_to_end! r2 limit },
-    [r2, false] => { let buf = Reader.buffer r2; let at = Reader.at r2; [str.slice at (len buf - at) buf, Reader.make (Reader.socket r2) buf (len buf)] },
-};
+let read_to_end! r limit = read_body! r [] true limit;
 
 /// The start line and the headers up to the blank line: `[start, headers,
 /// reader]`, or `()` when the stream ended before anything arrived -- a
@@ -411,42 +417,112 @@ let read_head! r limit = match read_line! r 8192 {
     },
 };
 
-/// A body as the headers describe it: chunked, a length, or (for a response
-/// that has neither) everything until the connection closes.
-let read_body! : Reader -> [[:string]] -> :bool -> :integer -> [:string, Reader];
-let read_body! r headers until_close limit = {
+// --- bodies, a piece at a time ---------------------------------------------------------
+//
+// A body is read by one function, `next_piece!`, which answers the next piece
+// of it and where it has got to: by a length, by chunks, or until the
+// connection closes. Everything else is a loop over that -- `read_body!`
+// collects the pieces, the client's `stream!` hands each to a callback, and
+// a server streaming a request body hands them to the handler when it asks
+// -- so a body is never held whole unless something asks for it whole, and
+// there is one body reader to get right rather than three.
+
+/// Where a body has got to: `[:exact, left]`, `[:chunked, left_in_chunk]`,
+/// `[:chunk_end]` (the line break after a chunk's data), `[:to_end]` or
+/// `[:done]`.
+type BodyState = [:exact, :integer] | [:chunked, :integer] | [:chunk_end] | [:to_end] | [:done];
+
+/// How a body is framed, from its headers: chunked, a length, or (for a
+/// response that says neither) everything until the connection closes.
+let body_state! : [[:string]] -> :bool -> BodyState;
+let body_state! headers until_close = {
     let msg = %{ :headers => headers };
     let encoding = match header "transfer-encoding" msg { () => "", v => str.lower v };
-    if str.contains_str "chunked" encoding { read_chunked! r limit [] 0 }
+    if str.contains_str "chunked" encoding { [:chunked, 0] }
     else {
         match header "content-length" msg {
-            () => if until_close { read_to_end! r limit } else { ["", r] },
+            () => if until_close { [:to_end] } else { [:exact, 0] },
             v => match num.parse_int (str.trim v) {
-                n if n != () && n >= 0 => if n > limit { raise! (error.new :too_large "a body larger than the limit") } else { read_exact! r n },
+                n if n != () && n >= 0 => [:exact, n],
                 _ => raise! (error.new :bad_message ("not a length: " + v)),
             },
         }
     }
 };
 
-priv let read_chunked! : Reader -> :integer -> [:string] -> :integer -> [:string, Reader];
-priv let rec read_chunked! r limit acc !total = match read_line! r 8192 {
-    [(), _] => raise! (error.new :bad_message "the stream ended inside a chunked body"),
-    [line, r2] => {
-        let size_text = str.trim (str.slice 0 (str.upto ";" 0 line) line);
-        let size = hex_number size_text;
-        if size < 0 { raise! (error.new :bad_message ("not a chunk size: " + line)) }
-        if size == 0 {
-            // Trailers, which nothing here uses, up to the blank line.
-            let rec trailers! rr = match read_line! rr 8192 { ["", r3] => r3, [(), r3] => r3, [_, r3] => trailers! r3 };
-            [str.concat_all (list.reverse acc), trailers! r2]
-        } else {
-            if total + size > limit { raise! (error.new :too_large "a body larger than the limit") }
-            let [data, r3] = read_exact! r2 size;
-            let [_, r4] = read_line! r3 8192;
-            read_chunked! r4 limit (data :: acc) (total + size)
-        }
+/// The next piece of a body -- what has arrived of it, up to 64 KiB -- or
+/// `()` when it is over: `[piece, state, reader]`.
+let next_piece! : Reader -> BodyState -> [:any, BodyState, Reader];
+let rec next_piece! r state = match state {
+    [:done] => [(), state, r],
+    [:exact, 0] => [(), [:done], r],
+    [:exact, n] => {
+        let [piece, r2] = available! r n;
+        if piece == "" { raise! (error.new :bad_message ("the stream ended " + to_string n + " bytes short of the body")) }
+        [piece, [:exact, n - len piece], r2]
     },
+    [:to_end] => {
+        let [piece, r2] = available! r 65536;
+        if piece == "" { [(), [:done], r2] } else { [piece, state, r2] }
+    },
+    [:chunk_end] => { let [_, r2] = read_line! r 8192; next_piece! r2 [:chunked, 0] },
+    [:chunked, 0] => match read_line! r 8192 {
+        [(), _] => raise! (error.new :bad_message "the stream ended inside a chunked body"),
+        [line, r2] => {
+            let size = hex_number (str.trim (str.slice 0 (str.upto ";" 0 line) line));
+            if size < 0 { raise! (error.new :bad_message ("not a chunk size: " + line)) }
+            if size == 0 {
+                // Trailers, which nothing here uses, up to the blank line.
+                let rec trailers! rr = match read_line! rr 8192 { ["", r3] => r3, [(), r3] => r3, [_, r3] => trailers! r3 };
+                [(), [:done], trailers! r2]
+            } else { next_piece! r2 [:chunked, size] }
+        },
+    },
+    [:chunked, n] => {
+        let [piece, r2] = available! r n;
+        if piece == "" { raise! (error.new :bad_message "the stream ended inside a chunk") }
+        [piece, if n - len piece == 0 { [:chunk_end] } else { [:chunked, n - len piece] }, r2]
+    },
+};
+
+/// Up to `most` bytes: what is buffered, or what one read brings when nothing
+/// is. `""` only at the end of the stream.
+priv let available! : Reader -> :integer -> [:string, Reader];
+priv let available! r most = {
+    let buf = Reader.buffer r;
+    let at = Reader.at r;
+    if len buf > at {
+        let take = list.minimum [most, len buf - at];
+        [str.slice at take buf, Reader.make (Reader.socket r) buf (at + take)]
+    } else {
+        match fill! r {
+            [r2, true] => available! r2 most,
+            [r2, false] => ["", r2],
+        }
+    }
+};
+
+/// Fold `step!` over the pieces of a body: `[acc, reader]`. More than `limit`
+/// bytes raises `:too_large`.
+let fold_body! : Reader -> BodyState -> :integer -> a -> (a -> :string -> a) -> [a, Reader];
+let rec fold_body! r state limit acc step! = match next_piece! r state {
+    [(), _, r2] => [acc, r2],
+    [piece, state2, r2] => {
+        if len piece > limit { raise! (error.new :too_large "a body larger than the limit") }
+        let acc2 = step! acc piece;
+        strict! acc2
+        fold_body! r2 state2 (limit - len piece) acc2 step!
+    },
+};
+
+/// A body as the headers describe it, whole.
+let read_body! : Reader -> [[:string]] -> :bool -> :integer -> [:string, Reader];
+let read_body! r headers until_close limit = {
+    let state = body_state! headers until_close;
+    // A length past the limit is refused before a byte of it is read.
+    match state { [:exact, n] if n > limit => raise! (error.new :too_large "a body larger than the limit"), _ => () }
+    let [pieces, r2] = fold_body! r state limit [] (fn acc piece -> piece :: acc);
+    [str.concat_all (list.reverse pieces), r2]
 };
 
 priv let hex_number : :string -> :integer;
@@ -457,17 +533,108 @@ priv let hex_number t =
 priv let hex_digit : :char -> :integer;
 priv let hex_digit c = { let k = _char_code c; if k <= 57 { k - 48 } else if k <= 70 { k - 55 } else { k - 87 } };
 
+// --- streams ------------------------------------------------------------------------
+//
+// A body that is made, or arrives, in pieces. A stream is either a list of
+// strings -- lazy, so each piece is computed when it is about to be sent, and
+// a list as long as you like costs only the piece in hand -- or a function of
+// unit that answers the next piece, or `()` when there are no more, which is
+// the form for pieces that need effects: a file read a block at a time, a
+// message waited for. Server-sent events are a stream with a format.
+
+/// A 200 response whose body is sent in pieces as `chunks` makes them: a
+/// list of strings, or a function answering the next one or `()`.
+let stream : :any -> :map;
+let stream chunks = Response.new () |> Response.set_stream chunks;
+
+/// The request with a body sent in pieces, chunked.
+let with_stream : :any -> :map -> :map;
+let with_stream chunks req = req.[:stream => chunks];
+
+/// The next piece of a stream and the rest of it: `[piece, rest]`, the piece
+/// `()` at the end.
+let pull! : :any -> [:any, :any];
+let pull! s = match type_of s {
+    :list => match s { [] => [(), []], [piece, ..rest] => [piece, rest] },
+    :unit => [(), ()],
+    :array => match s {
+        #[:mapped, f, inner] => match pull! inner { [(), _] => [(), ()], [piece, rest] => [f piece, #[:mapped, f, rest]] },
+        _ => [(), ()],
+    },
+    _ => { let piece = s (); strict! piece; [piece, s] },
+};
+
+/// Every piece of a stream, concatenated: for a handler that wants a
+/// streamed request body whole after all.
+let stream_text! : :any -> :string;
+let stream_text! s = {
+    let rec go! rest acc = match pull! rest {
+        [(), _] => str.concat_all (list.reverse acc),
+        [piece, more] => go! more (piece :: acc),
+    };
+    go! s []
+};
+
+/// The body of a request or response, whether it came whole or as a stream.
+let body_text! : :map -> :string;
+let body_text! msg = match msg.[:stream else ()] { () => body msg, s => stream_text! s };
+
+/// Write a stream to a socket, chunked (`chunked` true) or as it is, calling
+/// `progress!` after each piece. Empty pieces are skipped, since an empty
+/// chunk is how a chunked body ends.
+let write_stream! : :any -> :any -> :bool -> (:unit -> :any) -> :unit;
+let rec write_stream! sock s chunked progress! = match pull! s {
+    [(), _] => { if chunked { streams.write_all! sock "0\r\n\r\n" }; () },
+    [piece, rest] => {
+        if len piece > 0 {
+            streams.write_all! sock (if chunked { hex_of (len piece) + "\r\n" + piece + "\r\n" } else { piece })
+            progress! ()
+        }
+        write_stream! sock rest chunked progress!
+    },
+};
+
+priv let hex_of : :integer -> :string;
+priv let rec hex_of n = if n < 16 { str.slice n 1 "0123456789abcdef" } else { hex_of (n / 16) + str.slice (n % 16) 1 "0123456789abcdef" };
+
+/// One server-sent event, as `text/event-stream` spells it. A string is its
+/// data; a map may give `"data"`, `"event"`, `"id"` and `"retry"`. Data with
+/// line breaks becomes several `data:` lines, as the format requires.
+let sse_event : :any -> :string;
+let sse_event e = {
+    let fields = if type_of e == :map { e } else { %{ "data" => e } };
+    let line k = match fields.[k else ()] { () => [], v => [k + ": " + text_of v + "\n"] };
+    let data = match fields.["data" else ()] { () => [], d => list.map (fn l -> "data: " + l + "\n") (str.split "\n" (text_of d)) };
+    str.concat_all (line "event" + line "id" + line "retry" + data + ["\n"])
+};
+
+/// A response that sends server-sent events: `events` is a stream (a list,
+/// or a function answering the next event or `()`) of what `sse_event` takes.
+let event_stream : :any -> :map;
+let event_stream events = {
+    stream (map_stream sse_event events) |> with_header "content-type" "text/event-stream" |> with_header "cache-control" "no-cache"
+};
+
+/// A stream whose pieces are `f` of another's, as they are pulled.
+let map_stream : (:any -> :string) -> :any -> :any;
+let map_stream f s = if type_of s == :list { list.map f s } else { #[:mapped, f, s] };
+
 // --- the wire: writing -----------------------------------------------------------------------
 
 /// A request as bytes: the request line with `target`, a `Host` header, the
 /// request's own headers, a `Content-Length` when there is a body to send.
+///
+/// A request with a `stream` gets `Transfer-Encoding: chunked` and no body
+/// here: the pieces follow, through `write_stream!`.
 let encode_request : :map -> :string -> :string -> :string;
 let encode_request req target host = {
-    let body_text = body req;
+    let streaming = req.[:stream else ()] != ();
+    let body_text = if streaming { "" } else { body req };
     let method = Request.method req;
-    let needs_length = len body_text > 0 || method == "POST" || method == "PUT" || method == "PATCH";
+    let needs_length = not streaming && (len body_text > 0 || method == "POST" || method == "PUT" || method == "PATCH");
     let base = req |> with_header "host" host
-                   |> (fn r -> if needs_length { with_header "content-length" (len body_text) r } else { r });
+                   |> (fn r -> if needs_length { with_header "content-length" (len body_text) r } else { r })
+                   |> (fn r -> if streaming { with_header "transfer-encoding" "chunked" (without_header "content-length" r) } else { r });
     str.concat_all ([method, " ", target, " HTTP/1.1\r\n"]
                     + list.flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Request.headers base)
                     + ["\r\n", body_text])
@@ -485,6 +652,19 @@ let encode_response resp head = {
                     + ["\r\n", if head || bodiless { "" } else { body resp }])
 };
 
+/// The head of a response whose body is a stream: chunked for HTTP/1.1, and
+/// for an HTTP/1.0 client neither chunked nor with a length, the end of the
+/// body being the end of the connection.
+let encode_stream_head : :map -> :bool -> :string;
+let encode_stream_head resp chunked = {
+    let code = Response.status resp;
+    let framed = without_header "content-length" resp
+                 |> (fn r -> if chunked { with_header "transfer-encoding" "chunked" r } else { with_header "connection" "close" r });
+    str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
+                    + list.flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers framed)
+                    + ["\r\n"])
+};
+
 /// `content-type` as `Content-Type`: how a header name is usually written,
 /// for peers that are fussier than the RFC lets them be.
 let canonical : :string -> :string;
@@ -494,25 +674,122 @@ let canonical name = str.join_str "-" (list.map (fn part -> match str.chars part
 }) (str.split "-" name));
 
 // --- the client --------------------------------------------------------------------------------
+//
+// `send!` and its relatives open a connection for each request and close it
+// after. A `Client` keeps them: it is a pool -- a process holding idle
+// connections by scheme, host and port -- with a base URL, headers and
+// options that every request through it gets, so a program talking to one
+// API makes one connection and reuses it:
+//
+//     let api = http.client_with! %{ :base => "https://api.example.com/v1",
+//                                    :headers => [["authorization", "Bearer " + token]],
+//                                    :timeout => time.seconds 10 };
+//     let? user = http.call! api (http.request "GET" "/users/7");
+//     http.close_client! api
+//
+// A connection goes back to the pool only when the response said it could
+// and was read to its end, and one that sat idle for `idle` is closed. A
+// pooled connection the server has since closed is found out when the
+// request fails before any answer, and the request is sent again once on a
+// new connection -- unless its body was a stream of pieces that cannot be
+// made again.
 
 /// The default for `with_timeout`.
 let default_timeout : :integer;
 let default_timeout = 30000000000;
 
-/// The largest response body the client reads, 256 MiB.
+/// The largest response body the client reads whole, 256 MiB. `stream!`
+/// reads any size.
 let max_response : :integer;
 let max_response = 268435456;
 
+/// A client: its pool (a process, or `()` for one connection per request), the
+/// URL relative request URLs are read against, headers every request gets
+/// unless it sets them, and options (`:timeout`, `:redirects`, `:tls`) every
+/// request gets unless it sets them.
+mapping Client {
+    pool : :any = ()
+    base : :string = ""
+    headers : [[:string]] = []
+    options : :map = %{}
+}
+
+/// A client with a pool and nothing else.
+let client! : :unit -> :map;
+let client! () = client_with! %{};
+
+/// A client from `%{ :base, :headers, :timeout, :redirects, :tls, :idle }`,
+/// each optional. `:idle` is how long an unused connection is kept (30 s).
+let client_with! : :map -> :map;
+let client_with! config = {
+    let idle = config.[:idle else 30000000000];
+    let pool = connections.start! (time.to_milliseconds idle);
+    let opts = list.fold (fn m k -> match config.[k else ()] { () => m, v => m.[k => v] }) %{} [:timeout, :redirects, :tls];
+    Client.make pool (config.[:base else ""]) (list.map (fn [k, v] -> [str.lower k, v]) (config.[:headers else []])) opts
+};
+
+/// Close a client's idle connections and stop its pool.
+let close_client! : :map -> :unit;
+let close_client! c = match Client.pool c { () => (), pid => connections.close! pid };
+
+/// Send a request through a client: `[:ok, response]` or `[:error, e]`.
+let call! : :map -> :map -> result.Of :map :error;
+let call! c req = run! c req ();
+
 /// Send a request and read the response: `[:ok, response]` or `[:error, e]`.
+/// One connection, closed after; see `call!` for keeping them.
 let send! : :map -> result.Of :map :error;
-let send! req = {
+let send! req = run! (Client.new ()) req ();
+
+/// Send a request and hand the body to `on_piece!` as it arrives, a piece at
+/// a time, instead of collecting it: for a body too large to hold, or one to
+/// act on as it comes (a log being followed, events from a server). Answers
+/// the response with an empty body. `on_piece!` runs in the process doing
+/// the request, so what it does must not depend on being in the caller's.
+let stream! : :map -> (:string -> :any) -> result.Of :map :error;
+let stream! req on_piece! = run! (Client.new ()) req (sink_step! on_piece!);
+
+/// `stream!` through a client.
+let stream_with! : :map -> :map -> (:string -> :any) -> result.Of :map :error;
+let stream_with! c req on_piece! = run! c req (sink_step! on_piece!);
+
+priv let sink_step! : (:string -> :any) -> :unit -> :string -> :unit;
+priv let sink_step! on_piece! acc piece = { on_piece! piece; () };
+
+priv let run! : :map -> :map -> :any -> result.Of :map :error;
+priv let run! c req0 sink = {
+    let req = with_client_defaults c req0;
     let opts = Request.options req;
     let timeout = opts.[:timeout else default_timeout];
-    match time.within! timeout (follow! req (opts.[:redirects else 10])) {
+    match time.within! timeout (follow! c req (opts.[:redirects else 10]) sink) {
         [:ok, resp] => result.ok resp,
         [:error, e] => result.error (if error.is_error e { e } else { error.new :error e }),
         :timeout => result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
     }
+};
+
+/// The request with the client's base URL, headers and options under its own.
+priv let with_client_defaults : :map -> :map -> :map;
+priv let with_client_defaults c req = {
+    let address = match Client.base c {
+        "" => Request.url req,
+        base => match url.parse base {
+            [:ok, b] => {
+                let rel = Request.url req;
+                // A path under the base, as "/users" under ".../v1" is meant.
+                let joined = if str.starts_with "/" rel && not (str.starts_with "//" rel) {
+                    let bp = url.Url.path b;
+                    url.to_text (b |> url.Url.set_path ((if str.ends_with "/" bp { str.slice 0 (len bp - 1) bp } else { bp }) + url.Url.path (url.parse_or_raise rel))
+                                   |> url.Url.set_query (url.Url.query (url.parse_or_raise rel))
+                                   |> url.Url.set_has_query (url.Url.has_query (url.parse_or_raise rel)))
+                } else { url.to_text (url.resolve b rel) };
+                joined
+            },
+            _ => Request.url req,
+        },
+    };
+    let with_headers_set = list.fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req (Client.headers c);
+    with_headers_set |> Request.set_url address |> Request.set_options (map.merge (Client.options c) (Request.options req))
 };
 
 let get! : :string -> result.Of :map :error;
@@ -553,45 +830,60 @@ let get_json! address = {
     result.map_error (fn why -> error.new :bad_json why) (json.decode text_body)
 };
 
-/// Save the body of a 2xx response to a file: `[:ok, bytes written]`.
+/// Save the body of a 2xx response to a file, a piece at a time, so a file of
+/// any size costs no more memory than one piece: `[:ok, bytes written]`. A
+/// response that is not 2xx is an error of kind `:status`, and the file is
+/// left as it was.
 let download! : :string -> :string -> result.Of :integer :error;
 let download! address path = {
-    let? text_body = get_text! address;
-    try! { _file_write! path text_body; result.ok (len text_body) } catch e { result.error e }
+    let partial = path + ".part";
+    let h = io.open! partial :write;
+    let outcome = stream! (request "GET" address) (write_piece! h);
+    io.close! h
+    match outcome {
+        [:ok, resp] => if is_success resp {
+            io.rename! partial path
+            let size = match io.stat! path { () => 0, [n, _, _] => n };
+            strict! size
+            result.ok size
+        } else { io.remove! partial; expect_ok resp |> result.map (fn _ -> 0) },
+        [:error, e] => { try! { io.remove! partial } catch ignored { () }; result.error e },
+    }
 };
 
-priv let _file_write! : :string -> :string -> :unit;
-priv let _file_write! path content = {
-    let h = io.open! path :write;
-    streams.write_all! h content
-    io.close! h
-};
+priv let write_piece! : :any -> :string -> :unit;
+priv let write_piece! h piece = { streams.write_all! h piece; () };
 
 /// One exchange, then the redirects, as browsers follow them: 303, and 301
 /// or 302 after anything but GET or HEAD, become a GET without a body;
 /// 307 and 308 repeat the request as it was. Credentials are not carried to
 /// another host.
-priv let follow! : :map -> :integer -> :map;
-priv let rec follow! req left = {
-    let resp = exchange! req;
+priv let follow! : :map -> :map -> :integer -> :any -> :map;
+priv let rec follow! c req left sink = {
+    let resp = exchange! c req sink (left > 0);
     let code = Response.status resp;
     let location = header "location" resp;
-    if location == () || not (list.contains code [301, 302, 303, 307, 308]) { resp }
+    if location == () || not (is_redirect code) { resp }
     else if left <= 0 { raise! (error.new :too_many_redirects ("still redirected after the last allowed, to " + location)) }
     else {
         let here = url.parse_or_raise (Request.url req);
         let there = url.resolve here location;
         let to_get = code == 303 || ((code == 301 || code == 302) && Request.method req != "GET" && Request.method req != "HEAD");
         let moved = req |> Request.set_url (url.to_text (there |> url.Url.set_fragment ""))
-                        |> (fn r -> if to_get { r |> Request.set_method "GET" |> with_body "" |> without_header "content-type" |> without_header "content-length" } else { r })
+                        |> (fn r -> if to_get { r |> Request.set_method "GET" |> with_body "" |> Request.set_stream ()
+                                                  |> without_header "content-type" |> without_header "content-length" } else { r })
                         |> (fn r -> if url.Url.host there != url.Url.host here { without_header "authorization" (without_header "cookie" r) } else { r });
-        follow! moved (left - 1)
+        follow! c moved (left - 1) sink
     }
 };
 
-/// Connect, send, read, close.
-priv let exchange! : :map -> :map;
-priv let exchange! req = {
+priv let is_redirect : :integer -> :bool;
+priv let is_redirect code = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+
+/// The URL of a request, checked: one that is not http or https, or has no
+/// host, raises `:bad_url`.
+priv let target_url! : :map -> :map;
+priv let target_url! req = {
     let u = match url.parse (Request.url req) {
         [:ok, parsed] => parsed,
         [:error, why] => raise! (error.new :bad_url why),
@@ -599,37 +891,117 @@ priv let exchange! req = {
     let scheme = url.Url.scheme u;
     if scheme != "http" && scheme != "https" { raise! (error.new :bad_url ("not an http or https URL: " + Request.url req)) }
     if url.Url.host u == "" { raise! (error.new :bad_url ("no host in " + Request.url req)) }
-    let sock = net.connect! (url.bare_host u) (url.port_of u);
-    let outcome = try! {
-        if scheme == "https" {
-            let opts = map.merge %{ :host => url.bare_host u, :alpn => ["http/1.1"] } ((Request.options req).[:tls else %{}]);
-            tls.connect! sock opts
-        }
-        let defaults = [["user-agent", "dream-http/1.0"], ["accept", "*/*"], ["connection", "close"]];
-        let prepared = list.fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req defaults;
-        streams.write_all! sock (encode_request prepared (url.target u) (url.host_header u))
-        let resp = read_response! (reader sock) (Request.method req == "HEAD");
-        strict! resp
-        [:ok, Response.set_url (Request.url req) resp]
-    } catch e { [:error, e] };
-    try! { io.close! sock } catch ignored { () }
-    match outcome { [:ok, resp] => resp, [:error, e] => raise! e }
+    u
 };
+
+/// A new connection to the URL's host, through TLS for https.
+priv let connect! : :map -> :map -> :any;
+priv let connect! u req = {
+    let sock = net.connect! (url.bare_host u) (url.port_of u);
+    if url.Url.scheme u == "https" {
+        let opts = map.merge %{ :host => url.bare_host u, :alpn => ["http/1.1"] } ((Request.options req).[:tls else %{}]);
+        try! { tls.connect! sock opts } catch e { try! { io.close! sock } catch ignored { () }; raise! e }
+    }
+    sock
+};
+
+priv let pool_key : :map -> :string;
+priv let pool_key u = url.Url.scheme u + "://" + url.Url.host u + ":" + to_string (url.port_of u);
+
+/// One request, on a pooled connection if the client has one and a new one
+/// otherwise, which goes back to the pool afterwards if it can.
+priv let exchange! : :map -> :map -> :any -> :bool -> :map;
+priv let exchange! c req sink following = {
+    let u = target_url! req;
+    let key = pool_key u;
+    let pool = Client.pool c;
+    let pooled = match pool { () => (), pid => connections.checkout! pid key };
+    let sock = match pooled { () => connect! u req, s => s };
+    let keep = pool != ();
+    let outcome = try! {
+        let got = exchange_on! sock u req sink keep following;
+        strict! got
+        [:ok, got]
+    } catch e { [:error, e] };
+    match outcome {
+        [:ok, [resp, reusable]] => {
+            if keep && reusable { connections.checkin! pool key sock } else { close_quietly! sock }
+            resp
+        },
+        [:error, e] => {
+            close_quietly! sock
+            // A pooled connection the server closed while it sat idle fails
+            // before any answer; that is not this request's failure, so it
+            // goes again, once, on a connection of its own.
+            let replayable = type_of (req.[:stream else ()]) != :pure_fn && type_of (req.[:stream else ()]) != :impure_fn;
+            if pooled != () && replayable && retryable e {
+                let fresh = connect! u req;
+                match try! { let got = exchange_on! fresh u req sink keep following; strict! got; [:ok, got] } catch e2 { [:error, e2] } {
+                    [:ok, [resp, reusable]] => {
+                        if reusable { connections.checkin! pool key fresh } else { close_quietly! fresh }
+                        resp
+                    },
+                    [:error, e2] => { close_quietly! fresh; raise! e2 },
+                }
+            } else { raise! e }
+        },
+    }
+};
+
+priv let retryable : :any -> :bool;
+priv let retryable e = list.contains (error.kind e) [:bad_response, :connection_lost, :connection_reset, :io_closed, :io_error, :broken_pipe];
+
+priv let close_quietly! : :any -> :unit;
+priv let close_quietly! sock = connections.close_quietly! sock;
+
+/// Write a request on an open connection and read its response:
+/// `[response, reusable]`, where `reusable` says the connection can carry
+/// another request. With a `sink`, the body's pieces go to it rather than
+/// into the response -- except a redirect's when it will be followed.
+priv let exchange_on! : :any -> :map -> :map -> :any -> :bool -> :bool -> [:map, :bool];
+priv let exchange_on! sock u req sink keep following = {
+    let defaults = [["user-agent", "dream-http/1.0"], ["accept", "*/*"], ["connection", if keep { "keep-alive" } else { "close" }]];
+    let prepared = list.fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req defaults;
+    streams.write_all! sock (encode_request prepared (url.target u) (url.host_header u))
+    match req.[:stream else ()] { () => (), s => write_stream! sock s true nothing }
+    let [resp, reusable] = read_response_with! (reader sock) (Request.method req == "HEAD") sink following;
+    [Response.set_url (Request.url req) resp, reusable && keep]
+};
+
+priv let nothing : :unit -> :unit;
+priv let nothing u = ();
 
 /// A response from the reader, skipping any 1xx before it.
 let read_response! : Reader -> :bool -> :map;
-let read_response! r head = match read_head! r 65536 {
+let read_response! r head = (read_response_with! r head () false).[0];
+
+/// The same, with a sink for the body: `[response, reusable]`.
+priv let read_response_with! : Reader -> :bool -> :any -> :bool -> [:map, :bool];
+priv let rec read_response_with! r head sink following = match read_head! r 65536 {
     () => raise! (error.new :bad_response "the server closed the connection without answering"),
     [start, headers, r2] => {
         let parts = str.split " " start;
         let parsed = match parts { [_, c, .._] => num.parse_int c, _ => () };
         match (if str.starts_with "HTTP/" start { parsed } else { () }) {
             () => raise! (error.new :bad_response ("not a status line: " + start)),
-            code if code >= 100 && code < 200 => read_response! r2 head,
+            code if code >= 100 && code < 200 => read_response_with! r2 head sink following,
             code => {
-                let bodiless = head || code == 204 || code == 304;
-                let [body_text, _] = if bodiless { ["", r2] } else { read_body! r2 headers true max_response };
-                Response.new () |> Response.set_status code |> Response.set_headers headers |> Response.set_body body_text
+                let base = Response.new () |> Response.set_status code |> Response.set_headers headers;
+                let says_close = str.contains_str "close" (str.lower (match header "connection" base { () => "", v => v }));
+                let http11 = str.starts_with "HTTP/1.1" start;
+                if head || code == 204 || code == 304 { [base, http11 && not says_close] }
+                else {
+                    let state = body_state! headers true;
+                    let to_end = state == [:to_end];
+                    let collect = sink == () || (following && is_redirect code && header "location" base != ());
+                    if collect {
+                        let [pieces, _] = fold_body! r2 state max_response [] (fn acc piece -> piece :: acc);
+                        [Response.set_body (str.concat_all (list.reverse pieces)) base, http11 && not says_close && not to_end]
+                    } else {
+                        fold_body! r2 state 9223372036854775807 () sink
+                        [base, http11 && not says_close && not to_end]
+                    }
+                }
             },
         }
     },

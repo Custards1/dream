@@ -30,8 +30,10 @@ import std.error;
 import std.file;
 import std.foreign;
 import std.http;
+import std.http.pool as http_pool;
 import std.http.server as http_server;
 import std.http.url;
+import std.http.websocket;
 import std.image;
 import std.install;
 import std.json;
@@ -78,7 +80,7 @@ let modules = ["std.agent", "std.array", "std.atom", "std.build", "std.build.cc"
                "std.build.cc.gnu", "std.build.cc.msvc", "std.build.cc.steps", "std.build.check",
                "std.build.command", "std.build.dream", "std.build.fetch", "std.build.probe",
                "std.build.run", "std.build.tool", "std.char", "std.cli",
-               "std.codec", "std.console", "std.error", "std.file", "std.http", "std.http.server", "std.http.url",
+               "std.codec", "std.console", "std.error", "std.file", "std.http", "std.http.pool", "std.http.server", "std.http.url", "std.http.websocket",
                "std.json", "std.list", "std.log", "std.map", "std.macros", "std.num", "std.parse", "std.payload", "std.proc",
                "std.property", "std.random", "std.record", "std.regex", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.sql", "std.sql.lint", "std.sql.pg", "std.sql.pool", "std.sql.sqlite", "std.str", "std.streams",

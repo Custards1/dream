@@ -1,0 +1,426 @@
+// WebSockets (RFC 6455): a message channel over an HTTP connection, both ways.
+//
+//     import std.http.websocket as ws;
+//
+//     // a server: echo every text message back
+//     let echo! socket = match ws.recv! socket {
+//         [:text, t] => { ws.send_text! socket ("you said " + t); echo! socket },
+//         [:binary, b] => { ws.send_binary! socket b; echo! socket },
+//         [:close, _, _] => (),
+//     };
+//     server.serve! 8080 (server.router |> server.get "/chat" (ws.upgrade! echo!))
+//
+//     // a client
+//     let? socket = ws.connect! "ws://localhost:8080/chat";
+//     ws.send_text! socket "hello"
+//     ws.recv! socket                       // [:text, "you said hello"]
+//     ws.close! socket
+//
+// **A socket is read by a process of its own.** Frames are read, put back
+// together when a message was sent in fragments, and delivered to the
+// socket's owner -- the process that accepted or opened it -- as messages in
+// its mailbox. So `recv!` is a selective receive: it takes the next message
+// from *this* socket and leaves everything else in the mailbox where it was,
+// a process can wait on a socket and on other processes at once with
+// `receive!`, and `recv_within!` is a timeout like any other. The reader also
+// answers pings with pongs and the peer's close with the closing handshake,
+// so a program never sees either unless it asks.
+//
+// What arrives is `[:text, string]`, `[:binary, bytes]`, or, once,
+// `[:close, code, reason]` -- 1000 for a clean close, 1006 when the
+// connection simply ended. Sending is from any process: each frame is one
+// write, so frames from several processes do not interleave.
+//
+// Client frames are masked and server frames are not, as the RFC requires;
+// a server refuses an unmasked frame, and a message over `max_message`
+// (16 MiB) closes the connection with 1009.
+
+import std.crypto;
+import std.error;
+import std.io;
+import std.list;
+import std.map;
+import std.net;
+import std.num;
+import std.proc;
+import std.result;
+import std.str;
+import std.streams;
+import std.tls;
+import std.http;
+import std.http.url;
+
+/// The GUID RFC 6455 hashes a client's key with, to prove a server read it.
+priv let guid : :string;
+priv let guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// The largest message a reader assembles, 16 MiB.
+let max_message : :integer;
+let max_message = 16777216;
+
+/// An open WebSocket: the connection, which end of it this is (`:client`
+/// masks its frames), the process its messages are delivered to, the
+/// process reading it, and the subprotocol the two sides agreed on.
+mapping Socket {
+    !connection : :any
+    !role : :atom
+    !owner : :any
+    !reader : :any
+    protocol : :any = ()
+}
+
+/// What `Sec-WebSocket-Accept` must be for a `Sec-WebSocket-Key`.
+let accept_for : :string -> :string;
+let accept_for key = crypto.base64 (crypto.sha1 (key + guid));
+
+// --- the server side ------------------------------------------------------------------
+
+/// A handler that upgrades a request to a WebSocket and runs `on_open!` on
+/// the socket, in the connection's process, until it returns -- after which
+/// the socket is closed if it is not already. A request that is not a
+/// WebSocket handshake is answered 400 (or 426 for a version this does not
+/// speak).
+let upgrade! : (:map -> :any) -> :map -> :map;
+let upgrade! on_open! req = upgrade_with! %{} on_open! req;
+
+/// The same, choosing a subprotocol from `%{ :protocols => ["chat.v2", ..] }`:
+/// the first of the client's that is in the list.
+let upgrade_with! : :map -> (:map -> :any) -> :map -> :map;
+let upgrade_with! config on_open! req = {
+    let key = http.header "sec-websocket-key" req;
+    let wants = str.lower (match http.header "upgrade" req { () => "", u => u });
+    let version = http.header "sec-websocket-version" req;
+    if key == () || wants != "websocket" || http.Request.method req != "GET" {
+        http.bad_request "not a WebSocket handshake"
+    } else if version != "13" {
+        http.status_only 426 |> http.with_header "sec-websocket-version" "13"
+    } else {
+        let offered = list.map str.trim (str.split "," (match http.header "sec-websocket-protocol" req { () => "", p => p }));
+        let chosen = match list.filter (fn p -> list.contains p (config.[:protocols else []])) offered { [] => (), [p, .._] => p };
+        let resp = http.respond 101 ""
+            |> http.with_header "upgrade" "websocket"
+            |> http.with_header "connection" "Upgrade"
+            |> http.with_header "sec-websocket-accept" (accept_for (match key { () => "", k => k }))
+            |> (fn r -> match chosen { () => r, p => http.with_header "sec-websocket-protocol" p r });
+        resp.[:upgrade => serve_session! on_open! chosen]
+    }
+};
+
+/// What the server runs on an upgraded connection.
+priv let serve_session! : (:map -> :any) -> :any -> :any -> :any -> :unit;
+priv let serve_session! on_open! protocol sock r = {
+    let me = self! ();
+    let reader = spawn! $( read_loop! sock r :server me );
+    let socket = Socket.make sock :server me reader protocol;
+    try! { on_open! socket; () } catch e { () }
+    close_with! socket 1000 ""
+};
+
+// --- the client side ------------------------------------------------------------------
+
+/// Open a WebSocket to a `ws://` or `wss://` URL: `[:ok, socket]` or
+/// `[:error, e]`. Its messages are delivered to the calling process.
+let connect! : :string -> result.Of :map :error;
+let connect! address = connect_with! %{} address;
+
+/// The same, with `%{ :protocols => [..], :headers => [[name, value], ..],
+/// :tls => %{ .. } }`, each optional.
+let connect_with! : :map -> :string -> result.Of :map :error;
+let connect_with! config address = try! {
+    let socket = open! config address;
+    strict! socket
+    result.ok socket
+} catch e { result.error (if error.is_error e { e } else { error.new :error e }) };
+
+priv let open! : :map -> :string -> :map;
+priv let open! config address = {
+    let u = match url.parse address { [:ok, parsed] => parsed, [:error, why] => raise! (error.new :bad_url why) };
+    let scheme = url.Url.scheme u;
+    if scheme != "ws" && scheme != "wss" { raise! (error.new :bad_url ("not a ws or wss URL: " + address)) }
+    let sock = net.connect! (url.bare_host u) (url.port_of u);
+    if scheme == "wss" {
+        tls.connect! sock (map.merge %{ :host => url.bare_host u, :alpn => ["http/1.1"] } (config.[:tls else %{}]))
+    }
+    let key = crypto.base64 (crypto.random_bytes! 16);
+    let protocols = config.[:protocols else []];
+    let req = http.request "GET" address
+        |> http.with_header "upgrade" "websocket"
+        |> http.with_header "connection" "Upgrade"
+        |> http.with_header "sec-websocket-key" key
+        |> http.with_header "sec-websocket-version" "13"
+        |> (fn r -> if protocols == [] { r } else { http.with_header "sec-websocket-protocol" (str.join_str ", " protocols) r })
+        |> http.with_headers (config.[:headers else []]);
+    streams.write_all! sock (http.encode_request req (url.target u) (url.host_header u))
+    match http.read_head! (http.reader sock) 65536 {
+        () => { io.close! sock; raise! (error.new :bad_response "the server closed the connection during the handshake") },
+        [start, headers, r] => {
+            let msg = %{ :headers => headers };
+            if not (str.contains_str " 101" start) {
+                io.close! sock
+                raise! (error.new :handshake_refused ("the server answered " + start))
+            }
+            if http.header "sec-websocket-accept" msg != accept_for key {
+                io.close! sock
+                raise! (error.new :handshake_refused "the server's Sec-WebSocket-Accept is not the one the key calls for")
+            }
+            let me = self! ();
+            let reader = spawn! $( read_loop! sock r :client me );
+            Socket.make sock :client me reader (http.header "sec-websocket-protocol" msg)
+        },
+    }
+};
+
+// --- using a socket ------------------------------------------------------------------------
+
+/// The next message from this socket, waiting for it.
+let recv! : :map -> :any;
+let recv! socket = {
+    let reader = Socket.reader socket;
+    receive! { [:websocket, from, message] if from == reader => message }
+};
+
+/// The next message, or `:timeout` after `ms` milliseconds.
+let recv_within! : :map -> :integer -> :any;
+let recv_within! socket ms = {
+    let reader = Socket.reader socket;
+    receive! {
+        [:websocket, from, message] if from == reader => message,
+        after ms => :timeout,
+    }
+};
+
+/// Whether a message from `recv!` is this socket's, for a `receive!` that
+/// waits on a socket and on something else at once:
+/// `[:websocket, from, m] if ws.is_from socket from => ..`.
+let is_from : :map -> :any -> :bool;
+let is_from socket from = from == Socket.reader socket;
+
+let send_text! : :map -> :string -> :unit;
+let send_text! socket text = write_frame! socket 1 text;
+
+let send_binary! : :map -> :string -> :unit;
+let send_binary! socket bytes = write_frame! socket 2 bytes;
+
+/// A ping; the peer's pong is answered by nobody, which is fine -- a ping
+/// that cannot be sent is how a dead connection is found.
+let ping! : :map -> :string -> :unit;
+let ping! socket data = write_frame! socket 9 data;
+
+/// Close the socket cleanly, with code 1000.
+let close! : :map -> :unit;
+let close! socket = close_with! socket 1000 "";
+
+/// Close with a code and a reason: send the close frame, wait a moment for
+/// the peer's, and drop the connection.
+let close_with! : :map -> :integer -> :string -> :unit;
+let close_with! socket code reason = {
+    let reader = Socket.reader socket;
+    // The reader ends when the peer's close arrives, and may have already --
+    // when it was the peer that closed first, and the close was what this
+    // socket's owner last received. Watching it, rather than waiting for a
+    // close message, covers both, and costs no wait in the second.
+    proc.monitor! reader
+    try! { write_frame! socket 8 (be16 code + reason) } catch e { () }
+    receive! {
+        [:websocket, from, [:close, _, _]] if from == reader => (),
+        [:down, who, _] if who == reader => (),
+        after 1000 => (),
+    }
+    proc.demonitor! reader
+    // A report sent before the demonitor stays in the mailbox; take it.
+    receive! { [:down, who, _] if who == reader => (), after 0 => () }
+    try! { io.close! (Socket.connection socket) } catch e { () }
+    ()
+};
+
+priv let write_frame! : :map -> :integer -> :string -> :unit;
+priv let write_frame! socket opcode payload = {
+    streams.write_all! (Socket.connection socket) (frame opcode payload (Socket.role socket == :client) (crypto.random_bytes! 4))
+    ()
+};
+
+// --- frames ----------------------------------------------------------------------------------
+
+/// A whole frame: FIN set, the opcode, the length in 7, 16 or 64 bits, and
+/// the payload, masked with `key` when `masked`.
+let frame : :integer -> :string -> :bool -> :string -> :string;
+let frame opcode payload masked key = {
+    let n = len payload;
+    let mask_bit = if masked { 128 } else { 0 };
+    let length = if n < 126 { str.of_bytes [mask_bit + n] }
+                 else if n < 65536 { str.of_bytes [mask_bit + 126] + be16 n }
+                 else { str.of_bytes [mask_bit + 127] + be64 n };
+    str.of_bytes [128 + opcode] + length + (if masked { key + mask key payload } else { payload })
+};
+
+/// The payload exclusive-or'd with the key repeated, which is both masking
+/// and unmasking.
+let mask : :string -> :string -> :string;
+let mask key payload = {
+    let n = len payload;
+    if n == 0 { "" } else { crypto.xor payload (str.slice 0 n (str.repeat (n / 4 + 1) key)) }
+};
+
+priv let be16 : :integer -> :string;
+priv let be16 n = str.of_bytes [n / 256 % 256, n % 256];
+
+priv let be64 : :integer -> :string;
+priv let be64 n = str.of_bytes (list.map (fn k -> n / pow256 (7 - k) % 256) (list.range 0 8));
+
+priv let pow256 : :integer -> :integer;
+priv let rec pow256 k = if k <= 0 { 1 } else { 256 * pow256 (k - 1) };
+
+priv let u16 : :string -> :integer;
+priv let u16 b = str.byte 0 b * 256 + str.byte 1 b;
+
+/// The next frame: `[fin, opcode, payload, reader]`, the payload unmasked,
+/// or `()` at the end of the stream. A server's reader (`must_mask`)
+/// refuses an unmasked frame.
+priv let read_frame! : :any -> :bool -> :integer -> :any;
+priv let read_frame! r must_mask limit = {
+    let [head, r1] = http.read_exact! r 2;
+    let b0 = str.byte 0 head;
+    let b1 = str.byte 1 head;
+    let masked = b1 >= 128;
+    if must_mask && not masked { raise! (error.new :protocol "an unmasked frame from a client") }
+    let len7 = b1 % 128;
+    let [n, r2] = if len7 == 126 { let [b, rr] = http.read_exact! r1 2; [u16 b, rr] }
+                  else if len7 == 127 { let [b, rr] = http.read_exact! r1 8; [list.fold (fn acc i -> acc * 256 + str.byte i b) 0 (list.range 0 8), rr] }
+                  else { [len7, r1] };
+    if n > limit { raise! (error.new :too_large "a frame larger than the limit") }
+    let [key, r3] = if masked { http.read_exact! r2 4 } else { ["", r2] };
+    let [payload, r4] = http.read_exact! r3 n;
+    [b0 >= 128, b0 % 16, if masked { mask key payload } else { payload }, r4]
+};
+
+/// Read frames until the connection ends, delivering whole messages to
+/// `owner`, answering pings, and completing the closing handshake.
+priv let read_loop! : :any -> :any -> :atom -> :process -> :unit;
+priv let read_loop! sock r role owner = {
+    let me = self! ();
+    let deliver! m = { send! owner [:websocket, me, m]; () };
+    let reply! opcode payload = {
+        try! { streams.write_all! sock (frame opcode payload (role == :client) (crypto.random_bytes! 4)); () } catch e { () }
+    };
+    let rec go! rr partial_op parts !size = match try! { let f = read_frame! rr (role == :server) max_message; strict! f; [:ok, f] } catch e { [:error, e] } {
+        [:error, e] => {
+            let code = match error.kind e { :protocol => 1002, :too_large => 1009, _ => 1006 };
+            if code != 1006 { reply! 8 (be16 code) }
+            deliver! [:close, code, error.describe e]
+        },
+        [:ok, [fin, opcode, payload, r2]] => match opcode {
+            8 => {
+                let code = if len payload >= 2 { u16 payload } else { 1005 };
+                reply! 8 (if len payload >= 2 { str.slice 0 2 payload } else { "" })
+                deliver! [:close, code, if len payload > 2 { str.slice 2 (len payload - 2) payload } else { "" }]
+            },
+            9 => { reply! 10 payload; go! r2 partial_op parts size },
+            10 => go! r2 partial_op parts size,
+            0 => {
+                let size2 = size + len payload;
+                if size2 > max_message { reply! 8 (be16 1009); deliver! [:close, 1009, "a message larger than the limit"] }
+                else if fin { deliver! (message partial_op (str.concat_all (list.reverse (payload :: parts)))); go! r2 0 [] 0 }
+                else { go! r2 partial_op (payload :: parts) size2 }
+            },
+            op if op == 1 || op == 2 =>
+                if fin { deliver! (message op payload); go! r2 0 [] 0 }
+                else { go! r2 op [payload] (len payload) },
+            _ => { reply! 8 (be16 1002); deliver! [:close, 1002, "an opcode this end does not know"] },
+        },
+    };
+    go! r 0 [] 0
+};
+
+priv let message : :integer -> :string -> :any;
+priv let message op payload = if op == 2 { [:binary, payload] } else { [:text, payload] };
+
+when test {
+    import std.test;
+    import std.time;
+    import std.vm;
+    import std.http.server;
+
+    /// Every process a case started has ended: the runner's and the case's own
+    /// are the two that remain.
+    let settled! () = test.eq! 2 (test.eventually! (fn () -> vm.processes! ()) (fn n -> n <= 2) test.patience);
+
+    let echo! socket = match recv! socket {
+        [:text, t] => { send_text! socket ("echo " + t); echo! socket },
+        [:binary, b] => { send_binary! socket b; echo! socket },
+        _ => (),
+    };
+
+    let tests = [
+        test.case "the accept key, as the RFC's example has it"
+            $( test.eq! "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" (accept_for "dGhlIHNhbXBsZSBub25jZQ==") ),
+        test.case "masking is its own inverse" $( test.eq! "hello" (mask "abcd" (mask "abcd" "hello")) ),
+        test.case "frame lengths" $( test.eq! [2, 4, 10] [len (frame 1 "" false ""), len (frame 1 (str.repeat 126 "x") false "") - 126,
+                                                         len (frame 1 (str.repeat 70000 "x") false "") - 70000] ),
+        test.case "echo, text and binary, small and large" $( {
+            let s = server.serve! 0 (server.router |> server.get "/ws" (upgrade! echo!));
+            let got = match connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/ws") {
+                [:ok, socket] => {
+                    send_text! socket "hi"
+                    let a = recv! socket;
+                    send_binary! socket (str.of_bytes [0, 255, 1])
+                    let b = recv! socket;
+                    let big = str.repeat 50000 "0123";
+                    send_text! socket big
+                    let c = recv! socket;
+                    close! socket
+                    [a, b, c == [:text, "echo " + big]]
+                },
+                [:error, e] => [e],
+            };
+            server.stop! s
+            settled! ()
+            test.eq! [[:text, "echo hi"], [:binary, str.of_bytes [0, 255, 1]], true] got
+        } ),
+        test.case "the server's close reaches the client" $( {
+            let greet_and_go! socket = { send_text! socket "bye"; close_with! socket 4000 "done" };
+            let s = server.serve! 0 (server.router |> server.get "/" (upgrade! greet_and_go!));
+            let got = match connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/") {
+                [:ok, socket] => { let first = recv! socket; let second = recv! socket; [first, second] },
+                [:error, e] => [e],
+            };
+            server.stop! s
+            settled! ()
+            test.eq! [[:text, "bye"], [:close, 4000, "done"]] got
+        } ),
+        test.case "a subprotocol is agreed" $( {
+            let s = server.serve! 0 (server.router |> server.get "/" (upgrade_with! %{ :protocols => ["v2", "v1"] } echo!));
+            let got = match connect_with! %{ :protocols => ["v1", "v3"] } ("ws://127.0.0.1:" + to_string (server.port s) + "/") {
+                [:ok, socket] => { let p = Socket.protocol socket; close! socket; p },
+                [:error, e] => e,
+            };
+            server.stop! s
+            settled! ()
+            test.eq! "v1" got
+        } ),
+        test.case "a plain request is refused" $( {
+            let s = server.serve! 0 (server.router |> server.get "/" (upgrade! echo!));
+            let got = http.get! (server.local_url s);
+            server.stop! s
+            settled! ()
+            test.eq! [:ok, 400] (result.map http.status got)
+        } ),
+        test.case "recv_within times out" $( {
+            let quiet! socket = { recv! socket; () };
+            let s = server.serve! 0 (server.router |> server.get "/" (upgrade! quiet!));
+            let got = match connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/") {
+                [:ok, socket] => { let r = recv_within! socket 50; close! socket; r },
+                [:error, e] => e,
+            };
+            server.stop! s
+            settled! ()
+            test.eq! :timeout got
+        } ),
+        test.case "a handshake refused" $( {
+            let s = server.serve! 0 (server.router |> server.get "/" (fn req -> http.text "no"));
+            let got = connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/");
+            server.stop! s
+            settled! ()
+            test.eq! :handshake_refused (error.kind (result.reason () got))
+        } ),
+    ];
+}

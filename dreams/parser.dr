@@ -2840,6 +2840,11 @@ when test {
 
         test.case "private let retains its visibility"
             $( test.eq! "(priv (let x (int 1)))" (items "priv let x = 1;") ),
+        test.case "a receive! body keeps a declaration's span to itself"
+            $( test.true! (match parse_module "priv let f! u = receive! { x => x };\nlet y = 1;" {
+                   [:ok, [first, .._], _] => ast.span_end (ast.span first) <= 36,
+                   _ => false,
+               }) ),
         test.case "priv requires a let or type declaration"
             $( test.eq! "expected `let` or `type` after `priv`" (fails_module "priv mod a {}") ),
         test.case "priv is reserved as a binding name"

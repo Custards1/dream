@@ -290,7 +290,12 @@ let receive_e arms after span = {
         [_, .._] => list.map fill t,
         _ => t,
     };
-    fill generated
+    // The whole keeps the span it was written at. Freshening gives the
+    // scaffold synthetic spans past the end of any file, and a declaration
+    // takes its span from its body's: a `priv let f! u = receive! { .. }`
+    // whose span ran to the synthetic end made private everything after it.
+    let filled = fill generated;
+    list.reverse (span :: list.tail (list.reverse filled))
 };
 
 // --- unions --------------------------------------------------------------------
