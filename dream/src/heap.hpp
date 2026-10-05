@@ -99,6 +99,10 @@ void shared_census_walk(Value v, uint64_t round);
 void* tensor_handle(const TensorObj* t);
 void retain_external(Obj* o);
 void release_external(Obj* o);
+/// The most external memory a heap should let accumulate before it collects,
+/// whatever the doubling rule says: a quarter of the GPU's memory once a GPU
+/// is in use, and no bound before then. Defined beside the tensors.
+size_t external_budget();
 
 /// Supplies the roots for a collection. Implemented by Process.
 struct RootSource {
@@ -365,6 +369,9 @@ public:
     size_t bytes_allocated() const { return allocated_; }
     size_t bytes_live() const { return live_after_gc_; }
     uint64_t collections() const { return collections_; }
+    /// Memory held outside the heap by objects in it: GPU buffers, a
+    /// bignum's limbs.
+    size_t external_bytes() const { return external_bytes_; }
     uint64_t major_collections() const { return major_collections_; }
     uint64_t minor_collections() const { return minor_collections_; }
     /// Rounds that were divided across the helper threads rather than run on

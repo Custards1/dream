@@ -1,0 +1,140 @@
+// Initial weights: tensors whose spread keeps a network's signals from
+// growing or dying as they pass through its layers.
+//
+//     init.glorot_uniform 7 [784, 128]     // a dense layer's weights
+//     init.he_normal 7 [128, 64]           // ..before a relu
+//     init.zeros 0 [64]                    // a bias
+//
+// **An initializer is a function of a seed and a shape**, `:integer ->
+// [:integer] -> :tensor`, so a layer is handed one and calls it, and anything
+// with that shape -- a closure over a constant, a pretrained table -- will do.
+// The same seed gives the same tensor on every machine (`tensor.random` and
+// `tensor.normal` are splitmix64 streams), which is what makes a training
+// run repeatable.
+//
+// **Fan in and fan out** are read off the shape the way every framework reads
+// them: for a matrix, its rows and its columns; for anything larger, the last
+// two axes scaled by the rest (a convolution's kernel as `[.., in, out]`).
+// Glorot (Xavier) keeps the variance of both the forward signal and the
+// backward gradient near one, for `tanh` and `sigmoid`; He doubles it, for
+// `relu`, which zeroes half its inputs; LeCun is Glorot's forward half alone,
+// for `selu`-like units.
+
+import std.list;
+import std.math;
+import std.tensor;
+
+/// What an initializer is.
+type Init = :integer -> [:integer] -> :tensor;
+
+/// The fan in and fan out of a weight of `shape`.
+let fans : [:integer] -> [:integer, :integer];
+let fans shape = match shape {
+    [n] => [n, n],
+    [a, b] => [a, b],
+    _ => {
+        let r = len shape;
+        let field = list.fold_strict (fn !a b -> a * b) 1 (list.take (r - 2) shape);
+        [shape.[r - 2] * field, shape.[r - 1] * field]
+    },
+};
+
+/// Uniform in `[lo, hi)`.
+let uniform : :float -> :float -> Init;
+let uniform lo hi seed shape = tensor.random seed shape * (hi - lo) + lo;
+
+/// Normal with mean 0 and standard deviation `sd`.
+let normal : :float -> Init;
+let normal sd seed shape = tensor.normal seed shape * sd;
+
+/// Normal, with anything past two standard deviations drawn again -- here,
+/// folded back inside, which keeps the shape of the tails' absence without a
+/// loop: the distribution most transformer recipes ask for.
+let truncated_normal : :float -> Init;
+let truncated_normal sd seed shape = {
+    let z = tensor.normal seed shape;
+    let folded = tensor.min (tensor.max z (-2.0)) 2.0;
+    let refill = tensor.min (tensor.max (tensor.normal (seed + 1) shape * 0.5) (-2.0)) 2.0;
+    let inside = tensor.le (tensor.abs z) 2.0;
+    (inside * folded + (1.0 - inside) * refill) * sd
+};
+
+let zeros : Init;
+let zeros seed shape = tensor.zeros shape;
+
+let ones : Init;
+let ones seed shape = tensor.ones shape;
+
+/// Every number `c`.
+let constant : :float -> Init;
+let constant c seed shape = tensor.fill shape c;
+
+/// Glorot (Xavier) uniform: `[-l, l]` with `l = sqrt (6 / (in + out))`.
+let glorot_uniform : Init;
+let glorot_uniform seed shape = {
+    let [i, o] = fans shape;
+    let l = math.sqrt (6.0 / (i + o));
+    uniform (-l) l seed shape
+};
+
+/// Glorot (Xavier) normal: standard deviation `sqrt (2 / (in + out))`.
+let glorot_normal : Init;
+let glorot_normal seed shape = { let [i, o] = fans shape; normal (math.sqrt (2.0 / (i + o))) seed shape };
+
+/// He (Kaiming) normal, for `relu`: standard deviation `sqrt (2 / in)`.
+let he_normal : Init;
+let he_normal seed shape = { let [i, _] = fans shape; normal (math.sqrt (2.0 / i)) seed shape };
+
+/// He (Kaiming) uniform: `[-l, l]` with `l = sqrt (6 / in)`.
+let he_uniform : Init;
+let he_uniform seed shape = { let [i, _] = fans shape; let l = math.sqrt (6.0 / i); uniform (-l) l seed shape };
+
+/// LeCun normal: standard deviation `sqrt (1 / in)`.
+let lecun_normal : Init;
+let lecun_normal seed shape = { let [i, _] = fans shape; normal (math.sqrt (1.0 / i)) seed shape };
+
+/// An orthogonal matrix (scaled by `gain`) for a square-ish weight: the
+/// Q of a Gram-Schmidt pass over a normal matrix, which keeps a recurrent
+/// layer's repeated products from growing or shrinking. A shape that is not
+/// a matrix is normal instead.
+let orthogonal : :float -> Init;
+let orthogonal gain seed shape = match shape {
+    [r, c] => {
+        let tall = r >= c;
+        let [n, m] = if tall { [r, c] } else { [c, r] };
+        let cols = list.map (fn j -> tensor.normal (seed + j) [n]) (list.range 0 m);
+        let q = gram_schmidt cols;
+        let qm = tensor.transpose (tensor.concat (list.map (fn v -> tensor.reshape [1, n] v) q));
+        (if tall { qm } else { tensor.transpose qm }) * gain
+    },
+    _ => normal gain seed shape,
+};
+
+priv let gram_schmidt : [:tensor] -> [:tensor];
+priv let gram_schmidt vs = list.reverse (list.fold (fn done v -> {
+    let w = list.fold (fn acc u -> acc - tensor.dot acc u * u) v done;
+    (w / tensor.norm w) :: done
+}) [] vs);
+
+/// A seed for the `i`th of several things made from `seed`: far enough apart
+/// that their streams do not overlap, and the same on every run.
+let seed_for : :integer -> :integer -> :integer;
+let seed_for seed i = (seed * 1000003 + i * 7919 + 17) % 2305843009213693951;
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "fans of a matrix" $( test.eq! [3, 4] (fans [3, 4]) ),
+        test.case "fans of a kernel" $( test.eq! [27, 144] (fans [3, 3, 3, 16]) ),
+        test.case "glorot stays inside its limit"
+            $( test.true! (tensor.maximum (tensor.abs (glorot_uniform 1 [50, 50])) <= math.sqrt (6.0 / 100.0)) ),
+        test.case "he normal has the right spread"
+            $( test.near! 2.0e-4 (2.0 / 400.0) (tensor.mean (he_normal 3 [400, 400] * he_normal 3 [400, 400])) ),
+        test.case "the same seed, the same weights" $( test.eq! (he_normal 5 [3, 3]) (he_normal 5 [3, 3]) ),
+        test.case "orthogonal columns"
+            $( test.true! ({ let q = orthogonal 1.0 2 [5, 3]; tensor.maximum (tensor.abs (tensor.transpose q @ q - tensor.identity 3)) < 1.0e-9 }) ),
+        test.case "truncated normal stays inside" $( test.true! (tensor.maximum (tensor.abs (truncated_normal 1.0 4 [1000])) <= 2.0) ),
+        test.case "derived seeds differ" $( test.ne! (seed_for 1 0) (seed_for 1 1) ),
+    ];
+}

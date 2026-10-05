@@ -1,0 +1,263 @@
+// Optimizers: how a gradient becomes a change to the parameters.
+//
+//     let opt = optim.adam 0.001;
+//     let state = optim.start opt params;
+//     let [params2, state2] = optim.step opt grads state params;
+//
+//     optim.sgd_with 0.1 %{ :momentum => 0.9, :nesterov => true }
+//     optim.adamw 0.001 0.01                        // decoupled weight decay
+//     optim.adam (optim.cosine 0.001 10000 0.0)     // a schedule for the rate
+//     optim.clip_norm 1.0 (optim.adam 0.001)        // gradients held to a length
+//
+// **An optimizer is a value**: a record of `init params -> state` and
+// `update grads state params -> [params, state]`. Its state -- the step
+// count, Adam's moments, momentum's velocity -- is data handed back each
+// step, the same shape as the parameters (`std.ml.tree`), so a training run
+// can be stopped, saved and resumed by keeping two trees. Nothing here
+// mutates; every update answers new tensors.
+//
+// **The arithmetic fuses.** Adam's update of one parameter is a dozen
+// elementwise operations over the parameter, its gradient and two moments;
+// `std.tensor` records them and runs each new tensor as one pass (or one GPU
+// kernel) where it is read. A training loop should force the new parameters
+// and state each step (`strict!`, which `ml.fit!` does), so that a step's
+// work is done once and not again inside the next step's chain.
+//
+// **A learning rate is a number or a schedule**, a function from the step
+// (counting from 0) to the rate. The schedules here are those.
+
+import std.map;
+import std.math;
+import std.ml.tree;
+import std.tensor;
+
+/// An optimizer: its name, `init params -> state`, and `update grads state
+/// params -> [params, state]`.
+mapping Optimizer {
+    name : :string
+    init : :any
+    update : :any
+}
+
+/// The state `opt` starts from for `params`.
+let start : Optimizer -> :any -> :any;
+let start opt params = (Optimizer.init opt) params;
+
+/// One step: the new parameters and state, from the gradient.
+let step : Optimizer -> :any -> :any -> :any -> [:any, :any];
+let step opt grads state params = (Optimizer.update opt) grads state params;
+
+/// The rate at step `t`: a number as it is, a schedule applied.
+let rate : :any -> :integer -> :float;
+let rate lr t = rate_of (type_of lr) lr t;
+
+priv let rate_of : :atom -> :any -> :integer -> :float;
+priv let rate_of kind lr t = match kind { :float => lr, :integer => 1.0 * lr, _ => 1.0 * lr t };
+
+/// The step count a state carries.
+let steps : :any -> :integer;
+let steps state = state.["t" else 0];
+
+// --- the optimizers ------------------------------------------------------------------------
+
+/// Plain stochastic gradient descent: `p - lr * g`.
+let sgd : :any -> Optimizer;
+let sgd lr = sgd_with lr %{};
+
+/// SGD with options: `:momentum` (0), `:nesterov` (false), `:weight_decay`
+/// (0, added to the gradient as `wd * p`, which is L2 regularization).
+let sgd_with : :any -> %{:atom => :any} -> Optimizer;
+let sgd_with lr opts = {
+    let mu = 1.0 * opts.[:momentum else 0.0];
+    let nesterov = opts.[:nesterov else false];
+    let wd = 1.0 * opts.[:weight_decay else 0.0];
+    let decayed g p = if wd > 0.0 { g + wd * p } else { g };
+    Optimizer.make "sgd"
+        (fn params -> %{"t" => 0, "v" => if mu > 0.0 { tree.zeros_like params } else { () }})
+        (fn grads state params -> {
+            let t = steps state;
+            let a = rate lr t;
+            if mu > 0.0 {
+                let v = tree.map3 (fn vel g p -> mu * vel + decayed g p) state.["v"] grads params;
+                let dir = if nesterov { tree.map3 (fn g vel p -> decayed g p + mu * vel) grads v params } else { v };
+                [tree.map2 (fn p d -> p - a * d) params dir, %{"t" => t + 1, "v" => v}]
+            } else {
+                [tree.map2 (fn p g -> p - a * decayed g p) params grads, %{"t" => t + 1, "v" => ()}]
+            }
+        })
+};
+
+/// Adam: per-parameter rates from running means of the gradient and its
+/// square, corrected for starting at zero. `beta1` 0.9, `beta2` 0.999,
+/// `eps` 1e-8.
+let adam : :any -> Optimizer;
+let adam lr = adam_with lr %{};
+
+/// AdamW: Adam with weight decay applied to the parameters directly
+/// (`p - lr * wd * p`), rather than through the gradient where Adam's
+/// scaling would undo it.
+let adamw : :any -> :float -> Optimizer;
+let adamw lr wd = adam_with lr %{:decay => wd};
+
+/// Adam with options: `:beta1`, `:beta2`, `:eps`, `:decay` (decoupled
+/// weight decay, as AdamW; 0) and `:weight_decay` (L2, through the
+/// gradient; 0).
+let adam_with : :any -> %{:atom => :any} -> Optimizer;
+let adam_with lr opts = {
+    let b1 = 1.0 * opts.[:beta1 else 0.9];
+    let b2 = 1.0 * opts.[:beta2 else 0.999];
+    let eps = 1.0 * opts.[:eps else 1.0e-8];
+    let decay = 1.0 * opts.[:decay else 0.0];
+    let l2 = 1.0 * opts.[:weight_decay else 0.0];
+    Optimizer.make (if decay > 0.0 { "adamw" } else { "adam" })
+        (fn params -> %{"t" => 0, "m" => tree.zeros_like params, "v" => tree.zeros_like params})
+        (fn grads state params -> {
+            let t = steps state + 1;
+            let a = rate lr (t - 1);
+            let g2 = if l2 > 0.0 { tree.map2 (fn g p -> g + l2 * p) grads params } else { grads };
+            let m = tree.map2 (fn mo g -> b1 * mo + (1.0 - b1) * g) state.["m"] g2;
+            let v = tree.map2 (fn ve g -> b2 * ve + (1.0 - b2) * g * g) state.["v"] g2;
+            // The bias corrections are numbers, folded into one scale.
+            let c1 = 1.0 - math.pow b1 t;
+            let c2 = 1.0 - math.pow b2 t;
+            let a_t = a * math.sqrt c2 / c1;
+            let eps_t = eps * math.sqrt c2;
+            let move p mo ve = {
+                let stepped = p - a_t * mo / (sqrt_of ve + eps_t);
+                if decay > 0.0 { stepped - a * decay * p } else { stepped }
+            };
+            [tree.map3 move params m v, %{"t" => t, "m" => m, "v" => v}]
+        })
+};
+
+/// RMSProp: each parameter's rate divided by a running root mean square of
+/// its gradients. `rho` 0.9, `eps` 1e-8.
+let rmsprop : :any -> Optimizer;
+let rmsprop lr = rmsprop_with lr %{};
+
+let rmsprop_with : :any -> %{:atom => :any} -> Optimizer;
+let rmsprop_with lr opts = {
+    let rho = 1.0 * opts.[:rho else 0.9];
+    let eps = 1.0 * opts.[:eps else 1.0e-8];
+    Optimizer.make "rmsprop"
+        (fn params -> %{"t" => 0, "s" => tree.zeros_like params})
+        (fn grads state params -> {
+            let t = steps state;
+            let a = rate lr t;
+            let s = tree.map2 (fn sq g -> rho * sq + (1.0 - rho) * g * g) state.["s"] grads;
+            [tree.map3 (fn p g sq -> p - a * g / (sqrt_of sq + eps)) params grads s, %{"t" => t + 1, "s" => s}]
+        })
+};
+
+/// Adagrad: each parameter's rate divided by the root of the sum of all its
+/// squared gradients so far. `eps` 1e-10.
+let adagrad : :any -> Optimizer;
+let adagrad lr = Optimizer.make "adagrad"
+    (fn params -> %{"t" => 0, "s" => tree.zeros_like params})
+    (fn grads state params -> {
+        let t = steps state;
+        let a = rate lr t;
+        let s = tree.map2 (fn sq g -> sq + g * g) state.["s"] grads;
+        [tree.map3 (fn p g sq -> p - a * g / (sqrt_of sq + 1.0e-10)) params grads s, %{"t" => t + 1, "s" => s}]
+    });
+
+priv let sqrt_of : :any -> :any;
+priv let sqrt_of x = if type_of x == :tensor { tensor.sqrt x } else { math.sqrt x };
+
+// --- around an optimizer --------------------------------------------------------------------
+
+/// `opt` with each gradient scaled down, when the whole gradient is longer
+/// than `max`, to length `max`: a bound on how far one bad batch can throw
+/// the parameters.
+let clip_norm : :float -> Optimizer -> Optimizer;
+let clip_norm max opt = Optimizer.make (Optimizer.name opt + " (clipped)") (Optimizer.init opt)
+    (fn grads state params -> {
+        let n = tree.norm grads;
+        let g = if n > max { tree.map_numeric (fn x -> x * (max / n)) grads } else { grads };
+        step opt g state params
+    });
+
+/// `opt` with every gradient held to `[-limit, limit]`, number by number.
+let clip_value : :float -> Optimizer -> Optimizer;
+let clip_value limit opt = Optimizer.make (Optimizer.name opt + " (clipped)") (Optimizer.init opt)
+    (fn grads state params -> {
+        let held t = tensor.min (tensor.max t (-limit)) limit;
+        let clip x = if type_of x == :tensor { held x } else { tensor.sum (held (tensor.of_list [x])) };
+        step opt (tree.map_numeric clip grads) state params
+    });
+
+// --- schedules -----------------------------------------------------------------------------
+
+/// The same rate at every step.
+let constant : :float -> (:integer -> :float);
+let constant lr t = lr;
+
+/// `lr`, multiplied by `factor` every `every` steps.
+let step_decay : :float -> :integer -> :float -> (:integer -> :float);
+let step_decay lr every factor t = lr * math.pow factor (t / every);
+
+/// `lr * factor ^ (t / steps)`: a smooth exponential decay.
+let exponential : :float -> :integer -> :float -> (:integer -> :float);
+let exponential lr steps factor t = lr * math.pow factor (1.0 * t / steps);
+
+/// From `lr` down to `floor` along half a cosine over `total` steps, then
+/// `floor`.
+let cosine : :float -> :integer -> :float -> (:integer -> :float);
+let cosine lr total floor t =
+    if t >= total { floor }
+    else { floor + 0.5 * (lr - floor) * (1.0 + math.cos (3.141592653589793 * t / total)) };
+
+/// A straight line from `lr` to `last` over `total` steps, then `last`.
+let linear : :float -> :float -> :integer -> (:integer -> :float);
+let linear lr last total t = if t >= total { last } else { lr + (last - lr) * t / total };
+
+/// `schedule`, after a linear warm-up from 0 over the first `steps` steps:
+/// what a large model wants before its moments have settled.
+let warmup : :integer -> (:integer -> :float) -> (:integer -> :float);
+let warmup steps schedule t =
+    if t < steps { schedule 0 * (t + 1) / steps } else { schedule (t - steps) };
+
+when test {
+    import std.list;
+    import std.test;
+
+    // Minimizing (p - 3)^2 from 0: every optimizer should get close.
+    let target = tensor.fill [4] 3.0;
+    let grad_at p = 2.0 * (p - target);
+    let run opt n = {
+        let rec go i p s = if i == n { p } else {
+            let [p2, s2] = step opt (grad_at p) s p;
+            go (i + 1) p2 s2
+        };
+        let p0 = tensor.zeros [4];
+        go 0 p0 (start opt p0)
+    };
+    let near p = tensor.maximum (tensor.abs (p - target)) < 0.05;
+
+    let tests = [
+        test.case "sgd" $( test.true! (near (run (sgd 0.1) 100)) ),
+        test.case "momentum" $( test.true! (near (run (sgd_with 0.05 %{:momentum => 0.9}) 200)) ),
+        test.case "nesterov" $( test.true! (near (run (sgd_with 0.05 %{:momentum => 0.9, :nesterov => true}) 200)) ),
+        test.case "adam" $( test.true! (near (run (adam 0.1) 300)) ),
+        test.case "adamw" $( test.true! (near (run (adamw 0.1 0.0001) 300)) ),
+        test.case "rmsprop" $( test.true! (near (run (rmsprop 0.01) 500)) ),
+        test.case "adagrad" $( test.true! (near (run (adagrad 0.5) 300)) ),
+        test.case "clipped" $( test.true! (near (run (clip_norm 1.0 (sgd 0.1)) 200)) ),
+        test.case "a tree of parameters"
+            $( test.true! ({
+                let opt = adam 0.1;
+                let p = %{"a" => tensor.zeros [2], "b" => [0.0]};
+                let g q = %{"a" => 2.0 * (q.["a"] - 1.0), "b" => [2.0 * (q.["b"].[0] - 1.0)]};
+                let rec go i q s = if i == 200 { q } else { let [q2, s2] = step opt (g q) s q; go (i + 1) q2 s2 };
+                let r = go 0 p (start opt p);
+                tensor.maximum (tensor.abs (r.["a"] - 1.0)) < 0.05 && r.["b"].[0] > 0.95
+            }) ),
+        test.case "the first step of adam moves by the rate"
+            $( test.near! 1.0e-6 (-0.1) (tensor.sum ((step (adam 0.1) (tensor.of_list [5.0]) (start (adam 0.1) (tensor.of_list [0.0])) (tensor.of_list [0.0])).[0])) ),
+        test.case "cosine ends at its floor" $( test.near! 1.0e-12 0.0 (cosine 1.0 100 0.0 100) ),
+        test.case "cosine is half way at half way" $( test.near! 1.0e-12 0.5 (cosine 1.0 100 0.0 50) ),
+        test.case "warmup rises" $( test.eq! [0.25, 0.5, 0.75, 1.0, 1.0] (list.map (warmup 4 (constant 1.0)) (list.range 0 5)) ),
+        test.case "step decay" $( test.near! 1.0e-12 0.25 (step_decay 1.0 10 0.5 25) ),
+        test.case "a schedule as the rate" $( test.near! 1.0e-12 0.5 (rate (cosine 1.0 100 0.0) 50) ),
+    ];
+}

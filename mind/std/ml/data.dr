@@ -1,0 +1,303 @@
+// Datasets: examples and their targets, and what is done to them before a
+// model sees them.
+//
+//     let ds = data.of_lists [[5.1, 3.5], [4.9, 3.0], ..] [0, 0, ..];
+//     let [train, test] = data.split 0.8 7 ds;          // a fifth held out
+//     let scaler = data.fit_standard (data.x train);    // learned from train only
+//     let train2 = data.scale_x scaler train;
+//     data.batches 32 (data.shuffle 1 train2)           // a list of batches
+//
+//     let ds = data.of_csv! "iris.csv" %{ :target => 4 } // the fifth column is y
+//
+// **A dataset is two tensors with a row per example** (`Dataset`): `x`, the
+// inputs, and `y`, the targets -- a class per example, rows of
+// probabilities, or numbers to regress on. Every function here keeps rows
+// together: a shuffle takes the same rows of both (`tensor.take`), a batch is
+// the same slice of both (`tensor.slice`). Both are tensors, so a dataset
+// moved to the GPU (`to_gpu`) is shuffled and batched there, with nothing
+// copied back.
+//
+// **A scaler is learned, then applied.** `fit_standard` reads the mean and
+// spread of each column of the training inputs; `scale` applies that same
+// shift and stretch to anything else -- the test set, tomorrow's input --
+// which must not be scaled by its own statistics. A scaler is a value and
+// can be saved beside the model.
+//
+// **The synthetic sets** -- `spirals`, `blobs`, `linear` -- are for trying a
+// model on a problem whose answer is known, and are the same for the same
+// seed everywhere.
+
+import std.file;
+import std.list;
+import std.math;
+import std.ml.ops;
+import std.num;
+import std.str;
+import std.tensor;
+
+/// Examples and targets, a row of each per example.
+mapping Dataset {
+    x : :tensor
+    y : :tensor
+}
+
+/// A dataset of two tensors with the same number of rows. (`ml.fit!` says so
+/// when they do not.)
+let make : :tensor -> :tensor -> Dataset;
+let make x y = Dataset.make x y;
+
+/// A dataset from lists: rows of numbers, and a target per row (a number, a
+/// class, or a row).
+let of_lists : [:any] -> [:any] -> Dataset;
+let of_lists xs ys = make (tensor.of_list xs) (tensor.of_list ys);
+
+let x : Dataset -> :tensor;
+let x ds = Dataset.x ds;
+
+let y : Dataset -> :tensor;
+let y ds = Dataset.y ds;
+
+/// How many examples.
+let size : Dataset -> :integer;
+let size ds = ops.rows (x ds);
+
+/// The shape of one example's input.
+let example_shape : Dataset -> [:integer];
+let example_shape ds = list.drop 1 (tensor.shape (x ds));
+
+/// The examples at `indices`, in that order.
+let rows : [:integer] -> Dataset -> Dataset;
+let rows indices ds = Dataset.make (tensor.take indices (x ds)) (tensor.take indices (y ds));
+
+/// `count` examples from `start`.
+let slice : :integer -> :integer -> Dataset -> Dataset;
+let slice start count ds = Dataset.make (tensor.slice start count (x ds)) (tensor.slice start count (y ds));
+
+/// The examples in an order fixed by `seed`.
+let shuffle : :integer -> Dataset -> Dataset;
+let shuffle seed ds = rows (ops.permutation seed (size ds)) ds;
+
+/// The dataset in batches of `n` examples, in order; the last may be smaller.
+/// A list, computed batch by batch as it is walked.
+let batches : :integer -> Dataset -> [Dataset];
+let batches n ds = {
+    let total = size ds;
+    list.map (fn start -> slice start (if start + n > total { total - start } else { n }) ds)
+        (list.map (fn i -> i * n) (list.range 0 ((total + n - 1) / n)))
+};
+
+/// The dataset shuffled by `seed` and split in two, the first with `share`
+/// of the examples: a training set and a held-out one.
+let split : :float -> :integer -> Dataset -> [Dataset, Dataset];
+let split share seed ds = {
+    let n = size ds;
+    let order = ops.permutation seed n;
+    let k = math.floor (share * n);
+    let cut = if k < 1 { 1 } else if k >= n { n - 1 } else { k };
+    [rows (list.take cut order) ds, rows (list.drop cut order) ds]
+};
+
+/// The dataset in `k` folds, each answered as `[train, held_out]`: what
+/// cross-validation trains and scores on, `k` times.
+let folds : :integer -> :integer -> Dataset -> [[Dataset, Dataset]];
+let folds k seed ds = {
+    let n = size ds;
+    let order = ops.permutation seed n;
+    let bounds i = [i * n / k, (i + 1) * n / k];
+    list.map (fn i -> {
+        let [lo, hi] = bounds i;
+        let held = list.take (hi - lo) (list.drop lo order);
+        let rest = list.take lo order + list.drop hi order;
+        [rows rest ds, rows held ds]
+    }) (list.range 0 k)
+};
+
+/// Both tensors on the GPU (float32), when there is one.
+let to_gpu : Dataset -> Dataset;
+let to_gpu ds = if tensor.gpu_available () { Dataset.make (tensor.gpu (x ds)) (tensor.gpu (y ds)) } else { ds };
+
+/// Both tensors on the host.
+let to_host : Dataset -> Dataset;
+let to_host ds = Dataset.make (tensor.host (x ds)) (tensor.host (y ds));
+
+/// The targets, as classes, made one-hot rows `k` wide.
+let one_hot : :integer -> Dataset -> Dataset;
+let one_hot k ds = Dataset.set_y (tensor.one_hot k (tensor.host (y ds))) ds;
+
+/// How many classes the targets name: one more than the largest.
+let class_count : Dataset -> :integer;
+let class_count ds = num.to_int (tensor.maximum (y ds)) + 1;
+
+// --- scaling ------------------------------------------------------------------------------
+
+/// A learned change of each input column: subtract `shift`, divide by
+/// `stretch`.
+mapping Scaler {
+    shift : :tensor
+    stretch : :tensor
+}
+
+/// Each column to mean 0 and standard deviation 1, as measured on `t`. A
+/// column that never changes is left its spread of 1 rather than divided by 0.
+let fit_standard : :tensor -> Scaler;
+let fit_standard t = {
+    let mean = ops.mean_axis 0 t;
+    let sd = tensor.sqrt (ops.var_axis 0 t);
+    Scaler.make mean (sd + tensor.eq sd 0.0)
+};
+
+/// Each column to `[0, 1]`, as measured on `t`.
+let fit_minmax : :tensor -> Scaler;
+let fit_minmax t = {
+    let lo = tensor.min_axis 0 t;
+    let range = tensor.max_axis 0 t - lo;
+    Scaler.make lo (range + tensor.eq range 0.0)
+};
+
+/// `t` changed by the scaler, on whatever device `t` is.
+let scale : Scaler -> :tensor -> :tensor;
+let scale s t = (t - ops.like t (Scaler.shift s)) / ops.like t (Scaler.stretch s);
+
+/// The change undone: scaled numbers back in the original units.
+let unscale : Scaler -> :tensor -> :tensor;
+let unscale s t = t * ops.like t (Scaler.stretch s) + ops.like t (Scaler.shift s);
+
+/// A dataset with its inputs scaled.
+let scale_x : Scaler -> Dataset -> Dataset;
+let scale_x s ds = Dataset.set_x (scale s (x ds)) ds;
+
+/// A dataset with its targets scaled -- a regression's, to put them in the
+/// range the model's output starts in.
+let scale_y : Scaler -> Dataset -> Dataset;
+let scale_y s ds = Dataset.set_y (scale s (y ds)) ds;
+
+// --- reading --------------------------------------------------------------------------------
+
+/// The rows of a CSV file of numbers, as lists of floats. A first line that
+/// is not numbers is taken as a header and skipped, as are blank lines. A
+/// field that is not a number raises, naming its line.
+let read_csv! : :string -> [[:float]];
+let read_csv! path = match file.read! path {
+    () => raise! ("cannot read " + path),
+    text => match parse_csv text {
+        [:ok, table] => table,
+        [:error, why] => raise! (path + ": " + why),
+    },
+};
+
+/// The rows of CSV text, as `read_csv!` reads a file: `[:ok, rows]`, or
+/// `[:error, why]` naming the first line with a field that is not a number.
+let parse_csv : :string -> [:ok, [[:any]]] | [:error, :string];
+let parse_csv text = {
+    let lines = list.filter (fn [_, l] -> not (str.is_empty l))
+        (list.enumerate (list.map str.trim (str.split "\n" text)));
+    let body = match lines {
+        [[_, first], ..rest] => if is_header first { rest } else { lines },
+        [] => [],
+    };
+    let parsed = list.map (fn [i, l] -> [i, list.map field (str.split "," l)]) body;
+    match list.filter (fn [_, r] -> list.contains () r) parsed {
+        [] => [:ok, list.map (fn [_, r] -> r) parsed],
+        [[i, _], .._] => [:error, "line " + to_string (i + 1) + " has a field that is not a number"],
+    }
+};
+
+priv let is_header : :string -> :bool;
+priv let is_header line = list.any (fn f -> num.parse_float (str.trim f) == () && num.parse_int (str.trim f) == ()) (str.split "," line);
+
+/// A field as a float, or `()` when it is not a number.
+priv let field : :string -> :float | :unit;
+priv let field text = {
+    let t = str.trim text;
+    match num.parse_float t {
+        () => match num.parse_int t { () => (), n => 1.0 * n },
+        f => f,
+    }
+};
+
+/// A dataset from a CSV file of numbers. `opts` takes `:target`, the column
+/// that is the target (the last, by default; `-1` counts from the end);
+/// every other column is an input.
+let of_csv! : :string -> %{:atom => :any} -> Dataset;
+let of_csv! path opts = of_rows (read_csv! path) opts.[:target else -1];
+
+/// A dataset from rows of numbers, column `target` the target.
+let of_rows : [[:float]] -> :integer -> Dataset;
+let of_rows table target = {
+    let width = len (list.head table);
+    let t = if target < 0 { width + target } else { target };
+    let inputs = list.map (fn r -> list.map (fn [_, v] -> v) (list.filter (fn [j, _] -> j != t) (list.enumerate r))) table;
+    let targets = list.map (fn r -> list.nth t r) table;
+    make (tensor.of_list inputs) (tensor.of_list targets)
+};
+
+// --- synthetic --------------------------------------------------------------------------------
+
+/// `k` interleaved spirals of `n` points each in the plane, the class of each
+/// point its spiral: a problem no straight line separates.
+let spirals : :integer -> :integer -> :integer -> Dataset;
+let spirals seed n k = {
+    let one c = {
+        let t = tensor.range n / n;
+        let theta = t * 4.0 + 2.0 * 3.141592653589793 * c / k + tensor.normal (seed + c) [n] * 0.2;
+        let pts = tensor.concat [tensor.reshape [1, n] (t * tensor.sin theta), tensor.reshape [1, n] (t * tensor.cos theta)];
+        [tensor.transpose pts, tensor.fill [n] (1.0 * c)]
+    };
+    let parts = list.map one (list.range 0 k);
+    make (tensor.concat (list.map (fn [a, _] -> a) parts)) (tensor.concat (list.map (fn [_, b] -> b) parts))
+};
+
+/// `k` round clusters of `n` points each in `dim` dimensions, centres drawn
+/// in `[-5, 5]`, spread 1; the class of each point its cluster.
+let blobs : :integer -> :integer -> :integer -> :integer -> Dataset;
+let blobs seed n k dim = {
+    let centres = tensor.random seed [k, dim] * 10.0 - 5.0;
+    let one c = [tensor.normal (seed + 1 + c) [n, dim] + centres.[c], tensor.fill [n] (1.0 * c)];
+    let parts = list.map one (list.range 0 k);
+    make (tensor.concat (list.map (fn [a, _] -> a) parts)) (tensor.concat (list.map (fn [_, b] -> b) parts))
+};
+
+/// `n` points of `dim` inputs and a target that is a fixed linear function of
+/// them plus normal noise of spread `noise`: a regression whose best fit is
+/// known (`linear_truth`).
+let linear : :integer -> :integer -> :integer -> :float -> Dataset;
+let linear seed n dim noise = {
+    let xs = tensor.normal seed [n, dim];
+    let w = linear_truth seed dim;
+    make xs (tensor.reshape [n, 1] (xs @ w + 0.5 + tensor.normal (seed + 1) [n] * noise))
+};
+
+/// The weights `linear` drew its targets from (its intercept is 0.5).
+let linear_truth : :integer -> :integer -> :tensor;
+let linear_truth seed dim = tensor.random (seed + 2) [dim] * 4.0 - 2.0;
+
+when test {
+    import std.test;
+
+    let ds = of_lists [[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]] [0, 1, 0, 1, 0];
+
+    let tests = [
+        test.case "size" $( test.eq! 5 (size ds) ),
+        test.case "rows keep x and y together"
+            $( test.eq! [[3.0, 30.0], 0.0] ({ let r = rows [2] ds; [tensor.to_list (x r).[0], (y r).[0]] }) ),
+        test.case "batches cover everything"
+            $( test.eq! [2, 2, 1] (list.map size (batches 2 ds)) ),
+        test.case "a shuffle keeps the pairs"
+            $( test.true! ({ let s = shuffle 3 ds; tensor.sum (x s) == tensor.sum (x ds) && tensor.sum ((tensor.sum_axis 1 (x s)) * (y s)) == tensor.sum ((tensor.sum_axis 1 (x ds)) * (y ds)) }) ),
+        test.case "split" $( test.eq! [4, 1] (list.map size (split 0.8 1 ds)) ),
+        test.case "folds hold out everything once"
+            $( test.eq! 5 (list.fold (fn n [_, held] -> n + size held) 0 (folds 5 2 ds)) ),
+        test.case "standard scaling"
+            $( test.true! ({ let s = scale (fit_standard (x ds)) (x ds); tensor.maximum (tensor.abs (ops.mean_axis 0 s)) < 1.0e-12 && tensor.maximum (tensor.abs (ops.var_axis 0 s - 1.0)) < 1.0e-9 }) ),
+        test.case "unscale undoes scale"
+            $( test.true! ({ let sc = fit_minmax (x ds); tensor.maximum (tensor.abs (unscale sc (scale sc (x ds)) - x ds)) < 1.0e-9 }) ),
+        test.case "minmax reaches 0 and 1" $( test.eq! [0.0, 1.0] ({ let s = scale (fit_minmax (x ds)) (x ds); [tensor.minimum s, tensor.maximum s] }) ),
+        test.case "csv with a header" $( test.eq! [[1.0, 2.0], [3.5, -4.0]] (parse_csv "a,b\n1,2\n\n3.5, -4\n").[1] ),
+        test.case "a bad field names its line" $( test.eq! [:error, "line 3 has a field that is not a number"] (parse_csv "a,b\n1,2\n3,x\n") ),
+        test.case "csv rows to a dataset"
+            $( test.eq! [[2, 1], [2]] ({ let d = of_rows [[1.0, 9.0], [2.0, 8.0]] 0; [tensor.shape (x d), tensor.shape (y d)] }) ),
+        test.case "spirals" $( test.eq! [[300, 2], 3] ({ let d = spirals 1 100 3; [tensor.shape (x d), class_count d] }) ),
+        test.case "blobs" $( test.eq! [40, 3] (tensor.shape (x (blobs 1 10 4 3))) ),
+        test.case "one-hot targets" $( test.eq! [5, 2] (tensor.shape (y (one_hot 2 ds))) ),
+    ];
+}

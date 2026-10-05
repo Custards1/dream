@@ -445,6 +445,16 @@ The lessons that keep coming back:
   WebSockets. `std.regex` matches natively (`vm.regex_run`,
   dream/src/regex.cpp: a lazy DFA and a Pike VM).
   Examples 18-21 tour them.
+- `import std.ml` is **machine learning** on `std.tensor`: autodiff
+  (`std.ml.ad`, graph nodes found again by identity map keys), layers
+  (`std.ml.nn`: dense, conv2d, attention, transformer, LSTM, ..), losses,
+  optimizers, datasets and `ml.fit!`, which trains on the GPU when one is
+  there and the model is large enough. What it needed underneath went into
+  `std.tensor` (`repeat`, `max_axis`, `take`, `im2col`, batched `@`,
+  `permute`, ..), not into Dream. Its hot walks are shaped for the JIT;
+  `DREAM_JIT_WHY=1` names what refuses a function (a `match` on anything
+  but a parameter is the usual one). [docs/notes/ml.md](docs/notes/ml.md),
+  and example 22.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

@@ -341,6 +341,12 @@ public:
     /// already claimed, and this is the running tally they claim into. Only
     /// touched while profiling.
     uint64_t alloc_attributed = 0;
+    /// The heap's collection count when the heap limit was last raised in
+    /// this process. The limit is judged by the live bytes the last
+    /// collection measured, so until another collection has measured them
+    /// again every step would raise it afresh -- including the steps of the
+    /// `catch` that caught it, which is what made it uncatchable.
+    uint64_t heap_limit_raised_at = UINT64_MAX;
 
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }

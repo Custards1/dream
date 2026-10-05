@@ -264,6 +264,8 @@ import std.math;
 | `sqrt` | `number → float` | Square root. |
 | `abs` | `integer\|float → integer\|float` | Absolute value. Returns the same type as the input. |
 | `floor` | `integer\|float → integer` | Rounds down to the nearest integer. |
+| `exp` · `log` · `sin` · `cos` · `tan` · `tanh` · `atan` | `number → float` | The functions of a real variable. |
+| `pow x y` | `number → number → float` | `x` to the power `y`. |
 
 ---
 
@@ -292,7 +294,9 @@ tensor and a number on either side. The shapes must be equal, or one must be
 the trailing part of the other, which repeats it (a vector added to every row
 of a matrix). Unary `-` negates. `a @ b` is the matrix product: matrix by
 matrix, matrix by vector, vector by matrix, or vector by vector, which is the
-dot product and answers a float. `@` binds like `*`. `t.[i]` is an element of
+dot product and answers a float -- or a batch of matrices `[b, m, k]` by a batch
+`[b, k, n]` (each pair multiplied; one launch on the GPU) or by one matrix `[k,
+n]`. `@` binds like `*`. `t.[i]` is an element of
 a vector, or a copy of row `i` of anything larger; `len t` is the length of the
 first axis. `==` compares shapes and numbers.
 
@@ -342,8 +346,23 @@ tensor raises `:device_error`.
 | `at t indices` | `tensor → [integer] → float` | One element, one index per axis. |
 | `matmul a b` · `dot a b` · `outer a b` | `tensor → tensor → ..` | `a @ b`; `@` of two vectors only; every `a[i] * b[j]`. |
 | `sum` · `mean` · `minimum` · `maximum` · `norm` | `tensor → float` | Over every number. `norm` is the Euclidean length. |
-| `sum_axis axis t` | `integer → tensor → tensor` | Sums along one axis, which drops out of the shape. |
-| `sqrt` · `exp` · `log` · `abs` · `tanh` · `sin` · `cos` · `relu` · `sigmoid` | `tensor → tensor` | Elementwise. |
+| `sum_axis axis t` | `integer → tensor → tensor` | Sums along one axis, which drops out of the shape. A vector's is a number. |
+| `max_axis` · `min_axis` | `integer → tensor → tensor` | The largest or smallest along one axis, which drops out. |
+| `argmax_axis` · `argmin_axis` | `integer → tensor → tensor` | Where along the axis the largest or smallest first is, as numbers (so they stay on the GPU); a vector's is an integer. |
+| `sqrt` · `exp` · `log` · `abs` · `tanh` · `sin` · `cos` · `relu` · `sigmoid` · `floor` · `ceil` · `round` · `sign` · `erf` | `tensor → tensor` | Elementwise. `round` takes a half away from zero. |
+| `max a b` · `min a b` · `pow a b` | `tensor\|number → tensor\|number → tensor` | Elementwise, broadcast and fused as the operators are. (One argument's `maximum` and `minimum` are the reductions.) |
+| `lt` · `le` · `gt` · `ge` · `eq` · `ne` | `tensor\|number → tensor\|number → tensor` | Elementwise comparisons answering 1 where they hold and 0 where not: a mask, which multiplies into a chain. |
+| `fill_like t x` | `tensor → number → tensor` | `t`'s shape, where `t` is, every number `x`. Free on the GPU: nothing is uploaded. |
+| `repeat n t` | `integer → tensor → tensor` | `t` with a new last axis of length `n`, each number repeated along it: a value per row stretched across the row. Read in place by a chain, so `x - repeat k (max_axis 1 x)` is one pass. |
+| `slice start count t` | `integer → integer → tensor → tensor` | Rows `start` to `start + count` of the first axis. |
+| `take rows t` | `[integer]\|tensor → tensor → tensor` | The rows named, in that order, any row any number of times. One gather on the GPU. |
+| `concat ts` | `[tensor] → tensor` | Joined along the first axis; the rest of the shapes must agree. |
+| `one_hot n classes` | `integer → [integer]\|tensor → tensor` | A row per class, `n` wide, 1 at the class. |
+| `permute axes t` | `[integer] → tensor → tensor` | The axes reordered: axis `k` of the answer is axis `axes[k]` of `t`. |
+| `im2col kh kw stride pad x` | `integer → integer → integer → integer → tensor → tensor` | Every `kh x kw` window of images `[n, h, w, c]` (channels last), moved `stride` at a time over them padded with `pad` zeros, as a row: `[n * oh * ow, kh * kw * c]`. A convolution is one `@` of these rows by the kernel. |
+| `col2im shape kh kw stride pad cols` | `[integer] → .. → tensor → tensor` | The reverse: images of `shape` whose each number is the sum of the places `im2col` copied it to. |
+| `normal seed shape` | `integer → [integer] → tensor` | Standard normal numbers, the same for the same seed everywhere. |
+| `to_bytes t` · `of_bytes shape bytes` | `tensor → string` · `[integer] → string → tensor` | The numbers as little-endian doubles, and back, exactly. |
 | `gpu t` · `gpu64 t` | `tensor → tensor` | Onto the GPU as float32 or float64. Raises `:no_gpu` naming what is missing. |
 | `host t` | `tensor → tensor` | Back onto the host. |
 | `gpu_available ()` · `gpu_name ()` | `unit → ..` | Whether a GPU can be used, and its name (or `()`). |

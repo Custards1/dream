@@ -1,0 +1,229 @@
+// Parameter trees: a model's numbers as one value.
+//
+//     tree.map (fn t -> t * 0.5) params              // every tensor halved
+//     tree.map2 (fn p g -> p - 0.1 * g) params grads  // a gradient step
+//     tree.size params                               // how many numbers
+//
+// **A tree is whatever nests.** Its leaves are tensors and numbers; its
+// branches are lists, arrays and maps of trees. A `sequential` model's
+// parameters are a list with a map per layer (`[%{"w" => w, "b" => b}, ..]`),
+// an optimizer's state is the same shape again, and a gradient is the same
+// shape as what it is the gradient of. Nothing names the shape: every
+// function here walks whatever it is given, so a model written by hand as a
+// map of maps is as welcome as one `std.ml.nn` built.
+//
+// Any other value -- a string, an atom, a function, an autodiff variable --
+// is a leaf too, carried through `map` untouched by anything that only
+// changes numbers (`map_numeric`). That is what lets a layer keep a setting
+// beside its weights without the optimizer trying to train it.
+
+import std.array;
+import std.list;
+import std.map as maps;
+import std.math;
+import std.tensor;
+
+/// Whether `x` is a branch of a tree -- a list, an array or a map -- rather
+/// than a leaf. An autodiff variable (`std.ml.ad`) is an array with `:ad_node`
+/// first, and is a leaf.
+let is_branch : :any -> :bool;
+let is_branch x = branch_kind (type_of x) x;
+
+// A `match` here is always on a parameter: the JIT refuses a function that
+// matches on anything computed (a `match` binds its subject strictly, and
+// the tier only takes a strict binding of a parameter), so a computed
+// subject is handed to a helper and matched there. These run once per leaf
+// per training step.
+priv let branch_kind : :atom -> :any -> :bool;
+priv let branch_kind kind x = match kind {
+    :list => true,
+    :map => true,
+    :array => len x == 0 || x.[0] != :ad_node,
+    _ => false,
+};
+
+/// Whether `x` is a number or a tensor: what is trained.
+let is_numeric : :any -> :bool;
+let is_numeric x = numeric_kind (type_of x);
+
+priv let numeric_kind : :atom -> :bool;
+priv let numeric_kind kind = match kind { :tensor => true, :float => true, :integer => true, _ => false };
+
+// `map`, `map2` and `map3` run over every parameter at every optimizer
+// step, so they are written for the JIT: each walk is a top-level function
+// recursing on its own, with no lambda made inside it and nothing captured
+// -- the shapes the tier refuses.
+
+/// `f` applied to every leaf, the branches kept as they are.
+let map : (:any -> :any) -> :any -> :any;
+let map f t = if is_branch t { map_branch (type_of t) f t } else { f t };
+
+priv let map_branch : :atom -> (:any -> :any) -> :any -> :any;
+priv let map_branch kind f t = match kind {
+    :list => map_list f t,
+    :array => array.of_list (map_list f (array.to_list t)),
+    _ => map_entries f (maps.pairs t) %{},
+};
+
+priv let map_list : (:any -> :any) -> [:any] -> [:any];
+priv let map_list f xs = match xs { [] => [], [x, ..rest] => map f x :: map_list f rest };
+
+priv let map_entries : (:any -> :any) -> [:any] -> %{:any => :any} -> %{:any => :any};
+priv let map_entries f pairs !acc = match pairs {
+    [] => acc,
+    [[k, v], ..rest] => map_entries f rest acc.[k => map f v],
+};
+
+/// `f` applied to every numeric leaf; any other leaf is kept.
+let map_numeric : (:any -> :any) -> :any -> :any;
+let map_numeric f t = map (numeric_only f) t;
+
+priv let numeric_only : (:any -> :any) -> :any -> :any;
+priv let numeric_only f x = if is_numeric x { f x } else { x };
+
+/// `f` applied to the leaves of two trees of one shape, pairwise. The shape
+/// is the first tree's; a leaf of the first that is not numeric is kept.
+let map2 : (:any -> :any -> :any) -> :any -> :any -> :any;
+let map2 f a b =
+    if is_branch a { map2_branch (type_of a) f a b }
+    else if is_numeric a { f a b } else { a };
+
+priv let map2_branch : :atom -> (:any -> :any -> :any) -> :any -> :any -> :any;
+priv let map2_branch kind f a b = match kind {
+    :list => map2_list f a b,
+    :array => array.of_list (map2_list f (array.to_list a) (array.to_list b)),
+    _ => map2_entries f (maps.pairs a) b %{},
+};
+
+priv let map2_list : (:any -> :any -> :any) -> [:any] -> [:any] -> [:any];
+priv let map2_list f xs ys = match xs {
+    [] => [],
+    [x, ..rest] => map2 f x (list.head ys) :: map2_list f rest (list.tail ys),
+};
+
+priv let map2_entries : (:any -> :any -> :any) -> [:any] -> :any -> %{:any => :any} -> %{:any => :any};
+priv let map2_entries f pairs other !acc = match pairs {
+    [] => acc,
+    [[k, v], ..rest] => map2_entries f rest other acc.[k => map2 f v other.[k]],
+};
+
+/// `f` over three trees of one shape: a parameter, its gradient and its
+/// optimizer state, at once.
+let map3 : (:any -> :any -> :any -> :any) -> :any -> :any -> :any -> :any;
+let map3 f a b c =
+    if is_branch a { map3_branch (type_of a) f a b c }
+    else if is_numeric a { f a b c } else { a };
+
+priv let map3_branch : :atom -> (:any -> :any -> :any -> :any) -> :any -> :any -> :any -> :any;
+priv let map3_branch kind f a b c = match kind {
+    :list => map3_list f a b c,
+    :array => array.of_list (map3_list f (array.to_list a) (array.to_list b) (array.to_list c)),
+    _ => map3_entries f (maps.pairs a) b c %{},
+};
+
+priv let map3_list : (:any -> :any -> :any -> :any) -> [:any] -> [:any] -> [:any] -> [:any];
+priv let map3_list f xs ys zs = match xs {
+    [] => [],
+    [x, ..rest] => map3 f x (list.head ys) (list.head zs) :: map3_list f rest (list.tail ys) (list.tail zs),
+};
+
+priv let map3_entries : (:any -> :any -> :any -> :any) -> [:any] -> :any -> :any -> %{:any => :any} -> %{:any => :any};
+priv let map3_entries f pairs b c !acc = match pairs {
+    [] => acc,
+    [[k, v], ..rest] => map3_entries f rest b c acc.[k => map3 f v b.[k] c.[k]],
+};
+
+/// Every leaf, depth first, in a fixed order: a list's and an array's in
+/// position, a map's by sorted key.
+let leaves : :any -> [:any];
+let leaves t = list.reverse (gather [] t);
+
+priv let gather : [:any] -> :any -> [:any];
+priv let gather acc t =
+    if not (is_branch t) { t :: acc }
+    else { match type_of t {
+        :list => list.fold gather acc t,
+        :array => list.fold gather acc (array.to_list t),
+        _ => list.fold (fn a k -> gather a t.[k]) acc (maps.sorted_keys t),
+    } };
+
+/// Every numeric leaf with the path that reaches it -- a list of positions
+/// and keys -- in `leaves`'s order. What saving a model writes.
+let paths : :any -> [[[:any], :any]];
+let paths t = list.reverse (walk [] [] t);
+
+priv let walk : [:any] -> [:any] -> :any -> [[[:any], :any]];
+priv let walk acc at t =
+    if not (is_branch t) { if is_numeric t { [list.reverse at, t] :: acc } else { acc } }
+    else { match type_of t {
+        :list => list.fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate t),
+        :array => list.fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate (array.to_list t)),
+        _ => list.fold (fn a k -> walk a (k :: at) t.[k]) acc (maps.sorted_keys t),
+    } };
+
+/// The leaf at `path` (as `paths` gives it), or `()`.
+let at : [:any] -> :any -> :any;
+let at path t = match path {
+    [] => t,
+    [k, ..rest] => match type_of t {
+        :list => at rest (list.nth k t),
+        :array => at rest t.[k],
+        :map => at rest t.[k else ()],
+        _ => (),
+    },
+};
+
+/// How many numbers the tree holds: a tensor counts its size, a number one.
+let size : :any -> :integer;
+let size t = list.fold_strict (fn !n x -> n + count x) 0 (leaves t);
+
+priv let count : :any -> :integer;
+priv let count x = match type_of x { :tensor => tensor.size x, :float => 1, :integer => 1, _ => 0 };
+
+/// The sum of `f` over every numeric leaf, as a float.
+let sum_of : (:any -> :float) -> :any -> :float;
+let sum_of f t = list.fold_strict (fn !acc x -> if is_numeric x { acc + f x } else { acc }) 0.0 (leaves t);
+
+/// The Euclidean length of every number in the tree together: what gradient
+/// clipping measures.
+let norm : :any -> :float;
+let norm t = {
+    let sq x = match type_of x { :tensor => { let n = tensor.norm x; n * n }, _ => 1.0 * x * x };
+    math.sqrt (sum_of sq t)
+};
+
+/// Every tensor moved to the GPU (float32), or left where it is when there is
+/// no GPU to move it to.
+let gpu : :any -> :any;
+let gpu t = if tensor.gpu_available () { map_numeric (fn x -> if type_of x == :tensor { tensor.gpu x } else { x }) t } else { t };
+
+/// Every tensor brought back to the host.
+let host : :any -> :any;
+let host t = map_numeric (fn x -> if type_of x == :tensor { tensor.host x } else { x }) t;
+
+/// A tree of zeros shaped like `t`: each tensor's zeros where it is.
+let zeros_like : :any -> :any;
+let zeros_like t = map_numeric (fn x -> if type_of x == :tensor { tensor.fill_like x 0.0 } else { 0.0 }) t;
+
+when test {
+    import std.test;
+
+    let p = [%{"w" => tensor.of_list [[1, 2], [3, 4]], "b" => tensor.of_list [1, 1], "act" => :relu}, %{}];
+
+    let tests = [
+        test.case "size counts numbers and skips settings" $( test.eq! 6 (size p) ),
+        test.case "map_numeric leaves a setting alone"
+            $( test.eq! :relu ((map_numeric (fn t -> t * 2) p).[0].["act"]) ),
+        test.case "map2 pairs leaves"
+            $( test.eq! (tensor.of_list [2, 2]) ((map2 (fn a b -> a + b) p p).[0].["b"]) ),
+        test.case "map3 sees three trees"
+            $( test.eq! (tensor.of_list [3, 3]) ((map3 (fn a b c -> a + b + c) p p p).[0].["b"]) ),
+        test.case "leaves in a fixed order" $( test.eq! 3 (len (leaves p)) ),
+        test.case "paths reach what at reads"
+            $( test.true! (list.all (fn [path, x] -> at path p == x) (paths p)) ),
+        test.case "paths name the keys" $( test.eq! [[0, "b"], [0, "w"]] (list.map (fn [k, _] -> k) (paths p)) ),
+        test.case "norm" $( test.near! 1.0e-12 5.0 (norm [tensor.of_list [3], 4.0]) ),
+        test.case "an autodiff variable is a leaf" $( test.false! (is_branch #[:ad_node, 1.0, []]) ),
+        test.case "zeros_like" $( test.eq! 0.0 (tensor.sum ((zeros_like p).[0].["w"])) ),
+    ];
+}

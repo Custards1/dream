@@ -90,6 +90,11 @@ void release_external(Obj* o) {
     gpu::release(static_cast<gpu::Buffer*>(tensor_handle(static_cast<TensorObj*>(o))));
 }
 
+size_t external_budget() {
+    const size_t m = gpu::memory_bytes();
+    return m ? m / 4 : std::numeric_limits<size_t>::max();
+}
+
 namespace {
 
 constexpr uint8_t TENSOR_GPU = 1;
@@ -495,20 +500,11 @@ int kernel_op(Op op) {
     }
 }
 
-const char* op_text(Op op) {
-    switch (op) {
-        case Op::Add: return "+";
-        case Op::Sub: return "-";
-        case Op::Mul: return "*";
-        case Op::Div: return "/";
-        default: return "%";
-    }
-}
-
 /// The shape of `a op b`. Equal shapes, or one whose shape is the trailing
 /// part of the other's -- a row added to every row of a matrix -- which is
 /// numpy's broadcasting without its stretching of length-one axes.
-bool broadcast(Process& p, Op op, const Shape& a, const Shape& b, Shape* out, Value* err) {
+bool broadcast(Process& p, const char* what, const Shape& a, const Shape& b, Shape* out,
+               Value* err) {
     if (same_shape(a, b)) {
         *out = a;
         return true;
@@ -520,7 +516,7 @@ bool broadcast(Process& p, Op op, const Shape& a, const Shape& b, Shape* out, Va
         suffix = small.dims[i] == big.dims[big.rank - small.rank + i];
     if (!suffix)
         return fail(p, err, "shape_error",
-                    std::string("cannot apply `") + op_text(op) + "` to tensors of shape " +
+                    std::string("cannot apply `") + what + "` to tensors of shape " +
                         shape_text(a) + " and " + shape_text(b));
     *out = big;
     return true;
@@ -612,7 +608,8 @@ struct Program {
         unsigned sp = 0, most = 0;
         for (unsigned i = 0; i < ncode; ++i) {
             switch (code[2 * i]) {
-                case FUSE_LOAD: case FUSE_LOADT: case FUSE_CONST: case FUSE_PRODUCT:
+                case FUSE_LOAD: case FUSE_LOADT: case FUSE_LOADR: case FUSE_CONST:
+                case FUSE_PRODUCT:
                     most = std::max(most, ++sp);
                     break;
                 case FUSE_BIN: --sp; break;
@@ -654,6 +651,10 @@ void append(Program& prog, Value v) {
                 arg = prog.input(static_cast<TensorObj*>(as_obj(e->inputs()[arg])));
                 break;
             case FUSE_CONST: arg = prog.constant(e->consts()[arg]); break;
+            case FUSE_LOADR:
+                arg = prog.input(static_cast<TensorObj*>(as_obj(e->inputs()[arg & 7]))) |
+                      prog.constant(e->consts()[arg >> 3]) << 3;
+                break;
             case FUSE_PRODUCT:
                 prog.product(static_cast<TensorObj*>(as_obj(e->product_a)),
                              static_cast<TensorObj*>(as_obj(e->product_b)));
@@ -736,6 +737,24 @@ const double* run_block(const FuseProgram& prog, TensorObj* const* inputs, const
                     if (++r == R) {
                         r = 0;
                         if (++c == C) c = 0;
+                    }
+                }
+                stack[sp++] = Slot{buf, 0, false};
+                break;
+            }
+            case FUSE_LOADR: {
+                // Each number of the input `r` times over, the whole input
+                // repeating every `r * m`: position `o` reads `(o / r) % m`.
+                const TensorObj* in = inputs[arg & 7];
+                const size_t m = size_t(in->count), r = size_t(consts[arg >> 3]);
+                const double* src = in->data();
+                double* buf = scratch.at(sp, 0);
+                size_t at = (base / r) % m, rem = base % r;
+                for (size_t j = 0; j < len; ++j) {
+                    buf[j] = src[at];
+                    if (++rem == r) {
+                        rem = 0;
+                        if (++at == m) at = 0;
                     }
                 }
                 stack[sp++] = Slot{buf, 0, false};
@@ -991,6 +1010,65 @@ void plan_operand(TensorObj* t, size_t cols, OperandPlan& plan) {
     plan.host = GemmOperand{nullptr, 0, 0, operand_segment, &plan, 0};
 }
 
+bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device, uint8_t dtype,
+                 Value* out);
+
+/// A GPU product cut along K (see "split-K" at `gpu::matmul`), with the
+/// chain after it, if any, run as a second pass. The generated product
+/// kernel applies a chain to each element of C as it stores it, which a
+/// split product cannot: no slice holds a finished element. So the product
+/// is computed on its own -- its operands computed first if they are
+/// programs, since the split kernel reads buffers -- and the chain then runs
+/// as an ordinary fused program that loads it. One extra pass over C, on
+/// products whose C is small by construction.
+bool run_split_product(Process& p, const Program& prog, const Shape& s, uint8_t dtype, Value* out) {
+    TensorObj* a = prog.product_a;
+    TensorObj* b = prog.product_b;
+    const Gemm g = gemm_of(a, b);
+    OperandPlan pa, pb;
+    plan_operand(a, g.K, pa);
+    if (pa.device.program) {
+        if (!settle(p, &a, out)) return false;
+        pa = OperandPlan{};
+        plan_operand(a, g.K, pa);
+    }
+    plan_operand(b, g.N, pb);
+    if (pb.device.program) {
+        if (!settle(p, &b, out)) return false;
+        pb = OperandPlan{};
+        plan_operand(b, g.N, pb);
+    }
+    const Shape ps = g.N == 1 ? shape1(uint32_t(g.M)) : shape2(uint32_t(g.M), uint32_t(g.N));
+    gpu::Buffer* c = gpu_alloc(p, uint64_t(g.M) * g.N, dtype, out);
+    if (!c) return false;
+    std::string why;
+    if (!gpu::matmul(dtype, pa.device, pb.device, c, g.M, g.K, g.N, &why)) {
+        gpu::release(c);
+        return gpu_fail(p, out, why);
+    }
+    Value product = wrap_gpu(p, ps, dtype, c);
+    if (prog.ncode == 1) {
+        // A bare product: the answer is the product, in the answer's shape.
+        if (same_shape(ps, s)) {
+            *out = product;
+            return true;
+        }
+        gpu::retain(c);
+        *out = wrap_gpu(p, s, dtype, c);
+        return true;
+    }
+    Program rest = prog;
+    rest.product_a = rest.product_b = nullptr;
+    const unsigned k = rest.input(tensor_of(product));
+    if (rest.overflow) return fail(p, out, "shape_error", "a tensor expression too large to compute");
+    for (unsigned i = 0; i < rest.ncode; ++i)
+        if (rest.code[2 * i] == FUSE_PRODUCT) {
+            rest.code[2 * i] = FUSE_LOAD;
+            rest.code[2 * i + 1] = uint8_t(k);
+        }
+    return run_program(p, rest, s, TENSOR_GPU, dtype, out);
+}
+
 /// Compute a program into a new tensor of shape `s` where its inputs are.
 ///
 /// A program that starts from a product is the product with an epilogue: the
@@ -1012,6 +1090,8 @@ bool run_program(Process& p, const Program& prog, const Shape& s, uint8_t device
         plan_operand(prog.product_a, g.K, pa);
         plan_operand(prog.product_b, g.N, pb);
     }
+    if (device == TENSOR_GPU && prog.product_a && gpu::splits_k(g.M, g.K, g.N))
+        return run_split_product(p, prog, s, dtype, out);
     if (device == TENSOR_GPU) {
         gpu::Buffer* b = gpu_alloc(p, s.count, dtype, out);
         if (!b) return false;
@@ -1206,35 +1286,84 @@ bool reduce(Process& p, int op, TensorObj* x, double* out, Value* err) {
     return true;
 }
 
-/// The sums along an axis on the host, the operand's program computed as it
-/// is summed and never stored. `out` is `outer x inner` and zeroed; source
-/// position `(o * len + a) * inner + i` adds into `out[o * inner + i]`, in the
-/// order of `a`, which is what makes the answer the same at any thread count.
+/// How a reduction along an axis folds one more value in, for `KRED_SUM`,
+/// `KRED_MIN` and `KRED_MAX` and their `ARG` forms. `acc` is the running
+/// answer and `best` the value it stands for (the same slot for the plain
+/// forms; a separate one for the `ARG` forms, whose answer is a position).
+/// `a` is the position along the axis; the first one starts the fold, so a
+/// minimum or maximum never begins from a made-up identity. Ties keep the
+/// first position, which is what every argmax does.
+struct AxisFold {
+    int op;
+    void start(double* acc, double* best, double v) const {
+        if (op >= KRED_ARGMIN) {
+            *best = v;
+            *acc = 0;
+        } else {
+            *acc = v;
+        }
+    }
+    void add(double* acc, double* best, double v, size_t a) const {
+        switch (op) {
+            case KRED_SUM: *acc += v; break;
+            case KRED_MIN: *acc = v < *acc ? v : *acc; break;
+            case KRED_MAX: *acc = v > *acc ? v : *acc; break;
+            case KRED_ARGMIN:
+                if (v < *best) {
+                    *best = v;
+                    *acc = double(a);
+                }
+                break;
+            default:
+                if (v > *best) {
+                    *best = v;
+                    *acc = double(a);
+                }
+                break;
+        }
+    }
+};
+
+/// A fold along an axis on the host, the operand's program computed as it is
+/// folded and never stored. `out` is `outer x inner`; source position
+/// `(o * len + a) * inner + i` folds into `out[o * inner + i]`, in the order of
+/// `a`, which is what makes the answer the same at any thread count.
 ///
-/// Two ways through, by the width of what follows the axis. A wide one adds a
-/// segment of a row per step along the axis, the threads dividing the
+/// Two ways through, by the width of what follows the axis. A wide one folds
+/// a segment of a row per step along the axis, the threads dividing the
 /// outputs. A narrow one -- the last axis, `inner` 1 -- scans each output's
 /// whole contiguous range once, a block at a time, the threads dividing the
-/// rows; adding segments of one number would be a block evaluation per
+/// rows; folding segments of one number would be a block evaluation per
 /// number.
-void sum_axis_host(const FuseProgram& prog, TensorObj* const* inputs, const double* consts,
-                   double* out, size_t outer, size_t len, size_t inner) {
+void axis_host(int op, const FuseProgram& prog, TensorObj* const* inputs, const double* consts,
+               double* out, size_t outer, size_t len, size_t inner) {
     const size_t work = outer * len * inner;
+    const AxisFold fold{op};
+    const bool arg = op >= KRED_ARGMIN;
     if (inner >= kFuseBlock) {
         parallel_range(outer * inner, [&](size_t begin, size_t end, size_t) {
             Scratch scratch(std::max(prog.depth, 1u));
-            std::vector<double> block(kFuseBlock);
+            std::vector<double> block(kFuseBlock), best(arg ? end - begin : 0);
             for (size_t u = begin; u < end;) {
                 const size_t o = u / inner, i0 = u % inner;
                 const size_t piece = std::min(end - u, inner - i0);
                 double* acc = out + u;
+                double* b = arg ? best.data() + (u - begin) : acc;
                 for (size_t a = 0; a < len; ++a) {
                     const size_t base = (o * len + a) * inner + i0;
                     for (size_t done = 0; done < piece; done += kFuseBlock) {
                         const size_t l = std::min(kFuseBlock, piece - done);
                         const double* r = run_block(prog, inputs, consts, nullptr, base + done, l,
                                                     scratch, block.data());
-                        for (size_t j = 0; j < l; ++j) acc[done + j] += r[j];
+                        if (op == KRED_SUM) {
+                            for (size_t j = 0; j < l; ++j) acc[done + j] += r[j];
+                        } else if (a == 0) {
+                            for (size_t j = 0; j < l; ++j)
+                                fold.start(acc + done + j, b + done + j, r[j]);
+                        } else {
+                            for (size_t j = 0; j < l; ++j)
+                                fold.add(acc + done + j, b + done + j, r[j], a);
+                        }
                     }
                 }
                 u += piece;
@@ -1244,25 +1373,35 @@ void sum_axis_host(const FuseProgram& prog, TensorObj* const* inputs, const doub
     }
     parallel_range(outer, [&](size_t begin, size_t end, size_t) {
         Scratch scratch(std::max(prog.depth, 1u));
-        std::vector<double> block(kFuseBlock);
+        std::vector<double> block(kFuseBlock), best(arg ? inner : 0);
         for (size_t o = begin; o < end; ++o) {
             double* acc = out + o * inner;
+            double* b = arg ? best.data() : acc;
             const size_t start = o * len * inner, stop = start + len * inner;
             for (size_t base = start; base < stop; base += kFuseBlock) {
                 const size_t l = std::min(kFuseBlock, stop - base);
                 const double* r = run_block(prog, inputs, consts, nullptr, base, l, scratch,
                                             block.data());
-                for (size_t j = 0; j < l; ++j) acc[(base - start + j) % inner] += r[j];
+                if (op == KRED_SUM) {
+                    for (size_t j = 0; j < l; ++j) acc[(base - start + j) % inner] += r[j];
+                    continue;
+                }
+                for (size_t j = 0; j < l; ++j) {
+                    const size_t at = base - start + j, i = at % inner, a = at / inner;
+                    if (a == 0) fold.start(acc + i, b + i, r[j]);
+                    else fold.add(acc + i, b + i, r[j], a);
+                }
             }
         }
     }, work, 1);
 }
 
-/// `t` summed along `axis` (of a tensor of two or more axes), which drops out
-/// of the shape. Fused: the program of a deferred `t` runs as it is summed,
-/// on the host or in a generated GPU kernel, and nothing but the sums is
-/// stored. A product is computed first, as for any reduction.
-bool sum_axis(Process& p, TensorObj* t, uint32_t axis, Value* out) {
+/// `t` folded along `axis` (of a tensor of two or more axes) by `op`, a
+/// `KRED_*`; the axis drops out of the shape. Fused: the program of a
+/// deferred `t` runs as it is folded, on the host or in a generated GPU
+/// kernel, and nothing but the answers is stored. A product is computed
+/// first, as for any reduction.
+bool reduce_axis(Process& p, int op, TensorObj* t, uint32_t axis, Value* out) {
     if (pending_product(t) && !settle(p, &t, out)) return false;
     Program prog;
     append(prog, from_obj(t));
@@ -1283,8 +1422,8 @@ bool sum_axis(Process& p, TensorObj* t, uint32_t axis, Value* out) {
         size_t counts[kFuseMaxInputs], rows[kFuseMaxInputs];
         buffers_of(prog, ins, counts, rows);
         std::string why;
-        if (!gpu::fused_axis(t->dtype, view, ins, counts, rows, prog.consts, outer, len, inner, b,
-                             &why)) {
+        if (!gpu::fused_axis(op, t->dtype, view, ins, counts, rows, prog.consts, outer, len, inner,
+                             b, &why)) {
             gpu::release(b);
             return gpu_fail(p, out, why);
         }
@@ -1294,7 +1433,7 @@ bool sum_axis(Process& p, TensorObj* t, uint32_t axis, Value* out) {
     double* data;
     if (!new_host(p, s, out, &data)) return false;
     std::fill(data, data + s.count, 0.0);
-    sum_axis_host(view, prog.inputs, prog.consts, data, outer, len, inner);
+    axis_host(op, view, prog.inputs, prog.consts, data, outer, len, inner);
     return true;
 }
 
@@ -1317,10 +1456,15 @@ bool product_operand(Process& p, TensorObj** t, Value* err) {
 
 /// `a @ b`. Two vectors give their dot product, a number; a matrix and a
 /// vector, in either order, a vector; two matrices a matrix.
+bool batched_matmul(Process& p, TensorObj* a, TensorObj* b, Value* out);
+bool reshape(Process& p, TensorObj* t, const Shape& s, Value* out);
+
 bool matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
+    if (a->rank == 3 && (b->rank == 3 || b->rank == 2)) return batched_matmul(p, a, b, out);
     if (a->rank > 2 || b->rank > 2)
         return fail(p, out, "shape_error",
-                    "`@` multiplies vectors and matrices, not tensors of shape " +
+                    "`@` multiplies vectors, matrices and batches of matrices (`[b, m, k] @ [b, k, n]` "
+                    "or `[b, m, k] @ [k, n]`), not tensors of shape " +
                         shape_text(shape_of(a)) + " and " + shape_text(shape_of(b)));
     if (!same_device(p, a, b, "`@`", out)) return false;
     // As matrices: a vector on the left is a row, on the right a column.
@@ -1404,6 +1548,139 @@ bool matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
     }
     host_gemm(plain_operand(a->data(), K), plain_operand(b->data(), N), data, M, K, N);
     *out = t;
+    return true;
+}
+
+/// `a @ b` for a batch of matrices `a` (`[B, M, K]`): by one matrix `b`
+/// (`[K, N]`), which is one ordinary product of `a`'s rows -- `[B * M, K]`
+/// -- and so defers and fuses like any other; or by a batch `b` (`[B, K,
+/// N]`), each pair multiplied, `[B, M, N]`. A batch of products is what
+/// attention is made of: many small products, so the host runs one per
+/// thread rather than splitting each, and the GPU one launch for them all.
+bool batched_matmul(Process& p, TensorObj* a, TensorObj* b, Value* out) {
+    if (!same_device(p, a, b, "`@`", out)) return false;
+    const uint32_t B = a->dims[0], M = a->dims[1], K = a->dims[2];
+    if (b->rank == 2) {
+        if (b->dims[0] != K)
+            return fail(p, out, "shape_error",
+                        "`@` needs the inner lengths to agree, but they are " + std::to_string(K) +
+                            " and " + std::to_string(b->dims[0]) + " (shapes " +
+                            shape_text(shape_of(a)) + " and " + shape_text(shape_of(b)) + ")");
+        Value rows, prod;
+        if (!reshape(p, a, shape2(B * M, K), &rows)) {
+            *out = rows;
+            return false;
+        }
+        if (!matmul(p, tensor_of(rows), b, &prod)) {
+            *out = prod;
+            return false;
+        }
+        Shape s;
+        s.rank = 3;
+        s.dims[0] = B;
+        s.dims[1] = M;
+        s.dims[2] = b->dims[1];
+        s.count = uint64_t(B) * M * b->dims[1];
+        return reshape(p, tensor_of(prod), s, out);
+    }
+    const uint32_t N = b->dims[2];
+    if (b->dims[0] != B || b->dims[1] != K)
+        return fail(p, out, "shape_error",
+                    "`@` of two batches needs as many matrices in each and the inner lengths to "
+                    "agree, not shapes " + shape_text(shape_of(a)) + " and " + shape_text(shape_of(b)));
+    if (!settle(p, &a, out) || !settle(p, &b, out)) return false;
+    Shape s;
+    s.rank = 3;
+    s.dims[0] = B;
+    s.dims[1] = M;
+    s.dims[2] = N;
+    s.count = uint64_t(B) * M * N;
+    if (s.count > kMaxElements)
+        return fail(p, out, "out_of_memory", "a batch of products this large is larger than 4 GiB");
+    if (on_gpu(a)) {
+        gpu::Buffer* c = gpu_alloc(p, s.count, a->dtype, out);
+        if (!c) return false;
+        std::string why;
+        if (!gpu::bmm(a->dtype, buffer_of(a), buffer_of(b), c, B, M, K, N, &why)) {
+            gpu::release(c);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, s, a->dtype, c);
+        return true;
+    }
+    double* data;
+    Value t;
+    if (!new_host(p, s, &t, &data)) {
+        *out = t;
+        return false;
+    }
+    const double* da = a->data();
+    const double* db = b->data();
+    const TensorKernels& k = tensor_kernels();
+    parallel_range(B, [&](size_t begin, size_t end, size_t) {
+        for (size_t i = begin; i < end; ++i)
+            k.gemm(plain_operand(da + i * M * K, K), plain_operand(db + i * K * N, N),
+                   data + i * M * N, M, K, N, nullptr);
+    }, size_t(s.count) * K, 1);
+    *out = t;
+    return true;
+}
+
+/// `t` with its axes reordered: axis `k` of the answer is axis `axes[k]` of
+/// `t`. A matrix's transpose is `[1, 0]`; attention's heads are moved
+/// between the batch and the sequence with `[0, 2, 1, 3]`.
+bool permute_axes(Process& p, TensorObj* t, const std::vector<uint32_t>& axes, Value* out) {
+    if (!settle(p, &t, out)) return false;
+    const uint32_t r = t->rank;
+    size_t in_stride[TENSOR_MAX_RANK];
+    size_t step = 1;
+    for (uint32_t k = r; k-- > 0;) {
+        in_stride[k] = step;
+        step *= t->dims[k];
+    }
+    Shape s;
+    s.rank = r;
+    s.count = t->count;
+    size_t dims[TENSOR_MAX_RANK], strides[TENSOR_MAX_RANK];
+    for (uint32_t k = 0; k < r; ++k) {
+        s.dims[k] = t->dims[axes[k]];
+        dims[k] = s.dims[k];
+        strides[k] = in_stride[axes[k]];
+    }
+    if (on_gpu(t)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, t->dtype, out);
+        if (!b) return false;
+        std::string why;
+        if (!gpu::permute(t->dtype, buffer_of(t), b, r, dims, strides, size_t(s.count), &why)) {
+            gpu::release(b);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, s, t->dtype, b);
+        return true;
+    }
+    double* data;
+    if (!new_host(p, s, out, &data)) return false;
+    const double* in = t->data();
+    // Each thread walks its range of the answer with a counter per axis,
+    // starting from the coordinates of its first element.
+    parallel_range(size_t(s.count), [&](size_t begin, size_t end, size_t) {
+        size_t coord[TENSOR_MAX_RANK] = {};
+        size_t rest = begin, at = 0;
+        for (uint32_t k = r; k-- > 0;) {
+            coord[k] = rest % dims[k];
+            rest /= dims[k];
+            at += coord[k] * strides[k];
+        }
+        for (size_t i = begin; i < end; ++i) {
+            data[i] = in[at];
+            for (uint32_t k = r; k-- > 0;) {
+                at += strides[k];
+                if (++coord[k] < dims[k]) break;
+                at -= coord[k] * strides[k];
+                coord[k] = 0;
+            }
+        }
+    });
     return true;
 }
 
@@ -1827,26 +2104,43 @@ NativeResult t_norm(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(p.heap().make_float(std::sqrt(r)));
 }
 
-/// The sums along one axis, which drops out of the shape: `sum_axis 0` of a
-/// matrix is the sum of its rows, `sum_axis 1` the sum of each row. Host
-/// arithmetic, on the GPU too (see the head of this file).
-NativeResult t_sum_axis(Process& p, Value, Value* args, uint32_t) {
+/// A fold along one axis, which drops out of the shape, by the native's
+/// `user` field (a `KRED_*`): `sum_axis 0` of a matrix is the sum of its rows,
+/// `max_axis 1` the largest of each row, `argmax_axis 1` where in each row it
+/// is. The `ARG` forms answer positions as numbers, which is what lets them
+/// stay on the GPU. A vector folds to one number -- an integer position for
+/// the `ARG` forms.
+NativeResult t_axis(Process& p, Value callee, Value* args, uint32_t) {
+    const int op = int(static_cast<NativeObj*>(as_obj(callee))->user);
+    static const char* const names[] = {"sum_axis", "min_axis", "max_axis", "argmin_axis",
+                                        "argmax_axis"};
     Value ax = resolve(args[0]);
     DREAM_SHAPE_ARG(t, 1);
     Value err;
     if (!is_fixnum(ax) || fixnum_value(ax) < 0 || fixnum_value(ax) >= int64_t(t->rank)) {
         fail(p, &err, "shape_error",
-             "`sum_axis` takes an axis of shape " + shape_text(shape_of(t)) + ", not " +
-                 describe(p, ax));
+             std::string("`") + names[op] + "` takes an axis of shape " +
+                 shape_text(shape_of(t)) + ", not " + describe(p, ax));
         return raised(err);
     }
-    if (t->rank == 1) {
+    if (t->rank == 1 && op < KRED_ARGMIN) {
         double r;
-        if (!reduce(p, KRED_SUM, t, &r, &err)) return raised(err);
+        if (!reduce(p, op, t, &r, &err)) return raised(err);
         return NativeResult::ok(p.heap().make_float(r));
     }
+    if (t->rank == 1) {
+        // A vector as a one-row matrix, folded along its row.
+        Value row, at;
+        if (!reshape(p, t, shape2(1, t->dims[0]), &row)) return raised(row);
+        if (!reduce_axis(p, op, tensor_of(row), 1, &at)) return raised(at);
+        TensorObj* one = tensor_of(at);
+        std::vector<double> scratch;
+        const double* data;
+        if (!host_view(p, one, scratch, &data, &err)) return raised(err);
+        return NativeResult::ok(make_fixnum(int64_t(data[0])));
+    }
     Value out;
-    if (!sum_axis(p, t, uint32_t(fixnum_value(ax)), &out)) return raised(out);
+    if (!reduce_axis(p, op, t, uint32_t(fixnum_value(ax)), &out)) return raised(out);
     return NativeResult::ok(out);
 }
 
@@ -1856,6 +2150,593 @@ NativeResult t_unary(Process& p, Value callee, Value* args, uint32_t) {
     DREAM_SHAPE_ARG(t, 0);
     Value out;
     if (!map_unary(p, fn, t, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// The name a binary `std.tensor` function is called by, for its errors.
+const char* binary_name(int op) {
+    static const char* const names[] = {"+", "-", "*", "/", "%", "max", "min", "pow",
+                                        "lt", "le", "gt", "ge", "eq", "ne"};
+    return names[op];
+}
+
+/// An operand of a binary function: a number as it is, or a tensor, made
+/// from lists if need be.
+bool binary_operand(Process& p, Value v, Value* out, Value* err) {
+    Value w;
+    if (!force_whnf(p, v, &w)) {
+        *err = p.result;
+        return false;
+    }
+    if (is_number(w)) {
+        *out = w;
+        return true;
+    }
+    TensorObj* t;
+    if (!coerce(p, w, &t, err)) return false;
+    *out = from_obj(t);
+    return true;
+}
+
+/// `max`, `min`, `pow` and the comparisons, by the native's `user` field (a
+/// `KOP_*`): elementwise exactly as the operators are -- a tensor or a number
+/// on either side, broadcast the same way, fused the same way.
+NativeResult t_binary(Process& p, Value callee, Value* args, uint32_t) {
+    const int op = int(static_cast<NativeObj*>(as_obj(callee))->user);
+    Value a, b, out;
+    if (!binary_operand(p, args[0], &a, &out) || !binary_operand(p, args[1], &b, &out))
+        return raised(out);
+    if (!tensor_binary(p, op, a, b, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// A tensor of `t`'s shape, and where `t` is, every number `x`. Deferred
+/// like any elementwise result -- a program of one constant -- so on the GPU
+/// it costs no upload and fuses into whatever reads it.
+NativeResult t_fill_like(Process& p, Value, Value* args, uint32_t) {
+    DREAM_SHAPE_ARG(t, 0);
+    Value x = resolve(args[1]), out;
+    if (!is_number(x)) {
+        type_fail(p, &out, "`fill_like` fills with a number, not " + describe(p, x));
+        return raised(out);
+    }
+    Program prog;
+    prog.emit(FUSE_CONST, prog.constant(number_of(x)));
+    const Shape s = shape_of(t);
+    if (!on_gpu(t) && s.count < kFuseMin) {
+        if (!run_program(p, prog, s, t->device, t->dtype, &out)) return raised(out);
+        return NativeResult::ok(out);
+    }
+    return NativeResult::ok(defer(p, prog, s, t->device, t->dtype));
+}
+
+/// `t` with a new last axis of length `n`, each of its numbers repeated `n`
+/// times along it: a value per row, stretched across the row. Nothing is
+/// stretched in memory -- it is a `[LOADR k]` program, which a chain reads in
+/// place, so `x - repeat k (max_axis 1 x)` is one pass over `x`.
+NativeResult t_repeat(Process& p, Value, Value* args, uint32_t) {
+    uint32_t n;
+    Value out;
+    if (!length_arg(p, args[0], "repeat", &n, &out)) return raised(out);
+    DREAM_ARG(t, 1);
+    Shape s = shape_of(t);
+    if (s.rank == TENSOR_MAX_RANK) {
+        fail(p, &out, "shape_error",
+             "`repeat` adds an axis, and a tensor has at most " +
+                 std::to_string(TENSOR_MAX_RANK) + " axes");
+        return raised(out);
+    }
+    s.dims[s.rank++] = n;
+    s.count *= n;
+    if (s.count > kMaxElements) {
+        fail(p, &out, "out_of_memory", "a repeated tensor this large is larger than 4 GiB");
+        return raised(out);
+    }
+    Program prog;
+    prog.emit(FUSE_LOADR, prog.input(t) | prog.constant(double(n)) << 3);
+    if (!on_gpu(t) && s.count < kFuseMin) {
+        if (!run_program(p, prog, s, t->device, t->dtype, &out)) return raised(out);
+        return NativeResult::ok(out);
+    }
+    return NativeResult::ok(defer(p, prog, s, t->device, t->dtype));
+}
+
+/// The shape of `t` with its first axis `rows` long: what a slice, a gather
+/// or a concatenation answers.
+Shape with_rows(const TensorObj* t, uint32_t rows) {
+    Shape s = shape_of(t);
+    s.dims[0] = rows;
+    s.count = s.count / t->dims[0] * rows;
+    return s;
+}
+
+/// A tensor made of whole rows -- the first axis -- of others, row `r` of the
+/// answer copied from `rows[r]` of `src`. What `slice`, `take` and `concat`
+/// come down to; on the GPU it is copies or one gather, and nothing comes
+/// back to the host.
+bool gather_rows(Process& p, TensorObj* src, const std::vector<uint32_t>& rows, Value* out) {
+    const Shape s = with_rows(src, uint32_t(rows.size()));
+    const size_t width = size_t(src->count / src->dims[0]);
+    if (on_gpu(src)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, src->dtype, out);
+        if (!b) return false;
+        std::string why;
+        // A run of consecutive rows is one copy; anything else one gather.
+        bool consecutive = true;
+        for (size_t r = 1; r < rows.size() && consecutive; ++r)
+            consecutive = rows[r] == rows[r - 1] + 1;
+        const bool ok = consecutive
+                            ? gpu::copy(buffer_of(src), src->dtype, size_t(rows[0]) * width, b,
+                                        rows.size() * width, &why)
+                            : gpu::gather(src->dtype, buffer_of(src), rows.data(), rows.size(),
+                                          width, b, &why);
+        if (!ok) {
+            gpu::release(b);
+            return gpu_fail(p, out, why);
+        }
+        *out = wrap_gpu(p, s, src->dtype, b);
+        return true;
+    }
+    double* data;
+    if (!new_host(p, s, out, &data)) return false;
+    const double* from = src->data();
+    for (size_t r = 0; r < rows.size(); ++r)
+        std::memcpy(data + r * width, from + size_t(rows[r]) * width, width * sizeof(double));
+    return true;
+}
+
+/// A non-negative integer argument below `limit`.
+bool index_arg(Process& p, Value v, const char* what, uint64_t limit, uint32_t* n, Value* err) {
+    Value w;
+    if (!force_whnf(p, v, &w)) {
+        *err = p.result;
+        return false;
+    }
+    if (!is_fixnum(w) || fixnum_value(w) < 0 || uint64_t(fixnum_value(w)) >= limit) {
+        *err = raise_error(p, well_known(p.runtime()).out_of_bounds,
+                           std::string("`") + what + "` takes a row from 0 to " +
+                               std::to_string(limit) + ", exclusive, not " + describe(p, w));
+        return false;
+    }
+    *n = uint32_t(fixnum_value(w));
+    return true;
+}
+
+/// `slice start count t`: rows `start` to `start + count` of `t`, along its
+/// first axis. A batch of a dataset.
+NativeResult t_slice(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 2);
+    uint32_t start, count;
+    Value err;
+    if (!index_arg(p, args[0], "slice", t->dims[0], &start, &err)) return raised(err);
+    if (!length_arg(p, args[1], "slice", &count, &err)) return raised(err);
+    if (uint64_t(start) + count > t->dims[0]) {
+        err = raise_error(p, well_known(p.runtime()).out_of_bounds,
+                          "`slice` of " + std::to_string(count) + " rows from row " +
+                              std::to_string(start) + " runs past the end of " +
+                              std::to_string(t->dims[0]));
+        return raised(err);
+    }
+    std::vector<uint32_t> rows(count);
+    for (uint32_t r = 0; r < count; ++r) rows[r] = start + r;
+    Value out;
+    if (!gather_rows(p, t, rows, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// Row numbers from a list, an array, or a tensor of whole numbers, each
+/// below `limit`.
+bool row_indices(Process& p, Value v, const char* what, uint64_t limit,
+                 std::vector<uint32_t>& rows, Value* err) {
+    Value w;
+    if (!force_whnf(p, v, &w)) {
+        *err = p.result;
+        return false;
+    }
+    if (TensorObj* t = tensor_of(w)) {
+        std::vector<double> scratch;
+        const double* data;
+        if (!host_view(p, t, scratch, &data, err)) return false;
+        rows.resize(size_t(t->count));
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const double d = data[i];
+            if (!(d >= 0) || d >= double(limit) || d != std::floor(d)) {
+                *err = raise_error(p, well_known(p.runtime()).out_of_bounds,
+                                   std::string("`") + what + "` was given row " +
+                                       std::to_string(d) + " of " + std::to_string(limit));
+                return false;
+            }
+            rows[i] = uint32_t(d);
+        }
+        return true;
+    }
+    std::vector<Value> items;
+    bool is_seq;
+    if (!items_of(p, w, items, &is_seq, err)) {
+        if (!is_seq)
+            type_fail(p, err, std::string("`") + what + "` takes a list of row numbers, not " +
+                                  describe(p, w));
+        return false;
+    }
+    rows.resize(items.size());
+    for (size_t i = 0; i < items.size(); ++i)
+        if (!index_arg(p, items[i], what, limit, &rows[i], err)) return false;
+    return true;
+}
+
+/// `take indices t`: the rows of `t` named by `indices`, in that order, any
+/// row any number of times. Shuffling a dataset, or looking up embeddings.
+NativeResult t_take(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 1);
+    std::vector<uint32_t> rows;
+    Value out;
+    if (!row_indices(p, args[0], "take", t->dims[0], rows, &out)) return raised(out);
+    if (rows.empty()) {
+        fail(p, &out, "shape_error", "`take` needs at least one row: a tensor cannot be empty");
+        return raised(out);
+    }
+    if (!gather_rows(p, t, rows, &out)) return raised(out);
+    return NativeResult::ok(out);
+}
+
+/// `concat ts`: tensors joined along their first axis. Every one must have the
+/// same shape after it, and all be in one place.
+NativeResult t_concat(Process& p, Value, Value* args, uint32_t) {
+    std::vector<Value> items;
+    bool is_seq;
+    Value err;
+    if (!items_of(p, args[0], items, &is_seq, &err)) {
+        if (!is_seq) type_fail(p, &err, "`concat` takes a list of tensors");
+        return raised(err);
+    }
+    if (items.empty()) {
+        fail(p, &err, "shape_error", "`concat` needs at least one tensor");
+        return raised(err);
+    }
+    // Every piece computed first, and kept: nothing collects in a native.
+    std::vector<TensorObj*> parts(items.size());
+    uint64_t rows = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (!coerce(p, items[i], &parts[i], &err) || !settle(p, &parts[i], &err))
+            return raised(err);
+        const TensorObj* t = parts[i];
+        const TensorObj* first = parts[0];
+        bool same = t->rank == first->rank;
+        for (uint32_t d = 1; same && d < t->rank; ++d) same = t->dims[d] == first->dims[d];
+        if (!same) {
+            fail(p, &err, "shape_error",
+                 "`concat` joins tensors whose shapes agree after the first axis, not " +
+                     shape_text(shape_of(first)) + " and " + shape_text(shape_of(t)));
+            return raised(err);
+        }
+        if (!same_device(p, first, t, "`concat`", &err)) return raised(err);
+        rows += t->dims[0];
+    }
+    if (rows > std::numeric_limits<uint32_t>::max()) {
+        fail(p, &err, "shape_error", "`concat` would make an axis too long for a tensor");
+        return raised(err);
+    }
+    const Shape s = with_rows(parts[0], uint32_t(rows));
+    if (s.count > kMaxElements) {
+        fail(p, &err, "out_of_memory", "a concatenation this large is larger than 4 GiB");
+        return raised(err);
+    }
+    Value out;
+    if (on_gpu(parts[0])) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, parts[0]->dtype, &out);
+        if (!b) return raised(out);
+        std::string why;
+        size_t at = 0;
+        for (TensorObj* t : parts) {
+            if (!gpu::copy(buffer_of(t), t->dtype, 0, b, size_t(t->count), &why, at)) {
+                gpu::release(b);
+                gpu_fail(p, &out, why);
+                return raised(out);
+            }
+            at += size_t(t->count);
+        }
+        return NativeResult::ok(wrap_gpu(p, s, parts[0]->dtype, b));
+    }
+    double* data;
+    if (!new_host(p, s, &out, &data)) return raised(out);
+    for (TensorObj* t : parts) {
+        std::memcpy(data, t->data(), size_t(t->count) * sizeof(double));
+        data += t->count;
+    }
+    return NativeResult::ok(out);
+}
+
+/// `one_hot n indices`: a row per index, `n` wide, 1 at the index and 0
+/// everywhere else. Class labels as a classifier's target.
+NativeResult t_one_hot(Process& p, Value, Value* args, uint32_t) {
+    uint32_t n;
+    Value out;
+    if (!length_arg(p, args[0], "one_hot", &n, &out)) return raised(out);
+    std::vector<uint32_t> rows;
+    if (!row_indices(p, args[1], "one_hot", n, rows, &out)) return raised(out);
+    if (rows.empty()) {
+        fail(p, &out, "shape_error", "`one_hot` needs at least one index");
+        return raised(out);
+    }
+    if (uint64_t(rows.size()) * n > kMaxElements) {
+        fail(p, &out, "out_of_memory", "a one-hot matrix this large is larger than 4 GiB");
+        return raised(out);
+    }
+    double* data;
+    if (!new_host(p, shape2(uint32_t(rows.size()), n), &out, &data)) return raised(out);
+    std::fill(data, data + rows.size() * n, 0.0);
+    for (size_t r = 0; r < rows.size(); ++r) data[r * n + rows[r]] = 1.0;
+    return NativeResult::ok(out);
+}
+
+/// Standard normal numbers, the same for the same seed on every machine:
+/// `random`'s splitmix64 stream, two uniforms at a time through Box and
+/// Muller. The first uniform is taken from (0, 1] so its logarithm is finite.
+NativeResult t_normal(Process& p, Value, Value* args, uint32_t) {
+    Value seed = resolve(args[0]);
+    if (!is_fixnum(seed)) {
+        Value err;
+        type_fail(p, &err, "`normal` takes an integer seed, not " + describe(p, seed));
+        return raised(err);
+    }
+    Shape s;
+    Value t;
+    if (!read_shape(p, args[1], &s, &t)) return raised(t);
+    double* data;
+    if (!new_host(p, s, &t, &data)) return raised(t);
+    uint64_t x = uint64_t(fixnum_value(seed)) ^ 0x6A09E667F3BCC909ull;
+    auto uniform = [&x] {
+        uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        return double(z >> 11) * (1.0 / 9007199254740992.0);
+    };
+    const double two_pi = 6.283185307179586476925286766559;
+    for (uint64_t i = 0; i < s.count; i += 2) {
+        const double u1 = 1.0 - uniform(), u2 = uniform();
+        const double r = std::sqrt(-2.0 * std::log(u1));
+        data[i] = r * std::cos(two_pi * u2);
+        if (i + 1 < s.count) data[i + 1] = r * std::sin(two_pi * u2);
+    }
+    return NativeResult::ok(t);
+}
+
+/// The numbers as a string of bytes: each a little-endian IEEE double, in
+/// order. What saving a model writes; `of_bytes` reads it back exactly.
+NativeResult t_to_bytes(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(t, 0);
+    std::vector<double> scratch;
+    const double* data;
+    Value err;
+    if (!host_view(p, t, scratch, &data, &err)) return raised(err);
+    const uint64_t bytes = t->count * sizeof(double);
+    if (bytes > std::numeric_limits<uint32_t>::max()) {
+        fail(p, &err, "out_of_memory", "a tensor this large does not fit a string");
+        return raised(err);
+    }
+    std::string out(size_t(bytes), '\0');
+    for (uint64_t i = 0; i < t->count; ++i) {
+        uint64_t bits;
+        std::memcpy(&bits, &data[i], sizeof bits);
+        for (int b = 0; b < 8; ++b) out[size_t(i * 8 + b)] = char(bits >> (8 * b));
+    }
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
+/// A host tensor of `shape` from the bytes `to_bytes` wrote.
+NativeResult t_of_bytes(Process& p, Value, Value* args, uint32_t) {
+    Shape s;
+    Value out;
+    if (!read_shape(p, args[0], &s, &out)) return raised(out);
+    Value b = resolve(args[1]);
+    if (!is_obj(b, ObjType::Str)) {
+        type_fail(p, &out, "`of_bytes` reads a string of bytes, not " + describe(p, b));
+        return raised(out);
+    }
+    const auto* str = static_cast<const StrObj*>(as_obj(b));
+    if (uint64_t(str->len) != s.count * sizeof(double)) {
+        fail(p, &out, "shape_error",
+             "`of_bytes` needs " + std::to_string(s.count * sizeof(double)) +
+                 " bytes for shape " + shape_text(s) + ", not " + std::to_string(str->len));
+        return raised(out);
+    }
+    double* data;
+    if (!new_host(p, s, &out, &data)) return raised(out);
+    const auto* bytes = reinterpret_cast<const unsigned char*>(str->data());
+    for (uint64_t i = 0; i < s.count; ++i) {
+        uint64_t bits = 0;
+        for (int k = 0; k < 8; ++k) bits |= uint64_t(bytes[i * 8 + k]) << (8 * k);
+        std::memcpy(&data[i], &bits, sizeof bits);
+    }
+    return NativeResult::ok(out);
+}
+
+/// A whole number argument at least `least`, for a window's geometry.
+bool count_arg(Process& p, Value v, const char* what, int64_t least, size_t* n, Value* err) {
+    v = resolve(v);
+    if (!is_fixnum(v) || fixnum_value(v) < least || fixnum_value(v) > (int64_t(1) << 31))
+        return fail(p, err, "shape_error",
+                    std::string("`") + what + "` takes a whole number of at least " +
+                        std::to_string(least) + ", not " + describe(p, v));
+    *n = size_t(fixnum_value(v));
+    return true;
+}
+
+/// The window `kh x kw`, `stride`, `pad` over images of `shape` (`[n, h, w,
+/// c]`), with the grid of windows it makes; false when it makes none.
+bool window_of(Process& p, const char* what, const uint32_t* dims, Value* args, gpu::Window* g,
+               Value* err) {
+    if (!count_arg(p, args[0], what, 1, &g->kh, err) || !count_arg(p, args[1], what, 1, &g->kw, err) ||
+        !count_arg(p, args[2], what, 1, &g->stride, err) || !count_arg(p, args[3], what, 0, &g->pad, err))
+        return false;
+    g->n = dims[0];
+    g->h = dims[1];
+    g->w = dims[2];
+    g->c = dims[3];
+    if (g->h + 2 * g->pad < g->kh || g->w + 2 * g->pad < g->kw)
+        return fail(p, err, "shape_error",
+                    std::string("`") + what + "`: a " + std::to_string(g->kh) + " x " +
+                        std::to_string(g->kw) + " window does not fit an image of " +
+                        std::to_string(g->h) + " x " + std::to_string(g->w) + " padded by " +
+                        std::to_string(g->pad));
+    g->oh = (g->h + 2 * g->pad - g->kh) / g->stride + 1;
+    g->ow = (g->w + 2 * g->pad - g->kw) / g->stride + 1;
+    return true;
+}
+
+/// `im2col kh kw stride pad x`: every `kh x kw` window of the images `x`
+/// (`[n, h, w, c]`, channels last), moved `stride` at a time over the images
+/// padded by `pad` zeros, as a row: `[n * oh * ow, kh * kw * c]`. A
+/// convolution is then one product of these rows with the kernel as a
+/// matrix, and a pooling one fold along each row.
+NativeResult t_im2col(Process& p, Value, Value* args, uint32_t) {
+    DREAM_ARG(x, 4);
+    Value err;
+    if (x->rank != 4) {
+        fail(p, &err, "shape_error",
+             "`im2col` takes images `[n, h, w, c]`, not shape " + shape_text(shape_of(x)));
+        return raised(err);
+    }
+    gpu::Window g;
+    if (!window_of(p, "im2col", x->dims, args, &g, &err)) return raised(err);
+    const uint64_t rows = uint64_t(g.n) * g.oh * g.ow, K = uint64_t(g.kh) * g.kw * g.c;
+    if (rows > std::numeric_limits<uint32_t>::max() || K > std::numeric_limits<uint32_t>::max() ||
+        rows * K > kMaxElements) {
+        fail(p, &err, "out_of_memory", "the windows of these images are larger than 4 GiB");
+        return raised(err);
+    }
+    const Shape s = shape2(uint32_t(rows), uint32_t(K));
+    Value out;
+    if (on_gpu(x)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, x->dtype, &out);
+        if (!b) return raised(out);
+        std::string why;
+        if (!gpu::im2col(x->dtype, g, buffer_of(x), b, &why)) {
+            gpu::release(b);
+            gpu_fail(p, &out, why);
+            return raised(out);
+        }
+        return NativeResult::ok(wrap_gpu(p, s, x->dtype, b));
+    }
+    double* data;
+    if (!new_host(p, s, &out, &data)) return raised(out);
+    const double* in = x->data();
+    parallel_range(size_t(rows), [&](size_t begin, size_t end, size_t) {
+        for (size_t row = begin; row < end; ++row) {
+            const size_t ox = row % g.ow, oy = (row / g.ow) % g.oh, b = row / (g.ow * g.oh);
+            double* dst = data + row * K;
+            for (size_t ky = 0; ky < g.kh; ++ky) {
+                const int64_t iy = int64_t(oy * g.stride + ky) - int64_t(g.pad);
+                for (size_t kx = 0; kx < g.kw; ++kx, dst += g.c) {
+                    const int64_t ix = int64_t(ox * g.stride + kx) - int64_t(g.pad);
+                    if (iy < 0 || iy >= int64_t(g.h) || ix < 0 || ix >= int64_t(g.w)) {
+                        std::fill(dst, dst + g.c, 0.0);
+                    } else {
+                        std::memcpy(dst, in + ((b * g.h + size_t(iy)) * g.w + size_t(ix)) * g.c,
+                                    g.c * sizeof(double));
+                    }
+                }
+            }
+        }
+    }, size_t(rows * K), 1);
+    return NativeResult::ok(out);
+}
+
+/// `col2im shape kh kw stride pad cols`: the reverse of `im2col` for images
+/// of `shape` -- each number the sum of every place in `cols` that `im2col`
+/// would have copied it to. What a convolution's gradient flows back through.
+NativeResult t_col2im(Process& p, Value, Value* args, uint32_t) {
+    Shape is;
+    Value err;
+    if (!read_shape(p, args[0], &is, &err)) return raised(err);
+    DREAM_ARG(cols, 5);
+    if (is.rank != 4) {
+        fail(p, &err, "shape_error", "`col2im` makes images `[n, h, w, c]`, not shape " + shape_text(is));
+        return raised(err);
+    }
+    gpu::Window g;
+    if (!window_of(p, "col2im", is.dims, args + 1, &g, &err)) return raised(err);
+    const uint64_t rows = uint64_t(g.n) * g.oh * g.ow, K = uint64_t(g.kh) * g.kw * g.c;
+    if (cols->rank != 2 || cols->dims[0] != rows || cols->dims[1] != K) {
+        fail(p, &err, "shape_error",
+             "`col2im` needs the rows `im2col` makes for images of shape " + shape_text(is) +
+                 ", which are [" + std::to_string(rows) + ", " + std::to_string(K) + "], not " +
+                 shape_text(shape_of(cols)));
+        return raised(err);
+    }
+    Value out;
+    if (on_gpu(cols)) {
+        gpu::Buffer* b = gpu_alloc(p, is.count, cols->dtype, &out);
+        if (!b) return raised(out);
+        std::string why;
+        if (!gpu::col2im(cols->dtype, g, buffer_of(cols), b, &why)) {
+            gpu::release(b);
+            gpu_fail(p, &out, why);
+            return raised(out);
+        }
+        return NativeResult::ok(wrap_gpu(p, is, cols->dtype, b));
+    }
+    double* data;
+    if (!new_host(p, is, &out, &data)) return raised(out);
+    std::fill(data, data + is.count, 0.0);
+    const double* src = cols->data();
+    // Each image is its own: the threads divide the images, and within one
+    // the windows are added in order, so the sums are the same at any thread
+    // count.
+    const size_t per_image = g.oh * g.ow;
+    parallel_range(g.n, [&](size_t begin, size_t end, size_t) {
+        for (size_t b = begin; b < end; ++b) {
+            for (size_t r = 0; r < per_image; ++r) {
+                const size_t ox = r % g.ow, oy = r / g.ow;
+                const double* row = src + (b * per_image + r) * K;
+                for (size_t ky = 0; ky < g.kh; ++ky) {
+                    const int64_t iy = int64_t(oy * g.stride + ky) - int64_t(g.pad);
+                    for (size_t kx = 0; kx < g.kw; ++kx, row += g.c) {
+                        const int64_t ix = int64_t(ox * g.stride + kx) - int64_t(g.pad);
+                        if (iy < 0 || iy >= int64_t(g.h) || ix < 0 || ix >= int64_t(g.w)) continue;
+                        double* dst = data + ((b * g.h + size_t(iy)) * g.w + size_t(ix)) * g.c;
+                        for (size_t ci = 0; ci < g.c; ++ci) dst[ci] += row[ci];
+                    }
+                }
+            }
+        }
+    }, size_t(rows * K), 1);
+    return NativeResult::ok(out);
+}
+
+/// `permute axes t`: the axes of `t` reordered, axis `k` of the answer being
+/// axis `axes[k]` of `t`.
+NativeResult t_permute(Process& p, Value, Value* args, uint32_t) {
+    DREAM_SHAPE_ARG(t, 1);
+    std::vector<Value> items;
+    bool is_seq;
+    Value err;
+    if (!items_of(p, args[0], items, &is_seq, &err)) {
+        if (!is_seq) type_fail(p, &err, "`permute` takes a list of axes");
+        return raised(err);
+    }
+    std::vector<uint32_t> axes(items.size());
+    std::vector<bool> seen(t->rank, false);
+    bool ok = items.size() == t->rank;
+    for (size_t k = 0; ok && k < items.size(); ++k) {
+        Value w;
+        if (!force_whnf(p, items[k], &w)) return raised(p.result);
+        ok = is_fixnum(w) && fixnum_value(w) >= 0 && fixnum_value(w) < int64_t(t->rank) &&
+             !seen[size_t(fixnum_value(w))];
+        if (ok) {
+            axes[k] = uint32_t(fixnum_value(w));
+            seen[axes[k]] = true;
+        }
+    }
+    if (!ok) {
+        fail(p, &err, "shape_error",
+             "`permute` takes each axis of shape " + shape_text(shape_of(t)) +
+                 " once, in its new order");
+        return raised(err);
+    }
+    Value out;
+    if (!permute_axes(p, t, axes, &out)) return raised(out);
     return NativeResult::ok(out);
 }
 
@@ -1923,16 +2804,20 @@ NativeResult t_cpu_kernels(Process& p, Value, Value*, uint32_t) {
 // --- what the rest of the VM calls -----------------------------------------------
 
 bool tensor_arith(Process& p, Op op, Value a, Value b, Value* out) {
+    return tensor_binary(p, kernel_op(op), a, b, out);
+}
+
+bool tensor_binary(Process& p, int kop, Value a, Value b, Value* out) {
     a = resolve(a);
     b = resolve(b);
     TensorObj* x = tensor_of(a);
     TensorObj* y = tensor_of(b);
+    const char* what = binary_name(kop);
     Shape s;
     const TensorObj* like;
     if (x && y) {
-        if (!broadcast(p, op, shape_of(x), shape_of(y), &s, out)) return false;
-        if (!same_device(p, x, y, (std::string("`") + op_text(op) + "`").c_str(), out))
-            return false;
+        if (!broadcast(p, what, shape_of(x), shape_of(y), &s, out)) return false;
+        if (!same_device(p, x, y, (std::string("`") + what + "`").c_str(), out)) return false;
         like = x;
     } else if (x && is_number(b)) {
         s = shape_of(x);
@@ -1941,12 +2826,12 @@ bool tensor_arith(Process& p, Op op, Value a, Value b, Value* out) {
         s = shape_of(y);
         like = y;
     } else {
-        return type_fail(p, out, std::string("cannot apply `") + op_text(op) + "` to " +
+        return type_fail(p, out, std::string("cannot apply `") + what + "` to " +
                                      describe(p, a) + " and " + describe(p, b) +
                                      ": a tensor combines with a tensor or a number");
     }
     const Value operands[2] = {a, b};
-    return elementwise(p, operands, 2, FUSE_BIN, uint8_t(kernel_op(op)), s, like, out);
+    return elementwise(p, operands, 2, FUSE_BIN, uint8_t(kop), s, like, out);
 }
 
 bool tensor_force(Process& p, Value v, Value* err) {
@@ -2110,7 +2995,11 @@ ModuleDef make_tensor_module() {
             {"maximum", 1, 0b1, t_reduce, KRED_MAX},
             {"mean", 1, 0b1, t_mean},
             {"norm", 1, 0b1, t_norm},
-            {"sum_axis", 2, 0b11, t_sum_axis},
+            {"sum_axis", 2, 0b11, t_axis, KRED_SUM},
+            {"min_axis", 2, 0b11, t_axis, KRED_MIN},
+            {"max_axis", 2, 0b11, t_axis, KRED_MAX},
+            {"argmin_axis", 2, 0b11, t_axis, KRED_ARGMIN},
+            {"argmax_axis", 2, 0b11, t_axis, KRED_ARGMAX},
             {"sqrt", 1, 0b1, t_unary, KFN_SQRT},
             {"exp", 1, 0b1, t_unary, KFN_EXP},
             {"log", 1, 0b1, t_unary, KFN_LOG},
@@ -2120,6 +3009,32 @@ ModuleDef make_tensor_module() {
             {"cos", 1, 0b1, t_unary, KFN_COS},
             {"relu", 1, 0b1, t_unary, KFN_RELU},
             {"sigmoid", 1, 0b1, t_unary, KFN_SIGMOID},
+            {"floor", 1, 0b1, t_unary, KFN_FLOOR},
+            {"ceil", 1, 0b1, t_unary, KFN_CEIL},
+            {"round", 1, 0b1, t_unary, KFN_ROUND},
+            {"sign", 1, 0b1, t_unary, KFN_SIGN},
+            {"erf", 1, 0b1, t_unary, KFN_ERF},
+            {"max", 2, 0b11, t_binary, KOP_MAX},
+            {"min", 2, 0b11, t_binary, KOP_MIN},
+            {"pow", 2, 0b11, t_binary, KOP_POW},
+            {"lt", 2, 0b11, t_binary, KOP_LT},
+            {"le", 2, 0b11, t_binary, KOP_LE},
+            {"gt", 2, 0b11, t_binary, KOP_GT},
+            {"ge", 2, 0b11, t_binary, KOP_GE},
+            {"eq", 2, 0b11, t_binary, KOP_EQ},
+            {"ne", 2, 0b11, t_binary, KOP_NE},
+            {"fill_like", 2, 0b11, t_fill_like},
+            {"repeat", 2, 0b11, t_repeat},
+            {"slice", 3, 0b111, t_slice},
+            {"take", 2, 0b11, t_take},
+            {"concat", 1, 0b1, t_concat},
+            {"one_hot", 2, 0b11, t_one_hot},
+            {"normal", 2, 0b11, t_normal},
+            {"to_bytes", 1, 0b1, t_to_bytes},
+            {"im2col", 5, 0b11111, t_im2col},
+            {"permute", 2, 0b11, t_permute},
+            {"col2im", 6, 0b111111, t_col2im},
+            {"of_bytes", 2, 0b11, t_of_bytes},
             {"gpu", 1, 0b1, t_gpu, gpu::F32},
             {"gpu64", 1, 0b1, t_gpu, gpu::F64},
             {"host", 1, 0b1, t_host},

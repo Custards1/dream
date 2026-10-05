@@ -1,0 +1,55 @@
+// Machine learning: a classifier and a regression trained from scratch, a
+// gradient of a function written by hand, and a model read as data.
+//
+// `std.ml` builds models from layers (`std.ml.nn`), trains them by gradient
+// descent (`ml.fit!`, with an optimizer from `std.ml.optim`), and takes the
+// gradient of any function of tensors (`std.ml.ad`). Everything numeric is
+// `std.tensor`, so it runs fused on the host's vector units, or on the GPU
+// when there is one and the model is large enough to repay it -- these are
+// small enough that `:auto` keeps them on the host, which is why the output
+// below is the same on every machine.
+import std.console;
+import std.list;
+import std.ml;
+import std.ml.ad;
+import std.ml.data;
+import std.ml.metrics;
+import std.ml.nn;
+import std.ml.optim;
+import std.ml.tree;
+import std.num;
+import std.tensor;
+
+let main! = {
+    // Three interleaved spirals: no straight line separates them.
+    let ds = data.spirals 1 100 3;
+    let [train, test] = data.split 0.8 7 ds;
+    let model = nn.sequential [nn.dense 32, nn.relu, nn.dense 32, nn.relu, nn.dense 3];
+    console.print! (nn.summary model [2])
+    let fitted = ml.fit! model train %{
+        :loss => :cross_entropy, :optimizer => optim.adam 0.01, :epochs => 60,
+        :batch => 16, :metrics => [:accuracy], :verbose => false, :seed => 3,
+    };
+    let scores = ml.evaluate fitted test;
+    console.print! ("test accuracy " + ml.fixed 2 scores.["accuracy"])
+    console.print! (list.take 8 (ml.classify fitted (data.x test)))
+    console.print! (list.take 8 (list.map num.to_int (tensor.to_list (data.y test))))
+    console.print! (metrics.confusion 3 (ml.predict fitted (data.x test)) (data.y test))
+
+    // A regression: the best fit of noisy linear data, scored by r2.
+    let lin = data.linear 4 200 3 0.1;
+    let reg = ml.fit! (nn.dense 1) lin %{ :optimizer => optim.sgd 0.1, :epochs => 40, :batch => 20, :verbose => false };
+    console.print! ("r2 " + ml.fixed 3 (metrics.r2 (ml.predict reg (data.x lin)) (data.y lin)))
+    console.print! (list.map (ml.fixed 2) (tensor.to_list (tensor.reshape [3] (ml.params reg).["w"])))
+    console.print! (list.map (ml.fixed 2) (tensor.to_list (data.linear_truth 4 3)))
+
+    // The gradient of a function written by hand: d/dx of sum (x^3 - 2x) is
+    // 3x^2 - 2.
+    let f x = ad.sum (ad.sub (ad.pow x 3.0) (ad.scale 2.0 x));
+    console.print! (list.map (ml.fixed 1) (tensor.to_list (ad.grad f (tensor.of_list [0, 1, 2]))))
+
+    // Parameters are a tree of tensors, read and changed as data.
+    let p = ml.params fitted;
+    console.print! (list.map (fn [path, t] -> [path, tensor.shape t]) (tree.paths p))
+    console.print! (tree.size p)
+};

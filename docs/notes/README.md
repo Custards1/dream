@@ -121,6 +121,21 @@ How `lucid` answers an editor, and which tree answers which question.
 - A record is a declaration before it is a module
 - A host module's members come from the host
 
+## [Machine learning](ml.md)
+
+`std.ml`: autodiff, layers, losses, optimizers and the training loop on
+`std.tensor`, and shaping its Dream code for the JIT.
+
+- The pieces
+- Autodiff without a tape
+- Losses are single operations
+- Where it runs
+- Why `fit!` trains in a process of its own
+- When the model does not fit the heap
+- Shaping the Dream code for the JIT
+- Measured: a training run
+- What is not done
+
 ## [Tensors](tensors.md)
 
 Packed numeric arrays, `@` and the GPU: what made the product fast, what it
@@ -139,6 +154,9 @@ took to free device memory, and how a chain of operations runs as one pass.
 - Measuring a fresh tensor, and the pool for large blocks
 - Transposes, and chains into a product
 - Finishing fusion
+- What machine learning needed
+- A GPU program could crash as it exited
+- On a real GPU
 - Considered: a server process that owns the tensors and mutates them
 - What is not done yet
 

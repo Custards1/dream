@@ -2766,7 +2766,13 @@ static inline bool check_limits(Process& p, const WellKnownAtoms& wk,
     }
     // Checked after a collection has had its chance, so this fires only for a
     // process whose *live* data is too big, not one that merely allocates fast.
-    if (p.heap().bytes_allocated() > max_heap && p.heap().bytes_live() > max_heap / 2) {
+    //
+    // Once raised, it is not raised again until a collection has measured
+    // the live data afresh: what the last one found is stale the moment the
+    // error unwinds the frames that held it, and a `catch` must be able to run.
+    if (p.heap().bytes_allocated() > max_heap && p.heap().bytes_live() > max_heap / 2 &&
+        p.heap_limit_raised_at != p.heap().collections()) {
+        p.heap_limit_raised_at = p.heap().collections();
         raise_heap_limit(p, wk, max_heap);
         return true;
     }

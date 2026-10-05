@@ -934,6 +934,53 @@ NativeResult math_sqrt(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(p.heap().make_float(std::sqrt(d)));
 }
 
+/// A number argument as a double, for the functions of a real variable.
+bool math_arg(Process& p, Value v, const char* what, double* d, Value* err) {
+    v = resolve(v);
+    if (is_obj(v, ObjType::Float)) {
+        *d = static_cast<FloatObj*>(as_obj(v))->value;
+        return true;
+    }
+    if (bigint::is_integer(v)) {
+        *d = bigint::to_double(v);
+        return true;
+    }
+    *err = raise_error(p, well_known(p.runtime()).type_error,
+                       std::string(what) + " needs a number, not " + describe(p, v));
+    return false;
+}
+
+/// `exp`, `log`, `sin`, `cos`, `tan`, `tanh`, `atan`: a float of a number,
+/// by the native's `user` field. What a learning-rate schedule or a
+/// statistic computes on one number, where a tensor would be ceremony.
+NativeResult math_real(Process& p, Value callee, Value* args, uint32_t) {
+    static const char* const names[] = {"exp", "log", "sin", "cos", "tan", "tanh", "atan"};
+    const uint32_t fn = static_cast<NativeObj*>(as_obj(callee))->user;
+    double d;
+    Value err;
+    if (!math_arg(p, args[0], names[fn], &d, &err)) return NativeResult::raise(err);
+    double r;
+    switch (fn) {
+        case 0: r = std::exp(d); break;
+        case 1: r = std::log(d); break;
+        case 2: r = std::sin(d); break;
+        case 3: r = std::cos(d); break;
+        case 4: r = std::tan(d); break;
+        case 5: r = std::tanh(d); break;
+        default: r = std::atan(d); break;
+    }
+    return NativeResult::ok(p.heap().make_float(r));
+}
+
+/// `pow x y`: `x` to the power `y`, as a float.
+NativeResult math_pow(Process& p, Value, Value* args, uint32_t) {
+    double x, y;
+    Value err;
+    if (!math_arg(p, args[0], "pow", &x, &err) || !math_arg(p, args[1], "pow", &y, &err))
+        return NativeResult::raise(err);
+    return NativeResult::ok(p.heap().make_float(std::pow(x, y)));
+}
+
 NativeResult math_abs(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (is_fixnum(v)) {
@@ -1495,6 +1542,7 @@ NativeResult vm_stats(Process& p, Value, Value*, uint32_t) {
         {"minor_collections", make_integer(p, int64_t(p.heap().minor_collections()))},
         {"major_collections", make_integer(p, int64_t(p.heap().major_collections()))},
         {"bytes_promoted", make_integer(p, int64_t(p.heap().bytes_promoted()))},
+        {"external_bytes", make_integer(p, int64_t(p.heap().external_bytes()))},
     }));
 }
 
@@ -1578,6 +1626,14 @@ ModuleDef make_math_module() {
                          {"sqrt", 1, 0b1, math_sqrt},
                          {"abs", 1, 0b1, math_abs},
                          {"floor", 1, 0b1, math_floor},
+                         {"exp", 1, 0b1, math_real, 0},
+                         {"log", 1, 0b1, math_real, 1},
+                         {"sin", 1, 0b1, math_real, 2},
+                         {"cos", 1, 0b1, math_real, 3},
+                         {"tan", 1, 0b1, math_real, 4},
+                         {"tanh", 1, 0b1, math_real, 5},
+                         {"atan", 1, 0b1, math_real, 6},
+                         {"pow", 2, 0b11, math_pow},
                      }};
 }
 

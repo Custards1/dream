@@ -686,7 +686,13 @@ void Heap::reap_external(bool full) {
     // it found the memory held by old objects, which only a major can judge.
     // A major settles the question either way.
     external_major_ = !full && before >= external_trigger_ && external_bytes_ * 2 > before;
-    external_trigger_ = std::max(external_bytes_ * 2, external_bytes_ + kExternalSlack);
+    //
+    // The doubling is capped by the device. GPU memory is not the heap's to
+    // grow: a training loop makes a gigabyte of temporaries a second on the
+    // device, and with the trigger at twice what survived, the peaks between
+    // collections grew until an 8 GB card ran out (`external_budget`).
+    const size_t doubled = std::min(external_bytes_ * 2, external_budget());
+    external_trigger_ = std::max(doubled, external_bytes_ + kExternalSlack);
 }
 
 Value Heap::make_pid(uint64_t id) {

@@ -547,6 +547,146 @@ into GPU products on either side and in the one-column kernel, the GPU
 - **Elementwise work across the two devices.** A host tensor and a GPU tensor
   in one operation is still an error (`:device_error`), by design.
 
+## What machine learning needed
+
+`std.ml` (see [ml.md](ml.md)) is written on `std.tensor` and nothing else,
+and it found the operators and the handful of functions above short of
+what a network's forward and backward passes are made of. What was added, and
+the shape each took:
+
+- **Comparisons and the larger of two.** `lt le gt ge eq ne`, `max`, `min`
+  and `pow` are binary `KernelOp`s like `+`, so they broadcast, defer and
+  fuse exactly as the operators do (`tensor_binary`, which `tensor_arith`
+  now calls). A comparison answers 1 or 0, so a relu's gradient is `g *
+  tensor.gt x 0.0` -- one more instruction in the chain, not a pass. `max`
+  and `min` of two are named apart from the reductions only by arity.
+  `floor ceil round sign erf` joined the functions of one argument; `erf`
+  is what an exact GELU needs.
+- **A value per row, across the row.** Broadcasting is trailing only, and a
+  softmax subtracts each row's maximum from the row: the row's value is
+  *leading*. `tensor.repeat n t` gives `t` a new last axis along which each
+  number repeats, and it is not stretched in memory: it is a program of one
+  instruction, `FUSE_LOADR`, which reads input `k` at `(i / r) % count`. The
+  instruction's argument packs the input (3 bits) and the constant holding
+  `r` (4 bits), so no field was added to `TensorExpr`; on the GPU the
+  repeat is a kernel argument like every constant. `softmax` of a matrix is
+  therefore two folds and one fused pass, with nothing the size of the input
+  stored but the answer.
+- **Folds along an axis other than the sum.** `sum_axis` became
+  `reduce_axis` with an op: `max_axis`, `min_axis`, and the `ARG` forms,
+  which answer positions as numbers so that they can stay on the device.
+  The host's fold starts from each output's first value rather than an
+  identity (there is no honest identity for a maximum of floats), in order
+  along the axis, so answers are the same at any thread count. The GPU's
+  generated `axis` kernel takes the op; `argaxis` is a sibling kernel in
+  the same generated program.
+- **Rows: `slice`, `take`, `concat`, `one_hot`.** A batch is a slice; a
+  shuffled batch, or an embedding lookup, is a `take`. On the GPU a run of
+  consecutive rows is one `clEnqueueCopyBuffer` and anything else is one
+  `gather` kernel, whose row numbers go up as a small buffer of their own.
+  `concat` is copies at offsets (`gpu::copy` gained a destination offset).
+- **Windows: `im2col` and `col2im`.** A convolution is every window of the
+  image as a row, times the kernel as a matrix -- the arrangement every fast
+  convolution reduces to, which makes its speed the product's. Images are
+  channels last, so that a window's channels are contiguous and each
+  window's row is `kh * kw` memcpys. `col2im` is the gradient: each pixel the
+  sum of the places it was copied to. On the GPU it is written as a gather,
+  one work-item per pixel adding up the windows that cover it, so nothing
+  is written twice and no atomics are needed; on the host the threads divide
+  the images, so the sums are in the same order at any thread count.
+- **Batched products and `permute`.** `@` takes `[b, m, k]` by `[b, k, n]`
+  -- attention is many small products, so the host runs one per thread
+  rather than splitting each, and the GPU runs them as the third dimension
+  of one tiled launch (`bmm`) -- and `[b, m, k]` by `[k, n]`, which is an
+  ordinary product of the rows and so still defers and fuses. `permute`
+  reorders any axes, which is how heads move between the sequence and the
+  batch; the host walks the answer with a counter per axis, and the GPU
+  kernel takes the strides as arguments.
+- **`normal`, `to_bytes`, `of_bytes`.** Initial weights, and saving them
+  exactly.
+
+`tensor_functions.dr` checks every one of these exactly on the host, and
+`tensor_gpu.dr` checks each against the host on the GPU.
+
+### A GPU program could crash as it exited
+
+About one exit in thirty, under POCL, a program that had used the GPU died
+with SIGSEGV *after* printing everything right. The core showed the main
+thread in `exit()` running library destructors (`_dl_fini`) while one of
+POCL's driver threads was still compiling a kernel that had been queued and
+not waited for -- its LLVM state destroyed underneath it. Nothing in the VM
+waited for the queue at exit, because nothing had to for the answer: work
+queued and never read is work nobody needs. The fix is an `atexit` handler,
+registered when the device is set up, that waits for the queue
+(`drain_at_exit` in gpu.cpp); `atexit` handlers run before the libraries are
+torn down. It was older than the functions above, which only made it more
+likely by queueing more. 0 crashes in 100 runs after, against about 1 in 30
+before.
+
+## On a real GPU
+
+Everything above about the GPU was measured on POCL, which runs OpenCL on the
+host's own cores and so could only say that a path worked. Run on an RTX
+3070 (NVIDIA's OpenCL, 2026-10-04), against the 12-core Ryzen 5900X host,
+`std.ml` training showed four things the CPU implementation hid.
+
+**A long K with a small answer.** The tiled kernel gives each tile of C one
+work-group, which walks the whole of K. A convolution's kernel gradient is
+`[kh * kw * c, rows] x [rows, filters]` with `rows` a hundred thousand: two
+work-groups each doing a hundred thousand steps, on a device built to run
+thousands at once. **Split-K**: when C has too few tiles, K is cut into
+slices (`matmul_part`, the slice the launch's third dimension) whose partial
+products a second kernel adds in slice order. A product with a chain after
+it is then the product and the chain as a separate fused pass
+(`run_split_product`), since no slice holds a finished element to apply the
+chain to.
+
+**A long axis with few answers.** The same shape in `sum_axis`: a bias's
+gradient sums a hundred thousand rows into thirty-two numbers, and the axis
+kernel ran one work-item per answer -- 32 ms of a 34 ms training step. Such
+an axis is folded in slices side by side, and the partials folded again by
+the same generated kernel over a program that only loads them. A conv
+training step went from **34 ms to 3.6 ms**. The `ARG` folds stay single
+pass.
+
+**The product kernel itself.** The textbook tiled kernel reads two values
+from local memory per multiply-add, and that bound it: **1.2 TFLOP/s** for a
+4096-square product on a card that does twenty. Now every product -- plain,
+split slice, batched, and the generated one with a chain in its store -- is
+one generator (`product_kernel`) in which a work-item computes a `w x w`
+block of C held in registers, reading `2w` values per `w * w`
+multiply-adds. 8 x 8 runs the 4096 product at **5.9 TFLOP/s** (23 ms) and
+4 x 4 at 4.1, but a large block makes few work-groups: a 256 x 64 product
+is one work-group at 8 x 8, and small networks got slower. So the products
+are built at 2, 4 and 8, and each launch takes the largest that still makes
+96 work-groups (`pick_wpt`).
+
+| | host | RTX 3070 | |
+|---|---|---|---|
+| `@`, 512 | 4.5 ms | 0.25 ms | 18x |
+| `@`, 2048 | 95 ms | 3.3 ms | 29x |
+| `@`, 4096 | 545 ms | 23 ms | 23x |
+| 64 products of 128 x 64 by 64 x 128 | 10.2 ms | 0.48 ms | 21x |
+| 3 x 3 convolution, 64 images of 32 x 32 x 16 | 22 ms | 1.9 ms | 11x |
+| a five-step fused chain over 16M | 3.1 ms | 0.47 ms | 6x |
+
+Each is the time per call with the answer read back, after a warm-up call.
+
+**Device memory between collections.** A training loop under a caller that
+could not collect (see "Why a process" at `ml.fit!`) filled the 8 GB card.
+Looking for that found two weaker bounds, both tightened though neither was
+the cause: the launch throttle now also closes a window once it has
+allocated an eighth of the device's memory, since two windows of
+convolution launches each touching a hundred megabytes pinned gigabytes of
+released buffers; and the collector's trigger for external memory, which
+doubles past what survived the last collection, is capped at a quarter of
+the device (`external_budget`). `vm.stats!` now reports `external_bytes`,
+which is how the cause was told apart from these.
+
+`tensor_gpu.dr` checks split products (plain, with a chain, through a
+transpose, with a computed operand), split folds along each kind of axis,
+and float64 products, on both POCL and the 3070.
+
 ## Considered: a server process that owns the tensors and mutates them
 
 The question was whether tensor operations should run in a VM process (or
@@ -572,11 +712,10 @@ What mutation would actually buy is fewer allocations in a chain like
 - **Fusing into the product** -- see "What fusion does not do yet".
 - **Float32 on the host.** Twice the vector throughput, and the type a model
   is stored in. `dtype` is already in the header.
-- **Batched products.** `@` refuses more than two axes.
-- **A faster GPU product.** The tiled kernel is the textbook one, a long way
-  from cuBLAS. Register tiling (each work-item computing a 4 x 4 or 8 x 8
-  block) is the known next step. A CUDA or Metal backend would sit behind the
-  same `gpu::` functions.
+- **A faster GPU product.** Register tiling is done ("On a real GPU"); at
+  5.9 TFLOP/s it is still a third or less of what cuBLAS gets from the same
+  card. Vector loads, double-buffered tiles, and a CUDA or Metal backend
+  behind the same `gpu::` functions are what is left.
 - **Sending a host tensor without copying it.** A large one could be
   reference-counted the way BEAM shares large binaries.
 - **The wire format** (`std.remote`) and compile-time values (`comp`) do not

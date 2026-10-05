@@ -79,6 +79,18 @@ learn.
 | `sql` | SQL for any database: fragments, query builders, dialects, a pool, and SQLite |
 | `sql.pg` | a PostgreSQL client in pure Dream ([README](sql/pg/README.md)) |
 
+**Machine learning** ([docs/notes/ml.md](../../docs/notes/ml.md))
+
+| | |
+|---|---|
+| `ml` | `fit!`, `predict`, `classify`, `evaluate`, `save!` and `load!`: the training loop, on the GPU when it pays |
+| `ml.ad` | reverse-mode autodiff of any function of tensors and numbers |
+| `ml.nn` | layers and models: dense, conv2d and pooling, attention and transformer blocks, RNN/GRU/LSTM, embeddings, norms, dropout |
+| `ml.loss`, `ml.metrics` | what training minimizes, and what is reported |
+| `ml.optim` | SGD, Adam, AdamW, RMSProp, Adagrad, clipping, learning-rate schedules |
+| `ml.data` | datasets: batches, shuffles, splits and folds, scalers, CSV, synthetic sets |
+| `ml.init`, `ml.tree`, `ml.ops` | initial weights, parameter trees, and the tensor compositions the rest share |
+
 **Writing programs**
 
 | | |

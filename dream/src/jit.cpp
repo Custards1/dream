@@ -688,8 +688,14 @@ public:
         // in the body has just been accounted for -- so this is checked rather
         // than argued, because the argument is about the compiler and this file
         // is not.
-        if (reads_beyond_params_) return a;
-        if (!bindings_substitutable()) return a;
+        if (reads_beyond_params_) {
+            why(img_.node(f_.body), "a slot no parameter or binding owns");
+            return a;
+        }
+        if (!bindings_substitutable()) {
+            why(img_.node(f_.body), "a binding that cannot be written where it is read");
+            return a;
+        }
 
         // Which arguments are evaluated.
         //
@@ -850,8 +856,15 @@ private:
         const Node& n = img_.node(node);
         Op op = Op(n.op);
 
-        if (op == Op::Apply || is_primitive(op)) return check_apply(node, n, depth);
-        if (!op_is_supported(op)) return false;
+        if (op == Op::Apply || is_primitive(op)) {
+            if (check_apply(node, n, depth)) return true;
+            why(n, kind_at(node) == CallKind::Refused ? "a call this tier cannot make" : "an argument");
+            return false;
+        }
+        if (!op_is_supported(op)) {
+            why(n, "an operation this tier does not emit");
+            return false;
+        }
         // An integer too big for a fixnum is a boxed constant the emitter has
         // no way to name, so it is refused here rather than there -- same
         // reason as the two ops missing from the list above.
@@ -925,6 +938,19 @@ private:
                 return true;
         }
     }
+
+    /// `DREAM_JIT_WHY=1` says, for each function refused, the first node that
+    /// refused it -- which is what to change in a library that wants a loop
+    /// compiled. Reported innermost first, once per function.
+    void why(const Node& n, const char* what) {
+        static const bool on = std::getenv("DREAM_JIT_WHY") != nullptr;
+        if (!on || said_why_) return;
+        said_why_ = true;
+        StringRef name = img_.str(img_.func(fi_).name);
+        std::fprintf(stderr, "; jit why fn#%u %.*s: %s (%s)\n", fi_, int(name.len), name.data, what,
+                     op_name(Op(n.op)));
+    }
+    bool said_why_ = false;
 
     /// This function calling itself with a full argument list. In tail position
     /// it becomes a loop back-edge; anywhere else a machine call, which is what
@@ -1077,7 +1103,10 @@ private:
             // load_slot remembers the forced value. Other strict bindings need
             // real stored values and remain outside this tier.
             const Node& value = img_.node(n.b);
-            if (Op(value.op) != Op::Local || value.a >= f_.arity) return false;
+            if (Op(value.op) != Op::Local || value.a >= f_.arity) {
+                why(value, "a strict `let`, or a `match` on something other than a parameter");
+                return false;
+            }
         }
         // Into a parameter's slot, or past the end of the frame: neither is
         // something the compiler emits, and neither has a meaning here.
@@ -5036,7 +5065,17 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
                              const Image& img, uint32_t func_index, const std::string& name) {
     PeerSet peers(rt, img);
     Analysis root = Analyzer(rt, img, func_index, &peers, 0).run();
-    if (!root.compilable || !peers.sound(root)) return nullptr;
+    // `DREAM_JIT_WHY` (see `Analyzer::why`) for the refusals made here.
+    static const bool say = std::getenv("DREAM_JIT_WHY") != nullptr;
+    auto refuse = [&](const char* what) -> llvm::Function* {
+        if (say) {
+            StringRef n = img.str(img.func(func_index).name);
+            std::fprintf(stderr, "; jit why fn#%u %.*s: %s\n", func_index, int(n.len), n.data, what);
+        }
+        return nullptr;
+    };
+    if (!root.compilable) return nullptr;
+    if (!peers.sound(root)) return refuse("a function it calls was refused (`DREAM_JIT_WHY` names it)");
 
     PeerFns fns;
     for (const auto& member : peers.members) {
@@ -5062,7 +5101,7 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
     for (const auto& member : peers.members) {
         const PeerFn& pf = fns[member.first];
         Emitter generic(ctx, mod, rt, img, member.first, member.second, &fns, pf.generic);
-        if (!generic.emit(pf.generic->getName().str())) return nullptr;
+        if (!generic.emit(pf.generic->getName().str())) return refuse("the emitter refused a function it calls");
         if (pf.typed) {
             Analysis t = member.second;
             t.float_slots = pf.typed_slots;
@@ -5071,7 +5110,8 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
             if (!typed.emit(pf.typed->getName().str())) return nullptr;
         }
     }
-    return Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
+    llvm::Function* f = Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
+    return f ? f : refuse("the emitter refused it");
 }
 
 }  // namespace
@@ -5364,20 +5404,25 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     // `DREAM_JIT_TRACE=1` prints every compile, whether it was taken and what
     // LLVM charged for it -- the number that decided compiling in the
     // background, and the one to read before widening the tier again.
+    // The function's name is printed beside its index, as `--profile` names
+    // it, so that a trace says which of a library's functions the tier took.
     struct Trace {
         uint32_t fi;
         CompiledFn* result;
+        const Image* img;
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Trace() {
             static const bool on = std::getenv("DREAM_JIT_TRACE") != nullptr;
             if (!on) return;
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t0).count();
-            std::fprintf(stderr, "; jit fn#%u %s %.2f ms\n", fi, *result ? "compiled" : "refused", ms);
+            StringRef name = img->str(img->func(fi).name);
+            std::fprintf(stderr, "; jit fn#%u %.*s %s %.2f ms\n", fi, int(name.len), name.data,
+                         *result ? "compiled" : "refused", ms);
         }
     };
     CompiledFn traced = nullptr;
-    Trace trace{func_index, &traced};
+    Trace trace{func_index, &traced, &impl_->rt.image()};
 
     const Image& img = impl_->rt.image();
     if (!impl_->ensure_jit(error)) return nullptr;

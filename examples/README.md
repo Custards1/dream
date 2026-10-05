@@ -45,6 +45,7 @@ Read them in order the first time; each assumes the ones before it.
 | [`19_text.dr`](19_text.dr) | `std.parse` and `std.regex`: grammars from functions, patterns checked while compiling |
 | [`20_random.dr`](20_random.dr) | `std.random` and `std.property`: replayable generators, and counterexamples that shrink |
 | [`21_http.dr`](21_http.dr) | `std.http`: a router, a server and a client in one program |
+| [`22_ml.dr`](22_ml.dr) | `std.ml`: a classifier and a regression trained from scratch, a hand-written gradient, parameters as data |
 
 ## The packages
 

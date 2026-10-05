@@ -1,0 +1,183 @@
+// Metrics: how good a model's predictions are, in terms a person reads.
+//
+//     metrics.accuracy logits labels          // 0.93
+//     metrics.confusion 3 logits labels       // a 3 x 3 table of counts
+//     metrics.r2 predicted actual             // 0.87
+//
+// A loss is what training minimizes; a metric is what is reported. Each
+// metric takes the model's output and the target, as a loss does, and
+// answers a float. Each is a few `std.tensor` operations and one number read
+// back, so it runs where the predictions are -- on the GPU, nothing comes
+// back but the answer.
+//
+// **Classification metrics read the output as scores.** With more than one
+// column, the predicted class is the column with the largest score (logits
+// and probabilities agree on that). With one column, or a vector, the
+// prediction is yes where the score is above a threshold: 0.5 for
+// probabilities, and 0 for logits (`binary_accuracy 0.0`), which is what a
+// sigmoid at 0.5 is. Targets are classes or one-hot rows, as for
+// `loss.cross_entropy`.
+
+import std.list;
+import std.math;
+import std.ml.ops;
+import std.tensor;
+
+/// The predicted class of each row of scores.
+let classes_of : :tensor -> :tensor;
+let classes_of scores = tensor.argmax_axis (tensor.rank scores - 1) scores;
+
+/// The target's classes, from classes or one-hot rows shaped like
+/// `scores`, as a vector on the device of `scores`.
+priv let target_classes : :tensor -> :any -> :tensor;
+priv let target_classes scores y = {
+    let t = if type_of y == :tensor { y } else { tensor.of_list y };
+    let c = if tensor.rank t == tensor.rank scores && tensor.rank t > 1 { classes_of t } else { t };
+    ops.like scores (tensor.reshape [tensor.size c] c)
+};
+
+/// Whether `scores` has a single output per example.
+priv let single : :tensor -> :bool;
+priv let single scores = tensor.rank scores == 1 || (tensor.shape scores).[tensor.rank scores - 1] == 1;
+
+/// The share of examples classified correctly: the largest score's column
+/// against the target class, or, for one output, the score above 0.5.
+let accuracy : :tensor -> :any -> :float;
+let accuracy scores y =
+    if single scores { binary_accuracy 0.5 scores y }
+    else { tensor.mean (tensor.eq (classes_of scores) (target_classes scores y)) };
+
+/// The share of yes-or-no predictions (score above `threshold`) that match
+/// targets of 0 and 1.
+let binary_accuracy : :float -> :tensor -> :any -> :float;
+let binary_accuracy threshold scores y = {
+    let p = tensor.reshape [tensor.size scores] (tensor.gt scores threshold);
+    let t = ops.like p (as_flat y);
+    tensor.mean (tensor.eq p (tensor.gt t 0.5))
+};
+
+/// The share of examples whose target class is among the `k` highest scores.
+let top_k : :integer -> :tensor -> :any -> :float;
+let top_k k scores y = {
+    let c = target_classes scores y;
+    let n = tensor.size c;
+    let width = (tensor.shape scores).[1];
+    // A target's score, and how many scores beat it: in the top k when fewer
+    // than k do.
+    let hot = ops.like scores (tensor.one_hot width (tensor.host c));
+    let own = tensor.sum_axis 1 (scores * hot);
+    let beaten = tensor.sum_axis 1 (tensor.gt scores (tensor.repeat width own));
+    tensor.sum (tensor.lt beaten (1.0 * k)) / n
+};
+
+priv let as_flat : :any -> :tensor;
+priv let as_flat y = { let t = if type_of y == :tensor { y } else { tensor.of_list y }; tensor.reshape [tensor.size t] t };
+
+/// A `k x k` table: row `i`, column `j` counts the examples of class `i`
+/// predicted as class `j`. A product of two one-hot matrices, so it is one
+/// operation on either device.
+let confusion : :integer -> :tensor -> :any -> :tensor;
+let confusion k scores y = {
+    let predicted = if single scores { tensor.gt (as_flat scores) 0.5 } else { classes_of scores };
+    let actual = if single scores { tensor.gt (as_flat y) 0.5 } else { target_classes scores y };
+    tensor.transpose (tensor.one_hot k (tensor.host actual)) @ tensor.one_hot k (tensor.host predicted)
+};
+
+/// Of the examples predicted yes, the share that were (score above
+/// `threshold`, targets 0 and 1).
+let precision : :float -> :tensor -> :any -> :float;
+let precision threshold scores y = {
+    let [tp, fp, _] = counts threshold scores y;
+    if tp + fp == 0.0 { 0.0 } else { tp / (tp + fp) }
+};
+
+/// Of the examples that were yes, the share predicted so.
+let recall : :float -> :tensor -> :any -> :float;
+let recall threshold scores y = {
+    let [tp, _, fn_] = counts threshold scores y;
+    if tp + fn_ == 0.0 { 0.0 } else { tp / (tp + fn_) }
+};
+
+/// The harmonic mean of precision and recall.
+let f1 : :float -> :tensor -> :any -> :float;
+let f1 threshold scores y = {
+    let [tp, fp, fn_] = counts threshold scores y;
+    if tp == 0.0 { 0.0 } else { 2.0 * tp / (2.0 * tp + fp + fn_) }
+};
+
+/// True positives, false positives and false negatives.
+priv let counts : :float -> :tensor -> :any -> [:float, :float, :float];
+priv let counts threshold scores y = {
+    let p = tensor.gt (as_flat scores) threshold;
+    let t = tensor.gt (ops.like p (as_flat y)) 0.5;
+    [tensor.sum (p * t), tensor.sum (p * (1.0 - t)), tensor.sum ((1.0 - p) * t)]
+};
+
+/// The mean squared error.
+let mse : :tensor -> :any -> :float;
+let mse pred y = { let d = pred - target pred y; tensor.mean (d * d) };
+
+/// The square root of the mean squared error, in the target's units.
+let rmse : :tensor -> :any -> :float;
+let rmse pred y = math.sqrt (mse pred y);
+
+/// The mean absolute error.
+let mae : :tensor -> :any -> :float;
+let mae pred y = tensor.mean (tensor.abs (pred - target pred y));
+
+/// The coefficient of determination: 1 for a perfect fit, 0 for one no
+/// better than predicting the mean.
+let r2 : :tensor -> :any -> :float;
+let r2 pred y = {
+    let t = target pred y;
+    let d = pred - t;
+    let c = t - tensor.mean t;
+    1.0 - tensor.sum (d * d) / tensor.sum (c * c)
+};
+
+priv let target : :tensor -> :any -> :tensor;
+priv let target pred y = {
+    let t = ops.like pred (if type_of y == :tensor { y } else { tensor.of_list y });
+    if tensor.shape t == tensor.shape pred { t } else { tensor.reshape (tensor.shape pred) t }
+};
+
+/// A metric by name: `:accuracy`, `:top5`, `:mse`, `:rmse`, `:mae`, `:r2`,
+/// `:precision`, `:recall`, `:f1` (the last three at 0.5). A function is its
+/// own metric.
+let of : :any -> (:tensor -> :any -> :float);
+let of name = match name {
+    :accuracy => accuracy,
+    :top5 => top_k 5,
+    :mse => mse,
+    :rmse => rmse,
+    :mae => mae,
+    :r2 => r2,
+    :precision => precision 0.5,
+    :recall => recall 0.5,
+    :f1 => f1 0.5,
+    f => f,
+};
+
+when test {
+    import std.test;
+
+    let scores = tensor.of_list [[0.9, 0.1, 0.0], [0.2, 0.7, 0.1], [0.1, 0.2, 0.7], [0.6, 0.3, 0.1]];
+    let labels = tensor.of_list [0, 1, 1, 2];
+
+    let tests = [
+        test.case "accuracy of classes" $( test.near! 1.0e-12 0.5 (accuracy scores labels) ),
+        test.case "accuracy of one-hot rows" $( test.near! 1.0e-12 0.5 (accuracy scores (tensor.one_hot 3 labels)) ),
+        test.case "accuracy of a list" $( test.near! 1.0e-12 0.5 (accuracy scores [0, 1, 1, 2]) ),
+        test.case "top 2" $( test.near! 1.0e-12 0.75 (top_k 2 scores labels) ),
+        test.case "binary accuracy of a column"
+            $( test.near! 1.0e-12 0.75 (accuracy (tensor.of_list [[0.9], [0.2], [0.6], [0.4]]) [1, 0, 0, 0]) ),
+        test.case "logits at zero" $( test.near! 1.0e-12 1.0 (binary_accuracy 0.0 (tensor.of_list [2.0, -1.0]) [1, 0]) ),
+        test.case "confusion counts"
+            $( test.eq! (tensor.of_list [[1, 0, 0], [0, 1, 1], [1, 0, 0]]) (confusion 3 scores labels) ),
+        test.case "precision, recall, f1"
+            $( test.eq! [0.5, 1.0, 2.0 / 3.0] [precision 0.5 (tensor.of_list [0.9, 0.8, 0.1]) [1, 0, 0], recall 0.5 (tensor.of_list [0.9, 0.8, 0.1]) [1, 0, 0], f1 0.5 (tensor.of_list [0.9, 0.8, 0.1]) [1, 0, 0]] ),
+        test.case "r2 of a perfect fit" $( test.near! 1.0e-12 1.0 (r2 (tensor.of_list [1, 2, 3]) [1, 2, 3]) ),
+        test.case "r2 of the mean" $( test.near! 1.0e-12 0.0 (r2 (tensor.of_list [2, 2, 2]) [1, 2, 3]) ),
+        test.case "rmse" $( test.near! 1.0e-12 2.0 (rmse (tensor.of_list [[1], [1]]) [3, 3]) ),
+    ];
+}

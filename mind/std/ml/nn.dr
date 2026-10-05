@@ -1,0 +1,667 @@
+// Layers, and models made of them.
+//
+//     import std.ml.nn;
+//
+//     let model = nn.sequential [
+//         nn.dense 128, nn.relu, nn.dropout 0.2,
+//         nn.dense 10,
+//     ];
+//     let params = nn.init model 42 [784];        // seed, and one example's shape
+//     nn.apply model params images                 // [n, 784] in, [n, 10] out
+//     console.print! (nn.summary model [784])
+//
+// **A layer is two functions in a record.** `init seed shape` answers the
+// layer's parameters and the shape of what it outputs, given the shape of one
+// example it will be handed (no batch axis). `apply params x ctx` computes
+// the output from a batch, where `x` may be a plain tensor or an autodiff
+// variable (`std.ml.ad`) and `ctx` says whether this is training and gives
+// the step's seed, for the layers whose behaviour depends on either
+// (`dropout`). Every function here is written with `ad`'s operations, so the
+// same `apply` serves prediction, where nothing is a variable and nothing is
+// recorded, and training, where the parameters are variables and the
+// gradient comes back through it.
+//
+// A layer's own definition is the whole of a new one: `Layer.new name init
+// apply`, or `function` for one with no parameters. `sequential` is itself a
+// layer, so a block of layers nests inside another, and `residual` wraps any
+// layer in a skip connection.
+//
+// **Parameters are a tree** (`std.ml.tree`): a map per layer, keyed by
+// strings ("w", "b", ..), and a list of those for a `sequential`. That is
+// what the optimizers walk and what `ml.save!` writes, and a model's
+// parameters can be read and edited as ordinary data.
+//
+// **Shapes are inferred.** A layer is declared by what it makes -- `dense 10`
+// -- not by what it is fed; `init` threads the shape of one example through
+// the layers, so each learns its input size there. Hand `init` the wrong
+// shape and the first product raises a `:shape_error` naming both.
+
+import std.list;
+import std.math;
+import std.map;
+import std.ml.ad;
+import std.ml.init as initial;
+import std.ml.ops;
+import std.ml.tree;
+import std.str;
+import std.tensor;
+
+// --- what a layer is --------------------------------------------------------------------
+
+/// The step a layer is applied in: training or not, and the seed for any
+/// randomness it draws (a dropout mask), different every step.
+mapping Ctx {
+    training : :bool = false
+    seed : :integer = 0
+}
+
+/// A layer: its name, `init seed shape -> [params, out_shape]`, and
+/// `apply params x ctx -> y`.
+mapping Layer {
+    name : :string
+    init : :any
+    apply : :any
+    children : [:any] = []
+}
+
+/// The context a prediction runs in: not training.
+let predicting : Ctx;
+let predicting = Ctx.new ();
+
+/// The context of training step `step` of a run seeded with `seed`.
+let training : :integer -> :integer -> Ctx;
+let training seed step = Ctx.make true (initial.seed_for seed step);
+
+/// A layer's parameters, and the shape of one example of its output.
+let init_layer : Layer -> :integer -> [:integer] -> [:any, [:integer]];
+let init_layer layer seed shape = (Layer.init layer) seed shape;
+
+/// The parameters of `model` for examples of `shape`, from `seed`.
+let init : Layer -> :integer -> [:integer] -> :any;
+let init model seed shape = (init_layer model seed shape).[0];
+
+/// The shape of one example of what `model` makes from one of `shape`.
+let out_shape : Layer -> [:integer] -> [:integer];
+let out_shape model shape = (init_layer model 0 shape).[1];
+
+/// `model` run on `x` in `ctx`, with gradients recorded wherever the
+/// parameters or `x` are variables.
+let forward : Layer -> :any -> :any -> Ctx -> :any;
+let forward model params x ctx = (Layer.apply model) params x ctx;
+
+/// `model` run on a batch `x` for a prediction: a plain tensor in, a plain
+/// tensor out.
+let apply : Layer -> :any -> :any -> :any;
+let apply model params x = ad.value (forward model params x predicting);
+
+/// A layer with no parameters that answers `f x`, `f` written with `ad`'s
+/// operations; its output shape is found by running it on one example.
+let function : :string -> (:any -> :any) -> Layer;
+let function name f = Layer.new name
+    (fn _ shape -> [%{}, tensor.shape (f (tensor.zeros (1 :: shape))) |> list.drop 1])
+    (fn _ x _ -> f x);
+
+/// A layer that keeps its shape and has no parameters.
+priv let same_shape : :string -> (:any -> :any) -> Layer;
+priv let same_shape name f = Layer.new name (fn _ shape -> [%{}, shape]) (fn _ x _ -> f x);
+
+// --- activations ------------------------------------------------------------------------------
+
+let relu : Layer;
+let relu = same_shape "relu" ad.relu;
+
+let sigmoid : Layer;
+let sigmoid = same_shape "sigmoid" ad.sigmoid;
+
+let tanh : Layer;
+let tanh = same_shape "tanh" ad.tanh;
+
+let gelu : Layer;
+let gelu = same_shape "gelu" ad.gelu;
+
+let silu : Layer;
+let silu = same_shape "silu" ad.silu;
+
+let elu : Layer;
+let elu = same_shape "elu" ad.elu;
+
+let softplus : Layer;
+let softplus = same_shape "softplus" ad.softplus;
+
+let softmax : Layer;
+let softmax = same_shape "softmax" ad.softmax;
+
+let log_softmax : Layer;
+let log_softmax = same_shape "log_softmax" ad.log_softmax;
+
+let leaky_relu : :float -> Layer;
+let leaky_relu a = same_shape "leaky_relu" (ad.leaky_relu a);
+
+/// An activation by name -- `:relu`, `:sigmoid`, `:tanh`, `:gelu`, `:silu`,
+/// `:elu`, `:softplus`, `:leaky_relu`, `:softmax`, `:log_softmax`, or
+/// `:linear` for none -- or a function, which is answered as it is.
+let activation : :any -> (:any -> :any);
+let activation a = match a {
+    :relu => ad.relu,
+    :sigmoid => ad.sigmoid,
+    :tanh => ad.tanh,
+    :gelu => ad.gelu,
+    :silu => ad.silu,
+    :swish => ad.silu,
+    :elu => ad.elu,
+    :softplus => ad.softplus,
+    :leaky_relu => ad.leaky_relu 0.01,
+    :softmax => ad.softmax,
+    :log_softmax => ad.log_softmax,
+    :linear => fn x -> x,
+    () => fn x -> x,
+    f => f,
+};
+
+// --- dense ------------------------------------------------------------------------------------
+
+/// A fully connected layer of `units` outputs: `x @ w + b`.
+let dense : :integer -> Layer;
+let dense units = dense_with units %{};
+
+/// `dense` with options: `:activation` (a name `activation` knows, or a
+/// function; none by default), `:bias` (`true`), `:init` for the weights
+/// (Glorot uniform, or He normal when the activation is a relu) and
+/// `:bias_init` (zeros).
+///
+/// An input of more than two axes -- a sequence of vectors -- is multiplied
+/// along its last axis, as every framework does it: `[n, s, d]` in, `[n, s,
+/// units]` out.
+let dense_with : :integer -> %{:atom => :any} -> Layer;
+let dense_with units opts = {
+    let act = opts.[:activation else :linear];
+    let use_bias = opts.[:bias else true];
+    let w_init = opts.[:init else (if act == :relu || act == :leaky_relu { initial.he_normal } else { initial.glorot_uniform })];
+    let b_init = opts.[:bias_init else initial.zeros];
+    let f = activation act;
+    let make seed shape = {
+        let d = shape.[len shape - 1];
+        let w = w_init (initial.seed_for seed 0) [d, units];
+        let p = if use_bias { %{"w" => w, "b" => b_init (initial.seed_for seed 1) [units]} } else { %{"w" => w} };
+        [p, list.take (len shape - 1) shape + [units]]
+    };
+    let run p x _ = {
+        let shape = tensor.shape (ad.value x);
+        let r = len shape;
+        let d = shape.[r - 1];
+        let flat = if r > 2 { ad.reshape [tensor.size (ad.value x) / d, d] x } else { x };
+        let y = ad.matmul flat p.["w"];
+        let biased = if use_bias { ad.add y p.["b"] } else { y };
+        let shaped = if r > 2 { ad.reshape (list.take (r - 1) shape + [units]) biased } else { biased };
+        f shaped
+    };
+    Layer.new ("dense " + to_string units) make run
+};
+
+// --- images -----------------------------------------------------------------------------------
+//
+// Images are `[n, h, w, c]`, channels last, so that a pixel's channels are
+// contiguous and everything this file does along the last axis -- a dense
+// layer, a layer norm -- applies to them unchanged. A convolution is
+// `tensor.im2col` and one product: every window of the image as a row,
+// times the kernel as a `[kh * kw * c, filters]` matrix. That is the
+// arrangement every fast convolution reduces to, and it makes the
+// convolution's speed the product's, on either device. Pooling is the same
+// rows folded: the windows' numbers grouped by channel and the largest (or
+// the mean) of each group kept.
+
+/// The zeros a `k`-wide window needs on each side to keep a `:same` size.
+priv let pad_for : :any -> :integer -> :integer;
+priv let pad_for padding k = match padding {
+    :same => (k - 1) / 2,
+    :valid => 0,
+    n => n,
+};
+
+/// A 2-D convolution of `filters` kernels `k x k`, stride 1, padded to keep
+/// the image's size.
+let conv2d : :integer -> :integer -> Layer;
+let conv2d filters k = conv2d_with filters k %{};
+
+/// `conv2d` with options: `:stride` (1), `:padding` (`:same`, `:valid`, or a
+/// number of zeros), `:activation` (none), `:bias` (`true`), `:init` (He
+/// normal for a relu, Glorot uniform otherwise).
+let conv2d_with : :integer -> :integer -> %{:atom => :any} -> Layer;
+let conv2d_with filters k opts = {
+    let stride = opts.[:stride else 1];
+    let pad = pad_for opts.[:padding else :same] k;
+    let act = opts.[:activation else :linear];
+    let use_bias = opts.[:bias else true];
+    let w_init = opts.[:init else (if act == :relu || act == :leaky_relu { initial.he_normal } else { initial.glorot_uniform })];
+    let f = activation act;
+    let out_size n = (n + 2 * pad - k) / stride + 1;
+    let make seed shape = match shape {
+        [h, w, c] => {
+            let wt = w_init (initial.seed_for seed 0) [k * k * c, filters];
+            let p = if use_bias { %{"w" => wt, "b" => initial.zeros 0 [filters]} } else { %{"w" => wt} };
+            [p, [out_size h, out_size w, filters]]
+        },
+        _ => [%{}, shape],
+    };
+    let run p x _ = {
+        let [n, h, w, _] = tensor.shape (ad.value x);
+        let cols = ad.im2col k k stride pad x;
+        let y = ad.matmul cols p.["w"];
+        let biased = if use_bias { ad.add y p.["b"] } else { y };
+        f (ad.reshape [n, out_size h, out_size w, filters] biased)
+    };
+    Layer.new ("conv2d " + to_string filters + " " + to_string k + "x" + to_string k) make run
+};
+
+/// Each `k x k` block of each channel replaced by its largest number (a
+/// stride of `k`, so blocks do not overlap).
+let max_pool2d : :integer -> Layer;
+let max_pool2d k = pool "max_pool2d" k ad.max_axis;
+
+/// Each `k x k` block of each channel replaced by its mean.
+let avg_pool2d : :integer -> Layer;
+let avg_pool2d k = pool "avg_pool2d" k ad.mean_axis;
+
+priv let pool : :string -> :integer -> (:integer -> :any -> :any) -> Layer;
+priv let pool name k fold = Layer.new (name + " " + to_string k)
+    (fn _ shape -> match shape { [h, w, c] => [%{}, [h / k, w / k, c]], _ => [%{}, shape] })
+    (fn _ x _ -> {
+        let [n, h, w, c] = tensor.shape (ad.value x);
+        let cols = ad.im2col k k k 0 x;
+        let rows = n * (h / k) * (w / k);
+        ad.reshape [n, h / k, w / k, c] (fold 1 (ad.reshape [rows, k * k, c] cols))
+    });
+
+/// Each image's channels averaged over all its pixels: `[n, h, w, c]` to
+/// `[n, c]`, what a convolutional network hands its classifier.
+let global_avg_pool : Layer;
+let global_avg_pool = Layer.new "global_avg_pool"
+    (fn _ shape -> [%{}, [shape.[len shape - 1]]])
+    (fn _ x _ -> {
+        let [n, h, w, c] = tensor.shape (ad.value x);
+        ad.mean_axis 1 (ad.reshape [n, h * w, c] x)
+    });
+
+// --- regularization and normalization -----------------------------------------------------------
+
+/// While training, each number zeroed with probability `rate` and the rest
+/// scaled up by `1 / (1 - rate)`, so that what a prediction sees is the same
+/// on average; while predicting, nothing.
+let dropout : :float -> Layer;
+let dropout rate = Layer.new ("dropout " + to_string rate) (fn _ shape -> [%{}, shape]) (fn _ x ctx ->
+    if not (Ctx.training ctx) || rate <= 0.0 { x }
+    else {
+        let v = ad.value x;
+        let keep = tensor.gt (tensor.random (Ctx.seed ctx) (tensor.shape v)) rate;
+        ad.mul x (ops.like v keep * (1.0 / (1.0 - rate)))
+    });
+
+/// Layer normalization over the last axis: each example's features to mean 0
+/// and variance 1, then a learned scale (`gamma`) and shift (`beta`).
+let layer_norm : Layer;
+let layer_norm = layer_norm_with 1.0e-5;
+
+let layer_norm_with : :float -> Layer;
+let layer_norm_with eps = Layer.new "layer_norm"
+    (fn _ shape -> {
+        let d = shape.[len shape - 1];
+        [%{"gamma" => tensor.ones [d], "beta" => tensor.zeros [d]}, shape]
+    })
+    (fn p x _ -> ad.add (ad.mul (ad.normalize eps x) p.["gamma"]) p.["beta"]);
+
+// --- shape --------------------------------------------------------------------------------------
+
+/// Each example flattened to a vector.
+let flatten : Layer;
+let flatten = Layer.new "flatten" (fn _ shape -> [%{}, [list.fold_strict (fn !a b -> a * b) 1 shape]]) (fn _ x _ -> ad.flatten x);
+
+/// Each example reshaped to `shape`.
+let reshape : [:integer] -> Layer;
+let reshape shape = Layer.new ("reshape " + to_string shape) (fn _ _ -> [%{}, shape])
+    (fn _ x _ -> ad.reshape (ops.rows (ad.value x) :: shape) x);
+
+/// The mean over a sequence: `[n, s, d]` to `[n, d]`.
+let mean_pool : Layer;
+let mean_pool = Layer.new "mean_pool" (fn _ shape -> [%{}, list.drop 1 shape]) (fn _ x _ -> ad.mean_axis 1 x);
+
+// --- lookup ---------------------------------------------------------------------------------------
+
+/// A table of `vocab` learned vectors of `dim` numbers, looked up by index:
+/// an input of whole numbers `[n]` (or `[n, s]`) becomes `[n, dim]` (or `[n,
+/// s, dim]`). The way back adds each row's gradients into the rows it read.
+let embedding : :integer -> :integer -> Layer;
+let embedding vocab dim = Layer.new ("embedding " + to_string vocab + "x" + to_string dim)
+    (fn seed shape -> [%{"table" => initial.uniform (-0.05) 0.05 seed [vocab, dim]}, shape + [dim]])
+    (fn p x _ -> {
+        let idx = ad.value x;
+        let shape = tensor.shape idx;
+        let flat = tensor.reshape [tensor.size idx] idx;
+        let rows = ad.take flat p.["table"];
+        if len shape == 1 { rows } else { ad.reshape (shape + [dim]) rows }
+    });
+
+// --- sequences ------------------------------------------------------------------------------------
+//
+// A sequence is `[n, s, d]`: `n` examples of `s` steps of `d` features.
+// Attention is written as whole-batch products -- `@` of `[b, m, k]` by `[b,
+// k, n]` multiplies a batch of matrices at once -- with the heads moved into
+// the batch by `tensor.permute`, so that one launch serves every head of
+// every example. A recurrent layer walks the steps, each one a small
+// product; its gradient comes back through the whole walk.
+
+/// Multi-head self-attention over sequences `[n, s, d]`: each step attends to
+/// every step (or, with `:causal`, to itself and the steps before it),
+/// `heads` ways at once, each head `d / heads` wide. `d` must divide by
+/// `heads`.
+let attention : :integer -> Layer;
+let attention heads = attention_with heads %{};
+
+/// `attention` with options: `:causal` (`false`), a mask that stops a step
+/// seeing the steps after it, as a language model needs.
+let attention_with : :integer -> %{:atom => :any} -> Layer;
+let attention_with heads opts = {
+    let causal = opts.[:causal else false];
+    let make seed shape = {
+        let d = shape.[len shape - 1];
+        let w i = initial.glorot_uniform (initial.seed_for seed i) [d, d];
+        [%{"wq" => w 0, "wk" => w 1, "wv" => w 2, "wo" => w 3, "bo" => initial.zeros 0 [d]}, shape]
+    };
+    let run p x _ = {
+        let [n, steps, d] = tensor.shape (ad.value x);
+        let dh = d / heads;
+        // `[n, s, d]` to `[n * heads, s, dh]`: the heads become batches.
+        let split t = ad.reshape [n * heads, steps, dh] (ad.permute [0, 2, 1, 3] (ad.reshape [n, steps, heads, dh] t));
+        let q = split (ad.matmul x p.["wq"]);
+        let k = split (ad.matmul x p.["wk"]);
+        let v = split (ad.matmul x p.["wv"]);
+        let scores = ad.scale (1.0 / math.sqrt (1.0 * dh)) (ad.matmul q (ad.permute [0, 2, 1] k));
+        let masked = if causal { ad.add scores (ops.like (ad.value scores) (causal_mask steps)) } else { scores };
+        let mixed = ad.matmul (ad.softmax masked) v;
+        let joined = ad.reshape [n, steps, d] (ad.permute [0, 2, 1, 3] (ad.reshape [n, heads, steps, dh] mixed));
+        ad.add (ad.matmul joined p.["wo"]) p.["bo"]
+    };
+    Layer.new ("attention " + to_string heads + (if causal { " causal" } else { "" })) make run
+};
+
+/// `[s, s]`: 0 where a step may see another (itself and those before it)
+/// and a large negative number where it may not, added to the scores so
+/// that the softmax gives those steps nothing.
+let causal_mask : :integer -> :tensor;
+let causal_mask steps = {
+    let rows = tensor.repeat steps (tensor.range steps);
+    let cols = tensor.fill_like rows 0.0 + tensor.range steps;
+    tensor.gt cols rows * (-1.0e9)
+};
+
+/// A transformer block: attention and then a two-layer network of width
+/// `hidden` (with a GELU between), each with a layer norm before it and its
+/// input added back after it -- the "pre-norm" arrangement, which trains
+/// without a warm-up.
+let transformer : :integer -> :integer -> Layer;
+let transformer heads hidden = transformer_with heads hidden %{};
+
+/// `transformer` with `attention_with`'s options.
+let transformer_with : :integer -> :integer -> %{:atom => :any} -> Layer;
+let transformer_with heads hidden opts = Layer.new "transformer"
+    (fn seed shape -> {
+        let d = shape.[len shape - 1];
+        let [mix, _] = init_layer (sequential [layer_norm, attention_with heads opts]) (initial.seed_for seed 0) shape;
+        let [ff, _] = init_layer (sequential [layer_norm, dense_with hidden %{:activation => :gelu}, dense d]) (initial.seed_for seed 1) shape;
+        [%{"attend" => mix, "feed" => ff}, shape]
+    })
+    (fn p x ctx -> {
+        let h = ad.add x (forward (sequential [layer_norm, attention_with heads opts]) p.["attend"] x ctx);
+        let d = (tensor.shape (ad.value x)).[2];
+        ad.add h (forward (sequential [layer_norm, dense_with hidden %{:activation => :gelu}, dense d]) p.["feed"] h ctx)
+    });
+
+/// A learned vector for each position of a sequence of up to `steps`,
+/// added to `[n, s, d]`: what tells attention, which has no sense of order,
+/// where each step is.
+let positional : :integer -> Layer;
+let positional steps = Layer.new ("positional " + to_string steps)
+    (fn seed shape -> [%{"table" => initial.normal 0.02 seed [steps, shape.[len shape - 1]]}, shape])
+    (fn p x _ -> {
+        let s = (tensor.shape (ad.value x)).[1];
+        ad.add x (ad.slice 0 s p.["table"])
+    });
+
+/// The last step of each sequence: `[n, s, d]` to `[n, d]`.
+let last_step : Layer;
+let last_step = Layer.new "last_step" (fn _ shape -> [%{}, list.drop 1 shape]) (fn _ x _ -> {
+    let [n, s, d] = tensor.shape (ad.value x);
+    ad.reshape [n, d] (ad.slice (s - 1) 1 (ad.permute [1, 0, 2] x))
+});
+
+/// The steps of `[n, s, d]` as `s` tensors `[n, d]`, in order.
+priv let steps_of : :any -> [:any];
+priv let steps_of x = {
+    let [n, s, d] = tensor.shape (ad.value x);
+    let by_time = ad.permute [1, 0, 2] x;
+    list.map (fn t -> ad.reshape [n, d] (ad.slice t 1 by_time)) (list.range 0 s)
+};
+
+/// States `[n, units]`, one per step, joined back into `[n, s, units]`.
+priv let join_steps : [:any] -> :any;
+priv let join_steps hs = {
+    let [n, u] = tensor.shape (ad.value (list.head hs));
+    ad.permute [1, 0, 2] (ad.reshape [len hs, n, u] (ad.concat hs))
+};
+
+/// A recurrent layer: `cell params h x -> h'` run over each step from a
+/// state of zeros, answering every step's state (`[n, s, units]`), or with
+/// `last` the final one (`[n, units]`).
+priv let recurrent : :string -> :integer -> :bool -> (:integer -> :integer -> :any) -> (:any -> :any -> :any -> :any) -> Layer;
+priv let recurrent name units last make_params cell = Layer.new (name + " " + to_string units)
+    (fn seed shape -> [make_params seed shape.[len shape - 1], if last { [units] } else { list.take (len shape - 1) shape + [units] }])
+    (fn p x _ -> {
+        let xs = steps_of x;
+        let first = ad.value (list.head xs);
+        let h0 = ops.like first (tensor.zeros [ops.rows first, units]);
+        let [hs, _] = list.fold (fn [acc, h] xt -> { let h2 = cell p h xt; [h2 :: acc, h2] }) [[], h0] xs;
+        if last { list.head hs } else { join_steps (list.reverse hs) }
+    });
+
+/// The plain recurrent layer, `h' = tanh (x @ wx + h @ wh + b)`. With `last`,
+/// only the final state.
+let rnn : :integer -> :bool -> Layer;
+let rnn units last = recurrent "rnn" units last
+    (fn seed d -> %{
+        "wx" => initial.glorot_uniform (initial.seed_for seed 0) [d, units],
+        "wh" => initial.orthogonal 1.0 (initial.seed_for seed 1) [units, units],
+        "b" => initial.zeros 0 [units],
+    })
+    (fn p h x -> ad.tanh (ad.add (ad.add (ad.matmul x p.["wx"]) (ad.matmul h p.["wh"])) p.["b"]));
+
+/// A gated recurrent unit: an update gate decides how much of the state to
+/// replace, a reset gate how much of it the candidate sees. The gates'
+/// weights are one product, split by columns.
+let gru : :integer -> :bool -> Layer;
+let gru units last = recurrent "gru" units last
+    (fn seed d -> %{
+        "wx" => initial.glorot_uniform (initial.seed_for seed 0) [d, 3 * units],
+        "wh" => initial.glorot_uniform (initial.seed_for seed 1) [units, 3 * units],
+        "b" => initial.zeros 0 [3 * units],
+    })
+    (fn p h x -> {
+        let gx = ad.add (ad.matmul x p.["wx"]) p.["b"];
+        let gh = ad.matmul h p.["wh"];
+        let part i t = columns (i * units) units t;
+        let z = ad.sigmoid (ad.add (part 0 gx) (part 0 gh));
+        let r = ad.sigmoid (ad.add (part 1 gx) (part 1 gh));
+        let cand = ad.tanh (ad.add (part 2 gx) (ad.mul r (part 2 gh)));
+        ad.add (ad.mul z h) (ad.mul (ad.sub 1.0 z) cand)
+    });
+
+/// Long short-term memory: a cell carried alongside the state, written and
+/// read through input, forget and output gates. The state handed on is the
+/// cell and the output side by side, `[n, 2 * units]`; what the layer
+/// answers is the output half.
+let lstm : :integer -> :bool -> Layer;
+let lstm units last = {
+    let inner = recurrent "lstm" (2 * units) last
+        (fn seed d -> %{
+            "wx" => initial.glorot_uniform (initial.seed_for seed 0) [d, 4 * units],
+            "wh" => initial.glorot_uniform (initial.seed_for seed 1) [units, 4 * units],
+            // The forget gate starts open (a bias of 1), the usual remedy
+            // for a gradient that otherwise vanishes in the first steps.
+            "b" => tensor.concat [tensor.zeros [units], tensor.ones [units], tensor.zeros [2 * units]],
+        })
+        (fn p state x -> {
+            let c = columns 0 units state;
+            let h = columns units units state;
+            let g = ad.add (ad.add (ad.matmul x p.["wx"]) (ad.matmul h p.["wh"])) p.["b"];
+            let part i = columns (i * units) units g;
+            let c2 = ad.add (ad.mul (ad.sigmoid (part 1)) c) (ad.mul (ad.sigmoid (part 0)) (ad.tanh (part 2)));
+            let h2 = ad.mul (ad.sigmoid (part 3)) (ad.tanh c2);
+            ad.permute [1, 0] (ad.concat [ad.permute [1, 0] c2, ad.permute [1, 0] h2])
+        });
+    Layer.new ("lstm " + to_string units) (fn seed shape -> {
+        let [p, out] = init_layer inner seed shape;
+        [p, list.take (len out - 1) out + [units]]
+    }) (fn p x ctx -> {
+        let both = forward inner p x ctx;
+        if last { columns units units both }
+        else {
+            let [n, s, _] = tensor.shape (ad.value both);
+            ad.reshape [n, s, units] (columns units units (ad.reshape [n * s, 2 * units] both))
+        }
+    })
+};
+
+/// Columns `start` to `start + count` of a matrix: rows of the transpose.
+priv let columns : :integer -> :integer -> :any -> :any;
+priv let columns start count m = ad.transpose (ad.slice start count (ad.transpose m));
+
+// --- composition ------------------------------------------------------------------------------------
+
+/// Layers one after another, each fed what the one before made. Its
+/// parameters are a list of the layers' own, in order.
+let sequential : [Layer] -> Layer;
+let sequential layers = Layer.make "sequential"
+    (fn seed shape -> {
+        let step [ps, s, i] layer = {
+            let [p, out] = init_layer layer (initial.seed_for seed i) s;
+            [p :: ps, out, i + 1]
+        };
+        let [ps, out, _] = list.fold step [[], shape, 0] layers;
+        [list.reverse ps, out]
+    })
+    (fn ps x ctx -> {
+        let run [h, i] [layer, p] = [forward layer p h (Ctx.set_seed (initial.seed_for (Ctx.seed ctx) i) ctx), i + 1];
+        (list.fold run [x, 0] (list.zip layers ps)).[0]
+    })
+    layers;
+
+/// `layer` with its input added to its output -- a skip connection, which
+/// lets a deep network's gradient reach its first layers undiminished.
+/// `layer` must keep the shape.
+let residual : Layer -> Layer;
+let residual layer = Layer.new ("residual " + Layer.name layer) (Layer.init layer)
+    (fn p x ctx -> ad.add x (forward layer p x ctx));
+
+/// The layers of a model, with what each outputs and how many numbers it
+/// learns, as a table to print.
+let summary : Layer -> [:integer] -> :string;
+let summary model shape = {
+    let layers = layers_of model;
+    let rows = list.reverse ((list.fold (fn [acc, s, i] layer -> {
+        let [p, out] = init_layer layer i s;
+        [[Layer.name layer, to_string out, tree.size p] :: acc, out, i + 1]
+    }) [[], shape, 0] layers).[0]);
+    let total = list.fold_strict (fn !n [_, _, k] -> n + k) 0 rows;
+    let width = list.fold (fn w [name, _, _] -> if str.length name > w { str.length name } else { w }) 5 rows;
+    let pad s n = s + str.repeat (n - str.length s) " ";
+    let line [name, out, k] = "  " + pad name width + "  " + pad out 16 + "  " + to_string k;
+    str.join_str "\n" (["  " + pad "layer" width + "  " + pad "output" 16 + "  params"]
+        + list.map line rows
+        + ["  " + to_string total + " parameters in all, for input " + to_string shape])
+};
+
+/// The layers a `sequential` was made of; any other layer is its own.
+priv let layers_of : Layer -> [Layer];
+priv let layers_of model = match Layer.children model { [] => [model], layers => layers };
+
+when test {
+    import std.test;
+
+    let x = tensor.random 1 [4, 3];
+    let model = sequential [dense 5, relu, dropout 0.5, dense 2];
+    let p = init model 7 [3];
+
+    let tests = [
+        test.case "shapes are inferred" $( test.eq! [2] (out_shape model [3]) ),
+        test.case "a prediction" $( test.eq! [4, 2] (tensor.shape (apply model p x)) ),
+        test.case "parameters are a list of maps" $( test.eq! [3, 5] (tensor.shape p.[0].["w"]) ),
+        test.case "dropout is off while predicting"
+            $( test.eq! (apply model p x) (apply model p x) ),
+        test.case "dropout zeroes while training"
+            $( test.true! ({
+                let y = ad.value (forward (dropout 0.5) %{} (tensor.ones [100]) (training 1 1));
+                tensor.sum (tensor.eq y 0.0) > 20.0
+            }) ),
+        test.case "gradients reach every parameter"
+            $( test.true! ({
+                let g = ad.grad (fn q -> ad.mean (ad.square (forward model q x (training 3 0)))) p;
+                tree.size g == tree.size p
+            }) ),
+        test.case "a dense layer over a sequence" $( test.eq! [2, 7, 4] (tensor.shape (apply (dense 4) (init (dense 4) 1 [7, 3]) (tensor.zeros [2, 7, 3]))) ),
+        test.case "embedding" $( test.eq! [2, 3, 8] (tensor.shape (apply (embedding 10 8) (init (embedding 10 8) 1 [3]) (tensor.of_list [[1, 2, 3], [4, 5, 9]]))) ),
+        test.case "layer norm" $( test.true! (tensor.maximum (tensor.abs (ops.mean_last (apply layer_norm (init layer_norm 0 [6]) (tensor.random 2 [3, 6])))) < 1.0e-9) ),
+        test.case "residual keeps the shape" $( test.eq! [4, 3] (tensor.shape (apply (residual (dense 3)) (init (residual (dense 3)) 1 [3]) x)) ),
+        test.case "a function layer" $( test.eq! [6] (out_shape (function "twice" (fn v -> ad.concat [v, v])) [6]) ),
+        test.case "a convolution keeps a :same size"
+            $( test.eq! [2, 5, 6, 4] (tensor.shape (apply (conv2d 4 3) (init (conv2d 4 3) 1 [5, 6, 2]) (tensor.random 1 [2, 5, 6, 2]))) ),
+        test.case "a strided valid convolution"
+            $( test.eq! [3, 3, 4] (out_shape (conv2d_with 4 3 %{:stride => 2, :padding => :valid}) [7, 8, 2]) ),
+        test.case "max pooling"
+            $( test.eq! (tensor.of_list [[[[5.0], [7.0]], [[13.0], [15.0]]]]) (apply (max_pool2d 2) %{} (tensor.reshape [1, 4, 4, 1] (tensor.range 16))) ),
+        test.case "average pooling"
+            $( test.eq! (tensor.of_list [[[[2.5], [4.5]], [[10.5], [12.5]]]]) (apply (avg_pool2d 2) %{} (tensor.reshape [1, 4, 4, 1] (tensor.range 16))) ),
+        test.case "global average pooling" $( test.eq! (tensor.of_list [[7.5]]) (apply global_avg_pool %{} (tensor.reshape [1, 4, 4, 1] (tensor.range 16))) ),
+        test.case "a convolutional network's gradient"
+            $( test.true! ({
+                let net = sequential [conv2d 3 3, relu, max_pool2d 2, flatten, dense 2];
+                let q = init net 4 [4, 4, 1];
+                let img = tensor.random 9 [2, 4, 4, 1];
+                let f r = ad.mean (ad.square (forward net r img predicting));
+                let g = ad.grad f q;
+                let want = ad.numeric_grad f q 1.0e-5;
+                list.all (fn [path, t] -> tensor.maximum (tensor.abs (t - tree.at path want)) < 1.0e-5) (tree.paths g)
+            }) ),
+        test.case "attention keeps the shape"
+            $( test.eq! [2, 5, 8] (tensor.shape (apply (attention 2) (init (attention 2) 1 [5, 8]) (tensor.random 1 [2, 5, 8]))) ),
+        test.case "causal attention ignores the future"
+            $( test.true! ({
+                let layer = attention_with 2 %{:causal => true};
+                let q = init layer 3 [4, 6];
+                let a = tensor.random 1 [1, 4, 6];
+                let b = tensor.concat [tensor.reshape [3, 6] (tensor.slice 0 3 (tensor.reshape [4, 6] a)), tensor.random 9 [1, 6]] |> tensor.reshape [1, 4, 6];
+                let first3 t = tensor.slice 0 3 (tensor.reshape [4, 6] t);
+                tensor.maximum (tensor.abs (first3 (apply layer q a) - first3 (apply layer q b))) < 1.0e-12
+            }) ),
+        test.case "a transformer's gradient"
+            $( test.true! ({
+                let net = sequential [positional 4, transformer 2 8, mean_pool, dense 2];
+                let q = init net 4 [3, 4];
+                let xs = tensor.random 9 [2, 3, 4];
+                let f r = ad.mean (ad.square (forward net r xs predicting));
+                let g = ad.grad f q;
+                let want = ad.numeric_grad f q 1.0e-5;
+                list.all (fn [path, t] -> tensor.maximum (tensor.abs (t - tree.at path want)) < 1.0e-5) (tree.paths g)
+            }) ),
+        test.case "recurrent shapes"
+            $( test.eq! [[2, 5, 3], [2, 3], [2, 5, 3], [2, 3]] (list.map (fn l -> tensor.shape (apply l (init l 1 [5, 4]) (tensor.random 2 [2, 5, 4]))) [rnn 3 false, gru 3 true, lstm 3 false, lstm 3 true]) ),
+        test.case "the recurrent layers' gradients"
+            $( test.true! (list.all (fn layer -> {
+                let net = sequential [layer, dense 1];
+                let q = init net 4 [3, 2];
+                let xs = tensor.random 9 [2, 3, 2];
+                let f r = ad.mean (ad.square (forward net r xs predicting));
+                let g = ad.grad f q;
+                let want = ad.numeric_grad f q 1.0e-5;
+                list.all (fn [path, t] -> tensor.maximum (tensor.abs (t - tree.at path want)) < 1.0e-5) (tree.paths g)
+            }) [rnn 3 true, gru 3 true, lstm 3 true]) ),
+        test.case "summary counts parameters" $( test.true! (str.contains_str "32 parameters" (summary model [3])) ),
+    ];
+}
