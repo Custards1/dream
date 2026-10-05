@@ -1,7 +1,10 @@
 // The connection pool behind `std.http`'s `Client`.
 //
 // A process holding idle connections by key (`scheme://host:port`), each
-// with when it was put back. Checking one out takes the most recently used,
+// with when it was put back -- and, for a host that speaks HTTP/2, the one
+// connection to it, which is shared rather than lent: every request to that
+// host goes over it at once. The pool watches each such connection and
+// forgets it when it ends. Checking one out takes the most recently used,
 // which is the one least likely to have been closed by the server; a
 // connection idle past `idle_ms` is closed whenever the pool next does
 // anything, and every few seconds besides.
@@ -13,17 +16,29 @@
 import std.io;
 import std.list;
 import std.map;
+import std.proc;
 import std.time;
 
 /// A pool that keeps a connection for `idle_ms` milliseconds after its last use.
 let start! : :integer -> :process;
-let start! idle_ms = spawn! $( loop! idle_ms %{} );
+let start! idle_ms = spawn! $( loop! idle_ms %{} %{} );
 
-/// An idle connection for `key`, or `()` when there is none.
+/// A connection for `key`: `[:h2, coordinator]` to share, `[:h1, socket]` to
+/// borrow, or `()` when there is none.
 let checkout! : :process -> :string -> :any;
 let checkout! pool key = {
     send! pool [:checkout, self! (), key]
     receive! { [:pooled, sock] => sock, after 5000 => () }
+};
+
+/// Keep an HTTP/2 connection for `key`, for every request after this one:
+/// `true`, or `false` when the pool already has one -- several requests that
+/// started at once each opened their own -- and this one should be closed
+/// once its request is done.
+let share! : :process -> :string -> :process -> :bool;
+let share! pool key coordinator = {
+    send! pool [:share, key, coordinator, self! ()]
+    receive! { [:shared, kept] => kept, after 5000 => false }
 };
 
 /// Give a connection back, to be used again.
@@ -42,22 +57,35 @@ let close! pool = {
 let close_quietly! : :any -> :unit;
 let close_quietly! sock = { try! { io.close! sock } catch e { () }; () };
 
-priv let loop! : :integer -> :map -> :unit;
-priv let rec loop! idle_ms idle = {
+priv let loop! : :integer -> :map -> :map -> :unit;
+priv let rec loop! idle_ms idle shared = {
     let now = time.monotonic! () / 1000000;
     let fresh = reap! idle_ms now idle;
     receive! {
-        [:checkout, from, key] => match fresh.[key else []] {
-            [] => { send! from [:pooled, ()]; loop! idle_ms fresh },
-            [[sock, _], ..rest] => { send! from [:pooled, sock]; loop! idle_ms fresh.[key => rest] },
+        [:checkout, from, key] => match shared.[key else ()] {
+            () => match fresh.[key else []] {
+                [] => { send! from [:pooled, ()]; loop! idle_ms fresh shared },
+                [[sock, _], ..rest] => { send! from [:pooled, [:h1, sock]]; loop! idle_ms fresh.[key => rest] shared },
+            },
+            coordinator => { send! from [:pooled, [:h2, coordinator]]; loop! idle_ms fresh shared },
         },
-        [:checkin, key, sock] => loop! idle_ms fresh.[key => [sock, now] :: fresh.[key else []]],
+        [:checkin, key, sock] => loop! idle_ms fresh.[key => [sock, now] :: fresh.[key else []]] shared,
+        [:share, key, coordinator, from] => match shared.[key else ()] {
+            () => {
+                proc.monitor! coordinator
+                send! from [:shared, true]
+                loop! idle_ms fresh shared.[key => coordinator]
+            },
+            _ => { send! from [:shared, false]; loop! idle_ms fresh shared },
+        },
+        [:down, who, _] => loop! idle_ms fresh (map.from_pairs (list.filter (fn [_, c] -> c != who) (map.pairs shared))),
         [:close, from] => {
             close_all! (list.flat_map (fn k -> fresh.[k]) (map.keys fresh))
+            shutdown_all! (map.values shared)
             send! from :pool_closed
             ()
         },
-        after 5000 => loop! idle_ms fresh,
+        after 5000 => loop! idle_ms fresh shared,
     }
 };
 
@@ -67,6 +95,9 @@ priv let reap! idle_ms now idle = {
     close_all! (list.filter (fn [_, stamp] -> now - stamp >= idle_ms) all)
     map.from_pairs (list.map (fn k -> [k, list.filter (fn [_, stamp] -> now - stamp < idle_ms) (idle.[k])]) (map.keys idle))
 };
+
+priv let shutdown_all! : [:process] -> :unit;
+priv let rec shutdown_all! cs = match cs { [] => (), [c, ..rest] => { send! c [:h2_shutdown]; shutdown_all! rest } };
 
 priv let close_all! : [[:any]] -> :unit;
 priv let rec close_all! entries = match entries {

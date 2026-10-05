@@ -440,7 +440,10 @@ The lessons that keep coming back:
   `std.parse` (parser combinators), `std.regex` (a linear-time Pike VM; a
   bad literal pattern is a compile error through `Pattern`'s `where`),
   `std.log` (structured events, `DREAM_LOG=warn,db=debug`), and `std.http`
-  with `std.http.server` and `std.http.url` (HTTP/1.1 client and server).
+  with `std.http.server`, `.url`, `.websocket`, `.h2` and `.hpack`: client
+  and server over HTTP/1.1 and HTTP/2, streaming bodies, a pooled client,
+  WebSockets. `std.regex` matches natively (`vm.regex_run`,
+  dream/src/regex.cpp: a lazy DFA and a Pike VM).
   Examples 18-21 tour them.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.

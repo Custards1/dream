@@ -37,10 +37,16 @@
 // read.
 //
 // **HTTPS** is `options.https`: a PKCS#12 identity, as `std.tls` takes one.
+// A client that asks for HTTP/2 in the handshake gets it, as does one that
+// opens with HTTP/2's preface in clear text (`std.http.h2`); its requests
+// reach the same handler as everyone else's, each in a process of its own.
 //
-// What is not here: HTTP/2, websockets and streaming bodies. A response is
-// built whole and sent with its length; for the sizes a handler builds in
-// memory that is simplest and fastest, and the rest is future work.
+// **Bodies can be streams**, both ways. A response whose `stream` is a lazy
+// list or a pull function is sent chunked as it is made -- `http.stream`,
+// and `http.event_stream` for server-sent events -- and with `stream_bodies`
+// a request's body is handed to its handler a piece at a time as it pulls.
+// A handler can also take a connection over entirely with a 101 and an
+// `upgrade`, which is how `std.http.websocket` serves WebSockets.
 
 import std.crypto;
 import std.error;
@@ -56,6 +62,7 @@ import std.streams;
 import std.time;
 import std.tls;
 import std.http;
+import std.http.h2;
 import std.http.url;
 
 // --- serving -------------------------------------------------------------------------
@@ -69,7 +76,9 @@ import std.http.url;
 /// stream (`stream_bodies`): then a request's `body` is empty and its
 /// `stream` hands the body over a piece at a time as the handler pulls it
 /// (`http.pull!`, `http.body_text!`), so an upload of any size is read as it
-/// arrives, and `max_body` still bounds it.
+/// arrives, and `max_body` still bounds it. `http2` lets a client speak
+/// HTTP/2: over TLS when it asks for `h2`, and in clear text when it opens
+/// with HTTP/2's preface ("prior knowledge"). Bodies over HTTP/2 arrive whole.
 mapping Options {
     port : :integer = 8080
     max_body : :integer = 10485760
@@ -79,6 +88,7 @@ mapping Options {
     logger : :any = ()
     name : :string = "dream"
     stream_bodies : :bool = false
+    http2 : :bool = true
 }
 
 /// A running server: its listening socket, the port it is on, and the
@@ -141,9 +151,22 @@ priv let connection! sock handle options = {
     let watchdog = spawn! $( watch! sock (Options.idle options) me );
     let secured = match Options.https options {
         () => true,
-        tls_opts => try! { tls.accept! sock tls_opts; true } catch e { false },
+        tls_opts => {
+            let offered = if Options.http2 options && not (map.has :alpn tls_opts) { tls_opts.[:alpn => ["h2", "http/1.1"]] } else { tls_opts };
+            try! { tls.accept! sock offered; true } catch e { false }
+        },
     };
-    if secured { requests! sock (http.reader sock) handle options peer watchdog }
+    let agreed_h2 = secured && Options.https options != () && match try! { tls.info! sock } catch e { () } {
+        () => false,
+        info => info.[:alpn else ()] == "h2",
+    };
+    if agreed_h2 {
+        // HTTP/2 by ALPN: the client's preface comes first.
+        match try! { let got = http.read_exact! (http.reader sock) 24; strict! got; [:ok, got] } catch e { [:error, e] } {
+            [:ok, [p, r]] => if p == h2.preface { serve_h2! sock r handle options peer watchdog },
+            _ => (),
+        }
+    } else if secured { requests! sock (http.reader sock) handle options peer watchdog }
     send! watchdog :done
     try! { io.close! sock } catch e { () }
     ()
@@ -172,6 +195,7 @@ priv let rec requests! sock r handle options peer watchdog =
     // in the handler, where it would be a 500.
     match try! { let got = read_request! sock r options peer; strict! got; [:ok, got] } catch e { [:error, e] } {
         [:ok, ()] => (),
+        [:ok, [:h2, r2]] => serve_h2! sock r2 handle options peer watchdog,
         [:ok, [req, r2, body_proc]] => {
             send! watchdog :active
             let resp = finish! (answer! handle req options) req options;
@@ -212,6 +236,18 @@ priv let rec requests! sock r handle options peer watchdog =
         },
     };
 
+/// HTTP/2 on this connection, answering each request as an HTTP/1.1 one would
+/// be: the same handler, the same 500 for a raise, the same headers added.
+priv let serve_h2! : :any -> :any -> :any -> :map -> :string -> :any -> :unit;
+priv let serve_h2! sock r handle options peer watchdog =
+    h2.serve! sock r (respond_h2! handle options peer) (Options.max_body options) (still_going! watchdog);
+
+priv let respond_h2! : :any -> :map -> :string -> :map -> :map;
+priv let respond_h2! handle options peer req = {
+    let with_peer = http.Request.set_peer peer req;
+    finish! (answer! handle with_peer options) with_peer options
+};
+
 /// Write a response: whole, with its length, or as its stream comes, chunked
 /// (or, to an HTTP/1.0 client, until the connection closes). Each piece of a
 /// stream tells the watchdog the connection is still making progress, so an
@@ -237,6 +273,13 @@ priv let still_going! watchdog u = { send! watchdog :active; () };
 priv let read_request! : :any -> :any -> :map -> :string -> :any;
 priv let read_request! sock r options peer = match http.read_head! r (Options.max_header options) {
     () => (),
+    // HTTP/2 with prior knowledge: its preface reads as a request line
+    // `PRI * HTTP/2.0` and an empty header block, and then `SM` and a blank line.
+    [start, _, r2] if start == "PRI * HTTP/2.0" && Options.http2 options => {
+        let [tail, r3] = http.read_exact! r2 6;
+        if tail != "SM\r\n\r\n" { raise! (error.new :bad_message "not HTTP/2's preface") }
+        [:h2, r3]
+    },
     [start, headers, r2] => {
         let [method, target, version] = match str.split " " start {
             [m, t, v] if str.starts_with "HTTP/1." v => [m, t, v],
@@ -764,6 +807,43 @@ when test {
             http.close_client! c
             stop! s
             test.eq! [:ok, :ok] [first.[0], second.[0]]
+        } ),
+        // HTTP/2, in clear text by prior knowledge so that no certificate is needed.
+        test.case "HTTP/2: a request and its answer" $( {
+            let s = serve! 0 (router |> get "/" (fn req -> http.text (http.Request.version req)) |> get "/boom" (fn req -> http.text (to_string (1 / 0))));
+            let h2_get! path = http.send! (http.request "GET" (local_url s + path) |> http.Request.set_options %{ :http2 => :prior_knowledge });
+            let ok = h2_get! "/";
+            let boom = h2_get! "/boom";
+            let missing = h2_get! "/nope";
+            stop! s
+            test.eq! [[:ok, "HTTP/2"], [:ok, 500], [:ok, 404]] [result.map http.body ok, result.map http.status boom, result.map http.status missing]
+        } ),
+        test.case "HTTP/2: bodies past the flow-control window, both ways" $( {
+            let s = serve! 0 app;
+            let big = str.repeat 300000 "0123456789";
+            let got = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_body big |> http.Request.set_options %{ :http2 => :prior_knowledge });
+            stop! s
+            test.eq! [:ok, true] (result.map (fn r -> http.body r == big) got)
+        } ),
+        test.case "HTTP/2: streams out and in" $( {
+            let s = serve! 0 (router |> get "/" (fn req -> http.stream (list.map (fn n -> to_string n + ";") (list.range 0 300))) |> post "/echo" (fn req -> http.text (http.body req)));
+            let opts = %{ :http2 => :prior_knowledge };
+            let down = http.send! (http.request "GET" (local_url s) |> http.Request.set_options opts);
+            let up = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_stream ["x", "y", "z"] |> http.Request.set_options opts);
+            stop! s
+            test.eq! [[:ok, str.concat_all (list.map (fn n -> to_string n + ";") (list.range 0 300))], [:ok, "xyz"]]
+                     [result.map http.body down, result.map http.body up]
+        } ),
+        test.case "HTTP/2: many requests at once over one connection" $( {
+            let s = serve! 0 (router |> get "/who" (fn req -> http.text (http.Request.peer req)));
+            let c = http.client_with! %{ :base => local_url s, :http2 => :prior_knowledge };
+            let first = http.call! c (http.request "GET" "/who");
+            let all = proc.parallel! (list.map (fn i -> $( http.call! c (http.request "GET" "/who") )) (list.range 0 30));
+            http.close_client! c
+            stop! s
+            test.eq! [30, 1, true] [list.length (list.filter (fn r -> result.is_ok r) all),
+                                    list.length (list.unique (list.map (fn r -> result.map http.body r) all)),
+                                    list.head all == first]
         } ),
         test.case "static files, and nothing outside them" $( {
             let dir = "/tmp/dream-http-static-" + to_string (time.now! ());
