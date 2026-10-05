@@ -27,7 +27,7 @@ import dreams.config;
 
 // --- the vocabulary ------------------------------------------------------------
 
-type Os = :linux | :macos | :windows;
+type Os = :linux | :macos | :windows | :android;
 type Arch = :x86_64 | :aarch64;
 
 /// A set of each, as a list with no repeats. Empty is not "nowhere" but
@@ -55,6 +55,7 @@ let is_any t = list.is_empty (Target.os t) && list.is_empty (Target.arch t);
 let os_named : :string -> Os | :unit;
 let os_named s = match s {
     "linux" => :linux,
+    "android" => :android,
     "macos" => :macos, "darwin" => :macos, "osx" => :macos,
     "windows" => :windows, "win32" => :windows,
     _ => (),
@@ -76,7 +77,7 @@ let family_of : Os -> :string;
 let family_of o = match o { :windows => "windows", _ => "unix" };
 
 let every_os : [Os];
-let every_os = [:linux, :macos, :windows];
+let every_os = [:linux, :macos, :windows, :android];
 
 let every_arch : [Arch];
 let every_arch = [:x86_64, :aarch64];
@@ -89,7 +90,7 @@ let every_arch = [:x86_64, :aarch64];
 // written today has to mean the same thing to next year's VM.
 
 let os_bit : Os -> :integer;
-let os_bit o = match o { :linux => 1, :macos => 2, :windows => 4 };
+let os_bit o = match o { :linux => 1, :macos => 2, :windows => 4, :android => 8 };
 
 let arch_bit : Arch -> :integer;
 let arch_bit a = match a { :x86_64 => 1, :aarch64 => 2 };
@@ -171,7 +172,7 @@ let parse spec =
                 let value = if at < 0 { part } else { str.slice (at + 1) (str.byte_length part - at - 1) part };
                 match [key, os_named value, arch_named value] {
                     ["os", (), _] => [:error, "`" + value + "` is not an operating system; "
-                                              + "say linux, macos or windows"],
+                                              + "say linux, macos, windows or android"],
                     ["arch", _, ()] => [:error, "`" + value + "` is not an architecture; "
                                                 + "say x86_64 or aarch64"],
                     ["os", o, _] => [:ok, list.append os [o], arch],
@@ -370,6 +371,15 @@ when test {
     let java = bytes 64 [202, 254, 186, 190, 0, 0, 0, 52];
 
     let tests = [
+        test.case "Android has its own stable OS bit and Unix family"
+            $( test.eq! [2048, [:ok, make [:android] [:aarch64]], "unix"]
+                        [flags (make [:android] []), parse "os=android,arch=arm64", family_of :android] ),
+        test.case "Android cross compilation sets the condition environment"
+            $( test.eq! ["android", "unix", "aarch64"]
+                        { let c = configure (make [:android] [:aarch64]) config.empty;
+                          [config.value "os" c, config.value "family" c, config.value "arch" c] } ),
+        test.case "Linux and Android are incompatible targets"
+            $( test.eq! [:error, "os"] (meet (make [:linux] []) (make [:android] [])) ),
         test.case "no target is the header's zero"
             $( test.eq! 0 (flags any) ),
         test.case "systems are bits 8-15 and architectures 16-23"
@@ -405,7 +415,7 @@ when test {
         test.case "an image carrying libraries for two systems runs on either"
             $( test.eq! (make [:linux, :windows] [:x86_64]) (of_payloads [elf64, pe_x64, "data"]) ),
         test.case "reading os pins the system; reading family pins the family"
-            $( test.eq! [make [:linux] [], make [:linux, :macos] [], any]
+            $( test.eq! [make [:linux] [], make [:linux, :macos, :android] [], any]
                         (list.map (fn rs -> from_reads (config.empty |> config.set "os" "linux"
                                                                      |> config.set "family" "unix") rs)
                                   [["os", "test"], ["family"], ["arch", "test"]]) ),

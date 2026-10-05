@@ -85,6 +85,17 @@ check "payloads and conditions that disagree are a compile error" compile "dream
 check "an unknown platform is a compile error" compile "dreams: --target beos" \
     "$tmp/hello.dr" --target beos --
 
+cat >"$tmp/android.dr" <<'DR'
+import std.console;
+when os == "android" { let where = "android"; }
+when not (os == "android") { let where = "elsewhere"; }
+let main! = console.print! where;
+DR
+check "Android is a separate image target" 1 "dream: $tmp/out.dream was built for android;" \
+    "$tmp/hello.dr" --target android --
+check "Android selects its compile-time branch" 0 "android" \
+    "$tmp/android.dr" --target android -- --any-target
+
 echo
 echo "$pass target cases passed, $fail failed"
 [ "$fail" -eq 0 ]

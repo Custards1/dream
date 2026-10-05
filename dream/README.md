@@ -249,7 +249,7 @@ reference.
 | `std.io` | handles, bytes, files, pipes; reads that park the process, not the thread |
 | `std.os` | arguments, environment, directories, child processes (`exec!`, `replace!`), clocks, the platform |
 | `std.net` | TCP sockets and listeners, through epoll on Linux and a poller elsewhere |
-| `std.tls` | TLS on a socket, upgraded in place: OpenSSL on Linux and macOS, SChannel on Windows ([src/tls.hpp](src/tls.hpp)) |
+| `std.tls` | TLS on a socket, upgraded in place: OpenSSL on Linux, macOS and Android, SChannel on Windows ([src/tls.hpp](src/tls.hpp)) |
 | `std.ffi` | calling C through libffi; C pointers as owned handles ([docs/ffi.md](../docs/ffi.md)) |
 | `std.math` | the floating-point functions |
 | `std.crypto` | hashes, HMAC, PBKDF2, HKDF, constant-time comparison, random bytes |

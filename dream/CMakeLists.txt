@@ -17,7 +17,41 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-option(DREAM_ENABLE_JIT "Build the LLVM JIT tier" ON)
+# Android is an interpreter target. Never discover a host llvm-config while
+# cross-compiling: its libraries cannot be linked into an Android VM.
+option(DREAM_TERMUX "Native on-device build using Termux's Android toolchain" OFF)
+if(ANDROID OR DREAM_TERMUX)
+  set(DREAM_JIT_DEFAULT OFF)
+  if(ANDROID AND NOT CMAKE_ANDROID_ARCH_ABI MATCHES "^(arm64-v8a|x86_64)$")
+    message(FATAL_ERROR "Dream Android requires arm64-v8a or x86_64")
+  endif()
+  set(DREAM_ANDROID_API "${CMAKE_SYSTEM_VERSION}")
+  if(DEFINED ANDROID_PLATFORM_LEVEL)
+    set(DREAM_ANDROID_API "${ANDROID_PLATFORM_LEVEL}")
+  endif()
+  if(ANDROID AND DREAM_ANDROID_API LESS 34)
+    message(FATAL_ERROR "Dream Android requires API 34 or newer (posix_spawn chdir)")
+  endif()
+  add_link_options("-Wl,-z,max-page-size=16384")
+  if(DREAM_TERMUX)
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("
+      #if !defined(__ANDROID__) || __ANDROID_API__ < 34
+      #error Dream Termux requires an Android API 34+ compiler target
+      #endif
+      static_assert(sizeof(void*) == 8);
+      int main() { return 0; }" DREAM_TERMUX_TOOLCHAIN_OK)
+    if(NOT DREAM_TERMUX_TOOLCHAIN_OK)
+      message(FATAL_ERROR "Use the Termux installer with a 64-bit Android API 34+ compiler target")
+    endif()
+  endif()
+else()
+  set(DREAM_JIT_DEFAULT ON)
+endif()
+option(DREAM_ENABLE_JIT "Build the LLVM JIT tier" ${DREAM_JIT_DEFAULT})
+if((ANDROID OR DREAM_TERMUX) AND DREAM_ENABLE_JIT)
+  message(FATAL_ERROR "Dream Android currently supports the interpreter; use DREAM_ENABLE_JIT=OFF")
+endif()
 option(DREAM_PORTABLE_POLLER "Use the portable readiness poller even on Linux" OFF)
 option(DREAM_BUILD_TESTS "Build the VM test suite" ON)
 
@@ -464,6 +498,16 @@ void dream_ffi_probe(void)
   # every archive really gets tested.
   unset(archive_works CACHE)
 
+  # Whole-project try_compile on CMake 3.20 does not propagate the NDK's ABI
+  # and API settings. Without these the probe silently targets 32-bit ARM.
+  set(probe_platform_flags)
+  if(ANDROID)
+    list(APPEND probe_platform_flags
+      "-DANDROID_ABI:STRING=${CMAKE_ANDROID_ARCH_ABI}"
+      "-DANDROID_PLATFORM:STRING=android-${DREAM_ANDROID_API}"
+      "-DANDROID_STL:STRING=${ANDROID_STL}")
+  endif()
+
   try_compile(
     archive_works
     "${probe_bin_dir}"
@@ -471,6 +515,7 @@ void dream_ffi_probe(void)
     dream_ffi_probe
     dream_ffi_probe
     CMAKE_FLAGS
+      ${probe_platform_flags}
       "-DDREAM_FFI_PROBE_ARCHIVE:FILEPATH=${archive}"
       "-DDREAM_FFI_PROBE_INCLUDE:PATH=${include_dir}"
     OUTPUT_VARIABLE probe_output)
@@ -743,6 +788,9 @@ else()
 endif()
 
 add_library(dream SHARED ${DREAM_SOURCES})
+if(DREAM_TERMUX)
+  target_compile_definitions(dream PRIVATE DREAM_TERMUX=1)
+endif()
 
 set_target_properties(
   dream
@@ -1125,7 +1173,7 @@ if(DREAM_BUILD_TESTS)
     NAME dream_tests
     COMMAND dream_tests)
 
-  if(UNIX)
+  if(UNIX AND NOT CMAKE_CROSSCOMPILING)
     # End-to-end tests need the compiler, so they are skipped when it is absent
     # rather than failing a VM-only build.
     add_test(

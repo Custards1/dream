@@ -41,6 +41,11 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <spawn.h>
+#if defined(DREAM_TERMUX)
+// Termux supplies its own spawn.h, which omits this API 34 libc function.
+// We target API 34 and link Bionic directly, not libandroid-spawn's older ABI.
+extern "C" int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t*, const char*);
+#endif
 #include <sys/stat.h>
 #include <csignal>
 #include <sys/wait.h>
@@ -386,7 +391,7 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
         // Before the program is looked up, so a relative program name is
         // relative to `dir`, as it would be to a shell that had `cd`'d there.
         // Every libc this VM is built against has it: glibc since 2.29, and
-        // macOS since 10.15. Nothing here falls back to `chdir!`, which would
+        // macOS since 10.15, Android since API 34. Nothing here falls back to `chdir!`, which would
         // move every other process's working directory with it.
         posix_spawn_file_actions_addchdir_np(&actions, job->dir.c_str());
     }
@@ -707,7 +712,9 @@ NativeResult os_arch(Process& p, Value, Value*, uint32_t) {
 }
 
 NativeResult os_platform(Process& p, Value, Value*, uint32_t) {
-#if defined(__linux__)
+#if defined(__ANDROID__)
+    const char* name = "android";
+#elif defined(__linux__)
     const char* name = "linux";
 #elif defined(__APPLE__)
     const char* name = "macos";

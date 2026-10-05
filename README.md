@@ -121,8 +121,8 @@ by what they depend on, and the image written from them is byte for byte the
 one a clean build writes.
 
 **A portable image.** A `.dream` file is bytecode: fixed-width little-endian
-integers, indices rather than pointers. The same file runs on Linux, macOS and
-Windows ([docs/platforms.md](docs/platforms.md)). The VM maps it and reads it
+integers, indices rather than pointers. The same file runs on Linux, macOS, Windows and
+Android ([docs/platforms.md](docs/platforms.md)). The VM maps it and reads it
 where it lies. The JIT generates machine code locally, at run time.
 
 **A self-hosting compiler.** `dreams/bootstrap/dreams.dream` is an image of the
@@ -145,6 +145,6 @@ running server has mapped, and the server dies of `SIGBUS`.
 
 ## Platforms
 
-Linux, macOS and Windows, 64-bit little-endian. Linux is where it is developed
+Linux, macOS, Windows and Android, 64-bit little-endian. Linux is where it is developed
 and where every suite runs; [docs/platforms.md](docs/platforms.md) says what is
-portable, what is not, and how it is checked on the other two.
+portable, what is not, and how it is checked on each platform.

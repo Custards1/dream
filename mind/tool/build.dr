@@ -849,7 +849,7 @@ let output_of m o =
 // only when they would have written the same header.
 
 let os_names : [:string];
-let os_names = ["linux", "macos", "windows"];
+let os_names = ["linux", "macos", "windows", "android"];
 
 let arch_names : [:string];
 let arch_names = ["x86_64", "aarch64"];
@@ -964,8 +964,8 @@ let scripted! m o g = {
 /// the field's type asks for -- and a name that is not one of them is refused
 /// by the compiler before a script could act on it, so `:unknown` is never
 /// what a build goes on to use.
-let os_atom : :string -> (:linux | :macos | :windows | :unknown);
-let os_atom name = match name { "linux" => :linux, "macos" => :macos, "windows" => :windows, _ => :unknown };
+let os_atom : :string -> (:linux | :macos | :windows | :android | :unknown);
+let os_atom name = match name { "linux" => :linux, "macos" => :macos, "windows" => :windows, "android" => :android, _ => :unknown };
 
 let arch_atom : :string -> (:x86_64 | :aarch64 | :unknown);
 let arch_atom name = match name { "x86_64" => :x86_64, "aarch64" => :aarch64, _ => :unknown };

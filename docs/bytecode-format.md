@@ -47,10 +47,10 @@ aligned. The sentinel `0xFFFFFFFF` (`NO_NODE`) marks an absent edge.
 Bits 8-15 of `flags` are the operating systems the image may run on and bits
 16-23 the architectures, each a set with one bit per member:
 
-| Bits | Field | `0x01` | `0x02` | `0x04` |
-|---|---|---|---|---|
-| 8-15 | systems | linux | macos | windows |
-| 16-23 | architectures | x86_64 | aarch64 | |
+| Bits | Field | `0x01` | `0x02` | `0x04` | `0x08` |
+|---|---|---|---|---|---|
+| 8-15 | systems | linux | macos | windows | android |
+| 16-23 | architectures | x86_64 | aarch64 | | |
 
 An empty set means **any**, so every image written before these bits existed,
 and every image whose program does not care, means what it always did. A
