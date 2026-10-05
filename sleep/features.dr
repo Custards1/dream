@@ -1,0 +1,62 @@
+// What a model sees of each epoch: a dozen numbers in place of 120 readings.
+//
+//     features.of_signals signals      // [epochs, 30, 4] -> [epochs, 14]
+//
+// For each of the four channels, its mean, its spread and its largest value
+// over the epoch's thirty seconds: movement's peak tells a twitch from
+// stillness, heart rate's spread tells REM's irregular heart from N3's
+// steady one. Every one of those columns is then **standardized within the
+// night**, against that night's own mean and spread. A resting heart rate of
+// 50 and one of 70 are different people, not different stages; what a stage
+// changes is a reading *relative to the rest of that person's night*, and
+// standardizing per night is what lets a model trained on some sleepers
+// stage others. Last come two columns for the clock: how far through the
+// night the epoch is, and that squared -- slow-wave sleep belongs early and
+// REM late, and the model is told where it is.
+//
+// All of it is `std.tensor`: folds along the seconds axis, a fitted scaler,
+// one concatenation. A night's features are computed where its signals are.
+
+import std.ml.data;
+import std.ml.ops;
+import std.tensor;
+
+/// How many features each epoch has.
+let width : :integer;
+let width = 14;
+
+/// The features of every epoch of a night's signals: `[epochs, width]`.
+let of_signals : :tensor -> :tensor;
+let of_signals signals = {
+    let e = (tensor.shape signals).[0];
+    let mean = ops.mean_axis 1 signals;
+    let spread = tensor.sqrt (tensor.max (ops.var_axis 1 signals) 0.0);
+    let peak = tensor.max_axis 1 signals;
+    let raw = tensor.permute [1, 0] (tensor.concat [tensor.permute [1, 0] mean, tensor.permute [1, 0] spread,
+                                                    tensor.permute [1, 0] peak]);
+    let scaled = data.scale (data.fit_standard raw) raw;
+    let f = tensor.reshape [e, 1] (tensor.range e / e);
+    tensor.permute [1, 0] (tensor.concat [tensor.permute [1, 0] scaled, tensor.permute [1, 0] f,
+                                          tensor.permute [1, 0] (f * f)])
+};
+
+when test {
+    import std.list;
+    import std.test;
+
+    let signals = tensor.random 1 [40, 30, 4] * 10.0 + 50.0;
+    let f = of_signals signals;
+
+    let tests = [
+        test.case "a row an epoch, width columns" $( test.eq! [40, width] (tensor.shape f) ),
+        test.case "the measured columns are standardized"
+            $( test.true! ({
+                let measured = tensor.permute [1, 0] (tensor.slice 0 12 (tensor.permute [1, 0] f));
+                tensor.maximum (tensor.abs (ops.mean_axis 0 measured)) < 1.0e-9
+            }) ),
+        test.case "the clock runs from 0 toward 1"
+            $( test.eq! [0.0, 39.0 / 40.0] [tensor.at f [0, 12], tensor.at f [39, 12]] ),
+        test.case "a person's baseline does not matter"
+            $( test.true! (tensor.maximum (tensor.abs (of_signals (signals + 20.0) - f)) < 1.0e-9) ),
+    ];
+}

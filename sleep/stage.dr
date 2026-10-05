@@ -1,0 +1,59 @@
+// Sleep stages, as the American Academy of Sleep Medicine scores them: one
+// label per 30-second epoch.
+//
+// Wake, then three depths of non-REM sleep -- N1, the doze at the edge of
+// sleep; N2, most of a night; N3, slow-wave sleep, which comes early -- and
+// REM, the dreaming stage, which comes late and in growing stretches. A night
+// is a list of them, a *hypnogram*.
+//
+// A stage is a union value (`:wake`, `:n1`, ..), so a `match` on one must
+// handle all five, and the model's classes are their positions in `all`.
+
+import std.list;
+import std.str;
+
+/// One epoch's stage.
+union Stage { wake, n1, n2, n3, rem }
+
+/// Every stage, in class order: what a model's five outputs mean.
+let all : [Stage];
+let all = [Stage.wake, Stage.n1, Stage.n2, Stage.n3, Stage.rem];
+
+/// How many stages there are, and so how many classes a model has.
+let count : :integer;
+let count = 5;
+
+/// A stage's class number.
+let index : Stage -> :integer;
+let index s = match s { :wake => 0, :n1 => 1, :n2 => 2, :n3 => 3, :rem => 4 };
+
+/// The stage with class number `i`.
+let of_index : :integer -> Stage;
+let of_index i = match i { 0 => Stage.wake, 1 => Stage.n1, 2 => Stage.n2, 3 => Stage.n3, _ => Stage.rem };
+
+/// Whether a stage is sleep (anything but wake).
+let is_sleep : Stage -> :bool;
+let is_sleep s = s != Stage.wake;
+
+/// The stage's name as a person writes it.
+let name : Stage -> :string;
+let name s = match s { :wake => "Wake", :n1 => "N1", :n2 => "N2", :n3 => "N3", :rem => "REM" };
+
+/// The stage named `text`, in any case (`"rem"`, `"N3"`), or `()`.
+let parse : :string -> (Stage | :unit);
+let parse text = list.first_or () (list.filter (fn s -> str.lower (name s) == str.lower text) all);
+
+/// Every epoch is thirty seconds.
+let epoch_seconds : :integer;
+let epoch_seconds = 30;
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "index and of_index agree" $( test.eq! all (list.map (fn s -> of_index (index s)) all) ),
+        test.case "only wake is not sleep" $( test.eq! [false, true, true, true, true] (list.map is_sleep all) ),
+        test.case "parse ignores case" $( test.eq! Stage.rem (parse "rem") ),
+        test.case "parse rejects" $( test.eq! () (parse "deep") ),
+    ];
+}

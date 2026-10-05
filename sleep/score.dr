@@ -1,0 +1,195 @@
+// What a night's stages say: the numbers a sleep clinic reports, and how
+// alike two scorings of one night are.
+//
+//     score.summary stages                  // %{:tst => 412.5, :efficiency => 0.91, ..}
+//     score.kappa truth predicted           // 0.78: agreement beyond chance
+//     console.print! (score.hypnogram stages)
+//
+// **The measures are the standard ones**, in minutes unless said otherwise:
+//
+// | | |
+// |---|---|
+// | `tib` | time in bed: the whole recording |
+// | `tst` | total sleep time: every epoch of any sleep stage |
+// | `efficiency` | `tst / tib` |
+// | `latency` | sleep onset latency: lying down to the first sleep |
+// | `rem_latency` | first sleep to the first REM, `()` if there was none |
+// | `waso` | wake after sleep onset, up to the final awakening |
+// | `awakenings` | how many separate times waking interrupted sleep |
+// | `shifts_per_hour` | stage changes an hour asleep: how broken the night was |
+// | `cycles` | REM episodes, counting a gap of 15 minutes as a new one |
+// | `n1` .. `rem` | each stage's minutes, and `*_share` its fraction of `tst` |
+//
+// **Kappa, not accuracy**, is how scorers are compared, because a night is
+// mostly N2: always answering N2 is right half the time and agrees with
+// nothing. Cohen's kappa is the agreement beyond what the two scorings' own
+// proportions would give by chance. Human scorers agree with each other at
+// about 0.76.
+
+import std.list;
+import std.map;
+import std.str;
+
+import stage;
+import stage.Stage;
+
+/// The minutes in `n` epochs.
+let minutes : :integer -> :float;
+let minutes n = n * stage.epoch_seconds / 60.0;
+
+/// Every measure of one night's stages (see the head of this file).
+let summary : [Stage] -> %{:atom => :any};
+let summary stages = {
+    let total = len stages;
+    let asleep = list.count stage.is_sleep stages;
+    let onset = list.index_of_from 0 true (list.map stage.is_sleep stages);
+    let last_sleep = total - 1 - list.index_of_from 0 true (list.reverse (list.map stage.is_sleep stages));
+    let between = if onset < 0 { [] } else { list.take (last_sleep - onset + 1) (list.drop onset stages) };
+    let waso = list.count (fn s -> s == Stage.wake) between;
+    let first_rem = list.index_of Stage.rem between;
+    let count s = list.count (fn x -> x == s) stages;
+    let share s = if asleep == 0 { 0.0 } else { 1.0 * count s / asleep };
+    %{
+        :tib => minutes total,
+        :tst => minutes asleep,
+        :efficiency => if total == 0 { 0.0 } else { 1.0 * asleep / total },
+        :latency => if onset < 0 { minutes total } else { minutes onset },
+        :rem_latency => if first_rem < 0 { () } else { minutes first_rem },
+        :waso => minutes waso,
+        :awakenings => bouts Stage.wake between,
+        :shifts_per_hour => if asleep == 0 { 0.0 } else { changes between 0 / (minutes asleep / 60.0) },
+        :cycles => rem_episodes between,
+        :n1 => minutes (count Stage.n1), :n2 => minutes (count Stage.n2),
+        :n3 => minutes (count Stage.n3), :rem => minutes (count Stage.rem),
+        :n1_share => share Stage.n1, :n2_share => share Stage.n2,
+        :n3_share => share Stage.n3, :rem_share => share Stage.rem,
+        :onset_epoch => onset,
+    }
+};
+
+/// How many separate runs of `s` there are.
+let bouts : Stage -> [Stage] -> :integer;
+let bouts s stages = count_bouts s stages false 0;
+
+priv let count_bouts : Stage -> [Stage] -> :bool -> :integer -> :integer;
+priv let count_bouts s stages inside !n = match stages {
+    [] => n,
+    [x, ..rest] => if x == s { count_bouts s rest true (if inside { n } else { n + 1 }) }
+                   else { count_bouts s rest false n },
+};
+
+/// How many times the stage changes.
+priv let changes : [Stage] -> :integer -> :integer;
+priv let changes stages !n = match stages {
+    [a, b, ..rest] => changes (b :: rest) (if a != b { n + 1 } else { n }),
+    _ => n,
+};
+
+/// REM episodes: runs of REM, a gap of less than fifteen minutes joining two.
+let rem_episodes : [Stage] -> :integer;
+let rem_episodes stages = episodes stages 30 0 1000000;
+
+/// Walk, counting REM epochs that come more than `gap` epochs after the last.
+priv let episodes : [Stage] -> :integer -> :integer -> :integer -> :integer;
+priv let episodes stages gap !n !since = match stages {
+    [] => n,
+    [s, ..rest] => match s {
+        :rem => episodes rest gap (if since > gap { n + 1 } else { n }) 0,
+        _ => episodes rest gap n (since + 1),
+    },
+};
+
+// --- agreement --------------------------------------------------------------------------
+
+/// A `5 x 5` table: row `i`, column `j` counts the epochs `truth` calls stage
+/// `i` and `predicted` calls stage `j`.
+let confusion : [Stage] -> [Stage] -> [[:integer]];
+let confusion truth predicted = {
+    let pairs = list.zip truth predicted;
+    let cell i j = list.count (fn [a, b] -> stage.index a == i && stage.index b == j) pairs;
+    list.map (fn i -> list.map (cell i) (list.range 0 stage.count)) (list.range 0 stage.count)
+};
+
+/// The share of epochs on which two scorings agree.
+let agreement : [Stage] -> [Stage] -> :float;
+let agreement truth predicted = {
+    let pairs = list.zip truth predicted;
+    if pairs == [] { 0.0 } else { 1.0 * list.count (fn [a, b] -> a == b) pairs / len pairs }
+};
+
+/// Cohen's kappa of two scorings of the same epochs: 1 for perfect
+/// agreement, 0 for what chance gives.
+let kappa : [Stage] -> [Stage] -> :float;
+let kappa truth predicted = kappa_of (confusion truth predicted);
+
+/// Cohen's kappa from a confusion table.
+let kappa_of : [[:integer]] -> :float;
+let kappa_of table = {
+    let n = 1.0 * list.sum (list.map list.sum table);
+    let diagonal = list.sum (list.map (fn i -> list.nth i (list.nth i table)) (list.range 0 (len table)));
+    let rows = list.map list.sum table;
+    let cols = list.map (fn j -> list.sum (list.map (list.nth j) table)) (list.range 0 (len table));
+    let observed = diagonal / n;
+    let chance = list.sum (list.map (fn [r, c] -> r * c) (list.zip rows cols)) / (n * n);
+    if n == 0.0 || chance >= 1.0 { 0.0 } else { (observed - chance) / (1.0 - chance) }
+};
+
+// --- the picture ---------------------------------------------------------------------------
+
+/// The hypnogram as text: a row per stage, in the order clinicians draw them
+/// (wake on top, deepest at the bottom), a column per `per` epochs, marked
+/// where that stretch's commonest stage is.
+let hypnogram : [Stage] -> :string;
+let hypnogram stages = hypnogram_with 10 stages;
+
+let hypnogram_with : :integer -> [Stage] -> :string;
+let hypnogram_with per stages = {
+    let columns = list.map (fn i -> commonest (list.take per (list.drop (i * per) stages)))
+        (list.range 0 ((len stages + per - 1) / per));
+    let row s = pad (stage.name s) + " |" + str.concat_all (list.map (fn c -> if c == s { mark s } else { " " }) columns);
+    str.join_str "\n" (list.map row [Stage.wake, Stage.rem, Stage.n1, Stage.n2, Stage.n3])
+};
+
+priv let pad : :string -> :string;
+priv let pad name = str.repeat (4 - str.length name) " " + name;
+
+priv let mark : Stage -> :string;
+priv let mark s = match s { :wake => "^", :rem => "=", :n1 => "-", :n2 => "_", :n3 => "#" };
+
+/// The stage most of `stages` are; the earlier in class order on a tie.
+let commonest : [Stage] -> Stage;
+let commonest stages = {
+    let counts = list.map (fn s -> [list.count (fn x -> x == s) stages, s]) stage.all;
+    (list.fold (fn best c -> if c.[0] > best.[0] { c } else { best }) [-1, Stage.wake] counts).[1]
+};
+
+when test {
+    import std.test;
+
+    let w = Stage.wake;
+    let n1 = Stage.n1;
+    let n2 = Stage.n2;
+    let n3 = Stage.n3;
+    let r = Stage.rem;
+    // 4 awake, then sleep with one awakening of two epochs, REM twice far
+    // apart, and two awake at the end.
+    let night = [w, w, w, w, n1, n2, n2, n3, n3, w, w, n2, r, r] + list.replicate 40 n2 + [r, n2, w, w];
+    let s = summary night;
+
+    let tests = [
+        test.case "time in bed and asleep" $( test.eq! [29.0, 25.0] [s.[:tib], s.[:tst]] ),
+        test.case "latency, waso and awakenings" $( test.eq! [2.0, 1.0, 1] [s.[:latency], s.[:waso], s.[:awakenings]] ),
+        test.case "REM latency counts from onset" $( test.eq! 4.0 s.[:rem_latency] ),
+        test.case "two REM episodes, being far apart" $( test.eq! 2 s.[:cycles] ),
+        test.case "shares add to one"
+            $( test.near! 1.0e-12 1.0 (s.[:n1_share] + s.[:n2_share] + s.[:n3_share] + s.[:rem_share]) ),
+        test.case "a night with no sleep" $( test.eq! [0.0, 1.0] ({ let z = summary [w, w]; [z.[:tst], z.[:latency]] }) ),
+        test.case "kappa of identical scorings is one" $( test.near! 1.0e-12 1.0 (kappa night night) ),
+        test.case "kappa of always-N2 is about zero"
+            $( test.true! (math_abs (kappa night (list.replicate (len night) n2)) < 0.05) ),
+        test.case "a hypnogram has a row per stage" $( test.eq! 5 (len (str.split "\n" (hypnogram night))) ),
+        test.case "the commonest stage" $( test.eq! n2 (commonest [n2, r, n2, w]) ),
+    ];
+
+    let math_abs x = if x < 0.0 { 0.0 - x } else { x };
+}

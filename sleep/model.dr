@@ -1,0 +1,222 @@
+// The stager: a network that reads a night's features and answers a stage
+// for every epoch.
+//
+//     let trained = model.train! nights %{ :epochs => 30 };
+//     model.stages_of (ml.params trained) night    // [:wake, :wake, :n1, ..]
+//     model.evaluate (ml.params trained) held_out  // %{:accuracy, :kappa, ..}
+//
+// **What it is.** A night is read in windows of 64 epochs -- 32 minutes,
+// about a third of a sleep cycle. Each epoch's features go through a dense
+// layer, are told their position in the window, and then two transformer
+// blocks let every epoch attend to every other in the window: what a scorer
+// does when they read the minutes either side of an epoch before deciding
+// it. A last dense layer gives each epoch five scores, one per stage.
+// Where in the whole night a window is, the features' clock columns say.
+//
+// **How it is trained.** `ml.fit!` with cross-entropy over every epoch of
+// every window, the windows cut twice from each night -- once from the start
+// and once half a window in -- so that every epoch is seen both near a
+// window's edge and in its middle. On a GPU, `:auto` puts it there.
+//
+// **How it stages a night.** Windows are cut half a window apart and each
+// epoch takes the scores of the window it sits nearest the middle of, which
+// is where a window has the most context on both sides. A night shorter
+// than a window is padded and the padding dropped.
+
+import std.list;
+import std.map;
+import std.ml;
+import std.ml.ad;
+import std.ml.data;
+import std.ml.loss;
+import std.ml.metrics;
+import std.ml.nn;
+import std.ml.optim;
+import std.num;
+import std.tensor;
+
+import features;
+import recording;
+import recording.Recording;
+import score;
+import stage;
+import stage.Stage;
+
+/// The epochs a window holds.
+let window : :integer;
+let window = 64;
+
+/// The network.
+let network : nn.Layer;
+let network = nn.sequential [
+    nn.dense_with 64 %{:activation => :gelu},
+    nn.positional window,
+    nn.transformer 4 128,
+    nn.transformer 4 128,
+    nn.layer_norm,
+    nn.dense stage.count,
+];
+
+/// The epochs' scores from `[windows, window, 5]` as `[epochs, 5]`, and the
+/// labels the same way: what the loss and the metrics compare.
+priv let flat_scores : :any -> :any;
+priv let flat_scores out = {
+    let shape = tensor.shape (ad.value out);
+    ad.reshape [shape.[0] * shape.[1], stage.count] out
+};
+
+priv let flat_labels : :any -> :tensor;
+priv let flat_labels y = tensor.reshape [tensor.size y] y;
+
+/// Cross-entropy over every epoch of every window.
+let loss_of : :any -> :any -> :any;
+let loss_of out y = loss.cross_entropy (flat_scores out) (flat_labels y);
+
+/// The share of epochs staged right, as `ml.fit!` reports it.
+let epoch_accuracy : :tensor -> :any -> :float;
+let epoch_accuracy out y = metrics.accuracy (ad.value (flat_scores out)) (flat_labels y);
+
+// --- cutting nights into windows --------------------------------------------------------
+
+/// A night's features padded at the end, by repeating its last epoch, to a
+/// whole number of half windows past `from`; and how many epochs it had.
+priv let padded : :tensor -> :integer -> :tensor;
+priv let padded f total = {
+    let e = (tensor.shape f).[0];
+    if total <= e { tensor.slice 0 total f }
+    else { tensor.concat [f, tensor.take (list.replicate (total - e) (e - 1)) f] }
+};
+
+/// The windows starting at `starts`, as `[windows, window, width]`.
+priv let windows_at : :tensor -> [:integer] -> :tensor;
+priv let windows_at f starts = {
+    let rows = list.flat_map (fn s -> list.range s (s + window)) starts;
+    tensor.reshape [len starts, window, features.width] (tensor.take rows f)
+};
+
+/// Training windows from one scored night: from the start, and from half a
+/// window in, every window whole.
+let training_windows : Recording -> [:tensor, :tensor];
+let training_windows r = {
+    let f = features.of_signals (Recording.signals r);
+    let e = recording.epochs r;
+    let half = window / 2;
+    let starts = list.filter (fn s -> s + window <= e) (list.map (fn k -> k * half) (list.range 0 (e / half)));
+    let labels = tensor.of_list (list.map stage.index (Recording.stages r));
+    let label_rows = list.flat_map (fn s -> list.range s (s + window)) starts;
+    [windows_at f starts, tensor.reshape [len starts, window] (tensor.take label_rows labels)]
+};
+
+/// A dataset of windows from scored nights.
+let dataset : [Recording] -> data.Dataset;
+let dataset nights = {
+    let parts = list.map training_windows (list.filter recording.is_scored nights);
+    data.make (tensor.concat (list.map (fn [x, _] -> x) parts)) (tensor.concat (list.map (fn [_, y] -> y) parts))
+};
+
+// --- training -------------------------------------------------------------------------------
+
+/// Train on `nights` (the scored ones). Options are `ml.fit!`'s, and these
+/// defaults: 25 epochs, batches of 32 windows, AdamW at 0.002 with cosine
+/// decay, gradients clipped, and a tenth of the windows held out.
+let train! : [Recording] -> %{:atom => :any} -> ml.Fitted;
+let train! nights opts = {
+    let ds = dataset nights;
+    let [fit_on, held] = data.split 0.9 opts.[:seed else 1] ds;
+    let epochs = opts.[:epochs else 25];
+    let steps = epochs * ((data.size fit_on + 31) / 32);
+    let defaults = %{
+        :loss => loss_of,
+        :optimizer => optim.clip_norm 1.0 (optim.adamw (optim.cosine 0.002 steps 0.0001) 0.01),
+        :epochs => epochs,
+        :batch => 32,
+        :metrics => [["accuracy", epoch_accuracy]],
+        :validation => held,
+        :seed => 1,
+    };
+    ml.fit! network fit_on (map.merge defaults opts)
+};
+
+// --- staging -------------------------------------------------------------------------------
+
+/// Every epoch's five scores for a night: `[epochs, 5]`, as probabilities.
+let probabilities : :any -> Recording -> :tensor;
+let probabilities params r = {
+    let f = features.of_signals (Recording.signals r);
+    let e = recording.epochs r;
+    let half = window / 2;
+    // Windows half a window apart, covering the night and a little more.
+    let count = (e + half - 1) / half + 1;
+    let total = (count + 1) * half;
+    let starts = list.map (fn k -> k * half) (list.range 0 count);
+    let scores = ml.predict_with network params (windows_at (padded f total) starts);
+    // Each epoch's scores from the window it sits nearest the middle of:
+    // window `k` covers epochs `k * half .. k * half + window`, and the
+    // middle half of it is `k * half + half / 2 ..`.
+    let pick i = {
+        let k = max0 ((i - half / 2) / half);
+        let k2 = if k >= count { count - 1 } else { k };
+        k2 * window + (i - k2 * half)
+    };
+    let flat = tensor.reshape [count * window, stage.count] scores;
+    let rows = tensor.take (list.map pick (list.range 0 e)) flat;
+    softmax_rows rows
+};
+
+priv let max0 : :integer -> :integer;
+priv let max0 n = if n < 0 { 0 } else { n };
+
+priv let softmax_rows : :tensor -> :tensor;
+priv let softmax_rows t = {
+    let e = tensor.exp (t - tensor.repeat stage.count (tensor.max_axis 1 t));
+    e / tensor.repeat stage.count (tensor.sum_axis 1 e)
+};
+
+/// The stages of a night.
+let stages_of : :any -> Recording -> [Stage];
+let stages_of params r = list.map (fn c -> stage.of_index (num.to_int c))
+    (tensor.to_list (metrics.classes_of (probabilities params r)));
+
+/// How well the model stages scored nights it was not trained on: accuracy,
+/// Cohen's kappa, the confusion table summed over every night, and each
+/// stage's recall (the share of its epochs found).
+let evaluate : :any -> [Recording] -> %{:atom => :any};
+let evaluate params nights = {
+    let scored = list.filter recording.is_scored nights;
+    let pairs = list.map (fn r -> [Recording.stages r, stages_of params r]) scored;
+    let truth = list.flat_map (fn [t, _] -> t) pairs;
+    let guess = list.flat_map (fn [_, g] -> g) pairs;
+    let table = score.confusion truth guess;
+    let recall i = {
+        let row = list.nth i table;
+        let total = list.sum row;
+        if total == 0 { 0.0 } else { 1.0 * list.nth i row / total }
+    };
+    %{
+        :nights => len scored,
+        :epochs => len truth,
+        :accuracy => score.agreement truth guess,
+        :kappa => score.kappa_of table,
+        :confusion => table,
+        :recall => map.from_pairs (list.map (fn s -> [s, recall (stage.index s)]) stage.all),
+    }
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "windows from a night are [n, 64, 14] and [n, 64]"
+            $( test.true! ({
+                let r = Recording.make "x" 0 "UTC" (tensor.random 1 [200, 30, 4]) (list.replicate 200 Stage.n2);
+                let [x, y] = training_windows r;
+                tensor.shape x == [5, window, features.width] && tensor.shape y == [5, window]
+            }) ),
+        test.case "a night of any length is staged epoch for epoch"
+            $( test.true! ({
+                let p = nn.init network 0 [window, features.width];
+                let lengths = [10, 64, 65, 200];
+                list.all (fn e -> len (stages_of p (Recording.make "x" 0 "UTC" (tensor.random e [e, 30, 4]) ())) == e) lengths
+            }) ),
+    ];
+}
