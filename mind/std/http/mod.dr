@@ -359,6 +359,9 @@ let read_exact! r n = rd.read_exact! r n;
 let read_to_end! : Reader -> :integer -> [:string, Reader];
 let read_to_end! r limit = read_body! r [] true limit;
 
+priv let valid_header_name name = name != "" && str.span "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" 0 name == len name;
+priv let valid_header_value value = str.all (fn c -> { let n = _char_code c; n == 9 || (n >= 32 && n != 127) }) value;
+
 /// The start line and the headers up to the blank line: `[start, headers,
 /// reader]`, or `()` when the stream ended before anything arrived -- a
 /// kept-alive connection closing between messages, which is not an error.
@@ -366,18 +369,22 @@ let read_head! : Reader -> :integer -> :any;
 let read_head! r limit = match read_line! r 8192 {
     [(), _] => (),
     // A blank line before the start line is allowed and skipped (RFC 9112 2.2).
-    ["", r2] => read_head! r2 limit,
+    ["", r2] => {
+        if limit < 2 { raise! (error.new :too_large "too many leading blank lines") }
+        read_head! r2 (limit - 2)
+    },
     [start, r2] => {
         let rec headers! rr acc !size = match read_line! rr 8192 {
             [(), _] => raise! (error.new :bad_message "the stream ended inside the headers"),
             ["", r3] => [list.reverse acc, r3],
             [line, r3] => {
-                if size + len line > limit { raise! (error.new :too_large "headers larger than the limit") }
+                if size + len line + 2 > limit { raise! (error.new :too_large "headers larger than the limit") }
                 let colon = str.find ":" line;
                 if colon <= 0 { raise! (error.new :bad_message ("not a header: " + line)) }
                 let name = str.lower (str.slice 0 colon line);
-                if str.upto " \t" 0 name < len name { raise! (error.new :bad_message ("space in a header name: " + line)) }
-                headers! r3 ([name, str.trim (str.slice (colon + 1) (len line) line)] :: acc) (size + len line)
+                let value = str.slice (colon + 1) (len line) line;
+                if not (valid_header_name name) || not (valid_header_value value) { raise! (error.new :bad_message "invalid header") }
+                headers! r3 ([name, str.trim value] :: acc) (size + len line + 2)
             },
         };
         let [hs, r4] = headers! r2 [] 0;
@@ -405,16 +412,29 @@ type BodyState = [:exact, :integer] | [:chunked, :integer] | [:chunk_end] | [:to
 let body_state! : [[:string]] -> :bool -> BodyState;
 let body_state! headers until_close = {
     let msg = %{ :headers => headers };
-    let encoding = match header "transfer-encoding" msg { () => "", v => str.lower v };
-    if str.contains_str "chunked" encoding { [:chunked, 0] }
-    else {
-        match header "content-length" msg {
-            () => if until_close { [:to_end] } else { [:exact, 0] },
-            v => match num.parse_int (str.trim v) {
-                n if n != () && n >= 0 => [:exact, n],
-                _ => raise! (error.new :bad_message ("not a length: " + v)),
+    let encodings = header_all "transfer-encoding" msg;
+    let lengths = header_all "content-length" msg;
+    // Reject ambiguous framing even when duplicate lengths happen to agree.
+    // A proxy must never choose a different boundary from this reader.
+    if len encodings > 1 || len lengths > 1 || (encodings != [] && lengths != []) {
+        raise! (error.new :bad_message "ambiguous body framing")
+    }
+    match encodings {
+        [v] => if str.lower (str.trim v) == "chunked" { [:chunked, 0] }
+               else { raise! (error.new :bad_message "unsupported transfer encoding") },
+        _ => match lengths {
+            [] => if until_close { [:to_end] } else { [:exact, 0] },
+            [v] => {
+                let digits = str.trim v;
+                if digits == "" || str.span "0123456789" 0 digits != len digits {
+                    raise! (error.new :bad_message "invalid content length")
+                }
+                match num.parse_int digits {
+                    n if n != () && n >= 0 => [:exact, n],
+                    _ => raise! (error.new :bad_message "invalid content length"),
+                }
             },
-        }
+        },
     }
 };
 
@@ -433,16 +453,31 @@ let rec next_piece! r state = match state {
         let [piece, r2] = rd.available! r 65536;
         if piece == "" { [(), [:done], r2] } else { [piece, state, r2] }
     },
-    [:chunk_end] => { let [_, r2] = read_line! r 8192; next_piece! r2 [:chunked, 0] },
+    [:chunk_end] => {
+        let [ending, r2] = read_exact! r 2;
+        if ending != "\r\n" { raise! (error.new :bad_message "invalid chunk terminator") }
+        next_piece! r2 [:chunked, 0]
+    },
     [:chunked, 0] => match read_line! r 8192 {
         [(), _] => raise! (error.new :bad_message "the stream ended inside a chunked body"),
         [line, r2] => {
-            let size = hex_number (str.trim (str.slice 0 (str.upto ";" 0 line) line));
+            let size = hex_number (str.slice 0 (str.upto ";" 0 line) line);
             if size < 0 { raise! (error.new :bad_message ("not a chunk size: " + line)) }
             if size == 0 {
                 // Trailers, which nothing here uses, up to the blank line.
-                let rec trailers! rr = match read_line! rr 8192 { ["", r3] => r3, [(), r3] => r3, [_, r3] => trailers! r3 };
-                [(), [:done], trailers! r2]
+                let rec trailers! rr !remaining = match read_line! rr 8192 {
+                    ["", r3] => r3,
+                    [(), _] => raise! (error.new :bad_message "the stream ended inside trailers"),
+                    [line, r3] => {
+                        if len line + 2 > remaining { raise! (error.new :too_large "trailers larger than the limit") }
+                        let colon = str.find ":" line;
+                        if colon <= 0 || not (valid_header_name (str.slice 0 colon line)) || not (valid_header_value (str.slice (colon + 1) (len line) line)) { raise! (error.new :bad_message "invalid trailer") }
+                        let name = str.lower (str.slice 0 colon line);
+                        if name == "content-length" || name == "transfer-encoding" { raise! (error.new :bad_message "framing header in trailers") }
+                        trailers! r3 (remaining - len line - 2)
+                    },
+                };
+                [(), [:done], trailers! r2 65536]
             } else { next_piece! r2 [:chunked, size] }
         },
     },

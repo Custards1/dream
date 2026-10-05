@@ -13,6 +13,12 @@ runs. What is here:
   `std.ffi`, `std.math`, `std.crypto`, `std.tensor`, `std.vm` -- that the rest
   of the standard library is written on.
 
+## Security
+
+Dream executes programs with host permissions; it is not a sandbox for hostile
+code. See [security boundaries and hardening](../docs/security.md) before
+compiling or running untrusted projects.
+
 ## Building and running
 
 ```

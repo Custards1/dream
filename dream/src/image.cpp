@@ -569,6 +569,7 @@ bool Image::validate(std::string& error) {
     for (uint32_t i = 0; i < n_funcs_; ++i) {
         const FuncRec& f = funcs_[i];
         if (f.name >= n_strs_) return fail("bad function name index");
+        if (f.arity > f.slots) return fail("function arguments exceed its frame slots");
         if (f.body >= n_nodes_) {
             // Which function, because a compiler that produced this needs to
             // know where to look, and the number is the only handle it has.
@@ -601,7 +602,7 @@ bool Image::validate(std::string& error) {
             case Op::ConstFloat: if (n.a >= n_floats_) return fail("bad float constant index"); break;
             case Op::ConstStr: if (n.a >= n_strs_) return fail("bad string constant index"); break;
             case Op::ConstAtom: if (n.a >= n_atoms_) return fail("bad atom index"); break;
-            case Op::ConstChar: if (n.a > 0x10FFFF) return fail("char constant is not a Unicode scalar value"); break;
+            case Op::ConstChar: if (n.a > 0x10FFFF || (n.a >= 0xD800 && n.a <= 0xDFFF)) return fail("char constant is not a Unicode scalar value"); break;
             case Op::ConstBool: if (n.a > 1) return fail("bool constant is neither 0 nor 1"); break;
             case Op::Global: if (n.a >= n_globals_) return fail("bad global index"); break;
             case Op::Builtin: if (n.a >= builtin_limit()) return fail("unknown builtin id"); break;
@@ -677,25 +678,23 @@ bool Image::validate(std::string& error) {
         std::vector<uint32_t> kids_of;
         for (uint32_t root = 0; root < n_nodes_; ++root) {
             if (mark[root] != White) continue;
-            std::vector<std::pair<uint32_t, uint32_t>> stack;
-            stack.push_back({root, 0});
-            mark[root] = Grey;
+            // Enter/leave events enumerate each node's edges only once. Rebuilding
+            // the child vector for every edge made wide lists quadratic to load.
+            std::vector<std::pair<uint32_t, bool>> stack;
+            stack.push_back({root, false});
             while (!stack.empty()) {
-                auto [ni, child] = stack.back();
+                auto [ni, leaving] = stack.back();
                 stack.pop_back();
+                if (ni == NO_NODE) continue;
+                if (leaving) { mark[ni] = Black; continue; }
+                if (mark[ni] == Grey) return fail("the execution tree contains a cycle");
+                if (mark[ni] == Black) continue;
+                mark[ni] = Grey;
+                stack.push_back({ni, true});
                 kids_of.clear();
                 node_children(nodes_[ni], kids_, kids_of);
-                if (child >= kids_of.size()) {
-                    mark[ni] = Black;
-                    continue;
-                }
-                stack.push_back({ni, child + 1});
-                uint32_t c = kids_of[child];
-                if (c == NO_NODE || c >= n_nodes_) continue;
-                if (mark[c] == Grey) return fail("the execution tree contains a cycle");
-                if (mark[c] == White) {
-                    mark[c] = Grey;
-                    stack.push_back({c, 0});
+                for (auto it = kids_of.rbegin(); it != kids_of.rend(); ++it) {
+                    stack.push_back({*it, false});
                 }
             }
         }
@@ -727,51 +726,16 @@ bool Image::validate(std::string& error) {
                     break;
                 case Op::Bind:
                     if (n.a >= f.slots) return fail("bind slot is outside the function frame");
-                    work.push_back(n.b);
                     break;
                 case Op::Try:
                     if (n.c >= f.slots) return fail("catch slot is outside the function frame");
-                    work.push_back(n.a);
-                    work.push_back(n.b);
-                    break;
-                DREAM_PRIMITIVE_CASES
-                    for (uint32_t k = 0; k < n.c; ++k) work.push_back(kids_[n.b + k]);
-                    break;
-                case Op::Apply:
-                    work.push_back(n.a);
-                    for (uint32_t k = 0; k < n.c; ++k) work.push_back(kids_[n.b + k]);
-                    break;
-                case Op::Block:
-                case Op::MakeList:
-                case Op::MakeArray:
-                    for (uint32_t k = 0; k < n.b; ++k) work.push_back(kids_[n.a + k]);
-                    break;
-                case Op::MakeMap:
-                    for (uint32_t k = 0; k < n.b * 2; ++k) work.push_back(kids_[n.a + k]);
-                    break;
-                case Op::SwitchHead: case Op::SwitchAtom:
-                    work.push_back(n.a);
-                    for (uint32_t k = 0; k < n.c; ++k) work.push_back(kids_[n.b + k]);
-                    break;
-                case Op::If:
-                    work.push_back(n.a);
-                    work.push_back(n.b);
-                    work.push_back(n.c);
-                    break;
-                case Op::Field:
-                case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
-                    work.push_back(n.a);
-                    break;
-                case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
-                case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
-                case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
-                case Op::And: case Op::Or: case Op::Cons:
-                    work.push_back(n.a);
-                    work.push_back(n.b);
                     break;
                 default:
                     break;
             }
+            // Use the same edges as the structural walk, including Get/Set
+            // operands and Get's fallback: all can contain frame accesses.
+            node_children(n, kids_, work);
         }
         // Capture descriptors are read against the *parent* frame at closure
         // creation, so they are bounds-checked there rather than here.

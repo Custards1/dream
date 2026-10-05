@@ -1038,6 +1038,88 @@ static void test_type_test_nodes() {
     }
 }
 
+static void test_image_frame_validation() {
+    std::printf("image frame validation\n");
+    // Every Get/Set operand, including a Get fallback, must be traversed.
+    for (Op parent : {Op::Get, Op::Set}) {
+        for (Op access : {Op::Local, Op::Capture, Op::Bind, Op::Try}) {
+            for (unsigned operand = 0; operand < 3; ++operand) {
+                for (bool invalid : {false, true}) {
+                    ImageBuilder b;
+                    add_minimum(b);
+                    std::vector<uint8_t> nodes;
+                    auto node = [&](Op op, uint32_t a, uint32_t c1, uint32_t c2) {
+                        nodes.insert(nodes.end(), {uint8_t(op), 0, 0, 0});
+                        ImageBuilder::put32(nodes, a);
+                        ImageBuilder::put32(nodes, c1);
+                        ImageBuilder::put32(nodes, c2);
+                    };
+                    node(Op::Unit, 0, 0, 0);
+                    node(access, access == Op::Try ? 0 : unsigned(invalid), 0,
+                         access == Op::Try ? unsigned(invalid) : 0);
+                    node(parent, operand == 0 ? 1 : 0, operand == 1 ? 1 : 0,
+                         operand == 2 ? 1 : 0);
+                    b.add("NODE", nodes, 3);
+                    std::vector<uint8_t> func(32, 0);
+                    func[4] = 2; // body
+                    func[12] = 1; // slots
+                    func[14] = 1; // captures
+                    b.add("FUNC", func, 1);
+                    b.add("KIDS", std::vector<uint8_t>(4, 0), 1);
+                    auto bytes = b.build();
+                    Image img;
+                    std::string error;
+                    CHECK_EQ(img.load_bytes(bytes.data(), bytes.size(), error), !invalid);
+                }
+            }
+        }
+    }
+    for (bool invalid : {false, true}) {
+        ImageBuilder b;
+        add_minimum(b);
+        std::vector<uint8_t> nodes(16, 0);
+        nodes[0] = uint8_t(Op::Unit);
+        b.add("NODE", nodes, 1);
+        std::vector<uint8_t> func(32, 0);
+        func[8] = invalid ? 2 : 1;
+        func[12] = 1;
+        b.add("FUNC", func, 1);
+        auto bytes = b.build();
+        Image img;
+        std::string error;
+        CHECK_EQ(img.load_bytes(bytes.data(), bytes.size(), error), !invalid);
+    }
+    for (uint32_t scalar : {0xD7FFu, 0xD800u, 0xDFFFu, 0xE000u, 0x10FFFFu, 0x110000u}) {
+        ImageBuilder chars;
+        add_minimum(chars);
+        std::vector<uint8_t> node{uint8_t(Op::ConstChar), 0, 0, 0};
+        ImageBuilder::put32(node, scalar);
+        ImageBuilder::put32(node, 0);
+        ImageBuilder::put32(node, 0);
+        chars.add("NODE", node, 1);
+        auto bytes = chars.build();
+        Image img;
+        std::string error;
+        CHECK_EQ(img.load_bytes(bytes.data(), bytes.size(), error),
+                 scalar <= 0x10FFFF && (scalar < 0xD800 || scalar > 0xDFFF));
+    }
+    // A wide DAG with repeated children must load in linear time.
+    ImageBuilder b;
+    add_minimum(b);
+    std::vector<uint8_t> nodes(16, 0);
+    nodes[0] = uint8_t(Op::Unit);
+    nodes.insert(nodes.end(), {uint8_t(Op::MakeList), 0, 0, 0});
+    ImageBuilder::put32(nodes, 0);
+    ImageBuilder::put32(nodes, 100000);
+    ImageBuilder::put32(nodes, 0);
+    b.add("NODE", nodes, 2);
+    b.add("KIDS", std::vector<uint8_t>(400000, 0), 100000);
+    auto bytes = b.build();
+    Image img;
+    std::string error;
+    CHECK(img.load_bytes(bytes.data(), bytes.size(), error));
+}
+
 static void test_integer_hints() {
     std::printf("integer signature hints\n");
     for (int mode = 0; mode < 4; ++mode) {
@@ -1677,6 +1759,7 @@ int main() {
     test_big_block_pool();
     test_tensor_kernels();
     test_image_rejects_bad_input();
+    test_image_frame_validation();
     test_integer_hints();
     test_type_test_nodes();
     test_payload_sections();
