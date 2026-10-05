@@ -50,6 +50,7 @@ learn.
 | `codec` | the generic half: everything a format gets once it can spell a value |
 | `json` | JSON, parsed and rendered |
 | `wire` | every Dream value, exactly, as bytes |
+| `binary`, `binary.word`, `binary.io` | checked binary layouts, fixed-width word operations and transport adapters ([guide](../../docs/binary.md)) |
 | `record` | records on a wire: a declared value's named form, and the way back |
 | `toml` | the TOML `mind.toml` uses |
 | `version` | versions, and which versions a requirement accepts (`^1.2`, `>=0.3, <0.5`) |

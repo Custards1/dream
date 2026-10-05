@@ -372,6 +372,13 @@ test-bootstrap: bootstrap-check
 test-std: build
     ./{{dreams}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
     ./{{dream}} /tmp/dream-std-tests.dream
+    python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
+
+# Binary layouts against reference integers and every finite IEEE binary16 value.
+test-binary: build
+    ./{{dreams}} mind/std/binary/tests.dr --test -L mind -o /tmp/dream-binary-tests.dream
+    ./{{dream}} /tmp/dream-binary-tests.dream
+    python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
 
 # std.tls: a server and its clients in one VM, and the VM against OpenSSL's
 # own client and server in both directions.

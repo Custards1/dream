@@ -1,0 +1,238 @@
+// Public API tests: wire vectors, malformed inputs, composition and cursors.
+import std.binary as b;
+import std.binary.word as word;
+import std.binary.io as bio;
+import std.agent;
+import std.crypto;
+import std.list;
+import std.result;
+import std.str;
+import std.wire;
+
+when test {
+    import std.test;
+
+    let value : :any -> :any;
+    let value r = result.or_else :failed r;
+    let kind r = match r { [:error, e] => e.[:kind], _ => :ok };
+    let path r = match r { [:error, e] => e.[:path], _ => [] };
+    let offset r = match r { [:error, e] => [e.[:offset], e.[:bit_offset]], _ => [] };
+    let hex c v = result.map crypto.hex (b.encode c v);
+    let trip c v = result.and_then (b.decode c) (b.encode c v);
+    let packet = b.record [[:magic, b.magic "DB"], [:id, b.u32be], [:data, b.blob b.u16le 1024]];
+    let message = %{ :magic => (), :id => 4294967295, :data => "a\0b" };
+    let packed = comp b.encode (b.tuple [b.u16be, b.uvarint]) [258, 300];
+    let bit_header = b.tuple [b.bits :msb 3, b.flag, b.signed_bits :msb 9, b.byte_align 0, b.u8];
+    let section = b.sized b.u8 100 (b.tuple [b.u8, b.align 4 0, b.u8]);
+
+    let tests = [
+        test.case "unsigned integer byte order"
+            $( test.eq! [[:ok, "010203"], [:ok, "030201"]] [hex b.u24be 66051, hex b.u24le 66051] ),
+        test.case "signed integer two's complement"
+            $( test.eq! [[:ok, "fffe"], [:ok, "feff"]] [hex b.i16be (-2), hex b.i16le (-2)] ),
+        test.case "integer boundaries through 128 bits"
+            $( test.eq! [] (list.filter (fn [c, n] -> trip c n != [:ok, n])
+                [[b.u8, 255], [b.i8, -128], [b.i8, 127], [b.u64be, (1 << 64) - 1],
+                 [b.i64le, -(1 << 63)], [b.u128le, (1 << 128) - 1], [b.i128be, -(1 << 127)]]) ),
+        test.case "overflow never truncates"
+            $( test.eq! [:out_of_range, :out_of_range, :out_of_range, :type_error]
+                [kind (b.encode b.u8 (-1)), kind (b.encode b.u8 256),
+                 kind (b.encode b.i8 128), kind (b.encode b.u8 1.0)] ),
+        test.case "width and order are checked"
+            $( test.eq! [:invalid_argument, :invalid_argument, :invalid_argument]
+                [kind (b.encode (b.uint :native 2) 0), kind (b.decode (b.uint :be 0) ""),
+                 kind (b.encode (b.uint :le 65537) 0)] ),
+        test.case "whole decoding requires whole input"
+            $( test.eq! [:truncated, :trailing_data] [kind (b.decode b.u16le "x"), kind (b.decode b.u8 "xx")] ),
+        test.case "raw bytes and byte reversal preserve invalid UTF8"
+            $( test.eq! [:ok, "ff8000"] (hex (b.bytes 3) (b.reverse_bytes (str.of_bytes [0, 128, 255]))) ),
+        test.case "fixed bytes require exact lengths"
+            $( test.eq! [:out_of_range, :truncated] [kind (b.encode (b.bytes 2) "x"), kind (b.decode (b.bytes 2) "x")] ),
+        test.case "readers support checkpoints and bounded ranges"
+            $( {
+                let r = value (b.reader_at 1 2 "abcd");
+                test.eq! [98, 99] (list.nth 0 (value (b.read (b.repeat 2 b.u8) r)))
+                test.eq! 8 (b.position r)
+                test.eq! :truncated (kind (b.read (b.bytes 3) r))
+            } ),
+        test.case "range checks include negative offsets"
+            $( test.eq! [:invalid_argument, :truncated, :truncated]
+                [kind (b.reader_at (-1) 1 "a"), kind (b.reader_at 2 0 "a"), kind (b.reader_at 0 2 "a")] ),
+        test.case "a prefix reader points to the next value"
+            $( {
+                let [first, next] = value (b.decode_prefix b.u8 "ab");
+                test.eq! [97, 8, 1] [first, b.position next, b.remaining_bytes next]
+                test.eq! 98 (list.nth 0 (value (b.read b.u8 next)))
+            } ),
+        test.case "builders are reusable values"
+            $( {
+                let base = value (b.write b.u8 1 b.builder);
+                test.eq! [:ok, "0102"] (result.map crypto.hex (result.and_then b.finish (b.write b.u8 2 base)))
+                test.eq! [:ok, "0103"] (result.map crypto.hex (result.and_then b.finish (b.write b.u8 3 base)))
+            } ),
+        test.case "patch preserves the surrounding bytes"
+            $( test.eq! [:ok, (str.of_bytes [97, 98, 1, 2, 101, 102])] (b.patch b.u16be 2 258 "abcdef") ),
+        test.case "patch cannot extend a destination"
+            $( test.eq! :out_of_range (kind (b.patch b.u32be 1 0 "abcd")) ),
+        test.case "varint published examples"
+            $( test.eq! [[:ok, "00"], [:ok, "7f"], [:ok, "8001"], [:ok, "e58e26"]]
+                (list.map (hex b.uvarint) [0, 127, 128, 624485]) ),
+        test.case "varints span the full unsigned range"
+            $( test.eq! [:ok, (1 << 64) - 1] (trip b.uvarint ((1 << 64) - 1)) ),
+        test.case "varints support wider caller-selected bounds"
+            $( test.eq! [:ok, 1 << 200] (trip (b.varuint 201) (1 << 200)) ),
+        test.case "varints reject redundant, truncated and overflowing spellings"
+            $( test.eq! [:noncanonical, :truncated, :out_of_range, :out_of_range]
+                [kind (b.decode b.uvarint (str.of_bytes [128, 0])), kind (b.decode b.uvarint (str.of_bytes [128])),
+                 kind (b.decode (b.varuint 8) (str.of_bytes [128, 2])), kind (b.encode (b.varuint 8) 256)] ),
+        test.case "ZigZag signed boundaries"
+            $( test.eq! [[:ok, "01"], [:ok, "02"], [:ok, -(1 << 63)], [:ok, (1 << 63) - 1]]
+                [hex b.svarint (-1), hex b.svarint 1, trip b.svarint (-(1 << 63)), trip b.svarint ((1 << 63) - 1)] ),
+        test.case "IEEE float vectors"
+            $( test.eq! [[:ok, "3c00"], [:ok, "0000803f"], [:ok, "3ff0000000000000"]]
+                [hex b.f16be 1.0, hex b.f32le 1.0, hex b.f64be 1.0] ),
+        test.case "IEEE signed zero is preserved"
+            $( test.eq! [:ok, "80000000"]
+                (result.and_then (b.encode b.f32be) (b.decode b.f32be (str.of_bytes [128, 0, 0, 0])) |> result.map crypto.hex) ),
+        test.case "binary16 smallest subnormal"
+            $( test.eq! [:ok, 0.000000059604644775390625] (b.decode b.f16be (str.of_bytes [0, 1])) ),
+        test.case "binary16 rounds ties to even"
+            $( test.eq! [[:ok, "3c00"], [:ok, "3c02"]]
+                [hex b.f16be 1.00048828125, hex b.f16be 1.00146484375] ),
+        test.case "binary16 overflow rounds to infinity"
+            $( test.eq! [:ok, "7c00"] (hex b.f16be 65520.0) ),
+        test.case "bit fields cross byte boundaries"
+            $( test.eq! [:ok, [5, true, -3, (), 255]] (trip bit_header [5, true, -3, (), 255]) ),
+        test.case "least significant value bit first is explicit"
+            $( test.eq! [:ok, "a0"] (hex (b.tuple [b.bits :lsb 3, b.byte_align 0]) [5, ()]) ),
+        test.case "unfilled final bytes are errors"
+            $( test.eq! :unaligned (kind (b.encode (b.bits :msb 3) 5)) ),
+        test.case "byte fields cannot silently align"
+            $( test.eq! [:unaligned, :unaligned]
+                [kind (b.encode (b.tuple [b.flag, b.u8]) [true, 0]),
+                 kind (b.decode (b.tuple [b.flag, b.u8]) "\0\0")] ),
+        test.case "reserved padding bits must match"
+            $( test.eq! :invalid_value (kind (b.decode (b.tuple [b.flag, b.byte_align 0]) (str.of_bytes [129]))) ),
+        test.case "bit errors locate the exact bit"
+            $( test.eq! [0, 7] (offset (b.decode (b.tuple [b.bits :msb 7, b.bits :msb 2]) "\0")) ),
+        test.case "records share one layout for both directions"
+            $( test.eq! [:ok, message] (trip packet message) ),
+        test.case "record writer refuses missing and extra keys"
+            $( test.eq! [:missing_field, :extra_field]
+                [kind (b.encode packet %{}), kind (b.encode packet message.[:typo => 0])] ),
+        test.case "record error paths agree in both directions"
+            $( test.eq! [[:id], [:id]]
+                [path (b.decode packet "DBx"), path (b.encode packet message.[:id => -1])] ),
+        test.case "record constants and padding need no placeholder values"
+            $( test.eq! [:ok, %{ :id => 7 }]
+                (trip (b.record [b.magic "D", [:id, b.u8], b.padding 2 0]) %{ :id => 7 }) ),
+        test.case "duplicate field names are invalid"
+            $( test.eq! :invalid_argument (kind (b.decode (b.record [[:x, b.u8], [:x, b.u8]]) "xx")) ),
+        test.case "nested paths include sequence indices"
+            $( test.eq! [:items, 1] (path (b.decode (b.record [[:items, b.repeat 2 b.u16be]]) "abc")) ),
+        test.case "vector enforces its limit before reading its body"
+            $( test.eq! :out_of_range (kind (b.decode (b.vector b.u8 2 b.u8) (str.of_bytes [3]))) ),
+        test.case "vector bounds even an infinite input list"
+            $( test.eq! :out_of_range (kind (b.encode (b.vector b.u8 2 b.u8) (list.from 0))) ),
+        test.case "bounded list round trip"
+            $( test.eq! [:ok, [1, 256, 65535]] (trip (b.vector b.u8 10 b.u16le) [1, 256, 65535]) ),
+        test.case "sized sections enforce exact consumption"
+            $( test.eq! :trailing_data (kind (b.decode (b.sized b.u8 10 b.u8) (str.of_bytes [2, 97, 98]))) ),
+        test.case "section errors preserve absolute offsets"
+            $( test.eq! [2, 0] (offset (b.decode (b.sized b.u8 10 (b.tuple [b.u8, b.u16be])) (str.of_bytes [2, 97, 98]))) ),
+        test.case "section alignment is relative to the section"
+            $( test.eq! [:ok, [1, (), 2]] (trip section [1, (), 2]) ),
+        test.case "sections cannot consume the next field"
+            $( test.eq! :truncated (kind (b.decode (b.sized b.u8 10 b.u16be) (str.of_bytes [1, 97, 98]))) ),
+        test.case "bounded strings include zero bytes"
+            $( test.eq! [:ok, "a\0b"] (trip (b.blob b.u8 3) "a\0b") ),
+        test.case "terminated fields round trip"
+            $( test.eq! [:ok, "hello"] (trip (b.cstring 5) "hello") ),
+        test.case "terminated fields reject missing and embedded terminators"
+            $( test.eq! [:truncated, :invalid_value, :out_of_range]
+                [kind (b.decode (b.cstring 5) "hi"), kind (b.encode (b.cstring 5) "a\0b"),
+                 kind (b.decode (b.cstring 2) "abc")] ),
+        test.case "overlapping delimiters cannot change the decoded value"
+            $( test.eq! :invalid_value (kind (b.encode (b.terminated "aba" 10) "ab")) ),
+        test.case "tagged variants are explicit"
+            $( test.eq! [:ok, [2, 65535]] (trip (b.tagged b.u8 %{ 1 => b.u8, 2 => b.u16be }) [2, 65535]) ),
+        test.case "unknown variant tags are failures"
+            $( test.eq! :unknown_tag (kind (b.decode (b.tagged b.u8 %{ 1 => b.u8 }) (str.of_bytes [2]))) ),
+        test.case "dependent layouts inspect a header"
+            $( test.eq! [:ok, [3, "abc"]] (trip (b.dependent b.u8 b.bytes) [3, "abc"]) ),
+        test.case "constraints run both ways"
+            $( test.eq! [:invalid_value, :invalid_value]
+                [kind (b.encode (b.where (fn n -> n < 4) "small" b.u8) 5),
+                 kind (b.decode (b.where (fn n -> n < 4) "small" b.u8) (str.of_bytes [5]))] ),
+        test.case "boolean bytes reject noncanonical truth"
+            $( test.eq! [:ok, :invalid_value] [kind (trip b.boolean true), kind (b.decode b.boolean (str.of_bytes [2]))] ),
+        test.case "layouts execute at compile time"
+            $( test.eq! [:ok, (str.of_bytes [1, 2, 172, 2])] packed ),
+        test.case "wire framing remains compatible"
+            $( test.eq! [:ok, message] (list.head (wire.next_frame (wire.frame message))) ),
+        test.case "a binary layout can describe existing wire framing"
+            $( test.eq! [:ok, wire.frame message] (b.encode (b.blob b.u32le 4096) (wire.encode message)) ),
+        test.case "signed LEB128 vectors and boundaries"
+            $( test.eq! [[:ok, "9bf159"], [:ok, -128], [:ok, 127], [:ok, -(1 << 63)]]
+                [hex (b.sleb128 64) (-624485), trip (b.sleb128 8) (-128),
+                 trip (b.sleb128 8) 127, trip (b.sleb128 64) (-(1 << 63))] ),
+        test.case "signed LEB128 rejects redundant sign extension and overflow"
+            $( test.eq! [:noncanonical, :out_of_range]
+                [kind (b.decode (b.sleb128 64) (str.of_bytes [255, 127])),
+                 kind (b.decode (b.sleb128 8) (str.of_bytes [128, 1]))] ),
+        test.case "word wrapping is explicit"
+            $( test.eq! [[:ok, 255], [:ok, -1], [:ok, 0]]
+                [word.unsigned 8 (-1), word.signed 8 255, word.unsigned 8 256] ),
+        test.case "rotations wrap counts and width"
+            $( test.eq! [[:ok, 3], [:ok, 192], [:ok, 192], [:ok, 3]]
+                [word.rotate_left 8 1 129, word.rotate_right 8 1 129,
+                 word.rotate_left 8 (-1) 129, word.rotate_left 8 9 129] ),
+        test.case "bit extraction and insertion preserve neighboring bits"
+            $( test.eq! [[:ok, 10], [:ok, 0x12f4], [:ok, -241]]
+                [word.extract 4 4 0xab, word.replace 4 4 15 0x1234, word.replace 4 4 0 (-1)] ),
+        test.case "word counts and bit reversal"
+            $( test.eq! [[:ok, 8], [:ok, 8], [:ok, 3], [:ok, 4], [:ok, 128]]
+                [word.popcount 8 (-1), word.leading_zeros 8 0, word.leading_zeros 8 16,
+                 word.trailing_zeros 8 16, word.reverse 8 1] ),
+        test.case "word operations validate widths before shifts"
+            $( test.eq! [:invalid_argument, :invalid_argument, :invalid_argument]
+                [kind (word.rotate_left 0 1 0), kind (word.replace 0 4 16 0), kind (word.extract (-1) 4 0)] ),
+        test.case "checksummed layouts verify their exact body"
+            $( test.eq! [:ok, "hello"] (trip (b.checksummed 32 crypto.sha256 (b.blob b.u8 100)) "hello") ),
+        test.case "corruption is a checksum error"
+            $( {
+                let codec = b.checksummed 32 crypto.sha256 (b.blob b.u8 100);
+                let original = value (b.encode codec "hello");
+                let damaged = value (b.patch b.u8 2 0 original);
+                test.eq! :checksum_mismatch (kind (b.decode codec damaged))
+            } ),
+        test.case "IO assembles short reads and reports truncated input"
+            $( {
+                let source! n = str.slice 0 n "aa";
+                let ended! n = "";
+                test.eq! [:ok, "aaaaa"] (bio.read_exact_with! 5 source!)
+                test.eq! :truncated (kind (bio.read_exact_with! 1 ended!))
+                test.eq! [:ok, 24929] (bio.read_with! b.u16be 2 source!)
+            } ),
+        test.case "IO refuses callbacks that over-read or make no write progress"
+            $( {
+                let over! n = "xx";
+                let stuck! data = 0;
+                test.eq! :io_error (kind (bio.read_exact_with! 1 over!))
+                test.eq! :io_error (kind (bio.write_with! b.u8 1 stuck!))
+            } ),
+        test.case "IO writes all short chunks and validates before writing"
+            $( {
+                let pid = agent.start! "";
+                let sink! data = {
+                    let part = str.slice 0 2 data;
+                    agent.update! pid (fn acc -> acc + part)
+                    len part
+                };
+                test.eq! [:ok, ()] (bio.write_with! (b.bytes 5) "hello" sink!)
+                test.eq! :out_of_range (kind (bio.write_with! b.u8 300 sink!))
+                test.eq! "hello" (agent.value! pid)
+                agent.stop! pid
+            } ),
+    ];
+}

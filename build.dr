@@ -61,6 +61,9 @@ let checks ctx =
     |> build.check "console" (command.check_in (build.Context.root ctx) "console" (tools ctx) "python3"
         ["dream/tests/console.py", "--dream", build.Context.vm ctx,
          "--compiler", list.last (build.Context.compiler ctx)])
+    |> build.check "binary" (command.check_in (build.Context.root ctx) "binary" (tools ctx) "python3"
+        ["dreams/tests/binary.py", "--dream", build.Context.vm ctx,
+         "--compiler", list.last (build.Context.compiler ctx)])
     |> build.check "e2e" (suite ctx "e2e" "dream/tests/e2e.sh")
     |> build.check "examples" (suite ctx "examples" "examples/run.sh")
     |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh")
