@@ -27,9 +27,7 @@
 // **The algorithm is MRG32k3a**, L'Ecuyer's combined multiple recursive
 // generator: period 2^191, passes TestU01's BigCrush, and -- the reason it was
 // picked -- needs nothing but multiplication and remainder on numbers under
-// 2^53. Dream has no bitwise operators, which rules out xorshift, PCG and
-// SplitMix written in Dream, and a generator that leans on bignums would be
-// slow. Each step is a few multiplications and yields one word in
+// 2^53. Each step is a few multiplications and yields one word in
 // `[0, 4294967087)`. `split` derives two independent generators by hashing
 // the state, so a parallel computation gives each process its own stream.
 // None of this is fit for secrets: the state can be recovered from outputs.
@@ -379,8 +377,7 @@ let uuid rng = { let [b, rng2] = bytes 16 rng; [uuid_text b, rng2] };
 priv let uuid_text : :string -> :string;
 priv let uuid_text b = {
     // Version 4 in the high nibble of byte 6, and the RFC 9562 variant (10xx)
-    // in the high bits of byte 8 -- written with arithmetic, there being no
-    // bitwise operators to write it with.
+    // in the high bits of byte 8, using remainder to keep the lower bits.
     let fixed = str.slice 0 6 b + str.of_bytes [str.byte 6 b % 16 + 64] + str.slice 7 1 b
                 + str.of_bytes [str.byte 8 b % 64 + 128] + str.slice 9 7 b;
     let h = crypto.hex fixed;

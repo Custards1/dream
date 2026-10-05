@@ -195,6 +195,12 @@ lazy VM cannot work out for itself:
 | 72 | `data_at` | builtin ID 48 | kids offset | argument count 1 |
 | 73 | `compare` | builtin ID 49 | kids offset | argument count 2 |
 | 74 | `str_interp` | builtin ID 52 | kids offset | argument count 1 |
+| 75 | `band` | left node | right node | — |
+| 76 | `bor` | left node | right node | — |
+| 77 | `bxor` | left node | right node | — |
+| 78 | `bnot` | operand node | — | — |
+| 79 | `shl` | left node | count node | — |
+| 80 | `shr` | left node | count node | — |
 
 
 `type_is` forces its subject to WHNF and compares its runtime type, answering a

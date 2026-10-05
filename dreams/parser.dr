@@ -213,14 +213,20 @@ let rec binary_tail c level lhs ts = {
     }
 };
 
-/// A leading `-` or `not`. Both bind tighter than any infix operator and
-/// looser than application, so `not f x` is `not (f x)`.
+/// A leading `-`, `~` or `not`. Each binds tighter than any infix operator
+/// and looser than application, so `not f x` is `not (f x)`.
 let rec parse_unary c ts = {
     let start = peek_span ts;
     if at ts :minus {
         match parse_unary c (list.tail ts) {
             [:error, m, s] => err m s,
             [:ok, e, rest] => ok (ast.unary_e :neg e (ast.span_to start (ast.span e))) rest,
+        }
+    }
+    else if at ts :tilde {
+        match parse_unary c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, e, rest] => ok (ast.unary_e :bnot e (ast.span_to start (ast.span e))) rest,
         }
     }
     else if is_kw ts "not" {
@@ -3029,6 +3035,14 @@ when test {
             $( test.eq! "(unary neg (name x))" (shape "-x") ),
         test.case "not is looser than application"
             $( test.eq! "(unary not (apply (name f) (name x)))" (shape "not f x") ),
+
+        test.case "bitwise precedence between comparisons and arithmetic"
+            $( test.eq! "(binary eq (binary bor (int 1) (binary bxor (int 2) (binary band (int 3) (binary shl (int 4) (binary add (int 5) (int 6)))))) (int 7))"
+                        (shape "1 | 2 ^ 3 & 4 << 5 + 6 == 7") ),
+        test.case "complement follows unary application precedence"
+            $( test.eq! "(unary bnot (apply (name f) (name x)))" (shape "~f x") ),
+        test.case "bitwise shifts associate left"
+            $( test.eq! "(binary shr (binary shl (int 1) (int 2)) (int 3))" (shape "1 << 2 >> 3") ),
 
         // --- member access ---
         test.case "member access"

@@ -65,7 +65,7 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
         for (uint64_t i = 0; i < count; ++i) out.push_back(kids[off + i]);
     };
     switch (static_cast<Op>(n.op)) {
-        case Op::Field: case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
+        case Op::Field: case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
             out.push_back(n.a);
             break;
         DREAM_PRIMITIVE_CASES
@@ -98,6 +98,7 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
             out.push_back(n.b);
             break;
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or: case Op::Cons:
             out.push_back(n.a);
@@ -187,6 +188,12 @@ const char* op_name(Op op) {
         case Op::And: return "and";
         case Op::Or: return "or";
         case Op::Neg: return "neg";
+        case Op::BitAnd: return "band";
+        case Op::BitOr: return "bor";
+        case Op::BitXor: return "bxor";
+        case Op::BitNot: return "bnot";
+        case Op::Shl: return "shl";
+        case Op::Shr: return "shr";
         case Op::Not: return "not";
         case Op::MakeList: return "list";
         case Op::MakeArray: return "array";
@@ -638,12 +645,13 @@ bool Image::validate(std::string& error) {
             case Op::Try:
                 if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad try body or handler");
                 break;
-            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
                 if (!node_ok(n.a)) return fail("bad unary operand");
                 if (Op(n.op) == Op::TypeIs && (n.b > DREAM_TYPE_MAP || n.c > 1))
                     return fail("bad type test");
                 break;
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or: case Op::Cons:
                 if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad binary operand");
@@ -751,10 +759,11 @@ bool Image::validate(std::string& error) {
                     work.push_back(n.c);
                     break;
                 case Op::Field:
-                case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
+                case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
                     work.push_back(n.a);
                     break;
                 case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+                case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
                 case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
                 case Op::And: case Op::Or: case Op::Cons:
                     work.push_back(n.a);

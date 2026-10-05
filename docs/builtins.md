@@ -498,7 +498,7 @@ On Windows SChannel does its cryptography outside the process, so a PKCS#12 iden
 
 ## `std.crypto`
 
-Hashes, MACs, key derivation and randomness, done by the machine. Dream has no bitwise operators, so any of these written in Dream is thousands of reductions per block; here each is one call. Everything is **bytes in, bytes out**: a digest, a MAC or a derived key is a string of raw bytes, ready to be the next step's key or salt, and `hex`/`base64` spell one for printing. The hashes are written out in the VM (`dream/src/digest.cpp`), not taken from the TLS library, so they are the same on every platform.
+Hashes, MACs, key derivation and randomness, done by the machine. Writing these in Dream costs thousands of reductions per block; here each is one call. Everything is **bytes in, bytes out**: a digest, a MAC or a derived key is a string of raw bytes, ready to be the next step's key or salt, and `hex`/`base64` spell one for printing. The hashes are written out in the VM (`dream/src/digest.cpp`), not taken from the TLS library, so they are the same on every platform.
 
 Where the algorithm is a parameter it is an atom: `:md5`, `:sha1`, `:sha256`, `:sha384` or `:sha512`. Anything else raises `:type_error`.
 

@@ -202,6 +202,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::Force:
         case Op::Neg:
         case Op::Not:
+        case Op::BitNot:
         case Op::TypeIs:
             dump_node(img, n.a, depth + 1, out);
             break;
@@ -237,6 +238,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
             if (n.c != NO_NODE) dump_node(img, n.c, depth + 1, out);
             break;
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or:
             dump_node(img, n.a, depth + 1, out);

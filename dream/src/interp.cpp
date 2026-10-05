@@ -910,8 +910,64 @@ bool concat_lists(Process& p, Value a, Value b, Value* out) {
     return true;
 }
 
+/// The bitwise operators, past the fixnum fast paths: an operand that is a
+/// bignum, a shift that leaves the fixnum range, or something that is not an
+/// integer at all.
+bool bitwise_arith(Process& p, Op op, Value a, Value b, Value* out) {
+    const char* name = op == Op::BitAnd ? "&" : op == Op::BitOr ? "|" : op == Op::BitXor ? "^"
+                     : op == Op::Shl ? "<<" : ">>";
+    if (!bigint::is_integer(a) || !bigint::is_integer(b)) {
+        *out = type_error(p, std::string("`") + name + "` needs integers, got " + describe(p, a) + " and " +
+                                 describe(p, b));
+        return false;
+    }
+    Heap& h = p.heap();
+    switch (op) {
+        case Op::BitAnd: *out = bigint::bit_and(h, a, b); return true;
+        case Op::BitOr: *out = bigint::bit_or(h, a, b); return true;
+        case Op::BitXor: *out = bigint::bit_xor(h, a, b); return true;
+        default: break;
+    }
+    if (bigint::compare(b, make_fixnum(0)) < 0) {
+        *out = raise_error(p, well_known(p.runtime()).out_of_bounds, std::string("a negative shift count for `") + name + "`");
+        return false;
+    }
+    if (op == Op::Shr) {
+        // A count past every bit leaves only the sign: 0 or -1.
+        int64_t k = 0;
+        if (!bigint::to_int64(b, &k)) k = INT64_MAX;
+        *out = bigint::shift_right(h, a, uint64_t(k));
+        return true;
+    }
+    // A left shift is as large as its count says. Past 2^32 bits -- half a
+    // gigabyte for the one number -- it is a mistake rather than a value, and
+    // is refused before it is allocated.
+    int64_t k = 0;
+    if (a == make_fixnum(0)) { *out = make_fixnum(0); return true; }
+    if (!bigint::to_int64(b, &k) || k > (int64_t(1) << 32)) {
+        *out = raise_error(p, well_known(p.runtime()).out_of_memory,
+                           "a left shift by " + bigint::to_string(b) + " bits is too large to make");
+        return false;
+    }
+    *out = bigint::shift_left(h, a, uint64_t(k));
+    return true;
+}
+
 bool arith(Process& p, Op op, Value a, Value b, Value* out) {
     const auto& wk = well_known(p.runtime());
+
+    if (op == Op::BitNot) {
+        if (!bigint::is_integer(a)) {
+            *out = type_error(p, "`~` needs an integer, got " + describe(p, a));
+            return false;
+        }
+        *out = bigint::bit_not(p.heap(), a);
+        return true;
+    }
+
+    if (op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor || op == Op::Shl || op == Op::Shr) {
+        return bitwise_arith(p, op, a, b, out);
+    }
 
     // Elementwise, and the reason this is a VM operation at all: `a * b` on
     // two tensors is one pass over packed numbers. Only reached once the
@@ -1571,6 +1627,27 @@ void finish_binary(Process& p, Op op, Value lhs, Value rhs) {
                     return;
                 }
                 break;
+            // Two fixnums' bits combine into a fixnum: both are sign-extended
+            // 63-bit numbers, and so is anything `&`, `|` or `^` makes of them.
+            case Op::BitAnd: ret(p, make_fixnum(x & y)); return;
+            case Op::BitOr: ret(p, make_fixnum(x | y)); return;
+            case Op::BitXor: ret(p, make_fixnum(x ^ y)); return;
+            case Op::Shl:
+                // Shifting left is multiplying by a power of two, and overflows
+                // the same way; a count past 62 always does, unless x is 0.
+                if (y >= 0 && y < 63 && !mul_overflow(x, int64_t(1) << y, &r) && fixnum_fits(r)) {
+                    ret(p, make_fixnum(r));
+                    return;
+                }
+                break;
+            case Op::Shr:
+                // Arithmetic, as C++20 defines `>>` of a negative number:
+                // floor division by 2^y, ending at -1 rather than 0.
+                if (y >= 0) {
+                    ret(p, make_fixnum(y >= 63 ? (x < 0 ? -1 : 0) : x >> y));
+                    return;
+                }
+                break;
             case Op::Eq: ret(p, make_bool(x == y)); return;
             case Op::Ne: ret(p, make_bool(x != y)); return;
             case Op::Lt: ret(p, make_bool(x < y)); return;
@@ -1704,6 +1781,13 @@ void finish_unary(Process& p, Op op, Value v, uint32_t type, uint32_t invert) {
     }
     if (op == Op::TypeIs) {
         ret(p, make_bool((surface_type(v) == dream_type(type)) != bool(invert)));
+        return;
+    }
+    if (op == Op::BitNot) {
+        // ~x is -x - 1, which for a fixnum is a fixnum.
+        if (is_fixnum(v)) { ret(p, make_fixnum(~fixnum_value(v))); return; }
+        if (bigint::is_big(v)) { ret(p, bigint::bit_not(p.heap(), v)); return; }
+        do_raise(p, type_error(p, "`~` needs an integer, got " + describe(p, v)));
         return;
     }
     if (op == Op::Neg) {
@@ -1949,6 +2033,7 @@ void step_eval(Process& p) {
         case Op::Force: eval_node(p, n.a, frame); return;
 
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::Eq: case Op::Ne: {
             Value lhs;
@@ -1978,7 +2063,7 @@ void step_eval(Process& p) {
             return;
         }
 
-        case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty: {
+        case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty: {
             Value v;
             if (!operand_value(p, img, n.a, frame, &v)) {
                 push_cont(p, ContKind::UnaryFinish, n.op, n.b, n.c, UNIT);

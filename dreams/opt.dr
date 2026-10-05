@@ -99,6 +99,8 @@ let node_edges = [
     [:eq, [0, 1]], [:ne, [0, 1]], [:lt, [0, 1]],
     [:le, [0, 1]], [:gt, [0, 1]], [:ge, [0, 1]],
     [:and, [0, 1]], [:or, [0, 1]],
+    [:band, [0, 1]], [:bor, [0, 1]], [:bxor, [0, 1]], [:shl, [0, 1]], [:shr, [0, 1]],
+    [:bnot, [0]],
     /// `c` is the fallback, and absent when there is none.
     [:get, [0, 1, 2]],
     [:set, [0, 1, 2]],

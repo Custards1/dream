@@ -14,8 +14,8 @@
 //
 // **Representation.** A sign and a magnitude in 64-bit limbs, least
 // significant first. Sign-magnitude rather than two's complement because
-// every operation here is arithmetic, not bitwise, and the magnitude
-// algorithms are the textbook ones over unsigned words.
+// the arithmetic algorithms are the textbook ones over unsigned words.
+// Bitwise operations convert to two's complement temporarily.
 //
 // **The algorithms.** Addition and subtraction are linear. Multiplication is
 // schoolbook below `kKaratsubaThreshold` limbs and Karatsuba above, with an
@@ -59,6 +59,20 @@ Value quot(Heap& h, Value a, Value b);
 Value rem(Heap& h, Value a, Value b);
 Value negate(Heap& h, Value a);
 Value abs(Heap& h, Value a);
+
+// The bitwise operations, on the infinite two's complement every integer has
+// in principle: a negative number has ones above its top bit forever, so
+// `-1 & x` is `x` and `~x` is `-x - 1`, as in Python. Both operands are
+// integers; the answer is canonical.
+Value bit_and(Heap& h, Value a, Value b);
+Value bit_or(Heap& h, Value a, Value b);
+Value bit_xor(Heap& h, Value a, Value b);
+Value bit_not(Heap& h, Value a);
+/// `a * 2^k`.
+Value shift_left(Heap& h, Value a, uint64_t k);
+/// `a / 2^k` rounded toward negative infinity, which is an arithmetic shift:
+/// a negative number stays negative and never reaches zero, only -1.
+Value shift_right(Heap& h, Value a, uint64_t k);
 
 /// -1, 0 or 1, exactly.
 int compare(Value a, Value b);

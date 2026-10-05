@@ -66,4 +66,4 @@ let plan ctx =
                |> build.check "unit_cache" (suite ctx "unit_cache" (under_test ctx) "dreams/tests/units.sh" [])
                |> build.check "bootstrap" (suite ctx "bootstrap" (%{}) "sh" ["-c", bootstrap])
                |> build.check "corpus" (suite ctx "corpus" (under_test ctx) "sh" ["-c", corpus]))
-              ["macros", "optional_types", "static_types", "type_codegen", "contracts", "core_primitives", "modules"];
+              ["macros", "optional_types", "static_types", "bitwise", "type_codegen", "contracts", "core_primitives", "modules"];

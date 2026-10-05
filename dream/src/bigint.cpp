@@ -527,6 +527,122 @@ Value abs(Heap& h, Value a) {
     return finish(o, x.n, false);
 }
 
+// --- bitwise -----------------------------------------------------------------------------
+//
+// Sign-magnitude has no bits to combine, so `&`, `|` and `^` go through two's
+// complement and back, as CPython's do: each operand is written out in one
+// limb more than the wider of them -- so the top limb is all sign extension,
+// zeros or ones -- the limbs are combined, and the top limb of the answer
+// says its sign. A negative answer's magnitude is its two's complement
+// negated again. Shifts need none of that: they move a magnitude, and only
+// `>>` of a negative number looks at the bits it drops.
+
+namespace {
+
+/// `m` as `n` limbs of two's complement; `n` exceeds `m.n`.
+void to_twos(const Mag& m, size_t n, Limb* out) {
+    std::memset(out, 0, n * 8);
+    std::memcpy(out, m.d, m.n * 8);
+    if (m.neg) {
+        Limb carry = 1;
+        for (size_t i = 0; i < n; ++i) {
+            Limb v = ~out[i];
+            out[i] = v + carry;
+            carry = carry && out[i] == 0 ? 1 : 0;
+        }
+    }
+}
+
+enum class BitOp { And, Or, Xor };
+
+Value bitwise(Heap& h, Value a, Value b, BitOp op) {
+    Mag x, y;
+    read(a, &x);
+    read(b, &y);
+    const size_t n = std::max(x.n, y.n) + 1;
+    std::vector<Limb> xa(n), ya(n);
+    to_twos(x, n, xa.data());
+    to_twos(y, n, ya.data());
+    BigIntObj* o = h.alloc_bigint(uint32_t(n));
+    Limb* r = o->limbs();
+    for (size_t i = 0; i < n; ++i) {
+        switch (op) {
+            case BitOp::And: r[i] = xa[i] & ya[i]; break;
+            case BitOp::Or: r[i] = xa[i] | ya[i]; break;
+            case BitOp::Xor: r[i] = xa[i] ^ ya[i]; break;
+        }
+    }
+    const bool neg = (r[n - 1] >> 63) != 0;
+    if (neg) {
+        // Back to a magnitude: invert and add one.
+        Limb carry = 1;
+        for (size_t i = 0; i < n; ++i) {
+            Limb v = ~r[i];
+            r[i] = v + carry;
+            carry = carry && r[i] == 0 ? 1 : 0;
+        }
+    }
+    return finish(o, n, neg);
+}
+
+}  // namespace
+
+Value bit_and(Heap& h, Value a, Value b) { return bitwise(h, a, b, BitOp::And); }
+Value bit_or(Heap& h, Value a, Value b) { return bitwise(h, a, b, BitOp::Or); }
+Value bit_xor(Heap& h, Value a, Value b) { return bitwise(h, a, b, BitOp::Xor); }
+
+Value bit_not(Heap& h, Value a) {
+    // ~a is -(a + 1).
+    return negate(h, add(h, a, make_fixnum(1)));
+}
+
+Value shift_left(Heap& h, Value a, uint64_t k) {
+    Mag x;
+    read(a, &x);
+    if (x.n == 0) return make_fixnum(0);
+    const size_t limbs = size_t(k / 64);
+    const unsigned bits = unsigned(k % 64);
+    const size_t n = x.n + limbs + 1;
+    BigIntObj* o = h.alloc_bigint(uint32_t(n));
+    Limb* r = o->limbs();
+    std::memset(r, 0, n * 8);
+    for (size_t i = 0; i < x.n; ++i) {
+        r[i + limbs] |= x.d[i] << bits;
+        if (bits) r[i + limbs + 1] |= x.d[i] >> (64 - bits);
+    }
+    return finish(o, n, x.neg);
+}
+
+Value shift_right(Heap& h, Value a, uint64_t k) {
+    Mag x;
+    read(a, &x);
+    const uint64_t limbs = k / 64;
+    const unsigned bits = unsigned(k % 64);
+    if (limbs >= x.n) return make_fixnum(x.neg ? -1 : 0);
+    // Whether any 1 bit falls off the bottom: a negative number then rounds
+    // down, one further from zero, as floor division by 2^k does.
+    bool lost = false;
+    for (uint64_t i = 0; i < limbs && !lost; ++i) lost = x.d[i] != 0;
+    if (!lost && bits) lost = (x.d[limbs] & ((Limb(1) << bits) - 1)) != 0;
+    const size_t n = size_t(x.n - limbs);
+    BigIntObj* o = h.alloc_bigint(uint32_t(n + 1));
+    Limb* r = o->limbs();
+    for (size_t i = 0; i < n; ++i) {
+        Limb lo = x.d[i + limbs] >> bits;
+        Limb hi = bits && i + limbs + 1 < x.n ? x.d[i + limbs + 1] << (64 - bits) : 0;
+        r[i] = lo | hi;
+    }
+    r[n] = 0;
+    if (x.neg && lost) {
+        Limb carry = 1;
+        for (size_t i = 0; i <= n && carry; ++i) {
+            r[i] += 1;
+            carry = r[i] == 0 ? 1 : 0;
+        }
+    }
+    return finish(o, n + 1, x.neg);
+}
+
 // --- comparison --------------------------------------------------------------------------
 
 int compare(Value a, Value b) {

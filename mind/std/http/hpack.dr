@@ -10,8 +10,8 @@
 //     hpack.encode [[":status", "200"], ["content-type", "text/html"]]
 //
 // **Decoding is complete**: every representation, the dynamic table with its
-// evictions and size updates, and Huffman strings. Dream has no bitwise
-// operators, so Huffman is decoded a bit at a time down a binary tree --
+// evictions and size updates, and Huffman strings. Huffman is decoded a bit
+// at a time down a binary tree --
 // built from the code table while the program is compiled (`comp`), so a
 // program carries the tree rather than building it -- and a bit is a
 // division. Header strings are short, so that is cheap.

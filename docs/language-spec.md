@@ -374,9 +374,13 @@ From loosest to tightest:
 | `&&` | left |
 | `==` `!=` `<` `<=` `>` `>=` | left |
 | `::` | **right** |
+| `\|` | left |
+| `^` | left |
+| `&` | left |
+| `<<` `>>` | left |
 | `+` `-` | left |
 | `*` `/` `%` `@` | left |
-| prefix `-`, `not`, and `comp`, `comp!`, `expand` | prefix |
+| prefix `-`, `~`, `not`, and `comp`, `comp!`, `expand` | prefix |
 | application `f a b` | left |
 | `.name`, `.[ ]` | postfix |
 
@@ -411,6 +415,17 @@ A parameter written `()` takes a slot but binds no name: `let now! () = ..`
 is called as `now! ()`.
 
 ### Operators
+
+The integer operators `&`, `|`, `^` and `~` use infinite two's complement:
+`~x == -x - 1` and `-1 & x == x`. They accept integers only, including
+arbitrarily large integers. `x << n` multiplies by `2^n`; `x >> n` divides
+by `2^n` rounded toward negative infinity, so `-3 >> 1 == -2`. A negative
+count raises `:out_of_bounds`; a nonzero left shift by more than `2^32` bits
+raises `:out_of_memory` before allocation. Ordinary process heap limits
+also apply. Huge right shifts yield `0` or `-1` according to the sign.
+
+`x & 1 == 0` means `(x & 1) == 0`; `1 << n - 1` means `1 << (n - 1)`.
+
 
 | | |
 |---|---|
